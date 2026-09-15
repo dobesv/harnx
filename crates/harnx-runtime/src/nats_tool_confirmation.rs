@@ -58,7 +58,7 @@ impl ToolConfirmationRoute {
         })
     }
 
-    pub(crate) fn subject(&self) -> &str {
+    pub fn subject(&self) -> &str {
         &self.subject
     }
 

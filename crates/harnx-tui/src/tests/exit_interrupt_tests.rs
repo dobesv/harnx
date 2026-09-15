@@ -172,6 +172,8 @@ async fn attaching_to_cancelling_session_automatically_retries_recovery() {
         .transition(harnx_execution_control::OperationState::Unconfirmed)
         .unwrap();
 
+    tui.live_events
+        .select(Some(operation.reference.execution_id.clone()));
     tui.hydrate_execution_state(LOCAL_CLUSTER_KEY.into(), operation);
 
     assert!(tui.pending_exit_cancel.is_some());
@@ -209,6 +211,8 @@ async fn failed_automatic_recovery_can_abandon_the_observed_generation() {
     );
     operation.request_cancel("cancel", false).unwrap();
 
+    tui.live_events
+        .select(Some(operation.reference.execution_id.clone()));
     tui.hydrate_execution_state(LOCAL_CLUSTER_KEY.into(), operation);
     tui.poll_pending_exit_cancel().await;
     assert!(matches!(
@@ -217,18 +221,15 @@ async fn failed_automatic_recovery_can_abandon_the_observed_generation() {
     ));
 
     tui.handle_key(esc()).await.unwrap();
-    assert!(matches!(
-        tui.app.modal,
-        Some(ModalState::ConfirmAbandonCancellation)
-    ));
-    tui.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .await
-        .unwrap();
+    assert!(tui.app.modal.is_none());
 
     assert_eq!(
         *actions.lock().unwrap(),
         vec![
-            (None, crate::types::CancellationAction::Request),
+            (
+                Some("observed-execution".into()),
+                crate::types::CancellationAction::Request
+            ),
             (
                 Some("observed-execution".into()),
                 crate::types::CancellationAction::Abandon
@@ -474,13 +475,13 @@ async fn interrupt_exit_finishes_on_durable_acceptance_before_shutdown() {
     tui.poll_pending_exit_cancel().await;
     assert_exit_finished(&tui);
     assert!(
-        tui.app.llm_busy,
-        "durable acceptance must not claim the worker is idle"
+        !tui.app.llm_busy,
+        "busy is logical turn activity, not physical cleanup"
     );
 }
 
 #[tokio::test]
-async fn interrupt_exit_keeps_locally_owned_worker_alive_until_shutdown_is_confirmed() {
+async fn interrupt_exit_finishes_for_locally_owned_worker_on_acceptance() {
     let mut tui = prompting_exit_tui_with_worker(ExitWorkerState::LocalOwnedHere).await;
     tui.set_exit_cancel_factory(Arc::new(|_, _, _, _, _, _| {
         Box::pin(async {
@@ -493,22 +494,6 @@ async fn interrupt_exit_keeps_locally_owned_worker_alive_until_shutdown_is_confi
     }));
 
     tui.handle_modal_key(ctrl('c')).await.unwrap();
-    tui.poll_pending_exit_cancel().await;
-
-    assert!(!tui.app.should_quit);
-    assert!(tui.app.modal.is_none());
-    assert!(tui.cancellation.is_some());
-    assert!(tui.exit_after_cancel);
-
-    tui.monitor_cancellation(harnx_execution_control::CancelReceipt {
-        cancelled: true,
-        disposition: harnx_execution_control::CancelDisposition::Cancelled,
-        cancellation_id: Some("cancel".into()),
-        execution_id: Some("execution".into()),
-        requested_at: None,
-        unconfirmed_after_ms: 5_000,
-        abandoned: false,
-    });
     tui.poll_pending_exit_cancel().await;
 
     assert_exit_finished(&tui);
@@ -535,7 +520,8 @@ async fn root_cancellation_blocks_editing_and_has_static_unconfirmed_tray() {
     assert!(harness
         .screen_contents()
         .contains("Cancellation unconfirmed"));
-    assert!(harness.screen_contents().contains("Esc: resume anyway"));
+    assert!(harness.screen_contents().contains("Esc: back to editor"));
+    assert!(!harness.screen_contents().contains("Esc: resume anyway"));
     harness
         .tui()
         .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -560,27 +546,11 @@ async fn unconfirmed_cancellation_can_be_explicitly_abandoned() {
             Box::pin(std::future::pending())
         }
     }));
-    tui.start_cancellation("root".into(), "local".into(), None);
-    tui.monitor_cancellation(harnx_execution_control::CancelReceipt {
-        cancelled: true,
-        disposition: harnx_execution_control::CancelDisposition::Requested,
-        cancellation_id: Some("cancel".into()),
-        execution_id: Some("execution".into()),
-        requested_at: None,
-        unconfirmed_after_ms: 5_000,
-        abandoned: false,
-    });
+    // Unknown acceptance retains the observed generation for explicit repair.
+    tui.start_observed_cancellation("root".into(), "local".into(), "execution".into());
     tui.cancellation.as_mut().unwrap().phase = crate::cancellation::CancellationPhase::Unconfirmed;
 
     tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    assert!(matches!(
-        tui.app.modal,
-        Some(ModalState::ConfirmAbandonCancellation)
-    ));
-
-    tui.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
         .await
         .unwrap();
     assert!(tui.app.modal.is_none());
@@ -588,7 +558,10 @@ async fn unconfirmed_cancellation_can_be_explicitly_abandoned() {
     assert_eq!(
         *actions.lock().unwrap(),
         vec![
-            (None, crate::types::CancellationAction::Request),
+            (
+                Some("execution".into()),
+                crate::types::CancellationAction::Request
+            ),
             (
                 Some("execution".into()),
                 crate::types::CancellationAction::Abandon

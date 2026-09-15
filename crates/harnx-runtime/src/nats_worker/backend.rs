@@ -2,20 +2,14 @@
 
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
+use crate::nats_session_metadata::MetadataOutput;
 use anyhow::{Context, Result};
-use async_nats::jetstream::{self, context::PublishErrorKind};
+use async_nats::jetstream;
 use harnx_core::execution_context::ExecutionContextObservation;
 use std::sync::Arc;
 
 const APPEND_ATTEMPTS: usize = 3;
 
-fn is_stream_advanced_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<jetstream::context::PublishError>()
-            .is_some_and(|error| error.kind() == PublishErrorKind::WrongLastSequence)
-    })
-}
 const APPEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 enum MetadataReplacement {
@@ -48,6 +42,7 @@ impl MetadataReplacement {
 pub struct NatsSessionLogBackend {
     jetstream: jetstream::Context,
     session_id: String,
+    execution: Option<crate::execution_fence::GenerationFence>,
     /// Optional observer of the latest durable append sequence. When set, every
     /// successful append advances it via `fetch_max`, so the live-event fan-out
     /// sink (P4.1) can stamp advisories with an up-to-date `after_seq` during
@@ -59,6 +54,13 @@ pub struct NatsSessionLogBackend {
 impl crate::config::session::SessionAppendSink for NatsSessionLogBackend {
     fn append(&self, entry: &harnx_core::session::SessionLogEntry) -> Result<u64> {
         self.append_event_blocking(entry)
+    }
+
+    fn validate_output(&self) -> Result<()> {
+        if let Some(fence) = &self.execution {
+            fence.check_blocking("transcript-reducer")?;
+        }
+        Ok(())
     }
 
     fn failure_is_fatal(&self) -> bool {
@@ -112,32 +114,16 @@ impl crate::config::session::SessionAppendSink for NatsSessionLogBackend {
     }
 }
 
-/// Fence-guarded append sink for HA worker writes (P2.2).
+/// Worker sink bound to one execution generation and lease owner.
 ///
-/// Wraps a [`NatsSessionLogBackend`] with the holding [`NatsSessionLease`].
-/// Every worker-originated append checks local lease state and stamps
-/// `fence_token = lease.fence_token()` on entries that carry one.
+/// The backend commits exact output through the tree gate before its private
+/// ordered projector appends. Local lease checks are fast rejects only; owner
+/// handover and stop share the same gate CAS as output. A valid lease cannot
+/// authorize an old generation's output.
 ///
-/// # HITL single-winner (CAS + ownership revalidation)
-///
-/// HITL control entries MUST use stream-tail CAS via
-/// [`Self::append_hitl_event_cas`] because local `is_held()` checks are NOT
-/// broker-authoritative. After TTL expiry, a stale worker's `is_held()` returns
-/// true until its next renewal attempt fails, creating a window where two
-/// workers can both believe they hold the lease. The fence token is only an
-/// audit field—it is NOT checked by the broker on append. Without CAS, a stale
-/// worker racing a fresh lease-holder can successfully append conflicting
-/// decisions, and replay accepts the later physical entry as authoritative.
-///
-/// CAS alone is insufficient: the stale worker can still win if it publishes
-/// first after expiry. To close double-execution, `run_hitl_continuation_segment`
-/// must call [`NatsSessionLease::revalidate_ownership`] after deriving the
-/// durable decision and immediately before invoking the approved tool. Lost
-/// ownership aborts before side effects.
-///
-/// **Do not** relax this to `is_held()` + unconditional append: the original
-/// design assumed "lease+fence = CAS" and was wrong (see `hitl-toctou-actual-impact`,
-/// `durable-session-events` plan).
+/// HITL also retains the expected stream tail used to derive the decision. A
+/// conditional projection that loses forces re-derivation. The continuation
+/// still revalidates lease ownership immediately before approved tool dispatch.
 #[derive(Clone)]
 pub struct FencedSessionLogSink {
     backend: NatsSessionLogBackend,
@@ -165,8 +151,8 @@ impl FencedSessionLogSink {
         entry: &harnx_core::session::SessionLogEntry,
         expected_last_sequence: u64,
     ) -> Result<Option<u64>> {
-        let mut fenced = entry.clone();
-        fenced.set_fence_token(self.lease.fence_token());
+        self.require_generation()?;
+        let fenced = self.fenced_entry(entry);
         self.backend
             .append_event_with_expected_last_sequence_and_lease(
                 &fenced,
@@ -182,13 +168,40 @@ impl FencedSessionLogSink {
         entry: &harnx_core::session::SessionLogEntry,
         expected_last_sequence: u64,
     ) -> Result<Option<u64>> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(self.append_hitl_event_cas(entry, expected_last_sequence))
+        let sink = self.clone();
+        let entry = entry.clone();
+        crate::execution_fence::block_on_io(async move {
+            sink.append_hitl_event_cas(&entry, expected_last_sequence)
+                .await
         })
     }
 
+    fn require_generation(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.backend.execution.is_some(),
+            "worker output requires execution generation authority"
+        );
+        Ok(())
+    }
+
+    fn fenced_entry(
+        &self,
+        entry: &harnx_core::session::SessionLogEntry,
+    ) -> harnx_core::session::SessionLogEntry {
+        use harnx_core::session::SessionLogEntry;
+        let mut entry = entry.clone();
+        let revision = self.lease.fence_token();
+        match &mut entry {
+            SessionLogEntry::Cancel { fence_token }
+            | SessionLogEntry::Error { fence_token, .. }
+            | SessionLogEntry::TurnEnd { fence_token, .. } => *fence_token = revision,
+            _ => entry.set_fence_token(revision),
+        }
+        entry
+    }
+
     fn persist_metadata(&self, replacement: MetadataReplacement) -> Result<()> {
+        self.require_generation()?;
         anyhow::ensure!(
             self.lease.is_held(),
             "session lease lost before metadata update"
@@ -200,10 +213,17 @@ impl FencedSessionLogSink {
 
 impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
     fn append(&self, entry: &harnx_core::session::SessionLogEntry) -> Result<u64> {
-        let mut fenced = entry.clone();
-        fenced.set_fence_token(self.lease.fence_token());
+        self.require_generation()?;
+        let fenced = self.fenced_entry(entry);
         self.backend
             .append_event_blocking_with_lease(&fenced, Some(&self.lease))
+    }
+
+    fn validate_output(&self) -> Result<()> {
+        if let Some(fence) = &self.backend.execution {
+            fence.check_blocking("transcript-reducer")?;
+        }
+        Ok(())
     }
 
     fn failure_is_fatal(&self) -> bool {
@@ -211,6 +231,7 @@ impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
     }
 
     fn persist_title(&self, title: &str, manual: bool, tokens: usize) -> Result<()> {
+        self.require_generation()?;
         anyhow::ensure!(
             self.lease.is_held(),
             "session lease lost before title update"
@@ -251,6 +272,7 @@ impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
         observations: &'a [ExecutionContextObservation],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            self.require_generation()?;
             anyhow::ensure!(
                 self.lease.is_held(),
                 "session lease lost before execution-context update"
@@ -271,9 +293,18 @@ impl NatsSessionLogBackend {
         Self {
             jetstream,
             session_id: session_id.into(),
+            execution: None,
             after_seq_observer: None,
             metadata_store: None,
         }
+    }
+
+    pub fn with_execution(
+        mut self,
+        execution: Option<crate::execution_fence::GenerationFence>,
+    ) -> Self {
+        self.execution = execution;
+        self
     }
 
     pub fn jetstream(&self) -> jetstream::Context {
@@ -335,6 +366,13 @@ impl NatsSessionLogBackend {
         fence_token: Option<u64>,
     ) -> Result<()> {
         let title = update.title.to_string();
+        if self.project_metadata_blocking(MetadataOutput::Title {
+            title: title.clone(),
+            manual: update.manual,
+            tokens: update.tokens,
+        })? {
+            return Ok(());
+        }
         self.patch_metadata_blocking(fence_token, move |metadata| {
             metadata.title.value = Some(title.clone());
             metadata.title.manual = update.manual;
@@ -348,6 +386,14 @@ impl NatsSessionLogBackend {
         replacement: MetadataReplacement,
         fence_token: Option<u64>,
     ) -> Result<()> {
+        let output = match &replacement {
+            MetadataReplacement::Overrides(value) => MetadataOutput::Overrides(value.clone()),
+            MetadataReplacement::Override(value) => MetadataOutput::Override(value.clone()),
+            MetadataReplacement::Variables(value) => MetadataOutput::Variables(value.clone()),
+        };
+        if self.project_metadata_blocking(output)? {
+            return Ok(());
+        }
         self.patch_metadata_blocking(fence_token, move |metadata| {
             replacement.apply(metadata);
             Ok(())
@@ -373,6 +419,12 @@ impl NatsSessionLogBackend {
         observations: &[ExecutionContextObservation],
         fence_token: Option<u64>,
     ) -> Result<()> {
+        if self
+            .project_metadata(MetadataOutput::ExecutionContexts(observations.to_vec()))
+            .await?
+        {
+            return Ok(());
+        }
         let store = self.metadata_store()?;
         if let Some(fence_token) = fence_token {
             store
@@ -384,6 +436,34 @@ impl NatsSessionLogBackend {
                 .await?;
         }
         Ok(())
+    }
+
+    fn project_metadata_blocking(&self, output: MetadataOutput) -> Result<bool> {
+        if self.execution.is_none() {
+            return Ok(false);
+        }
+        let backend = self.clone();
+        crate::execution_fence::block_on_io(async move { backend.project_metadata(output).await })
+    }
+
+    async fn project_metadata(&self, output: MetadataOutput) -> Result<bool> {
+        let Some(fence) = &self.execution else {
+            return Ok(false);
+        };
+        self.metadata_store()?;
+        let receipt = fence
+            .output(
+                harnx_execution_control::OutputKind::SessionMetadata,
+                serde_json::to_value(output)?,
+            )
+            .await?;
+        crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            self.session_id.clone(),
+        )
+        .project_through(fence, &receipt)
+        .await?;
+        Ok(true)
     }
 
     pub fn session_id(&self) -> &str {
@@ -435,39 +515,18 @@ impl NatsSessionLogBackend {
             self.jetstream.clone(),
             self.session_id.clone(),
         );
-        let message_id = uuid::Uuid::new_v4().to_string();
-        let mut last_error = None;
-        for attempt in 1..=APPEND_ATTEMPTS {
-            self.ensure_lease_held(lease, entry)?;
-            match log
-                .append_event_with_expected_last_sequence_and_message_id_async(
-                    entry,
-                    expected_last_sequence,
-                    message_id.clone(),
-                )
-                .await
-            {
-                Ok(seq) => {
-                    self.observe_append(seq);
-                    return Ok(Some(seq));
-                }
-                Err(error) if is_stream_advanced_error(&error) => return Ok(None),
-                Err(error) => {
-                    if attempt < APPEND_ATTEMPTS {
-                        warn!(
-                            "retrying conditional session append: session_id={} entry_type={} attempt={}/{} error={error:#}",
-                            self.session_id(),
-                            crate::session_history::entry_type(entry),
-                            attempt,
-                            APPEND_ATTEMPTS,
-                        );
-                        tokio::time::sleep(APPEND_RETRY_DELAY).await;
-                    }
-                    last_error = Some(error);
-                }
-            }
+        let fence = self
+            .execution
+            .as_ref()
+            .context("worker append requires execution generation authority")?;
+        self.ensure_lease_held(lease, entry)?;
+        let seq = log
+            .append_output(fence, entry, Some(expected_last_sequence))
+            .await?;
+        if let Some(seq) = seq {
+            self.observe_append(seq);
         }
-        Err(last_error.expect("at least one conditional append attempt must record an error"))
+        Ok(seq)
     }
 
     fn ensure_lease_held(
@@ -476,6 +535,14 @@ impl NatsSessionLogBackend {
         entry: &harnx_core::session::SessionLogEntry,
     ) -> Result<()> {
         if lease.is_held() {
+            if let Some(fence) = &self.execution {
+                // Renewals advance the audit revision, not the gate owner captured at claim.
+                anyhow::ensure!(
+                    fence.context.generation_owner().instance_id == lease.worker_id()
+                        && fence.context.generation_owner().fence <= lease.fence_token(),
+                    "sink lease does not own execution generation"
+                );
+            }
             return Ok(());
         }
         nats_metrics::fenced_write_rejected();
@@ -498,14 +565,35 @@ impl NatsSessionLogBackend {
             self.jetstream.clone(),
             self.session_id.clone(),
         );
+        if let Some(lease) = lease {
+            self.ensure_lease_held(lease, entry)?;
+        }
+        if let Some(fence) = &self.execution {
+            return self.append_committed(&log, fence, entry).await;
+        }
+        self.append_control_entry(&log, entry).await
+    }
+
+    async fn append_control_entry(
+        &self,
+        log: &crate::nats_session_log::NatsSessionLog,
+        entry: &harnx_core::session::SessionLogEntry,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            matches!(
+                entry,
+                harnx_core::session::SessionLogEntry::Cancel { .. }
+                    | harnx_core::session::SessionLogEntry::Message {
+                        role: harnx_core::message::MessageRole::User,
+                        ..
+                    }
+            ),
+            "worker output requires execution generation authority"
+        );
         let message_id = uuid::Uuid::new_v4().to_string();
         let mut last_error = None;
         let mut appended_seq = None;
         for attempt in 1..=APPEND_ATTEMPTS {
-            if let Some(lease) = lease {
-                self.ensure_lease_held(lease, entry)?;
-            }
-
             match log
                 .append_event_with_message_id_async(entry, message_id.clone())
                 .await
@@ -538,6 +626,29 @@ impl NatsSessionLogBackend {
         Ok(seq)
     }
 
+    async fn append_committed(
+        &self,
+        log: &crate::nats_session_log::NatsSessionLog,
+        fence: &crate::execution_fence::GenerationFence,
+        entry: &harnx_core::session::SessionLogEntry,
+    ) -> Result<u64> {
+        let seq = if let harnx_core::session::SessionLogEntry::Cancel { fence_token } = entry {
+            let entries = log.load_events_latest_async().await?;
+            log.append_cancellation(
+                fence,
+                (entries.last().map_or(0, |(seq, _)| *seq), *fence_token),
+            )
+            .await?
+            .context("cancel projection superseded")?
+        } else {
+            log.append_output(fence, entry, None)
+                .await?
+                .context("transcript projection missing")?
+        };
+        self.observe_append(seq);
+        Ok(seq)
+    }
+
     /// Append an entry, blocking on the async NATS call.
     ///
     /// Must be called from within a Tokio multi-threaded runtime.
@@ -552,12 +663,19 @@ impl NatsSessionLogBackend {
     fn append_event_blocking_with_lease(
         &self,
         entry: &harnx_core::session::SessionLogEntry,
-        lease: Option<&NatsSessionLease>,
+        lease: Option<&Arc<NatsSessionLease>>,
     ) -> Result<u64> {
-        let seq = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.append_event_with_lease(entry, lease))
-        })?;
-        Ok(seq)
+        if let Some(lease) = lease {
+            self.ensure_lease_held(lease, entry)?;
+        }
+        let backend = self.clone();
+        let entry = entry.clone();
+        let lease = lease.cloned();
+        crate::execution_fence::block_on_io(async move {
+            backend
+                .append_event_with_lease(&entry, lease.as_deref())
+                .await
+        })
     }
 
     /// Advance the P4.1 fan-out `after_seq` so subsequent advisories in this
@@ -612,21 +730,56 @@ impl NatsSessionLogBackend {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::is_stream_advanced_error;
-    use async_nats::jetstream::context::{PublishError, PublishErrorKind};
+pub(crate) async fn test_generation_fence(
+    jetstream: &jetstream::Context,
+    session_id: &str,
+    lease: &NatsSessionLease,
+) -> crate::execution_fence::GenerationFence {
+    let store = harnx_execution_control::ExecutionStore::ensure(jetstream, 1)
+        .await
+        .unwrap();
+    let operation = store.session(session_id, None, None).await.unwrap();
+    store
+        .claim(
+            &operation.reference,
+            harnx_execution_control::Owner {
+                instance_id: lease.worker_id().into(),
+                fence: lease.fence_token(),
+            },
+        )
+        .await
+        .unwrap();
+    let context = store.activate_gate(&operation.reference).await.unwrap();
+    crate::execution_fence::GenerationFence::new(store, context)
+}
 
-    #[test]
-    fn stream_advanced_detection_uses_wrapped_publish_error_kind() {
-        let wrong_sequence =
-            anyhow::Error::new(PublishError::new(PublishErrorKind::WrongLastSequence))
-                .context("wrapped publish failure");
-        assert!(is_stream_advanced_error(&wrong_sequence));
-
-        let textual_match = anyhow::anyhow!("wrong last sequence");
-        assert!(!is_stream_advanced_error(&textual_match));
-
-        let other_publish_error = anyhow::Error::new(PublishError::new(PublishErrorKind::Other));
-        assert!(!is_stream_advanced_error(&other_publish_error));
-    }
+#[cfg(test)]
+pub(crate) async fn test_session_authority(
+    jetstream: &jetstream::Context,
+    session_id: &str,
+    store: &crate::nats_session_metadata::SessionMetadataStore,
+) -> (
+    Arc<NatsSessionLease>,
+    crate::execution_fence::GenerationFence,
+) {
+    use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig};
+    let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+        jetstream: jetstream.clone(),
+        session_id,
+        worker_id: "test-worker".to_string(),
+        generation: 1,
+        config: NatsLeaseConfig {
+            ttl: std::time::Duration::from_secs(5),
+            renew_interval: std::time::Duration::from_millis(500),
+            replicas: 1,
+            ..Default::default()
+        },
+        session_metadata: Some(store.clone()),
+    })
+    .await
+    .unwrap()
+    .expect("lease should be acquired");
+    let lease = Arc::new(lease);
+    let fence = test_generation_fence(jetstream, session_id, &lease).await;
+    (lease, fence)
 }

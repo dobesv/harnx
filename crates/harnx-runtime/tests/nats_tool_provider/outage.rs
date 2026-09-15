@@ -48,7 +48,7 @@ async fn assert_outage_result(explicit_abort: bool) -> Result<()> {
     drop(server);
     let timeout = if explicit_abort {
         abort.set_ctrlc();
-        Duration::from_secs(7)
+        Duration::from_secs(2)
     } else {
         Duration::from_secs(40)
     };
@@ -61,6 +61,11 @@ async fn assert_outage_result(explicit_abort: bool) -> Result<()> {
         (false, Err(ToolError::Recoverable(error))) => error,
         _ => anyhow::bail!("expected explicit unavailable result"),
     };
-    assert!(format!("{error:#}").contains("unconfirmed"), "{error:#}");
+    if explicit_abort {
+        // Returning execution control doesn't await broker recovery or shutdown.
+        assert_eq!(error.to_string(), "tool call aborted");
+    } else {
+        assert!(format!("{error:#}").contains("unconfirmed"), "{error:#}");
+    }
     Ok(())
 }

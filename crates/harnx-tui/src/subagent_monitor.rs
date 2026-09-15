@@ -1,6 +1,6 @@
 //! Independent subscribe-first monitors for nested agent session transcripts.
 
-use crate::session_activity::{attach_session_event_stream, history_has_pending_turn};
+use crate::session_activity::{attach_session_event_stream_with_state, history_has_pending_turn};
 use crate::types::{MonitoredSessionKey, SubAgentStatus, TranscriptItem, Tui, TuiEvent};
 use harnx_core::event::{AgentEvent, ModelEvent, TurnEvent};
 use harnx_core::session::SessionLogEntry;
@@ -12,6 +12,11 @@ use tokio::task::JoinHandle;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const DURABLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+struct ObservedInvocation {
+    id: Option<String>,
+    live: harnx_runtime::nats_event_sink::LiveEventState,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttachmentOutcome {
@@ -84,12 +89,22 @@ impl Tui {
         if let Some(handle) = self.subagent_monitor_handles.remove(&key) {
             handle.abort();
         }
+        self.app.monitored_sessions[&key].live_events.retire();
+        let live = self.live_events.fork();
+        self.app
+            .monitored_sessions
+            .get_mut(&key)
+            .unwrap()
+            .live_events = live.clone();
         let invocation_id = self.app.monitored_sessions[&key].invocation_id.clone();
         let handle = spawn_subagent_monitor(
             self.config.clone(),
             self.event_tx.clone(),
             key.clone(),
-            invocation_id,
+            ObservedInvocation {
+                id: invocation_id,
+                live,
+            },
         );
         self.subagent_monitor_handles.insert(key, handle);
     }
@@ -115,13 +130,13 @@ fn spawn_subagent_monitor(
     config: GlobalConfig,
     event_tx: UnboundedSender<TuiEvent>,
     key: MonitoredSessionKey,
-    invocation_id: Option<String>,
+    invocation: ObservedInvocation,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let target = (key.storage_key(), key.cluster.clone());
         tokio::join!(
             crate::cancellation::monitor_execution(&config, &event_tx, &target),
-            monitor_subagent_session(config.clone(), event_tx.clone(), key, invocation_id)
+            monitor_subagent_session(config.clone(), event_tx.clone(), key, invocation)
         );
     })
 }
@@ -130,19 +145,13 @@ async fn monitor_subagent_session(
     config: GlobalConfig,
     event_tx: UnboundedSender<TuiEvent>,
     key: MonitoredSessionKey,
-    invocation_id: Option<String>,
+    invocation: ObservedInvocation,
 ) {
     let target = (key.storage_key(), key.cluster.clone());
     let mut reconnect_delay = RECONNECT_DELAY;
     loop {
-        let outcome = monitor_subagent_attachment(
-            &config,
-            &event_tx,
-            &key,
-            &target,
-            invocation_id.as_deref(),
-        )
-        .await;
+        let outcome =
+            monitor_subagent_attachment(&config, &event_tx, &key, &target, &invocation).await;
         if outcome == AttachmentOutcome::Terminal {
             return;
         }
@@ -167,9 +176,13 @@ async fn monitor_subagent_attachment(
     event_tx: &UnboundedSender<TuiEvent>,
     key: &MonitoredSessionKey,
     target: &(String, String),
-    invocation_id: Option<&str>,
+    invocation: &ObservedInvocation,
 ) -> AttachmentOutcome {
-    let (mut stream, _client) = match attach_session_event_stream(config, target).await {
+    let invocation_id = invocation.id.as_deref();
+    let live = &invocation.live;
+    let mut stream = match attach_session_event_stream_with_state(config, target, live.clone())
+        .await
+    {
         Ok(result) => result,
         Err(error) => {
             log::debug!(
@@ -181,6 +194,9 @@ async fn monitor_subagent_attachment(
             return AttachmentOutcome::AttachFailed;
         }
     };
+    if let Some(id) = invocation_id {
+        stream.follow_generation(id.into());
+    }
     let boundary = AttachmentBoundary {
         attached_seq: stream.last_applied_seq(),
         attached_during_turn: history_has_pending_turn(stream.history()),
@@ -208,6 +224,10 @@ async fn monitor_subagent_attachment(
                 let terminal = is_subagent_terminal_event(&envelope.event);
                 if event_tx
                     .send(TuiEvent::SubAgentSessionEvent {
+                        stamp: crate::event_isolation::EventStamp::live(
+                            live,
+                            envelope.execution_id,
+                        ),
                         key: key.clone(),
                         event: envelope.event,
                     })

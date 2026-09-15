@@ -13,3 +13,4 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio-util = { workspace = true }
+tokio.workspace = true

@@ -467,6 +467,20 @@ async fn assert_cancel_reached_worker(config: &harnx_runtime::config::Config, se
             .any(|(_, entry)| matches!(entry, harnx_core::session::SessionLogEntry::Cancel { .. })),
         "web cancel did not reach worker control listener"
     );
+    let raw = entries
+        .into_iter()
+        .map(|(seq, entry)| (seq as usize, entry))
+        .collect::<Vec<_>>();
+    let restored =
+        harnx_runtime::config::session::replay_log_entries_for_external(&raw, session_id)
+            .expect("replay cancelled serve session");
+    let user_texts = restored
+        .messages
+        .iter()
+        .filter(|message| message.role.is_user())
+        .map(|message| message.content.to_text())
+        .collect::<Vec<_>>();
+    assert_eq!(user_texts, ["first prompt", "cancel this prompt"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

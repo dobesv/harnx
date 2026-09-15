@@ -7,6 +7,18 @@ mod hierarchy;
 #[path = "cancellation/recovery.rs"]
 mod recovery;
 
+#[path = "cancellation/prompt_persistence.rs"]
+mod prompt_persistence;
+
+#[path = "cancellation/overlap.rs"]
+mod overlap;
+
+#[path = "cancellation/lease_overlap.rs"]
+mod lease_overlap;
+
+#[path = "cancellation/projection_overlap.rs"]
+mod projection_overlap;
+
 async fn session(url: &str, id: &str) -> Result<NatsSession> {
     session_with_route(
         url,
@@ -101,24 +113,11 @@ async fn durable_watch_cancels_streaming_without_a_core_command() -> Result<()> 
         return Ok(());
     };
     let entered = Arc::new(Notify::new());
-    let aborted = Arc::new(AtomicBool::new(false));
+    let model_dropped = tokio_util::sync::CancellationToken::new();
     let daemon = spawn_worker_daemon_with_call_fn(
         local_nats_runtime_config(server.url()),
         "watch-only-worker",
-        Arc::new({
-            let entered = entered.clone();
-            let aborted = aborted.clone();
-            move |_, _, abort| {
-                let entered = entered.clone();
-                let aborted = aborted.clone();
-                Box::pin(async move {
-                    entered.notify_one();
-                    harnx_core::abort::wait_abort_signal(&abort).await;
-                    aborted.store(true, Ordering::SeqCst);
-                    anyhow::bail!("model stopped after cancellation")
-                })
-            }
-        }),
+        abort_blocked_call_fn(entered.clone(), model_dropped.clone()),
     )
     .await;
     let session = session(server.url(), "watch-only-cancel").await?;
@@ -135,7 +134,10 @@ async fn durable_watch_cancels_streaming_without_a_core_command() -> Result<()> 
         .wait_for_cancel(&receipt, tokio::time::Instant::now() + CI_SAFE_TIMEOUT)
         .await?;
     assert_eq!(status.disposition, CancelDisposition::Cancelled);
-    assert!(aborted.load(Ordering::SeqCst));
+    assert!(
+        model_dropped.is_cancelled(),
+        "confirmed cleanup requires model drop, not another cooperative poll"
+    );
     daemon.abort();
     let _ = daemon.await;
     Ok(())

@@ -2,11 +2,15 @@ use crate::*;
 use anyhow::{bail, ensure, Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[path = "retention.rs"]
+mod retention;
+pub use retention::RecoveryHistory;
 
 #[derive(Clone, Debug)]
 pub struct ExecutionStore {
-    kv: kv::Store,
+    pub(crate) kv: kv::Store,
 }
 
 impl ExecutionStore {
@@ -34,27 +38,6 @@ impl ExecutionStore {
         Ok(Self { kv })
     }
 
-    pub async fn get(&self, reference: &OperationRef) -> Result<Option<Operation>> {
-        reference.validate()?;
-        Ok(self
-            .entry(&reference.key())
-            .await?
-            .map(|(operation, _)| operation))
-    }
-
-    async fn entry(&self, key: &str) -> Result<Option<(Operation, u64)>> {
-        let Some(entry) = harnx_nats_common::recovery::read(|| self.kv.entry(key)).await? else {
-            return Ok(None);
-        };
-        if entry.operation != kv::Operation::Put {
-            return Ok(None);
-        }
-        Ok(Some((
-            serde_json::from_slice(&entry.value)?,
-            entry.revision,
-        )))
-    }
-
     pub async fn current(&self, session: &str) -> Result<Option<Operation>> {
         let Some(value) =
             harnx_nats_common::recovery::read(|| self.kv.get(current_key(session))).await?
@@ -67,7 +50,8 @@ impl ExecutionStore {
         )?))
     }
 
-    /// Install a generation only after the previous generation is terminal.
+    /// Install after logical completion/interruption, without awaiting cleanup
+    /// of explicitly interrupted work. Legacy cancellation still waits.
     /// A losing candidate never executes; all admissions CAS the winning record.
     pub async fn session(
         &self,
@@ -90,9 +74,9 @@ impl ExecutionStore {
                     .get(&reference)
                     .await?
                     .context("current execution missing")?;
-                if !current.state.is_terminal() {
+                if !self.can_replace_session_generation(&current).await? {
                     ensure!(
-                        current.state.accepts_work(),
+                        current.allows_continuation(),
                         "session cancellation is {:?}; retry cancellation before prompting",
                         current.state
                     );
@@ -113,17 +97,17 @@ impl ExecutionStore {
             let id = execution_id
                 .map(str::to_string)
                 .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-            let candidate = Operation::preparing(
+            let candidate = Operation::session_generation(
                 OperationRef::new(session, id),
-                OperationKind::Session,
                 parent.clone(),
+                previous.clone(),
             );
             self.create(&candidate).await?;
             let payload = serde_json::to_vec(&candidate.reference)?;
             match self.kv.update(&key, payload.into(), revision).await {
                 Ok(_) => {
                     if let Some(previous) = &previous {
-                        self.purge_observed_terminal(previous).await?;
+                        self.retire_observed(previous).await?;
                     }
                     if let Some(parent) = &parent {
                         self.register(&candidate.reference, parent).await?;
@@ -135,7 +119,7 @@ impl ExecutionStore {
                 }
                 Err(error) if error.kind() == kv::UpdateErrorKind::WrongLastRevision => {
                     self.cancel_unstarted(&candidate.reference).await?;
-                    self.kv.purge(candidate.reference.key()).await?;
+                    self.retire_observed(&candidate.reference).await?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -213,7 +197,16 @@ impl ExecutionStore {
                 .context("execution missing; cancellation unconfirmed")?;
             let before = serde_json::to_vec(&operation)?;
             let previous_state = operation.state;
+            let previous_stop = operation.stop_decision.clone();
+            let gate_registration = operation.gate_registration.clone();
             update(&mut operation)?;
+            operation.check_stop_decision(previous_stop.as_ref())?;
+            if let Some(registration) = gate_registration {
+                ensure!(
+                    operation.gate_registration.as_ref() == Some(&registration),
+                    "gate registration cannot be replaced"
+                );
+            }
             if serde_json::to_vec(&operation)? == before {
                 return Ok(operation);
             }
@@ -238,25 +231,32 @@ impl ExecutionStore {
     }
 
     pub async fn claim(&self, reference: &OperationRef, owner: Owner) -> Result<Operation> {
-        self.mutate(reference, |operation| {
-            ensure!(!operation.state.is_terminal(), "execution already terminal");
-            if let Some(previous) = &operation.owner {
-                ensure!(
-                    previous == &owner
-                        || (operation.kind == OperationKind::Session
-                            && owner.fence > previous.fence),
-                    "stale execution owner"
-                );
-            }
-            operation.owner = Some(owner.clone());
-            operation.owner_stopped = false;
-            operation.sealed = false;
-            if operation.state == OperationState::Preparing {
-                operation.transition(OperationState::Running)?;
-            }
-            Ok(())
-        })
-        .await
+        let operation = self
+            .mutate(reference, |operation| {
+                ensure!(!operation.is_stopped(), "execution already stopped");
+                if let Some(previous) = &operation.owner {
+                    ensure!(
+                        previous == &owner
+                            || (operation.kind == OperationKind::Session
+                                && owner.fence > previous.fence),
+                        "stale execution owner"
+                    );
+                }
+                if let Some(previous) = &operation.owner {
+                    operation.owner_fences.insert(previous.fence);
+                }
+                operation.owner_fences.insert(owner.fence);
+                operation.owner = Some(owner.clone());
+                operation.owner_stopped = false;
+                operation.sealed = false;
+                if operation.state == OperationState::Preparing {
+                    operation.transition(OperationState::Running)?;
+                }
+                Ok(())
+            })
+            .await?;
+        Box::pin(self.bridge_owner(&operation, &owner)).await?;
+        Ok(operation)
     }
 
     /// Replay is a tool-server decision, authorized by the current session
@@ -286,13 +286,17 @@ impl ExecutionStore {
         let result = self
             .mutate(reference, |operation| {
                 ensure!(
-                    operation.kind == OperationKind::Tool && operation.state.accepts_work(),
+                    operation.kind == OperationKind::Tool && operation.allows_continuation(),
                     "tool execution cannot be replayed"
                 );
                 ensure!(
                     operation.parent == previous.parent && operation.owner == previous.owner,
                     "tool owner changed during replay"
                 );
+                if let Some(previous) = &operation.owner {
+                    operation.owner_fences.insert(previous.fence);
+                }
+                operation.owner_fences.insert(owner.fence);
                 operation.owner = Some(owner.clone());
                 operation.owner_stopped = false;
                 operation.sealed = false;
@@ -323,18 +327,32 @@ impl ExecutionStore {
     }
 
     pub async fn reserve_prompt(&self, reference: &OperationRef, message_id: &str) -> Result<()> {
-        self.mutate(reference, |operation| {
-            ensure!(
-                operation.accepts_work(),
-                "session is cancelling; prompt rejected"
-            );
-            operation
-                .admissions
-                .entry(message_id.into())
-                .or_insert(None);
-            Ok(())
-        })
-        .await?;
+        let operation = self
+            .mutate(reference, |operation| {
+                ensure!(
+                    operation.accepts_work(),
+                    "session is cancelling; prompt rejected"
+                );
+                operation
+                    .admissions
+                    .entry(message_id.into())
+                    .or_insert(None);
+                Ok(())
+            })
+            .await?;
+        if operation.gate_registration.is_some() {
+            let context = self.activate_gate(reference).await?;
+            self.commit_if_admissible(
+                &context,
+                CommitAction {
+                    id: format!("prompt-{message_id}"),
+                    kind: GateAction::AdmitWork {
+                        input: serde_json::json!({"prompt": message_id}),
+                    },
+                },
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -398,7 +416,7 @@ impl ExecutionStore {
         }
 
         let current = self.status(&current.reference).await?;
-        if current.state.is_terminal() {
+        if current.state.is_lifecycle_terminal() {
             return Ok(CancelReceipt::from_operation(&current, false));
         }
         ensure!(
@@ -421,8 +439,35 @@ impl ExecutionStore {
         let id = cancellation_id
             .map(str::to_string)
             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-        self.mutate(reference, |operation| operation.request_cancel(&id, retry))
-            .await
+        let operation = self
+            .mutate(reference, |operation| operation.request_cancel(&id, retry))
+            .await?;
+        Box::pin(self.bridge_cancel(&operation, &id)).await?;
+        Ok(operation)
+    }
+
+    /// Opt-in model acceptance on one generation's CAS key. Existing cancellation
+    /// callers are not migrated yet. This is NOT the tree-wide output commit gate;
+    /// later stages must serialize all observable writes with stop acceptance.
+    pub async fn accept_interrupt(
+        &self,
+        reference: &OperationRef,
+        cancellation_id: &str,
+        reason: &str,
+    ) -> Result<Operation> {
+        let decision = StopDecision {
+            cancellation_id: cancellation_id.into(),
+            accepted_at: chrono::Utc::now(),
+            reason: reason.into(),
+        };
+        self.mutate(reference, |operation| {
+            ensure!(
+                operation.gate_registration.is_none(),
+                "gated execution requires tree interrupt"
+            );
+            operation.accept_interrupt(decision.clone())
+        })
+        .await
     }
 
     pub async fn quiesce(&self, reference: &OperationRef, owner: &Owner) -> Result<Operation> {
@@ -462,7 +507,7 @@ impl ExecutionStore {
                 .await?
                 .context("execution ancestor missing; cancellation unconfirmed")?;
             ensure!(
-                operation.state.accepts_work(),
+                operation.allows_continuation(),
                 "execution {} is {:?}",
                 reference.execution_id,
                 operation.state
@@ -496,7 +541,8 @@ impl ExecutionStore {
                 operation.reconcile_completion()
             })
             .await?;
-        if operation.state.is_terminal() {
+        if operation.state.is_lifecycle_terminal() {
+            Box::pin(self.bridge_finish(&operation)).await?;
             return Ok(operation);
         }
         self.status(reference).await
@@ -539,24 +585,23 @@ impl ExecutionStore {
 
     async fn reconcile_one(&self, reference: &OperationRef) -> Result<Operation> {
         let operation = self.get(reference).await?.context("execution missing")?;
-        if operation.state.is_terminal() {
+        if operation.state.is_lifecycle_terminal() {
             return Ok(operation);
         }
         let mut finished = BTreeSet::new();
+        let mut cleanup_unconfirmed = false;
         for child in &operation.children {
-            if self
-                .get(child)
-                .await?
-                .is_some_and(|child| child.state.is_terminal())
-            {
-                finished.insert(child.clone());
+            if let Some(child) = self.get(child).await?.filter(Operation::can_prune) {
+                cleanup_unconfirmed |= !child.cleanup_confirmed();
+                finished.insert(child.reference);
             }
         }
         let result = self
             .mutate(reference, |operation| {
-                if operation.state.is_terminal() {
+                if operation.state.is_lifecycle_terminal() {
                     return Ok(());
                 }
+                operation.retired_cleanup_unconfirmed |= cleanup_unconfirmed;
                 let previous_children = operation.children.len();
                 operation.children.retain(|child| !finished.contains(child));
                 if previous_children != operation.children.len() {
@@ -569,44 +614,18 @@ impl ExecutionStore {
                 Ok(())
             })
             .await?;
+        Box::pin(self.bridge_finish(&result)).await?;
         for child in finished {
-            self.purge_observed_terminal(&child).await?;
+            self.retire_observed(&child).await?;
         }
         Ok(result)
-    }
-
-    async fn purge_observed_terminal(&self, reference: &OperationRef) -> Result<()> {
-        let Some(operation) = self.get(reference).await? else {
-            return Ok(());
-        };
-        if !operation.state.is_terminal() {
-            return Ok(());
-        }
-        if operation.kind == OperationKind::Session
-            && self
-                .current(&reference.session_id)
-                .await?
-                .is_some_and(|op| op.reference == *reference)
-        {
-            return Ok(());
-        }
-        if let Some(parent) = &operation.parent {
-            if self
-                .get(parent)
-                .await?
-                .is_some_and(|parent| parent.children.contains(reference))
-            {
-                return Ok(());
-            }
-        }
-        self.kv.purge(reference.key()).await?;
-        Ok(())
     }
 
     pub fn from_store(kv: kv::Store) -> Self {
         Self { kv }
     }
 
+    /// Record transcript projection coverage, not stop acceptance or cleanup.
     pub async fn record_coverage(
         &self,
         reference: &OperationRef,
@@ -705,7 +724,7 @@ async fn abandon_postorder(
         .into_iter()
         .filter(|reference| reference != root)
     {
-        store.purge_observed_terminal(&reference).await?;
+        store.retire_observed(&reference).await?;
     }
     Ok(result)
 }
@@ -755,7 +774,7 @@ async fn read_status_operation(
         .get(reference)
         .await?
         .context("execution descendant missing; cancellation unconfirmed")?;
-    if ancestor_cancelling && !operation.state.is_terminal() {
+    if ancestor_cancelling && !operation.state.is_lifecycle_terminal() {
         operation = cancel_from_ancestor(store, reference).await?;
     }
     Ok(Some(operation))
@@ -775,7 +794,7 @@ async fn cancel_from_ancestor(
     let cancellation_id = uuid::Uuid::now_v7().to_string();
     store
         .mutate(reference, |operation| {
-            if operation.state.is_terminal() {
+            if operation.state.is_lifecycle_terminal() {
                 return Ok(());
             }
             let never_started =
@@ -801,12 +820,12 @@ fn restore_replay_claim(
     previous: &Operation,
     owner: &Owner,
 ) -> Result<()> {
-    if operation.owner.as_ref() != Some(owner) || operation.state.is_terminal() {
+    if operation.owner.as_ref() != Some(owner) || operation.state.is_lifecycle_terminal() {
         return Ok(());
     }
     operation.owner = previous.owner.clone();
     operation.owner_stopped = previous.owner_stopped;
-    if operation.state.accepts_work() {
+    if operation.allows_continuation() {
         // This was an uncommitted claim; no handler ran under the new owner.
         operation.state = previous.state;
         operation.sealed = previous.sealed;

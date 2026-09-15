@@ -247,6 +247,7 @@ pub async fn run_worker_daemon(
         readiness.ready();
     }
     let runtime = Arc::new(WorkerRuntime {
+        _cleanup: services.cleanup,
         config,
         instance_id,
         _background_services: services.background,

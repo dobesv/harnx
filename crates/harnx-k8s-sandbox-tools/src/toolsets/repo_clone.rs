@@ -112,7 +112,7 @@ async fn clone_once(
         .await;
     match result {
         Ok(result) => Ok(parse_clone_result(result)),
-        Err(error @ ToolInvokeError::Fatal(_)) => Err(error),
+        Err(error @ (ToolInvokeError::Fatal(_) | ToolInvokeError::Interrupted(_))) => Err(error),
         Err(error @ ToolInvokeError::Recoverable(_)) => Ok(CloneAttempt::Failed(error.to_string())),
     }
 }

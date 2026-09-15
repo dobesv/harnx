@@ -24,6 +24,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod history;
+mod isolation;
+pub use isolation::LiveEventState;
+pub(crate) use isolation::LiveGenerationSink;
+
 const CONTROL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
@@ -34,10 +39,16 @@ enum DeliveryMode {
 
 enum PublisherCommand {
     Event {
-        envelope: AdvisoryEnvelope,
+        envelope: Box<AdvisoryEnvelope>,
         delivery: DeliveryMode,
+        execution: Option<crate::execution_fence::GenerationFence>,
     },
     Flush(tokio::sync::oneshot::Sender<std::result::Result<(), String>>),
+    #[cfg(test)]
+    Barrier(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ),
 }
 
 /// Advisory subject pattern for a session's live events.
@@ -52,7 +63,8 @@ pub fn events_subject(session_id: &str) -> String {
 /// Each advisory message carries `after_seq` = the session-log stream's current
 /// `last_seq` at emit time. Clients use this for dedup/ordering:
 /// - Durable entries are applied by stream seq (monotonic, idempotent)
-/// - An advisory envelope is rendered only if `after_seq >= client's last-applied durable seq`
+/// - Live origin must equal the active generation and must not be locally stopped.
+/// - An advisory envelope also requires `after_seq >= client's last-applied durable seq`
 ///
 /// This ensures:
 /// - No gap: durable replay complete to last_seq, then continue with live events
@@ -64,6 +76,9 @@ pub struct AdvisoryEnvelope {
     /// Clients should only render this event if they have applied all durable
     /// entries up to and including this sequence.
     pub after_seq: u64,
+    /// Original execution/operation generation, captured when the producer is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
     /// The actual agent event (Model chunk, tool progress, status, etc.)
     pub event: AgentEvent,
 }
@@ -71,7 +86,16 @@ pub struct AdvisoryEnvelope {
 impl AdvisoryEnvelope {
     /// Create a new advisory envelope.
     pub fn new(after_seq: u64, event: AgentEvent) -> Self {
-        Self { after_seq, event }
+        Self {
+            after_seq,
+            execution_id: None,
+            event,
+        }
+    }
+
+    pub fn with_execution_id(mut self, execution_id: impl Into<String>) -> Self {
+        self.execution_id = Some(execution_id.into());
+        self
     }
 
     /// Serialize to JSON bytes for NATS publish.
@@ -103,6 +127,7 @@ pub struct NatsEventSink {
     /// Stale-low values are safe (a caught-up client just drops that advisory;
     /// advisory delivery is lossy by contract).
     after_seq: Arc<AtomicU64>,
+    execution: Option<crate::execution_fence::GenerationFence>,
     /// Ordered hand-off to the single publisher task. `emit` stamps and enqueues
     /// synchronously; one task drains this FIFO so advisories reach NATS in
     /// emission order. Previously `emit` spawned a task per event, which let
@@ -136,53 +161,32 @@ impl NatsEventSink {
             Err(_) => 0,
         };
         let subject = events_subject(&session_id);
-        let (publisher, mut rx) = tokio::sync::mpsc::unbounded_channel::<PublisherCommand>();
-        let publisher_client = client.clone();
-        let publisher_subject = subject.clone();
-        // Ends when every clone of this sink is dropped and the channel closes.
-        tokio::spawn(async move {
-            let mut pending_error = None;
-            while let Some(command) = rx.recv().await {
-                match command {
-                    PublisherCommand::Event { envelope, delivery } => {
-                        let result = tokio::time::timeout(
-                            CONTROL_DELIVERY_TIMEOUT,
-                            publish_envelope(&publisher_client, &publisher_subject, envelope),
-                        )
-                        .await;
-                        let error = match result {
-                            Ok(Ok(())) => None,
-                            Ok(Err(error)) => Some(format!("{error:#}")),
-                            Err(_) => Some("publish advisory event timed out".to_string()),
-                        };
-                        if let Some(error) = error {
-                            log::debug!("advisory event publish failed: {error}");
-                            remember_publish_error(&mut pending_error, delivery, error);
-                        }
-                    }
-                    PublisherCommand::Flush(reply) => {
-                        let flush_error = match tokio::time::timeout(
-                            CONTROL_DELIVERY_TIMEOUT,
-                            publisher_client.flush(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => None,
-                            Ok(Err(error)) => Some(format!("flush advisory events: {error}")),
-                            Err(_) => Some("flush advisory events timed out".to_string()),
-                        };
-                        let result = pending_error.take().or(flush_error).map_or(Ok(()), Err);
-                        let _ = reply.send(result);
-                    }
-                }
-            }
-        });
+        let publisher = spawn_publisher(client.clone(), subject.clone());
         Self {
             client,
             subject,
             after_seq: Arc::new(AtomicU64::new(seed)),
+            execution: None,
             publisher,
         }
+    }
+
+    /// Bind before emitting anything; clones keep this original authority.
+    pub fn with_execution(
+        mut self,
+        execution: Option<crate::execution_fence::GenerationFence>,
+    ) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    fn envelope(&self, event: AgentEvent) -> AdvisoryEnvelope {
+        let mut envelope = AdvisoryEnvelope::new(self.after_seq.load(Ordering::Relaxed), event);
+        envelope.execution_id = self
+            .execution
+            .as_ref()
+            .map(|fence| fence.context.generation().execution_id.clone());
+        envelope
     }
 
     /// Advance the cached `after_seq` to `seq` (monotonic). The worker calls
@@ -199,14 +203,15 @@ impl NatsEventSink {
     }
 
     /// Publish an event to the advisory fan-out subject. Best-effort core NATS
-    /// (non-durable); failures are logged, never propagated. No JetStream
-    /// round-trip — `after_seq` comes from the cached atomic.
+    /// (non-durable); failures are logged, never propagated. `after_seq` comes
+    /// from the cached atomic; generation authority is checked before publish.
     pub async fn publish_event(&self, event: AgentEvent) {
-        let after_seq = self.after_seq.load(Ordering::Relaxed);
-        if let Err(error) = publish_envelope(
+        let envelope = self.envelope(event);
+        if let Err(error) = publish_live_envelope(
             &self.client,
             &self.subject,
-            AdvisoryEnvelope::new(after_seq, event),
+            envelope,
+            self.execution.as_ref(),
         )
         .await
         {
@@ -234,9 +239,19 @@ impl NatsEventSink {
     }
 
     fn enqueue(&self, event: AgentEvent, delivery: DeliveryMode) {
-        let after_seq = self.after_seq.load(Ordering::Relaxed);
+        let envelope = self.envelope(event);
+        if self
+            .execution
+            .as_ref()
+            .is_some_and(|fence| fence.events_stopped())
+        {
+            return;
+        }
+        // The captured fence cannot be rebound to whichever generation is current
+        // when the publisher eventually drains this command.
         let _ = self.publisher.send(PublisherCommand::Event {
-            envelope: AdvisoryEnvelope::new(after_seq, event),
+            envelope: Box::new(envelope),
+            execution: self.execution.clone(),
             delivery,
         });
     }
@@ -261,6 +276,102 @@ impl NatsEventSink {
         // Best-effort: wake-up advisory doesn't need Required delivery semantics
         self.enqueue(event, DeliveryMode::BestEffort);
     }
+}
+
+fn spawn_publisher(
+    client: async_nats::Client,
+    subject: String,
+) -> tokio::sync::mpsc::UnboundedSender<PublisherCommand> {
+    let (publisher, mut rx) = tokio::sync::mpsc::unbounded_channel::<PublisherCommand>();
+    // Ends when every clone of this sink is dropped and the channel closes.
+    tokio::spawn(async move {
+        let mut pending_error = None;
+        while let Some(command) = rx.recv().await {
+            match command {
+                #[cfg(test)]
+                PublisherCommand::Barrier(entered, release) => {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+                PublisherCommand::Event {
+                    envelope,
+                    delivery,
+                    execution,
+                } => {
+                    let result = tokio::time::timeout(
+                        CONTROL_DELIVERY_TIMEOUT,
+                        publish_live_envelope(&client, &subject, *envelope, execution.as_ref()),
+                    )
+                    .await;
+                    let error = match result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(format!("{error:#}")),
+                        Err(_) => Some("publish advisory event timed out".to_string()),
+                    };
+                    if let Some(error) = error {
+                        log::debug!("advisory event publish failed: {error}");
+                        remember_publish_error(&mut pending_error, delivery, error);
+                    }
+                }
+                PublisherCommand::Flush(reply) => {
+                    let flush_error = match tokio::time::timeout(
+                        CONTROL_DELIVERY_TIMEOUT,
+                        client.flush(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(format!("flush advisory events: {error}")),
+                        Err(_) => Some("flush advisory events timed out".to_string()),
+                    };
+                    let result = pending_error.take().or(flush_error).map_or(Ok(()), Err);
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    });
+    publisher
+}
+
+async fn publish_live_envelope(
+    client: &async_nats::Client,
+    subject: &str,
+    envelope: AdvisoryEnvelope,
+    execution: Option<&crate::execution_fence::GenerationFence>,
+) -> Result<()> {
+    if publication_allowed(execution, &envelope).await? {
+        publish_envelope(client, subject, envelope).await?;
+    }
+    Ok(())
+}
+
+async fn publication_allowed(
+    execution: Option<&crate::execution_fence::GenerationFence>,
+    envelope: &AdvisoryEnvelope,
+) -> Result<bool> {
+    let Some(fence) = execution else {
+        return Ok(envelope.execution_id.is_none());
+    };
+    let context = &fence.context;
+    if fence.events_stopped()
+        || envelope.execution_id.as_deref() != Some(&context.generation().execution_id)
+    {
+        return Ok(false);
+    }
+    let active = fence
+        .store
+        .gate_generation(context.gate_root(), &context.generation().session_id)
+        .await?;
+    let stopped = fence
+        .store
+        .gate_stop(context.gate_root(), context.operation())
+        .await?
+        .is_some();
+    let allowed = active == *context.generation() && !stopped;
+    if !allowed {
+        fence.stop_events();
+    }
+    Ok(allowed)
 }
 
 fn remember_publish_error(
@@ -345,6 +456,15 @@ impl AgentEventSink for NatsEventSink {
         // failure means the publisher task is gone, and is dropped as before.
         self.enqueue(event, DeliveryMode::BestEffort);
     }
+    fn emit_live(&self, event: AgentEvent, execution_id: &str) {
+        if self
+            .execution
+            .as_ref()
+            .is_some_and(|fence| fence.context.generation().execution_id == execution_id)
+        {
+            self.enqueue(event, DeliveryMode::BestEffort);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,13 +474,38 @@ impl AgentEventSink for NatsEventSink {
 /// Type alias for JetStream context to avoid needing async_nats in downstream crates.
 pub type JetstreamContext = async_nats::jetstream::Context;
 
+async fn refresh_live_authority(
+    js: &jetstream::Context,
+    session: &str,
+    live: &LiveEventState,
+) -> Result<()> {
+    let bucket = match harnx_nats_common::recovery::retry_until(
+        tokio::time::Instant::now() + harnx_nats_common::recovery::RECOVERY_TIMEOUT,
+        || js.get_key_value(harnx_execution_control::BUCKET),
+        |error| !crate::nats_admin::kv_bucket_missing(error),
+    )
+    .await
+    {
+        Ok(bucket) => bucket,
+        Err(error) => {
+            live.select(None);
+            return Err(error);
+        }
+    };
+    live.refresh(
+        &harnx_execution_control::ExecutionStore::from_store(bucket),
+        session,
+    )
+    .await
+}
+
 /// Client-side helper for attaching to a session's event stream.
 ///
 /// Provides gap-free, dup-free event delivery:
-/// 1. Opens the durable NatsSessionLog, records current stream last_seq
-/// 2. Replays log [first..=last_seq] to build history
-/// 3. Subscribes to `sessions.{id}.events`
-/// 4. Dedup rule: durable entries applied by seq; advisory only if after_seq >= last-applied
+/// 1. Subscribes to `sessions.{id}.events`
+/// 2. Loads generation authority, then durable history
+/// 3. Applies durable entries by seq; live events require a current, unstopped generation
+/// 4. Advisory ordering additionally requires after_seq >= last-applied
 ///
 /// # Example
 ///
@@ -377,7 +522,7 @@ pub type JetstreamContext = async_nats::jetstream::Context;
 ///     
 ///     // Then, consume live events
 ///     while let Some(envelope) = stream.next().await {
-///         if envelope.after_seq >= stream.last_applied_seq() {
+///         if stream.should_render(&envelope) {
 ///             // Render the advisory event
 ///         }
 ///     }
@@ -393,14 +538,18 @@ pub struct SessionEventStream {
     last_durable_seq: u64,
     /// Subscription to the advisory events subject.
     subscriber: async_nats::Subscriber,
+    live: LiveEventState,
+    jetstream: jetstream::Context,
+    session_id: String,
+    pending: Option<AdvisoryEnvelope>,
 }
 
 impl SessionEventStream {
     /// Attach to a session's event stream.
     ///
-    /// 1. Opens the durable session log stream, replays history
-    /// 2. Subscribes to the advisory events subject
-    /// 3. Returns history and live event stream
+    /// 1. Subscribes to the advisory events subject
+    /// 2. Loads generation fence state, then durable history
+    /// 3. Returns history and the generation-filtered live stream
     ///
     /// # Arguments
     /// * `jetstream` - JetStream context for durable log access
@@ -410,6 +559,15 @@ impl SessionEventStream {
         jetstream: jetstream::Context,
         client: async_nats::Client,
         session_id: &str,
+    ) -> Result<Self> {
+        Self::attach_with_state(jetstream, client, session_id, LiveEventState::default()).await
+    }
+
+    pub async fn attach_with_state(
+        jetstream: jetstream::Context,
+        client: async_nats::Client,
+        session_id: &str,
+        live: LiveEventState,
     ) -> Result<Self> {
         // 1. Subscribe to advisory events FIRST, then load durable history.
         //    Ordering matters: any advisory emitted while we replay the log
@@ -423,6 +581,20 @@ impl SessionEventStream {
             .await
             .map_err(|e| anyhow::anyhow!("failed to subscribe to events subject: {e}"))?;
 
+        Self::finish_attach(jetstream, session_id, live, subscriber).await
+    }
+
+    async fn finish_attach(
+        jetstream: jetstream::Context,
+        session_id: &str,
+        live: LiveEventState,
+        subscriber: async_nats::Subscriber,
+    ) -> Result<Self> {
+        // Unknown authority disables live effects, but does not hide committed history.
+        if let Err(error) = refresh_live_authority(&jetstream, session_id, &live).await {
+            log::debug!("live generation unavailable at attachment: {error:#}");
+        }
+
         // 2. Load durable history (after subscribing).
         let log = crate::nats_session_log::NatsSessionLog::new(jetstream.clone(), session_id);
         let history = log.load_events_async().await?;
@@ -433,7 +605,30 @@ impl SessionEventStream {
             history,
             last_durable_seq,
             subscriber,
+            live,
+            jetstream,
+            session_id: session_id.into(),
+            pending: None,
         })
+    }
+
+    /// Dedicated prompt followers must not adopt a replacement turn's events.
+    pub fn follow_generation(&mut self, execution_id: String) {
+        self.live.bind(execution_id);
+    }
+
+    pub fn live_state(&self) -> &LiveEventState {
+        &self.live
+    }
+
+    pub async fn refresh_generation(&self) -> Result<()> {
+        refresh_live_authority(&self.jetstream, &self.session_id, &self.live).await
+    }
+
+    /// Replace an admission-time observer before following; never stamp events here.
+    pub async fn use_live_state(&mut self, live: LiveEventState) -> Result<()> {
+        self.live = live;
+        self.refresh_generation().await
     }
 
     /// Get the durable history (replayed entries).
@@ -453,6 +648,9 @@ impl SessionEventStream {
     /// that infer state from the durable history can call this after a quiet
     /// interval to converge without reconnecting the subscription.
     pub async fn refresh_history(&mut self) -> Result<bool> {
+        if let Err(error) = self.refresh_generation().await {
+            log::debug!("live generation unavailable during history refresh: {error:#}");
+        }
         let entries = self
             .log
             .load_events_after_async(self.last_durable_seq)
@@ -470,25 +668,50 @@ impl SessionEventStream {
     /// Returns `None` when the subscription is closed.
     ///
     /// Client dedup rule: render the advisory only if `should_render` is true
-    /// (i.e. `after_seq >= last_applied_seq()`).
+    /// (generation identity, local stop and durable sequence checks).
     pub async fn next(&mut self) -> Option<AdvisoryEnvelope> {
         use futures_util::StreamExt;
 
         loop {
-            let msg = self.subscriber.next().await?;
-            match AdvisoryEnvelope::from_bytes(&msg.payload) {
-                Ok(envelope) => return Some(envelope),
-                Err(error) => {
-                    log::warn!(
-                        "skipping malformed NATS advisory payload for session event stream: {error:#}"
-                    );
+            if self.pending.is_none() {
+                let msg = self.subscriber.next().await?;
+                match AdvisoryEnvelope::from_bytes(&msg.payload) {
+                    Ok(envelope) => self.pending = Some(envelope),
+                    Err(error) => {
+                        log::warn!("skipping malformed NATS advisory payload: {error:#}");
+                        continue;
+                    }
                 }
+            }
+            // Retain the envelope on self while awaiting authority: select!
+            // cancellation must not lose it before the final drain can inspect it.
+            if let Err(error) = self.refresh_generation().await {
+                log::warn!("cannot resolve live event generation: {error:#}");
+                self.pending = None;
+                continue;
+            }
+            return self.pending.take();
+        }
+    }
+
+    /// Drain already-buffered events only after `refresh_generation` has completed.
+    /// Unlike polling `next`, this cannot consume a message then abandon its fence read.
+    pub fn try_next(&mut self) -> Option<AdvisoryEnvelope> {
+        use futures_util::{FutureExt, StreamExt};
+        if self.pending.is_some() {
+            return self.pending.take();
+        }
+        loop {
+            let message = self.subscriber.next().now_or_never()??;
+            if let Ok(envelope) = AdvisoryEnvelope::from_bytes(&message.payload) {
+                return Some(envelope);
             }
         }
     }
 
     /// Check if an advisory envelope should be rendered.
     ///
+    /// Generation mismatch or local stop always rejects, regardless of sequence.
     /// Dedup rule: render only if the advisory's `after_seq` is `>=` the last
     /// durable seq the client has applied. `>=` (not `>`) is required so a
     /// freshly-attached client (history replayed to seq N) still renders the
@@ -499,7 +722,7 @@ impl SessionEventStream {
     /// dropped. The authoritative final state always comes from the durable
     /// log; advisories are lossy previews.
     pub fn should_render(&self, envelope: &AdvisoryEnvelope) -> bool {
-        envelope.after_seq >= self.last_durable_seq
+        self.live.should_render(envelope, self.last_durable_seq)
     }
 }
 
@@ -539,7 +762,14 @@ mod tests {
         //   must still see them as live preview.
         // - after_seq = 5  -> DROP (stale, predates client position)
         fn render(after_seq: u64, last_durable_seq: u64) -> bool {
-            after_seq >= last_durable_seq
+            let live = LiveEventState::default();
+            live.select(Some("generation".into()));
+            let envelope = AdvisoryEnvelope::new(
+                after_seq,
+                AgentEvent::Notice(NoticeEvent::Info("test".into())),
+            )
+            .with_execution_id("generation");
+            live.should_render(&envelope, last_durable_seq)
         }
         assert!(render(15, 10), "newer advisory must render");
         assert!(
@@ -555,3 +785,7 @@ mod tests {
         assert_eq!(back.after_seq, 15);
     }
 }
+
+#[cfg(test)]
+#[path = "nats_event_sink/isolation_tests.rs"]
+mod isolation_tests;

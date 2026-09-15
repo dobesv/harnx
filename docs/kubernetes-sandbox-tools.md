@@ -289,13 +289,12 @@ returned unchanged for the agent to inspect and are counted as `sandbox_error`.
 
 The MCP response budget defaults to 25 hours so it doesn't shorten
 `bash_exec`'s documented 24-hour foreground default. Setting the response
-budget to `0` disables it. When the budget expires, the gateway stops waiting
-successfully and sends `notifications/cancelled` to request cooperative
-cancellation. This timeout is **not proof that sandbox execution stopped**. The
-gateway retains its local response waiter; if the connection is lost before
-completion can be confirmed, the invocation remains pending rather than
-falsely acknowledging a stop. Cancellation uses the same waiter-preserving
-path and remains fatal to the current invocation.
+budget to `0` disables it. When the budget expires, the gateway sends a bounded
+best-effort `notifications/cancelled` and drops this request's response waiter.
+A late reply is ignored. This timeout is **not proof that sandbox execution
+stopped**; the invocation owner reports cleanup as `Unconfirmed`. Cancellation
+doesn't invalidate the shared MCP session or kill the sandbox, so other calls
+continue on the same connection.
 
 Permanent handler errors remain recoverable tool results when the agent can
 correct its request. Transport lifecycle death and result serialization are

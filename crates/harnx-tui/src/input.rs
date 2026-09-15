@@ -1,7 +1,7 @@
 use crate::lifecycle::session_history_transcript_items;
 use crate::render_helpers::render_status_line;
 use crate::strip_ansi;
-use crate::types::{ExitPhase, ModalState, TranscriptItem, Tui, TuiEvent};
+use crate::types::{ExitPhase, ModalState, TranscriptItem, Tui};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use crossterm::ExecutableCommand;
@@ -62,13 +62,6 @@ fn paste_should_attach(text: &str) -> bool {
     let line_count = text.lines().count();
     line_count > PASTE_ATTACHMENT_MAX_LINES || text.chars().count() > PASTE_ATTACHMENT_MAX_CHARS
 }
-
-/// How long `start_prompt` waits for a prior prompt task to finish
-/// cooperatively (after signalling its abort) before force-cancelling it
-/// via `JoinHandle::abort`. Long enough for `bash_wait` and similar
-/// cooperative tools to observe the abort and return; short enough that
-/// the user does not feel a stall.
-const PROMPT_TASK_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickerCommand {
@@ -262,13 +255,9 @@ impl Tui {
         // task was running.
         self.app.pending_message = None;
         *self.shared_pending_message.lock().await = None;
-        // `llm_busy` stays true while a prompt task is still
-        // winding down; the Final/Error event from that task is
-        // what flips it off. Flipping it eagerly here is what
-        // produced Bug 2 — the next Enter would race a fresh
-        // prompt task against the still-running old one. When no
-        // prompt task is in flight (idle Ctrl+C) we still clear
-        // the flag for parity with the prior UX.
+        // A local signal isn't durable acceptance. The requesting tray stays
+        // until the receipt settles the prompt, independently of physical cleanup.
+        // Idle Ctrl+C can clear local activity without a follower to retire.
         if self.current_prompt_handle.is_none() {
             self.app.llm_busy = false;
             self.active_remote_session = None;
@@ -417,73 +406,7 @@ impl Tui {
                 self.open_focused_root_item();
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                if self.try_handle_attach_command().await {
-                    return Ok(());
-                }
-                self.app.completions.clear();
-                let text = self.app.input.lines().join("\n");
-                if !text.trim().is_empty() || !self.app.attachments.is_empty() {
-                    // Mark read before prompt submission (if unread)
-                    self.mark_current_session_read_if_unread().await;
-                    // Reset abort signal before each new submission (fix #3)
-                    self.abort_signal.reset();
-                    // Add to history (fix #4)
-                    self.push_history(text.clone());
-                    if self.app.llm_busy {
-                        self.queue_busy_input(text).await;
-                    } else if text.trim_start().starts_with('.') {
-                        // Dot-command: route through command handler
-                        let attachments_snapshot = self.app.attachments.clone();
-                        self.app.transcript.push(TranscriptItem::UserText {
-                            text: text.clone(),
-                            seq: None,
-                            timestamp: Some(chrono::Utc::now()),
-                        });
-                        self.render_submitted_attachments(&attachments_snapshot)
-                            .await;
-                        self.pin_transcript_to_bottom();
-                        self.app.input = Self::new_input();
-                        self.run_command(&text).await?;
-                        self.refresh_input_chrome();
-                    } else {
-                        // Guard: agent and session must both be active before
-                        // submitting a prompt. If not, open the appropriate picker
-                        // and keep the text in the input so the user can retry.
-                        // The in-memory check (agent/session None) is always safe;
-                        // resolve_initial_modal is only called when the check fires.
-                        {
-                            let needs_picker = {
-                                let cfg = self.config.read();
-                                cfg.agent.is_none() || cfg.session.is_none()
-                            };
-                            if needs_picker {
-                                if let Some(modal) =
-                                    crate::types::Tui::resolve_initial_modal(&self.config).await
-                                {
-                                    self.app.modal = Some(modal);
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        let attachments_snapshot = self.app.attachments.clone();
-                        self.app.transcript.push(TranscriptItem::UserText {
-                            text: text.clone(),
-                            seq: None,
-                            timestamp: Some(chrono::Utc::now()),
-                        });
-                        self.render_submitted_attachments(&attachments_snapshot)
-                            .await;
-                        self.pin_transcript_to_bottom();
-                        self.app.input = Self::new_input();
-                        let msg = crate::types::PendingMessage {
-                            text,
-                            attachments: std::mem::take(&mut self.app.attachments),
-                            attachment_dir: self.app.attachment_dir.take(),
-                            paste_count: self.app.paste_count,
-                        };
-                        self.start_prompt(msg).await?;
-                    }
-                }
+                self.handle_enter_key().await?;
             }
             (KeyCode::Enter, KeyModifiers::SHIFT) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                 // Shift+Enter / Ctrl+J inserts a newline - clear pending if any
@@ -542,6 +465,83 @@ impl Tui {
             }
         }
         Ok(())
+    }
+
+    fn can_accept_paste(&self) -> bool {
+        let overlay_open = self.app.detail_view_open
+            || self.app.transcript_browsing
+            || !self.app.subagent_view_stack.is_empty();
+        !overlay_open && (!self.has_root_cancellation() || self.cancellation_editor_restored())
+    }
+
+    async fn handle_enter_key(&mut self) -> Result<()> {
+        if self.try_handle_attach_command().await || self.has_root_cancellation() {
+            return Ok(());
+        }
+        self.app.completions.clear();
+        let text = self.app.input.lines().join("\n");
+        if text.trim().is_empty() && self.app.attachments.is_empty() {
+            return Ok(());
+        }
+        self.mark_current_session_read_if_unread().await;
+        self.abort_signal.reset();
+        self.push_history(text.clone());
+        if self.app.llm_busy {
+            self.queue_busy_input(text).await;
+            return Ok(());
+        }
+        if text.trim_start().starts_with('.') {
+            return self.submit_dot_command(text).await;
+        }
+        if let Some(modal) = self.check_picker_modal().await {
+            self.app.modal = Some(modal);
+            return Ok(());
+        }
+        let attachments_snapshot = self.app.attachments.clone();
+        self.app.transcript.push(TranscriptItem::UserText {
+            text: text.clone(),
+            seq: None,
+            timestamp: Some(chrono::Utc::now()),
+        });
+        self.render_submitted_attachments(&attachments_snapshot)
+            .await;
+        self.pin_transcript_to_bottom();
+        self.app.input = Self::new_input();
+        let msg = crate::types::PendingMessage {
+            text,
+            attachments: std::mem::take(&mut self.app.attachments),
+            attachment_dir: self.app.attachment_dir.take(),
+            paste_count: self.app.paste_count,
+        };
+        self.start_prompt(msg).await
+    }
+
+    async fn submit_dot_command(&mut self, text: String) -> Result<()> {
+        let attachments_snapshot = self.app.attachments.clone();
+        self.app.transcript.push(TranscriptItem::UserText {
+            text: text.clone(),
+            seq: None,
+            timestamp: Some(chrono::Utc::now()),
+        });
+        self.render_submitted_attachments(&attachments_snapshot)
+            .await;
+        self.pin_transcript_to_bottom();
+        self.app.input = Self::new_input();
+        self.run_command(&text).await?;
+        self.refresh_input_chrome();
+        Ok(())
+    }
+
+    async fn check_picker_modal(&self) -> Option<ModalState> {
+        let (no_agent, no_session) = {
+            let cfg = self.config.read();
+            (cfg.agent.is_none(), cfg.session.is_none())
+        };
+        if no_agent || no_session {
+            crate::types::Tui::resolve_initial_modal(&self.config).await
+        } else {
+            None
+        }
     }
 
     async fn handle_exclusive_view_key(&mut self, key: KeyEvent) -> Option<Result<()>> {
@@ -673,12 +673,7 @@ impl Tui {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
-        // Ignore paste while the detail view or browsing view is open — same isolation
-        // policy as handle_key: these overlays hide the input field.
-        let overlay_depth = usize::from(self.app.detail_view_open)
-            + usize::from(self.app.transcript_browsing)
-            + self.app.subagent_view_stack.len();
-        if overlay_depth > 0 {
+        if !self.can_accept_paste() {
             return;
         }
         if let Some(pending) = self.app.pending_message.take() {
@@ -756,111 +751,6 @@ impl Tui {
         }
     }
 
-    pub(crate) async fn handle_tui_event(&mut self, event: TuiEvent) -> Result<()> {
-        self.handle_tui_event_inner(event).await
-    }
-
-    async fn handle_tui_event_inner(&mut self, event: TuiEvent) -> Result<()> {
-        match event {
-            TuiEvent::Agent(event) => {
-                self.render_agent_event(event).await;
-            }
-            TuiEvent::PromptTaskFinished { task, error } => {
-                self.finish_prompt_task(task, error).await;
-            }
-            TuiEvent::ExecutionState { cluster, operation } => {
-                self.hydrate_execution_state(cluster, operation)
-            }
-            TuiEvent::SessionActivity {
-                session_id,
-                cluster,
-                active,
-            } => {
-                self.handle_session_activity(session_id, cluster, active)
-                    .await;
-            }
-            TuiEvent::SessionAgent {
-                session_id,
-                cluster,
-                event,
-            } => {
-                self.handle_shared_session_agent_event(session_id, cluster, event)
-                    .await;
-            }
-            TuiEvent::SubAgentSessionSnapshot { key, snapshot } => {
-                self.handle_subagent_snapshot(key, snapshot);
-            }
-            TuiEvent::SubAgentSessionEvent { key, event } => {
-                self.handle_subagent_session_event(key, event);
-            }
-            TuiEvent::SubAgentInvocationFailed { key, invocation_id } => {
-                self.fail_monitored_invocation(&key, &invocation_id);
-            }
-            TuiEvent::ToolRoundComplete => {
-                // Intermediate tool round — prompt loop continues, don't clear llm_busy.
-                // Flush any pending thought so follow-up thought after tool results
-                // starts a fresh block instead of appending to the earlier one.
-                self.flush_pending_thought();
-                // Reset streaming index so the next LLM turn creates a fresh
-                // AssistantText item instead of appending to the previous one.
-                // This keeps tool-call rows visually between the two turns.
-                self.app.streaming_open = false;
-                self.pin_transcript_to_bottom();
-            }
-            TuiEvent::PendingMessageConsumed(pending) => {
-                // The prompt task consumed our pending message during a tool
-                // round.  Clear the local pending state, reset the input field,
-                // and show the consumed text (and any attachments) in the
-                // transcript.
-                self.app.pending_message = None;
-                self.app.input = Self::new_input();
-                self.app.transcript.push(TranscriptItem::UserText {
-                    text: pending.text.clone(),
-                    seq: None,
-                    timestamp: Some(chrono::Utc::now()),
-                });
-                self.render_submitted_attachments(&pending.attachments)
-                    .await;
-                self.pin_transcript_to_bottom();
-                self.refresh_input_chrome();
-            }
-            TuiEvent::ToolConfirmation(event) => {
-                self.handle_tool_confirmation_event(event);
-            }
-            TuiEvent::SessionReadInvalidation { session_id } => {
-                // NATS read-state refresh is large enough to bloat this shared dispatch frame.
-                Box::pin(self.handle_session_read_invalidation(&session_id)).await;
-            }
-            TuiEvent::RefreshSessionList => {
-                // Box::pin to avoid stack overflow in the event loop handler
-                Box::pin(self.handle_refresh_session_list()).await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_refresh_session_list(&mut self) {
-        let modal = self.app.modal.take();
-        let Some(crate::types::ModalState::SessionPicker {
-            selected,
-            origin_agent,
-            origin_session,
-            ..
-        }) = modal
-        else {
-            return;
-        };
-
-        let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
-        self.app.modal = Some(crate::types::ModalState::SessionPicker {
-            sessions,
-            selected,
-            origin_agent,
-            origin_session,
-            error: fetch_error,
-        });
-    }
-
     #[cfg(test)]
     pub(crate) async fn submit_pending_message(
         &mut self,
@@ -909,7 +799,10 @@ impl Tui {
         *self.shared_pending_message.lock().await = None;
     }
 
-    async fn render_submitted_attachments(&mut self, attachments: &[crate::types::Attachment]) {
+    pub(super) async fn render_submitted_attachments(
+        &mut self,
+        attachments: &[crate::types::Attachment],
+    ) {
         if attachments.is_empty() {
             return;
         }
@@ -1354,125 +1247,6 @@ impl Tui {
             // producing a single run-on paragraph that mixes content from
             // multiple agents on the top-level row.
             self.app.streaming_open = false;
-        }
-    }
-
-    pub(super) async fn start_prompt(&mut self, msg: crate::types::PendingMessage) -> Result<()> {
-        // Drain any prior prompt task BEFORE spawning the new one. Two
-        // prompt tasks must never run concurrently against the same
-        // session — they would interleave append_session_tool_calls /
-        // append_session_tool_results writes and corrupt the in-memory
-        // pending Tool message (see Bug 2: orphan tool_calls in the
-        // session log around line 24785/24794 of the reproducing
-        // session).
-        self.drain_previous_prompt_task().await;
-
-        // Allocate a fresh abort signal for this task. Subsequent Ctrl+C
-        // will signal exactly this task; later submissions get their
-        // own fresh signal so that nothing in this branch can be
-        // un-aborted by a future `abort_signal.reset()`.
-        let new_abort = harnx_runtime::utils::create_abort_signal();
-        self.current_prompt_abort = Some(new_abort.clone());
-        // This prompt receives its worker events directly through
-        // TuiAgentEventSink. Pause the shared observer before activating the
-        // worker so its advisory copy cannot be queued and rendered later.
-        self.sync_session_activity_monitor();
-
-        self.app.llm_busy = true;
-        self.app.streaming_open = false;
-        self.app.main_streamed_text_idx = None;
-
-        let (agent, cluster, session_target) = {
-            let guard = self.config.read();
-            let (agent, cluster) = guard.remote_agent.clone().unwrap_or_else(|| {
-                (
-                    guard
-                        .agent
-                        .as_ref()
-                        .map(|agent| agent.name().to_string())
-                        .unwrap_or_default(),
-                    harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
-                )
-            });
-            let target = guard
-                .session
-                .as_ref()
-                .map(|session| (session.storage_key(), cluster.clone()));
-            (agent, cluster, target)
-        };
-        self.active_remote_session = session_target;
-
-        let event_tx = self.event_tx.clone();
-
-        let ctx = crate::prompt::PromptTaskContext {
-            config: self.config.clone(),
-            abort_signal: new_abort.clone(),
-            #[cfg(test)]
-            shared_pending_message: self.shared_pending_message.clone(),
-            local_worker: self.local_worker.clone(),
-            event_tx: event_tx.clone(),
-            tool_confirmation_route: self.tool_confirmation_route.clone(),
-        };
-
-        let handle = tokio::spawn(async move {
-            #[cfg(test)]
-            let result: Result<()> = if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
-                Self::run_test_prompt_task(msg, ctx).await
-            } else {
-                Self::run_nats_prompt_task(msg, ctx, agent, cluster).await
-            };
-            #[cfg(not(test))]
-            let result: Result<()> = Self::run_nats_prompt_task(msg, ctx, agent, cluster).await;
-
-            let error = match result {
-                Err(_) if new_abort.aborted() => None,
-                Err(err) => Some(pretty_error_string(&err)),
-                Ok(()) => None,
-            };
-            let _ = event_tx.send(TuiEvent::PromptTaskFinished {
-                task: new_abort,
-                error,
-            });
-        });
-        self.current_prompt_handle = Some(handle);
-
-        Ok(())
-    }
-
-    /// Wait for any prior prompt task to finish before spawning a new
-    /// one. Cooperative shutdown via the prior task's abort signal is
-    /// tried first with a short timeout; if the task does not exit
-    /// within `PROMPT_TASK_DRAIN_TIMEOUT`, force-cancel it via
-    /// `JoinHandle::abort`.
-    async fn drain_previous_prompt_task(&mut self) {
-        // Signal cooperative abort first (if a signal is around). This is
-        // a no-op if the prior task has already finished and we just
-        // never cleared the signal.
-        if let Some(abort) = self.current_prompt_abort.take() {
-            abort.set_ctrlc();
-        }
-
-        let Some(handle) = self.current_prompt_handle.take() else {
-            return;
-        };
-
-        // Already-completed handle resolves immediately; live handle is
-        // given up to PROMPT_TASK_DRAIN_TIMEOUT to wind down before we
-        // hard-cancel it.
-        let abort_handle = handle.abort_handle();
-        match tokio::time::timeout(PROMPT_TASK_DRAIN_TIMEOUT, handle).await {
-            Ok(Ok(())) => {} // task ended cleanly
-            Ok(Err(_)) => {
-                // Task panicked or was already cancelled; the unwound
-                // task can no longer touch session state, so we move on.
-            }
-            Err(_) => {
-                // Cooperative shutdown timed out — force the task to
-                // stop. The corresponding future is dropped at its next
-                // .await; until then it's wedged on something
-                // synchronous (block_in_place / a non-cooperative tool).
-                abort_handle.abort();
-            }
         }
     }
 
@@ -2754,9 +2528,6 @@ impl Tui {
                     self.app.transcript_browsing = false;
                     self.app.transcript_focus = None;
                     self.app.transcript_selection_anchor = None;
-                }
-                crate::types::ModalState::ConfirmAbandonCancellation => {
-                    self.start_cancellation_abandonment();
                 }
                 _ => {}
             }

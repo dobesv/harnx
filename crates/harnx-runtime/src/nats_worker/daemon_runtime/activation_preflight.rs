@@ -27,7 +27,7 @@ impl WorkerRuntime {
         }
         if current.reference.execution_id != *expected || current.state.is_terminal() {
             if current.reference.execution_id == *expected {
-                self.end_session_tool_servers(&activation.session_id).await;
+                self.end_session_tool_servers(&current.reference).await;
             }
             message
                 .ack()

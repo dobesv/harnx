@@ -4,7 +4,7 @@
 use super::agent_loop::fold_new_user_messages_since;
 use super::backend::NatsSessionLogBackend;
 use super::daemon::SessionActivate;
-use super::daemon_runtime::WorkerRuntime;
+use super::session_turn::TurnWorker;
 use crate::config::{GlobalConfig, Input};
 use crate::nats_lease::NatsSessionLease;
 use anyhow::{Context, Result};
@@ -24,7 +24,31 @@ struct ResumableTurnState<'a> {
     next_turn_messages: &'a [harnx_core::message::Message],
 }
 
-impl WorkerRuntime {
+impl TurnWorker {
+    /// Reconstruct session state using the canonical algorithm.
+    ///
+    /// Returns the session's turn status, effective pending message, and
+    /// resumable context for driving the agent loop correctly.
+    pub(super) async fn reconstruct_session_state(
+        &self,
+        backend: &NatsSessionLogBackend,
+    ) -> harnx_core::session_reconstruct::ReconstructedState {
+        match backend.load_events_latest_async().await {
+            Ok(entries) => harnx_core::session_reconstruct::reconstruct_state_from_nats(&entries),
+            Err(err) => {
+                log::warn!(
+                    "failed to load session log for reconstruction: session_id={} worker_id={} err={err}",
+                    backend.session_id(),
+                    self.worker_id,
+                );
+                harnx_core::session_reconstruct::ReconstructedState {
+                    turn_status: harnx_core::session_reconstruct::TurnStatus::Idle,
+                    next_turn_messages: Vec::new(),
+                    resumable_ctx: None,
+                }
+            }
+        }
+    }
     pub(super) async fn derive_continuation_turn_input(
         &self,
         ctx: TurnInputCtx<'_>,

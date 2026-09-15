@@ -1,8 +1,7 @@
 use crate::policy::{operation_metric, retry_metric, BackoffConfig, EndReason, FailureKind};
 use async_trait::async_trait;
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, CustomNotification,
-    ServerResult,
+    CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ServerResult,
 };
 use rmcp::service::{PeerRequestOptions, RoleClient, RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::{
@@ -418,25 +417,20 @@ impl StreamableHttpMcpCaller {
 
     async fn stop_waiting(
         &self,
-        peer: &rmcp::service::Peer<RoleClient>,
-        request_id: rmcp::model::RequestId,
-        call: impl std::future::Future<Output = Result<ServerResult, ServiceError>>,
+        mut handle: rmcp::service::RequestHandle<RoleClient>,
         reason: &'static str,
         error: McpCallError,
     ) -> Result<ServerResult, McpCallError> {
-        let notification = peer.send_notification(
-            CustomNotification::new(
-                "notifications/cancelled",
-                Some(serde_json::json!({"requestId": request_id, "reason": reason})),
-            )
-            .into(),
+        harnx_toolset::cleanup::unconfirmed(
+            "sandbox MCP cancellation is best-effort; remote shutdown unconfirmed",
         );
-        let _ = tokio::time::timeout(CANCEL_NOTIFICATION_TIMEOUT, notification).await;
-        let acknowledgement = call.await;
-        if !matches!(acknowledgement, Ok(_) | Err(ServiceError::McpError(_))) {
-            // Lost transport cannot confirm that the remote handler stopped.
-            return std::future::pending().await;
-        }
+        handle.rx.close();
+        let _ = tokio::time::timeout(
+            CANCEL_NOTIFICATION_TIMEOUT,
+            handle.cancel(Some(reason.into())),
+        )
+        .await;
+        // No shared-service invalidation here: another call may still use it.
         Err(error)
     }
 }
@@ -479,7 +473,7 @@ impl McpCaller for StreamableHttpMcpCaller {
             ClientRequest::CallToolRequest(CallToolRequest::new(request)),
             PeerRequestOptions::no_options(),
         );
-        let handle = tokio::select! {
+        let mut handle = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 operation_metric("mcp", tool, "cancelled");
@@ -499,9 +493,6 @@ impl McpCaller for StreamableHttpMcpCaller {
             }
         };
 
-        let request_id = handle.id.clone();
-        let call = handle.await_response();
-        tokio::pin!(call);
         let response_deadline = async {
             match self.config.response_timeout {
                 Some(timeout) => tokio::time::sleep(timeout).await,
@@ -514,9 +505,7 @@ impl McpCaller for StreamableHttpMcpCaller {
             _ = cancel.cancelled() => {
                 operation_metric("mcp", tool, "cancelled");
                 return self.stop_waiting(
-                    &peer,
-                    request_id,
-                    call,
+                    handle,
                     "Harnx tool call cancelled",
                     McpCallError::cancelled("response", 1),
                 ).await.map(|_| unreachable!());
@@ -525,14 +514,12 @@ impl McpCaller for StreamableHttpMcpCaller {
                 operation_metric("mcp", tool, "timeout");
                 let timeout = self.config.response_timeout.unwrap_or_default();
                 return self.stop_waiting(
-                    &peer,
-                    request_id,
-                    call,
+                    handle,
                     "Harnx tool response deadline exceeded",
                     McpCallError::deadline("response", 1, timeout),
                 ).await.map(|_| unreachable!());
             }
-            result = &mut call => match result {
+            result = &mut handle.rx => match result.unwrap_or(Err(ServiceError::TransportClosed)) {
                 Ok(response) => response,
                 Err(error) => {
                     self.invalidate(sandbox_id, &service).await;

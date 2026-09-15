@@ -1,3 +1,6 @@
+mod projection;
+pub(crate) mod recovery;
+
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{
     self,

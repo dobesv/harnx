@@ -25,15 +25,23 @@ async fn enqueue_child(parent: &NatsSession, url: &str, id: &str) -> Result<Nats
     Ok(child)
 }
 
+struct ModelStopped(Arc<AtomicUsize>);
+impl Drop for ModelStopped {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn waiting_model(entered: Arc<AtomicUsize>, stopped: Arc<AtomicUsize>) -> AgentCallFn {
-    Arc::new(move |_, _, abort| {
+    Arc::new(move |_, _, _abort| {
         let entered = entered.clone();
         let stopped = stopped.clone();
         Box::pin(async move {
+            let _stopped = ModelStopped(stopped);
             entered.fetch_add(1, Ordering::SeqCst);
-            harnx_core::abort::wait_abort_signal(&abort).await;
-            stopped.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("model cancelled")
+            // Models are dropped on interruption. They need not cooperate by
+            // polling another cancellation branch before control can return.
+            std::future::pending().await
         })
     })
 }

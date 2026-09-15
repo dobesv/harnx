@@ -16,6 +16,8 @@ async fn orphaned_child_reply(original_error: Option<&str>) -> Result<()> {
         ExecutionStore::ensure(&async_nats::jetstream::new(harness.client.clone()), 1).await?;
     let call_id = "orphaned-child-call";
     let request = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         call_id: call_id.into(),
         operation_id: call_id.into(),
@@ -48,23 +50,18 @@ async fn orphaned_child_reply(original_error: Option<&str>) -> Result<()> {
     // The child's worker disappears without recording owner_stopped. The
     // tool future still completes, just as a sub-agent's lease watchdog does.
     harness.toolset.allow_cleanup.notify_one();
-    let message = tokio::time::timeout(Duration::from_secs(10), pending).await??;
+    let message = tokio::time::timeout(Duration::from_secs(2), pending).await??;
     let reply: ToolReply = serde_json::from_slice(&message.payload)?;
-    let Err(ToolErrorPayload::Fatal(error)) = reply.result else {
-        anyhow::bail!("must report unconfirmed shutdown, got {:?}", reply.result);
-    };
-    assert!(error.contains("tool shutdown unconfirmed"), "{error}");
-    if let Some(original_error) = original_error {
-        assert!(
-            error.contains(original_error),
-            "original failure was lost: {error}"
-        );
+    // Cleanup is independent of the committed reply. A vanished child cannot
+    // replace a successful result or the handler's original error with Fatal.
+    match original_error {
+        Some(original) => assert_eq!(
+            reply.result,
+            Err(ToolErrorPayload::Recoverable(original.into()))
+        ),
+        None => assert_eq!(reply.result, Ok(request.args.clone())),
     }
-    let operation = store
-        .get(&reference)
-        .await?
-        .context("invocation retained")?;
-    assert!(operation.owner_stopped);
+    let operation = wait_owner(&store, &reference).await?;
     assert!(
         !operation.state.is_terminal(),
         "must not attest descendant shutdown"
@@ -84,4 +81,22 @@ async fn failed_tool_with_orphaned_child_reports_original_error() -> Result<()> 
         "child worker stopped without answering (session_id: orphaned-session)",
     ))
     .await
+}
+
+async fn wait_owner(
+    store: &ExecutionStore,
+    reference: &OperationRef,
+) -> Result<harnx_execution_control::Operation> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        use futures_util::StreamExt;
+        let mut watch = store.watch().await?;
+        loop {
+            let operation = store.get(reference).await?.context("invocation retained")?;
+            if operation.owner_stopped {
+                return Ok::<_, anyhow::Error>(operation);
+            }
+            watch.next().await.context("watch closed")??;
+        }
+    })
+    .await?
 }

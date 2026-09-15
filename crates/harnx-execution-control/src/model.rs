@@ -1,3 +1,4 @@
+use crate::StopDecision;
 use anyhow::{ensure, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -61,14 +62,26 @@ pub enum OperationState {
 }
 
 impl OperationState {
+    /// Compatibility alias for legacy lifecycle completion.
+    ///
+    /// Deliberately does NOT include `Interrupted`. Use purpose-specific
+    /// predicates instead: `accepts_work()` for new admissions, `cancelling()`
+    /// for in-flight cancellation, `is_lifecycle_terminal()` for physical-record
+    /// retirement. See [`state.rs`] for logical interruption semantics.
     pub fn is_terminal(self) -> bool {
+        self.is_lifecycle_terminal()
+    }
+
+    /// Legacy lifecycle completion, including the explicit abandonment override.
+    /// This is not proof of physical cleanup; use `Operation::cleanup_confirmed`.
+    pub fn is_lifecycle_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled)
     }
     pub fn accepts_work(self) -> bool {
         matches!(self, Self::Preparing | Self::Running)
     }
     pub fn cancelling(self) -> bool {
-        !self.accepts_work() && !self.is_terminal()
+        !self.accepts_work() && !self.is_lifecycle_terminal()
     }
 
     pub fn can_transition(self, next: Self) -> bool {
@@ -115,20 +128,39 @@ pub struct Operation {
     pub reference: OperationRef,
     pub kind: OperationKind,
     pub parent: Option<OperationRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_generation: Option<OperationRef>,
     pub children: BTreeSet<OperationRef>,
     pub owner: Option<Owner>,
+    /// Historical worker fences bind pre-gate transcript entries across handover.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub owner_fences: Box<BTreeSet<u64>>,
     pub state: OperationState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub cancellation: Option<Cancellation>,
+    /// Accepted logical stop, independent of cleanup and transcript projection.
+    /// Once present, store mutations cannot clear or replace it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_decision: Option<StopDecision>,
+    /// Activation marker, serialized against legacy cancellation before opening the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_registration: Option<Box<crate::gate::GateRegistration>>,
     /// None means append is reserved but has not yet been acknowledged.
     pub admissions: BTreeMap<String, Option<u64>>,
     pub blocker: Option<String>,
     /// Set only by the owner after per-call cleanup and lease release.
     pub owner_stopped: bool,
+    /// A retired descendant lacked physical cleanup confirmation. Dropping its
+    /// graph edge must not make this operation report confirmed shutdown.
+    #[serde(default)]
+    pub retired_cleanup_unconfirmed: bool,
     /// CAS-sealed by an owner once its admission high-water mark is drained.
     pub sealed: bool,
     pub covered_through: u64,
+    /// Transcript cancellation coverage has been projected (or no projection is
+    /// required for never-started/abandoned work under the compatibility path).
+    /// This is neither stop acceptance nor evidence of physical cleanup.
     pub cancel_recorded: bool,
     /// An operator explicitly made an unconfirmed cancellation terminal.
     /// The abandoned owner may still be running outside the control plane.
@@ -146,20 +178,35 @@ impl Operation {
             reference,
             kind,
             parent,
+            previous_generation: None,
             children: BTreeSet::new(),
             owner: None,
+            owner_fences: Box::default(),
             state: OperationState::Preparing,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             cancellation: None,
+            stop_decision: None,
+            gate_registration: None,
             admissions: BTreeMap::new(),
             blocker: None,
             owner_stopped: false,
+            retired_cleanup_unconfirmed: false,
             sealed: false,
             covered_through: 0,
             cancel_recorded: false,
             abandoned: false,
         }
+    }
+
+    pub(crate) fn session_generation(
+        reference: OperationRef,
+        parent: Option<OperationRef>,
+        previous_generation: Option<OperationRef>,
+    ) -> Self {
+        let mut operation = Self::preparing(reference, OperationKind::Session, parent);
+        operation.previous_generation = previous_generation;
+        operation
     }
 
     pub fn transition(&mut self, state: OperationState) -> Result<()> {
@@ -178,7 +225,7 @@ impl Operation {
     }
 
     pub fn request_cancel(&mut self, cancellation_id: &str, retry: bool) -> Result<()> {
-        if self.state.is_terminal() {
+        if self.state.is_lifecycle_terminal() {
             return Ok(());
         }
         let now = Utc::now();
@@ -211,7 +258,7 @@ impl Operation {
     }
 
     pub fn accepts_work(&self) -> bool {
-        self.state.accepts_work() && !self.sealed && !self.owner_stopped
+        self.allows_continuation() && !self.sealed && !self.owner_stopped
     }
 
     pub fn admissions_covered(&self, through: u64) -> bool {
@@ -230,6 +277,8 @@ impl Operation {
         if self.state == OperationState::Running {
             return self.transition(OperationState::Completed);
         }
+        // Legacy lifecycle/pruning still waits for transcript projection. The
+        // independent cleanup view can already be Confirmed at this point.
         if self.kind == OperationKind::Session && !self.cancel_recorded {
             return Ok(());
         }
@@ -265,7 +314,7 @@ impl Operation {
     }
 
     pub(crate) fn abandon_unconfirmed(&mut self) -> Result<()> {
-        if self.state.is_terminal() {
+        if self.state.is_lifecycle_terminal() {
             return Ok(());
         }
         ensure!(

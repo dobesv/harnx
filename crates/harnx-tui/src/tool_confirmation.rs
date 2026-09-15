@@ -11,14 +11,27 @@ use ratatui::Frame;
 /// depend on a Tokio runtime, while remote handlers need cancellable async waits.
 pub(crate) enum ToolConfirmationReply {
     Blocking(std::sync::mpsc::Sender<bool>),
-    Async(tokio::sync::oneshot::Sender<bool>),
+    Routed {
+        reply: tokio::sync::oneshot::Sender<bool>,
+        closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
 }
 
 impl ToolConfirmationReply {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Blocking(_) => false,
+            Self::Routed { reply, closed } => {
+                reply.is_closed() || closed.load(std::sync::atomic::Ordering::Acquire)
+            }
+        }
+    }
+
     pub(crate) fn send(self, approved: bool) -> Result<(), bool> {
+        let approved = approved && !self.is_closed();
         match self {
             Self::Blocking(reply) => reply.send(approved).map_err(|error| error.0),
-            Self::Async(reply) => reply.send(approved),
+            Self::Routed { reply, .. } => reply.send(approved),
         }
     }
 }
@@ -73,6 +86,12 @@ impl Tui {
         reason: Option<String>,
         reply: ToolConfirmationReply,
     ) {
+        // Route retirement is synchronous. A queued G1 Show cannot recreate a
+        // modal after acceptance even if the responder has not dropped yet.
+        if reply.is_closed() {
+            let _ = reply.send(false);
+            return;
+        }
         if self.app.modal.is_some() || self.app.pending_confirm_reply.is_some() {
             let _ = reply.send(false);
             self.app.transcript.push(TranscriptItem::SystemText(

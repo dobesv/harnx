@@ -147,8 +147,9 @@ fn one_shot_timeout_emits_contract_then_same_session_retry_succeeds() -> Result<
         .expect("timeout contract should contain a session id")
         .to_string();
 
-    // Timeout handling awaits durable Cancel coverage before returning. An
-    // immediate retry exercises the tombstone race that coverage prevents.
+    // Acceptance need not wait for worker startup or transcript projection.
+    // If the deadline won before model dispatch, G2 consumes the first mock turn.
+    let calls_before_retry = mock.get_request_log().len();
     let mut retry = spawn_oneshot_with_args(
         &paths,
         &harnx_bin,
@@ -161,10 +162,22 @@ fn one_shot_timeout_emits_contract_then_same_session_retry_succeeds() -> Result<
         retry_status.success(),
         "same-session retry exited with {retry_status}; stderr: {retry_stderr:?}"
     );
-    assert_eq!(retry_stdout, "same-session retry succeeded\n");
     assert_eq!(retry_stderr, "");
-    assert_eq!(mock.get_request_log().len(), 2);
+    assert_retry_response(&mock, calls_before_retry, &retry_stdout);
     Ok(())
+}
+
+fn assert_retry_response(mock: &MockOpenAiServer, calls_before_retry: usize, retry_stdout: &str) {
+    let expected = if calls_before_retry == 0 {
+        "partialtoo late\n"
+    } else {
+        "same-session retry succeeded\n"
+    };
+    assert_eq!(retry_stdout, expected);
+    let requests = mock.get_request_log();
+    assert_eq!(requests.len(), calls_before_retry + 1);
+    let messages = requests.last().unwrap()["messages"].as_array().unwrap();
+    assert_eq!(messages.last().unwrap()["content"], "retry after timeout");
 }
 
 #[test]
@@ -254,7 +267,8 @@ fn final_only_reports_terminal_failures_on_stderr() -> Result<()> {
 
     assert!(
         !status.success(),
-        "final-only failure unexpectedly succeeded"
+        "final-only failure unexpectedly succeeded: stdout={stdout:?} stderr={stderr:?} log={:?}",
+        std::fs::read_to_string(paths.harnx_state_dir.join("harnx.log"))
     );
     assert_eq!(stdout, "");
     assert!(

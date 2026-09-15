@@ -80,6 +80,7 @@ pub struct Tui {
     /// started) prompt task. Ctrl+C signals this; `start_prompt` consults
     /// it to abort an in-flight task before spawning a new one.
     pub(super) current_prompt_abort: Option<AbortSignal>,
+    pub(crate) live_events: harnx_runtime::nats_event_sink::LiveEventState,
     /// JoinHandle for the currently running (or most recently started)
     /// prompt task. `start_prompt` awaits/aborts this before spawning a
     /// new task — guaranteeing one prompt task at a time.
@@ -134,7 +135,10 @@ pub(super) struct ActiveToolConfirmationRoute {
 
 #[derive(Clone)]
 pub(super) enum ToolConfirmationRouteHandle {
-    Nats(Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationRoute>),
+    Nats(
+        Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationRoute>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ),
     #[cfg(test)]
     Test(Arc<std::sync::atomic::AtomicBool>),
 }
@@ -142,7 +146,10 @@ pub(super) enum ToolConfirmationRouteHandle {
 impl ToolConfirmationRouteHandle {
     pub(super) fn shutdown(&self) {
         match self {
-            Self::Nats(route) => route.shutdown(),
+            Self::Nats(route, closed) => {
+                closed.store(true, std::sync::atomic::Ordering::Release);
+                route.shutdown();
+            }
             #[cfg(test)]
             Self::Test(shutdown) => shutdown.store(true, std::sync::atomic::Ordering::SeqCst),
         }
@@ -152,7 +159,7 @@ impl ToolConfirmationRouteHandle {
         &self,
     ) -> Option<Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationRoute>> {
         match self {
-            Self::Nats(route) => Some(Arc::clone(route)),
+            Self::Nats(route, _) => Some(Arc::clone(route)),
             #[cfg(test)]
             Self::Test(_) => None,
         }
@@ -368,6 +375,7 @@ impl SubAgentInvocationProgress {
 }
 
 pub(super) struct MonitoredSessionState {
+    pub live_events: harnx_runtime::nats_event_sink::LiveEventState,
     pub invocation_id: Option<String>,
     pub execution_id: Option<String>,
     pub transcript: Vec<TranscriptItem>,
@@ -385,6 +393,7 @@ impl MonitoredSessionState {
         Self {
             transcript: Vec::new(),
             execution_id: None,
+            live_events: Default::default(),
             invocation_id: None,
             status,
             transcript_focus: None,
@@ -453,9 +462,6 @@ pub(super) enum ModalState {
         worker_state: ExitWorkerState,
         phase: ExitPhase,
     },
-    /// Confirmation for making an unconfirmed cancellation terminal even
-    /// though work outside the control plane may still be running.
-    ConfirmAbandonCancellation,
     /// Agent selection
     AgentPicker {
         agents: Vec<String>,
@@ -491,9 +497,6 @@ impl ModalState {
             }
             Self::ConfirmDelete { from, to } => Some(format!("Delete entries {from}–{to}? [y/N]")),
             Self::ConfirmRewind { seq, .. } => Some(format!("Rewind to entry {seq}? [y/N]")),
-            Self::ConfirmAbandonCancellation => {
-                Some("Resume anyway? Prior work may still be running. [y/N]".into())
-            }
             _ => None,
         }
     }
@@ -647,7 +650,13 @@ pub(crate) enum TuiEvent {
         cluster: String,
         operation: harnx_execution_control::Operation,
     },
-    Agent(harnx_core::event::AgentEvent),
+    /// Local commands/startup only. Never used by a live NATS follower.
+    LocalAgent(harnx_core::event::AgentEvent),
+    Agent {
+        task: AbortSignal,
+        stamp: crate::event_isolation::EventStamp,
+        event: harnx_core::event::AgentEvent,
+    },
     /// The locally-owned prompt task has exited. `Turn::Ended` normally closes
     /// busy state; this is the fallback for a lossy advisory or setup failure.
     PromptTaskFinished {
@@ -656,12 +665,16 @@ pub(crate) enum TuiEvent {
     },
     /// Shared activity observed directly from the session fan-out stream.
     SessionActivity {
+        historical: bool,
+        stamp: crate::event_isolation::EventStamp,
         session_id: String,
         cluster: String,
         active: bool,
     },
     /// Agent output observed from another frontend on the selected session.
     SessionAgent {
+        stamp: crate::event_isolation::EventStamp,
+        historical: bool,
         session_id: String,
         cluster: String,
         event: harnx_core::event::AgentEvent,
@@ -673,6 +686,7 @@ pub(crate) enum TuiEvent {
     },
     /// Live advisory belonging exclusively to a monitored child session.
     SubAgentSessionEvent {
+        stamp: crate::event_isolation::EventStamp,
         key: MonitoredSessionKey,
         event: harnx_core::event::AgentEvent,
     },

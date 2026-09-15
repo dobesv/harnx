@@ -215,7 +215,9 @@ async fn assert_cancel_control(
         .call_tool("time_wait", json!({ "seconds": 30.0 }), &abort)
         .await;
     abort_task.await?;
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // Cancellation can arrive during gate registration. The compatibility
+    // transport waits up to 5s for cleanup acknowledgement (changed in Stage 7).
+    assert!(started.elapsed() < Duration::from_secs(7));
     assert!(matches!(cancelled, Err(ToolError::Fatal(_))));
     let control = tokio::time::timeout(Duration::from_secs(1), controls.next())
         .await
@@ -412,7 +414,9 @@ async fn readiness_waits_for_servers_concurrently() -> Result<()> {
         "stall-server",
         "stall",
         Some(time_binary),
-        Duration::from_secs(1),
+        // Subprocess startup competes with workspace stress tests. The stalled
+        // server still never registers; healthy startup is not a 1s contract.
+        Duration::from_secs(5),
     )
     .await?
     else {

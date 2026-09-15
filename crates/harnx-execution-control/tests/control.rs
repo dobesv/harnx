@@ -255,7 +255,12 @@ async fn child_registration_racing_cancel_never_starts_detached_work() -> Result
         if registered.is_ok() {
             assert!(root.children.contains(&child));
         } else {
-            assert!(store.get(&child).await?.unwrap().state.is_terminal());
+            assert!(store
+                .get(&child)
+                .await?
+                .unwrap()
+                .state
+                .is_lifecycle_terminal());
         }
     }
     Ok(())
@@ -411,7 +416,7 @@ async fn unresolved_admission_blocks_confirmation_until_reconciled() -> Result<(
         .owner_stopped(&root.reference, &owner(1))
         .await?
         .state
-        .is_terminal());
+        .is_lifecycle_terminal());
     assert!(store.reserve_prompt(&root.reference, "late").await.is_err());
     store
         .commit_prompt(&root.reference, "admitted-before-cancel", 5)
@@ -460,7 +465,7 @@ async fn cancellation_waits_for_three_levels_and_concurrent_observers_converge()
             .owner_stopped(&operation.reference, &owner(1))
             .await?
             .state
-            .is_terminal());
+            .is_lifecycle_terminal());
     }
     store.owner_stopped(&nested.reference, &owner(1)).await?;
     let (a, b) = tokio::join!(store.status(&root.reference), store.status(&root.reference));

@@ -14,6 +14,11 @@ pub trait SessionAppendSink: Send + Sync + Any {
     /// Append an entry and return its one-based durable sequence number.
     fn append(&self, entry: &SessionLogEntry) -> Result<u64>;
 
+    /// Recheck exact sink authority when a legacy bool-returning append lost its error.
+    fn validate_output(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether an append failure makes the active turn invalid. File-backed
     /// sessions can mark themselves dirty and rewrite later; a NATS worker log
     /// is authoritative and must never publish a successful turn boundary
@@ -165,7 +170,8 @@ pub(super) fn require_authoritative_appends(
     if all_appended {
         return Ok(());
     }
-    if sink(session).is_some_and(|sink| sink.failure_is_fatal()) {
+    if let Some(sink) = sink(session).filter(|sink| sink.failure_is_fatal()) {
+        sink.validate_output()?;
         anyhow::bail!("failed to durably persist {operation}");
     }
     Ok(())

@@ -28,7 +28,7 @@ filter = 'binary(tmux_e2e) | binary(interrupt_e2e)'
 test-group = 'heavy-e2e'
 
 [[profile.default.overrides]]
-filter = 'binary(/nats/) | binary(local_worker_supervisor) | test(/nats/)'
+filter = 'binary(/nats/) | binary(local_worker_supervisor) | test(/nats/) | test(/subagent_replay/) | test(/tool_confirmation/) | test(/nats_tool_provider/)'
 test-group = 'broker-e2e'
 
 [profile.ci]
@@ -47,5 +47,5 @@ filter = 'binary(tmux_e2e) | binary(interrupt_e2e)'
 test-group = 'heavy-e2e'
 
 [[profile.ci.overrides]]
-filter = 'binary(/nats/) | binary(local_worker_supervisor) | test(/nats/)'
+filter = 'binary(/nats/) | binary(local_worker_supervisor) | test(/nats/) | test(/subagent_replay/) | test(/tool_confirmation/) | test(/nats_tool_provider/)'
 test-group = 'broker-e2e'

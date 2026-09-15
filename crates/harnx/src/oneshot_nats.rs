@@ -193,13 +193,11 @@ pub(crate) async fn run_turn(
         _ = &mut deadline => {
             // Timeout is caller-local: only this deadline arm classifies a timeout.
             options.abort_signal.set_ctrlc();
-            if let Err(error) = (&mut run_turn).await {
-                log::debug!(
-                    "one-shot turn cleanup failed after timeout for session '{}': {error:#}",
-                    session.session_id(),
-                );
-            }
-            finish_timed_out_turn(session.session_id(), session.cancel_pending_turn().await)
+            // The follower cancels its admitted generation and returns on root
+            // acceptance. Never send a second session-current cancel here: G2
+            // may already have replaced this invocation by the time we return.
+            let cancellation = (&mut run_turn).await.map(|result| result.was_cancelled);
+            finish_timed_out_turn(session.session_id(), cancellation)
         }
     }
 }

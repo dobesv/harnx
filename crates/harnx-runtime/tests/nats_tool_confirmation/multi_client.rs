@@ -63,7 +63,7 @@ async fn assert_observer_matches_source(
     observer: &SessionEventStream,
     attached_seq: u64,
 ) -> Result<()> {
-    let source_entries = NatsSessionLog::for_agent(
+    let source_entries = harnx_runtime::nats_session_log::NatsSessionLog::for_agent(
         harness.jetstream.clone(),
         "approval-gated",
         SOURCE_SESSION_ID,

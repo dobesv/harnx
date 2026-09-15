@@ -26,6 +26,7 @@ pub(super) struct HitlCallbackContext<'a> {
     pub event_sink: Option<&'a Arc<NatsEventSink>>,
     pub after_seq_observer: Option<&'a Arc<AtomicU64>>,
     pub metadata_store: Option<&'a SessionMetadataStore>,
+    pub fence: Option<crate::execution_fence::GenerationFence>,
 }
 
 /// Runtime state for HITL approval request handling.
@@ -48,7 +49,8 @@ impl<'a> HitlCallbackContext<'a> {
                     .cloned()
                     .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
             )
-            .with_metadata_store(self.metadata_store.cloned());
+            .with_metadata_store(self.metadata_store.cloned())
+            .with_execution(self.fence.clone());
         let sink = FencedSessionLogSink::new(backend.clone(), Arc::clone(self.lease));
         (backend, sink)
     }
@@ -261,7 +263,6 @@ fn notify_session_updated(event_sink: &Option<Arc<NatsEventSink>>) {
 #[cfg(test)]
 mod hitl_attention_tests {
     use super::*;
-    use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
     use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
     use crate::tool::DeferredToolCall;
     use harnx_core::require_nextest;
@@ -293,23 +294,9 @@ mod hitl_attention_tests {
             .unwrap();
 
         // Acquire a lease for the session
-        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
-            jetstream: jetstream.clone(),
-            session_id: &storage_key,
-            worker_id: "test-worker".to_string(),
-            generation: 1,
-            config: NatsLeaseConfig {
-                ttl: std::time::Duration::from_secs(5),
-                renew_interval: std::time::Duration::from_millis(500),
-                replicas: 1,
-                ..Default::default()
-            },
-            session_metadata: Some(store.clone()),
-        })
-        .await
-        .unwrap()
-        .expect("lease should be acquired");
-        let lease = Arc::new(lease);
+        let (lease, fence) =
+            crate::nats_worker::backend::test_session_authority(&jetstream, &storage_key, &store)
+                .await;
         let after_seq_observer = Arc::new(AtomicU64::new(0));
 
         // Build the callback with metadata store attached
@@ -320,6 +307,7 @@ mod hitl_attention_tests {
             event_sink: None,
             after_seq_observer: Some(&after_seq_observer),
             metadata_store: Some(&store),
+            fence: Some(fence),
         };
         let callback = build_hitl_approval_request_callback_for_test(ctx);
 

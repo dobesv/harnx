@@ -221,13 +221,7 @@ impl SessionControlHandler {
                 return;
             }
         }
-        let event_sink = crate::nats_event_sink::NatsEventSink::new(
-            self.client.clone(),
-            self.jetstream.clone(),
-            self.session_id.clone(),
-        )
-        .await;
-        event_sink.publish_session_updated();
+        self.publish_updated().await;
         let _ = self.hitl_decision_tx.send(AppliedHitlDecision {
             tool_call_id,
             approved,
@@ -235,6 +229,17 @@ impl SessionControlHandler {
         });
         self.acknowledge(reply).await;
     }
+    async fn publish_updated(&self) {
+        let event_sink = crate::nats_event_sink::NatsEventSink::new(
+            self.client.clone(),
+            self.jetstream.clone(),
+            self.session_id.clone(),
+        )
+        .await
+        .with_execution(self.execution.fence.clone());
+        event_sink.publish_session_updated();
+    }
+
     fn append_cancel(&self) -> bool {
         if !should_append_control_log_entry(&self.lease) {
             return false;

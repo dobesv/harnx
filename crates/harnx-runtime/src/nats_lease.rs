@@ -15,6 +15,8 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time;
 
+mod interruption;
+
 const LEASE_BUCKET: &str = "harnx_leases";
 const LEASE_KEY_PREFIX: &str = "sessions";
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
@@ -24,6 +26,10 @@ const ACTIVITY_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeaseRecord {
+    /// Original execution, not the session's current generation. Legacy leases
+    /// without this binding cannot be revoked before their TTL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
     pub worker_id: String,
     pub generation: u64,
     pub acquired_at: String,
@@ -88,6 +94,7 @@ pub struct NatsSessionLease {
 
 #[derive(Debug)]
 struct LeaseState {
+    execution_id: Option<String>,
     worker_id: String,
     generation: u64,
     ttl: Duration,
@@ -100,6 +107,15 @@ struct LeaseState {
 
 impl NatsSessionLease {
     pub async fn acquire(params: NatsLeaseAcquireParams<'_>) -> Result<Option<Self>> {
+        Self::acquire_for_execution(params, None).await
+    }
+
+    /// Bind a worker lease so accepted interruption permits immediate takeover.
+    /// Execution still requires a separate generation/owner claim through the gate.
+    pub async fn acquire_for_execution(
+        params: NatsLeaseAcquireParams<'_>,
+        execution_id: Option<String>,
+    ) -> Result<Option<Self>> {
         let NatsLeaseAcquireParams {
             jetstream,
             session_id,
@@ -111,25 +127,27 @@ impl NatsSessionLease {
         config.validate()?;
         let bucket = ensure_lease_bucket(&jetstream, &config).await?;
         let key = config.key_for_session(session_id);
-        let record = LeaseRecord::new(worker_id.clone(), generation);
-        let payload = serde_json::to_vec(&record).context("Failed to serialize lease record")?;
-
+        let mut record = LeaseRecord::new(worker_id.clone(), generation);
+        record.execution_id = execution_id.clone();
         let acquired_at = time::Instant::now();
-        let revision = match bucket
-            .create_with_ttl(&key, payload.into(), config.ttl)
-            .await
-        {
-            Ok(revision) => revision,
-            Err(error) if is_create_conflict(&error) => return Ok(None),
-            Err(error) => {
-                return Err(anyhow!(error)).with_context(|| {
-                    format!("Failed to acquire NATS lease for session '{session_id}'")
-                })
-            }
+        let Some(revision) = interruption::create_lease(
+            &jetstream,
+            &bucket,
+            interruption::LeaseCreate {
+                key: &key,
+                session_id,
+                record: &record,
+                ttl: config.ttl,
+            },
+        )
+        .await?
+        else {
+            return Ok(None);
         };
 
         let (status_tx, _status_rx) = watch::channel(true);
         let state = Arc::new(LeaseState {
+            execution_id,
             worker_id,
             generation,
             ttl: config.ttl,
@@ -298,6 +316,7 @@ impl Drop for NatsSessionLease {
 impl LeaseRecord {
     fn new(worker_id: String, generation: u64) -> Self {
         Self {
+            execution_id: None,
             worker_id,
             generation,
             acquired_at: chrono::Utc::now().to_rfc3339(),
@@ -557,7 +576,8 @@ async fn renew_once(
     let expected_revision = state.fence_token.load(Ordering::SeqCst);
     let sent_at = time::Instant::now();
     let deadline = *state.confirmed_until.lock();
-    let record = LeaseRecord::new(state.worker_id.clone(), state.generation);
+    let mut record = LeaseRecord::new(state.worker_id.clone(), state.generation);
+    record.execution_id = state.execution_id.clone();
     let payload =
         serde_json::to_vec(&record).context("Failed to serialize renewed lease record")?;
     let subject = format!("$KV.{}.{}", bucket.name, key);

@@ -4,7 +4,17 @@
 //! `ask` must cross NATS before the existing TUI modal can answer it. These
 //! tests exercise the real handoff tool and hook server for both answers.
 
+#[path = "nats_tool_confirmation/ack_recovery.rs"]
+mod ack_recovery;
+#[path = "common/admitted_log.rs"]
+mod admitted_log;
 mod common;
+use admitted_log::AdmittedSessionLog as NatsSessionLog;
+#[path = "nats_tool_confirmation/fencing.rs"]
+mod fencing;
+#[allow(dead_code)]
+#[path = "common/generation.rs"]
+mod generation;
 #[path = "nats_tool_confirmation/multi_client.rs"]
 mod multi_client;
 
@@ -21,7 +31,6 @@ use harnx_runtime::{
     config::Config,
     nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease},
     nats_session::{NatsSession, NatsSessionConfig},
-    nats_session_log::NatsSessionLog,
     nats_session_metadata::SessionInitializer,
     nats_tool_confirmation::{ToolConfirmationHandler, ToolConfirmationRequest},
     nats_worker::{
@@ -143,13 +152,7 @@ impl ConfirmationHarness {
         ensure_hook_server_binary().await?;
         let environment = TestEnvironment::new(server.url())?;
         let (config, client, jetstream) = environment.load().await?;
-        let daemon = tokio::spawn(run_worker_daemon(
-            config,
-            WorkerDaemonConfig::managing("local", "worker-tool-confirmation"),
-            Some(call_fn),
-            None,
-        ));
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let daemon = start_ready_daemon(config, call_fn, &client).await?;
         let source = NatsSession::new(
             NatsSessionConfig {
                 cluster: "local".to_string(),
@@ -204,6 +207,38 @@ impl Drop for ConfirmationHarness {
     fn drop(&mut self) {
         self.daemon.abort();
     }
+}
+
+async fn start_ready_daemon(
+    config: Arc<RwLock<Config>>,
+    call_fn: harnx_runtime::agent_loop::AgentCallFn,
+    client: &async_nats::Client,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    use futures_util::StreamExt;
+
+    // Subscribe before spawning so even immediate readiness cannot be missed.
+    let mut ready = client
+        .subscribe(harnx_runtime::nats_worker::worker_ready_subject("local"))
+        .await?;
+    client.flush().await?;
+    let mut daemon = tokio::spawn(run_worker_daemon(
+        config,
+        WorkerDaemonConfig::managing("local", "worker-tool-confirmation"),
+        Some(call_fn),
+        None,
+    ));
+    let outcome = tokio::select! {
+        message = ready.next() => message.context("worker readiness subscription closed").map(|_| ()),
+        result = &mut daemon => Err(anyhow::anyhow!("worker exited before readiness: {result:?}")),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            Err(anyhow::anyhow!("worker daemon did not become ready within 30s"))
+        }
+    };
+    if let Err(error) = outcome {
+        daemon.abort();
+        return Err(error);
+    }
+    Ok(daemon)
 }
 
 struct ConfirmationOutcome {
@@ -500,7 +535,7 @@ where
     F: FnMut(&SessionLogEntry) -> bool,
 {
     let log = NatsSessionLog::new(jetstream.clone(), source_key());
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let entries = log.load_events_async().await?;
         if entries.iter().filter(|(_, entry)| predicate(entry)).count() >= expected {
@@ -643,9 +678,9 @@ async fn durable_hitl_duplicate_approval_has_one_decision_and_executes_after_it(
     );
     let first = first?;
     let second = second?;
-    assert_ne!(
-        first, second,
-        "exactly one concurrent approval must report that it applied"
+    assert!(
+        first && second,
+        "matching concurrent approvals must recover the same durable decision"
     );
     let entries = wait_for_source_entry(&harness.jetstream, |entry| {
         matches!(entry, SessionLogEntry::ToolResults { .. })
@@ -729,37 +764,7 @@ async fn durable_hitl_restart_recovers_pending_and_executes_once() -> Result<()>
     harness.daemon.abort();
     let _ = (&mut harness.daemon).await;
 
-    let log = NatsSessionLog::new(harness.jetstream.clone(), source_key());
-    log.append_event_async(&SessionLogEntry::Message {
-        id: Some(uuid::Uuid::new_v4().to_string()),
-        role: MessageRole::User,
-        content: MessageContent::Text("start handoff".to_string()),
-        timestamp: None,
-        fence_token: None,
-    })
-    .await?;
-    log.append_event_async(&SessionLogEntry::ToolCalls {
-        text: "activation completed".to_string(),
-        thought: None,
-        calls: vec![ToolCall::new(
-            "target_session_handoff".to_string(),
-            json!({
-                "prompt": "finish after approval",
-                "session_id": TARGET_SESSION_ID,
-            }),
-            Some("hook-approval-handoff".to_string()),
-            None,
-        )],
-        timestamp: None,
-        fence_token: Some(1),
-    })
-    .await?;
-    log.append_event_async(&SessionLogEntry::HitlApprovalRequested {
-        tool_call_id: "hook-approval-handoff".to_string(),
-        summary: "Approve the handoff?".to_string(),
-        fence_token: 1,
-    })
-    .await?;
+    seed_pending_hitl_round(&harness).await?;
 
     let (config, _, _) = harness._environment.load().await?;
     let mut replacement = tokio::spawn(run_worker_daemon(
@@ -808,143 +813,6 @@ async fn durable_hitl_restart_recovers_pending_and_executes_once() -> Result<()>
         "restart handoff target must execute exactly once"
     );
     replacement.abort();
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hitl_handoff_stale_worker_loses_decision_and_execution_race() -> Result<()> {
-    require_nextest();
-    let Some(server) = common::spawn_nats_server().await? else {
-        return Ok(());
-    };
-    let client = async_nats::connect(server.url()).await?;
-    let jetstream = async_nats::jetstream::new(client);
-    let lease_config = NatsLeaseConfig {
-        ttl: std::time::Duration::from_secs(1),
-        renew_interval: std::time::Duration::from_millis(200),
-        replicas: 1,
-        tombstone_ttl: std::time::Duration::from_secs(10),
-        ..Default::default()
-    };
-    let stale_lease = Arc::new(
-        NatsSessionLease::acquire(NatsLeaseAcquireParams {
-            jetstream: jetstream.clone(),
-            session_id: &source_key(),
-            worker_id: "stale-hitl-worker".to_string(),
-            generation: 1,
-            config: lease_config.clone(),
-            session_metadata: None,
-        })
-        .await?
-        .context("stale worker acquires lease")?,
-    );
-    let log = NatsSessionLog::new(jetstream.clone(), source_key());
-    log.append_event_async(&SessionLogEntry::ToolCalls {
-        text: "pending handoff".to_string(),
-        thought: None,
-        calls: vec![ToolCall::new(
-            "target_session_handoff".to_string(),
-            json!({"session_id": TARGET_SESSION_ID, "prompt": "run once"}),
-            Some("handoff-race-call".to_string()),
-            None,
-        )],
-        timestamp: None,
-        fence_token: Some(stale_lease.fence_token()),
-    })
-    .await?;
-    log.append_event_async(&SessionLogEntry::HitlApprovalRequested {
-        tool_call_id: "handoff-race-call".to_string(),
-        summary: "Approve handoff".to_string(),
-        fence_token: stale_lease.fence_token(),
-    })
-    .await?;
-    let stale_snapshot = log.load_events_async().await?;
-    let stale_expected = stale_snapshot.last().expect("request tail").0;
-
-    stale_lease.stop_renewal_for_test().await;
-    let replacement_lease = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let Some(lease) = NatsSessionLease::acquire(NatsLeaseAcquireParams {
-                jetstream: jetstream.clone(),
-                session_id: &source_key(),
-                worker_id: "replacement-hitl-worker".to_string(),
-                generation: 1,
-                config: lease_config.clone(),
-                session_metadata: None,
-            })
-            .await?
-            {
-                return Result::<_>::Ok(Arc::new(lease));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .context("replacement worker did not acquire expired lease")??;
-    assert!(
-        stale_lease.is_held(),
-        "stale worker must still believe it owns lease during handoff race"
-    );
-
-    let replacement_sink = harnx_runtime::nats_worker::FencedSessionLogSink::new(
-        harnx_runtime::nats_worker::NatsSessionLogBackend::new(jetstream.clone(), source_key()),
-        Arc::clone(&replacement_lease),
-    );
-    let replacement_entry = SessionLogEntry::HitlApprovalDecision {
-        tool_call_id: "handoff-race-call".to_string(),
-        approved: true,
-        note: None,
-        fence_token: replacement_lease.fence_token(),
-    };
-    assert!(
-        replacement_sink
-            .append_hitl_event_cas(&replacement_entry, stale_expected)
-            .await?
-            .is_some(),
-        "replacement worker must win decision CAS"
-    );
-
-    let stale_sink = harnx_runtime::nats_worker::FencedSessionLogSink::new(
-        harnx_runtime::nats_worker::NatsSessionLogBackend::new(jetstream.clone(), source_key()),
-        Arc::clone(&stale_lease),
-    );
-    let stale_entry = SessionLogEntry::HitlApprovalDecision {
-        tool_call_id: "handoff-race-call".to_string(),
-        approved: false,
-        note: Some("stale denial".to_string()),
-        fence_token: stale_lease.fence_token(),
-    };
-    assert!(
-        stale_sink
-            .append_hitl_event_cas(&stale_entry, stale_expected)
-            .await?
-            .is_none(),
-        "stale worker decision must lose stream-tail CAS"
-    );
-
-    let execution_count = AtomicUsize::new(0);
-    if stale_lease.revalidate_ownership().await? {
-        execution_count.fetch_add(1, Ordering::SeqCst);
-    }
-    if replacement_lease.revalidate_ownership().await? {
-        execution_count.fetch_add(1, Ordering::SeqCst);
-    }
-    assert_eq!(
-        execution_count.load(Ordering::SeqCst),
-        1,
-        "only current lease holder may cross tool execution boundary"
-    );
-
-    let entries = log.load_events_async().await?;
-    assert_eq!(
-        entries
-            .iter()
-            .filter(|(_, entry)| matches!(entry, SessionLogEntry::HitlApprovalDecision { .. }))
-            .count(),
-        1,
-        "handoff race must durably apply exactly one decision"
-    );
-    replacement_lease.release().await?;
     Ok(())
 }
 
@@ -1157,4 +1025,67 @@ fn source_key() -> String {
 
 fn target_key() -> String {
     harnx_core::session_identity::session_key(Some("target"), TARGET_SESSION_ID)
+}
+
+async fn seed_pending_hitl_round(harness: &ConfirmationHarness) -> Result<()> {
+    let log = NatsSessionLog::new(harness.jetstream.clone(), source_key());
+    log.append_event_async(&SessionLogEntry::Message {
+        id: Some(uuid::Uuid::new_v4().to_string()),
+        role: MessageRole::User,
+        content: MessageContent::Text("start handoff".to_string()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await?;
+    let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+        jetstream: harness.jetstream.clone(),
+        session_id: &source_key(),
+        worker_id: "crashed-hitl-worker".into(),
+        generation: 1,
+        config: NatsLeaseConfig::default(),
+        session_metadata: None,
+    })
+    .await?
+    .context("predecessor lease")?;
+    let fence = generation::generation_fence(
+        &harness.jetstream,
+        &source_key(),
+        harnx_execution_control::Owner {
+            instance_id: lease.worker_id().into(),
+            fence: lease.fence_token(),
+        },
+    )
+    .await?;
+    let backend = harnx_runtime::nats_worker::NatsSessionLogBackend::new(
+        harness.jetstream.clone(),
+        source_key(),
+    )
+    .with_execution(Some(fence));
+    backend
+        .append_event(&SessionLogEntry::ToolCalls {
+            text: "activation completed".to_string(),
+            thought: None,
+            calls: vec![ToolCall::new(
+                "target_session_handoff".to_string(),
+                json!({
+                    "prompt": "finish after approval",
+                    "session_id": TARGET_SESSION_ID,
+                }),
+                Some("hook-approval-handoff".to_string()),
+                None,
+            )],
+            timestamp: None,
+            fence_token: Some(1),
+        })
+        .await?;
+    backend
+        .append_event(&SessionLogEntry::HitlApprovalRequested {
+            tool_call_id: "hook-approval-handoff".to_string(),
+            summary: "Approve the handoff?".to_string(),
+            fence_token: 1,
+        })
+        .await?;
+
+    lease.release().await?;
+    Ok(())
 }

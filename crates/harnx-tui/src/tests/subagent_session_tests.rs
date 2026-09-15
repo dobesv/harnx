@@ -62,7 +62,7 @@ async fn emit_subagent_invocation_started(
     key: &MonitoredSessionKey,
     invocation_id: Option<&str>,
 ) {
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
         TurnEvent::SubAgentStarted {
             agent: key.agent.clone(),
             session_id: key.session_id.clone(),
@@ -134,12 +134,12 @@ async fn compact_subagent_row_deduplicates_durable_completion() {
     let completed = completed_subagent_event(&key);
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(completed.clone()))
+        .handle_tui_event(TuiEvent::LocalAgent(completed.clone()))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(completed))
+        .handle_tui_event(TuiEvent::LocalAgent(completed))
         .await
         .unwrap();
 
@@ -171,7 +171,7 @@ async fn progress_animates_counts_elapsed_and_freezes_terminal_metrics() {
     emit_subagent_invocation_started(harness.tui(), &key, Some("inv-progress")).await;
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
             TurnEvent::SubAgentProgress(subagent_progress(
                 &key,
                 "inv-progress",
@@ -207,7 +207,7 @@ async fn progress_animates_counts_elapsed_and_freezes_terminal_metrics() {
 
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
             TurnEvent::SubAgentProgress(subagent_progress(
                 &key,
                 "inv-progress",
@@ -237,7 +237,7 @@ async fn terminal_progress_is_not_reopened_by_child_monitor_or_late_progress() {
     emit_subagent_invocation_started(harness.tui(), &key, Some("inv-terminal")).await;
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
             TurnEvent::SubAgentProgress(subagent_progress(
                 &key,
                 "inv-terminal",
@@ -260,9 +260,11 @@ async fn terminal_progress_is_not_reopened_by_child_monitor_or_late_progress() {
         })
         .await
         .unwrap();
+    let stamp = child_event_stamp(harness.tui(), &key);
     harness
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionEvent {
+            stamp,
             key: key.clone(),
             event: AgentEvent::Turn(TurnEvent::Started),
         })
@@ -270,7 +272,7 @@ async fn terminal_progress_is_not_reopened_by_child_monitor_or_late_progress() {
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
             TurnEvent::SubAgentProgress(subagent_progress(
                 &key,
                 "inv-terminal",
@@ -308,7 +310,7 @@ async fn invocation_ids_keep_reused_child_sessions_as_distinct_rows() {
         emit_subagent_invocation_started(harness.tui(), &key, Some(invocation_id)).await;
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+            .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
                 TurnEvent::SubAgentProgress(subagent_progress(
                     &key,
                     invocation_id,
@@ -348,12 +350,12 @@ async fn prompting_a_completed_child_restarts_monitoring_and_tracks_failure() {
     emit_subagent_started(harness.tui(), &key).await;
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(completed_subagent_event(&key)))
+        .handle_tui_event(TuiEvent::LocalAgent(completed_subagent_event(&key)))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
             id: "delegate-call-2".into(),
             name: "researcher_session_prompt".into(),
             kind: harnx_core::event::ToolKind::Other,
@@ -379,9 +381,11 @@ async fn prompting_a_completed_child_restarts_monitoring_and_tracks_failure() {
         statuses,
         vec![&SubAgentStatus::Completed, &SubAgentStatus::Running]
     );
+    let stamp = child_event_stamp(harness.tui(), &key);
     harness
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionEvent {
+            stamp,
             key: key.clone(),
             event: AgentEvent::Model(ModelEvent::Error("child failed".into())),
         })
@@ -401,7 +405,7 @@ async fn nested_session_harness() -> (TuiTestHarness, MonitoredSessionKey, Monit
     emit_subagent_invocation_started(harness.tui(), &parent, Some("inv-parent")).await;
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
             TurnEvent::SubAgentProgress(subagent_progress(
                 &parent,
                 "inv-parent",
@@ -502,9 +506,11 @@ async fn nested_progress_is_attached_to_the_parent_child_transcript() {
     let nested = monitored_key("reviewer", "nested-session");
     emit_subagent_invocation_started(harness.tui(), &parent, Some("parent-inv")).await;
 
+    let stamp = child_event_stamp(harness.tui(), &parent);
     harness
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionEvent {
+            stamp,
             key: parent.clone(),
             event: AgentEvent::sub_agent(
                 harnx_core::event::AgentSource {
@@ -618,7 +624,7 @@ async fn root_session_change_aborts_child_monitors_and_discards_child_views() {
     let mut tui = crate::types::Tui::init(&config).await.unwrap();
     tui.sync_session_activity_monitor();
     let child = monitored_key("worker", "child-session");
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
         TurnEvent::SubAgentStarted {
             agent: child.agent.clone(),
             session_id: child.session_id.clone(),
@@ -665,7 +671,9 @@ async fn child_live_events_do_not_mutate_parent_busy_or_streaming_state() {
     let child = monitored_key("worker", "isolated-child");
     tui.app.llm_busy = false;
     tui.app.streaming_open = false;
+    let stamp = child_event_stamp(&mut tui, &child);
     tui.handle_tui_event(TuiEvent::SubAgentSessionEvent {
+        stamp,
         key: child.clone(),
         event: AgentEvent::Model(ModelEvent::MessageChunk {
             blocks: vec![ContentBlock::Text("child output".into())],
@@ -687,7 +695,9 @@ async fn child_live_thoughts_strip_model_tags_and_ansi_sequences() {
     let mut tui = crate::types::Tui::init(&test_config()).await.unwrap();
     let child = monitored_key("worker", "clean-thought-child");
 
+    let stamp = child_event_stamp(&mut tui, &child);
     tui.handle_tui_event(TuiEvent::SubAgentSessionEvent {
+        stamp,
         key: child.clone(),
         event: AgentEvent::Model(ModelEvent::ThoughtChunk {
             blocks: vec![ContentBlock::Text(
@@ -718,7 +728,9 @@ async fn child_final_without_streamed_chunks_preserves_prior_assistant_message()
         .unwrap()
         .transcript = vec![assistant_text("prior turn")];
 
+    let stamp = child_event_stamp(&mut tui, &child);
     tui.handle_tui_event(TuiEvent::SubAgentSessionEvent {
+        stamp,
         key: child.clone(),
         event: AgentEvent::Model(ModelEvent::Final {
             output: "new final".into(),
@@ -762,7 +774,7 @@ async fn tui_switches_only_after_committed_handoff_and_ignores_late_source_compl
     tui.app.llm_busy = true;
     tui.app.streaming_open = true;
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
         TurnEvent::HandoffRequested {
             agent: "target".into(),
             session_id: Some("target-session".into()),
@@ -779,7 +791,7 @@ async fn tui_switches_only_after_committed_handoff_and_ignores_late_source_compl
         );
     }
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         harnx_core::event::SessionEvent::HandoffCommitted {
             agent: "target".into(),
             session_id: "target-session".into(),
@@ -831,7 +843,7 @@ async fn live_subagent_reply_appears_before_status_row() {
     let key = monitored_key("agentA", "sessionX");
 
     // 1) Tool started (prompt)
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: "delegate-call".into(),
         name: "agentA_session_prompt".to_string(),
         kind: harnx_core::event::ToolKind::Other,
@@ -858,7 +870,7 @@ async fn live_subagent_reply_appears_before_status_row() {
     ));
 
     // For production fidelity, emit a standalone terminal TurnEvent::SubAgentProgress BEFORE the ToolEvent::Completed
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
         TurnEvent::SubAgentProgress(subagent_progress(
             &key,
             "inv-1",
@@ -870,7 +882,7 @@ async fn live_subagent_reply_appears_before_status_row() {
     .unwrap();
 
     // 3) Tool completed (reply)
-    tui.handle_tui_event(TuiEvent::Agent(completed_subagent_event(&key)))
+    tui.handle_tui_event(TuiEvent::LocalAgent(completed_subagent_event(&key)))
         .await
         .unwrap();
 
@@ -904,9 +916,11 @@ async fn nested_subagent_reply_appears_in_parent_child_transcript() {
     emit_subagent_invocation_started(harness.tui(), &parent, Some("parent-inv")).await;
 
     // Send a sub-agent started (Progress) event for the nested session through the parent's TuiEvent wrapper.
+    let stamp = child_event_stamp(harness.tui(), &parent);
     harness
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionEvent {
+            stamp,
             key: parent.clone(),
             event: AgentEvent::sub_agent(
                 harnx_core::event::AgentSource {
@@ -926,9 +940,11 @@ async fn nested_subagent_reply_appears_in_parent_child_transcript() {
         .unwrap();
 
     // Now send the completion tool event nested inside the parent's SubAgentSessionEvent.
+    let stamp = child_event_stamp(harness.tui(), &parent);
     harness
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionEvent {
+            stamp,
             key: parent.clone(),
             event: AgentEvent::sub_agent(
                 harnx_core::event::AgentSource {
@@ -971,7 +987,7 @@ async fn live_subagent_empty_response_omits_reply_row() {
     let key = monitored_key("agentA", "sessionX");
 
     // 1) Tool started (prompt)
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: "delegate-call".into(),
         name: "agentA_session_prompt".to_string(),
         kind: harnx_core::event::ToolKind::Other,
@@ -1001,7 +1017,7 @@ async fn live_subagent_empty_response_omits_reply_row() {
         markdown: Some("".into()),
     });
 
-    tui.handle_tui_event(TuiEvent::Agent(empty_response_event))
+    tui.handle_tui_event(TuiEvent::LocalAgent(empty_response_event))
         .await
         .unwrap();
 
@@ -1133,4 +1149,19 @@ async fn test_subagent_session_jump_keys() {
     let (pos, follow, max_pos) = scroll_state(&mut harness);
     assert_eq!(pos, max_pos, "End should jump to bottom in subagent view");
     assert!(follow, "End should enable follow");
+}
+
+fn child_event_stamp(
+    tui: &mut crate::types::Tui,
+    key: &MonitoredSessionKey,
+) -> crate::event_isolation::EventStamp {
+    let state = tui
+        .app
+        .monitored_sessions
+        .entry(key.clone())
+        .or_insert_with(|| crate::types::MonitoredSessionState::new(SubAgentStatus::Running));
+    state
+        .live_events
+        .select(Some("child-fixture-generation".into()));
+    crate::event_isolation::EventStamp::snapshot(&state.live_events)
 }

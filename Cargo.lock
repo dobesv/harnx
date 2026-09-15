@@ -3742,9 +3742,11 @@ dependencies = [
  "chrono",
  "futures-util",
  "harnx-nats-common",
+ "log",
  "metrics",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "uuid",
@@ -4525,6 +4527,7 @@ dependencies = [
  "harnx-execution-control",
  "serde",
  "serde_json",
+ "tokio",
  "tokio-util",
 ]
 
@@ -4550,10 +4553,12 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
  "which",
 ]
 

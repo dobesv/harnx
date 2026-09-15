@@ -28,6 +28,9 @@ use uuid::Uuid;
 mod support;
 use support::{read_sse_until, AppResponse};
 
+#[path = "ag_ui_remote_follow/overlap.rs"]
+mod overlap;
+
 struct LeasedSession {
     _sandbox: TestConfigSandbox,
     config: Config,

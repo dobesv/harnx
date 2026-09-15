@@ -1,6 +1,9 @@
 //! Integration coverage for frontend-targeted local NATS workers.
 
+#[path = "common/admitted_log.rs"]
+mod admitted_log;
 mod common;
+use admitted_log::AdmittedSessionLog as NatsSessionLog;
 
 use anyhow::{Context, Result};
 use common::spawn_nats_server;
@@ -15,7 +18,6 @@ use harnx_runtime::{
     client::CompletionTokenUsage,
     config::Config,
     nats_lease::NatsLeaseConfig,
-    nats_session_log::NatsSessionLog,
     nats_worker::{
         publish_targeted_session_activate, run_worker_daemon, targeted_consumer_name,
         targeted_notify_subject, targeted_worker_ready_subject, LocalWorkerTarget, SessionActivate,

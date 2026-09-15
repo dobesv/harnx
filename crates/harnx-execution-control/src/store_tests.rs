@@ -1,5 +1,4 @@
-#[path = "../../harnx-runtime/tests/common/mod.rs"]
-mod common;
+use crate::test_common as common;
 
 use super::*;
 

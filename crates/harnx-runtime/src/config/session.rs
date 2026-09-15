@@ -814,7 +814,31 @@ fn is_tool_continuation(input: &Input, messages: &[Message]) -> bool {
     input.tool_calls.is_some() && messages.last().is_some_and(|m| m.role == MessageRole::Tool)
 }
 
+/// Persist input before model work. Cancellation may reject every output from
+/// this round, but cannot undo its input. NATS inputs retain their admission's
+/// `skip_user_log_append`; they are already generation-owned durable history.
+pub(crate) fn prepare_input(session: &mut Session, input: &mut Input) -> Result<()> {
+    if input.session_input_start.is_some() {
+        return Ok(());
+    }
+    if input.continue_output().is_some() || input.regenerate() {
+        return Ok(());
+    }
+    let history_len = session.messages.len();
+    let mut unpatched = input.clone();
+    unpatched.clear_patch();
+    let all_appended = begin_turn(session, &unpatched, "")?;
+    session.dirty |= !all_appended;
+    require_authoritative_appends(session, all_appended, "user input")?;
+    input.session_input_start = Some(history_len);
+    session.update_tokens();
+    Ok(())
+}
+
 fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<bool> {
+    if input.session_input_start.is_some() {
+        return Ok(true);
+    }
     let mut all_appended = true;
     let is_continuation = is_tool_continuation(input, &session.messages);
 
@@ -1083,6 +1107,15 @@ fn build_messages_inner(session: &Session, input: &Input) -> Result<Vec<Message>
     if input.regenerate() {
         trim_trailing_non_user(&mut messages);
         return Ok(messages);
+    }
+    // Compose prepared input from Input so request-only patches still reach the
+    // model once. Edit modes above reuse full history, not this old round cursor.
+    if let Some(history_end) = input.session_input_start {
+        anyhow::ensure!(
+            history_end <= messages.len(),
+            "session history changed after input persistence"
+        );
+        messages.truncate(history_end);
     }
     let need_add_msg = if messages.is_empty() {
         messages = input.agent().build_messages(input)?;

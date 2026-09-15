@@ -348,8 +348,10 @@ impl BashServer {
 
         let outcome = wait_for_child(child.as_mut(), timeout_secs).await;
         if outcome.is_err() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            // Never retry a raw group kill after identity validation failed.
+            harnx_toolset::cleanup::unconfirmed(
+                "bash child wait failed; process cleanup unconfirmed",
+            );
         }
 
         let stdout_bytes = join_pipe(stdout_task, "stdout").await?;
@@ -377,6 +379,7 @@ async fn wait_for_child(
     child: &mut dyn ChildWrapper,
     timeout_secs: Option<u64>,
 ) -> anyhow::Result<(std::process::ExitStatus, bool)> {
+    let identity = super::foreground_cleanup::ProcessIdentity::capture(child);
     let cancel = crate::toolset::INVOCATION_CANCEL
         .try_with(Clone::clone)
         .unwrap_or_default();
@@ -392,8 +395,12 @@ async fn wait_for_child(
         result = child.wait() => return Ok((result?, false)),
         _ = deadline => true,
     };
-    // ProcessGroup / JobObject forwards this to the entire owned process tree.
-    child.start_kill()?;
+    // The tool server's owner supervisor polls this after the logical reply.
+    // Reaping is physical evidence; neither the signal nor a dropped waiter is.
+    if let Err(error) = identity.terminate(child).await {
+        harnx_toolset::cleanup::unconfirmed(format!("bash process-group cleanup: {error:#}"));
+        return Err(error);
+    }
     Ok((child.wait().await?, timed_out))
 }
 

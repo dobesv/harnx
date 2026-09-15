@@ -28,18 +28,15 @@
 //!
 //! New workers append a durable `TurnEnd` after the complete model/tool/hook
 //! loop, including the highest user-message sequence it consumed. That marker
-//! is the authoritative success boundary. For compatibility with older
-//! workers, an assistant row plus either a parent `Turn::Ended` advisory or a
-//! confirmed worker-lease release is accepted as a fallback. Durable errors
-//! and cancellation remain terminal barriers.
+//! is the authoritative success boundary. An assistant row and `Turn::Ended`
+//! advisory may precede a durable Error, so neither completes a follower.
+//! Root stop acceptance completes interruption independently of physical cleanup.
 
 use anyhow::{Context, Result};
 use async_nats::jetstream;
 use futures_util::StreamExt;
 use harnx_core::abort::wait_abort_signal;
-use harnx_core::event::{
-    AgentEvent, AgentEventSink, ModelEvent, SessionEvent, TurnEvent, UserEvent,
-};
+use harnx_core::event::{AgentEvent, AgentEventSink, ModelEvent, SessionEvent, UserEvent};
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::session::SessionLogEntry;
 use harnx_core::session_reconstruct::{
@@ -61,6 +58,7 @@ pub use harnx_execution_control::{CancelReceipt, CancelRequest, CancellationStat
 use harnx_execution_control::{ExecutionStore, OperationRef};
 pub(crate) mod cancellation;
 mod completion;
+mod hitl;
 pub use completion::completed_subagent_progress;
 #[cfg(test)]
 mod replay_tests;
@@ -298,6 +296,7 @@ fn requested_seq_status_with_effective(
 ///
 /// Orchestrates the workflow: append user message, activate, stream events,
 /// detect completion.
+#[derive(Clone)]
 pub struct NatsSession {
     config: NatsSessionConfig,
     session_id: String,
@@ -309,6 +308,8 @@ pub struct NatsSession {
     attachment_replicas: usize,
     execution_store: ExecutionStore,
     execution_parent: Option<OperationRef>,
+    parent_fence: Option<crate::execution_fence::GenerationFence>,
+    parent_cancel: Option<tokio_util::sync::CancellationToken>,
     invocation_id: Option<String>,
 }
 
@@ -350,6 +351,18 @@ pub struct AppendedPrompt {
     user_msg_seq: u64,
     execution_id: String,
     events: Option<Arc<tokio::sync::Mutex<Option<SessionEventStream>>>>,
+    live: Option<crate::nats_event_sink::LiveEventState>,
+}
+
+impl AppendedPrompt {
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    pub fn with_live_state(mut self, live: crate::nats_event_sink::LiveEventState) -> Self {
+        self.live = Some(live);
+        self
+    }
 }
 
 impl std::fmt::Debug for AppendedPrompt {
@@ -430,6 +443,8 @@ impl NatsSession {
             attachment_replicas: replicas,
             execution_store: ExecutionStore::ensure(&jetstream, replicas).await?,
             execution_parent: None,
+            parent_fence: None,
+            parent_cancel: None,
             invocation_id: None,
         })
     }
@@ -478,6 +493,37 @@ impl NatsSession {
         Ok(nats_session)
     }
 
+    pub(crate) fn with_parent_fence(
+        mut self,
+        fence: Option<crate::execution_fence::GenerationFence>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        self.parent_fence = fence;
+        self.parent_cancel = Some(cancel);
+        self
+    }
+
+    async fn check_parent_work(&self, boundary: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .parent_cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.is_cancelled()),
+            "sub-agent tool call aborted"
+        );
+        if let Some(fence) = &self.parent_fence {
+            fence.check(boundary).await?;
+        }
+        anyhow::ensure!(
+            !self
+                .parent_cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.is_cancelled()),
+            "sub-agent tool call aborted"
+        );
+        Ok(())
+    }
+
     /// Get the session ID.
     pub fn session_id(&self) -> &str {
         &self.session_id
@@ -508,11 +554,13 @@ impl NatsSession {
     }
 
     async fn append_user_content(&self, content: MessageContent) -> Result<AppendedPrompt> {
+        self.check_parent_work("child-prompt-admission").await?;
         if let Some(invocation) = &self.invocation_id {
             if let Some(prompt) = self.existing_invocation_prompt(invocation).await? {
                 return Ok(prompt);
             }
         }
+        self.reconcile_previous_stop().await?;
         let user_msg_id = self
             .invocation_id
             .clone()
@@ -555,6 +603,7 @@ impl NatsSession {
             user_msg_id,
             user_msg_seq,
             events: None,
+            live: None,
         })
     }
 
@@ -575,6 +624,7 @@ impl NatsSession {
                 user_msg_seq: *seq,
                 execution_id: operation.reference.execution_id,
                 events: None,
+                live: None,
             }));
         }
         Ok(None)
@@ -591,8 +641,7 @@ impl NatsSession {
         };
         let entries = self.load_durable_entries().await?;
         let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
-        if !Self::is_turn_completion_visible(&entries, Some(&effective), prompt.user_msg_seq, false)
-        {
+        if !Self::is_turn_completion_visible(&entries, Some(&effective), prompt.user_msg_seq) {
             return Ok(None);
         }
         let (response, error) = Self::extract_turn_outcome(&entries, prompt.user_msg_seq);
@@ -619,6 +668,17 @@ impl NatsSession {
     }
 
     async fn publish_activation(
+        &self,
+        execution: (&str, u64),
+        tool_confirmation_subject: Option<&str>,
+        token_budget: Option<u64>,
+    ) -> Result<()> {
+        self.check_parent_work("child-activation").await?;
+        self.publish_control_activation(execution, tool_confirmation_subject, token_budget)
+            .await
+    }
+
+    async fn publish_control_activation(
         &self,
         execution: (&str, u64),
         tool_confirmation_subject: Option<&str>,
@@ -780,7 +840,8 @@ impl NatsSession {
     }
 
     /// Route a tool-approval decision to the lease holder and wait until its
-    /// fenced durable decision entry has been applied.
+    /// fenced durable decision entry has been applied. Matching decisions are
+    /// idempotent, including when the worker's acknowledgement was lost.
     pub async fn decide_hitl_approval(
         &self,
         tool_call_id: &str,
@@ -789,16 +850,21 @@ impl NatsSession {
     ) -> Result<bool> {
         let entries = self.load_durable_entries().await?;
         let pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?;
-        if !pending.iter().any(|item| item.tool_call_id == tool_call_id) {
-            return Ok(false);
-        }
+        let Some(pending) = pending
+            .iter()
+            .find(|item| item.tool_call_id == tool_call_id)
+        else {
+            return hitl::already_decided(&entries, tool_call_id, approved);
+        };
+        let request = hitl::ApprovalRequest {
+            tool_call_id,
+            tool_round_seq: pending.tool_round_seq,
+            request_seq: pending.seq,
+        };
         let Some(_) = self.activate_pending_turn().await? else {
             let entries = self.load_durable_entries().await?;
-            if !crate::nats_worker::derive_pending_hitl_approvals(&entries)?
-                .iter()
-                .any(|item| item.tool_call_id == tool_call_id)
-            {
-                return Ok(false);
+            if let Some(outcome) = request.outcome(&entries, approved)? {
+                return Ok(outcome);
             }
             anyhow::bail!(
                 "pending HITL approval '{}' has no activatable durable turn",
@@ -824,11 +890,8 @@ impl NatsSession {
                 return Ok(true);
             }
             let entries = self.load_durable_entries().await?;
-            if !crate::nats_worker::derive_pending_hitl_approvals(&entries)?
-                .iter()
-                .any(|item| item.tool_call_id == tool_call_id)
-            {
-                return Ok(false);
+            if let Some(outcome) = request.outcome(&entries, approved)? {
+                return Ok(outcome);
             }
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!(
@@ -954,6 +1017,24 @@ impl NatsSession {
         input: &crate::config::Input,
         source_dir: Option<&std::path::Path>,
     ) -> Result<AppendedPrompt> {
+        self.admit_input_routed(input, source_dir, None).await
+    }
+
+    pub async fn admit_input_with_tool_confirmation_route(
+        &self,
+        input: &crate::config::Input,
+        route: &crate::nats_tool_confirmation::ToolConfirmationRoute,
+    ) -> Result<AppendedPrompt> {
+        self.admit_input_routed(input, None, Some(route.subject()))
+            .await
+    }
+
+    async fn admit_input_routed(
+        &self,
+        input: &crate::config::Input,
+        source_dir: Option<&std::path::Path>,
+        confirmation_subject: Option<&str>,
+    ) -> Result<AppendedPrompt> {
         let mut content = input.message_content();
         crate::nats_attachments::externalize_message_attachments(
             crate::nats_attachments::AttachmentLocation::new(
@@ -976,7 +1057,11 @@ impl NatsSession {
         let mut appended = self.append_user_content(content).await?;
         appended.events = Some(Arc::new(tokio::sync::Mutex::new(Some(events))));
         if let Err(error) = self
-            .publish_activation((&appended.execution_id, appended.user_msg_seq), None, None)
+            .publish_activation(
+                (&appended.execution_id, appended.user_msg_seq),
+                confirmation_subject,
+                None,
+            )
             .await
         {
             log::warn!("admitted prompt requires activation retry: {error:#}");
@@ -1066,6 +1151,55 @@ impl NatsSession {
         tool_confirmation_subject: Option<&str>,
         options: RunTurnOptions,
     ) -> Result<NatsTurnResult> {
+        let execution_id = appended.execution_id.clone();
+        let stopped_result = NatsTurnResult {
+            response: None,
+            session_id: self.session_id.clone(),
+            was_cancelled: true,
+            error: None,
+            user_msg_seq: appended.user_msg_seq,
+            user_msg_id: appended.user_msg_id.clone(),
+        };
+        let live = appended.live.clone();
+        // Stop observation remains pollable during attachment, activation and
+        // final transcript reads. None of them is a prerequisite for acceptance.
+        let result = tokio::select! {
+            biased;
+            stopped = self.wait_for_root_stop(&execution_id) => {
+                stopped?;
+                if let Some(live) = live { live.stop(&execution_id); }
+                return Ok(stopped_result);
+            }
+            result = Box::pin(self.follow_prompt_inner(appended, event_sink, pending_cancel, tool_confirmation_subject, options)) => result,
+        };
+        if result.as_ref().is_ok_and(|result| result.was_cancelled) {
+            return result;
+        }
+        // Completion and the stop watch can become ready together. Reconcile
+        // the original generation before returning bytes from shared history.
+        let reference = OperationRef::new(&self.storage_key, &execution_id);
+        if self
+            .execution_store
+            .accepted_stop(&reference)
+            .await?
+            .is_some()
+        {
+            if let Some(live) = live {
+                live.stop(&execution_id);
+            }
+            return Ok(stopped_result);
+        }
+        result
+    }
+
+    async fn follow_prompt_inner(
+        &self,
+        appended: AppendedPrompt,
+        event_sink: Arc<dyn AgentEventSink>,
+        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+        tool_confirmation_subject: Option<&str>,
+        options: RunTurnOptions,
+    ) -> Result<NatsTurnResult> {
         let user_msg_id = appended.user_msg_id;
         let user_msg_seq = appended.user_msg_seq;
 
@@ -1074,7 +1208,7 @@ impl NatsSession {
             Some(events) => events.lock().await.take(),
             None => None,
         };
-        let event_stream = match retained {
+        let mut event_stream = match retained {
             Some(events) => events,
             None => SessionEventStream::attach(
                 self.jetstream.clone(),
@@ -1084,6 +1218,20 @@ impl NatsSession {
             .await
             .context("failed to attach to session event stream")?,
         };
+
+        if let Some(live) = appended.live {
+            event_stream.use_live_state(live).await?;
+        } else {
+            event_stream.refresh_generation().await?;
+        }
+        event_stream.follow_generation(appended.execution_id.clone());
+        let live = event_stream.live_state().clone();
+        let event_sink: Arc<dyn AgentEventSink> =
+            Arc::new(crate::nats_event_sink::LiveGenerationSink {
+                sink: event_sink,
+                state: live.clone(),
+                execution_id: appended.execution_id.clone(),
+            });
 
         // Render history to event sink (for resume/attach scenarios)
         let history = event_stream.history();
@@ -1134,7 +1282,6 @@ impl NatsSession {
         let mut pending_cancel_rx = pending_cancel;
         let mut was_cancelled = false;
         let mut saw_terminal_model_error = false;
-        let mut saw_turn_ended = false;
 
         // Main event loop with abort signal handling
         let abort_signal_clone = self.abort_signal.clone();
@@ -1144,10 +1291,11 @@ impl NatsSession {
                 _ = wait_abort_signal(&abort_signal_clone) => {
                     was_cancelled = true;
                     log::info!("nats session: abort signal received, publishing cancel");
-                    self.request_cancel(CancelRequest {
+                    let receipt = self.request_cancel(CancelRequest {
                         expected_execution_id: Some(appended.execution_id.clone()),
                         retry: false,
                     }).await?;
+                    live.accept_stop(&receipt);
                     break;
                 }
 
@@ -1161,10 +1309,11 @@ impl NatsSession {
                 } => {
                     was_cancelled = true;
                     log::info!("nats session: pending cancel received, publishing cancel");
-                    self.request_cancel(CancelRequest {
+                    let receipt = self.request_cancel(CancelRequest {
                         expected_execution_id: Some(appended.execution_id.clone()),
                         retry: false,
                     }).await?;
+                    live.accept_stop(&receipt);
                     break;
                 }
 
@@ -1174,14 +1323,13 @@ impl NatsSession {
                 Some(update) = completion_updates.next() => {
                     match update {
                         Ok(completion::DurableUpdate { entries, orphaned }) => {
+                        event_stream.refresh_generation().await?;
                         // Refresh cached effective log for live LogSeqAssigned.
                         let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).ok();
                         let completion_visible = Self::is_turn_completion_visible(
                             &entries,
                             effective.as_deref(),
-                            user_msg_seq,
-                            saw_turn_ended,
-                        );
+                            user_msg_seq);
                         if let Some(effective) = effective {
                             cached_effective = Some(effective);
                             emit_all_logical_seqs_for_window(
@@ -1195,6 +1343,7 @@ impl NatsSession {
                                 &event_sink,
                                 &mut emitted_logical_seqs,
                                 AdvisoryFlush::Live,
+                                &live,
                             );
                         }
                         completion::reconcile_subagent_progress(
@@ -1245,11 +1394,6 @@ impl NatsSession {
                                     envelope.event,
                                     AgentEvent::Model(ModelEvent::Error(_))
                                 );
-                                let turn_ended = matches!(
-                                    envelope.event,
-                                    AgentEvent::Turn(TurnEvent::Ended { .. })
-                                );
-                                saw_turn_ended |= turn_ended;
                                 pending_advisories.push_back(envelope.clone());
                                 flush_pending_advisories(
                                     &mut pending_advisories,
@@ -1257,6 +1401,7 @@ impl NatsSession {
                                     &event_sink,
                                     &mut emitted_logical_seqs,
                                     AdvisoryFlush::Live,
+                                    &live,
                                 );
                             }
                         }
@@ -1269,6 +1414,20 @@ impl NatsSession {
                 }
             }
         }
+
+        if was_cancelled {
+            // Receipt is the completion boundary. No final log/status read may
+            // delay acceptance or return a later generation's response.
+            return Ok(NatsTurnResult {
+                response: None,
+                session_id: self.session_id.clone(),
+                was_cancelled: true,
+                error: None,
+                user_msg_seq,
+                user_msg_id,
+            });
+        }
+        event_stream.refresh_generation().await?;
 
         // Re-load durable log to get final state if we haven't already.
         //
@@ -1303,11 +1462,13 @@ impl NatsSession {
             }
         }
 
+        // The final durable reload can outlive a stop accepted by another client.
+        event_stream.refresh_generation().await?;
+
         // Admission may start the worker before this follower is polled. Drain
         // its retained subscription before a durable completion check can hide
         // response events already queued by that worker.
-        while let Some(Some(envelope)) = futures_util::FutureExt::now_or_never(event_stream.next())
-        {
+        while let Some(envelope) = event_stream.try_next() {
             if event_stream.should_render(&envelope) {
                 saw_terminal_model_error |=
                     matches!(envelope.event, AgentEvent::Model(ModelEvent::Error(_)));
@@ -1336,6 +1497,7 @@ impl NatsSession {
             &event_sink,
             &mut emitted_logical_seqs,
             AdvisoryFlush::Final,
+            &live,
         );
 
         if let Some(error) = final_reload_error {
@@ -1426,18 +1588,10 @@ impl NatsSession {
             .context("failed to load durable session log")
     }
 
-    fn has_durable_assistant_response(
-        entries: &[(u64, SessionLogEntry)],
-        user_msg_seq: u64,
-    ) -> bool {
-        Self::extract_final_response(entries, user_msg_seq).is_some()
-    }
-
     fn is_turn_completion_visible(
         entries: &[(u64, SessionLogEntry)],
         effective: Option<&[(u64, SessionLogEntry)]>,
         user_msg_seq: u64,
-        saw_turn_ended: bool,
     ) -> bool {
         let status = effective.map_or_else(
             || requested_seq_status(entries, user_msg_seq).ok(),
@@ -1455,13 +1609,7 @@ impl NatsSession {
                     .iter()
                     .any(|approval| approval.tool_round_seq > user_msg_seq)
             });
-        status == Some(RequestedSeqStatus::Covered)
-            || awaiting_hitl
-            || (saw_turn_ended
-                && !entries
-                    .iter()
-                    .any(|(_, entry)| matches!(entry, SessionLogEntry::TurnEnd { .. }))
-                && Self::has_durable_assistant_response(entries, user_msg_seq))
+        status == Some(RequestedSeqStatus::Covered) || awaiting_hitl
     }
 
     /// Final assistant text and worker-reported failure for the current turn.
@@ -1638,7 +1786,9 @@ fn flush_pending_advisories(
     sink: &Arc<dyn AgentEventSink>,
     emitted_logical_seqs: &mut HashSet<usize>,
     mode: AdvisoryFlush,
+    live: &crate::nats_event_sink::LiveEventState,
 ) {
+    pending_advisories.retain(|envelope| live.allows(envelope.execution_id.as_deref()));
     let window = match effective_entries {
         Some(entries) => Some(active_context_window(entries)),
         // Reconstruction failed, or no durable load has succeeded yet.
@@ -1646,6 +1796,12 @@ fn flush_pending_advisories(
         None => None,
     };
     while let Some(envelope) = pending_advisories.pop_front() {
+        let Some(execution_id) = envelope.execution_id.as_deref() else {
+            continue;
+        };
+        if !live.allows(Some(execution_id)) {
+            continue;
+        }
         // `after_seq` may point at a physical mutation entry that reconstruction
         // intentionally removes. Sequence decoration is therefore best-effort;
         // never hold a live streaming advisory forever merely because that
@@ -1662,7 +1818,7 @@ fn flush_pending_advisories(
             envelope.event,
             AgentEvent::Session(SessionEvent::LogSeqAssigned { .. })
         ) {
-            sink.emit(envelope.event);
+            sink.emit_live(envelope.event, execution_id);
         }
     }
 }
@@ -1924,11 +2080,21 @@ mod tests {
         let mut pending = VecDeque::from(vec![crate::nats_event_sink::AdvisoryEnvelope::new(
             7,
             AgentEvent::Notice(NoticeEvent::Warning("exhausted retries".to_string())),
-        )]);
+        )
+        .with_execution_id("generation")]);
+        let live = crate::nats_event_sink::LiveEventState::default();
+        live.select(Some("generation".into()));
         let mut emitted = HashSet::new();
 
         // Live: nothing to decorate against, so wait for a later flush.
-        flush_pending_advisories(&mut pending, None, &sink, &mut emitted, AdvisoryFlush::Live);
+        flush_pending_advisories(
+            &mut pending,
+            None,
+            &sink,
+            &mut emitted,
+            AdvisoryFlush::Live,
+            &live,
+        );
         assert_eq!(pending.len(), 1, "live flush must retain, not drop");
         assert_eq!(
             count.load(Ordering::SeqCst),
@@ -1943,6 +2109,7 @@ mod tests {
             &sink,
             &mut emitted,
             AdvisoryFlush::Final,
+            &live,
         );
         assert!(pending.is_empty(), "final flush must drain the queue");
         // The point of the test: drained AND delivered, not drained by dropping.
@@ -1979,14 +2146,9 @@ mod tests {
         ]);
 
         assert!(
-            !NatsSession::is_turn_completion_visible(&entries, None, 1, false),
+            !NatsSession::is_turn_completion_visible(&entries, None, 1),
             "an assistant row may still be followed by stop-hook or pending-context work"
         );
-        assert!(
-            NatsSession::is_turn_completion_visible(&entries, None, 1, true),
-            "older workers use the parent turn advisory as a compatibility fallback"
-        );
-
         let mut durably_ended = entries;
         durably_ended.push((
             3,
@@ -2000,8 +2162,7 @@ mod tests {
         assert!(NatsSession::is_turn_completion_visible(
             &durably_ended,
             None,
-            1,
-            false
+            1
         ));
     }
 
@@ -2038,9 +2199,7 @@ mod tests {
                 },
             ),
         ];
-        assert!(!NatsSession::is_turn_completion_visible(
-            &entries, None, 2, false
-        ));
+        assert!(!NatsSession::is_turn_completion_visible(&entries, None, 2));
     }
 
     #[test]
@@ -2091,11 +2250,9 @@ mod tests {
             ),
         ];
 
-        assert!(NatsSession::is_turn_completion_visible(
-            &entries, None, 1, false
-        ));
+        assert!(NatsSession::is_turn_completion_visible(&entries, None, 1));
         assert!(
-            !NatsSession::is_turn_completion_visible(&entries, None, 3, false),
+            !NatsSession::is_turn_completion_visible(&entries, None, 3),
             "an approval requested after a queued user still belongs to the earlier tool round"
         );
     }
@@ -2444,3 +2601,7 @@ mod tests {
         assert_eq!(NatsSession::extract_final_response(&entries, 3), None);
     }
 }
+
+#[cfg(test)]
+#[path = "nats_session/event_isolation_tests.rs"]
+mod event_isolation_tests;

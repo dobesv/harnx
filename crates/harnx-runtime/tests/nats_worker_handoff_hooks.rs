@@ -492,6 +492,7 @@ async fn completed_agent_turn_cleans_hook_routes_before_next_handoff() -> Result
         .await?;
     assert_hook_routes_cleaned(&client).await?;
 
+    wait_for_source_owner_release(&js, source.session_id()).await?;
     source
         .run_turn("handoff now", Arc::new(NullSink), None)
         .await?;
@@ -563,4 +564,24 @@ async fn cancelled_agent_turn_cleans_hook_routes() -> Result<()> {
     daemon.abort();
     let _ = daemon.await;
     Ok(())
+}
+
+/// TurnEnd precedes the worker's final owner/lease release. This test exercises
+/// sequential activations, not the still-disabled overlapping-generation path.
+async fn wait_for_source_owner_release(
+    js: &async_nats::jetstream::Context,
+    session: &str,
+) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if !harnx_runtime::nats_lease::session_has_active_lease(js, session).await?
+                && harnx_runtime::nats_metrics::snapshot().active_sessions_per_worker == 0
+            {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("source owner did not finish its activation")?
 }

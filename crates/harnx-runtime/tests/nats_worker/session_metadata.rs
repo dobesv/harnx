@@ -188,7 +188,10 @@ async fn missing_named_agent_fails_durably_without_calling_the_model() -> Result
         },
     )
     .await?;
-    let log = NatsSessionLog::for_agent(jetstream, "does-not-exist", session_id);
+    let log = NatsSessionLog::new(
+        jetstream,
+        harnx_core::session_identity::session_key(Some("does-not-exist"), session_id),
+    );
 
     let entries = tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {

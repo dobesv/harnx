@@ -193,47 +193,32 @@ describe('SubAgentSessionNotes', () => {
   });
 
   describe('ChildMetricsSubscriber', () => {
-    it('dispatches CHILD_TERMINAL with status done when RUN_FINISHED is received', () => {
-      const dispatch = vi.fn();
-      const runningNote: SubAgentNote = {
-        ...note('running', 'live-child'),
-        startedAtMs: Date.now() - 12000,
-      };
+    it.each([
+      { eventType: 'RUN_FINISHED', expectedStatus: 'done' },
+      { eventType: 'RUN_ERROR', expectedStatus: 'failed' },
+    ])(
+      'dispatches CHILD_TERMINAL with status $expectedStatus when $eventType is received',
+      ({ eventType, expectedStatus }) => {
+        const dispatch = vi.fn();
+        const runningNote: SubAgentNote = {
+          ...note('running', 'live-child'),
+          startedAtMs: Date.now() - 10000,
+        };
 
-      render(
-        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
-          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
-        </SubAgentNotesContext.Provider>
-      );
+        render(
+          <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+            <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+          </SubAgentNotesContext.Provider>
+        );
 
-      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
-      agentInstance.simulateEvent({ type: 'RUN_FINISHED' });
+        const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+        agentInstance.simulateEvent({ type: eventType });
 
-      expect(dispatch).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'CHILD_TERMINAL', status: 'done' })
-      );
-    });
-
-    it('dispatches CHILD_TERMINAL with status failed when RUN_ERROR is received', () => {
-      const dispatch = vi.fn();
-      const runningNote: SubAgentNote = {
-        ...note('running', 'live-child'),
-        startedAtMs: Date.now() - 10000,
-      };
-
-      render(
-        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
-          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
-        </SubAgentNotesContext.Provider>
-      );
-
-      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
-      agentInstance.simulateEvent({ type: 'RUN_ERROR' });
-
-      expect(dispatch).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'CHILD_TERMINAL', status: 'failed' })
-      );
-    });
+        expect(dispatch).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'CHILD_TERMINAL', status: expectedStatus })
+        );
+      },
+    );
 
     it('defers rather than loses RUN_FINISHED received during startup', () => {
       vi.useFakeTimers();

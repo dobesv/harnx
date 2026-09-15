@@ -217,8 +217,7 @@ impl Tui {
     }
 
     pub(crate) async fn poll_pending_exit_cancel(&mut self) {
-        self.poll_cancellation_status();
-        if self.finish_exit_after_confirmed_cancellation() {
+        if self.finish_exit_after_accepted_cancellation() {
             return;
         }
         let result = self
@@ -231,27 +230,14 @@ impl Tui {
         self.pending_exit_cancel = None;
         match result {
             Ok(receipt) => {
-                let locally_owned_worker = matches!(
+                if matches!(
                     self.app.modal,
-                    Some(crate::types::ModalState::ConfirmExit {
-                        worker_state: ExitWorkerState::LocalOwnedHere,
-                        ..
-                    })
-                );
-                if self.exit_after_cancel && !locally_owned_worker {
-                    self.exit_after_cancel = false;
+                    Some(crate::types::ModalState::ConfirmExit { .. })
+                ) {
                     self.app.modal = None;
-                    self.app.should_quit = true;
-                } else {
-                    // A local worker and its managed tool/sub-agent servers are
-                    // children of this frontend. Keep that process tree alive
-                    // until the durable operation graph confirms it stopped;
-                    // exiting on acceptance alone can strand descendants in an
-                    // unconfirmed state that permanently blocks later prompts.
-                    self.app.modal = None;
-                    self.monitor_cancellation(receipt);
-                    self.finish_exit_after_confirmed_cancellation();
                 }
+                self.monitor_cancellation(receipt);
+                self.finish_exit_after_accepted_cancellation();
             }
             Err(error) => {
                 let error = format!("{error:#}");
@@ -268,7 +254,7 @@ impl Tui {
         }
     }
 
-    fn finish_exit_after_confirmed_cancellation(&mut self) -> bool {
+    fn finish_exit_after_accepted_cancellation(&mut self) -> bool {
         if !self.exit_after_cancel {
             return false;
         }

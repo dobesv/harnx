@@ -6,6 +6,9 @@
 //! (c) Mid-turn drop of advisory still converges via durable log
 
 mod common;
+#[allow(dead_code)]
+#[path = "common/generation.rs"]
+mod generation;
 
 use anyhow::Result;
 use common::spawn_nats_server;
@@ -14,7 +17,6 @@ use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent, SessionEvent};
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::session::SessionLogEntry;
 use harnx_runtime::nats_event_sink::{events_subject, AdvisoryEnvelope, SessionEventStream};
-use harnx_runtime::nats_worker::NatsSessionLogBackend;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -74,7 +76,7 @@ async fn late_subscriber_gets_history_then_live() -> Result<()> {
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
 
     // Create session and append some entries to the DURABLE log
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), &session_id);
+    let backend = generation::output_backend(&jetstream, &session_id).await?;
 
     // Append Message (user)
     let user_msg = SessionLogEntry::Message {
@@ -151,7 +153,7 @@ async fn attached_stream_refreshes_delayed_turn_end() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), &session_id);
+    let backend = generation::output_backend(&jetstream, &session_id).await?;
 
     let user_seq = backend.append_event_blocking(&SessionLogEntry::Message {
         id: None,
@@ -211,7 +213,7 @@ async fn advisory_envelope_dedup_by_after_seq() -> Result<()> {
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
 
     // Create session and append entries to durable log
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), &session_id);
+    let backend = generation::output_backend(&jetstream, &session_id).await?;
 
     let user_msg = SessionLogEntry::Message {
         id: None,
@@ -271,7 +273,7 @@ async fn advisory_dropout_converges_from_durable_log() -> Result<()> {
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
 
     // Create session and append durable state
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), &session_id);
+    let backend = generation::output_backend(&jetstream, &session_id).await?;
 
     // User message and assistant response (authoritative)
     let user_msg = SessionLogEntry::Message {
