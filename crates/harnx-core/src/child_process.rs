@@ -5,7 +5,7 @@
 //! `block_in_place` can hand that worker to the blocking pool, whose idle
 //! threads retire and make healthy children believe their parent died. This
 //! manager serializes process creation through one ordinary thread that lives
-//! for as long as its owning supervisor.
+//! for as long as its owning manager.
 
 use std::io;
 use std::sync::{mpsc, Arc, OnceLock};
@@ -14,7 +14,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
 #[derive(Clone)]
-pub(super) struct ChildProcessManager {
+pub struct ChildProcessManager {
     inner: Arc<ManagerInner>,
 }
 
@@ -37,8 +37,22 @@ enum ManagerRequest {
     Shutdown,
 }
 
+impl std::fmt::Debug for ChildProcessManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildProcessManager")
+            .field("started", &self.inner.started.get().is_some())
+            .finish()
+    }
+}
+
+impl Default for ChildProcessManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChildProcessManager {
-    pub(super) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(ManagerInner {
                 started: OnceLock::new(),
@@ -48,7 +62,7 @@ impl ChildProcessManager {
 
     /// Spawn `command` from the manager's stable OS thread and return a Tokio
     /// child handle that callers may monitor from any runtime task.
-    pub(super) async fn spawn(&self, mut command: Command) -> io::Result<Child> {
+    pub async fn spawn(&self, mut command: Command) -> io::Result<Child> {
         configure_managed_process(&mut command);
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
             io::Error::other(format!(
