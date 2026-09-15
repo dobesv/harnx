@@ -351,6 +351,35 @@ broker-authoritative—a stale worker can race after TTL expiry. See
 NATS. Adding a field or variant is a local TUI change, not a transcript-protocol change. Contrast
 with `SessionLogEntry` variants (previous section), which are protocol-versioned.
 
+### Spawning long-lived child processes
+
+Spawn any child that must not outlive harnx through
+`harnx_core::child_process::ChildProcessManager`, not `Command::spawn` directly.
+
+`kill_on_drop(true)` alone is not process-exit cleanup. It fires only when the
+`Child` value is dropped, so a handle reachable from a `static` — a process-wide
+registry, a cache, a `OnceLock` — is never killed at all: Rust does not run
+destructors on statics at process exit, and the child reparents to PID 1. The
+llama-server registry in `crates/harnx-client/src/llama_server/process.rs` relied
+on this and stranded a live `llama-server` on every exit, which accumulated into
+thousands of orphaned mock servers across test runs.
+
+`ChildProcessManager` has the kernel enforce it instead (`setpgid` +
+`PR_SET_PDEATHSIG`), which also covers panic, abort, and SIGKILL. It spawns from
+one stable OS thread because Linux binds `PR_SET_PDEATHSIG` to the *thread* that
+forked: spawning straight from a Tokio worker lets `block_in_place` hand that
+worker to the blocking pool, whose idle threads retire and take healthy children
+down with them.
+
+`PR_SET_PDEATHSIG` is Linux-only and has no portable equivalent, so on macOS and
+Windows a child held by a `static` still outlives its parent — the manager only
+puts it in its own process group there. Gate tests that assert parent-death on
+`target_os = "linux"`, as `harnx-core`'s own child-process tests do. Anything
+that must be cleaned up off Linux needs an explicit shutdown path instead.
+
+Keep `kill_on_drop(true)` as well — it retires the child promptly when its
+manager is dropped while the process keeps running.
+
 ## CLI Flag Constraints
 
 The root `Cli.file: Vec<String>` has `#[clap(short, long, global = true, hide = true)]` at

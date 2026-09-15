@@ -25,7 +25,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 sys-locale = { workspace = true }
-tokio = { workspace = true, features = ["fs", "sync"] }
+tokio = { workspace = true, features = ["fs", "process", "rt", "sync"] }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 uuid = { workspace = true }
@@ -37,6 +37,10 @@ jaq-core = { workspace = true }
 jaq-std = { workspace = true }
 jaq-json = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 futures-util.workspace = true
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
