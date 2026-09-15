@@ -4,9 +4,9 @@ use super::hook_registration::{
     ensure_bucket_for, prepare_hook_registrations, remove_registration_and_expectation,
     wait_for_registration, PreparedHook,
 };
-use super::process_manager::ChildProcessManager;
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::kv;
+use harnx_core::child_process::ChildProcessManager;
 use harnx_core::hooks::{HookConfig, HooksConfig};
 use harnx_core::instance::ServerScope;
 use harnx_hookset::HOOK_EXPECTATIONS_BUCKET;

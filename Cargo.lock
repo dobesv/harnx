@@ -3695,6 +3695,7 @@ dependencies = [
  "jaq-core",
  "jaq-json",
  "jaq-std",
+ "libc",
  "log",
  "minijinja",
  "os_info",

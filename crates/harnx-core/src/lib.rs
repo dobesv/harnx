@@ -9,6 +9,7 @@ pub mod agent_ref;
 pub mod alloc_guard;
 pub mod api_types;
 pub mod attachments;
+pub mod child_process;
 pub mod cli;
 pub mod config_data;
 pub mod config_paths;
