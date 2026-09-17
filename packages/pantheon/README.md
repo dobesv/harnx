@@ -37,7 +37,7 @@ results, and a multi-agent code review pipeline.
 | `librarian` | gemini-3.8-flash | External knowledge — web search, docs, GitHub |
 | `oracle` | gpt-6-astra:max | Architectural decisions and consultation |
 | `argus` | gemini-3.8-flash | Independent verification — PASS/FAIL with evidence |
-| `mnemosyne` | zai.glm-5 | Knowledge compounding — writes `docs/solutions/` entries |
+| `mnemosyne` | zai.glm-5 | Knowledge compounding — reconciles durable knowledge into the authoritative docs, instructions, comments and tests |
 | `clio` | gemini-3.8-flash | Git operations — squash, rebase, push |
 
 ### Code Review Pipeline (Aristarchus)

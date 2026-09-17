@@ -23,7 +23,7 @@ PRESERVE VERBATIM (do not paraphrase or omit):
 SUMMARIZE (condense but retain meaning):
 - Discussion leading to the knowledge-maintenance decision
 - Git history and diff review findings
-- Existing documentation, code-comment, instruction, and docs/solutions overlap analysis
+- Existing documentation, code-comment, and instruction overlap analysis
 - Repetitive tool outputs (keep unique results, note "N similar results omitted")
 
 OMIT:

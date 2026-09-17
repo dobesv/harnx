@@ -13,8 +13,7 @@ knowledge-maintenance changes get folded into the same final squashed commit.
 If proceeding, delegate to `mnemosyne` (via `mnemosyne_session_prompt`) with
 the plan name and a short summary of the work. Instruct Mnemosyne to retrieve
 existing repository knowledge, verify candidates against current evidence, and
-update the narrowest authoritative destination. `docs/solutions/` is only a
-fallback for reusable investigation history. It must NOT commit or push.
+update the narrowest authoritative destination. It must NOT commit or push.
 After Mnemosyne returns successfully, stage and commit changed knowledge files as a
 regular incremental commit (e.g. "Document <topic> constraints"). If Mnemosyne
 fails or times out, log it and continue — repository knowledge maintenance is an enhancement, not

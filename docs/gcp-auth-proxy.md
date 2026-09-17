@@ -127,10 +127,6 @@ Do **not** add `googleapis.com` or `127.0.0.1` to your `NO_PROXY` environment va
 - Auth injection relies on the proxy intercepting calls to `googleapis.com`.
 If these are in `NO_PROXY`, the tool will bypass the proxy and fail to authenticate.
 
-## Context
-
-For more technical details on the implementation, see the solution note: [GCP Auth Injection via Resident Proxy Hooks](solutions/proxy-hooks/gcp-auth-injection-2026-07-01.md).
-
 ## See Also
 
 - [AWS Credential Injection](aws-creds.md)
