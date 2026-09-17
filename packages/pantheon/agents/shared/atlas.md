@@ -214,9 +214,8 @@ maintenance gets folded into the same squashed commit as the work.
 - A brief summary of what was accomplished
 - Instruction to read plan notes and the diff, then create or update a
   the most appropriate current knowledge source. Prefer tests/enforcement, code-local
-  rationale, scoped `AGENTS.md`, or maintained subject docs; use `docs/solutions/`
-  only for reusable investigation history. Reconcile stale or conflicting guidance.
-  Write files ONLY; do NOT commit or push.
+  rationale, scoped `AGENTS.md`, or maintained subject docs. Reconcile stale or
+  conflicting guidance. Write files ONLY; do NOT commit or push.
 
 **If Mnemosyne succeeds**: Stage and commit any knowledge-maintenance files as a
 normal incremental commit (e.g. "Document <topic> constraints") before
