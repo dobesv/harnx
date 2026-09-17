@@ -1,26 +1,31 @@
 //! Server-side adapter for hosting a [`harnx_hookset::Hook`] over Core NATS.
 
+mod control;
 mod execution;
 mod lifecycle;
+mod wire;
+use control::handle_control;
+use execution::HookRegistry;
 
 pub use lifecycle::ServeLifecycle;
+pub use wire::{decode_hook_reply, hook_request_headers, HOOK_CALL_HEADER, HOOK_SESSION_HEADER};
 
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
 use futures_util::{stream::select_all, StreamExt};
-use harnx_core::hooks::{HookOutcome, HookPayload, HookResult, HookResultControl};
 use harnx_core::instance::ServerScope;
-use harnx_hookset::{Hook, HookRegistration, HookSpec, HOOK_PROTOCOL_VERSION, HOOK_SCHEMA_VERSION};
+use harnx_hookset::{Hook, HookRegistration, HOOK_PROTOCOL_VERSION, HOOK_SCHEMA_VERSION};
 use harnx_nats_common::connect::NatsConnection;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub use harnx_hookset::HOOK_REGISTRY_BUCKET;
 
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// KV key for one hook server's registration under a scope. The scope may
 /// belong to a worker's own children or to an independently deployed set with
@@ -103,6 +108,12 @@ pub async fn serve_with_shutdown(
     }
     let mut requests = select_all(subscribers);
 
+    let control_subject = instance_id.hook_control_subject(&server);
+    let mut controls = client
+        .subscribe(control_subject.clone())
+        .await
+        .with_context(|| format!("subscribe to hook controls on {control_subject}"))?;
+
     // Subscriptions must be active before registration makes this server discoverable.
     client.flush().await.context("flush hook subscriptions")?;
 
@@ -122,11 +133,14 @@ pub async fn serve_with_shutdown(
     let registry = ensure_hook_registry_bucket(&jetstream, replicas).await?;
     let mut revision = publish_hook_registration(&registry, &instance_id, &registration).await?;
 
+    let active: HookRegistry = Arc::default();
     let outcome = serve_requests(
         &client,
         &hook,
         HookSubscriptions {
             requests: &mut requests,
+            controls: &mut controls,
+            active,
             shutdown,
         },
         RegistrationRefresh {
@@ -184,11 +198,15 @@ struct RegistrationRefresh<'a> {
     revision: &'a mut u64,
 }
 
-/// The subscriptions `serve_requests` polls, plus the signal that ends the
-/// loop on purpose. See `harnx-toolset-server`'s `ToolSubscriptions` for why
-/// `shutdown` is distinct from a subscription simply closing.
+/// The subscriptions `serve_requests` polls, the registry of hook calls
+/// currently running (shared with the control handler so a cancel can find
+/// them), plus the signal that ends the loop on purpose. See
+/// `harnx-toolset-server`'s `ToolSubscriptions` for why `shutdown` is
+/// distinct from a subscription simply closing.
 struct HookSubscriptions<'a> {
     requests: &'a mut futures_util::stream::SelectAll<async_nats::Subscriber>,
+    controls: &'a mut async_nats::Subscriber,
+    active: HookRegistry,
     shutdown: CancellationToken,
 }
 
@@ -212,11 +230,22 @@ async fn serve_requests(
                 };
                 let client = client.clone();
                 let hook = Arc::clone(hook);
-                let specs = refresh.registration.hooks.clone();
+                let active = subscriptions.active.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_hook_request(client, hook, &specs, request).await {
+                    if let Err(error) = handle_hook_request(client, hook, active, request).await {
                         log::warn!("handle hook request failed: {error:#}");
                     }
+                });
+            }
+            control = subscriptions.controls.next() => {
+                let Some(control) = control else {
+                    anyhow::bail!("hook control subscription closed");
+                };
+                let client = client.clone();
+                let server = refresh.registration.server.clone();
+                let active = subscriptions.active.clone();
+                tokio::spawn(async move {
+                    handle_control(control, &server, &active, &client).await;
                 });
             }
             Some(renewal) = renewals.next() => {
@@ -234,63 +263,14 @@ async fn serve_requests(
     }
 }
 
-fn continue_outcome() -> HookOutcome {
-    HookOutcome {
-        control: HookResultControl::Continue,
-        result: HookResult::default(),
-    }
-}
-
 async fn handle_hook_request(
     client: async_nats::Client,
     hook: Arc<dyn Hook>,
-    specs: &[HookSpec],
+    active: HookRegistry,
     message: async_nats::Message,
 ) -> Result<()> {
     let _activity = harnx_nats_common::rpc::RequestActivity::start(&client, &message);
-    if message
-        .headers
-        .as_ref()
-        .is_some_and(|headers| headers.get("Harnx-Hook-Operation").is_some())
-    {
-        return execution::handle(client, hook, message).await;
-    }
-    let Ok(reply_subject) = harnx_nats_common::rpc::ReplyTarget::from_message(&message) else {
-        log::warn!("hook request missing reply subject");
-        return Ok(());
-    };
-
-    let outcome = match serde_json::from_slice::<HookPayload>(&message.payload) {
-        Ok(payload) => {
-            let event = payload.hook_event.event_name();
-            let timeout = specs
-                .iter()
-                .find(|spec| spec.event == event)
-                .and_then(|spec| spec.timeout_secs)
-                .map(Duration::from_secs)
-                .unwrap_or(DEFAULT_HOOK_TIMEOUT);
-            match tokio::time::timeout(timeout, hook.handle_hook(payload)).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    log::warn!(
-                        "{event} hook timed out after {}s; replying with Continue",
-                        timeout.as_secs()
-                    );
-                    continue_outcome()
-                }
-            }
-        }
-        Err(error) => {
-            log::warn!("decode hook request failed; replying with Continue: {error}");
-            continue_outcome()
-        }
-    };
-    let payload = serde_json::to_vec(&outcome).context("encode hook outcome")?;
-    reply_subject
-        .send(&client, payload)
-        .await
-        .context("publish hook outcome")?;
-    client.flush().await.context("flush hook outcome")
+    execution::handle(client, hook, active, message).await
 }
 
 /// Create or open the hook registration KV bucket.

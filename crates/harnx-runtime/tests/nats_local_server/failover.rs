@@ -1,10 +1,11 @@
 use super::*;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use harnx_execution_control::{ExecutionStore, Operation, OperationKind, OperationRef};
+use harnx_core::session::SessionLogEntry;
 use harnx_nats_common::{connect::NatsEndpoint, rpc};
 use harnx_runtime::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use harnx_runtime::nats_local_server::{LocalBroker, SharedNatsServer};
+use harnx_runtime::nats_session_log::NatsSessionLog;
 use std::time::Duration;
 
 async fn client(server: &SharedNatsServer) -> Result<async_nats::Client> {
@@ -17,26 +18,12 @@ async fn client(server: &SharedNatsServer) -> Result<async_nats::Client> {
     .await
 }
 
-async fn cancellation_observer(
-    store: &ExecutionStore,
-    reference: &OperationRef,
-) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let cancel_store = store.clone();
-    let cancel_reference = reference.clone();
-    let mut updates = store.watch().await?;
-    Ok(tokio::spawn(async move {
-        while let Some(update) = updates.next().await {
-            update?;
-            cancel_store.check_ancestors(&cancel_reference).await?;
-        }
-        anyhow::bail!("cancellation watch closed")
-    }))
-}
+const FAILOVER_SESSION: &str = "failover";
 
 async fn failover_lease(js: &async_nats::jetstream::Context) -> Result<NatsSessionLease> {
     NatsSessionLease::acquire(NatsLeaseAcquireParams {
         jetstream: js.clone(),
-        session_id: "failover",
+        session_id: FAILOVER_SESSION,
         worker_id: "survivor".into(),
         generation: 1,
         config: NatsLeaseConfig {
@@ -62,16 +49,15 @@ async fn background_failover_preserves_live_clients_leases_and_cancellation() ->
     let client = client(&owner).await?;
     let js = async_nats::jetstream::new(client.clone());
     let lease = failover_lease(&js).await?;
-    let store = ExecutionStore::ensure(&js, 1).await?;
-    let reference = OperationRef::new("failover", "operation");
-    store
-        .create(&Operation::preparing(
-            reference.clone(),
-            OperationKind::Tool,
-            None,
+    // Interruption is durable state in the session log, so the broker handover
+    // is what it has to survive.
+    let log = NatsSessionLog::new(js.clone(), FAILOVER_SESSION);
+    let cancel_seq = log
+        .append_event_async(&SessionLogEntry::cancel_request(
+            "failover-cancellation".into(),
+            "client:test".into(),
         ))
         .await?;
-    let mut cancellation = cancellation_observer(&store, &reference).await?;
     let mut subscription = client.subscribe("surviving-client").await?;
     client.flush().await?;
     let old_identity = (owner.url.clone(), owner.token.clone(), owner.nonce.clone());
@@ -98,18 +84,17 @@ async fn background_failover_preserves_live_clients_leases_and_cancellation() ->
         lease.revalidate_ownership().await?,
         "failover fenced a surviving worker"
     );
+    // Only that the entry survived: nothing in this test appends a second
+    // `Cancel`, so "the outage did not invent another" is not something the
+    // handover could have got wrong, and asserting it would pass whatever
+    // happened.
+    let entries = log.load_events_latest_async().await?;
     assert!(
-        tokio::time::timeout(Duration::from_millis(1200), &mut cancellation)
-            .await
-            .is_err(),
-        "broker outage became cancellation"
-    );
-    store.cancel_operation(&reference, None, false).await?;
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), cancellation)
-            .await??
-            .is_err(),
-        "cancellation was missed after reconnect"
+        entries
+            .iter()
+            .any(|(seq, entry)| *seq == cancel_seq
+                && matches!(entry, SessionLogEntry::Cancel { .. })),
+        "the interruption accepted before failover must read back unchanged: {entries:?}"
     );
     lease.release().await?;
     Ok(())

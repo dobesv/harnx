@@ -2,6 +2,7 @@ use ag_ui_core::types::ids::RunId;
 use ag_ui_core::{event::Event, types::message::Message as AgUiMessage};
 use chrono::{DateTime, Utc};
 use harnx_core::abort::AbortSignal;
+use harnx_runtime::nats_session::InterruptOutcome;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -58,12 +59,7 @@ pub enum SessionCommand {
         reply: oneshot::Sender<PromptResult>,
     },
     Cancel {
-        expected_execution_id: Option<String>,
-        reply: oneshot::Sender<Result<harnx_execution_control::CancelReceipt, String>>,
-    },
-    AbandonCancellation {
-        expected_execution_id: String,
-        reply: oneshot::Sender<Result<harnx_execution_control::CancelReceipt, String>>,
+        reply: oneshot::Sender<Result<InterruptOutcome, String>>,
     },
     HitlApprovalDecision {
         tool_call_id: String,
@@ -114,9 +110,10 @@ pub struct SessionCapabilities {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionInfo {
-    pub execution_state: Option<harnx_execution_control::OperationState>,
-    pub execution_id: Option<String>,
     pub state: SessionState,
+    /// A worker holds this session's lease, so its turn is running somewhere
+    /// even when `state` has no run this server started.
+    pub worker_active: bool,
     pub history_snapshot: Vec<AgUiMessage>,
     pub history_warnings: Vec<String>,
     pub capabilities: SessionCapabilities,
@@ -125,14 +122,20 @@ pub struct SessionInfo {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionState {
     Idle,
-    Cancelling(harnx_execution_control::CancelReceipt),
-    CancelUnconfirmed(harnx_execution_control::CancelReceipt),
     Running {
         run_id: String,
         started_at: DateTime<Utc>,
     },
-    /// Durable HITL gate derived from unmatched approval requests in the session log.
+    /// The interrupt is being appended to the session log, or the append failed
+    /// and nobody knows yet whether the turn was stopped.
+    Interrupting,
+    /// A `Cancel` is in the log at `cancel_seq`; the turn it stopped is over as
+    /// far as this session is concerned.
     Interrupted {
+        cancel_seq: u64,
+    },
+    /// Durable HITL gate derived from unmatched approval requests in the session log.
+    AwaitingApproval {
         pending: Box<PendingInterrupt>,
     },
 }

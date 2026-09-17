@@ -13,7 +13,7 @@ mod isolation;
 #[path = "ag_ui_remote_follow/isolation_tests.rs"]
 mod isolation_tests;
 pub(crate) use frames::{event_frames, QueuedEvent};
-use isolation::RemoteGeneration;
+use isolation::RemoteInterruptWatch;
 use std::{pin::Pin, time::Duration};
 
 use ag_ui_core::event::Event;
@@ -168,10 +168,8 @@ async fn build_remote_follow_event_stream(
 ) -> Result<AgUiEventStream> {
     let client = params.config.nats_client(LOCAL_CLUSTER_KEY).await?;
     let jetstream = params.config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
-    let mut event_stream =
+    let event_stream =
         SessionEventStream::attach(jetstream.clone(), client, params.session_id).await?;
-    let generation =
-        RemoteGeneration::bind(&mut event_stream, &jetstream, params.session_id).await?;
     let started_frame = Bytes::from(frame_run_boundary_event(
         "RUN_STARTED",
         params.thread_id,
@@ -182,7 +180,10 @@ async fn build_remote_follow_event_stream(
     ))?);
 
     // Compute through_seq from the single history snapshot (avoiding duplicate load).
+    // It is both the completion boundary this follow waits for and the
+    // sequence an interrupting `Cancel` has to sit above to be this prompt's.
     let through_seq = last_user_sequence(event_stream.history());
+    let interrupt_watch = RemoteInterruptWatch::bind(&jetstream, params.session_id, through_seq);
 
     if turn_ended(event_stream.history(), through_seq) {
         // Idle remote session: control-state hydration from durable log.
@@ -205,7 +206,7 @@ async fn build_remote_follow_event_stream(
     }
 
     Ok(build_live_follow_stream(LiveFollowParams {
-        generation,
+        interrupt_watch,
         event_stream,
         jetstream,
         session_id: params.session_id.to_string(),
@@ -228,7 +229,7 @@ struct RemoteEventStreamParams<'a> {
 }
 
 struct LiveFollowParams {
-    generation: Option<RemoteGeneration>,
+    interrupt_watch: RemoteInterruptWatch,
     event_stream: SessionEventStream,
     jetstream: JetstreamContext,
     session_id: String,
@@ -242,6 +243,7 @@ struct LiveFollowParams {
 
 fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
     let live = params.event_stream.live_state().clone();
+    let attached_seq = params.event_stream.last_applied_seq();
     let (tx, rx) = tokio::sync::mpsc::channel(FRAME_CHANNEL_SIZE);
 
     // Control-state hydration for remote-follow: emit control CUSTOM events after snapshot
@@ -256,7 +258,7 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
         .collect();
 
     spawn_follow_task(FollowTaskParams {
-        generation: params.generation,
+        interrupt_watch: params.interrupt_watch,
         event_stream: params.event_stream,
         jetstream: params.jetstream,
         session_id: params.session_id,
@@ -268,7 +270,7 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
         .into_iter()
         .chain(params.snapshot_frame)
         .chain(control_frames);
-    let event_frames = event_frames(rx, live);
+    let event_frames = event_frames(rx, live, attached_seq);
     let finished_stream = tokio_stream::once(Bytes::from(frame_run_boundary_event(
         "RUN_FINISHED",
         &params.thread_id,
@@ -300,7 +302,7 @@ pub(crate) fn completed_remote_stream(
 }
 
 struct FollowTaskParams {
-    generation: Option<RemoteGeneration>,
+    interrupt_watch: RemoteInterruptWatch,
     event_stream: SessionEventStream,
     jetstream: JetstreamContext,
     session_id: String,
@@ -316,16 +318,22 @@ fn spawn_follow_task(params: FollowTaskParams) {
     });
 }
 
-async fn remote_follow_task(mut params: FollowTaskParams) -> Result<()> {
-    let generation = params.generation.take();
+async fn remote_follow_task(params: FollowTaskParams) -> Result<()> {
     let live = params.event_stream.live_state().clone();
+    let interrupt_watch = params.interrupt_watch.clone();
     // Stop observation must stay pollable while history reads or a full output
     // queue hold the follower. Closing the channel settles the wire lifecycle.
     tokio::select! {
         biased;
-        result = isolation::wait_for_stop(generation) => {
+        result = async move { interrupt_watch.wait_for_stop().await } => {
+            // Fence first, then detach: anything still queued from below the
+            // `Cancel` is output the interrupt already ended, and the fence
+            // outlives this attachment where `retire` does not.
+            if let Ok(cancel_seq) = &result {
+                live.accept_interrupt(*cancel_seq);
+            }
             live.retire();
-            result
+            result.map(|_| ())
         }
         result = follow_remote_turn(params) => result,
     }
@@ -394,19 +402,17 @@ impl AdvisoryForwarder {
         if !event_stream.should_render(&envelope) {
             return true;
         }
-        let Some(generation) = envelope.execution_id else {
-            return true;
-        };
+        // Carry the advisory's sequence with the frames it maps to: the queue
+        // re-checks it against the fence when they reach the wire, which may be
+        // long after an interrupt has landed.
+        let after_seq = envelope.after_seq;
         self.sink.emit(envelope.event);
-        self.drain_events(&generation).await
+        self.drain_events(after_seq).await
     }
 
-    async fn drain_events(&mut self, generation: &str) -> bool {
+    async fn drain_events(&mut self, after_seq: u64) -> bool {
         while let Ok(event) = self.event_rx.try_recv() {
-            let queued = QueuedEvent {
-                generation: generation.into(),
-                event,
-            };
+            let queued = QueuedEvent { after_seq, event };
             if self.tx.send(queued).await.is_err() {
                 return false;
             }
@@ -414,13 +420,16 @@ impl AdvisoryForwarder {
         true
     }
 
+    /// Queue one agent event as if an advisory carrying `after_seq` had mapped
+    /// to it, so a test can place output either side of an interrupt fence.
     #[cfg(test)]
     pub(crate) async fn forward_agent_event(
         &mut self,
+        after_seq: u64,
         event: harnx_core::event::AgentEvent,
     ) -> bool {
         self.sink.emit(event);
-        self.drain_events("test-generation").await
+        self.drain_events(after_seq).await
     }
 }
 

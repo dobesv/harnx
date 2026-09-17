@@ -1,8 +1,11 @@
+//! A replacement worker finishes what a dead owner left half-done.
 use super::*;
 use anyhow::Context;
-use harnx_execution_control::Owner;
 use harnx_runtime::nats_lease::{NatsLeaseAcquireParams, NatsSessionLease};
 
+/// The owner disappears mid-turn without releasing its lease. Once that lease
+/// expires, the replacement picks the session up, sees the `Cancel` that
+/// landed meanwhile, winds the interrupted turn up, and never calls the model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replacement_confirms_durable_cancel_after_dead_owners_lease_expires() -> Result<()> {
     let server = require_nats_server()
@@ -27,26 +30,19 @@ async fn replacement_confirms_durable_cancel_after_dead_owners_lease_expires() -
     })
     .await?
     .context("acquire dead owner lease")?;
-    let operation = session
-        .execution_store()
-        .current(session.storage_key())
-        .await?
-        .unwrap();
-    let old_fence = lease.fence_token();
-    session
-        .execution_store()
-        .claim(
-            &operation.reference,
-            Owner {
-                instance_id: "dead-owner".into(),
-                fence: old_fence,
-            },
-        )
-        .await?;
+    let log =
+        harnx_runtime::nats_session_log::NatsSessionLog::new(js.clone(), session.storage_key());
+    seed_unanswered_round(&log, lease.fence_token()).await?;
     // Simulate a process disappearing before it writes Cancel or releases its
     // lease. Retain the test object so Drop cannot perform a graceful release.
     lease.stop_renewal_for_test().await;
-    let receipt = session.request_cancel(CancelRequest::default()).await?;
+
+    let outcome = session.interrupt("client cancel").await?;
+    assert!(
+        matches!(outcome, InterruptOutcome::Accepted { .. }),
+        "the dead owner's turn must be interruptible, got {outcome:?}"
+    );
+
     let calls = Arc::new(AtomicUsize::new(0));
     let mut daemon_config = WorkerDaemonConfig::managing("local", "replacement");
     daemon_config.lease = lease_config;
@@ -56,24 +52,53 @@ async fn replacement_confirms_durable_cancel_after_dead_owners_lease_expires() -
         Some(counting_stub_call_fn(calls.clone())),
         None,
     ));
-    let status = session
-        .wait_for_cancel(&receipt, tokio::time::Instant::now() + CI_SAFE_TIMEOUT)
-        .await?;
-    assert_eq!(status.disposition, CancelDisposition::Cancelled);
-    assert_eq!(status.cancellation_id, receipt.cancellation_id);
+
+    await_wind_up(&log).await?;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    let recovered = session
-        .execution_store()
-        .current(session.storage_key())
-        .await?
-        .unwrap();
-    assert!(recovered.owner.unwrap().fence > old_fence);
-    let entries = NatsSessionLog::new(js, session.storage_key())
-        .load_events_async()
-        .await?;
-    assert!(entries.iter().any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { fence_token } if *fence_token > old_fence)));
     daemon.abort();
     let _ = daemon.await;
     drop(lease);
     Ok(())
+}
+
+/// The dead owner leaves an unanswered tool round behind: that is what the
+/// replacement owes a result for once it takes the session over.
+async fn seed_unanswered_round(
+    log: &harnx_runtime::nats_session_log::NatsSessionLog,
+    fence_token: u64,
+) -> Result<()> {
+    log.append_event_async(&Entry::ToolCalls {
+        text: "started before the crash".into(),
+        thought: None,
+        calls: vec![ToolCall::new(
+            "unanswered".into(),
+            json!({}),
+            Some("orphan-call".into()),
+            None,
+        )],
+        timestamp: None,
+        fence_token: Some(fence_token),
+    })
+    .await
+    .map(drop)
+}
+
+/// The wind-up answering that round is the proof the replacement took over.
+async fn await_wind_up(log: &harnx_runtime::nats_session_log::NatsSessionLog) -> Result<()> {
+    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
+        loop {
+            let entries = log.load_events_latest_async().await?;
+            if entries.iter().any(|(_, entry)| {
+                matches!(
+                    entry,
+                    Entry::ToolResults { results, .. }
+                        if results.iter().any(|r| r.id.as_deref() == Some("orphan-call"))
+                )
+            }) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?
 }

@@ -1,66 +1,11 @@
-//! Activation admission and recovery before claiming an execution owner.
+//! What an activation has to satisfy before a worker claims the session:
+//! canonical metadata, the right route, and — for a session whose last turn
+//! was interrupted — winding that turn up before anything else may run.
 use super::*;
+use harnx_core::session::SessionLogEntry;
+use harnx_core::session_reconstruct::TurnStatus;
 
 impl WorkerRuntime {
-    async fn execution_preflight_passes(
-        &self,
-        message: &async_nats::jetstream::Message,
-        activation: &SessionActivate,
-    ) -> Result<bool> {
-        let Some(expected) = activation.execution_id.as_ref() else {
-            return Ok(true);
-        };
-        let store =
-            harnx_execution_control::ExecutionStore::ensure(&self.jetstream, self.lease.replicas)
-                .await?;
-        let Some(current) = store.current(&activation.session_id).await? else {
-            return Ok(true);
-        };
-        let current = store.status(&current.reference).await?;
-        if current.reference.execution_id == *expected
-            && current.owner_stopped
-            && !current.state.is_terminal()
-            && !self.has_uncovered_admission(&store, &current).await?
-        {
-            Self::delayed_nak(message).await?;
-            return Ok(false);
-        }
-        if current.reference.execution_id != *expected || current.state.is_terminal() {
-            if current.reference.execution_id == *expected {
-                self.end_session_tool_servers(&current.reference).await;
-            }
-            message
-                .ack()
-                .await
-                .map_err(|error| anyhow::anyhow!("ack stale execution: {error}"))?;
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    async fn has_uncovered_admission(
-        &self,
-        store: &harnx_execution_control::ExecutionStore,
-        operation: &harnx_execution_control::Operation,
-    ) -> Result<bool> {
-        let log =
-            NatsSessionLogBackend::new(self.jetstream.clone(), &operation.reference.session_id);
-        let entries = log.load_events_latest_async().await?;
-        crate::nats_session::cancellation::reconcile_admissions(store, operation, &entries).await?;
-        let operation = store
-            .get(&operation.reference)
-            .await?
-            .context("execution missing")?;
-        if operation.state.cancelling() && !operation.cancel_recorded {
-            return Ok(true);
-        }
-        Ok(operation
-            .admissions
-            .values()
-            .filter_map(|seq| *seq)
-            .any(|seq| seq > operation.covered_through))
-    }
-
     async fn metadata_preflight_passes(
         &self,
         message: &async_nats::jetstream::Message,
@@ -107,6 +52,89 @@ impl WorkerRuntime {
         Ok(true)
     }
 
+    /// Close out an interrupted turn before anything else runs for this
+    /// session: the log owes a result for every call its `Cancel` cut off, and
+    /// a transcript whose last `ToolCalls` is unanswered cannot go to a model.
+    ///
+    /// Returns whether the activation still has a turn to run. A pure wind-up
+    /// is acknowledged here and goes no further; a wind-up with a steering
+    /// message queued behind the `Cancel` continues into the turn loop, which
+    /// now sees an idle session with pending input.
+    async fn wind_up_preflight(
+        &self,
+        message: &async_nats::jetstream::Message,
+        activation: &SessionActivate,
+    ) -> Result<bool> {
+        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id);
+        let entries = backend.load_events_latest_async().await?;
+        let state = harnx_core::session_reconstruct::reconstruct_state_from_nats(&entries);
+        match state.turn_status {
+            TurnStatus::InterruptedPendingWindUp { .. } => {}
+            // The interruption this activation was published for has already
+            // been wound up; there is nothing left for it to do.
+            TurnStatus::Idle if cancel_landed_at(&entries, activation.requested_seq) => {
+                Self::acknowledge(message, "wound-up interruption").await?;
+                return Ok(false);
+            }
+            _ => return Ok(true),
+        }
+        let Some(lease) = self
+            .acquire_or_defer_activation(message, activation)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let wound_up = self.wind_up_interrupted_session(&backend, &lease).await;
+        lease.release().await?;
+        wound_up?;
+        if !state.next_turn_messages.is_empty() {
+            // Input typed after the interrupt: the activation still has a turn
+            // to run, now that the interrupted one is closed out.
+            return Ok(true);
+        }
+        Self::acknowledge(message, "wind-up").await?;
+        Ok(false)
+    }
+
+    async fn wind_up_interrupted_session(
+        &self,
+        backend: &NatsSessionLogBackend,
+        lease: &NatsSessionLease,
+    ) -> Result<()> {
+        let event_sink = crate::nats_event_sink::NatsEventSink::new(
+            self.client.clone(),
+            self.jetstream.clone(),
+            backend.session_id().to_string(),
+        )
+        .await;
+        let outcome =
+            super::super::wind_up::wind_up_interrupted_turn(super::super::wind_up::WindUpInputs {
+                backend,
+                lease,
+                client: &self.client,
+                jetstream: &self.jetstream,
+                replicas: self.lease.replicas,
+                in_flight: &crate::nats_tool_provider::NatsInFlightCalls::for_instance(
+                    &self.instance_id,
+                ),
+                event_sink: Some(&event_sink),
+            })
+            .await?;
+        log::info!(
+            "activation wound up an interrupted turn: session_id={} worker_id={} outcome={outcome:?}",
+            backend.session_id(),
+            self.worker_id,
+        );
+        Ok(())
+    }
+
+    async fn acknowledge(message: &async_nats::jetstream::Message, reason: &str) -> Result<()> {
+        message
+            .ack()
+            .await
+            .map_err(|error| anyhow::anyhow!("ack {reason} SessionActivate: {error}"))
+    }
+
     pub(super) async fn activation_is_ready(
         &self,
         message: &async_nats::jetstream::Message,
@@ -122,19 +150,19 @@ impl WorkerRuntime {
             return Ok(false);
         }
 
-        if !self.execution_preflight_passes(message, activation).await? {
-            return Ok(false);
-        }
-
         // A targeted re-activation stays durable until the active loop's tool
-        // boundary or final drain has covered the requested sequence.
+        // boundary or final drain has covered the requested sequence. Checked
+        // before wind-up so a running turn's lease is never taken from it.
         if self.already_running(&activation.session_id).await {
             self.settle_running_activation(message).await?;
             return Ok(false);
         }
 
-        if activation.execution_id.is_none()
-            && self.uses_targeted_activation()
+        if !self.wind_up_preflight(message, activation).await? {
+            return Ok(false);
+        }
+
+        if self.uses_targeted_activation()
             && self
                 .targeted_status_preflight_finished(message, activation)
                 .await?
@@ -144,4 +172,14 @@ impl WorkerRuntime {
 
         Ok(true)
     }
+}
+
+/// Whether the sequence this activation names is a `Cancel` still in the log.
+fn cancel_landed_at(entries: &[(u64, SessionLogEntry)], requested_seq: Option<u64>) -> bool {
+    let Some(requested_seq) = requested_seq else {
+        return false;
+    };
+    entries.iter().any(|(seq, entry)| {
+        *seq == requested_seq && matches!(entry, SessionLogEntry::Cancel { .. })
+    })
 }

@@ -409,34 +409,58 @@ describe('SubAgentSessionNotes', () => {
 
 
 describe('child cancellation', () => {
-  it('stops the attested invocation without opening the session', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_id: 'invocation', execution_state: 'running' });
-    vi.mocked(cancel).mockResolvedValue({ cancelled: true, disposition: 'requested', execution_id: 'invocation' });
+  it('stops the running child session without opening it', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' } });
+    vi.mocked(cancel).mockResolvedValue({ outcome: 'accepted', cancel_seq: 12 });
     const onOpen = vi.fn();
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={onOpen} />);
     fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));
     expect(onOpen).not.toHaveBeenCalled();
-    expect(cancel).toHaveBeenCalledWith('researcher', 'child-session-running', 'invocation');
+    expect(cancel).toHaveBeenCalledWith('researcher', 'child-session-running');
     expect(screen.getByText('Cancelling')).toBeVisible();
     expect(screen.queryByRole('button', { name: /^Stop / })).not.toBeInTheDocument();
   });
 
-  it.each(['completed', 'cancelled', 'stale'] as const)('hides Stop for a %s execution', async (state) => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'idle' }, execution_id: state === 'stale' ? 'new-invocation' : 'invocation', execution_state: state === 'stale' ? 'running' : state });
+  it('offers Stop from the parent progress note even when the child session reports idle', async () => {
+    // A sub-agent session is never prompted through this server, so a row that
+    // waited for the child session to claim a run of its own hid Stop forever.
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'idle' } });
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
     await waitFor(() => expect(sessionControl).toHaveBeenCalled());
+    expect(await screen.findByRole('button', { name: /^Stop / })).toBeEnabled();
+  });
+
+  it('gives Stop back when the child session reports running again', async () => {
+    // The session id outlives one invocation, so a stale `interrupted` answer
+    // must not label this row Cancelled for the rest of the next one.
+    vi.mocked(sessionControl)
+      .mockResolvedValueOnce({ state: { status: 'interrupted', cancel_seq: 9 } })
+      .mockResolvedValue({ state: { status: 'running' } });
+    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
+    expect(await screen.findByText('Cancelled')).toBeVisible();
+    expect(
+      await screen.findByRole('button', { name: /^Stop / }, { timeout: 3000 }),
+    ).toBeEnabled();
+  });
+
+  it('hides Stop once the child session reports it was interrupted', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'interrupted', cancel_seq: 9 } });
+    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
+    expect(await screen.findByText('Cancelled')).toBeVisible();
     expect(screen.queryByRole('button', { name: /^Stop / })).not.toBeInTheDocument();
   });
 
-  it('hydrates an unconfirmed cancellation with an actionable retry', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'cancel_unconfirmed', cancellation: { cancelled: true, disposition: 'unconfirmed' } }, execution_id: 'invocation', execution_state: 'unconfirmed' });
+  it('labels a child parked at an approval gate without calling it cancelled', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({
+      state: { status: 'awaiting_approval' },
+    });
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
-    expect(await screen.findByText('Unconfirmed')).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Retry stopping researcher' })).toBeEnabled();
+    expect(await screen.findByText('Awaiting approval')).toBeVisible();
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
   });
 
   it('does not surface "signal is aborted without reason" on screen (#1838)', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_id: 'invocation', execution_state: 'running' });
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' } });
     vi.mocked(cancel).mockRejectedValue(new DOMException('signal is aborted without reason', 'AbortError'));
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
     fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));
@@ -445,7 +469,7 @@ describe('child cancellation', () => {
   });
 
   it('does not surface TimeoutError on screen (#1838, #1861)', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_id: 'invocation', execution_state: 'running' });
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' } });
     vi.mocked(cancel).mockRejectedValue(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
     fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));
@@ -454,7 +478,7 @@ describe('child cancellation', () => {
   });
 
   it('surfaces legitimate non-abort errors on screen', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_id: 'invocation', execution_state: 'running' });
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' } });
     vi.mocked(cancel).mockRejectedValue(new Error('Server communication failed'));
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
     fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));

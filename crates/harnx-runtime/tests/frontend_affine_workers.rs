@@ -1,9 +1,7 @@
 //! Integration coverage for frontend-targeted local NATS workers.
 
-#[path = "common/admitted_log.rs"]
-mod admitted_log;
 mod common;
-use admitted_log::AdmittedSessionLog as NatsSessionLog;
+use harnx_runtime::nats_session_log::NatsSessionLog;
 
 use anyhow::{Context, Result};
 use common::spawn_nats_server;

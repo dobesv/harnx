@@ -87,3 +87,22 @@ where
         .expect("SSE read should finish before outer timeout")
         .unwrap_or_else(|error| panic!("{error:#}"))
 }
+
+/// Read until the stream goes quiet for `window`, and return whatever arrived
+/// without requiring anything to. This is how a test asserts a stream stays
+/// *open* — the opposite question to [`read_sse_until`], which fails when
+/// nothing ever satisfies it.
+#[allow(dead_code)]
+pub(crate) async fn read_sse_for(response: AppResponse, window: Duration) -> SseRead {
+    let mut body = response.into_body().into_data_stream();
+    let mut read = SseRead::default();
+    let mut partial = String::new();
+    let never = |_: &SseRead| false;
+    while let Ok(Some(Ok(chunk))) =
+        tokio::time::timeout(window, futures_util::StreamExt::next(&mut body)).await
+    {
+        partial.push_str(std::str::from_utf8(&chunk).expect("sse utf8"));
+        parse_sse_frames(&mut partial, &mut read, &never);
+    }
+    read
+}

@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use anyhow::{Context, Result};
-use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResultControl};
+use harnx_core::hooks::{HookEvent, HookPayload, HookResultControl};
 use harnx_core::instance::ServerScope;
 use harnx_hookset::{FailPolicy, HookRegistration};
 use harnx_hookset_server::{hook_registration_key, serve_over_nats, HOOK_REGISTRY_BUCKET};
@@ -161,13 +161,12 @@ async fn proxy_auth_registers_and_mutates_tool_env_over_nats() -> Result<()> {
             tool_use_id: "tool-use-1".to_string(),
         },
     };
-    let message = client
-        .request(
-            instance_id.hook_subject(ASSIGNED_NAME, "PreToolUse"),
-            serde_json::to_vec(&payload)?.into(),
-        )
-        .await?;
-    let outcome: HookOutcome = serde_json::from_slice(&message.payload)?;
+    let outcome = request_hook(
+        &client,
+        &instance_id.hook_subject(ASSIGNED_NAME, "PreToolUse"),
+        &payload,
+    )
+    .await?;
     assert_eq!(outcome.control, HookResultControl::Continue);
     let mutated = outcome
         .result
@@ -244,4 +243,25 @@ fn first_nats_client_url(dir: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+/// One hook request over the wire contract the server defines: it names the
+/// session and call it belongs to, so a control message could cancel it.
+async fn request_hook(
+    client: &async_nats::Client,
+    subject: &str,
+    payload: &HookPayload,
+) -> Result<harnx_core::hooks::HookOutcome> {
+    let message = client
+        .send_request(
+            subject.to_string(),
+            async_nats::Request::new()
+                .headers(harnx_hookset_server::hook_request_headers(
+                    &payload.session_id,
+                    "proxy-auth-call",
+                ))
+                .payload(serde_json::to_vec(payload)?.into()),
+        )
+        .await?;
+    harnx_hookset_server::decode_hook_reply(&message.payload)
 }

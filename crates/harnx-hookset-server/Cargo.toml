@@ -8,7 +8,6 @@ repository.workspace = true
 description = "NATS server runtime for harnx hooks"
 
 [dependencies]
-harnx-execution-control.workspace = true
 anyhow = { workspace = true }
 async-nats = { workspace = true }
 futures-util = { workspace = true }
@@ -17,6 +16,7 @@ harnx-healthz = { workspace = true }
 harnx-hookset = { path = "../harnx-hookset" }
 harnx-metrics = { workspace = true }
 harnx-nats-common = { workspace = true }
+harnx-toolset = { path = "../harnx-toolset" }
 log = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

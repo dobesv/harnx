@@ -15,10 +15,6 @@ use tokio_util::sync::CancellationToken;
 #[path = "expired_replay_tests.rs"]
 mod expired_replay_tests;
 
-#[cfg(test)]
-#[path = "detach_tests.rs"]
-mod detach_tests;
-
 pub(super) fn subagent_error_message(prefix: impl std::fmt::Display, session_id: &str) -> String {
     format!("{prefix} (session_id: {session_id})")
 }
@@ -38,15 +34,16 @@ pub(super) async fn run_prompt(
     toolset: &SubagentToolset,
     params: PromptParams<'_>,
 ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
-    let admission =
-        super::admission::Admission::capture(toolset, &params.context, params.cancel.clone())
-            .await?;
-    let (session, deadline) = checkpointed_session(toolset, &params, &admission).await?;
-    // The child timeout can close its own admission capability without
-    // cancelling the parent tool (which returns the timeout result).
-    let session =
-        session.with_parent_fence(admission.fence.clone(), admission.cancel.child_token());
-    let session = match params.context.operation {
+    if params.cancel.is_cancelled() {
+        return Err(ToolInvokeError::Fatal("sub-agent tool call aborted".into()));
+    }
+    let cancel = params.cancel.clone();
+    let (session, deadline) = checkpointed_session(toolset, &params).await?;
+    // Replay of an already-answered invocation keys off
+    // `NatsSession::invocation_id`, so every child needs one bound here. The
+    // parent session id rides along only to label who requested an interrupt
+    // the child appends; it carries no authority of its own.
+    let session = match params.context.invoking_session_id.clone() {
         Some(parent) => session.with_execution_parent(parent, params.context.call_id.clone()),
         None => session,
     };
@@ -54,10 +51,9 @@ pub(super) async fn run_prompt(
     let child_session_id = session.session_id().to_string();
     let reporter = toolset
         .start_progress_reporter(ProgressReporterStart {
-            admission: admission.clone(),
             child_session_id: child_session_id.clone(),
             parent_session_id: params.parent_session_id,
-            invocation_id: params.context.call_id,
+            invocation_id: params.context.call_id.clone(),
             tool_call_id: params.tool_call_id,
         })
         .await?;
@@ -77,9 +73,9 @@ pub(super) async fn run_prompt(
     .await;
 
     // A late child completion cannot resume the stopped parent.
-    if let Err(error) = admission.check("child-completion").await {
+    if cancel.is_cancelled() {
         let _ = reporter.finish(SubAgentProgressStatus::Cancelled).await;
-        return Err(error);
+        return Err(ToolInvokeError::Fatal("sub-agent tool call aborted".into()));
     }
     match turn {
         PromptTurn::Completed(Ok(result)) => {
@@ -107,108 +103,50 @@ pub(super) async fn run_prompt(
 async fn checkpointed_session(
     toolset: &SubagentToolset,
     params: &PromptParams<'_>,
-    admission: &super::admission::Admission,
 ) -> Result<(NatsSession, Option<tokio::time::Instant>), ToolInvokeError> {
-    if params.context.operation.is_none() {
-        let deadline = remaining_timeout(params.timeout_secs, None)
-            .map(|remaining| tokio::time::Instant::now() + remaining);
-        let session = toolset
-            .create_session(
-                params.session_id.clone(),
-                params.parent_session_id.as_deref(),
-                Some(admission),
-            )
-            .await?;
-        return Ok((session, deadline));
-    }
-    let journal =
-        harnx_toolset_server::invocation_journal::InvocationJournal::ensure(&toolset.jetstream)
-            .await
-            .map_err(|error| {
-                ToolInvokeError::Fatal(format!("open sub-agent checkpoint: {error:#}"))
-            })?;
+    let deadline = remaining_timeout(params.timeout_secs, None)
+        .map(|remaining| tokio::time::Instant::now() + remaining);
     let parent = params.parent_session_id.as_deref();
-    let record = match parent {
-        Some(parent) => journal
-            .recorded(parent, &params.context.call_id)
-            .await
-            .map_err(|error| {
-                ToolInvokeError::Fatal(format!("read sub-agent checkpoint: {error:#}"))
-            })?,
-        None => None,
-    };
-    let timeout = remaining_timeout(
-        params.timeout_secs,
-        record.as_ref().map(|record| record.started_at_ms),
-    )
-    .map(|remaining| tokio::time::Instant::now() + remaining);
-    let Some(record) = record else {
-        let session = toolset
-            .create_session(params.session_id.clone(), parent, Some(admission))
-            .await?;
-        return Ok((session, timeout));
-    };
-    Ok((
-        checkpointed_handle(toolset, (params, admission), &journal, record).await?,
-        timeout,
-    ))
-}
-
-async fn checkpointed_handle(
-    toolset: &SubagentToolset,
-    request: (&PromptParams<'_>, &super::admission::Admission),
-    journal: &harnx_toolset_server::invocation_journal::InvocationJournal,
-    record: harnx_toolset_server::invocation_journal::RecordedInvocation,
-) -> Result<NatsSession, ToolInvokeError> {
-    let (params, admission) = request;
-    let parent = params.parent_session_id.as_deref();
-    let checkpoint = record.checkpoint;
-    let mut session_id = checkpoint
+    let session_id = params
+        .context
+        .checkpoint
         .as_ref()
-        .and_then(|value| value["session_id"].as_str())
+        .and_then(|checkpoint| checkpoint["session_id"].as_str())
         .map(str::to_string)
         .or_else(|| params.session_id.clone());
-    if session_id.is_none() {
-        let config = toolset.session_config(None, parent).await?;
-        admission.start(serde_json::json!({"kind": "reserve-child-session", "invocation": params.context.call_id})).await?;
-        let allocation = format!("{}/{}", parent.unwrap_or(""), params.context.call_id);
-        session_id = Some(
-            crate::utils::session_name::reserve_invocation_session_id(
-                &toolset.session_metadata,
-                &config.initializer,
-                &allocation,
-                record.started_at_ms,
-            )
-            .await
-            .map_err(|error| {
-                ToolInvokeError::Fatal(format!("reserve sub-agent session: {error:#}"))
-            })?,
-        );
-    }
     let session = toolset
-        .create_session(session_id, parent, Some(admission))
+        .create_session(session_id, parent, params.tool_call_id.as_deref())
         .await?;
-    if let Some(parent) = parent {
-        let checkpoint = journal
-            .checkpoint(
-                parent,
-                &params.context.call_id,
-                serde_json::json!({"session_id": session.session_id()}),
-            )
-            .await
-            .map_err(|error| {
-                ToolInvokeError::Fatal(format!("persist sub-agent checkpoint: {error:#}"))
-            })?;
-        let id = checkpoint["session_id"]
-            .as_str()
-            .ok_or_else(|| ToolInvokeError::Fatal("invalid sub-agent checkpoint".into()))?;
-        if id != session.session_id() {
-            return toolset
-                .create_session(Some(id.into()), Some(parent), Some(admission))
-                .await;
-        }
+    let Some(parent) = parent else {
+        return Ok((session, deadline));
+    };
+    let Some(store) = params.context.checkpoint_store.as_ref() else {
+        return Ok((session, deadline));
+    };
+    // First writer wins: a concurrent or replayed attempt converges on
+    // whichever child id landed first, instead of running a second one.
+    let stored = store
+        .checkpoint(serde_json::json!({"session_id": session.session_id()}))
+        .await
+        .map_err(|error| {
+            ToolInvokeError::Fatal(format!("persist sub-agent checkpoint: {error:#}"))
+        })?;
+    let id = stored["session_id"]
+        .as_str()
+        .ok_or_else(|| ToolInvokeError::Fatal("invalid sub-agent checkpoint".into()))?;
+    if id == session.session_id() {
+        return Ok((session, deadline));
     }
-    Ok(session)
+    Ok((
+        toolset
+            .create_session(
+                Some(id.into()),
+                Some(parent),
+                params.tool_call_id.as_deref(),
+            )
+            .await?,
+        deadline,
+    ))
 }
 
 fn remaining_timeout(seconds: Option<u64>, started_at_ms: Option<u64>) -> Option<Duration> {
@@ -302,10 +240,12 @@ async fn await_owned_turn(
     turn
 }
 
+/// Let an abandoned turn's follower run itself out. The tool call has already
+/// returned a timeout or abort result, so nothing is waiting on this one; the
+/// follower only reads the child session's log and its own event stream, which
+/// is why leaving it detached cannot corrupt anything behind our back.
 fn supervise_turn(turn: tokio::task::JoinHandle<anyhow::Result<NatsTurnResult>>) {
-    // The owned follower is G1-bound. It cannot release a worker lease or mutate
-    // another session/generation. Dropping a JoinHandle would merely detach it.
-    harnx_execution_control::CleanupTasks::process().spawn(async move {
+    tokio::spawn(async move {
         let _ = turn.await;
     });
 }
@@ -319,12 +259,15 @@ async fn invocation_deadline(timeout: Option<Duration>) {
 
 async fn ensure_timeout_cancellation(session: &NatsSession) -> Result<(), ToolInvokeError> {
     let session_id = session.session_id();
-    session.request_invocation_cancel().await.map_err(|error| {
-        timeout_cancellation_error(
-            session_id,
-            format!("cancellation request failed: {error:#}"),
-        )
-    })?;
+    session
+        .interrupt("parent interrupted")
+        .await
+        .map_err(|error| {
+            timeout_cancellation_error(
+                session_id,
+                format!("cancellation request failed: {error:#}"),
+            )
+        })?;
     Ok(())
 }
 

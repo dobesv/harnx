@@ -860,7 +860,6 @@ pub async fn run_command_with_output_and_local_worker(
                     provider: nats_hook_provider.as_deref(),
                     meta: HookDispatchMeta {
             abort: None,
-            execution: None,
                         session_id: session_id.clone(),
                         cwd: cwd.clone(),
                         resume_count: 0,

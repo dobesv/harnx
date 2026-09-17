@@ -104,7 +104,12 @@ fn nats_tool_confirmation_late_decision_outside_round_is_not_evidence() -> Resul
     for boundary in [
         results(),
         calls("different-call"),
-        SessionLogEntry::Cancel { fence_token: 1 },
+        SessionLogEntry::Cancel {
+            fence_token: 1,
+            cancellation_id: None,
+            requested_by: None,
+            timestamp: None,
+        },
     ] {
         let mut entries = pending();
         entries.extend([(3, boundary), (4, decision(true))]);
@@ -117,7 +122,15 @@ fn nats_tool_confirmation_late_decision_outside_round_is_not_evidence() -> Resul
 #[test]
 fn nats_tool_confirmation_cancel_without_decision_is_not_success() -> Result<()> {
     let mut entries = pending();
-    entries.push((3, SessionLogEntry::Cancel { fence_token: 1 }));
+    entries.push((
+        3,
+        SessionLogEntry::Cancel {
+            fence_token: 1,
+            cancellation_id: None,
+            requested_by: None,
+            timestamp: None,
+        },
+    ));
     assert_eq!(original().outcome(&entries, true)?, Some(false));
     assert!(!already_decided(&entries, CALL, true)?);
     Ok(())

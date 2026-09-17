@@ -330,12 +330,6 @@ pub struct Config {
     pub last_message: Option<LastMessage>,
 
     pub session: Option<Session>,
-    pub execution_control: Option<(
-        harnx_execution_control::ExecutionStore,
-        harnx_execution_control::OperationRef,
-    )>,
-    /// Captured when this worker claims its execution, never rebound on output.
-    pub generation_fence: Option<crate::execution_fence::GenerationFence>,
     pub maintenance_abort: Option<crate::utils::AbortSignal>,
     pub rag: Option<Arc<Rag>>,
     pub agent: Option<Agent>,
@@ -410,8 +404,6 @@ impl Clone for Config {
             last_message: self.last_message.clone(),
             session: self.session.clone(),
             maintenance_abort: self.maintenance_abort.clone(),
-            execution_control: self.execution_control.clone(),
-            generation_fence: self.generation_fence.clone(),
             rag: self.rag.clone(),
             agent: self.agent.clone(),
             remote_agent: self.remote_agent.clone(),
@@ -457,8 +449,6 @@ impl Config {
             last_message: self.last_message.clone(),
             session: None,
             maintenance_abort: None,
-            execution_control: None,
-            generation_fence: None,
             rag: self.rag.clone(),
             agent: self.agent.clone(),
             remote_agent: self.remote_agent.clone(),
@@ -497,8 +487,6 @@ impl Default for Config {
 
             session: None,
             maintenance_abort: None,
-            execution_control: None,
-            generation_fence: None,
             rag: None,
             agent: None,
             remote_agent: None,

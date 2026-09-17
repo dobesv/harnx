@@ -1412,6 +1412,26 @@ pub(crate) async fn load_nats_session_with_base(
     Vec<(u64, harnx_core::session::SessionLogEntry)>,
     harnx_core::session::Session,
 )> {
+    let loaded = load_nats_session_state(config, agent, session).await?;
+    Ok((loaded.session, loaded.entries, loaded.base_session))
+}
+
+/// One durable read of a session: its replayed history, the raw log entries and
+/// whether a worker held its lease across the read. The lease sample is taken
+/// here because this read needs it anyway, and sampling it again would mean a
+/// second connection for an answer this one already has.
+pub(crate) struct LoadedNatsSession {
+    pub(crate) session: harnx_core::session::Session,
+    pub(crate) entries: Vec<(u64, harnx_core::session::SessionLogEntry)>,
+    pub(crate) base_session: harnx_core::session::Session,
+    pub(crate) worker_active: bool,
+}
+
+pub(crate) async fn load_nats_session_state(
+    config: &Config,
+    agent: &str,
+    session: &str,
+) -> Result<LoadedNatsSession> {
     ensure_frontend_nats_owner().await?;
     let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
     let metadata_store =
@@ -1426,12 +1446,7 @@ pub(crate) async fn load_nats_session_with_base(
     // Mirrors load_remote_transcript_for_render in harnx-runtime. A trailing
     // ToolCalls row is in flight (pending) rather than interrupted when either
     // sample shows an active lease.
-    let lease_was_active =
-        harnx_runtime::nats_lease::session_has_active_lease(&jetstream, &storage_key)
-            .await
-            .map_err(|err| {
-                anyhow!("Failed to inspect worker lease for session '{session}': {err}")
-            })?;
+    let lease_was_active = worker_lease_sample(&jetstream, &storage_key, session).await?;
     let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
         jetstream.clone(),
         storage_key.clone(),
@@ -1440,31 +1455,12 @@ pub(crate) async fn load_nats_session_with_base(
         .load_events_async()
         .await
         .map_err(|err| anyhow!("Failed to load session history for '{session}': {err}"))?;
-    // Reconcile attention state from log on server read path (repair lost bumps)
-    let attention_seq = harnx_runtime::nats_worker::derive_attention_seq(&entries);
-    if attention_seq > 0 {
-        if let Err(error) = metadata_store
-            .bump_attention(&storage_key, attention_seq)
-            .await
-        {
-            log::warn!(
-                "failed to reconcile attention on server read: session_id={} storage_key={} seq={} error={error:#}",
-                session,
-                storage_key,
-                attention_seq
-            );
-        }
-    }
+    reconcile_attention(&metadata_store, &storage_key, session, &entries).await;
     // If there was no holder before the read, sample once more to cover a
     // worker acquiring the lease and appending ToolCalls during the read.
-    let preserve_pending = if lease_was_active {
-        true
-    } else {
-        harnx_runtime::nats_lease::session_has_active_lease(&jetstream, &storage_key)
-            .await
-            .map_err(|err| {
-                anyhow!("Failed to inspect worker lease for session '{session}': {err}")
-            })?
+    let preserve_pending = match lease_was_active {
+        true => true,
+        false => worker_lease_sample(&jetstream, &storage_key, session).await?,
     };
     let base_session = metadata.base_session();
     let loaded = if preserve_pending {
@@ -1481,7 +1477,46 @@ pub(crate) async fn load_nats_session_with_base(
         )
     }
     .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))?;
-    Ok((loaded, entries, base_session))
+    Ok(LoadedNatsSession {
+        session: loaded,
+        entries,
+        base_session,
+        worker_active: preserve_pending,
+    })
+}
+
+/// Whether a worker holds this session's lease right now.
+async fn worker_lease_sample(
+    jetstream: &harnx_runtime::nats_event_sink::JetstreamContext,
+    storage_key: &str,
+    session: &str,
+) -> Result<bool> {
+    harnx_runtime::nats_lease::session_has_active_lease(jetstream, storage_key)
+        .await
+        .map_err(|err| anyhow!("Failed to inspect worker lease for session '{session}': {err}"))
+}
+
+/// Repair attention state from the log on the server read path: a bump lost on
+/// the way in would leave a session looking read when it is not. Best effort —
+/// a session's history is worth returning even when its unread mark is stale.
+async fn reconcile_attention(
+    metadata_store: &harnx_runtime::nats_session_metadata::SessionMetadataStore,
+    storage_key: &str,
+    session: &str,
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+) {
+    let attention_seq = harnx_runtime::nats_worker::derive_attention_seq(entries);
+    if attention_seq == 0 {
+        return;
+    }
+    if let Err(error) = metadata_store
+        .bump_attention(storage_key, attention_seq)
+        .await
+    {
+        log::warn!(
+            "failed to reconcile attention on server read: session_id={session} storage_key={storage_key} seq={attention_seq} error={error:#}"
+        );
+    }
 }
 
 /// Test helper exposing load_nats_session_with_base for integration tests.

@@ -76,8 +76,7 @@ vi.mock('@assistant-ui/react', async (importOriginal) => {
 const cancellationControl = (
   phase: CancellationControl['phase'],
   stop = vi.fn(async () => {}),
-  resumeAnyway = vi.fn(async () => {}),
-): CancellationControl => ({ phase, stop, resumeAnyway, observe: vi.fn() });
+): CancellationControl => ({ phase, stop });
 
 describe('cancellation UI', () => {
   beforeEach(() => {
@@ -111,80 +110,44 @@ describe('cancellation UI', () => {
     expect(stop).toHaveBeenCalledOnce();
   });
 
-  it('disables cancellation while the request is being accepted or work is stopping', () => {
-    const { rerender } = render(
+  it('disables the button only while the interrupt is being appended', () => {
+    render(
       <CancellationContext.Provider value={cancellationControl('requesting')}>
         <CancelButton />
       </CancellationContext.Provider>,
     );
-    const requestingBtn = screen.getByRole('button', { name: 'Requesting cancellation…' });
+    const requestingBtn = screen.getByRole('button', { name: 'Interrupting…' });
     expect(requestingBtn).toBeDisabled();
     expect(requestingBtn).toHaveClass('aui-composer-icon-btn');
-
-    rerender(
-      <CancellationContext.Provider value={cancellationControl('stopping')}>
-        <CancelButton />
-      </CancellationContext.Provider>,
-    );
-    const stoppingBtn = screen.getByRole('button', { name: 'Stopping…' });
-    expect(stoppingBtn).toBeDisabled();
-    expect(stoppingBtn).toHaveClass('aui-composer-icon-btn');
-
-    rerender(
-      <CancellationContext.Provider value={cancellationControl('abandoning')}>
-        <CancelButton />
-      </CancellationContext.Provider>,
-    );
-    const resumingBtn = screen.getByRole('button', { name: 'Resuming…' });
-    expect(resumingBtn).toBeDisabled();
-    expect(resumingBtn).toHaveClass('aui-composer-icon-btn');
   });
 
-  it('offers retry and confirmed resume after cancellation becomes unconfirmed', () => {
-    const stop = vi.fn(async () => {});
-    const resumeAnyway = vi.fn(async () => {});
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    render(
-      <CancellationContext.Provider value={cancellationControl('unconfirmed', stop, resumeAnyway)}>
-        <CancelButton />
-      </CancellationContext.Provider>,
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'Retry cancellation' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Resume anyway' }));
-    expect(stop).toHaveBeenCalledOnce();
-    expect(confirm).toHaveBeenCalledWith('Resume anyway? Prior work may still be running.');
-    expect(resumeAnyway).toHaveBeenCalledOnce();
-    confirm.mockRestore();
-  });
-
-  it('offers retry after the cancellation request fails', () => {
+  it('offers retry after the interrupt fails to land', () => {
     const stop = vi.fn(async () => {});
     render(
       <CancellationContext.Provider value={cancellationControl('failed', stop)}>
         <CancelButton />
       </CancellationContext.Provider>,
     );
-    const failed = screen.getByRole('button', { name: 'Cancellation request failed — Retry' });
+    const failed = screen.getByRole('button', { name: 'Interrupt failed — Retry' });
     expect(failed).toBeEnabled();
     fireEvent.click(failed);
     expect(stop).toHaveBeenCalledOnce();
   });
 
-  it('uses a static warning instead of a spinner when cancellation is unconfirmed', () => {
+  it('spins while the interrupt is in flight and stops once it has failed', () => {
     const { rerender, container } = render(
-      <CancellationContext.Provider value={cancellationControl('stopping')}>
+      <CancellationContext.Provider value={cancellationControl('requesting')}>
         <StatusIndicator isRunning statusText={null} />
       </CancellationContext.Provider>,
     );
-    expect(screen.getByText('Cancelling')).toBeInTheDocument();
+    expect(screen.getByText('Interrupting…')).toBeInTheDocument();
     expect(container.querySelector('.aui-spinner')).toBeInTheDocument();
 
     rerender(
-      <CancellationContext.Provider value={cancellationControl('unconfirmed')}>
+      <CancellationContext.Provider value={cancellationControl('failed')}>
         <StatusIndicator isRunning statusText={null} />
       </CancellationContext.Provider>,
     );
-    expect(screen.getByText('Cancellation unconfirmed')).toBeInTheDocument();
     expect(container.querySelector('.aui-spinner')).not.toBeInTheDocument();
   });
 });
@@ -470,8 +433,8 @@ describe('MyComposer', () => {
     expect(sendPrompt).not.toHaveBeenCalled();
   });
 
-  it('blocks composer controls and submission throughout cancellation', () => {
-    vi.mocked(useCancellation).mockReturnValue(cancellationControl('stopping'));
+  it('blocks composer controls and submission while the interrupt is being appended', () => {
+    vi.mocked(useCancellation).mockReturnValue(cancellationControl('requesting'));
     renderComposer(false);
 
     expect(screen.getByRole('textbox')).toBeDisabled();

@@ -102,7 +102,7 @@ async fn e2e_success_criterion_4_cancel_running_persists_partial_and_returns_idl
         json!({"jsonrpc":"2.0","id":2,"method":"session/cancel"}),
     )
     .await;
-    assert_eq!(cancel["result"]["cancelled"], true);
+    assert_eq!(cancel["result"]["outcome"], "accepted");
 
     // Release the gate so if the run didn't catch the abort it can still exit
     release.notify_one();

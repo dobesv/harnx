@@ -32,6 +32,28 @@ fn metadata_round_trip_preserves_identity_and_private_values() {
 }
 
 #[test]
+fn metadata_written_by_the_execution_control_gate_still_loads() {
+    // `SessionMetadata` denies unknown fields, and records written while the
+    // worker committed through the execution-control gate carry a
+    // `worker_projection` object. Reading one must not fail, and re-writing it
+    // must drop the key.
+    let mut record = serde_json::to_value(metadata()).unwrap();
+    record.as_object_mut().unwrap().insert(
+        "worker_projection".into(),
+        serde_json::json!({
+            "gate_root": {"session_id": "metis/session-1", "execution_id": "exec-1"},
+            "commit_id": "commit-1",
+            "sequence": 7,
+        }),
+    );
+
+    let decoded: SessionMetadata = serde_json::from_value(record).unwrap();
+    decoded.validate("session-1").unwrap();
+    let rewritten = serde_json::to_value(&decoded).unwrap();
+    assert!(rewritten.get("worker_projection").is_none());
+}
+
+#[test]
 fn initializer_persists_a_private_tool_context_snapshot() {
     let mut context = ToolContext::default();
     context.values.insert(

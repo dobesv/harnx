@@ -41,7 +41,9 @@ pub(super) fn apply_child_event(
 ) -> Option<SubAgentStatus> {
     match event {
         AgentEvent::Turn(TurnEvent::Started) => start_child_turn(state),
-        AgentEvent::Turn(TurnEvent::Ended { .. }) => finish_child_turn(state),
+        AgentEvent::Turn(TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. }) => {
+            finish_child_turn(state)
+        }
         AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
             append_child_message(state, concat_text_blocks(&blocks));
             None

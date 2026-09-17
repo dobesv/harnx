@@ -1,164 +1,76 @@
-//! Live display authority. Stop caches only reject; they never authorize durable output.
+//! Live display authority: a sequence fence over advisory output.
+//!
+//! Interruption is a durable `Cancel` in the session log; there is no worker
+//! generation id left to isolate live output by. A client's own follow loop
+//! is the only thing that can observe a `Cancel` early — from durable
+//! history, before a stale advisory queued ahead of it drains — so the fence
+//! it keeps is a sequence, not an identity: [`LiveEventState::accept_interrupt`]
+//! records the `Cancel`'s log sequence, and [`LiveEventState::should_render`]
+//! drops any advisory that predates it.
+//!
+//! Stop caches only ever reject live/advisory output; they never authorize or
+//! gate durable output, which the session log already settles on its own.
 use super::AdvisoryEnvelope;
-use anyhow::Result;
-use harnx_core::event::{AgentEvent, AgentEventSink};
-use harnx_execution_control::{CancelReceipt, ExecutionStore};
 use parking_lot::RwLock;
-use std::{collections::HashSet, sync::Arc};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 #[derive(Clone, Default, Debug)]
 pub struct LiveEventState {
-    active: Arc<RwLock<Attachment>>,
-    stopped: Arc<RwLock<HashSet<String>>>,
+    attached: Arc<RwLock<Attachment>>,
+    cancel_seq: Arc<AtomicU64>,
 }
 
+/// Per-attachment state, distinct from the cancel fence: a `fork` always
+/// gets a fresh one, while every clone of one `LiveEventState` (via `Clone`)
+/// shares it.
 #[derive(Default, Debug)]
 struct Attachment {
-    execution_id: Option<String>,
-    attached_generation: Option<String>,
     retired: bool,
 }
 
 impl LiveEventState {
-    /// A new attachment cannot be changed by the previous attachment's reader.
-    /// Retain accepted stops across prompt changes and reconnects.
+    /// A new attachment cannot be changed by the previous attachment's reader
+    /// (`same_attachment` is `Arc` identity, and this allocates a fresh one),
+    /// but it keeps the same cancel fence: an interrupt already observed
+    /// still applies to whatever this attachment goes on to read.
     pub fn fork(&self) -> Self {
         Self {
-            active: Default::default(),
-            stopped: self.stopped.clone(),
+            attached: Default::default(),
+            cancel_seq: Arc::clone(&self.cancel_seq),
         }
     }
 
-    /// A detached reader must never re-arm its queue after the UI replaces it.
+    /// A detached reader must never re-arm its queue after the UI replaces
+    /// it with a fresh attachment. Every clone of this `LiveEventState`
+    /// shares the same `Attachment`, so this reaches all of them even though
+    /// none of them changed identity.
     pub fn retire(&self) {
-        let mut attachment = self.active.write();
-        attachment.retired = true;
-        attachment.execution_id = None;
-        attachment.attached_generation = None;
-    }
-
-    pub fn replacement(&self) -> Self {
-        self.retire();
-        self.fork()
+        self.attached.write().retired = true;
     }
 
     pub fn same_attachment(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.active, &other.active)
+        Arc::ptr_eq(&self.attached, &other.attached)
     }
 
-    pub fn active(&self) -> Option<String> {
-        let attachment = self.active.read();
-        attachment
-            .attached_generation
-            .clone()
-            .or_else(|| attachment.execution_id.clone())
+    /// Drop everything emitted before `cancel_seq`: the sequence a `Cancel`
+    /// landed at in the session log, as observed by the client replaying
+    /// durable history. Monotonic — an older observation can never lower a
+    /// fence a later one already raised.
+    pub fn accept_interrupt(&self, cancel_seq: u64) {
+        self.cancel_seq.fetch_max(cancel_seq, Ordering::Relaxed);
     }
 
-    /// Dedicated followers keep their admitted UI generation. Gate refreshes
-    /// can revoke it, but cannot turn that follower into the next prompt's UI.
-    pub fn bind(&self, execution_id: String) {
-        self.active.write().attached_generation = Some(execution_id);
-    }
-
-    pub fn select(&self, execution_id: Option<String>) {
-        let mut attachment = self.active.write();
-        if !attachment.retired {
-            attachment.execution_id = execution_id;
-        }
-    }
-
-    pub fn stop(&self, execution_id: &str) {
-        self.stopped.write().insert(execution_id.into());
-    }
-
-    pub fn is_stopped(&self, execution_id: &str) -> bool {
-        self.stopped.read().contains(execution_id)
-    }
-
-    pub fn accept_stop(&self, receipt: &CancelReceipt) {
-        if receipt.cancelled {
-            if let Some(id) = &receipt.execution_id {
-                self.stop(id);
-            }
-        }
-    }
-
-    pub fn matches(&self, execution_id: Option<&str>) -> bool {
-        let attachment = self.active.read();
-        !attachment.retired
-            && attachment.execution_id.as_deref() == execution_id
-            && attachment
-                .attached_generation
-                .as_deref()
-                .is_none_or(|attached| Some(attached) == execution_id)
-    }
-
-    pub fn allows(&self, execution_id: Option<&str>) -> bool {
-        execution_id.is_some_and(|id| self.matches(Some(id)) && !self.stopped.read().contains(id))
-    }
-
+    /// Whether an advisory should be rendered: its `after_seq` must clear
+    /// both the client's last-applied durable sequence and the latest
+    /// accepted interrupt. A retired attachment renders nothing at all.
     pub fn should_render(&self, envelope: &AdvisoryEnvelope, last_durable_seq: u64) -> bool {
-        self.allows(envelope.execution_id.as_deref()) && envelope.after_seq >= last_durable_seq
-    }
-
-    /// Read authority before draining a subscription, including after reconnect.
-    /// Unknown authority fails closed; a missing ID is never inferred from an event.
-    pub async fn refresh(&self, store: &ExecutionStore, session: &str) -> Result<()> {
-        let result = self.load(store, session).await;
-        if result.is_err() {
-            self.select(None);
+        if self.attached.read().retired {
+            return false;
         }
-        result
-    }
-
-    async fn load(&self, store: &ExecutionStore, session: &str) -> Result<()> {
-        let (generation, stopped) = match store.gate_root(session).await? {
-            Some(root) => {
-                let Some(generation) = store.gate_generation_if_registered(&root, session).await?
-                else {
-                    self.select(None);
-                    return Ok(());
-                };
-                let stopped = store.gate_stop(&root, &generation).await?.is_some();
-                (generation, stopped)
-            }
-            None => {
-                let Some(operation) = store.current(session).await? else {
-                    self.select(None);
-                    return Ok(());
-                };
-                let stopped = store.is_stop_fenced(&operation.reference).await?;
-                (operation.reference, stopped)
-            }
-        };
-        if stopped {
-            self.stop(&generation.execution_id);
-        }
-        self.select(Some(generation.execution_id));
-        Ok(())
+        let fence = last_durable_seq.max(self.cancel_seq.load(Ordering::Relaxed));
+        envelope.after_seq >= fence
     }
 }
-
-/// Creation-bound follower output, including live projections of durable status.
-/// Explicit historical replay does not use this sink.
-pub(crate) struct LiveGenerationSink {
-    pub sink: Arc<dyn AgentEventSink>,
-    pub state: LiveEventState,
-    pub execution_id: String,
-}
-
-impl AgentEventSink for LiveGenerationSink {
-    fn emit(&self, event: AgentEvent) {
-        self.emit_live(event, &self.execution_id);
-    }
-
-    fn emit_live(&self, event: AgentEvent, execution_id: &str) {
-        if execution_id == self.execution_id && self.state.allows(Some(execution_id)) {
-            self.sink.emit_live(event, execution_id);
-        }
-    }
-}
-
-#[cfg(test)]
-#[path = "registration_tests.rs"]
-mod registration_tests;

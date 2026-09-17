@@ -3,6 +3,12 @@ use crate::session::{SessionLogEntry, ToolOutput};
 use crate::tool::ToolCall;
 use anyhow::{bail, Result};
 
+mod turn_status;
+pub use turn_status::{
+    current_turn_entries, current_turn_is_cancelled, last_terminator_is_cancel,
+    last_terminator_seq, prompt_interrupted_at, prompt_was_interrupted,
+};
+
 /// Apply mutation entries (EditEntries, Rewind) to build the effective entry stream.
 ///
 /// This is the canonical resolver for mutation semantics:
@@ -234,30 +240,52 @@ impl<'a, T: PhysicalSessionEntry> ActiveContextWindow<'a, T> {
 }
 
 pub fn active_context_window<T: PhysicalSessionEntry>(entries: &[T]) -> ActiveContextWindow<'_, T> {
-    let boundary_index = entries
-        .iter()
-        .rposition(|entry| is_context_boundary(entry.entry()));
-    match boundary_index {
-        Some(index) => ActiveContextWindow {
-            entries: &entries[index + 1..],
-            boundary_index: Some(index),
-        },
-        None => ActiveContextWindow {
-            entries,
-            boundary_index: None,
-        },
+    let start = after_last(entries, |entry| is_context_boundary(entry.entry()));
+    ActiveContextWindow {
+        entries: &entries[start..],
+        boundary_index: start.checked_sub(1),
     }
+}
+
+/// Where the suffix after the last entry matching `boundary` begins, or 0 when
+/// nothing matches. Every boundary in this module -- a compaction point, a turn
+/// barrier, a turn terminator -- cuts the log the same way, so they all read
+/// their suffix from here rather than repeating the off-by-one.
+fn after_last<T>(entries: &[T], boundary: impl Fn(&T) -> bool) -> usize {
+    entries
+        .iter()
+        .rposition(boundary)
+        .map_or(0, |index| index + 1)
 }
 
 fn is_context_boundary(entry: &SessionLogEntry) -> bool {
     matches!(entry, SessionLogEntry::Compress { .. })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrphanToolCalls {
+    pub seq: u64,
+    pub calls: Vec<ToolCall>,
+}
+
+// `ToolCall` doesn't implement `Eq` (it holds a `serde_json::Value`
+// argument bag), so neither this enum nor `OrphanToolCalls` can derive it;
+// `PartialEq` is all `assert_eq!`/`matches!` in the tests need.
+#[derive(Debug, Clone, PartialEq)]
 pub enum TurnStatus {
     Idle,
-    InFlightResumable,
-    InFlightCancelled,
+    /// The last terminator is a Cancel and at least one ToolCalls entry before
+    /// it has no ToolResults anywhere in the log. The worker must wind up.
+    InterruptedPendingWindUp {
+        cancel_seq: u64,
+        cancellation_id: Option<String>,
+        orphans: Vec<OrphanToolCalls>,
+    },
+    /// A user message follows the last terminator; `orphans` are ToolCalls in
+    /// this turn without results.
+    InFlightResumable {
+        orphans: Vec<OrphanToolCalls>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -368,7 +396,10 @@ struct ReplayAccumulator {
     resumable_last_assistant: Option<AssistantTurn>,
     pending_tool_results: Vec<ToolOutput>,
     active_fence_token: Option<u64>,
-    cancel_fence_token: Option<u64>,
+    /// ToolCalls of the current turn that have no ToolResults yet, in order.
+    open_calls: Vec<OrphanToolCalls>,
+    /// Set by Cancel: the interrupted turn's still-open calls and the Cancel identity.
+    interrupted: Option<(u64, Option<String>, Vec<OrphanToolCalls>)>,
 }
 
 impl ReplayAccumulator {
@@ -379,15 +410,29 @@ impl ReplayAccumulator {
 
     fn apply_entry_with_seq(&mut self, log_seq: Option<usize>, entry: &SessionLogEntry) {
         match entry {
-            SessionLogEntry::Cancel { fence_token } => self.on_cancel(*fence_token),
+            SessionLogEntry::Cancel {
+                cancellation_id, ..
+            } => self.on_cancel(
+                log_seq.map_or(0, |s| u64::try_from(s).unwrap_or(0)),
+                cancellation_id.clone(),
+            ),
             SessionLogEntry::Message { role, .. } if role.is_user() => {
                 self.on_user_message_with_seq(log_seq, entry)
             }
             SessionLogEntry::Message { role, .. } if role.is_assistant() => {
                 self.on_assistant_message(entry)
             }
-            SessionLogEntry::ToolCalls { .. } => self.on_tool_calls(entry),
-            SessionLogEntry::ToolResults { results, .. } => self.on_tool_results(results),
+            SessionLogEntry::ToolCalls { calls, .. } => {
+                self.open_calls.push(OrphanToolCalls {
+                    seq: log_seq.map_or(0, |s| u64::try_from(s).unwrap_or(0)),
+                    calls: calls.clone(),
+                });
+                self.on_tool_calls(entry)
+            }
+            SessionLogEntry::ToolResults { results, .. } => {
+                self.close_calls(results);
+                self.on_tool_results(results)
+            }
             _ => {}
         }
     }
@@ -398,17 +443,34 @@ impl ReplayAccumulator {
             Some(AssistantTurn::ToolCalls { .. })
         );
 
-        if let Some(fence_token) = self.cancel_fence_token {
-            return ReconstructedState {
-                turn_status: TurnStatus::InFlightCancelled,
-                next_turn_messages: Vec::new(),
-                resumable_ctx: Some(ResumableCtx {
-                    last_user: None,
-                    last_assistant: None,
-                    pending_tool_results: Vec::new(),
-                    fence_token: Some(fence_token),
-                }),
-            };
+        if let Some((cancel_seq, cancellation_id, orphans)) = self.interrupted {
+            if !orphans.is_empty() {
+                // The Cancel still has tool calls nobody answered. This holds
+                // regardless of anything queued after the Cancel: the worker
+                // owes those calls a result before the turn can be considered
+                // over, so report the accumulated next_turn_messages too
+                // rather than dropping a steering message on the floor.
+                return ReconstructedState {
+                    turn_status: TurnStatus::InterruptedPendingWindUp {
+                        cancel_seq,
+                        cancellation_id,
+                        orphans,
+                    },
+                    next_turn_messages: self.next_turn_messages,
+                    resumable_ctx: None,
+                };
+            }
+            if self.next_turn_messages.is_empty() {
+                return ReconstructedState {
+                    turn_status: TurnStatus::Idle,
+                    next_turn_messages: Vec::new(),
+                    resumable_ctx: None,
+                };
+            }
+            // No tool call is still waiting on a result (either none were
+            // made, or all were answered), and a user message followed the
+            // Cancel: the interruption is fully resolved, so fall through
+            // and report the new turn's messages normally.
         }
 
         if !self.next_turn_messages.is_empty() && !is_resumable {
@@ -422,7 +484,9 @@ impl ReplayAccumulator {
         let next_turn_messages = self.next_turn_messages;
         ReconstructedState {
             turn_status: if is_resumable {
-                TurnStatus::InFlightResumable
+                TurnStatus::InFlightResumable {
+                    orphans: self.open_calls,
+                }
             } else {
                 TurnStatus::Idle
             },
@@ -440,8 +504,40 @@ impl ReplayAccumulator {
         }
     }
 
-    fn on_cancel(&mut self, fence_token: u64) {
-        self.cancel_fence_token = Some(fence_token);
+    /// Remove any open call (queued or already recorded on an interrupted
+    /// turn) that this batch of results answers. A round with several calls
+    /// can be answered partially: only the answered calls are dropped from
+    /// an entry, and the entry itself is dropped only once every call in it
+    /// has been answered (an unset `id` never counts as answered).
+    fn close_calls(&mut self, results: &[ToolOutput]) {
+        let answered: std::collections::HashSet<&str> =
+            results.iter().filter_map(|r| r.id.as_deref()).collect();
+        let close = |orphans: &mut Vec<OrphanToolCalls>| {
+            for orphan in orphans.iter_mut() {
+                orphan
+                    .calls
+                    .retain(|c| !c.id.as_deref().is_some_and(|id| answered.contains(id)));
+            }
+            orphans.retain(|o| !o.calls.is_empty());
+        };
+        close(&mut self.open_calls);
+        if let Some((_, _, orphans)) = self.interrupted.as_mut() {
+            close(orphans);
+        }
+    }
+
+    fn on_cancel(&mut self, seq: u64, cancellation_id: Option<String>) {
+        let mut orphans = std::mem::take(&mut self.open_calls);
+        // A repeated Cancel with no intervening ToolCalls/ToolResults (a
+        // client retrying cancellation, or two independent cancel sources)
+        // must not forget orphans the previous Cancel already recorded: carry
+        // them forward and only update the cancel identity to the latest.
+        if let Some((_, _, mut previous_orphans)) = self.interrupted.take() {
+            previous_orphans.append(&mut orphans);
+            orphans = previous_orphans;
+        }
+        self.interrupted = Some((seq, cancellation_id, orphans));
+        self.next_turn_messages.clear();
         self.resumable_last_user = None;
         self.resumable_last_assistant = None;
         self.pending_tool_results.clear();
@@ -462,11 +558,11 @@ impl ReplayAccumulator {
             message.log_seq = Some(seq);
         }
 
-        if self.cancel_fence_token.is_some() {
-            self.cancel_fence_token = None;
-            self.next_turn_messages.clear();
-        }
-
+        // A user message never clears `interrupted`: if the Cancel it
+        // followed left tool calls unanswered, the turn still owes the
+        // worker a wind-up regardless of what the user says next (see
+        // `finish`). Messages queued before the Cancel were already
+        // discarded there, so there is nothing left to clear here.
         if matches!(
             self.resumable_last_assistant,
             Some(AssistantTurn::ToolCalls { .. })
@@ -488,11 +584,11 @@ impl ReplayAccumulator {
         self.resumable_last_assistant = None;
         self.pending_tool_results.clear();
         self.active_fence_token = None;
-        self.cancel_fence_token = None;
+        self.interrupted = None;
     }
 
     fn on_tool_calls(&mut self, entry: &SessionLogEntry) {
-        if self.cancel_fence_token.is_some() {
+        if self.interrupted.is_some() {
             return;
         }
 
@@ -525,7 +621,7 @@ impl ReplayAccumulator {
     }
 
     fn on_tool_results(&mut self, results: &[ToolOutput]) {
-        if self.cancel_fence_token.is_none()
+        if self.interrupted.is_none()
             && matches!(
                 self.resumable_last_assistant,
                 Some(AssistantTurn::ToolCalls { .. })
@@ -559,33 +655,16 @@ fn cloned_message(entry: &SessionLogEntry) -> Option<Message> {
 
 #[allow(dead_code)]
 fn entries_after_last_barrier(entries: &[SessionLogEntry]) -> &[SessionLogEntry] {
-    let last_barrier = entries
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, entry)| is_terminal_barrier(entry).then_some(index));
-
-    last_barrier.map_or(entries, |index| &entries[index + 1..])
+    &entries[after_last(entries, is_terminal_barrier)..]
 }
 
 fn entries_after_last_barrier_with_seq(
     entries: &[(Option<usize>, SessionLogEntry)],
 ) -> Vec<(Option<usize>, &SessionLogEntry)> {
-    let last_barrier = entries
+    entries[after_last(entries, |(_, entry)| is_terminal_barrier(entry))..]
         .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, (_, entry))| is_terminal_barrier(entry).then_some(index));
-
-    last_barrier.map_or_else(
-        || entries.iter().map(|(seq, e)| (*seq, e)).collect(),
-        |index| {
-            entries[index + 1..]
-                .iter()
-                .map(|(seq, e)| (*seq, e))
-                .collect()
-        },
-    )
+        .map(|(seq, entry)| (*seq, entry))
+        .collect()
 }
 
 fn is_terminal_barrier(entry: &SessionLogEntry) -> bool {
@@ -603,6 +682,80 @@ fn is_terminal_barrier(entry: &SessionLogEntry) -> bool {
             ..
         } | SessionLogEntry::Error { .. }
     )
+}
+
+/// Builds a "user -> tool calls -> cancel [-> user]" log: a user message, one
+/// `ToolCalls` entry that never gets a matching `ToolResults` (an orphan), a
+/// `Cancel`, and -- when `trailing_user` is set -- one more user message
+/// appended after it. Shared between `tests` (which replays it through
+/// `reconstruct_state`, seq-agnostic) and `turn_status_tests` (which needs
+/// the explicit NATS sequence numbers for `reconstruct_state_from_nats`).
+#[cfg(test)]
+fn cancel_after_orphan_tool_call(trailing_user: bool) -> Vec<(u64, SessionLogEntry)> {
+    let mut log = vec![
+        (
+            1,
+            SessionLogEntry::Message {
+                id: None,
+                role: MessageRole::User,
+                content: crate::message::MessageContent::Text("go".to_string()),
+                timestamp: None,
+                fence_token: None,
+            },
+        ),
+        (
+            2,
+            SessionLogEntry::ToolCalls {
+                text: String::new(),
+                thought: None,
+                calls: vec![ToolCall {
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({}),
+                    id: Some("c1".to_string()),
+                    thought_signature: None,
+                    reasoning_provenance: None,
+                }],
+                timestamp: None,
+                fence_token: None,
+            },
+        ),
+        (
+            3,
+            SessionLogEntry::cancel_request("x".to_string(), "tui:t".to_string()),
+        ),
+    ];
+    if trailing_user {
+        log.push((
+            4,
+            SessionLogEntry::Message {
+                id: None,
+                role: MessageRole::User,
+                content: crate::message::MessageContent::Text("steer".to_string()),
+                timestamp: None,
+                fence_token: None,
+            },
+        ));
+    }
+    log
+}
+
+/// A `ToolResults` entry answering call id `"c1"` with an ok result. Shared
+/// between `tests::tool_results` and `turn_status_tests::results`, which
+/// otherwise built the same `ToolOutput` independently; neither module's
+/// assertions depend on the specific id/name, only on a result existing.
+#[cfg(test)]
+fn tool_result_ok() -> SessionLogEntry {
+    SessionLogEntry::ToolResults {
+        results: vec![ToolOutput {
+            id: Some("c1".to_string()),
+            name: "bash".to_string(),
+            output: serde_json::json!({"ok": true}),
+            markdown: None,
+            content: Vec::new(),
+            switch_agent: None,
+        }],
+        timestamp: None,
+    }
 }
 
 #[cfg(test)]
@@ -643,7 +796,7 @@ mod tests {
         let failed_turn = vec![
             user_message("u1"),
             tool_calls_assistant(7),
-            tool_results("tool-a"),
+            tool_results(),
             worker_error(7),
         ];
         assert_case(
@@ -729,7 +882,7 @@ mod tests {
     #[test]
     fn tool_results_without_matching_tool_calls_are_ignored() {
         assert_case(
-            vec![final_assistant("done"), tool_results("tool-a")],
+            vec![final_assistant("done"), tool_results()],
             ExpectedState::Idle {
                 next_turn_messages: &[],
             },
@@ -744,7 +897,7 @@ mod tests {
                 user_message("u1"),
                 tool_calls_assistant(7),
                 user_message("u2"),
-                tool_results("tool-a"),
+                tool_results(),
             ],
             ExpectedState::Resumable {
                 fence_token: Some(7),
@@ -768,7 +921,7 @@ mod tests {
             tool_calls_assistant(7),
         ];
         entries.extend(injected_user.map(user_message));
-        entries.extend([tool_results("tool-a"), tool_calls_assistant(8)]);
+        entries.extend([tool_results(), tool_calls_assistant(8)]);
         entries.extend(queued_user.map(user_message));
         assert_case(
             entries,
@@ -789,51 +942,67 @@ mod tests {
         assert_later_tool_round(None, Some("queued"), "u1", &["queued"]);
     }
 
+    /// The shared cancel-after-orphan log behind a turn barrier, replayed
+    /// without sequence numbers the way `reconstruct_state` reads it.
+    fn barrier_then_cancel_after_orphan(trailing_user: bool) -> Vec<SessionLogEntry> {
+        let mut entries = vec![final_assistant("done")];
+        entries.extend(
+            cancel_after_orphan_tool_call(trailing_user)
+                .into_iter()
+                .map(|(_, entry)| entry),
+        );
+        entries
+    }
+
     #[test]
     fn cancel_after_tool_calls_marks_inflight_cancelled() {
         assert_case(
-            vec![
-                final_assistant("done"),
-                user_message("u1"),
-                tool_calls_assistant(7),
-                cancel(7),
-            ],
+            barrier_then_cancel_after_orphan(false),
             ExpectedState::Cancelled {
-                fence_token: Some(7),
+                next_turn_messages: &[],
             },
         );
     }
 
+    /// The cancelled tool call is still unanswered, so a message sent while
+    /// wind-up is pending does not clear it back to a plain new turn: the
+    /// worker still owes the call a result (see `turn_status_tests` for the
+    /// precise `InterruptedPendingWindUp` shape this produces).
     #[test]
-    fn user_after_cancel_starts_next_turn_and_clears_tombstone() {
+    fn user_after_cancel_keeps_pending_wind_up_when_orphan_is_unanswered() {
         assert_case(
-            vec![
-                final_assistant("done"),
-                user_message("u1"),
-                tool_calls_assistant(7),
-                cancel(7),
-                user_message("u2"),
-            ],
-            ExpectedState::Idle {
-                next_turn_messages: &["u2"],
+            barrier_then_cancel_after_orphan(true),
+            ExpectedState::Cancelled {
+                next_turn_messages: &["steer"],
             },
         );
     }
 
+    /// The second Cancel must not forget the first Cancel's still-unanswered
+    /// orphan: the tool call from `tool_calls_assistant(7)` never got a
+    /// result, so this stays a pending wind-up under the latest cancel's seq
+    /// rather than collapsing to `Idle`.
     #[test]
     fn latest_cancel_tombstone_wins() {
-        assert_case(
-            vec![
-                final_assistant("done"),
-                user_message("u1"),
-                tool_calls_assistant(7),
-                cancel(7),
-                cancel(8),
-            ],
-            ExpectedState::Cancelled {
-                fence_token: Some(8),
-            },
-        );
+        let state = reconstruct_state(&[
+            final_assistant("done"),
+            user_message("u1"),
+            tool_calls_assistant(7),
+            cancel(7),
+            cancel(8),
+        ]);
+        match state.turn_status {
+            TurnStatus::InterruptedPendingWindUp {
+                cancel_seq,
+                orphans,
+                ..
+            } => {
+                assert_eq!(cancel_seq, 4, "the latest cancel's own log seq wins");
+                assert_eq!(orphans.len(), 1);
+            }
+            other => panic!("expected wind-up under the latest cancel, got {other:?}"),
+        }
+        assert!(state.next_turn_messages.is_empty());
     }
 
     #[test]
@@ -841,7 +1010,7 @@ mod tests {
         assert_case(
             vec![cancel(9)],
             ExpectedState::Cancelled {
-                fence_token: Some(9),
+                next_turn_messages: &[],
             },
         );
     }
@@ -849,7 +1018,7 @@ mod tests {
     #[test]
     fn tool_results_without_tool_calls_after_barrier_stay_idle() {
         assert_case(
-            vec![final_assistant("done"), tool_results("tool-a")],
+            vec![final_assistant("done"), tool_results()],
             ExpectedState::Idle {
                 next_turn_messages: &[],
             },
@@ -1107,7 +1276,7 @@ mod tests {
             next_turn_messages: &'a [&'a str],
         },
         Cancelled {
-            fence_token: Option<u64>,
+            next_turn_messages: &'a [&'a str],
         },
     }
 
@@ -1130,7 +1299,10 @@ mod tests {
                 pending_tool_results_len,
                 next_turn_messages,
             } => {
-                assert_eq!(state.turn_status, TurnStatus::InFlightResumable);
+                assert!(matches!(
+                    state.turn_status,
+                    TurnStatus::InFlightResumable { .. }
+                ));
                 assert_next_turn_messages(&state.next_turn_messages, next_turn_messages);
                 let ctx = state.resumable_ctx.expect("resumable ctx");
                 assert_eq!(ctx.fence_token, fence_token);
@@ -1148,14 +1320,13 @@ mod tests {
                 }
                 assert_eq!(ctx.pending_tool_results.len(), pending_tool_results_len);
             }
-            ExpectedState::Cancelled { fence_token } => {
-                assert_eq!(state.turn_status, TurnStatus::InFlightCancelled);
-                assert!(state.next_turn_messages.is_empty());
-                let ctx = state.resumable_ctx.expect("cancel ctx");
-                assert_eq!(ctx.fence_token, fence_token);
-                assert!(ctx.last_user.is_none());
-                assert!(ctx.last_assistant.is_none());
-                assert!(ctx.pending_tool_results.is_empty());
+            ExpectedState::Cancelled { next_turn_messages } => {
+                assert!(matches!(
+                    state.turn_status,
+                    TurnStatus::Idle | TurnStatus::InterruptedPendingWindUp { .. }
+                ));
+                assert_next_turn_messages(&state.next_turn_messages, next_turn_messages);
+                assert!(state.resumable_ctx.is_none());
             }
         }
     }
@@ -1233,18 +1404,11 @@ mod tests {
         }
     }
 
-    fn tool_results(name: &str) -> SessionLogEntry {
-        SessionLogEntry::ToolResults {
-            results: vec![ToolOutput {
-                id: Some("call-1".to_string()),
-                name: name.to_string(),
-                output: json!({"ok": true}),
-                markdown: None,
-                content: vec![],
-                switch_agent: None,
-            }],
-            timestamp: None,
-        }
+    /// A `ToolResults` entry closing out the turn's open tool call. No test
+    /// in this module inspects its id/name, so it shares `tool_result_ok`'s
+    /// fixed values with `turn_status_tests::results`.
+    fn tool_results() -> SessionLogEntry {
+        tool_result_ok()
     }
 
     #[test]
@@ -1363,6 +1527,11 @@ mod tests {
     }
 
     fn cancel(fence_token: u64) -> SessionLogEntry {
-        SessionLogEntry::Cancel { fence_token }
+        SessionLogEntry::Cancel {
+            fence_token,
+            cancellation_id: None,
+            requested_by: None,
+            timestamp: None,
+        }
     }
 }

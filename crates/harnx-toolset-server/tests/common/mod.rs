@@ -14,10 +14,12 @@ use async_trait::async_trait;
 use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
-    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolSpec, Toolset, HDR_CALL_ID,
-    HDR_IDEMPOTENCY_KEY,
+    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolRequest, ToolSpec, Toolset,
+    HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
 };
-use harnx_toolset_server::{serve_with_shutdown, ServeLifecycle};
+use harnx_toolset_server::{
+    invocation_journal::InvocationJournal, serve_with_shutdown, ServeLifecycle,
+};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -143,7 +145,9 @@ pub(crate) struct TestToolset {
     pub(crate) idempotent: bool,
     pub(crate) echo_invocations: Arc<AtomicUsize>,
     pub(crate) slow_started: Arc<Notify>,
-    pub(crate) slow_cancelled: Arc<Notify>,
+    /// Notified once a cancelled handler has run to completion, including any
+    /// cleanup it parked in.
+    pub(crate) slow_finished: Arc<Notify>,
     pub(crate) allow_cleanup: Arc<Notify>,
     pub(crate) last_context: Arc<Mutex<Option<ToolInvocationContext>>>,
     pub(crate) reply_barriers: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
@@ -162,7 +166,7 @@ impl TestToolset {
             idempotent: false,
             echo_invocations: Arc::default(),
             slow_started: Arc::default(),
-            slow_cancelled: Arc::default(),
+            slow_finished: Arc::default(),
             allow_cleanup: Arc::default(),
             last_context: Arc::default(),
             reply_barriers: None,
@@ -198,7 +202,7 @@ impl Toolset for TestToolset {
         match tool {
             "echo" => {
                 self.echo_invocations.fetch_add(1, Ordering::SeqCst);
-                if args.get("gate_result").and_then(Value::as_bool) == Some(true) {
+                if args.get("park_result").and_then(Value::as_bool) == Some(true) {
                     self.slow_started.notify_one();
                     self.allow_cleanup.notified().await;
                 }
@@ -212,6 +216,11 @@ impl Toolset for TestToolset {
                     ready.wait().await;
                     release.wait().await;
                 }
+                if args.get("cancel_before_returning").and_then(Value::as_bool) == Some(true) {
+                    // Reproduce the poll in which a cancellation lands between a
+                    // tool returning and the server observing its result.
+                    cancel.cancel();
+                }
                 Ok(args)
             }
             "never" => {
@@ -221,10 +230,10 @@ impl Toolset for TestToolset {
             "slow" => {
                 self.slow_started.notify_one();
                 cancel.cancelled().await;
-                self.slow_cancelled.notify_one();
-                if args.get("gate_cleanup").and_then(Value::as_bool) == Some(true) {
+                if args.get("park_cleanup").and_then(Value::as_bool) == Some(true) {
                     self.allow_cleanup.notified().await;
                 }
+                self.slow_finished.notify_one();
                 Err(ToolInvokeError::Fatal("cancelled".to_string()))
             }
             _ => Err(ToolInvokeError::Recoverable("unknown tool".to_string())),
@@ -236,6 +245,17 @@ impl Toolset for TestToolset {
         invocation: ToolInvocation,
     ) -> Result<Value, ToolInvokeError> {
         *self.last_context.lock().await = Some(invocation.context.clone());
+        // `checkpoint` in the arguments stands in for a tool that publishes a
+        // durable handle to remote work before it starts running.
+        if let (Some(store), Some(handle)) = (
+            invocation.context.checkpoint_store.as_ref(),
+            invocation.args.get("checkpoint").cloned(),
+        ) {
+            store
+                .checkpoint(handle)
+                .await
+                .map_err(|error| ToolInvokeError::Fatal(format!("{error:#}")))?;
+        }
         self.invoke(&invocation.tool, invocation.args, invocation.cancel)
             .await
     }
@@ -411,4 +431,163 @@ fn first_nats_client_url(dir: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Spawn a broker and open the invocation journal against it. The handle keeps
+/// `nats-server` alive for as long as the caller holds it.
+pub(crate) async fn journal() -> (NatsServerHandle, InvocationJournal) {
+    let server = spawn_nats_server()
+        .await
+        .expect("spawn nats-server")
+        .expect("nats-server binary is required for journal tests");
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await
+        .expect("connect to the test broker");
+    let journal = InvocationJournal::ensure(&async_nats::jetstream::new(client), 1)
+        .await
+        .expect("ensure the invocation journal bucket");
+    (server, journal)
+}
+
+/// A session-scoped `echo` request whose operation ID matches its call ID.
+pub(crate) fn request(session: &str, call_id: &str) -> ToolRequest {
+    ToolRequest {
+        replay: None,
+        operation_id: call_id.to_string(),
+        call_id: call_id.to_string(),
+        tool: "echo".to_string(),
+        args: json!({"value": 42}),
+        parent_session_id: Some(session.to_string()),
+        tool_call_id: Some("model-call".to_string()),
+        capabilities: Default::default(),
+    }
+}
+
+/// A minimal [`ToolSpec`] for a tool that exists only to be named; tests that
+/// build their own [`Toolset`] to exercise `serve` never actually invoke it.
+pub(crate) fn tool_spec(name: &str) -> ToolSpec {
+    ToolSpec {
+        cancellation_guarantee: Default::default(),
+        name: name.to_string(),
+        description: format!("{name} tool"),
+        input_schema: json!({ "type": "object" }),
+        idempotent_hint: false,
+        read_only_hint: false,
+        timeout_secs: None,
+        meta: None,
+    }
+}
+
+/// A running tool server hosting an arbitrary [`Toolset`], for tests that
+/// need to drive `Toolset::cancel` directly instead of going through
+/// [`TestToolset`].
+pub(crate) struct ServedToolset {
+    identity: String,
+    instance_id: ServerScope,
+    _server: NatsServerHandle,
+    server_task: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl ServedToolset {
+    /// The identity token this server registered under, i.e. the `server`
+    /// field a `ControlMessage` must carry to reach it.
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub(crate) fn control_subject(&self) -> String {
+        self.instance_id.control_subject()
+    }
+}
+
+impl Drop for ServedToolset {
+    fn drop(&mut self) {
+        self.server_task.abort();
+    }
+}
+
+/// Spawn a broker and serve `toolset` against it, waiting for its
+/// registration to publish (and therefore its subscriptions to be live)
+/// before returning. Returns a handle to address it by control subject, a
+/// client connected to the same broker, and an `InvocationJournal` opened
+/// against the same durable bucket the server itself uses.
+pub(crate) async fn serve<T: Toolset + 'static>(
+    toolset: T,
+) -> (ServedToolset, async_nats::Client, InvocationJournal) {
+    let server = spawn_nats_server()
+        .await
+        .expect("spawn nats-server")
+        .expect("nats-server binary is required for this test");
+    let instance_id = ServerScope::new();
+    let readiness = harnx_healthz::Readiness::default();
+    let shutdown = CancellationToken::new();
+    let identity = harnx_toolset::server_identity_token(None, "", toolset.name());
+    let server_client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await
+        .expect("connect tool server to test broker");
+    let server_instance_id = instance_id.clone();
+    let server_shutdown = shutdown.clone();
+    let server_task = tokio::spawn(async move {
+        serve_with_shutdown(
+            Arc::new(toolset),
+            server_instance_id,
+            NatsConnection {
+                client: server_client,
+                replicas: 1,
+            },
+            ServeLifecycle::new(server_shutdown, Some(readiness)),
+        )
+        .await
+    });
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await
+        .expect("connect test client to test broker");
+    wait_for_registration_key(&client, &instance_id, &identity).await;
+    let journal = InvocationJournal::ensure(&async_nats::jetstream::new(client.clone()), 1)
+        .await
+        .expect("ensure the invocation journal bucket");
+    (
+        ServedToolset {
+            identity,
+            instance_id,
+            _server: server,
+            server_task,
+        },
+        client,
+        journal,
+    )
+}
+
+/// Poll until `identity`'s registration key appears. `serve_configured`
+/// subscribes before it publishes the registration, so this is also the
+/// signal that the server is ready to answer control messages.
+async fn wait_for_registration_key(
+    client: &async_nats::Client,
+    instance_id: &ServerScope,
+    identity: &str,
+) {
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(store) = jetstream
+            .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
+            .await
+        {
+            let key = harnx_toolset_server::registration_key(instance_id, identity);
+            if matches!(store.get(&key).await, Ok(Some(_))) {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for tool registration under identity '{identity}'"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

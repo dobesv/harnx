@@ -146,6 +146,11 @@ pub enum TurnEvent {
     Ended {
         outcome: TurnOutcome,
     },
+    /// The turn ended because the session was interrupted. Frontends treat it
+    /// like `Ended` for busy state; no `TurnEnd` log entry follows.
+    Interrupted {
+        cancellation_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,12 +338,6 @@ pub struct AgentHandoff {
 /// sink can be held as `Arc<dyn AgentEventSink>`.
 pub trait AgentEventSink: Send + Sync {
     fn emit(&self, event: AgentEvent);
-
-    /// Forward live output without replacing its creation-time execution ID.
-    /// Historical replay and local UI notices continue to use `emit`.
-    fn emit_live(&self, event: AgentEvent, _execution_id: &str) {
-        self.emit(event);
-    }
 }
 
 /// A no-op sink useful for tests or code paths that run before a real sink

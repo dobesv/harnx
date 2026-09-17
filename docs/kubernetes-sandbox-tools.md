@@ -291,10 +291,14 @@ The MCP response budget defaults to 25 hours so it doesn't shorten
 `bash_exec`'s documented 24-hour foreground default. Setting the response
 budget to `0` disables it. When the budget expires, the gateway sends a bounded
 best-effort `notifications/cancelled` and drops this request's response waiter.
-A late reply is ignored. This timeout is **not proof that sandbox execution
-stopped**; the invocation owner reports cleanup as `Unconfirmed`. Cancellation
-doesn't invalidate the shared MCP session or kill the sandbox, so other calls
-continue on the same connection.
+A late reply is ignored. The call itself comes back as a recoverable
+`DeadlineExceeded` tool error, which the agent can read and act on. This timeout
+is **not proof that sandbox execution stopped**, and nothing reports back that it
+did. If the turn was interrupted rather than merely timed out, the call is
+answered a different way: wind-up writes it a placeholder result, and a worker
+that resumes re-sends the cancel from the invocation journal, which is
+idempotent. Cancellation doesn't invalidate the shared MCP session or kill the
+sandbox, so other calls continue on the same connection.
 
 Permanent handler errors remain recoverable tool results when the agent can
 correct its request. Transport lifecycle death and result serialization are

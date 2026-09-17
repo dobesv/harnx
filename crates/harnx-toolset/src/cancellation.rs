@@ -1,52 +1,48 @@
-//! Protocol v4 separates durable stop acceptance from physical cleanup.
+//! Session- and call-scoped tool cancellation.
 //!
-//! The `CancelAcceptance` tagged enum (`Accepted`, `AlreadyFinished`, `Rejected`,
-//! `Unknown`) is independent from the optional `CleanupStatus` field. This replaces
-//! the v3 `stopped: bool` field which conflated logical acceptance with physical cleanup.
-//!
-//! Protocol v4 requires atomic deployment: workers and tool-servers must be upgraded
-//! together. V3 clients receive a rejection with guidance to "upgrade workers and tool
-//! servers together".
+//! A cancel is addressed by `(session_id, call_id)` rather than by
+//! execution-control generation ownership: whichever process holds the
+//! session's log can request one, and the acknowledgement reports whether the
+//! tool server accepted it, the call had already finished, it was rejected,
+//! or the server cannot tell (retry with the same `cancellation_id`).
 
-use harnx_execution_control::{CleanupStatus, ExecutionContext, OperationRef, StopReceipt};
 use serde::{Deserialize, Serialize};
 
-pub const TOOL_PROTOCOL_VERSION: u32 = 4;
+pub const TOOL_PROTOCOL_VERSION: u32 = 5;
 
+/// Whether a cancel request was accepted, and if not, why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CancelAcceptance {
-    Accepted {
-        stop: StopReceipt,
-    },
+    Accepted,
     AlreadyFinished,
     Rejected {
         reason: String,
     },
-    /// The durable stop may have committed. Retry with the same cancellation ID.
+    /// The cancel may have committed. Retry with the same cancellation ID.
     Unknown {
         reason: String,
     },
 }
 
+/// Reply to one [`ControlMessage`], addressed back by session and call id.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancellationAcknowledgement {
     pub protocol_version: u32,
-    pub generation: OperationRef,
-    pub operation_id: String,
+    pub session_id: String,
+    pub call_id: String,
     pub cancellation_id: String,
     pub acceptance: CancelAcceptance,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cleanup: Option<CleanupStatus>,
 }
 
-/// Generation-bound, idempotent request to the resource owner. The server name
-/// prevents another subscriber on the shared control subject from answering it.
+/// Request to cancel one tool invocation, addressed by session and call id.
+/// The server name prevents another subscriber on a shared control subject
+/// from answering on its behalf.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlMessage {
     pub protocol_version: u32,
-    pub execution: ExecutionContext,
     pub server: String,
+    pub session_id: String,
     pub operation_id: String,
     pub cancellation_id: String,
     pub call_id: String,
@@ -60,30 +56,30 @@ pub enum ControlKind {
 }
 
 impl ControlMessage {
-    pub fn cancel(execution: ExecutionContext, server: String, cancellation_id: String) -> Self {
+    pub fn cancel(
+        server: String,
+        session_id: String,
+        call_id: String,
+        cancellation_id: String,
+    ) -> Self {
         Self {
             protocol_version: TOOL_PROTOCOL_VERSION,
-            operation_id: execution.operation().execution_id.clone(),
-            call_id: execution.operation().execution_id.clone(),
-            execution,
             server,
+            session_id,
+            operation_id: call_id.clone(),
             cancellation_id,
+            call_id,
             kind: ControlKind::Cancel,
         }
     }
 
-    pub fn acknowledgement(
-        &self,
-        acceptance: CancelAcceptance,
-        cleanup: Option<CleanupStatus>,
-    ) -> CancellationAcknowledgement {
+    pub fn acknowledgement(&self, acceptance: CancelAcceptance) -> CancellationAcknowledgement {
         CancellationAcknowledgement {
             protocol_version: TOOL_PROTOCOL_VERSION,
-            generation: self.execution.generation().clone(),
-            operation_id: self.operation_id.clone(),
+            session_id: self.session_id.clone(),
+            call_id: self.call_id.clone(),
             cancellation_id: self.cancellation_id.clone(),
             acceptance,
-            cleanup,
         }
     }
 }

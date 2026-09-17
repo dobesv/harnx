@@ -76,7 +76,7 @@ async fn late_subscriber_gets_history_then_live() -> Result<()> {
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
 
     // Create session and append some entries to the DURABLE log
-    let backend = generation::output_backend(&jetstream, &session_id).await?;
+    let backend = generation::fenced_backend(&jetstream, &session_id).await?;
 
     // Append Message (user)
     let user_msg = SessionLogEntry::Message {
@@ -153,7 +153,7 @@ async fn attached_stream_refreshes_delayed_turn_end() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
-    let backend = generation::output_backend(&jetstream, &session_id).await?;
+    let backend = generation::fenced_backend(&jetstream, &session_id).await?;
 
     let user_seq = backend.append_event_blocking(&SessionLogEntry::Message {
         id: None,
@@ -213,7 +213,7 @@ async fn advisory_envelope_dedup_by_after_seq() -> Result<()> {
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
 
     // Create session and append entries to durable log
-    let backend = generation::output_backend(&jetstream, &session_id).await?;
+    let backend = generation::fenced_backend(&jetstream, &session_id).await?;
 
     let user_msg = SessionLogEntry::Message {
         id: None,
@@ -273,7 +273,7 @@ async fn advisory_dropout_converges_from_durable_log() -> Result<()> {
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
 
     // Create session and append durable state
-    let backend = generation::output_backend(&jetstream, &session_id).await?;
+    let backend = generation::fenced_backend(&jetstream, &session_id).await?;
 
     // User message and assistant response (authoritative)
     let user_msg = SessionLogEntry::Message {

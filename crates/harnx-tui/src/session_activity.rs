@@ -27,7 +27,7 @@ impl Tui {
         observation: SessionObservation,
         active: bool,
     ) {
-        if !observation.accepts(self, !observation.historical || active) {
+        if !observation.accepts(self) {
             return;
         }
         let target = observation.target.clone();
@@ -60,7 +60,7 @@ impl Tui {
                 self.refresh_shared_session_transcript(&observation.stamp)
                     .await;
             }
-            if observation.accepts(self, !observation.historical) {
+            if observation.accepts(self) {
                 self.complete_main_prompt().await;
             }
         }
@@ -71,7 +71,7 @@ impl Tui {
         observation: SessionObservation,
         event: AgentEvent,
     ) {
-        if !observation.accepts(self, !observation.historical) {
+        if !observation.accepts(self) {
             return;
         }
         if observation.historical
@@ -80,12 +80,15 @@ impl Tui {
             return;
         }
         let refresh_before = matches!(event, AgentEvent::Turn(TurnEvent::Started));
-        let refresh_after = matches!(event, AgentEvent::Turn(TurnEvent::Ended { .. }));
+        let refresh_after = matches!(
+            event,
+            AgentEvent::Turn(TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. })
+        );
         if refresh_before {
             self.refresh_shared_session_transcript(&observation.stamp)
                 .await;
         }
-        if !observation.accepts(self, !observation.historical) {
+        if !observation.accepts(self) {
             return;
         }
         self.render_agent_event(event).await;
@@ -100,7 +103,7 @@ impl Tui {
 
     async fn refresh_shared_session_transcript(&mut self, stamp: &EventStamp) {
         let transcript = crate::lifecycle::session_history_transcript_items(&self.config).await;
-        if !stamp.is_current(&self.live_events) {
+        if !stamp.allows(&self.live_events) {
             return;
         }
         self.app.transcript = transcript;
@@ -129,7 +132,7 @@ impl Tui {
                 self.refresh_input_chrome();
                 true
             }
-            AgentEvent::Turn(TurnEvent::Ended { .. }) => {
+            AgentEvent::Turn(TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. }) => {
                 self.flush_pending_thought();
                 self.app.streaming_open = false;
                 self.complete_main_prompt().await;
@@ -156,7 +159,7 @@ impl Tui {
         self.stop_session_activity_monitor();
         self.session_activity_target = desired.clone();
         self.session_activity_handle = desired.map(|target| {
-            self.live_events = self.live_events.replacement();
+            self.live_events = self.live_events.fork();
             spawn_session_activity_monitor(
                 self.config.clone(),
                 self.event_tx.clone(),

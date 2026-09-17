@@ -6,10 +6,8 @@
 
 #[path = "nats_tool_confirmation/ack_recovery.rs"]
 mod ack_recovery;
-#[path = "common/admitted_log.rs"]
-mod admitted_log;
 mod common;
-use admitted_log::AdmittedSessionLog as NatsSessionLog;
+use harnx_runtime::nats_session_log::NatsSessionLog;
 #[path = "nats_tool_confirmation/fencing.rs"]
 mod fencing;
 #[allow(dead_code)]
@@ -1047,20 +1045,7 @@ async fn seed_pending_hitl_round(harness: &ConfirmationHarness) -> Result<()> {
     })
     .await?
     .context("predecessor lease")?;
-    let fence = generation::generation_fence(
-        &harness.jetstream,
-        &source_key(),
-        harnx_execution_control::Owner {
-            instance_id: lease.worker_id().into(),
-            fence: lease.fence_token(),
-        },
-    )
-    .await?;
-    let backend = harnx_runtime::nats_worker::NatsSessionLogBackend::new(
-        harness.jetstream.clone(),
-        source_key(),
-    )
-    .with_execution(Some(fence));
+    let backend = generation::fenced_backend(&harness.jetstream, &source_key()).await?;
     backend
         .append_event(&SessionLogEntry::ToolCalls {
             text: "activation completed".to_string(),

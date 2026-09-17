@@ -15,7 +15,6 @@ use serde_json::{json, Value};
 mod cancellation;
 
 pub const JSON_RPC_UNKNOWN_SESSION_CODE: i64 = -32001;
-pub const JSON_RPC_IDLE_CANCEL_CODE: i64 = -32002;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceKind {
@@ -134,9 +133,7 @@ pub async fn handle_ag_ui_rpc_bytes(
         "session/hitl_decision" => {
             handle_hitl_decision(rpc.id, rpc.params, config, registry, key).await
         }
-        "session/cancel" | "session/abandon_cancellation" => {
-            cancellation::handle((&rpc.method, rpc.id, rpc.params), (config, registry, key)).await
-        }
+        "session/cancel" => cancellation::handle(rpc.id, (config, registry, key)).await,
         "session/mark_read" => handle_mark_read(rpc.id, config, key).await,
         "session/mark_unread" => handle_mark_unread(rpc.id, config, key).await,
         _ => json_rpc_response(
@@ -181,9 +178,7 @@ async fn handle_get(
             "jsonrpc": "2.0",
             "id": id,
             "result": {
-                "state": session_state_json(&info.state),
-                "execution_id": info.execution_id,
-                "execution_state": info.execution_state,
+                "state": session_state_json(&info.state, info.worker_active),
                 "canPrompt": info.capabilities.can_prompt,
                 "canCancel": info.capabilities.can_cancel,
                 "history_snapshot": info.history_snapshot,
@@ -528,22 +523,29 @@ async fn handle_mark_read_state(
     )
 }
 
-fn session_state_json(state: &SessionState) -> Value {
+/// The session's state as a client reads it. `worker_active` is the session
+/// lease: a turn this server never prompted still runs somewhere, and a client
+/// that only ever saw `idle` for it could not offer to stop it.
+///
+/// A turn held at an approval gate reports a status of its own. It is not
+/// interrupted — nothing stopped it, and a client's next move is a decision,
+/// not another interrupt.
+fn session_state_json(state: &SessionState, worker_active: bool) -> Value {
     match state {
+        SessionState::Idle if worker_active => json!({ "status": "running" }),
         SessionState::Idle => json!({ "status": "idle" }),
-        SessionState::Cancelling(receipt) => {
-            json!({ "status": "cancelling", "cancellation": receipt })
-        }
-        SessionState::CancelUnconfirmed(receipt) => {
-            json!({ "status": "cancel_unconfirmed", "cancellation": receipt })
-        }
         SessionState::Running { run_id, started_at } => json!({
             "status": "running",
             "run_id": run_id,
             "started_at": started_at,
         }),
-        SessionState::Interrupted { pending } => json!({
+        SessionState::Interrupting => json!({ "status": "interrupting" }),
+        SessionState::Interrupted { cancel_seq } => json!({
             "status": "interrupted",
+            "cancel_seq": cancel_seq,
+        }),
+        SessionState::AwaitingApproval { pending } => json!({
+            "status": "awaiting_approval",
             "pending_interrupts": pending.metadata,
         }),
     }
@@ -814,41 +816,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_session_abandon_cancellation_requires_observed_execution_id() {
-        let _guard = TestStateGuard::new(None).await;
-        let sandbox = TestConfigSandbox::new();
-        sandbox.write_agent("plain", "You are plain.");
-        let config = sandbox.config();
-        let registry = SessionRegistry::new(config.clone());
-        registry.get_or_spawn(SessionKey {
-            agent: "plain".into(),
-            session: "stuck".into(),
-        });
-
-        let response = handle_ag_ui_rpc_bytes(
-            Method::POST,
-            "plain",
-            "stuck",
-            Bytes::from(
-                json!({"jsonrpc":"2.0","id":13,"method":"session/abandon_cancellation","params":{}})
-                    .to_string(),
-            ),
-            &config,
-            &registry,
-            PersistenceKind::Nats,
-        )
-        .await
-        .expect("rpc response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["code"], -32602);
-        assert_eq!(
-            body["error"]["message"],
-            "expected_execution_id is required"
-        );
-    }
-
-    #[tokio::test]
     async fn rpc_session_prompt_returns_ack_and_persists_effect() {
         let _guard = TestStateGuard::new(None).await;
         let sandbox = TestConfigSandbox::new();
@@ -1083,8 +1050,196 @@ mod tests {
         .expect("rpc response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["result"]["cancelled"], true);
+        assert_eq!(body["result"]["outcome"], "accepted");
         gate_release.notify_one();
+    }
+
+    /// The interrupt a client is told about has to be the one the log took, and
+    /// it has to survive the history refresh every `session/get` performs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpc_session_get_reports_the_interrupt_the_log_accepted() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        let session_id = format!("rpc-interrupt-{}", uuid::Uuid::new_v4());
+        assert!(
+            crate::test_support::seed_nats_session(
+                &config,
+                crate::test_support::NatsSessionSeed {
+                    agent: "plain",
+                    session_id: &session_id,
+                    messages: &[harnx_core::message::Message {
+                        id: Some("interrupt-me".into()),
+                        role: harnx_core::message::MessageRole::User,
+                        content: harnx_core::message::MessageContent::Text("long answer".into()),
+                        ..Default::default()
+                    }],
+                }
+            )
+            .await,
+            "NATS required"
+        );
+        let registry = SessionRegistry::new(config.clone());
+
+        let accepted = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            &session_id,
+            Bytes::from(json!({"jsonrpc":"2.0","id":1,"method":"session/cancel"}).to_string()),
+            &config,
+            &registry,
+            PersistenceKind::Nats,
+        )
+        .await
+        .expect("interrupt response");
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let accepted = response_json(accepted).await;
+        assert_eq!(accepted["result"]["outcome"], "accepted");
+        let cancel_seq = accepted["result"]["cancel_seq"]
+            .as_u64()
+            .expect("accepted interrupt names its sequence");
+
+        let state = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            &session_id,
+            Bytes::from(json!({"jsonrpc":"2.0","id":2,"method":"session/get"}).to_string()),
+            &config,
+            &registry,
+            PersistenceKind::Nats,
+        )
+        .await
+        .expect("state response");
+        let state = response_json(state).await;
+        assert_eq!(state["result"]["state"]["status"], "interrupted");
+        assert_eq!(state["result"]["state"]["cancel_seq"], cancel_seq);
+    }
+
+    /// Interrupting a session parked at an approval gate has to stick: the gate
+    /// belongs to the turn the `Cancel` ended, so the refresh behind the next
+    /// `session/get` must not park the session back at it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpc_session_get_keeps_an_interrupt_that_overtook_an_approval_gate() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        let session_id = format!("rpc-gated-interrupt-{}", uuid::Uuid::new_v4());
+        assert!(
+            crate::test_support::seed_nats_session(
+                &config,
+                crate::test_support::NatsSessionSeed {
+                    agent: "plain",
+                    session_id: &session_id,
+                    messages: &[harnx_core::message::Message {
+                        id: Some("gated".into()),
+                        role: harnx_core::message::MessageRole::User,
+                        content: harnx_core::message::MessageContent::Text("run a tool".into()),
+                        ..Default::default()
+                    }],
+                }
+            )
+            .await,
+            "NATS required"
+        );
+        let jetstream = config
+            .nats_jetstream(crate::LOCAL_CLUSTER_KEY)
+            .await
+            .expect("local JetStream");
+        harnx_runtime::nats_session_log::NatsSessionLog::new(
+            jetstream,
+            harnx_core::session_identity::session_key(Some("plain"), &session_id),
+        )
+        .append_event_async(
+            &harnx_core::session::SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "gated-call".to_string(),
+                summary: "Approve the call".to_string(),
+                fence_token: 1,
+            },
+        )
+        .await
+        .expect("append approval request");
+        let registry = SessionRegistry::new(config.clone());
+
+        let gated = session_status(&config, &registry, &session_id).await;
+        assert_eq!(gated["result"]["state"]["status"], "awaiting_approval");
+
+        let accepted = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            &session_id,
+            Bytes::from(json!({"jsonrpc":"2.0","id":1,"method":"session/cancel"}).to_string()),
+            &config,
+            &registry,
+            PersistenceKind::Nats,
+        )
+        .await
+        .expect("interrupt response");
+        let accepted = response_json(accepted).await;
+        assert_eq!(accepted["result"]["outcome"], "accepted");
+
+        // Twice: the first read refreshes history, the second proves the
+        // interrupt is what the refresh now derives.
+        for _ in 0..2 {
+            let state = session_status(&config, &registry, &session_id).await;
+            assert_eq!(state["result"]["state"]["status"], "interrupted");
+            assert_eq!(
+                state["result"]["state"]["cancel_seq"],
+                accepted["result"]["cancel_seq"]
+            );
+        }
+    }
+
+    async fn session_status(
+        config: &harnx_runtime::config::Config,
+        registry: &SessionRegistry,
+        session_id: &str,
+    ) -> Value {
+        let response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            session_id,
+            Bytes::from(json!({"jsonrpc":"2.0","id":2,"method":"session/get"}).to_string()),
+            config,
+            registry,
+            PersistenceKind::Nats,
+        )
+        .await
+        .expect("state response");
+        response_json(response).await
+    }
+
+    /// Four states a client has to tell apart, and only one of them is an
+    /// interrupt: a gate is waiting for a decision, and a leased session is
+    /// running work this server never started.
+    #[test]
+    fn session_state_json_names_gates_and_remote_runs_apart_from_interrupts() {
+        let gate = SessionState::AwaitingApproval {
+            pending: Box::new(crate::session_actor::PendingInterrupt {
+                metadata: json!({ "type": "interrupt" }),
+            }),
+        };
+        assert_eq!(
+            session_state_json(&gate, false),
+            json!({ "status": "awaiting_approval", "pending_interrupts": { "type": "interrupt" } })
+        );
+        assert_eq!(
+            session_state_json(&SessionState::Interrupted { cancel_seq: 12 }, false),
+            json!({ "status": "interrupted", "cancel_seq": 12 })
+        );
+        assert_eq!(
+            session_state_json(&SessionState::Interrupting, false),
+            json!({ "status": "interrupting" })
+        );
+        assert_eq!(
+            session_state_json(&SessionState::Idle, true),
+            json!({ "status": "running" })
+        );
+        assert_eq!(
+            session_state_json(&SessionState::Idle, false),
+            json!({ "status": "idle" })
+        );
     }
 
     #[tokio::test]
@@ -1237,8 +1392,7 @@ mod extra_rpc_tests {
         assert_eq!(idle_cancel.status(), StatusCode::OK);
         let idle_body = response_json(idle_cancel).await;
         assert_eq!(idle_body["id"], "idle");
-        assert_eq!(idle_body["result"]["disposition"], "idle");
-        assert_eq!(idle_body["result"]["cancelled"], false);
+        assert_eq!(idle_body["result"]["outcome"], "idle");
 
         let missing_params = handle_ag_ui_rpc_bytes(
             Method::POST,

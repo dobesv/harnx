@@ -2,4 +2,4 @@
 harnx: patch
 ---
 
-Fence live session events by their original execution generation so buffered output from an interrupted or replaced execution cannot change the TUI's current turn. Keep committed transcript history visible after interruption.
+Fence live session events against interruption so buffered output from a turn that was already stopped cannot change the TUI's current turn, while committed transcript history stays visible.

@@ -38,21 +38,15 @@ pub(crate) enum ExitPhase {
     RequestFailed,
 }
 
-pub(crate) type ExitCancelFuture =
-    Pin<Box<dyn Future<Output = anyhow::Result<harnx_execution_control::CancelReceipt>> + Send>>;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CancellationAction {
-    Request,
-    Abandon,
-}
+pub(crate) type ExitCancelFuture = Pin<
+    Box<dyn Future<Output = anyhow::Result<harnx_runtime::nats_session::InterruptOutcome>> + Send>,
+>;
 pub(crate) type ExitCancelFactory = Arc<
     dyn Fn(
             GlobalConfig,
             Arc<Mutex<Option<LocalWorkerSupervisor>>>,
             String,
             String,
-            Option<String>,
-            CancellationAction,
         ) -> ExitCancelFuture
         + Send
         + Sync,
@@ -296,14 +290,6 @@ pub struct MonitoredSessionKey {
 }
 
 impl MonitoredSessionKey {
-    pub fn matches_operation(
-        &self,
-        cluster: &str,
-        operation: &harnx_execution_control::OperationRef,
-    ) -> bool {
-        self.cluster == cluster && self.storage_key() == operation.session_id
-    }
-
     pub fn storage_key(&self) -> String {
         harnx_core::session_identity::session_key(Some(&self.agent), &self.session_id)
     }
@@ -646,10 +632,6 @@ pub(super) struct SubAgentSnapshot {
 }
 
 pub(crate) enum TuiEvent {
-    ExecutionState {
-        cluster: String,
-        operation: harnx_execution_control::Operation,
-    },
     /// Local commands/startup only. Never used by a live NATS follower.
     LocalAgent(harnx_core::event::AgentEvent),
     Agent {

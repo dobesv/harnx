@@ -44,6 +44,20 @@ fn invocation_limit_reached(error: &anyhow::Error) -> bool {
     error.is::<oneshot_nats::InvocationLimitReached>()
 }
 
+/// A one-shot turn's result is already classified at its source: the Ctrl+C
+/// arm names itself `"interrupted by user"`, a failed timeout append carries
+/// its own "not safe to retry" message, and an invocation limit is marked so
+/// it still wins downstream. So every `Err` passes through untouched here —
+/// only a successful result gets normalized, into the generic interrupted
+/// message, when the abort signal was set somewhere along the way.
+fn classify_one_shot_exit<T>(result: anyhow::Result<T>, aborted: bool) -> anyhow::Result<T> {
+    let value = result?;
+    if aborted {
+        bail!("interrupted by user");
+    }
+    Ok(value)
+}
+
 /// Routing decision for `list sessions` handler.
 /// Extracted as a pure function for testability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -714,15 +728,10 @@ async fn run_one_shot(
         cli.final_only,
         cli.timeout_secs,
         cli.token_budget,
-    )
-    .with_resume_anyway(cli.resume_anyway);
+    );
     let result = start_directive(config, input, options).await;
     exit_session(config, !cli.final_only)?;
-    match result {
-        Err(error) if invocation_limit_reached(&error) => Err(error),
-        _ if aborted_check.aborted() => bail!("interrupted by user"),
-        result => result,
-    }
+    classify_one_shot_exit(result, aborted_check.aborted())
 }
 
 fn session_resume_command(config: &GlobalConfig) -> Option<String> {
@@ -901,7 +910,6 @@ async fn start_directive(
     )
     .await
     .context("failed to create NATS session")?;
-    resume_session_anyway(&session, options.resume_anyway()).await?;
     if let Some(heading) =
         one_shot_session_heading(options.final_only(), &agent, session.session_id())
     {
@@ -925,32 +933,6 @@ async fn start_directive(
             options: &options,
         },
     )
-}
-
-async fn resume_session_anyway(session: &harnx_runtime::NatsSession, enabled: bool) -> Result<()> {
-    if !enabled {
-        return Ok(());
-    }
-    let Some(expected_execution_id) = session
-        .execution_store()
-        .current(session.storage_key())
-        .await?
-        .map(|operation| operation.reference.execution_id)
-    else {
-        return Ok(());
-    };
-    let receipt = session
-        .abandon_unconfirmed_cancellation(&expected_execution_id)
-        .await
-        .context("--resume-anyway could not abandon the pending cancellation")?;
-    if receipt.abandoned {
-        eprintln!(
-            "Warning: resumed session '{}' by abandoning execution '{}'; prior work may still be running.",
-            session.session_id(),
-            receipt.execution_id.as_deref().unwrap_or("unknown"),
-        );
-    }
-    Ok(())
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
@@ -1002,6 +984,39 @@ use harnx_runtime::bootstrap::setup_logger;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_one_shot_exit_passes_an_invocation_limit_error_through_unchanged() {
+        let error = anyhow::Error::from(oneshot_nats::InvocationLimitReached);
+        let result: Result<()> = classify_one_shot_exit(Err(error), true);
+
+        let error = result.expect_err("an invocation-limit error must still be an error");
+        assert!(
+            invocation_limit_reached(&error),
+            "must still be recognizable as an invocation limit downstream"
+        );
+    }
+
+    #[test]
+    fn classify_one_shot_exit_passes_any_other_error_through_with_its_own_text() {
+        let result: Result<()> = classify_one_shot_exit(Err(anyhow::anyhow!("boom")), true);
+
+        let error = result.expect_err("an error must stay an error");
+        assert_eq!(error.to_string(), "boom");
+    }
+
+    #[test]
+    fn classify_one_shot_exit_normalizes_an_aborted_ok_result() {
+        let result = classify_one_shot_exit(Ok(()), true);
+
+        let error = result.expect_err("an Ok result reached while aborted must become an error");
+        assert_eq!(error.to_string(), "interrupted by user");
+    }
+
+    #[test]
+    fn classify_one_shot_exit_leaves_an_unaborted_ok_result_alone() {
+        assert_eq!(classify_one_shot_exit(Ok(42), false).unwrap(), 42);
+    }
 
     #[test]
     fn one_shot_heading_identifies_root_agent_and_session() {

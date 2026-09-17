@@ -222,19 +222,84 @@ async fn hookset_registers_and_serves_hook_over_nats() -> Result<()> {
             tool_use_id: "tool-use-1".to_string(),
         },
     };
+    let headers = harnx_hookset_server::hook_request_headers("test-session", "test-call");
     let message = client
-        .request(
+        .send_request(
             instance_id.hook_subject("echo", "PreToolUse"),
-            serde_json::to_vec(&payload)?.into(),
+            async_nats::Request::new()
+                .headers(headers)
+                .payload(serde_json::to_vec(&payload)?.into())
+                .timeout(Some(Duration::from_secs(10))),
         )
         .await?;
-    let outcome: HookOutcome =
-        serde_json::from_slice(&message.payload).context("decode hook outcome")?;
+    let outcome = harnx_hookset_server::decode_hook_reply(&message.payload)?;
     assert_eq!(outcome.control, HookResultControl::Continue);
     assert_eq!(
         outcome.result.mutated_tool_input,
         Some(json!({"seen": true}))
     );
+
+    server_task.abort();
+    drop(server);
+    Ok(())
+}
+
+/// A request the server will not run still gets an answer. Dropping it would
+/// leave the caller with nothing but its own timeout, which its fail policy
+/// then acts on without ever learning why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_without_call_identity_is_refused_rather_than_dropped() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let instance_id = ServerScope::new();
+    let server_instance_id = instance_id.clone();
+    let server_url = server.url.clone();
+    let server_task = tokio::spawn(async move {
+        serve_over_nats(EchoHook, server_instance_id, &server_url, TOKEN).await
+    });
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await?;
+    wait_for_registration(&client, &instance_id).await?;
+
+    let payload = HookPayload {
+        session_id: "test-session".to_string(),
+        cwd: std::env::current_dir()?,
+        resume_count: 0,
+        hook_event: HookEvent::PreToolUse {
+            tool_name: "example".to_string(),
+            tool_input: json!({"input": true}),
+            tool_use_id: "tool-use-1".to_string(),
+        },
+    };
+    // No headers at all, then a session without the call it belongs to: both
+    // are answered, and the answer says which piece was missing.
+    let mut session_only = async_nats::HeaderMap::new();
+    session_only.insert(harnx_hookset_server::HOOK_SESSION_HEADER, "test-session");
+    for (headers, expected) in [
+        (None, "headers"),
+        (Some(session_only), harnx_hookset_server::HOOK_CALL_HEADER),
+    ] {
+        let mut request = async_nats::Request::new()
+            .payload(serde_json::to_vec(&payload)?.into())
+            .timeout(Some(Duration::from_secs(10)));
+        if let Some(headers) = headers {
+            request = request.headers(headers);
+        }
+        let message = client
+            .send_request(instance_id.hook_subject("echo", "PreToolUse"), request)
+            .await?;
+        let error = harnx_hookset_server::decode_hook_reply(&message.payload)
+            .expect_err("a request with no call identity cannot be run");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("refused") && error.contains(expected),
+            "the refusal must name what was missing: {error}"
+        );
+    }
 
     server_task.abort();
     drop(server);

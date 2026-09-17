@@ -152,17 +152,7 @@ async fn seed_resume_fixture(server_url: &str) -> Result<ResumeFixture> {
     log.append_event_async(&append_user_message_entry("user-1", "original request"))
         .await?;
     let lease = acquire_test_lease(js.clone(), SESSION_ID, "crashed-worker").await?;
-    let fence = generation::generation_fence(
-        &js,
-        &storage_key(SESSION_ID),
-        harnx_execution_control::Owner {
-            instance_id: lease.worker_id().into(),
-            fence: lease.fence_token(),
-        },
-    )
-    .await?;
-    let backend =
-        NatsSessionLogBackend::new(js.clone(), storage_key(SESSION_ID)).with_execution(Some(fence));
+    let backend = generation::fenced_backend(&js, &storage_key(SESSION_ID)).await?;
     backend
         .append_event(&tool_calls("first_tool", "call-complete", "first round"))
         .await?;
@@ -270,7 +260,7 @@ async fn multi_round_resume_with_queued_user_repairs_once_and_becomes_idle() -> 
         "worker-multi-round-resume",
         call_fn,
     )
-    .await;
+    .await?;
     let fixture = seed_resume_fixture(server.url()).await?;
     let metrics_before = harnx_runtime::nats_metrics::snapshot();
 

@@ -345,41 +345,44 @@ confirmation requests retain the local ID.
 See `docs/nats-ha.md` under “Session identity”. Do not pass a local ID to by-key APIs.
 
 Client/control code can append to another session's log via
-`NatsSessionLog::new(jetstream, storage_key)`. Worker/tool output must instead use
-`append_output` with its creation-time `GenerationFence`. A sub-agent start in the
-parent log uses the invoking tool's context, including the parent's generation-owner
-fence. Never resolve the current generation when a delayed reply arrives.
+`NatsSessionLog::new(jetstream, storage_key)`. Worker/tool output must instead go
+through the session log backend while holding the lease, so the append is fenced
+on the tail the turn last observed and a `Cancel` that landed meanwhile stops it.
+A sub-agent start in the parent log is written through the invoking tool's
+handle on that same lease.
 
 The worker appends the durable `HandoffCommitted` entry **before** emitting the advisory
 `SessionEvent::HandoffCommitted` (see `agent_loop.rs:979-1001`). This guarantees a live
 handoff's sequence is strictly greater than any attach boundary captured before the commit,
 enabling clients to gate navigation on `after_seq > attached_seq`.
 
-Worker appends use a generation-bound backend/`FencedSessionLogSink`. The gate commits
-exact `Transcript` output before the private projector appends it. The projector drains
-in gate order, checks durable commit IDs in stream headers, and uses stream-tail CAS;
-JetStream's finite dedup window alone is not enough. HITL retains its expected-tail
-condition and ownership revalidation at execution. `Cancel` is a restricted
-`RecordCancellation` control projection, never normal output. See
-`nats_session_log/projection.rs` and `docs/nats-ha.md` (Stage 4).
+Worker appends go through `FencedSessionLogSink`, which carries the lease fence and
+the expected tail. Stream-tail CAS is the authority: JetStream's finite dedup window
+alone is not enough, so keep the same message ID and expected-last-sequence across a
+retry and treat a conflict as a decision to re-read, never as a reason to append
+again. A `Cancel` is an ordinary log entry any holder of the session can write,
+including frontends that hold no lease. See `docs/nats-ha.md` under "Interruption".
 
-### Interrupt acceptance and cleanup
+### Interrupt acceptance
 
-Tool protocol v4 separates `CancelAcceptance` from `CleanupStatus`. A root stop
-receipt, not a tool acknowledgement or process exit, establishes interruption.
-Record physical evidence with the generation-scoped gate `CleanupUpdate`; don't
-add a parallel cleanup flag or use missing metadata as shutdown confirmation.
+Interruption is established by one durable `Cancel` entry in the session log and
+by nothing else. Acceptance is that append landing, not a tool acknowledgement,
+a lease disappearing or a process exiting. TUI, one-shot and followers return on
+it; don't reintroduce a wait for tools to die before the editor comes back.
+
+Tool protocol v5 carries `CancelAcceptance::{Accepted, AlreadyFinished, Rejected,
+Unknown}` and nothing else. There is no cleanup status to report and no physical
+shutdown to confirm — a cancel is best effort and its acknowledgement is for
+logging. Cancels are idempotent, so resending one is always allowed and is how
+wind-up and resume reach a call whose original invocation is gone. Don't add a
+parallel cleanup flag, and don't read missing metadata as proof anything stopped.
 
 Resource owners keep cleanup handles outside turn/reply futures. A dropped
 `JoinHandle` detaches its task, and started `spawn_blocking` work can't be aborted.
-Old cleanup must retain its original generation and must not release G2's lease,
-clear G2's state or remove G2's tool-server user claim. MCP cancellation closes
-only the request waiter; never restart shared infrastructure to cancel a call.
-See `nats_worker/cleanup_supervisor.rs` and `docs/nats-ha.md` (Stages 7-8). TUI,
-one-shot and followers return on durable root acceptance. Don't reintroduce a
-cleanup/status wait or a session-current retry that can interrupt G2.
+MCP cancellation closes only the request waiter; never restart shared
+infrastructure to cancel a call. See `docs/nats-ha.md` under "Interruption".
 
-Build the workspace before cross-process tests after changing gate or tool wire
+Build the workspace before cross-process tests after changing tool or hook wire
 types. Those tests launch workspace sidecars as well as linked test code; a stale
 hook or tool binary can fail decoding even when a per-crate build succeeds.
 

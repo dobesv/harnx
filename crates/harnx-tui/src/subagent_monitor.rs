@@ -37,6 +37,21 @@ impl AttachmentBoundary {
     }
 }
 
+/// A `Cancel` durable history already recorded fences live output by its
+/// seq, so a client attaching (or refreshing) after the interrupt landed
+/// never renders an advisory that predates it — even one it never issued
+/// or otherwise observed itself.
+fn fence_live_events_from_history(
+    live: &harnx_runtime::nats_event_sink::LiveEventState,
+    history: &[(u64, SessionLogEntry)],
+) {
+    if harnx_core::session_reconstruct::last_terminator_is_cancel(history) {
+        live.accept_interrupt(harnx_core::session_reconstruct::last_terminator_seq(
+            history,
+        ));
+    }
+}
+
 impl Tui {
     pub(super) fn sync_subagent_monitor_root(&mut self) {
         let desired = self.session_activity_destination();
@@ -133,11 +148,7 @@ fn spawn_subagent_monitor(
     invocation: ObservedInvocation,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let target = (key.storage_key(), key.cluster.clone());
-        tokio::join!(
-            crate::cancellation::monitor_execution(&config, &event_tx, &target),
-            monitor_subagent_session(config.clone(), event_tx.clone(), key, invocation)
-        );
+        monitor_subagent_session(config, event_tx, key, invocation).await;
     })
 }
 
@@ -194,9 +205,7 @@ async fn monitor_subagent_attachment(
             return AttachmentOutcome::AttachFailed;
         }
     };
-    if let Some(id) = invocation_id {
-        stream.follow_generation(id.into());
-    }
+    fence_live_events_from_history(live, stream.history());
     let boundary = AttachmentBoundary {
         attached_seq: stream.last_applied_seq(),
         attached_during_turn: history_has_pending_turn(stream.history()),
@@ -224,10 +233,7 @@ async fn monitor_subagent_attachment(
                 let terminal = is_subagent_terminal_event(&envelope.event);
                 if event_tx
                     .send(TuiEvent::SubAgentSessionEvent {
-                        stamp: crate::event_isolation::EventStamp::live(
-                            live,
-                            envelope.execution_id,
-                        ),
+                        stamp: crate::event_isolation::EventStamp::live(live),
                         key: key.clone(),
                         event: envelope.event,
                     })
@@ -256,6 +262,7 @@ async fn monitor_subagent_attachment(
                 if stream.refresh_history().await.is_err() {
                     return AttachmentOutcome::Disconnected;
                 }
+                fence_live_events_from_history(live, stream.history());
                 if subagent_history_status(stream.history()) != SubAgentStatus::Running {
                     let _ = send_subagent_snapshot(
                         config,
@@ -378,7 +385,8 @@ async fn load_subagent_transcript(
 fn is_subagent_terminal_event(event: &AgentEvent) -> bool {
     matches!(
         event,
-        AgentEvent::Turn(TurnEvent::Ended { .. }) | AgentEvent::Model(ModelEvent::Error(_))
+        AgentEvent::Turn(TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. })
+            | AgentEvent::Model(ModelEvent::Error(_))
     )
 }
 

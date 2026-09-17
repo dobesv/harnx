@@ -18,15 +18,17 @@ use harnx_runtime::{
 };
 use harnx_serve::{
     ag_ui::ag_ui_run_with_call_fn,
+    ag_ui_rpc::{handle_ag_ui_rpc_bytes, PersistenceKind},
     session_actor::SessionRegistry,
     test_support::{seed_nats_session, NatsSessionSeed, TestConfigSandbox},
 };
+use http_body_util::BodyExt;
 use serde_json::json;
 use uuid::Uuid;
 
 #[path = "support/mod.rs"]
 mod support;
-use support::{read_sse_until, AppResponse};
+use support::{read_sse_for, read_sse_until, AppResponse};
 
 #[path = "ag_ui_remote_follow/overlap.rs"]
 mod overlap;
@@ -222,6 +224,53 @@ fn assert_remote_attach_order(events: &[serde_json::Value], durable_tail: u64) {
     assert!(started < boundary);
     assert!(boundary < snapshot);
     assert!(snapshot < finished);
+}
+
+async fn session_get(session: &LeasedSession) -> serde_json::Value {
+    let registry =
+        SessionRegistry::new_for_tests(session.config.clone(), Duration::from_secs(30), None);
+    let response = handle_ag_ui_rpc_bytes(
+        http::Method::POST,
+        "plain",
+        &session.session_id,
+        bytes::Bytes::from(json!({"jsonrpc":"2.0","id":1,"method":"session/get"}).to_string()),
+        &session.config,
+        &registry,
+        PersistenceKind::Nats,
+    )
+    .await
+    .expect("session/get response");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect rpc body")
+        .to_bytes();
+    serde_json::from_slice(&body).expect("parse rpc json")
+}
+
+/// A turn this server never prompted — a sub-agent session, or one another
+/// frontend started — has no local run to report. The lease is the only thing
+/// that says it is running, and a client told `idle` would never offer to stop
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn leased_session_reports_running_without_a_run_this_server_started() {
+    let Some(session) = seed_in_progress_leased_session().await else {
+        return;
+    };
+
+    let running = session_get(&session).await;
+    assert_eq!(
+        running["result"]["state"]["status"], "running",
+        "a leased session is running: {running:?}"
+    );
+
+    session.lease.release().await.expect("lease release");
+    let released = session_get(&session).await;
+    assert_eq!(
+        released["result"]["state"]["status"], "idle",
+        "once the lease is gone nothing is running it: {released:?}"
+    );
 }
 
 /// One promptless stream stays busy, then finishes when its remote turn ends live.

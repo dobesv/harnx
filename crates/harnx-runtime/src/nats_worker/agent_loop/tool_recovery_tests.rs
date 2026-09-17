@@ -29,9 +29,7 @@ impl ToolProvider for MixedRecovery {
     }
 }
 
-pub(crate) fn mixed_context(
-    scope: harnx_core::instance::ServerScope,
-) -> crate::tool::ToolEvalContext {
+fn mixed_context(scope: harnx_core::instance::ServerScope) -> crate::tool::ToolEvalContext {
     crate::tool::ToolEvalContext {
         work_boundary: None,
         instance_id: scope,
@@ -66,9 +64,8 @@ async fn mixed_recovery_preserves_original_positions_including_anonymous_calls()
     declaration.idempotent_hint = Some(true);
     repair.decl_map.insert("rerun".into(), declaration);
     let abort = crate::utils::create_abort_signal();
-    let (_server, log, fence) = recovery_fixture(&config).await?;
+    let (_server, log) = recovery_fixture().await?;
     let args = RepairOrphanToolCallsArgs {
-        log: &log,
         config,
         instance_id: &scope,
         fence_token: None,
@@ -81,19 +78,14 @@ async fn mixed_recovery_preserves_original_positions_including_anonymous_calls()
         .map(|name| ToolCall::new(name.into(), json!({}), None, None))
         .to_vec();
     let seq = log
-        .append_output(
-            &fence,
-            &SessionLogEntry::ToolCalls {
-                text: String::new(),
-                thought: None,
-                calls: calls.clone(),
-                timestamp: None,
-                fence_token: Some(1),
-            },
-            None,
-        )
-        .await?
-        .context("call sequence")?;
+        .append_event_async(&SessionLogEntry::ToolCalls {
+            text: String::new(),
+            thought: None,
+            calls: calls.clone(),
+            timestamp: None,
+            fence_token: Some(1),
+        })
+        .await?;
     let orphan = PendingToolCalls {
         seq,
         text: String::new(),
@@ -101,8 +93,7 @@ async fn mixed_recovery_preserves_original_positions_including_anonymous_calls()
         calls,
         timestamp: None,
     };
-    let mut eval = mixed_context(scope.clone());
-    eval.work_boundary = crate::execution_fence::tool_boundary(Some(fence));
+    let eval = mixed_context(scope.clone());
     let results = repair_single_orphan(&orphan, &args, &repair, &eval).await?;
     assert_eq!(
         results
@@ -120,31 +111,14 @@ async fn mixed_recovery_preserves_original_positions_including_anonymous_calls()
     Ok(())
 }
 
-async fn recovery_fixture(
-    config: &GlobalConfig,
-) -> Result<(
+async fn recovery_fixture() -> Result<(
     crate::nats_test_common::NatsServerHandle,
     crate::nats_session_log::NatsSessionLog,
-    crate::execution_fence::GenerationFence,
 )> {
     let server = crate::nats_test_common::spawn_nats_server()
         .await?
         .context("nats-server required")?;
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let store = harnx_execution_control::ExecutionStore::ensure(&js, 1).await?;
-    let operation = store.session("parent", None, Some("g1")).await?;
-    store
-        .claim(
-            &operation.reference,
-            harnx_execution_control::Owner {
-                instance_id: "worker".into(),
-                fence: 1,
-            },
-        )
-        .await?;
-    let context = store.activate_gate(&operation.reference).await?;
-    let fence = crate::execution_fence::GenerationFence::new(store, context);
-    config.write().generation_fence = Some(fence.clone());
     let log = crate::nats_session_log::NatsSessionLog::new(js, "parent");
-    Ok((server, log, fence))
+    Ok((server, log))
 }

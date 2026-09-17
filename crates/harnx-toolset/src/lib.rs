@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Environment variable carrying the tool server's package name.
@@ -117,12 +118,35 @@ impl ToolSpec {
     }
 }
 
+/// Terminal for this call: the session was interrupted before the tool
+/// produced a result. Not a model-recoverable tool failure.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterruptedCall {
+    /// The cancellation that caused the interruption, when the call knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_id: Option<String>,
+    pub reason: String,
+}
+
+impl fmt::Display for InterruptedCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.cancellation_id {
+            Some(id) => write!(
+                f,
+                "tool call interrupted ({}, cancellation {id})",
+                self.reason
+            ),
+            None => write!(f, "tool call interrupted ({})", self.reason),
+        }
+    }
+}
+
 /// Error returned directly by a [`Toolset`] implementation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolInvokeError {
     Recoverable(String),
     Fatal(String),
-    Interrupted(Box<harnx_execution_control::Interrupted>),
+    Interrupted(InterruptedCall),
 }
 
 impl fmt::Display for ToolInvokeError {
@@ -136,18 +160,54 @@ impl fmt::Display for ToolInvokeError {
 
 impl std::error::Error for ToolInvokeError {}
 
+/// Durable storage for one call's checkpoint handle, so an orphaned call can
+/// later be cancelled without the process that started it.
+///
+/// Implementations back this with whatever the tool server already uses for
+/// durability (KV, a file, a database row); [`Toolset`] implementations only
+/// ever see the opaque [`Value`] they wrote.
+#[async_trait]
+pub trait CheckpointStore: Send + Sync {
+    /// First writer wins; returns the stored value.
+    async fn checkpoint(&self, value: Value) -> anyhow::Result<Value>;
+}
+
 /// Transport-provided facts about one tool invocation.
 ///
 /// These values are trusted infrastructure context, not model-controlled tool
 /// arguments. Toolsets that do not need them can continue implementing
 /// [`Toolset::invoke`] only.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct ToolInvocationContext {
-    pub operation: Option<harnx_execution_control::OperationRef>,
-    pub execution: Option<harnx_execution_control::ExecutionContext>,
     pub call_id: String,
     pub invoking_session_id: Option<String>,
     pub capabilities: BTreeSet<String>,
+    /// Handle for a checkpoint recorded on a prior attempt, if any. Set on
+    /// replay so the tool can resume instead of restarting from scratch.
+    pub checkpoint: Option<Value>,
+    /// Where to record this call's checkpoint handle, so [`Toolset::cancel`]
+    /// can act on it after the original invocation is gone. Absent when the
+    /// transport does not support checkpointing.
+    pub checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+}
+
+impl fmt::Debug for ToolInvocationContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolInvocationContext")
+            .field("call_id", &self.call_id)
+            .field("invoking_session_id", &self.invoking_session_id)
+            .field("capabilities", &self.capabilities)
+            .field("checkpoint", &self.checkpoint)
+            .field(
+                "checkpoint_store",
+                &if self.checkpoint_store.is_some() {
+                    "<set>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .finish()
+    }
 }
 
 /// One tool invocation, including its transport-attested context and cancellation signal.
@@ -201,27 +261,37 @@ pub trait Toolset: Send + Sync {
             ))
         }
     }
+
+    /// Cancel a call this process is not running (its original invocation is
+    /// gone). `invocation.context.checkpoint` carries the handle the tool
+    /// recorded, if any. Must be idempotent. Default: nothing to do.
+    async fn cancel(&self, _invocation: ToolInvocation) -> Result<(), ToolInvokeError> {
+        Ok(())
+    }
 }
 
 /// Request body for one tool invocation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequest {
-    /// Original producer and receiving generation, captured before dispatch.
+    /// Set when this request replays a call whose original result was never
+    /// observed. Preserves call_id/operation_id and never silently falls
+    /// through to a normal invoke.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution: Option<ToolExecution>,
-    /// New attempt identity, attested at replay creation. Original execution is retained.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay_execution: Option<ToolExecution>,
-    /// A replay is attested by the current parent execution owner. It preserves
-    /// call_id/operation_id and never silently falls through to normal invoke.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay: Option<harnx_execution_control::Owner>,
+    pub replay: Option<ReplayAttempt>,
     pub operation_id: String,
+    /// Wire id of this invocation, minted per dispatch attempt. The tool
+    /// server journals the call under it and cancels are addressed by it, so
+    /// it is never the transcript's tool-call id: a retried or replayed call
+    /// gets a new `call_id` while its `tool_call_id` stays the same.
     pub call_id: String,
     pub tool: String,
     pub args: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// The transcript's tool-call id (`ToolCall.id`) this invocation answers,
+    /// when the caller has one. Wind-up and replay resolve a journal row by
+    /// `(session, tool round, tool_call_id)`, never by `call_id`, because only
+    /// the transcript id survives a worker restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     /// Additive capabilities understood by the caller. An absent field means
@@ -230,11 +300,12 @@ pub struct ToolRequest {
     pub capabilities: BTreeSet<String>,
 }
 
-/// Authority carried by an invocation, not inferred when its result arrives.
+/// One attempt to replay a call whose original result was never observed,
+/// rather than that call's first invocation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolExecution {
-    pub producer: harnx_execution_control::ExecutionContext,
-    pub consumer: harnx_execution_control::ExecutionContext,
+pub struct ReplayAttempt {
+    pub attempt: u32,
+    pub requested_by: String,
 }
 
 /// Raw tool name for creating a sub-agent session.
@@ -252,7 +323,7 @@ pub const SUBAGENT_SESSION_CANCEL_TOOL: &str = "session_cancel";
 pub enum ToolErrorPayload {
     Recoverable(String),
     Fatal(String),
-    Interrupted(Box<harnx_execution_control::Interrupted>),
+    Interrupted(InterruptedCall),
 }
 
 /// Reply body for one tool invocation.
@@ -328,21 +399,6 @@ mod tests {
         let encoded = serde_json::to_vec(&value).expect("serialize wire type");
         let decoded: T = serde_json::from_slice(&encoded).expect("deserialize wire type");
         assert_eq!(decoded, value);
-    }
-
-    fn test_execution() -> harnx_execution_control::ExecutionContext {
-        use harnx_execution_control::{ExecutionContext, OperationRef, Owner};
-        let generation = OperationRef::new("test", "g1");
-        let owner = Owner {
-            instance_id: "worker".into(),
-            fence: 1,
-        };
-        ExecutionContext::new(
-            generation.clone(),
-            generation,
-            OperationRef::new("test", "call-1"),
-            (owner.clone(), owner),
-        )
     }
 
     fn tool_spec() -> ToolSpec {
@@ -426,17 +482,9 @@ mod tests {
     }
 
     #[test]
-    fn v4_acceptance_and_cleanup_are_independent_wire_fields() {
-        use harnx_execution_control::{CleanupStatus, StopReceipt};
-        let execution = test_execution();
-        let stop: StopReceipt = serde_json::from_value(json!({
-            "scope": execution.operation(),
-            "decision": {"cancellation_id": "stop", "accepted_at": "2026-09-14T00:00:00Z", "reason": "interrupt"},
-            "commit": {"gate_root": execution.gate_root(), "commit_id": "01980000-0000-7000-8000-000000000001", "sequence": 1}
-        })).unwrap();
-        let control = ControlMessage::cancel(execution, "test".into(), "stop".into());
+    fn cancel_acceptance_variants_tag_and_round_trip_through_serde() {
         for (acceptance, tag) in [
-            (CancelAcceptance::Accepted { stop }, "accepted"),
+            (CancelAcceptance::Accepted, "accepted"),
             (CancelAcceptance::AlreadyFinished, "already_finished"),
             (
                 CancelAcceptance::Rejected {
@@ -451,31 +499,53 @@ mod tests {
                 "unknown",
             ),
         ] {
-            let ack = control.acknowledgement(
-                acceptance,
-                Some(CleanupStatus::unconfirmed("owner unreachable")),
-            );
-            let wire = serde_json::to_value(&ack).unwrap();
-            assert_eq!(wire["protocol_version"], 4);
-            assert_eq!(wire["acceptance"]["kind"], tag);
-            assert_eq!(wire["cleanup"]["state"], "unconfirmed");
-            assert!(wire.get("stopped").is_none());
-            assert_round_trip(ack);
+            let wire = serde_json::to_value(&acceptance).unwrap();
+            assert_eq!(wire["kind"], tag);
+            assert_round_trip(acceptance);
         }
+    }
+
+    #[test]
+    fn protocol_version_is_5() {
+        assert_eq!(TOOL_PROTOCOL_VERSION, 5);
+    }
+
+    #[test]
+    fn control_message_carries_session_and_call_ids() {
+        let control =
+            ControlMessage::cancel("srv".into(), "sess".into(), "call-1".into(), "c-1".into());
+        let json = serde_json::to_value(&control).unwrap();
+        assert_eq!(json["session_id"], "sess");
+        assert_eq!(json["call_id"], "call-1");
+        assert_eq!(json["protocol_version"], TOOL_PROTOCOL_VERSION);
+        let ack = control.acknowledgement(CancelAcceptance::AlreadyFinished);
+        assert_eq!(ack.session_id, "sess");
+        assert!(matches!(ack.acceptance, CancelAcceptance::AlreadyFinished));
     }
 
     #[test]
     fn wire_types_round_trip_through_serde() {
         assert_round_trip(tool_spec());
         assert_round_trip(ToolRequest {
-            execution: None,
-            replay_execution: None,
             replay: None,
             operation_id: "call-1".to_string(),
             call_id: "call-1".to_string(),
             tool: "time_now".to_string(),
             args: json!({ "timezone": "UTC" }),
             parent_session_id: Some("parent-session".to_string()),
+            tool_call_id: None,
+            capabilities: BTreeSet::new(),
+        });
+        assert_round_trip(ToolRequest {
+            replay: Some(ReplayAttempt {
+                attempt: 2,
+                requested_by: "worker-b".to_string(),
+            }),
+            operation_id: "call-1".to_string(),
+            call_id: "call-1".to_string(),
+            tool: "time_now".to_string(),
+            args: json!({ "timezone": "UTC" }),
+            parent_session_id: None,
             tool_call_id: None,
             capabilities: BTreeSet::new(),
         });
@@ -490,9 +560,9 @@ mod tests {
             )),
         });
         assert_round_trip(ControlMessage {
-            execution: test_execution(),
             protocol_version: TOOL_PROTOCOL_VERSION,
             server: "test".into(),
+            session_id: "sess".to_string(),
             operation_id: "call-1".to_string(),
             cancellation_id: "cancel-test".into(),
             call_id: "call-1".to_string(),
@@ -533,6 +603,19 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_error_payload_round_trips() {
+        let payload = ToolErrorPayload::Interrupted(InterruptedCall {
+            cancellation_id: Some("c-1".into()),
+            reason: "user".into(),
+        });
+        let back: ToolErrorPayload =
+            serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
+        assert!(
+            matches!(back, ToolErrorPayload::Interrupted(InterruptedCall { cancellation_id: Some(id), .. }) if id == "c-1")
+        );
+    }
+
+    #[test]
     fn server_identity_token_preserves_package_boundary() {
         assert_eq!(
             server_identity_token(Some("coding"), "time", "time"),
@@ -544,9 +627,9 @@ mod tests {
     #[test]
     fn control_subject_messages_are_tagged_by_kind() {
         let cancel = serde_json::to_value(ControlMessage {
-            execution: test_execution(),
             protocol_version: TOOL_PROTOCOL_VERSION,
             server: "test".into(),
+            session_id: "sess".to_string(),
             operation_id: "call-1".to_string(),
             cancellation_id: "cancel-test".into(),
             call_id: "call-1".to_string(),

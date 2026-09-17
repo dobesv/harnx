@@ -1160,8 +1160,5 @@ fn child_event_stamp(
         .monitored_sessions
         .entry(key.clone())
         .or_insert_with(|| crate::types::MonitoredSessionState::new(SubAgentStatus::Running));
-    state
-        .live_events
-        .select(Some("child-fixture-generation".into()));
     crate::event_isolation::EventStamp::snapshot(&state.live_events)
 }

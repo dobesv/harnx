@@ -15,8 +15,6 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time;
 
-mod interruption;
-
 const LEASE_BUCKET: &str = "harnx_leases";
 const LEASE_KEY_PREFIX: &str = "sessions";
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
@@ -26,8 +24,8 @@ const ACTIVITY_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeaseRecord {
-    /// Original execution, not the session's current generation. Legacy leases
-    /// without this binding cannot be revoked before their TTL.
+    /// Original execution the holder acquired this lease for, not the session's
+    /// current generation. Recorded for diagnostics; nothing reads it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
     pub worker_id: String,
@@ -110,8 +108,9 @@ impl NatsSessionLease {
         Self::acquire_for_execution(params, None).await
     }
 
-    /// Bind a worker lease so accepted interruption permits immediate takeover.
-    /// Execution still requires a separate generation/owner claim through the gate.
+    /// Acquire the lease and record which execution the holder took it for.
+    /// The binding is descriptive only: a held lease is never taken from its
+    /// owner, so a replacement waits for the TTL either way.
     pub async fn acquire_for_execution(
         params: NatsLeaseAcquireParams<'_>,
         execution_id: Option<String>,
@@ -130,18 +129,7 @@ impl NatsSessionLease {
         let mut record = LeaseRecord::new(worker_id.clone(), generation);
         record.execution_id = execution_id.clone();
         let acquired_at = time::Instant::now();
-        let Some(revision) = interruption::create_lease(
-            &jetstream,
-            &bucket,
-            interruption::LeaseCreate {
-                key: &key,
-                session_id,
-                record: &record,
-                ttl: config.ttl,
-            },
-        )
-        .await?
-        else {
+        let Some(revision) = create_lease(&bucket, &key, &record, config.ttl).await? else {
             return Ok(None);
         };
 
@@ -415,6 +403,23 @@ pub async fn session_has_active_lease(
     Ok(lease_holder_in(&bucket, &config, session_id)
         .await?
         .is_some())
+}
+
+/// Claim the session's lease key. A create conflict means another owner still
+/// holds it, so the caller backs off rather than taking the session over; the
+/// holder's own TTL is what eventually frees the key.
+async fn create_lease(
+    bucket: &kv::Store,
+    key: &str,
+    record: &LeaseRecord,
+    ttl: Duration,
+) -> Result<Option<u64>> {
+    let payload = serde_json::to_vec(record).context("Failed to serialize lease record")?;
+    match bucket.create_with_ttl(key, payload.into(), ttl).await {
+        Ok(revision) => Ok(Some(revision)),
+        Err(error) if is_create_conflict(&error) => Ok(None),
+        Err(error) => Err(error).context("Failed to acquire NATS lease"),
+    }
 }
 
 /// Open the lease bucket, creating it at `config.replicas` if it doesn't

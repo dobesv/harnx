@@ -1,4 +1,5 @@
 use super::*;
+use harnx_toolset::ReplayAttempt;
 
 impl NatsToolProvider {
     pub(super) async fn record_invocation(
@@ -7,26 +8,31 @@ impl NatsToolProvider {
         tool_name: &str,
         server: &str,
     ) -> anyhow::Result<()> {
-        if self.execution_control.is_none() {
+        let Some(session) = request.parent_session_id.as_deref() else {
             return Ok(());
-        }
-        let session = request
-            .parent_session_id
-            .as_deref()
-            .context("controlled tool session missing")?;
+        };
         let js = async_nats::jetstream::new(self.client.clone());
+        // The round is the transcript sequence whose `ToolCalls` made this
+        // call, and it keys the journal row. A call dispatched outside a
+        // durable round — a direct provider call, a tool a frontend invoked —
+        // has none, which is what zero records, exactly as for a call with no
+        // id at all. Only a transcript orphan is ever replayed by round, and
+        // an orphan by definition has the entry this looks for.
         let round = match request.tool_call_id.as_deref() {
-            Some(call_id) => invocation_round(&js, session, call_id).await?,
+            Some(call_id) => invocation_round(&js, session, call_id).await?.unwrap_or(0),
             None => 0,
         };
-        harnx_toolset_server::invocation_journal::InvocationJournal::ensure(&js)
-            .await?
-            .record(
-                request,
-                (tool_name, self.instance_id.as_str(), server),
-                round,
-            )
-            .await
+        harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
+            &js,
+            self.journal_replicas,
+        )
+        .await?
+        .record(
+            request,
+            (tool_name, self.instance_id.as_str(), server),
+            round,
+        )
+        .await
     }
 
     pub(super) async fn replay_recorded_call(
@@ -44,79 +50,52 @@ impl NatsToolProvider {
             return Ok(None);
         };
         let js = async_nats::jetstream::new(self.client.clone());
-        let journal =
-            harnx_toolset_server::invocation_journal::InvocationJournal::ensure(&js).await?;
+        let journal = harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
+            &js,
+            self.journal_replicas,
+        )
+        .await?;
         let Some(record) = journal.find(session, round, call_id).await? else {
             return Ok(None);
         };
         anyhow::ensure!(record.tool_name == call.name, "replayed tool name changed");
-        let (store, request) = self.replay_request(&record, replay).await?;
-        harnx_toolset_server::reply_fence::admit_recovery(store, &request).await?;
-        if let Some(reply) = journal.completed_reply(&request).await? {
-            let saved = journal
-                .committed_reply(&request)
-                .await?
-                .context("reply proof missing")?;
-            acknowledge_saved_handler(store, &saved).await?;
-            return recovered_output(Self::decode_recorded_reply(
-                reply,
-                ToolObservationProvenance::new(
-                    record.server_scope,
-                    record.server,
-                    record.request.tool,
-                    record.request.call_id,
-                ),
-            ));
+        if let Some(reply) = journal.completed_reply(&record.request).await? {
+            return recovered_output(decode_journaled_reply(&record, reply));
         }
-        self.dispatch_replay((record, request), replay, abort).await
+        self.dispatch_replay(record, replay, abort).await
     }
 
+    /// Re-dispatch a durably recorded call that has no completed reply yet.
+    /// The journal is the only source of truth for the outcome now: this
+    /// worker sends the wire request tagged as a replay attempt and trusts
+    /// whatever the tool server returns (its own reply is journaled
+    /// first-writer-wins before it ever reaches the wire).
     async fn dispatch_replay(
         &self,
-        invocation: (
-            harnx_toolset_server::invocation_journal::RecordedInvocation,
-            ToolRequest,
-        ),
+        record: harnx_toolset_server::invocation_journal::RecordedInvocation,
         replay: harnx_core::tool::ToolReplay<'_>,
         abort: &AbortSignal,
     ) -> anyhow::Result<Option<ToolProviderOutput>> {
-        let (record, mut request) = invocation;
-        let store = &self
-            .execution_control
-            .as_ref()
-            .context("replay execution missing")?
-            .0;
-        let journal = harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
-            &async_nats::jetstream::new(self.client.clone()),
-        )
-        .await?;
         let route = self
             .resolve_route(&record.tool_name)
             .context("replayed tool unavailable; keeping the pending invocation for recovery")?;
         // Scope identifies a process lifetime and must change across restart.
         // The logical server identity and raw tool must still be the same.
         validate_replay_route(&route, &record)?;
-        let consumer = request
-            .replay_execution
-            .as_ref()
-            .context("replay identity missing")?
-            .consumer
-            .clone();
-        harnx_toolset_server::invocation_admission::prepare_replay(store, &mut request, consumer)
-            .await?;
+        let mut request = record.request;
+        request.replay = Some(ReplayAttempt {
+            attempt: 1,
+            requested_by: self.instance_id.to_string(),
+        });
         let id = request.call_id.clone();
-        harnx_toolset_server::reply_fence::admit(store, &request).await?;
-        let receiving_request = request.clone();
         let pending =
             self.prepare_recorded_request(request, &route)
                 .map_err(|error| match error {
                     ToolError::Fatal(error) | ToolError::Recoverable(error) => error,
                 })?;
-        replay
-            .authorization
-            .context("replay requires a live session lease")?
-            .revalidate()
-            .await?;
+        if let Some(authorization) = replay.authorization {
+            authorization.revalidate().await?;
+        }
         anyhow::ensure!(!abort.aborted(), "tool replay aborted before dispatch");
         let message = self
             .await_response(pending, abort)
@@ -124,106 +103,60 @@ impl NatsToolProvider {
             .map_err(|error| match error {
                 ToolError::Fatal(error) | ToolError::Recoverable(error) => error,
             })?;
-        if let Some(reply) = journal.completed_reply(&receiving_request).await? {
-            return recovered_output(Self::decode_recorded_reply(
-                reply,
-                ToolObservationProvenance::new(
-                    self.instance_id.to_string(),
-                    route.server,
-                    route.raw_name,
-                    id,
-                ),
-            ));
-        }
         recovered_output(self.decode_reply(message, id, route))
-    }
-
-    async fn replay_request(
-        &self,
-        record: &harnx_toolset_server::invocation_journal::RecordedInvocation,
-        replay: harnx_core::tool::ToolReplay<'_>,
-    ) -> anyhow::Result<(&harnx_execution_control::ExecutionStore, ToolRequest)> {
-        let (store, parent) = self
-            .execution_control
-            .as_ref()
-            .context("replay requires execution control")?;
-        harnx_toolset_server::reply_fence::check_request_stop(store, &record.request).await?;
-        let original = record
-            .request
-            .execution
-            .as_ref()
-            .context("legacy replay has no retained generation authority")?;
-        anyhow::ensure!(
-            parent == original.consumer.operation(),
-            "replay cannot adopt another generation"
-        );
-        let (store, owner) = self.replay_owner(replay).await?;
-        let consumer = store
-            .gate_context(original.consumer.gate_root(), parent)
-            .await?;
-        anyhow::ensure!(consumer.owner() == &owner, "replay gate owner mismatch");
-        let mut request = record.request.clone();
-        request.replay = Some(owner);
-        request.replay_execution = Some(harnx_toolset::ToolExecution {
-            producer: original.producer.clone(),
-            consumer: consumer.clone(),
-        });
-        Ok((store, request))
-    }
-
-    async fn replay_owner(
-        &self,
-        replay: harnx_core::tool::ToolReplay<'_>,
-    ) -> anyhow::Result<(
-        &harnx_execution_control::ExecutionStore,
-        harnx_execution_control::Owner,
-    )> {
-        let (store, parent) = self
-            .execution_control
-            .as_ref()
-            .context("replay requires an execution owner")?;
-        anyhow::ensure!(
-            parent.session_id == replay.session_id,
-            "replay session mismatch"
-        );
-        let owner = store
-            .get(parent)
-            .await?
-            .context("replay parent missing")?
-            .owner
-            .context("replay parent has no owner")?;
-        // A stale worker must not borrow its replacement's owner from KV.
-        // Lease renewals can raise the caller's fence beyond its graph claim.
-        anyhow::ensure!(
-            replay.worker_id == Some(owner.instance_id.as_str())
-                && replay.fence_token.is_some_and(|fence| owner.fence <= fence),
-            "replay requester no longer owns the parent execution"
-        );
-        Ok((store, owner))
     }
 }
 
+/// Decode a reply the journal kept, attested to the row that recorded it.
+///
+/// A journaled value is the tool's raw handler output: the server writes it
+/// before the reply envelope is finalized, so its `_meta` execution-context
+/// block has never been through the worker's own validation. Every reader of
+/// a durable reply therefore decodes it here instead of taking the value as
+/// it stands, which is what keeps the tool server's private context out of
+/// the transcript and stamps the observation with provenance this side
+/// vouches for.
+pub(crate) fn decode_journaled_reply(
+    record: &harnx_toolset_server::invocation_journal::RecordedInvocation,
+    reply: ToolReply,
+) -> Result<ToolProviderOutput, ToolError> {
+    NatsToolProvider::decode_recorded_reply(
+        reply,
+        ToolObservationProvenance::new(
+            record.server_scope.clone(),
+            record.server.clone(),
+            record.request.tool.clone(),
+            record.request.call_id.clone(),
+        ),
+    )
+}
+
+/// The sequence of the `ToolCalls` entry that made `call_id`, or `None` when
+/// this session's transcript never recorded one.
+///
+/// This scans the RAW log, while every caller that hands a round back in —
+/// wind-up and the orphan detection a replay comes from — takes it from the
+/// effective log, after `apply_log_mutations`. The two agree unless an
+/// `EditEntries` replaced the range holding this `ToolCalls` entry, because a
+/// replacement inherits the `EditEntries` sequence: a round journaled before
+/// such an edit no longer matches the entry that asks for it, and the row
+/// reads as absent.
 async fn invocation_round(
     js: &async_nats::jetstream::Context,
     session: &str,
     call_id: &str,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<Option<u64>> {
     let entries = crate::nats_session_log::NatsSessionLog::new(js.clone(), session)
         .load_events_latest_async()
         .await?;
-    let round = entries
-        .iter()
-        .rev()
-        .find_map(|(seq, entry)| match entry {
-            harnx_core::session::SessionLogEntry::ToolCalls { calls, .. }
-                if calls.iter().any(|call| call.id.as_deref() == Some(call_id)) =>
-            {
-                Some(*seq)
-            }
-            _ => None,
-        })
-        .context("tool invocation has no durable call round")?;
-    Ok(round)
+    Ok(entries.iter().rev().find_map(|(seq, entry)| match entry {
+        harnx_core::session::SessionLogEntry::ToolCalls { calls, .. }
+            if calls.iter().any(|call| call.id.as_deref() == Some(call_id)) =>
+        {
+            Some(*seq)
+        }
+        _ => None,
+    }))
 }
 
 fn validate_replay_route(
@@ -234,24 +167,6 @@ fn validate_replay_route(
         route.server == record.server && route.raw_name == record.request.tool,
         "replayed tool server identity changed"
     );
-    Ok(())
-}
-
-async fn acknowledge_saved_handler(
-    store: &harnx_execution_control::ExecutionStore,
-    saved: &harnx_toolset_server::invocation_journal::CommittedReply,
-) -> anyhow::Result<()> {
-    // Only the committed producer returned. Never acknowledge a replacement
-    // handler using an old reply. Descendants remain physical blockers.
-    let reference = saved.producer.operation();
-    let Some(operation) = store.get(reference).await? else {
-        return Ok(());
-    };
-    if !operation.state.is_terminal() && operation.owner.as_ref() == Some(saved.producer.owner()) {
-        store
-            .owner_stopped(reference, saved.producer.owner())
-            .await?;
-    }
     Ok(())
 }
 

@@ -1,11 +1,40 @@
 use super::*;
+use crate::ag_ui_remote_follow::{event_frames, AdvisoryForwarder, QueuedEvent};
+use harnx_runtime::nats_event_sink::LiveEventState;
 
-async fn collect_remote_frames(
-    rx: tokio::sync::mpsc::Receiver<crate::ag_ui_remote_follow::QueuedEvent>,
+/// Queue the frames of one text chunk the way a live advisory carrying
+/// `after_seq` would, then close the queue so a reader sees exactly those.
+async fn queued_chunk(after_seq: u64, text: &str) -> tokio::sync::mpsc::Receiver<QueuedEvent> {
+    use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
+
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let mut forwarder = AdvisoryForwarder::new(tx);
+    assert!(
+        forwarder
+            .forward_agent_event(
+                after_seq,
+                AgentEvent::Model(ModelEvent::MessageChunk {
+                    blocks: vec![ContentBlock::Text(text.into())],
+                })
+            )
+            .await,
+        "the output queue must accept the chunk"
+    );
+    rx
+}
+
+/// Everything the queue lets through to a reader with this fence, at the
+/// durable position it has already applied.
+async fn drained_frames(
+    rx: tokio::sync::mpsc::Receiver<QueuedEvent>,
+    live: LiveEventState,
+    last_durable_seq: u64,
 ) -> Vec<Bytes> {
-    let live = harnx_runtime::nats_event_sink::LiveEventState::default();
-    live.select(Some("test-generation".into()));
-    tokio_stream::StreamExt::collect(crate::ag_ui_remote_follow::event_frames(rx, live)).await
+    tokio_stream::StreamExt::collect(event_frames(rx, live, last_durable_seq)).await
+}
+
+async fn collect_remote_frames(rx: tokio::sync::mpsc::Receiver<QueuedEvent>) -> Vec<Bytes> {
+    drained_frames(rx, LiveEventState::default(), 0).await
 }
 
 #[tokio::test]
@@ -136,11 +165,14 @@ async fn remote_attach_suppresses_completed_tool_tail_without_forwarded_start() 
 
     assert!(
         forwarder
-            .forward_agent_event(AgentEvent::Tool(ToolEvent::Completed {
-                id: "chatcmpl-tool-late".to_string(),
-                output: serde_json::json!("done"),
-                markdown: None,
-            }))
+            .forward_agent_event(
+                u64::MAX,
+                AgentEvent::Tool(ToolEvent::Completed {
+                    id: "chatcmpl-tool-late".to_string(),
+                    output: serde_json::json!("done"),
+                    markdown: None,
+                })
+            )
             .await
     );
     drop(forwarder);
@@ -179,9 +211,12 @@ async fn remote_poll_terminal_closes_text_when_final_advisory_is_missing() {
 
     assert!(
         forwarder
-            .forward_agent_event(AgentEvent::Model(ModelEvent::MessageChunk {
-                blocks: vec![ContentBlock::Text("partial".to_string())],
-            }))
+            .forward_agent_event(
+                u64::MAX,
+                AgentEvent::Model(ModelEvent::MessageChunk {
+                    blocks: vec![ContentBlock::Text("partial".to_string())],
+                })
+            )
             .await
     );
     drop(forwarder);
@@ -214,50 +249,47 @@ async fn remote_poll_terminal_closes_text_when_final_advisory_is_missing() {
     assert_strict_lifecycle_valid(&events);
 }
 
+/// A reader that detached before the queue drained sends nothing at all, so
+/// the START it never sent cannot leave an END behind.
 #[tokio::test]
 async fn queued_remote_start_is_discarded_without_an_orphan_end_after_stop() {
-    use crate::ag_ui_remote_follow::{event_frames, AdvisoryForwarder};
-    use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
-    let (tx, rx) = tokio::sync::mpsc::channel(4);
-    let mut forwarder = AdvisoryForwarder::new(tx);
-    assert!(
-        forwarder
-            .forward_agent_event(AgentEvent::Model(ModelEvent::MessageChunk {
-                blocks: vec![ContentBlock::Text("queued before stop".into())],
-            }))
-            .await
-    );
-    drop(forwarder);
-    let live = harnx_runtime::nats_event_sink::LiveEventState::default();
-    live.select(Some("test-generation".into()));
-    live.stop("test-generation");
-    let frames: Vec<_> = tokio_stream::StreamExt::collect(event_frames(rx, live)).await;
+    let rx = queued_chunk(u64::MAX, "queued before stop").await;
+    let live = LiveEventState::default();
+    live.retire();
+
+    let frames = drained_frames(rx, live, 0).await;
     assert!(
         frames.is_empty(),
         "unsent START must not produce a synthetic END"
     );
 }
 
+/// The queue re-checks the fence when an event reaches the wire, not when it is
+/// enqueued. Here nothing is retired and the chunk clears the reader's durable
+/// position, so the accepted `Cancel` is the only thing that can drop it.
+#[tokio::test]
+async fn the_accepted_cancel_alone_drops_a_chunk_queued_below_it() {
+    let rx = queued_chunk(5, "output the Cancel ended").await;
+    let live = LiveEventState::default();
+    live.accept_interrupt(9);
+
+    let frames = drained_frames(rx, live, 5).await;
+    assert!(
+        frames.is_empty(),
+        "an advisory from below the Cancel must not reach the wire: {frames:?}"
+    );
+}
+
+/// Detaching midway is the other half: the lifecycle already on the wire has to
+/// be closed, and only that one.
 #[tokio::test]
 async fn stopped_remote_queue_closes_only_the_lifecycle_already_sent() {
-    use crate::ag_ui_remote_follow::{event_frames, AdvisoryForwarder};
-    use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
-    let (tx, rx) = tokio::sync::mpsc::channel(4);
-    let mut forwarder = AdvisoryForwarder::new(tx);
-    assert!(
-        forwarder
-            .forward_agent_event(AgentEvent::Model(ModelEvent::MessageChunk {
-                blocks: vec![ContentBlock::Text("not sent before stop".into())],
-            }))
-            .await
-    );
-    drop(forwarder);
-    let live = harnx_runtime::nats_event_sink::LiveEventState::default();
-    live.select(Some("test-generation".into()));
-    let stream = event_frames(rx, live.clone());
+    let rx = queued_chunk(u64::MAX, "not sent before stop").await;
+    let live = LiveEventState::default();
+    let stream = event_frames(rx, live.clone(), 0);
     tokio::pin!(stream);
     let start = tokio_stream::StreamExt::next(&mut stream).await.unwrap();
-    live.stop("test-generation");
+    live.retire();
     let mut frames = vec![start];
     frames.extend(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
     frames.push(Bytes::from(frame_run_boundary_event(

@@ -58,21 +58,19 @@ async fn same_local_id_has_independent_history_leases_cancellation_and_deletion(
     assert_independent_history(&alpha_log, &beta_log).await?;
 
     let attachment_cid = upload_shared_attachment(&js, [&alpha, &beta]).await?;
-    alpha.request_cancel(Default::default()).await?;
-    assert!(alpha
-        .execution_store()
-        .current(alpha.storage_key())
+    alpha.interrupt("client cancel").await?;
+    // The interrupt lands in alpha's own log and nowhere else: the two
+    // sessions share an agent name prefix but not a transcript.
+    assert!(alpha_log
+        .load_events_async()
         .await?
-        .unwrap()
-        .state
-        .cancelling());
-    assert!(beta
-        .execution_store()
-        .current(beta.storage_key())
+        .iter()
+        .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. })));
+    assert!(!beta_log
+        .load_events_async()
         .await?
-        .unwrap()
-        .state
-        .accepts_work());
+        .iter()
+        .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. })));
     alpha_lease.release().await?;
     let admin = admin_config(server.url());
     let deleted = delete_remote_session(&admin, "local", "alpha", "review-12345").await?;
@@ -229,11 +227,6 @@ async fn assert_beta_survived_deletion(
         .is_some());
     assert_eq!(beta_log.load_events_async().await?.len(), 1);
     assert!(beta_lease.is_held());
-    assert!(beta
-        .execution_store()
-        .current(beta.storage_key())
-        .await?
-        .is_some());
     Ok(())
 }
 
