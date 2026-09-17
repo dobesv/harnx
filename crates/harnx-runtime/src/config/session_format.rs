@@ -343,7 +343,12 @@ mod tests {
                 note: Some("denied\nby user".into()),
                 fence_token: 7,
             },
-            SessionLogEntry::Cancel { fence_token: 7 },
+            SessionLogEntry::Cancel {
+                fence_token: 7,
+                cancellation_id: None,
+                requested_by: None,
+                timestamp: None,
+            },
             SessionLogEntry::Unknown,
         ]);
         entries

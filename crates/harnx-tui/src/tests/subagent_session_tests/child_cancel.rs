@@ -1,8 +1,9 @@
 use super::*;
 use crate::types::{MonitoredSessionState, SubAgentInvocationProgress, Tui};
+use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 use std::sync::{Arc, Mutex};
 
-type Targets = Arc<Mutex<Vec<(String, Option<String>)>>>;
+type Targets = Arc<Mutex<Vec<String>>>;
 
 async fn child_tui() -> (Tui, MonitoredSessionKey, Targets) {
     let mut tui = Tui::init(&test_config()).await.unwrap();
@@ -25,28 +26,51 @@ async fn child_tui() -> (Tui, MonitoredSessionKey, Targets) {
     tui.app.monitored_sessions.insert(key.clone(), monitor);
     tui.app.llm_busy = true;
     tui.current_prompt_abort = Some(harnx_core::abort::create_abort_signal());
+    // The parent's own turn, distinct from the child's storage key below —
+    // an accepted child interrupt must never fence or settle it.
+    tui.active_remote_session = Some(("parent-session".into(), LOCAL_CLUSTER_KEY.into()));
     let targets: Targets = Default::default();
     tui.set_exit_cancel_factory(Arc::new({
         let targets = targets.clone();
-        move |_, _, session, _, expected, _| {
-            targets.lock().unwrap().push((session, expected));
-            Box::pin(async { Ok(harnx_execution_control::CancelReceipt::idle()) })
+        move |_, _, session, _| {
+            targets.lock().unwrap().push(session);
+            Box::pin(async {
+                Ok(harnx_runtime::nats_session::InterruptOutcome::Accepted { cancel_seq: 42 })
+            })
         }
     }));
     (tui, key, targets)
 }
 
 #[tokio::test]
-async fn focused_child_stop_uses_expected_generation_and_preserves_parent() {
+async fn focused_child_stop_targets_the_child_session_and_preserves_parent() {
     let (mut tui, key, targets) = child_tui().await;
     assert!(tui.cancel_selected_child());
-    assert_eq!(
-        *targets.lock().unwrap(),
-        vec![(key.storage_key(), Some("active".into()))]
-    );
+    assert_eq!(*targets.lock().unwrap(), vec![key.storage_key()]);
+    // One durable interrupt append per session: cancelling a child shows the
+    // same tray a root interrupt would, without touching the parent's own
+    // follower task.
+    assert!(tui.has_root_cancellation());
+
+    tui.poll_pending_exit_cancel().await;
+
+    // The child's own interrupt is fully accepted, but it targets a
+    // different session than the one this Tui is actively driving, so it
+    // must never fence or settle the parent's turn.
     assert!(!tui.current_prompt_abort.as_ref().unwrap().aborted());
     assert!(tui.app.llm_busy);
-    assert!(!tui.has_root_cancellation());
+    assert_eq!(
+        tui.active_remote_session,
+        Some(("parent-session".into(), LOCAL_CLUSTER_KEY.into()))
+    );
+    let probe = harnx_runtime::nats_event_sink::AdvisoryEnvelope::new(
+        0,
+        AgentEvent::Notice(harnx_core::event::NoticeEvent::Info("probe".into())),
+    );
+    assert!(
+        tui.live_events.should_render(&probe, 0),
+        "a child interrupt must not fence the parent's live state"
+    );
 }
 
 #[tokio::test]
@@ -69,10 +93,7 @@ async fn fullscreen_child_takes_precedence_over_root_row_focus() {
     assert!(tui.open_focused_root_subagent());
     tui.app.transcript.clear();
     assert!(tui.cancel_selected_child());
-    assert_eq!(
-        *targets.lock().unwrap(),
-        vec![(key.storage_key(), Some("active".into()))]
-    );
+    assert_eq!(*targets.lock().unwrap(), vec![key.storage_key()]);
 }
 
 #[tokio::test]
@@ -93,40 +114,6 @@ async fn cancelling_child_progress_can_converge_to_cancelled() {
         &tui.app.transcript[0],
         TranscriptItem::SubAgentSession {
             status: SubAgentStatus::Cancelled,
-            ..
-        }
-    ));
-}
-
-#[tokio::test]
-async fn execution_hydration_does_not_update_the_same_agent_and_id_on_another_cluster() {
-    let (mut tui, key, _) = child_tui().await;
-    let mut other = key.clone();
-    other.cluster = "other-cluster".into();
-    tui.app.transcript.push(TranscriptItem::SubAgentSession {
-        key: other.clone(),
-        status: SubAgentStatus::Running,
-        invocation_id: Some("active".into()),
-        progress: None,
-    });
-    let mut operation = harnx_execution_control::Operation::preparing(
-        harnx_execution_control::OperationRef::new(key.storage_key(), "active"),
-        harnx_execution_control::OperationKind::Session,
-        None,
-    );
-    operation.state = harnx_execution_control::OperationState::CancelRequested;
-    tui.hydrate_execution_state(key.cluster.clone(), operation);
-    assert!(matches!(
-        &tui.app.transcript[0],
-        TranscriptItem::SubAgentSession {
-            status: SubAgentStatus::Cancelling,
-            ..
-        }
-    ));
-    assert!(matches!(
-        &tui.app.transcript[1],
-        TranscriptItem::SubAgentSession {
-            status: SubAgentStatus::Running,
             ..
         }
     ));

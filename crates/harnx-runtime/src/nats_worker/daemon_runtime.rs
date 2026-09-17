@@ -45,7 +45,6 @@ pub(super) struct ControlListenerCtx<'a> {
     pub(super) lease: &'a Arc<NatsSessionLease>,
     pub(super) backend: &'a NatsSessionLogBackend,
     pub(super) abort_signal: &'a crate::utils::AbortSignal,
-    pub(super) execution: &'a WorkerExecution,
 }
 
 struct PreparedControl {
@@ -59,7 +58,6 @@ struct ActivationAckCtx<'a> {
     message: &'a async_nats::jetstream::Message,
     lease: &'a Arc<NatsSessionLease>,
     abort_signal: &'a crate::utils::AbortSignal,
-    execution: &'a WorkerExecution,
 }
 
 struct ClaimedActivation {
@@ -95,7 +93,6 @@ fn agent_activation_span(
 }
 
 pub(super) struct WorkerRuntime {
-    pub(super) _cleanup: super::cleanup_supervisor::CleanupSupervisor,
     pub(super) config: GlobalConfig,
     pub(super) instance_id: harnx_core::instance::ServerScope,
     pub(super) _background_services: Arc<Mutex<Option<BackgroundServices>>>,
@@ -103,7 +100,6 @@ pub(super) struct WorkerRuntime {
     /// `None` for a consuming worker, or a managing worker with nothing
     /// configured to spawn anywhere.
     pub(super) server_reconciler: Option<Arc<ServerReconciler>>,
-    #[allow(dead_code)]
     pub(super) cluster: String,
     pub(super) activation_route: SessionActivationRoute,
     pub(super) activation_mode: WorkerActivationMode,
@@ -172,14 +168,7 @@ impl WorkerRuntime {
             return;
         }
         let to_start = reconciler
-            .claim_users(
-                &format!(
-                    "{}/{}",
-                    activation.session_id,
-                    activation.execution_id.as_deref().unwrap_or("unclaimed")
-                ),
-                servers,
-            )
+            .claim_users(&activation.session_id, servers)
             .await;
         if to_start.is_empty() {
             return;
@@ -210,17 +199,9 @@ impl WorkerRuntime {
         }
     }
 
-    pub(super) async fn end_session_tool_servers(
-        &self,
-        reference: &harnx_execution_control::OperationRef,
-    ) {
+    pub(super) async fn end_session_tool_servers(&self, session_id: &str) {
         if let Some(reconciler) = &self.server_reconciler {
-            reconciler
-                .session_ended(&format!(
-                    "{}/{}",
-                    reference.session_id, reference.execution_id
-                ))
-                .await;
+            reconciler.session_ended(session_id).await;
         }
     }
 
@@ -372,11 +353,9 @@ impl WorkerRuntime {
             activation,
             lease,
             abort_signal,
-            execution,
             ..
         } = *ctx;
-        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id)
-            .with_execution(execution.fence.clone());
+        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id);
         match Self::spawn_control_listener(ControlListenerCtx {
             client: &self.client,
             jetstream: &self.jetstream,
@@ -384,7 +363,6 @@ impl WorkerRuntime {
             lease,
             backend: &backend,
             abort_signal,
-            execution,
         })
         .await
         {
@@ -410,7 +388,7 @@ impl WorkerRuntime {
         let control = match self.prepare_activation_control(&ctx).await {
             Ok(control) => control,
             Err(error) => {
-                self.end_session_tool_servers(&ctx.execution.reference)
+                self.end_session_tool_servers(&ctx.activation.session_id)
                     .await;
                 return Err(error);
             }
@@ -418,7 +396,7 @@ impl WorkerRuntime {
         if let Err(error) = ctx.message.ack_with(AckKind::Progress).await {
             control.task.abort();
             let _ = ctx.lease.release().await;
-            self.end_session_tool_servers(&ctx.execution.reference)
+            self.end_session_tool_servers(&ctx.activation.session_id)
                 .await;
             return Err(anyhow::anyhow!("ack SessionActivate: {error}"));
         }
@@ -431,21 +409,11 @@ impl WorkerRuntime {
         message: &async_nats::jetstream::Message,
     ) -> Result<PreparedActivation> {
         let ClaimedActivation {
-            mut activation,
+            activation,
             lease,
             span,
         } = claimed;
-        let store =
-            harnx_execution_control::ExecutionStore::ensure(&self.jetstream, self.lease.replicas)
-                .await?;
-        let execution =
-            match WorkerExecution::claim(store, &mut activation, &lease, &self.jetstream).await {
-                Ok(execution) => execution,
-                Err(error) => {
-                    let _ = lease.release().await;
-                    return Err(error);
-                }
-            };
+        let execution = WorkerExecution::claim(&activation, &lease);
         log::info!(
             "session activate claimed: session_id={} worker_id={} worker_pid={} build={} activation_route={:?} revision={} epoch={}",
             activation.session_id,
@@ -464,21 +432,10 @@ impl WorkerRuntime {
                 message,
                 lease: &lease,
                 abort_signal: &abort_signal,
-                execution: &execution,
             })
             .await?;
-        if !execution.cancelled().await?
-            && execution
-                .store
-                .check_ancestors(&execution.reference)
-                .await
-                .is_ok()
-        {
-            self.prepare_session_services(&activation, &abort_signal)
-                .await;
-        } else {
-            abort_signal.set_ctrlc();
-        }
+        self.prepare_session_services(&activation, &abort_signal)
+            .await;
         Ok(PreparedActivation {
             execution,
             message: message.clone(),
@@ -501,21 +458,16 @@ impl WorkerRuntime {
         let mut startup = tokio::spawn(async move {
             worker.start_session_tool_servers(&activation).await;
             if stopped.aborted() {
-                if let Some(id) = &activation.execution_id {
-                    worker
-                        .end_session_tool_servers(&harnx_execution_control::OperationRef::new(
-                            &activation.session_id,
-                            id,
-                        ))
-                        .await;
-                }
+                worker
+                    .end_session_tool_servers(&activation.session_id)
+                    .await;
             }
         });
         tokio::select! {
             _ = crate::utils::wait_abort_signal(abort) => {
-                // Keep the registration task: its final G1-only release repairs
-                // claims that arrive after logical acceptance, without touching G2.
-                harnx_execution_control::CleanupTasks::process().spawn(async move { let _ = startup.await; });
+                // Keep the registration task: its final release repairs claims
+                // that arrive after the interruption was already accepted.
+                tokio::spawn(async move { let _ = startup.await; });
                 return;
             }
             _ = &mut startup => {},
@@ -539,8 +491,6 @@ impl WorkerRuntime {
         let worker = Arc::clone(self);
         let session_id = activation.session_id.clone();
         let task_session_id = session_id.clone();
-        let cleanup_execution = execution.clone();
-        let server_reconciler = self.server_reconciler.clone();
         nats_metrics::active_session_started();
         async move {
                 let snapshot = nats_metrics::snapshot();
@@ -564,15 +514,7 @@ impl WorkerRuntime {
                 if result.as_ref().is_ok_and(|terminal| *terminal) {
                     let _ = message.ack().await;
                 } else { let _ = Self::delayed_nak(&message).await; }
-                // A cooperative call may still own work. Keep its shared server
-                // alive until durable reconciliation observes the whole subtree.
-                if result.as_ref().is_ok_and(|terminal| *terminal)
-                    || cleanup_execution.cancelled().await.unwrap_or(false)
-                {
-                    // G2 admission can make G1's redundant Cancel projection
-                    // fail. Its accepted stop still owns supervised claim cleanup.
-                    super::cleanup_supervisor::release_server_claim_when_clean(server_reconciler, cleanup_execution);
-                }
+                worker.end_session_tool_servers(&task_session_id).await;
                 nats_metrics::active_session_finished();
                 let snapshot = nats_metrics::snapshot();
                 log::info!(
@@ -651,23 +593,10 @@ impl WorkerRuntime {
             .flush()
             .await
             .context("flush session control subscription")?;
-        // A request/reply acknowledgement is sent only after the worker has
-        // written the fenced Cancel entry. It is published before firing abort
-        // so execute_session cannot tear down this listener in between.
-        let watch = ctx.execution.store.watch().await?;
-        if ctx
-            .execution
-            .store
-            .check_ancestors(&ctx.execution.reference)
-            .await
-            .is_err()
-        {
-            ctx.abort_signal.set_ctrlc();
-        }
         let (hitl_decision_tx, hitl_decision_rx) = tokio::sync::mpsc::unbounded_channel();
         let handler = SessionControlHandler::new(&ctx, hitl_decision_tx);
         Ok(PreparedControl {
-            task: tokio::spawn(handler.listen(subscriber, watch)),
+            task: tokio::spawn(handler.listen(subscriber)),
             hitl_decision_rx,
         })
     }

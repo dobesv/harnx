@@ -49,17 +49,7 @@ impl Fixture {
             .await?
             .context("worker lease")?,
         );
-        let fence = generation::generation_fence(
-            &js,
-            source.storage_key(),
-            harnx_execution_control::Owner {
-                instance_id: lease.worker_id().into(),
-                fence: lease.fence_token(),
-            },
-        )
-        .await?;
-        let backend =
-            NatsSessionLogBackend::new(js, source.storage_key()).with_execution(Some(fence));
+        let backend = generation::fenced_backend(&js, source.storage_key()).await?;
         let sink = FencedSessionLogSink::new(backend.clone(), lease.clone());
         let fixture = Self {
             _server: server,

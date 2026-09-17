@@ -89,7 +89,6 @@ pub type OnHitlApprovalRequiredFn =
 /// frontend `LocalSet`.
 pub struct AgentLoopContext {
     pub config: GlobalConfig,
-    pub generation_fence: Option<crate::execution_fence::GenerationFence>,
     pub instance_id: harnx_core::instance::ServerScope,
     pub abort_signal: AbortSignal,
     pub token_budget: Option<u64>,
@@ -118,17 +117,17 @@ pub struct AgentLoopContext {
 }
 
 impl AgentLoopContext {
-    pub(crate) async fn check_generation(&self, boundary: &str) -> Result<()> {
-        crate::execution_fence::check(self.generation_fence.as_ref(), &self.abort_signal, boundary)
-            .await
+    /// The session log is the only interrupt authority; the abort signal is
+    /// this process's view of the `Cancel` its watcher already saw. Every
+    /// former gate boundary is now just this check.
+    pub(crate) fn check_generation(&self, boundary: &str) -> Result<()> {
+        anyhow::ensure!(!self.abort_signal.aborted(), "interrupted at {boundary}");
+        Ok(())
     }
 }
 
 async fn defer_tool_approval(ctx: &AgentLoopContext, error: anyhow::Error) -> Result<LoopResult> {
-    if error.is::<harnx_execution_control::Interrupted>() {
-        return Err(error);
-    }
-    ctx.check_generation("completion-error").await?;
+    ctx.check_generation("completion-error")?;
     let Some(callback) = &ctx.on_hitl_approval_required else {
         return Err(error);
     };
@@ -343,17 +342,10 @@ fn emit_turn_started() {
 async fn emit_turn_ended<T>(ctx: &AgentLoopContext, result: &Result<T>) -> Result<()> {
     use harnx_core::event::{AgentEvent, ModelEvent, TurnEvent, TurnOutcome};
 
-    if result
-        .as_ref()
-        .is_err_and(|error| error.is::<harnx_execution_control::Interrupted>())
-    {
-        ctx.abort_signal.set_ctrlc();
-        return Ok(());
-    }
     if ctx.abort_signal.aborted() {
         return Ok(());
     }
-    ctx.check_generation("turn-ended").await?;
+    ctx.check_generation("turn-ended")?;
     if let Err(error) = result {
         if !ctx.abort_signal.aborted() {
             harnx_core::sink::emit_agent_event(AgentEvent::Model(ModelEvent::Error(
@@ -426,16 +418,11 @@ async fn dispatch_agent_loop_hook(params: AgentHookDispatch<'_>) -> harnx_core::
         cwd,
         resume_count,
     } = params;
-    let execution = ctx
-        .generation_fence
-        .as_ref()
-        .map(|fence| fence.context.clone());
     dispatch_hook_event(HookEventDispatch {
         event,
         provider: ctx.nats_hook_provider.as_deref(),
         meta: HookDispatchMeta {
             abort: Some(ctx.abort_signal.clone()),
-            execution,
             session_id: session_id.to_string(),
             cwd: cwd.to_path_buf(),
             resume_count,
@@ -539,7 +526,7 @@ async fn pre_model_call_boundary_passes(
         return Ok(false);
     }
 
-    ctx.check_generation("model-handoff").await?;
+    ctx.check_generation("model-handoff")?;
     enforce_token_budget(ctx)?;
     Ok(true)
 }
@@ -557,14 +544,8 @@ async fn call_agent_model(ctx: &AgentLoopContext, input: &mut Input) -> AgentMod
 
 async fn committed_agent_model(ctx: &AgentLoopContext, input: &mut Input) -> AgentModelResult {
     let result = call_agent_model(ctx, input).await;
-    // The response can win the local select after durable stop committed.
-    ctx.check_generation("model-resolved").await?;
-    if let Ok((output, thought, tool_calls, usage)) = &result {
-        if let Some(fence) = &ctx.generation_fence {
-            fence.output(harnx_execution_control::OutputKind::ModelResponse,
-                serde_json::json!({"output": output, "thought": thought, "tool_calls": tool_calls, "usage": usage})).await?;
-        }
-    }
+    // The response can win the local select after the interrupt landed.
+    ctx.check_generation("model-resolved")?;
     result
 }
 
@@ -587,10 +568,10 @@ async fn fail_model_turn(params: FailedModelTurn<'_>) -> Result<LoopResult> {
     // Remote cancellation is already represented by its durable Cancel entry.
     // Persisting an empty assistant response here would come after that entry
     // and incorrectly make reconstruction treat the cancelled turn as idle.
-    if ctx.abort_signal.aborted() || error.is::<harnx_execution_control::Interrupted>() {
+    if ctx.abort_signal.aborted() {
         return Err(error);
     }
-    ctx.check_generation("model-failure").await?;
+    ctx.check_generation("model-failure")?;
     let _ = dispatch_agent_loop_hook(AgentHookDispatch {
         ctx,
         event: HookEvent::StopFailure {
@@ -780,7 +761,7 @@ async fn advance_tool_round(
     input: Input,
     round: ToolRoundOutput,
 ) -> Result<ToolRoundAdvance> {
-    ctx.check_generation("tool-round-reducer").await?;
+    ctx.check_generation("tool-round-reducer")?;
     let switch_agent = round
         .tool_results
         .iter()
@@ -930,7 +911,7 @@ async fn prepare_round_input(
     wait_for_session_compaction(&ctx.config).await;
     apply_round_embeddings(input, &ctx.config, &ctx.abort_signal, with_embeddings).await?;
     inject_shared_pending_context(input, ctx.pending_async_context.as_ref()).await;
-    ctx.check_generation("before-model").await?;
+    ctx.check_generation("before-model")?;
     ctx.config.write().before_chat_completion(input)
 }
 
@@ -999,7 +980,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
             Err(error) => return defer_tool_approval(ctx, error).await,
         };
 
-        ctx.check_generation("completion-reducer").await?;
+        ctx.check_generation("completion-reducer")?;
         // Input was persisted before the model call. Clear this one-shot field
         // before on_tool_round can supply the next pending user message.
         input.injected_user_text = None;
@@ -1058,14 +1039,14 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
             ResumeAction::None => {}
         }
 
-        ctx.check_generation("model-final").await?;
+        ctx.check_generation("model-final")?;
         emit_final_text_response(ctx, output, turn_usage).await;
 
         // Done.
         break;
     }
 
-    ctx.check_generation("loop-completed").await?;
+    ctx.check_generation("loop-completed")?;
     finish_agent_loop(config, abort_signal)
 }
 
@@ -1163,7 +1144,10 @@ mod tests {
         ));
         assert!(matches!(
             events.last(),
-            Some((AgentEvent::Turn(TurnEvent::Ended { .. }), None))
+            Some((
+                AgentEvent::Turn(TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. }),
+                None
+            ))
         ));
         let final_outputs: Vec<&str> = events
             .iter()
@@ -1497,9 +1481,7 @@ mod tests {
     }
 
     fn metrics_loop_context(config: GlobalConfig) -> AgentLoopContext {
-        let generation_fence = config.read().generation_fence.clone();
         AgentLoopContext {
-            generation_fence,
             config,
             instance_id: harnx_core::instance::ServerScope::new(),
             abort_signal: create_abort_signal(),
@@ -1670,9 +1652,7 @@ mod tests {
         call_fn: AgentCallFn,
         on_tool_round: OnToolRoundFn,
     ) -> AgentLoopContext {
-        let generation_fence = global_config.read().generation_fence.clone();
         AgentLoopContext {
-            generation_fence,
             instance_id: harnx_core::instance::ServerScope::new(),
             config: global_config,
             abort_signal: create_abort_signal(),

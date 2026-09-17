@@ -8,6 +8,7 @@ use crate::types::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 use harnx_runtime::local_orchestrator::LocalWorkerSupervisor;
+use harnx_runtime::nats_session::InterruptOutcome;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Notify};
 
@@ -98,13 +99,13 @@ fn controlled_cancel_factory(
     release: Arc<Notify>,
     error: Option<&'static str>,
 ) -> ExitCancelFactory {
-    Arc::new(move |_, _, _, _, _, _| -> ExitCancelFuture {
+    Arc::new(move |_, _, _, _| -> ExitCancelFuture {
         let release = Arc::clone(&release);
         Box::pin(async move {
             release.notified().await;
             match error {
                 Some(message) => Err(anyhow::anyhow!(message)),
-                None => Ok(harnx_execution_control::CancelReceipt::idle()),
+                None => Ok(InterruptOutcome::Idle),
             }
         })
     })
@@ -134,8 +135,6 @@ async fn cancellation_worker_preparation_is_not_misreported_as_request_timeout()
         Arc::clone(&local_worker),
         session_id,
         LOCAL_CLUSTER_KEY.to_string(),
-        None,
-        crate::types::CancellationAction::Request,
     );
     tokio::pin!(cancellation);
 
@@ -145,97 +144,17 @@ async fn cancellation_worker_preparation_is_not_misreported_as_request_timeout()
             .is_err()
     );
     drop(worker_guard);
-    let receipt = tokio::time::timeout(Duration::from_secs(10), cancellation)
+    // Preparation starts a local worker process once the lock is free. That is
+    // genuinely slow under a loaded machine, and this bound only has to be
+    // generous enough to tell "still waiting for the worker" from "gave up".
+    let outcome = tokio::time::timeout(Duration::from_secs(60), cancellation)
         .await
         .expect("cancellation should continue after worker preparation becomes available")
         .expect("prepare cancellation request");
 
-    assert_eq!(
-        receipt.disposition,
-        harnx_execution_control::CancelDisposition::Idle
-    );
-}
-
-#[tokio::test]
-async fn attaching_to_cancelling_session_automatically_retries_recovery() {
-    let mut tui = Tui::init(&test_config())
-        .await
-        .expect("initialize test TUI");
-    tui.session_activity_target = Some(("session".into(), LOCAL_CLUSTER_KEY.into()));
-    let mut operation = harnx_execution_control::Operation::preparing(
-        harnx_execution_control::OperationRef::new("session", "execution"),
-        harnx_execution_control::OperationKind::Session,
-        None,
-    );
-    operation.request_cancel("cancel", false).unwrap();
-    operation
-        .transition(harnx_execution_control::OperationState::Unconfirmed)
-        .unwrap();
-
-    tui.live_events
-        .select(Some(operation.reference.execution_id.clone()));
-    tui.hydrate_execution_state(LOCAL_CLUSTER_KEY.into(), operation);
-
-    assert!(tui.pending_exit_cancel.is_some());
-    assert!(matches!(
-        tui.cancellation.as_ref().map(|tray| &tray.phase),
-        Some(crate::cancellation::CancellationPhase::Requesting)
-    ));
-}
-
-#[tokio::test]
-async fn failed_automatic_recovery_can_abandon_the_observed_generation() {
-    let mut tui = Tui::init(&test_config())
-        .await
-        .expect("initialize test TUI");
-    tui.session_activity_target = Some(("session".into(), LOCAL_CLUSTER_KEY.into()));
-    let actions = Arc::new(std::sync::Mutex::new(Vec::new()));
-    tui.set_exit_cancel_factory(Arc::new({
-        let actions = Arc::clone(&actions);
-        move |_, _, _, _, expected, action| {
-            actions.lock().unwrap().push((expected, action));
-            Box::pin(async move {
-                match action {
-                    crate::types::CancellationAction::Request => {
-                        anyhow::bail!("automatic recovery failed")
-                    }
-                    crate::types::CancellationAction::Abandon => std::future::pending().await,
-                }
-            })
-        }
-    }));
-    let mut operation = harnx_execution_control::Operation::preparing(
-        harnx_execution_control::OperationRef::new("session", "observed-execution"),
-        harnx_execution_control::OperationKind::Session,
-        None,
-    );
-    operation.request_cancel("cancel", false).unwrap();
-
-    tui.live_events
-        .select(Some(operation.reference.execution_id.clone()));
-    tui.hydrate_execution_state(LOCAL_CLUSTER_KEY.into(), operation);
-    tui.poll_pending_exit_cancel().await;
-    assert!(matches!(
-        tui.cancellation.as_ref().map(|tray| &tray.phase),
-        Some(crate::cancellation::CancellationPhase::Failed(_))
-    ));
-
-    tui.handle_key(esc()).await.unwrap();
-    assert!(tui.app.modal.is_none());
-
-    assert_eq!(
-        *actions.lock().unwrap(),
-        vec![
-            (
-                Some("observed-execution".into()),
-                crate::types::CancellationAction::Request
-            ),
-            (
-                Some("observed-execution".into()),
-                crate::types::CancellationAction::Abandon
-            )
-        ]
-    );
+    // Nothing was ever admitted for this brand-new session, so there is
+    // nothing to interrupt.
+    assert!(matches!(outcome, InterruptOutcome::Idle));
 }
 
 #[test]
@@ -447,6 +366,11 @@ async fn interrupt_exit_failure_stays_with_retry_and_error() {
     assert!(!tui.app.should_quit);
     assert_exit_phase(&tui, ExitPhase::RequestFailed);
     assert_eq!(tui.exit_interrupt_error(), Some("boom"));
+    let tray = tui.cancellation.as_ref().expect("failed tray still shown");
+    assert_eq!(
+        tui.cancellation_message(tray, false),
+        "Interrupt failed: boom  Ctrl+C: retry  Ctrl+D: exit anyway  Esc: back"
+    );
 }
 
 #[tokio::test]
@@ -463,13 +387,8 @@ async fn force_exit_does_not_wait_for_cancel_persistence() {
 #[tokio::test]
 async fn interrupt_exit_finishes_on_durable_acceptance_before_shutdown() {
     let mut tui = prompting_exit_tui().await;
-    tui.set_exit_cancel_factory(Arc::new(|_, _, _, _, _, _| {
-        Box::pin(async {
-            let mut receipt = harnx_execution_control::CancelReceipt::idle();
-            receipt.cancelled = true;
-            receipt.disposition = harnx_execution_control::CancelDisposition::Requested;
-            Ok(receipt)
-        })
+    tui.set_exit_cancel_factory(Arc::new(|_, _, _, _| {
+        Box::pin(async { Ok(InterruptOutcome::Accepted { cancel_seq: 7 }) })
     }));
     tui.handle_modal_key(ctrl('c')).await.unwrap();
     tui.poll_pending_exit_cancel().await;
@@ -483,14 +402,8 @@ async fn interrupt_exit_finishes_on_durable_acceptance_before_shutdown() {
 #[tokio::test]
 async fn interrupt_exit_finishes_for_locally_owned_worker_on_acceptance() {
     let mut tui = prompting_exit_tui_with_worker(ExitWorkerState::LocalOwnedHere).await;
-    tui.set_exit_cancel_factory(Arc::new(|_, _, _, _, _, _| {
-        Box::pin(async {
-            let mut receipt = harnx_execution_control::CancelReceipt::idle();
-            receipt.cancelled = true;
-            receipt.disposition = harnx_execution_control::CancelDisposition::Requested;
-            receipt.execution_id = Some("execution".into());
-            Ok(receipt)
-        })
+    tui.set_exit_cancel_factory(Arc::new(|_, _, _, _| {
+        Box::pin(async { Ok(InterruptOutcome::Accepted { cancel_seq: 7 }) })
     }));
 
     tui.handle_modal_key(ctrl('c')).await.unwrap();
@@ -498,78 +411,4 @@ async fn interrupt_exit_finishes_for_locally_owned_worker_on_acceptance() {
 
     assert_exit_finished(&tui);
     assert!(!tui.exit_after_cancel);
-}
-
-#[tokio::test]
-async fn root_cancellation_blocks_editing_and_has_static_unconfirmed_tray() {
-    let mut harness = TuiTestHarness::with_size(100, 20).await;
-    let tui = harness.tui();
-    tui.set_exit_cancel_factory(controlled_cancel_factory(Arc::new(Notify::new()), None));
-    tui.start_cancellation("root".into(), "local".into(), None);
-    tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
-        .await
-        .unwrap();
-    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    assert!(tui.app.input.lines().iter().all(String::is_empty));
-    assert!(tui.app.pending_message.is_none());
-    tui.cancellation.as_mut().unwrap().phase = crate::cancellation::CancellationPhase::Unconfirmed;
-    assert!(tui.cancellation_unconfirmed());
-    harness.render();
-    assert!(harness
-        .screen_contents()
-        .contains("Cancellation unconfirmed"));
-    assert!(harness.screen_contents().contains("Esc: back to editor"));
-    assert!(!harness.screen_contents().contains("Esc: resume anyway"));
-    harness
-        .tui()
-        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-        .await
-        .unwrap();
-    assert!(matches!(
-        harness.tui().cancellation.as_ref().map(|tray| &tray.phase),
-        Some(crate::cancellation::CancellationPhase::Requesting)
-    ));
-}
-
-#[tokio::test]
-async fn unconfirmed_cancellation_can_be_explicitly_abandoned() {
-    let mut tui = Tui::init(&test_config())
-        .await
-        .expect("initialize test TUI");
-    let actions = Arc::new(std::sync::Mutex::new(Vec::new()));
-    tui.set_exit_cancel_factory(Arc::new({
-        let actions = Arc::clone(&actions);
-        move |_, _, _, _, expected, action| {
-            actions.lock().unwrap().push((expected, action));
-            Box::pin(std::future::pending())
-        }
-    }));
-    // Unknown acceptance retains the observed generation for explicit repair.
-    tui.start_observed_cancellation("root".into(), "local".into(), "execution".into());
-    tui.cancellation.as_mut().unwrap().phase = crate::cancellation::CancellationPhase::Unconfirmed;
-
-    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    assert!(tui.app.modal.is_none());
-    assert!(tui.pending_exit_cancel.is_some());
-    assert_eq!(
-        *actions.lock().unwrap(),
-        vec![
-            (
-                Some("execution".into()),
-                crate::types::CancellationAction::Request
-            ),
-            (
-                Some("execution".into()),
-                crate::types::CancellationAction::Abandon
-            )
-        ]
-    );
-    assert!(matches!(
-        tui.cancellation.as_ref().map(|tray| &tray.phase),
-        Some(crate::cancellation::CancellationPhase::Abandoning)
-    ));
 }

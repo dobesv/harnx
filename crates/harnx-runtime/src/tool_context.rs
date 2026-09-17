@@ -85,14 +85,13 @@ const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_CACHE_MAX_ENTRIES: usize = 256;
 
 type HookDiscoveryCache = std::sync::Mutex<HashMap<ServerScope, CachedDiscovery<NatsHookProvider>>>;
-/// `NatsToolProvider` captures the invoking session and execution parent, so
-/// registration snapshots may only be shared within that exact context.
+/// `NatsToolProvider` captures the invoking session, so registration
+/// snapshots may only be shared within that exact context.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ToolDiscoveryKey {
     instance_id: ServerScope,
     active_package: Option<String>,
     parent_session_id: Option<String>,
-    execution: Option<(String, String)>,
 }
 type ToolDiscoveryCache =
     std::sync::Mutex<HashMap<ToolDiscoveryKey, CachedDiscovery<NatsToolProvider>>>;
@@ -108,10 +107,6 @@ fn tool_discovery_key(
         instance_id: instance_id.clone(),
         active_package: active_package.map(str::to_string),
         parent_session_id: config.session.as_ref().map(|session| session.storage_key()),
-        execution: config
-            .execution_control
-            .as_ref()
-            .map(|(_, reference)| (reference.session_id.clone(), reference.execution_id.clone())),
     }
 }
 
@@ -148,9 +143,9 @@ fn cache_discovery<K: Clone + Eq + std::hash::Hash, T>(
     {
         return;
     }
-    // Execution-scoped keys may never be read again after completion, so writes
+    // Session-scoped keys may never be read again after completion, so writes
     // must prune stale entries too. The capacity also bounds short-lived bursts;
-    // refreshing an existing execution never evicts another provider.
+    // refreshing an existing session never evicts another provider.
     cache.retain(|_, entry| {
         discovered_at.saturating_duration_since(entry.discovered_at) < REGISTRATION_REFRESH_INTERVAL
     });

@@ -111,7 +111,6 @@ async fn run_nats_turn_with_tui_confirmation(
         ctx.event_tx.clone(),
         ctx.abort_signal.clone(),
         ctx.live_events.clone(),
-        appended.execution_id().into(),
     ));
     session
         .follow_admitted_prompt(
@@ -156,7 +155,6 @@ fn test_agent_loop_context(
     on_text_response: harnx_runtime::OnTextResponseFn,
 ) -> harnx_runtime::AgentLoopContext {
     harnx_runtime::AgentLoopContext {
-        generation_fence: ctx.config.read().generation_fence.clone(),
         instance_id: harnx_core::instance::ServerScope::new(),
         config: ctx.config.clone(),
         abort_signal: ctx.abort_signal.clone(),
@@ -354,24 +352,18 @@ impl Tui {
             return;
         }
 
-        if self
-            .live_events
-            .active()
-            .is_some_and(|id| self.live_events.is_stopped(&id))
-        {
-            // Includes stops accepted by another frontend while this follower ran.
-            self.cancellation = None;
-            self.pending_exit_cancel = None;
+        if task.aborted() {
+            // Set either by a local interrupt (eagerly, at keypress) or by
+            // the follower's own turn result reporting one accepted
+            // elsewhere. Either way, settle as interrupted: never replay a
+            // queued message into a turn that just stopped.
+            // `monitor_interrupt` settles the same way, redundantly but
+            // harmlessly, once its own durable outcome lands for a local
+            // interrupt still in flight.
             self.settle_interrupted_prompt();
             return;
         }
         self.current_prompt_abort = None;
-        if task.aborted() {
-            self.clear_tool_confirmation_route();
-            if self.app.pending_confirm_reply.is_some() {
-                self.resolve_tool_confirm(false);
-            }
-        }
         if let Some(error) = error {
             self.finish_main_prompt_error(error).await;
         }

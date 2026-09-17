@@ -57,7 +57,7 @@ pub struct ReasoningProvenance {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ToolResult {
     pub call: ToolCall,
     pub output: Value,
@@ -73,7 +73,7 @@ pub struct ToolResult {
     pub execution_context: Option<ExecutionContextObservation>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwitchAgentData {
     pub agent: String,
     pub prompt: String,
@@ -464,7 +464,7 @@ impl JsonSchema {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct ToolCall {
     pub name: String,
     pub arguments: Value,

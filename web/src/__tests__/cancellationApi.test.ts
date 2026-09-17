@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
-  abandonCancellation,
   cancel,
   sessionControl,
   CANCELLATION_TIMEOUT_MS,
@@ -36,15 +35,14 @@ describe('cancellationApi', () => {
         ok: true,
         json: async () => ({
           result: {
-            execution_state: 'running',
             state: { status: 'running' },
-            execution_id: 'exec-1',
+            canPrompt: true,
           },
         }),
       });
 
       const state = await sessionControl('agent-1', 'session-1');
-      expect(state.execution_id).toBe('exec-1');
+      expect(state.state.status).toBe('running');
       expect(fetchMock).toHaveBeenCalledWith(
         '/v1/agents/agent-1/sessions/session-1',
         expect.objectContaining({
@@ -131,8 +129,8 @@ describe('cancellationApi', () => {
         json: async () => ({ error: { code: -32002, message: 'already idle' } }),
       });
 
-      const result = await cancel('agent-1', 'session-1', 'exec-1');
-      expect(result).toEqual({ cancelled: false, disposition: 'idle' });
+      const result = await cancel('agent-1', 'session-1');
+      expect(result).toEqual({ outcome: 'idle' });
     });
 
     it('does NOT flip connection status to degraded on timeout (#1861)', async () => {
@@ -141,32 +139,6 @@ describe('cancellationApi', () => {
       fetchMock.mockRejectedValueOnce(timeoutError);
 
       await expect(cancel('agent-1', 'session-1')).rejects.toMatchObject({
-        name: 'TimeoutError',
-      });
-
-      expect(connection.noteTransientTrouble).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('abandonCancellation', () => {
-    it('uses the 15-second timeout and succeeds', async () => {
-      fetchMock.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          result: { cancelled: true, disposition: 'cancelled', execution_id: 'exec-1' },
-        }),
-      });
-
-      const result = await abandonCancellation('agent-1', 'session-1', 'exec-1');
-      expect(result.disposition).toBe('cancelled');
-    });
-
-    it('does NOT flip connection status to degraded on timeout (#1861)', async () => {
-      const connection = (connectionModule as any).connection;
-      const timeoutError = new DOMException('Request timeout', 'TimeoutError');
-      fetchMock.mockRejectedValueOnce(timeoutError);
-
-      await expect(abandonCancellation('agent-1', 'session-1', 'exec-1')).rejects.toMatchObject({
         name: 'TimeoutError',
       });
 

@@ -47,8 +47,8 @@ async fn interrupted_state_is_reconstructed_from_durable_hitl_entries() {
         let registry = SessionRegistry::new(config.clone());
         let handle = registry.get_or_spawn(key("plain", &session_id));
         let info = get_info(&handle).await;
-        let SessionState::Interrupted { pending } = info.state else {
-            panic!("expected interrupted state reconstructed from log");
+        let SessionState::AwaitingApproval { pending } = info.state else {
+            panic!("expected an approval gate reconstructed from the log");
         };
         assert_eq!(pending.metadata["type"], "interrupt");
         assert_eq!(
@@ -435,18 +435,18 @@ async fn assert_first_turn_streamed_and_finished(
     assert!(saw_chunk, "NATS advisory did not reach AG-UI text stream");
 }
 
-async fn wait_for_cancelled_run(events: &mut tokio::sync::broadcast::Receiver<Event>) {
+async fn wait_for_interrupted_run(events: &mut tokio::sync::broadcast::Receiver<Event>) {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            match events.recv().await.expect("cancel turn event") {
+            match events.recv().await.expect("interrupted turn event") {
                 Event::RunFinished(_) => return,
-                Event::RunError(error) => panic!("cancelled run failed: {}", error.message),
+                Event::RunError(error) => panic!("interrupted run failed: {}", error.message),
                 _ => {}
             }
         }
     })
     .await
-    .expect("cancelled serve NATS turn did not finish");
+    .expect("interrupted serve NATS turn did not finish");
 }
 
 async fn assert_cancel_reached_worker(config: &harnx_runtime::config::Config, session_id: &str) {
@@ -479,6 +479,7 @@ async fn assert_cancel_reached_worker(config: &harnx_runtime::config::Config, se
         .iter()
         .filter(|message| message.role.is_user())
         .map(|message| message.content.to_text())
+        .filter(|text| !text.starts_with(harnx_runtime::config::session::RUNTIME_NOTE_PREFIX))
         .collect::<Vec<_>>();
     assert_eq!(user_texts, ["first prompt", "cancel this prompt"]);
 }
@@ -526,7 +527,7 @@ async fn serve_local_nats_smoke_streams_sse_events_and_cancel_publishes_control(
         .expect("worker did not start cancellable request")
         .expect("mock request notifier dropped");
     cancel(&handle).await;
-    wait_for_cancelled_run(&mut events).await;
+    wait_for_interrupted_run(&mut events).await;
     assert_cancel_reached_worker(&config, &session_id).await;
     mock.task.abort();
 }

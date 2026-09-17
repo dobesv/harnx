@@ -15,8 +15,6 @@ mod activity;
 mod execution_context;
 mod initializer;
 mod model;
-mod projection;
-pub(crate) use projection::MetadataOutput;
 mod read_state;
 mod store;
 mod tool_context;
@@ -32,7 +30,8 @@ pub use activity::SessionActivity;
 pub use execution_context::execution_contexts;
 pub use initializer::SessionInitializer;
 pub use model::{
-    SessionAgentSource, SessionMetadata, SessionOverrideUpdate, SessionOverrides, SessionTitle,
+    ParentLink, SessionAgentSource, SessionMetadata, SessionOverrideUpdate, SessionOverrides,
+    SessionTitle,
 };
 pub use read_state::SessionReadState;
 pub use store::{

@@ -4,6 +4,7 @@ pub mod cancellation_client;
 mod control;
 use control::handle_control;
 mod aggregate;
+mod cleanup_tasks;
 pub mod content;
 mod drain;
 mod execution;
@@ -62,11 +63,9 @@ use tracing::Instrument;
 pub const TOOL_REGISTRY_BUCKET: &str = "harnx_tool_registry";
 pub use harnx_toolset::TOOL_PROTOCOL_VERSION;
 
-pub mod invocation_admission;
 pub mod invocation_journal;
 mod recovery;
 mod reply_cache;
-pub mod reply_fence;
 use reply_cache::*;
 pub const TOOL_SCHEMA_VERSION: u32 = 1;
 
@@ -86,15 +85,16 @@ struct ToolRequestContext {
     active_requests: InFlightRequests,
     server_scope: ServerScope,
     server_identity: String,
-    execution_store: harnx_execution_control::ExecutionStore,
     journal: invocation_journal::InvocationJournal,
-    cleanup: Arc<harnx_execution_control::CleanupTasks>,
+    /// The configured replica count, so the journal bucket's durability can be
+    /// reconciled with the connection's while the server runs.
+    replicas: usize,
+    cleanup: Arc<cleanup_tasks::CleanupTasks>,
 }
 
 struct ValidatedToolRequest {
     reply_subject: harnx_nats_common::rpc::ReplyTarget,
     request: ToolRequest,
-    idempotency_key: String,
     parent_cx: OtelContext,
 }
 
@@ -264,9 +264,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         schema_version: TOOL_SCHEMA_VERSION,
         proto_version: TOOL_PROTOCOL_VERSION,
     };
-    let (registry, execution_store) = ensure_control_stores(&client, replicas).await?;
-    let journal =
-        invocation_journal::InvocationJournal::ensure(&jetstream::new(client.clone())).await?;
+    let (registry, journal) = ensure_control_stores(&client, replicas).await?;
     let mut revision = publish_registration(&registry, &instance_id, &registration).await?;
     signal_started(started);
 
@@ -274,7 +272,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
     let request_context = request_context(
         (&client, toolset),
         (&instance_id, identity_token.clone()),
-        (active_requests, execution_store, journal),
+        (active_requests, journal, replicas),
     );
 
     let outcome = serve_requests(
@@ -313,10 +311,10 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
 fn request_context(
     (client, toolset): (&async_nats::Client, Arc<dyn Toolset>),
     (instance_id, server_identity): (&ServerScope, String),
-    (active_requests, execution_store, journal): (
+    (active_requests, journal, replicas): (
         InFlightRequests,
-        harnx_execution_control::ExecutionStore,
         invocation_journal::InvocationJournal,
+        usize,
     ),
 ) -> ToolRequestContext {
     ToolRequestContext {
@@ -327,8 +325,8 @@ fn request_context(
         active_requests,
         server_scope: instance_id.clone(),
         server_identity,
-        execution_store,
         journal,
+        replicas,
         cleanup: Arc::default(),
     }
 }
@@ -368,6 +366,7 @@ async fn serve_requests(
 ) -> Result<()> {
     let mut journal_reconciliation = Box::pin(invocation_journal::replica_reconciliations(
         jetstream::new(request_context.client.clone()),
+        request_context.replicas,
         REGISTRATION_REFRESH_INTERVAL,
     ));
     let mut renewals = Box::pin(harnx_nats_common::registry::refreshes(
@@ -432,24 +431,18 @@ async fn process_tool_request(
     let ValidatedToolRequest {
         reply_subject,
         request,
-        idempotency_key,
         parent_cx,
     } = validated;
-    let completion = match reserve_cache_entry(
-        &context.reply_cache,
-        &cache_key(&request, &idempotency_key)?,
-    )
-    .await
-    {
+    let key = cache_key(&request)?;
+    let completion = match reserve_cache_entry(&context.reply_cache, &key).await {
         CacheReservation::Complete(saved) => {
-            return serve_cached(context, &request, reply_subject, Ok(saved)).await;
+            return serve_cached(context, &request, reply_subject, saved).await;
         }
         CacheReservation::Wait(reply) => {
             let saved = wait_for_cached_reply(reply).await?;
             return serve_cached(context, &request, reply_subject, saved).await;
         }
         CacheReservation::Full => {
-            execution::complete_without_invocation(context, &request).await?;
             return publish_recoverable_reply(
                 &context.client,
                 reply_subject,
@@ -462,19 +455,12 @@ async fn process_tool_request(
     };
 
     let result = invoke_uncached_tool(context, &request, parent_cx).await;
-    let reply = ToolReply {
+    let reply = Arc::new(ToolReply {
         call_id: request.call_id.clone(),
         result: result.map_err(map_invoke_error),
-    };
-    let saved = cache_completion(context, &request, reply).await;
-    complete_cache_entry(
-        &context.reply_cache,
-        cache_key(&request, &idempotency_key)?,
-        saved.clone(),
-        completion,
-    )
-    .await;
-    serve_cached(context, &request, reply_subject, saved).await
+    });
+    complete_cache_entry(&context.reply_cache, key, reply.clone(), completion).await;
+    serve_cached(context, &request, reply_subject, reply).await
 }
 
 async fn validate_tool_request(
@@ -488,7 +474,7 @@ async fn validate_tool_request(
         .unwrap_or_default();
     let reply_subject = harnx_nats_common::rpc::ReplyTarget::from_message(&message)?;
     let header_call_id = header_value(&message, HDR_CALL_ID);
-    let mut request: ToolRequest = match serde_json::from_slice(&message.payload) {
+    let request: ToolRequest = match serde_json::from_slice(&message.payload) {
         Ok(request) => request,
         Err(error) => {
             publish_recoverable_reply(
@@ -513,7 +499,7 @@ async fn validate_tool_request(
             return Ok(None);
         }
     }
-    let Some(idempotency_key) = header_value(&message, HDR_IDEMPOTENCY_KEY) else {
+    if header_value(&message, HDR_IDEMPOTENCY_KEY).is_none() {
         publish_recoverable_reply(
             &context.client,
             reply_subject,
@@ -522,16 +508,16 @@ async fn validate_tool_request(
         )
         .await?;
         return Ok(None);
-    };
+    }
     let validation = async {
-        invocation_admission::prepare(context, &mut request).await?;
-        recovery::validate_replay(context, &request).await
+        prepare(context, &request).await?;
+        context.journal.validate_replay(&request).await
     }
     .await;
     if let Err(error) = validation {
         let reply = ToolReply {
             call_id: request.call_id,
-            result: Err(map_invoke_error(reply_fence::invoke_error(error))),
+            result: Err(map_invoke_error(recovery::invoke_error(error))),
         };
         return publish_reply(&context.client, reply_subject, &reply)
             .await
@@ -540,9 +526,36 @@ async fn validate_tool_request(
     Ok(Some(ValidatedToolRequest {
         reply_subject,
         request,
-        idempotency_key,
         parent_cx,
     }))
+}
+
+/// Give every call a journal row before it runs. A worker records its own
+/// invocations before dispatching them; a client calling a tool server directly
+/// has nowhere else to record one, and without a row the call has no durable
+/// place for its checkpoint or its reply.
+///
+/// A row written here is a direct-client row: it carries `tool_round` 0 and this
+/// server's own scope and identity, because a request that nobody journaled came
+/// from no transcript round. [`invocation_journal::InvocationJournal::find`], which resolves a
+/// worker's `ToolCalls` round back to its invocation, therefore never matches
+/// one — correctly, since these calls are not in any worker's transcript.
+async fn prepare(context: &ToolRequestContext, request: &ToolRequest) -> Result<()> {
+    if context.journal.get(request).await?.is_some() {
+        return Ok(());
+    }
+    context
+        .journal
+        .record(
+            request,
+            (
+                &request.tool,
+                context.server_scope.as_str(),
+                &context.server_identity,
+            ),
+            0,
+        )
+        .await
 }
 
 async fn publish_recoverable_reply(
@@ -594,11 +607,11 @@ fn header_value(message: &async_nats::Message, name: &str) -> Option<String> {
 async fn ensure_control_stores(
     client: &async_nats::Client,
     replicas: usize,
-) -> Result<(kv::Store, harnx_execution_control::ExecutionStore)> {
+) -> Result<(kv::Store, invocation_journal::InvocationJournal)> {
     let js = jetstream::new(client.clone());
     Ok((
         ensure_registry_bucket(&js, replicas).await?,
-        harnx_execution_control::ExecutionStore::ensure(&js, replicas).await?,
+        invocation_journal::InvocationJournal::ensure(&js, replicas).await?,
     ))
 }
 
@@ -725,8 +738,5 @@ where
     result
 }
 
-#[cfg(test)]
-#[path = "../../harnx-runtime/tests/common/mod.rs"]
-mod nats_test_common;
 #[cfg(test)]
 mod tests;

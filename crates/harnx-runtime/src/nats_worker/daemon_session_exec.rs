@@ -37,8 +37,6 @@ impl WorkerRuntime {
         // fresh from the worker's configuration.
         let per_session = {
             let mut base = self.config.read().clone();
-            base.execution_control = Some((execution.store.clone(), execution.reference.clone()));
-            base.generation_fence = execution.fence.clone();
             base.maintenance_abort = Some(abort_signal.clone());
             Arc::new(parking_lot::RwLock::new(base))
         };
@@ -63,8 +61,7 @@ impl WorkerRuntime {
             self.jetstream.clone(),
             activation.session_id.clone(),
         )
-        .await
-        .with_execution(execution.fence.clone());
+        .await;
         let after_seq_observer = event_sink.after_seq_handle();
         let event_sink = Arc::new(event_sink);
 
@@ -73,8 +70,49 @@ impl WorkerRuntime {
         // worker tail reads themselves use leader-authoritative `load_events_latest_async`.
         let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id)
             .with_after_seq_observer(Arc::clone(&after_seq_observer))
-            .with_metadata_store(Some(self.session_metadata.clone()))
-            .with_execution(execution.fence.clone());
+            .with_metadata_store(Some(self.session_metadata.clone()));
+
+        // Follow the session's own stream concurrently with the turn: a
+        // foreign `Cancel` is the only thing that can interrupt it, and a
+        // foreign `Message` only flags that input is waiting. Holding this
+        // instance's `NatsInFlightCalls` handle for the whole execution keeps
+        // the shared map alive, so tool/hook registrations made during the
+        // turn land where the watcher's snapshot can find them.
+        let pending_input = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interrupted = Arc::new(parking_lot::Mutex::new(None));
+        let in_flight =
+            crate::nats_tool_provider::NatsInFlightCalls::for_instance(&self.instance_id);
+        let watcher_start_after = backend
+            .load_events_latest_async()
+            .await?
+            .last()
+            .map_or(0, |(seq, _)| *seq);
+        let session_watcher = super::session_watcher::spawn_session_watcher(
+            super::session_watcher::SessionWatcherCtx {
+                jetstream: self.jetstream.clone(),
+                client: self.client.clone(),
+                session_id: activation.session_id.clone(),
+                start_after: watcher_start_after,
+                abort_signal: abort_signal.clone(),
+                in_flight: in_flight.clone(),
+                own_appends: Arc::clone(&after_seq_observer),
+                pending_input: Arc::clone(&pending_input),
+                interrupted: Arc::clone(&interrupted),
+            },
+        );
+
+        // Winding the interrupted turn up happens in `finish`, once the turn
+        // task is gone and while the lease is still held. Hand the execution
+        // what that needs: the watcher's notice of the interrupt, and the
+        // handles to reach the tool calls it cut off.
+        let execution = execution.with_wind_up(super::execution_control::WindUpContext {
+            client: self.client.clone(),
+            jetstream: self.jetstream.clone(),
+            replicas: self.lease.replicas,
+            in_flight,
+            event_sink: Arc::clone(&event_sink),
+            interrupted,
+        });
 
         // Abort turns promptly if lease is lost.
         let watch_task =
@@ -86,11 +124,11 @@ impl WorkerRuntime {
             lease: lease.clone(),
             abort_signal: abort_signal.clone(),
             hitl_decision_rx,
-            execution: execution.clone(),
             per_session: per_session.clone(),
             backend: backend.clone(),
             event_sink,
             after_seq_observer,
+            pending_input,
             agent_setup,
         };
         // A spawned turn owns its poll/drop work. Aborting it requests a drop;
@@ -100,25 +138,36 @@ impl WorkerRuntime {
             biased;
             _ = harnx_core::abort::wait_abort_signal(&abort_signal) => {
                 turn.abort();
-                (Ok(()), Some(turn))
+                (Ok(true), Some(turn))
             }
             result = &mut turn => (result.unwrap_or_else(|error| Err(error.into())), None),
         };
+        // A turn that failed left a durable `Error`, which terminates it just
+        // as a completion would: there is nothing for a redelivery to retry.
+        let settled = *result.as_ref().unwrap_or(&true);
+
+        // A turn whose append lost to a `Cancel` was interrupted, not broken.
+        // It can notice the interruption before the session watcher does, so
+        // the abort signal is fired from here rather than assumed to be set
+        // already — an `Error` written after that `Cancel` would terminate the
+        // turn a second time and leave `finish` nothing to wind up.
+        if let Some(interrupted) = result.as_ref().err().and_then(cancel_that_interrupted) {
+            log::info!(
+                "turn append lost to a Cancel; aborting instead of recording an error: \
+                 session_id={} cancel_seq={}",
+                activation.session_id,
+                interrupted.cancel_seq
+            );
+            abort_signal.set_ctrlc();
+        }
 
         // Record the failure durably BEFORE releasing the lease: attached
         // clients treat an `Error` entry as a terminal boundary, and a client that
         // reconnects later still sees why the turn produced nothing.
-        if result
-            .as_ref()
-            .is_err_and(|error| error.is::<harnx_execution_control::Interrupted>())
-        {
-            abort_signal.set_ctrlc();
-        }
         let turn_error = result.as_ref().err().filter(|_| !abort_signal.aborted());
-        let error_sequence = match turn_error {
-            Some(error) => Self::record_session_error(&backend, &lease, error).await,
-            None => None,
-        };
+        if let Some(error) = turn_error {
+            Self::record_session_error(&backend, &lease, error).await;
+        }
 
         if !lease.is_held() {
             log::warn!(
@@ -135,36 +184,28 @@ impl WorkerRuntime {
 
         watch_task.abort();
         control_task.abort();
-        harnx_execution_control::CleanupTasks::process().spawn(async move {
+        session_watcher.abort();
+        tokio::spawn(async move {
             let _ = watch_task.await;
             let _ = control_task.await;
+            let _ = session_watcher.await;
         });
 
-        if let Some(sequence) = error_sequence.filter(|_| lease.is_held()) {
-            // Coverage belongs to this Error commit, not a later tail that may
-            // already contain a retry prompted by the terminal notification.
-            execution.cover_turn(sequence).await?;
-            execution
-                .store
-                .seal(&execution.reference, &execution.owner)
-                .await?;
-        }
-        if result.is_err() {
-            let operation = execution.store.status(&execution.reference).await?;
-            // The durable Error already completed this prompt. Stop leftover
-            // children, not the root: a root stop would misclassify the failure
-            // as user interruption for acceptance-driven followers.
-            for child in &operation.children {
-                execution.store.cancel_operation(child, None, false).await?;
-            }
-        }
         let terminal = execution
-            .finish(&backend, &lease, per_session, cleanup_turn)
+            .finish(
+                &backend,
+                &lease,
+                super::execution_control::FinishedTurn {
+                    task: cleanup_turn,
+                    settled,
+                    config: per_session,
+                },
+            )
             .await?;
         if abort_signal.aborted() {
             Ok(terminal)
         } else {
-            result.map(|()| terminal)
+            result.map(|_| terminal)
         }
     }
 
@@ -197,29 +238,34 @@ impl WorkerRuntime {
     ///
     /// Skipped when the lease is gone: a newer worker owns the session and
     /// writing behind it would corrupt the log. That case is covered by the
-    /// client's orphan watchdog instead.
+    /// client's orphan watchdog instead. Skipped too for an interruption,
+    /// which the `Cancel` already terminated: a second terminator would end
+    /// the turn before its wind-up could answer the calls it cut off.
     async fn record_session_error(
         backend: &NatsSessionLogBackend,
         lease: &NatsSessionLease,
         error: &anyhow::Error,
-    ) -> Option<u64> {
+    ) {
+        if interrupted_by_cancel(error) {
+            log::info!(
+                "turn ended in an interruption, not a failure: session_id={} error={error:#}",
+                backend.session_id()
+            );
+            return;
+        }
         if !should_append_control_log_entry(lease) {
-            return None;
+            return;
         }
         let entry = harnx_core::session::SessionLogEntry::Error {
             message: format!("{error:#}"),
             fence_token: lease.fence_token(),
             timestamp: Some(chrono::Utc::now()),
         };
-        match backend.append_event(&entry).await {
-            Ok(sequence) => Some(sequence),
-            Err(append_error) => {
-                log::warn!(
-                    "failed to append Error entry: session_id={} err={append_error:#}",
-                    backend.session_id()
-                );
-                None
-            }
+        if let Err(append_error) = backend.append_event(&entry).await {
+            log::warn!(
+                "failed to append Error entry: session_id={} err={append_error:#}",
+                backend.session_id()
+            );
         }
     }
 
@@ -294,6 +340,21 @@ impl WorkerRuntime {
     }
 }
 
+/// The `Cancel` that ended this turn while one of its appends was in flight,
+/// when that is what the turn error is. The interruption can be wrapped in
+/// context by the time it surfaces, so the whole cause chain is searched.
+fn cancel_that_interrupted(error: &anyhow::Error) -> Option<&super::backend::TurnInterrupted> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<super::backend::TurnInterrupted>())
+}
+
+/// Whether this turn error is a `Cancel` that ended the turn while one of its
+/// appends was in flight.
+fn interrupted_by_cancel(error: &anyhow::Error) -> bool {
+    cancel_that_interrupted(error).is_some()
+}
+
 #[derive(Clone)]
 pub(super) struct ToolRoundAttachmentSync {
     pub(super) jetstream: async_nats::jetstream::Context,
@@ -358,10 +419,9 @@ mod attention_tests {
             .with_metadata_store(Some(store.clone()));
 
         // Acquire a lease for the session
-        let (lease, fence) =
+        let lease =
             crate::nats_worker::backend::test_session_authority(&jetstream, &storage_key, &store)
                 .await;
-        let backend = backend.with_execution(Some(fence));
 
         // Append a user message first so we have valid through_seq
         backend
@@ -402,6 +462,71 @@ mod attention_tests {
         let _ = child.wait();
     }
 
+    /// An interrupted turn is already terminated by its `Cancel`. Writing an
+    /// `Error` behind that `Cancel` would terminate it a second time, and
+    /// reconstruction would then see an idle session with the interrupted
+    /// round's tool calls still unanswered — nothing left to wind up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_interrupted_turn_records_no_error_entry() {
+        require_nextest();
+        let Some((url, mut child, _store_dir)) = crate::nats_worker::tests::spawn_test_nats().await
+        else {
+            return;
+        };
+        let client = async_nats::connect(&url).await.unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+        let store = SessionMetadataStore::ensure(&jetstream, 1).await.unwrap();
+        let session_id = crate::nats_worker::new_remote_session_id();
+        let storage_key = harnx_core::session_identity::session_key(Some("metis"), &session_id);
+        store
+            .create(&SessionMetadata::new(
+                &session_id,
+                SessionInitializer::named("metis", Default::default()),
+            ))
+            .await
+            .unwrap();
+        let backend = NatsSessionLogBackend::new(jetstream.clone(), &storage_key)
+            .with_metadata_store(Some(store.clone()));
+        let lease =
+            crate::nats_worker::backend::test_session_authority(&jetstream, &storage_key, &store)
+                .await;
+
+        // The interruption surfaces wrapped in context, as it does when it
+        // travels up through the tool round that lost the append.
+        let interrupted =
+            anyhow::Error::new(crate::nats_worker::backend::TurnInterrupted { cancel_seq: 7 })
+                .context("failed to durably persist tool results");
+        WorkerRuntime::record_session_error(&backend, &lease, &interrupted).await;
+
+        // Read through the log itself: the structural guard over this file's
+        // family counts the worker's leader-authoritative decision points.
+        let log = crate::nats_session_log::NatsSessionLog::new(jetstream.clone(), &storage_key);
+        assert!(
+            !log.load_events_async()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(_, entry)| matches!(
+                    entry,
+                    harnx_core::session::SessionLogEntry::Error { .. }
+                )),
+            "an interruption is not a turn failure"
+        );
+
+        // An ordinary failure still lands, so the guard is about the cause and
+        // not about silencing errors.
+        WorkerRuntime::record_session_error(&backend, &lease, &anyhow::anyhow!("model exploded"))
+            .await;
+        assert!(log.load_events_async().await.unwrap().iter().any(|(_, entry)| matches!(
+            entry,
+            harnx_core::session::SessionLogEntry::Error { message, .. } if message.contains("model exploded")
+        )));
+
+        lease.release().await.unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     /// Test that record_session_turn_end skips when through_seq is zero.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn record_session_turn_end_rejects_zero_through_seq() {
@@ -428,10 +553,9 @@ mod attention_tests {
         let backend = NatsSessionLogBackend::new(jetstream.clone(), &storage_key)
             .with_metadata_store(Some(store.clone()));
 
-        let (lease, fence) =
+        let lease =
             crate::nats_worker::backend::test_session_authority(&jetstream, &storage_key, &store)
                 .await;
-        let backend = backend.with_execution(Some(fence));
 
         // through_seq = 0 should bail
         let result = WorkerRuntime::record_session_turn_end(
@@ -456,7 +580,3 @@ mod attention_tests {
         let _ = child.wait();
     }
 }
-
-#[cfg(test)]
-#[path = "daemon_session_exec/coverage_tests.rs"]
-mod coverage_tests;

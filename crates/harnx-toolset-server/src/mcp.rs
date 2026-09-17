@@ -84,11 +84,13 @@ impl McpToolsetAdapter {
             .into_iter()
             .collect();
         let invocation_context = ToolInvocationContext {
-            operation: None,
-            execution: None,
             call_id: format!("{:?}", context.id),
             invoking_session_id: None,
             capabilities,
+            // stdio has no journal to record a checkpoint in, and no control
+            // subject a later cancel could arrive on.
+            checkpoint: None,
+            checkpoint_store: None,
         };
         let attestation = RequestAttestation {
             call_id: invocation_context.call_id.clone(),

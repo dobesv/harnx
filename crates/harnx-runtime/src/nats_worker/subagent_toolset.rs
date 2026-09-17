@@ -1,7 +1,9 @@
 //! NATS toolset for nested sub-agent sessions.
 
-mod admission;
 mod termination;
+
+#[cfg(test)]
+mod interrupt_tests;
 
 use super::subagent_progress::SubagentProgressReporter;
 use crate::nats_event_sink::NatsEventSink;
@@ -43,6 +45,14 @@ impl SubagentSessionRoute {
         }
     }
 
+    pub(crate) fn cluster(&self) -> &str {
+        &self.cluster
+    }
+
+    pub(crate) fn activation_route(&self) -> &SessionActivationRoute {
+        &self.activation
+    }
+
     fn session_config(&self, agent: &str, session_id: Option<String>) -> NatsSessionConfig {
         NatsSessionConfig {
             cluster: self.cluster.clone(),
@@ -65,8 +75,6 @@ pub(crate) struct SubagentToolset {
     jetstream: jetstream::Context,
     session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     progress_heartbeat: Duration,
-    #[cfg(test)]
-    admission_barrier: Option<std::sync::Arc<admission::AdmissionBarrier>>,
 }
 
 pub(crate) struct SubagentNats {
@@ -90,14 +98,12 @@ impl SubagentNats {
 }
 
 struct SubagentStart<'a> {
-    admission: &'a admission::Admission,
     child_session_id: &'a str,
     invocation_id: &'a str,
     tool_call_id: Option<&'a str>,
 }
 
 struct ProgressReporterStart {
-    admission: admission::Admission,
     child_session_id: String,
     parent_session_id: Option<String>,
     invocation_id: String,
@@ -122,8 +128,6 @@ impl SubagentToolset {
             jetstream: nats.jetstream,
             session_metadata: nats.session_metadata,
             progress_heartbeat: SUBAGENT_PROGRESS_HEARTBEAT,
-            #[cfg(test)]
-            admission_barrier: None,
         }
     }
 
@@ -137,14 +141,11 @@ impl SubagentToolset {
         &self,
         session_id: Option<String>,
         parent_session_id: Option<&str>,
-        admission: Option<&admission::Admission>,
+        tool_call_id: Option<&str>,
     ) -> Result<NatsSession, ToolInvokeError> {
         let config = self
-            .session_config(session_id.clone(), parent_session_id)
+            .session_config(session_id, parent_session_id, tool_call_id)
             .await?;
-        if let Some(admission) = admission {
-            admission.start(json!({"kind": "subagent-session", "session_id": session_id, "agent": self.agent})).await?;
-        }
         NatsSession::new(
             config,
             self.client.clone(),
@@ -157,15 +158,29 @@ impl SubagentToolset {
         })
     }
 
+    /// `tool_call_id` is the id the PARENT's transcript gave this call, not
+    /// the wire id dispatch minted for it. The ancestor check looks the link
+    /// up in the parent's `ToolCalls` entries, which only ever carry the
+    /// transcript id, so a wire id there could never match and would leave
+    /// every child reading as "parent still waiting". A call with no
+    /// transcript id at all cannot be found in the parent's log either, so it
+    /// gets no link rather than one that can only answer wrongly.
     async fn session_config(
         &self,
         session_id: Option<String>,
         parent_session_id: Option<&str>,
+        tool_call_id: Option<&str>,
     ) -> Result<crate::NatsSessionConfig, ToolInvokeError> {
         let mut config = self.route.session_config(&self.agent, session_id.clone());
+        if let (Some(parent_session_id), Some(tool_call_id)) = (parent_session_id, tool_call_id) {
+            config.initializer.parent = Some(crate::nats_session_metadata::ParentLink {
+                session_id: parent_session_id.to_string(),
+                tool_call_id: tool_call_id.to_string(),
+            });
+        }
         if session_id.is_none() {
             if let Some(parent_session_id) = parent_session_id {
-                let context = self
+                let tool_context = self
                     .session_metadata
                     .get_tool_context(parent_session_id)
                     .await
@@ -176,8 +191,8 @@ impl SubagentToolset {
                     })?;
                 // Older sessions and direct Toolset callers may have no metadata record.
                 // Treat that as an empty context so delegation remains rollout-compatible.
-                if let Some(context) = context {
-                    config.initializer = config.initializer.with_tool_context(context);
+                if let Some(tool_context) = tool_context {
+                    config.initializer = config.initializer.with_tool_context(tool_context);
                 }
             }
         }
@@ -195,7 +210,6 @@ impl SubagentToolset {
         &self,
         start: ProgressReporterStart,
     ) -> Result<SubagentProgressReporter, ToolInvokeError> {
-        start.admission.check("subagent-started").await?;
         let parent_sink = match start.parent_session_id {
             Some(parent_session_id) => {
                 let sink = NatsEventSink::new(
@@ -203,13 +217,11 @@ impl SubagentToolset {
                     self.jetstream.clone(),
                     parent_session_id.clone(),
                 )
-                .await
-                .with_execution(start.admission.fence.clone());
+                .await;
                 self.emit_parent_subagent_started(
                     &sink,
                     &parent_session_id,
                     SubagentStart {
-                        admission: &start.admission,
                         child_session_id: &start.child_session_id,
                         invocation_id: &start.invocation_id,
                         tool_call_id: start.tool_call_id.as_deref(),
@@ -238,7 +250,6 @@ impl SubagentToolset {
         start: SubagentStart<'_>,
     ) -> Result<(), ToolInvokeError> {
         let SubagentStart {
-            admission,
             child_session_id,
             invocation_id,
             tool_call_id,
@@ -250,13 +261,10 @@ impl SubagentToolset {
             tool_call_id: tool_call_id.map(str::to_string),
             started_at: Some(chrono::Utc::now()),
         };
-        let inserted =
-            admission::append_started(self, (parent_session_id, invocation_id), &entry, admission)
-                .await?;
+        let inserted = append_started(self, (parent_session_id, invocation_id), &entry).await?;
         if !inserted {
             return Ok(());
         }
-        admission.check("subagent-start-event").await?;
         let source = AgentSource {
             agent: self.agent.clone(),
             session_id: Some(child_session_id.to_string()),
@@ -370,25 +378,45 @@ impl SubagentToolset {
     async fn session_cancel(&self, args: Value) -> Result<Value, ToolInvokeError> {
         let args: SessionArgs = parse_args(SUBAGENT_SESSION_CANCEL_TOOL, args)?;
         let session_id = required_session_id(args.session_id)?;
-        let session = self
-            .create_session(Some(session_id.clone()), None, None)
-            .await?;
-        let receipt = session
-            .request_cancel(crate::nats_session::CancelRequest {
-                expected_execution_id: args.expected_execution_id,
-                retry: true,
-            })
-            .await
-            .map_err(|error| {
-                ToolInvokeError::Recoverable(format!(
-                    "cancel sub-agent session '{session_id}': {error:#}"
-                ))
-            })?;
-        let mut value = serde_json::to_value(receipt)
+        let request = crate::nats_session::interrupt::InterruptRequest {
+            session_id: harnx_core::session_identity::session_key(Some(&self.agent), &session_id),
+            cluster: self.route.cluster().to_string(),
+            cancellation_id: uuid::Uuid::now_v7().to_string(),
+            requested_by: "session_cancel".to_string(),
+            reason: "cancelled via session_cancel tool".into(),
+        };
+        let outcome = crate::nats_session::interrupt::interrupt_session(
+            &self.jetstream,
+            &self.client,
+            self.route.activation_route(),
+            request,
+        )
+        .await
+        .map_err(|error| {
+            ToolInvokeError::Recoverable(format!(
+                "cancel sub-agent session '{session_id}': {error:#}"
+            ))
+        })?;
+        let mut value = serde_json::to_value(outcome)
             .map_err(|error| ToolInvokeError::Fatal(error.to_string()))?;
         value["session_id"] = json!(session_id);
         Ok(value)
     }
+}
+
+/// Append a durable `SubAgentStarted` marker to the parent's transcript,
+/// deduplicated by invocation ID so a retried announcement is a no-op.
+async fn append_started(
+    toolset: &SubagentToolset,
+    destination: (&str, &str),
+    entry: &SessionLogEntry,
+) -> Result<bool, ToolInvokeError> {
+    let (parent, invocation) = destination;
+    let log = NatsSessionLog::new(toolset.jetstream.clone(), parent);
+    crate::nats_session::append_invocation_entry(&log, entry, invocation)
+        .await
+        .map(|(_, inserted)| inserted)
+        .map_err(|error| ToolInvokeError::Fatal(format!("{error:#}")))
 }
 
 struct CompletedSubagentTurn {
@@ -470,8 +498,6 @@ struct PromptArgs {
 #[derive(Deserialize)]
 struct SessionArgs {
     session_id: String,
-    #[serde(default)]
-    expected_execution_id: Option<String>,
 }
 
 #[async_trait]
@@ -487,16 +513,11 @@ impl Toolset for SubagentToolset {
     }
 
     async fn replay(&self, invocation: ToolInvocation) -> Result<Value, ToolInvokeError> {
-        if invocation.tool == SUBAGENT_SESSION_CANCEL_TOOL
-            && invocation.args["expected_execution_id"].is_null()
-        {
-            return Err(ToolInvokeError::Recoverable(
-                "interrupted cancellation cannot be replayed without its original execution ID"
-                    .into(),
-            ));
-        }
-        // run_prompt binds a durable child handle and deduplicates its admitted
-        // prompt by invocation identity, so this reattaches instead of redelegating.
+        // A replayed cancel is one more fenced `Cancel` append against a turn
+        // the first one already ended, which `interrupt_session` reports as
+        // `AlreadyInterrupted` and writes nothing for. `run_prompt` binds a
+        // durable child handle and deduplicates its prompt by invocation
+        // identity, so that reattaches instead of redelegating.
         self.invoke_with_context(invocation).await
     }
 
@@ -562,6 +583,43 @@ impl Toolset for SubagentToolset {
                     .await
             }
         }
+    }
+
+    /// Interrupt the child session an orphaned `session_prompt`/`session_new`
+    /// call was running, by appending a `Cancel` to the CHILD's own log. Never
+    /// created (no checkpoint recorded yet): nothing to interrupt.
+    async fn cancel(&self, invocation: ToolInvocation) -> Result<(), ToolInvokeError> {
+        let Some(child) = invocation
+            .context
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint["session_id"].as_str())
+        else {
+            return Ok(());
+        };
+        let parent = invocation
+            .context
+            .invoking_session_id
+            .clone()
+            .unwrap_or_default();
+        let request = crate::nats_session::interrupt::InterruptRequest {
+            session_id: harnx_core::session_identity::session_key(Some(&self.agent), child),
+            cluster: self.route.cluster().to_string(),
+            cancellation_id: uuid::Uuid::now_v7().to_string(),
+            requested_by: format!("parent:{parent}"),
+            reason: "parent interrupted".into(),
+        };
+        crate::nats_session::interrupt::interrupt_session(
+            &self.jetstream,
+            &self.client,
+            self.route.activation_route(),
+            request,
+        )
+        .await
+        .map(drop)
+        .map_err(|error| {
+            ToolInvokeError::Recoverable(format!("interrupt sub-agent '{child}': {error:#}"))
+        })
     }
 }
 
@@ -696,10 +754,7 @@ fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
 fn standalone_context() -> ToolInvocationContext {
     ToolInvocationContext {
         call_id: uuid::Uuid::now_v7().to_string(),
-        operation: None,
-        execution: None,
-        invoking_session_id: None,
-        capabilities: Default::default(),
+        ..Default::default()
     }
 }
 

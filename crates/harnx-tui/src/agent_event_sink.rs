@@ -28,42 +28,40 @@ impl TuiAgentEventSink {
         tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
         task: harnx_core::abort::AbortSignal,
         state: harnx_runtime::nats_event_sink::LiveEventState,
-        execution_id: String,
     ) -> Self {
         Self {
             tx,
-            prompt: Some((
-                task,
-                crate::event_isolation::EventStamp::live(&state, Some(execution_id)),
-            )),
+            prompt: Some((task, crate::event_isolation::EventStamp::live(&state))),
         }
     }
 }
 
 impl AgentEventSink for TuiAgentEventSink {
     fn emit(&self, event: AgentEvent) {
-        match &self.prompt {
-            Some((_, stamp)) => self.emit_live(
-                event,
-                stamp.execution_id.as_deref().expect("prompt identity"),
-            ),
-            None => {
+        match self.prompt.is_some() {
+            true => self.forward_prompt_event(event),
+            false => {
                 let _ = self.tx.send(TuiEvent::LocalAgent(event));
             }
         }
     }
+}
 
-    fn emit_live(&self, event: AgentEvent, execution_id: &str) {
+impl TuiAgentEventSink {
+    /// Hand one of this prompt's events to the UI queue. This sink only ever
+    /// holds the one attachment it was built with, so there is nothing here
+    /// to compare it against — the real guard is at consume time, in
+    /// `handle_prompt_agent_event`, which checks the stamp against the
+    /// `Tui`'s current `live_events` (the one that may have since moved on).
+    fn forward_prompt_event(&self, event: AgentEvent) {
         let Some((task, stamp)) = &self.prompt else {
             return;
         };
-        if stamp.execution_id.as_deref() == Some(execution_id) && stamp.allows(&stamp.state) {
-            let _ = self.tx.send(TuiEvent::Agent {
-                task: task.clone(),
-                stamp: stamp.clone(),
-                event,
-            });
-        }
+        let _ = self.tx.send(TuiEvent::Agent {
+            task: task.clone(),
+            stamp: stamp.clone(),
+            event,
+        });
     }
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { abandonCancellation, listAgents, listSessions, createSession, getAgent, cancel, sessionControl, uploadAttachment, sendPrompt } from '../api';
+import { listAgents, listSessions, createSession, getAgent, cancel, sessionControl, uploadAttachment, sendPrompt } from '../api';
 
 const fetchMock = vi.fn();
 globalThis.fetch = fetchMock as any;
@@ -93,10 +93,10 @@ describe('api.ts', () => {
     it('resolves cancel result on success', async () => {
       fetchMock.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ result: { cancelled: true } }),
+        json: async () => ({ result: { outcome: 'accepted', cancel_seq: 12 } }),
       });
       const result = await cancel('agent', 'session');
-      expect(result).toEqual({ cancelled: true });
+      expect(result).toEqual({ outcome: 'accepted', cancel_seq: 12 });
       expect(fetchMock).toHaveBeenCalledWith('/v1/agents/agent/sessions/session', expect.objectContaining({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -110,7 +110,7 @@ describe('api.ts', () => {
         json: async () => ({ error: { code: -32002 } }),
       });
       const result = await cancel('agent', 'session');
-      expect(result).toEqual({ cancelled: false, disposition: 'idle' });
+      expect(result).toEqual({ outcome: 'idle' });
     });
 
     it('throws on other JSON-RPC errors', async () => {
@@ -131,30 +131,6 @@ describe('api.ts', () => {
     });
   });
 
-  describe('abandonCancellation', () => {
-    it('sends the observed execution id and returns the abandonment receipt', async () => {
-      fetchMock.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ result: { cancelled: true, disposition: 'cancelled', execution_id: 'exec-1', abandoned: true } }),
-      });
-      await expect(abandonCancellation('agent/A', 'session B', 'exec-1')).resolves.toEqual(
-        expect.objectContaining({ execution_id: 'exec-1', abandoned: true }),
-      );
-      expect(fetchMock).toHaveBeenCalledWith(
-        '/v1/agents/agent%2FA/sessions/session%20B',
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'session/abandon_cancellation',
-            params: { expected_execution_id: 'exec-1' },
-          }),
-        }),
-      );
-    });
-  });
-
   describe('sessionControl', () => {
     it('loads durable cancellation state with a 15-second request deadline', async () => {
       const timeoutSignal = new AbortController().signal;
@@ -163,9 +139,7 @@ describe('api.ts', () => {
         ok: true,
         json: async () => ({
           result: {
-            execution_state: 'cancel_requested',
-            state: { status: 'cancelling' },
-            execution_id: 'exec-1',
+            state: { status: 'interrupting' },
             canPrompt: false,
             canCancel: true,
           },
@@ -174,7 +148,7 @@ describe('api.ts', () => {
 
       try {
         await expect(sessionControl('agent/A', 'session B')).resolves.toEqual(
-          expect.objectContaining({ execution_id: 'exec-1', canPrompt: false }),
+          expect.objectContaining({ state: { status: 'interrupting' }, canPrompt: false }),
         );
         expect(timeoutSpy).toHaveBeenCalledWith(15000);
         expect(fetchMock).toHaveBeenCalledWith(

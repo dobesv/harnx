@@ -930,6 +930,74 @@ fn ag_ui_sink_maps_only_sub_agent_turns_to_step_events() {
     assert!(rx.try_recv().is_err());
 }
 
+/// An interrupted sub-agent turn must close its AG-UI step exactly like a
+/// normally `Ended` one, so a viewer never sees a `StepStarted` with no
+/// matching `StepFinished`. Runs one sub-agent turn of each kind through the
+/// same sink to show both paths converge on the same step lifecycle and
+/// diverge only in what they emit afterward.
+#[test]
+fn ag_ui_sink_finishes_step_for_both_ended_and_interrupted_sub_agent_turns() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), true, None);
+    let source = harnx_core::event::AgentSource {
+        agent: "sub".into(),
+        session_id: None,
+        model: None,
+    };
+
+    sink.emit(AgentEvent::sub_agent(
+        source.clone(),
+        AgentEvent::Turn(TurnEvent::Started),
+    ));
+    sink.emit(AgentEvent::sub_agent(
+        source.clone(),
+        AgentEvent::Turn(TurnEvent::Ended {
+            outcome: harnx_core::event::TurnOutcome::default(),
+        }),
+    ));
+
+    match rx.try_recv().expect("step started (ended turn)") {
+        Event::StepStarted(event) => assert_eq!(event.step_name, "turn-1"),
+        other => panic!("expected StepStarted, got: {other:?}"),
+    }
+    match rx.try_recv().expect("step finished (ended turn)") {
+        Event::StepFinished(event) => assert_eq!(event.step_name, "turn-1"),
+        other => panic!("expected StepFinished, got: {other:?}"),
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "a default (empty) outcome emits nothing beyond StepFinished"
+    );
+
+    sink.emit(AgentEvent::sub_agent(
+        source.clone(),
+        AgentEvent::Turn(TurnEvent::Started),
+    ));
+    sink.emit(AgentEvent::sub_agent(
+        source,
+        AgentEvent::Turn(TurnEvent::Interrupted {
+            cancellation_id: "c-1".into(),
+        }),
+    ));
+
+    match rx.try_recv().expect("step started (interrupted turn)") {
+        Event::StepStarted(event) => assert_eq!(event.step_name, "turn-2"),
+        other => panic!("expected StepStarted, got: {other:?}"),
+    }
+    match rx.try_recv().expect("step finished (interrupted turn)") {
+        Event::StepFinished(event) => assert_eq!(event.step_name, "turn-2"),
+        other => panic!("expected StepFinished, got: {other:?}"),
+    }
+    match rx.try_recv().expect("turn_interrupted custom event") {
+        Event::Custom(event) => {
+            assert_eq!(event.name, "turn_interrupted");
+            assert_eq!(event.value, json!({ "cancellation_id": "c-1" }));
+        }
+        other => panic!("expected Custom(turn_interrupted), got: {other:?}"),
+    }
+    assert!(rx.try_recv().is_err());
+}
+
 #[test]
 fn ag_ui_sink_maps_plan_event_to_custom() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
@@ -3008,8 +3076,40 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_and_text_s
     assert_eq!(events[thinking_text_content_index]["delta"], "plan");
 }
 
+/// An interrupt ends the turn an approval request belongs to. Leaving the
+/// request pending would park the session back at a gate nobody is waiting on,
+/// and hide the interrupt it just accepted.
 #[test]
-fn session_state_is_active_treats_running_and_interrupted_as_live() {
+fn a_cancel_clears_the_approval_requests_of_the_turn_it_stopped() {
+    use harnx_core::session::SessionLogEntry;
+
+    let request = |tool_call_id: &str| SessionLogEntry::HitlApprovalRequested {
+        tool_call_id: tool_call_id.to_string(),
+        summary: "Approve it".to_string(),
+        fence_token: 1,
+    };
+    let entries = vec![
+        (1u64, request("gated-call")),
+        (
+            2,
+            SessionLogEntry::cancel_request("stop".into(), "client:test".into()),
+        ),
+    ];
+    assert!(crate::ag_ui::derive_hitl_interrupt_outcome(&entries).is_none());
+
+    // A request that outlives the `Cancel` belongs to the turn after it.
+    let mut later = entries.clone();
+    later.push((3, request("asked-again")));
+    let outcome = crate::ag_ui::derive_hitl_interrupt_outcome(&later).expect("pending gate");
+    assert_eq!(outcome["interrupts"][0]["toolCallId"], "asked-again");
+    assert_eq!(
+        outcome["interrupts"].as_array().expect("interrupts").len(),
+        1
+    );
+}
+
+#[test]
+fn session_state_is_active_treats_running_and_approval_gates_as_live() {
     use crate::session_actor::{PendingInterrupt, SessionState};
 
     let now = chrono::Utc::now();
@@ -3023,13 +3123,19 @@ fn session_state_is_active_treats_running_and_interrupted_as_live() {
         started_at: now,
     }));
 
-    // Interrupted remains active for routing, but promptless replay closes with the
-    // saved interrupt outcome instead of following the non-replaying broadcast.
+    // An approval gate remains active for routing, but promptless replay closes
+    // with the saved interrupt outcome instead of following the non-replaying
+    // broadcast.
     let pending = PendingInterrupt {
         metadata: serde_json::Value::Null,
     };
-    assert!(session_state_is_active(&SessionState::Interrupted {
+    assert!(session_state_is_active(&SessionState::AwaitingApproval {
         pending: Box::new(pending),
+    }));
+
+    // An interrupted session has nothing live left to follow.
+    assert!(!session_state_is_active(&SessionState::Interrupted {
+        cancel_seq: 7
     }));
 }
 

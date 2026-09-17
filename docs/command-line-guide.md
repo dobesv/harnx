@@ -16,7 +16,6 @@ Commands:
 Options:
       --timeout-secs <SECONDS>  Maximum one-shot invocation duration in seconds (0 or unset means no limit)
       --token-budget <TOKENS>   Maximum budgeted tokens for one-shot invocation (0 or unset means unlimited)
-      --resume-anyway           Abandon an unconfirmed cancellation before running a one-shot prompt
   -h, --help                    Print help
   -V, --version                 Print version
 ```
@@ -52,7 +51,6 @@ harnx --macro macro2 -- arg1 arg2              # Execute macro 'macro2' with arg
 
 output=$(harnx prompt --final-only -- "$input") # Return only the final response
 harnx prompt --timeout-secs 30 --token-budget 100000 -- "Summarize system logs"
-harnx -a agent1 -s session1 prompt --resume-anyway continue
 cat prompt.txt | harnx prompt                    # Read the prompt from stdin
 
 harnx prompt -f a.png -f b.png diff images     # Use files
@@ -75,13 +73,13 @@ independently.
 startup/progress output. On success, stdout contains only the final response,
 which makes the mode safe for command substitution and pipelines.
 
-If an earlier cancellation is unconfirmed because its execution owners
-disappeared, normal one-shot prompt admission fails closed. Pass
-`--resume-anyway` to abandon that exact current execution generation before
-submitting the prompt. Harnx prints a warning because external work from the
-abandoned generation may still be running. The option does not interrupt or
-replace a healthy running execution and fails if cancellation has not reached
-the unconfirmed state.
+Ctrl+C during a one-shot prompt appends an interrupt to the session log and
+exits as soon as the broker acknowledges that append. The CLI does not wait for
+the worker to stop its tools or wind the turn up; the worker does that on its
+own, and tying the exit to it would make a dead worker hang the terminal. A
+one-line summary on stderr says whether there was a turn to stop, and an append
+that fails is reported as an error rather than a silent exit. A `--timeout-secs`
+expiry interrupts the same way but keeps its own exit contract below.
 
 ## Bounding a One-Shot Run
 
@@ -92,11 +90,17 @@ Non-interactive prompts (`harnx prompt` or `harnx -- <text>`) can set per-invoca
 
 ### Limit Exhaustion Behavior
 
-When a non-interactive invocation reaches either limit:
-1. The active turn is hard-cancelled through the background cancellation path.
-2. Harnx writes a synthesized human-readable explanation to `stdout`.
-3. Harnx writes a single compact JSON line to `stderr`.
-4. The process exits with code **2** (distinct from generic error exit code 1).
+The two limits end the turn differently. A `--timeout-secs` expiry is a
+caller-side interrupt: the CLI appends a durable `Cancel` to the session log,
+which terminates the turn wherever the worker is. `--token-budget` is enforced
+worker-side at a round boundary, before a model call, so it ends the turn with
+an `Error` entry instead — nothing is cut off mid-flight, and there is no
+interrupt to deliver.
+
+Either way, the caller-facing behaviour is the same:
+1. Harnx writes a synthesized human-readable explanation to `stdout`.
+2. Harnx writes a single compact JSON line to `stderr`.
+3. The process exits with code **2** (distinct from generic error exit code 1).
 
 If `--final-only` is active, normal startup headers and progress lines are suppressed, but on limit exhaustion Harnx still prints the synthesized text to `stdout` and the JSON line to `stderr`.
 

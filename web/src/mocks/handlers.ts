@@ -52,19 +52,7 @@ async function isRpcRequest(request: Request): Promise<boolean> {
 
 function cancellationRpcResponse(body: any): Record<string, unknown> | null {
   if (body.method === 'session/cancel') {
-    return { jsonrpc: '2.0', result: { cancelled: true }, id: body.id };
-  }
-  if (body.method === 'session/abandon_cancellation') {
-    return {
-      jsonrpc: '2.0',
-      result: {
-        cancelled: true,
-        disposition: 'cancelled',
-        execution_id: body.params?.expected_execution_id,
-        abandoned: true,
-      },
-      id: body.id,
-    };
+    return { jsonrpc: '2.0', result: { outcome: 'accepted', cancel_seq: 3 }, id: body.id };
   }
   return null;
 }

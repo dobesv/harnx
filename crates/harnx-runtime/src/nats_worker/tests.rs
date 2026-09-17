@@ -737,11 +737,11 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         .await
         .expect("worker never entered in-flight call_fn before cancel publish");
 
-    let receipt = session
-        .request_cancel(crate::nats_session::CancelRequest::default())
+    let outcome = session
+        .interrupt("client cancel")
         .await
         .expect("durably request cancellation");
-    assert!(receipt.cancelled);
+    assert!(outcome.cancel_seq().is_some(), "turn must be interrupted");
     tokio::time::timeout(NATS_TEST_CONDITION_TIMEOUT, model_dropped.cancelled())
         .await
         .expect("worker must drop the model future after remote cancel");
@@ -759,7 +759,7 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         NatsSessionLog::for_agent(async_nats::jetstream::new(log_client), "metis", &session_id);
     let final_entries = wait_for_cancel_projection(&log).await;
     let cancel_fence_token = final_entries.iter().find_map(|(_, entry)| match entry {
-        SessionLogEntry::Cancel { fence_token } => Some(*fence_token),
+        SessionLogEntry::Cancel { fence_token, .. } => Some(*fence_token),
         _ => None,
     });
     let first_assistant_fence_token = final_entries.iter().find_map(|(_, entry)| match entry {
@@ -769,10 +769,12 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         _ => None,
     });
     let reconstructed = reconstruct_state_from_nats(&final_entries);
-    assert_eq!(
-        reconstructed.turn_status,
-        TurnStatus::InFlightCancelled,
-        "durable log should reconstruct to InFlightCancelled after remote cancel when no assistant message follows cancel; cancel fence={cancel_fence_token:?}, assistant fence={first_assistant_fence_token:?}, entries={final_entries:#?}"
+    assert!(
+        matches!(
+            reconstructed.turn_status,
+            TurnStatus::Idle | TurnStatus::InterruptedPendingWindUp { .. }
+        ),
+        "durable log should reconstruct to a cancelled turn state after remote cancel when no assistant message follows cancel; cancel fence={cancel_fence_token:?}, assistant fence={first_assistant_fence_token:?}, entries={final_entries:#?}"
     );
     assert!(
         wait_for_condition(NATS_TEST_CONDITION_TIMEOUT, || {
@@ -1844,19 +1846,7 @@ async fn remote_delete_accepts_first_transcript_row() {
         ))
         .await
         .expect("create canonical metadata");
-    let execution_store = harnx_execution_control::ExecutionStore::ensure(&jetstream, 1)
-        .await
-        .unwrap();
-    let storage_key = harnx_core::session_identity::session_key(Some("metis"), &session_id);
-    let operation = execution_store
-        .session(&storage_key, None, None)
-        .await
-        .unwrap();
     let message_id = uuid::Uuid::new_v4().to_string();
-    execution_store
-        .reserve_prompt(&operation.reference, &message_id)
-        .await
-        .unwrap();
     let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
     let first_user_seq = log
         .append_event_async(&SessionLogEntry::Message {
@@ -1868,10 +1858,6 @@ async fn remote_delete_accepts_first_transcript_row() {
         })
         .await
         .expect("append first user message");
-    execution_store
-        .commit_prompt(&operation.reference, &message_id, first_user_seq)
-        .await
-        .unwrap();
     assert_eq!(first_user_seq, 1, "first physical row is the user message");
 
     let worker =
@@ -2558,21 +2544,9 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         ))
         .await
         .expect("seed canonical session metadata");
-    let execution_store = harnx_execution_control::ExecutionStore::ensure(&jetstream, 1)
-        .await
-        .unwrap();
-    let storage_key = harnx_core::session_identity::session_key(Some("metis"), &session_id);
-    let operation = execution_store
-        .session(&storage_key, None, None)
-        .await
-        .unwrap();
     let seed_log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
     for text in ["leading one", "leading two"] {
-        execution_store
-            .reserve_prompt(&operation.reference, text.replace(' ', "-").as_str())
-            .await
-            .unwrap();
-        let seq = seed_log
+        seed_log
             .append_event_async(&SessionLogEntry::Message {
                 id: Some(text.replace(' ', "-")),
                 role: MessageRole::User,
@@ -2582,10 +2556,6 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
             })
             .await
             .expect("seed leading user message");
-        execution_store
-            .commit_prompt(&operation.reference, text.replace(' ', "-").as_str(), seq)
-            .await
-            .unwrap();
     }
 
     let worker =

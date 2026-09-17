@@ -4510,7 +4510,7 @@ async fn test_ctrl_c_interrupts_in_flight_streaming() {
         "stream should be interrupted before gate release chunk appears: {screen}"
     );
     assert!(
-        screen.contains("Requesting cancellation"),
+        screen.contains("Interrupting…"),
         "screen should show cancellation acceptance pending, got: {screen}"
     );
     assert!(

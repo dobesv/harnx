@@ -1,6 +1,3 @@
-mod projection;
-pub(crate) mod recovery;
-
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{
     self,
@@ -89,6 +86,31 @@ impl NatsSessionLog {
                 .expected_last_sequence(expected_last_sequence),
         )
         .await
+    }
+
+    /// Append with `Nats-Expected-Last-Sequence = expected_tail`. On a tail
+    /// conflict, return everything appended after `expected_tail` so the
+    /// caller can decide (section 4 of the spec) instead of retrying blindly.
+    pub async fn append_fenced(
+        &self,
+        entry: &SessionLogEntry,
+        expected_tail: u64,
+        message_id: &str,
+    ) -> Result<FencedAppend> {
+        match self
+            .append_event_with_expected_last_sequence_and_message_id_async(
+                entry,
+                expected_tail,
+                message_id.to_string(),
+            )
+            .await
+        {
+            Ok(seq) => Ok(FencedAppend::Appended(seq)),
+            Err(error) if is_sequence_conflict(&error) => Ok(FencedAppend::Conflict {
+                entries: self.load_events_after_async(expected_tail).await?,
+            }),
+            Err(error) => Err(error),
+        }
     }
 
     async fn append_event_with_publish_message_async(
@@ -301,6 +323,25 @@ impl NatsSessionLog {
     }
 }
 
+/// Outcome of [`NatsSessionLog::append_fenced`].
+pub enum FencedAppend {
+    Appended(u64),
+    /// The tail moved. `entries` are every entry after `expected_tail`.
+    Conflict {
+        entries: Vec<(u64, SessionLogEntry)>,
+    },
+}
+
+pub(crate) fn is_sequence_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<jetstream::context::PublishError>()
+            .is_some_and(|error| {
+                error.kind() == jetstream::context::PublishErrorKind::WrongLastSequence
+            })
+    })
+}
+
 impl SessionLog for NatsSessionLog {
     fn append_event(&mut self, entry: &SessionLogEntry) -> Result<u64> {
         block_on_session_log_future(self.append_event_async(entry))?
@@ -430,3 +471,7 @@ where
         .context("Failed to build temporary Tokio runtime for NatsSessionLog")?
         .block_on(future))
 }
+
+#[cfg(test)]
+#[path = "nats_session_log/fenced_tests.rs"]
+mod fenced_tests;

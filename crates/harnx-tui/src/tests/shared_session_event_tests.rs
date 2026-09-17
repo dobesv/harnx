@@ -5,7 +5,6 @@ use harnx_core::event::{AgentEvent, ModelEvent};
 async fn shared_session_tui() -> Tui {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
-    tui.live_events.select(Some("shared-generation".into()));
     tui.session_activity_target = Some(("session-1".to_string(), "cluster-1".to_string()));
     tui
 }

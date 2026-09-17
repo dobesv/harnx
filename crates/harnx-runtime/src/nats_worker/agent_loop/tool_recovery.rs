@@ -15,51 +15,12 @@ impl harnx_core::tool::ReplayAuthorization for NatsSessionLease {
     }
 }
 
-/// HITL-managed rounds bypass orphan repair, but not original-generation admission.
-pub(super) async fn admit_pending_rounds(
-    backend: &NatsSessionLogBackend,
-    config: &GlobalConfig,
-    entries: &[(u64, SessionLogEntry)],
-) -> Result<()> {
-    let orphans = find_orphan_tool_calls(entries);
-    if orphans.is_empty() {
-        return Ok(());
-    }
-    let fence = config
-        .read()
-        .generation_fence
-        .clone()
-        .context("unknown pending round authority")?;
-    let log =
-        crate::nats_session_log::NatsSessionLog::new(backend.jetstream(), backend.session_id());
-    for orphan in orphans {
-        let original = log
-            .entry_authority(&fence.store, orphan.seq, &orphan.calls)
-            .await?;
-        crate::nats_session_log::recovery::admit_original(&fence, original).await?;
-    }
-    Ok(())
-}
-
 pub(super) async fn repair_single_orphan(
     orphan: &PendingToolCalls,
     args: &RepairOrphanToolCallsArgs<'_>,
     repair: &ToolRepairContext,
     eval_ctx: &crate::tool::ToolEvalContext,
 ) -> Result<Vec<harnx_core::session::ToolOutput>> {
-    let fence = args
-        .config
-        .read()
-        .generation_fence
-        .clone()
-        .context("unknown orphan recovery authority")?;
-    let original = args
-        .log
-        .entry_authority(&fence.store, orphan.seq, &orphan.calls)
-        .await?;
-    // BEFORE journal dispatch or the legacy idempotency partition. Stop and owner
-    // handover race this admission; idempotence never overrides interruption.
-    crate::nats_session_log::recovery::admit_original(&fence, original).await?;
     let mut results = vec![Vec::new(); orphan.calls.len()];
     let mut reruns = Vec::new();
     for (index, call) in orphan.calls.iter().enumerate() {
@@ -88,7 +49,10 @@ pub(super) async fn repair_single_orphan(
                 switch_agent: result.switch_agent,
             }),
             None => {
-                fence.check("legacy-orphan-partition").await?;
+                anyhow::ensure!(
+                    !args.abort_signal.aborted(),
+                    "interrupted before orphan repair"
+                );
                 let (synthetic, rerun) =
                     partition_orphan_calls(std::slice::from_ref(call), args, repair);
                 results[index] = synthetic;
@@ -99,7 +63,10 @@ pub(super) async fn repair_single_orphan(
         }
     }
     recover_legacy_calls(reruns, args, eval_ctx, &mut results).await?;
-    fence.check("recovery-results").await?;
+    anyhow::ensure!(
+        !args.abort_signal.aborted(),
+        "interrupted before orphan repair results"
+    );
     Ok(results.into_iter().flatten().collect())
 }
 

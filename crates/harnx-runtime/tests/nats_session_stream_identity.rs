@@ -32,25 +32,46 @@ async fn case_distinct_sessions_have_independent_transcripts() -> Result<()> {
     };
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let old = NatsSessionLog::new(js.clone(), "aqCV1g");
-    old.append_event_async(&SessionLogEntry::Cancel { fence_token: 11 })
-        .await?;
+    old.append_event_async(&SessionLogEntry::Cancel {
+        fence_token: 11,
+        cancellation_id: None,
+        requested_by: None,
+        timestamp: None,
+    })
+    .await?;
     let new = NatsSessionLog::new(js.clone(), "aqcV1g");
     assert!(new.load_events_async().await?.is_empty());
-    new.append_event_async(&SessionLogEntry::Cancel { fence_token: 22 })
-        .await?;
-    old.append_event_async(&SessionLogEntry::Cancel { fence_token: 33 })
-        .await?;
+    new.append_event_async(&SessionLogEntry::Cancel {
+        fence_token: 22,
+        cancellation_id: None,
+        requested_by: None,
+        timestamp: None,
+    })
+    .await?;
+    old.append_event_async(&SessionLogEntry::Cancel {
+        fence_token: 33,
+        cancellation_id: None,
+        requested_by: None,
+        timestamp: None,
+    })
+    .await?;
     let old_entries = old.load_events_async().await?;
     assert_eq!(old_entries.len(), 2);
     assert!(matches!(
         old_entries[1].1,
-        SessionLogEntry::Cancel { fence_token: 33 }
+        SessionLogEntry::Cancel {
+            fence_token: 33,
+            ..
+        }
     ));
     let new_entries = new.load_events_async().await?;
     assert_eq!(new_entries.len(), 1);
     assert!(matches!(
         new_entries[0].1,
-        SessionLogEntry::Cancel { fence_token: 22 }
+        SessionLogEntry::Cancel {
+            fence_token: 22,
+            ..
+        }
     ));
     assert_eq!(
         js.get_stream(stream_name_for_session("aqCV1g"))

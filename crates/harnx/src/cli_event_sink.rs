@@ -374,7 +374,7 @@ impl CliSinkState {
     fn print_turn_event(&mut self, event: TurnEvent) {
         match event {
             TurnEvent::Started => {}
-            TurnEvent::Ended { .. } => self.cleanup_or_warn(),
+            TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. } => self.cleanup_or_warn(),
             TurnEvent::RetryAttempt { attempt, reason } => {
                 eprintln!("{}", warning_text(&format!("retry #{attempt}: {reason}")));
             }

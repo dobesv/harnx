@@ -163,12 +163,6 @@ async fn nats_session_sends_control_commands() -> Result<()> {
         .subscribe(harnx_runtime::nats_worker::control_subject(&session_id))
         .await?;
 
-    let store = harnx_execution_control::ExecutionStore::ensure(
-        &async_nats::jetstream::new(client.clone()),
-        1,
-    )
-    .await?;
-    let execution = store.session(&session_id, None, None).await?;
     // Send a control command
     send_control_command(&client, &session_id, ControlCommand::Cancel).await?;
 
@@ -179,9 +173,7 @@ async fn nats_session_sends_control_commands() -> Result<()> {
         .expect("should receive control message");
 
     let cmd: ControlCommand = serde_json::from_slice(&msg.payload)?;
-    assert!(
-        matches!(cmd, ControlCommand::CancelExecution { execution_id, .. } if execution_id == execution.reference.execution_id)
-    );
+    assert_eq!(cmd, ControlCommand::Cancel);
 
     Ok(())
 }

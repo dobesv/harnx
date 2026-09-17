@@ -1,42 +1,32 @@
 use super::test_config;
-use crate::types::{CancellationAction, PendingMessage, Tui, TuiEvent};
+use crate::types::{PendingMessage, Tui, TuiEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use harnx_execution_control::{CancelDisposition, CancelReceipt};
+use harnx_runtime::nats_session::InterruptOutcome;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 
-fn accepted() -> CancelReceipt {
-    let mut receipt = CancelReceipt::idle();
-    receipt.cancelled = true;
-    receipt.disposition = CancelDisposition::Requested;
-    receipt.execution_id = Some("g1".into());
-    receipt.cancellation_id = Some("stop-g1".into());
-    receipt
-}
-
 #[tokio::test(start_paused = true)]
 async fn accepted_root_reopens_composer_and_starts_g2_without_draining_g1() {
     let mut tui = Tui::init(&test_config()).await.unwrap();
     tui.app.llm_busy = true;
-    tui.live_events.select(Some("g1".into()));
+    tui.active_remote_session = Some(("session".to_string(), "local".to_string()));
     let old = harnx_runtime::utils::create_abort_signal();
     tui.current_prompt_abort = Some(old.clone());
     tui.current_prompt_handle = Some(tokio::spawn(std::future::pending()));
-    tui.set_exit_cancel_factory(Arc::new(|_, _, _, _, expected, action| {
-        assert_eq!(expected.as_deref(), Some("g1"));
-        assert!(matches!(action, CancellationAction::Request));
-        Box::pin(async { Ok(accepted()) })
+    tui.set_exit_cancel_factory(Arc::new(|_, _, session_id, cluster| {
+        assert_eq!(session_id, "session");
+        assert_eq!(cluster, "local");
+        Box::pin(async { Ok(InterruptOutcome::Accepted { cancel_seq: 5 }) })
     }));
-    tui.start_cancellation("session".into(), "local".into(), None);
+    tui.start_cancellation("session".into(), "local".into());
     let before = tokio::time::Instant::now();
     tui.poll_pending_exit_cancel().await;
     assert_eq!(tokio::time::Instant::now(), before);
     assert!(!tui.app.llm_busy);
     assert!(tui.cancellation.is_none() && tui.app.modal.is_none());
     assert!(tui.current_prompt_handle.is_none());
-    assert!(!tui.live_events.allows(Some("g1")));
     tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
         .await
         .unwrap();
@@ -67,23 +57,6 @@ async fn accepted_root_reopens_composer_and_starts_g2_without_draining_g1() {
 }
 
 #[tokio::test]
-async fn child_and_stale_receipts_cannot_clear_g2_busy_state() {
-    for expected in [None, Some("g1".into())] {
-        let mut tui = Tui::init(&test_config()).await.unwrap();
-        tui.set_exit_cancel_factory(Arc::new(
-            |_, _, _, _, _, _| Box::pin(std::future::pending()),
-        ));
-        tui.app.llm_busy = true;
-        tui.live_events.select(Some("g2".into()));
-        tui.start_cancellation("session".into(), "local".into(), expected);
-        tui.monitor_cancellation(accepted());
-        assert!(tui.app.llm_busy);
-        assert!(tui.cancellation.is_none());
-        assert!(tui.live_events.allows(Some("g2")));
-    }
-}
-
-#[tokio::test]
 async fn queued_confirmation_from_retired_route_cannot_open_g2_modal() {
     let mut tui = Tui::init(&test_config()).await.unwrap();
     let closed = Arc::new(AtomicBool::new(false));
@@ -102,7 +75,6 @@ async fn queued_confirmation_from_retired_route_cannot_open_g2_modal() {
     // Match route.shutdown's synchronous boundary, without waiting for its responder.
     closed.store(true, Ordering::Release);
     tui.app.llm_busy = true;
-    tui.live_events.select(Some("g2".into()));
     let before = tui.app.transcript.len();
     tui.handle_tui_event(event).await.unwrap();
     assert!(tui.app.modal.is_none());

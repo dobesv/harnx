@@ -1,6 +1,8 @@
-use harnx_core::abort::AbortSignal;
+use anyhow::Context;
+use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::api_types::CompletionTokenUsage;
 use harnx_core::event::{AgentEvent, AgentEventSink, ContentBlock, ModelEvent};
+use harnx_runtime::nats_session::InterruptOutcome;
 use harnx_runtime::{
     parse_budget_terminal, synthesize_terminated_result, InvocationBufferingSink, NatsSession,
     NatsTurnResult, RunTurnOptions, SynthesizedResult, TerminationInputs, TerminationKind,
@@ -34,7 +36,6 @@ pub(crate) struct InvocationOptions {
     final_only: bool,
     timeout_secs: Option<u64>,
     token_budget: Option<u64>,
-    resume_anyway: bool,
 }
 
 impl InvocationOptions {
@@ -49,13 +50,7 @@ impl InvocationOptions {
             final_only,
             timeout_secs: timeout_secs.filter(|seconds| *seconds > 0),
             token_budget: token_budget.filter(|budget| *budget > 0),
-            resume_anyway: false,
         }
-    }
-
-    pub(crate) fn with_resume_anyway(mut self, resume_anyway: bool) -> Self {
-        self.resume_anyway = resume_anyway;
-        self
     }
 
     pub(crate) fn abort_signal(&self) -> &AbortSignal {
@@ -64,10 +59,6 @@ impl InvocationOptions {
 
     pub(crate) fn final_only(&self) -> bool {
         self.final_only
-    }
-
-    pub(crate) fn resume_anyway(&self) -> bool {
-        self.resume_anyway
     }
 }
 
@@ -189,28 +180,75 @@ pub(crate) async fn run_turn(
     tokio::pin!(deadline);
 
     tokio::select! {
+        // Biased so a Ctrl+C observed here always wins the race against the
+        // follower's own `wait_abort_signal` arm inside `run_turn_with_options`
+        // — both watch the same signal, and only one of them should be the
+        // one to append the `Cancel`.
+        biased;
+
+        _ = wait_abort_signal(options.abort_signal()) => {
+            let outcome = session.interrupt("user interrupt from cli").await;
+            eprintln!("{}", describe_interrupt_outcome(&outcome));
+            // The abort signal is already set at this point regardless of
+            // whether the append itself landed, so main.rs still exits as
+            // interrupted even when we return this error instead of that one.
+            outcome.with_context(|| {
+                format!("failed to interrupt session '{}'", session.session_id())
+            })?;
+            Err(anyhow::anyhow!("interrupted by user"))
+        }
         result = &mut run_turn => Ok(Some(result?)),
         _ = &mut deadline => {
-            // Timeout is caller-local: only this deadline arm classifies a timeout.
-            options.abort_signal.set_ctrlc();
-            // The follower cancels its admitted generation and returns on root
-            // acceptance. Never send a second session-current cancel here: G2
-            // may already have replaced this invocation by the time we return.
-            let cancellation = (&mut run_turn).await.map(|result| result.was_cancelled);
-            finish_timed_out_turn(session.session_id(), cancellation)
+            // Timeout is caller-local: only this deadline arm classifies a
+            // timeout. Appending the fenced Cancel *is* the acceptance —
+            // interrupt() returns as soon as the log has it. The worker winds
+            // the interrupted turn up on its own, asynchronously, so we never
+            // await the follower here: doing so would tie this process's exit
+            // to a worker that might not even be running anymore.
+            let outcome = session.interrupt("one-shot timeout").await;
+            // A confirmed outcome says nothing on its own: it already reaches
+            // stdout/stderr as the synthesized timeout contract below, and
+            // that contract is pinned to exactly one JSON line on stderr
+            // (`timeout_output_has_synthesized_stdout_single_json_stderr_line_and_exit_code_two`
+            // plus the matching e2e test) — printing here too would corrupt
+            // it. A failed append has no such contract to land in, so surface
+            // it immediately rather than leave it to be discovered only when
+            // `main` unwinds all the way out to its generic error renderer.
+            if outcome.is_err() {
+                eprintln!("{}", describe_interrupt_outcome(&outcome));
+            }
+            finish_timed_out_turn(session.session_id(), outcome)
         }
+    }
+}
+
+/// One-line, human-readable summary of an interrupt outcome for stderr — the
+/// only feedback the CLI gives before it exits that the append landed (or
+/// didn't).
+fn describe_interrupt_outcome(outcome: &anyhow::Result<InterruptOutcome>) -> String {
+    match outcome {
+        Ok(InterruptOutcome::Idle) => "no turn was running".to_string(),
+        Ok(InterruptOutcome::Accepted { cancel_seq }) => {
+            format!("interrupt accepted (cancel seq {cancel_seq})")
+        }
+        Ok(InterruptOutcome::AlreadyInterrupted { cancel_seq }) => {
+            format!("already interrupted (cancel seq {cancel_seq})")
+        }
+        Err(error) => format!("interrupt could not be appended: {error:#}"),
     }
 }
 
 fn finish_timed_out_turn(
     session_id: &str,
-    cancellation: anyhow::Result<bool>,
+    outcome: anyhow::Result<InterruptOutcome>,
 ) -> anyhow::Result<Option<NatsTurnResult>> {
-    // Synthesized timeout output promises same-session retry, so cancellation
-    // confirmation failure is an infrastructure error, not an invocation limit.
-    cancellation.map(|_| None).map_err(|error| {
+    // Synthesized timeout output promises same-session retry, so a failed
+    // append is an infrastructure error, not an invocation limit: every
+    // confirmed outcome (Idle, Accepted or AlreadyInterrupted) preserves the
+    // timeout classification, and only a failed append is not safe to retry.
+    outcome.map(|_| None).map_err(|error| {
         anyhow::anyhow!(
-            "one-shot timeout: durable cancellation could not be confirmed for session '{session_id}'; not safe to retry: {error:#}"
+            "one-shot timeout: interrupt could not be appended for session '{session_id}'; not safe to retry: {error:#}"
         )
     })
 }
@@ -306,13 +344,13 @@ mod tests {
     fn timeout_cancellation_failure_is_generic_error_not_invocation_limit() {
         let result = finish_timed_out_turn(
             "unsafe-session",
-            Err(anyhow::anyhow!("injected cancellation failure")),
+            Err(anyhow::anyhow!("injected append failure")),
         );
 
-        let error = result.expect_err("unconfirmed cancellation must fail the invocation");
+        let error = result.expect_err("a failed interrupt append must fail the invocation");
         assert_eq!(
             error.to_string(),
-            "one-shot timeout: durable cancellation could not be confirmed for session 'unsafe-session'; not safe to retry: injected cancellation failure"
+            "one-shot timeout: interrupt could not be appended for session 'unsafe-session'; not safe to retry: injected append failure"
         );
         assert!(!error.is::<InvocationLimitReached>());
         assert!(!crate::invocation_limit_reached(&error));
@@ -320,20 +358,50 @@ mod tests {
 
     #[test]
     fn timeout_cancellation_success_is_synthesized_invocation_limit() {
-        let result = finish_timed_out_turn("safe-session", Ok(true))
-            .expect("confirmed cancellation must preserve timeout classification");
+        // Every confirmed outcome — a fresh Cancel, one that already landed,
+        // or no turn to interrupt at all — preserves the timeout
+        // classification; only a failed append (covered above) does not.
+        for outcome in [
+            InterruptOutcome::Accepted { cancel_seq: 7 },
+            InterruptOutcome::AlreadyInterrupted { cancel_seq: 7 },
+            InterruptOutcome::Idle,
+        ] {
+            let result = finish_timed_out_turn("safe-session", Ok(outcome))
+                .expect("a confirmed interrupt outcome must preserve timeout classification");
 
-        assert!(result.is_none());
-        assert_eq!(
-            termination_spec(result.as_ref()),
-            Some(TerminationSpec {
-                kind: TerminationKind::Timeout,
-                budget: None,
-            })
-        );
+            assert!(result.is_none());
+            assert_eq!(
+                termination_spec(result.as_ref()),
+                Some(TerminationSpec {
+                    kind: TerminationKind::Timeout,
+                    budget: None,
+                })
+            );
+        }
         let marker = anyhow::Error::from(InvocationLimitReached);
         assert!(crate::invocation_limit_reached(&marker));
         assert_eq!(INVOCATION_LIMIT_EXIT_CODE, 2);
+    }
+
+    #[test]
+    fn describe_interrupt_outcome_summarizes_every_case_on_one_line() {
+        assert_eq!(
+            describe_interrupt_outcome(&Ok(InterruptOutcome::Idle)),
+            "no turn was running"
+        );
+        assert_eq!(
+            describe_interrupt_outcome(&Ok(InterruptOutcome::Accepted { cancel_seq: 9 })),
+            "interrupt accepted (cancel seq 9)"
+        );
+        assert_eq!(
+            describe_interrupt_outcome(&Ok(InterruptOutcome::AlreadyInterrupted { cancel_seq: 3 })),
+            "already interrupted (cancel seq 3)"
+        );
+        let message = describe_interrupt_outcome(&Err(anyhow::anyhow!("nats unreachable")));
+        assert!(
+            message.contains("nats unreachable"),
+            "expected the append error in the message: {message}"
+        );
     }
 
     #[test]

@@ -805,7 +805,7 @@ impl Tui {
             .into_iter()
             .collect();
 
-        let spinner = if self.app.llm_busy && !self.cancellation_unconfirmed() {
+        let spinner = if self.app.llm_busy && !self.cancellation_failed() {
             SPINNER_FRAMES[self.app.spinner_index]
         } else {
             "•"

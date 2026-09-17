@@ -34,8 +34,10 @@ async function safeParseJson<T>(res: Response): Promise<JsonRpcResponse<T> | und
 }
 
 function handleRpcError(error: { code: number | string; message?: string }): CancelResult {
+  // A server from before interruption moved into the session log answered an
+  // idle cancel with this error instead of an outcome.
   if (error.code === -32002) {
-    return { cancelled: false, disposition: 'idle' };
+    return { outcome: 'idle' };
   }
   const message = error.message || error.code;
   throw new Error(`RPC Error: ${message}`);
@@ -52,10 +54,11 @@ async function parseCancelResult(res: Response): Promise<CancelResult> {
   return json?.result as CancelResult;
 }
 
+// Interrupting takes no arguments: it always targets whatever turn the session
+// is running, and the answer is the `Cancel` the log accepted.
 export async function cancel(
   agent: string,
   session: string,
-  expectedExecutionId?: string,
   options?: { signal?: AbortSignal }
 ): Promise<CancelResult> {
   const res = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
@@ -68,32 +71,8 @@ export async function cancel(
       jsonrpc: '2.0',
       id: 1,
       method: 'session/cancel',
-      params: { expected_execution_id: expectedExecutionId, retry: true }
     })
   });
 
   return parseCancelResult(res);
-}
-
-export async function abandonCancellation(
-  agent: string,
-  session: string,
-  expectedExecutionId: string,
-  options?: { signal?: AbortSignal }
-): Promise<CancelResult> {
-  const res = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
-    method: 'POST',
-    signal: createTimeoutSignal(CANCELLATION_TIMEOUT_MS, options?.signal),
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'session/abandon_cancellation',
-      params: { expected_execution_id: expectedExecutionId }
-    })
-  });
-  const json = await res.json() as JsonRpcResponse<CancelResult>;
-  if (json.error) throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
-  if (!res.ok || !json.result) throw new Error(`RPC call failed with HTTP ${res.status}`);
-  return json.result;
 }

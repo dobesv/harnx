@@ -1,55 +1,35 @@
 use super::*;
-use harnx_execution_control::{ExecutionStore, OperationRef, OperationState, Owner};
+use harnx_toolset::{CancelAcceptance, CancellationAcknowledgement, ControlMessage};
 use tokio::sync::Notify;
 
+/// A hook that signals it has started, then blocks forever. Only a
+/// cancellation ends the call; nothing here ever completes on its own.
 #[derive(Default)]
-struct GatedHook {
+struct BlockingHook {
     entered: Notify,
-    release: Notify,
 }
 
 #[async_trait]
-impl Hook for GatedHook {
+impl Hook for BlockingHook {
     fn name(&self) -> &str {
         "echo"
     }
     fn hooks(&self) -> Vec<HookSpec> {
         EchoHook.hooks()
     }
-    async fn handle_hook(&self, payload: HookPayload) -> HookOutcome {
+    async fn handle_hook(&self, _payload: HookPayload) -> HookOutcome {
         self.entered.notify_one();
-        self.release.notified().await;
-        EchoHook.handle_hook(payload).await
+        std::future::pending().await
     }
 }
 
-async fn cancel_and_expire(store: &ExecutionStore, reference: &OperationRef) -> Result<()> {
-    store.cancel_operation(reference, None, false).await?;
-    store
-        .mutate(reference, |operation| {
-            operation.cancellation.as_mut().unwrap().progress_at =
-                operation.created_at - Duration::from_secs(6);
-            Ok(())
-        })
-        .await?;
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread")]
-async fn parent_cancellation_waits_for_blocking_hook_future() -> Result<()> {
+async fn cancel_control_message_interrupts_running_hook() -> Result<()> {
     harnx_core::require_nextest();
     let server = spawn_nats_server().await?.context("nats-server required")?;
     let client = connect_test_client(&server.url).await?;
-    let store = ExecutionStore::ensure(&async_nats::jetstream::new(client.clone()), 1).await?;
-    let root = store.session("hook-parent", None, None).await?;
-    let owner = Owner {
-        instance_id: "worker".into(),
-        fence: 1,
-    };
-    store.claim(&root.reference, owner.clone()).await?;
-    let child = OperationRef::new("hook-parent", "blocking-hook");
-    let producer = register_hook(&store, &root.reference, &child).await?;
-    let hook = Arc::new(GatedHook::default());
+
+    let hook = Arc::new(BlockingHook::default());
     let scope = ServerScope::new();
     let shutdown = CancellationToken::new();
     let task = tokio::spawn(serve_with_shutdown(
@@ -62,18 +42,19 @@ async fn parent_cancellation_waits_for_blocking_hook_future() -> Result<()> {
         ServeLifecycle::new(shutdown.clone(), None),
     ));
     wait_for_registration(&client, &scope).await?;
+
+    let session_id = "hook-session";
+    let call_id = "blocking-hook-call";
     let mut headers = async_nats::HeaderMap::new();
-    headers.insert(
-        "Harnx-Hook-Operation",
-        serde_json::to_string(&producer)?.as_str(),
-    );
+    headers.insert("Harnx-Hook-Session", session_id);
+    headers.insert("Harnx-Hook-Call", call_id);
     let payload = HookPayload {
-        session_id: "hook-parent".into(),
+        session_id: session_id.into(),
         cwd: std::env::current_dir()?,
         resume_count: 0,
         hook_event: HookEvent::PreToolUse {
             tool_name: "example".into(),
-            tool_input: json!({"text": "x".repeat(96 * 1024)}),
+            tool_input: json!({"text": "x"}),
             tool_use_id: "call".into(),
         },
     };
@@ -89,27 +70,25 @@ async fn parent_cancellation_waits_for_blocking_hook_future() -> Result<()> {
         _ = hook.entered.notified() => {},
         result = &mut invoke => anyhow::bail!("hook finished early: {result:?}"),
     }
-    cancel_and_expire(&store, &root.reference).await?;
-    store
-        .record_coverage(&root.reference, &owner, 0, true)
+
+    let control = ControlMessage::cancel(
+        "echo".into(),
+        session_id.into(),
+        call_id.into(),
+        "c-1".into(),
+    );
+    let ack_message = client
+        .request(
+            scope.hook_control_subject("echo"),
+            serde_json::to_vec(&control)?.into(),
+        )
         .await?;
-    store.owner_stopped(&root.reference, &owner).await?;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), &mut invoke)
-            .await
-            .is_err()
-    );
-    assert!(!store.get(&child).await?.unwrap().owner_stopped);
-    assert_eq!(
-        store.status(&root.reference).await?.state,
-        OperationState::Unconfirmed
-    );
-    hook.release.notify_one();
-    assert_interrupted_reply(tokio::time::timeout(Duration::from_secs(2), &mut invoke).await??)?;
-    assert_eq!(
-        store.status(&root.reference).await?.state,
-        OperationState::Cancelled
-    );
+    let ack: CancellationAcknowledgement = serde_json::from_slice(&ack_message.payload)?;
+    assert_eq!(ack.acceptance, CancelAcceptance::Accepted);
+
+    let reply = tokio::time::timeout(Duration::from_secs(2), &mut invoke).await??;
+    assert_interrupted_reply(reply)?;
+
     shutdown.cancel();
     task.await??;
     Ok(())
@@ -117,18 +96,9 @@ async fn parent_cancellation_waits_for_blocking_hook_future() -> Result<()> {
 
 fn assert_interrupted_reply(reply: async_nats::Message) -> Result<()> {
     let value: serde_json::Value = serde_json::from_slice(&reply.payload)?;
-    assert!(
-        value.get("interrupted").is_some(),
-        "late hook output must be suppressed: {value}"
-    );
+    let interrupted = value
+        .get("interrupted")
+        .context("expected an interrupted hook reply")?;
+    assert_eq!(interrupted["cancellation_id"], "c-1");
     Ok(())
-}
-
-async fn register_hook(
-    store: &ExecutionStore,
-    root: &OperationRef,
-    child: &OperationRef,
-) -> Result<harnx_execution_control::ExecutionContext> {
-    store.child(child.clone(), root.clone()).await?;
-    store.activate_gate(child).await
 }

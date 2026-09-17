@@ -11,9 +11,8 @@ impl AgentEventSink for Capture {
 }
 
 #[test]
-fn final_flush_drops_stopped_and_replaced_generations_before_any_decoration() {
+fn final_flush_drops_events_at_or_before_the_cancel_sequence_before_any_decoration() {
     let live = LiveEventState::default();
-    live.select(Some("g1".into()));
     let capture = Arc::new(Capture::default());
     let sink: Arc<dyn AgentEventSink> = capture.clone();
     let events = vec![
@@ -34,24 +33,22 @@ fn final_flush_drops_stopped_and_replaced_generations_before_any_decoration() {
             outcome: Default::default(),
         }),
     ];
+    // Every event here predates the cancel fence set below (seq 5 < seq 10).
     let queued: VecDeque<_> = events
         .into_iter()
-        .map(|event| AdvisoryEnvelope::new(u64::MAX, event).with_execution_id("g1"))
+        .map(|event| AdvisoryEnvelope::new(5, event))
         .collect();
     let mut seqs = HashSet::new();
-    live.stop("g1");
-    for generation in ["g1", "g2"] {
-        live.select(Some(generation.into()));
-        for mode in [AdvisoryFlush::Live, AdvisoryFlush::Final] {
-            let mut pending = queued.clone();
-            flush_pending_advisories(&mut pending, None, &sink, &mut seqs, mode, &live);
-            assert!(pending.is_empty());
-            assert!(capture.0.lock().unwrap().is_empty());
-            assert!(
-                seqs.is_empty(),
-                "stale event must not assign a current transcript seq"
-            );
-        }
+    live.accept_interrupt(10);
+    for mode in [AdvisoryFlush::Live, AdvisoryFlush::Final] {
+        let mut pending = queued.clone();
+        flush_pending_advisories(&mut pending, None, &sink, &mut seqs, mode, &live, 0);
+        assert!(pending.is_empty());
+        assert!(capture.0.lock().unwrap().is_empty());
+        assert!(
+            seqs.is_empty(),
+            "stale event must not assign a current transcript seq"
+        );
     }
 }
 

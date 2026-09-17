@@ -100,8 +100,6 @@ struct SessionActor {
     broadcast_tx: broadcast::Sender<Event>,
     subscribers: usize,
     state: SessionState,
-    execution_id: Option<String>,
-    execution_state: Option<harnx_execution_control::OperationState>,
     pending: VecDeque<PendingPrompt>,
     active_run: Option<ActiveRun>,
     run_done_tx: mpsc::Sender<RunFinished>,
@@ -127,6 +125,9 @@ struct SessionActor {
     tokens_usage: Option<crate::ag_ui::UsageContextSnapshot>,
     /// Canonical metadata state for replaying attached history without another metadata lookup.
     session_base: Option<harnx_core::session::Session>,
+    /// Lease sample from the last durable read: a worker is running a turn this
+    /// server never started.
+    worker_active: bool,
     actor_config: SessionActorConfig,
 }
 
@@ -137,6 +138,35 @@ struct LoadedHistorySnapshot {
     entries: Option<Vec<(u64, harnx_core::session::SessionLogEntry)>>,
     tokens_usage: Option<crate::ag_ui::UsageContextSnapshot>,
     session_base: Option<harnx_core::session::Session>,
+    /// A worker held this session's lease across the durable read.
+    worker_active: bool,
+}
+
+/// The session state the durable log implies for a session with no run of this
+/// server's own: an approval gate it is parked at, the `Cancel` that stopped
+/// its turn, or nothing. Deriving it here is what makes an interrupt survive
+/// a history refresh, an actor reap and a server restart alike — the log is
+/// the authority, and this actor only ever caches its answer.
+fn derive_state_from_log(
+    entries: Option<&[(u64, harnx_core::session::SessionLogEntry)]>,
+) -> SessionState {
+    let Some(entries) = entries else {
+        return SessionState::Idle;
+    };
+    // The `Cancel` is read first: it ends the turn the gate belongs to, and a
+    // session that answered an interrupt must not report itself back at a gate
+    // nobody is waiting on any more.
+    if harnx_core::session_reconstruct::current_turn_is_cancelled(entries) {
+        return SessionState::Interrupted {
+            cancel_seq: harnx_core::session_reconstruct::last_terminator_seq(entries),
+        };
+    }
+    if let Some(metadata) = crate::ag_ui::derive_hitl_interrupt_outcome(entries) {
+        return SessionState::AwaitingApproval {
+            pending: Box::new(PendingInterrupt { metadata }),
+        };
+    }
+    SessionState::Idle
 }
 
 fn spawn_session_actor(
@@ -173,8 +203,6 @@ fn make_session_actor(
         broadcast_tx,
         subscribers: 0,
         state: SessionState::Idle,
-        execution_id: None,
-        execution_state: None,
         pending: VecDeque::new(),
         active_run: None,
         run_done_tx,
@@ -189,6 +217,7 @@ fn make_session_actor(
         log_entries: None,
         tokens_usage: None,
         session_base: None,
+        worker_active: false,
         actor_config,
     };
     (actor, handle)
@@ -328,22 +357,16 @@ impl SessionActor {
     }
 
     async fn start(self) {
-        let poll = cancellation::poller(self.actor_config.clone(), self.key.clone());
-        self.run(poll).await;
+        self.run().await;
     }
 
-    async fn run(mut self, mut cancellation_poll: cancellation::CancellationPoller) {
+    async fn run(mut self) {
         let far_future = Instant::now() + Duration::from_secs(FAR_FUTURE_SECS);
         let reap_sleep = sleep_until(far_future);
         tokio::pin!(reap_sleep);
 
         loop {
             tokio::select! {
-                result = cancellation_poll.next(), if self.actor_config.call_fn.is_none() => {
-                    if let Some(result) = result {
-                        self.apply_cancellation_refresh(result);
-                    }
-                },
                 maybe_cmd = self.rx.recv() => {
                     let Some(cmd) = maybe_cmd else {
                         if let Some(active_run) = &self.active_run {
@@ -353,7 +376,6 @@ impl SessionActor {
                         break;
                     };
                     self.handle_command(cmd, &mut reap_sleep).await;
-                    cancellation_poll.invalidate();
                 }
                 maybe_done = self.run_done_rx.recv() => {
                     let Some(done) = maybe_done else {
@@ -361,12 +383,10 @@ impl SessionActor {
                         break;
                     };
                     self.handle_run_done(done, &mut reap_sleep).await;
-                    cancellation_poll.invalidate();
                 }
                 Some(done) = self.hitl_approval_done_rx.recv() => {
                     self.refresh_history_snapshot().await;
                     let _ = done.reply.send(done.result);
-                    cancellation_poll.invalidate();
                 }
                 _ = &mut reap_sleep, if self.reap_deadline.is_some() => {
                     if self.reap_now() {
@@ -392,7 +412,7 @@ impl SessionActor {
                 self.subscribers += 1;
                 self.cancel_reap(reap_sleep);
                 self.refresh_history_snapshot().await;
-                self.refresh_cancellation().await;
+                self.republish_pending_activation().await;
                 let _ = reply.send(SubscribeResult {
                     snapshot: self.history_snapshot.clone(),
                     history_warnings: self.history_warnings.clone(),
@@ -411,10 +431,7 @@ impl SessionActor {
                 let result = self.handle_prompt(text, options, reap_sleep).await;
                 let _ = reply.send(result);
             }
-            command @ (SessionCommand::Cancel { .. }
-            | SessionCommand::AbandonCancellation { .. }) => {
-                self.answer_cancellation_command(command).await
-            }
+            SessionCommand::Cancel { reply } => self.answer_interrupt(reply).await,
             SessionCommand::HitlApprovalDecision {
                 tool_call_id,
                 approved,
@@ -439,7 +456,6 @@ impl SessionActor {
             }
             SessionCommand::Get { reply } => {
                 self.refresh_history_snapshot().await;
-                self.refresh_cancellation().await;
                 let _ = reply.send(self.session_info());
             }
             SessionCommand::Unsubscribe => {
@@ -463,16 +479,6 @@ impl SessionActor {
         mut options: SessionPromptOptions,
         reap_sleep: &mut std::pin::Pin<&mut Sleep>,
     ) -> PromptResult {
-        self.refresh_cancellation().await;
-        if matches!(
-            self.state,
-            SessionState::Cancelling(_) | SessionState::CancelUnconfirmed(_)
-        ) {
-            return PromptResult::Rejected {
-                reason: "session cancellation is pending; retry cancellation before prompting"
-                    .into(),
-            };
-        }
         if self.actor_config.call_fn.is_none() {
             match self.admit_prompt(&text, &options).await {
                 Ok(admitted) => options.admitted = Some(admitted),
@@ -557,13 +563,13 @@ impl SessionActor {
 
     fn finish_completed_run(&mut self, done: &RunFinished) {
         let result = match &self.state {
-            SessionState::Interrupted { pending } => Some(serde_json::json!({
+            SessionState::AwaitingApproval { pending } => Some(serde_json::json!({
                 "outcome": pending.metadata.clone()
             })),
             SessionState::Idle
             | SessionState::Running { .. }
-            | SessionState::Cancelling(_)
-            | SessionState::CancelUnconfirmed(_) => None,
+            | SessionState::Interrupting
+            | SessionState::Interrupted { .. } => None,
         };
         self.finish_run(done, result);
         if matches!(
@@ -677,29 +683,33 @@ impl SessionActor {
 
     fn session_info(&self) -> SessionInfo {
         SessionInfo {
-            execution_id: self.execution_id.clone(),
-            execution_state: self.execution_state,
             state: self.state.clone(),
+            // A turn this server never prompted — a sub-agent session, or one
+            // another frontend started — has no local run to report, and the
+            // lease sampled by the last durable read is what says it is
+            // running anyway.
+            worker_active: self.worker_active,
             history_snapshot: self.history_snapshot.clone(),
             history_warnings: self.history_warnings.clone(),
             capabilities: SessionCapabilities {
-                can_prompt: !matches!(
-                    self.state,
-                    SessionState::Cancelling(_) | SessionState::CancelUnconfirmed(_)
-                ),
+                // A prompt is always admissible: the session log orders it
+                // against any `Cancel` already in flight, so there is no state
+                // in which the client has to hold one back.
+                can_prompt: true,
                 can_cancel: true,
                 supports_snapshot: true,
             },
         }
     }
 
+    /// Whether this actor is doing work that must not be reaped out from under
+    /// a client. An interrupted or interrupting session is not: its turn is
+    /// over or unresolved, and the session log — not this actor — is the
+    /// authority on which, so a replacement actor rebuilds the same answer.
     fn is_running(&self) -> bool {
         matches!(
             self.state,
-            SessionState::Running { .. }
-                | SessionState::Interrupted { .. }
-                | SessionState::Cancelling(_)
-                | SessionState::CancelUnconfirmed(_)
+            SessionState::Running { .. } | SessionState::AwaitingApproval { .. }
         )
     }
 
@@ -753,45 +763,44 @@ impl SessionActor {
 
     async fn refresh_history_snapshot(&mut self) {
         let loaded = self.load_history_snapshot().await;
-        let derived_interrupt = loaded
-            .entries
-            .as_deref()
-            .and_then(crate::ag_ui::derive_hitl_interrupt_outcome)
-            .map(|metadata| SessionState::Interrupted {
-                pending: Box::new(PendingInterrupt { metadata }),
-            });
-        if self.active_run.is_none() {
-            self.state = derived_interrupt.unwrap_or(SessionState::Idle);
+        // `Interrupting` is this actor's own append. The actor answers one
+        // command at a time, so today no refresh can run while one is in
+        // flight; the guard is here to keep the state machine right if the
+        // append ever moves off the command path.
+        if self.active_run.is_none() && !matches!(self.state, SessionState::Interrupting) {
+            self.state = derive_state_from_log(loaded.entries.as_deref());
         }
         self.history_snapshot = loaded.messages;
         self.history_warnings = loaded.warnings;
         self.log_entries = loaded.entries;
         self.tokens_usage = loaded.tokens_usage;
         self.session_base = loaded.session_base;
+        self.worker_active = loaded.worker_active;
     }
 
     async fn load_history_snapshot(&self) -> LoadedHistorySnapshot {
         if self.actor_config.call_fn.is_some() {
             return self.test_history_snapshot();
         }
-        match crate::load_nats_session_with_base(
+        match crate::load_nats_session_state(
             &self.actor_config.base_config,
             &self.key.agent,
             &self.key.session,
         ).await {
-            Ok((session, entries, base_session)) if session.agent_name.as_deref() == Some(self.key.agent.as_str()) => {
+            Ok(loaded) if loaded.session.agent_name.as_deref() == Some(self.key.agent.as_str()) => {
                 LoadedHistorySnapshot {
-                    messages: crate::ag_ui::history_messages_for_snapshot(&session.messages),
-                    tokens_usage: Some(crate::ag_ui::UsageContextSnapshot::from_session(&session)),
-                    warnings: session.replay_warnings,
-                    entries: Some(entries),
-                    session_base: Some(base_session),
+                    messages: crate::ag_ui::history_messages_for_snapshot(&loaded.session.messages),
+                    tokens_usage: Some(crate::ag_ui::UsageContextSnapshot::from_session(&loaded.session)),
+                    warnings: loaded.session.replay_warnings,
+                    entries: Some(loaded.entries),
+                    session_base: Some(loaded.base_session),
+                    worker_active: loaded.worker_active,
                 }
             }
-            Ok((session, _, _)) => LoadedHistorySnapshot {
+            Ok(loaded) => LoadedHistorySnapshot {
                 warnings: vec![format!(
                     "Failed to load session history: session belongs to agent '{}' rather than '{}'",
-                    session.agent_name.as_deref().unwrap_or("unknown"), self.key.agent
+                    loaded.session.agent_name.as_deref().unwrap_or("unknown"), self.key.agent
                 )],
                 ..Default::default()
             },
@@ -1069,10 +1078,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         handle
             .tx
-            .send(SessionCommand::Cancel {
-                reply: reply_tx,
-                expected_execution_id: None,
-            })
+            .send(SessionCommand::Cancel { reply: reply_tx })
             .await
             .expect("send cancel");
         reply_rx

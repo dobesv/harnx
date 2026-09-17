@@ -33,12 +33,6 @@ async fn cancel_control_command_serializes_and_is_publishable() -> Result<()> {
         ))
         .await?;
 
-    let store = harnx_execution_control::ExecutionStore::ensure(
-        &async_nats::jetstream::new(client.clone()),
-        1,
-    )
-    .await?;
-    store.session("control-cancel-only", None, None).await?;
     publish_control_command(&client, "control-cancel-only", &ControlCommand::Cancel).await?;
 
     use futures_util::StreamExt;
@@ -46,8 +40,10 @@ async fn cancel_control_command_serializes_and_is_publishable() -> Result<()> {
         .await?
         .expect("should receive control message");
 
+    // Commands reach the lease holder as written: nothing is resolved against
+    // durable state before publishing, because the log is the only authority.
     let cmd: ControlCommand = serde_json::from_slice(&msg.payload)?;
-    assert!(matches!(cmd, ControlCommand::CancelExecution { .. }));
+    assert_eq!(cmd, ControlCommand::Cancel);
     Ok(())
 }
 
@@ -81,17 +77,25 @@ async fn cancel_appends_entry_before_abort() -> Result<()> {
         fence_token: Some(42),
     })
     .await?;
-    log.append_event_async(&SessionLogEntry::Cancel { fence_token: 42 })
-        .await?;
+    log.append_event_async(&SessionLogEntry::Cancel {
+        fence_token: 42,
+        cancellation_id: None,
+        requested_by: None,
+        timestamp: None,
+    })
+    .await?;
 
     let entries = log.load_events_async().await?;
     let entries_only: Vec<_> = entries.into_iter().map(|(_, e)| e).collect();
     assert!(entries_only
         .iter()
-        .any(|e| matches!(e, SessionLogEntry::Cancel { fence_token } if *fence_token == 42)));
+        .any(|e| matches!(e, SessionLogEntry::Cancel { fence_token, .. } if *fence_token == 42)));
 
     let state = reconstruct_state(&entries_only);
-    assert_eq!(state.turn_status, TurnStatus::InFlightCancelled);
+    assert!(matches!(
+        state.turn_status,
+        TurnStatus::Idle | TurnStatus::InterruptedPendingWindUp { .. }
+    ));
 
     Ok(())
 }
@@ -125,13 +129,21 @@ async fn cancel_prevents_resume_on_reactivation() -> Result<()> {
         fence_token: Some(10),
     })
     .await?;
-    log.append_event_async(&SessionLogEntry::Cancel { fence_token: 10 })
-        .await?;
+    log.append_event_async(&SessionLogEntry::Cancel {
+        fence_token: 10,
+        cancellation_id: None,
+        requested_by: None,
+        timestamp: None,
+    })
+    .await?;
 
     let entries = log.load_events_async().await?;
     let entries_only: Vec<_> = entries.into_iter().map(|(_, e)| e).collect();
     let state = reconstruct_state(&entries_only);
 
-    assert_eq!(state.turn_status, TurnStatus::InFlightCancelled);
+    assert!(matches!(
+        state.turn_status,
+        TurnStatus::Idle | TurnStatus::InterruptedPendingWindUp { .. }
+    ));
     Ok(())
 }

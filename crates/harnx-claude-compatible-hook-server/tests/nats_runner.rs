@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use harnx_claude_compatible_hook_server::{Args, ClaudeCompatibleHook, CliFailPolicy};
-use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResultControl};
+use harnx_core::hooks::{HookEvent, HookPayload, HookResultControl};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_hookset::{HookRegistration, HARNX_HOOK_NAME};
 use harnx_hookset_server::{hook_registration_key, serve_over_nats, HOOK_REGISTRY_BUCKET};
@@ -226,12 +226,17 @@ async fn command_hook_registers_and_answers_over_nats() -> Result<()> {
         },
     };
     let message = client
-        .request(
+        .send_request(
             instance_id.hook_subject(SERVER_NAME, "PreToolUse"),
-            serde_json::to_vec(&payload)?.into(),
+            async_nats::Request::new()
+                .headers(harnx_hookset_server::hook_request_headers(
+                    &payload.session_id,
+                    "nats-runner-call",
+                ))
+                .payload(serde_json::to_vec(&payload)?.into()),
         )
         .await?;
-    let outcome: HookOutcome = serde_json::from_slice(&message.payload)?;
+    let outcome = harnx_hookset_server::decode_hook_reply(&message.payload)?;
     assert_eq!(outcome.control, HookResultControl::Continue);
     assert_eq!(
         outcome.result.mutated_tool_input,

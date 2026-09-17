@@ -20,11 +20,14 @@ use uuid::Uuid;
 
 mod cancellation;
 mod in_flight;
+pub use cancellation::publish_tool_cancel;
 use in_flight::InFlightFailure;
-pub use in_flight::NatsInFlightCalls;
+pub(crate) use in_flight::InFlightRegistration;
+pub use in_flight::{InFlightCancelTarget, NatsInFlightCalls};
 mod execution_context;
 mod replay;
 mod request;
+pub(crate) use replay::decode_journaled_reply;
 
 use execution_context::extract_execution_context;
 
@@ -38,19 +41,6 @@ struct RegisteredTool {
     selector_server: String,
     raw_name: String,
     request_timeout: Option<Duration>,
-}
-
-fn canonical_parent_session_id(
-    session: Option<&str>,
-    execution: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    if let (Some(session), Some(execution)) = (session, execution) {
-        anyhow::ensure!(
-            session == execution,
-            "tool session differs from execution parent"
-        );
-    }
-    Ok(execution.or(session).map(str::to_owned))
 }
 
 struct PendingToolRequest {
@@ -67,15 +57,16 @@ pub struct NatsToolProvider {
     client: async_nats::Client,
     instance_id: ServerScope,
     parent_session_id: Option<String>,
-    execution_control: Option<(
-        harnx_execution_control::ExecutionStore,
-        harnx_execution_control::OperationRef,
-    )>,
     tools: HashMap<String, RegisteredTool>,
     registrations: Vec<Registration>,
     active_package: Option<String>,
     declarations: Vec<ToolDeclaration>,
     registry: Option<async_nats::jetstream::kv::Store>,
+    /// Durability for the invocation journal's bucket. Whichever writer
+    /// creates the bucket first fixes its replica count for every later one,
+    /// and dispatch is usually first, so it has to carry the cluster's
+    /// configured count rather than assume a single replica.
+    journal_replicas: usize,
     // Owning this subscription establishes the progress/cancel channel before requests start.
     _control_subscription: Mutex<async_nats::Subscriber>,
     in_flight: NatsInFlightCalls,
@@ -89,6 +80,10 @@ impl NatsToolProvider {
         in_flight: NatsInFlightCalls,
         active_package: Option<&str>,
     ) -> anyhow::Result<Self> {
+        let journal_replicas = config
+            .resolve_nats_server(LOCAL_CLUSTER_KEY)
+            .await?
+            .resolved_replicas();
         let client = config.nats_client(LOCAL_CLUSTER_KEY).await?;
         let control_subject = instance_id.control_subject();
         let control_subscription = client.subscribe(control_subject).await?;
@@ -130,28 +125,18 @@ impl NatsToolProvider {
             Some(_) => 2,
         });
         let (tools, declarations) = build_registered_tools(active_package, registrations.clone());
-        let parent_session_id = canonical_parent_session_id(
-            config
-                .session
-                .as_ref()
-                .map(|session| session.storage_key())
-                .as_deref(),
-            config
-                .execution_control
-                .as_ref()
-                .map(|(_, parent)| parent.session_id.as_str()),
-        )?;
+        let parent_session_id = config.session.as_ref().map(|session| session.storage_key());
 
         Ok(Self {
             client,
             instance_id,
             parent_session_id,
-            execution_control: config.execution_control.clone(),
             tools,
             registrations,
             active_package: active_package.map(str::to_string),
             declarations,
             registry,
+            journal_replicas,
             _control_subscription: Mutex::new(control_subscription),
             in_flight,
         })
@@ -231,14 +216,6 @@ impl NatsToolProvider {
         }
     }
 
-    async fn register_operation(&self, call_id: &str) -> anyhow::Result<()> {
-        if let Some((store, parent)) = &self.execution_control {
-            let child = harnx_execution_control::OperationRef::new(&parent.session_id, call_id);
-            store.child(child, parent.clone()).await?;
-        }
-        Ok(())
-    }
-
     async fn wait_for_registration_loss(&self, key: &str) -> String {
         let Some(registry) = self.registry.as_ref() else {
             std::future::pending::<()>().await;
@@ -284,7 +261,12 @@ impl NatsToolProvider {
         } = pending;
         let mut supervised_failure = self
             .in_flight
-            .register(call_id.clone(), server.clone())
+            .register(InFlightRegistration {
+                call_id: call_id.clone(),
+                server: server.clone(),
+                session_id: durable.parent_session_id.clone().unwrap_or_default(),
+                control_subject: self.instance_id.control_subject(),
+            })
             .await;
         let request = harnx_nats_common::rpc::request(&self.client, subject, request);
         tokio::pin!(request);
@@ -320,11 +302,7 @@ impl NatsToolProvider {
     }
     fn transport_failure(&self, request: &ToolRequest, server: &str, message: String) -> ToolError {
         self.schedule_cancel(request, server);
-        if self.execution_control.is_none() {
-            ToolError::Recoverable(anyhow!(message))
-        } else {
-            ToolError::Fatal(anyhow!(message))
-        }
+        ToolError::Recoverable(anyhow!(message))
     }
 }
 
@@ -623,25 +601,6 @@ pub async fn describe_discovery(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn parent_session_identity_must_match_execution_parent() {
-        use super::canonical_parent_session_id;
-        assert!(canonical_parent_session_id(Some("wrong"), Some("parent")).is_err());
-        for session in [None, Some("parent")] {
-            assert_eq!(
-                canonical_parent_session_id(session, Some("parent"))
-                    .unwrap()
-                    .as_deref(),
-                Some("parent")
-            );
-        }
-        assert_eq!(
-            canonical_parent_session_id(Some("direct"), None)
-                .unwrap()
-                .as_deref(),
-            Some("direct")
-        );
-    }
     use super::{
         build_registered_tools, request_timeout, NatsInFlightCalls, NatsToolProvider,
         RegisteredTool, DEFAULT_REQUEST_TIMEOUT,
@@ -680,12 +639,12 @@ mod tests {
             client,
             instance_id,
             parent_session_id: None,
-            execution_control: None,
             tools: HashMap::new(),
             registrations: Vec::new(),
             active_package: None,
             declarations: Vec::new(),
             registry: None,
+            journal_replicas: 1,
             _control_subscription: Mutex::new(control_subscription),
             in_flight: NatsInFlightCalls::default(),
         };

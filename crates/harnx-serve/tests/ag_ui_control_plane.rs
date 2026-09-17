@@ -377,6 +377,10 @@ async fn e2e_success_criterion_3_prompt_while_running_injects_mid_loop() {
         .iter()
         .filter(|msg| msg.role.is_user())
         .map(|msg| msg.content.to_text())
+        // Runtime notes (e.g. an interruption note) are synthesized context
+        // for the model, not prompts the user typed; exclude them so this
+        // history check only sees what the user actually sent.
+        .filter(|text| !text.starts_with(harnx_runtime::config::session::RUNTIME_NOTE_PREFIX))
         .collect();
     assert_eq!(
         user_texts,
@@ -1123,7 +1127,7 @@ async fn sse_cancel_mid_run_closes_after_run_error_without_extra_frames() {
         json!({"jsonrpc":"2.0","id":9,"method":"session/cancel"}),
     )
     .await;
-    assert_eq!(cancel["result"]["cancelled"], true);
+    assert_eq!(cancel["result"]["outcome"], "accepted");
 
     let read = read_sse_until(response, Duration::from_secs(5), |read| {
         read.events.iter().any(|event| event["type"] == "RUN_ERROR")

@@ -13,7 +13,7 @@ impl Tui {
         // un-aborted by a future `abort_signal.reset()`.
         let new_abort = harnx_runtime::utils::create_abort_signal();
         self.current_prompt_abort = Some(new_abort.clone());
-        self.live_events = self.live_events.replacement();
+        self.live_events = self.live_events.fork();
         // This prompt receives its worker events directly through
         // TuiAgentEventSink. Pause the shared observer before activating the
         // worker so its advisory copy cannot be queued and rendered later.
@@ -67,7 +67,10 @@ impl Tui {
         }
         if let Some(handle) = self.current_prompt_handle.take() {
             handle.abort();
-            harnx_execution_control::CleanupTasks::process().spawn(async move {
+            // Detached, not awaited here: reaping the handle is fire-and-forget
+            // cleanup, and this call site cannot block on it without stalling
+            // the frame that retired it.
+            tokio::spawn(async move {
                 let _ = handle.await;
             });
         }

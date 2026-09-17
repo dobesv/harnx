@@ -26,7 +26,6 @@ pub(super) struct HitlCallbackContext<'a> {
     pub event_sink: Option<&'a Arc<NatsEventSink>>,
     pub after_seq_observer: Option<&'a Arc<AtomicU64>>,
     pub metadata_store: Option<&'a SessionMetadataStore>,
-    pub fence: Option<crate::execution_fence::GenerationFence>,
 }
 
 /// Runtime state for HITL approval request handling.
@@ -49,8 +48,7 @@ impl<'a> HitlCallbackContext<'a> {
                     .cloned()
                     .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
             )
-            .with_metadata_store(self.metadata_store.cloned())
-            .with_execution(self.fence.clone());
+            .with_metadata_store(self.metadata_store.cloned());
         let sink = FencedSessionLogSink::new(backend.clone(), Arc::clone(self.lease));
         (backend, sink)
     }
@@ -294,7 +292,7 @@ mod hitl_attention_tests {
             .unwrap();
 
         // Acquire a lease for the session
-        let (lease, fence) =
+        let lease =
             crate::nats_worker::backend::test_session_authority(&jetstream, &storage_key, &store)
                 .await;
         let after_seq_observer = Arc::new(AtomicU64::new(0));
@@ -307,7 +305,6 @@ mod hitl_attention_tests {
             event_sink: None,
             after_seq_observer: Some(&after_seq_observer),
             metadata_store: Some(&store),
-            fence: Some(fence),
         };
         let callback = build_hitl_approval_request_callback_for_test(ctx);
 

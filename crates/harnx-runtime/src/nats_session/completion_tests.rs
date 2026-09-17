@@ -35,8 +35,13 @@ async fn nats_completion_reads_only_entries_after_its_successful_cursor() -> Res
     };
     let js = async_nats::jetstream::new(client.clone());
     let log = NatsSessionLog::new(js.clone(), "incremental");
-    log.append_event_async(&SessionLogEntry::Cancel { fence_token: 1 })
-        .await?;
+    log.append_event_async(&SessionLogEntry::Cancel {
+        fence_token: 1,
+        cancellation_id: None,
+        requested_by: None,
+        timestamp: None,
+    })
+    .await?;
     let history = log.load_events_async().await?;
     let mut requests = client
         .subscribe(format!(

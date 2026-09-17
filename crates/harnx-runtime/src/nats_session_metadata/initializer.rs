@@ -1,4 +1,4 @@
-use super::{SessionAgentSource, SessionOverrides, ToolContext};
+use super::{ParentLink, SessionAgentSource, SessionOverrides, ToolContext};
 use anyhow::Result;
 use harnx_core::agent_config::AgentVariables;
 
@@ -8,6 +8,9 @@ pub struct SessionInitializer {
     pub variables: AgentVariables,
     pub overrides: SessionOverrides,
     pub tool_context: ToolContext,
+    /// Set when this session is being created as a sub-agent child, so its
+    /// metadata records the parent invocation that created it.
+    pub parent: Option<ParentLink>,
 }
 
 impl SessionInitializer {
@@ -21,6 +24,7 @@ impl SessionInitializer {
             variables,
             overrides: SessionOverrides::default(),
             tool_context: ToolContext::default(),
+            parent: None,
         }
     }
 
@@ -36,6 +40,7 @@ impl SessionInitializer {
             variables,
             overrides,
             tool_context: ToolContext::default(),
+            parent: None,
         }
     }
 

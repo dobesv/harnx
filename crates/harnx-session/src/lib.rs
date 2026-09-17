@@ -28,9 +28,7 @@ pub fn build_context(
     on_tool_round: Option<OnToolRoundFn>,
     working_dir: Option<PathBuf>,
 ) -> AgentLoopContext {
-    let generation_fence = prompt_config.read().generation_fence.clone();
     AgentLoopContext {
-        generation_fence,
         instance_id: harnx_core::instance::ServerScope::new(),
         config: prompt_config,
         abort_signal,
