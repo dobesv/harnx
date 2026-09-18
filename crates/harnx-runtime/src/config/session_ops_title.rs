@@ -262,19 +262,31 @@ fn post_process_title(raw: &str) -> String {
 
 /// Handle the outcome of a spawned `generate_title`: emit `TitleUpdated` on a
 /// new title, emit `TitleGenerationFailed` and warn on error, and ignore the
-/// "nothing to title" case.
-pub(crate) fn handle_title_result(result: anyhow::Result<Option<String>>) {
+/// "nothing to title" case. Routes completion through the provided sink when
+/// `Some`, else falls back to the global `emit_agent_event`.
+pub(crate) fn handle_title_result(
+    result: anyhow::Result<Option<String>>,
+    event_sink: Option<&std::sync::Arc<dyn harnx_core::event::AgentEventSink>>,
+) {
+    let emit = |event| {
+        if let Some(sink) = event_sink {
+            sink.emit(event);
+        } else {
+            harnx_core::sink::emit_agent_event(event);
+        }
+    };
+
     match result {
         Ok(Some(title)) => {
             info!("session title generated: {title:?}");
-            harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+            emit(harnx_core::event::AgentEvent::Session(
                 harnx_core::event::SessionEvent::TitleUpdated(title),
             ));
         }
         Ok(None) => debug!("title generation produced nothing"),
         Err(err) => {
             warn!("Failed to generate session title: {err:#}");
-            harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+            emit(harnx_core::event::AgentEvent::Session(
                 harnx_core::event::SessionEvent::TitleGenerationFailed(format!("{err:#}")),
             ));
         }
@@ -412,14 +424,15 @@ impl Config {
             info!("title generation: starting for session {id}");
         }
 
+        let event_sink = harnx_core::sink::current_agent_event_sink();
         tokio::spawn(async move {
             let result = harnx_core::sink::with_agent_event_sink(
                 Arc::new(harnx_core::event::NullSink),
                 Self::with_maintenance_abort(&config, Self::generate_title(&config)),
             )
             .await;
+            handle_title_result(result, event_sink.as_ref());
             Self::clear_titling(&config, titling_session_id.as_deref());
-            handle_title_result(result);
         });
     }
 
@@ -916,10 +929,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_title_completion_reaches_captured_scoped_sink() {
+        let scoped = Arc::new(CollectingSink::default());
+
+        harnx_core::sink::with_agent_event_sink(scoped.clone(), async {
+            let captured = harnx_core::sink::current_agent_event_sink();
+            tokio::spawn(async move {
+                handle_title_result(Ok(Some("t".into())), captured.as_ref());
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+
+        let events = scoped.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Session(SessionEvent::TitleUpdated(title)) if title == "t"
+        ));
+    }
+
+    #[tokio::test]
     async fn title_failure_emits_full_error_after_isolated_generation_events() {
         let sink = Arc::new(CollectingSink::default());
 
         harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            let event_sink = harnx_core::sink::current_agent_event_sink();
             let result = harnx_core::sink::with_agent_event_sink(
                 Arc::new(harnx_core::event::NullSink),
                 async {
@@ -932,7 +968,7 @@ mod tests {
             )
             .await;
 
-            handle_title_result(result);
+            handle_title_result(result, event_sink.as_ref());
         })
         .await;
 
