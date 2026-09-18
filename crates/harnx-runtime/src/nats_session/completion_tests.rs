@@ -4,7 +4,7 @@ use harnx_core::{api_types::CompletionTokenUsage, session::ToolOutput};
 use serde_json::json;
 
 struct Server {
-    child: std::process::Child,
+    child: crate::nats_worker::tests::TestNatsServer,
     _directory: tempfile::TempDir,
 }
 impl Drop for Server {

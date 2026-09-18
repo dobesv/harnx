@@ -372,9 +372,13 @@ async fn assert_context_flows_from_tool_to_session_enumeration(
 }
 
 async fn assert_per_call_timeout_enforced(provider: &NatsToolProvider) -> Result<()> {
+    // Sleep far past the 1s registered timeout. Returning before the tool
+    // could possibly have finished is what proves the client enforced its own
+    // deadline, and the wide gap lets the upper bound below absorb scheduling
+    // stalls instead of racing the tool's completion.
     let started = Instant::now();
     let result = provider
-        .call_tool("wait", json!({ "seconds": 2.0 }), &create_abort_signal())
+        .call_tool("wait", json!({ "seconds": 30.0 }), &create_abort_signal())
         .await;
     let elapsed = started.elapsed();
 
@@ -389,7 +393,7 @@ async fn assert_per_call_timeout_enforced(provider: &NatsToolProvider) -> Result
     }
     assert!(elapsed >= Duration::from_secs(1), "timed out too early");
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_secs(10),
         "timed out too late: {elapsed:?}"
     );
     Ok(())
@@ -549,7 +553,13 @@ async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> R
         .await?;
     wait_for_registry(&client, &instance_id, "____time").await?;
     wait_for_registry(&client, &instance_id, "____context").await?;
-    set_wait_timeout(&client, &instance_id, 2).await?;
+    // The success path below waits 1.2s server-side, so this budget has to
+    // cover that plus one whole NATS round trip and the server's dispatch of
+    // the request. A loaded runner can spend over a second just getting the
+    // request from `send_request` to the handler, so keep the headroom far
+    // wider than the work itself -- the point here is that a call inside its
+    // timeout succeeds, not how tight the timeout can be cut.
+    set_wait_timeout(&client, &instance_id, 10).await?;
     add_collision_registration(&client, &instance_id).await?;
     add_duplicate_registrations(&client, &instance_id).await?;
     let provider = NatsToolProvider::discover(

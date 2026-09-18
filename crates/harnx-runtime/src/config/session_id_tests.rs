@@ -108,8 +108,11 @@ async fn reserve_short_session_id_retries_on_collision() {
     let _ = nats.wait();
 }
 
-async fn isolated_session_config() -> Option<(GlobalConfig, std::process::Child, tempfile::TempDir)>
-{
+async fn isolated_session_config() -> Option<(
+    GlobalConfig,
+    crate::nats_worker::tests::TestNatsServer,
+    tempfile::TempDir,
+)> {
     let (url, child, store_dir) = crate::nats_worker::tests::spawn_test_nats().await?;
     let mut config = Config {
         model: harnx_client::Model::new("test", "test-model"),
