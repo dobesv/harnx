@@ -509,13 +509,25 @@ describe('MyComposer', () => {
     // Composer disabled
     expect(screen.getByRole('textbox')).toBeDisabled();
     expect(document.querySelector('.aui-spinner')).toBeInTheDocument();
+
+    // Draft is NOT cleared while send is in-flight
+    expect(composerRuntime.setText).not.toHaveBeenCalled();
+    expect(composerRuntime.clearAttachments).not.toHaveBeenCalled();
     
     // Try second submit
     fireEvent.submit(form!);
     expect(sendPrompt).toHaveBeenCalledTimes(1);
+    expect(composerRuntime.setText).not.toHaveBeenCalled();
+    expect(composerRuntime.clearAttachments).not.toHaveBeenCalled();
     
     // Resolve RPC
     resolveSendPrompt!({ status: 'enqueued', run_id: '1' });
+
+    // Composer IS cleared after sendPrompt resolves
+    await waitFor(() => {
+      expect(composerRuntime.setText).toHaveBeenCalledWith('');
+    });
+    expect(composerRuntime.clearAttachments).toHaveBeenCalled();
     
     // Still sending because user message count hasn't increased
     rerender(
@@ -572,30 +584,76 @@ describe('MyComposer', () => {
     fireEvent.submit(form!);
 
     await waitFor(() => {
-      expect(composerRuntime.setText).toHaveBeenCalledWith('my draft');
+      expect(screen.getByRole('textbox')).not.toBeDisabled();
     });
 
-    expect(composerRuntime.addAttachment).toHaveBeenCalledWith(file);
-    expect(screen.getByRole('textbox')).not.toBeDisabled();
+    expect(composerRuntime.setText).not.toHaveBeenCalled();
+    expect(composerRuntime.clearAttachments).not.toHaveBeenCalled();
+    expect(composerRuntime.addAttachment).not.toHaveBeenCalled();
   };
 
-  it('restores input text and attachments on sendPrompt error', async () => {
+  it('retains input text and attachments on sendPrompt error', async () => {
     await submitWithSendPromptError(new Error('RPC boom'));
     expect(setErrorText).toHaveBeenCalledWith('RPC boom');
   });
 
-  it('restores input text and attachments on sendPrompt timeout without surfacing error (#1861)', async () => {
+  it('retains input text and attachments on sendPrompt timeout without surfacing error (#1861)', async () => {
     await submitWithSendPromptError(
       new DOMException('The operation was aborted due to timeout', 'TimeoutError')
     );
     expect(setErrorText).not.toHaveBeenCalledWith(expect.any(String));
   });
 
-  it('restores input text and attachments on bare abort ("signal is aborted without reason") without surfacing error (#1838)', async () => {
+  it('retains input text and attachments on bare abort ("signal is aborted without reason") without surfacing error (#1838)', async () => {
     await submitWithSendPromptError(
       new DOMException('signal is aborted without reason', 'AbortError')
     );
     expect(setErrorText).not.toHaveBeenCalledWith(expect.any(String));
+  });
+
+  it('keeps text and attachments visible while sendPrompt is pending and clears only on success', async () => {
+    let resolveSendPrompt: (value: any) => void;
+    vi.mocked(sendPrompt).mockReturnValue(new Promise(resolve => {
+      resolveSendPrompt = resolve;
+    }));
+    vi.mocked(uploadAttachment).mockResolvedValueOnce(['cid:file.png']);
+
+    const file = new File([''], 'file.png');
+    const attachment = { status: { type: 'running' as const }, file, type: 'image' };
+    composerRuntime.getState = () => ({
+      text: 'pending draft message',
+      attachments: [attachment],
+    });
+
+    renderComposer(false);
+    const form = document.querySelector('form');
+    fireEvent.submit(form!);
+
+    await waitFor(() => {
+      expect(uploadAttachment).toHaveBeenCalledWith('foo', 'bar', file);
+    });
+
+    expect(sendPrompt).toHaveBeenCalledWith('foo', 'bar', {
+      text: 'pending draft message',
+      attachmentRefs: ['cid:file.png'],
+    });
+
+    // In-flight window: input is disabled and spinner shown
+    expect(screen.getByRole('textbox')).toBeDisabled();
+    expect(document.querySelector('.aui-spinner')).toBeInTheDocument();
+
+    // Draft is NOT cleared yet (setText and clearAttachments have not been called)
+    expect(composerRuntime.setText).not.toHaveBeenCalled();
+    expect(composerRuntime.clearAttachments).not.toHaveBeenCalled();
+
+    // Resolve sendPrompt
+    resolveSendPrompt!({ status: 'enqueued', run_id: '1' });
+
+    // After success: composer is cleared
+    await waitFor(() => {
+      expect(composerRuntime.setText).toHaveBeenCalledWith('');
+    });
+    expect(composerRuntime.clearAttachments).toHaveBeenCalled();
   });
 
   it('uploads attachments on existing-session submit', async () => {

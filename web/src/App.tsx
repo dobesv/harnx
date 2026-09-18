@@ -202,20 +202,14 @@ async function resolveOutofBandAttachmentRefs(
   return attachmentRefs;
 }
 
-function restoreComposerAfterSendFailure({
+function handleSendFailure({
   err,
   setErrorText,
-  composerRuntime,
-  savedText,
-  savedAttachments,
   setIsSending,
   focusAndResize,
 }: {
   err: unknown;
   setErrorText: (text: string | null) => void;
-  composerRuntime: any;
-  savedText: string;
-  savedAttachments: readonly Attachment[];
   setIsSending: (sending: boolean) => void;
   focusAndResize: () => void;
 }): void {
@@ -223,10 +217,6 @@ function restoreComposerAfterSendFailure({
     console.error('Failed to send prompt or upload attachments out of band', err);
     setErrorText(err instanceof Error ? err.message : String(err));
   }
-  composerRuntime.setText(savedText);
-  savedAttachments.forEach((att: Attachment) => {
-    if (att.file) void composerRuntime.addAttachment(att.file);
-  });
   setIsSending(false);
   focusAndResize();
 }
@@ -388,10 +378,7 @@ export const MyComposer = ({
       // which hydrates the server-authored user row without re-execution.
       setIsSending(true);
       prevUserMessageCount.current = userMessageCount;
-      const savedText = text;
       const savedAttachments = state.attachments;
-
-      resetComposerInput();
 
       // assistant-ui (0.15.18) only uploads attachments inside composerRuntime.send().
       // addAttachment() merely marks them as 'running' — the adapter.send() call that
@@ -403,15 +390,17 @@ export const MyComposer = ({
           ? []
           : await resolveOutofBandAttachmentRefs(savedAttachments, agentName, sessionId);
         await sendPrompt(agentName, sessionId, { text, attachmentRefs });
+        // Clear only once the prompt is queued (#1945). Keeping the draft in the
+        // disabled composer until now means the message and attachments stay
+        // visible during upload + RPC instead of vanishing on click; the spinner
+        // covers the brief gap until RuntimeSessionSubscriber hydrates the row.
+        resetComposerInput();
       };
 
       doSend().catch(err => {
-        restoreComposerAfterSendFailure({
+        handleSendFailure({
           err,
           setErrorText,
-          composerRuntime,
-          savedText,
-          savedAttachments,
           setIsSending,
           focusAndResize: () => {
             requestAnimationFrame(() => {
