@@ -395,6 +395,76 @@ describe('ToolCallCard', () => {
       expect(screen.queryByText('Result:')).toBeNull();
       expect(screen.getByText('Progress-only child response.')).toBeInTheDocument();
     });
+
+    // Regression for #1911: the sub-agent prompt must render exactly once, never
+    // duplicated across the header preview and the expanded body "Prompt:" section.
+    const promptOnceCases = [
+      {
+        scenario: 'args has { message }, no server summary, status running (A)',
+        prompt: 'Unique subagent prompt for scenario A',
+        props: {
+          toolName: 'researcher_session_prompt',
+          toolCallId: 'call_sub_running_msg_only',
+          args: { message: 'Unique subagent prompt for scenario A' },
+          status: { type: 'running' },
+        },
+        summaries: undefined as Map<string, string> | undefined,
+      },
+      {
+        scenario: 'args has { message, session_id }, no server summary, status running (B)',
+        prompt: 'Unique subagent prompt for scenario B',
+        props: {
+          toolName: 'researcher_session_prompt',
+          toolCallId: 'call_sub_running_with_session',
+          args: { message: 'Unique subagent prompt for scenario B', session_id: 'sub_sess_b' },
+          status: { type: 'running' },
+        },
+        summaries: undefined as Map<string, string> | undefined,
+      },
+      {
+        scenario: '@ summary is present, status complete (C)',
+        prompt: 'Unique subagent prompt for scenario C',
+        props: {
+          toolName: 'researcher_session_prompt',
+          toolCallId: 'call_sub_complete_summary',
+          args: { message: 'Unique subagent prompt for scenario C', session_id: 'sub_sess_c' },
+          result: JSON.stringify({ response: 'Child task finished.' }),
+          status: { type: 'complete' },
+        },
+        summaries: new Map([
+          ['call_sub_complete_summary', '@ researcher [sub_sess_c]\nUnique subagent prompt for scenario C'],
+        ]),
+      },
+    ];
+
+    it.each(promptOnceCases)('renders prompt text exactly once when $scenario', ({ prompt, props, summaries }) => {
+      const { container } = renderWithContext(props as any, summaries);
+      const card = container.querySelector('.aui-tool-call') as HTMLElement;
+
+      expect(screen.getByText('Prompt:')).toBeInTheDocument();
+      expect(container.querySelector('.aui-tool-prompt-markdown')?.textContent).toContain(prompt);
+      const occurrences = (card.textContent?.split(prompt).length ?? 1) - 1;
+      expect(occurrences).toBe(1);
+    });
+
+    it('session_new sub-agent (no message arg → no promptText) still shows its header summary (D)', () => {
+      // session_new carries no `message`, so promptText is null and the
+      // fallback-suppression guard must NOT fire — the header summary is the
+      // only place the sub-agent identity is shown, so it must render.
+      const props = {
+        toolName: 'researcher_session_new',
+        toolCallId: 'call_sub_new',
+        args: {},
+        status: { type: 'running' },
+      } as any;
+      const summaries = new Map([['call_sub_new', '@ researcher new session']]);
+
+      renderWithContext(props, summaries);
+
+      // No body "Prompt:" section (no message), and the header summary renders.
+      expect(screen.queryByText('Prompt:')).toBeNull();
+      expect(screen.getByText('@ researcher new session')).toBeInTheDocument();
+    });
   });
 
   describe('status presentation and initial expansion', () => {
