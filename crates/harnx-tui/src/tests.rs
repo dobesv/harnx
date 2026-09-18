@@ -3558,6 +3558,120 @@ async fn queued_message_keeps_attachments_visible_while_busy() {
     );
 }
 
+#[tokio::test]
+async fn queued_attachment_not_resent_after_delivery() {
+    use crate::types::Attachment;
+
+    let config = test_config_with_mock_client_and_agent(
+        "test-agent",
+        Some("queued-attachment-not-resent-session"),
+    );
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_text_chunk("queued response")
+                    .build(),
+            )
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_text_chunk("plain response")
+                    .build(),
+            )
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
+
+    let temp_dir = std::env::temp_dir().join(format!("harnx-queued-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("paste-1.txt");
+    tokio::fs::write(&path, "attached text").await.unwrap();
+
+    harness.tui().app.attachments.push(Attachment {
+        path,
+        display_name: "paste-1.txt".to_string(),
+    });
+    harness.tui().app.attachment_dir = Some(temp_dir.clone());
+    harness.tui().app.paste_count = 1;
+    harness.tui().app.llm_busy = true;
+    harness.tui().set_input_text("queued attachment");
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(harness.tui().app.pending_message.is_some());
+    assert_eq!(harness.tui().app.attachments.len(), 1);
+    assert_eq!(harness.tui().app.attachment_dir.as_ref(), Some(&temp_dir));
+
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
+            output: "first response".to_string(),
+            usage: Default::default(),
+        })))
+        .await
+        .unwrap();
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
+            harnx_core::event::TurnEvent::Ended {
+                outcome: Default::default(),
+            },
+        )))
+        .await
+        .unwrap();
+
+    harness
+        .wait_until_screen_contains("queued response", Duration::from_secs(5))
+        .await
+        .unwrap();
+    harness.drain_and_settle().await.unwrap();
+
+    assert!(harness.tui().app.attachments.is_empty());
+    assert!(harness.tui().app.attachment_dir.is_none());
+    assert_eq!(harness.tui().app.paste_count, 0);
+    assert!(!temp_dir.exists());
+    assert!(!harness.tui().app.llm_busy);
+    assert_eq!(mock_client.remaining_turns(), 1);
+
+    harness.tui().set_input_text("plain follow-up");
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(
+        harness.tui().app.llm_busy,
+        "plain follow-up should start a prompt"
+    );
+    harness
+        .sync()
+        .wait_until_mock_exhausted(&mock_client, Duration::from_secs(5))
+        .await
+        .unwrap();
+    harness.drain_and_settle().await.unwrap();
+
+    assert!(!harness.tui().app.llm_busy);
+    let transcript = &harness.tui().app.transcript;
+    let error_texts: Vec<&str> = transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::ErrorText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(error_texts.is_empty(), "unexpected errors: {error_texts:?}");
+    assert!(
+        !format!("{transcript:?}").contains("Failed to load files"),
+        "plain follow-up tried to reload the deleted attachment"
+    );
+}
+
 /// Test recovery after cancellation - user can send a new message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_recovery_after_cancellation() {
