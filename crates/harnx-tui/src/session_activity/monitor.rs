@@ -41,8 +41,8 @@ impl SessionEventForwarder<'_> {
             || (self.attached_during_turn && after_seq == self.attached_seq)
     }
 
-    fn send_durable_activity(&self, active: bool, generation: Option<String>) -> bool {
-        self.send_activity_stamped(active, EventStamp::live(&self.live, generation), true)
+    fn send_durable_activity(&self, active: bool) -> bool {
+        self.send_activity_stamped(active, EventStamp::live(&self.live), true)
     }
 
     fn send_activity_stamped(&self, active: bool, stamp: EventStamp, historical: bool) -> bool {
@@ -109,10 +109,7 @@ pub(super) fn spawn_session_activity_monitor(
     live: LiveEventState,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        tokio::join!(
-            crate::cancellation::monitor_execution(&config, &event_tx, &target),
-            monitor_session_activity(config.clone(), event_tx.clone(), target.clone(), live)
-        );
+        monitor_session_activity(config, event_tx, target, live).await;
     })
 }
 
@@ -127,6 +124,18 @@ async fn monitor_session_activity(
             return;
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
+/// A `Cancel` durable history already recorded fences live output by its
+/// seq, so a client attaching (or refreshing) after the interrupt landed
+/// never renders an advisory that predates it — even one it never issued
+/// or otherwise observed itself.
+fn fence_live_events_from_history(live: &LiveEventState, history: &[(u64, SessionLogEntry)]) {
+    if harnx_core::session_reconstruct::last_terminator_is_cancel(history) {
+        live.accept_interrupt(harnx_core::session_reconstruct::last_terminator_seq(
+            history,
+        ));
     }
 }
 
@@ -153,9 +162,11 @@ async fn monitor_session_connection(
             return true;
         }
     };
-    let generation = stream.history_generation().await.unwrap_or_default();
-    let attached_during_turn =
-        history_has_pending_turn(stream.history()) && live.allows(generation.as_deref());
+    fence_live_events_from_history(live, stream.history());
+    // Advisories no longer name a generation (the worker stopped stamping one
+    // when interruption moved to the session log); the sequence fence in
+    // `should_render` is what now gates individual advisories.
+    let attached_during_turn = history_has_pending_turn(stream.history());
     let attached_seq = stream.last_applied_seq();
     let forwarder = SessionEventForwarder {
         event_tx,
@@ -167,7 +178,7 @@ async fn monitor_session_connection(
     // A reconnect can seed its cursor beyond the missed child result while
     // the parent is still busy, so reconcile the attachment history as well.
     if !forwarder.recover_subagent_progress(stream.history(), 0)
-        || !forwarder.send_durable_activity(attached_during_turn, generation)
+        || !forwarder.send_durable_activity(attached_during_turn)
     {
         return false;
     }
@@ -222,7 +233,16 @@ async fn forward_session_activity(
             .await
         {
             SessionActivityInput::Advisory(envelope) => {
-                if !forward_advisory(forwarder, *envelope, &mut active) {
+                // Deliberately not `stream.should_render`: that folds in the
+                // durable read cursor, which a refresh can advance past a
+                // still-queued advisory (a `HandoffCommitted` has no other
+                // delivery path) and drop it forever. The attachment and
+                // cancel fence are the only things allowed to gate a live
+                // advisory here; `follows_attach` below is the sole cursor
+                // check, and it reads the attachment boundary, never the
+                // read cursor.
+                let should_render = forwarder.live.should_render(&envelope, 0);
+                if !forward_advisory(forwarder, *envelope, should_render, &mut active) {
                     return false;
                 }
             }
@@ -271,21 +291,17 @@ async fn next_session_activity_input(
 fn forward_advisory(
     forwarder: &SessionEventForwarder<'_>,
     envelope: harnx_runtime::nats_event_sink::AdvisoryEnvelope,
+    should_render: bool,
     active: &mut bool,
 ) -> bool {
-    if !forwarder.live.allows(envelope.execution_id.as_deref())
-        || !forwarder.follows_attach(envelope.after_seq)
-    {
+    if !should_render || !forwarder.follows_attach(envelope.after_seq) {
         return true;
     }
     let activity = event_activity(&envelope.event);
     if let Some(next) = activity {
         *active = next;
     }
-    forwarder.send_agent_event(
-        envelope.event,
-        EventStamp::live(&forwarder.live, envelope.execution_id),
-    )
+    forwarder.send_agent_event(envelope.event, EventStamp::live(&forwarder.live))
 }
 
 async fn refresh_durable_activity(
@@ -302,22 +318,18 @@ async fn refresh_durable_activity(
         );
         return DurableRefreshOutcome::Reconnect;
     }
+    fence_live_events_from_history(&forwarder.live, stream.history());
     // Completion of a child does not end the parent's turn. Repair its row
     // before checking whether root activity changed, without replaying output.
     if !forwarder.recover_subagent_progress(stream.history(), after_seq) {
         return DurableRefreshOutcome::Stop;
     }
-    let generation = stream.history_generation().await.unwrap_or_default();
-    if !forwarder.live.matches(generation.as_deref()) {
-        return DurableRefreshOutcome::Continue;
-    }
-    let durable_activity =
-        history_has_pending_turn(stream.history()) && forwarder.live.allows(generation.as_deref());
+    let durable_activity = history_has_pending_turn(stream.history());
     if durable_activity == *active {
         return DurableRefreshOutcome::Continue;
     }
     *active = durable_activity;
-    if forwarder.send_durable_activity(durable_activity, generation) {
+    if forwarder.send_durable_activity(durable_activity) {
         DurableRefreshOutcome::Continue
     } else {
         DurableRefreshOutcome::Stop
@@ -327,7 +339,7 @@ async fn refresh_durable_activity(
 fn event_activity(event: &AgentEvent) -> Option<bool> {
     match event {
         AgentEvent::Turn(TurnEvent::Started) => Some(true),
-        AgentEvent::Turn(TurnEvent::Ended { .. }) => Some(false),
+        AgentEvent::Turn(TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. }) => Some(false),
         AgentEvent::Turn(_)
         | AgentEvent::Model(_)
         | AgentEvent::Tool(_)
@@ -412,12 +424,11 @@ mod tests {
     }
 
     #[test]
-    fn read_invalidation_remains_visible_after_generation_stop() {
+    fn read_invalidation_remains_visible_after_interrupt_is_accepted() {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let target = ("session".to_string(), "cluster".to_string());
         let live = LiveEventState::default();
-        live.select(Some("g1".into()));
-        live.stop("g1");
+        live.accept_interrupt(1);
         let forwarder = SessionEventForwarder {
             event_tx: &event_tx,
             target: &target,
@@ -501,6 +512,12 @@ mod tests {
         assert_eq!(
             event_activity(&AgentEvent::Turn(TurnEvent::Ended {
                 outcome: Default::default(),
+            })),
+            Some(false)
+        );
+        assert_eq!(
+            event_activity(&AgentEvent::Turn(TurnEvent::Interrupted {
+                cancellation_id: "c".into()
             })),
             Some(false)
         );

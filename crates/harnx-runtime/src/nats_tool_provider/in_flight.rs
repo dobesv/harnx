@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::{oneshot, Mutex};
 #[derive(Clone, Debug)]
-pub(super) enum InFlightFailure {
+pub(crate) enum InFlightFailure {
     Unavailable(String),
 }
 
@@ -12,7 +12,8 @@ type InFlightMap = Mutex<HashMap<String, InFlightCall>>;
 static INSTANCE_IN_FLIGHT: OnceLock<std::sync::Mutex<HashMap<ServerScope, Weak<InFlightMap>>>> =
     OnceLock::new();
 
-/// Shared handle used by tool-process supervision to fail active NATS calls.
+/// Shared handle used by tool-process supervision to fail active NATS calls,
+/// and by a session-scoped cancel to find every call it should reach.
 #[derive(Clone, Default)]
 pub struct NatsInFlightCalls {
     calls: Arc<InFlightMap>,
@@ -20,7 +21,27 @@ pub struct NatsInFlightCalls {
 
 struct InFlightCall {
     server: String,
+    session_id: String,
+    control_subject: String,
     failure: oneshot::Sender<InFlightFailure>,
+}
+
+/// Everything a call is registered under: its own identity, the server
+/// running it, the session it belongs to, and where a cancel for it goes.
+pub(crate) struct InFlightRegistration {
+    pub call_id: String,
+    pub server: String,
+    pub session_id: String,
+    pub control_subject: String,
+}
+
+/// One in-flight call a session-scoped cancel can address: which server owns
+/// it and where to publish the cancel control message.
+#[derive(Clone, Debug)]
+pub struct InFlightCancelTarget {
+    pub call_id: String,
+    pub server: String,
+    pub control_subject: String,
 }
 
 impl NatsInFlightCalls {
@@ -39,20 +60,30 @@ impl NatsInFlightCalls {
         Self { calls }
     }
 
-    pub(super) async fn register(
+    pub(crate) async fn register(
         &self,
-        call_id: String,
-        server: String,
+        registration: InFlightRegistration,
     ) -> oneshot::Receiver<InFlightFailure> {
+        let InFlightRegistration {
+            call_id,
+            server,
+            session_id,
+            control_subject,
+        } = registration;
         let (failure, receiver) = oneshot::channel();
-        self.calls
-            .lock()
-            .await
-            .insert(call_id, InFlightCall { server, failure });
+        self.calls.lock().await.insert(
+            call_id,
+            InFlightCall {
+                server,
+                session_id,
+                control_subject,
+                failure,
+            },
+        );
         receiver
     }
 
-    pub(super) async fn complete(&self, call_id: &str) {
+    pub(crate) async fn complete(&self, call_id: &str) {
         self.calls.lock().await.remove(call_id);
     }
 
@@ -74,5 +105,46 @@ impl NatsInFlightCalls {
         for failure in failures {
             let _ = failure.send(InFlightFailure::Unavailable(message.clone()));
         }
+    }
+
+    /// Snapshot the calls in flight for one session, so a session-scoped
+    /// cancel can address each of them without holding the registry lock.
+    pub async fn snapshot_for_session(&self, session_id: &str) -> Vec<InFlightCancelTarget> {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, call)| call.session_id == session_id)
+            .map(|(call_id, call)| InFlightCancelTarget {
+                call_id: call_id.clone(),
+                server: call.server.clone(),
+                control_subject: call.control_subject.clone(),
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registration(call_id: &str, session_id: &str) -> InFlightRegistration {
+        InFlightRegistration {
+            call_id: call_id.into(),
+            server: "srv".into(),
+            session_id: session_id.into(),
+            control_subject: "ctl.srv".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_scoped_to_one_session() {
+        let calls = NatsInFlightCalls::default();
+        let _a = calls.register(registration("a", "s1")).await;
+        let _b = calls.register(registration("b", "s2")).await;
+        let snapshot = calls.snapshot_for_session("s1").await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].call_id, "a");
+        assert_eq!(snapshot[0].control_subject, "ctl.srv");
     }
 }

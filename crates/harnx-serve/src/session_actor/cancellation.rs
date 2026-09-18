@@ -1,70 +1,13 @@
 use super::*;
-use harnx_execution_control::{
-    CancelDisposition, CancelReceipt, CancelRequest, ExecutionStore, Operation,
-};
-
-mod poll;
-pub(super) use poll::{poller, CancellationPoller};
-
-type RefreshResult = anyhow::Result<Option<Operation>>;
-
-async fn read_cancellation(config: &Config, session_id: &str) -> RefreshResult {
-    let js = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
-    let bucket = match js.get_key_value(harnx_execution_control::BUCKET).await {
-        Ok(bucket) => bucket,
-        Err(error) if harnx_runtime::nats_admin::kv_bucket_missing(&error) => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let store = ExecutionStore::from_store(bucket);
-    let Some(current) = store.current(session_id).await? else {
-        return Ok(None);
-    };
-    store.status(&current.reference).await.map(Some)
-}
-
-async fn bounded_refresh(read: impl std::future::Future<Output = RefreshResult>) -> RefreshResult {
-    tokio::time::timeout(Duration::from_secs(2), read)
-        .await
-        .context("cancellation hydration timed out")?
-}
+use harnx_runtime::nats_session::InterruptOutcome;
 
 impl SessionActor {
-    pub(super) async fn answer_cancellation_command(&mut self, command: SessionCommand) {
-        match command {
-            SessionCommand::Cancel {
-                reply,
-                expected_execution_id,
-            } => self.answer_cancellation(reply, expected_execution_id).await,
-            SessionCommand::AbandonCancellation {
-                reply,
-                expected_execution_id,
-            } => {
-                self.answer_cancellation_abandonment(reply, expected_execution_id)
-                    .await
-            }
-            _ => unreachable!("non-cancellation command routed to cancellation handler"),
-        }
-    }
-
-    pub(super) async fn answer_cancellation(
+    pub(super) async fn answer_interrupt(
         &mut self,
-        reply: tokio::sync::oneshot::Sender<Result<CancelReceipt, String>>,
-        expected_execution_id: Option<String>,
+        reply: tokio::sync::oneshot::Sender<Result<InterruptOutcome, String>>,
     ) {
         let result = self
-            .request_cancellation(expected_execution_id)
-            .await
-            .map_err(|error| format!("{error:#}"));
-        let _ = reply.send(result);
-    }
-
-    pub(super) async fn answer_cancellation_abandonment(
-        &mut self,
-        reply: tokio::sync::oneshot::Sender<Result<CancelReceipt, String>>,
-        expected_execution_id: String,
-    ) {
-        let result = self
-            .abandon_cancellation(expected_execution_id)
+            .append_interrupt()
             .await
             .map_err(|error| format!("{error:#}"));
         let _ = reply.send(result);
@@ -99,9 +42,10 @@ impl SessionActor {
                 cluster: LOCAL_CLUSTER_KEY.into(),
                 initializer,
                 session_id: Some(self.key.session.clone()),
-                // Durable cancellation acceptance must not wait for the local
-                // worker-supervisor lock. Active owners observe the KV graph;
-                // the shared activation is only a recovery wake-up fast path.
+                // The interrupt is one append to the session log and must not
+                // wait for the local worker-supervisor lock. Active owners
+                // watch their own session stream; the shared activation is only
+                // a wake-up for a session whose worker is gone.
                 activation_route: harnx_runtime::nats_worker::SessionActivationRoute::ClusterShared,
             },
             &config,
@@ -110,76 +54,69 @@ impl SessionActor {
         .await
     }
 
-    pub(super) async fn request_cancellation(
-        &mut self,
-        expected_execution_id: Option<String>,
-    ) -> anyhow::Result<CancelReceipt> {
-        if expected_execution_id.is_none() {
-            self.abort_active_run();
-        }
-        // The injected test executor has no worker activation/control record.
+    /// Local worker ids change across restarts, so a wind-up or resume
+    /// activation addressed to a worker that is gone was dropped and nothing
+    /// will retry it. A frontend attaching to the session republishes it, which
+    /// is how an interrupted turn still winds up after this server restarted.
+    pub(super) async fn republish_pending_activation(&self) {
         if self.actor_config.call_fn.is_some() {
-            let mut receipt = CancelReceipt::idle();
-            if self.active_run.is_some() {
-                receipt.cancelled = true;
-                receipt.disposition = CancelDisposition::Requested;
-            }
-            return Ok(receipt);
+            return;
         }
-        let receipt = self
-            .control_session()
-            .await?
-            .request_cancel(CancelRequest {
-                expected_execution_id,
-                retry: true,
-            })
-            .await?;
-        if receipt.cancelled {
-            self.abort_active_run();
+        match self.publish_pending_activation().await {
+            Ok(republished) => log::debug!(
+                "session attach: agent={} session_id={} republished_activation={republished}",
+                self.key.agent,
+                self.key.session
+            ),
+            Err(error) => log::debug!(
+                "session attach: agent={} session_id={} pending activation not republished: {error:#}",
+                self.key.agent,
+                self.key.session
+            ),
         }
-        self.apply_cancellation(receipt.clone());
-        Ok(receipt)
     }
 
-    async fn abandon_cancellation(
-        &mut self,
-        expected_execution_id: String,
-    ) -> anyhow::Result<CancelReceipt> {
-        let receipt = self
-            .control_session()
+    async fn publish_pending_activation(&self) -> anyhow::Result<bool> {
+        self.control_session()
             .await?
-            .abandon_unconfirmed_cancellation(&expected_execution_id)
-            .await?;
-        if receipt.abandoned {
-            self.detach_active_run_for_abandonment().await;
-            self.execution_id = receipt.execution_id.clone();
-            self.execution_state = Some(harnx_execution_control::OperationState::Cancelled);
-            self.apply_cancellation(receipt.clone());
-        }
-        Ok(receipt)
+            .republish_pending_activation()
+            .await
     }
 
-    async fn detach_active_run_for_abandonment(&mut self) {
-        self.pending.clear();
-        let active_run = self.active_run.take();
-        if let Some(run) = &active_run {
-            run.abort_signal.set_ctrlc();
+    /// Interrupt this session: abort whatever this server is running for it,
+    /// then append one `Cancel` to the durable log. Acceptance is the append,
+    /// so this returns as soon as the log has it — never waiting for a worker,
+    /// a tool or a sub-agent to notice.
+    pub(super) async fn append_interrupt(&mut self) -> anyhow::Result<InterruptOutcome> {
+        self.abort_active_run();
+        // The injected test executor runs in-process: there is no session log
+        // to append a `Cancel` to, so an active run is the only thing an
+        // interrupt can stop there. Sequence 0 stands for "no log entry" — a
+        // durable log never hands one out.
+        if self.actor_config.call_fn.is_some() {
+            return Ok(match self.active_run.is_some() {
+                true => InterruptOutcome::Accepted { cancel_seq: 0 },
+                false => InterruptOutcome::Idle,
+            });
         }
-        if let Some(mut task) = self.run_done_task.take() {
-            task.abort();
-            let _ = (&mut task).await;
-        }
-        // Awaiting the sole run task above guarantees that any completion it
-        // sent is already queued. Discard it so it cannot later reset a fresh
-        // replacement run to idle.
-        while self.run_done_rx.try_recv().is_ok() {}
-        if active_run.is_some() {
-            let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
-                base: base_event(),
-                message: "Run abandoned; prior work may still be running".into(),
-                code: None,
-            }));
-        }
+        let resumed = std::mem::replace(&mut self.state, SessionState::Interrupting);
+        let outcome = self.interrupt_session().await;
+        // Only an accepted `Cancel` names a state of its own. A failed append
+        // restores what was there: the log is the authority, and the next
+        // history refresh reads the truth off it — including an append that
+        // landed after its acknowledgement was lost.
+        self.state = match outcome.as_ref().ok().and_then(InterruptOutcome::cancel_seq) {
+            Some(cancel_seq) => SessionState::Interrupted { cancel_seq },
+            None => resumed,
+        };
+        outcome
+    }
+
+    async fn interrupt_session(&self) -> anyhow::Result<InterruptOutcome> {
+        self.control_session()
+            .await?
+            .interrupt("user interrupt from web")
+            .await
     }
 
     fn abort_active_run(&mut self) {
@@ -187,65 +124,5 @@ impl SessionActor {
         if let Some(run) = &self.active_run {
             run.abort_signal.set_ctrlc();
         }
-    }
-
-    pub(super) async fn refresh_cancellation(&mut self) {
-        if self.actor_config.call_fn.is_some() {
-            return;
-        }
-        let result = bounded_refresh(read_cancellation(
-            &self.actor_config.base_config,
-            &self.key.storage_key(),
-        ))
-        .await;
-        self.apply_cancellation_refresh(result);
-    }
-
-    pub(super) fn apply_cancellation_refresh(&mut self, result: RefreshResult) {
-        match result {
-            Ok(Some(current)) => {
-                self.execution_id = Some(current.reference.execution_id.clone());
-                self.execution_state = Some(current.state);
-                if current.cancellation.is_some() {
-                    self.apply_cancellation(CancelReceipt::from_operation(&current, false));
-                }
-            }
-            Ok(None) => {}
-            error => {
-                log::debug!("cancellation hydration unavailable: {error:?}");
-                if let SessionState::Cancelling(receipt)
-                | SessionState::CancelUnconfirmed(receipt) = &self.state
-                {
-                    let mut receipt = receipt.clone();
-                    receipt.disposition = CancelDisposition::Unconfirmed;
-                    self.apply_cancellation(receipt);
-                }
-            }
-        }
-    }
-
-    fn apply_cancellation(&mut self, receipt: CancelReceipt) {
-        let next = match receipt.disposition {
-            CancelDisposition::Requested
-            | CancelDisposition::AlreadyRequested
-            | CancelDisposition::Quiescing => SessionState::Cancelling(receipt.clone()),
-            CancelDisposition::Unconfirmed => SessionState::CancelUnconfirmed(receipt.clone()),
-            _ if matches!(
-                self.state,
-                SessionState::Cancelling(_) | SessionState::CancelUnconfirmed(_)
-            ) =>
-            {
-                SessionState::Idle
-            }
-            _ => return,
-        };
-        if self.state == next {
-            return;
-        }
-        self.state = next;
-        let _ = self.broadcast_tx.send(Event::Custom(ag_ui_core::event::CustomEvent {
-            base: base_event(), name: "cancellation_state".into(),
-            value: serde_json::json!({ "session_id": self.key.session, "cancellation": receipt }),
-        }));
     }
 }

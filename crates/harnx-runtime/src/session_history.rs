@@ -68,6 +68,14 @@ fn entry_searchable_text(entry: &SessionLogEntry) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         SessionLogEntry::Compress { prompt } => prompt.clone(),
+        SessionLogEntry::Cancel {
+            fence_token,
+            requested_by,
+            ..
+        } => match requested_by {
+            Some(by) => format!("cancel (fence {fence_token}, by {by})"),
+            None => format!("cancel (fence {fence_token})"),
+        },
         SessionLogEntry::Error { message, .. } => message.clone(),
         SessionLogEntry::SubAgentStarted {
             agent,

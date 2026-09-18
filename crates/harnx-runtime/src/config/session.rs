@@ -61,9 +61,43 @@ struct PendingToolCalls {
     timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Marks a message replay synthesizes as informational context for the
+/// model, not a prompt the user typed. Public so callers replaying a
+/// session (tests included) can tell runtime notes apart from real
+/// user-authored history despite both carrying `MessageRole::User`.
+pub const RUNTIME_NOTE_PREFIX: &str = "[Runtime note] ";
+
 const LOST_TOOL_RESPONSE_ERROR: &str =
     "tool response lost (session was interrupted before results were persisted)";
 const PENDING_TOOL_RESPONSE_ERROR: &str = "tool response pending (results not yet persisted)";
+/// Public only so integration tests can name the placeholder a wind-up
+/// writes instead of repeating its text; not part of the crate's API.
+#[doc(hidden)]
+pub const INTERRUPTED_TOOL_RESPONSE_ERROR: &str = "tool call interrupted by user";
+
+/// Synthesize placeholder results for tool calls cut off by a user
+/// interruption. The worker's wind-up persists these as the `ToolResults`
+/// entry that closes out the round the `Cancel` entry terminated, for every
+/// call the invocation journal has no real reply for.
+pub(crate) fn interrupted_tool_outputs(
+    calls: &[harnx_core::tool::ToolCall],
+    cancellation_id: Option<&str>,
+) -> Vec<harnx_core::session::ToolOutput> {
+    calls
+        .iter()
+        .map(|call| harnx_core::session::ToolOutput {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            output: serde_json::json!({
+                "error": INTERRUPTED_TOOL_RESPONSE_ERROR,
+                "cancellation_id": cancellation_id,
+            }),
+            markdown: None,
+            content: Vec::new(),
+            switch_agent: None,
+        })
+        .collect()
+}
 
 pub(crate) fn collect_raw_log_entries(
     content: &str,
@@ -233,7 +267,7 @@ fn replay_log_entries_into_session(
                 let note = Message::new(
                     MessageRole::User,
                     MessageContent::Text(format!(
-                        "[Runtime note] Started sub-agent '{agent}' in session {session_id}."
+                        "{RUNTIME_NOTE_PREFIX}Started sub-agent '{agent}' in session {session_id}."
                     )),
                 )
                 .with_log_seq(seq);
@@ -335,7 +369,20 @@ fn replay_log_entries_into_session(
             // history — replaying it would feed the error back to the model.
             SessionLogEntry::Error { .. } => {}
             SessionLogEntry::TurnEnd { .. } => {}
-            SessionLogEntry::Cancel { .. } => {}
+            SessionLogEntry::Cancel { .. } => {
+                let note = Message::new(
+                    MessageRole::User,
+                    MessageContent::Text(format!(
+                        "{RUNTIME_NOTE_PREFIX}The user interrupted this turn. Incomplete tool calls above were cancelled."
+                    )),
+                )
+                .with_log_seq(seq);
+                if pending.is_some() {
+                    messages_queued_during_tool.push(note);
+                } else {
+                    session.messages.push(note);
+                }
+            }
             // Durable control state is hydrated separately from model messages.
             // Ignoring it here preserves any pending tool-call/result adjacency.
             SessionLogEntry::HandoffCommitted { .. }
@@ -1911,6 +1958,81 @@ invocation_id: invocation-direct
                         .to_string(),
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn cancel_note_is_rendered_into_model_context_after_placeholder_results() {
+        let calls = vec![crate::tool::ToolCall::new(
+            "bash".to_string(),
+            serde_json::json!({}),
+            Some("c1".to_string()),
+            None,
+        )];
+        let entries = vec![
+            (
+                0,
+                SessionLogEntry::Message {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text("go".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                1,
+                SessionLogEntry::ToolCalls {
+                    text: String::new(),
+                    thought: None,
+                    calls: calls.clone(),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                2,
+                SessionLogEntry::cancel_request("x".to_string(), "tui:t".to_string()),
+            ),
+            (
+                3,
+                SessionLogEntry::ToolResults {
+                    results: interrupted_tool_outputs(&calls, Some("x")),
+                    timestamp: None,
+                },
+            ),
+        ];
+
+        let loaded = replay_log_entries_for_external(&entries, "interrupted").unwrap();
+
+        let note_index = loaded
+            .messages
+            .iter()
+            .position(|message| {
+                message
+                    .content
+                    .to_text()
+                    .contains("[Runtime note] The user interrupted this turn")
+            })
+            .expect("note present");
+        // The Tool-role message's `to_text()` is intentionally blank (see
+        // `MessageContent::to_text` doc comment), so the placeholder error is
+        // read from the reconstructed tool results rather than from text.
+        let results_index = loaded
+            .messages
+            .iter()
+            .position(|message| match &message.content {
+                MessageContent::ToolCalls(tool_calls) => tool_calls
+                    .tool_results
+                    .iter()
+                    .any(|result| result.output["error"] == INTERRUPTED_TOOL_RESPONSE_ERROR),
+                _ => false,
+            })
+            .expect("interrupted placeholder present");
+
+        assert!(
+            results_index < note_index,
+            "note should follow the interrupted round's results"
         );
     }
 

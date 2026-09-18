@@ -147,39 +147,55 @@ Same canonical session URL, negotiated into programmatic control.
   ```json
   { "jsonrpc": "2.0", "id": 1, "method": "session/get" }
   ```
-  **Result:** `{ "state": { "status": "idle" }, "history_snapshot": [...], "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }` (a running session reports `"state": { "status": "running", "run_id": "…", "started_at": "…" }`)
+  **Result:** `{ "state": { … }, "history_snapshot": [...], "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }`
+
+  `state` is one of five shapes, derived from the durable session log (plus the
+  session lease, so a turn this server never started is still reported as
+  running):
+  - `{ "status": "idle" }`
+  - `{ "status": "running", "run_id": "…", "started_at": "…" }` — a turn owned
+    by a remote worker reports plain `{ "status": "running" }`, with no run id.
+  - `{ "status": "interrupting" }` — this server's interrupt append is in
+    flight.
+  - `{ "status": "interrupted", "cancel_seq": 12 }` — a `Cancel` at that log
+    sequence ended the turn.
+  - `{ "status": "awaiting_approval", "pending_interrupts": { … } }` — the turn
+    is parked at an approval gate. It is not interrupted; the client's next move
+    is a decision, not another cancel.
 - **`session/prompt`**: Sends a new user prompt.
   ```json
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello" } }
   ```
   **Result:** `{ "status": "accepted", "run_id": "..." }` (idle) or `{ "status": "enqueued", "run_id": "..." }` (running).
-- **`session/cancel`**: Aborts running agent loop.
+- **`session/cancel`**: Interrupts the session's current turn by appending one
+  durable `Cancel` to its session log. Takes no parameters — an interrupt always
+  targets whatever turn is running. It returns as soon as that append is
+  acknowledged, not when the worker has finished stopping its tools.
   ```json
   { "jsonrpc": "2.0", "id": 3, "method": "session/cancel" }
   ```
-  **Result:** `{ "cancelled": true }`
-- **`session/abandon_cancellation`**: Explicitly abandons an unconfirmed
-  cancellation so a new execution can be admitted. The observed execution ID
-  is required to prevent abandoning a newer generation by mistake.
-  ```json
-  { "jsonrpc": "2.0", "id": 4, "method": "session/abandon_cancellation", "params": { "expected_execution_id": "..." } }
-  ```
-  **Result:** `{ "cancelled": true, "disposition": "cancelled", "execution_id": "...", "abandoned": true }`
+  **Result:** one of
+  - `{ "outcome": "idle" }` — no turn was running, so nothing was appended.
+  - `{ "outcome": "accepted", "cancel_seq": 12 }` — the `Cancel` landed at that
+    log sequence.
+  - `{ "outcome": "already_interrupted", "cancel_seq": 12 }` — a `Cancel`
+    already terminates this turn. Repeating the call is harmless.
 
 **Error Codes:**
 - `-32001`: Unknown session (HTTP 404)
-- `-32002`: Session is not running — `session/cancel` on an idle session (HTTP 400)
 - `-32003`: Session actor unreachable (HTTP 503). Transient: the session's in-process actor could not be reached, so retry the call.
 - `-32601`: Method not found
 - Standard JSON-RPC 2.0 codes (-32700, -32600, -32602)
+
+`session/cancel` on an idle session is not an error; it returns
+`{ "outcome": "idle" }`.
 
 ### Client Implementation Flow
 
 1. **Create**: `POST` the session collection and use the returned `session_id` as the URL, NATS stream, and persistence identity.
 2. **Connect**: Open the session event feed and use promptless AG-UI runs to hydrate or join an active run.
 3. **Drive**: Use JSON-RPC on the same canonical session URL to send prompts
-   (`session/prompt`), cancel runs (`session/cancel`), or explicitly recover an
-   unconfirmed cancellation (`session/abandon_cancellation`).
+   (`session/prompt`) and interrupt runs (`session/cancel`).
 4. **Stateless UI**: Clients only send new inputs via RPC; they do not need to re-POST full transcript.
 
 ### Disconnect Semantics (D5)
@@ -297,12 +313,16 @@ Legacy resume decisions also route to the worker; they do not replay a saved pro
 
 #### Cancel during a decision
 
-`session/cancel` clears queued prompts and signals the active run. An approval
-already being routed completes independently and still returns its result. Cancel
-does not retract an approval, imply denial, or roll back a committed decision or
-tool side effect. If a durable cancellation clears the pending request before a
-decision applies, the decision may return `applied: false`. To reject a pending
-tool approval explicitly, submit `approved: false`.
+`session/cancel` clears queued prompts, signals the active run, and appends the
+durable `Cancel`. That `Cancel` ends the turn, and with it the turn's pending
+approval requests: a decision that arrives afterwards still routes and still
+returns, but with `applied: false`, because there is no longer anything waiting
+on it. An approval already being routed when the interrupt lands completes
+independently and returns its own result.
+
+Cancelling is not a denial. It does not retract an approval, imply rejection, or
+roll back a decision or tool side effect that already committed. To reject a
+pending tool approval, submit `approved: false`.
 
 #### Framing for reconnect
 

@@ -48,8 +48,8 @@ If you encounter challenges or blockers, attempt to resolve them yourself.
 - `aristarchus` — code review and quality critique
 - `argus` — independent task verification (reads files, runs tests, returns PASS/FAIL)
 - `mnemosyne` — repository knowledge reconciliation. Verifies durable learnings and updates the
-  narrowest authoritative source; historical solution notes are a fallback. Run BEFORE Clio so
-  knowledge maintenance is included in the same squashed final commit.
+  narrowest authoritative source. Run BEFORE Clio so knowledge maintenance is included in the
+  same squashed final commit.
 - `clio` — git operations (squash, rebase).
   **Always include the plan ID** when delegating to clio.
 

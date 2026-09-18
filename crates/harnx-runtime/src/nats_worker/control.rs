@@ -26,11 +26,9 @@ pub enum ControlCommand {
     /// Worker-originated: carries the fence token for tombstone.
     /// The worker appends a Cancel entry BEFORE firing the AbortSignal.
     Cancel,
-    /// Generation-scoped latency hint. Durable KV state is authoritative.
-    CancelExecution {
-        execution_id: String,
-        cancellation_id: String,
-    },
+    /// Latency hint that a `Cancel` entry was appended to this session's log.
+    /// The log is authoritative; the listener re-reads the tail on receipt.
+    Interrupt { cancellation_id: String },
     /// Resolve one durable pending tool approval.
     HitlApprovalDecision {
         tool_call_id: String,
@@ -64,7 +62,6 @@ pub(super) struct SessionControlHandler {
     lease: Arc<NatsSessionLease>,
     backend: NatsSessionLogBackend,
     abort_signal: crate::utils::AbortSignal,
-    execution: super::execution_control::WorkerExecution,
     hitl_decision_tx: tokio::sync::mpsc::UnboundedSender<AppliedHitlDecision>,
 }
 
@@ -74,7 +71,6 @@ impl SessionControlHandler {
         hitl_decision_tx: tokio::sync::mpsc::UnboundedSender<AppliedHitlDecision>,
     ) -> Self {
         Self {
-            execution: ctx.execution.clone(),
             client: ctx.client.clone(),
             jetstream: ctx.jetstream.clone(),
             session_id: ctx.session_id.to_string(),
@@ -85,64 +81,52 @@ impl SessionControlHandler {
         }
     }
 
-    pub(super) async fn listen(
-        self,
-        mut subscriber: async_nats::Subscriber,
-        mut watch: harnx_nats_common::recovery::KvUpdates,
-    ) {
+    pub(super) async fn listen(self, mut subscriber: async_nats::Subscriber) {
         use futures_util::StreamExt;
-        loop {
-            if !self.abort_signal.aborted()
-                && self
-                    .execution
-                    .store
-                    .check_ancestors(&self.execution.reference)
-                    .await
-                    .is_err()
-            {
-                self.cancel(None).await;
+        while let Some(message) = subscriber.next().await {
+            match ControlCommand::from_bytes(&message.payload) {
+                Ok(command) => self.apply(command, message.reply).await,
+                Err(error) => {
+                    log::debug!("invalid control command payload, ignoring: {error}")
+                }
             }
-            tokio::select! {
-                update = watch.next() => {
-                    if !matches!(update, Some(Ok(_))) {
-                        self.abort_signal.set_ctrlc();
-                        let _ = self.execution.store.cancel_operation(&self.execution.reference, None, false).await;
-                        return;
-                    }
-                }
-                message = subscriber.next() => {
-                    let Some(message) = message else { self.abort_signal.set_ctrlc(); return; };
-                    match ControlCommand::from_bytes(&message.payload) {
-                        Ok(ControlCommand::CancelExecution { execution_id, cancellation_id }) if execution_id == self.execution.reference.execution_id => {
-                            let _ = self.execution.store.cancel_operation(&self.execution.reference, Some(&cancellation_id), false).await;
-                            self.cancel(message.reply).await;
-                        }
-                        Ok(ControlCommand::HitlApprovalDecision { tool_call_id, approved, note }) => {
-                            self.apply_hitl_decision(tool_call_id, approved, note, message.reply).await;
-                        }
-                        Ok(ControlCommand::Cancel) => self.cancel(message.reply).await,
-                        Ok(ControlCommand::CancelExecution { .. }) => {}
-                        Err(error) => log::debug!("invalid control command payload, ignoring: {error}"),
-                    }
-                }
+        }
+        self.abort_signal.set_ctrlc();
+    }
+
+    async fn apply(&self, command: ControlCommand, reply: Option<async_nats::Subject>) {
+        match command {
+            ControlCommand::Interrupt { .. } => self.confirm_logged_interrupt(reply).await,
+            ControlCommand::Cancel => self.cancel(reply).await,
+            ControlCommand::HitlApprovalDecision {
+                tool_call_id,
+                approved,
+                note,
+            } => {
+                self.apply_hitl_decision(tool_call_id, approved, note, reply)
+                    .await
             }
         }
     }
 
+    /// An `Interrupt` command is only a hint that a `Cancel` was appended. The
+    /// log decides: abort (and acknowledge) only once it carries one for the
+    /// turn in progress.
+    async fn confirm_logged_interrupt(&self, reply: Option<async_nats::Subject>) {
+        let Ok(entries) = self.backend.load_events_latest_async().await else {
+            return;
+        };
+        if harnx_core::session_reconstruct::current_turn_is_cancelled(&entries) {
+            self.abort_signal.set_ctrlc();
+            self.acknowledge(reply).await;
+        }
+    }
+
+    /// The legacy client cancel: no `Cancel` is in the log yet, so this worker
+    /// writes one itself before aborting, exactly as a frontend's
+    /// `interrupt_session` would have.
     async fn cancel(&self, reply: Option<async_nats::Subject>) {
-        self.abort_signal.set_ctrlc();
-        let _ = self
-            .execution
-            .store
-            .cancel_operation(&self.execution.reference, None, false)
-            .await;
-        let _ = self
-            .execution
-            .store
-            .quiesce(&self.execution.reference, &self.execution.owner)
-            .await;
-        let durable = self.append_cancel();
-        if durable {
+        if self.append_cancel().await {
             self.acknowledge(reply).await;
         }
         self.abort_signal.set_ctrlc();
@@ -235,20 +219,40 @@ impl SessionControlHandler {
             self.jetstream.clone(),
             self.session_id.clone(),
         )
-        .await
-        .with_execution(self.execution.fence.clone());
+        .await;
         event_sink.publish_session_updated();
     }
 
-    fn append_cancel(&self) -> bool {
+    async fn append_cancel(&self) -> bool {
         if !should_append_control_log_entry(&self.lease) {
             return false;
         }
+        let entries = match self.backend.load_events_latest_async().await {
+            Ok(entries) => entries,
+            Err(error) => {
+                log::warn!("failed to read the log before appending Cancel: {error:#}");
+                return false;
+            }
+        };
+        if harnx_core::session_reconstruct::current_turn_is_cancelled(&entries) {
+            return true;
+        }
         let entry = harnx_core::session::SessionLogEntry::Cancel {
             fence_token: self.lease.fence_token(),
+            cancellation_id: Some(uuid::Uuid::now_v7().to_string()),
+            requested_by: Some("client:legacy".into()),
+            timestamp: Some(chrono::Utc::now()),
         };
-        if let Err(error) = self.backend.append_event_blocking(&entry) {
-            log::warn!("failed to append Cancel entry: {error}");
+        let expected_tail = entries.last().map_or(0, |(seq, _)| *seq);
+        if let Err(error) = self
+            .backend
+            .append_event_fenced_with_lease(&entry, &self.lease, expected_tail)
+            .await
+        {
+            if error.is::<super::backend::TurnInterrupted>() {
+                return true;
+            }
+            log::warn!("failed to append Cancel entry: {error:#}");
             return false;
         }
         true
@@ -284,10 +288,6 @@ pub async fn publish_control_command(
     session_id: &str,
     command: &ControlCommand,
 ) -> Result<()> {
-    let command = durable_command(client, session_id, command).await?;
-    let Some(command) = command else {
-        return Ok(());
-    };
     let subject = control_subject(session_id);
     let payload = command.to_bytes()?;
     client
@@ -313,10 +313,6 @@ pub async fn request_control_command(
     command: &ControlCommand,
     timeout: std::time::Duration,
 ) -> Result<()> {
-    let command = durable_command(client, session_id, command).await?;
-    let Some(command) = command else {
-        return Ok(());
-    };
     let subject = control_subject(session_id);
     let payload = command.to_bytes()?;
     tokio::time::timeout(timeout, client.request(subject, payload.into()))
@@ -326,36 +322,18 @@ pub async fn request_control_command(
     Ok(())
 }
 
-async fn durable_command(
-    client: &async_nats::Client,
-    session_id: &str,
-    command: &ControlCommand,
-) -> Result<Option<ControlCommand>> {
-    if !matches!(command, ControlCommand::Cancel) {
-        return Ok(Some(command.clone()));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupt_command_round_trips() {
+        let command = ControlCommand::Interrupt {
+            cancellation_id: "c-1".into(),
+        };
+        let back = ControlCommand::from_bytes(&command.to_bytes().unwrap()).unwrap();
+        assert!(
+            matches!(back, ControlCommand::Interrupt { cancellation_id } if cancellation_id == "c-1")
+        );
     }
-    let js = async_nats::jetstream::new(client.clone());
-    // Legacy callers do not carry cluster configuration. Opening an existing
-    // bucket must preserve its replica count rather than applying a local default.
-    let store = match js.get_key_value(harnx_execution_control::BUCKET).await {
-        Ok(bucket) => harnx_execution_control::ExecutionStore::from_store(bucket),
-        Err(error) if crate::nats_admin::kv_bucket_missing(&error) => {
-            harnx_execution_control::ExecutionStore::ensure(&js, 1).await?
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let Some(operation) =
-        crate::nats_session::cancellation::resolve_pending_execution(&store, &js, session_id)
-            .await?
-    else {
-        return Ok(None);
-    };
-    let operation = store
-        .cancel_operation(&operation.reference, None, false)
-        .await?;
-    let cancel = operation.cancellation.context("cancellation missing")?;
-    Ok(Some(ControlCommand::CancelExecution {
-        execution_id: operation.reference.execution_id,
-        cancellation_id: cancel.cancellation_id,
-    }))
 }

@@ -1,8 +1,11 @@
-//! In-process payload cache; positive hits still require durable consumption CAS.
+//! In-process payload cache for duplicate requests. It is a shortcut past the
+//! journal, never an authority of its own: only replies the journal already
+//! holds are kept here.
 use super::*;
-use invocation_journal::CommittedReply;
+use sha2::{Digest, Sha256};
 
 pub(super) type ReplyCache = Arc<Mutex<HashMap<String, ReplyCacheEntry>>>;
+pub(super) type CachedReply = Arc<ToolReply>;
 
 pub(super) enum ReplyCacheEntry {
     InProgress {
@@ -10,14 +13,14 @@ pub(super) enum ReplyCacheEntry {
     },
     Complete {
         created: Instant,
-        reply: Arc<CommittedReply>,
+        reply: CachedReply,
     },
 }
 
 pub(super) enum CacheReservation {
     Execute(watch::Sender<Option<CachedReply>>),
     Wait(watch::Receiver<Option<CachedReply>>),
-    Complete(Arc<CommittedReply>),
+    Complete(CachedReply),
     Full,
 }
 
@@ -77,68 +80,47 @@ pub(super) async fn wait_for_cached_reply(
     cached.context("original idempotent tool request ended without a reply")
 }
 
-pub(super) type CachedReply = Result<Arc<CommittedReply>, ToolErrorPayload>;
-
 pub(super) async fn complete_cache_entry(
     cache: &ReplyCache,
     key: String,
-    saved: CachedReply,
+    reply: CachedReply,
     completion: watch::Sender<Option<CachedReply>>,
 ) {
     let mut cache = cache.lock().await;
-    match &saved {
-        Ok(reply) => {
-            cache.insert(
-                key,
-                ReplyCacheEntry::Complete {
-                    created: Instant::now(),
-                    reply: reply.clone(),
-                },
-            );
-        }
-        Err(_) => {
-            cache.remove(&key);
-        }
+    if reply.result.is_ok() {
+        cache.insert(
+            key,
+            ReplyCacheEntry::Complete {
+                created: Instant::now(),
+                reply: reply.clone(),
+            },
+        );
+    } else {
+        // A failure may have been rejected before it was journaled, so let a
+        // duplicate ask the journal again instead of serving it from memory.
+        cache.remove(&key);
     }
-    let _ = completion.send(Some(saved));
+    let _ = completion.send(Some(reply));
 }
 
-pub(super) fn cache_key(request: &ToolRequest, idempotency_key: &str) -> Result<String> {
-    Ok(serde_json::to_string(&(
-        reply_fence::identity(request)?,
-        &request.call_id,
-        idempotency_key,
-    ))?)
+/// Two requests share a cached reply only when they are the same call of the
+/// same session carrying the same arguments.
+pub(super) fn cache_key(request: &ToolRequest) -> Result<String> {
+    let session = request
+        .parent_session_id
+        .as_deref()
+        .unwrap_or(&request.call_id);
+    let digest = digest(&serde_json::to_vec(request).context("encode tool request")?);
+    Ok(format!("{session}/{}/{digest}", request.call_id))
 }
 
-pub(super) async fn cache_completion(
-    context: &ToolRequestContext,
-    request: &ToolRequest,
-    reply: ToolReply,
-) -> CachedReply {
-    let result = async {
-        reply_fence::check_stop(&context.execution_store, reply_fence::identity(request)?).await?;
-        let Some(saved) = context.journal.committed_reply(request).await? else {
-            anyhow::ensure!(reply.result.is_err(), "success has no committed proof");
-            return Ok(None);
-        };
-        if saved.reply != reply {
-            return Ok(None);
-        }
-        reply_fence::consume(&context.execution_store, request, &saved).await?;
-        Ok::<_, anyhow::Error>(Some(saved))
+fn digest(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut hex, "{byte:02x}").expect("writing into a String");
     }
-    .await;
-    match result {
-        Ok(Some(saved)) => Ok(Arc::new(saved)),
-        Ok(None) => match reply.result {
-            Err(error) => Err(error),
-            Ok(_) => Err(ToolErrorPayload::Fatal(
-                "tool reply differs from committed proof".into(),
-            )),
-        },
-        Err(error) => Err(map_invoke_error(reply_fence::invoke_error(error))),
-    }
+    hex
 }
 
 pub(super) async fn serve_cached(
@@ -147,20 +129,7 @@ pub(super) async fn serve_cached(
     subject: harnx_nats_common::rpc::ReplyTarget,
     saved: CachedReply,
 ) -> Result<()> {
-    let result = match saved {
-        Ok(saved) => reply_fence::consume(&context.execution_store, request, &saved).await,
-        Err(error) => Ok(ToolReply {
-            call_id: request.call_id.clone(),
-            result: Err(error),
-        }),
-    };
-    let mut reply = result.unwrap_or_else(|error| ToolReply {
-        call_id: request.call_id.clone(),
-        result: Err(map_invoke_error(reply_fence::invoke_error(error))),
-    });
+    let mut reply = (*saved).clone();
     finalize_execution_context(context, request, &mut reply);
     publish_reply(&context.client, subject, &reply).await
 }
-
-#[cfg(test)]
-mod tests;

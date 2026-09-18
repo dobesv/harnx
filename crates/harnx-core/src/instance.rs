@@ -48,6 +48,11 @@ impl ServerScope {
     pub fn hook_subject(&self, server: &str, event: &str) -> String {
         format!("harnx.v1.{self}.hook.{server}.{event}")
     }
+
+    /// Build the per-server hook subject used for cancel.
+    pub fn hook_control_subject(&self, server: &str) -> String {
+        format!("harnx.v1.{self}.hook.{server}.control")
+    }
 }
 
 /// How a server binary can be run without a worker supplying its scope.
@@ -159,6 +164,10 @@ mod tests {
         assert_eq!(
             instance_id.hook_subject("proxy-auth", "PreToolUse"),
             format!("harnx.v1.{instance_id}.hook.proxy-auth.PreToolUse")
+        );
+        assert_eq!(
+            instance_id.hook_control_subject("proxy-auth"),
+            format!("harnx.v1.{instance_id}.hook.proxy-auth.control")
         );
     }
 }

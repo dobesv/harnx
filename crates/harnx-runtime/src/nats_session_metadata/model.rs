@@ -63,6 +63,18 @@ pub struct SessionOverrides {
     pub max_output_tokens: Option<isize>,
 }
 
+/// A child session's link back to the invocation that created it, so a
+/// restarted worker can later check its ancestors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentLink {
+    pub session_id: String,
+    /// The parent's transcript tool-call id (`ToolCall.id`), not the wire
+    /// `call_id` the tool provider minted for the dispatch: the ancestor check
+    /// matches this against the parent's `ToolCalls` entries, which never
+    /// contain wire ids.
+    pub tool_call_id: String,
+}
+
 /// A field-scoped session override mutation.
 ///
 /// Runtime `.set` and `.model` commands use this representation so concurrent
@@ -113,6 +125,9 @@ pub struct SessionMetadata {
     /// Immutable allocation identity for replayable sub-agent session creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_invocation: Option<String>,
+    /// The invocation that created this session as a sub-agent child, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ParentLink>,
     pub agent: SessionAgentSource,
     #[serde(default)]
     pub variables: AgentVariables,
@@ -126,8 +141,12 @@ pub struct SessionMetadata {
     /// deliberately omitted from the HTTP redacted view.
     #[serde(default)]
     pub(super) worker_fence_token: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) worker_projection: Option<harnx_execution_control::CommitReceipt>,
+    /// Records written while worker commits went through the execution-control
+    /// gate carry this key. It is read back only so `deny_unknown_fields` still
+    /// accepts them; nothing consumes it and it is never written again, so it
+    /// can go once those records have aged out.
+    #[serde(default, skip_serializing)]
+    pub(super) worker_projection: Option<serde_json::Value>,
 }
 
 impl SessionMetadata {
@@ -145,6 +164,7 @@ impl SessionMetadata {
             session_id: session_id.into(),
             created_at: Utc::now(),
             creation_invocation: None,
+            parent: initializer.parent,
             agent: initializer.agent,
             variables: initializer.variables,
             overrides: initializer.overrides,

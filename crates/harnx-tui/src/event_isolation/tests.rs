@@ -1,6 +1,7 @@
 use super::*;
 use crate::{agent_event_sink::TuiAgentEventSink, test_utils::TuiTestHarness, types::TuiEvent};
 use harnx_core::event::{AgentEventSink, ModelEvent, SessionEvent, ToolEvent, TurnEvent};
+use harnx_runtime::nats_session::InterruptOutcome;
 
 pub(crate) fn old_events() -> Vec<AgentEvent> {
     vec![
@@ -44,16 +45,17 @@ async fn queued_g1_events_and_old_task_cleanup_cannot_mutate_g2() {
     tui.clear_transcript();
     let old_task = harnx_core::abort::create_abort_signal();
     tui.current_prompt_abort = Some(old_task.clone());
-    tui.live_events.select(Some("g1".into()));
+    let old_live = tui.live_events.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let sink =
-        TuiAgentEventSink::for_prompt(tx, old_task.clone(), tui.live_events.clone(), "g1".into());
+    let sink = TuiAgentEventSink::for_prompt(tx, old_task.clone(), old_live.clone());
     for event in old_events() {
-        sink.emit_live(event, "g1");
+        sink.emit(event);
     }
     let current_task = harnx_core::abort::create_abort_signal();
     tui.current_prompt_abort = Some(current_task.clone());
-    tui.live_events.select(Some("g2".into()));
+    // A new prompt forks a fresh attachment; the sink above still holds the
+    // one it was built with.
+    tui.live_events = tui.live_events.fork();
     tui.app.llm_busy = true;
     tui.app.streaming_open = true;
     while let Ok(event) = rx.try_recv() {
@@ -65,13 +67,17 @@ async fn queued_g1_events_and_old_task_cleanup_cannot_mutate_g2() {
     })
     .await
     .unwrap();
-    // Isolate the two guards: a matching task with stale origin, then a stale
-    // task with a matching origin. Neither can borrow the other's identity.
+    // Isolate the two guards: a matching task with a stale attachment, then a
+    // stale task with the matching attachment. Neither can borrow the
+    // other's identity.
     for event in old_events() {
-        for (task, generation) in [(current_task.clone(), "g1"), (old_task.clone(), "g2")] {
+        for (task, live) in [
+            (current_task.clone(), old_live.clone()),
+            (old_task.clone(), tui.live_events.clone()),
+        ] {
             tui.handle_tui_event(TuiEvent::Agent {
                 task,
-                stamp: EventStamp::live(&tui.live_events, Some(generation.into())),
+                stamp: EventStamp::live(&live),
                 event: event.clone(),
             })
             .await
@@ -88,52 +94,28 @@ async fn queued_g1_events_and_old_task_cleanup_cannot_mutate_g2() {
 }
 
 #[tokio::test]
-async fn delayed_publisher_checks_generation_at_enqueue() {
-    let state = LiveEventState::default();
-    state.select(Some("g1".into()));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let sink = TuiAgentEventSink::for_prompt(
-        tx,
-        harnx_core::abort::create_abort_signal(),
-        state.clone(),
-        "g1".into(),
-    );
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let publisher = tokio::spawn(async move {
-        ready_tx.send(()).unwrap();
-        release_rx.await.unwrap();
-        for event in old_events() {
-            sink.emit_live(event, "g1");
-        }
-    });
-    ready_rx.await.unwrap();
-    let replacement = state.replacement();
-    replacement.select(Some("g2".into()));
-    // A delayed reconnect from the detached reader cannot make it current again.
-    state.select(Some("g1".into()));
-    release_tx.send(()).unwrap();
-    publisher.await.unwrap();
-    assert!(rx.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn accepted_receipt_rejects_buffered_output_before_cleanup_finishes() {
+async fn accepted_interrupt_rejects_buffered_output_and_the_fence_survives_reconnect() {
     let mut harness = TuiTestHarness::new().await;
     let tui = harness.tui();
     tui.clear_transcript();
     let task = harnx_core::abort::create_abort_signal();
     tui.current_prompt_abort = Some(task.clone());
-    tui.live_events.select(Some("g1".into()));
+    // monitor_interrupt only fences/settles a tray targeting the session
+    // this Tui is actually driving; give it a root tray to match.
+    tui.active_remote_session = Some(("session".to_string(), "cluster".to_string()));
+    tui.cancellation = Some(crate::cancellation::CancellationTray {
+        phase: crate::cancellation::CancellationPhase::Requesting,
+        session_id: "session".to_string(),
+        cluster: "cluster".to_string(),
+        editor_restored: false,
+    });
     let stamp = EventStamp::snapshot(&tui.live_events);
-    let mut receipt = harnx_execution_control::CancelReceipt::idle();
-    receipt.execution_id = Some("g1".into());
-    receipt.cancellation_id = Some("accepted-stop".into());
-    receipt.cancelled = true;
-    receipt.disposition = harnx_execution_control::CancelDisposition::Requested;
-    tui.monitor_cancellation(receipt);
-    assert!(!tui.live_events.allows(Some("g1")));
-    tui.app.llm_busy = true; // Stage 6 does not enable early return/overlap.
+    tui.monitor_interrupt(InterruptOutcome::Accepted { cancel_seq: 5 });
+    assert!(
+        tui.current_prompt_abort.is_none(),
+        "settling an accepted interrupt retires the prompt task"
+    );
+    tui.app.llm_busy = true; // A settled prompt does not enable early return/overlap.
     for event in old_events() {
         tui.handle_tui_event(TuiEvent::Agent {
             task: task.clone(),
@@ -145,23 +127,30 @@ async fn accepted_receipt_rejects_buffered_output_before_cleanup_finishes() {
     }
     assert!(tui.app.llm_busy);
     assert!(tui.app.transcript.is_empty());
+
+    // A reconnect (fork) keeps the same cancel fence, so a pre-interrupt
+    // advisory still cannot render even from a brand-new attachment.
     let reattached = tui.live_events.fork();
-    reattached.select(Some("g1".into()));
+    let stale = harnx_runtime::nats_event_sink::AdvisoryEnvelope::new(
+        3,
+        AgentEvent::Notice(harnx_core::event::NoticeEvent::Info("stale".into())),
+    );
     assert!(
-        !reattached.allows(Some("g1")),
-        "reconnect lost locally accepted stop"
+        !reattached.should_render(&stale, 0),
+        "reconnect lost the accepted interrupt fence"
     );
 }
 
 #[tokio::test]
-async fn shared_live_and_durable_cleanup_are_generation_checked_at_render() {
+async fn shared_live_and_durable_cleanup_are_attachment_checked_at_render() {
     let mut harness = TuiTestHarness::new().await;
     let tui = harness.tui();
     tui.clear_transcript();
     tui.session_activity_target = Some(("session".into(), "cluster".into()));
-    tui.live_events.select(Some("g1".into()));
     let old = EventStamp::snapshot(&tui.live_events);
-    tui.live_events.select(Some("g2".into()));
+    // A fresh attachment (e.g. a new prompt) replaces `tui.live_events`; `old`
+    // still points at the one that came before it.
+    tui.live_events = tui.live_events.fork();
     tui.app.llm_busy = true;
     tui.app.streaming_open = true;
     for event in old_events() {
@@ -189,24 +178,10 @@ async fn shared_live_and_durable_cleanup_are_generation_checked_at_render() {
     assert!(tui.app.llm_busy);
     assert!(tui.app.streaming_open);
     assert!(tui.app.transcript.is_empty());
-    // A queued advisory from the current generation also loses permission as
-    // soon as its stop receipt is accepted, even with active=false.
-    let stopped = EventStamp::snapshot(&tui.live_events);
-    tui.live_events.stop("g2");
-    tui.handle_tui_event(TuiEvent::SessionActivity {
-        session_id: "session".into(),
-        cluster: "cluster".into(),
-        stamp: stopped,
-        historical: false,
-        active: false,
-    })
-    .await
-    .unwrap();
-    assert!(tui.app.llm_busy);
 }
 
 #[tokio::test]
-async fn old_child_events_and_execution_cleanup_cannot_replace_child_g2() {
+async fn old_child_events_cannot_replace_child_g2() {
     use crate::types::{MonitoredSessionKey, MonitoredSessionState, SubAgentStatus};
     let mut harness = TuiTestHarness::new().await;
     let tui = harness.tui();
@@ -215,13 +190,13 @@ async fn old_child_events_and_execution_cleanup_cannot_replace_child_g2() {
         session_id: "child-session".into(),
         cluster: "cluster".into(),
     };
+    // A stamp captured for an earlier, never-inserted attachment must not
+    // mutate the child's actual, separately attached G2 state below.
+    let old = EventStamp::live(&tui.live_events.fork());
     let mut state = MonitoredSessionState::new(SubAgentStatus::Running);
-    state.live_events = tui.live_events.fork();
-    state.live_events.select(Some("child-g2".into()));
     state.execution_id = Some("child-g2".into());
     state.invocation_id = Some("child-g2".into());
     state.streaming_open = true;
-    let old = EventStamp::live(&state.live_events, Some("child-g1".into()));
     tui.app.monitored_sessions.insert(key.clone(), state);
     for event in old_events() {
         tui.handle_tui_event(TuiEvent::SubAgentSessionEvent {
@@ -232,35 +207,9 @@ async fn old_child_events_and_execution_cleanup_cannot_replace_child_g2() {
         .await
         .unwrap();
     }
-    let mut operation = harnx_execution_control::Operation::preparing(
-        harnx_execution_control::OperationRef::new("child-session", "child-g1"),
-        harnx_execution_control::OperationKind::Session,
-        None,
-    );
-    operation.request_cancel("old-stop", false).unwrap();
-    tui.hydrate_execution_state("cluster".into(), operation);
     let child = &tui.app.monitored_sessions[&key];
     assert_eq!(child.execution_id.as_deref(), Some("child-g2"));
     assert_eq!(child.status, SubAgentStatus::Running);
     assert!(child.streaming_open);
     assert!(child.transcript.is_empty());
-}
-
-#[tokio::test]
-async fn execution_snapshot_cannot_request_cancellation_before_fence_load_or_after_g2() {
-    let mut harness = TuiTestHarness::new().await;
-    let tui = harness.tui();
-    tui.session_activity_target = Some(("session".into(), "cluster".into()));
-    let mut operation = harnx_execution_control::Operation::preparing(
-        harnx_execution_control::OperationRef::new("session", "g1"),
-        harnx_execution_control::OperationKind::Session,
-        None,
-    );
-    operation.request_cancel("old-stop", false).unwrap();
-    tui.hydrate_execution_state("cluster".into(), operation.clone());
-    assert!(tui.pending_exit_cancel.is_none());
-    tui.live_events.select(Some("g2".into()));
-    tui.hydrate_execution_state("cluster".into(), operation);
-    assert!(tui.pending_exit_cancel.is_none());
-    assert!(tui.cancellation.is_none());
 }

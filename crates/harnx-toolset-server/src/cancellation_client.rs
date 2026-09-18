@@ -1,4 +1,5 @@
-//! A transport timeout leaves acceptance Unknown, not physical cleanup Unconfirmed.
+//! A transport timeout leaves acceptance Unknown: the cancel may still have
+//! been accepted, so a retry must carry the same cancellation ID.
 use harnx_toolset::{
     CancelAcceptance, CancellationAcknowledgement, ControlMessage, TOOL_PROTOCOL_VERSION,
 };
@@ -16,8 +17,8 @@ pub async fn request_cancellation(
         let ack: CancellationAcknowledgement = serde_json::from_slice(&response.payload)?;
         anyhow::ensure!(
             ack.protocol_version == TOOL_PROTOCOL_VERSION
-                && ack.generation == *control.execution.generation()
-                && ack.operation_id == control.operation_id
+                && ack.session_id == control.session_id
+                && ack.call_id == control.call_id
                 && ack.cancellation_id == control.cancellation_id,
             "cancellation acknowledgement identity mismatch"
         );
@@ -25,13 +26,10 @@ pub async fn request_cancellation(
     };
     match tokio::time::timeout(timeout, response).await {
         Ok(Ok(ack)) => ack,
-        result => control.acknowledgement(
-            CancelAcceptance::Unknown {
-                reason: format!(
-                    "cancellation acknowledgement unavailable; retry the same identity: {result:?}"
-                ),
-            },
-            None,
-        ),
+        result => control.acknowledgement(CancelAcceptance::Unknown {
+            reason: format!(
+                "cancellation acknowledgement unavailable; retry the same identity: {result:?}"
+            ),
+        }),
     }
 }

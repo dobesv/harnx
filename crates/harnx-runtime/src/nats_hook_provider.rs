@@ -25,7 +25,6 @@ const DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(50);
 #[derive(Clone)]
 pub struct HookDispatchMeta {
     pub abort: Option<harnx_core::abort::AbortSignal>,
-    pub execution: Option<harnx_execution_control::ExecutionContext>,
     pub session_id: String,
     pub cwd: PathBuf,
     pub resume_count: u32,
@@ -88,11 +87,26 @@ impl DiscoveredHook {
 struct HookRequestOptions {
     timeout: Duration,
     abort: Option<harnx_core::abort::AbortSignal>,
+    /// Scope and hook server the call belongs to, so the request path can
+    /// register it in the shared in-flight registry a session-scoped cancel
+    /// later searches.
+    instance_id: ServerScope,
+    server: String,
 }
 
 impl HookRequestOptions {
-    fn new(timeout: Duration, abort: Option<harnx_core::abort::AbortSignal>) -> Self {
-        Self { timeout, abort }
+    fn new(
+        timeout: Duration,
+        abort: Option<harnx_core::abort::AbortSignal>,
+        instance_id: ServerScope,
+        server: String,
+    ) -> Self {
+        Self {
+            timeout,
+            abort,
+            instance_id,
+            server,
+        }
     }
 }
 
@@ -315,7 +329,7 @@ impl NatsHookProvider {
             };
             let params = BestEffortHookDispatch {
                 abort: meta.abort.clone(),
-                execution: meta.execution.clone(),
+                instance_id: self.instance_id.clone(),
                 subject,
                 payload,
                 hook: hook.clone(),
@@ -416,7 +430,7 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
             resume_count: params.meta.resume_count,
             hook_event: running_event.clone(),
         };
-        let payload = match encode_hook_payload(&payload, params.meta.execution.as_ref()) {
+        let payload = match encode_hook_payload(&payload) {
             Ok(payload) => payload,
             Err(error) => {
                 return unavailable_outcome(hook, hook.spec.fail_policy, error);
@@ -433,7 +447,12 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
             .request(
                 subject,
                 payload,
-                HookRequestOptions::new(timeout, params.meta.abort.clone()),
+                HookRequestOptions::new(
+                    timeout,
+                    params.meta.abort.clone(),
+                    params.instance_id.clone(),
+                    hook.server.clone(),
+                ),
             )
             .await
         {
@@ -483,7 +502,7 @@ async fn dispatch_blocking_event_with(params: EventDispatch<'_>, event: &HookEve
             resume_count: params.meta.resume_count,
             hook_event: event.clone(),
         };
-        let payload = match encode_hook_payload(&payload, params.meta.execution.as_ref()) {
+        let payload = match encode_hook_payload(&payload) {
             Ok(payload) => payload,
             Err(error) => {
                 return unavailable_outcome(hook, hook.spec.fail_policy, error);
@@ -502,7 +521,12 @@ async fn dispatch_blocking_event_with(params: EventDispatch<'_>, event: &HookEve
             .request(
                 subject,
                 payload,
-                HookRequestOptions::new(timeout, params.meta.abort.clone()),
+                HookRequestOptions::new(
+                    timeout,
+                    params.meta.abort.clone(),
+                    params.instance_id.clone(),
+                    hook.server.clone(),
+                ),
             )
             .await
         {
@@ -539,7 +563,7 @@ async fn dispatch_blocking_event_with(params: EventDispatch<'_>, event: &HookEve
 
 struct BestEffortHookDispatch {
     abort: Option<harnx_core::abort::AbortSignal>,
-    execution: Option<harnx_execution_control::ExecutionContext>,
+    instance_id: ServerScope,
     subject: String,
     payload: HookPayload,
     hook: DiscoveredHook,
@@ -559,7 +583,7 @@ async fn dispatch_one_best_effort_hook(
         .timeout_secs
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_HOOK_TIMEOUT);
-    let payload = match encode_hook_payload(&params.payload, params.execution.as_ref()) {
+    let payload = match encode_hook_payload(&params.payload) {
         Ok(payload) => payload,
         Err(error) => {
             emit_post_notice(
@@ -573,7 +597,7 @@ async fn dispatch_one_best_effort_hook(
         .request(
             params.subject,
             payload,
-            HookRequestOptions::new(timeout, params.abort),
+            HookRequestOptions::new(timeout, params.abort, params.instance_id, server.clone()),
         )
         .await
     {
@@ -832,15 +856,8 @@ async fn bucket_snapshot(
     Ok(hooks)
 }
 
-fn encode_hook_payload(
-    payload: &HookPayload,
-    execution: Option<&harnx_execution_control::ExecutionContext>,
-) -> serde_json::Result<Vec<u8>> {
-    let mut value = serde_json::to_value(payload)?;
-    if let Some(execution) = execution {
-        value["_harnx_execution"] = serde_json::to_value(execution)?;
-    }
-    serde_json::to_vec(&value)
+fn encode_hook_payload(payload: &HookPayload) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(payload)
 }
 
 #[cfg(test)]
@@ -1033,7 +1050,6 @@ mod tests {
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             abort: None,
-            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1071,7 +1087,6 @@ mod tests {
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             abort: None,
-            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1102,7 +1117,6 @@ mod tests {
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             abort: None,
-            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1147,7 +1161,6 @@ mod tests {
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             abort: None,
-            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1185,7 +1198,6 @@ mod tests {
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             abort: None,
-            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1245,7 +1257,7 @@ mod tests {
             dispatcher,
             BestEffortHookDispatch {
                 abort: None,
-                execution: None,
+                instance_id: ServerScope::new(),
                 subject: "test.hook.server.SessionStart".to_string(),
                 payload,
                 hook: hook("server", "SessionStart", None, 0),
@@ -1296,7 +1308,7 @@ mod tests {
             dispatcher,
             BestEffortHookDispatch {
                 abort: None,
-                execution: None,
+                instance_id: ServerScope::new(),
                 subject: "subject".to_string(),
                 payload,
                 hook: hook("server", "PostToolUse", None, 0),
@@ -1323,7 +1335,6 @@ mod tests {
             provider: None,
             meta: HookDispatchMeta {
                 abort: None,
-                execution: None,
                 session_id: "session".to_string(),
                 cwd: PathBuf::from("/tmp"),
                 resume_count: 0,
@@ -1377,7 +1388,6 @@ mod tests {
                 Some(Arc::clone(&pending)),
                 HookDispatchMeta {
                     abort: None,
-                    execution: None,
                     session_id: "session".to_string(),
                     cwd: PathBuf::from("/tmp"),
                     resume_count: 0,
@@ -1432,7 +1442,6 @@ mod tests {
                 None,
                 HookDispatchMeta {
                     abort: None,
-                    execution: None,
                     session_id: "session".to_string(),
                     cwd: PathBuf::from("/tmp"),
                     resume_count: 4,
@@ -1457,7 +1466,6 @@ mod tests {
         let hooks = vec![hook("server", "PreToolUse", Some("exec"), 0)];
         let meta = HookDispatchMeta {
             abort: None,
-            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 7,
@@ -1489,7 +1497,6 @@ mod tests {
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             abort: None,
-            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1522,7 +1529,6 @@ mod tests {
             NatsHookProvider::from_dispatcher(ServerScope::from_string("test"), hooks, dispatcher);
         let meta = || HookDispatchMeta {
             abort: None,
-            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,

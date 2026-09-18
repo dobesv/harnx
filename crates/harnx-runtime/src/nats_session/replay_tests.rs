@@ -182,7 +182,15 @@ fn replay_empty_entries_emit_nothing() {
 #[test]
 fn replay_keeps_cancellation_and_error_notices() {
     let entries = vec![
-        (5, SessionLogEntry::Cancel { fence_token: 7 }),
+        (
+            5,
+            SessionLogEntry::Cancel {
+                fence_token: 7,
+                cancellation_id: None,
+                requested_by: None,
+                timestamp: None,
+            },
+        ),
         (
             6,
             SessionLogEntry::Error {

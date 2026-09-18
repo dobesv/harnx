@@ -1,8 +1,5 @@
 use super::*;
-use harnx_runtime::{
-    execution_fence::GenerationFence,
-    nats_worker::{FencedSessionLogSink, NatsSessionLogBackend},
-};
+use harnx_runtime::nats_worker::FencedSessionLogSink;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hitl_handoff_stale_worker_loses_decision_and_execution_race() -> Result<()> {
@@ -23,28 +20,26 @@ async fn hitl_handoff_stale_worker_loses_decision_and_execution_race() -> Result
         .context("stale worker acquires lease")?;
     let log = NatsSessionLog::new(jetstream.clone(), source_key());
     let stale_expected = seed_pending(&log, &stale_lease).await?;
-    let stale_fence = fence(&jetstream, &stale_lease).await?;
     stale_lease.stop_renewal_for_test().await;
     let replacement_lease = replacement(&jetstream, &lease_config).await?;
     assert!(
         stale_lease.is_held(),
         "stale worker still believes it owns expired lease"
     );
-    let replacement_fence = fence(&jetstream, &replacement_lease).await?;
-    let replacement_sink = sink(&jetstream, &replacement_lease, replacement_fence);
+    let replacement_sink = sink(&jetstream, &replacement_lease).await?;
     let replacement_entry = decision(&replacement_lease, true);
     assert!(replacement_sink
         .append_hitl_event_cas(&replacement_entry, stale_expected)
         .await?
         .is_some());
-    let stale_sink = sink(&jetstream, &stale_lease, stale_fence);
+    let stale_sink = sink(&jetstream, &stale_lease).await?;
     let stale_entry = decision(&stale_lease, false);
     assert!(
         stale_sink
             .append_hitl_event_cas(&stale_entry, stale_expected)
-            .await
-            .is_err(),
-        "gate rejects old owner before stream-tail CAS"
+            .await?
+            .is_none(),
+        "the stream tail the replacement already moved rejects the old owner"
     );
     assert!(!stale_lease.revalidate_ownership().await?);
     assert!(replacement_lease.revalidate_ownership().await?);
@@ -93,30 +88,14 @@ async fn replacement(
     .context("replacement worker did not acquire expired lease")?
 }
 
-async fn fence(
-    js: &async_nats::jetstream::Context,
-    lease: &NatsSessionLease,
-) -> Result<GenerationFence> {
-    generation::generation_fence(
-        js,
-        &source_key(),
-        harnx_execution_control::Owner {
-            instance_id: lease.worker_id().into(),
-            fence: lease.fence_token(),
-        },
-    )
-    .await
-}
-
-fn sink(
+async fn sink(
     js: &async_nats::jetstream::Context,
     lease: &Arc<NatsSessionLease>,
-    fence: GenerationFence,
-) -> FencedSessionLogSink {
-    FencedSessionLogSink::new(
-        NatsSessionLogBackend::new(js.clone(), source_key()).with_execution(Some(fence)),
+) -> Result<FencedSessionLogSink> {
+    Ok(FencedSessionLogSink::new(
+        generation::fenced_backend(js, &source_key()).await?,
         lease.clone(),
-    )
+    ))
 }
 
 fn decision(lease: &NatsSessionLease, approved: bool) -> SessionLogEntry {

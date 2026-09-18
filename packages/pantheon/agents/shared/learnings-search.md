@@ -29,9 +29,9 @@ against the current branch; otherwise refresh them.
    unexplained lines.
    Inspect relevant commits rather than relying on their subjects. Include linked issue/PR
    references when present.
-6. **Check curated historical knowledge.** Search `docs/solutions/` and relevant plan notes for
-   prior attempts, failure modes, and decisions.
-7. **Triangulate.** Issues, PRs, review comments, commits, plan notes, and solution docs are evidence
+6. **Check curated historical knowledge.** Search relevant plan notes, decision records, and PR
+   history for prior attempts, failure modes, and decisions.
+7. **Triangulate.** Issues, PRs, review comments, commits, plan notes, and decision records are evidence
    of historical intent—not proof of current behavior. Verify their current-state claims against
    the sources from steps 2–3. Identify contradictions and surface stale guidance as work rather
    than silently carrying both versions forward.

@@ -114,7 +114,6 @@ async fn final_waits_for_turn_end_before_clearing_busy() {
 async fn shared_session_activity_starts_and_stops_spinner() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
-    tui.live_events.select(Some("shared-generation".into()));
     tui.session_activity_target = Some(("session-1".to_string(), "cluster-1".to_string()));
 
     tui.handle_tui_event(TuiEvent::SessionActivity {

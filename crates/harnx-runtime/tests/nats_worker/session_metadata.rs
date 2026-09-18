@@ -104,7 +104,7 @@ async fn named_agents_reload_each_activation_and_inline_sessions_use_stored_prom
         "worker-agent-reload",
         capture_agent_call(Arc::clone(&captured)),
     )
-    .await;
+    .await?;
     let jetstream = local_test_nats(server.url()).await?;
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
 
@@ -174,7 +174,7 @@ async fn missing_named_agent_fails_durably_without_calling_the_model() -> Result
         "worker-missing-agent",
         counting_stub_call_fn(Arc::clone(&calls)),
     )
-    .await;
+    .await?;
     let jetstream = local_test_nats(server.url()).await?;
     let session_id = "missing-named-agent";
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
@@ -230,7 +230,7 @@ async fn same_local_id_executes_with_each_agents_configuration() -> Result<()> {
         "worker-agent-isolation",
         capture_agent_call(Arc::clone(&captured)),
     )
-    .await;
+    .await?;
     let js = local_test_nats(server.url()).await?;
     let store = SessionMetadataStore::ensure(&js, 1).await?;
     for agent in ["alpha", "beta"] {

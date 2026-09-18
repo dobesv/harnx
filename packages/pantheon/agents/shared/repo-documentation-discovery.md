@@ -10,8 +10,8 @@ on an approach:
 4. **Search by task language.** Search documentation and code for component names, paths, domain
    terms, error text, configuration keys, and important symbols. Follow references from repository
    indexes; do not assume the root instructions contain all relevant knowledge.
-5. **Check history when it can explain intent.** Search relevant `docs/solutions/`, commits, issues,
-   or plan notes for prior decisions and failed approaches. Treat historical material as a lead and
+5. **Check history when it can explain intent.** Search relevant commits, issues, or plan notes
+   for prior decisions and failed approaches. Treat historical material as a lead and
    verify it against current code, tests, configuration, and maintained docs before relying on it.
 6. **Carry evidence forward.** Cite the paths, symbols, or document sections that materially shape
    the work in plans, delegations, and reviews so downstream agents can retrieve the same context.

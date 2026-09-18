@@ -3,13 +3,13 @@ use crate::test_support::{seed_nats_session, NatsSessionSeed, TestConfigSandbox}
 use harnx_core::{
     event::{AgentEvent, ContentBlock, ModelEvent},
     message::{Message, MessageContent, MessageRole},
+    session::SessionLogEntry,
 };
-use harnx_execution_control::{ExecutionStore, InterruptScope, Owner};
+use harnx_runtime::nats_session_log::NatsSessionLog;
 
 struct Fixture {
     _sandbox: TestConfigSandbox,
     config: Config,
-    store: ExecutionStore,
     jetstream: JetstreamContext,
     stream: SessionEventStream,
 }
@@ -37,30 +37,6 @@ impl Fixture {
             "NATS required"
         );
         let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await.unwrap();
-        let store = ExecutionStore::ensure(&jetstream, 1).await.unwrap();
-        let original = store
-            .session(&storage_key(), None, Some("g1"))
-            .await
-            .unwrap();
-        store
-            .reserve_prompt(&original.reference, "input")
-            .await
-            .unwrap();
-        store
-            .commit_prompt(&original.reference, "input", 1)
-            .await
-            .unwrap();
-        store
-            .claim(
-                &original.reference,
-                Owner {
-                    instance_id: "worker".into(),
-                    fence: 1,
-                },
-            )
-            .await
-            .unwrap();
-        store.activate_gate(&original.reference).await.unwrap();
         let client = config.nats_client(LOCAL_CLUSTER_KEY).await.unwrap();
         let stream = SessionEventStream::attach(jetstream.clone(), client, &storage_key())
             .await
@@ -68,39 +44,54 @@ impl Fixture {
         Self {
             _sandbox: sandbox,
             config,
-            store,
             jetstream,
             stream,
         }
     }
 }
 
+/// Interrupt the way a frontend does: one `Cancel` appended to the log.
+async fn interrupt(jetstream: &JetstreamContext) {
+    NatsSessionLog::new(jetstream.clone(), storage_key())
+        .append_event_async(&SessionLogEntry::cancel_request(
+            "queue-stop".into(),
+            "client:test".into(),
+        ))
+        .await
+        .unwrap();
+}
+
+/// Two claims about a reader that was already attached when the interrupt
+/// landed. The stop watch has to stay pollable while a full output queue holds
+/// the follower — nothing will ever drain that queue if the interrupt cannot
+/// get through it — and the chunk waiting in that queue belongs to the turn the
+/// `Cancel` stopped. Its sequence clears the reader's durable position, so the
+/// fence is the only thing that can hold it back: the assertion reads through a
+/// fork, which keeps the fence and drops this attachment's detachment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn accepted_stop_interrupts_a_backpressured_remote_output_queue() {
-    let mut fixture = Fixture::new().await;
-    let generation =
-        RemoteGeneration::bind(&mut fixture.stream, &fixture.jetstream, &storage_key())
-            .await
-            .unwrap();
+    let fixture = Fixture::new().await;
+    // The seeded prompt is the only user message: sequence 1 is this follow's.
+    let interrupt_watch = RemoteInterruptWatch::bind(&fixture.jetstream, &storage_key(), 1);
     let live = fixture.stream.live_state().clone();
+    let attached_seq = fixture.stream.last_applied_seq();
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let probe = tx.clone();
     let task = tokio::spawn(remote_follow_task(FollowTaskParams {
-        generation,
+        interrupt_watch,
         event_stream: fixture.stream,
-        jetstream: fixture.jetstream,
+        jetstream: fixture.jetstream.clone(),
         session_id: storage_key(),
         tx,
         through_seq: 1,
     }));
     let client = fixture.config.nats_client(LOCAL_CLUSTER_KEY).await.unwrap();
     let envelope = AdvisoryEnvelope::new(
-        1,
+        attached_seq,
         AgentEvent::Model(ModelEvent::MessageChunk {
             blocks: vec![ContentBlock::Text("queued delta".into())],
         }),
-    )
-    .with_execution_id("g1");
+    );
     client
         .publish(
             harnx_runtime::nats_event_sink::events_subject(&storage_key()),
@@ -117,31 +108,21 @@ async fn accepted_stop_interrupts_a_backpressured_remote_output_queue() {
     })
     .await
     .unwrap();
-    let reference = harnx_execution_control::OperationRef::new(storage_key(), "g1");
-    let context = fixture.store.activate_gate(&reference).await.unwrap();
-    fixture
-        .store
-        .interrupt(
-            &InterruptScope {
-                gate_root: context.gate_root().clone(),
-                operation: reference,
-                reason: "queue stop".into(),
-            },
-            "stop",
-        )
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), task)
+    interrupt(&fixture.jetstream).await;
+    tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(live.is_stopped("g1"));
     drop(probe);
-    let frames: Vec<_> = event_frames(rx, live).collect().await;
+    let frames: Vec<_> = event_frames(rx, live.clone(), attached_seq).collect().await;
     assert!(
         frames.is_empty(),
         "unseen lifecycle start cannot leave an orphan end"
+    );
+    assert!(
+        !live.fork().should_render(&envelope, attached_seq),
+        "the accepted Cancel fences the stopped turn's output for later readers too"
     );
 }
 

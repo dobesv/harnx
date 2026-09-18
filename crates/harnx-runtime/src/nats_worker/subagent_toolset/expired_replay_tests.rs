@@ -1,7 +1,6 @@
 use super::*;
 use anyhow::{Context, Result};
 use harnx_core::{message::MessageRole, session::SessionLogEntry};
-use harnx_execution_control::OperationRef;
 
 #[tokio::test]
 async fn expired_replay_returns_completed_child_without_cancelling_or_readmitting() -> Result<()> {
@@ -45,13 +44,13 @@ async fn expired_replay_returns_completed_child_without_cancelling_or_readmittin
     assert_eq!(result.response.as_deref(), Some("already finished"));
     assert!(!result.was_cancelled);
     assert_eq!(log.load_events_async().await?.len(), before.len());
-    assert!(session
-        .execution_store()
-        .current(session.storage_key())
-        .await?
-        .unwrap()
-        .cancellation
-        .is_none());
+    assert!(
+        !log.load_events_async()
+            .await?
+            .iter()
+            .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. })),
+        "an expired replay of a completed child must not interrupt it"
+    );
     let _ = nats.kill();
     let _ = nats.wait();
     Ok(())
@@ -74,11 +73,7 @@ async fn completed_child(js: &async_nats::jetstream::Context) -> Result<NatsSess
         crate::utils::create_abort_signal(),
     )
     .await?;
-    let store = session.execution_store();
-    let parent = store.session("parent", None, None).await?;
-    let tool = OperationRef::new("parent", "invocation");
-    store.child(tool.clone(), parent.reference).await?;
-    let session = session.with_execution_parent(tool, "invocation".into());
+    let session = session.with_execution_parent("parent".into(), "invocation".into());
     let prompt = session.enqueue_text("original work").await?;
     let log = crate::nats_session_log::NatsSessionLog::new(js.clone(), session.storage_key());
     log.append_event_async(&SessionLogEntry::Message {

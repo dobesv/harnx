@@ -2,15 +2,179 @@
 
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
-use crate::nats_session_metadata::MetadataOutput;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
 use harnx_core::execution_context::ExecutionContextObservation;
 use std::sync::Arc;
 
+/// Run an async NATS round trip from a blocking persistence callback without
+/// wedging the Tokio worker thread it is on. The agent loop persists model and
+/// tool output through deeply synchronous code, so the broker call has to be
+/// handed to the runtime rather than awaited in place. The join handle is
+/// owned, so dropping the waiter aborts the task instead of detaching
+/// unfinished I/O.
+fn block_on_io<T: Send + 'static>(
+    future: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    use tracing::Instrument;
+    let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+        future.instrument(tracing::Span::current()),
+    ));
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(task))?
+}
+
 const APPEND_ATTEMPTS: usize = 3;
 
 const APPEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How many times a fenced append re-reads a moved tail before giving up.
+/// Only writers this worker is allowed to append behind (queued user input,
+/// and for wind-up another `Cancel`) move it, so a handful of rounds is
+/// generous; the bound is there so a pathological writer cannot livelock the
+/// worker.
+const FENCED_APPEND_ATTEMPTS: usize = 8;
+
+/// Which writer's conflict rule a fenced append follows.
+#[derive(Clone, Copy)]
+enum WriterRule {
+    /// The turn's own writer. A newer `Cancel` has ended the turn, so its
+    /// entry is abandoned rather than written behind the interruption.
+    Turn,
+    /// Wind-up of an interrupted turn. It is idempotent and owes the log a
+    /// result either way, so it appends behind a second `Cancel` too.
+    WindUp,
+}
+
+/// One fenced append: where the writer expects the log to end, which rule it
+/// follows when something else got there first, and the identity JetStream
+/// deduplicates the publish by.
+struct FencedWrite {
+    expected_tail: u64,
+    rule: WriterRule,
+    message_id: String,
+}
+
+/// The interrupted round a wind-up is closing out: the `Cancel` that ended it,
+/// and where the writer expects the log to end.
+pub(crate) struct WoundUpRound {
+    pub cancel_seq: u64,
+    pub expected_tail: u64,
+}
+
+impl WoundUpRound {
+    /// The publish identity every worker winding this round up shares, so a
+    /// replacement that takes over after a lease handover is deduplicated by
+    /// the broker rather than appending a second answer to a round the log
+    /// has already closed.
+    fn message_id(&self, session_id: &str) -> String {
+        format!("windup-{session_id}-{}", self.cancel_seq)
+    }
+}
+
+/// A newer `Cancel` terminated the turn while its writer was appending.
+/// Callers recognise it with `error.is::<TurnInterrupted>()` and stop writing
+/// instead of replaying the entry behind the interruption.
+#[derive(Debug)]
+pub(crate) struct TurnInterrupted {
+    pub cancel_seq: u64,
+}
+
+impl std::fmt::Display for TurnInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "turn interrupted by a Cancel at sequence {}",
+            self.cancel_seq
+        )
+    }
+}
+
+impl std::error::Error for TurnInterrupted {}
+
+/// Stamp `revision` onto whichever fence field the entry carries. `Cancel`,
+/// `Error` and `TurnEnd` always carry one; `Message` and `ToolCalls` carry an
+/// optional one; everything else is unfenced and left alone.
+fn stamp_fence_token(
+    entry: &harnx_core::session::SessionLogEntry,
+    revision: u64,
+) -> harnx_core::session::SessionLogEntry {
+    use harnx_core::session::SessionLogEntry;
+    let mut entry = entry.clone();
+    match &mut entry {
+        SessionLogEntry::Cancel { fence_token, .. }
+        | SessionLogEntry::Error { fence_token, .. }
+        | SessionLogEntry::TurnEnd { fence_token, .. } => *fence_token = revision,
+        _ => entry.set_fence_token(revision),
+    }
+    entry
+}
+
+/// What a fenced append does after losing the tail race.
+enum ConflictOutcome {
+    /// This exact entry is already in the log at that sequence.
+    AlreadyWritten(u64),
+    /// Retry the append expecting this tail.
+    Retry(u64),
+}
+
+/// Decide what a fenced append should do after losing the tail race, or refuse
+/// to retry at all. `entries` is everything appended past the expected tail.
+///
+/// Only a `Cancel` is a reason not to retry, and only for the turn's own
+/// writer: it ended the turn, so the entry is abandoned rather than written
+/// behind the interruption. Everything else that can move the tail — input
+/// queued behind the running turn, the control listener's HITL entries, a
+/// sub-agent or handoff marker written through another handle on the same
+/// lease — is a writer this worker appends in front of, not a rival.
+fn resolve_conflict(
+    entry: &harnx_core::session::SessionLogEntry,
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    rule: WriterRule,
+) -> Result<ConflictOutcome> {
+    use harnx_core::session::SessionLogEntry;
+    let (tail, _) = entries
+        .last()
+        .context("session log rejected an append without a newer entry")?;
+    for (seq, written) in entries {
+        // Wind-up's whole output is this one entry, so finding the round
+        // already answered is this same wind-up having got through: take that
+        // sequence as our own rather than appending a duplicate.
+        if matches!(rule, WriterRule::WindUp) && answers_the_same_calls(entry, written) {
+            return Ok(ConflictOutcome::AlreadyWritten(*seq));
+        }
+        if matches!(rule, WriterRule::Turn) && matches!(written, SessionLogEntry::Cancel { .. }) {
+            return Err(TurnInterrupted { cancel_seq: *seq }.into());
+        }
+    }
+    Ok(ConflictOutcome::Retry(*tail))
+}
+
+/// Whether `written` already answers a call our wind-up entry is answering.
+///
+/// Two workers closing out the same interrupted round do NOT produce equal
+/// entries: each stamps its own timestamp, and a reply that reached the
+/// journal between them turns a placeholder into a real result. Whole-entry
+/// equality therefore never recognised the other worker's `ToolResults`, and
+/// the conflict fell through to a retry that appended a second answer for a
+/// round the log had already closed. Answering any of the same calls is what
+/// makes two entries the same wind-up.
+fn answers_the_same_calls(
+    entry: &harnx_core::session::SessionLogEntry,
+    written: &harnx_core::session::SessionLogEntry,
+) -> bool {
+    use harnx_core::session::SessionLogEntry;
+    let (
+        SessionLogEntry::ToolResults { results: ours, .. },
+        SessionLogEntry::ToolResults {
+            results: theirs, ..
+        },
+    ) = (entry, written)
+    else {
+        return false;
+    };
+    ours.iter()
+        .any(|ours| ours.id.is_some() && theirs.iter().any(|theirs| theirs.id == ours.id))
+}
 
 enum MetadataReplacement {
     Overrides(crate::nats_session_metadata::SessionOverrides),
@@ -42,7 +206,6 @@ impl MetadataReplacement {
 pub struct NatsSessionLogBackend {
     jetstream: jetstream::Context,
     session_id: String,
-    execution: Option<crate::execution_fence::GenerationFence>,
     /// Optional observer of the latest durable append sequence. When set, every
     /// successful append advances it via `fetch_max`, so the live-event fan-out
     /// sink (P4.1) can stamp advisories with an up-to-date `after_seq` during
@@ -54,13 +217,6 @@ pub struct NatsSessionLogBackend {
 impl crate::config::session::SessionAppendSink for NatsSessionLogBackend {
     fn append(&self, entry: &harnx_core::session::SessionLogEntry) -> Result<u64> {
         self.append_event_blocking(entry)
-    }
-
-    fn validate_output(&self) -> Result<()> {
-        if let Some(fence) = &self.execution {
-            fence.check_blocking("transcript-reducer")?;
-        }
-        Ok(())
     }
 
     fn failure_is_fatal(&self) -> bool {
@@ -114,15 +270,13 @@ impl crate::config::session::SessionAppendSink for NatsSessionLogBackend {
     }
 }
 
-/// Worker sink bound to one execution generation and lease owner.
+/// Worker sink bound to one lease owner.
 ///
-/// The backend commits exact output through the tree gate before its private
-/// ordered projector appends. Local lease checks are fast rejects only; owner
-/// handover and stop share the same gate CAS as output. A valid lease cannot
-/// authorize an old generation's output.
+/// Every append is stamped with the lease's revision and refused once the
+/// lease is gone, so a fenced-out worker cannot write behind its replacement.
 ///
 /// HITL also retains the expected stream tail used to derive the decision. A
-/// conditional projection that loses forces re-derivation. The continuation
+/// conditional append that loses forces re-derivation. The continuation
 /// still revalidates lease ownership immediately before approved tool dispatch.
 #[derive(Clone)]
 pub struct FencedSessionLogSink {
@@ -151,7 +305,6 @@ impl FencedSessionLogSink {
         entry: &harnx_core::session::SessionLogEntry,
         expected_last_sequence: u64,
     ) -> Result<Option<u64>> {
-        self.require_generation()?;
         let fenced = self.fenced_entry(entry);
         self.backend
             .append_event_with_expected_last_sequence_and_lease(
@@ -170,38 +323,20 @@ impl FencedSessionLogSink {
     ) -> Result<Option<u64>> {
         let sink = self.clone();
         let entry = entry.clone();
-        crate::execution_fence::block_on_io(async move {
+        block_on_io(async move {
             sink.append_hitl_event_cas(&entry, expected_last_sequence)
                 .await
         })
-    }
-
-    fn require_generation(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.backend.execution.is_some(),
-            "worker output requires execution generation authority"
-        );
-        Ok(())
     }
 
     fn fenced_entry(
         &self,
         entry: &harnx_core::session::SessionLogEntry,
     ) -> harnx_core::session::SessionLogEntry {
-        use harnx_core::session::SessionLogEntry;
-        let mut entry = entry.clone();
-        let revision = self.lease.fence_token();
-        match &mut entry {
-            SessionLogEntry::Cancel { fence_token }
-            | SessionLogEntry::Error { fence_token, .. }
-            | SessionLogEntry::TurnEnd { fence_token, .. } => *fence_token = revision,
-            _ => entry.set_fence_token(revision),
-        }
-        entry
+        stamp_fence_token(entry, self.lease.fence_token())
     }
 
     fn persist_metadata(&self, replacement: MetadataReplacement) -> Result<()> {
-        self.require_generation()?;
         anyhow::ensure!(
             self.lease.is_held(),
             "session lease lost before metadata update"
@@ -213,17 +348,9 @@ impl FencedSessionLogSink {
 
 impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
     fn append(&self, entry: &harnx_core::session::SessionLogEntry) -> Result<u64> {
-        self.require_generation()?;
         let fenced = self.fenced_entry(entry);
         self.backend
             .append_event_blocking_with_lease(&fenced, Some(&self.lease))
-    }
-
-    fn validate_output(&self) -> Result<()> {
-        if let Some(fence) = &self.backend.execution {
-            fence.check_blocking("transcript-reducer")?;
-        }
-        Ok(())
     }
 
     fn failure_is_fatal(&self) -> bool {
@@ -231,7 +358,6 @@ impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
     }
 
     fn persist_title(&self, title: &str, manual: bool, tokens: usize) -> Result<()> {
-        self.require_generation()?;
         anyhow::ensure!(
             self.lease.is_held(),
             "session lease lost before title update"
@@ -272,7 +398,6 @@ impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
         observations: &'a [ExecutionContextObservation],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.require_generation()?;
             anyhow::ensure!(
                 self.lease.is_held(),
                 "session lease lost before execution-context update"
@@ -293,18 +418,9 @@ impl NatsSessionLogBackend {
         Self {
             jetstream,
             session_id: session_id.into(),
-            execution: None,
             after_seq_observer: None,
             metadata_store: None,
         }
-    }
-
-    pub fn with_execution(
-        mut self,
-        execution: Option<crate::execution_fence::GenerationFence>,
-    ) -> Self {
-        self.execution = execution;
-        self
     }
 
     pub fn jetstream(&self) -> jetstream::Context {
@@ -366,13 +482,6 @@ impl NatsSessionLogBackend {
         fence_token: Option<u64>,
     ) -> Result<()> {
         let title = update.title.to_string();
-        if self.project_metadata_blocking(MetadataOutput::Title {
-            title: title.clone(),
-            manual: update.manual,
-            tokens: update.tokens,
-        })? {
-            return Ok(());
-        }
         self.patch_metadata_blocking(fence_token, move |metadata| {
             metadata.title.value = Some(title.clone());
             metadata.title.manual = update.manual;
@@ -386,14 +495,6 @@ impl NatsSessionLogBackend {
         replacement: MetadataReplacement,
         fence_token: Option<u64>,
     ) -> Result<()> {
-        let output = match &replacement {
-            MetadataReplacement::Overrides(value) => MetadataOutput::Overrides(value.clone()),
-            MetadataReplacement::Override(value) => MetadataOutput::Override(value.clone()),
-            MetadataReplacement::Variables(value) => MetadataOutput::Variables(value.clone()),
-        };
-        if self.project_metadata_blocking(output)? {
-            return Ok(());
-        }
         self.patch_metadata_blocking(fence_token, move |metadata| {
             replacement.apply(metadata);
             Ok(())
@@ -419,12 +520,6 @@ impl NatsSessionLogBackend {
         observations: &[ExecutionContextObservation],
         fence_token: Option<u64>,
     ) -> Result<()> {
-        if self
-            .project_metadata(MetadataOutput::ExecutionContexts(observations.to_vec()))
-            .await?
-        {
-            return Ok(());
-        }
         let store = self.metadata_store()?;
         if let Some(fence_token) = fence_token {
             store
@@ -436,34 +531,6 @@ impl NatsSessionLogBackend {
                 .await?;
         }
         Ok(())
-    }
-
-    fn project_metadata_blocking(&self, output: MetadataOutput) -> Result<bool> {
-        if self.execution.is_none() {
-            return Ok(false);
-        }
-        let backend = self.clone();
-        crate::execution_fence::block_on_io(async move { backend.project_metadata(output).await })
-    }
-
-    async fn project_metadata(&self, output: MetadataOutput) -> Result<bool> {
-        let Some(fence) = &self.execution else {
-            return Ok(false);
-        };
-        self.metadata_store()?;
-        let receipt = fence
-            .output(
-                harnx_execution_control::OutputKind::SessionMetadata,
-                serde_json::to_value(output)?,
-            )
-            .await?;
-        crate::nats_session_log::NatsSessionLog::new(
-            self.jetstream.clone(),
-            self.session_id.clone(),
-        )
-        .project_through(fence, &receipt)
-        .await?;
-        Ok(true)
     }
 
     pub fn session_id(&self) -> &str {
@@ -515,18 +582,110 @@ impl NatsSessionLogBackend {
             self.jetstream.clone(),
             self.session_id.clone(),
         );
-        let fence = self
-            .execution
-            .as_ref()
-            .context("worker append requires execution generation authority")?;
         self.ensure_lease_held(lease, entry)?;
-        let seq = log
-            .append_output(fence, entry, Some(expected_last_sequence))
-            .await?;
+        let seq = match log
+            .append_fenced(
+                entry,
+                expected_last_sequence,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await?
+        {
+            crate::nats_session_log::FencedAppend::Appended(seq) => Some(seq),
+            crate::nats_session_log::FencedAppend::Conflict { .. } => None,
+        };
         if let Some(seq) = seq {
             self.observe_append(seq);
         }
         Ok(seq)
+    }
+
+    /// Append one entry at `expected_tail` under the turn writer's rule: a
+    /// newer `Cancel` ends the turn, so the entry is abandoned with a
+    /// [`TurnInterrupted`] error rather than written behind the interruption.
+    pub(crate) async fn append_event_fenced_with_lease(
+        &self,
+        entry: &harnx_core::session::SessionLogEntry,
+        lease: &NatsSessionLease,
+        expected_tail: u64,
+    ) -> Result<u64> {
+        self.append_under_writer_rule(
+            entry,
+            lease,
+            FencedWrite {
+                expected_tail,
+                rule: WriterRule::Turn,
+                message_id: uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Append the wind-up of an interrupted turn. Unlike a turn's own writer
+    /// it keeps going past another `Cancel`: the log still owes the
+    /// interrupted calls a result.
+    pub(crate) async fn append_wind_up_fenced_with_lease(
+        &self,
+        entry: &harnx_core::session::SessionLogEntry,
+        lease: &NatsSessionLease,
+        round: WoundUpRound,
+    ) -> Result<u64> {
+        self.append_under_writer_rule(
+            entry,
+            lease,
+            FencedWrite {
+                expected_tail: round.expected_tail,
+                rule: WriterRule::WindUp,
+                message_id: round.message_id(&self.session_id),
+            },
+        )
+        .await
+    }
+
+    async fn append_under_writer_rule(
+        &self,
+        entry: &harnx_core::session::SessionLogEntry,
+        lease: &NatsSessionLease,
+        mut write: FencedWrite,
+    ) -> Result<u64> {
+        let entry = stamp_fence_token(entry, lease.fence_token());
+        let log = crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            self.session_id.clone(),
+        );
+        // One message id for every attempt: a publish rejected for the wrong
+        // tail never enters the dedupe window, while one whose ack was lost
+        // is recognised as itself instead of appended a second time.
+        for _ in 0..FENCED_APPEND_ATTEMPTS {
+            // Every round is a fresh write decision made against a tail this
+            // worker has just re-read, and the lease can have gone in the
+            // meantime — checking only on the way in would let a worker that
+            // was fenced out mid-retry append under a token it no longer holds.
+            self.ensure_lease_held(lease, &entry)?;
+            match log
+                .append_fenced(&entry, write.expected_tail, &write.message_id)
+                .await?
+            {
+                crate::nats_session_log::FencedAppend::Appended(seq) => {
+                    self.observe_append(seq);
+                    return Ok(seq);
+                }
+                crate::nats_session_log::FencedAppend::Conflict { entries } => {
+                    match resolve_conflict(&entry, &entries, write.rule)? {
+                        ConflictOutcome::AlreadyWritten(seq) => {
+                            self.observe_append(seq);
+                            return Ok(seq);
+                        }
+                        ConflictOutcome::Retry(tail) => write.expected_tail = tail,
+                    }
+                }
+            }
+        }
+        anyhow::bail!(
+            "session log tail kept moving while appending: session_id={} entry_type={}",
+            self.session_id,
+            crate::session_history::entry_type(&entry)
+        )
     }
 
     fn ensure_lease_held(
@@ -535,14 +694,6 @@ impl NatsSessionLogBackend {
         entry: &harnx_core::session::SessionLogEntry,
     ) -> Result<()> {
         if lease.is_held() {
-            if let Some(fence) = &self.execution {
-                // Renewals advance the audit revision, not the gate owner captured at claim.
-                anyhow::ensure!(
-                    fence.context.generation_owner().instance_id == lease.worker_id()
-                        && fence.context.generation_owner().fence <= lease.fence_token(),
-                    "sink lease does not own execution generation"
-                );
-            }
             return Ok(());
         }
         nats_metrics::fenced_write_rejected();
@@ -556,6 +707,11 @@ impl NatsSessionLogBackend {
         anyhow::bail!("refusing worker-originated append: session lease not held (fenced out)")
     }
 
+    /// A lease-holding writer appends under the turn writer's rule, so a
+    /// `Cancel` that ended the turn stops the entry instead of letting it land
+    /// behind the interruption. The expected tail comes from the shared
+    /// `after_seq_observer` when this worker has already written something this
+    /// activation, and otherwise from a tail read.
     async fn append_event_with_lease(
         &self,
         entry: &harnx_core::session::SessionLogEntry,
@@ -565,31 +721,34 @@ impl NatsSessionLogBackend {
             self.jetstream.clone(),
             self.session_id.clone(),
         );
-        if let Some(lease) = lease {
-            self.ensure_lease_held(lease, entry)?;
-        }
-        if let Some(fence) = &self.execution {
-            return self.append_committed(&log, fence, entry).await;
-        }
-        self.append_control_entry(&log, entry).await
+        let Some(lease) = lease else {
+            return self.append_unfenced_entry(&log, entry).await;
+        };
+        self.ensure_lease_held(lease, entry)?;
+        let expected_tail = match self.observed_append_seq() {
+            Some(seq) => seq,
+            // No observer: this backend has no memory of where the turn last
+            // left the log, so the current tail is the best expectation it can
+            // form. A `Cancel` that lands after this read still stops the
+            // append, through the retry that reads the conflict.
+            None => log
+                .load_events_latest_async()
+                .await?
+                .last()
+                .map_or(0, |(seq, _)| *seq),
+        };
+        self.append_event_fenced_with_lease(entry, lease, expected_tail)
+            .await
     }
 
-    async fn append_control_entry(
+    /// Append without a lease: no turn owns this session in this process, so
+    /// there is no tail to fence against. Used by direct `run_agent_loop`
+    /// callers that persist through the backend rather than a worker lease.
+    async fn append_unfenced_entry(
         &self,
         log: &crate::nats_session_log::NatsSessionLog,
         entry: &harnx_core::session::SessionLogEntry,
     ) -> Result<u64> {
-        anyhow::ensure!(
-            matches!(
-                entry,
-                harnx_core::session::SessionLogEntry::Cancel { .. }
-                    | harnx_core::session::SessionLogEntry::Message {
-                        role: harnx_core::message::MessageRole::User,
-                        ..
-                    }
-            ),
-            "worker output requires execution generation authority"
-        );
         let message_id = uuid::Uuid::new_v4().to_string();
         let mut last_error = None;
         let mut appended_seq = None;
@@ -626,29 +785,6 @@ impl NatsSessionLogBackend {
         Ok(seq)
     }
 
-    async fn append_committed(
-        &self,
-        log: &crate::nats_session_log::NatsSessionLog,
-        fence: &crate::execution_fence::GenerationFence,
-        entry: &harnx_core::session::SessionLogEntry,
-    ) -> Result<u64> {
-        let seq = if let harnx_core::session::SessionLogEntry::Cancel { fence_token } = entry {
-            let entries = log.load_events_latest_async().await?;
-            log.append_cancellation(
-                fence,
-                (entries.last().map_or(0, |(seq, _)| *seq), *fence_token),
-            )
-            .await?
-            .context("cancel projection superseded")?
-        } else {
-            log.append_output(fence, entry, None)
-                .await?
-                .context("transcript projection missing")?
-        };
-        self.observe_append(seq);
-        Ok(seq)
-    }
-
     /// Append an entry, blocking on the async NATS call.
     ///
     /// Must be called from within a Tokio multi-threaded runtime.
@@ -671,7 +807,7 @@ impl NatsSessionLogBackend {
         let backend = self.clone();
         let entry = entry.clone();
         let lease = lease.cloned();
-        crate::execution_fence::block_on_io(async move {
+        block_on_io(async move {
             backend
                 .append_event_with_lease(&entry, lease.as_deref())
                 .await
@@ -684,6 +820,15 @@ impl NatsSessionLogBackend {
         if let Some(observer) = &self.after_seq_observer {
             observer.fetch_max(seq, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// The tail this worker last observed: seeded at activation from the
+    /// stream and advanced by every append it makes. `None` when no observer
+    /// is attached, which is not the same as an observer reading zero.
+    fn observed_append_seq(&self) -> Option<u64> {
+        self.after_seq_observer
+            .as_ref()
+            .map(|observer| observer.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Load all events, blocking on async NATS reads.
@@ -730,38 +875,11 @@ impl NatsSessionLogBackend {
 }
 
 #[cfg(test)]
-pub(crate) async fn test_generation_fence(
-    jetstream: &jetstream::Context,
-    session_id: &str,
-    lease: &NatsSessionLease,
-) -> crate::execution_fence::GenerationFence {
-    let store = harnx_execution_control::ExecutionStore::ensure(jetstream, 1)
-        .await
-        .unwrap();
-    let operation = store.session(session_id, None, None).await.unwrap();
-    store
-        .claim(
-            &operation.reference,
-            harnx_execution_control::Owner {
-                instance_id: lease.worker_id().into(),
-                fence: lease.fence_token(),
-            },
-        )
-        .await
-        .unwrap();
-    let context = store.activate_gate(&operation.reference).await.unwrap();
-    crate::execution_fence::GenerationFence::new(store, context)
-}
-
-#[cfg(test)]
 pub(crate) async fn test_session_authority(
     jetstream: &jetstream::Context,
     session_id: &str,
     store: &crate::nats_session_metadata::SessionMetadataStore,
-) -> (
-    Arc<NatsSessionLease>,
-    crate::execution_fence::GenerationFence,
-) {
+) -> Arc<NatsSessionLease> {
     use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig};
     let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
         jetstream: jetstream.clone(),
@@ -779,7 +897,63 @@ pub(crate) async fn test_session_authority(
     .await
     .unwrap()
     .expect("lease should be acquired");
-    let lease = Arc::new(lease);
-    let fence = test_generation_fence(jetstream, session_id, &lease).await;
-    (lease, fence)
+    Arc::new(lease)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::session::{SessionLogEntry, ToolOutput};
+
+    fn results(ids: &[&str], stamp: i64) -> SessionLogEntry {
+        SessionLogEntry::ToolResults {
+            results: ids
+                .iter()
+                .map(|id| ToolOutput {
+                    id: Some((*id).to_string()),
+                    name: "probe".into(),
+                    output: serde_json::json!({"stamp": stamp}),
+                    markdown: None,
+                    content: Vec::new(),
+                    switch_agent: None,
+                })
+                .collect(),
+            timestamp: chrono::DateTime::from_timestamp(stamp, 0),
+        }
+    }
+
+    /// Two workers closing out the same interrupted round never write the
+    /// same bytes: each stamps its own timestamp, and a reply that reached the
+    /// journal in between turns a placeholder into a real result. The round is
+    /// still answered, so the second one adopts that sequence instead of
+    /// appending a second answer behind it.
+    #[test]
+    fn a_wind_up_recognises_another_workers_answer_to_its_round() {
+        let outcome = resolve_conflict(
+            &results(&["c1", "c2"], 200),
+            &[(9, results(&["c1", "c2"], 100))],
+            WriterRule::WindUp,
+        )
+        .expect("a wind-up never refuses to resolve a conflict");
+        assert!(
+            matches!(outcome, ConflictOutcome::AlreadyWritten(9)),
+            "the round is answered at sequence 9"
+        );
+    }
+
+    /// Results for some other round are ordinary tail movement: the wind-up
+    /// still owes its own calls an answer and appends in front of them.
+    #[test]
+    fn a_wind_up_appends_in_front_of_results_for_another_round() {
+        let outcome = resolve_conflict(
+            &results(&["c1"], 200),
+            &[(9, results(&["other-round-call"], 100))],
+            WriterRule::WindUp,
+        )
+        .expect("a wind-up never refuses to resolve a conflict");
+        assert!(
+            matches!(outcome, ConflictOutcome::Retry(9)),
+            "nothing here answers this wind-up's calls"
+        );
+    }
 }

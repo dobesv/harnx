@@ -314,7 +314,6 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     async remove() {}
   }), [agentName, sessionId]);
 
-  const observeCancellation = cancellation.observe;
   const agent = useMemo(() => new HarnxHttpAgent({
     url: `/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}`,
     onStatus: (text) => setStatusText(text),
@@ -333,11 +332,8 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     isForeground: true,
     onHitlPendingApproval: (toolCallId, summary) =>
       addHydratedApproval({ toolCallId, summary }),
-    onSubAgentEvent: (event: any) => {
-      dispatchSubAgentEvent(event);
-      if (event?.type === 'CUSTOM' && event.name === 'cancellation_state') observeCancellation(event.value.cancellation);
-    },
-  }), [agentName, sessionId, onHandoff, addHydratedApproval, observeCancellation]);
+    onSubAgentEvent: (event: any) => dispatchSubAgentEvent(event),
+  }), [agentName, sessionId, onHandoff, addHydratedApproval]);
 
   const runtime = useAgUiRuntime({
     agent,

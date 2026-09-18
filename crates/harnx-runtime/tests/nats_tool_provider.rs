@@ -334,7 +334,7 @@ async fn assert_context_flows_from_tool_to_session_enumeration(
         SessionInitializer::named("metis", Default::default()),
     );
     store.create(&metadata).await?;
-    let backend = generation::output_backend(&jetstream, &metadata.storage_key())
+    let backend = generation::fenced_backend(&jetstream, &metadata.storage_key())
         .await?
         .with_metadata_store(Some(store.clone()));
     let mut session = metadata.base_session();

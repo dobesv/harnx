@@ -1,7 +1,7 @@
 //! Cancellation is operational state, independent of transcript completion.
-use crate::types::{CancellationAction, Tui};
+use crate::types::Tui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use harnx_execution_control::{CancelDisposition, CancelReceipt};
+use harnx_runtime::nats_session::InterruptOutcome;
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -9,54 +9,38 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
-use tokio::sync::mpsc;
-
-mod hydration;
 
 pub(crate) enum CancellationPhase {
     Requesting,
-    Abandoning,
-    Unconfirmed,
     Failed(String),
 }
 
 pub(crate) struct CancellationTray {
     pub phase: CancellationPhase,
-    pub(crate) session_id: String,
-    pub(crate) cluster: String,
-    pub(crate) expected: Option<String>,
-    pub execution_id: Option<String>,
+    pub session_id: String,
+    pub cluster: String,
     pub editor_restored: bool,
 }
 
-struct CancellationTarget {
-    session_id: String,
-    cluster: String,
-    expected: Option<String>,
-    execution_id: Option<String>,
-}
-
 impl Tui {
-    pub(crate) fn cancellation_unconfirmed(&self) -> bool {
-        self.cancellation.as_ref().is_some_and(|tray| {
-            tray.expected.is_none()
-                && matches!(
-                    tray.phase,
-                    CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
-                )
-        })
-    }
-
     pub(crate) fn has_root_cancellation(&self) -> bool {
-        self.cancellation
-            .as_ref()
-            .is_some_and(|tray| tray.expected.is_none())
+        self.cancellation.is_some()
     }
 
     pub(crate) fn cancellation_editor_restored(&self) -> bool {
         self.cancellation
             .as_ref()
-            .is_some_and(|tray| tray.expected.is_none() && tray.editor_restored)
+            .is_some_and(|tray| tray.editor_restored)
+    }
+
+    /// Whether the busy spinner should hold on a static glyph instead of
+    /// animating. A `Failed` interrupt is stalled on the user's own
+    /// retry/exit decision; `Requesting` always resolves on its own, so it
+    /// keeps animating.
+    pub(crate) fn cancellation_failed(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|tray| matches!(tray.phase, CancellationPhase::Failed(_)))
     }
 
     pub(crate) fn handle_cancellation_or_child_key(&mut self, key: KeyEvent) -> bool {
@@ -72,122 +56,54 @@ impl Tui {
         }
     }
 
-    pub(super) fn start_observed_cancellation(
-        &mut self,
-        session_id: String,
-        cluster: String,
-        execution_id: String,
-    ) {
-        self.start_cancellation_for_generation(CancellationTarget {
-            session_id,
-            cluster,
-            expected: None,
-            execution_id: Some(execution_id),
-        });
-    }
-
-    pub(crate) fn start_cancellation(
-        &mut self,
-        session_id: String,
-        cluster: String,
-        expected: Option<String>,
-    ) {
-        let execution_id = expected.clone().or_else(|| self.live_events.active());
-        self.start_cancellation_for_generation(CancellationTarget {
-            session_id,
-            cluster,
-            expected,
-            execution_id,
-        });
-    }
-
-    fn start_cancellation_for_generation(&mut self, target: CancellationTarget) {
-        let CancellationTarget {
-            session_id,
-            cluster,
-            expected,
-            execution_id,
-        } = target;
+    /// Start (or retry) a durable interrupt for `session_id`/`cluster`. A
+    /// retry preserves `editor_restored` from the tray it replaces — Esc
+    /// pressed before a Ctrl+C retry stays pressed across the retry.
+    pub(crate) fn start_cancellation(&mut self, session_id: String, cluster: String) {
         let editor_restored = self
             .cancellation
             .as_ref()
             .is_some_and(|tray| tray.editor_restored);
-        // Retries keep their original execution ID; restoring the editor is not
-        // permission to target whichever generation is live now.
-
         self.pending_exit_cancel = Some((self.exit_cancel_factory)(
             self.config.clone(),
             self.local_worker.clone(),
             session_id.clone(),
             cluster.clone(),
-            execution_id.clone(),
-            CancellationAction::Request,
         ));
         self.exit_interrupt_error = None;
         self.cancellation = Some(CancellationTray {
             phase: CancellationPhase::Requesting,
             session_id,
             cluster,
-            execution_id,
-            expected,
             editor_restored,
         });
-        if let Some(abort) = &self.current_prompt_abort {
-            if self.cancellation.as_ref().is_some_and(|tray| {
-                tray.expected.is_none() && tray.execution_id == self.live_events.active()
-            }) {
-                abort.set_ctrlc();
-            }
-        }
     }
 
-    pub(crate) fn start_cancellation_abandonment(&mut self) {
-        let Some(tray) = self.cancellation.as_ref() else {
-            return;
-        };
-        if !matches!(
-            tray.phase,
-            CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
-        ) {
-            return;
-        }
-        let session_id = tray.session_id.clone();
-        let cluster = tray.cluster.clone();
-        let Some(expected) = tray.execution_id.clone() else {
-            return;
-        };
-        self.pending_exit_cancel = Some((self.exit_cancel_factory)(
-            self.config.clone(),
-            self.local_worker.clone(),
-            session_id,
-            cluster,
-            Some(expected),
-            CancellationAction::Abandon,
-        ));
-        self.exit_interrupt_error = None;
-        if let Some(tray) = self.cancellation.as_mut() {
-            tray.phase = CancellationPhase::Abandoning;
-        }
-    }
-
-    pub(crate) fn monitor_cancellation(&mut self, receipt: CancelReceipt) {
-        self.live_events.accept_stop(&receipt);
-        let Some(tray) = self.cancellation.as_ref() else {
-            return;
-        };
-        if receipt.cancelled || receipt.disposition == CancelDisposition::Idle {
-            // A child receipt or a delayed G1 receipt cannot retire G2's composer.
-            let root = tray.expected.is_none();
-            let matches = self.live_events.active().is_none()
-                || self.live_events.active() == receipt.execution_id;
-            if root && matches {
+    /// `Accepted`/`AlreadyInterrupted` fence live output at `cancel_seq` and
+    /// settle the prompt exactly as a durable replay of the same `Cancel`
+    /// entry would (see `fence_live_events_from_history`); `Idle` means
+    /// there was nothing to interrupt, so only the tray clears.
+    ///
+    /// A child interrupt's tray never matches `active_remote_session` (it
+    /// names the child's own storage key), so it only ever clears the tray
+    /// here — the child's own monitor fences its own live state independently
+    /// once durable history shows the `Cancel` (`fence_live_events_from_history`
+    /// in `subagent_monitor.rs`), and its status converges through ordinary
+    /// progress events. Fencing or settling here on a child's outcome would
+    /// apply a foreign session's cancel sequence to this session's live state
+    /// and tear down a parent turn the child's interrupt was never about.
+    pub(crate) fn monitor_interrupt(&mut self, outcome: InterruptOutcome) {
+        let targets_active_session = self.cancellation.as_ref().is_some_and(|tray| {
+            self.active_remote_session.as_ref()
+                == Some(&(tray.session_id.clone(), tray.cluster.clone()))
+        });
+        if targets_active_session {
+            if let Some(cancel_seq) = outcome.cancel_seq() {
+                self.live_events.accept_interrupt(cancel_seq);
                 self.settle_interrupted_prompt();
             }
-            self.cancellation = None;
-        } else if let Some(tray) = self.cancellation.as_mut() {
-            tray.execution_id = receipt.execution_id;
-            tray.phase = CancellationPhase::Unconfirmed;
         }
+        self.cancellation = None;
     }
 
     pub(super) fn settle_interrupted_prompt(&mut self) {
@@ -207,7 +123,7 @@ impl Tui {
     }
 
     pub(crate) fn handle_cancellation_key(&mut self, key: KeyEvent) -> bool {
-        if !self.has_root_cancellation() || self.app.modal.is_some() {
+        if self.cancellation.is_none() || self.app.modal.is_some() {
             return false;
         }
         match (key.code, key.modifiers) {
@@ -217,30 +133,15 @@ impl Tui {
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 let tray = self.cancellation.as_ref().unwrap();
-                if matches!(
-                    tray.phase,
-                    CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
-                ) {
-                    self.start_cancellation_for_generation(CancellationTarget {
-                        session_id: tray.session_id.clone(),
-                        cluster: tray.cluster.clone(),
-                        expected: tray.expected.clone(),
-                        execution_id: tray.execution_id.clone(),
-                    });
+                if matches!(tray.phase, CancellationPhase::Failed(_)) {
+                    let session_id = tray.session_id.clone();
+                    let cluster = tray.cluster.clone();
+                    self.start_cancellation(session_id, cluster);
                 }
                 true
             }
             (KeyCode::Esc, KeyModifiers::NONE) => {
-                let tray = self.cancellation.as_mut().unwrap();
-                tray.editor_restored = true;
-                if tray.execution_id.is_some()
-                    && matches!(
-                        tray.phase,
-                        CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
-                    )
-                {
-                    self.start_cancellation_abandonment();
-                }
+                self.cancellation.as_mut().unwrap().editor_restored = true;
                 true
             }
             _ => {
@@ -283,86 +184,48 @@ impl Tui {
 
     pub(crate) fn cancellation_message(&self, tray: &CancellationTray, compact: bool) -> String {
         if compact {
-            compact_cancellation_message(&tray.phase, tray.execution_id.is_some())
+            compact_cancellation_message(&tray.phase)
         } else {
-            full_cancellation_message(&tray.phase, tray.execution_id.is_some())
+            full_cancellation_message(&tray.phase)
         }
     }
 }
 
-fn compact_cancellation_message(phase: &CancellationPhase, has_execution_id: bool) -> String {
-    match (phase, has_execution_id) {
-        (CancellationPhase::Requesting, _) => {
-            "Cancellation unresolved; draft retained. Requesting…".into()
-        }
-        (CancellationPhase::Abandoning, _) => {
-            "Resuming… Prior work may still run. Draft retained.".into()
-        }
-        (CancellationPhase::Unconfirmed, true) => {
-            "Unconfirmed; draft retained. Work may run.  Ctrl+C: retry  Esc: resume anyway".into()
-        }
-        (CancellationPhase::Unconfirmed, false) => {
-            "Cancellation unresolved; draft retained. Ctrl+C: retry.".into()
-        }
-        (CancellationPhase::Failed(error), true) => {
-            format!("Ctrl+C: retry  Esc: resume anyway  —  Failed: {error}. Draft retained.")
-        }
-        (CancellationPhase::Failed(error), false) => {
-            format!("Ctrl+C: retry  —  Failed: {error}. Draft retained.")
+/// The compact status renders as one unwrapped line, unlike the full tray,
+/// which wraps inside its own box. An error long enough to fill it would
+/// push the trailing `Ctrl+C: retry` hint past the terminal's edge, so the
+/// error is truncated to keep the hint on screen — the mandated shape
+/// (`"Interrupt failed: {error}  Ctrl+C: retry"`) is unchanged for any error
+/// short enough to need none.
+const COMPACT_ERROR_MAX_CHARS: usize = 40;
+
+fn truncate_for_compact_tray(error: &str) -> String {
+    if error.chars().count() <= COMPACT_ERROR_MAX_CHARS {
+        return error.to_string();
+    }
+    let truncated: String = error.chars().take(COMPACT_ERROR_MAX_CHARS).collect();
+    format!("{truncated}…")
+}
+
+fn compact_cancellation_message(phase: &CancellationPhase) -> String {
+    match phase {
+        CancellationPhase::Requesting => "Interrupting…".into(),
+        CancellationPhase::Failed(error) => {
+            format!(
+                "Interrupt failed: {}  Ctrl+C: retry",
+                truncate_for_compact_tray(error)
+            )
         }
     }
 }
 
-fn full_cancellation_message(phase: &CancellationPhase, has_execution_id: bool) -> String {
-    match (phase, has_execution_id) {
-        (CancellationPhase::Requesting, _) => {
-            "Requesting cancellation…  Esc: back to editor  Ctrl+D: exit immediately".into()
+fn full_cancellation_message(phase: &CancellationPhase) -> String {
+    match phase {
+        CancellationPhase::Requesting => {
+            "Interrupting…  Esc: back to editor  Ctrl+D: exit immediately".into()
         }
-        (CancellationPhase::Abandoning, _) => {
-            "Resuming with a new execution…  Prior work may still be running.  Esc: back to editor  Ctrl+D: exit".into()
+        CancellationPhase::Failed(error) => {
+            format!("Interrupt failed: {error}  Ctrl+C: retry  Ctrl+D: exit anyway  Esc: back")
         }
-        (CancellationPhase::Unconfirmed, true) => {
-            "Cancellation unconfirmed. Prior work may still be running.  Ctrl+C: retry  Esc: resume anyway  Ctrl+D: exit".into()
-        }
-        (CancellationPhase::Unconfirmed, false) => {
-            "Cancellation unconfirmed. Prior work may still be running.  Ctrl+C: retry  Esc: back to editor  Ctrl+D: exit".into()
-        }
-        (CancellationPhase::Failed(error), true) => {
-            format!("Cancellation request failed: {error}  Prior work may still be running.  Ctrl+C: retry  Esc: resume anyway  Ctrl+D: exit")
-        }
-        (CancellationPhase::Failed(error), false) => {
-            format!("Cancellation request failed: {error}  Prior work may still be running.  Ctrl+C: retry  Esc: back to editor  Ctrl+D: exit")
-        }
-    }
-}
-
-pub(crate) async fn monitor_execution(
-    config: &harnx_runtime::config::GlobalConfig,
-    events: &mpsc::UnboundedSender<crate::types::TuiEvent>,
-    target: &(String, String),
-) {
-    while !events.is_closed() {
-        let snapshot = config.read().clone();
-        let read = async {
-            let js = snapshot.nats_jetstream(&target.1).await?;
-            let bucket = js.get_key_value(harnx_execution_control::BUCKET).await?;
-            let store = harnx_execution_control::ExecutionStore::from_store(bucket);
-            let Some(mut operation) = store.current(&target.0).await? else {
-                return Ok::<_, anyhow::Error>(());
-            };
-            if let Some(stop) = store.accepted_stop(&operation.reference).await? {
-                // UI snapshot only. Cleanup convergence is not logical activity.
-                operation.stop_decision = Some(stop.decision);
-            } else {
-                operation = store.status(&operation.reference).await?;
-            }
-            let _ = events.send(crate::types::TuiEvent::ExecutionState {
-                cluster: target.1.clone(),
-                operation,
-            });
-            Ok(())
-        };
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), read).await;
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }

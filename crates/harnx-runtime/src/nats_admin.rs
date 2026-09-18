@@ -51,18 +51,6 @@ pub(crate) async fn delete_remote_session_by_key(
 ) -> Result<SessionDeleteResult> {
     let jetstream = config.nats_jetstream(cluster).await?;
     let lease_bucket = load_optional_lease_bucket(config, cluster).await?;
-    match jetstream
-        .get_key_value(harnx_execution_control::BUCKET)
-        .await
-    {
-        Ok(store) => {
-            harnx_execution_control::ExecutionStore::from_store(store)
-                .purge_session(session_id)
-                .await?
-        }
-        Err(error) if kv_bucket_missing(&error) => {}
-        Err(error) => return Err(error.into()),
-    }
     let stream_deleted = delete_session_stream(&jetstream, session_id).await?;
     let lease_deleted = delete_session_lease(lease_bucket, session_id).await?;
     match jetstream

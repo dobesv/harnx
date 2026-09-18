@@ -1,4 +1,4 @@
 ---
 harnx: minor
 ---
-Make session cancellation durable and generation-scoped, propagate it through tools, hooks, and nested sub-agents, and keep new prompts blocked until shutdown is confirmed. Add direct child cancellation controls, static unconfirmed/retry states, and a responsive full-width TUI exit tray that exits on durable acceptance. Upgrade the internal tool protocol to v2; deploy frontends, workers, and tool servers together because v1 tool registrations are rejected.
+Add a responsive full-width TUI exit tray that shows the outcome of an interrupt and exits once it is accepted, holding on a static state with a retry when the request fails. Add direct cancellation controls for a selected child session, and carry an interrupt through tools, hooks and nested sub-agents.

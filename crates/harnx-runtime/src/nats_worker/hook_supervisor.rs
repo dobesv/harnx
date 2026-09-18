@@ -190,8 +190,11 @@ impl Drop for HookServerSupervisor {
         let client = self.client.clone();
         let instance_id = self.instance_id.clone();
         let manager = self._process_manager.clone();
-        // Names are generated per supervisor. Old cleanup cannot deregister G2.
-        harnx_execution_control::CleanupTasks::process().spawn(async move {
+        // Drop cannot await, so the teardown is detached. Registration names are
+        // generated per supervisor, so it can only ever remove this
+        // supervisor's own entries: a replacement that has already registered
+        // under new names is untouched however late this lands.
+        tokio::spawn(async move {
             for task in &tasks {
                 task.abort();
             }

@@ -40,14 +40,8 @@ impl Tui {
         {
             return true;
         }
-        // The row's attested invocation ID is the expected execution generation;
-        // the coordinator rejects old rows after a child session is reused.
         self.exit_after_cancel = false;
-        self.start_cancellation(
-            view.key.storage_key(),
-            view.key.cluster,
-            Some(progress.snapshot.invocation_id),
-        );
+        self.start_cancellation(view.key.storage_key(), view.key.cluster);
         true
     }
 

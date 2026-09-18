@@ -24,7 +24,7 @@ use std::collections::HashMap;
 /// (`replay_nats_entries_into_session_with_policy`) rejects `Unknown`,
 /// so old workers cannot read transcripts containing new variants.
 /// Deploy readers before writers in multi-instance clusters.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum SessionLogEntry {
     #[serde(rename = "message")]
@@ -57,8 +57,20 @@ pub enum SessionLogEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fence_token: Option<u64>,
     },
+    /// Terminator for the turn in progress at this sequence. Anyone may write
+    /// it: a frontend, a parent session, or the worker on local abort. A writer
+    /// without a lease uses `fence_token: 0`.
     #[serde(rename = "cancel")]
-    Cancel { fence_token: u64 },
+    Cancel {
+        #[serde(default)]
+        fence_token: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<DateTime<Utc>>,
+    },
     /// Results for the immediately preceding `ToolCalls` entry.
     #[serde(rename = "tool_results")]
     ToolResults {
@@ -160,6 +172,17 @@ pub enum SessionLogEntry {
 }
 
 impl SessionLogEntry {
+    /// Build a lease-free cancellation request: `fence_token: 0`, timestamped now.
+    /// Used by writers that hold no lease (a frontend or a parent session).
+    pub fn cancel_request(cancellation_id: String, requested_by: String) -> Self {
+        Self::Cancel {
+            fence_token: 0,
+            cancellation_id: Some(cancellation_id),
+            requested_by: Some(requested_by),
+            timestamp: Some(Utc::now()),
+        }
+    }
+
     /// Stamp the fence token on worker-originated entries that carry one
     /// (`Message`, `ToolCalls`). Other variants are left unchanged: `Cancel`,
     /// `Error`, and `TurnEnd` carry their fence at construction, while
@@ -185,7 +208,7 @@ impl SessionLogEntry {
         match self {
             SessionLogEntry::Message { fence_token, .. }
             | SessionLogEntry::ToolCalls { fence_token, .. } => *fence_token,
-            SessionLogEntry::Cancel { fence_token }
+            SessionLogEntry::Cancel { fence_token, .. }
             | SessionLogEntry::Error { fence_token, .. }
             | SessionLogEntry::TurnEnd { fence_token, .. }
             | SessionLogEntry::HitlApprovalRequested { fence_token, .. }
@@ -207,7 +230,7 @@ pub fn max_worker_fence_token(entries: &[SessionLogEntry]) -> Option<u64> {
 /// A single tool-call result as persisted in the session log. Matches
 /// the corresponding `ToolCall` in the preceding `ToolCalls` entry by
 /// `id` (or by position when `id` is absent).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ToolOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -708,45 +731,35 @@ mod tests {
         }
     }
 
+    /// Serialises `entry` to YAML, deserialises it back, and asserts the round
+    /// trip reproduces `entry` exactly via the derived `PartialEq`. Returns the
+    /// serialised YAML so callers can assert on its exact text.
+    fn assert_entry_round_trips(entry: SessionLogEntry) -> String {
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(round_tripped, entry);
+        yaml
+    }
+
     #[test]
     fn session_log_entry_tool_calls_timestamp_serde_round_trip() {
-        let entry = SessionLogEntry::ToolCalls {
+        let yaml = assert_entry_round_trips(SessionLogEntry::ToolCalls {
             text: "doing work".to_string(),
             thought: None,
             calls: vec![],
             timestamp: Some(Utc::now()),
             fence_token: None,
-        };
-
-        let yaml = serde_yaml::to_string(&entry).unwrap();
+        });
         assert!(yaml.contains("timestamp:"));
-
-        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
-        match round_tripped {
-            SessionLogEntry::ToolCalls { timestamp, .. } => {
-                assert!(timestamp.is_some());
-            }
-            other => panic!("expected tool_calls, got {other:?}"),
-        }
     }
 
     #[test]
     fn session_log_entry_tool_results_timestamp_serde_round_trip() {
-        let entry = SessionLogEntry::ToolResults {
+        let yaml = assert_entry_round_trips(SessionLogEntry::ToolResults {
             results: vec![],
             timestamp: Some(Utc::now()),
-        };
-
-        let yaml = serde_yaml::to_string(&entry).unwrap();
+        });
         assert!(yaml.contains("timestamp:"));
-
-        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
-        match round_tripped {
-            SessionLogEntry::ToolResults { timestamp, .. } => {
-                assert!(timestamp.is_some());
-            }
-            other => panic!("expected tool_results, got {other:?}"),
-        }
     }
 
     #[test]
@@ -835,38 +848,25 @@ content: replacement two
 
     #[test]
     fn session_log_entry_cancel_serde_round_trip() {
-        let entry = SessionLogEntry::Cancel { fence_token: 42 };
-
-        let yaml = serde_yaml::to_string(&entry).unwrap();
-        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
-
+        let yaml = assert_entry_round_trips(SessionLogEntry::Cancel {
+            fence_token: 42,
+            cancellation_id: None,
+            requested_by: None,
+            timestamp: None,
+        });
         assert_eq!(yaml, "type: cancel\nfence_token: 42\n");
-        match round_tripped {
-            SessionLogEntry::Cancel { fence_token } => {
-                assert_eq!(fence_token, 42);
-            }
-            other => panic!("expected cancel, got {other:?}"),
-        }
     }
 
     #[test]
     fn session_log_entry_error_serde_round_trip() {
-        let entry = SessionLogEntry::Error {
+        // The round trip's `PartialEq` equality (inside the helper) already
+        // covers `fence_token` and `message` surviving intact; no serialised
+        // text is asserted here, so there's nothing to check beyond that.
+        assert_entry_round_trips(SessionLogEntry::Error {
             message: "Template error in agent 'sisyphus': undefined value".to_string(),
             fence_token: 7,
             timestamp: None,
-        };
-
-        let yaml = serde_yaml::to_string(&entry).unwrap();
-        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
-
-        assert_eq!(round_tripped.fence_token(), Some(7));
-        match round_tripped {
-            SessionLogEntry::Error { message, .. } => {
-                assert!(message.contains("undefined value"));
-            }
-            other => panic!("expected error, got {other:?}"),
-        }
+        });
     }
 
     #[test]
@@ -918,7 +918,12 @@ content: replacement two
 
     #[test]
     fn cancel_entry_reports_its_fence_token() {
-        let cancel = SessionLogEntry::Cancel { fence_token: 5 };
+        let cancel = SessionLogEntry::Cancel {
+            fence_token: 5,
+            cancellation_id: None,
+            requested_by: None,
+            timestamp: None,
+        };
         assert_eq!(cancel.fence_token(), Some(5));
     }
 
@@ -946,7 +951,12 @@ content: replacement two
                 timestamp: None,
                 fence_token: Some(8),
             },
-            SessionLogEntry::Cancel { fence_token: 6 },
+            SessionLogEntry::Cancel {
+                fence_token: 6,
+                cancellation_id: None,
+                requested_by: None,
+                timestamp: None,
+            },
         ];
         assert_eq!(max_worker_fence_token(&entries), Some(8));
         assert_eq!(max_worker_fence_token(&[]), None);
@@ -1266,5 +1276,37 @@ field: value
             ..Default::default()
         };
         assert!(session.mid_loop_title_interval_elapsed(60));
+    }
+}
+
+#[cfg(test)]
+mod cancel_entry_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_cancel_entry_still_deserializes() {
+        let entry: SessionLogEntry =
+            serde_json::from_str(r#"{"type":"cancel","fence_token":7}"#).unwrap();
+        assert!(matches!(
+            entry,
+            SessionLogEntry::Cancel {
+                fence_token: 7,
+                cancellation_id: None,
+                requested_by: None,
+                timestamp: None
+            }
+        ));
+    }
+
+    #[test]
+    fn cancel_request_round_trips_and_omits_empty_fields() {
+        let entry = SessionLogEntry::cancel_request("c-1".into(), "tui:abc".into());
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""cancellation_id":"c-1""#));
+        assert!(json.contains(r#""requested_by":"tui:abc""#));
+        assert!(json.contains(r#""fence_token":0"#));
+        let back: SessionLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.fence_token(), Some(0));
+        assert_eq!(back, entry);
     }
 }

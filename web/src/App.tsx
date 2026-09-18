@@ -115,30 +115,13 @@ const MyMessage = () => {
 
 const CANCELLATION_PHASE_LABELS: Record<string, string> = {
   idle: 'Stop',
-  requesting: 'Requesting cancellation…',
-  stopping: 'Stopping…',
-  abandoning: 'Resuming…',
-  failed: 'Cancellation request failed — Retry',
+  requesting: 'Interrupting…',
+  failed: 'Interrupt failed — Retry',
 };
 
-const CancellationActions = ({ phase, stop, resumeAnyway }: Pick<CancellationControl, 'phase' | 'stop' | 'resumeAnyway'>) => {
-  if (phase === 'unconfirmed') {
-    const confirmResume = () => {
-      if (window.confirm('Resume anyway? Prior work may still be running.')) void resumeAnyway();
-    };
-    return (
-      <span className="aui-cancel-actions">
-        <button type="button" className="aui-cancel-button aui-cancel-btn-text" onClick={() => void stop()}>
-          Retry cancellation
-        </button>
-        <button type="button" className="aui-cancel-button aui-cancel-btn-text aui-cancel-btn-secondary" onClick={confirmResume}>
-          Resume anyway
-        </button>
-      </span>
-    );
-  }
+const CancellationActions = ({ phase, stop }: Pick<CancellationControl, 'phase' | 'stop'>) => {
   const label = CANCELLATION_PHASE_LABELS[phase];
-  const isDisabled = phase === 'requesting' || phase === 'stopping' || phase === 'abandoning';
+  const isDisabled = phase === 'requesting';
 
   if (phase === 'idle' || isDisabled) {
     return (
@@ -324,7 +307,7 @@ export const MyComposer = ({
 }) => {
   const { setErrorText } = useContext(PendingContext);
   const { phase } = useContext(CancellationContext);
-  const cancelling = phase !== 'idle';
+  const interrupting = phase === 'requesting';
   const composerRuntime = useAui().composer;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [isSending, setIsSending] = useState(false);
@@ -377,7 +360,7 @@ export const MyComposer = ({
     collapseTextarea();
   }, [composerRuntime, collapseTextarea]);
 
-  const submissionDisabled = isSending || cancelling;
+  const submissionDisabled = isSending || interrupting;
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (submissionDisabled) return;
@@ -456,7 +439,7 @@ export const MyComposer = ({
         placeholder={placeholder}
         render={
           <textarea
-            disabled={isSending || cancelling}
+            disabled={submissionDisabled}
             ref={setTextareaRef}
             rows={1}
             onInput={(e) => {
@@ -467,7 +450,7 @@ export const MyComposer = ({
         }
       />
       <div className="aui-composer-controls">
-        <ComposerPrimitive.AddAttachment disabled={isSending || cancelling} className="aui-composer-add-attachment aui-composer-icon-btn" aria-label="Attach file" title="Attach file">
+        <ComposerPrimitive.AddAttachment disabled={submissionDisabled} className="aui-composer-add-attachment aui-composer-icon-btn" aria-label="Attach file" title="Attach file">
           <AttachIcon />
           <span className="aui-visually-hidden">Attach file</span>
         </ComposerPrimitive.AddAttachment>
@@ -480,7 +463,7 @@ export const MyComposer = ({
           <AgentSessionMenu {...menuProps} />
         </div>
         
-        <button disabled={isSending || cancelling} type="submit" className="aui-composer-send aui-composer-icon-btn" aria-label={sendLabel} title={sendLabel}>
+        <button disabled={submissionDisabled} type="submit" className="aui-composer-send aui-composer-icon-btn" aria-label={sendLabel} title={sendLabel}>
           {isSending ? <span className="aui-spinner"><span></span></span> : <SendIcon />}
           <span className="aui-visually-hidden">{sendLabel}</span>
         </button>
@@ -506,12 +489,12 @@ export const StatusIndicator = ({ isRunning, statusText }: { isRunning: boolean,
   const { phase } = useContext(CancellationContext);
   return (
   <div className="aui-status-left">
-    {isRunning && phase !== 'unconfirmed' && phase !== 'failed' ? (
+    {isRunning && phase !== 'failed' ? (
       <span className="aui-spinner"><span></span></span>
     ) : (
       <span className="aui-idle-dot"></span>
     )}
-    <span className="aui-status-text">{phase !== 'idle' ? (phase === 'unconfirmed' ? 'Cancellation unconfirmed' : phase === 'abandoning' ? 'Resuming…' : 'Cancelling') : statusText || (isRunning ? 'Running...' : 'Idle')}</span>
+    <span className="aui-status-text">{phase === 'requesting' ? 'Interrupting…' : statusText || (isRunning ? 'Running...' : 'Idle')}</span>
   </div>
 );
 };

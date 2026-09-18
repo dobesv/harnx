@@ -196,4 +196,4 @@ export async function markUnread(
   return sessionRpcStatusCall({ agent, session }, 'session/mark_unread');
 }
 
-export { abandonCancellation, cancel, sessionControl, CANCELLATION_TIMEOUT_MS } from './cancellationApi';
+export { cancel, sessionControl, CANCELLATION_TIMEOUT_MS } from './cancellationApi';

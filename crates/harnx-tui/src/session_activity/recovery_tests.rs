@@ -52,11 +52,22 @@ async fn nats_durable_refresh_preserves_queued_handoff() {
         event_rx.try_recv(),
         Ok(TuiEvent::SessionActivity { active: false, .. })
     ));
+
     let buffered = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
         .unwrap()
         .unwrap();
-    assert!(forward_advisory(&forwarder, buffered, &mut active));
+    // Not `stream.should_render`: the live filter here ignores the durable
+    // read cursor entirely (see `forward_advisory`'s call site in
+    // `monitor.rs`), so a refresh landing between the handoff and its
+    // advisory draining must never cost the handoff its only delivery path.
+    let should_render = forwarder.live.should_render(&buffered, 0);
+    assert!(forward_advisory(
+        &forwarder,
+        buffered,
+        should_render,
+        &mut active
+    ));
     assert!(matches!(
         event_rx.try_recv(),
         Ok(TuiEvent::SessionAgent {
@@ -211,8 +222,7 @@ async fn queue_completed_handoff(
             handoff_tool_call_id: None,
             after_seq: Some(handoff_seq),
         }),
-    )
-    .with_execution_id("source-generation");
+    );
     client
         .publish(
             events_subject(session_id),
@@ -234,11 +244,10 @@ async fn queue_completed_handoff(
 }
 
 #[test]
-fn old_advisory_with_high_after_seq_never_reaches_shared_queue() {
+fn advisory_rejected_by_should_render_never_reaches_shared_queue() {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let target = ("session".into(), "cluster".into());
     let live = LiveEventState::default();
-    live.select(Some("g2".into()));
     let forwarder = SessionEventForwarder {
         event_tx: &event_tx,
         target: &target,
@@ -247,40 +256,23 @@ fn old_advisory_with_high_after_seq_never_reaches_shared_queue() {
         attached_during_turn: true,
     };
     let mut active = true;
+    // A very high after_seq alone must not cause a rejected advisory to be
+    // forwarded — should_render (the caller's fence check) always wins.
     for event in crate::event_isolation::tests::old_events() {
-        let envelope = AdvisoryEnvelope::new(u64::MAX, event).with_execution_id("g1");
-        assert!(forward_advisory(&forwarder, envelope, &mut active));
-        assert!(active, "old Turn::Ended changed shared activity");
+        let envelope = AdvisoryEnvelope::new(u64::MAX, event);
+        assert!(forward_advisory(&forwarder, envelope, false, &mut active));
+        assert!(
+            active,
+            "a rejected advisory must not change shared activity"
+        );
         assert!(event_rx.try_recv().is_err());
     }
-    live.stop("g2");
-    for event in crate::event_isolation::tests::old_events() {
-        assert!(forward_advisory(
-            &forwarder,
-            AdvisoryEnvelope::new(u64::MAX, event).with_execution_id("g2"),
-            &mut active
-        ));
-    }
-    assert!(active);
-    assert!(event_rx.try_recv().is_err());
 }
 
 async fn admit_source_user(
     jetstream: &async_nats::jetstream::Context,
     session: &str,
 ) -> (NatsSessionLog, u64) {
-    let store = harnx_execution_control::ExecutionStore::ensure(jetstream, 1)
-        .await
-        .unwrap();
-    store
-        .session(session, None, Some("source-generation"))
-        .await
-        .unwrap();
-    let operation = store.current(session).await.unwrap().unwrap();
-    store
-        .reserve_prompt(&operation.reference, "user")
-        .await
-        .unwrap();
     let log = NatsSessionLog::new(jetstream.clone(), session);
     let user_seq = log
         .append_event_async(&SessionLogEntry::Message {
@@ -290,10 +282,6 @@ async fn admit_source_user(
             timestamp: None,
             fence_token: None,
         })
-        .await
-        .unwrap();
-    store
-        .commit_prompt(&operation.reference, "user", user_seq)
         .await
         .unwrap();
     (log, user_seq)

@@ -50,6 +50,11 @@ impl SessionActivate {
         self
     }
 
+    pub fn with_requested_seq(mut self, seq: u64) -> Self {
+        self.requested_seq = Some(seq);
+        self
+    }
+
     pub fn targeted(
         session_id: impl Into<String>,
         requested_seq: u64,

@@ -1,9 +1,9 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonCancellation, cancel, sessionControl } from '../api';
+import { cancel, sessionControl } from '../api';
 import { useCancellation } from '../useCancellation';
-import type { CancelResult, SessionControlState } from '../types';
-vi.mock('../api', () => ({ abandonCancellation: vi.fn(), cancel: vi.fn(), sessionControl: vi.fn() }));
+import type { CancelResult } from '../types';
+vi.mock('../api', () => ({ cancel: vi.fn(), sessionControl: vi.fn() }));
 beforeEach(() => vi.resetAllMocks());
 afterEach(() => vi.useRealTimers());
 
@@ -14,85 +14,61 @@ function deferred<T>() {
 }
 
 async function testStopError(error: unknown) {
-  vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_state: 'running', canPrompt: true });
+  vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, canPrompt: true });
   vi.mocked(cancel).mockRejectedValue(error);
   const { result } = renderHook(() => useCancellation('agent', 'session'));
   await act(async () => { await result.current.stop(); });
   return result.current.phase;
 }
 
-async function testResumeAnywayError(error: unknown) {
-  vi.mocked(sessionControl).mockResolvedValue({
-    state: { status: 'cancel_unconfirmed', cancellation: { cancelled: true, disposition: 'unconfirmed', execution_id: 'execution' } },
-  });
-  vi.mocked(abandonCancellation).mockRejectedValue(error);
-  const { result } = renderHook(() => useCancellation('agent', 'session'));
-  await waitFor(() => expect(result.current.phase).toBe('unconfirmed'));
-  await act(async () => { await result.current.resumeAnyway(); });
-  return result.current.phase;
-}
-
 describe('root cancellation state', () => {
-  it('lets the server distinguish a progressing cascade from unconfirmed work', async () => {
-    vi.useFakeTimers();
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'cancelling', cancellation: { cancelled: true, disposition: 'quiescing' } } });
-    const { result } = renderHook(() => useCancellation('agent', 'session'));
-    await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
-    expect(result.current.phase).toBe('stopping');
-    vi.mocked(sessionControl).mockRejectedValue(new Error('connection lost'));
-    await act(async () => { await vi.advanceTimersByTimeAsync(5500); });
-    expect(result.current.phase).toBe('unconfirmed');
-  });
-
-  it('does not clear a pending request from an older idle status response', async () => {
-    const hydration = deferred<SessionControlState>();
+  it('stop() moves to requesting then idle on accepted', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' } });
     const acceptance = deferred<CancelResult>();
-    vi.mocked(sessionControl).mockReturnValue(hydration.promise);
     vi.mocked(cancel).mockReturnValue(acceptance.promise);
     const { result } = renderHook(() => useCancellation('agent', 'session'));
     act(() => { void result.current.stop(); });
     expect(result.current.phase).toBe('requesting');
-    await act(async () => { hydration.resolve({ state: { status: 'idle' }, canPrompt: true }); });
+    // A hydration answered while the request is in flight must not clear it.
+    await act(async () => { await Promise.resolve(); });
     expect(result.current.phase).toBe('requesting');
-    await act(async () => { acceptance.resolve({ cancelled: true, disposition: 'requested', execution_id: 'execution' }); });
-    expect(result.current.phase).toBe('stopping');
-  });
-
-  it('hydrates unconfirmed and later converges to cancelled', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'cancel_unconfirmed', cancellation: { cancelled: true, disposition: 'unconfirmed', execution_id: 'execution' } } });
-    const { result } = renderHook(() => useCancellation('agent', 'session'));
-    await waitFor(() => expect(result.current.phase).toBe('unconfirmed'));
-    act(() => result.current.observe({ cancelled: true, disposition: 'cancelled', execution_id: 'execution' }));
+    await act(async () => { acceptance.resolve({ outcome: 'accepted', cancel_seq: 7 }); });
     expect(result.current.phase).toBe('idle');
+    expect(cancel).toHaveBeenCalledWith('agent', 'session');
   });
 
-  it('abandons only the execution observed in the unconfirmed receipt', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'cancel_unconfirmed', cancellation: { cancelled: true, disposition: 'unconfirmed', execution_id: 'execution' } } });
-    vi.mocked(abandonCancellation).mockResolvedValue({ cancelled: true, disposition: 'cancelled', execution_id: 'execution', abandoned: true });
-    const { result } = renderHook(() => useCancellation('agent', 'session'));
-    await waitFor(() => expect(result.current.phase).toBe('unconfirmed'));
-    await act(async () => { await result.current.resumeAnyway(); });
-    expect(abandonCancellation).toHaveBeenCalledWith('agent', 'session', 'execution');
-    expect(result.current.phase).toBe('idle');
-  });
-
-  it('keeps a failed request actionable even when the running session permits prompts', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_state: 'running', canPrompt: true });
+  it('stop() keeps failed actionable on a genuine error', async () => {
+    vi.useFakeTimers();
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, canPrompt: true });
     vi.mocked(cancel).mockRejectedValue(new Error('broker unavailable'));
     const { result } = renderHook(() => useCancellation('agent', 'session'));
     await act(async () => { await result.current.stop(); });
     expect(result.current.phase).toBe('failed');
+    // Hydrating a session that is still running must leave the retry offered.
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    expect(result.current.phase).toBe('failed');
   });
 
-  it('ignores a late receipt after navigating to another session', async () => {
+  it('ignores a late outcome after navigating to another session', async () => {
     vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'idle' } });
     const acceptance = deferred<CancelResult>();
     vi.mocked(cancel).mockReturnValue(acceptance.promise);
     const { result, rerender } = renderHook(({ session }) => useCancellation('agent', session), { initialProps: { session: 'old' } });
     act(() => { void result.current.stop(); });
+
+    // The session we navigate to is mid-interrupt of its own. The outcome that
+    // arrives late belongs to the session we left and must not clear it.
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'interrupting' } });
     rerender({ session: 'new' });
-    await act(async () => { acceptance.resolve({ cancelled: true, disposition: 'requested' }); });
-    expect(result.current.phase).toBe('idle');
+    await waitFor(() => expect(result.current.phase).toBe('requesting'));
+    await act(async () => { acceptance.resolve({ outcome: 'accepted', cancel_seq: 3 }); });
+    expect(result.current.phase).toBe('requesting');
+  });
+
+  it('hydrates a session whose interrupt is still being appended as requesting', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'interrupting' } });
+    const { result } = renderHook(() => useCancellation('agent', 'session'));
+    await waitFor(() => expect(result.current.phase).toBe('requesting'));
   });
 
   it('aborts the in-flight sessionControl call on unmount', () => {
@@ -118,15 +94,5 @@ describe('root cancellation state', () => {
   it('swallows TimeoutError in stop() without moving phase to failed (#1861)', async () => {
     const phase = await testStopError(new DOMException('Request timeout', 'TimeoutError'));
     expect(phase).toBe('requesting');
-  });
-
-  it('swallows abort/timeout errors in resumeAnyway() without moving phase to unconfirmed (#1838, #1861)', async () => {
-    const phase = await testResumeAnywayError(new DOMException('signal is aborted without reason', 'AbortError'));
-    expect(phase).toBe('abandoning');
-  });
-
-  it('moves phase to unconfirmed when resumeAnyway() encounters a genuine error', async () => {
-    const phase = await testResumeAnywayError(new Error('Network failure'));
-    expect(phase).toBe('unconfirmed');
   });
 });

@@ -37,14 +37,11 @@ export interface JsonRpcResponse<T = unknown> {
   };
 }
 
+// What `session/cancel` answered: the session log either took a new `Cancel`,
+// already had one for this turn, or had no turn to stop.
 export interface CancelResult {
-  cancelled: boolean;
-  disposition?: 'idle' | 'requested' | 'already_requested' | 'quiescing' | 'cancelled' | 'unconfirmed';
-  execution_id?: string | null;
-  cancellation_id?: string | null;
-  requested_at?: string | null;
-  unconfirmed_after_ms?: number;
-  abandoned?: boolean;
+  outcome: 'idle' | 'accepted' | 'already_interrupted';
+  cancel_seq?: number;
 }
 
 export interface PromptResult {
@@ -52,10 +49,13 @@ export interface PromptResult {
   run_id: string;
 }
 
+// `running` covers both a turn this server is driving and one a worker holds
+// the session lease for; `awaiting_approval` is a gate waiting on a decision,
+// which is not an interrupt and must not be shown as one.
+export type SessionStatus = 'idle' | 'running' | 'interrupting' | 'interrupted' | 'awaiting_approval';
+
 export interface SessionControlState {
-  execution_state?: "preparing" | "running" | "cancel_requested" | "quiescing" | "unconfirmed" | "completed" | "cancelled";
-  state: { status: string; cancellation?: CancelResult };
-  execution_id?: string;
+  state: { status: SessionStatus; cancel_seq?: number };
   canPrompt?: boolean;
   canCancel?: boolean;
 }

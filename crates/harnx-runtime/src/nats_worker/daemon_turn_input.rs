@@ -2,12 +2,15 @@
 //! tombstones, resumable in-flight turns, and queued next-turn messages.
 
 use super::agent_loop::fold_new_user_messages_since;
+use super::ancestor_check::{check_ancestors, AncestorVerdict};
 use super::backend::NatsSessionLogBackend;
 use super::daemon::SessionActivate;
 use super::session_turn::TurnWorker;
 use crate::config::{GlobalConfig, Input};
 use crate::nats_lease::NatsSessionLease;
+use crate::nats_session::{interrupt_session, InterruptRequest};
 use anyhow::{Context, Result};
+use harnx_core::session_reconstruct::TurnStatus;
 
 /// Shared, borrowed context for the `derive_*_turn_input` helpers. Groups the
 /// three references they all thread through so each helper stays within the
@@ -110,41 +113,28 @@ impl TurnWorker {
             reconstructed.resumable_ctx.is_some(),
         );
         let (mut input, seed_cursor) = match reconstructed.turn_status {
-            harnx_core::session_reconstruct::TurnStatus::InFlightCancelled => {
-                // Terminal: Cancel tombstone prevents resume. Do NOT consume pending.
-                // The turn is idle; wait for new user input or activation.
-                log::info!(
-                    "session has cancelled turn tombstone; not resuming (session_id={})",
-                    activation.session_id
-                );
-                (crate::config::input::from_str(per_session, "", None), None)
+            // Wind-up is the activation preflight's job; a steering message
+            // queued behind the Cancel is the only thing left to run here.
+            TurnStatus::InterruptedPendingWindUp { .. } | TurnStatus::Idle => {
+                self.derive_idle_turn_input(
+                    activation,
+                    per_session,
+                    reconstructed.next_turn_messages,
+                )
+                .await
             }
-            harnx_core::session_reconstruct::TurnStatus::InFlightResumable => self
-                .derive_resumable_turn_input(
-                    ctx,
-                    lease,
-                    ResumableTurnState {
-                        context: reconstructed.resumable_ctx.as_ref(),
-                        next_turn_messages: &reconstructed.next_turn_messages,
-                    },
-                )?,
-            harnx_core::session_reconstruct::TurnStatus::Idle => {
-                let msg_count = reconstructed.next_turn_messages.len();
-                let result = self
-                    .derive_idle_turn_input(
-                        activation,
-                        per_session,
-                        reconstructed.next_turn_messages,
-                    )
-                    .await;
-                // DEBUG: log the seed_cursor for this path
-                log::debug!(
-                    "derive_turn_input idle: session_id={} seed_cursor={:?} messages_count={}",
-                    activation.session_id,
-                    result.1,
-                    msg_count,
-                );
-                result
+            TurnStatus::InFlightResumable { .. } => {
+                match self.refuse_resume_under_interrupted_parent(backend).await? {
+                    true => (crate::config::input::from_str(per_session, "", None), None),
+                    false => self.derive_resumable_turn_input(
+                        ctx,
+                        lease,
+                        ResumableTurnState {
+                            context: reconstructed.resumable_ctx.as_ref(),
+                            next_turn_messages: &reconstructed.next_turn_messages,
+                        },
+                    )?,
+                }
             }
         };
         // The NATS worker ALWAYS operates on a session. The input is derived
@@ -160,6 +150,46 @@ impl TurnWorker {
         // burying them so they are never folded into a continuation turn.
         input.skip_user_log_append = true;
         Ok((input, seed_cursor))
+    }
+
+    /// A child session may only resume while the parent tool call that
+    /// created it is still open. When it is not, interrupt this session so the
+    /// log records why it stopped, and run nothing.
+    async fn refuse_resume_under_interrupted_parent(
+        &self,
+        backend: &NatsSessionLogBackend,
+    ) -> Result<bool> {
+        let AncestorVerdict::Interrupted {
+            parent_session,
+            cancellation_id,
+        } = check_ancestors(
+            &self.jetstream,
+            &self.session_metadata,
+            backend.session_id(),
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        log::info!(
+            "refusing to resume under interrupted parent: session_id={} parent={parent_session}",
+            backend.session_id()
+        );
+        interrupt_session(
+            &self.jetstream,
+            &self.client,
+            &self.activation_route,
+            InterruptRequest {
+                session_id: backend.session_id().to_string(),
+                cluster: self.cluster.clone(),
+                cancellation_id: cancellation_id
+                    .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+                requested_by: format!("parent:{parent_session}"),
+                reason: "parent invocation interrupted".into(),
+            },
+        )
+        .await?;
+        Ok(true)
     }
 
     /// Resumable-turn input: resume from the last user message that kicked
@@ -204,10 +234,15 @@ impl TurnWorker {
     /// Idle-state input: fold queued next-turn messages in log order.
     pub(super) async fn derive_idle_turn_input(
         &self,
-        _activation: &SessionActivate,
+        activation: &SessionActivate,
         per_session: &GlobalConfig,
         next_turn_messages: Vec<harnx_core::message::Message>,
     ) -> (Input, Option<u64>) {
+        log::debug!(
+            "derive_turn_input idle: session_id={} messages_count={}",
+            activation.session_id,
+            next_turn_messages.len(),
+        );
         let seed_cursor = next_turn_messages
             .last()
             .and_then(|message| message.log_seq.and_then(|seq| u64::try_from(seq).ok()));

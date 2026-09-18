@@ -8,29 +8,30 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct EventStamp {
     pub state: LiveEventState,
-    pub execution_id: Option<String>,
 }
 
 impl EventStamp {
-    pub fn live(state: &LiveEventState, execution_id: Option<String>) -> Self {
+    /// Stamp captured when a live advisory is admitted into the frontend queue.
+    pub fn live(state: &LiveEventState) -> Self {
         Self {
             state: state.clone(),
-            execution_id,
         }
     }
 
+    /// Stamp captured for an event synthesized from durable/recovery state.
+    /// Construction is identical to `live` — both readers race the same
+    /// attachment fence — kept as a separate name for call-site provenance.
     pub fn snapshot(state: &LiveEventState) -> Self {
-        Self::live(state, state.active())
+        Self {
+            state: state.clone(),
+        }
     }
 
+    /// Whether the attachment this stamp was captured under is still the one
+    /// `current` reads from. A retired or replaced attachment (a new prompt,
+    /// a reattached monitor) never allows a stamp captured before it.
     pub fn allows(&self, current: &LiveEventState) -> bool {
-        self.is_current(current) && current.allows(self.execution_id.as_deref())
-    }
-
-    /// Durable snapshots can describe a stopped generation. They remain history,
-    /// but a queued snapshot must not update a replacement attachment/generation.
-    pub fn is_current(&self, current: &LiveEventState) -> bool {
-        current.same_attachment(&self.state) && current.matches(self.execution_id.as_deref())
+        current.same_attachment(&self.state)
     }
 }
 
@@ -41,14 +42,10 @@ pub(crate) struct SessionObservation {
 }
 
 impl SessionObservation {
-    pub fn accepts(&self, tui: &Tui, require_live: bool) -> bool {
+    pub fn accepts(&self, tui: &Tui) -> bool {
         tui.session_activity_target.as_ref() == Some(&self.target)
             && tui.current_prompt_abort.is_none()
-            && if require_live {
-                self.stamp.allows(&tui.live_events)
-            } else {
-                self.stamp.is_current(&tui.live_events)
-            }
+            && self.stamp.allows(&tui.live_events)
     }
 }
 
@@ -69,9 +66,6 @@ impl Tui {
             }
             TuiEvent::PromptTaskFinished { task, error } => {
                 self.finish_prompt_task(task, error).await;
-            }
-            TuiEvent::ExecutionState { cluster, operation } => {
-                self.hydrate_execution_state(cluster, operation)
             }
             TuiEvent::SessionActivity {
                 historical,

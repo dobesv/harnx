@@ -1,6 +1,6 @@
 //! Shared construction and recovery operations for broker-backed sessions.
 
-use crate::types::{CancellationAction, ExitCancelFactory, ExitWorkerState, Tui};
+use crate::types::{ExitCancelFactory, ExitWorkerState, Tui};
 use anyhow::Result;
 use futures_util::FutureExt;
 use harnx_runtime::config::{GlobalConfig, LOCAL_CLUSTER_KEY};
@@ -52,7 +52,7 @@ pub(super) async fn nats_session_for_target(
     )
     .await?;
     let (session_id, initializer) = target_initializer(config, &cluster, &session_id).await?;
-    NatsSession::from_global_config(
+    let session = NatsSession::from_global_config(
         NatsSessionConfig {
             cluster,
             initializer,
@@ -62,29 +62,25 @@ pub(super) async fn nats_session_for_target(
         config,
         abort_signal,
     )
-    .await
-}
-
-/// Build a read-only cancellation status session without consulting the local
-/// worker supervisor. This session never publishes an activation.
-pub(super) async fn cancellation_status_session_for_target(
-    config: &GlobalConfig,
-    session_id: String,
-    cluster: String,
-) -> Result<NatsSession> {
-    let abort_signal = harnx_runtime::utils::create_abort_signal();
-    let (session_id, initializer) = target_initializer(config, &cluster, &session_id).await?;
-    NatsSession::from_global_config(
-        NatsSessionConfig {
-            cluster,
-            initializer,
-            session_id: Some(session_id),
-            activation_route: harnx_runtime::nats_worker::SessionActivationRoute::ClusterShared,
-        },
-        config,
-        abort_signal,
-    )
-    .await
+    .await?;
+    // A local worker's id changes across restarts, so a wind-up or resume
+    // activation addressed to a dead worker is discarded. Attaching here
+    // republishes one against the current worker before anything else runs.
+    match session.republish_pending_activation().await {
+        Ok(republished) => {
+            log::info!(
+                "attached to session {}: republished pending activation = {republished}",
+                session.storage_key()
+            );
+        }
+        Err(error) => {
+            log::warn!(
+                "attached to session {}: failed to republish pending activation: {error:#}",
+                session.storage_key()
+            );
+        }
+    }
+    Ok(session)
 }
 
 // Targets retain the storage identity even after the user changes agents.
@@ -115,58 +111,23 @@ async fn target_initializer(
         variables: metadata.variables.clone(),
         overrides: metadata.overrides.clone(),
         tool_context: harnx_runtime::nats_session_metadata::tool_context(&metadata)?,
+        parent: metadata.parent.clone(),
     };
     Ok((metadata.session_id, initializer))
 }
 
 pub(crate) fn default_exit_cancel_factory() -> ExitCancelFactory {
-    Arc::new(
-        |config, local_worker, session_id, cluster, expected_execution_id, action| {
-            Box::pin(async move {
-                match action {
-                    CancellationAction::Request => {
-                        // Worker preparation is intentionally outside the durable
-                        // request's own two-second persistence bound. Local workers
-                        // consume targeted activations, and readiness can legitimately
-                        // take longer than the cancellation CAS itself.
-                        let session =
-                            nats_session_for_target(&config, &local_worker, session_id, cluster)
-                                .await?;
-                        session
-                            .request_cancel(harnx_execution_control::CancelRequest {
-                                expected_execution_id,
-                                retry: true,
-                            })
-                            .await
-                    }
-                    CancellationAction::Abandon => {
-                        // Abandonment is a control-plane override and must not
-                        // start a replacement local worker merely to retire the
-                        // generation whose owners disappeared.
-                        let retire_local_worker = cluster == LOCAL_CLUSTER_KEY;
-                        let session =
-                            cancellation_status_session_for_target(&config, session_id, cluster)
-                                .await?;
-                        let expected_execution_id = expected_execution_id
-                            .as_deref()
-                            .ok_or_else(|| anyhow::anyhow!("cancellation generation missing"))?;
-                        let receipt = session
-                            .abandon_unconfirmed_cancellation(expected_execution_id)
-                            .await?;
-                        if receipt.abandoned && retire_local_worker {
-                            // Keep this wait in the background cancellation
-                            // future. Polling it from the TUI loop would freeze
-                            // the frame before the Abandoning state is drawn.
-                            // The composer remains locked until the old process
-                            // tree has been retired.
-                            local_worker.lock().await.take();
-                        }
-                        Ok(receipt)
-                    }
-                }
-            })
-        },
-    )
+    Arc::new(|config, local_worker, session_id, cluster| {
+        Box::pin(async move {
+            // Worker preparation is intentionally outside the durable
+            // request's own two-second persistence bound. Local workers
+            // consume targeted activations, and readiness can legitimately
+            // take longer than the cancellation CAS itself.
+            let session =
+                nats_session_for_target(&config, &local_worker, session_id, cluster).await?;
+            session.interrupt("user interrupt from tui").await
+        })
+    })
 }
 
 impl Tui {
@@ -212,7 +173,7 @@ impl Tui {
             return false;
         };
         self.exit_after_cancel = true;
-        self.start_cancellation(session_id, cluster, None);
+        self.start_cancellation(session_id, cluster);
         true
     }
 
@@ -229,14 +190,14 @@ impl Tui {
         };
         self.pending_exit_cancel = None;
         match result {
-            Ok(receipt) => {
+            Ok(outcome) => {
                 if matches!(
                     self.app.modal,
                     Some(crate::types::ModalState::ConfirmExit { .. })
                 ) {
                     self.app.modal = None;
                 }
-                self.monitor_cancellation(receipt);
+                self.monitor_interrupt(outcome);
                 self.finish_exit_after_accepted_cancellation();
             }
             Err(error) => {
@@ -279,7 +240,7 @@ impl Tui {
         self.clear_tool_confirmation_route();
         if let Some((session_id, cluster)) = self.active_remote_session.clone() {
             self.exit_after_cancel = false;
-            self.start_cancellation(session_id, cluster, None);
+            self.start_cancellation(session_id, cluster);
         }
     }
 }

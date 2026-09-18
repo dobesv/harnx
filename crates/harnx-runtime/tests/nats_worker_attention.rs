@@ -104,7 +104,7 @@ async fn setup_attention_test(
     let (store, session_id) = setup_attention_test_store(server, agent).await?;
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
-    let backend = generation::output_backend(&jetstream, &session_id)
+    let backend = generation::fenced_backend(&jetstream, &session_id)
         .await?
         .with_metadata_store(Some(store.clone()));
     Ok((store, session_id, backend))

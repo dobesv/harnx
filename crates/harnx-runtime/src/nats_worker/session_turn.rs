@@ -9,13 +9,12 @@ use super::daemon::SessionActivate;
 use super::daemon_runtime::WorkerRuntime;
 use super::daemon_session_exec::{build_durable_tool_round_callback, ToolRoundAttachmentSync};
 use super::daemon_turn_input::TurnInputCtx;
-use super::execution_control::WorkerExecution;
 use crate::config::{GlobalConfig, Input};
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_lease::NatsSessionLease;
 use anyhow::Result;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
@@ -28,6 +27,9 @@ pub(super) struct TurnWorker {
     pub call_fn: Option<crate::agent_loop::AgentCallFn>,
     pub session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     pub jetstream: async_nats::jetstream::Context,
+    /// Core NATS handle, used to publish the interrupt this worker appends
+    /// when it refuses to resume under an interrupted parent.
+    pub client: async_nats::Client,
     pub replicas: usize,
     pub worker_id: String,
 }
@@ -42,6 +44,7 @@ impl From<&WorkerRuntime> for TurnWorker {
             call_fn: worker.call_fn.clone(),
             session_metadata: worker.session_metadata.clone(),
             jetstream: worker.jetstream.clone(),
+            client: worker.client.clone(),
             replicas: worker.lease.replicas,
             worker_id: worker.worker_id.clone(),
         }
@@ -54,16 +57,21 @@ pub(super) struct SessionTurn {
     pub lease: Arc<NatsSessionLease>,
     pub abort_signal: crate::utils::AbortSignal,
     pub hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<AppliedHitlDecision>,
-    pub execution: WorkerExecution,
     pub per_session: GlobalConfig,
     pub backend: NatsSessionLogBackend,
     pub event_sink: Arc<NatsEventSink>,
     pub after_seq_observer: Arc<AtomicU64>,
+    /// Set by the session watcher the moment a user message lands. The turn
+    /// boundary consumes it so queued input runs without a new activation.
+    pub pending_input: Arc<AtomicBool>,
     pub agent_setup: Result<()>,
 }
 
 impl SessionTurn {
-    pub async fn run(mut self) -> Result<()> {
+    /// Runs this activation's turns and reports whether it is settled: whether
+    /// everything the activation was published for has now happened, so it may
+    /// be acknowledged instead of redelivered.
+    pub async fn run(mut self) -> Result<bool> {
         let event_sink = Arc::clone(&self.event_sink);
         harnx_core::sink::with_agent_event_sink(event_sink, async {
             // A half-installed agent cannot render its prompt. Let the caller
@@ -76,7 +84,7 @@ impl SessionTurn {
         .await
     }
 
-    async fn run_turns(&mut self) -> Result<()> {
+    async fn run_turns(&mut self) -> Result<bool> {
         // Includes both folded input and mid-round injections. Drain checks only
         // detect new messages; only consumed messages advance this cursor.
         let mut activation_high_water = None;
@@ -89,9 +97,10 @@ impl SessionTurn {
             let turn_cursor = Arc::new(AtomicU64::new(seed_cursor));
             advance_high_water(&mut activation_high_water, seed_cursor);
             let outcome = self.run_agent_turn(input, Arc::clone(&turn_cursor)).await?;
-            // The unmatched request keeps the tool round pending for reactivation.
+            // The unmatched request keeps the tool round pending: only the
+            // activation that follows the decision can run it.
             if outcome == NatsAgentLoopOutcome::AwaitingHitlApproval {
-                break;
+                return Ok(false);
             }
             let turn_cursor = turn_cursor.load(Ordering::SeqCst);
             advance_high_water(&mut activation_high_water, turn_cursor);
@@ -105,15 +114,15 @@ impl SessionTurn {
             // The handoff target is already activated. Reconstructing the source
             // tool result as an in-flight round would dispatch it a second time.
             if !self.is_running() || outcome == NatsAgentLoopOutcome::HandoffDispatched {
-                break;
+                return Ok(true);
             }
             // Retain the frontend-scoped activation route while draining queued
             // continuations. Requests to a detached frontend still fail closed.
             if self.finish_if_drained(activation_high_water).await? {
-                break;
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn is_running(&self) -> bool {
@@ -121,30 +130,13 @@ impl SessionTurn {
     }
 
     async fn next_turn_input(&mut self, high_water: Option<u64>) -> Result<Option<(Input, u64)>> {
-        while self.is_running() {
-            if !self.prepare_turn().await? {
-                break;
-            }
-            if let Some(input) = self.derive_input(high_water).await? {
-                return Ok(Some(input));
-            }
-            if self.seal_execution().await? {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if !self.is_running() || !self.prepare_turn().await? {
+            return Ok(None);
         }
-        Ok(None)
+        self.derive_input(high_water).await
     }
 
     async fn prepare_turn(&mut self) -> Result<bool> {
-        if let Some(fence) = &self.execution.fence {
-            crate::nats_session_log::NatsSessionLog::new(
-                self.worker.jetstream.clone(),
-                &self.activation.session_id,
-            )
-            .admit_reconstruction(fence)
-            .await?;
-        }
         let entries = self.backend.load_events_latest_async().await?;
         // Repair attention bumps lost after their durable transcript append.
         self.backend.reconcile_attention_from_log(&entries).await?;
@@ -274,11 +266,17 @@ impl SessionTurn {
             turn_cursor,
             usage,
         )
-        .await?;
-        self.execution.cover_turn(turn_cursor).await
+        .await
     }
 
     async fn finish_if_drained(&self, high_water: Option<u64>) -> Result<bool> {
+        // The watcher sees a user message the moment it lands, including one
+        // that arrives while the tail read below is in flight. Consuming that
+        // flag here costs at most one extra (empty) pass of the turn loop and
+        // closes the window where queued input would wait for a new activation.
+        if self.pending_input.swap(false, Ordering::Relaxed) {
+            return Ok(false);
+        }
         // A fresh leader-authoritative read sees our completion boundary and
         // concurrent edits/retractions. Reconstruction preserves NATS sequences.
         let tail = self.backend.load_events_latest_async().await?;
@@ -295,21 +293,7 @@ impl SessionTurn {
         );
         // Do not advance high-water here: the next turn must still consume these
         // messages. Advancing on detection would derive empty continuation input.
-        if !new_messages.is_empty() || has_resumable {
-            return Ok(false);
-        }
-        if self.seal_execution().await? {
-            return Ok(true);
-        }
-        tokio::task::yield_now().await;
-        Ok(false)
-    }
-
-    async fn seal_execution(&self) -> Result<bool> {
-        self.execution
-            .store
-            .seal(&self.execution.reference, &self.execution.owner)
-            .await
+        Ok(new_messages.is_empty() && !has_resumable)
     }
 }
 

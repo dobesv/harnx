@@ -26,8 +26,13 @@ async fn nats_session_log_rejects_transport_errors_instead_of_skipping_entries()
     let client = async_nats::connect(server.url()).await?;
     let js = async_nats::jetstream::new(client.clone());
     let log = NatsSessionLog::new(js.clone(), "read-failure");
-    log.append_event_async(&SessionLogEntry::Cancel { fence_token: 1 })
-        .await?;
+    log.append_event_async(&SessionLogEntry::Cancel {
+        fence_token: 1,
+        cancellation_id: None,
+        requested_by: None,
+        timestamp: None,
+    })
+    .await?;
     let info = client
         .request(
             format!(
@@ -74,8 +79,13 @@ async fn nats_session_log_still_skips_confirmed_retention_gaps() -> Result<()> {
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let log = NatsSessionLog::new(js.clone(), "read-gap");
     for fence_token in 1..=3 {
-        log.append_event_async(&SessionLogEntry::Cancel { fence_token })
-            .await?;
+        log.append_event_async(&SessionLogEntry::Cancel {
+            fence_token,
+            cancellation_id: None,
+            requested_by: None,
+            timestamp: None,
+        })
+        .await?;
     }
     js.get_stream(stream_name_for_session("read-gap"))
         .await?
@@ -184,7 +194,10 @@ async fn nats_session_log_orphan_repair_matches_file_replay() -> Result<()> {
     assert_eq!(loaded_yaml, expected_yaml);
 
     let state = reconstruct_state(&loaded_entries);
-    assert_eq!(state.turn_status, TurnStatus::InFlightResumable);
+    assert!(matches!(
+        state.turn_status,
+        TurnStatus::InFlightResumable { .. }
+    ));
     let resumable = state.resumable_ctx.expect("resumable ctx");
     assert_eq!(resumable.pending_tool_results.len(), 0);
     assert_eq!(resumable.fence_token, Some(77));
@@ -245,7 +258,12 @@ fn mixed_entries() -> Vec<SessionLogEntry> {
             }],
             timestamp: None,
         },
-        SessionLogEntry::Cancel { fence_token: 41 },
+        SessionLogEntry::Cancel {
+            fence_token: 41,
+            cancellation_id: None,
+            requested_by: None,
+            timestamp: None,
+        },
         SessionLogEntry::Message {
             id: None,
             role: MessageRole::Assistant,
