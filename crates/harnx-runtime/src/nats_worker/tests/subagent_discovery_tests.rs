@@ -266,14 +266,28 @@ async fn repeated_nested_delegation() {
     .await
     .expect("create parent session");
 
-    // Two complete nested turns include gate and transcript projection I/O.
-    // Keep the whole-turn CI deadline separate from cancellation latency bounds.
+    // Two complete nested turns cost about four seconds of transcript
+    // projection I/O on an idle machine. This backstop only exists to turn a
+    // wedged turn into a message instead of a hang, so it sits far above that:
+    // a contended CI runner has been measured taking well over ten times the
+    // idle cost for broker-backed work, and a backstop inside that range
+    // reports a slow runner as a broken turn. Stay under nextest's own
+    // terminate-after so the panic below is what surfaces.
+    const PARENT_TURN_BACKSTOP: Duration = Duration::from_secs(180);
+    let started = std::time::Instant::now();
     let result = tokio::time::timeout(
-        Duration::from_secs(60),
+        PARENT_TURN_BACKSTOP,
         session.run_turn("delegate twice", Arc::new(NoopEventSink), None),
     )
     .await
-    .expect("parent turn timed out")
+    .unwrap_or_else(|_| {
+        panic!(
+            "parent turn did not finish within {}s (idle cost is ~4s, elapsed {:?}); \
+             the second delegation never completed",
+            PARENT_TURN_BACKSTOP.as_secs(),
+            started.elapsed()
+        )
+    })
     .expect("parent turn failed");
     assert_eq!(
         result.response.as_deref(),

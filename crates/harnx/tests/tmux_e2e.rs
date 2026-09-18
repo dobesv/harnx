@@ -133,7 +133,20 @@ fn normalize_screen(screen: &str) -> String {
         .map(|line| line.trim_end())
         .collect::<Vec<_>>()
         .join("\n");
-    mask_harnx_version(&trimmed)
+    strip_unread_indicator(&mask_harnx_version(&trimmed))
+}
+
+/// Drop the input title's unread dot so snapshots don't depend on whether the
+/// session's read-state invalidation landed before the screen was captured.
+///
+/// A finished turn bumps the session's attention state, and the TUI only
+/// learns about it when the invalidation event arrives -- which can be after
+/// the screen has already gone stable. Nothing clears the dot until the next
+/// keypress, so a capture taken with no further input keeps whichever side of
+/// that race it saw. Unread behaviour has its own coverage; these snapshots
+/// are about transcript rendering.
+fn strip_unread_indicator(text: &str) -> String {
+    text.replace("\u{25cf} ", "")
 }
 
 /// Replace the literal version in the welcome banner (and anywhere else
