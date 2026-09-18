@@ -788,6 +788,11 @@ impl Tui {
             Box::pin(self.run_command(&pending.text)).await?;
             self.refresh_input_chrome();
         } else {
+            // Prompt task cleans the delivered temp dir; drop its live mirror to avoid
+            // re-sending deleted attachment files (#1917).
+            self.app.attachments.clear();
+            self.app.attachment_dir = None;
+            self.app.paste_count = 0;
             self.start_prompt(pending).await?;
         }
         Ok(())
