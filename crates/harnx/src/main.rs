@@ -329,7 +329,14 @@ async fn flush_new_entries(
     use std::io::Write;
 
     let old_len = stream.history().len();
-    if stream.refresh_history().await? {
+    let refreshed = match stream.refresh_history().await {
+        Ok(refreshed) => refreshed,
+        Err(error) => {
+            log::warn!("failed to refresh durable session dump: {error:#}");
+            return Ok(());
+        }
+    };
+    if refreshed {
         let new_entries = &stream.history()[old_len..];
         if !new_entries.is_empty() {
             replay_dump_entries(new_entries, format).await?;
