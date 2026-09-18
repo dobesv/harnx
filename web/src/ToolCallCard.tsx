@@ -142,8 +142,28 @@ function previewFromArgs(parsedArgs: Record<string, any>): string | null {
   return null;
 }
 
-function getFallbackPreview(summaryMarkdown?: string, parsedArgs?: any): string | null {
+// ─── Sub-agent prompt deduplication invariant (#1911) ─────────────────────────────
+// Sub-agent prompt text can surface through three independent rendering paths:
+// 1. Body "Prompt:" section (ToolCallFormattedView, when isSubAgent && promptText)
+// 2. Header server-summary (formatHeaderSummary collapses '@ '-prefixed summaries)
+// 3. Header args-fallback (previewFromArgs when no summary available)
+// Invariant: prompt must render once. Body (path 1) is primary. Paths 2 and 3 must
+// suppress prompt text when body already shows it:
+// - shouldCollapseSubAgentHeader: suppresses path 2 when expanded and '@ ' summary
+// - getFallbackPreview: suppresses path 3 when isSubAgent && promptText
+// Exception: session_new tools (no message arg) have promptText=null, so fallback OK.
+// ────────────────────────────────────────────────────────────────────────────────
+
+function getFallbackPreview(
+  summaryMarkdown?: string,
+  parsedArgs?: any,
+  isSubAgent?: boolean,
+  promptText?: string | null,
+): string | null {
   if (summaryMarkdown) {
+    return null;
+  }
+  if (isSubAgent && promptText) {
     return null;
   }
   if (!parsedArgs || typeof parsedArgs !== 'object') {
@@ -396,7 +416,7 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const [viewSource, setViewSource] = useState(false);
 
-  const fallbackPreview = getFallbackPreview(summaryMarkdown, parsedArgs);
+  const fallbackPreview = getFallbackPreview(summaryMarkdown, parsedArgs, isSubAgent, promptText);
   const headerSummaryMarkdown = useMemo(
     () => formatHeaderSummary(summaryMarkdown, isSubAgent, expanded, promptText),
     [summaryMarkdown, isSubAgent, expanded, promptText]
