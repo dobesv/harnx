@@ -5,6 +5,48 @@ use super::*;
 type CompactionTranscript = (String, usize, (Option<usize>, Option<usize>, usize), String);
 
 impl Config {
+    /// Handle the outcome of a spawned `compact_session`: emit
+    /// `CompactingCompleted` on success or `CompactingFailed` (with the full
+    /// error cause chain) on failure. Routes through `event_sink` when `Some`,
+    /// falling back to the global `emit_agent_event` otherwise — spawned tasks
+    /// do not inherit the caller's task-local sink, so the owning turn captures
+    /// it before spawning and passes it here.
+    pub(crate) fn handle_compaction_result(
+        result: &anyhow::Result<()>,
+        started: std::time::Instant,
+        msg_count: usize,
+        event_sink: Option<&std::sync::Arc<dyn harnx_core::event::AgentEventSink>>,
+    ) {
+        let emit = |event| {
+            if let Some(sink) = event_sink {
+                sink.emit(event);
+            } else {
+                harnx_core::sink::emit_agent_event(event);
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                log::info!(
+                    "compaction: completed in {:?} (messages_before={msg_count})",
+                    started.elapsed()
+                );
+                emit(harnx_core::event::AgentEvent::Session(
+                    harnx_core::event::SessionEvent::CompactingCompleted,
+                ));
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to compact the session after {:?}: {err}",
+                    started.elapsed()
+                );
+                emit(harnx_core::event::AgentEvent::Session(
+                    harnx_core::event::SessionEvent::CompactingFailed(format!("{err:#}")),
+                ));
+            }
+        }
+    }
+
     pub fn maybe_compact_session(config: GlobalConfig) {
         let mut need_compact = false;
         let mut msg_count = 0usize;
@@ -40,34 +82,16 @@ impl Config {
         harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
             harnx_core::event::SessionEvent::CompactingStarted,
         ));
+        let event_sink = harnx_core::sink::current_agent_event_sink();
         tokio::spawn(async move {
             let result =
                 Config::with_maintenance_abort(&config, Config::compact_session(&config)).await;
+            Self::handle_compaction_result(&result, started, msg_count, event_sink.as_ref());
             if let Some(compacting_session_id) = compacting_session_id.as_deref() {
                 if let Some(session) = config.write().session.as_mut() {
                     if session.id == compacting_session_id {
                         session.set_compressing(false);
                     }
-                }
-            }
-            match &result {
-                Ok(()) => {
-                    log::info!(
-                        "compaction: completed in {:?} (messages_before={msg_count})",
-                        started.elapsed()
-                    );
-                    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
-                        harnx_core::event::SessionEvent::CompactingCompleted,
-                    ));
-                }
-                Err(err) => {
-                    warn!(
-                        "Failed to compact the session after {:?}: {err}",
-                        started.elapsed()
-                    );
-                    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
-                        harnx_core::event::SessionEvent::CompactingFailed(err.to_string()),
-                    ));
                 }
             }
         });
@@ -234,6 +258,82 @@ impl Config {
             biased;
             _ = harnx_core::abort::wait_abort_signal(&signal) => anyhow::bail!("session maintenance cancelled"),
             result = future => result,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::event::{AgentEvent, AgentEventSink, SessionEvent};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct CollectingSink {
+        events: Mutex<Vec<AgentEvent>>,
+    }
+
+    impl AgentEventSink for CollectingSink {
+        fn emit(&self, event: AgentEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_compaction_completion_reaches_captured_scoped_sink() {
+        let scoped = Arc::new(CollectingSink::default());
+
+        harnx_core::sink::with_agent_event_sink(scoped.clone(), async {
+            let captured = harnx_core::sink::current_agent_event_sink();
+            tokio::spawn(async move {
+                Config::handle_compaction_result(
+                    &Ok(()),
+                    std::time::Instant::now(),
+                    0,
+                    captured.as_ref(),
+                );
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+
+        let events = scoped.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Session(SessionEvent::CompactingCompleted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn detached_compaction_failure_reaches_captured_scoped_sink_with_full_error() {
+        let scoped = Arc::new(CollectingSink::default());
+
+        harnx_core::sink::with_agent_event_sink(scoped.clone(), async {
+            let captured = harnx_core::sink::current_agent_event_sink();
+            tokio::spawn(async move {
+                let result = Err(anyhow::anyhow!("boom").context("outer"));
+                Config::handle_compaction_result(
+                    &result,
+                    std::time::Instant::now(),
+                    0,
+                    captured.as_ref(),
+                );
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+
+        let events = scoped.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::Session(SessionEvent::CompactingFailed(message)) => {
+                assert!(message.contains("outer"));
+                assert!(message.contains("boom"));
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 }

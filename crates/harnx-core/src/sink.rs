@@ -83,6 +83,18 @@ where
     SCOPED_SINK.scope(sink, fut).await
 }
 
+/// Returns the current task-local sink, falling back to the process-global sink.
+///
+/// **Important:** Tokio task-locals are NOT inherited by `tokio::spawn` (detached)
+/// tasks. Before spawning a task that will emit `AgentEvent`s and may outlive the
+/// current turn scope, capture the sink with `current_agent_event_sink()` and pass
+/// the resulting `Arc<dyn AgentEventSink>` to the spawned task. Emit through the
+/// captured handle instead of calling `emit_agent_event`, which would fall through
+/// to the global sink and misroute events.
+///
+/// The worker path scopes the sink per-turn (`with_agent_event_sink` in
+/// `nats_worker/session_turn.rs`), so any spawned maintenance task (e.g.,
+/// title generation, compaction) must capture before spawn or lose events.
 pub fn current_agent_event_sink() -> Option<Arc<dyn AgentEventSink>> {
     if let Ok(sink) = SCOPED_SINK.try_with(|sink| sink.clone()) {
         return Some(sink);
