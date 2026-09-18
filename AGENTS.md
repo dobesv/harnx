@@ -476,7 +476,7 @@ When implementing `--follow` or live-tail rendering (CLI or TUI):
 1. Replay `stream.history()` for initial output.
 2. In the follow loop, `tokio::select!{ next() | timeout | ctrl_c() }`.
 3. On wake, record `old_len = stream.history().len()`.
-4. Call `stream.refresh_history().await` and emit `history()[old_len..]` as `SessionLogEntry`.
+4. Call `stream.refresh_history().await` and emit `history()[old_len..]` as `SessionLogEntry`. On transient failure, log and continue polling — reads fail fast; the caller owns retry cadence (see `CompletionPoller` in `nats_session/completion.rs`).
 5. NEVER serialize `AdvisoryEnvelope.event` directly — it's a preview, not durable state.
 
 `--follow` is read-only observation; it does not interrupt or cancel the running session.

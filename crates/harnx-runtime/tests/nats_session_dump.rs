@@ -2,6 +2,7 @@ mod common;
 
 use anyhow::{Context, Result};
 use common::spawn_nats_server;
+use futures_util::StreamExt;
 use harnx_core::{
     message::{MessageContent, MessageRole},
     require_nextest,
@@ -17,6 +18,10 @@ use harnx_runtime::{
     nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore},
 };
 use serde_json::Value;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 use uuid::Uuid;
 
 fn new_session_id() -> String {
@@ -101,6 +106,151 @@ fn setup_temp_agent_dir(model_id: &str) -> Result<(tempfile::TempDir, Option<Str
         std::env::set_var("HARNX_CONFIG_DIR", temp_dir.path());
     }
     Ok((temp_dir, prev))
+}
+
+// Regression for #1958: `harnx dump session --follow` used to abort the whole
+// process when a transient `jetstream request timed out` hit the periodic
+// durable poll. The follow loop now logs and keeps polling, so a momentary
+// failure is a no-op the next tick recovers from. This exercises that seam via
+// `SessionEventStream::refresh_history`, which `flush_new_entries` drives.
+#[tokio::test]
+async fn session_dump_follow_refresh_recovers_after_transient_failure() -> Result<()> {
+    use harnx_runtime::nats_event_sink::SessionEventStream;
+
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = new_session_id();
+
+    // Seed one durable entry through the real `$JS.API` so the stream exists
+    // and `attach` observes normal history.
+    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    log.append_event_async(&SessionLogEntry::Message {
+        id: Some("m1".to_string()),
+        role: MessageRole::User,
+        content: MessageContent::Text("Hello".to_string()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await?;
+
+    // A fault-injecting JetStream proxy on the `RETRY` API prefix models a brief
+    // broker hiccup during a `--follow` poll without tearing the connection down.
+    let proxy = spawn_faulting_jetstream_proxy(&client).await?;
+
+    // Attach through the proxied context while disarmed, so initial history
+    // loads cleanly.
+    let proxy_jetstream =
+        async_nats::jetstream::with_prefix(async_nats::connect(server.url()).await?, "RETRY");
+    let mut stream =
+        SessionEventStream::attach(proxy_jetstream, client.clone(), &session_id).await?;
+    let attached_len = stream.history().len();
+    assert_eq!(attached_len, 1);
+
+    // Append an entry the follow loop should eventually surface.
+    log.append_event_async(&SessionLogEntry::Message {
+        id: Some("m2".to_string()),
+        role: MessageRole::Assistant,
+        content: MessageContent::Text("Hi there".to_string()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await?;
+
+    // A transient failure surfaces as an error. The `--follow` loop logs this
+    // and continues instead of exiting the process.
+    proxy.armed.store(true, Ordering::SeqCst);
+    let transient = stream.refresh_history().await;
+    assert!(
+        transient.is_err(),
+        "a transient JetStream failure should surface as a recoverable error"
+    );
+    assert!(
+        proxy.injected.load(Ordering::SeqCst) >= 1,
+        "the injected failure should have been served"
+    );
+
+    // The next poll recovers and picks up the entry appended in the meantime,
+    // proving the tail keeps running after the hiccup.
+    proxy.armed.store(false, Ordering::SeqCst);
+    let recovered = stream.refresh_history().await?;
+    assert!(
+        recovered,
+        "refresh should report new entries after recovery"
+    );
+    assert!(
+        stream.history().len() > attached_len,
+        "recovered refresh should append the entry added during the outage"
+    );
+
+    proxy.responder.abort();
+
+    Ok(())
+}
+
+/// A JetStream proxy on the `RETRY.>` prefix that forwards to the real
+/// `$JS.API` unless `armed` is set, in which case the first request thereafter
+/// is answered with a transient 503. Lets a test inject a single momentary
+/// broker failure at a chosen moment without dropping the connection. Build the
+/// client context with `async_nats::jetstream::with_prefix(conn, "RETRY")`.
+struct FaultingJetStreamProxy {
+    armed: Arc<AtomicBool>,
+    injected: Arc<AtomicUsize>,
+    responder: tokio::task::JoinHandle<()>,
+}
+
+async fn spawn_faulting_jetstream_proxy(
+    client: &async_nats::Client,
+) -> Result<FaultingJetStreamProxy> {
+    let mut requests = client.subscribe("RETRY.>".to_string()).await?;
+    client.flush().await?;
+    let armed = Arc::new(AtomicBool::new(false));
+    let injected = Arc::new(AtomicUsize::new(0));
+    let responder_armed = Arc::clone(&armed);
+    let responder_injected = Arc::clone(&injected);
+    let responder_client = client.clone();
+    let responder = tokio::spawn(async move {
+        while let Some(request) = requests.next().await {
+            let suffix = request
+                .subject
+                .as_str()
+                .strip_prefix("RETRY.")
+                .expect("request uses retry test prefix");
+            let inject = responder_armed.load(Ordering::SeqCst)
+                && responder_injected.fetch_add(1, Ordering::SeqCst) == 0;
+            let payload = if inject {
+                serde_json::to_vec(&serde_json::json!({
+                    "error": {
+                        "code": 503,
+                        "err_code": 10008,
+                        "description": "injected transient JetStream failure"
+                    }
+                }))
+                .expect("serialize injected JetStream error")
+                .into()
+            } else {
+                responder_client
+                    .request(format!("$JS.API.{suffix}"), request.payload)
+                    .await
+                    .expect("proxy JetStream request")
+                    .payload
+            };
+            responder_client
+                .publish(request.reply.expect("JetStream request has reply"), payload)
+                .await
+                .expect("reply to proxied JetStream request");
+        }
+    });
+    Ok(FaultingJetStreamProxy {
+        armed,
+        injected,
+        responder,
+    })
 }
 
 #[tokio::test]
