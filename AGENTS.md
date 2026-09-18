@@ -85,6 +85,27 @@ test failures.
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
 **CodeScene Health scores MUST NOT decrease as part of the change, only increase**
 
+### Broker-backed tests and wall-clock margins
+
+Tests that spawn a `nats-server` run in the `broker-e2e` / `heavy-e2e` groups
+(`.config/nextest.toml`). On a contended GitHub runner that whole block has been
+measured running 6 to 40 times its idle cost, comparing runs whose diffs did not
+touch it: `cancellation::hierarchy::direct_child_cancellation_stops_only_its_worker_subtree`
+went 0.53s to 21.2s, and the ubuntu job 184s to 483s. Tests whose duration is a
+fixed sleep stayed flat, so the cause is starvation of real work rather than
+clock skew. The trigger is not understood.
+
+Size deadlines in these tests against the degraded cost, not the idle one. A
+per-call timeout with a few hundred milliseconds of slack, or a turn backstop
+set near the idle duration, reports a slow runner as a broken turn; those two
+shapes caused 23 of 31 CI failures in one sample of 100 runs. The `ci` profile's
+`slow-timeout = { period = "60s", terminate-after = 4 }` is what catches a real
+hang, so an in-test backstop only has to beat 240s and say something more useful
+than a SIGKILL would.
+
+When one of these tests fails, check a passing run's timings for the same block
+before blaming the test. If the whole block is slow, the margin is the bug.
+
 ### Web/Frontend Verification
 
 **Run all web/frontend commands from `web/`, never the repo root.** The root has no
@@ -420,6 +441,15 @@ that must be cleaned up off Linux needs an explicit shutdown path instead.
 
 Keep `kill_on_drop(true)` as well — it retires the child promptly when its
 manager is dropped while the process keeps running.
+
+Test helpers that spawn a broker need the same guarantee for a narrower reason:
+a failing assertion unwinds past the helper's own `kill`/`wait`, and
+`std::process::Child` does not reap on drop. The stranded `nats-server` then
+competes with every later broker test in that nextest run, and `retries = 3`
+turns one flake into several. `spawn_test_nats` returns `TestNatsServer`
+(`crates/harnx-runtime/src/nats_worker/tests.rs`) and the integration harness
+returns `NatsServerHandle` (`crates/harnx-runtime/tests/common/mod.rs`); both
+reap in `Drop`. Keep new broker helpers in that shape.
 
 ## CLI Flag Constraints
 

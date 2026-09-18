@@ -2,7 +2,7 @@ use super::*;
 use std::time::Duration;
 
 struct Server {
-    child: std::process::Child,
+    child: crate::nats_worker::tests::TestNatsServer,
     _directory: tempfile::TempDir,
 }
 

@@ -32,12 +32,40 @@ mod invocation_limit_tests;
 mod subagent_discovery_tests;
 mod transcript_render_tests;
 
+/// A `nats-server` that dies with the test that started it.
+///
+/// Tests kill the broker on their happy path, but an assertion that fires
+/// first skips that cleanup, and `std::process::Child` does not reap on drop.
+/// A leaked broker keeps running for the rest of the nextest run and competes
+/// with every later broker test for the runner's CPU and disk -- the retries a
+/// flake already costs multiply that into several stranded servers. Unwinding
+/// through this guard reaps the process instead.
+pub(crate) struct TestNatsServer(std::process::Child);
+
+impl TestNatsServer {
+    pub(crate) fn kill(&mut self) -> std::io::Result<()> {
+        self.0.kill()
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.wait()
+    }
+}
+
+impl Drop for TestNatsServer {
+    fn drop(&mut self) {
+        // Both are no-ops once a test has already killed and reaped the child.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Spawn a local JetStream-enabled nats-server on a free port with an isolated
 /// temp store dir, returning the connect URL, the child process, and the temp
 /// dir guard. Using a free port + per-run store dir avoids cross-run state
 /// bleed (JetStream KV/lease buckets) and port collisions that make tests flaky
 /// when run repeatedly or in parallel. Returns `None` if nats-server is absent.
-pub(crate) async fn spawn_test_nats() -> Option<(String, std::process::Child, tempfile::TempDir)> {
+pub(crate) async fn spawn_test_nats() -> Option<(String, TestNatsServer, tempfile::TempDir)> {
     if which::which("nats-server").is_err() {
         eprintln!("skipping: nats-server not available");
         return None;
@@ -56,6 +84,7 @@ pub(crate) async fn spawn_test_nats() -> Option<(String, std::process::Child, te
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
+    let mut child = TestNatsServer(child);
     let url = format!("nats://127.0.0.1:{port}");
     // Poll for readiness rather than a fixed sleep.
     for _ in 0..50 {
@@ -64,7 +93,6 @@ pub(crate) async fn spawn_test_nats() -> Option<(String, std::process::Child, te
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let mut child = child;
     let _ = child.kill();
     let _ = child.wait();
     None
