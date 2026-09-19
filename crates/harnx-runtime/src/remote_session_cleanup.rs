@@ -5,8 +5,12 @@ use crate::nats_session_metadata::{ListedSession, SessionMetadataStore, SESSION_
 use async_nats::jetstream::kv::{Operation, Store};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+const SECONDS_PER_HOUR: u64 = 60 * 60;
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 const GC_SESSION_ID: &str = "session_metadata_gc";
+/// KV key in `harnx_leases` recording the epoch-hour of the last completed periodic GC pass;
+/// used to dedup staggered workers to one pass per wall-clock hour.
+pub const GC_LAST_RUN_EPOCH_HOUR_KEY: &str = "session_metadata_gc/last_run_epoch_hour";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RemoteCleanupStats {
@@ -16,11 +20,38 @@ pub struct RemoteCleanupStats {
     pub errors: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupOutcome {
+    NotLeader,
+    Skipped,
+    Failed,
+    Ran(RemoteCleanupStats),
+}
+
 pub async fn run_remote_cleanup(config: &Config, days: u64, cluster: &str) -> RemoteCleanupStats {
     if days == 0 {
         return RemoteCleanupStats::default();
     }
     run_remote_cleanup_with_gc_id(config, days, cluster, GC_SESSION_ID).await
+}
+
+pub async fn run_periodic_remote_cleanup(
+    config: &Config,
+    days: u64,
+    cluster: &str,
+) -> CleanupOutcome {
+    // Zero explicitly disables cleanup, so don't acquire a lease or create marker state.
+    if days == 0 {
+        return CleanupOutcome::Skipped;
+    }
+    run_periodic_remote_cleanup_with(
+        config,
+        days,
+        cluster,
+        GC_SESSION_ID,
+        epoch_hour(now_unix_secs()),
+    )
+    .await
 }
 
 async fn run_remote_cleanup_with_gc_id(
@@ -44,6 +75,53 @@ async fn run_remote_cleanup_with_gc_id(
         }
     };
 
+    let stats = run_cleanup_pass(config, days, cluster).await;
+    release_gc_lease(lease, cluster).await;
+    stats
+}
+
+#[doc(hidden)]
+pub async fn run_periodic_remote_cleanup_with(
+    config: &Config,
+    days: u64,
+    cluster: &str,
+    gc_session_id: &str,
+    epoch_hour: u64,
+) -> CleanupOutcome {
+    // Match the public entry point when callers inject a slot for deterministic tests.
+    if days == 0 {
+        return CleanupOutcome::Skipped;
+    }
+
+    let lease = match acquire_gc_lease(config, cluster, gc_session_id).await {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return CleanupOutcome::NotLeader,
+        Err(error) => {
+            warn!(
+                "periodic remote session cleanup leader-election failed: cluster={} err={error:#}",
+                cluster
+            );
+            return CleanupOutcome::Failed;
+        }
+    };
+
+    let last_run_epoch_hour = match load_last_run_epoch_hour(config, cluster).await {
+        Ok(last_run_epoch_hour) => last_run_epoch_hour,
+        Err(error) => {
+            warn!(
+                "periodic remote session cleanup marker read failed: cluster={} err={error:#}",
+                cluster
+            );
+            release_gc_lease(lease, cluster).await;
+            return CleanupOutcome::Failed;
+        }
+    };
+
+    if last_run_epoch_hour == Some(epoch_hour) {
+        release_gc_lease(lease, cluster).await;
+        return CleanupOutcome::Skipped;
+    }
+
     let stats = match run_remote_cleanup_inner(config, days, cluster).await {
         Ok(stats) => stats,
         Err(error) => {
@@ -51,21 +129,84 @@ async fn run_remote_cleanup_with_gc_id(
                 "remote session cleanup failed: cluster={} days={} err={error:#}",
                 cluster, days
             );
-            RemoteCleanupStats {
-                errors: 1,
-                ..RemoteCleanupStats::default()
-            }
+            release_gc_lease(lease, cluster).await;
+            return CleanupOutcome::Failed;
         }
     };
+    let marker_write = store_last_run_epoch_hour(config, cluster, epoch_hour).await;
+    release_gc_lease(lease, cluster).await;
+    outcome_after_marker_write(stats, cluster, marker_write)
+}
 
+/// Fold marker persistence into completed-pass stats. A stale marker can cause
+/// a harmless repeat scan, so it doesn't change the fact that this pass ran.
+fn outcome_after_marker_write(
+    mut stats: RemoteCleanupStats,
+    cluster: &str,
+    marker_write: anyhow::Result<()>,
+) -> CleanupOutcome {
+    if let Err(error) = marker_write {
+        warn!(
+            "periodic remote session cleanup marker write failed: cluster={} err={error:#}",
+            cluster
+        );
+        stats.errors += 1;
+    }
+    CleanupOutcome::Ran(stats)
+}
+
+async fn run_cleanup_pass(config: &Config, days: u64, cluster: &str) -> RemoteCleanupStats {
+    match run_remote_cleanup_inner(config, days, cluster).await {
+        Ok(stats) => stats,
+        Err(error) => {
+            warn!(
+                "remote session cleanup failed: cluster={} days={} err={error:#}",
+                cluster, days
+            );
+            cleanup_error_stats()
+        }
+    }
+}
+
+fn cleanup_error_stats() -> RemoteCleanupStats {
+    RemoteCleanupStats {
+        errors: 1,
+        ..RemoteCleanupStats::default()
+    }
+}
+
+async fn release_gc_lease(lease: NatsSessionLease, cluster: &str) {
     if let Err(error) = lease.release().await {
         warn!(
             "remote session cleanup lease release failed: cluster={} err={error:#}",
             cluster
         );
     }
+}
 
-    stats
+async fn load_last_run_epoch_hour(config: &Config, cluster: &str) -> anyhow::Result<Option<u64>> {
+    let Some(store) = load_optional_lease_store(config, cluster).await? else {
+        return Ok(None);
+    };
+    let Some(value) = store.get(GC_LAST_RUN_EPOCH_HOUR_KEY).await? else {
+        return Ok(None);
+    };
+    let value = std::str::from_utf8(&value)?;
+    Ok(Some(value.parse()?))
+}
+
+async fn store_last_run_epoch_hour(
+    config: &Config,
+    cluster: &str,
+    epoch_hour: u64,
+) -> anyhow::Result<()> {
+    let Some(store) = load_optional_lease_store(config, cluster).await? else {
+        return Ok(());
+    };
+    store
+        .put(GC_LAST_RUN_EPOCH_HOUR_KEY, epoch_hour.to_string().into())
+        .await?;
+    Ok(())
 }
 
 struct CandidateContext<'a> {
@@ -121,8 +262,8 @@ async fn acquire_gc_lease(
     // ever raises an existing bucket's replicas now (see
     // `reconcile_bucket_replicas`), so pinning that default here can no
     // longer downgrade a bucket another creator already got right — but
-    // this GC task runs hourly against every configured cluster (see
-    // `run_periodic_remote_cleanup`) and could just as easily be the first
+    // the worker daemon runs this GC hourly through
+    // `run_periodic_remote_cleanup` and could just as easily be the first
     // thing to ever touch `harnx_leases` on a given cluster, in which case
     // the initial `create_key_value` (not reconcile) sets the real replica
     // count. Resolve the cluster's actual configured value so that first
@@ -270,6 +411,10 @@ fn cleanup_threshold(now_unix_secs: u64, days: u64) -> u64 {
     now_unix_secs.saturating_sub(days.saturating_mul(SECONDS_PER_DAY))
 }
 
+fn epoch_hour(now_unix_secs: u64) -> u64 {
+    now_unix_secs / SECONDS_PER_HOUR
+}
+
 fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -280,8 +425,10 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_session_ids, cleanup_threshold, lease_present, run_remote_cleanup,
-        run_remote_cleanup_with_gc_id, RemoteCleanupStats, SECONDS_PER_DAY,
+        candidate_session_ids, cleanup_threshold, epoch_hour, lease_present,
+        outcome_after_marker_write, run_periodic_remote_cleanup, run_periodic_remote_cleanup_with,
+        run_remote_cleanup, run_remote_cleanup_with_gc_id, CleanupOutcome, RemoteCleanupStats,
+        SECONDS_PER_DAY, SECONDS_PER_HOUR,
     };
     use crate::config::{Config, NatsServerConfig};
     use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
@@ -382,6 +529,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn epoch_hour_uses_wall_clock_hour_slots() {
+        assert_eq!(epoch_hour(0), 0);
+        assert_eq!(epoch_hour(SECONDS_PER_HOUR - 1), 0);
+        assert_eq!(epoch_hour(SECONDS_PER_HOUR), 1);
+        assert_eq!(epoch_hour(SECONDS_PER_HOUR * 17 + 42), 17);
+    }
+
+    #[test]
+    fn successful_marker_write_preserves_completed_pass_stats() {
+        let stats = RemoteCleanupStats {
+            scanned: 3,
+            deleted: 2,
+            skipped_active: 1,
+            errors: 0,
+        };
+
+        assert_eq!(
+            outcome_after_marker_write(stats.clone(), "local", Ok(())),
+            CleanupOutcome::Ran(stats)
+        );
+    }
+
+    #[test]
+    fn failed_marker_write_counts_error_but_pass_stays_ran() {
+        let stats = RemoteCleanupStats {
+            scanned: 3,
+            deleted: 2,
+            skipped_active: 1,
+            errors: 0,
+        };
+        let expected = RemoteCleanupStats {
+            errors: 1,
+            ..stats.clone()
+        };
+
+        assert_eq!(
+            outcome_after_marker_write(stats, "local", Err(anyhow::anyhow!("boom"))),
+            CleanupOutcome::Ran(expected)
+        );
+    }
+
     #[tokio::test]
     async fn lease_present_returns_false_when_lease_store_missing() {
         assert!(!lease_present(None, "session-123")
@@ -396,6 +585,26 @@ mod tests {
         assert_eq!(
             run_remote_cleanup(&config, 0, "no-cluster").await,
             RemoteCleanupStats::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_periodic_remote_cleanup_skips_when_days_zero() {
+        let config = Config::default();
+
+        assert_eq!(
+            run_periodic_remote_cleanup(&config, 0, "no-cluster").await,
+            CleanupOutcome::Skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_cleanup_reports_failed_when_lease_acquisition_errors() {
+        let config = Config::default();
+
+        assert_eq!(
+            run_periodic_remote_cleanup_with(&config, 1, "no-cluster", "gc-test", 42).await,
+            CleanupOutcome::Failed
         );
     }
 

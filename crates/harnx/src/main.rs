@@ -36,9 +36,7 @@ use harnx_runtime::utils::*;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use parking_lot::RwLock;
-use std::{sync::Arc, time::Duration};
-
-use harnx_runtime::remote_session_cleanup::{run_remote_cleanup, RemoteCleanupStats};
+use std::sync::Arc;
 
 fn invocation_limit_reached(error: &anyhow::Error) -> bool {
     error.is::<oneshot_nats::InvocationLimitReached>()
@@ -523,40 +521,6 @@ async fn activate_cli_agent(
     result
 }
 
-fn spawn_remote_session_cleanup(config: &GlobalConfig) {
-    let Some(days) = config
-        .read()
-        .cleanup_remote_sessions_days
-        .filter(|days| *days > 0)
-    else {
-        return;
-    };
-    let config = Arc::clone(config);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(3600));
-        loop {
-            interval.tick().await;
-            let mut cluster_names = config
-                .read()
-                .nats_servers
-                .iter()
-                .map(|server| server.name.clone())
-                .collect::<Vec<_>>();
-            if !cluster_names
-                .iter()
-                .any(|name| name == harnx_runtime::config::LOCAL_CLUSTER_KEY)
-            {
-                cluster_names.push(harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
-            }
-            for cluster_name in cluster_names {
-                let snapshot = config.read().clone();
-                let stats = run_remote_cleanup(&snapshot, days, &cluster_name).await;
-                emit_remote_cleanup_summary(cluster_name, stats);
-            }
-        }
-    });
-}
-
 fn spawn_cmd_sigint_watcher(config: &GlobalConfig, abort_signal: &AbortSignal) {
     let working_mode = config.read().working_mode.clone();
     if matches!(working_mode, WorkingMode::Cmd) {
@@ -701,7 +665,6 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         return Ok(());
     }
 
-    spawn_remote_session_cleanup(&config);
     run_mode(&config, &cli, text, &abort_signal).await
 }
 
@@ -1386,20 +1349,4 @@ mod tests_list_sessions_routing {
             }
         }
     }
-}
-
-/// Emit remote cleanup summary if any work was done.
-/// Logs per-cluster summary for server visibility.
-fn emit_remote_cleanup_summary(cluster: String, stats: RemoteCleanupStats) {
-    if stats == RemoteCleanupStats::default() {
-        return;
-    }
-    log::info!(
-        "Remote session cleanup ({}): scanned={}, deleted={}, skipped_active={}, errors={}",
-        cluster,
-        stats.scanned,
-        stats.deleted,
-        stats.skipped_active,
-        stats.errors
-    );
 }

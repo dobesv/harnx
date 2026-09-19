@@ -28,6 +28,11 @@ harnx-worker --cluster prod --worker-id worker-1
 Multiple persistent workers compete through the same cluster-wide activation
 stream. This cloud topology is unchanged.
 
+When session retention is configured (`cleanup_remote_sessions_days` /
+`HARNX_CLEANUP_REMOTE_SESSIONS_DAYS`), cluster workers also run periodic session
+garbage collection. Passes are leader-elected across workers, ensuring one
+cleanup pass runs per wall-clock hour per cluster.
+
 ## Frontend-managed local workers
 
 `harnx` and `harnx-serve` each supervise one worker for their own process
