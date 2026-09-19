@@ -119,7 +119,7 @@ fn install(args: InstallArgs) -> Result<()> {
 }
 
 /// Build the web UI and copy the compiled assets into the directory that
-/// `harnx serve` loads from by default (`<data_dir>/web-assets`).
+/// `harnx-serve` loads from by default (`<data_dir>/web-assets`).
 ///
 /// The web project lives in `web/` at the workspace root and builds with pnpm
 /// (`pnpm install` + `pnpm build`), emitting static files into `web/dist`.
@@ -258,7 +258,7 @@ fn harnx_data_dir() -> Result<PathBuf> {
 /// (`destination -> <destination>.old`, then `staging -> destination`). Renames
 /// are near-instant and, on Windows, moving a directory that holds open files
 /// tends to succeed where deleting it in place would fail — so a concurrent
-/// `harnx serve` is very unlikely to observe a missing or half-written asset
+/// `harnx-serve` is very unlikely to observe a missing or half-written asset
 /// directory.
 fn replace_dir(source: &Path, destination: &Path) -> Result<()> {
     let parent = destination
@@ -647,7 +647,7 @@ fn help_text() -> &'static str {
 }
 
 fn install_help_text() -> &'static str {
-    "Build and copy workspace binaries into cargo bin dir\n\nAlso builds the web UI (pnpm) and copies it to the default web-assets\ndirectory that `harnx serve` loads from (<data_dir>/web-assets).\n\nUsage: cargo xtask install [OPTIONS] [BINS]...\n\nArguments:\n  [BINS]...  Restrict install to one or more workspace binary names\n\nOptions:\n      --debug     Install debug build instead of default release build\n      --skip-web  Skip building and installing the web UI assets\n  -h, --help      Print help"
+    "Build and copy workspace binaries into cargo bin dir\n\nAlso builds the web UI (pnpm) and copies it to the default web-assets\ndirectory that `harnx-serve` loads from (<data_dir>/web-assets).\n\nUsage: cargo xtask install [OPTIONS] [BINS]...\n\nArguments:\n  [BINS]...  Restrict install to one or more workspace binary names\n\nOptions:\n      --debug     Install debug build instead of default release build\n      --skip-web  Skip building and installing the web UI assets\n  -h, --help      Print help"
 }
 
 struct Metadata {

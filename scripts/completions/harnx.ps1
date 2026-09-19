@@ -33,7 +33,6 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
             [CompletionResult]::new('--rag', '--rag', [CompletionResultType]::ParameterName, 'Start a RAG')
             [CompletionResult]::new('--rebuild-rag', '--rebuild-rag', [CompletionResultType]::ParameterName, 'Rebuild the RAG to sync document changes')
             [CompletionResult]::new('--macro', '--macro', [CompletionResultType]::ParameterName, 'Execute a macro')
-            [CompletionResult]::new('--serve', '--serve', [CompletionResultType]::ParameterName, 'Serve the LLM API and WebAPP')
             [CompletionResult]::new('-f', '-f', [CompletionResultType]::ParameterName, 'Include files, directories, or URLs')
             [CompletionResult]::new('--file', '--file', [CompletionResultType]::ParameterName, 'Include files, directories, or URLs')
             [CompletionResult]::new('-S', '-S', [CompletionResultType]::ParameterName, 'Turn off stream mode')

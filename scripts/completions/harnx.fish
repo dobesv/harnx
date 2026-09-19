@@ -8,7 +8,6 @@ complete -c harnx -l agent-variable -d 'Set agent variables'
 complete -c harnx -l rag -x  -a"(harnx --list-rags)" -d 'Start a RAG' -r
 complete -c harnx -l rebuild-rag -d 'Rebuild the RAG to sync document changes'
 complete -c harnx -l macro -x  -a"(harnx --list-macros)" -d 'Execute a macro' -r
-complete -c harnx -l serve -d 'Serve the LLM API and WebAPP' -r
 complete -c harnx -s f -l file -d 'Include files, directories, or URLs' -r -F
 complete -c harnx -s S -l no-stream -d 'Turn off stream mode'
 complete -c harnx -l dry-run -d 'Display the message without sending it'

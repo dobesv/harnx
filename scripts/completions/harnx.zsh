@@ -28,7 +28,6 @@ _harnx() {
 '--rag[Start a RAG]:RAG:->rags' \
 '--rebuild-rag[Rebuild the RAG to sync document changes]' \
 '--macro[Execute a macro]:MACRO:->macros' \
-'--serve[Serve the LLM API and WebAPP]:ADDRESS: ' \
 '*-f[Include files, directories, or URLs]:FILE:_files' \
 '*--file[Include files, directories, or URLs]:FILE:_files' \
 '-S[Turn off stream mode]' \
