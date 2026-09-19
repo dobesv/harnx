@@ -264,7 +264,7 @@ jobs:
           find web-assets-dist -type f -name '*.map' -delete
 
       - name: Upload Web UI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: web-assets-dist
           path: web-assets-dist/
@@ -430,7 +430,7 @@ jobs:
           [ "$missing" -eq 0 ] || { echo "Some binaries are missing. Check asset download step."; exit 1; }
 
       - name: Download Web UI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: web-assets-dist
           path: web-assets/
