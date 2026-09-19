@@ -1,5 +1,5 @@
 use super::test_config;
-use crate::test_utils::TuiTestHarness;
+use crate::test_utils::{settle_exit_cancel, TuiTestHarness};
 use crate::types::Tui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_runtime::nats_session::InterruptOutcome;
@@ -111,7 +111,7 @@ async fn requesting_cancellation_esc_preserves_future_and_processes_outcome() {
     tx.send(InterruptOutcome::Accepted { cancel_seq: 1 })
         .unwrap();
 
-    tui.poll_pending_exit_cancel().await;
+    assert!(settle_exit_cancel(&mut tui, 50).await);
     assert_acceptance_cleared_guard_and_retained_draft(&tui, "r");
     assert!(tui.pending_exit_cancel.is_none());
 }
@@ -123,7 +123,7 @@ async fn failed_ctrl_c_retry_then_acceptance_clears_guard() {
     let (targets, factory) = recovering_cancel_factory();
     tui.set_exit_cancel_factory(factory);
     tui.start_cancellation("root".into(), "local".into());
-    tui.poll_pending_exit_cancel().await;
+    assert!(settle_exit_cancel(&mut tui, 50).await);
     assert!(matches!(
         tui.cancellation.as_ref().map(|tray| &tray.phase),
         Some(crate::cancellation::CancellationPhase::Failed(_))
@@ -143,7 +143,7 @@ async fn failed_ctrl_c_retry_then_acceptance_clears_guard() {
     // A retry preserves the editor-restored flag set before it.
     assert!(tui.cancellation_editor_restored());
     assert_editor_restored_submission_blocked(&mut tui, 'd').await;
-    tui.poll_pending_exit_cancel().await;
+    assert!(settle_exit_cancel(&mut tui, 50).await);
     assert_acceptance_cleared_guard_and_retained_draft(&tui, "d");
 
     // No cancellation is left to react to a further Esc.
@@ -260,7 +260,7 @@ async fn accepted_interrupt_returns_to_editor_with_draft_intact() {
     }));
 
     tui.handle_key(ctrl('c')).await.unwrap();
-    tui.poll_pending_exit_cancel().await;
+    assert!(settle_exit_cancel(tui, 50).await);
 
     assert_eq!(tui.app.input.lines(), &["keep me"]);
     assert!(!tui.app.llm_busy);

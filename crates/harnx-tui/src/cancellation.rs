@@ -64,12 +64,12 @@ impl Tui {
             .cancellation
             .as_ref()
             .is_some_and(|tray| tray.editor_restored);
-        self.pending_exit_cancel = Some((self.exit_cancel_factory)(
+        self.pending_exit_cancel = Some(tokio::spawn((self.exit_cancel_factory)(
             self.config.clone(),
             self.local_worker.clone(),
             session_id.clone(),
             cluster.clone(),
-        ));
+        )));
         self.exit_interrupt_error = None;
         self.cancellation = Some(CancellationTray {
             phase: CancellationPhase::Requesting,

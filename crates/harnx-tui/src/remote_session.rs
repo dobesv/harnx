@@ -189,6 +189,11 @@ impl Tui {
             return;
         };
         self.pending_exit_cancel = None;
+        // A join error means the request panicked. Report it like any other
+        // failed interrupt so the user can retry or exit.
+        let result = result
+            .map_err(anyhow::Error::from)
+            .and_then(std::convert::identity);
         match result {
             Ok(outcome) => {
                 if matches!(
@@ -212,6 +217,17 @@ impl Tui {
                     *phase = crate::types::ExitPhase::RequestFailed;
                 }
             }
+        }
+    }
+
+    /// The loop has exited without waiting for the cancel: Ctrl+D "exit
+    /// anyway", or an error. Stop the request here so it cannot keep the
+    /// local worker supervisor busy while the process tears down. A `Cancel`
+    /// it already published is durable regardless.
+    pub(crate) async fn abandon_pending_exit_cancel(&mut self) {
+        if let Some(task) = self.pending_exit_cancel.take() {
+            task.abort();
+            let _ = task.await;
         }
     }
 

@@ -403,6 +403,15 @@ Resource owners keep cleanup handles outside turn/reply futures. A dropped
 MCP cancellation closes only the request waiter; never restart shared
 infrastructure to cancel a call. See `docs/nats-ha.md` under "Interruption".
 
+The TUI runs broker requests as spawned tasks and only checks their join
+handles from its render loop (`pending_exit_cancel` in `harnx-tui/src/types.rs`).
+That loop blocks in the terminal poll for up to one 80 ms tick and looks at a
+pending request with `now_or_never`, so a bare future polled from the loop
+advances one await per tick. An interrupt request awaits one JetStream round
+trip per session log entry; driven from the loop, a 300-entry session's Ctrl+C
+spent 22 seconds attaching and then timed out inside its two-second append
+budget on every retry. Don't hand the loop a bare future to poll.
+
 Build the workspace before cross-process tests after changing tool or hook wire
 types. Those tests launch workspace sidecars as well as linked test code; a stale
 hook or tool binary can fail decoding even when a per-crate build succeeds.
@@ -466,6 +475,12 @@ locally, so they contaminate each other's state. New NATS/GC tests that must run
 in CI belong in `crates/harnx-runtime/tests/`, use `spawn_nats_server` for
 per-test isolation, and assert on specific session IDs rather than global
 bucket stats. Precedent: `tests/worker_remote_session_cleanup.rs`.
+
+A TUI test that spawns the local broker or worker isolates them with
+`TestEnvironment` (`crates/harnx-tui/src/test_utils/environment.rs`) under
+`ENV_LOCK`. Without it the test shares the user's broker directory with every
+other test process in the run, including the persisted broker port, and a port
+still held by a broker another process just stopped fails every spawn attempt.
 
 ## CLI Flag Constraints
 
