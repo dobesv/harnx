@@ -1,17 +1,22 @@
 use super::{
-    agent_scoped_config, ensure_frontend_nats_owner, json_response, json_response_with_status,
-    negotiate_agents_route, AgentsRepresentation, AgentsRoute, AppResponse, Server,
+    ensure_frontend_nats_owner, json_response, json_response_with_status, negotiate_agents_route,
+    AgentsRepresentation, AgentsRoute, AppResponse, Server,
 };
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
-use harnx_runtime::config::{Config, LOCAL_CLUSTER_KEY};
+use harnx_runtime::config::Config;
+#[cfg(test)]
+use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 use http::{HeaderMap, Method, Response, StatusCode};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Body, Frame};
+#[cfg(test)]
 use parking_lot::RwLock;
 use serde_json::json;
-use std::{convert::Infallible, sync::Arc, time::Duration};
+#[cfg(test)]
+use std::sync::Arc;
+use std::{convert::Infallible, time::Duration};
 use tokio_stream::wrappers::IntervalStream;
 
 const SESSION_METADATA_REQUEST_MAX_BYTES: usize = 256 * 1024;
@@ -22,15 +27,40 @@ pub(crate) enum SessionMetadataRoute {
     Extension(String),
 }
 
+pub(crate) struct SessionsRouteContext<'a> {
+    pub(crate) target: &'a crate::session_actor::ResolvedAgentTarget,
+    pub(crate) scoped: &'a harnx_runtime::config::GlobalConfig,
+}
 #[derive(Clone, Copy)]
 pub(crate) struct AgentSessionRef<'a> {
     pub(crate) agent: &'a str,
+    pub(crate) cluster: &'a str,
     pub(crate) session: &'a str,
 }
 
 impl<'a> AgentSessionRef<'a> {
-    pub(crate) fn new(agent: &'a str, session: &'a str) -> Self {
-        Self { agent, session }
+    #[cfg(test)]
+    pub(crate) fn local(agent: &'a str, session: &'a str) -> Self {
+        Self {
+            agent,
+            cluster: LOCAL_CLUSTER_KEY,
+            session,
+        }
+    }
+
+    pub(crate) fn from_target(
+        target: &'a crate::session_actor::ResolvedAgentTarget,
+        session: &'a str,
+    ) -> Self {
+        Self {
+            agent: target.agent(),
+            cluster: target.cluster(),
+            session,
+        }
+    }
+
+    pub(crate) fn from_key(key: &'a crate::session_actor::SessionKey) -> Self {
+        Self::from_target(key.target(), key.session())
     }
 }
 
@@ -45,8 +75,8 @@ impl Server {
         B: Body<Data = Bytes> + Send + Unpin,
         B::Error: std::fmt::Display,
     {
-        ensure_frontend_nats_owner().await?;
-        let jetstream = self.config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+        ensure_frontend_nats_owner(target.cluster).await?;
+        let jetstream = crate::serve_nats_jetstream(&self.config, target.cluster).await?;
         let store =
             harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
                 .await?;
@@ -102,13 +132,14 @@ impl Server {
         &self,
         method: &Method,
         headers: &HeaderMap,
-        agent: &str,
+        context: SessionsRouteContext<'_>,
     ) -> Result<AppResponse> {
         match negotiate_agents_route(method, headers, AgentsRoute::Sessions)? {
             AgentsRepresentation::Json if *method == Method::POST => {
-                self.create_session_json(agent).await
+                self.create_session_json(context.target, context.scoped)
+                    .await
             }
-            AgentsRepresentation::Json => self.sessions_json(agent).await,
+            AgentsRepresentation::Json => self.sessions_json(context.target).await,
             AgentsRepresentation::Html
             | AgentsRepresentation::AgUiSse
             | AgentsRepresentation::AgUiRpc => bail!("Not Acceptable"),
@@ -129,17 +160,20 @@ impl Server {
         }
     }
 
-    async fn create_session_json(&self, agent: &str) -> Result<AppResponse> {
-        ensure_frontend_nats_owner().await?;
-        let scoped = Arc::new(RwLock::new(agent_scoped_config(&self.config, agent)?));
-        let session_id = Config::reserve_new_session_id(&scoped).await?;
+    async fn create_session_json(
+        &self,
+        target: &crate::session_actor::ResolvedAgentTarget,
+        scoped: &harnx_runtime::config::GlobalConfig,
+    ) -> Result<AppResponse> {
+        ensure_frontend_nats_owner(target.cluster()).await?;
+        let session_id = Config::reserve_new_session_id(scoped).await?;
         json_response_with_status(StatusCode::CREATED, json!({ "session_id": session_id }))
     }
 
     async fn session_events(&self, target: AgentSessionRef<'_>) -> Result<AppResponse> {
         let event_stream = attach_agent_session(&self.config, target).await?;
         // Subscribe to read-invalidation for this session
-        let client = self.config.nats_client(LOCAL_CLUSTER_KEY).await?;
+        let client = crate::serve_nats_client(&self.config, target.cluster).await?;
         let storage_key =
             harnx_core::session_identity::session_key(Some(target.agent), target.session);
         let read_invalidation_sub = client
@@ -242,9 +276,9 @@ pub(crate) async fn attach_agent_session(
     config: &Config,
     target: AgentSessionRef<'_>,
 ) -> Result<harnx_runtime::nats_event_sink::SessionEventStream> {
-    ensure_frontend_nats_owner().await?;
-    let client = config.nats_client(LOCAL_CLUSTER_KEY).await?;
-    let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+    ensure_frontend_nats_owner(target.cluster).await?;
+    let client = crate::serve_nats_client(config, target.cluster).await?;
+    let jetstream = crate::serve_nats_jetstream(config, target.cluster).await?;
     let store =
         harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
     let incarnation = store
@@ -271,8 +305,8 @@ pub(crate) async fn canonical_agent_session_exists(
     config: &Config,
     target: AgentSessionRef<'_>,
 ) -> Result<bool> {
-    ensure_frontend_nats_owner().await?;
-    let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+    ensure_frontend_nats_owner(target.cluster).await?;
+    let jetstream = crate::serve_nats_jetstream(config, target.cluster).await?;
     let store =
         harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
     Ok(store
@@ -475,9 +509,12 @@ mod tests {
         sandbox.write_agent("session-creator", "You create sessions.");
         let global = Arc::new(RwLock::new(sandbox.config()));
         let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
+        let (target, scoped) = crate::resolve_agent_target(&server.config, "session-creator")
+            .await
+            .expect("resolve session creator");
 
         let response = server
-            .create_session_json("session-creator")
+            .create_session_json(&target, &scoped)
             .await
             .expect("create session response");
 
@@ -514,9 +551,13 @@ mod tests {
             }
         }
         for agent in ["alpha", "beta"] {
-            let (loaded, _) = crate::load_nats_session(&config, agent, "review-12345")
-                .await
-                .unwrap();
+            let (loaded, _) = crate::load_nats_session(
+                &config,
+                &crate::session_actor::ResolvedAgentTarget::local(agent),
+                "review-12345",
+            )
+            .await
+            .unwrap();
             assert_eq!(loaded.id(), "review-12345");
             assert_eq!(loaded.agent_name.as_deref(), Some(agent));
             assert_eq!(loaded.messages.len(), 1);
@@ -559,7 +600,7 @@ mod tests {
         let response = server
             .handle_session_metadata_route(
                 request,
-                AgentSessionRef::new("metadata-redaction", &session_id),
+                AgentSessionRef::local("metadata-redaction", &session_id),
                 SessionMetadataRoute::Metadata,
             )
             .await
@@ -599,7 +640,7 @@ mod tests {
         let store = test_metadata_store(&config).await;
         let global = Arc::new(RwLock::new(config));
         let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
-        let target = AgentSessionRef::new("metadata-mutations", &session_id);
+        let target = AgentSessionRef::local("metadata-mutations", &session_id);
 
         let patched = metadata_mutation_json(
             &server,
@@ -676,7 +717,7 @@ mod tests {
         let error = server
             .handle_session_metadata_route(
                 invalid,
-                AgentSessionRef::new("metadata-validation", &session_id),
+                AgentSessionRef::local("metadata-validation", &session_id),
                 SessionMetadataRoute::Metadata,
             )
             .await
@@ -690,7 +731,7 @@ mod tests {
         let error = server
             .handle_session_metadata_route(
                 mismatched,
-                AgentSessionRef::new("different-agent", &session_id),
+                AgentSessionRef::local("different-agent", &session_id),
                 SessionMetadataRoute::Metadata,
             )
             .await
@@ -708,7 +749,7 @@ mod tests {
         let response = server
             .handle_session_metadata_route(
                 oversized,
-                AgentSessionRef::new("metadata-validation", &session_id),
+                AgentSessionRef::local("metadata-validation", &session_id),
                 SessionMetadataRoute::Extension("example.client".to_string()),
             )
             .await
@@ -759,7 +800,7 @@ mod tests {
         harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         let config = sandbox.config();
-        ensure_frontend_nats_owner()
+        ensure_frontend_nats_owner(LOCAL_CLUSTER_KEY)
             .await
             .expect("local NATS owner");
         let jetstream = config
@@ -770,9 +811,13 @@ mod tests {
             .await
             .expect("metadata bucket");
 
-        let error = crate::load_nats_session(&config, "plain", "missing-canonical-metadata")
-            .await
-            .expect_err("history without canonical metadata must be hidden");
+        let error = crate::load_nats_session(
+            &config,
+            &crate::session_actor::ResolvedAgentTarget::local("plain"),
+            "missing-canonical-metadata",
+        )
+        .await
+        .expect_err("history without canonical metadata must be hidden");
         assert_eq!(error.to_string(), "Not Found");
         assert_eq!(
             crate::status_from_error(&error),

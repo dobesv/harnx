@@ -18,10 +18,10 @@ impl SessionActor {
         text: &str,
         options: &SessionPromptOptions,
     ) -> anyhow::Result<harnx_runtime::nats_session::AppendedPrompt> {
-        let config = self.prompt_config();
+        let config = self.prompt_config().await;
         let input = build_input(&config, text, &options.attachment_refs)?;
         let source_dir = Config::session_attachments_dir(SessionAttachmentPath {
-            agent_name: &self.key.agent,
+            agent_name: self.key.agent(),
             session_id: &self.key.session,
         });
         self.control_session()
@@ -32,14 +32,15 @@ impl SessionActor {
 
     async fn control_session(&self) -> anyhow::Result<NatsSession> {
         let abort = create_abort_signal();
-        let config = self.prompt_config();
+        let config = self.prompt_config().await;
         let initializer = harnx_runtime::SessionInitializer::named_from_config(
-            self.key.agent.clone(),
+            self.key.agent().to_string(),
             &config.read(),
         );
+        let cluster = self.key.cluster().to_string();
         NatsSession::from_global_config(
             NatsSessionConfig {
-                cluster: LOCAL_CLUSTER_KEY.into(),
+                cluster: cluster.clone(),
                 initializer,
                 session_id: Some(self.key.session.clone()),
                 // The interrupt is one append to the session log and must not
@@ -52,6 +53,7 @@ impl SessionActor {
             abort,
         )
         .await
+        .map_err(|error| crate::sanitize_nats_session_error(&cluster, error))
     }
 
     /// Local worker ids change across restarts, so a wind-up or resume
@@ -65,12 +67,12 @@ impl SessionActor {
         match self.publish_pending_activation().await {
             Ok(republished) => log::debug!(
                 "session attach: agent={} session_id={} republished_activation={republished}",
-                self.key.agent,
+                self.key.agent(),
                 self.key.session
             ),
             Err(error) => log::debug!(
                 "session attach: agent={} session_id={} pending activation not republished: {error:#}",
-                self.key.agent,
+                self.key.agent(),
                 self.key.session
             ),
         }

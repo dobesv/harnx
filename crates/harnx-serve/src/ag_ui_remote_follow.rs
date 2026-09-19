@@ -21,7 +21,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use harnx_core::{event::AgentEventSink, session::SessionLogEntry};
 use harnx_runtime::{
-    config::{Config, LOCAL_CLUSTER_KEY},
+    config::Config,
     nats_event_sink::{AdvisoryEnvelope, JetstreamContext, SessionEventStream},
     nats_lease::session_has_active_lease,
 };
@@ -63,6 +63,7 @@ type AgUiEventStream = Pin<Box<dyn Stream<Item = Bytes> + Send + Sync + 'static>
 /// Passed from `ag_ui.rs` to `resolve_event_stream` when the local actor is idle.
 pub(crate) struct EventStreamParams<'a> {
     pub(crate) config: &'a Config,
+    pub(crate) cluster: &'a str,
     pub(crate) session_id: &'a str,
     pub(crate) run_id: &'a str,
     pub(crate) thread_id: &'a str,
@@ -78,12 +79,13 @@ pub(crate) async fn resolve_event_stream(
     if !params.eligible {
         return Ok(None);
     }
-    if !check_remote_lease(params.config, params.session_id).await? {
+    if !check_remote_lease(params.config, params.cluster, params.session_id).await? {
         return Ok(None);
     }
 
     let stream = build_remote_follow_ag_ui_stream(RemoteFollowStreamParams {
         config: params.config,
+        cluster: params.cluster,
         session_id: params.session_id,
         run_id: params.run_id,
         thread_id: params.thread_id,
@@ -94,14 +96,17 @@ pub(crate) async fn resolve_event_stream(
 }
 
 /// Checks whether a remote worker holds the lease for this session.
-async fn check_remote_lease(config: &Config, session_id: &str) -> Result<bool, AgUiError> {
-    crate::ensure_frontend_nats_owner()
+async fn check_remote_lease(
+    config: &Config,
+    cluster: &str,
+    session_id: &str,
+) -> Result<bool, AgUiError> {
+    crate::ensure_frontend_nats_owner(cluster)
         .await
         .map_err(|err| AgUiError::Internal(format!("NATS unavailable: {err}")))?;
-    let jetstream = config
-        .nats_jetstream(LOCAL_CLUSTER_KEY)
+    let jetstream = crate::serve_nats_jetstream(config, cluster)
         .await
-        .map_err(|err| AgUiError::Internal(format!("JetStream unavailable: {err}")))?;
+        .map_err(|err| AgUiError::Internal(err.to_string()))?;
     session_has_active_lease(&jetstream, session_id)
         .await
         .map_err(|err| AgUiError::Internal(format!("Lease check failed: {err}")))
@@ -124,6 +129,7 @@ fn last_user_sequence(entries: &[(u64, SessionLogEntry)]) -> u64 {
 
 struct RemoteFollowStreamParams<'a> {
     config: &'a Config,
+    cluster: &'a str,
     session_id: &'a str,
     run_id: &'a str,
     thread_id: &'a str,
@@ -164,6 +170,7 @@ async fn build_remote_follow_ag_ui_stream(
 
     build_remote_follow_event_stream(RemoteEventStreamParams {
         config: params.config,
+        cluster: params.cluster,
         session_id: params.session_id,
         run_id: params.run_id,
         thread_id: params.thread_id,
@@ -178,8 +185,8 @@ async fn build_remote_follow_ag_ui_stream(
 async fn build_remote_follow_event_stream(
     params: RemoteEventStreamParams<'_>,
 ) -> Result<AgUiEventStream> {
-    let client = params.config.nats_client(LOCAL_CLUSTER_KEY).await?;
-    let jetstream = params.config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+    let client = crate::serve_nats_client(params.config, params.cluster).await?;
+    let jetstream = crate::serve_nats_jetstream(params.config, params.cluster).await?;
     let event_stream =
         SessionEventStream::attach(jetstream.clone(), client, params.session_id).await?;
     let started_frame = Bytes::from(frame_run_boundary_event(
@@ -238,6 +245,7 @@ async fn build_remote_follow_event_stream(
 
 struct RemoteEventStreamParams<'a> {
     config: &'a Config,
+    cluster: &'a str,
     session_id: &'a str,
     run_id: &'a str,
     thread_id: &'a str,

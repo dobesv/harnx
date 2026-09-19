@@ -9,7 +9,9 @@ mod ag_ui_remote_follow;
 pub mod ag_ui_rpc;
 mod ag_ui_sync;
 mod ag_ui_usage;
+mod agent_resolve;
 mod interrupt_resume;
+mod nats_access;
 pub mod session_actor;
 mod session_actor_types;
 pub mod session_routes;
@@ -18,11 +20,22 @@ pub mod session_routes;
 // `harnx_serve::test_support` imports. Kept public for cross-crate test reuse.
 pub mod test_support;
 
-use crate::ag_ui::{resolve_agent, AgUiError, AppResponse as AgUiAppResponse};
-use crate::ag_ui_rpc::{handle_ag_ui_rpc, PersistenceKind};
-use crate::session_actor::SessionRegistry;
-use crate::session_routes::AgentSessionRef;
+#[cfg(test)]
+mod remote_agent_nats_tests;
 
+pub(crate) use agent_resolve::{is_safe_agent_path, is_safe_path_segment, resolve_agent_target};
+pub(crate) use nats_access::{
+    sanitize_nats_cluster_error, sanitize_nats_session_error, serve_nats_client,
+    serve_nats_jetstream,
+};
+
+use crate::ag_ui::{AgUiError, AppResponse as AgUiAppResponse};
+use crate::ag_ui_rpc::{handle_ag_ui_rpc, PersistenceKind};
+use crate::session_actor::{ResolvedAgentTarget, SessionRegistry};
+use crate::session_routes::{AgentSessionRef, SessionsRouteContext};
+
+#[cfg(test)]
+use harnx_core::agent_ref::AgentRef;
 use harnx_core::message::MessageRole;
 use harnx_rag::*;
 use harnx_runtime::{client::*, config::*, utils::*};
@@ -303,10 +316,11 @@ impl Server {
             })
             .collect();
         let session_registry = SessionRegistry::new(config.clone());
+        let agents = config.all_agents();
         Self {
             config,
             models,
-            agents: Config::all_agents(),
+            agents,
             rags: Config::list_rags(),
             session_registry,
             web_assets,
@@ -314,16 +328,22 @@ impl Server {
     }
 
     #[doc(hidden)]
-    pub async fn list_sessions_json(&self, agent: &str) -> Result<Value> {
+    pub async fn list_sessions_json(&self, agent_ref: &str) -> Result<Value> {
+        let (target, _) = resolve_agent_target(&self.config, agent_ref)
+            .await
+            .map_err(ag_ui_error_to_anyhow)?;
         Ok(Value::Array(
-            agent_sessions_json(&self.config, agent).await?,
+            agent_sessions_json(&self.config, &target).await?,
         ))
     }
 
     #[doc(hidden)]
-    pub async fn list_session_history(&self, agent: &str, session: &str) -> Result<Value> {
+    pub async fn list_session_history(&self, agent_ref: &str, session: &str) -> Result<Value> {
         use http_body_util::BodyExt;
-        let resp = self.session_history_json(agent, session).await?;
+        let (target, _) = resolve_agent_target(&self.config, agent_ref)
+            .await
+            .map_err(ag_ui_error_to_anyhow)?;
+        let resp = self.session_history_json(&target, session).await?;
         let body = resp.into_body().collect().await?.to_bytes();
         Ok(serde_json::from_slice(&body)?)
     }
@@ -583,49 +603,61 @@ impl Server {
     async fn handle_agent_tree(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
-        if let Some((agent, session, route)) = session_routes::parse_session_metadata_route(&path) {
-            resolve_agent(&self.config, &agent).map_err(ag_ui_error_to_anyhow)?;
-            let target = AgentSessionRef::new(&agent, &session);
-            return self.handle_session_metadata_route(req, target, route).await;
+        if let Some((agent_ref, session, route)) =
+            session_routes::parse_session_metadata_route(&path)
+        {
+            let (target, _) = resolve_agent_target(&self.config, &agent_ref)
+                .await
+                .map_err(ag_ui_error_to_anyhow)?;
+            let session_ref = AgentSessionRef::from_target(&target, &session);
+            return self
+                .handle_session_metadata_route(req, session_ref, route)
+                .await;
         }
-        let route = match parse_agents_route(&path) {
-            Some(route) => route,
-            None => return Err(anyhow!("Not Found")),
-        };
-        let (agent_name, session_name, agent_route) = route;
-
-        resolve_agent(&self.config, &agent_name).map_err(ag_ui_error_to_anyhow)?;
+        let route = parse_agents_route(&path).ok_or_else(|| anyhow!("Not Found"))?;
+        let (agent_ref, session_name, agent_route) = route;
+        let (target, scoped) = resolve_agent_target(&self.config, &agent_ref)
+            .await
+            .map_err(ag_ui_error_to_anyhow)?;
+        let display_ref = target.display_ref();
 
         match agent_route {
             AgentsRoute::Agent => {
                 match negotiate_agents_route(&method, req.headers(), agent_route)? {
-                    AgentsRepresentation::Html => self.agent_html_page(&agent_name),
-                    AgentsRepresentation::Json => self.agent_json(&agent_name).await,
+                    AgentsRepresentation::Html => self.agent_html_page(&display_ref),
+                    AgentsRepresentation::Json => self.agent_json(&target).await,
                     AgentsRepresentation::AgUiSse | AgentsRepresentation::AgUiRpc => {
                         Err(anyhow!("Not Acceptable"))
                     }
                 }
             }
             AgentsRoute::Sessions => {
-                self.handle_sessions_route(&method, req.headers(), &agent_name)
-                    .await
+                self.handle_sessions_route(
+                    &method,
+                    req.headers(),
+                    SessionsRouteContext {
+                        target: &target,
+                        scoped: &scoped,
+                    },
+                )
+                .await
             }
             AgentsRoute::Session => {
                 let session_name = session_name.expect("session route always has session name");
                 match negotiate_agents_route(&method, req.headers(), agent_route)? {
                     AgentsRepresentation::Html => {
-                        self.session_html_page(&agent_name, &session_name)
+                        self.session_html_page(&display_ref, &session_name)
                     }
                     AgentsRepresentation::Json => {
-                        self.session_history_json(&agent_name, &session_name).await
+                        self.session_history_json(&target, &session_name).await
                     }
                     AgentsRepresentation::AgUiSse => {
-                        self.ag_ui_run_route(req, &agent_name, &session_name).await
+                        self.ag_ui_run_route(req, &target, &session_name).await
                     }
                     AgentsRepresentation::AgUiRpc => {
                         handle_ag_ui_rpc(
                             req,
-                            &agent_name,
+                            &target,
                             &session_name,
                             &self.config,
                             &self.session_registry,
@@ -640,10 +672,7 @@ impl Server {
                 self.handle_session_events_route(
                     &method,
                     req.headers(),
-                    session_routes::AgentSessionRef {
-                        agent: &agent_name,
-                        session: &session_name,
-                    },
+                    AgentSessionRef::from_target(&target, &session_name),
                 )
                 .await
             }
@@ -666,25 +695,26 @@ impl Server {
         Ok(res)
     }
 
-    async fn agent_json(&self, agent: &str) -> Result<AppResponse> {
-        let sessions = agent_sessions_json(&self.config, agent).await?;
+    async fn agent_json(&self, target: &ResolvedAgentTarget) -> Result<AppResponse> {
+        let sessions = agent_sessions_json(&self.config, target).await?;
+        let display_ref = target.display_ref();
         let description = self
             .agents
             .iter()
-            .find(|candidate| candidate.name() == agent)
+            .find(|candidate| candidate.name() == display_ref)
             .map(AgentConfig::description)
             .filter(|description| !description.is_empty());
         let data = json!({
-            "name": agent,
+            "name": display_ref,
             "description": description,
             "sessions": sessions,
         });
         json_response(data)
     }
 
-    async fn sessions_json(&self, agent: &str) -> Result<AppResponse> {
+    async fn sessions_json(&self, target: &ResolvedAgentTarget) -> Result<AppResponse> {
         json_response(Value::Array(
-            agent_sessions_json(&self.config, agent).await?,
+            agent_sessions_json(&self.config, target).await?,
         ))
     }
 
@@ -692,14 +722,17 @@ impl Server {
         if req.method() != Method::GET {
             bail!("Method Not Allowed");
         }
-        let (agent, session, cid) = parse_session_attachment_blob_path(req.uri().path())
+        let (agent_ref, session, cid) = parse_session_attachment_blob_path(req.uri().path())
             .ok_or_else(|| anyhow!("Not Found"))?;
         if !is_canonical_attachment_cid(&cid) {
             return attachment_error_response(StatusCode::BAD_REQUEST, "malformed attachment cid");
         }
 
-        let (loaded_session, _entries) = load_nats_session(&self.config, &agent, &session).await?;
-        if loaded_session.agent_name.as_deref() != Some(agent.as_str())
+        let (target, _) = resolve_agent_target(&self.config, &agent_ref)
+            .await
+            .map_err(ag_ui_error_to_anyhow)?;
+        let (loaded_session, _entries) = load_nats_session(&self.config, &target, &session).await?;
+        if loaded_session.agent_name.as_deref() != Some(target.agent())
             || !collect_cid_refs(&loaded_session.messages)
                 .iter()
                 .any(|member| member == &cid)
@@ -707,14 +740,15 @@ impl Server {
             return attachment_error_response(StatusCode::NOT_FOUND, "attachment not found");
         }
 
-        let attachments_dir = Config::agent_data_dir(&agent)
+        let attachments_dir = Config::agent_data_dir(target.agent())
             .join("attachments")
             .join(&session);
         let attachment = match read_attachment_async(&attachments_dir, &cid).await {
             Ok(attachment) => Some(attachment),
             Err(_) => {
-                let jetstream = self.config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
-                let storage_key = harnx_core::session_identity::session_key(Some(&agent), &session);
+                let jetstream = serve_nats_jetstream(&self.config, target.cluster()).await?;
+                let storage_key =
+                    harnx_core::session_identity::session_key(Some(target.agent()), &session);
                 harnx_runtime::nats_attachments::get_session_attachment(
                     &jetstream,
                     1,
@@ -752,7 +786,7 @@ impl Server {
             bail!("Method Not Allowed");
         }
         let path = req.uri().path().to_string();
-        let (agent, session) =
+        let (agent_ref, session) =
             parse_session_attachments_path(&path).ok_or_else(|| anyhow!("Not Found"))?;
 
         if request_is_oversized(req.headers()) {
@@ -771,8 +805,10 @@ impl Server {
         .ok() else {
             bail!("Bad Request");
         };
-        let _scoped = agent_scoped_config(&self.config, &agent)?;
-        let attachments_dir = Config::agent_data_dir(&agent)
+        let (target, _) = resolve_agent_target(&self.config, &agent_ref)
+            .await
+            .map_err(ag_ui_error_to_anyhow)?;
+        let attachments_dir = Config::agent_data_dir(target.agent())
             .join("attachments")
             .join(&session);
 
@@ -847,9 +883,13 @@ impl Server {
         )
     }
 
-    async fn session_history_json(&self, agent: &str, session: &str) -> Result<AppResponse> {
-        let (loaded_session, _entries) = load_nats_session(&self.config, agent, session).await?;
-        if loaded_session.agent_name.as_deref() != Some(agent) {
+    async fn session_history_json(
+        &self,
+        target: &ResolvedAgentTarget,
+        session: &str,
+    ) -> Result<AppResponse> {
+        let (loaded_session, _entries) = load_nats_session(&self.config, target, session).await?;
+        if loaded_session.agent_name.as_deref() != Some(target.agent()) {
             bail!("Not Found");
         }
 
@@ -872,11 +912,11 @@ impl Server {
     async fn ag_ui_run_route(
         &self,
         req: hyper::Request<Incoming>,
-        agent: &str,
+        target: &ResolvedAgentTarget,
         session: &str,
     ) -> Result<AppResponse> {
         let req_body = req.collect().await?.to_bytes();
-        self.ag_ui_run(agent, session, &req_body)
+        self.ag_ui_run(target, session, &req_body)
             .await
             .map_err(ag_ui_error_to_anyhow)
     }
@@ -916,14 +956,14 @@ impl Server {
 
     pub(crate) async fn ag_ui_run(
         &self,
-        agent: &str,
+        target: &ResolvedAgentTarget,
         session: &str,
         req_body: &[u8],
     ) -> Result<AgUiAppResponse, AgUiError> {
-        ag_ui::ag_ui_run_with_call_fn(
+        ag_ui::ag_ui_run_for_target_with_call_fn(
             &self.config,
             &self.session_registry,
-            agent,
+            target,
             session,
             req_body,
             None,
@@ -1116,10 +1156,14 @@ fn set_cors_header(res: &mut AppResponse) {
     );
 }
 
+const ERROR_STATUS_MARKER: &str = "::__status=";
+
 fn ret_err<T: std::fmt::Display>(err: T) -> AppResponse {
+    let error = err.to_string();
+    let message = public_error_message(&error);
     let data = json!({
         "error": {
-            "message": err.to_string(),
+            "message": message,
             "type": "invalid_request_error",
         },
     });
@@ -1129,6 +1173,11 @@ fn ret_err<T: std::fmt::Display>(err: T) -> AppResponse {
         .unwrap()
 }
 
+fn public_error_message(message: &str) -> &str {
+    message
+        .split_once(ERROR_STATUS_MARKER)
+        .map_or(message, |(public, _)| public)
+}
 fn percent_decode(input: &str) -> String {
     let mut bytes = Vec::with_capacity(input.len());
     let mut iter = input.bytes();
@@ -1283,18 +1332,6 @@ fn request_is_oversized(headers: &http::HeaderMap) -> bool {
         .is_some_and(|length| length > MAX_UPLOAD_BYTES)
 }
 
-fn is_safe_path_segment(value: &str) -> bool {
-    !value.is_empty()
-        && std::path::Path::new(value)
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
-        && !value.contains(['/', '\\'])
-}
-
-fn is_safe_agent_path(value: &str) -> bool {
-    !value.is_empty() && !value.starts_with('/') && value.split('/').all(is_safe_path_segment)
-}
-
 fn negotiate_agents_route(
     method: &Method,
     headers: &http::HeaderMap,
@@ -1432,16 +1469,6 @@ fn accept_header_allows_event_stream(value: &str) -> bool {
     })
 }
 
-fn agent_scoped_config(config: &Config, agent: &str) -> Result<Config> {
-    let scoped = harnx_session::fork_prompt_config(config);
-    scoped
-        .write()
-        .use_agent_by_name(agent)
-        .map_err(|err| anyhow!("Failed to scope config to agent '{agent}': {err}"))?;
-    let config = scoped.read().clone();
-    Ok(config)
-}
-
 /// Ordering for the web session list: most-recently-modified first so active
 /// work surfaces at the top. Sessions without a modified time sort last; ties
 /// (equal or both-missing modified) fall back to id (descending) for stable,
@@ -1456,15 +1483,16 @@ fn session_recency_ordering(
         .then_with(|| right.id.cmp(&left.id))
 }
 
-async fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>> {
-    ensure_frontend_nats_owner().await?;
+async fn agent_sessions_json(config: &Config, target: &ResolvedAgentTarget) -> Result<Vec<Value>> {
+    ensure_frontend_nats_owner(target.cluster()).await?;
     let mut sessions: Vec<_> = config
-        .list_remote_sessions_with_meta(LOCAL_CLUSTER_KEY)
-        .await?
+        .list_remote_sessions_with_meta(target.cluster())
+        .await
+        .map_err(|error| sanitize_nats_cluster_error(target.cluster(), error))?
         .into_iter()
         // Per-agent endpoints must not leak sessions without agent attribution or for other agents.
         // Missing/empty agent_name stays excluded from per-agent lists until a later backfill pass.
-        .filter(|session| session.agent_name.as_deref() == Some(agent))
+        .filter(|session| session.agent_name.as_deref() == Some(target.agent()))
         .collect();
 
     sessions.sort_by(session_recency_ordering);
@@ -1498,28 +1526,28 @@ async fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>>
 /// for control-state hydration on promptless attach.
 pub(crate) async fn load_nats_session(
     config: &Config,
-    agent: &str,
+    target: &ResolvedAgentTarget,
     session: &str,
 ) -> Result<(
     harnx_core::session::Session,
     Vec<(u64, harnx_core::session::SessionLogEntry)>,
 )> {
     let (loaded, entries, _base_session) =
-        load_nats_session_with_base(config, agent, session).await?;
+        load_nats_session_with_base(config, target, session).await?;
     Ok((loaded, entries))
 }
 
 /// Load session history and retain canonical metadata state for replaying a fresher log snapshot.
 pub(crate) async fn load_nats_session_with_base(
     config: &Config,
-    agent: &str,
+    target: &ResolvedAgentTarget,
     session: &str,
 ) -> Result<(
     harnx_core::session::Session,
     Vec<(u64, harnx_core::session::SessionLogEntry)>,
     harnx_core::session::Session,
 )> {
-    let loaded = load_nats_session_state(config, agent, session).await?;
+    let loaded = load_nats_session_state(config, target, session).await?;
     Ok((loaded.session, loaded.entries, loaded.base_session))
 }
 
@@ -1536,14 +1564,14 @@ pub(crate) struct LoadedNatsSession {
 
 pub(crate) async fn load_nats_session_state(
     config: &Config,
-    agent: &str,
+    target: &ResolvedAgentTarget,
     session: &str,
 ) -> Result<LoadedNatsSession> {
-    ensure_frontend_nats_owner().await?;
-    let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+    ensure_frontend_nats_owner(target.cluster()).await?;
+    let jetstream = serve_nats_jetstream(config, target.cluster()).await?;
     let metadata_store =
         harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let storage_key = harnx_core::session_identity::session_key(Some(agent), session);
+    let storage_key = harnx_core::session_identity::session_key(Some(target.agent()), session);
     let metadata = metadata_store
         .get(&storage_key)
         .await?
@@ -1630,18 +1658,24 @@ async fn reconcile_attention(
 #[doc(hidden)]
 pub async fn load_nats_session_with_base_for_test(
     config: &Config,
-    agent: &str,
+    agent_ref: &str,
     session: &str,
 ) -> Result<(
     harnx_core::session::Session,
     Vec<(u64, harnx_core::session::SessionLogEntry)>,
     harnx_core::session::Session,
 )> {
-    load_nats_session_with_base(config, agent, session).await
+    let (target, _) = resolve_agent_target(config, agent_ref)
+        .await
+        .map_err(ag_ui_error_to_anyhow)?;
+    load_nats_session_with_base(config, &target, session).await
 }
 
 #[doc(hidden)]
-pub async fn ensure_frontend_nats_owner() -> Result<()> {
+pub async fn ensure_frontend_nats_owner(cluster: &str) -> Result<()> {
+    if cluster != LOCAL_CLUSTER_KEY {
+        return Ok(());
+    }
     if std::env::var_os("HARNX_NATS_URL").is_some()
         && std::env::var_os("HARNX_NATS_TOKEN").is_some()
     {
@@ -1754,7 +1788,11 @@ fn attachment_error_response(status: StatusCode, message: &str) -> Result<AppRes
 }
 
 fn ag_ui_error_to_anyhow(err: AgUiError) -> anyhow::Error {
-    anyhow!(format!("{}::__status={}", err, err.status_code().as_u16()))
+    anyhow!(format!(
+        "{}{ERROR_STATUS_MARKER}{}",
+        err,
+        err.status_code().as_u16()
+    ))
 }
 
 fn status_from_error(err: &anyhow::Error) -> Option<StatusCode> {
@@ -1768,8 +1806,7 @@ fn status_from_error(err: &anyhow::Error) -> Option<StatusCode> {
     if message == "Not Acceptable" {
         return Some(StatusCode::NOT_ACCEPTABLE);
     }
-    let marker = "__status=";
-    let status = message.split(marker).nth(1)?;
+    let (_, status) = message.split_once(ERROR_STATUS_MARKER)?;
     let code = status.parse::<u16>().ok()?;
     StatusCode::from_u16(code).ok()
 }
@@ -1871,6 +1908,11 @@ mod tests {
     #[test]
     fn percent_decode_decodes_slashes_and_preserves_invalid_escapes() {
         assert_eq!(percent_decode("coding%2Fcoder"), "coding/coder");
+        assert_eq!(percent_decode("sisyphus%40shared"), "sisyphus@shared");
+        assert_eq!(
+            percent_decode("coding%2Fcoder%40shared"),
+            "coding/coder@shared"
+        );
         assert_eq!(percent_decode("hephaestus"), "hephaestus");
         assert_eq!(percent_decode("bad%2"), "bad%");
         assert_eq!(percent_decode("bad%zz"), "bad%");
@@ -1898,6 +1940,21 @@ mod tests {
             parse_agents_route("/v1/agents/coding%2Fcoder"),
             Some(("coding/coder".to_string(), None, AgentsRoute::Agent))
         );
+        for (path, expected_agent) in [
+            ("/v1/agents/sisyphus%40shared", "sisyphus"),
+            ("/v1/agents/coding%2Fcoder%40shared", "coding/coder"),
+        ] {
+            let (decoded, session, route) = parse_agents_route(path).expect("agent route");
+            assert_eq!(session, None);
+            assert_eq!(route, AgentsRoute::Agent);
+            assert_eq!(
+                AgentRef::parse(&decoded),
+                AgentRef::Remote {
+                    agent: expected_agent.into(),
+                    cluster: "shared".into(),
+                }
+            );
+        }
         assert_eq!(
             parse_agents_route("/v1/agents/coding%2Fcoder/sessions"),
             Some(("coding/coder".to_string(), None, AgentsRoute::Sessions))
@@ -2083,16 +2140,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agent_route_error_mapping_covers_404_405_and_406_shapes() {
+    #[tokio::test]
+    async fn agent_route_error_mapping_covers_404_405_and_406_shapes() {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = sandbox.config();
 
-        let missing_agent = resolve_agent(&config, "missing").map_err(ag_ui_error_to_anyhow);
+        let missing_agent = resolve_agent_target(&config, "missing")
+            .await
+            .map_err(ag_ui_error_to_anyhow);
         let missing_err = missing_agent.expect_err("unknown agent should 404");
         assert!(missing_err.to_string().contains("__status=404"));
         assert_eq!(status_from_error(&missing_err), Some(StatusCode::NOT_FOUND));
+        let missing_response = response_json(ret_err(&missing_err)).await;
+        assert_eq!(
+            missing_response["error"]["message"],
+            "agent 'missing' not found"
+        );
+        assert!(!missing_response.to_string().contains("__status"));
+
+        let unknown_cluster = resolve_agent_target(&config, "atlas@missing-cluster")
+            .await
+            .expect_err("unknown cluster should fail");
+        assert!(matches!(unknown_cluster, AgUiError::BadRequest(_)));
+        assert!(unknown_cluster.to_string().contains("missing-cluster"));
+        let unknown_cluster = ag_ui_error_to_anyhow(unknown_cluster);
+        assert_eq!(
+            status_from_error(&unknown_cluster),
+            Some(StatusCode::BAD_REQUEST)
+        );
 
         let wrong_method_err =
             negotiate_agents_route(&Method::DELETE, &http::HeaderMap::new(), AgentsRoute::Agent)
@@ -2120,6 +2196,19 @@ mod tests {
             status_from_error(&not_acceptable_err),
             Some(StatusCode::NOT_ACCEPTABLE)
         );
+    }
+
+    #[tokio::test]
+    async fn nats_transport_error_response_hides_configured_endpoint() {
+        let error = anyhow!("connection refused")
+            .context("Failed to connect to NATS cluster 'down' at 'nats://token@127.0.0.1:1'");
+        let public = sanitize_nats_session_error("down", error);
+        let body = response_json(ret_err(&public)).await;
+        let message = body["error"]["message"].as_str().expect("error message");
+
+        assert_eq!(message, "NATS cluster 'down' is unavailable");
+        assert!(!message.contains("nats://"));
+        assert!(!message.contains("token"));
     }
 
     #[test]
@@ -2270,6 +2359,10 @@ mod tests {
             "role: subagent\nmodel: openai:gpt-4o\ndescription: Beta",
             "You are helper beta.",
         );
+        sandbox.write_nats_server(
+            "shared",
+            "url: nats://localhost:4222\nagents:\n  - name: sisyphus\n    description: Remote assistant\n    role: assistant\n  - name: remote-helper\n    role: subagent\n",
+        );
 
         let config = Arc::new(RwLock::new(sandbox.config()));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
@@ -2288,14 +2381,27 @@ mod tests {
             .expect("unfiltered agents array");
         let filtered_agents = filtered["data"].as_array().expect("filtered agents array");
 
-        assert_eq!(unfiltered_agents.len(), 2);
-        assert_eq!(filtered_agents.len(), 1);
-        assert_eq!(filtered_agents[0]["name"], "assistant-alpha");
-        assert_eq!(filtered_agents[0]["role"], "assistant");
-        assert_eq!(filtered_agents[0]["description"], "Alpha");
+        assert_eq!(unfiltered_agents.len(), 4);
+        assert_eq!(filtered_agents.len(), 2);
+        assert!(filtered_agents.iter().any(|agent| {
+            agent["name"] == "assistant-alpha"
+                && agent["role"] == "assistant"
+                && agent["description"] == "Alpha"
+        }));
+        assert!(filtered_agents.iter().any(|agent| {
+            agent["name"] == "sisyphus@shared"
+                && agent["role"] == "assistant"
+                && agent["description"] == "Remote assistant"
+        }));
         assert!(unfiltered_agents
             .iter()
             .any(|agent| agent["name"] == "helper-beta"));
+        assert!(unfiltered_agents
+            .iter()
+            .any(|agent| agent["name"] == "remote-helper@shared"));
+        assert!(!filtered_agents
+            .iter()
+            .any(|agent| agent["name"] == "remote-helper@shared"));
         assert!(filtered_agents
             .iter()
             .all(|agent| agent["role"] == "assistant"));
@@ -2545,6 +2651,58 @@ mod tests {
         assert_eq!(rpc_named_session.0, "coding/coder");
         assert_eq!(rpc_named_session.1.as_deref(), Some("rpc"));
         assert_eq!(rpc_named_session.2, AgentsRoute::Session);
+    }
+
+    #[tokio::test]
+    async fn attachment_http_routes_reject_remote_agent_path_traversal() -> Result<()> {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_nats_server(
+            "shared",
+            "url: nats://127.0.0.1:1\nagents:\n  - name: safe-agent\n",
+        );
+        let escaped_attachments = Config::agents_data_dir()
+            .parent()
+            .expect("agents data directory has a parent")
+            .join("attachments")
+            .join("s1");
+        assert!(!escaped_attachments.exists());
+
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Arc::new(Server::new(&config, PathBuf::from("web-assets")));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let stop = Arc::clone(&server).run(listener).await?;
+        let client = reqwest::Client::new();
+        let boundary = "traversal-boundary";
+        let image = b"not written";
+        let body =
+            build_multipart_body(boundary, &[("attachment", "test.png", "image/png", image)]);
+
+        let upload = client
+            .post(format!(
+                "http://{address}/v1/agents/..%40shared/sessions/s1/attachments"
+            ))
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await?;
+        assert_eq!(upload.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let cid = format!("cid%3A{}", "0".repeat(64));
+        let retrieval = client
+            .get(format!(
+                "http://{address}/v1/agents/..%40shared/sessions/s1/attachments/{cid}"
+            ))
+            .send()
+            .await?;
+        assert_eq!(retrieval.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(!escaped_attachments.exists());
+
+        let _ = stop.send(());
+        Ok(())
     }
 
     /// Helper to build and execute an upload request through the real handler

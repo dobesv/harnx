@@ -1,5 +1,6 @@
 use super::*;
 use futures_util::StreamExt;
+use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupted_state_is_reconstructed_from_durable_hitl_entries() {
@@ -83,9 +84,13 @@ async fn history_load_uses_worker_lease_to_keep_tool_call_pending() {
         return;
     };
 
-    let (active, _entries) = crate::load_nats_session(&config, "plain", &session_id)
-        .await
-        .expect("load active session");
+    let (active, _entries) = crate::load_nats_session(
+        &config,
+        &crate::session_actor::ResolvedAgentTarget::local("plain"),
+        &session_id,
+    )
+    .await
+    .expect("load active session");
     let active_tool = active.messages.last().expect("pending tool message");
     let harnx_core::message::MessageContent::ToolCalls(active_calls) = &active_tool.content else {
         panic!("expected pending tool-call content");
@@ -100,9 +105,13 @@ async fn history_load_uses_worker_lease_to_keep_tool_call_pending() {
     );
 
     lease.release().await.expect("release test lease");
-    let (interrupted, _entries) = crate::load_nats_session(&config, "plain", &session_id)
-        .await
-        .expect("load interrupted session");
+    let (interrupted, _entries) = crate::load_nats_session(
+        &config,
+        &crate::session_actor::ResolvedAgentTarget::local("plain"),
+        &session_id,
+    )
+    .await
+    .expect("load interrupted session");
     let harnx_core::message::MessageContent::ToolCalls(interrupted_calls) = &interrupted
         .messages
         .last()
@@ -362,10 +371,7 @@ async fn reserved_session_accepts_events_and_rpc_prompt_before_header_exists() {
     let config = sandbox.config();
     let session_id = reserve_session(&config, "plain").await;
 
-    let target = crate::session_routes::AgentSessionRef {
-        agent: "plain",
-        session: &session_id,
-    };
+    let target = crate::session_routes::AgentSessionRef::local("plain", &session_id);
     let event_stream = crate::session_routes::attach_agent_session(&config, target)
         .await
         .expect("reserved session event route");

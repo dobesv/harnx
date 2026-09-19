@@ -2,8 +2,8 @@ use crate::ag_ui::AppResponse;
 use crate::interrupt_resume::{parse_resume_params, InterruptResumeParam};
 use crate::load_nats_session;
 use crate::session_actor::{
-    PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionKey, SessionPromptOptions,
-    SessionRegistry, SessionState,
+    PromptResult, ResolvedAgentTarget, SessionCommand, SessionHandle, SessionInfo, SessionKey,
+    SessionPromptOptions, SessionRegistry, SessionState,
 };
 use bytes::Bytes;
 use http::{Method, Response, StatusCode};
@@ -66,16 +66,16 @@ struct HitlDecisionParams {
 
 pub async fn handle_ag_ui_rpc(
     req: Request<Incoming>,
-    agent: &str,
+    target: &ResolvedAgentTarget,
     session: &str,
     config: &harnx_runtime::config::Config,
     registry: &SessionRegistry,
     persistence: PersistenceKind,
 ) -> anyhow::Result<AppResponse> {
     let (parts, body) = req.into_parts();
-    handle_ag_ui_rpc_bytes(
+    handle_ag_ui_rpc_bytes_for_target(
         parts.method,
-        agent,
+        target,
         session,
         body.collect().await?.to_bytes(),
         config,
@@ -87,7 +87,31 @@ pub async fn handle_ag_ui_rpc(
 
 pub async fn handle_ag_ui_rpc_bytes(
     method: Method,
-    agent: &str,
+    agent_ref: &str,
+    session: &str,
+    req_body: Bytes,
+    config: &harnx_runtime::config::Config,
+    registry: &SessionRegistry,
+    persistence: PersistenceKind,
+) -> anyhow::Result<AppResponse> {
+    let (target, _) = crate::resolve_agent_target(config, agent_ref)
+        .await
+        .map_err(crate::ag_ui_error_to_anyhow)?;
+    handle_ag_ui_rpc_bytes_for_target(
+        method,
+        &target,
+        session,
+        req_body,
+        config,
+        registry,
+        persistence,
+    )
+    .await
+}
+
+async fn handle_ag_ui_rpc_bytes_for_target(
+    method: Method,
+    target: &ResolvedAgentTarget,
     session: &str,
     req_body: Bytes,
     config: &harnx_runtime::config::Config,
@@ -128,10 +152,7 @@ pub async fn handle_ag_ui_rpc_bytes(
         );
     }
 
-    let key = SessionKey {
-        agent: agent.to_string(),
-        session: session.to_string(),
-    };
+    let key = SessionKey::new(target.clone(), session);
 
     match rpc.method.as_str() {
         "session/get" => handle_get(rpc.id, config, registry, key, persistence).await,
@@ -156,14 +177,14 @@ async fn handle_get(
     key: SessionKey,
     persistence: PersistenceKind,
 ) -> anyhow::Result<AppResponse> {
-    if !session_exists(config, &key).await && !registry.has_session(&key) {
+    if !session_exists(config, &key).await? && !registry.has_session(&key) {
         return json_rpc_response(
             StatusCode::NOT_FOUND,
             json_rpc_error(
                 id,
                 JSON_RPC_UNKNOWN_SESSION_CODE,
                 "session not found",
-                Some(json!({ "agent": key.agent, "session": key.session })),
+                Some(json!({ "agent": key.agent(), "session": key.session })),
             ),
         );
     }
@@ -245,14 +266,14 @@ async fn handle_prompt(
         );
     }
 
-    if !registry.has_session(&key) && !session_exists(config, &key).await {
+    if !registry.has_session(&key) && !session_exists(config, &key).await? {
         return json_rpc_response(
             StatusCode::NOT_FOUND,
             json_rpc_error(
                 id,
                 JSON_RPC_UNKNOWN_SESSION_CODE,
                 "session not found",
-                Some(json!({ "agent": key.agent, "session": key.session })),
+                Some(json!({ "agent": key.agent(), "session": key.session })),
             ),
         );
     }
@@ -388,7 +409,7 @@ async fn handle_hitl_decision(
             );
         }
     };
-    if !registry.has_session(&key) && !session_exists(config, &key).await {
+    if !registry.has_session(&key) && !session_exists(config, &key).await? {
         return json_rpc_response(
             StatusCode::NOT_FOUND,
             json_rpc_error(id, JSON_RPC_UNKNOWN_SESSION_CODE, "session not found", None),
@@ -429,23 +450,22 @@ pub(crate) async fn route_hitl_decision(
         .map_err(|_| "session actor unavailable".to_string())?
 }
 
-async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
-    match load_nats_session(config, &key.agent, &key.session).await {
+async fn session_exists(
+    config: &harnx_runtime::config::Config,
+    key: &SessionKey,
+) -> anyhow::Result<bool> {
+    match load_nats_session(config, key.target(), &key.session).await {
         Ok((session, _entries)) => {
-            return session.agent_name.as_deref() == Some(key.agent.as_str());
+            return Ok(session.agent_name.as_deref() == Some(key.agent()));
         }
         Err(error) if error.to_string() == "Not Found" => {}
-        Err(_) => return false,
+        Err(error) => return Err(error),
     }
     crate::session_routes::canonical_agent_session_exists(
         config,
-        crate::session_routes::AgentSessionRef {
-            agent: &key.agent,
-            session: &key.session,
-        },
+        crate::session_routes::AgentSessionRef::from_key(key),
     )
     .await
-    .unwrap_or(false)
 }
 
 async fn handle_mark_read(
@@ -486,22 +506,19 @@ async fn handle_mark_read_state(
     key: SessionKey,
     op: MarkReadOp,
 ) -> anyhow::Result<AppResponse> {
-    if !session_exists(config, &key).await {
+    if !session_exists(config, &key).await? {
         return json_rpc_response(
             StatusCode::NOT_FOUND,
             json_rpc_error(
                 id,
                 JSON_RPC_UNKNOWN_SESSION_CODE,
                 "session not found",
-                Some(json!({ "agent": key.agent, "session": key.session })),
+                Some(json!({ "agent": key.agent(), "session": key.session })),
             ),
         );
     }
 
-    let jetstream = config
-        .nats_jetstream(crate::LOCAL_CLUSTER_KEY)
-        .await
-        .map_err(|err| anyhow::anyhow!("Failed to connect to NATS: {err}"))?;
+    let jetstream = crate::serve_nats_jetstream(config, key.cluster()).await?;
     let metadata_store =
         harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
             .await
@@ -748,10 +765,7 @@ mod tests {
             })
         });
         let registry = registry_with_call_fn(call_fn);
-        let handle = registry.get_or_spawn(SessionKey {
-            agent: "plain".into(),
-            session: "rpc-get".into(),
-        });
+        let handle = registry.get_or_spawn(SessionKey::local("plain", "rpc-get"));
         let _ = prompt(&handle, "seed history", SessionPromptOptions::default()).await;
         wait_for_state(&handle, "idle after seeding history", |state| {
             *state == SessionState::Idle
@@ -820,10 +834,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let registry = SessionRegistry::new(crate::session_actor::load_base_config_for_tests());
-        let key = SessionKey {
-            agent: "plain".into(),
-            session: "never-prompted".into(),
-        };
+        let key = SessionKey::local("plain", "never-prompted");
 
         let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "never-prompted", Bytes::from(json!({"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{"text":"hello"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Nats).await.expect("rpc response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -839,10 +850,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let registry = SessionRegistry::new(crate::session_actor::load_base_config_for_tests());
-        let key = SessionKey {
-            agent: "plain".into(),
-            session: "never-cancelled".into(),
-        };
+        let key = SessionKey::local("plain", "never-cancelled");
 
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,
@@ -880,10 +888,7 @@ mod tests {
         });
         let registry = registry_with_call_fn(call_fn);
 
-        let handle = registry.get_or_spawn(SessionKey {
-            agent: "plain".into(),
-            session: "rpc-prompt".into(),
-        });
+        let handle = registry.get_or_spawn(SessionKey::local("plain", "rpc-prompt"));
 
         let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "rpc-prompt", Bytes::from(json!({"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"text":"run me"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Nats).await.expect("rpc response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -908,10 +913,7 @@ mod tests {
         sandbox.write_agent("plain", "You are plain.");
         let config = crate::session_actor::load_base_config_for_tests();
         let registry = SessionRegistry::new(config.clone());
-        let key = SessionKey {
-            agent: "plain".into(),
-            session: "rpc-prompt-resume".into(),
-        };
+        let key = SessionKey::local("plain", "rpc-prompt-resume");
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         registry.insert_handle_for_tests(key, SessionHandle { tx, actor_id: 1 });
 
@@ -992,10 +994,7 @@ mod tests {
         sandbox.write_agent("plain", "You are plain.");
         let config = crate::session_actor::load_base_config_for_tests();
         let registry = SessionRegistry::new(config.clone());
-        let key = SessionKey {
-            agent: "plain".into(),
-            session: "rpc-prompt-resume-failure".into(),
-        };
+        let key = SessionKey::local("plain", "rpc-prompt-resume-failure");
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         registry.insert_handle_for_tests(key, SessionHandle { tx, actor_id: 2 });
 
@@ -1077,10 +1076,7 @@ mod tests {
             })
         };
         let registry = registry_with_call_fn(call_fn);
-        let handle = registry.get_or_spawn(SessionKey {
-            agent: "plain".into(),
-            session: "rpc-cancel".into(),
-        });
+        let handle = registry.get_or_spawn(SessionKey::local("plain", "rpc-cancel"));
         let _ = prompt(&handle, "cancel me", SessionPromptOptions::default()).await;
         gate_ready.notified().await;
 
@@ -1319,10 +1315,7 @@ mod tests {
         sandbox.write_agent("plain", "You are plain.");
         let registry = SessionRegistry::new(crate::session_actor::load_base_config_for_tests());
 
-        let handle = registry.get_or_spawn(SessionKey {
-            agent: "plain".into(),
-            session: "attach-rpc".into(),
-        });
+        let handle = registry.get_or_spawn(SessionKey::local("plain", "attach-rpc"));
         let _ = prompt(&handle, "seed history", SessionPromptOptions::default()).await;
 
         let response = handle_ag_ui_rpc_bytes(
@@ -1419,10 +1412,7 @@ mod extra_rpc_tests {
         let config = load_base_config_for_tests();
         let registry = SessionRegistry::new(config.clone());
 
-        let handle = registry.get_or_spawn(SessionKey {
-            agent: "plain".into(),
-            session: "idle-cancel".into(),
-        });
+        let handle = registry.get_or_spawn(SessionKey::local("plain", "idle-cancel"));
         let _ = get_info(&handle).await.expect("seed idle session");
 
         let idle_cancel = handle_ag_ui_rpc_bytes(

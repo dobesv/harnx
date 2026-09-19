@@ -2,18 +2,93 @@ use ag_ui_core::types::ids::RunId;
 use ag_ui_core::{event::Event, types::message::Message as AgUiMessage};
 use chrono::{DateTime, Utc};
 use harnx_core::abort::AbortSignal;
-use harnx_runtime::nats_session::InterruptOutcome;
+use harnx_runtime::{config::LOCAL_CLUSTER_KEY, nats_session::InterruptOutcome};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ResolvedAgentTarget {
+    agent: String,
+    cluster: String,
+}
+
+impl ResolvedAgentTarget {
+    pub fn new(agent: impl Into<String>, cluster: impl Into<String>) -> Self {
+        Self {
+            agent: agent.into(),
+            cluster: cluster.into(),
+        }
+    }
+
+    pub fn local(agent: impl Into<String>) -> Self {
+        Self::new(agent, LOCAL_CLUSTER_KEY)
+    }
+
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    pub fn cluster(&self) -> &str {
+        &self.cluster
+    }
+
+    pub fn display_ref(&self) -> String {
+        if self.cluster == LOCAL_CLUSTER_KEY {
+            self.agent.clone()
+        } else {
+            format!("{}@{}", self.agent, self.cluster)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct SessionKey {
-    pub agent: String,
+    target: ResolvedAgentTarget,
     pub session: String,
 }
 
 impl SessionKey {
-    pub(crate) fn storage_key(&self) -> String {
-        harnx_core::session_identity::session_key(Some(&self.agent), &self.session)
+    pub fn new(target: ResolvedAgentTarget, session: impl Into<String>) -> Self {
+        Self {
+            target,
+            session: session.into(),
+        }
+    }
+
+    pub fn local(agent: impl Into<String>, session: impl Into<String>) -> Self {
+        Self::new(ResolvedAgentTarget::local(agent), session)
+    }
+
+    pub fn target(&self) -> &ResolvedAgentTarget {
+        &self.target
+    }
+
+    pub fn agent(&self) -> &str {
+        self.target.agent()
+    }
+
+    pub fn cluster(&self) -> &str {
+        self.target.cluster()
+    }
+
+    pub fn display_ref(&self) -> String {
+        self.target.display_ref()
+    }
+
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    /// NATS storage key for this session.
+    ///
+    /// **Invariant:** The storage key uses only the bare agent name and session ID.
+    /// The cluster determines which JetStream namespace/store to use, but is deliberately
+    /// excluded from the key itself. Putting the cluster (or `agent@cluster` string) into
+    /// the storage key would break CLI/TUI compatibility and mis-route storage.
+    /// The cluster *does* participate in `Eq`/`Hash` for actor isolation (local and remote
+    /// sessions with the same agent+id are distinct actors), but storage keys are
+    /// cluster-scoped by namespace, not key content.
+    pub fn storage_key(&self) -> String {
+        harnx_core::session_identity::session_key(Some(self.agent()), self.session())
     }
 }
 
@@ -79,6 +154,32 @@ pub enum SessionCommand {
     Panic,
 }
 
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn display_ref_omits_local_cluster_and_includes_remote_cluster() {
+        assert_eq!(ResolvedAgentTarget::local("atlas").display_ref(), "atlas");
+        assert_eq!(
+            ResolvedAgentTarget::new("atlas", "shared").display_ref(),
+            "atlas@shared"
+        );
+    }
+
+    #[test]
+    fn cluster_scopes_actor_identity_but_not_storage_key() {
+        let local = SessionKey::local("atlas", "review-12345");
+        let remote = SessionKey::new(ResolvedAgentTarget::new("atlas", "shared"), "review-12345");
+
+        assert_ne!(local, remote);
+        assert_eq!(local.storage_key(), remote.storage_key());
+        assert_eq!(
+            local.storage_key(),
+            harnx_core::session_identity::session_key(Some("atlas"), "review-12345")
+        );
+    }
+}
 pub struct SubscribeResult {
     pub snapshot: Vec<AgUiMessage>,
     pub history_warnings: Vec<String>,

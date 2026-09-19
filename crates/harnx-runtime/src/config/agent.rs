@@ -496,7 +496,7 @@ pub fn list_agents() -> Vec<String> {
 }
 
 /// Markdown agent stems in the top-level agents config dir.
-fn list_local_agent_names() -> Vec<String> {
+pub(super) fn list_local_agent_names() -> Vec<String> {
     let Ok(entries) = read_dir(Config::agents_config_dir()) else {
         return vec![];
     };
@@ -508,7 +508,7 @@ fn list_local_agent_names() -> Vec<String> {
 
 /// Package agents discovered under `packages/<pkg>/agents`, returned as
 /// qualified `pkg/stem` names.
-fn list_package_agent_names() -> Vec<String> {
+pub(super) fn list_package_agent_names() -> Vec<String> {
     let packages_dir = harnx_core::config_paths::packages_dir();
     let Ok(pkg_entries) = read_dir(&packages_dir) else {
         return vec![];

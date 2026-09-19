@@ -41,7 +41,6 @@ use ag_ui_core::{
 };
 use bytes::Bytes;
 use harnx_core::{
-    agent_config::AgentConfig,
     event::{
         AgentEvent, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent,
         TurnOutcome,
@@ -49,7 +48,7 @@ use harnx_core::{
     message::{Message as HistoryMsg, MessageContent, MessageContentPart, MessageRole},
 };
 use harnx_runtime::{
-    config::{Agent, Config, GlobalConfig},
+    config::{Config, GlobalConfig},
     AgentCallFn,
 };
 use http::{Response, StatusCode};
@@ -1271,7 +1270,20 @@ pub(crate) fn build_ag_ui_event_stream(
 pub async fn ag_ui_run_with_call_fn(
     base_config: &Config,
     registry: &SessionRegistry,
-    agent: &str,
+    agent_ref: &str,
+    session: &str,
+    req_body: &[u8],
+    call_fn: Option<AgentCallFn>,
+) -> Result<AppResponse, AgUiError> {
+    let (target, _) = crate::resolve_agent_target(base_config, agent_ref).await?;
+    ag_ui_run_for_target_with_call_fn(base_config, registry, &target, session, req_body, call_fn)
+        .await
+}
+
+pub(crate) async fn ag_ui_run_for_target_with_call_fn(
+    base_config: &Config,
+    registry: &SessionRegistry,
+    target: &crate::session_actor::ResolvedAgentTarget,
     session: &str,
     req_body: &[u8],
     _call_fn: Option<AgentCallFn>,
@@ -1285,10 +1297,8 @@ pub async fn ag_ui_run_with_call_fn(
     let resume = parse_resume_params(&relaxed_run_input.resume)
         .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI resume: {err}")))?;
     let run_input = parse_run_input(req_body)?;
-    let key = crate::session_actor::SessionKey {
-        agent: agent.to_string(),
-        session: session.to_string(),
-    };
+    let key = crate::session_actor::SessionKey::new(target.clone(), session);
+    let cluster = target.cluster().to_string();
     let handle = registry.get_or_spawn(key);
     let is_resume = !resume.is_empty();
     for decision in resume {
@@ -1323,7 +1333,8 @@ pub async fn ag_ui_run_with_call_fn(
     let stream = if let Some(stream) = crate::ag_ui_remote_follow::resolve_event_stream(
         crate::ag_ui_remote_follow::EventStreamParams {
             config: base_config,
-            session_id: &harnx_core::session_identity::session_key(Some(agent), session),
+            cluster: &cluster,
+            session_id: &harnx_core::session_identity::session_key(Some(target.agent()), session),
             run_id: &run_id,
             thread_id: &thread_id_text,
             subscription: &subscription,
@@ -1357,13 +1368,6 @@ pub async fn ag_ui_run_with_call_fn(
         .header("X-Thread-Id", thread_id.to_string())
         .body(BodyExt::boxed(StreamBody::new(stream)))
         .map_err(|err| AgUiError::Internal(format!("failed to build AG-UI response: {err}")))
-}
-
-pub fn resolve_agent(config: &Config, name: &str) -> Result<AgentConfig, AgUiError> {
-    config
-        .retrieve_agent(name)
-        .map(Agent::into_config)
-        .map_err(|_| AgUiError::NotFound(format!("agent '{name}' not found")))
 }
 
 #[cfg(test)]

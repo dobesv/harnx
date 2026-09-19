@@ -468,7 +468,12 @@ To use an agent via NATS, append `@cluster` to the agent name:
 harnx -a coder@local
 ```
 
-This works from the CLI and TUI.
+This works from the CLI, the TUI, and `harnx-serve` (the HTTP API and Web UI).
+Over HTTP the `@` in the agent name is percent-encoded, so `sisyphus@shared`
+is addressed as `/v1/agents/sisyphus%40shared`; a package-qualified remote
+agent combines both, e.g. `/v1/agents/coding%2Fcoder%40shared`. A remote agent
+runs its turns on a worker in the target cluster, and a server addressing only
+remote agents never starts a local broker or worker.
 
 - **New Sessions**: Canonical metadata and activity are reserved before the
   first user row is appended. The worker creates a lease only when activated.
@@ -502,7 +507,7 @@ agents:
 - **Naming**: Agents appear as `name@cluster`. For example, `name: atlas` in `prod.yaml` surfaces as `atlas@prod`.
 - **Filtering**:
     - **Shell Completion**: All agents appear in `--list-agents` and tab-completion regardless of role.
-    - **Assistant Picker**: Only agents with `role: assistant` (the default) appear in interactive assistant selection menus. `subagent` entries are excluded from the picker.
+    - **Assistant Picker**: Only agents with `role: assistant` (the default) appear in interactive assistant selection menus, including the TUI picker and the Web UI agent list served by `GET /v1/agents?role=assistant`. `subagent` entries are excluded from the picker.
 - **Static Config**: This is purely local configuration. Harnx does not perform network calls to discover or list these agents.
 
 ## Interruption
