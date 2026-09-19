@@ -1051,15 +1051,64 @@ suppress the replacement worker's wakeup during the duplicate window.
 ## Cleanup
 
 Session logs, leases, canonical metadata, and attachment blobs persist in
-JetStream until explicitly deleted. Deletion purges the transcript stream,
-lease, every KV key under `sessions/{id}`, and every attachment object owned by
-the session. The periodic remote-session cleanup uses the same deletion path.
-There is no separate control-plane state to reap: interruption leaves nothing
-behind but log entries, which the same deletion removes.
+JetStream until explicitly deleted or collected. Manual deletion purges the
+transcript stream, lease, every KV key under `sessions/{id}` (including read
+and unread state), tool-invocation journal entries, and attachment objects owned
+by the session:
 
 ```bash
 harnx delete session <session_id> --agent <agent> --cluster local
 ```
+
+There is no separate control-plane state to reap: interruption leaves nothing
+behind but log entries, which the same deletion removes.
+
+### Automatic Session Garbage Collection
+
+In multi-node deployments, session garbage collection runs from the
+`harnx-worker` daemon rather than the CLI or `harnx-serve`. Every running worker
+participates in hourly leader election using the `session_metadata_gc` KV lease
+on `harnx_leases`. The winning worker checks a durable epoch-hour marker key
+(`session_metadata_gc/last_run_epoch_hour`) before scanning, guaranteeing that
+only one worker per cluster performs a cleanup pass per wall-clock hour even
+when worker startup times are staggered.
+
+Each worker only collects expired sessions in its own cluster
+(`daemon.connection_key()`). If a cluster runs `harnx-serve` or other frontends
+with zero workers deployed, no automatic garbage collection runs for that
+cluster until at least one worker joins.
+
+Automatic collection uses the exact same deletion path as manual cleanup. In
+the normal case it removes the transcript stream, lease, all `sessions/{id}`
+metadata keys (including read and unread tracking), tool-invocation journal
+entries, and attachment objects. Workers also verify that candidate sessions
+are inactive before deletion, skipping any session with an active or
+reactivated lease.
+
+Retention is controlled by `cleanup_remote_sessions_days` in `config.yaml` or
+the `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS` environment variable. Configure the
+same value on every worker in a cluster because the worker elected for an hour
+applies its own retention setting:
+
+- **Unset (default)**: Automatic expiry is disabled. Session data grows
+  unbounded until removed manually. When unset, workers log a `WARN` at startup
+  advising that GC is disabled and explaining how to configure retention.
+- **`0`**: Explicitly disabled. Workers log an `INFO` notice at startup and
+  skip GC passes without acquiring the election lease or setting marker state.
+- **`n > 0`**: Enabled with an `n`-day retention period.
+
+The expiration threshold is measured from the session's last activity timestamp,
+falling back to its creation timestamp when no activity record exists.
+
+### Stream Retention Decision (`max_age`)
+
+Harnx deliberately avoids configuring a JetStream `max_age` backstop on session
+transcript streams. Message age does not equal session inactivity: an automatic
+stream-level cutoff would ignore active leases, truncate resumable conversation
+history on long-lived sessions, and leave orphaned records behind in the
+metadata KV store, invocation journal, and attachment buckets. Session-aware
+garbage collection in the worker daemon is the sole authoritative mechanism for
+expiring inactive sessions cleanly across all storage layers.
 
 ## Observability
 

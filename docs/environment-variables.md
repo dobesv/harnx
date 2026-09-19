@@ -30,6 +30,7 @@ Harnx can load environment variables from a `.env` file located in the data dire
 - **HARNX_USER_AGENT**: The user agent string for API requests.
 - **HARNX_SAVE_SHELL_HISTORY**: Whether to save shell history (boolean).
 - **HARNX_SYNC_MODELS_URL**: The URL to sync models from.
+- **HARNX_CLEANUP_REMOTE_SESSIONS_DAYS**: Retention period in days for remote NATS sessions (integer). Unset disables automatic expiry (state grows unbounded; workers log a warning at startup). `0` explicitly disables expiry. Values `>0` enable worker-owned periodic session garbage collection.
 
 ## Client-Related Envs
 

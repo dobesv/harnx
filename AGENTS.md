@@ -451,6 +451,22 @@ turns one flake into several. `spawn_test_nats` returns `TestNatsServer`
 returns `NatsServerHandle` (`crates/harnx-runtime/tests/common/mod.rs`); both
 reap in `Drop`. Keep new broker helpers in that shape.
 
+### NATS/GC tests: CI coverage and isolation
+
+CI runs integration tests against an isolated `nats-server` per test file via
+`spawn_nats_server` in `crates/harnx-runtime/tests/common/mod.rs`. The CI
+workflow installs `nats-server` on all platforms (`.github/workflows/ci.yaml`);
+tests that skip when the binary is absent still pass, but real coverage requires
+the installed binary.
+
+In-module `#[cfg(test)]` tests that gate on `HARNX_NATS_TEST_URL` (unset in CI)
+**do not run in CI** — they skip when that env var is missing. Those tests also
+share one physical server and the global `SESSION_METADATA_BUCKET` when run
+locally, so they contaminate each other's state. New NATS/GC tests that must run
+in CI belong in `crates/harnx-runtime/tests/`, use `spawn_nats_server` for
+per-test isolation, and assert on specific session IDs rather than global
+bucket stats. Precedent: `tests/worker_remote_session_cleanup.rs`.
+
 ## CLI Flag Constraints
 
 The root `Cli.file: Vec<String>` has `#[clap(short, long, global = true, hide = true)]` at
