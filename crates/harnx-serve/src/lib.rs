@@ -206,6 +206,32 @@ fn advertised_base_url(local_addr: Option<SocketAddr>, requested_addr: &str) -> 
     }
 }
 
+/// Return an actionable warning when the resolved web-assets directory can't
+/// serve the UI (missing, or present without an `index.html`), else `None`.
+/// Checked once at startup so a container/service with an unmounted or empty
+/// assets dir logs why the UI 404s instead of failing silently.
+fn web_assets_warning(dir: &Path) -> Option<String> {
+    if dir.join("index.html").is_file() {
+        None
+    } else {
+        Some(format!(
+            "Web assets unavailable at '{}': directory is missing or does not contain index.html; set HARNX_WEB_ASSETS, pass --web-assets, or run `cargo xtask install`",
+            dir.display()
+        ))
+    }
+}
+
+/// Resolve the web-assets directory (explicit path, else the default under the
+/// data dir) and log the startup warning once if it can't serve the UI. Kept
+/// out of `run()` so the resolve-and-warn branch doesn't inflate its complexity.
+fn resolve_web_assets(web_assets: Option<PathBuf>) -> PathBuf {
+    let dir = web_assets.unwrap_or_else(|| harnx_core::config_paths::data_dir().join("web-assets"));
+    if let Some(warning) = web_assets_warning(&dir) {
+        warn!("{warning}");
+    }
+    dir
+}
+
 pub async fn run(
     config: GlobalConfig,
     addr: Option<String>,
@@ -226,8 +252,7 @@ pub async fn run(
         }
         None => config.read().serve_addr(),
     };
-    let web_assets =
-        web_assets.unwrap_or_else(|| harnx_core::config_paths::data_dir().join("web-assets"));
+    let web_assets = resolve_web_assets(web_assets);
     let server = Arc::new(Server::new(&config, web_assets));
     let listener = TcpListener::bind(&addr).await?;
     // Advertise the bound address so URLs reflect the real host/port even when
@@ -1828,6 +1853,23 @@ mod tests {
     use harnx_core::message::{ImageUrl, Message, MessageContent, MessageContentPart};
     use harnx_core::session::SessionLogEntry;
     use http::HeaderValue;
+
+    #[test]
+    fn web_assets_warning_reports_missing_or_incomplete_directories() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+
+        let missing = tempdir.path().join("missing");
+        let warning = web_assets_warning(&missing).expect("missing directory should warn");
+        assert!(warning.contains(&missing.display().to_string()));
+
+        let empty = tempdir.path().join("empty");
+        std::fs::create_dir(&empty).expect("create empty assets directory");
+        let warning = web_assets_warning(&empty).expect("directory without index.html should warn");
+        assert!(warning.contains(&empty.display().to_string()));
+
+        std::fs::write(empty.join("index.html"), "<html></html>").expect("write index.html");
+        assert_eq!(web_assets_warning(&empty), None);
+    }
 
     #[test]
     fn browser_base_url_maps_wildcards_and_brackets_ipv6() {
