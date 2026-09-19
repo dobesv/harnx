@@ -20,7 +20,7 @@ ag-ui-core = "=0.1.0"
 anyhow = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["env"] }
 dashmap = "6"
 futures = "0.3"
 futures-util = { workspace = true }
