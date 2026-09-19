@@ -1,17 +1,184 @@
 use super::*;
+use harnx_runtime::nats_lease::NatsLeaseConfig;
+use harnx_runtime::nats_worker::{
+    publish_session_activate, run_worker_daemon, SessionActivate, WorkerDaemonConfig,
+};
+use std::future::Future;
+use tokio_util::task::AbortOnDropHandle;
+
+type WorkerDaemonHandle = AbortOnDropHandle<Result<()>>;
+
+async fn progress_or_daemon_exit<F, T>(
+    label: &str,
+    progress: F,
+    worker_one: &mut WorkerDaemonHandle,
+    worker_two: &mut WorkerDaemonHandle,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::select! {
+        result = progress => result,
+        stopped = &mut *worker_one => {
+            anyhow::bail!("worker-one daemon stopped during {label}: {stopped:?}")
+        }
+        stopped = &mut *worker_two => {
+            anyhow::bail!("worker-two daemon stopped during {label}: {stopped:?}")
+        }
+    }
+}
+
+fn spawn_test_worker(
+    server_url: &str,
+    worker_id: &str,
+    lease: &NatsLeaseConfig,
+    counter: Arc<AtomicUsize>,
+) -> (WorkerDaemonHandle, harnx_healthz::Readiness) {
+    let mut daemon = WorkerDaemonConfig::managing("local", worker_id);
+    daemon.lease = lease.clone();
+    let config = local_nats_runtime_config(server_url);
+    let readiness = harnx_healthz::Readiness::default();
+    let handle = AbortOnDropHandle::new(tokio::spawn({
+        let readiness = readiness.clone();
+        async move {
+            run_worker_daemon(
+                config,
+                daemon,
+                Some(counting_stub_call_fn(counter)),
+                Some(readiness),
+            )
+            .await
+        }
+    }));
+    (handle, readiness)
+}
+
+struct WorkerPair {
+    worker_one: WorkerDaemonHandle,
+    worker_two: WorkerDaemonHandle,
+    readiness_one: harnx_healthz::Readiness,
+    readiness_two: harnx_healthz::Readiness,
+    counter_one: Arc<AtomicUsize>,
+    counter_two: Arc<AtomicUsize>,
+}
+
+impl WorkerPair {
+    fn spawn(server_url: &str, lease: &NatsLeaseConfig) -> Self {
+        let counter_one = Arc::new(AtomicUsize::new(0));
+        let counter_two = Arc::new(AtomicUsize::new(0));
+        let (worker_one, readiness_one) =
+            spawn_test_worker(server_url, "worker-one", lease, Arc::clone(&counter_one));
+        let (worker_two, readiness_two) =
+            spawn_test_worker(server_url, "worker-two", lease, Arc::clone(&counter_two));
+        Self {
+            worker_one,
+            worker_two,
+            readiness_one,
+            readiness_two,
+            counter_one,
+            counter_two,
+        }
+    }
+
+    async fn wait_until_ready(&mut self) -> Result<()> {
+        let readiness_one = self.readiness_one.clone();
+        let readiness_two = self.readiness_two.clone();
+        progress_or_daemon_exit(
+            "startup",
+            wait_until(CI_SAFE_TIMEOUT, move || {
+                readiness_one.is_ready() && readiness_two.is_ready()
+            }),
+            &mut self.worker_one,
+            &mut self.worker_two,
+        )
+        .await
+    }
+
+    async fn wait_for_execution_count(&mut self, label: &str, expected: usize) -> Result<()> {
+        let counter_one = Arc::clone(&self.counter_one);
+        let counter_two = Arc::clone(&self.counter_two);
+        progress_or_daemon_exit(
+            label,
+            wait_until(CI_SAFE_TIMEOUT, move || {
+                counter_one.load(Ordering::SeqCst) + counter_two.load(Ordering::SeqCst) >= expected
+            }),
+            &mut self.worker_one,
+            &mut self.worker_two,
+        )
+        .await
+    }
+
+    async fn wait_for_session_cleanup(
+        &mut self,
+        label: &str,
+        jetstream: &async_nats::jetstream::Context,
+        session_id: &str,
+    ) -> Result<()> {
+        progress_or_daemon_exit(
+            label,
+            wait_for_worker_session_cleanup(jetstream, session_id),
+            &mut self.worker_one,
+            &mut self.worker_two,
+        )
+        .await
+    }
+
+    fn execution_count(&self) -> usize {
+        self.counter_one.load(Ordering::SeqCst) + self.counter_two.load(Ordering::SeqCst)
+    }
+
+    fn assert_running(&self) {
+        assert!(
+            !self.worker_one.is_finished(),
+            "worker-one daemon stopped unexpectedly"
+        );
+        assert!(
+            !self.worker_two.is_finished(),
+            "worker-two daemon stopped unexpectedly"
+        );
+    }
+
+    async fn abort_and_assert_cancelled(self) {
+        self.worker_one.abort();
+        self.worker_two.abort();
+        let stopped_one = self.worker_one.await;
+        let stopped_two = self.worker_two.await;
+        assert!(
+            matches!(&stopped_one, Err(error) if error.is_cancelled()),
+            "worker-one daemon did not stop by cancellation: {stopped_one:?}"
+        );
+        assert!(
+            matches!(&stopped_two, Err(error) if error.is_cancelled()),
+            "worker-two daemon did not stop by cancellation: {stopped_two:?}"
+        );
+    }
+}
+
+async fn seed_and_publish_activation(
+    jetstream: &async_nats::jetstream::Context,
+    session_id: &str,
+    user_text: &str,
+) -> Result<SessionActivate> {
+    NatsSessionLog::new(jetstream.clone(), storage_key(session_id))
+        .append_event_async(&SessionLogEntry::Message {
+            id: None,
+            role: harnx_core::message::MessageRole::User,
+            content: harnx_core::message::MessageContent::Text(user_text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await?;
+    seed_session_metadata(jetstream, session_id).await?;
+    let activation = SessionActivate::new(storage_key(session_id));
+    publish_session_activate(jetstream, "local", &activation).await?;
+    Ok(activation)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dispatch_runs_exactly_one_worker_per_activation_and_reactivation_is_noop() -> Result<()> {
-    use harnx_runtime::nats_lease::NatsLeaseConfig;
-    use harnx_runtime::nats_worker::{
-        publish_session_activate, run_worker_daemon, SessionActivate, WorkerDaemonConfig,
-    };
-    use std::time::Duration;
-
+async fn two_workers_share_the_activation_queue_and_dispatch_is_deduplicated() -> Result<()> {
     let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
-
     let fast_lease = NatsLeaseConfig {
         ttl: Duration::from_secs(3),
         renew_interval: Duration::from_millis(500),
@@ -19,70 +186,45 @@ async fn dispatch_runs_exactly_one_worker_per_activation_and_reactivation_is_noo
         tombstone_ttl: Duration::from_secs(10),
         ..Default::default()
     };
+    let mut workers = WorkerPair::spawn(server.url(), &fast_lease);
+    workers.wait_until_ready().await?;
+    let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
 
-    let counter_one = Arc::new(AtomicUsize::new(0));
-    let counter_two = Arc::new(AtomicUsize::new(0));
-
-    let mut cfg_one = WorkerDaemonConfig::managing("local", "worker-one");
-    cfg_one.lease = fast_lease.clone();
-    let mut cfg_two = WorkerDaemonConfig::managing("local", "worker-two");
-    cfg_two.lease = fast_lease.clone();
-
-    let config_one = local_nats_runtime_config(server.url());
-    let config_two = local_nats_runtime_config(server.url());
-
-    let h1 = tokio::spawn({
-        let c = config_one.clone();
-        let call = counting_stub_call_fn(counter_one.clone());
-        async move { run_worker_daemon(c, cfg_one, Some(call), None).await }
-    });
-    let h2 = tokio::spawn({
-        let c = config_two.clone();
-        let call = counting_stub_call_fn(counter_two.clone());
-        async move { run_worker_daemon(c, cfg_two, Some(call), None).await }
-    });
-
-    // Give the daemons a moment to subscribe.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-
-    // Client appends a user message to the session log, then activates it.
-    let session_id = "dispatch-session";
-    let client_log = NatsSessionLog::new(js.clone(), storage_key(session_id));
-    client_log
-        .append_event_async(&SessionLogEntry::Message {
-            id: None,
-            role: harnx_core::message::MessageRole::User,
-            content: harnx_core::message::MessageContent::Text("hello worker".to_string()),
-            timestamp: None,
-            fence_token: None,
-        })
+    let first_session_id = "dispatch-session-one";
+    let first_activation =
+        seed_and_publish_activation(&jetstream, first_session_id, "hello worker one").await?;
+    publish_session_activate(&jetstream, "local", &first_activation).await?;
+    workers
+        .wait_for_execution_count("first dispatch", 1)
         .await?;
-
-    seed_session_metadata(&js, session_id).await?;
-    let activation = SessionActivate::new(storage_key(session_id));
-    publish_session_activate(&js, "local", &activation).await?;
-    // Duplicate publish is deduped by Nats-Msg-Id; still only one execution.
-    publish_session_activate(&js, "local", &activation).await?;
-
-    // Exactly one worker executes one turn.
-    wait_until(CI_SAFE_TIMEOUT, || {
-        counter_one.load(Ordering::SeqCst) + counter_two.load(Ordering::SeqCst) >= 1
-    })
-    .await?;
-    // Let any erroneous second executor surface.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let total = counter_one.load(Ordering::SeqCst) + counter_two.load(Ordering::SeqCst);
+    workers
+        .wait_for_session_cleanup("cleanup after first dispatch", &jetstream, first_session_id)
+        .await?;
+    let first_total = workers.execution_count();
     assert_eq!(
-        total, 1,
-        "exactly one worker should execute the activation (got {total})"
+        first_total, 1,
+        "duplicate activation should execute exactly once (got {first_total})"
     );
 
-    h1.abort();
-    h2.abort();
-    let _ = h1.await;
-    let _ = h2.await;
+    let second_session_id = "dispatch-session-two";
+    seed_and_publish_activation(&jetstream, second_session_id, "hello worker two").await?;
+    workers
+        .wait_for_execution_count("second dispatch", 2)
+        .await?;
+    workers
+        .wait_for_session_cleanup(
+            "cleanup after second dispatch",
+            &jetstream,
+            second_session_id,
+        )
+        .await?;
+    let total = workers.execution_count();
+    assert_eq!(
+        total, 2,
+        "each activation should execute once (got {total})"
+    );
+    workers.assert_running();
+    workers.abort_and_assert_cancelled().await;
     Ok(())
 }
 

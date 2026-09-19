@@ -13,7 +13,7 @@ use async_nats::jetstream::{
 use std::time::Duration;
 
 const WORK_NOTIFY_STREAM_PREFIX: &str = "WORK_NOTIFY_";
-const WORK_NOTIFY_CONSUMER_PREFIX: &str = "worker-";
+const WORK_NOTIFY_CONSUMER_NAME: &str = "workers";
 const WORK_NOTIFY_ACK_WAIT: Duration = Duration::from_secs(30);
 const WORK_NOTIFY_INACTIVE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 const LOCAL_WORK_NOTIFY_STREAM: &str = "LOCAL_WORK_NOTIFY_V2";
@@ -98,11 +98,8 @@ fn notify_stream_name(cluster: &str) -> String {
     )
 }
 
-fn durable_consumer_name(worker_id: &str) -> String {
-    format!(
-        "{WORK_NOTIFY_CONSUMER_PREFIX}{}",
-        sanitize_name_component(worker_id)
-    )
+fn shared_notify_consumer_name() -> String {
+    WORK_NOTIFY_CONSUMER_NAME.to_string()
 }
 
 fn sanitize_name_component(value: &str) -> String {
@@ -307,7 +304,7 @@ async fn consumer_route(
             let subject = notify_subject(&daemon.session_scope);
             Ok((
                 ensure_notify_stream(jetstream, &daemon.session_scope, &subject).await?,
-                durable_consumer_name(&daemon.worker_id),
+                shared_notify_consumer_name(),
                 subject,
             ))
         }
