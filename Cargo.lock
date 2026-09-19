@@ -2097,9 +2097,9 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
-version = "0.19.1"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52e0387578e845beb7a1acff126228499f26cb18edf12919cc513bb863266464"
+checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
 dependencies = [
  "bit-set 0.8.0",
  "regex-automata",
@@ -3494,7 +3494,7 @@ dependencies = [
  "crossterm",
  "dirs 7.0.0",
  "duct",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "futures-util",
  "fuzzy-matcher",
  "glob",
@@ -3588,7 +3588,7 @@ version = "0.33.4"
 dependencies = [
  "anyhow",
  "async-trait",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "gix",
  "harnx-core",
  "harnx-mcp-history",
@@ -3688,7 +3688,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs 7.0.0",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "futures-util",
  "hmac",
  "indexmap",
@@ -3738,7 +3738,7 @@ name = "harnx-fetch"
 version = "0.33.4"
 dependencies = [
  "anyhow",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "futures-util",
  "harnx-core",
  "html_to_markdown",
@@ -3763,7 +3763,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "base64 0.23.1",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "gix",
  "glob",
  "harnx-core",
@@ -3788,7 +3788,7 @@ version = "0.33.4"
 dependencies = [
  "anyhow",
  "async-trait",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "harnx-core",
  "harnx-metrics",
  "harnx-toolset",
@@ -3820,7 +3820,7 @@ name = "harnx-hooks"
 version = "0.33.4"
 dependencies = [
  "anyhow",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "harnx-core",
  "inquire",
  "log",
@@ -4264,7 +4264,7 @@ dependencies = [
  "crossterm",
  "dirs 7.0.0",
  "duct",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "futures-util",
  "fuzzy-matcher",
  "globset",
@@ -4548,7 +4548,7 @@ dependencies = [
  "bincode 2.0.1",
  "chrono",
  "crossterm",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "futures-util",
  "harnx-core",
  "harnx-render",
