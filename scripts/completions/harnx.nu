@@ -45,7 +45,6 @@ module completions {
     --rag: string@"nu-complete harnx rag"              # Start a RAG
     --rebuild-rag                                       # Rebuild the RAG to sync document changes
     --macro: string@"nu-complete harnx macro"          # Execute a macro
-    --serve                                             # Serve the LLM API and WebAPP
     --file(-f): string                                  # Include files, directories, or URLs
     --no-stream(-S)                                     # Turn off stream mode
     --dry-run                                           # Display the message without sending it

@@ -80,7 +80,7 @@ overwrites any existing bins.
 
 It also builds the web UI (via `corepack install`, `corepack pnpm --version`,
 `pnpm install`, and `pnpm build` in `web/`) and copies the compiled assets into the default
-directory `harnx serve` loads from (`<data_dir>/web-assets`, i.e.
+directory `harnx-serve` loads from (`<data_dir>/web-assets`, i.e.
 `~/.local/share/harnx/web-assets` on Linux). This requires
 [Corepack](https://github.com/nodejs/corepack) and its pnpm shim on your `PATH`.
 The Corepack steps cache both the pinned package and pnpm's native executable
