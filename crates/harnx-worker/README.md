@@ -15,8 +15,9 @@ harnx-worker --cluster prod --worker-id worker-1
 - `--cluster` selects `nats_servers/<name>.yaml`. The reserved name
   `__local__` is rejected because local workers are owned and addressed by a
   frontend, not shared through cluster dispatch.
-- `--worker-id` is the deployment identity used for leases and the durable
-  cluster consumer. It defaults to a generated ID; a stable value is
+- `--worker-id` is the deployment identity used for session leases. All cluster
+  workers share one durable activation consumer, so the ID no longer names a
+  per-worker consumer. It defaults to a generated ID; a stable value is
   recommended in production.
 - `--manage-servers` launches this worker's tool and hook servers. Without it,
   the worker discovers independently deployed servers under

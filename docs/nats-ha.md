@@ -100,6 +100,15 @@ Harnx automatically manages the following JetStream resources:
   content-addressed cache before calling a model.
 - **Persistent activation streams**: `WORK_NOTIFY_<cluster>` captures
   `cluster.<cluster>.sessions.notify` with cluster-shared work-queue dispatch.
+  All cluster workers bind to one shared durable pull consumer; per-worker
+  durables would have overlapping filters and be rejected by the work-queue
+  stream. The session lease deduplicates dispatch.
+
+  Rollout note: clusters that ran an older build have a stale `worker-<id>`
+  durable per worker on this stream. Those durables are inert once workers move
+  to the shared consumer and self-clear after the 1h inactive threshold. If a
+  rollout must not wait, delete the old `worker-*` consumers on
+  `WORK_NOTIFY_<cluster>` after the last old worker stops.
 - **Local activation stream**: `LOCAL_WORK_NOTIFY_V2` captures
   `session_scope.__local__.workers.*.sessions.notify` with interest retention
   and one exact durable consumer per frontend worker ID.
