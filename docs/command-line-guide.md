@@ -170,7 +170,10 @@ Rerank API (POST):     http://127.0.0.1:8000/v1/rerank
 ```
 
 Open the Web UI URL in a browser (requires the web-ui assets — installed by
-`cargo xtask install`, or pass `--web-assets <dir>`). The API lines below it are
+`cargo xtask install`, or pass `--web-assets <dir>`). The flag also reads
+`HARNX_WEB_ASSETS` if unset; the harnx container image sets this env var
+automatically. See [Deploy harnx-serve on Kubernetes](kubernetes-serve.md)
+for containerized deployments. The API lines below it are
 POST-only endpoints for programmatic use. When binding to a wildcard host (e.g.
 `0.0.0.0`), the printed URL uses loopback (`127.0.0.1`) so it's directly clickable.
 
