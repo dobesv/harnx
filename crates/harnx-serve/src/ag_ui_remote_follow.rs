@@ -150,6 +150,17 @@ async fn build_remote_follow_ag_ui_stream(
         })
         .collect::<String>();
     let snapshot_frame = (!initial_frames.is_empty()).then(|| Bytes::from(initial_frames));
+    let attachment_frames = params
+        .subscription
+        .log_entries
+        .as_deref()
+        .map(|entries| {
+            super::ag_ui::message_attachment_snapshot_events(&params.subscription.snapshot, entries)
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|event| frame_event(&event).ok().map(Bytes::from))
+        .collect();
 
     build_remote_follow_event_stream(RemoteEventStreamParams {
         config: params.config,
@@ -157,6 +168,7 @@ async fn build_remote_follow_ag_ui_stream(
         run_id: params.run_id,
         thread_id: params.thread_id,
         snapshot_frame,
+        attachment_frames,
         session_base: params.subscription.session_base.clone(),
     })
     .await
@@ -192,14 +204,18 @@ async fn build_remote_follow_event_stream(
         });
         let control_events =
             super::ag_ui::control_snapshot_events(event_stream.history(), tokens_usage.as_ref());
-        let control_frames: Vec<Bytes> = control_events
+        let control_frames = control_events
             .into_iter()
-            .filter_map(|e| super::ag_ui::frame_event(&e).ok().map(Bytes::from))
+            .filter_map(|e| super::ag_ui::frame_event(&e).ok().map(Bytes::from));
+        let hydration_frames = params
+            .attachment_frames
+            .into_iter()
+            .chain(control_frames)
             .collect();
         return Ok(completed_remote_stream(
             [started_frame, boundary_frame],
             params.snapshot_frame,
-            control_frames,
+            hydration_frames,
             params.thread_id,
             params.run_id,
         ));
@@ -213,6 +229,7 @@ async fn build_remote_follow_event_stream(
         started_frame,
         boundary_frame,
         snapshot_frame: params.snapshot_frame,
+        attachment_frames: params.attachment_frames,
         thread_id: params.thread_id.to_string(),
         run_id: params.run_id.to_string(),
         through_seq,
@@ -225,6 +242,7 @@ struct RemoteEventStreamParams<'a> {
     run_id: &'a str,
     thread_id: &'a str,
     snapshot_frame: Option<Bytes>,
+    attachment_frames: Vec<Bytes>,
     session_base: Option<harnx_core::session::Session>,
 }
 
@@ -236,6 +254,7 @@ struct LiveFollowParams {
     started_frame: Bytes,
     boundary_frame: Bytes,
     snapshot_frame: Option<Bytes>,
+    attachment_frames: Vec<Bytes>,
     thread_id: String,
     run_id: String,
     through_seq: u64,
@@ -269,6 +288,7 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
     let initial_frames = vec![params.started_frame, params.boundary_frame]
         .into_iter()
         .chain(params.snapshot_frame)
+        .chain(params.attachment_frames)
         .chain(control_frames);
     let event_frames = event_frames(rx, live, attached_seq);
     let finished_stream = tokio_stream::once(Bytes::from(frame_run_boundary_event(

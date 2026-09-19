@@ -489,6 +489,15 @@ an effective snapshot — the helper renders entries in the supplied order witho
 Control entries (`TurnEnd`, `HandoffCommitted`, `HitlApproval*`, `SubAgentStarted`) are silent
 in text rendering because their state hydrates separately from human transcript output.
 
+`MessageContent::to_text()` (`harnx-core/src/message.rs`) extracts text only and drops image
+parts — it's for LLM-facing contexts. Human-readable transcripts (CLI dump/`--follow`, TUI
+history, REST `/history`, session-history search) must use `to_transcript_text()` instead,
+which renders `ImageUrl` parts as `[image attachment: <cid>]` markers. This ensures image-only
+messages produce non-empty output. Render sites: `nats_session.rs:render_message_entry`,
+`harnx-tui/src/lifecycle.rs:messages_to_transcript_items_for_cluster`,
+`harnx-serve/src/lib.rs:history_message_content`, and
+`harnx-runtime/src/session_history.rs:entry_searchable_text`.
+
 ### Metadata rendering requires session reconstruction
 
 Text-format session metadata (`.info session` or `harnx info session`) uses `session::render()`

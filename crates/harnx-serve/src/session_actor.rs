@@ -13,7 +13,7 @@ pub use crate::session_actor_types::*;
 pub use registry::SessionRegistry;
 pub use test_log::load_test_session_messages;
 
-use crate::ag_ui::{derive_thread_id, AgUiSink};
+use crate::ag_ui::{derive_thread_id, message_attachment_snapshot_events, AgUiSink};
 use ag_ui_core::{
     event::{BaseEvent, Event, RunErrorEvent, RunFinishedEvent, RunStartedEvent},
     types::{
@@ -481,7 +481,12 @@ impl SessionActor {
     ) -> PromptResult {
         if self.actor_config.call_fn.is_none() {
             match self.admit_prompt(&text, &options).await {
-                Ok(admitted) => options.admitted = Some(admitted),
+                Ok(admitted) => {
+                    options.admitted = Some(admitted);
+                    if !options.attachment_refs.is_empty() {
+                        self.broadcast_attachment_metadata().await;
+                    }
+                }
                 Err(error) => {
                     return PromptResult::Rejected {
                         reason: format!("{error:#}"),
@@ -508,6 +513,15 @@ impl SessionActor {
         }
         PromptResult::Enqueued {
             run_id: run_id.to_string(),
+        }
+    }
+
+    async fn broadcast_attachment_metadata(&mut self) {
+        self.refresh_history_snapshot().await;
+        if let Some(entries) = self.log_entries.as_deref() {
+            for event in message_attachment_snapshot_events(&self.history_snapshot, entries) {
+                let _ = self.broadcast_tx.send(event);
+            }
         }
     }
 

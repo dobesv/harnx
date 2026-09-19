@@ -50,6 +50,12 @@ struct PromptParams {
     resume: Vec<InterruptResumeParam>,
 }
 
+fn prompt_has_content(params: &PromptParams) -> bool {
+    !params.text.trim().is_empty()
+        || !params.attachment_refs.is_empty()
+        || !params.resume.is_empty()
+}
+
 #[derive(Debug, Deserialize)]
 struct HitlDecisionParams {
     tool_call_id: String,
@@ -227,7 +233,7 @@ async fn handle_prompt(
         }
     };
 
-    if params.text.trim().is_empty() && params.resume.is_empty() {
+    if !prompt_has_content(&params) {
         return json_rpc_response(
             StatusCode::BAD_REQUEST,
             json_rpc_error(
@@ -295,7 +301,7 @@ async fn handle_prompt(
         Some(applied)
     };
 
-    if params.text.trim().is_empty() {
+    if params.text.trim().is_empty() && params.attachment_refs.is_empty() {
         return json_rpc_response(
             StatusCode::OK,
             json!({
@@ -426,7 +432,7 @@ pub(crate) async fn route_hitl_decision(
 async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
     match load_nats_session(config, &key.agent, &key.session).await {
         Ok((session, _entries)) => {
-            return session.agent_name.as_deref() == Some(key.agent.as_str())
+            return session.agent_name.as_deref() == Some(key.agent.as_str());
         }
         Err(error) if error.to_string() == "Not Found" => {}
         Err(_) => return false,
@@ -657,6 +663,47 @@ mod tests {
             Duration::from_millis(25),
             Some(call_fn),
         )
+    }
+
+    #[test]
+    fn prompt_content_accepts_attachments_and_resume_but_rejects_empty_prompt() {
+        let attachment_prompt = PromptParams {
+            text: " \n".into(),
+            working_dir: None,
+            attachment_refs: vec!["cid:image".into()],
+            resume: vec![],
+        };
+        assert!(prompt_has_content(&attachment_prompt));
+
+        let resume_prompt = PromptParams {
+            text: "".into(),
+            working_dir: None,
+            attachment_refs: vec![],
+            resume: vec![InterruptResumeParam {
+                interrupt_id: "interrupt".into(),
+                status: "resolved".into(),
+                payload: crate::interrupt_resume::InterruptResumePayloadParam {
+                    approved: true,
+                    reason: None,
+                },
+            }],
+        };
+        assert!(prompt_has_content(&resume_prompt));
+
+        for text in ["", " \t\n"] {
+            for attachment_refs in [Vec::new(), vec!["cid:image".into()]] {
+                let prompt = PromptParams {
+                    text: text.into(),
+                    working_dir: None,
+                    attachment_refs,
+                    resume: vec![],
+                };
+                assert_eq!(
+                    prompt_has_content(&prompt),
+                    !prompt.attachment_refs.is_empty()
+                );
+            }
+        }
     }
 
     async fn response_json(response: AppResponse) -> Value {

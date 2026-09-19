@@ -51,10 +51,10 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
 }
 
 /// Best-effort plain-text rendering of an entry, for `text_regex` matching and
-/// the row's `text` field. Bounded; images are already `cid:` refs.
+/// the row's `text` field. Bounded; image `cid:` refs are included as attachment markers.
 fn entry_searchable_text(entry: &SessionLogEntry) -> String {
     match entry {
-        SessionLogEntry::Message { content, .. } => content.to_text(),
+        SessionLogEntry::Message { content, .. } => content.to_transcript_text(),
         SessionLogEntry::ToolCalls { text, calls, .. } => {
             let calls_text: Vec<String> = calls
                 .iter()
@@ -339,7 +339,7 @@ impl ToolProvider for SessionHistoryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harnx_core::message::{MessageContent, MessageRole};
+    use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart, MessageRole};
 
     #[test]
     fn entry_type_maps_variants() {
@@ -356,6 +356,72 @@ mod tests {
         assert_eq!(
             entry_type(&SessionLogEntry::Compress { prompt: "s".into() }),
             "compress"
+        );
+    }
+
+    #[test]
+    fn message_attachment_markers_are_searchable() {
+        let entries = vec![
+            (
+                1,
+                SessionLogEntry::Message {
+                    id: Some("image-only".to_string()),
+                    role: MessageRole::User,
+                    content: MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "cid:image-only".to_string(),
+                        },
+                    }]),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                2,
+                SessionLogEntry::Message {
+                    id: Some("text-and-image".to_string()),
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Array(vec![
+                        MessageContentPart::Text {
+                            text: "caption".to_string(),
+                        },
+                        MessageContentPart::ImageUrl {
+                            image_url: ImageUrl {
+                                url: "cid:text-and-image".to_string(),
+                            },
+                        },
+                    ]),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            entry_searchable_text(&entries[0].1),
+            "[image attachment: cid:image-only]"
+        );
+        assert_eq!(
+            entry_searchable_text(&entries[1].1),
+            "caption\n\n[image attachment: cid:text-and-image]"
+        );
+
+        let rows = query_entries(
+            &entries,
+            &HistoryQuery {
+                text_regex: Some("cid:text-and-image".to_string()),
+                ..HistoryQuery::default()
+            },
+        )
+        .expect("attachment marker search succeeds");
+        assert_eq!(
+            rows,
+            json!([{
+                "seq": 2,
+                "type": "message",
+                "text": "caption\n\n[image attachment: cid:text-and-image]",
+                "role": "assistant",
+            }])
         );
     }
 

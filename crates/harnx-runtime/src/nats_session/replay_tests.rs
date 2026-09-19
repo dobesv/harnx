@@ -3,7 +3,7 @@ use harnx_core::event::{
     AgentEvent, AgentEventSink, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent,
     ToolKind, UserEvent,
 };
-use harnx_core::message::{MessageContent, MessageRole};
+use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart, MessageRole};
 use harnx_core::session::{SessionLogEntry, ToolOutput};
 use harnx_core::session_reconstruct::apply_log_mutations_nats;
 use harnx_core::tool::ToolCall;
@@ -115,6 +115,52 @@ fn replay_emits_messages_and_tool_events_in_order() {
             }),
             final_event("done"),
             seq_event(3),
+        ],
+    );
+}
+
+#[test]
+fn replay_marks_image_attachments_in_user_and_assistant_messages() {
+    let image = || MessageContentPart::ImageUrl {
+        image_url: ImageUrl {
+            url: "cid:abc123".into(),
+        },
+    };
+    let entries = vec![
+        (
+            10,
+            SessionLogEntry::Message {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Array(vec![
+                    MessageContentPart::Text {
+                        text: "look at this".into(),
+                    },
+                    image(),
+                ]),
+                timestamp: None,
+                fence_token: None,
+            },
+        ),
+        (
+            20,
+            SessionLogEntry::Message {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Array(vec![image()]),
+                timestamp: None,
+                fence_token: None,
+            },
+        ),
+    ];
+
+    assert_replay(
+        &entries,
+        vec![
+            user_event("look at this\n\n[image attachment: cid:abc123]"),
+            seq_event(0),
+            final_event("[image attachment: cid:abc123]"),
+            seq_event(1),
         ],
     );
 }

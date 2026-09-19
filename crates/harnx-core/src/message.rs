@@ -151,6 +151,27 @@ impl MessageContent {
             MessageContent::ToolCalls(_) => String::new(),
         }
     }
+
+    /// Format message content for human-readable transcripts.
+    ///
+    /// Unlike [`Self::to_text`], this preserves image references as visible
+    /// attachment markers. Model-facing callers should continue using `to_text`.
+    pub fn to_transcript_text(&self) -> String {
+        match self {
+            MessageContent::Text(text) => text.to_string(),
+            MessageContent::Array(list) => list
+                .iter()
+                .map(|item| match item {
+                    MessageContentPart::Text { text } => text.clone(),
+                    MessageContentPart::ImageUrl { image_url } => {
+                        format!("[image attachment: {}]", image_url.url)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            MessageContent::ToolCalls(_) => String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -227,4 +248,64 @@ pub fn extract_system_message(messages: &mut Vec<Message>) -> Option<Vec<String>
         return Some(parts);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ImageUrl, MessageContent, MessageContentPart};
+
+    fn text(text: &str) -> MessageContentPart {
+        MessageContentPart::Text {
+            text: text.to_string(),
+        }
+    }
+
+    fn image(url: &str) -> MessageContentPart {
+        MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: url.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn transcript_text_matches_to_text_for_text_only_array() {
+        let content = MessageContent::Array(vec![text("first"), text("second")]);
+
+        assert_eq!(content.to_transcript_text(), content.to_text());
+        assert_eq!(content.to_transcript_text(), "first\n\nsecond");
+    }
+
+    #[test]
+    fn transcript_text_marks_image_after_text() {
+        let content = MessageContent::Array(vec![text("describe this"), image("cid:abc123")]);
+
+        assert_eq!(
+            content.to_transcript_text(),
+            "describe this\n\n[image attachment: cid:abc123]"
+        );
+    }
+
+    #[test]
+    fn transcript_text_for_image_only_is_non_empty() {
+        let content = MessageContent::Array(vec![image("cid:image-only")]);
+        let transcript = content.to_transcript_text();
+
+        assert_eq!(transcript, "[image attachment: cid:image-only]");
+        assert!(!transcript.is_empty());
+    }
+
+    #[test]
+    fn transcript_text_preserves_multiple_image_order() {
+        let content = MessageContent::Array(vec![
+            image("cid:first"),
+            text("between"),
+            image("cid:second"),
+        ]);
+
+        assert_eq!(
+            content.to_transcript_text(),
+            "[image attachment: cid:first]\n\nbetween\n\n[image attachment: cid:second]"
+        );
+    }
 }

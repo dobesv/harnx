@@ -2,10 +2,24 @@ import type { UsageData } from './UsageContext';
 import { setDocumentTitle } from './sessionTitle';
 
 /**
- * Internal Harnx control events that drive navigation and sequence gating,
- * but must NOT be forwarded to the assistant-ui runtime (they are not chat content).
+ * Internal Harnx control and metadata events that drive navigation, sequencing,
+ * or UI state, but must NOT be forwarded to the assistant-ui runtime (they are not chat content).
+ *
+ * `message_attachments` carries per-message attachment metadata beyond what the pinned
+ * `ag-ui-core = "=0.1.0"` user-message schema (String content, no parts/attachment field)
+ * can represent. The CUSTOM event side-channel mirrors the control-state hydration pattern.
  */
-export const NAVIGATION_CONTROL_EVENTS = ['session_attach_boundary', 'session_handoff'] as const;
+export const NAVIGATION_CONTROL_EVENTS = [
+  'session_attach_boundary',
+  'session_handoff',
+  'message_attachments',
+] as const;
+
+export interface MessageAttachmentMeta {
+  partIndex: number;
+  cid: string;
+  kind: 'image';
+}
 
 export interface HarnxCustomEventCallbacks {
   onStatus: (text: string | null) => void;
@@ -16,6 +30,8 @@ export interface HarnxCustomEventCallbacks {
   onHandoff?: (agent: string, sessionId: string, afterSeq: number) => void;
   /** Called when a hitl_pending_approval CUSTOM event is received. */
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
+  /** Called when a message_attachments CUSTOM event is received. */
+  onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
   /**
    * Whether events belong to the session currently shown in the foreground.
    * When `false`, the `session_title_updated` handler skips `setDocumentTitle`
@@ -65,6 +81,39 @@ function isUsageData(value: unknown): value is UsageData {
 
 function validSeq(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isMessageAttachmentMeta(entry: unknown): entry is MessageAttachmentMeta {
+  if (entry === null || typeof entry !== 'object') return false;
+  const item = entry as Record<string, unknown>;
+  return (
+    typeof item.partIndex === 'number' &&
+    Number.isSafeInteger(item.partIndex) &&
+    item.partIndex >= 0 &&
+    typeof item.cid === 'string' &&
+    item.cid.trim().length > 0 &&
+    item.kind === 'image'
+  );
+}
+
+function parseMessageAttachments(value: unknown): {
+  messageId: string;
+  attachments: MessageAttachmentMeta[];
+} | undefined {
+  const rec = eventRecord(value);
+  const messageId = nonBlankString(rec.messageId);
+  if (!messageId || !Array.isArray(rec.attachments)) return undefined;
+  for (const item of rec.attachments) {
+    if (!isMessageAttachmentMeta(item)) return undefined;
+  }
+  return {
+    messageId,
+    attachments: rec.attachments.map((item: MessageAttachmentMeta) => ({
+      partIndex: item.partIndex,
+      cid: item.cid,
+      kind: 'image',
+    })),
+  };
 }
 
 function handoffTarget(value: unknown): {
@@ -122,6 +171,11 @@ const handlers: Record<string, CustomEventHandler> = {
     const summary = stringField(value, 'summary') || '';
     if (!toolCallId) return;
     callbacks.onHitlPendingApproval?.(toolCallId, summary);
+  },
+  message_attachments: (callbacks, value) => {
+    const parsed = parseMessageAttachments(value);
+    if (!parsed) return;
+    callbacks.onMessageAttachments?.(parsed.messageId, parsed.attachments);
   },
 };
 
