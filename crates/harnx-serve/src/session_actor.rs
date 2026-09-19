@@ -29,7 +29,7 @@ use harnx_core::{
     tool::ToolResult,
 };
 use harnx_runtime::{
-    config::{self, Config, GlobalConfig, SessionAttachmentPath, LOCAL_CLUSTER_KEY},
+    config::{self, Config, GlobalConfig, SessionAttachmentPath},
     local_orchestrator::{activation_route_for_cluster, LocalWorkerSupervisor},
     AgentCallFn, AgentLoopContext, NatsSession, NatsSessionConfig, OnToolRoundFn,
 };
@@ -88,8 +88,7 @@ struct ActorTurnParams {
     attachment_refs: Vec<String>,
     sink: Arc<BroadcastEventSender>,
     local_worker: Arc<Mutex<Option<LocalWorkerSupervisor>>>,
-    agent: String,
-    session_id: String,
+    key: SessionKey,
 }
 
 struct SessionActor {
@@ -245,10 +244,7 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
     let session = match open_actor_nats_session(
         &params.prompt_config,
         &params.local_worker,
-        SessionKey {
-            agent: params.agent.clone(),
-            session: params.session_id.clone(),
-        },
+        params.key.clone(),
         params.abort_signal,
     )
     .await
@@ -268,8 +264,8 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
     } else {
         Some(
             Config::session_attachments_dir(SessionAttachmentPath {
-                agent_name: &params.agent,
-                session_id: &params.session_id,
+                agent_name: params.key.agent(),
+                session_id: params.key.session(),
             })
             .context("invalid session ID for attachment lookup")?,
         )
@@ -287,14 +283,15 @@ async fn open_actor_nats_session(
     abort_signal: AbortSignal,
 ) -> anyhow::Result<NatsSession> {
     let activation_route =
-        activation_route_for_cluster(LOCAL_CLUSTER_KEY, local_worker, abort_signal.clone()).await?;
+        activation_route_for_cluster(key.cluster(), local_worker, abort_signal.clone()).await?;
     let initializer = {
         let config = prompt_config.read();
-        harnx_runtime::SessionInitializer::named_from_config(key.agent, &config)
+        harnx_runtime::SessionInitializer::named_from_config(key.agent(), &config)
     };
+    let cluster = key.cluster().to_string();
     NatsSession::from_global_config(
         NatsSessionConfig {
-            cluster: LOCAL_CLUSTER_KEY.to_string(),
+            cluster: cluster.clone(),
             initializer,
             session_id: Some(key.session),
             activation_route,
@@ -303,6 +300,7 @@ async fn open_actor_nats_session(
         abort_signal,
     )
     .await
+    .map_err(|error| crate::sanitize_nats_session_error(&cluster, error))
 }
 
 fn test_injection_channel(
@@ -316,12 +314,13 @@ fn test_injection_channel(
     }
 }
 impl SessionActor {
-    fn prompt_config(&self) -> GlobalConfig {
+    async fn prompt_config(&self) -> GlobalConfig {
         prompt_config_for_agent_session_from_global(
             &self.actor_config.base_config,
             &self.key,
             self.actor_config.call_fn.is_some(),
         )
+        .await
     }
 
     async fn route_hitl_approval_decision(
@@ -335,7 +334,8 @@ impl SessionActor {
             &actor_config.base_config,
             &key,
             actor_config.call_fn.is_some(),
-        );
+        )
+        .await;
         let session = open_actor_nats_session(
             &prompt_config,
             &actor_config.local_worker,
@@ -348,12 +348,8 @@ impl SessionActor {
             .await
     }
 
-    fn event_context(&self) -> SessionEventContext {
-        SessionEventContext::new(
-            self.actor_config.base_config.clone(),
-            self.key.clone(),
-            self.history_snapshot.clone(),
-        )
+    fn event_context(&self, prompt_config: GlobalConfig) -> SessionEventContext {
+        SessionEventContext::new(prompt_config, self.history_snapshot.clone())
     }
 
     async fn start(self) {
@@ -559,7 +555,7 @@ impl SessionActor {
                 let message = format!("{err:#}");
                 log::error!(
                     "session run failed: agent={} session_id={} run_id={}: {message}",
-                    self.key.agent,
+                    self.key.display_ref(),
                     self.key.session,
                     done.run_id,
                 );
@@ -630,7 +626,7 @@ impl SessionActor {
         reap_sleep: &mut std::pin::Pin<&mut Sleep>,
     ) -> RunId {
         self.cancel_reap(reap_sleep);
-        let prompt_config = self.prompt_config();
+        let prompt_config = self.prompt_config().await;
         let run_id = RunId::random();
         let thread_id = derive_thread_id(&self.key.session);
         let started_at = Utc::now();
@@ -646,10 +642,11 @@ impl SessionActor {
         let done_tx = self.run_done_tx.clone();
         let run_id_for_task = run_id.clone();
         let thread_id_for_task = thread_id.clone();
+        let event_prompt_config = Arc::new(parking_lot::RwLock::new(prompt_config.read().clone()));
         let sink = Arc::new(BroadcastEventSender::new(
             self.broadcast_tx.clone(),
             MessageId::random(),
-            self.event_context(),
+            self.event_context(event_prompt_config),
         ));
         let sink_for_task = sink.clone();
         let attachment_refs = options.attachment_refs.clone();
@@ -665,8 +662,7 @@ impl SessionActor {
             attachment_refs: attachment_refs.clone(),
             sink: sink_for_task.clone(),
             local_worker: self.actor_config.local_worker.clone(),
-            agent: self.key.agent.clone(),
-            session_id: self.key.session.clone(),
+            key: self.key.clone(),
         };
         let task = AbortOnDropHandle::new(tokio::spawn(async move {
             let loop_result = run_actor_turn(turn).await;
@@ -794,14 +790,14 @@ impl SessionActor {
 
     async fn load_history_snapshot(&self) -> LoadedHistorySnapshot {
         if self.actor_config.call_fn.is_some() {
-            return self.test_history_snapshot();
+            return self.test_history_snapshot().await;
         }
         match crate::load_nats_session_state(
             &self.actor_config.base_config,
-            &self.key.agent,
+            self.key.target(),
             &self.key.session,
         ).await {
-            Ok(loaded) if loaded.session.agent_name.as_deref() == Some(self.key.agent.as_str()) => {
+            Ok(loaded) if loaded.session.agent_name.as_deref() == Some(self.key.agent()) => {
                 LoadedHistorySnapshot {
                     messages: crate::ag_ui::history_messages_for_snapshot(&loaded.session.messages),
                     tokens_usage: Some(crate::ag_ui::UsageContextSnapshot::from_session(&loaded.session)),
@@ -814,7 +810,7 @@ impl SessionActor {
             Ok(loaded) => LoadedHistorySnapshot {
                 warnings: vec![format!(
                     "Failed to load session history: session belongs to agent '{}' rather than '{}'",
-                    loaded.session.agent_name.as_deref().unwrap_or("unknown"), self.key.agent
+                    loaded.session.agent_name.as_deref().unwrap_or("unknown"), self.key.agent()
                 )],
                 ..Default::default()
             },
@@ -826,12 +822,13 @@ impl SessionActor {
         }
     }
 
-    fn test_history_snapshot(&self) -> LoadedHistorySnapshot {
+    async fn test_history_snapshot(&self) -> LoadedHistorySnapshot {
         let prompt_config = prompt_config_for_agent_session_from_global(
             &self.actor_config.base_config,
             &self.key,
             true,
-        );
+        )
+        .await;
         let messages = prompt_config
             .read()
             .session
@@ -852,16 +849,14 @@ struct BroadcastEventSender {
 
 #[derive(Clone)]
 struct SessionEventContext {
-    base_config: Config,
-    key: SessionKey,
+    prompt_config: GlobalConfig,
     history_snapshot: Vec<AgUiMessage>,
 }
 
 impl SessionEventContext {
-    fn new(base_config: Config, key: SessionKey, history_snapshot: Vec<AgUiMessage>) -> Self {
+    fn new(prompt_config: GlobalConfig, history_snapshot: Vec<AgUiMessage>) -> Self {
         Self {
-            base_config,
-            key,
+            prompt_config,
             history_snapshot,
         }
     }
@@ -871,7 +866,9 @@ impl SessionEventContext {
     }
 
     fn usage_context(&self) -> Option<crate::ag_ui::UsageContextSnapshot> {
-        usage_context_snapshot(&self.base_config, &self.key)
+        let config = self.prompt_config.read();
+        let session = config.session.as_ref()?;
+        Some(crate::ag_ui::UsageContextSnapshot::from_session(session))
     }
 }
 
@@ -935,15 +932,22 @@ fn build_loop_ctx(
     )
 }
 
-fn prompt_config_for_agent_session_from_global(
+async fn prompt_config_for_agent_session_from_global(
     base_config: &Config,
     key: &SessionKey,
     test_memory_log: bool,
 ) -> GlobalConfig {
-    let prompt_config = harnx_session::fork_prompt_config(base_config);
+    let agent_ref = key.display_ref();
+    let (target, prompt_config) = crate::resolve_agent_target(base_config, &agent_ref)
+        .await
+        .expect("set actor agent");
+    assert_eq!(
+        &target,
+        key.target(),
+        "actor target must resolve consistently"
+    );
     {
         let mut cfg = prompt_config.write();
-        cfg.use_agent_by_name(&key.agent).expect("set actor agent");
         if test_memory_log {
             cfg.use_session(Some(&key.session))
                 .expect("set actor session");
@@ -991,16 +995,6 @@ fn build_input(
     Ok(input)
 }
 
-fn usage_context_snapshot(
-    base_config: &Config,
-    key: &SessionKey,
-) -> Option<crate::ag_ui::UsageContextSnapshot> {
-    let prompt_config = prompt_config_for_agent_session_from_global(base_config, key, false);
-    let config = prompt_config.read();
-    let session = config.session.as_ref()?;
-    Some(crate::ag_ui::UsageContextSnapshot::from_session(session))
-}
-
 fn base_event() -> BaseEvent {
     BaseEvent {
         timestamp: None,
@@ -1040,10 +1034,7 @@ mod tests {
     };
 
     fn key(agent: &str, session: &str) -> SessionKey {
-        SessionKey {
-            agent: agent.to_string(),
-            session: session.to_string(),
-        }
+        SessionKey::local(agent.to_string(), session.to_string())
     }
 
     async fn subscribe(handle: &SessionHandle) -> SubscribeResult {

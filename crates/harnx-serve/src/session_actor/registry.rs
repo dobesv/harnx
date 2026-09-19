@@ -56,7 +56,7 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
-    pub(super) fn local_worker_for_tests(
+    pub(crate) fn local_worker_for_tests(
         &self,
     ) -> Arc<Mutex<Option<harnx_runtime::local_orchestrator::LocalWorkerSupervisor>>> {
         Arc::clone(&self.actor_config.local_worker)
@@ -116,7 +116,7 @@ pub(super) fn get_or_spawn_in(
         Entry::Occupied(mut entry) if entry.get().tx.is_closed() => {
             log::warn!(
                 "session actor for {}/{} stopped without deregistering; spawning a replacement",
-                key.agent,
+                key.agent(),
                 key.session
             );
             let handle = spawn_session_actor(key, Arc::clone(map), reap_ttl, actor_config.clone());

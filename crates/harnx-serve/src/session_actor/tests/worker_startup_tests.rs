@@ -60,9 +60,13 @@ async fn assert_missing_worker_error(
 
     let info = get_info(&handle).await;
     assert_eq!(info.state, SessionState::Idle);
-    let (session, _) = crate::load_nats_session(&config, "plain", &session_id)
-        .await
-        .expect("load saved prompt");
+    let (session, _) = crate::load_nats_session(
+        &config,
+        &crate::session_actor::ResolvedAgentTarget::local("plain"),
+        &session_id,
+    )
+    .await
+    .expect("load saved prompt");
     assert_eq!(session.messages.len(), 1);
     assert!(matches!(
         &session.messages[0].content,

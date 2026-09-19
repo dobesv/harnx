@@ -11,6 +11,36 @@ struct UseRemoteAgentParams<'a> {
 
 use harnx_core::agent_ref::AgentRef;
 
+fn local_agent_configs() -> HashMap<String, AgentConfig> {
+    self::agent::list_local_agent_names()
+        .into_iter()
+        .chain(self::agent::list_package_agent_names())
+        .filter_map(|name| {
+            let path = Config::agent_file(&name);
+            self::agent::load_with_qualified_name(&path, &name)
+                .ok()
+                .map(|agent| (name, agent.into_config()))
+        })
+        .collect()
+}
+
+fn remote_agent_configs(servers: &[NatsServerConfig]) -> HashMap<String, AgentConfig> {
+    servers
+        .iter()
+        .flat_map(|server| {
+            server.agents.iter().map(move |remote| {
+                let name = format!("{}@{}", remote.name, server.name);
+                let agent = AgentConfig::from_remote_catalog(
+                    &name,
+                    remote.description.clone(),
+                    remote.role,
+                );
+                (name, agent)
+            })
+        })
+        .collect()
+}
+
 impl Config {
     /// Set the agent and cluster for the active session.
     pub fn set_remote_agent(&mut self, agent: String, cluster: String) {
@@ -222,14 +252,9 @@ impl Config {
         Ok(())
     }
 
-    pub fn all_agents() -> Vec<AgentConfig> {
-        let mut agents: HashMap<String, AgentConfig> = HashMap::new();
-        for name in list_agents() {
-            let path = Self::agent_file(&name);
-            if let Ok(agent) = self::agent::load_with_qualified_name(&path, &name) {
-                agents.insert(name, agent.into_config());
-            }
-        }
+    pub fn all_agents(&self) -> Vec<AgentConfig> {
+        let mut agents = local_agent_configs();
+        agents.extend(remote_agent_configs(&self.nats_servers));
         let mut agents: Vec<_> = agents.into_values().collect();
         agents.sort_unstable_by(|a, b| a.name().cmp(b.name()));
         agents

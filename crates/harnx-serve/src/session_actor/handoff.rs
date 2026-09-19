@@ -1,16 +1,15 @@
 //! Acknowledged dispatch from a completed source turn to a target actor.
 
 use super::{
-    base_event, registry::get_or_spawn_in, test_log, PendingPrompt, PromptResult, RunFinished,
-    SessionActor, SessionCommand, SessionHandle, SessionKey, SessionPromptOptions, SessionState,
+    base_event, registry::get_or_spawn_in, test_log, PendingPrompt, PromptResult,
+    ResolvedAgentTarget, RunFinished, SessionActor, SessionCommand, SessionHandle, SessionKey,
+    SessionPromptOptions, SessionState,
 };
-use crate::agent_scoped_config;
 use ag_ui_core::event::{Event, RunErrorEvent};
 use anyhow::{anyhow, bail, Result};
 use harnx_core::event::{AgentEvent, AgentEventSink, SessionEvent};
 use harnx_runtime::config::Config;
-use parking_lot::RwLock;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 const HANDOFF_ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,17 +33,25 @@ impl SessionActor {
             prompt,
             handoff_tool_call_id,
         } = request;
-        let target_session_id = match self.resolve_handoff_session_id(&agent, session_id).await {
+        let (target, scoped) =
+            match crate::resolve_agent_target(&self.actor_config.base_config, &agent).await {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    self.fail_handoff(done, anyhow!(error));
+                    return;
+                }
+            };
+        let target_session_id = match self
+            .resolve_handoff_session_id(&target, &scoped, session_id)
+            .await
+        {
             Ok(session_id) => session_id,
             Err(error) => {
                 self.fail_handoff(done, error);
                 return;
             }
         };
-        let target_key = SessionKey {
-            agent: agent.clone(),
-            session: target_session_id.clone(),
-        };
+        let target_key = SessionKey::new(target, target_session_id.clone());
         if target_key == self.key {
             self.queue_self_handoff(prompt);
         } else if let Err(error) = self.send_handoff_prompt(&target_key, prompt).await {
@@ -56,22 +63,31 @@ impl SessionActor {
 
     async fn resolve_handoff_session_id(
         &self,
-        agent: &str,
+        target: &ResolvedAgentTarget,
+        scoped: &harnx_runtime::config::GlobalConfig,
         session_id: Option<String>,
     ) -> Result<String> {
         let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) else {
-            let scoped = agent_scoped_config(&self.actor_config.base_config, agent)?;
-            return Config::reserve_new_session_id(&Arc::new(RwLock::new(scoped))).await;
+            return Config::reserve_new_session_id(scoped).await;
         };
         let owner = self
             .registry
             .iter()
-            .find(|entry| entry.key().session == session_id && !entry.value().tx.is_closed())
-            .map(|entry| entry.key().agent.clone())
-            .or_else(|| test_log::test_session_owner(&session_id));
+            .find(|entry| {
+                entry.key().cluster() == target.cluster()
+                    && entry.key().session == session_id
+                    && !entry.value().tx.is_closed()
+            })
+            .map(|entry| entry.key().agent().to_string())
+            .or_else(|| {
+                (target.cluster() == harnx_runtime::config::LOCAL_CLUSTER_KEY)
+                    .then(|| test_log::test_session_owner(&session_id))
+                    .flatten()
+            });
         match owner {
-            Some(owner) if owner != agent => bail!(
-                "handoff failed: session '{session_id}' belongs to agent '{owner}', not '{agent}'"
+            Some(owner) if owner != target.agent() => bail!(
+                "handoff failed: session '{session_id}' belongs to agent '{owner}', not '{}'",
+                target.display_ref()
             ),
             _ => Ok(session_id),
         }
@@ -140,7 +156,7 @@ impl SessionActor {
 fn target_actor_error(target: &SessionKey, phase: &str) -> anyhow::Error {
     anyhow!(
         "handoff failed: target actor for '{}/{}' stopped before {phase}",
-        target.agent,
+        target.agent(),
         target.session
     )
 }
@@ -155,7 +171,7 @@ async fn wait_for_handoff_ack(
         Ok(Err(_)) => Err(target_actor_error(target, "acknowledging the prompt")),
         Err(_) => Err(anyhow!(
             "handoff failed: target actor for '{}/{}' did not acknowledge the prompt within {} seconds",
-            target.agent,
+            target.agent(),
             target.session,
             wait.as_secs()
         )),
@@ -169,10 +185,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_ack_wait_is_bounded() {
         let (_reply_tx, reply_rx) = oneshot::channel();
-        let target = SessionKey {
-            agent: "atlas".into(),
-            session: "target-session".into(),
-        };
+        let target = SessionKey::local("atlas", "target-session");
 
         let error = wait_for_handoff_ack(reply_rx, &target, Duration::ZERO)
             .await

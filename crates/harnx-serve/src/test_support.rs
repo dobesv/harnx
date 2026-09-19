@@ -98,6 +98,12 @@ impl TestConfigSandbox {
         .expect("write mock client config");
     }
 
+    pub fn write_nats_server(&self, name: &str, body: &str) {
+        let directory = self.root.join("nats_servers");
+        fs::create_dir_all(&directory).expect("create NATS server config directory");
+        fs::write(directory.join(format!("{name}.yaml")), body).expect("write NATS server config");
+    }
+
     pub fn config(&self) -> Config {
         let prev = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&self.root).expect("switch cwd");
@@ -132,7 +138,9 @@ pub struct NatsSessionSeed<'a> {
 
 /// Return whether the optional NATS test dependency is available.
 pub async fn ensure_test_nats() -> bool {
-    if let Err(error) = crate::ensure_frontend_nats_owner().await {
+    if let Err(error) =
+        crate::ensure_frontend_nats_owner(harnx_runtime::config::LOCAL_CLUSTER_KEY).await
+    {
         if error.to_string().contains("nats-server binary not found") {
             eprintln!("skipping NATS-backed harnx-serve test: {error}");
             return false;

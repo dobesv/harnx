@@ -1160,26 +1160,88 @@ fn parse_run_input_accepts_empty_messages_for_join_resume() {
     assert!(parsed.messages.is_empty());
 }
 
-#[test]
-fn resolve_agent_finds_existing_agent() {
+#[tokio::test]
+async fn resolve_agent_finds_existing_agent() {
     let sandbox = TestConfigSandbox::new();
     sandbox.write_agent("hephaestus", "You are Hephaestus.");
     let config = sandbox.config();
 
-    let agent = resolve_agent(&config, "hephaestus").expect("agent should resolve");
-    assert_eq!(agent.name(), "hephaestus");
+    let (target, _) = crate::resolve_agent_target(&config, "hephaestus")
+        .await
+        .expect("agent should resolve");
+    assert_eq!(target.agent(), "hephaestus");
+    assert_eq!(target.cluster(), harnx_runtime::config::LOCAL_CLUSTER_KEY);
 }
 
-#[test]
-fn resolve_agent_returns_not_found_for_unknown_agent() {
+#[tokio::test]
+async fn resolve_agent_returns_not_found_for_unknown_agent() {
     let sandbox = TestConfigSandbox::new();
     let config = sandbox.config();
 
-    let err = resolve_agent(&config, "missing-agent").expect_err("missing agent should fail");
+    let err = crate::resolve_agent_target(&config, "missing-agent")
+        .await
+        .expect_err("missing agent should fail");
     assert_eq!(
         err,
         AgUiError::NotFound("agent 'missing-agent' not found".to_string())
     );
+}
+
+#[tokio::test]
+async fn resolve_agent_uses_declared_remote_cluster_without_connecting() {
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_nats_server(
+        "shared",
+        "url: nats://127.0.0.1:65535\nagents:\n  - name: sisyphus\n",
+    );
+    let config = sandbox.config();
+
+    let (target, scoped) = crate::resolve_agent_target(&config, "sisyphus@shared")
+        .await
+        .expect("declared remote agent should resolve");
+    assert_eq!(target.agent(), "sisyphus");
+    assert_eq!(target.cluster(), "shared");
+    assert_eq!(
+        scoped.read().remote_agent.as_ref(),
+        Some(&("sisyphus".to_string(), "shared".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn resolve_agent_rejects_unsafe_bare_names_and_accepts_safe_local_and_remote_names() {
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("hephaestus", "You are Hephaestus.");
+    sandbox.write_nats_server(
+        "shared",
+        "url: nats://127.0.0.1:65535\nagents:\n  - name: coding/coder\n",
+    );
+    let config = sandbox.config();
+    let decoded_package_traversal = crate::parse_agents_route("/v1/agents/pkg%2F..%40shared")
+        .expect("encoded agent route")
+        .0;
+    assert_eq!(decoded_package_traversal, "pkg/..@shared");
+
+    for agent_ref in ["..@shared", decoded_package_traversal.as_str(), ".."] {
+        let error = crate::resolve_agent_target(&config, agent_ref)
+            .await
+            .expect_err("unsafe bare agent name must not resolve");
+        assert_eq!(
+            error,
+            AgUiError::NotFound(format!("agent '{agent_ref}' not found"))
+        );
+    }
+
+    let (remote, _) = crate::resolve_agent_target(&config, "coding/coder@shared")
+        .await
+        .expect("safe package-qualified remote agent");
+    assert_eq!(remote.agent(), "coding/coder");
+    assert_eq!(remote.cluster(), "shared");
+
+    let (local, _) = crate::resolve_agent_target(&config, "hephaestus")
+        .await
+        .expect("safe local agent");
+    assert_eq!(local.agent(), "hephaestus");
+    assert_eq!(local.cluster(), harnx_runtime::config::LOCAL_CLUSTER_KEY);
 }
 
 #[test]

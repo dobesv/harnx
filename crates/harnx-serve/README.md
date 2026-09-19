@@ -6,6 +6,16 @@
 
 The server allows external clients (such as IDE plugins or web interfaces) to interact with `harnx` agents over HTTP. It supports agent execution, session management, and MCP tool orchestration.
 
+## Remote Agents
+
+harnx-serve supports remote `agent@cluster` agents via the same mechanism as CLI/TUI. Agent resolution uses `AgentRef::parse` and `Config::use_agent`, which validates the cluster via `nats_servers/<cluster>.yaml` and records `remote_agent` state.
+
+**URL encoding:** The `@` in agent names is percent-encoded. Example:
+- `sisyphus@shared` → `/v1/agents/sisyphus%40shared`
+- Package-qualified remote: `coding/coder@shared` → `/v1/agents/coding%2Fcoder%40shared`
+
+A session targeting a remote agent runs its turns on a worker in that cluster. A server addressing only remote agents never starts a local broker or worker. Per-cluster JetStream namespaces isolate storage; session storage keys use only the bare agent name plus session ID. See [`docs/nats-ha.md`](../../docs/nats-ha.md) for the `agent@cluster` convention and catalog discovery.
+
 ## Installation
 
 To install `harnx-serve` from the `harnx` workspace:
