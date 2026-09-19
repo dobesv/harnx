@@ -29,7 +29,7 @@ struct Cli {
     dry_run: bool,
     /// Directory of web-ui static assets to serve
     /// (default: ~/.local/share/harnx/web-assets, XDG-aware)
-    #[clap(long, value_name = "PATH")]
+    #[clap(long, value_name = "PATH", env = "HARNX_WEB_ASSETS")]
     web_assets: Option<PathBuf>,
     /// Set agent variable pairs (format: --agent-variable key value or -x key value); can be repeated
     #[clap(short = 'x', long, value_names = ["KEY", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]

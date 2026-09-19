@@ -1,3 +1,12 @@
+# harnx all-in-one image: server + tools + Web UI.
+#
+# Binary set invariant: every COPY'd binary below MUST appear in ALL FOUR release.yaml lists:
+#   1. cargo build -p (line ~129)
+#   2. archive_specs (lines ~149-167)
+#   3. docker job gh release download patterns (lines ~339-407)
+#   4. "Verify extracted binaries" loop (line ~423)
+# Missing any one silently breaks the release build (COPY fails, download fails, or verify fails).
+# harnx-mcp-plans-github is intentionally NOT COPY'd here (has its own Dockerfile).
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
@@ -23,3 +32,5 @@ COPY linux-${TARGETARCH}/harnx-pkg /usr/local/bin/harnx-pkg
 COPY linux-${TARGETARCH}/harnx-proxy-auth /usr/local/bin/harnx-proxy-auth
 COPY linux-${TARGETARCH}/harnx-sandbox-run /usr/local/bin/harnx-sandbox-run
 COPY linux-${TARGETARCH}/harnx-sandbox-exec /usr/local/bin/harnx-sandbox-exec
+COPY web-assets/ /usr/local/share/harnx/web-assets/
+ENV HARNX_WEB_ASSETS=/usr/local/share/harnx/web-assets

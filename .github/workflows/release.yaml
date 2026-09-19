@@ -126,7 +126,7 @@ jobs:
       run: |
         $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
           -p harnx -p harnx-serve -p harnx-worker \
-          -p harnx-bash-tools -p harnx-fs-tools -p harnx-grep-tools -p harnx-plans-tools -p harnx-mcp-plans-github -p harnx-mcp-time \
+          -p harnx-bash-tools -p harnx-fs-tools -p harnx-grep-tools -p harnx-plans-tools -p harnx-mcp-plans-github -p harnx-mcp-time -p harnx-mcp-bridge -p harnx-time-server \
           -p harnx-aws-creds -p harnx-k8s-creds -p harnx-k8s-sandbox-tools -p harnx-pkg -p harnx-proxy-auth \
           -p harnx-sandbox-run \
           -p harnx-sandbox-common
@@ -156,6 +156,8 @@ jobs:
           "harnx-plans-tools:harnx-plans-tools"
           "harnx-mcp-plans-github:harnx-mcp-plans-github"
           "harnx-mcp-time:harnx-mcp-time"
+          "harnx-mcp-bridge:harnx-mcp-bridge"
+          "harnx-time-server:harnx-time-server"
           "harnx-aws-creds:harnx-aws-creds"
           "harnx-k8s-creds:harnx-k8s-creds"
           "harnx-k8s-sandbox-tools:harnx-k8s-sandbox-tools"
@@ -253,6 +255,22 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
+      - name: Stage Web UI artifact
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp -a web/dist/. web-assets-dist/
+          rm -f web-assets-dist/mockServiceWorker.js
+          find web-assets-dist -type f -name '*.map' -delete
+
+      - name: Upload Web UI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-assets-dist
+          path: web-assets-dist/
+          if-no-files-found: error
+          include-hidden-files: true
+
       - name: Package Web UI assets
         shell: bash
         env:
@@ -285,7 +303,7 @@ jobs:
 
   docker:
     name: Publish Docker Images
-    needs: release
+    needs: [release, web-assets]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     permissions:
@@ -335,6 +353,10 @@ jobs:
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-mcp-time-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-bridge-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-time-server-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-aws-creds-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-k8s-creds-$V-x86_64-unknown-linux-musl.tar.gz" || true
@@ -366,6 +388,10 @@ jobs:
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-mcp-time-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-bridge-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-time-server-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-aws-creds-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-k8s-creds-$V-aarch64-unknown-linux-musl.tar.gz" || true
@@ -394,7 +420,7 @@ jobs:
         run: |
           missing=0
           for dir in linux-amd64 linux-arm64; do
-            for bin in harnx harnx-serve harnx-worker harnx-bash-tools harnx-fs-tools harnx-grep-tools harnx-plans-tools harnx-mcp-plans-github harnx-mcp-time harnx-aws-creds harnx-k8s-creds harnx-k8s-sandbox-tools harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
+            for bin in harnx harnx-serve harnx-worker harnx-bash-tools harnx-fs-tools harnx-grep-tools harnx-plans-tools harnx-mcp-plans-github harnx-mcp-time harnx-mcp-bridge harnx-time-server harnx-aws-creds harnx-k8s-creds harnx-k8s-sandbox-tools harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
               if [ ! -f "$dir/$bin" ]; then
                 echo "ERROR: missing $dir/$bin"
                 missing=1
@@ -402,6 +428,15 @@ jobs:
             done
           done
           [ "$missing" -eq 0 ] || { echo "Some binaries are missing. Check asset download step."; exit 1; }
+
+      - name: Download Web UI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets-dist
+          path: web-assets/
+
+      - name: Verify Web UI artifact
+        run: test -f web-assets/index.html
 
       - name: Build and push harnx-mcp-time
         uses: docker/build-push-action@v7
@@ -435,6 +470,17 @@ jobs:
           tags: |
             ghcr.io/dobesv/harnx:${{ steps.version.outputs.version }}
             ${{ needs.release.outputs.rc == 'false' && 'ghcr.io/dobesv/harnx:latest' || '' }}
+
+      - name: Build and push harnx-web-assets
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/harnx-web-assets.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/dobesv/harnx-web-assets:${{ steps.version.outputs.version }}
+            ${{ needs.release.outputs.rc == 'false' && 'ghcr.io/dobesv/harnx-web-assets:latest' || '' }}
 
   publish-crate:
     name: Publish to crates.io
