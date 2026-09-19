@@ -5,6 +5,7 @@ use super::daemon_runtime::WorkerRuntime;
 use crate::config::{GlobalConfig, LOCAL_CLUSTER_KEY};
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_session_metadata::SessionMetadataStore;
+use crate::remote_session_cleanup::{run_periodic_remote_cleanup, CleanupOutcome};
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, consumer::pull};
 use futures_util::{Stream, StreamExt};
@@ -15,8 +16,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 const ACTIVATION_STREAM_RETRY_DELAY: Duration = Duration::from_millis(250);
+const REMOTE_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub use super::activation::{
     new_remote_session_id, new_worker_id, SessionActivate, SessionActivationRoute,
@@ -218,6 +221,74 @@ pub(super) fn install_session_metadata_agent(
     apply_session_overrides(&mut cfg, &metadata.overrides)
 }
 
+fn spawn_remote_session_cleanup(
+    config: GlobalConfig,
+    cluster: String,
+    retention: Option<u64>,
+) -> Option<JoinHandle<()>> {
+    let days = match retention {
+        None => {
+            log::warn!(
+                "session GC DISABLED for cluster='{cluster}'; NATS session state grows unbounded; \
+                 set HARNX_CLEANUP_REMOTE_SESSIONS_DAYS or config key \
+                 cleanup_remote_sessions_days to enable it"
+            );
+            return None;
+        }
+        Some(0) => {
+            log::info!("session GC explicitly disabled for cluster='{cluster}'");
+            return None;
+        }
+        Some(days) => days,
+    };
+
+    log::info!("session GC enabled for cluster='{cluster}': retention_days={days} interval=1h");
+    Some(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(REMOTE_SESSION_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let snapshot = config.read().clone();
+            match run_periodic_remote_cleanup(&snapshot, days, &cluster).await {
+                CleanupOutcome::Ran(stats) if stats.deleted > 0 || stats.errors > 0 => {
+                    log::info!(
+                        "session GC completed for cluster='{cluster}': scanned={} deleted={} \
+                         skipped_active={} errors={}",
+                        stats.scanned,
+                        stats.deleted,
+                        stats.skipped_active,
+                        stats.errors
+                    );
+                }
+                CleanupOutcome::Ran(stats) => {
+                    log::debug!(
+                        "session GC completed for cluster='{cluster}': scanned={} deleted=0 \
+                         skipped_active={} errors=0",
+                        stats.scanned,
+                        stats.skipped_active
+                    );
+                }
+                CleanupOutcome::NotLeader => {
+                    log::debug!(
+                        "session GC did not run for cluster='{cluster}': another worker is leader"
+                    );
+                }
+                CleanupOutcome::Failed => {
+                    log::warn!(
+                        "session GC did not complete for cluster='{cluster}' this cycle; will retry \
+                         next tick"
+                    );
+                }
+                CleanupOutcome::Skipped => {
+                    log::debug!(
+                        "session GC skipped for cluster='{cluster}': current hour already collected"
+                    );
+                }
+            }
+        }
+    }))
+}
+
 /// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
 /// KV lease, and execute the session (exactly one worker per session).
 pub async fn run_worker_daemon(
@@ -246,13 +317,21 @@ pub async fn run_worker_daemon(
     if let Some(readiness) = &readiness {
         readiness.ready();
     }
+    let cluster = daemon.connection_key().to_string();
+    let cleanup_retention = config.read().cleanup_remote_sessions_days;
+    // This is deliberately outside the activation reconnect loop: a broker
+    // reconnect must not create another hourly collector in the same worker.
+    let remote_cleanup =
+        spawn_remote_session_cleanup(Arc::clone(&config), cluster.clone(), cleanup_retention)
+            .map(tokio_util::task::AbortOnDropHandle::new);
     let runtime = Arc::new(WorkerRuntime {
         config,
         instance_id,
+        _remote_cleanup: remote_cleanup,
         _background_services: services.background,
         background_services_attempted: services.background_services_attempted,
         server_reconciler: services.server_reconciler,
-        cluster: daemon.connection_key().to_string(),
+        cluster,
         activation_route: daemon.activation_route(),
         activation_mode: daemon.activation_mode,
         manage_servers: daemon.manage_servers,
@@ -340,12 +419,27 @@ async fn reconnect_activation_stream<
 
 #[cfg(test)]
 mod tests {
-    use super::reconnect_activation_stream;
+    use super::{reconnect_activation_stream, spawn_remote_session_cleanup};
+    use crate::config::GlobalConfig;
     use futures_util::stream::{self, BoxStream};
     use futures_util::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn remote_session_cleanup_spawns_only_for_positive_retention() {
+        harnx_core::require_nextest();
+        let config = GlobalConfig::default();
+
+        assert!(spawn_remote_session_cleanup(config.clone(), "local".into(), None).is_none());
+        assert!(spawn_remote_session_cleanup(config.clone(), "local".into(), Some(0)).is_none());
+
+        let handle = spawn_remote_session_cleanup(config, "local".into(), Some(1))
+            .expect("positive retention must spawn cleanup");
+        handle.abort();
+        let _ = handle.await;
+    }
 
     #[tokio::test]
     async fn activation_stream_reopens_after_open_and_item_failures() {

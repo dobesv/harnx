@@ -263,3 +263,20 @@ and often return an empty or truncated title. Use a standard chat model.
 To set a title manually, use the [`.set title`](tui-guide.md) command in the
 TUI. A manually set title freezes automatic regeneration for the rest of the
 session.
+
+### Session Retention and Garbage Collection
+
+- **cleanup_remote_sessions_days**: Retention period in days for remote NATS
+  sessions (integer). Defaults to unset (`null`), which disables automatic
+  session garbage collection. Set `0` to explicitly disable collection. Set to
+  a positive integer (such as `30`) to collect inactive sessions older than that
+  many days. Garbage collection is enforced periodically by running
+  `harnx-worker` daemons across storage streams, metadata, leases, journals,
+  and attachments. When unset, workers emit a startup warning that automatic
+  expiry is disabled and remote session state will grow unbounded.
+
+Example `config.yaml`:
+
+```yaml
+cleanup_remote_sessions_days: 30
+```

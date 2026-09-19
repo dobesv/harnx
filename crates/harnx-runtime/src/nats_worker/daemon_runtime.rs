@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 /// Longest `handle_activation` waits for this session's own tool servers to
@@ -95,6 +96,7 @@ fn agent_activation_span(
 pub(super) struct WorkerRuntime {
     pub(super) config: GlobalConfig,
     pub(super) instance_id: harnx_core::instance::ServerScope,
+    pub(super) _remote_cleanup: Option<AbortOnDropHandle<()>>,
     pub(super) _background_services: Arc<Mutex<Option<BackgroundServices>>>,
     pub(super) background_services_attempted: tokio::sync::watch::Receiver<bool>,
     /// `None` for a consuming worker, or a managing worker with nothing
