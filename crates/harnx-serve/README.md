@@ -75,6 +75,18 @@ never used as a persistence or routing key.
 | `GET` | `/v1/agents/:agent/sessions/:session/events` | `Accept: text/event-stream` | Notify passive clients when any frontend updates the session. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Accept: text/event-stream` | **Subscription Plane**: SSE event stream. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Content-Type: application/json` | **Control Plane**: JSON-RPC 2.0 interface. |
+| `GET` | `/v1/agents/:agent/sessions/:session/attachments/:cid` | `image/*` | Retrieve attachment blob by content-ID. |
+
+### Attachment Retrieval
+
+`GET /v1/agents/:agent/sessions/:session/attachments/:cid` returns attachment blob bytes:
+- `{cid}` must be canonical `cid:` + 64 hex characters (URL-encoded as `cid%3A<hex>`).
+- Validates CID membership in the session log before storage access — session scoping is the access control.
+- Reads local content-addressed cache first, falls back to NATS ObjectStore.
+- MIME allowlist: `image/png`, `image/jpeg`, `image/webp`, `image/gif`. Returns `415 Unsupported Media Type` for other types.
+- Headers: `Content-Type: <mime>`, `X-Content-Type-Options: nosniff`, `Cache-Control: private, max-age=86400`.
+
+Note: harnx-serve routes are unauthenticated by design. This is the first route serving raw blob bytes.
 
 ### Canonical session metadata
 

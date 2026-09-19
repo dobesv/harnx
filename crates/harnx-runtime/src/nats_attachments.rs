@@ -194,6 +194,47 @@ async fn optional_store(
     }
 }
 
+/// Read one attachment from the session-scoped JetStream object store.
+///
+/// A missing bucket or object returns `Ok(None)`. The bucket is created only
+/// when another attachment operation has already established it.
+pub async fn get_session_attachment(
+    jetstream: &jetstream::Context,
+    replicas: usize,
+    session_id: &str,
+    cid: &str,
+) -> Result<Option<(Vec<u8>, String)>> {
+    let Some(store) = optional_store(jetstream).await? else {
+        return Ok(None);
+    };
+    if let Err(error) = raise_object_store_replicas(jetstream, replicas).await {
+        log::warn!(
+            "could not reconcile replicas for attachment object store '{SESSION_ATTACHMENTS_BUCKET}': {error:#}"
+        );
+    }
+    let name = attachment_object_name(session_id, cid);
+    let mut object = match store.get(&name).await {
+        Ok(object) => object,
+        Err(error) if error.kind() == object_store::GetErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("download attachment {cid} for session '{session_id}'"));
+        }
+    };
+    let mime_type = object
+        .info()
+        .metadata
+        .get(CONTENT_TYPE_METADATA_KEY)
+        .cloned()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let mut bytes = Vec::new();
+    object
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("read attachment {cid} for session '{session_id}'"))?;
+    Ok(Some((bytes, mime_type)))
+}
+
 fn parse_data_url(data_url: &str) -> Result<(String, Vec<u8>)> {
     let rest = data_url
         .strip_prefix("data:")

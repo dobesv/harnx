@@ -540,6 +540,49 @@ body {
   color: var(--danger);
 }
 
+.aui-message-attachments {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.aui-message-attachments:first-child {
+  margin-top: 0;
+}
+
+.aui-message-attachment-image {
+  max-width: 100%;
+  max-height: 360px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  display: block;
+}
+
+.aui-attachment-unavailable {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--text-muted, var(--text));
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-full, 9999px);
+  padding: 0.25rem 0.6rem;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.aui-attachment-unavailable-icon {
+  font-size: 0.85rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
 .aui-user-message {
   align-self: flex-end;
   background: var(--accent-bg);

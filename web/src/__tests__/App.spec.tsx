@@ -11,6 +11,7 @@ import {
   CancelButton,
   MyAttachment,
   MyComposer,
+  MyMessage,
   SendErrorIndicator,
   SessionPicker,
   StatusBar,
@@ -20,6 +21,7 @@ import { MarkdownLink } from '../markdownLink';
 import { sendPrompt, uploadAttachment, submitHitlDecision, markRead } from '../api';
 import { PendingContext } from '../PendingContext';
 import { UsageContext } from '../UsageContext';
+import { MessageAttachmentsContext } from '../MessageAttachmentsContext';
 import * as agUi from '@assistant-ui/react-ag-ui';
 import * as aui from '@assistant-ui/react';
 import { vi } from 'vitest';
@@ -69,6 +71,10 @@ vi.mock('@assistant-ui/react', async (importOriginal) => {
           {children}
         </button>
       ),
+    },
+    MessagePrimitive: {
+      Root: ({ className, children }: any) => <div className={className}>{children}</div>,
+      Content: () => null,
     },
   };
 });
@@ -881,5 +887,73 @@ describe('SessionPicker', () => {
     fireEvent.click(markUnreadBtn);
     expect(onToggleUnread).toHaveBeenCalledWith('session-new-read', false);
     expect(onSelect).not.toHaveBeenCalled();
+  });
+});
+
+describe('MyMessage attachment rendering', () => {
+  it('renders image attachment on attachment-only (empty text) user row', () => {
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) =>
+      selector({
+        message: {
+          id: 'user-msg-1',
+          role: 'user',
+          content: [],
+        },
+      }),
+    );
+
+    render(
+      <MessageAttachmentsContext.Provider
+        value={{
+          agent: 'agent-1',
+          session: 'session-1',
+          attachmentsByMessageId: {
+            'user-msg-1': [{ partIndex: 0, cid: 'cid:img123', kind: 'image' }],
+          },
+        }}
+      >
+        <MyMessage />
+      </MessageAttachmentsContext.Provider>,
+    );
+
+    const img = screen.getByRole('img');
+    expect(img).toBeInTheDocument();
+    expect(img).toHaveAttribute(
+      'src',
+      '/v1/agents/agent-1/sessions/session-1/attachments/cid%3Aimg123',
+    );
+  });
+
+  it('renders image attachment alongside text on user message', () => {
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) =>
+      selector({
+        message: {
+          id: 'user-msg-2',
+          role: 'user',
+          content: [{ type: 'text', text: 'Check this image' }],
+        },
+      }),
+    );
+
+    render(
+      <MessageAttachmentsContext.Provider
+        value={{
+          agent: 'agent-1',
+          session: 'session-1',
+          attachmentsByMessageId: {
+            'user-msg-2': [{ partIndex: 0, cid: 'cid:img456', kind: 'image' }],
+          },
+        }}
+      >
+        <MyMessage />
+      </MessageAttachmentsContext.Provider>,
+    );
+
+    const img = screen.getByRole('img');
+    expect(img).toBeInTheDocument();
+    expect(img).toHaveAttribute(
+      'src',
+      '/v1/agents/agent-1/sessions/session-1/attachments/cid%3Aimg456',
+    );
   });
 });

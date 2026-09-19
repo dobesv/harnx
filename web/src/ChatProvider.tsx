@@ -10,9 +10,11 @@ import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
 import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
-import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS } from './harnxCustomEvents';
+import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type MessageAttachmentMeta } from './harnxCustomEvents';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
+import { MessageAttachmentsContext } from './MessageAttachmentsContext';
+import { reduceMessageAttachments } from './messageAttachments';
 import { isAbortError, observedFetch } from './httpClient';
 import { connection } from './connection';
 
@@ -97,6 +99,7 @@ export interface HarnxHttpAgentOptions {
   onHandoff?: (agent: string, sessionId: string) => void;
   onSubAgentEvent: (event: unknown) => void;
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
+  onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
   isForeground?: boolean;
 }
 
@@ -126,6 +129,7 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onHandoff?: (agent: string, sessionId: string) => void;
   private readonly onSubAgentEvent: (event: unknown) => void;
   private readonly onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
+  private readonly onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
   private readonly isForeground: boolean;
   private handoffBoundarySeq?: number;
 
@@ -138,6 +142,7 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onHandoff = options.onHandoff;
     this.onSubAgentEvent = options.onSubAgentEvent;
     this.onHitlPendingApproval = options.onHitlPendingApproval;
+    this.onMessageAttachments = options.onMessageAttachments;
     this.isForeground = options.isForeground !== false;
   }
 
@@ -157,6 +162,7 @@ export class HarnxHttpAgent extends HttpAgent {
         }
       },
       onHitlPendingApproval: this.onHitlPendingApproval,
+      onMessageAttachments: this.onMessageAttachments,
       isForeground: this.isForeground,
     });
   }
@@ -248,6 +254,14 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     reduceSubAgentNotes,
     INITIAL_SUB_AGENT_NOTES_STATE,
   );
+  const [attachmentsState, dispatchAttachments] = useReducer(
+    reduceMessageAttachments,
+    {
+      agent: agentName,
+      session: sessionId,
+      attachmentsByMessageId: {},
+    },
+  );
   // Hydrated HITL pending approvals from durable log (hitl_pending_approval CUSTOM events)
   const [hydratedApprovals, setHydratedApprovals] = useState<HydratedPendingApproval[]>([]);
   
@@ -332,6 +346,15 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     isForeground: true,
     onHitlPendingApproval: (toolCallId, summary) =>
       addHydratedApproval({ toolCallId, summary }),
+    onMessageAttachments: (messageId, attachments) => {
+      dispatchAttachments({
+        type: 'SET_ATTACHMENTS',
+        agent: agentName,
+        session: sessionId,
+        messageId,
+        attachments,
+      });
+    },
     onSubAgentEvent: (event: any) => dispatchSubAgentEvent(event),
   }), [agentName, sessionId, onHandoff, addHydratedApproval]);
 
@@ -346,6 +369,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     setStatusText(null);
     setErrorText(null);
     dispatchSubAgentEvent({ type: 'RESET' });
+    dispatchAttachments({ type: 'RESET', agent: agentName, session: sessionId });
     clearHydratedApprovals();
   }, [agentName, sessionId, clearHydratedApprovals]);
 
@@ -355,9 +379,16 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     dispatch: dispatchSubAgentEvent,
   }), [onOpenSubAgent, subAgentState.notes, dispatchSubAgentEvent]);
 
+  const messageAttachmentsContext = useMemo(() => ({
+    agent: agentName,
+    session: sessionId,
+    attachmentsByMessageId: attachmentsState.attachmentsByMessageId,
+  }), [agentName, sessionId, attachmentsState.attachmentsByMessageId]);
+
   return (
     <CancellationContext.Provider value={cancellation}>
     <SubAgentNotesContext.Provider value={subAgentContext}>
+    <MessageAttachmentsContext.Provider value={messageAttachmentsContext}>
       <PendingContext.Provider value={{ 
         statusText, setStatusText, errorText, setErrorText,
         hydratedApprovals, addHydratedApproval, clearHydratedApprovals, removeHydratedApproval
@@ -376,6 +407,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
           </AssistantRuntimeProvider>
         </UsageContext.Provider>
       </PendingContext.Provider>
+    </MessageAttachmentsContext.Provider>
     </SubAgentNotesContext.Provider>
     </CancellationContext.Provider>
   );

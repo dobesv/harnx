@@ -46,7 +46,7 @@ use harnx_core::{
         AgentEvent, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent,
         TurnOutcome,
     },
-    message::{Message as HistoryMsg, MessageContent, MessageRole},
+    message::{Message as HistoryMsg, MessageContent, MessageContentPart, MessageRole},
 };
 use harnx_runtime::{
     config::{Agent, Config, GlobalConfig},
@@ -786,6 +786,39 @@ pub fn frame_event(event: &Event) -> Result<String, AgUiError> {
     Ok(format!("data: {json}\n\n"))
 }
 
+fn append_event_frames(initial: Option<Bytes>, events: Vec<Event>) -> Option<Bytes> {
+    let appended = events
+        .into_iter()
+        .filter_map(|event| frame_event(&event).ok())
+        .collect::<String>();
+    if appended.is_empty() {
+        return initial;
+    }
+
+    let mut frames = initial.map_or_else(Vec::new, |bytes| bytes.to_vec());
+    frames.extend_from_slice(appended.as_bytes());
+    Some(Bytes::from(frames))
+}
+
+fn initial_attach_frame_with_attachment_metadata(
+    snapshot: Vec<AgUiMessage>,
+    history_warnings: Vec<String>,
+    log_entries: Option<&[(u64, harnx_core::session::SessionLogEntry)]>,
+    hydrate_history: bool,
+) -> Option<Bytes> {
+    let attachment_events = if hydrate_history {
+        log_entries
+            .map(|entries| message_attachment_snapshot_events(&snapshot, entries))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    append_event_frames(
+        initial_attach_frame(snapshot, history_warnings, hydrate_history),
+        attachment_events,
+    )
+}
+
 fn keep_alive_stream(interval: Duration) -> impl tokio_stream::Stream<Item = Bytes> {
     tokio_stream::StreamExt::map(
         tokio_stream::StreamExt::skip(
@@ -1188,7 +1221,12 @@ pub(crate) fn build_ag_ui_event_stream(
         | crate::session_actor::SessionState::Interrupting
         | crate::session_actor::SessionState::Interrupted { .. } => None,
     };
-    let initial_frame = initial_attach_frame(snapshot, history_warnings, has_prompt.is_none());
+    let initial_frame = initial_attach_frame_with_attachment_metadata(
+        snapshot,
+        history_warnings,
+        log_entries.as_deref(),
+        has_prompt.is_none(),
+    );
     let handle_for_lag = handle.clone();
     let live_stream = tokio_stream::StreamExt::then(BroadcastStream::new(events), move |item| {
         let handle = handle_for_lag.clone();
@@ -1463,6 +1501,58 @@ fn completed_history_tool_message(
     })
 }
 
+fn image_attachment_values(content: &MessageContent) -> Vec<JsonValue> {
+    let MessageContent::Array(parts) = content else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .enumerate()
+        .filter_map(|(part_index, part)| match part {
+            // Only emit references the attachment GET route can serve. Durable
+            // NATS content is externalized to `cid:` before persistence; skip any
+            // other URL (e.g. an un-externalized `data:` or `https:` image) so the
+            // client never requests a blob the route rejects.
+            MessageContentPart::ImageUrl { image_url }
+                if image_url
+                    .url
+                    .starts_with(harnx_core::attachments::CID_PREFIX) =>
+            {
+                Some(json!({
+                    "partIndex": part_index,
+                    "cid": image_url.url,
+                    "kind": "image",
+                }))
+            }
+            MessageContentPart::ImageUrl { .. } | MessageContentPart::Text { .. } => None,
+        })
+        .collect()
+}
+
+fn message_attachments_event(message_id: MessageId, content: &MessageContent) -> Option<Event> {
+    let attachments = image_attachment_values(content);
+    message_attachments_event_from_values(message_id, attachments)
+}
+
+fn message_attachments_event_from_values(
+    message_id: MessageId,
+    attachments: Vec<JsonValue>,
+) -> Option<Event> {
+    (!attachments.is_empty()).then(|| {
+        Event::Custom(CustomEvent {
+            base: BaseEvent {
+                timestamp: None,
+                raw_event: None,
+            },
+            name: "message_attachments".to_string(),
+            value: json!({
+                "messageId": message_id,
+                "attachments": attachments,
+            }),
+        })
+    })
+}
+
 pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiMessage> {
     let mut messages = Vec::with_capacity(history.len());
     for (ordinal, message) in history.iter().enumerate() {
@@ -1539,6 +1629,36 @@ fn history_role_for_client(role: &Role) -> MessageRole {
         Role::User => MessageRole::User,
         Role::Tool => MessageRole::Tool,
     }
+}
+
+pub(crate) fn message_attachment_snapshot_events(
+    snapshot: &[AgUiMessage],
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+) -> Vec<Event> {
+    let Ok(effective_entries) = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)
+    else {
+        log::warn!("failed to resolve session mutations for attachment hydration");
+        return Vec::new();
+    };
+
+    snapshot
+        .iter()
+        .filter_map(|snapshot_message| {
+            let snapshot_id = snapshot_message.id().clone();
+            effective_entries
+                .iter()
+                .rev()
+                .find_map(|(_, entry)| match entry {
+                    harnx_core::session::SessionLogEntry::Message {
+                        id: Some(persisted_id),
+                        content,
+                        ..
+                    } if wire_message_id(persisted_id) == snapshot_id => Some(content),
+                    _ => None,
+                })
+                .and_then(|content| message_attachments_event(snapshot_id, content))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1755,6 +1875,160 @@ fn derive_pending_hitl_approvals(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod message_attachment_tests {
+    use super::*;
+    use harnx_core::message::ImageUrl;
+    use harnx_core::session::SessionLogEntry;
+
+    const CID_A: &str = "cid:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const CID_B: &str = "cid:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn history_message(id: Option<&str>, content: MessageContent) -> HistoryMsg {
+        HistoryMsg {
+            role: MessageRole::User,
+            content,
+            id: id.map(str::to_string),
+            log_seq: None,
+            log_timestamp: None,
+        }
+    }
+
+    fn image(cid: &str) -> MessageContentPart {
+        MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: cid.to_string(),
+            },
+        }
+    }
+
+    fn text(value: &str) -> MessageContentPart {
+        MessageContentPart::Text {
+            text: value.to_string(),
+        }
+    }
+
+    fn durable_entries(history: &[HistoryMsg]) -> Vec<(u64, SessionLogEntry)> {
+        history
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                (
+                    index as u64 + 1,
+                    SessionLogEntry::Message {
+                        id: message.id.clone(),
+                        role: message.role,
+                        content: message.content.clone(),
+                        timestamp: message.log_timestamp,
+                        fence_token: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn attachment_events(history: &[HistoryMsg]) -> (Vec<AgUiMessage>, Vec<Event>) {
+        let snapshot = history_messages_for_snapshot(history);
+        let events = message_attachment_snapshot_events(&snapshot, &durable_entries(history));
+        (snapshot, events)
+    }
+
+    fn custom_value(event: &Event) -> &JsonValue {
+        match event {
+            Event::Custom(CustomEvent { name, value, .. }) => {
+                assert_eq!(name, "message_attachments");
+                value
+            }
+            other => panic!("expected message_attachments CUSTOM event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_attachment_event_has_same_user_message_id() {
+        let persisted_id = "client-message-one";
+        let content = MessageContent::Array(vec![text("caption"), image(CID_A)]);
+        let history = vec![history_message(Some(persisted_id), content)];
+        let (snapshot, events) = attachment_events(&history);
+
+        assert_eq!(events.len(), 1);
+        let snapshot_id = match &snapshot[0] {
+            AgUiMessage::User { id, .. } => id,
+            other => panic!("expected user snapshot message, got {other:?}"),
+        };
+        let value = custom_value(&events[0]);
+        assert_eq!(value["messageId"], json!(snapshot_id));
+        assert_eq!(
+            value["attachments"],
+            json!([{ "partIndex": 1, "cid": CID_A, "kind": "image" }])
+        );
+    }
+
+    #[test]
+    fn snapshot_without_image_has_no_attachment_event() {
+        let history = vec![history_message(
+            Some("client-message-text"),
+            MessageContent::Array(vec![text("text only")]),
+        )];
+        let (_, events) = attachment_events(&history);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn snapshot_emits_one_ordered_replacement_event_for_two_images() {
+        let history = vec![history_message(
+            Some("client-message-two-images"),
+            MessageContent::Array(vec![
+                text("first"),
+                image(CID_A),
+                text("middle"),
+                image(CID_B),
+            ]),
+        )];
+        let (_, events) = attachment_events(&history);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            custom_value(&events[0])["attachments"],
+            json!([
+                { "partIndex": 1, "cid": CID_A, "kind": "image" },
+                { "partIndex": 3, "cid": CID_B, "kind": "image" }
+            ])
+        );
+    }
+
+    #[test]
+    fn snapshot_skips_attachment_event_without_persisted_message_id() {
+        let history = vec![history_message(
+            None,
+            MessageContent::Array(vec![image(CID_A)]),
+        )];
+        let (_, events) = attachment_events(&history);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn snapshot_skips_non_cid_image_urls() {
+        // The GET route only serves canonical `cid:` blobs, so metadata for a
+        // non-externalized URL (data:/https:) would be unservable. Keep the
+        // cid image in the same message so the event is still emitted for it.
+        let history = vec![history_message(
+            Some("client-message-mixed-urls"),
+            MessageContent::Array(vec![
+                image("data:image/png;base64,AAAA"),
+                image("https://example.com/pic.png"),
+                image(CID_A),
+            ]),
+        )];
+        let (_, events) = attachment_events(&history);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            custom_value(&events[0])["attachments"],
+            json!([{ "partIndex": 2, "cid": CID_A, "kind": "image" }])
+        );
+    }
 }
 
 #[cfg(test)]
