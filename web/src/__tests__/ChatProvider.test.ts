@@ -505,4 +505,48 @@ describe('toAgUiMessages', () => {
       expect(onSubAgentEvent).toHaveBeenCalledWith({ type: 'RUN_ERROR' });
       expect(onRunFailed).toHaveBeenCalledWith('Model error: context length exceeded');
     });
+
+    it('does not forward message_attachments custom events to the assistant-ui runtime', async () => {
+      const { HarnxHttpAgent } = await import('../ChatProvider');
+      const agent = new HarnxHttpAgent({
+        url: '/url',
+        onStatus: vi.fn(),
+        onRunFailed: vi.fn(),
+        onUsage: vi.fn(),
+        onToolSummary: vi.fn(),
+        onSubAgentEvent: vi.fn(),
+      });
+
+      expect((agent as any).forwardsCustomEvent('message_attachments')).toBe(false);
+      expect((agent as any).forwardsCustomEvent('session_attach_boundary')).toBe(false);
+      expect((agent as any).forwardsCustomEvent('session_handoff')).toBe(false);
+      expect((agent as any).forwardsCustomEvent('other_event')).toBe(true);
+    });
+
+    it('passes message_attachments to onMessageAttachments via handleAgentEvent', async () => {
+      const onMessageAttachments = vi.fn();
+      const { HarnxHttpAgent } = await import('../ChatProvider');
+      const agent = new HarnxHttpAgent({
+        url: '/url',
+        onStatus: vi.fn(),
+        onRunFailed: vi.fn(),
+        onUsage: vi.fn(),
+        onToolSummary: vi.fn(),
+        onSubAgentEvent: vi.fn(),
+        onMessageAttachments,
+      });
+
+      (agent as any).handleAgentEvent({
+        type: 'CUSTOM',
+        name: 'message_attachments',
+        value: {
+          messageId: 'msg-1',
+          attachments: [{ partIndex: 0, cid: 'cid:sha123', kind: 'image' }],
+        },
+      });
+
+      expect(onMessageAttachments).toHaveBeenCalledWith('msg-1', [
+        { partIndex: 0, cid: 'cid:sha123', kind: 'image' },
+      ]);
+    });
   });

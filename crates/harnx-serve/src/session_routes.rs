@@ -466,6 +466,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_session_json_returns_created() {
+        harnx_core::require_nextest();
+        if !crate::test_support::ensure_test_nats().await {
+            return;
+        }
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("session-creator", "You create sessions.");
+        let global = Arc::new(RwLock::new(sandbox.config()));
+        let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
+
+        let response = server
+            .create_session_json("session-creator")
+            .await
+            .expect("create session response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(response_json(response).await["session_id"]
+            .as_str()
+            .is_some_and(|session_id| !session_id.is_empty()));
+    }
+
+    #[tokio::test]
     async fn same_local_id_loads_history_and_metadata_for_the_requested_agent() {
         harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();

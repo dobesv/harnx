@@ -1842,12 +1842,12 @@ fn render_message_entry(
     if role.is_assistant() {
         use harnx_core::event::ModelEvent;
         sink.emit(AgentEvent::Model(ModelEvent::Final {
-            output: content.to_text(),
+            output: content.to_transcript_text(),
             usage: Default::default(),
         }));
     } else if role.is_user() {
         sink.emit(AgentEvent::User(UserEvent::Message {
-            content: content.to_text(),
+            content: content.to_transcript_text(),
         }));
     }
 }

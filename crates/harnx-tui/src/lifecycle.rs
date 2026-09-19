@@ -866,7 +866,7 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
         match msg.role {
             MessageRole::System => {}
             MessageRole::User => {
-                let text = msg.content.to_text();
+                let text = msg.content.to_transcript_text();
                 if !text.is_empty() {
                     items.push(TranscriptItem::UserText {
                         text,
@@ -876,7 +876,7 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                 }
             }
             MessageRole::Assistant => {
-                let text = msg.content.to_text();
+                let text = msg.content.to_transcript_text();
                 if !text.is_empty() {
                     items.push(TranscriptItem::AssistantText {
                         text,
@@ -1383,11 +1383,54 @@ pub(crate) fn nats_tool_confirmation_handler(
 mod tests {
     use super::*;
     use crate::types::{ToolCallBody, TranscriptItem};
-    use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+    use harnx_core::message::{
+        ImageUrl, Message, MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole,
+    };
     use harnx_core::tool::{ToolCall, ToolResult};
     use harnx_runtime::tool::ToolDeclaration;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn messages_to_transcript_marks_image_attachments() {
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "cid:user-image".to_string(),
+                    },
+                }]),
+            ),
+            Message::new(
+                MessageRole::Assistant,
+                MessageContent::Array(vec![
+                    MessageContentPart::Text {
+                        text: "caption".to_string(),
+                    },
+                    MessageContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "cid:assistant-image".to_string(),
+                        },
+                    },
+                ]),
+            ),
+        ];
+
+        let items = messages_to_transcript_items(&messages, &HashMap::new());
+
+        assert_eq!(items.len(), 2);
+        assert!(matches!(
+            &items[0],
+            TranscriptItem::UserText { text, .. }
+                if text == "[image attachment: cid:user-image]"
+        ));
+        assert!(matches!(
+            &items[1],
+            TranscriptItem::AssistantText { text, .. }
+                if text == "caption\n\n[image attachment: cid:assistant-image]"
+        ));
+    }
 
     #[test]
     fn messages_to_transcript_uses_markdown_when_template_exists() {

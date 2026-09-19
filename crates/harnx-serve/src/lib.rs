@@ -32,7 +32,9 @@ use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::stream::StreamExt;
-use harnx_core::attachments::store_attachment_bytes_async;
+use harnx_core::attachments::{
+    collect_cid_refs, read_attachment_async, store_attachment_bytes_async, CID_PREFIX,
+};
 use http::{Method, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -395,6 +397,9 @@ impl Server {
         } else if path == "/v1/agents" {
             route = "/v1/agents";
             self.list_agents(req.uri().query()).await
+        } else if is_session_attachment_blob_path(path) {
+            route = "/v1/agents/*/sessions/*/attachments/*";
+            self.get_session_attachment(req).await
         } else if is_session_attachments_path(path) {
             route = "/v1/agents/*/sessions/*/attachments";
             self.upload_session_attachments(req).await
@@ -417,13 +422,12 @@ impl Server {
         };
         let mut res = match res {
             Ok(res) => {
+                status = res.status();
                 info!("{method} {uri} {}", status.as_u16());
                 res
             }
             Err(err) => {
-                if status == StatusCode::OK {
-                    status = status_from_error(&err).unwrap_or(StatusCode::BAD_REQUEST);
-                }
+                status = finalize_err_status(status, &err);
                 error!("{method} {uri} {} {err}", status.as_u16());
                 ret_err(err)
             }
@@ -682,6 +686,61 @@ impl Server {
         json_response(Value::Array(
             agent_sessions_json(&self.config, agent).await?,
         ))
+    }
+
+    async fn get_session_attachment<B>(&self, req: hyper::Request<B>) -> Result<AppResponse> {
+        if req.method() != Method::GET {
+            bail!("Method Not Allowed");
+        }
+        let (agent, session, cid) = parse_session_attachment_blob_path(req.uri().path())
+            .ok_or_else(|| anyhow!("Not Found"))?;
+        if !is_canonical_attachment_cid(&cid) {
+            return attachment_error_response(StatusCode::BAD_REQUEST, "malformed attachment cid");
+        }
+
+        let (loaded_session, _entries) = load_nats_session(&self.config, &agent, &session).await?;
+        if loaded_session.agent_name.as_deref() != Some(agent.as_str())
+            || !collect_cid_refs(&loaded_session.messages)
+                .iter()
+                .any(|member| member == &cid)
+        {
+            return attachment_error_response(StatusCode::NOT_FOUND, "attachment not found");
+        }
+
+        let attachments_dir = Config::agent_data_dir(&agent)
+            .join("attachments")
+            .join(&session);
+        let attachment = match read_attachment_async(&attachments_dir, &cid).await {
+            Ok(attachment) => Some(attachment),
+            Err(_) => {
+                let jetstream = self.config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+                let storage_key = harnx_core::session_identity::session_key(Some(&agent), &session);
+                harnx_runtime::nats_attachments::get_session_attachment(
+                    &jetstream,
+                    1,
+                    &storage_key,
+                    &cid,
+                )
+                .await?
+            }
+        };
+        let Some((bytes, mime_type)) = attachment else {
+            return attachment_error_response(StatusCode::NOT_FOUND, "attachment not found");
+        };
+        if !is_inline_image_mime(&mime_type) {
+            return attachment_error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "attachment content type cannot be displayed inline",
+            );
+        }
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, mime_type)
+            .header("X-Content-Type-Options", "nosniff")
+            .header(http::header::CACHE_CONTROL, "private, max-age=86400")
+            .body(Full::new(Bytes::from(bytes)).boxed())?;
+        Ok(response)
     }
 
     async fn upload_session_attachments<B>(&self, req: hyper::Request<B>) -> Result<AppResponse>
@@ -1168,6 +1227,54 @@ fn parse_session_attachments_path(path: &str) -> Option<(String, String)> {
     }
 }
 
+fn is_session_attachment_blob_path(path: &str) -> bool {
+    let Some(suffix) = path.strip_prefix("/v1/agents/") else {
+        return false;
+    };
+    let segments: Vec<_> = suffix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    matches!(
+        segments.as_slice(),
+        [_agent, "sessions", _session, "attachments", _cid]
+    )
+}
+
+fn parse_session_attachment_blob_path(path: &str) -> Option<(String, String, String)> {
+    let suffix = path.strip_prefix("/v1/agents/")?;
+    let segments: Vec<_> = suffix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    match segments.as_slice() {
+        [agent, "sessions", session, "attachments", cid] => {
+            let agent = percent_decode(agent);
+            let session = percent_decode(session);
+            if !is_safe_agent_path(&agent) || !is_safe_path_segment(&session) {
+                return None;
+            }
+            Some((agent, session, percent_decode(cid)))
+        }
+        _ => None,
+    }
+}
+
+fn is_canonical_attachment_cid(cid: &str) -> bool {
+    cid.len() == CID_PREFIX.len() + 64
+        && cid.starts_with(CID_PREFIX)
+        && cid[CID_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_inline_image_mime(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
+}
+
 fn request_is_oversized(headers: &http::HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_LENGTH)
@@ -1584,7 +1691,7 @@ fn history_message_content(message: &Message) -> String {
                 tool_calls.text.clone()
             }
         }
-        _ => message.content.to_text(),
+        _ => message.content.to_transcript_text(),
     }
 }
 
@@ -1636,6 +1743,16 @@ fn json_response_with_status(status: StatusCode, data: Value) -> Result<AppRespo
     Ok(res)
 }
 
+fn attachment_error_response(status: StatusCode, message: &str) -> Result<AppResponse> {
+    let response = Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .header("X-Content-Type-Options", "nosniff")
+        .header(http::header::CACHE_CONTROL, "private, no-store")
+        .body(Full::new(Bytes::from(json!({ "error": message }).to_string())).boxed())?;
+    Ok(response)
+}
+
 fn ag_ui_error_to_anyhow(err: AgUiError) -> anyhow::Error {
     anyhow!(format!("{}::__status={}", err, err.status_code().as_u16()))
 }
@@ -1657,10 +1774,22 @@ fn status_from_error(err: &anyhow::Error) -> Option<StatusCode> {
     StatusCode::from_u16(code).ok()
 }
 
+/// Final HTTP status for a failed dispatch. An explicit dispatch status wins;
+/// otherwise the error mapping applies, with bad request as the fallback.
+fn finalize_err_status(dispatch_status: StatusCode, err: &anyhow::Error) -> StatusCode {
+    if dispatch_status == StatusCode::OK {
+        status_from_error(err).unwrap_or(StatusCode::BAD_REQUEST)
+    } else {
+        dispatch_status
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestConfigSandbox;
+    use crate::test_support::{seed_nats_session, NatsSessionSeed, TestConfigSandbox};
+    use harnx_core::message::{ImageUrl, Message, MessageContent, MessageContentPart};
+    use harnx_core::session::SessionLogEntry;
     use http::HeaderValue;
 
     #[test]
@@ -1826,6 +1955,30 @@ mod tests {
         .is_none());
     }
 
+    #[test]
+    fn session_attachment_blob_path_decodes_and_validates_cid_segment() {
+        let hash = "a".repeat(64);
+        let encoded_path =
+            format!("/v1/agents/coding%2Fcoder/sessions/thread-1/attachments/cid%3A{hash}");
+        assert!(is_session_attachment_blob_path(&encoded_path));
+        assert_eq!(
+            parse_session_attachment_blob_path(&encoded_path),
+            Some((
+                "coding/coder".to_string(),
+                "thread-1".to_string(),
+                format!("cid:{hash}"),
+            ))
+        );
+        assert!(is_canonical_attachment_cid(&format!("cid:{hash}")));
+        assert!(!is_canonical_attachment_cid(&format!(
+            "cid:{}",
+            "A".repeat(64)
+        )));
+        assert!(!is_canonical_attachment_cid("cid:../outside"));
+        assert!(!is_session_attachment_blob_path(
+            "/v1/agents/hephaestus/sessions/thread-1/attachments"
+        ));
+    }
     #[test]
     fn negotiate_agents_route_prefers_html_for_browser_gets() {
         let mut headers = http::HeaderMap::new();
@@ -2047,6 +2200,36 @@ mod tests {
         );
         let err = ag_ui_error_to_anyhow(AgUiError::BadRequest("bad body".to_string()));
         assert_eq!(status_from_error(&err), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn finalize_err_status_maps_known_errors() {
+        for (message, expected) in [
+            ("Not Found", StatusCode::NOT_FOUND),
+            ("Method Not Allowed", StatusCode::METHOD_NOT_ALLOWED),
+            ("Not Acceptable", StatusCode::NOT_ACCEPTABLE),
+        ] {
+            assert_eq!(
+                finalize_err_status(StatusCode::OK, &anyhow!(message)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_err_status_defaults_unmapped_errors_to_bad_request() {
+        assert_eq!(
+            finalize_err_status(StatusCode::OK, &anyhow!("generic failure")),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn finalize_err_status_preserves_explicit_dispatch_status() {
+        assert_eq!(
+            finalize_err_status(StatusCode::NOT_FOUND, &anyhow!("Method Not Allowed")),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
@@ -2279,6 +2462,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn history_message_content_marks_image_attachments() {
+        let image_only = Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "cid:image-only".to_string(),
+                },
+            }]),
+        );
+        let text_and_image = Message::new(
+            MessageRole::Assistant,
+            MessageContent::Array(vec![
+                MessageContentPart::Text {
+                    text: "caption".to_string(),
+                },
+                MessageContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "cid:text-and-image".to_string(),
+                    },
+                },
+            ]),
+        );
+
+        assert_eq!(
+            history_message_content(&image_only),
+            "[image attachment: cid:image-only]"
+        );
+        assert_eq!(
+            history_message_content(&text_and_image),
+            "caption\n\n[image attachment: cid:text-and-image]"
+        );
+    }
+
     // ===== Attachment upload endpoint tests (B5) =====
 
     /// Helper to build a multipart/form-data body
@@ -2352,6 +2569,332 @@ mod tests {
 
         // Call the real handler
         server.upload_session_attachments(req).await
+    }
+
+    fn attachment_message(cid: &str) -> Message {
+        Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: cid.to_string(),
+                },
+            }]),
+        )
+    }
+
+    async fn call_get_attachment_handler(server: &Server, path: &str) -> Result<AppResponse> {
+        let request = hyper::Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Full::new(Bytes::new()))?;
+        server.get_session_attachment(request).await
+    }
+
+    fn attachment_url(session: &str, cid: &str) -> String {
+        format!(
+            "/v1/agents/plain/sessions/{session}/attachments/{}",
+            cid.replacen(':', "%3A", 1)
+        )
+    }
+
+    fn assert_attachment_security_headers(response: &AppResponse, cache_control: &str) {
+        assert_eq!(response.headers()["X-Content-Type-Options"], "nosniff");
+        assert_eq!(
+            response.headers()[http::header::CACHE_CONTROL],
+            cache_control
+        );
+    }
+
+    /// Store a blob, seed a session with the message built from its cid, and
+    /// return a server ready to serve it. A missing broker keeps the existing
+    /// test-skip behavior.
+    async fn seeded_attachment_server(
+        session: &str,
+        bytes: &[u8],
+        mime_type: &str,
+        config: Config,
+        message_for_cid: impl FnOnce(&str) -> Message,
+    ) -> Result<Option<(Server, String)>> {
+        let attachments_dir = Config::agent_data_dir("plain")
+            .join("attachments")
+            .join(session);
+        let cid = store_attachment_bytes_async(&attachments_dir, bytes, mime_type).await?;
+        let messages = [message_for_cid(&cid)];
+        if !seed_nats_session(
+            &config,
+            NatsSessionSeed {
+                agent: "plain",
+                session_id: session,
+                messages: &messages,
+            },
+        )
+        .await
+        {
+            return Ok(None);
+        }
+        let global_config = Arc::new(RwLock::new(config));
+        let server = Server::new(&global_config, PathBuf::from("web-assets"));
+        Ok(Some((server, cid)))
+    }
+
+    #[tokio::test]
+    async fn get_attachment_returns_member_png_with_security_headers() -> Result<()> {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        let session = format!("attachment-get-local-{}", uuid::Uuid::new_v4());
+        let bytes = b"png attachment bytes";
+        let Some((server, cid)) =
+            seeded_attachment_server(&session, bytes, "image/png", config, attachment_message)
+                .await?
+        else {
+            return Ok(());
+        };
+
+        let response =
+            call_get_attachment_handler(&server, &attachment_url(&session, &cid)).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[http::header::CONTENT_TYPE], "image/png");
+        assert_attachment_security_headers(&response, "private, max-age=86400");
+        let body = response.into_body().collect().await?.to_bytes();
+        assert_eq!(body.as_ref(), bytes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_attachment_rejects_cid_not_in_session() -> Result<()> {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        let session = format!("attachment-get-nonmember-{}", uuid::Uuid::new_v4());
+        let Some((server, cid)) =
+            seeded_attachment_server(&session, b"secret", "image/png", config, |_| {
+                Message::new(
+                    MessageRole::User,
+                    MessageContent::Text("no attachment here".to_string()),
+                )
+            })
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let response =
+            call_get_attachment_handler(&server, &attachment_url(&session, &cid)).await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_attachment_security_headers(&response, "private, no-store");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_attachment_rejects_malformed_cid_before_session_read() -> Result<()> {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let global_config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Server::new(&global_config, PathBuf::from("web-assets"));
+        let response = call_get_attachment_handler(
+            &server,
+            "/v1/agents/plain/sessions/missing/attachments/cid%3Anot-hex",
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_attachment_security_headers(&response, "private, no-store");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_attachment_does_not_inline_disallowed_mime() -> Result<()> {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        let session = format!("attachment-get-svg-{}", uuid::Uuid::new_v4());
+        let Some((server, cid)) = seeded_attachment_server(
+            &session,
+            b"<svg xmlns='http://www.w3.org/2000/svg'></svg>",
+            "image/svg+xml",
+            config,
+            attachment_message,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        let response =
+            call_get_attachment_handler(&server, &attachment_url(&session, &cid)).await?;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_ne!(
+            response.headers().get(http::header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("image/svg+xml"))
+        );
+        assert_attachment_security_headers(&response, "private, no-store");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_attachment_falls_back_to_nats_when_local_cache_is_cold() -> Result<()> {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        if !crate::test_support::ensure_test_nats().await {
+            return Ok(());
+        }
+        let session = format!("attachment-get-nats-{}", uuid::Uuid::new_v4());
+        let storage_key = harnx_core::session_identity::session_key(Some("plain"), &session);
+        let bytes = b"cold cache png bytes";
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            harnx_core::crypto::base64_encode(bytes)
+        );
+        let mut content = MessageContent::Array(vec![MessageContentPart::ImageUrl {
+            image_url: ImageUrl { url: data_url },
+        }]);
+        let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+        harnx_runtime::nats_attachments::externalize_message_attachments(
+            harnx_runtime::nats_attachments::AttachmentLocation::new(&jetstream, 1, &storage_key),
+            &mut content,
+            None,
+        )
+        .await?;
+        let MessageContent::Array(parts) = &content else {
+            unreachable!("attachment content remains an array")
+        };
+        let MessageContentPart::ImageUrl { image_url } = &parts[0] else {
+            unreachable!("test content has one image")
+        };
+        let cid = image_url.url.clone();
+        let messages = [Message::new(MessageRole::User, content)];
+        assert!(
+            seed_nats_session(
+                &config,
+                NatsSessionSeed {
+                    agent: "plain",
+                    session_id: &session,
+                    messages: &messages,
+                },
+            )
+            .await
+        );
+        let attachments_dir = Config::agent_data_dir("plain")
+            .join("attachments")
+            .join(&session);
+        assert!(!attachments_dir.exists());
+        let global_config = Arc::new(RwLock::new(config));
+        let server = Server::new(&global_config, PathBuf::from("web-assets"));
+
+        let response =
+            call_get_attachment_handler(&server, &attachment_url(&session, &cid)).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[http::header::CONTENT_TYPE], "image/png");
+        assert_attachment_security_headers(&response, "private, max-age=86400");
+        let body = response.into_body().collect().await?.to_bytes();
+        assert_eq!(body.as_ref(), bytes);
+        Ok(())
+    }
+
+    /// One image attachment cid must flow intact through all three layers the
+    /// fix touches, so the transcript marker, the `message_attachments`
+    /// metadata event, and the blob route never drift apart:
+    ///   (a) the text transcript renders `[image attachment: <cid>]`,
+    ///   (b) the AG-UI snapshot emits a `message_attachments` event whose
+    ///       `messageId` matches the snapshot user row and whose `cid` matches,
+    ///   (c) the GET attachments route serves that same cid's bytes.
+    #[tokio::test]
+    async fn attachment_cid_flows_through_transcript_event_and_route() -> Result<()> {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        let session = format!("attachment-crosslayer-{}", uuid::Uuid::new_v4());
+        let bytes = b"cross layer png bytes";
+        let attachments_dir = Config::agent_data_dir("plain")
+            .join("attachments")
+            .join(&session);
+        let cid = store_attachment_bytes_async(&attachments_dir, bytes, "image/png").await?;
+
+        // The durable user message: caption text plus the stored cid image.
+        let content = MessageContent::Array(vec![
+            MessageContentPart::Text {
+                text: "look at this".to_string(),
+            },
+            MessageContentPart::ImageUrl {
+                image_url: ImageUrl { url: cid.clone() },
+            },
+        ]);
+
+        // (a) Text transcript keeps the image as a visible marker.
+        let transcript = content.to_transcript_text();
+        assert_eq!(
+            transcript,
+            format!("look at this\n\n[image attachment: {cid}]")
+        );
+
+        // (b) Snapshot metadata event shares the snapshot user row's wire id and
+        //     carries the same cid.
+        let history = [Message::new(MessageRole::User, content.clone()).with_id("user-msg-1")];
+        let snapshot = crate::ag_ui::history_messages_for_snapshot(&history);
+        let durable_entries = vec![(
+            1,
+            SessionLogEntry::Message {
+                id: history[0].id.clone(),
+                role: MessageRole::User,
+                content: content.clone(),
+                timestamp: None,
+                fence_token: None,
+            },
+        )];
+        let events = crate::ag_ui::message_attachment_snapshot_events(&snapshot, &durable_entries);
+        let user_id = match snapshot.first().expect("snapshot user message") {
+            ag_ui_core::types::message::Message::User { id, .. } => id.clone(),
+            other => panic!("expected user snapshot message, got {other:?}"),
+        };
+        let attachment_event = events
+            .iter()
+            .find_map(|event| match event {
+                ag_ui_core::event::Event::Custom(custom)
+                    if custom.name == "message_attachments" =>
+                {
+                    Some(&custom.value)
+                }
+                _ => None,
+            })
+            .expect("message_attachments event emitted");
+        assert_eq!(attachment_event["messageId"], serde_json::json!(user_id));
+        assert_eq!(
+            attachment_event["attachments"],
+            serde_json::json!([{ "partIndex": 1, "cid": cid, "kind": "image" }])
+        );
+
+        // (c) The GET route serves that exact cid (requires a NATS-backed
+        //     session; skip gracefully if the test broker is unavailable).
+        let messages = [attachment_message(&cid)];
+        if !seed_nats_session(
+            &config,
+            NatsSessionSeed {
+                agent: "plain",
+                session_id: &session,
+                messages: &messages,
+            },
+        )
+        .await
+        {
+            return Ok(());
+        }
+        let global_config = Arc::new(RwLock::new(config));
+        let server = Server::new(&global_config, PathBuf::from("web-assets"));
+        let response =
+            call_get_attachment_handler(&server, &attachment_url(&session, &cid)).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[http::header::CONTENT_TYPE], "image/png");
+        assert_attachment_security_headers(&response, "private, max-age=86400");
+        let body = response.into_body().collect().await?.to_bytes();
+        assert_eq!(body.as_ref(), bytes);
+        Ok(())
     }
 
     #[test]

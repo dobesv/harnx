@@ -1,7 +1,11 @@
 import type { Agent, AgentDetail, JsonRpcResponse, PromptResult, SessionRef } from './types';
 import { fetchJsonWithRetry, observedFetch, PermanentError } from './httpClient';
 
-const API_BASE = '/v1';
+export const API_BASE = '/v1';
+
+export function getSessionAttachmentUrl(agent: string, session: string, cid: string): string {
+  return `${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}/attachments/${encodeURIComponent(cid)}`;
+}
 
 export async function listAgents(options?: { signal?: AbortSignal }): Promise<Agent[]> {
   try {

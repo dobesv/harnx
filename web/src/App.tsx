@@ -20,6 +20,7 @@ import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
+import { MessageAttachments } from './MessageAttachments';
 import { sendPrompt, submitHitlDecision, uploadAttachment, markRead, markUnread } from './api';
 import { CancellationContext, type CancellationControl } from './CancellationContext';
 import type { Agent, SessionRef } from './types';
@@ -67,7 +68,8 @@ export const MessageContent = () => (
   }} />
 );
 
-const MyMessage = () => {
+// eslint-disable-next-line react-refresh/only-export-components
+export const MyMessage = () => {
   const role = useAuiState((s) => s.message.role);
   const messageId = useAuiState((s) => s.message.id);
   // An assistant message with no parts still gets .aui-message padding, so it
@@ -107,6 +109,7 @@ const MyMessage = () => {
     <MessagePrimitive.Root className={`aui-message ${roleClass}`}>
       <div className="aui-message-content">
         <MessageContent />
+        <MessageAttachments messageId={messageId} />
       </div>
       <SubAgentSessionNotes notes={messageNotes} onOpen={openSession} />
     </MessagePrimitive.Root>
