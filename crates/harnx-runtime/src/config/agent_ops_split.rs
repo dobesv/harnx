@@ -222,12 +222,26 @@ impl Config {
         Ok(())
     }
 
-    pub fn all_agents() -> Vec<AgentConfig> {
+    pub fn all_agents(&self) -> Vec<AgentConfig> {
         let mut agents: HashMap<String, AgentConfig> = HashMap::new();
-        for name in list_agents() {
+        let local_names = self::agent::list_local_agent_names()
+            .into_iter()
+            .chain(self::agent::list_package_agent_names());
+        for name in local_names {
             let path = Self::agent_file(&name);
             if let Ok(agent) = self::agent::load_with_qualified_name(&path, &name) {
                 agents.insert(name, agent.into_config());
+            }
+        }
+        for server in &self.nats_servers {
+            for remote in &server.agents {
+                let name = format!("{}@{}", remote.name, server.name);
+                let agent = AgentConfig::from_remote_catalog(
+                    &name,
+                    remote.description.clone(),
+                    remote.role,
+                );
+                agents.insert(name, agent);
             }
         }
         let mut agents: Vec<_> = agents.into_values().collect();

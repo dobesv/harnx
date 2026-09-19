@@ -5,6 +5,7 @@ use harnx_core::{
     message::{Message, MessageContent, MessageRole},
     session::SessionLogEntry,
 };
+use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 use harnx_runtime::nats_session_log::NatsSessionLog;
 
 struct Fixture {

@@ -58,6 +58,23 @@ async fn registry_sandbox() -> (
     (guard, sandbox, registry)
 }
 
+#[tokio::test]
+async fn registry_keeps_same_agent_and_session_distinct_across_clusters() {
+    let (_guard, _sandbox, registry) = registry_sandbox().await;
+    let session = "same-session";
+    let local_key = SessionKey::local("sisyphus", session);
+    let remote_key = SessionKey::new(ResolvedAgentTarget::new("sisyphus", "shared"), session);
+
+    let local = registry.get_or_spawn(local_key.clone());
+    let remote = registry.get_or_spawn(remote_key.clone());
+
+    assert_ne!(local.actor_id, remote.actor_id);
+    assert!(registry.has_session(&local_key));
+    assert!(registry.has_session(&remote_key));
+    assert_eq!(registry.get_or_spawn(local_key).actor_id, local.actor_id);
+    assert_eq!(registry.get_or_spawn(remote_key).actor_id, remote.actor_id);
+}
+
 /// Arm the reap deadline the way a departing subscriber does, and wait until the actor has
 /// processed it: `Unsubscribe` carries no reply, so a following `Get` round-trip is the
 /// confirmation that the deadline is set.

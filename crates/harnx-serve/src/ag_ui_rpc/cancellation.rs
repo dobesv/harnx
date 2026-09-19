@@ -17,14 +17,14 @@ type SessionContext<'a> = (
 /// the session log accepted.
 pub(super) async fn handle(id: Value, session: SessionContext<'_>) -> anyhow::Result<AppResponse> {
     let (config, registry, key) = session;
-    if !registry.has_session(&key) && !session_exists(config, &key).await {
+    if !registry.has_session(&key) && !session_exists(config, &key).await? {
         return json_rpc_response(
             StatusCode::NOT_FOUND,
             json_rpc_error(
                 id,
                 JSON_RPC_UNKNOWN_SESSION_CODE,
                 "session not found",
-                Some(json!({ "agent": key.agent, "session": key.session })),
+                Some(json!({ "agent": key.agent(), "session": key.session })),
             ),
         );
     }

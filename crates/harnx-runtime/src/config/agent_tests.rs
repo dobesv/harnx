@@ -603,6 +603,36 @@ agents:
 }
 
 #[test]
+fn all_agents_keeps_remote_catalog_metadata_without_local_markdown() {
+    with_test_config_dir(|config_dir| {
+        write_remote_cluster_fixture(
+            config_dir,
+            "shared",
+            r#"url: nats://localhost:4222
+agents:
+  - name: atlas
+    description: Remote Atlas
+    role: subagent
+"#,
+        )?;
+        let config = Config {
+            nats_servers: Config::load_nats_servers_from_dir(&config_dir.join("nats_servers"))?,
+            ..Default::default()
+        };
+
+        let agents = config.all_agents();
+        let atlas = agents
+            .iter()
+            .find(|agent| agent.name() == "atlas@shared")
+            .expect("remote catalog agent");
+        assert_eq!(atlas.description(), "Remote Atlas");
+        assert_eq!(atlas.role, AgentRole::Subagent);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn test_list_assistant_agents_includes_remote_assistants_only() {
     with_test_config_dir(|config_dir| {
         write_remote_cluster_fixture(

@@ -216,6 +216,19 @@ impl AgentConfig {
         }
     }
 
+    pub fn from_remote_catalog(
+        name: impl Into<String>,
+        description: Option<String>,
+        role: AgentRole,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.unwrap_or_default(),
+            role,
+            ..Default::default()
+        }
+    }
+
     pub fn description(&self) -> &str {
         &self.description
     }
