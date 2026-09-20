@@ -753,3 +753,15 @@ fn apply_agent_patch_with_invalid_jq_expression_returns_err() {
     assert!(result.is_err());
     assert_eq!(config.model_id(), original_model.as_deref());
 }
+
+#[test]
+fn apply_agent_patch_matches_bare_name_and_preserves_qualified_name() {
+    let mut config = make_agent_config("pantheon/atlas", "openai:gpt-4o");
+    let patch = make_patch(vec![
+        r#"if .name == "atlas" then .model = "anthropic:claude-3-5-sonnet" end"#,
+    ]);
+    let result = apply_agent_patch(&mut config, "atlas", &patch);
+    assert!(result.is_ok());
+    assert_eq!(config.model_id(), Some("anthropic:claude-3-5-sonnet"));
+    assert_eq!(config.name(), "pantheon/atlas");
+}

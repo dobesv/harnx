@@ -13,6 +13,9 @@ use_tools:
 - bash_spawn
 - bash_wait
 - bash_terminate
+- sandbox_connect
+- sandbox_status
+- sandbox_release
 - fs_read
 - fs_ls
 - fs_grep
@@ -48,6 +51,9 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: sandbox_workflow
+  description: Sandbox-mode workflow (dual)
+  path: shared/sandbox-workflow-dual.md
 - name: natural_writing
   description: Natural writing style rules for prose (comments, docs, commits, PRs)
   path: shared/natural-writing.md
@@ -59,6 +65,10 @@ variables:
 
 {{github_gh_lookup}}
 
+{% set has_sandbox = (tools | selectattr('name', 'equalto', 'sandbox_connect') | list | length) > 0 %}
+{% if has_sandbox %}
+{{sandbox_workflow}}
+{% else %}
 ## Local environment Workflow
 
 You work locally using the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) and `bash_exec` directly. Assume the repository under investigation is the current working directory unless the user names a different path.
@@ -71,6 +81,7 @@ You work locally using the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`,
 6. **Cache findings**: If a plan ID is provided, save durable findings as plan notes via `plans_add_note`.
 
 Do NOT modify repository files — investigate, execute, and report.
+{% endif %}
 
 {{repo_docs}}
 

@@ -582,3 +582,30 @@ Agent prompts are rendered using [MiniJinja](https://github.com/mitsuhiko/miniji
 - `{{ agent.model }}`: The active model ID (e.g., `openai:gpt-4o`). This updates automatically if the agent falls back to a different model.
 - `{{ tools }}`: A list of available tools. You can iterate over them: `{% for t in tools %}- {{ t.name }}: {{ t.description }}{% endfor %}`.
 - `{{ __os__ }}`, `{{ __arch__ }}`, `{{ __shell__ }}`, `{{ __cwd__ }}`, `{{ __now__ }}`, `{{ __locale__ }}`: Environment and system information.
+
+### Detecting Environment-Specific Tooling
+
+Sometimes you need agent behavior to adapt based on which tools are available. For example, agents running in a Kubernetes sandbox have different filesystem and workflow constraints than agents running locally.
+
+**Check `tools`, not `agent.use_tools`.** The `tools` variable contains resolved tool declarations—only tools that are actually registered and available. The `agent.use_tools` field lists declared tool names from front-matter, which may include tools that don't exist in the current environment. Checking `agent.use_tools` produces false positives when tools are declared but not registered.
+
+**Detection idiom.** To check whether a specific tool is available:
+
+```jinja
+{% set has_sandbox = (tools | selectattr('name', 'equalto', 'sandbox_connect') | list | length) > 0 %}
+{% if has_sandbox %}
+{{sandbox_workflow}}
+{% else %}
+<local workflow instructions>
+{% endif %}
+```
+
+**Single-pass rendering constraint.** File-backed variables (those with `path:` in front-matter) are substituted as literal strings without MiniJinja re-evaluation. Template tags (`{% if %}`, `{{ var }}`) inside fragment files are emitted verbatim, not evaluated. If you need conditional branching, place the `{% if %}` block in the agent body and keep fragments as pure Markdown.
+
+**Workflow categories.** Pantheon agents use three patterns for sandbox-adaptive prompts:
+
+| Category | When to use | Workflow fragment |
+|----------|-------------|-------------------|
+| **CREATE** | Orchestrators that create and own sandbox lifecycle | `shared/sandbox-workflow-create.md` |
+| **INHERIT** | Workers delegated by an orchestrator (sandbox already bound) | `shared/sandbox-workflow-inherit.md` |
+| **DUAL** | Research agents that may run standalone or delegated | `shared/sandbox-workflow-dual.md` |

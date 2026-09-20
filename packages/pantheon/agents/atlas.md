@@ -13,6 +13,9 @@ use_tools:
 - bash_spawn
 - bash_wait
 - bash_terminate
+- sandbox_connect
+- sandbox_status
+- sandbox_release
 - bash_wait_for_pr_stable
 - fs_read
 - fs_ls
@@ -68,6 +71,9 @@ variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
+- name: sandbox_workflow
+  description: Sandbox-mode workflow (orchestrator create)
+  path: shared/sandbox-workflow-create.md
 - name: atlas_core
   description: Core identity and instructions for Atlas
   path: shared/atlas.md
@@ -92,6 +98,19 @@ variables:
 ---
 
 {{atlas_core}}
+
+{% set has_sandbox = (tools | selectattr('name', 'equalto', 'sandbox_connect') | list | length) > 0 %}
+{% if has_sandbox %}
+{{sandbox_workflow}}
+{% else %}
+## Default Repository
+
+Assume the repository to work in is the current working directory. Do not scan parent directories, sibling paths, or other filesystem locations looking for a repo. Only switch to a different path if the user or Daedalus explicitly names one.
+
+All git operations should be performed using standard Bash commands.
+
+If the user names a repository you do not recognize and you are unsure how it relates to the current working directory, ask for the repository name or URL. Checking out the wrong repository wastes time.
+{% endif %}
 
 ## Repository Documentation Discovery
 {{repo_docs}}

@@ -9,6 +9,7 @@
 
 use std::{ffi::OsStr, fs, path::Path, path::PathBuf};
 
+use harnx_core::tool::ToolDeclaration;
 use harnx_runtime::client::{retrieve_model, ModelType};
 use harnx_runtime::config::agent::{load_with_qualified_name, resolve_variables};
 use harnx_runtime::config::Config;
@@ -50,6 +51,119 @@ fn workspace_root() -> Option<PathBuf> {
         .ancestors()
         .find(|ancestor| ancestor.join("packages").is_dir())
         .map(Path::to_path_buf)
+}
+
+/// Load an agent, resolve its variables, and render the prompt with tools.
+fn render_agent_prompt(qualified_name: &str, tools: &[ToolDeclaration]) -> Result<String, String> {
+    let agent_path = Config::agent_file(qualified_name);
+    let mut agent = load_with_qualified_name(&agent_path, qualified_name)
+        .map_err(|e| format!("{qualified_name}: failed to load: {e}"))?;
+    resolve_variables(&mut agent)
+        .map_err(|e| format!("{qualified_name}: failed to resolve variables: {e}"))?;
+    agent
+        .system_text_with_tools(tools)
+        .map_err(|e| format!("{qualified_name}: failed to render prompt: {e}"))
+}
+
+/// Test case for sandbox branching behavior verification.
+struct BranchTestCase {
+    agent: &'static str,
+    with_sandbox: bool,
+    must_contain: &'static str,
+    must_not_contain: Option<&'static str>,
+}
+
+/// Evaluate a single branch test case, returning an error message if it fails.
+fn evaluate_branch_test_case(
+    test_case: &BranchTestCase,
+    sandbox_tool: &ToolDeclaration,
+) -> Option<String> {
+    let tools = if test_case.with_sandbox {
+        std::slice::from_ref(sandbox_tool)
+    } else {
+        &[]
+    };
+
+    let prompt = match render_agent_prompt(test_case.agent, tools) {
+        Ok(prompt) => prompt,
+        Err(err) => return Some(err),
+    };
+
+    if !prompt.contains(test_case.must_contain) {
+        return Some(format!(
+            "{}: with_sandbox={}, expected to contain '{}' but did not",
+            test_case.agent, test_case.with_sandbox, test_case.must_contain
+        ));
+    }
+
+    if let Some(not_contain) = test_case.must_not_contain {
+        if prompt.contains(not_contain) {
+            return Some(format!(
+                "{}: with_sandbox={}, expected NOT to contain '{}' but did",
+                test_case.agent, test_case.with_sandbox, not_contain
+            ));
+        }
+    }
+
+    None
+}
+
+struct FragmentChecker<'a> {
+    file_name: &'a str,
+    content: &'a str,
+    failures: &'a mut Vec<String>,
+}
+
+impl<'a> FragmentChecker<'a> {
+    fn check_jinja(&mut self) {
+        for tag in ["{%", "{{"] {
+            if self.content.contains(tag) {
+                self.failures.push(format!(
+                    "{}: contains forbidden Jinja tag '{tag}'",
+                    self.file_name
+                ));
+            }
+        }
+    }
+
+    fn check_terms(&mut self) {
+        const FORBIDDEN_TERMS: [&str; 6] = [
+            "icap",
+            "github_token",
+            "caching-proxy",
+            "sidecar",
+            "agentgateway",
+            "formative",
+        ];
+        let lower = self.content.to_lowercase();
+        for term in FORBIDDEN_TERMS {
+            if lower.contains(term) {
+                self.failures.push(format!(
+                    "{}: contains forbidden term '{term}'",
+                    self.file_name
+                ));
+            }
+        }
+        if lower.contains("extend") && lower.contains("expiry") {
+            self.failures.push(format!(
+                "{}: contains forbidden expiry extension guidance",
+                self.file_name
+            ));
+        }
+    }
+}
+
+/// Verify sandbox workflow fragments contain no forbidden content.
+fn check_fragment_hygiene(file_name: &str, content: &str) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mut checker = FragmentChecker {
+        file_name,
+        content,
+        failures: &mut failures,
+    };
+    checker.check_jinja();
+    checker.check_terms();
+    failures
 }
 
 /// Point `HARNX_CONFIG_DIR` at a temp dir whose `packages/` mirrors the
@@ -299,5 +413,208 @@ fn clio_prompt_checks_for_an_existing_pull_request_after_push() {
     assert!(
         prompt.contains("Only when no open pull request exists for the branch"),
         "Clio must reserve the compare-link fallback for branches without an open pull request"
+    );
+}
+/// Target agents that should declare `sandbox_connect` in their front-matter `use_tools`.
+const TARGET_AGENTS: [&str; 11] = [
+    "atlas",
+    "apollo",
+    "athena",
+    "hephaestus",
+    "hermes",
+    "hestia",
+    "iris",
+    "peitho",
+    "plato",
+    "pytheas",
+    "zosimus",
+];
+
+/// Synthetic sandbox_connect tool declaration for testing.
+fn sandbox_connect_tool() -> ToolDeclaration {
+    ToolDeclaration {
+        name: "sandbox_connect".to_string(),
+        description: "Connect to sandbox".to_string(),
+        parameters: Default::default(),
+        mcp_tool_name: None,
+        mcp_server_name: None,
+        call_template: None,
+        result_template: None,
+        idempotent_hint: None,
+        read_only_hint: None,
+    }
+}
+
+#[test]
+fn target_agents_declare_sandbox_connect_in_use_tools() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+
+    let mut failures = Vec::new();
+
+    for agent_name in TARGET_AGENTS {
+        let qualified_name = format!("pantheon/{}", agent_name);
+        let agent_path = Config::agent_file(&qualified_name);
+        let agent = match load_with_qualified_name(&agent_path, &qualified_name) {
+            Ok(agent) => agent,
+            Err(error) => {
+                failures.push(format!("{}: failed to load: {error}", qualified_name));
+                continue;
+            }
+        };
+
+        let use_tools = agent.use_tools();
+        let has_sandbox_connect = use_tools
+            .as_ref()
+            .map(|tools| tools.iter().any(|t| t == "sandbox_connect"))
+            .unwrap_or(false);
+
+        if !has_sandbox_connect {
+            failures.push(format!(
+                "{}: does not declare sandbox_connect in front-matter use_tools",
+                qualified_name
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "target agents missing sandbox_connect in use_tools:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// All 22 test cases for sandbox branching behavior verification.
+/// Categories:
+/// - CREATE: atlas (2 test cases)
+/// - INHERIT/Workers: apollo, athena, hephaestus, hermes, hestia, iris, peitho, plato (16 test cases)
+/// - DUAL/Research: pytheas, zosimus (4 test cases)
+fn branch_test_cases() -> Vec<BranchTestCase> {
+    let mut cases = vec![
+        // CREATE category: Atlas
+        BranchTestCase {
+            agent: "pantheon/atlas",
+            with_sandbox: true,
+            must_contain: "## Sandbox environment workflow",
+            must_not_contain: Some("## Default Repository"),
+        },
+        BranchTestCase {
+            agent: "pantheon/atlas",
+            with_sandbox: false,
+            must_contain: "## Default Repository",
+            must_not_contain: Some("## Sandbox environment workflow"),
+        },
+    ];
+
+    const WORKERS: [&str; 8] = [
+        "pantheon/apollo",
+        "pantheon/athena",
+        "pantheon/hephaestus",
+        "pantheon/hermes",
+        "pantheon/hestia",
+        "pantheon/iris",
+        "pantheon/peitho",
+        "pantheon/plato",
+    ];
+    for agent in WORKERS {
+        cases.push(BranchTestCase {
+            agent,
+            with_sandbox: true,
+            must_contain: "## Sandbox environment workflow",
+            must_not_contain: Some("You work locally"),
+        });
+        cases.push(BranchTestCase {
+            agent,
+            with_sandbox: false,
+            must_contain: "You work locally",
+            must_not_contain: Some("## Sandbox environment workflow"),
+        });
+    }
+
+    const RESEARCH: [&str; 2] = ["pantheon/pytheas", "pantheon/zosimus"];
+    for agent in RESEARCH {
+        cases.push(BranchTestCase {
+            agent,
+            with_sandbox: true,
+            must_contain: "## Sandbox environment workflow",
+            must_not_contain: Some("## Local environment Workflow"),
+        });
+        cases.push(BranchTestCase {
+            agent,
+            with_sandbox: false,
+            must_contain: "## Local environment Workflow",
+            must_not_contain: Some("## Sandbox environment workflow"),
+        });
+    }
+
+    cases
+}
+
+#[test]
+fn sandbox_connect_tool_branches_correctly_for_category_agents() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+
+    let sandbox_tool = sandbox_connect_tool();
+    let mut failures = Vec::new();
+
+    for test_case in branch_test_cases() {
+        if let Some(err) = evaluate_branch_test_case(&test_case, &sandbox_tool) {
+            failures.push(err);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "sandbox branching behavior incorrect:\n{}",
+        failures.join("\n")
+    );
+}
+/// Verify all shared sandbox-workflow-*.md fragments are pure markdown and harnx-native:
+/// - NO Jinja tags ({% or {{)
+/// - NO forbidden terms: ICAP, GITHUB_TOKEN, caching-proxy, sidecar, agentgateway, formative, "extend .*expiry"
+#[test]
+fn shared_sandbox_workflow_fragments_are_pure_markdown_and_harnx_native() {
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+
+    let fragments_dir = workspace_root.join("packages/pantheon/agents/shared");
+    let sandbox_workflow_files: Vec<_> = fs::read_dir(&fragments_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("sandbox-workflow-"))
+        })
+        .collect();
+
+    assert!(
+        !sandbox_workflow_files.is_empty(),
+        "no sandbox-workflow-*.md files found in {}",
+        fragments_dir.display()
+    );
+
+    let mut failures = Vec::new();
+
+    for entry in sandbox_workflow_files {
+        let path = entry.path();
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        failures.extend(check_fragment_hygiene(file_name, &content));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "sandbox workflow fragments contain forbidden content:\n{}",
+        failures.join("\n")
     );
 }

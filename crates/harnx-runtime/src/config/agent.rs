@@ -150,18 +150,23 @@ fn load_package_patch_for(pkg_name: &str) -> Result<Option<harnx_core::package::
 
 fn apply_agent_patch(
     config: &mut AgentConfig,
-    _agent_stem: &str,
+    agent_stem: &str,
     patch: &harnx_core::package::PackagePatch,
 ) -> Result<()> {
     if patch.agents.is_empty() {
         return Ok(());
     }
+    let qualified_name = config.name().to_string();
+    config.set_name(agent_stem);
     let input = serde_json::to_value(&*config)
         .with_context(|| "Failed to serialize AgentConfig for jaq patch")?;
     let output = harnx_core::jaq::eval_filters_strict(&patch.agents, input)
         .with_context(|| "jq patch expression failed for agent config")?;
     *config = serde_json::from_value(output)
         .with_context(|| "Failed to deserialize AgentConfig after jaq patch")?;
+    if config.name() == agent_stem {
+        config.set_name(&qualified_name);
+    }
     Ok(())
 }
 
