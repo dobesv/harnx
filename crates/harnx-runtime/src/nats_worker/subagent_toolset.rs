@@ -655,7 +655,7 @@ fn session_prompt_spec(agent: &str) -> ToolSpec {
             cancellation_guarantee: Default::default(),
         name: SUBAGENT_SESSION_PROMPT_TOOL.to_string(),
         description: format!(
-            "Send a prompt to the '{agent}' agent. Session IDs are case-sensitive and local to this agent. Pass an existing ID to continue its conversation, or an unused ID such as review-12345 to create that exact session. Omit session_id (or pass an empty value) for a generated ID."
+            "Send a prompt to the '{agent}' agent. Omit session_id (or pass an empty/whitespace value) to start a new session with a generated ID — do this unless you are continuing an earlier session. To continue a session, pass the exact session_id returned by a prior session_prompt or session_new call. Session IDs are case-sensitive and local to this agent. Do not invent a session ID."
         ),
         input_schema: json!({
             "type": "object",
@@ -666,7 +666,7 @@ fn session_prompt_spec(agent: &str) -> ToolSpec {
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Optional ID local to this agent: reuse an exact existing ID to continue, supply an unused ID to create it, or omit for a generated ID"
+                    "description": "Optional. Omit (or pass an empty/whitespace value) to start a new session with a generated ID; this is the default. To continue an earlier session, pass the exact session_id returned by a prior session_prompt or session_new call. IDs are case-sensitive and local to this agent. Do not invent a session ID."
                 },
                 "timeout_secs": {
                     "type": "integer",
@@ -806,6 +806,39 @@ mod tests {
         assert_eq!(tools[1].timeout_secs, Some(0));
     }
 
+    /// The `session_prompt` descriptions must steer models toward omitting
+    /// `session_id` and must not suggest inventing one (regression guard for
+    /// GitHub issue #1993 / the wording changed in #1894).
+    #[test]
+    fn session_prompt_descriptions_discourage_invented_ids() {
+        let tools = tool_specs("pkg/helper");
+        let prompt = &tools[1];
+
+        let tool_description = prompt.description.as_str();
+        let param_description = prompt.input_schema["properties"]["session_id"]["description"]
+            .as_str()
+            .expect("session_id description should be a string");
+
+        for description in [tool_description, param_description] {
+            assert!(
+                description.contains("Do not invent"),
+                "description should warn against inventing IDs: {description:?}"
+            );
+            assert!(
+                description.contains("Omit") || description.contains("omit"),
+                "description should tell the model it can omit session_id: {description:?}"
+            );
+            assert!(
+                !description.contains("review-12345"),
+                "description should not suggest a made-up example ID: {description:?}"
+            );
+            assert!(
+                !description.to_lowercase().contains("unused id"),
+                "description should not invite supplying an unused ID: {description:?}"
+            );
+        }
+    }
+
     /// Without a `call_template` the client renders a YAML dump of the
     /// arguments, which for `session_prompt` means the whole prompt body.
     fn call_templates(agent: &str) -> Vec<String> {
@@ -822,33 +855,34 @@ mod tests {
             .collect()
     }
 
+    /// The call templates every agent's four session tools should advertise,
+    /// with `display` rendered into the leading `@ <agent>` mention.
+    fn expected_call_templates(display: &str) -> Vec<String> {
+        [
+            format!("@ {display} new session"),
+            format!(
+                "@ {display}{{% if args.session_id %}} [{{{{ args.session_id | truncate(8, end='') }}}}]{{% endif %}}\n{{{{ args.message }}}}"
+            ),
+            format!("@ {display} load {{{{ args.session_id | truncate(8, end='') }}}}"),
+            format!("@ {display} cancel {{{{ args.session_id | truncate(8, end='') }}}}"),
+        ]
+        .to_vec()
+    }
+
     /// A packaged agent shows its canonical `pkg/agent` name, not the sanitized
     /// tool-name form (`pkg__agent`) used for routing.
     #[test]
     fn every_session_tool_advertises_a_call_template() {
         assert_eq!(
             call_templates("pkg/helper"),
-            vec![
-                "@ pkg/helper new session",
-                "@ pkg/helper{% if args.session_id %} [{{ args.session_id | truncate(8, end='') }}]{% endif %}\n{{ args.message }}",
-                "@ pkg/helper load {{ args.session_id | truncate(8, end='') }}",
-                "@ pkg/helper cancel {{ args.session_id | truncate(8, end='') }}",
-            ]
+            expected_call_templates("pkg/helper")
         );
     }
 
     /// A top-level (non-packaged) agent name has no `/`, so it renders unchanged.
     #[test]
     fn call_templates_use_a_bare_agent_name_unchanged() {
-        assert_eq!(
-            call_templates("helper"),
-            vec![
-                "@ helper new session",
-                "@ helper{% if args.session_id %} [{{ args.session_id | truncate(8, end='') }}]{% endif %}\n{{ args.message }}",
-                "@ helper load {{ args.session_id | truncate(8, end='') }}",
-                "@ helper cancel {{ args.session_id | truncate(8, end='') }}",
-            ]
-        );
+        assert_eq!(call_templates("helper"), expected_call_templates("helper"));
     }
 
     #[test]
