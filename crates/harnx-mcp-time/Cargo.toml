@@ -8,6 +8,7 @@ repository.workspace = true
 description = "MCP server that exposes time and timezone utilities"
 
 [dependencies]
+harnx-nats-common = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }

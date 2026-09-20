@@ -27,6 +27,7 @@ futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-metrics = { workspace = true }
+harnx-nats-common = { workspace = true }
 harnx-rag = { path = "../harnx-rag" }
 harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
@@ -37,15 +38,15 @@ http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
-hyper-util = { workspace = true }
+hyper-util = { workspace = true, features = ["server-graceful"] }
 log = { workspace = true }
 multer = { workspace = true }
 parking_lot = { workspace = true }
+rand = "0.10.2"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tokio-graceful = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v5"] }
@@ -53,4 +54,6 @@ uuid = { workspace = true, features = ["v5"] }
 [dev-dependencies]
 harnx-hookset = { path = "../harnx-hookset" }
 futures = "0.3"
+libc = "0.2"
 tempfile = { workspace = true }
+which = "8"

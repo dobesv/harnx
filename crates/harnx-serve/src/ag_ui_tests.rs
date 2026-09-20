@@ -3344,8 +3344,10 @@ fn live_run_finished_frames_interrupt_outcome_at_top_level_and_omits_empty_resul
         interrupt_event,
         &mut state,
         &mut guard,
-        &thread_id.to_string(),
-        &run_id.to_string(),
+        LiveEventContext {
+            thread_id: &thread_id.to_string(),
+            run_id: &run_id.to_string(),
+        },
     )
     .expect("interrupt terminal frame");
     let interrupt_wire = parse_sse_frame(
@@ -3370,8 +3372,10 @@ fn live_run_finished_frames_interrupt_outcome_at_top_level_and_omits_empty_resul
         completed_event,
         &mut state,
         &mut guard,
-        &thread_id.to_string(),
-        &run_id.to_string(),
+        LiveEventContext {
+            thread_id: &thread_id.to_string(),
+            run_id: &run_id.to_string(),
+        },
     )
     .expect("completion terminal frame");
     let completed_wire = parse_sse_frame(

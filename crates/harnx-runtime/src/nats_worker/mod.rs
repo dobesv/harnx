@@ -76,9 +76,11 @@ pub use control::{
 pub use daemon::{
     new_remote_session_id, new_worker_id, notify_subject, publish_session_activate,
     publish_targeted_session_activate, resolve_worker_scope, run_worker_daemon,
-    targeted_consumer_name, targeted_notify_subject, targeted_worker_ready_subject,
-    validate_worker_id, worker_ready_subject, LocalWorkerTarget, NatsConnectionSource,
-    SessionActivate, SessionActivationRoute, WorkerActivationMode, WorkerDaemonConfig,
+    run_worker_daemon_with_shutdown, targeted_consumer_name, targeted_notify_subject,
+    targeted_worker_ready_subject, validate_worker_id, worker_ready_subject, DaemonRunOptions,
+    LocalWorkerTarget, NatsConnectionSource, SessionActivate, SessionActivationRoute,
+    WorkerActivationMode, WorkerDaemonConfig, WorkerShutdownDeadlineExceeded,
+    WORKER_SHUTDOWN_TIMEOUT,
 };
 #[doc(hidden)]
 pub use daemon_background::start_local_tool_servers_for_test;

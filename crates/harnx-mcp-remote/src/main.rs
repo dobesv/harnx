@@ -50,14 +50,10 @@ async fn run() -> anyhow::Result<()> {
         cli.url
     );
 
-    #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    #[cfg(not(unix))]
-    let mut sigterm = ();
-
     let server = RemoteProxyServer::new(cli);
     let transport = rmcp::transport::stdio();
     let serve_ct = CancellationToken::new();
+    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
 
     // Signal readiness when stdio transport starts serving.
     if let Some(ref r) = readiness {
@@ -67,14 +63,14 @@ async fn run() -> anyhow::Result<()> {
     tokio::select! {
         service = server.serve_with_ct(transport, serve_ct.clone()) => {
             let service = service?;
-            wait_for_shutdown(&mut sigterm).await;
+            shutdown.cancelled().await;
             if let Some(ref r) = readiness {
                 r.not_ready();
             }
             service.service().shutdown_remote().await?;
             service.cancel().await?;
         }
-        _ = wait_for_shutdown(&mut sigterm) => {
+        _ = shutdown.cancelled() => {
             // SIGTERM/SIGINT before initialize completes: cancel the in-progress
             // rmcp initialize wait and exit cleanly.
             if let Some(ref r) = readiness {
@@ -84,17 +80,4 @@ async fn run() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(unix)]
-async fn wait_for_shutdown(sigterm: &mut tokio::signal::unix::Signal) {
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = sigterm.recv() => {}
-    }
-}
-
-#[cfg(not(unix))]
-async fn wait_for_shutdown(_sigterm: &mut ()) {
-    let _ = tokio::signal::ctrl_c().await;
 }

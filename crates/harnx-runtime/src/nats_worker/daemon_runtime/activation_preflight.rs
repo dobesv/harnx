@@ -88,6 +88,11 @@ impl WorkerRuntime {
         else {
             return Ok(false);
         };
+        if self.shutdown.is_cancelled() {
+            lease.release().await?;
+            Self::shutdown_nak(message).await?;
+            return Ok(false);
+        }
         let wound_up = self.wind_up_interrupted_session(&backend, &lease).await;
         lease.release().await?;
         wound_up?;
@@ -157,7 +162,12 @@ impl WorkerRuntime {
         // A targeted re-activation stays durable until the active loop's tool
         // boundary or final drain has covered the requested sequence. Checked
         // before wind-up so a running turn's lease is never taken from it.
-        if self.already_running(&activation.session_id).await {
+        let already_running = self.already_running(&activation.session_id).await;
+        if self.shutdown.is_cancelled() {
+            Self::shutdown_nak(message).await?;
+            return Ok(false);
+        }
+        if already_running {
             self.settle_running_activation(message).await?;
             return Ok(false);
         }

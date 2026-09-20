@@ -8,6 +8,7 @@ repository.workspace = true
 description = "stdio MCP proxy that forwards to remote HTTP MCP servers"
 
 [dependencies]
+harnx-nats-common = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-healthz = { workspace = true }
 harnx-metrics = { workspace = true }

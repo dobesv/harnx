@@ -41,9 +41,21 @@ Readiness is tracked per process and transitions from `503` to `200` once initia
 
 ### Shutdown Behavior
 
-When a process initiates shutdown, binaries with shutdown hooks transition `/healthz` back to `503 Service Unavailable` before draining in-flight requests. This allows Kubernetes ingress controllers and service meshes to de-register the pod before traffic stops.
+When a process initiates shutdown, binaries with shutdown hooks transition `/healthz` back to `503 Service Unavailable` before draining in-flight work. This signals Kubernetes ingress controllers and service meshes to de-register the pod before traffic stops.
 
-Three binaries (`harnx-worker`, `harnx-aws-creds`, and `harnx-k8s-creds`) operate as ready-only services by design and do not flip back to `503` on shutdown.
+Two binaries (`harnx-aws-creds` and `harnx-k8s-creds`) operate as ready-only services by design and do not flip back to `503` on shutdown.
+
+`harnx-worker` transitions `/healthz` to `503 Service Unavailable` on SIGTERM or Ctrl+C and performs a failover shutdown: it releases its session lease and NAKs the activation so a replacement worker resumes execution immediately from the session journal.
+
+#### Graceful SIGTERM Shutdown by Binary Class
+
+- **HTTP and AG-UI servers (`harnx-serve`)**: Readiness flips to `503`. The server stops accepting new connections. In-flight HTTP requests complete within the grace window. Active AG-UI and SSE client streams close over an independent random 1–20s jitter window (each stream calls `finalize_open_lifecycles()` and emits `RUN_ERROR` to settle client UIs without cancelling backend worker turns). Backend turns running in the worker continue undisturbed. The process exits under a configurable drain ceiling (`--drain-timeout-seconds`, default 25s).
+- **Worker daemon (`harnx-worker`)**: Readiness flips to `503`. The daemon stops pulling activations and NAKs unstarted activations. In-flight local LLM and tool waits abort without writing a durable `Cancel` entry to the session log. The worker releases the session lease (revision-conditional against active renewal) and immediately NAKs the activation (`Nak(None)`), allowing a replacement worker to claim the lease and resume immediately from the journal. After a bounded client flush, the process exits under an internal ~25s ceiling (`WORKER_SHUTDOWN_TIMEOUT`).
+- **Tool and hook servers**: Deregister from discovery or NATS, then drain in-flight invocations up to their drain timeout.
+
+#### Deployment Guidance
+
+Configure Kubernetes `terminationGracePeriodSeconds` larger than the binary drain ceiling so the process finishes cleanup before the container runtime sends `SIGKILL`. For binaries using the default 25s drain ceiling (`harnx-serve` and `harnx-worker`), set `terminationGracePeriodSeconds` to at least 30s (e.g. 35s to provide headroom for container runtime operations).
 
 ## Distinction from Prometheus Metrics
 
@@ -94,6 +106,7 @@ metadata:
 spec:
   template:
     spec:
+      terminationGracePeriodSeconds: 35
       containers:
         - name: harnx-serve
           image: harnx-serve:latest

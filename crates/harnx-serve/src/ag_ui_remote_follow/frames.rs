@@ -6,7 +6,9 @@ use harnx_runtime::nats_event_sink::{AdvisoryEnvelope, LiveEventState};
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
 
-use crate::ag_ui_lifecycle::{frame_guarded_live_event, LiveStreamGuard};
+#[cfg(test)]
+use crate::ag_ui_lifecycle::LiveStreamGuard;
+use crate::{ag_ui::SharedLiveStreamGuard, ag_ui_events::frame_guarded_live_event};
 
 pub(crate) struct QueuedEvent {
     /// The `after_seq` of the advisory this event was mapped from: where the
@@ -20,7 +22,7 @@ struct FrameQueue {
     rx: mpsc::Receiver<QueuedEvent>,
     live: LiveEventState,
     last_durable_seq: u64,
-    guard: LiveStreamGuard,
+    guard: SharedLiveStreamGuard,
 }
 
 /// `should_render` reads only the envelope's sequence, and a queued event has
@@ -35,27 +37,50 @@ fn fence_probe(after_seq: u64) -> AdvisoryEnvelope {
 
 /// Finalize only lifecycles actually sent. Guarding before enqueue would emit
 /// orphan ENDs if a stop discards a queued START under backpressure.
+#[cfg(test)]
 pub(crate) fn event_frames(
     rx: mpsc::Receiver<QueuedEvent>,
     live: LiveEventState,
     last_durable_seq: u64,
 ) -> impl Stream<Item = Bytes> + Send + Sync {
+    event_frames_with_guard(
+        rx,
+        live,
+        last_durable_seq,
+        std::sync::Arc::new(std::sync::Mutex::new(LiveStreamGuard::default())),
+    )
+}
+
+pub(crate) fn event_frames_with_guard(
+    rx: mpsc::Receiver<QueuedEvent>,
+    live: LiveEventState,
+    last_durable_seq: u64,
+    guard: SharedLiveStreamGuard,
+) -> impl Stream<Item = Bytes> + Send + Sync {
     let queue = FrameQueue {
         rx,
         live,
         last_durable_seq,
-        guard: LiveStreamGuard::default(),
+        guard,
     };
     futures_util::stream::unfold(queue, |mut queue| async move {
         while let Some(queued) = queue.rx.recv().await {
             let fence = fence_probe(queued.after_seq);
             if queue.live.should_render(&fence, queue.last_durable_seq) {
-                if let Some(frame) = frame_guarded_live_event(queued.event, &mut queue.guard) {
+                let frame = frame_guarded_live_event(
+                    queued.event,
+                    &mut queue.guard.lock().expect("live stream guard"),
+                );
+                if let Some(frame) = frame {
                     return Some((frame, queue));
                 }
             }
         }
-        let closes = queue.guard.finalize_open_lifecycles();
+        let closes = queue
+            .guard
+            .lock()
+            .expect("live stream guard")
+            .finalize_open_lifecycles();
         (!closes.is_empty()).then_some((closes, queue))
     })
 }

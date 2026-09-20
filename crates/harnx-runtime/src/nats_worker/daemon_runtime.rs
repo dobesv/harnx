@@ -8,7 +8,7 @@ use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, SessionControlHandler};
 use super::daemon::{SessionActivate, SessionActivationRoute, WorkerActivationMode};
 use super::daemon_background::BackgroundServices;
-use super::execution_control::WorkerExecution;
+use super::execution_control::{FinishCause, WorkerExecution};
 use super::server_reconciler::{tool_servers_for_activation, ServerReconciler};
 use crate::config::GlobalConfig;
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
@@ -74,7 +74,13 @@ struct PreparedActivation {
     control: PreparedControl,
     execution: WorkerExecution,
     message: async_nats::jetstream::Message,
+    shutdown: tokio_util::sync::CancellationToken,
     span: tracing::Span,
+}
+
+pub(super) struct ActiveSession {
+    shutdown: tokio_util::sync::CancellationToken,
+    join: JoinHandle<()>,
 }
 
 fn agent_activation_span(
@@ -116,7 +122,8 @@ pub(super) struct WorkerRuntime {
     pub(super) client: async_nats::Client,
     pub(super) call_fn: Option<crate::agent_loop::AgentCallFn>,
     pub(super) generation: AtomicU64,
-    pub(super) active: Mutex<HashMap<String, JoinHandle<()>>>,
+    pub(super) shutdown: tokio_util::sync::CancellationToken,
+    pub(super) active: Mutex<HashMap<String, ActiveSession>>,
 }
 
 impl WorkerRuntime {
@@ -126,8 +133,38 @@ impl WorkerRuntime {
 
     pub(super) async fn already_running(&self, session_id: &str) -> bool {
         let mut active = self.active.lock().await;
-        active.retain(|_, handle| !handle.is_finished());
+        active.retain(|_, session| !session.join.is_finished());
         active.contains_key(session_id)
+    }
+
+    /// Close admission's active-session side and await every single-owner
+    /// supervisor. Session supervisors retain their message, lease, and NATS
+    /// client until failover cleanup completes.
+    pub(super) async fn shutdown_active_sessions(&self) {
+        let sessions = {
+            let mut active = self.active.lock().await;
+            active
+                .drain()
+                .map(|(_, session)| session)
+                .collect::<Vec<_>>()
+        };
+        for session in &sessions {
+            session.shutdown.cancel();
+        }
+        for session in sessions {
+            if let Err(error) = session.join.await {
+                log::warn!("worker session supervisor failed during shutdown: {error}");
+            }
+        }
+        match tokio::time::timeout(Duration::from_secs(2), self.client.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::warn!("failed to flush worker NATS client during shutdown: {error}");
+            }
+            Err(error) => {
+                log::warn!("timed out flushing worker NATS client during shutdown: {error}");
+            }
+        }
     }
 
     /// A worker that doesn't manage its own servers, or has nothing
@@ -227,6 +264,13 @@ impl WorkerRuntime {
         Ok(lease.map(Arc::new))
     }
 
+    async fn shutdown_nak(message: &async_nats::jetstream::Message) -> Result<()> {
+        message
+            .ack_with(AckKind::Nak(None))
+            .await
+            .map_err(|error| anyhow::anyhow!("NAK SessionActivate during shutdown: {error}"))
+    }
+
     async fn delayed_nak(message: &async_nats::jetstream::Message) -> Result<()> {
         let delivered = message.info().map(|info| info.delivered).unwrap_or(1);
         let exponent = u32::try_from(delivered.saturating_sub(1))
@@ -237,6 +281,18 @@ impl WorkerRuntime {
             .ack_with(AckKind::Nak(Some(Duration::from_millis(millis))))
             .await
             .map_err(|error| anyhow::anyhow!("delayed-NAK targeted SessionActivate: {error}"))
+    }
+
+    async fn flush_shutdown_disposition(&self) {
+        match tokio::time::timeout(Duration::from_secs(2), self.client.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::warn!("failed to flush shutdown activation NAK: {error}");
+            }
+            Err(_) => {
+                log::warn!("timed out flushing shutdown activation NAK");
+            }
+        }
     }
 
     async fn targeted_activation_is_covered(&self, activation: &SessionActivate) -> Result<bool> {
@@ -417,6 +473,7 @@ impl WorkerRuntime {
         self: &Arc<Self>,
         claimed: ClaimedActivation,
         message: &async_nats::jetstream::Message,
+        shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<PreparedActivation> {
         let ClaimedActivation {
             activation,
@@ -444,7 +501,7 @@ impl WorkerRuntime {
                 abort_signal: &abort_signal,
             })
             .await?;
-        self.prepare_session_services(&activation, &abort_signal)
+        self.prepare_session_services(&activation, &abort_signal, &shutdown)
             .await;
         Ok(PreparedActivation {
             execution,
@@ -453,6 +510,7 @@ impl WorkerRuntime {
             lease,
             abort_signal,
             control,
+            shutdown,
             span,
         })
     }
@@ -461,13 +519,15 @@ impl WorkerRuntime {
         self: &Arc<Self>,
         activation: &SessionActivate,
         abort: &crate::utils::AbortSignal,
+        shutdown: &tokio_util::sync::CancellationToken,
     ) {
         let worker = Arc::clone(self);
         let activation = activation.clone();
         let stopped = abort.clone();
+        let lifecycle = shutdown.clone();
         let mut startup = tokio::spawn(async move {
             worker.start_session_tool_servers(&activation).await;
-            if stopped.aborted() {
+            if stopped.aborted() || lifecycle.is_cancelled() {
                 worker
                     .end_session_tool_servers(&activation.session_id)
                     .await;
@@ -480,14 +540,42 @@ impl WorkerRuntime {
                 tokio::spawn(async move { let _ = startup.await; });
                 return;
             }
+            _ = shutdown.cancelled() => {
+                tokio::spawn(async move { let _ = startup.await; });
+                return;
+            }
             _ = &mut startup => {},
         }
         tokio::select! {
             _ = crate::utils::wait_abort_signal(abort) => {},
+            _ = shutdown.cancelled() => {},
             _ = super::daemon_background::await_initial_background_services(&self.background_services_attempted) => {},
         }
     }
 
+    fn active_session_started(activation: &SessionActivate, lease: &NatsSessionLease) {
+        nats_metrics::active_session_started();
+        let snapshot = nats_metrics::snapshot();
+        log::info!(
+            "active session started: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
+            activation.session_id,
+            lease.worker_id(),
+            lease.fence_token(),
+            snapshot.active_sessions_per_worker
+        );
+    }
+
+    fn active_session_finished(session_id: &str, lease: &NatsSessionLease) {
+        nats_metrics::active_session_finished();
+        let snapshot = nats_metrics::snapshot();
+        log::info!(
+            "active session finished: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
+            session_id,
+            lease.worker_id(),
+            lease.fence_token(),
+            snapshot.active_sessions_per_worker
+        );
+    }
     async fn run_session_task(self: &Arc<Self>, prepared: PreparedActivation) {
         let PreparedActivation {
             activation,
@@ -496,93 +584,140 @@ impl WorkerRuntime {
             control,
             execution,
             message,
+            shutdown,
             span,
         } = prepared;
         let worker = Arc::clone(self);
         let session_id = activation.session_id.clone();
         let task_session_id = session_id.clone();
-        nats_metrics::active_session_started();
+        Self::active_session_started(&activation, &lease);
         async move {
-                let snapshot = nats_metrics::snapshot();
-                log::info!(
-                    "active session started: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
-                    activation.session_id,
-                    lease.worker_id(),
-                    lease.fence_token(),
-                    snapshot.active_sessions_per_worker
+            let result = if shutdown.is_cancelled() {
+                control.task.abort();
+                let _ = control.task.await;
+                let backend = NatsSessionLogBackend::new(
+                    worker.jetstream.clone(),
+                    &activation.session_id,
+                    worker.lease.replicas,
                 );
-                let result = worker
-                    .execute_session(
-                        activation,
-                        Arc::clone(&lease),
-                        abort_signal,
-                        control.task,
-                        control.hitl_decision_rx,
-                        execution,
+                let turn_config = Arc::new(parking_lot::RwLock::new(worker.config.read().clone()));
+                execution
+                    .finish(
+                        &backend,
+                        &lease,
+                        super::execution_control::FinishedTurn::for_failover(
+                            None,
+                            turn_config,
+                            super::execution_control::FailoverCause::Shutdown,
+                        ),
                     )
-                    .await;
-                if result.as_ref().is_ok_and(|terminal| *terminal) {
+                    .await
+            } else {
+                worker
+                    .execute_session(super::daemon_session_exec::SessionExecutionInputs {
+                        activation,
+                        lease: Arc::clone(&lease),
+                        abort_signal,
+                        control_task: control.task,
+                        hitl_decision_rx: control.hitl_decision_rx,
+                        execution,
+                        shutdown,
+                    })
+                    .await
+            };
+            match result.as_ref() {
+                Ok(cause) if cause.is_terminal() => {
                     let _ = message.ack().await;
-                } else { let _ = Self::delayed_nak(&message).await; }
-                worker.end_session_tool_servers(&task_session_id).await;
-                nats_metrics::active_session_finished();
-                let snapshot = nats_metrics::snapshot();
-                log::info!(
-                    "active session finished: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
-                    task_session_id,
-                    lease.worker_id(),
-                    lease.fence_token(),
-                    snapshot.active_sessions_per_worker
-                );
-                if let Err(error) = result {
-                    log::warn!("worker session execution failed: {error:#}");
                 }
-            }.instrument(span).await;
+                Ok(FinishCause::Failover(_)) => {
+                    let _ = Self::shutdown_nak(&message).await;
+                    worker.flush_shutdown_disposition().await;
+                }
+                _ => {
+                    let _ = Self::delayed_nak(&message).await;
+                }
+            }
+            worker.end_session_tool_servers(&task_session_id).await;
+            Self::active_session_finished(&task_session_id, &lease);
+            if let Err(error) = result {
+                log::warn!("worker session execution failed: {error:#}");
+            }
+        }
+        .instrument(span)
+        .await;
+    }
+
+    async fn claim_activation(
+        &self,
+        message: &async_nats::jetstream::Message,
+    ) -> Result<Option<ClaimedActivation>> {
+        if self.shutdown.is_cancelled() {
+            Self::shutdown_nak(message).await?;
+            return Ok(None);
+        }
+        let Some(activation) = self.decode_activation(message).await? else {
+            return Ok(None);
+        };
+        let span = agent_activation_span(message.headers.as_ref(), &activation.session_id);
+        if !self.activation_is_ready(message, &activation).await? {
+            return Ok(None);
+        }
+        if self.shutdown.is_cancelled() {
+            Self::shutdown_nak(message).await?;
+            return Ok(None);
+        }
+        let Some(lease) = self
+            .acquire_or_defer_activation(message, &activation)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if self.shutdown.is_cancelled() {
+            lease.release().await?;
+            Self::shutdown_nak(message).await?;
+            return Ok(None);
+        }
+        Ok(Some(ClaimedActivation {
+            activation,
+            lease,
+            span,
+        }))
     }
 
     pub(super) async fn handle_activation(
         self: &Arc<Self>,
         message: async_nats::jetstream::Message,
     ) -> Result<()> {
-        let Some(activation) = self.decode_activation(&message).await? else {
+        let Some(claimed) = self.claim_activation(&message).await? else {
             return Ok(());
         };
-        let span = agent_activation_span(message.headers.as_ref(), &activation.session_id);
-        if !self.activation_is_ready(&message, &activation).await? {
-            return Ok(());
-        }
-
-        // A targeted lease loser uses a short delayed NAK so handling returns
-        // immediately while preserving the final-drain race closure.
-        let Some(lease) = self
-            .acquire_or_defer_activation(&message, &activation)
-            .await?
-        else {
-            return Ok(());
-        };
-
         let worker = Arc::clone(self);
-        let session_id = activation.session_id.clone();
+        let session_id = claimed.activation.session_id.clone();
+        let shutdown = self.shutdown.child_token();
+        let task_shutdown = shutdown.clone();
         let handle = tokio::spawn(async move {
             let prepared = worker
-                .prepare_claimed_activation(
-                    ClaimedActivation {
-                        activation,
-                        lease,
-                        span,
-                    },
-                    &message,
-                )
+                .prepare_claimed_activation(claimed, &message, task_shutdown)
                 .await;
             match prepared {
                 Ok(prepared) => worker.run_session_task(prepared).await,
                 Err(error) => {
                     log::warn!("session preparation failed: {error:#}");
-                    let _ = Self::delayed_nak(&message).await;
+                    if worker.shutdown.is_cancelled() {
+                        let _ = Self::shutdown_nak(&message).await;
+                    } else {
+                        let _ = Self::delayed_nak(&message).await;
+                    }
                 }
             }
         });
-        self.active.lock().await.insert(session_id, handle);
+        self.active.lock().await.insert(
+            session_id,
+            ActiveSession {
+                shutdown,
+                join: handle,
+            },
+        );
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-//! Event-driven Ctrl-C / Ctrl-D cancellation shared by long-running operations.
+//! Event-driven user cancellation and failover aborts shared by long-running operations.
 
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -31,6 +31,11 @@ impl AbortSignalInner {
         *self.state.borrow() & 2 != 0
     }
 
+    /// Local execution stopped for worker failover, not user cancellation.
+    pub fn aborted_failover(&self) -> bool {
+        *self.state.borrow() & 4 != 0
+    }
+
     pub fn reset(&self) {
         self.state.send_replace(0);
     }
@@ -41,6 +46,11 @@ impl AbortSignalInner {
 
     pub fn set_ctrld(&self) {
         self.state.send_modify(|state| *state |= 2);
+    }
+
+    /// Stop local execution without cancelling remote work needed for failover.
+    pub fn set_failover(&self) {
+        self.state.send_modify(|state| *state |= 4);
     }
 }
 
@@ -71,15 +81,17 @@ mod tests {
     }
 
     #[test]
-    fn reset_and_both_interrupt_kinds_preserve_the_public_api() {
+    fn reset_and_abort_kinds_preserve_the_public_api() {
         let signal = create_abort_signal();
         signal.set_ctrlc();
         signal.set_ctrld();
-        assert!(signal.aborted_ctrlc() && signal.aborted_ctrld());
+        signal.set_failover();
+        assert!(signal.aborted_ctrlc() && signal.aborted_ctrld() && signal.aborted_failover());
         signal.reset();
         assert!(!signal.aborted());
         signal.set_ctrld();
         assert!(signal.aborted() && signal.aborted_ctrld());
         assert!(!signal.aborted_ctrlc());
+        assert!(!signal.aborted_failover());
     }
 }

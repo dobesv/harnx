@@ -5,23 +5,123 @@
 use super::backend::NatsSessionLogBackend;
 use super::daemon::{should_append_control_log_entry, SessionActivate};
 use super::daemon_runtime::WorkerRuntime;
+use super::execution_control::{FailoverCause, FinishCause, FinishedTurn, WorkerExecution};
 use crate::nats_lease::NatsSessionLease;
 use crate::OnToolRoundFn;
 use anyhow::{Context, Result};
 use harnx_core::api_types::CompletionTokenUsage;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+
+pub(super) struct SessionExecutionInputs {
+    pub(super) activation: SessionActivate,
+    pub(super) lease: Arc<NatsSessionLease>,
+    pub(super) abort_signal: crate::utils::AbortSignal,
+    pub(super) control_task: JoinHandle<()>,
+    pub(super) hitl_decision_rx:
+        tokio::sync::mpsc::UnboundedReceiver<super::control::AppliedHitlDecision>,
+    pub(super) execution: super::execution_control::WorkerExecution,
+    pub(super) shutdown: tokio_util::sync::CancellationToken,
+}
+
+struct TurnBodyOutcome {
+    result: Result<bool>,
+    cleanup_turn: Option<JoinHandle<Result<bool>>>,
+    failover_cause: Option<FailoverCause>,
+}
+
+struct FinishExecutionInputs {
+    result: Result<bool>,
+    cleanup_turn: Option<JoinHandle<Result<bool>>>,
+    settled: bool,
+    failover_cause: Option<FailoverCause>,
+    config: crate::config::GlobalConfig,
+    execution_abort: crate::utils::AbortSignal,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+struct SessionRuntimeStartup {
+    activation: SessionActivate,
+    lease: Arc<NatsSessionLease>,
+    execution_abort: crate::utils::AbortSignal,
+    abort_relay: JoinHandle<()>,
+    shutdown_relay: JoinHandle<()>,
+    control_task: JoinHandle<()>,
+    hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<super::control::AppliedHitlDecision>,
+    execution: WorkerExecution,
+    shutdown: tokio_util::sync::CancellationToken,
+    per_session: crate::config::GlobalConfig,
+    backend: NatsSessionLogBackend,
+    event_sink: Arc<crate::nats_event_sink::NatsEventSink>,
+    after_seq_observer: Arc<AtomicU64>,
+    agent_setup: Result<()>,
+}
+
+struct PreparedSessionRuntime {
+    activation: SessionActivate,
+    lease: Arc<NatsSessionLease>,
+    execution_abort: crate::utils::AbortSignal,
+    abort_relay: JoinHandle<()>,
+    shutdown_relay: JoinHandle<()>,
+    control_task: JoinHandle<()>,
+    hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<super::control::AppliedHitlDecision>,
+    execution: WorkerExecution,
+    shutdown: tokio_util::sync::CancellationToken,
+    per_session: crate::config::GlobalConfig,
+    backend: NatsSessionLogBackend,
+    event_sink: Arc<crate::nats_event_sink::NatsEventSink>,
+    after_seq_observer: Arc<AtomicU64>,
+    pending_input: Arc<std::sync::atomic::AtomicBool>,
+    interrupted: Arc<parking_lot::Mutex<Option<super::session_watcher::InterruptNotice>>>,
+    in_flight: crate::nats_tool_provider::NatsInFlightCalls,
+    session_watcher: JoinHandle<()>,
+    agent_setup: Result<()>,
+}
+
+struct RunningSessionRuntime {
+    activation: SessionActivate,
+    lease: Arc<NatsSessionLease>,
+    execution_abort: crate::utils::AbortSignal,
+    abort_relay: JoinHandle<()>,
+    shutdown_relay: JoinHandle<()>,
+    control_task: JoinHandle<()>,
+    execution: WorkerExecution,
+    shutdown: tokio_util::sync::CancellationToken,
+    per_session: crate::config::GlobalConfig,
+    backend: NatsSessionLogBackend,
+    session_watcher: JoinHandle<()>,
+    watch_task: JoinHandle<()>,
+    turn: Option<JoinHandle<Result<bool>>>,
+}
 
 impl WorkerRuntime {
     pub(super) async fn execute_session(
         &self,
-        activation: SessionActivate,
-        lease: Arc<NatsSessionLease>,
-        abort_signal: crate::utils::AbortSignal,
-        control_task: JoinHandle<()>,
-        hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<super::control::AppliedHitlDecision>,
-        execution: super::execution_control::WorkerExecution,
-    ) -> Result<bool> {
+        inputs: SessionExecutionInputs,
+    ) -> Result<FinishCause> {
+        let startup = self.prepare_session_runtime(inputs).await?;
+        let prepared = self.start_session_runtime_services(startup).await?;
+        let mut running = self.start_session_execution(prepared);
+        let turn = running.turn.take().expect("prepared session turn");
+        let outcome =
+            Self::await_turn_body(turn, &running.execution_abort, &running.shutdown).await;
+        Self::complete_session_execution(running, outcome).await
+    }
+
+    async fn prepare_session_runtime(
+        &self,
+        inputs: SessionExecutionInputs,
+    ) -> Result<SessionRuntimeStartup> {
+        let SessionExecutionInputs {
+            activation,
+            lease,
+            abort_signal,
+            control_task,
+            hitl_decision_rx,
+            execution,
+            shutdown,
+        } = inputs;
         let metadata = self
             .session_metadata
             .get(&activation.session_id)
@@ -33,41 +133,29 @@ impl WorkerRuntime {
                 )
             })?
             .metadata;
-        // Per-session config clone with the canonical session agent loaded
-        // fresh from the worker's configuration.
+        let (execution_abort, abort_relay, shutdown_relay) =
+            Self::spawn_execution_abort_relays(abort_signal, shutdown.clone());
         let per_session = {
             let mut base = self.config.read().clone();
-            base.maintenance_abort = Some(abort_signal.clone());
+            base.maintenance_abort = Some(execution_abort.clone());
             Arc::new(parking_lot::RwLock::new(base))
         };
-        if let Some(subject) = activation.tool_confirmation_subject.as_ref() {
-            let confirm = crate::nats_tool_confirmation::nats_confirm_tool_use(
-                self.client.clone(),
-                subject.clone(),
-                metadata.session_id.clone(),
-                abort_signal.clone(),
-            );
-            per_session.write().set_tui_confirm_tool_use(Some(confirm));
-        } else {
-            per_session.write().set_tui_confirm_tool_use(Some(Arc::new(
-                |_call, _arguments, _reason| crate::tool::ToolUseConfirmation::Defer,
-            )));
-        }
+        self.configure_tool_confirmation(
+            &per_session,
+            activation.tool_confirmation_subject.as_ref(),
+            &metadata.session_id,
+            &execution_abort,
+        );
         let agent_setup = super::daemon::install_session_metadata_agent(&per_session, &metadata);
-
-        // Create event sink for live fan-out. `new` seeds `after_seq` from stream once.
-        let event_sink = crate::nats_event_sink::NatsEventSink::new(
-            self.client.clone(),
-            self.jetstream.clone(),
-            activation.session_id.clone(),
-        )
-        .await;
+        let event_sink = Arc::new(
+            crate::nats_event_sink::NatsEventSink::new(
+                self.client.clone(),
+                self.jetstream.clone(),
+                activation.session_id.clone(),
+            )
+            .await,
+        );
         let after_seq_observer = event_sink.after_seq_handle();
-        let event_sink = Arc::new(event_sink);
-
-        // Build the backend for control-plane operations and state reconstruction.
-        // Share the `after_seq` high-water mark for event-sink fan-out advisories;
-        // worker tail reads themselves use leader-authoritative `load_events_latest_async`.
         let backend = NatsSessionLogBackend::new(
             self.jetstream.clone(),
             &activation.session_id,
@@ -75,18 +163,34 @@ impl WorkerRuntime {
         )
         .with_after_seq_observer(Arc::clone(&after_seq_observer))
         .with_metadata_store(Some(self.session_metadata.clone()));
+        Ok(SessionRuntimeStartup {
+            activation,
+            lease,
+            execution_abort,
+            abort_relay,
+            shutdown_relay,
+            control_task,
+            hitl_decision_rx,
+            execution,
+            shutdown,
+            per_session,
+            backend,
+            event_sink,
+            after_seq_observer,
+            agent_setup,
+        })
+    }
 
-        // Follow the session's own stream concurrently with the turn: a
-        // foreign `Cancel` is the only thing that can interrupt it, and a
-        // foreign `Message` only flags that input is waiting. Holding this
-        // instance's `NatsInFlightCalls` handle for the whole execution keeps
-        // the shared map alive, so tool/hook registrations made during the
-        // turn land where the watcher's snapshot can find them.
+    async fn start_session_runtime_services(
+        &self,
+        startup: SessionRuntimeStartup,
+    ) -> Result<PreparedSessionRuntime> {
         let pending_input = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let interrupted = Arc::new(parking_lot::Mutex::new(None));
         let in_flight =
             crate::nats_tool_provider::NatsInFlightCalls::for_instance(&self.instance_id);
-        let watcher_start_after = backend
+        let watcher_start_after = startup
+            .backend
             .load_events_latest_async()
             .await?
             .last()
@@ -95,121 +199,261 @@ impl WorkerRuntime {
             super::session_watcher::SessionWatcherCtx {
                 jetstream: self.jetstream.clone(),
                 client: self.client.clone(),
-                session_id: activation.session_id.clone(),
+                session_id: startup.activation.session_id.clone(),
                 start_after: watcher_start_after,
-                abort_signal: abort_signal.clone(),
+                abort_signal: startup.execution_abort.clone(),
                 in_flight: in_flight.clone(),
-                own_appends: Arc::clone(&after_seq_observer),
+                own_appends: Arc::clone(&startup.after_seq_observer),
                 pending_input: Arc::clone(&pending_input),
                 interrupted: Arc::clone(&interrupted),
             },
         );
-
-        // Winding the interrupted turn up happens in `finish`, once the turn
-        // task is gone and while the lease is still held. Hand the execution
-        // what that needs: the watcher's notice of the interrupt, and the
-        // handles to reach the tool calls it cut off.
-        let execution = execution.with_wind_up(super::execution_control::WindUpContext {
-            client: self.client.clone(),
-            jetstream: self.jetstream.clone(),
-            replicas: self.lease.replicas,
-            in_flight,
-            event_sink: Arc::clone(&event_sink),
-            interrupted,
-        });
-
-        // Abort turns promptly if lease is lost.
-        let watch_task =
-            Self::spawn_lease_loss_watch(&lease, &abort_signal, &activation.session_id);
-
-        let inputs = super::session_turn::SessionTurn {
-            worker: super::session_turn::TurnWorker::from(self),
-            activation: activation.clone(),
-            lease: lease.clone(),
-            abort_signal: abort_signal.clone(),
-            hitl_decision_rx,
-            per_session: per_session.clone(),
-            backend: backend.clone(),
-            event_sink,
-            after_seq_observer,
+        Ok(PreparedSessionRuntime {
+            activation: startup.activation,
+            lease: startup.lease,
+            execution_abort: startup.execution_abort,
+            abort_relay: startup.abort_relay,
+            shutdown_relay: startup.shutdown_relay,
+            control_task: startup.control_task,
+            hitl_decision_rx: startup.hitl_decision_rx,
+            execution: startup.execution,
+            shutdown: startup.shutdown,
+            per_session: startup.per_session,
+            backend: startup.backend,
+            event_sink: startup.event_sink,
+            after_seq_observer: startup.after_seq_observer,
             pending_input,
-            agent_setup,
-        };
-        // A spawned turn owns its poll/drop work. Aborting it requests a drop;
-        // waiting for that drop belongs to cleanup, never the lease supervisor.
-        let mut turn = tokio::spawn(Box::pin(inputs.run()));
-        let (result, cleanup_turn) = tokio::select! {
-            biased;
-            _ = harnx_core::abort::wait_abort_signal(&abort_signal) => {
-                turn.abort();
-                (Ok(true), Some(turn))
-            }
-            result = &mut turn => (result.unwrap_or_else(|error| Err(error.into())), None),
-        };
-        // A turn that failed left a durable `Error`, which terminates it just
-        // as a completion would: there is nothing for a redelivery to retry.
-        let settled = *result.as_ref().unwrap_or(&true);
+            interrupted,
+            in_flight,
+            session_watcher,
+            agent_setup: startup.agent_setup,
+        })
+    }
 
-        // A turn whose append lost to a `Cancel` was interrupted, not broken.
-        // It can notice the interruption before the session watcher does, so
-        // the abort signal is fired from here rather than assumed to be set
-        // already — an `Error` written after that `Cancel` would terminate the
-        // turn a second time and leave `finish` nothing to wind up.
+    fn start_session_execution(&self, prepared: PreparedSessionRuntime) -> RunningSessionRuntime {
+        let execution = prepared
+            .execution
+            .with_wind_up(super::execution_control::WindUpContext {
+                client: self.client.clone(),
+                jetstream: self.jetstream.clone(),
+                replicas: self.lease.replicas,
+                in_flight: prepared.in_flight,
+                event_sink: Arc::clone(&prepared.event_sink),
+                interrupted: prepared.interrupted,
+            });
+        let watch_task = Self::spawn_lease_loss_watch(
+            &prepared.lease,
+            &prepared.execution_abort,
+            &prepared.activation.session_id,
+        );
+        let turn = super::session_turn::SessionTurn {
+            worker: super::session_turn::TurnWorker::from(self),
+            activation: prepared.activation.clone(),
+            lease: prepared.lease.clone(),
+            abort_signal: prepared.execution_abort.clone(),
+            hitl_decision_rx: prepared.hitl_decision_rx,
+            per_session: prepared.per_session.clone(),
+            backend: prepared.backend.clone(),
+            event_sink: prepared.event_sink,
+            after_seq_observer: prepared.after_seq_observer,
+            pending_input: prepared.pending_input,
+            agent_setup: prepared.agent_setup,
+        };
+        RunningSessionRuntime {
+            activation: prepared.activation,
+            lease: prepared.lease,
+            execution_abort: prepared.execution_abort,
+            abort_relay: prepared.abort_relay,
+            shutdown_relay: prepared.shutdown_relay,
+            control_task: prepared.control_task,
+            execution,
+            shutdown: prepared.shutdown,
+            per_session: prepared.per_session,
+            backend: prepared.backend,
+            session_watcher: prepared.session_watcher,
+            watch_task,
+            turn: Some(tokio::spawn(Box::pin(turn.run()))),
+        }
+    }
+
+    async fn complete_session_execution(
+        running: RunningSessionRuntime,
+        outcome: TurnBodyOutcome,
+    ) -> Result<FinishCause> {
+        let TurnBodyOutcome {
+            result,
+            cleanup_turn,
+            failover_cause,
+        } = outcome;
+        let settled = *result.as_ref().unwrap_or(&true);
         if let Some(interrupted) = result.as_ref().err().and_then(cancel_that_interrupted) {
             log::info!(
                 "turn append lost to a Cancel; aborting instead of recording an error: \
                  session_id={} cancel_seq={}",
-                activation.session_id,
+                running.activation.session_id,
                 interrupted.cancel_seq
             );
-            abort_signal.set_ctrlc();
+            running.execution_abort.set_ctrlc();
         }
-
-        // Record the failure durably BEFORE releasing the lease: attached
-        // clients treat an `Error` entry as a terminal boundary, and a client that
-        // reconnects later still sees why the turn produced nothing.
-        let turn_error = result.as_ref().err().filter(|_| !abort_signal.aborted());
+        let turn_error = result
+            .as_ref()
+            .err()
+            .filter(|_| !running.execution_abort.aborted());
         if let Some(error) = turn_error {
-            Self::record_session_error(&backend, &lease, error).await;
+            Self::record_session_error(&running.backend, &running.lease, error).await;
         }
-
-        if !lease.is_held() {
+        if !running.lease.is_held() {
             log::warn!(
                 "session execution ended after failover: session_id={} worker_id={} revision={}",
-                activation.session_id,
-                lease.worker_id(),
-                lease.fence_token()
+                running.activation.session_id,
+                running.lease.worker_id(),
+                running.lease.fence_token()
             );
         }
-
-        if !abort_signal.aborted() {
-            Self::wait_for_post_turn_maintenance(&per_session, &lease).await;
+        if !running.execution_abort.aborted() {
+            Self::wait_for_post_turn_maintenance(&running.per_session, &running.lease).await;
         }
+        Self::stop_execution_tasks([
+            running.watch_task,
+            running.control_task,
+            running.session_watcher,
+            running.abort_relay,
+            running.shutdown_relay,
+        ])
+        .await;
+        Self::finish_execution(
+            &running.execution,
+            &running.backend,
+            &running.lease,
+            FinishExecutionInputs {
+                result,
+                cleanup_turn,
+                settled,
+                failover_cause,
+                config: running.per_session,
+                execution_abort: running.execution_abort,
+                shutdown: running.shutdown,
+            },
+        )
+        .await
+    }
 
-        watch_task.abort();
-        control_task.abort();
-        session_watcher.abort();
-        tokio::spawn(async move {
-            let _ = watch_task.await;
-            let _ = control_task.await;
-            let _ = session_watcher.await;
-        });
+    fn spawn_execution_abort_relays(
+        user_abort: crate::utils::AbortSignal,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> (crate::utils::AbortSignal, JoinHandle<()>, JoinHandle<()>) {
+        let execution_abort = crate::utils::create_abort_signal();
+        let abort_relay = {
+            let execution_abort = execution_abort.clone();
+            tokio::spawn(async move {
+                crate::utils::wait_abort_signal(&user_abort).await;
+                execution_abort.set_ctrlc();
+            })
+        };
+        let shutdown_relay = {
+            let execution_abort = execution_abort.clone();
+            tokio::spawn(async move {
+                shutdown.cancelled().await;
+                execution_abort.set_failover();
+            })
+        };
+        (execution_abort, abort_relay, shutdown_relay)
+    }
 
-        let terminal = execution
-            .finish(
-                &backend,
-                &lease,
-                super::execution_control::FinishedTurn {
-                    task: cleanup_turn,
-                    settled,
-                    config: per_session,
-                },
-            )
-            .await?;
-        if abort_signal.aborted() {
-            Ok(terminal)
+    fn configure_tool_confirmation(
+        &self,
+        config: &crate::config::GlobalConfig,
+        subject: Option<&String>,
+        session_id: &str,
+        abort: &crate::utils::AbortSignal,
+    ) {
+        let confirm: Arc<crate::ConfirmToolUseFn> = match subject {
+            Some(subject) => crate::nats_tool_confirmation::nats_confirm_tool_use(
+                self.client.clone(),
+                subject.clone(),
+                session_id.to_string(),
+                abort.clone(),
+            ),
+            None => Arc::new(|_call, _arguments, _reason| crate::tool::ToolUseConfirmation::Defer),
+        };
+        config.write().set_tui_confirm_tool_use(Some(confirm));
+    }
+
+    async fn await_turn_body(
+        mut turn: JoinHandle<Result<bool>>,
+        abort: &crate::utils::AbortSignal,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> TurnBodyOutcome {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                abort.set_failover();
+                turn.abort();
+                TurnBodyOutcome {
+                    result: Ok(true),
+                    cleanup_turn: Some(turn),
+                    failover_cause: Some(FailoverCause::Shutdown),
+                }
+            }
+            _ = harnx_core::abort::wait_abort_signal(abort) => {
+                turn.abort();
+                TurnBodyOutcome {
+                    result: Ok(true),
+                    cleanup_turn: Some(turn),
+                    failover_cause: None,
+                }
+            }
+            result = &mut turn => TurnBodyOutcome {
+                result: result.unwrap_or_else(|error| Err(error.into())),
+                cleanup_turn: None,
+                failover_cause: None,
+            },
+        }
+    }
+
+    async fn stop_execution_tasks(tasks: [JoinHandle<()>; 5]) {
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    async fn finish_execution(
+        execution: &WorkerExecution,
+        backend: &NatsSessionLogBackend,
+        lease: &Arc<NatsSessionLease>,
+        inputs: FinishExecutionInputs,
+    ) -> Result<FinishCause> {
+        let FinishExecutionInputs {
+            result,
+            cleanup_turn,
+            settled,
+            failover_cause,
+            config,
+            execution_abort,
+            shutdown,
+        } = inputs;
+        let failover_cause =
+            failover_cause.or_else(|| shutdown.is_cancelled().then_some(FailoverCause::Shutdown));
+        let turn = match failover_cause {
+            Some(cause) => FinishedTurn::for_failover(cleanup_turn, config, cause),
+            None => FinishedTurn {
+                task: cleanup_turn,
+                settled,
+                config,
+                failover_cause: None,
+            },
+        };
+        let cause = execution.finish(backend, lease, turn).await?;
+        if shutdown.is_cancelled() && matches!(cause, FinishCause::Completed { .. }) {
+            return Ok(FinishCause::Failover(FailoverCause::Shutdown));
+        }
+        if execution_abort.aborted() {
+            Ok(cause)
         } else {
-            result.map(|_| terminal)
+            result.map(|_| cause)
         }
     }
 
@@ -336,7 +580,7 @@ impl WorkerRuntime {
                         watch_lease.worker_id(),
                         watch_lease.fence_token()
                     );
-                    abort_for_watch.set_ctrlc();
+                    abort_for_watch.set_failover();
                     break;
                 }
             }

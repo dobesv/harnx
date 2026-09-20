@@ -57,7 +57,7 @@ async fn nats_completion_reads_only_entries_after_its_successful_cursor() -> Res
         usage: None,
     })
     .await?;
-    let updates = updates(js, "incremental".into(), history);
+    let updates = updates(js, "incremental".into(), history, None);
     tokio::pin!(updates);
     let update = updates.next().await.unwrap()?;
     assert_eq!(update.entries.len(), 2);
@@ -91,7 +91,7 @@ async fn nats_completion_reports_persistent_read_failure_without_advisories() ->
     // responders, as happens when storage is unavailable during an outage.
     let mut js = async_nats::jetstream::with_prefix(client, "UNAVAILABLE");
     js.set_timeout(Duration::from_millis(100));
-    let updates = updates(js, "stalled-child".into(), Vec::new());
+    let updates = updates(js, "stalled-child".into(), Vec::new(), None);
     tokio::pin!(updates);
     let result = tokio::time::timeout(Duration::from_secs(5), updates.next())
         .await?
@@ -117,7 +117,7 @@ async fn nats_completion_read_keeps_its_deadline_when_other_select_branches_win(
     client.flush().await?;
     let mut js = async_nats::jetstream::with_prefix(client, "BLACKHOLE");
     js.set_timeout(Duration::from_millis(100));
-    let updates = updates(js, "busy-advisories".into(), Vec::new());
+    let updates = updates(js, "busy-advisories".into(), Vec::new(), None);
     tokio::pin!(updates);
     let mut advisories = tokio::time::interval(Duration::from_millis(10));
     let mut received = 0;

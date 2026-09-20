@@ -98,16 +98,28 @@ pub struct SessionLeaseWatchdog {
     next_check: tokio::time::Instant,
     saw_lease: bool,
     missing_checks: u32,
+    missing_checks_limit: u32,
 }
 
 impl SessionLeaseWatchdog {
     pub fn new() -> Self {
+        Self::with_orphan_timeout(None)
+    }
+
+    fn with_orphan_timeout(orphan_timeout: Option<std::time::Duration>) -> Self {
+        let missing_checks_limit = orphan_timeout.map_or(ORPHAN_MISSING_CHECKS, |timeout| {
+            timeout
+                .as_nanos()
+                .div_ceil(ORPHAN_CHECK_INTERVAL.as_nanos())
+                .clamp(1, u32::MAX as u128) as u32
+        });
         Self {
             lease_config: crate::nats_lease::NatsLeaseConfig::default(),
             bucket: None,
             next_check: tokio::time::Instant::now() + ORPHAN_CHECK_INTERVAL,
             saw_lease: false,
             missing_checks: 0,
+            missing_checks_limit,
         }
     }
 
@@ -151,7 +163,7 @@ impl SessionLeaseWatchdog {
                 return None;
             }
             self.missing_checks += 1;
-            if self.missing_checks < ORPHAN_MISSING_CHECKS {
+            if self.missing_checks < self.missing_checks_limit {
                 return None;
             }
             return Some(
@@ -182,6 +194,9 @@ impl Default for SessionLeaseWatchdog {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RunTurnOptions {
     pub token_budget: Option<u64>,
+    /// Grace period after a previously observed worker lease disappears before
+    /// the client reports an orphaned turn. `None` uses the interactive default.
+    pub orphan_timeout: Option<std::time::Duration>,
 }
 
 /// Configuration for a NATS session.
@@ -1245,6 +1260,7 @@ impl NatsSession {
             self.jetstream.clone(),
             self.storage_key.clone(),
             event_stream.history().to_vec(),
+            options.orphan_timeout,
         ));
         let mut completion_error = None;
         let mut emitted_subagent_completions = HashSet::new();
@@ -2071,7 +2087,20 @@ mod tests {
     fn default_run_turn_options_keep_interactive_callers_unbounded() {
         // TUI and WebUI use run_turn_input* methods, which delegate with this
         // default and expose no caller-side timeout argument.
-        assert_eq!(RunTurnOptions::default().token_budget, None);
+        let options = RunTurnOptions::default();
+        assert_eq!(options.token_budget, None);
+        assert_eq!(options.orphan_timeout, None);
+    }
+
+    #[test]
+    fn orphan_timeout_rounds_up_to_watchdog_check_intervals() {
+        let watchdog =
+            SessionLeaseWatchdog::with_orphan_timeout(Some(std::time::Duration::from_secs(5)));
+        assert_eq!(watchdog.missing_checks_limit, 3);
+
+        let minimum =
+            SessionLeaseWatchdog::with_orphan_timeout(Some(std::time::Duration::from_millis(1)));
+        assert_eq!(minimum.missing_checks_limit, 1);
     }
 
     /// A turn's last flush must not swallow notices just because the durable log

@@ -8,6 +8,7 @@ repository.workspace = true
 description = "GitHub Issues-backed auth and client layer for harnx plans MCP"
 
 [dependencies]
+harnx-nats-common = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }

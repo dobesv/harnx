@@ -12,9 +12,11 @@ mod isolation;
 #[cfg(test)]
 #[path = "ag_ui_remote_follow/isolation_tests.rs"]
 mod isolation_tests;
-pub(crate) use frames::{event_frames, QueuedEvent};
+#[cfg(test)]
+pub(crate) use frames::event_frames;
+pub(crate) use frames::{event_frames_with_guard, QueuedEvent};
 use isolation::RemoteInterruptWatch;
-use std::{pin::Pin, time::Duration};
+use std::time::Duration;
 
 use ag_ui_core::event::Event;
 use anyhow::Result;
@@ -26,9 +28,9 @@ use harnx_runtime::{
     nats_lease::session_has_active_lease,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio_stream::{Stream, StreamExt as _};
+use tokio_stream::StreamExt as _;
 
-use crate::ag_ui::UsageContextSnapshot;
+use crate::ag_ui::{GuardedEventStream, UsageContextSnapshot};
 
 use crate::{
     ag_ui::{frame_event, AgUiError, AgUiSink},
@@ -56,8 +58,6 @@ const LEASE_ABSENT_THRESHOLD: usize = 5;
 /// Matches the bounded nature of the local broadcast path (which uses 64).
 const FRAME_CHANNEL_SIZE: usize = 256;
 
-type AgUiEventStream = Pin<Box<dyn Stream<Item = Bytes> + Send + Sync + 'static>>;
-
 /// Parameters for deciding whether to follow a remote worker's stream.
 ///
 /// Passed from `ag_ui.rs` to `resolve_event_stream` when the local actor is idle.
@@ -75,7 +75,7 @@ pub(crate) struct EventStreamParams<'a> {
 /// Returns `None` when caller should use the regular local event stream.
 pub(crate) async fn resolve_event_stream(
     params: EventStreamParams<'_>,
-) -> Result<Option<AgUiEventStream>, AgUiError> {
+) -> Result<Option<GuardedEventStream>, AgUiError> {
     if !params.eligible {
         return Ok(None);
     }
@@ -138,7 +138,7 @@ struct RemoteFollowStreamParams<'a> {
 
 async fn build_remote_follow_ag_ui_stream(
     params: RemoteFollowStreamParams<'_>,
-) -> Result<AgUiEventStream, AgUiError> {
+) -> Result<GuardedEventStream, AgUiError> {
     let initial_events = std::iter::once(snapshot_event(params.subscription.snapshot.clone()))
         .chain(
             params
@@ -184,7 +184,7 @@ async fn build_remote_follow_ag_ui_stream(
 
 async fn build_remote_follow_event_stream(
     params: RemoteEventStreamParams<'_>,
-) -> Result<AgUiEventStream> {
+) -> Result<GuardedEventStream> {
     let client = crate::serve_nats_client(params.config, params.cluster).await?;
     let jetstream = crate::serve_nats_jetstream(params.config, params.cluster).await?;
     let event_stream =
@@ -268,8 +268,11 @@ struct LiveFollowParams {
     through_seq: u64,
 }
 
-fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
+fn build_live_follow_stream(params: LiveFollowParams) -> GuardedEventStream {
     let live = params.event_stream.live_state().clone();
+    let guard = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::ag_ui_lifecycle::LiveStreamGuard::default(),
+    ));
     let attached_seq = params.event_stream.last_applied_seq();
     let (tx, rx) = tokio::sync::mpsc::channel(FRAME_CHANNEL_SIZE);
 
@@ -298,18 +301,19 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
         .chain(params.snapshot_frame)
         .chain(params.attachment_frames)
         .chain(control_frames);
-    let event_frames = event_frames(rx, live, attached_seq);
+    let event_frames = event_frames_with_guard(rx, live, attached_seq, guard.clone());
     let finished_stream = tokio_stream::once(Bytes::from(frame_run_boundary_event(
         "RUN_FINISHED",
         &params.thread_id,
         &params.run_id,
     )));
 
-    Box::pin(
+    let stream = Box::pin(
         tokio_stream::iter(initial_frames)
             .chain(event_frames)
             .chain(finished_stream),
-    )
+    );
+    GuardedEventStream { stream, guard }
 }
 
 pub(crate) fn completed_remote_stream(
@@ -318,7 +322,7 @@ pub(crate) fn completed_remote_stream(
     control_frames: Vec<Bytes>,
     thread_id: &str,
     run_id: &str,
-) -> AgUiEventStream {
+) -> GuardedEventStream {
     let finished_frame = Bytes::from(frame_run_boundary_event("RUN_FINISHED", thread_id, run_id));
     let frames: Vec<Bytes> = initial_frames
         .into_iter()
@@ -326,7 +330,12 @@ pub(crate) fn completed_remote_stream(
         .chain(control_frames)
         .chain(std::iter::once(finished_frame))
         .collect();
-    Box::pin(tokio_stream::iter(frames))
+    GuardedEventStream {
+        stream: Box::pin(tokio_stream::iter(frames)),
+        guard: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::ag_ui_lifecycle::LiveStreamGuard::default(),
+        )),
+    }
 }
 
 struct FollowTaskParams {
