@@ -200,6 +200,13 @@ enum ChildOutput {
     Null,
 }
 
+impl ChildOutput {
+    /// Whether a child's output goes nowhere the parent can read back.
+    fn is_discarded(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+}
+
 /// Stdio for a child process, following the rule in the module docs: hand the
 /// child our log file when we have one, otherwise let it inherit our streams.
 ///
@@ -235,6 +242,16 @@ fn child_output(dest: Option<&LogDest>) -> ChildOutput {
         Some(LogDest::Stderr) => ChildOutput::Inherit,
         None => ChildOutput::Null,
     }
+}
+
+/// Whether [`child_output_sink`] throws a child's output away.
+///
+/// True only for a process that never called [`init`]: a file or stderr
+/// destination leaves the output somewhere a reader can still find it. A caller
+/// that needs a child's output to explain why the child died has to capture it
+/// itself when this is true.
+pub fn child_output_is_discarded() -> bool {
+    child_output(current().map(|settings| &settings.dest)).is_discarded()
 }
 
 /// Where [`child_output_sink`] sends a child's output, phrased for a message
@@ -759,15 +776,17 @@ mod tests {
 
     #[test]
     fn child_output_follows_our_own_destination() {
-        for (dest, expected, why) in [
+        for (dest, expected, discarded, why) in [
             (
                 Some(LogDest::File(default_path())),
                 ChildOutput::File(default_path()),
+                false,
                 "a file-logging process hands children that file",
             ),
             (
                 Some(LogDest::Stderr),
                 ChildOutput::Inherit,
+                false,
                 "a stderr-logging process lets children inherit",
             ),
             (
@@ -775,10 +794,13 @@ mod tests {
                 // which strands a test harness waiting on EOF.
                 None,
                 ChildOutput::Null,
+                true,
                 "a process with no logger discards child output",
             ),
         ] {
-            assert_eq!(child_output(dest.as_ref()), expected, "{why}");
+            let resolved = child_output(dest.as_ref());
+            assert_eq!(resolved, expected, "{why}");
+            assert_eq!(resolved.is_discarded(), discarded, "{why}");
         }
     }
 
