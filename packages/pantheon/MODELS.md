@@ -1,6 +1,6 @@
 # Package model policy
 
-Reviewed 2026-09-09 for issues #1765 and #1514. This policy covers Pantheon and
+Reviewed 2026-09-20 for issues #1765, #1514 and #2025. This policy covers Pantheon and
 the standalone coding package. It is a selection based on provider documentation
 and the agents' responsibilities, not a measured Harnx performance benchmark.
 
@@ -18,6 +18,14 @@ and the agents' responsibilities, not a measured Harnx performance benchmark.
   Heavy implementation, security/privacy review, plan review, and investigation
   keep GPT-5.6 Sol; Hephaestus retains high reasoning. Everyday coding and
   bounded judging use Terra. Existing GLM 5 specialists keep model diversity.
+- The reasoning-heavy agents take Kimi K3 as their Bedrock fallback: Oracle,
+  Plato, Hephaestus, Daedalus, Sisyphus, Melpomene, Momus, Polyhymnia and
+  Zosimus. It is the only frontier-class open-weight model on Bedrock, and its
+  1M context and vision cover the two things the other Bedrock choices cannot.
+  It costs roughly three times GLM 5 on input and five times on output, which
+  is affordable only because it sits last in every chain that selects it. The
+  mid-tier agents keep GLM 5, where it is often the primary and the 128K output
+  ceiling is the best available at that price.
 - Hermes uses Luna for small fixes; Hestia uses Bedrock MiniMax M2.5 for routine
   maintenance. Their Claude fallback is Haiku 4.5.
 - Compaction retains Gemini 3.5 Flash-Lite, with Luna as the OpenAI-family
@@ -38,12 +46,12 @@ Codex immediately precedes the same OpenAI model and reasoning setting.
 | `athena`, `metis`, `mnemosyne`, `nemesis`, `opis`, `rhadamanthus`, `tyche`, `urania` | `bedrock:zai.glm-5` → `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `claude:claude-sonnet-5` |
 | `atlas` | `gemini:gemini-3.8-flash` → `claude:claude-sonnet-5` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `bedrock:zai.glm-5` |
 | All nine `compact-*` agents (including coding) | `gemini:gemini-3.5-flash-lite` → `codex:gpt-5.6-luna` → `openai:gpt-5.6-luna` → `claude:claude-sonnet-5` → `bedrock:zai.glm-4.7-flash` |
-| `daedalus`, `sisyphus` | `claude:claude-opus-4-8` → `codex:gpt-5.6-sol` → `openai:gpt-5.6-sol` → `gemini:gemini-3.8-flash` → `bedrock:zai.glm-5` |
-| `hephaestus` | `codex:gpt-5.6-sol:high` → `openai:gpt-5.6-sol:high` → `claude:claude-opus-4-8` → `gemini:gemini-3.8-flash` → `bedrock:zai.glm-5` |
+| `daedalus`, `sisyphus` | `claude:claude-opus-4-8` → `codex:gpt-5.6-sol` → `openai:gpt-5.6-sol` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
+| `hephaestus` | `codex:gpt-5.6-sol:high` → `openai:gpt-5.6-sol:high` → `claude:claude-opus-4-8` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
 | `hermes` | `codex:gpt-5.6-luna` → `openai:gpt-5.6-luna` → `gemini:gemini-3.8-flash` → `claude:claude-haiku-4-5` → `bedrock:minimax.minimax-m2.5` |
 | `hestia` | `bedrock:minimax.minimax-m2.5` → `gemini:gemini-3.8-flash` → `codex:gpt-5.6-luna` → `openai:gpt-5.6-luna` → `claude:claude-haiku-4-5` |
-| `melpomene`, `momus`, `polyhymnia`, `zosimus` | `codex:gpt-5.6-sol` → `openai:gpt-5.6-sol` → `claude:claude-sonnet-5` → `gemini:gemini-3.8-flash` → `bedrock:zai.glm-5` |
-| `oracle`, `plato` | `codex:gpt-6-astra:max` → `openai:gpt-6-astra:max` → `claude:claude-fable-5-1:max` → `gemini:gemini-3.8-flash` → `bedrock:zai.glm-5` |
+| `melpomene`, `momus`, `polyhymnia`, `zosimus` | `codex:gpt-5.6-sol` → `openai:gpt-5.6-sol` → `claude:claude-sonnet-5` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
+| `oracle`, `plato` | `codex:gpt-6-astra:max` → `openai:gpt-6-astra:max` → `claude:claude-fable-5-1:max` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
 
 ## Cost and provider evidence
 
@@ -57,6 +65,7 @@ cost also depends on reasoning tokens, caching, retries, and tool turns.
 | GPT-5.6 Sol / Terra / Luna | $4 / $20; $2 / $12; $0.20 / $1.20 | [OpenAI model catalog](https://developers.openai.com/api/docs/models) |
 | Fable 5.1 / Sonnet 5 / Haiku 4.5 | $10 / $50; $2 / $10; $1 / $5 | [Claude model comparison](https://platform.claude.com/docs/en/models/fable-5-1/overview) |
 | Gemini 3.8 Flash | $0.75 / $3.75 introductory | [Gemini 3.8 guide](https://ai.google.dev/gemini-api/docs/latest-model) |
+| Bedrock Kimi K3 | $3.30 / $16.50 (US CRIS; $0.33 cache read) | [AWS pricing](https://aws.amazon.com/bedrock/pricing/) |
 | Bedrock GLM 5 / MiniMax M2.5 / GLM 4.7 Flash | $1 / $3.20; $0.30 / $1.20; $0.07 / $0.40 | [AWS pricing](https://aws.amazon.com/bedrock/pricing/) |
 
 Gemini 3.8 introductory pricing ends December 31, 2026; the announced standard
@@ -69,7 +78,8 @@ Sol, Terra, and Luna and describes their workload tradeoffs. Availability varies
 with the account, plan, and rollout. The
 [Gemini model list](https://ai.google.dev/gemini-api/docs/models) retains
 3.5 Flash-Lite as the small, inexpensive tier.
-AWS documents [GLM 5](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5.html),
+AWS documents [Kimi K3](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k3.html),
+[GLM 5](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5.html),
 [MiniMax M2.5](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-minimax-minimax-m2-5.html),
 and [GLM 4.7 Flash](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-4-7-flash.html)
 for its Chat Completions endpoint. A newer upstream model name is not sufficient
@@ -88,8 +98,11 @@ retries move to the next model and apply a cooldown. Missing local credentials
 can consume retries before moving on. This does not discover account entitlements:
 HTTP 400/404 request errors stop the turn, and valid credentials do not guarantee
 access to every selected model. Override the chain for restricted accounts.
-Context windows and modalities also differ: the selected Bedrock models are
-text-only and have roughly 200K context, and GLM 4.7 Flash has a 4K output cap.
+Context windows and modalities also differ. Kimi K3 takes images and 1M tokens
+of context; GLM 5, MiniMax M2.5 and GLM 4.7 Flash are text-only at roughly
+200K, and GLM 4.7 Flash has a 4K output cap. Kimi K3 is reachable only through
+cross-Region inference, so its id carries the `us.` prefix and there is no
+in-Region form.
 A fallback is not a guarantee that an oversized or image-bearing request fits.
 
 ## Maintaining the defaults

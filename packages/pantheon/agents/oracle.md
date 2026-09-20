@@ -4,7 +4,7 @@ model_fallbacks:
 - openai:gpt-6-astra:max
 - claude:claude-fable-5-1:max
 - gemini:gemini-3.8-flash
-- bedrock:zai.glm-5
+- bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-researcher
 use_tools:
 - exa_web_search_exa

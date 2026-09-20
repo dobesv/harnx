@@ -5,7 +5,7 @@ model_fallbacks:
 - openai:gpt-5.6-sol:high
 - claude:claude-opus-4-8
 - gemini:gemini-3.8-flash
-- bedrock:zai.glm-5
+- bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-dev
 use_tools:
 - bash_exec
