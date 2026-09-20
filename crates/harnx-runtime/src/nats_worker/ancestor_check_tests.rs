@@ -4,7 +4,7 @@ use crate::nats_session_log::NatsSessionLog;
 use crate::nats_session_metadata::{
     ParentLink, SessionInitializer, SessionMetadata, SessionMetadataStore,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::session::ToolOutput;
 use harnx_core::tool::ToolCall;
@@ -120,7 +120,7 @@ async fn append(
     session: &str,
     entry: &SessionLogEntry,
 ) -> Result<()> {
-    NatsSessionLog::new(js.clone(), session.to_string())
+    NatsSessionLog::new_with_replicas(js.clone(), session.to_string(), 1)
         .append_event_async(entry)
         .await
         .map(drop)
@@ -207,23 +207,15 @@ async fn an_unreadable_parent_log_is_an_error_not_a_clear_verdict() -> Result<()
     let Some(fixture) = Fixture::start("unreadable").await? else {
         return Ok(());
     };
-    // Claim the parent's log subject from a foreign stream. Opening the
-    // session's own stream then fails on the overlap instead of returning an
-    // empty history, which is exactly the "cannot see the parent" case that
-    // must not be mistaken for "the parent is still running".
-    fixture
-        .js
-        .create_stream(async_nats::jetstream::stream::Config {
-            name: "DECOY_PARENT_LOG".into(),
-            subjects: vec![crate::nats_session_log::subject_for_session(
-                &fixture.parent_key,
-            )],
-            ..Default::default()
-        })
+    // A nonstandard API prefix has no JetStream responder. The resulting
+    // request error must propagate rather than being treated as an absent log.
+    let unreadable = async_nats::jetstream::with_prefix(
+        fixture.js.client().clone(),
+        "UNREACHABLE_JETSTREAM_API",
+    );
+    let error = check_ancestors(&unreadable, &fixture.metadata, &fixture.child_key)
         .await
-        .context("claim the parent log subject")?;
-
-    let error = fixture.verdict().await.expect_err("unreadable parent log");
+        .expect_err("unreadable parent log");
     assert!(
         format!("{error:#}").contains("parent log unreadable"),
         "expected the unreadable-parent context, got {error:#}"

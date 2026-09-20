@@ -25,7 +25,7 @@ fn toolset(js: &async_nats::jetstream::Context, metadata: SessionMetadataStore) 
     SubagentToolset::new(
         AGENT,
         SubagentSessionRoute::new("local", crate::SessionActivationRoute::ClusterShared),
-        SubagentNats::new(js.client().clone(), js.clone(), metadata),
+        SubagentNats::new(js.client().clone(), js.clone(), metadata, 1),
     )
 }
 
@@ -44,7 +44,7 @@ async fn create_child(toolset: &SubagentToolset, parent: &str) -> Result<NatsSes
 /// Seed a pending user message so the log looks like an actively running
 /// turn (`interrupt_session` only appends a `Cancel` when it finds one).
 async fn seed_active_turn(js: &async_nats::jetstream::Context, storage_key: &str) -> Result<()> {
-    let log = NatsSessionLog::new(js.clone(), storage_key.to_string());
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key.to_string(), 1);
     log.append_event_async(&SessionLogEntry::Message {
         id: Some("user-1".into()),
         role: MessageRole::User,
@@ -89,7 +89,7 @@ async fn cancel_interrupts_the_child_and_records_the_parent_link() -> Result<()>
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let log = NatsSessionLog::new(js.clone(), storage_key.clone());
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key.clone(), 1);
     let entries = log.load_events_latest_async().await?;
     let (_, last) = entries.last().context("child log has no entries")?;
     let SessionLogEntry::Cancel { requested_by, .. } = last else {
@@ -164,7 +164,7 @@ async fn seed_interrupted_parent(
     js: &async_nats::jetstream::Context,
     parent_key: &str,
 ) -> Result<()> {
-    let log = NatsSessionLog::new(js.clone(), parent_key.to_string());
+    let log = NatsSessionLog::new_with_replicas(js.clone(), parent_key.to_string(), 1);
     log.append_event_async(&SessionLogEntry::Message {
         id: Some("parent-user".into()),
         role: MessageRole::User,

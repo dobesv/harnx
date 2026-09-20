@@ -118,9 +118,10 @@ impl Fixture {
     }
 
     async fn entries(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
-        harnx_runtime::nats_session_log::NatsSessionLog::new(
+        harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(
             self.js.clone(),
             self.session.storage_key(),
+            1,
         )
         .load_events_latest_async()
         .await

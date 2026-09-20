@@ -26,6 +26,7 @@ pub(super) struct HitlCallbackContext<'a> {
     pub event_sink: Option<&'a Arc<NatsEventSink>>,
     pub after_seq_observer: Option<&'a Arc<AtomicU64>>,
     pub metadata_store: Option<&'a SessionMetadataStore>,
+    pub replicas: usize,
 }
 
 /// Runtime state for HITL approval request handling.
@@ -42,13 +43,14 @@ pub(super) struct HitlApprovalState {
 impl<'a> HitlCallbackContext<'a> {
     /// Build the backend and sink for this context.
     fn build_backend_and_sink(&self) -> (NatsSessionLogBackend, FencedSessionLogSink) {
-        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), self.session_id)
-            .with_after_seq_observer(
-                self.after_seq_observer
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
-            )
-            .with_metadata_store(self.metadata_store.cloned());
+        let backend =
+            NatsSessionLogBackend::new(self.jetstream.clone(), self.session_id, self.replicas)
+                .with_after_seq_observer(
+                    self.after_seq_observer
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
+                )
+                .with_metadata_store(self.metadata_store.cloned());
         let sink = FencedSessionLogSink::new(backend.clone(), Arc::clone(self.lease));
         (backend, sink)
     }
@@ -305,6 +307,7 @@ mod hitl_attention_tests {
             event_sink: None,
             after_seq_observer: Some(&after_seq_observer),
             metadata_store: Some(&store),
+            replicas: 1,
         };
         let callback = build_hitl_approval_request_callback_for_test(ctx);
 

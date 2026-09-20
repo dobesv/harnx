@@ -119,6 +119,7 @@ async fn ensure_notify_stream(
     jetstream: &jetstream::Context,
     cluster: &str,
     subject: &str,
+    num_replicas: usize,
 ) -> Result<jetstream::stream::Stream> {
     let name = notify_stream_name(cluster);
     if let Ok(stream) = jetstream.get_stream(&name).await {
@@ -131,16 +132,18 @@ async fn ensure_notify_stream(
             subjects: vec![subject.to_string()],
             retention: RetentionPolicy::WorkQueue,
             storage: StorageType::File,
+            num_replicas,
             ..Default::default()
         })
         .await
     {
         Ok(stream) => Ok(stream),
-        Err(_) => jetstream
-            .get_stream(&name)
-            .await
-            .map_err(anyhow::Error::from)
-            .with_context(|| format!("Failed to create notify stream for cluster '{cluster}'")),
+        Err(create_error) => match jetstream.get_stream(&name).await {
+            Ok(stream) => Ok(stream),
+            Err(get_error) => Err(anyhow::Error::from(create_error).context(format!(
+                "Failed to create notify stream '{name}' for cluster '{cluster}' with {num_replicas} replicas; fallback get also failed: {get_error}"
+            ))),
+        },
     }
 }
 
@@ -165,15 +168,19 @@ async fn open_or_create_local_stream(
             subjects: vec![LOCAL_NOTIFY_SUBJECT.to_string()],
             retention: RetentionPolicy::Interest,
             storage: StorageType::File,
+            // Frontend-local stream never spans a NATS cluster.
+            num_replicas: 1,
             ..Default::default()
         })
         .await
     {
         Ok(stream) => Ok(stream),
-        Err(_) => jetstream
-            .get_stream(LOCAL_WORK_NOTIFY_STREAM)
-            .await
-            .context("get concurrently-created local-v2 notify stream"),
+        Err(create_error) => match jetstream.get_stream(LOCAL_WORK_NOTIFY_STREAM).await {
+            Ok(stream) => Ok(stream),
+            Err(get_error) => Err(anyhow::Error::from(create_error).context(format!(
+                "Failed to create local-v2 notify stream; fallback get also failed: {get_error}"
+            ))),
+        },
     }
 }
 
@@ -202,9 +209,10 @@ pub async fn publish_session_activate(
     jetstream: &jetstream::Context,
     cluster: &str,
     activation: &SessionActivate,
+    num_replicas: usize,
 ) -> Result<u64> {
     let subject = notify_subject(cluster);
-    ensure_notify_stream(jetstream, cluster, &subject).await?;
+    ensure_notify_stream(jetstream, cluster, &subject, num_replicas).await?;
     publish_activation(jetstream, subject, activation, activation.msg_id()).await
 }
 
@@ -303,7 +311,13 @@ async fn consumer_route(
         WorkerActivationMode::ClusterShared => {
             let subject = notify_subject(&daemon.session_scope);
             Ok((
-                ensure_notify_stream(jetstream, &daemon.session_scope, &subject).await?,
+                ensure_notify_stream(
+                    jetstream,
+                    &daemon.session_scope,
+                    &subject,
+                    daemon.lease.replicas,
+                )
+                .await?,
                 shared_notify_consumer_name(),
                 subject,
             ))

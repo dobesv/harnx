@@ -172,7 +172,8 @@ async fn finish_remote_turn_record(
     session: RemoteTurnHandle,
     usage: Option<harnx_core::api_types::CompletionTokenUsage>,
 ) {
-    let log = NatsSessionLog::for_agent(session.jetstream, "plain", &session.session_id);
+    let log =
+        NatsSessionLog::for_agent(session.jetstream, "plain", &session.session_id).with_replicas(1);
     let entries = log.load_events_async().await.expect("load entries");
     let user_msg_seq = entries.iter().rev().find(|(_, entry)| {
         matches!(entry, SessionLogEntry::Message { role, .. } if *role == MessageRole::User)

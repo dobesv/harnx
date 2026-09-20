@@ -60,7 +60,7 @@ async fn remote_transcript_marks_trailing_tool_call_pending_only_while_leased() 
         harnx_runtime::utils::create_abort_signal(),
     )
     .await?;
-    NatsSessionLog::new(jetstream.clone(), session.storage_key())
+    NatsSessionLog::new_with_replicas(jetstream.clone(), session.storage_key(), 1)
         .append_event_async(&SessionLogEntry::ToolCalls {
             text: "running tool".to_string(),
             thought: None,

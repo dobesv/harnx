@@ -9,7 +9,11 @@ async fn expired_replay_returns_completed_child_without_cancelling_or_readmittin
         .context("nats-server required")?;
     let js = async_nats::jetstream::new(async_nats::connect(&url).await?);
     let session = completed_child(&js).await?;
-    let log = crate::nats_session_log::NatsSessionLog::new(js.clone(), session.storage_key());
+    let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
+        js.clone(),
+        session.storage_key(),
+        1,
+    );
     let toolset = SubagentToolset::new(
         "helper",
         super::super::SubagentSessionRoute::new(
@@ -20,6 +24,7 @@ async fn expired_replay_returns_completed_child_without_cancelling_or_readmittin
             js.client().clone(),
             js.clone(),
             session.metadata_store().clone(),
+            1,
         ),
     );
     let buffer = Arc::new(InvocationBufferingSink::new(Arc::new(
@@ -75,7 +80,11 @@ async fn completed_child(js: &async_nats::jetstream::Context) -> Result<NatsSess
     .await?;
     let session = session.with_execution_parent("parent".into(), "invocation".into());
     let prompt = session.enqueue_text("original work").await?;
-    let log = crate::nats_session_log::NatsSessionLog::new(js.clone(), session.storage_key());
+    let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
+        js.clone(),
+        session.storage_key(),
+        1,
+    );
     log.append_event_async(&SessionLogEntry::Message {
         id: Some("answer".into()),
         role: MessageRole::Assistant,

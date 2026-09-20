@@ -207,7 +207,7 @@ pub(crate) enum RequestedSeqStatus {
 
 async fn ensure_session_metadata(
     store: &SessionMetadataStore,
-    jetstream: &jetstream::Context,
+    transcript: &NatsSessionLog,
     session_id: &str,
     initializer: &SessionInitializer,
 ) -> Result<()> {
@@ -218,8 +218,10 @@ async fn ensure_session_metadata(
         return Ok(());
     }
 
-    let log = NatsSessionLog::new(jetstream.clone(), &key);
-    let existing_entries = log
+    // `transcript` must be a creation-capable handle (built with the resolved
+    // replica count): this empty-transcript check is the first touch of a
+    // brand-new session's stream, so it decides the stream's replica count.
+    let existing_entries = transcript
         .load_events_async()
         .await
         .context("failed to inspect transcript before creating session metadata")?;
@@ -399,16 +401,16 @@ impl NatsSession {
         jetstream: jetstream::Context,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        Self::new_with_replicas((config, 1), client, jetstream, abort_signal).await
+        Self::new_with_resolved_replicas(config, 1, client, jetstream, abort_signal).await
     }
 
-    async fn new_with_replicas(
-        config: (NatsSessionConfig, usize),
+    pub(crate) async fn new_with_resolved_replicas(
+        config: NatsSessionConfig,
+        replicas: usize,
         client: async_nats::Client,
         jetstream: jetstream::Context,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        let (config, replicas) = config;
         let metadata_store = SessionMetadataStore::ensure(&jetstream, replicas)
             .await
             .context("failed to open canonical session metadata store")?;
@@ -422,9 +424,14 @@ impl NatsSession {
                 .await?
             }
         };
+        let metadata_transcript = NatsSessionLog::new_with_replicas(
+            jetstream.clone(),
+            config.initializer.session_key(&session_id),
+            replicas,
+        );
         ensure_session_metadata(
             &metadata_store,
-            &jetstream,
+            &metadata_transcript,
             &session_id,
             &config.initializer,
         )
@@ -463,8 +470,9 @@ impl NatsSession {
             .context("failed to connect to NATS cluster")?;
         let jetstream = async_nats::jetstream::new(client.clone());
 
-        let nats_session = Self::new_with_replicas(
-            (config, attachment_replicas),
+        let nats_session = Self::new_with_resolved_replicas(
+            config,
+            attachment_replicas,
             client,
             jetstream,
             abort_signal,
@@ -477,6 +485,7 @@ impl NatsSession {
         let backend = crate::nats_worker::NatsSessionLogBackend::new(
             nats_session.jetstream.clone(),
             nats_session.storage_key.clone(),
+            nats_session.attachment_replicas,
         )
         .with_metadata_store(Some(nats_session.metadata_store.clone()));
         let sink = Arc::new(backend) as Arc<dyn crate::config::session::SessionAppendSink>;
@@ -533,6 +542,13 @@ impl NatsSession {
         &self.jetstream
     }
 
+    /// Resolved replica count for this session's cluster. Callers that create a
+    /// transcript stream (rather than only reading an existing one) must pass
+    /// this so the stream is created at the configured replica count.
+    pub(crate) fn attachment_replicas(&self) -> usize {
+        self.attachment_replicas
+    }
+
     pub fn metadata_store(&self) -> &SessionMetadataStore {
         &self.metadata_store
     }
@@ -548,7 +564,11 @@ impl NatsSession {
             .invocation_id
             .clone()
             .unwrap_or_else(new_client_message_id);
-        let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
+        let log = NatsSessionLog::new_with_replicas(
+            self.jetstream.clone(),
+            self.storage_key.clone(),
+            self.attachment_replicas,
+        );
         let user_entry = SessionLogEntry::Message {
             id: Some(user_msg_id.clone()),
             role: MessageRole::User,
@@ -667,9 +687,14 @@ impl NatsSession {
                 let activation = SessionActivate::new(&self.storage_key)
                     .with_tool_confirmation_subject(tool_confirmation_subject)
                     .with_token_budget(token_budget);
-                publish_session_activate(&self.jetstream, &self.config.cluster, &activation)
-                    .await
-                    .context("failed to publish session activation")?;
+                publish_session_activate(
+                    &self.jetstream,
+                    &self.config.cluster,
+                    &activation,
+                    self.attachment_replicas,
+                )
+                .await
+                .context("failed to publish session activation")?;
             }
             SessionActivationRoute::WorkerTargeted {
                 session_scope,
@@ -774,7 +799,11 @@ impl NatsSession {
         &self,
         confirmation_subject: Option<&str>,
     ) -> Result<Option<u64>> {
-        let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
+        let log = NatsSessionLog::new_with_replicas(
+            self.jetstream.clone(),
+            self.storage_key.clone(),
+            self.attachment_replicas,
+        );
         let entries = log
             .load_events_latest_async()
             .await
@@ -1473,7 +1502,11 @@ impl NatsSession {
     /// # Returns
     /// The sequence number of the appended EditEntries entry.
     pub async fn retract_user_message(&self, seq: u64) -> Result<u64> {
-        let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
+        let log = NatsSessionLog::new_with_replicas(
+            self.jetstream.clone(),
+            self.storage_key.clone(),
+            self.attachment_replicas,
+        );
         let seq = usize::try_from(seq).context("JetStream seq does not fit into usize")?;
         let edit_entry = SessionLogEntry::EditEntries {
             from: seq,
@@ -1499,7 +1532,11 @@ impl NatsSession {
     /// # Returns
     /// The sequence number of the appended EditEntries entry.
     pub async fn edit_user_message(&self, seq: u64, new_text: String) -> Result<u64> {
-        let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
+        let log = NatsSessionLog::new_with_replicas(
+            self.jetstream.clone(),
+            self.storage_key.clone(),
+            self.attachment_replicas,
+        );
         let replacement_entry = SessionLogEntry::Message {
             id: Some(new_client_message_id()),
             role: MessageRole::User,
@@ -1522,7 +1559,11 @@ impl NatsSession {
 
     /// Load all durable entries from the session log.
     async fn load_durable_entries(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
-        let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
+        let log = NatsSessionLog::new_with_replicas(
+            self.jetstream.clone(),
+            self.storage_key.clone(),
+            self.attachment_replicas,
+        );
         log.load_events_async()
             .await
             .context("failed to load durable session log")
@@ -2000,7 +2041,11 @@ pub(crate) mod test_support {
         )
         .await
         .unwrap();
-        let log = NatsSessionLog::new(js, session.storage_key.clone());
+        let log = NatsSessionLog::new_with_replicas(
+            js,
+            session.storage_key.clone(),
+            session.attachment_replicas,
+        );
         (session, log)
     }
 }

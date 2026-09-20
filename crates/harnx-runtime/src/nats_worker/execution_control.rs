@@ -329,9 +329,10 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let log = crate::nats_session_log::NatsSessionLog::new(
+            let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
                 jetstream.clone(),
                 storage_key.clone(),
+                1,
             );
             log.append_event_async(&SessionLogEntry::Message {
                 id: None,
@@ -363,7 +364,7 @@ mod tests {
                     interrupted: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 });
             Self {
-                backend: NatsSessionLogBackend::new(jetstream, &storage_key),
+                backend: NatsSessionLogBackend::new(jetstream, &storage_key, 1),
                 execution,
                 lease,
                 log,

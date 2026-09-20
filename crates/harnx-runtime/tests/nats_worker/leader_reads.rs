@@ -82,7 +82,7 @@ async fn load_events_latest_async_reads_leader_authoritative_tail() -> Result<()
 
     let js = local_test_nats(server.url()).await?;
     let session_id = "latest-tail-test";
-    let log = NatsSessionLog::new(js, storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js, storage_key(session_id), 1);
 
     let user_seq = log
         .append_event_async(&append_user_message_entry(
@@ -194,7 +194,7 @@ async fn load_events_latest_async_empty_stream_returns_empty() -> Result<()> {
 
     let js = local_test_nats(server.url()).await?;
     let session_id = "latest-tail-empty-stream-test";
-    let log = NatsSessionLog::new(js, storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js, storage_key(session_id), 1);
 
     let entries = log.load_events_latest_async().await?;
     assert!(entries.is_empty(), "empty stream should return empty Vec");

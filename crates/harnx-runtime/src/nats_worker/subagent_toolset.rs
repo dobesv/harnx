@@ -74,6 +74,7 @@ pub(crate) struct SubagentToolset {
     client: async_nats::Client,
     jetstream: jetstream::Context,
     session_metadata: crate::nats_session_metadata::SessionMetadataStore,
+    replicas: usize,
     progress_heartbeat: Duration,
 }
 
@@ -81,6 +82,7 @@ pub(crate) struct SubagentNats {
     client: async_nats::Client,
     jetstream: jetstream::Context,
     session_metadata: crate::nats_session_metadata::SessionMetadataStore,
+    replicas: usize,
 }
 
 impl SubagentNats {
@@ -88,11 +90,13 @@ impl SubagentNats {
         client: async_nats::Client,
         jetstream: jetstream::Context,
         session_metadata: crate::nats_session_metadata::SessionMetadataStore,
+        replicas: usize,
     ) -> Self {
         Self {
             client,
             jetstream,
             session_metadata,
+            replicas,
         }
     }
 }
@@ -127,6 +131,7 @@ impl SubagentToolset {
             client: nats.client,
             jetstream: nats.jetstream,
             session_metadata: nats.session_metadata,
+            replicas: nats.replicas,
             progress_heartbeat: SUBAGENT_PROGRESS_HEARTBEAT,
         }
     }
@@ -146,8 +151,9 @@ impl SubagentToolset {
         let config = self
             .session_config(session_id, parent_session_id, tool_call_id)
             .await?;
-        NatsSession::new(
+        NatsSession::new_with_resolved_replicas(
             config,
+            self.replicas,
             self.client.clone(),
             self.jetstream.clone(),
             harnx_core::abort::create_abort_signal(),
@@ -381,6 +387,7 @@ impl SubagentToolset {
         let request = crate::nats_session::interrupt::InterruptRequest {
             session_id: harnx_core::session_identity::session_key(Some(&self.agent), &session_id),
             cluster: self.route.cluster().to_string(),
+            replicas: self.replicas,
             cancellation_id: uuid::Uuid::now_v7().to_string(),
             requested_by: "session_cancel".to_string(),
             reason: "cancelled via session_cancel tool".into(),
@@ -605,6 +612,7 @@ impl Toolset for SubagentToolset {
         let request = crate::nats_session::interrupt::InterruptRequest {
             session_id: harnx_core::session_identity::session_key(Some(&self.agent), child),
             cluster: self.route.cluster().to_string(),
+            replicas: self.replicas,
             cancellation_id: uuid::Uuid::now_v7().to_string(),
             requested_by: format!("parent:{parent}"),
             reason: "parent interrupted".into(),

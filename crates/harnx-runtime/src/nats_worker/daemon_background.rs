@@ -201,7 +201,12 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
     let toolset = Arc::new(SubagentToolset::new(
         agent,
         route,
-        super::subagent_toolset::SubagentNats::new(client.clone(), jetstream, session_metadata),
+        super::subagent_toolset::SubagentNats::new(
+            client.clone(),
+            jetstream,
+            session_metadata,
+            replicas,
+        ),
     ));
     let server_name = harnx_toolset::Toolset::name(toolset.as_ref()).to_string();
     let identity_token = harnx_toolset::server_identity_token(package.as_deref(), "", &server_name);

@@ -47,7 +47,7 @@ mod nats_test {
         store.create(&metadata).await?;
 
         // Append a TurnEnd without bumping attention (simulate lost bump)
-        let log = NatsSessionLog::new(jetstream.clone(), storage_key.clone());
+        let log = NatsSessionLog::new(jetstream.clone(), storage_key.clone()).with_replicas(1);
         log.append_event_async(&SessionLogEntry::Message {
             id: None,
             role: MessageRole::User,

@@ -1194,6 +1194,7 @@ mod tests {
             jetstream,
             harnx_core::session_identity::session_key(Some("plain"), &session_id),
         )
+        .with_replicas(1)
         .append_event_async(
             &harnx_core::session::SessionLogEntry::HitlApprovalRequested {
                 tool_call_id: "gated-call".to_string(),

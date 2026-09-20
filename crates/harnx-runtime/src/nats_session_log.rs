@@ -20,6 +20,7 @@ pub struct NatsSessionLog {
     session_id: String,
     stream_name: String,
     subject: String,
+    creation_replicas: Option<usize>,
 }
 
 impl NatsSessionLog {
@@ -32,7 +33,11 @@ impl NatsSessionLog {
         )
     }
 
-    /// Open a transcript by its agent-scoped storage key.
+    /// Open an existing transcript by its agent-scoped storage key.
+    ///
+    /// This handle never creates a missing stream. Call [`Self::new_with_replicas`]
+    /// when the caller knows the cluster's configured replica count and may be
+    /// the first process to touch the transcript.
     pub fn new(jetstream: jetstream::Context, session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
         Self {
@@ -40,7 +45,23 @@ impl NatsSessionLog {
             stream_name: stream_name_for_session(&session_id),
             subject: subject_for_session(&session_id),
             session_id,
+            creation_replicas: None,
         }
+    }
+
+    /// Open or create a transcript using the cluster's configured replica count.
+    pub fn new_with_replicas(
+        jetstream: jetstream::Context,
+        session_id: impl Into<String>,
+        replicas: usize,
+    ) -> Self {
+        Self::new(jetstream, session_id).with_replicas(replicas)
+    }
+
+    /// Allow this handle to create a missing transcript with `replicas` copies.
+    pub fn with_replicas(mut self, replicas: usize) -> Self {
+        self.creation_replicas = Some(replicas);
+        self
     }
 
     pub async fn append_event_async(&self, entry: &SessionLogEntry) -> Result<u64> {
@@ -118,7 +139,18 @@ impl NatsSessionLog {
         entry: &SessionLogEntry,
         publish_message: PublishMessage,
     ) -> Result<u64> {
-        harnx_nats_common::recovery::read(|| self.ensure_stream()).await?;
+        // Retry transient broker failures while opening the stream, but stop
+        // immediately on a "stream not found": for an open-existing-only handle
+        // (`creation_replicas == None`) that's a policy error, not a blip, so
+        // retrying it just burns the recovery window before the same failure.
+        // A creation-capable handle never sees not-found here (`get_or_create`
+        // makes it), so this only changes the None path.
+        harnx_nats_common::recovery::retry_until(
+            tokio::time::Instant::now() + harnx_nats_common::recovery::RECOVERY_TIMEOUT,
+            || self.ensure_stream(),
+            |error| !is_stream_not_found(error),
+        )
+        .await?;
         let payload = serialize_entry(entry)?;
         // The same message ID and CAS expectation survive a lost publish ack.
         // A conflict is authoritative and is never retried as a new append.
@@ -144,7 +176,6 @@ impl NatsSessionLog {
     }
 
     pub async fn load_events_async(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
-        self.ensure_stream().await?;
         self.read_all_from(1).await
     }
 
@@ -170,7 +201,9 @@ impl NatsSessionLog {
         &self,
         min_seq: u64,
     ) -> Result<Vec<(u64, SessionLogEntry)>> {
-        let mut stream = self.ensure_stream().await?;
+        let Some(mut stream) = self.open_stream_for_read().await? else {
+            return Ok(Vec::new());
+        };
         if min_seq > 0 {
             let deadline = tokio::time::Instant::now() + READ_TIMEOUT;
             loop {
@@ -228,7 +261,9 @@ impl NatsSessionLog {
     }
 
     pub async fn load_events_latest_async(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
-        let mut stream = self.ensure_stream().await?;
+        let Some(mut stream) = self.open_stream_for_read().await? else {
+            return Ok(Vec::new());
+        };
         let Some(latest) = self.last_raw_message(&stream).await? else {
             return Ok(Vec::new());
         };
@@ -249,21 +284,45 @@ impl NatsSessionLog {
     }
 
     async fn ensure_stream(&self) -> Result<jetstream::stream::Stream> {
+        let Some(replicas) = self.creation_replicas else {
+            return self
+                .jetstream
+                .get_stream(&self.stream_name)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to open existing JetStream log stream '{}' for session '{}' without a configured creation replica count",
+                        self.stream_name, self.session_id
+                    )
+                });
+        };
+
         self.jetstream
             .get_or_create_stream(StreamConfig {
                 name: self.stream_name.clone(),
                 subjects: vec![self.subject.clone()],
                 retention: RetentionPolicy::Limits,
                 duplicate_window: DUPLICATE_WINDOW,
+                num_replicas: replicas,
                 ..Default::default()
             })
             .await
             .with_context(|| {
                 format!(
-                    "Failed to create or open JetStream log stream '{}' for session '{}'",
-                    self.stream_name, self.session_id
+                    "Failed to create or open JetStream log stream '{}' for session '{}' with {} replicas",
+                    self.stream_name, self.session_id, replicas
                 )
             })
+    }
+
+    async fn open_stream_for_read(&self) -> Result<Option<jetstream::stream::Stream>> {
+        match self.ensure_stream().await {
+            Ok(stream) => Ok(Some(stream)),
+            Err(error) if self.creation_replicas.is_none() && is_stream_not_found(&error) => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Read all persisted entries with stream sequence `>= start_sequence`.
@@ -276,7 +335,9 @@ impl NatsSessionLog {
     /// runtime). Direct get works regardless of runtime flavor and never blocks
     /// on future messages. Each lookup is bounded by `READ_TIMEOUT`.
     async fn read_all_from(&self, start_sequence: u64) -> Result<Vec<(u64, SessionLogEntry)>> {
-        let mut stream = self.ensure_stream().await?;
+        let Some(mut stream) = self.open_stream_for_read().await? else {
+            return Ok(Vec::new());
+        };
         let stream_info = stream.info().await.with_context(|| {
             format!(
                 "Failed to inspect JetStream log stream '{}' for session '{}'",
@@ -343,6 +404,19 @@ impl NatsSessionLog {
         }
         Ok(entries)
     }
+}
+
+fn is_stream_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<jetstream::context::GetStreamError>()
+            .is_some_and(|error| match error.kind() {
+                jetstream::context::GetStreamErrorKind::JetStream(error) => {
+                    error.kind() == jetstream::ErrorCode::STREAM_NOT_FOUND
+                }
+                _ => false,
+            })
+    })
 }
 
 /// Outcome of [`NatsSessionLog::append_fenced`].

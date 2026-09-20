@@ -68,9 +68,13 @@ impl WorkerRuntime {
         // Build the backend for control-plane operations and state reconstruction.
         // Share the `after_seq` high-water mark for event-sink fan-out advisories;
         // worker tail reads themselves use leader-authoritative `load_events_latest_async`.
-        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id)
-            .with_after_seq_observer(Arc::clone(&after_seq_observer))
-            .with_metadata_store(Some(self.session_metadata.clone()));
+        let backend = NatsSessionLogBackend::new(
+            self.jetstream.clone(),
+            &activation.session_id,
+            self.lease.replicas,
+        )
+        .with_after_seq_observer(Arc::clone(&after_seq_observer))
+        .with_metadata_store(Some(self.session_metadata.clone()));
 
         // Follow the session's own stream concurrently with the turn: a
         // foreign `Cancel` is the only thing that can interrupt it, and a
@@ -415,7 +419,7 @@ mod attention_tests {
             .unwrap();
 
         // Create backend with metadata store attached
-        let backend = NatsSessionLogBackend::new(jetstream.clone(), &storage_key)
+        let backend = NatsSessionLogBackend::new(jetstream.clone(), &storage_key, 1)
             .with_metadata_store(Some(store.clone()));
 
         // Acquire a lease for the session
@@ -485,7 +489,7 @@ mod attention_tests {
             ))
             .await
             .unwrap();
-        let backend = NatsSessionLogBackend::new(jetstream.clone(), &storage_key)
+        let backend = NatsSessionLogBackend::new(jetstream.clone(), &storage_key, 1)
             .with_metadata_store(Some(store.clone()));
         let lease =
             crate::nats_worker::backend::test_session_authority(&jetstream, &storage_key, &store)
@@ -550,7 +554,7 @@ mod attention_tests {
             .await
             .unwrap();
 
-        let backend = NatsSessionLogBackend::new(jetstream.clone(), &storage_key)
+        let backend = NatsSessionLogBackend::new(jetstream.clone(), &storage_key, 1)
             .with_metadata_store(Some(store.clone()));
 
         let lease =

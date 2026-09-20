@@ -413,6 +413,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
             event_sink: event_sink.as_ref(),
             after_seq_observer: after_seq_observer.as_ref(),
             metadata_store: session_metadata,
+            replicas: attachment_sync.replicas(),
         })
     });
 
@@ -430,7 +431,11 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
 
     dispatch_context_session_start(&ctx, session_origin, session_id).await;
 
-    let backend = NatsSessionLogBackend::new(jetstream_ctx.clone(), session_id);
+    let backend = NatsSessionLogBackend::new(
+        jetstream_ctx.clone(),
+        session_id,
+        attachment_sync.replicas(),
+    );
     let hitl_continuation = derive_hitl_tool_round_continuation(&backend.load_events_blocking()?)?;
 
     let segment_args = AgentLoopSegmentArgs {
@@ -444,6 +449,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         activation_route,
         event_sink,
         lease,
+        replicas: attachment_sync.replicas(),
     };
     // Journal/gate I/O adds depth below tool dispatch. Keep segment construction
     // out of this activation frame as well as the enclosing daemon frame.
@@ -510,8 +516,12 @@ async fn prepare_agent_session(
     params: PrepareAgentSessionParams<'_>,
 ) -> Result<(jetstream::Context, SessionOrigin, SessionAttachmentSync)> {
     let cfg_snapshot = params.config.read().clone();
+    let replicas = cfg_snapshot
+        .resolve_nats_server(params.cluster_key)
+        .await?
+        .resolved_replicas();
     let jetstream = cfg_snapshot.nats_jetstream(params.cluster_key).await?;
-    let mut backend = NatsSessionLogBackend::new(jetstream.clone(), params.session_id);
+    let mut backend = NatsSessionLogBackend::new(jetstream.clone(), params.session_id, replicas);
     if let Some(observer) = params.after_seq_observer {
         backend = backend.with_after_seq_observer(observer);
     }
@@ -681,6 +691,7 @@ struct AgentLoopSegmentArgs<'a> {
     activation_route: super::SessionActivationRoute,
     event_sink: Option<Arc<NatsEventSink>>,
     lease: Option<Arc<NatsSessionLease>>,
+    replicas: usize,
 }
 
 /// Resolve the active agent's hooks and hand them to [`agent_hook_start_config`].
@@ -844,7 +855,7 @@ async fn dispatch_nats_handoff(
     let requested_session_id = session_id.filter(|session_id| !session_id.trim().is_empty());
     let destination = resolve_handoff_destination(args, &agent).await?;
     args.ctx.check_generation("handoff-create")?;
-    let target_session = NatsSession::new(
+    let target_session = NatsSession::new_with_resolved_replicas(
         NatsSessionConfig {
             cluster: destination.cluster,
             initializer: crate::SessionInitializer::named(
@@ -854,6 +865,7 @@ async fn dispatch_nats_handoff(
             session_id: requested_session_id,
             activation_route: destination.activation_route,
         },
+        destination.replicas,
         destination.client,
         destination.jetstream,
         args.abort_signal.clone(),
@@ -889,6 +901,7 @@ struct HandoffDestination {
     cluster: String,
     activation_route: super::SessionActivationRoute,
     committed_agent: String,
+    replicas: usize,
     client: async_nats::Client,
     jetstream: jetstream::Context,
 }
@@ -913,6 +926,7 @@ async fn resolve_handoff_destination(
                 cluster: args.cluster_key.to_string(),
                 activation_route: args.activation_route.clone(),
                 committed_agent,
+                replicas: args.replicas,
                 client: args.jetstream_ctx.client().clone(),
                 jetstream: args.jetstream_ctx.clone(),
             })
@@ -923,6 +937,10 @@ async fn resolve_handoff_destination(
         } => {
             let target_cluster = cluster.into_owned();
             let config = args.config.read().clone();
+            let replicas = config
+                .resolve_nats_server(&target_cluster)
+                .await?
+                .resolved_replicas();
             let client = config
                 .nats_client(&target_cluster)
                 .await
@@ -932,6 +950,7 @@ async fn resolve_handoff_destination(
                 cluster: target_cluster,
                 activation_route: super::SessionActivationRoute::ClusterShared,
                 committed_agent: agent.to_string(),
+                replicas,
                 jetstream: jetstream::new(client.clone()),
                 client,
             })
@@ -964,6 +983,7 @@ async fn emit_handoff_committed(
     let backend = crate::nats_worker::backend::NatsSessionLogBackend::new(
         args.jetstream_ctx.clone(),
         args.source_session_id,
+        args.replicas,
     );
     let after_seq = backend
         .append_event(&harnx_core::session::SessionLogEntry::HandoffCommitted {
@@ -2002,6 +2022,7 @@ mod hitl_attention_tests {
             event_sink: None,
             after_seq_observer: Some(&after_seq_observer),
             metadata_store: Some(&store),
+            replicas: 1,
         };
         let callback = build_hitl_approval_request_callback_for_test(ctx);
 

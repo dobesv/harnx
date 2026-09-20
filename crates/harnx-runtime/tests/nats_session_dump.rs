@@ -65,7 +65,8 @@ async fn seed_test_log_entries(
     jetstream: &async_nats::jetstream::Context,
     session_id: &str,
 ) -> Result<NatsSessionLog> {
-    let log = NatsSessionLog::for_agent(jetstream.clone(), "test-agent", session_id);
+    let log =
+        NatsSessionLog::for_agent(jetstream.clone(), "test-agent", session_id).with_replicas(1);
     log.append_event_async(&SessionLogEntry::Message {
         id: Some("m1".to_string()),
         role: MessageRole::User,
@@ -129,7 +130,7 @@ async fn session_dump_follow_refresh_recovers_after_transient_failure() -> Resul
 
     // Seed one durable entry through the real `$JS.API` so the stream exists
     // and `attach` observes normal history.
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), session_id.clone(), 1);
     log.append_event_async(&SessionLogEntry::Message {
         id: Some("m1".to_string()),
         role: MessageRole::User,

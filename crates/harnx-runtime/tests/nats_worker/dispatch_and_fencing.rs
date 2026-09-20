@@ -159,7 +159,7 @@ async fn seed_and_publish_activation(
     session_id: &str,
     user_text: &str,
 ) -> Result<SessionActivate> {
-    NatsSessionLog::new(jetstream.clone(), storage_key(session_id))
+    NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(session_id), 1)
         .append_event_async(&SessionLogEntry::Message {
             id: None,
             role: harnx_core::message::MessageRole::User,
@@ -170,7 +170,7 @@ async fn seed_and_publish_activation(
         .await?;
     seed_session_metadata(jetstream, session_id).await?;
     let activation = SessionActivate::new(storage_key(session_id));
-    publish_session_activate(jetstream, "local", &activation).await?;
+    publish_session_activate(jetstream, "local", &activation, 1).await?;
     Ok(activation)
 }
 
@@ -193,7 +193,7 @@ async fn two_workers_share_the_activation_queue_and_dispatch_is_deduplicated() -
     let first_session_id = "dispatch-session-one";
     let first_activation =
         seed_and_publish_activation(&jetstream, first_session_id, "hello worker one").await?;
-    publish_session_activate(&jetstream, "local", &first_activation).await?;
+    publish_session_activate(&jetstream, "local", &first_activation, 1).await?;
     workers
         .wait_for_execution_count("first dispatch", 1)
         .await?;
@@ -276,7 +276,7 @@ async fn fenced_sink_rejects_append_when_lease_lost() -> Result<()> {
     // Verify the persisted entry carries the lease revision. A renewal between
     // the read above and the append only advances it, so the stamp is at least
     // what the lease held going in.
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
     let loaded = log.load_events_async().await?;
     let stamped = loaded
         .iter()
@@ -336,7 +336,7 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
     };
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "resume-fence-session";
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
     append_resume_fence_seed(&log).await?;
     let lease = acquire_test_lease(js.clone(), session_id, "worker-stale").await?;
 

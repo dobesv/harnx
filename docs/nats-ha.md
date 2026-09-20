@@ -28,7 +28,7 @@ nats-server -js
 
 For production HA, run a NATS cluster with at least 3 nodes and set `replicas: 3`
 in the cluster's `nats_servers/<cluster_key>.yaml` (see the production example
-below) so the buckets harnx creates survive losing a node.
+below) so the resources harnx creates survive losing a node.
 
 ### Session identity
 
@@ -92,7 +92,8 @@ Harnx automatically manages the following JetStream resources:
   uses stream names as directory names, so simply preserving case still aliases
   distinct IDs on case-insensitive filesystems. The fixed-length digest also
   avoids filename length limits. Subjects carry the storage key; user-visible
-  local IDs remain unchanged.
+  local IDs remain unchanged. Honours the cluster's configured `replicas` count
+  at creation.
   Earlier stream names are not migrated; start fresh sessions after upgrading.
 - **Object Store**: `harnx_attachments` stores binary attachment payloads under
   session-scoped object names. Conversation entries contain only `cid:`
@@ -102,7 +103,8 @@ Harnx automatically manages the following JetStream resources:
   `cluster.<cluster>.sessions.notify` with cluster-shared work-queue dispatch.
   All cluster workers bind to one shared durable pull consumer; per-worker
   durables would have overlapping filters and be rejected by the work-queue
-  stream. The session lease deduplicates dispatch.
+  stream. The session lease deduplicates dispatch. Honours the cluster's
+  configured `replicas` count.
 
   Rollout note: clusters that ran an older build have a stale `worker-<id>`
   durable per worker on this stream. Those durables are inert once workers move
@@ -111,12 +113,25 @@ Harnx automatically manages the following JetStream resources:
   `WORK_NOTIFY_<cluster>` after the last old worker stops.
 - **Local activation stream**: `LOCAL_WORK_NOTIFY_V2` captures
   `session_scope.__local__.workers.*.sessions.notify` with interest retention
-  and one exact durable consumer per frontend worker ID.
+  and one exact durable consumer per frontend worker ID. Intentionally R1
+  (single-node by design; frontend-local).
 
-All of the KV buckets and the attachment object store above are created with
-the `replicas` count from the cluster's config (`None` means 1, no HA). Set it
-to 3 to match a 3-node cluster; a mismatch between the two is what leaves a
-bucket unable to tolerate a node loss.
+The following JetStream resources honour the cluster's configured `replicas`
+count (`None` means 1, no HA):
+
+- **Honour `replicas`**:
+  - All KV buckets (`harnx_leases`, `harnx_sessions`, `harnx_tool_registry`,
+    `harnx_hook_registry`, `harnx_hook_expectations`, and
+    `harnx_tool_invocations`)
+  - Attachment object store (`harnx_attachments`)
+  - Session transcript streams (`SESSION_<sha256(id)>`)
+  - Cluster activation stream (`WORK_NOTIFY_<cluster>`)
+- **Do not honour `replicas` (by design)**:
+  - Local activation stream (`LOCAL_WORK_NOTIFY_V2`) — intentionally R1
+    (single-node by design; frontend-local)
+
+Set `replicas` to 3 to match a 3-node cluster; a mismatch between the two leaves
+resources unable to tolerate a node loss.
 
 For NATS sessions, a local `cid:` file is only a cache entry. New local or
 inline payloads are uploaded before their `cid:` is appended to the transcript;
@@ -133,6 +148,13 @@ misconfiguration is better than silently running at `replicas: 1` while an
 operator believes they have HA. It only affects buckets that don't exist
 yet — a bucket created earlier at a lower `replicas` and later pointed at a
 higher one gets raised in place instead.
+
+Because KV buckets are created at startup at the configured `replicas` count,
+a cluster that cannot support the count fails loudly at startup before any
+session transcript stream is created. Per-session streams are created lazily on
+first write at the same replica count; if the cluster later loses placement
+capacity, stream creation surfaces the error rather than silently falling back
+to R1.
 
 **Reconcile only ever raises `replicas`, never lowers it.** Some callers
 (the hourly remote-session GC lease, for one) don't necessarily know the
@@ -335,7 +357,7 @@ url: "nats://localhost:4222"
 ```yaml
 url: "nats://nats.example.com:4222"
 token: "${NATS_TOKEN}"
-replicas: 3   # JetStream replica count for buckets harnx creates; defaults to 1
+replicas: 3   # JetStream replica count for resources harnx creates; defaults to 1
 tls: true
 tls_cert: "/etc/harnx/client-cert.pem"
 tls_key: "/etc/harnx/client-key.pem"

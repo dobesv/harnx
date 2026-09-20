@@ -60,7 +60,7 @@ async fn cancel_appends_entry_before_abort() -> Result<()> {
     let js = async_nats::jetstream::new(client.clone());
     let session_id = "control-cancel-session";
 
-    let log = NatsSessionLog::new(js.clone(), session_id);
+    let log = NatsSessionLog::new_with_replicas(js.clone(), session_id, 1);
     log.append_event_async(&SessionLogEntry::Message {
         id: None,
         role: harnx_core::message::MessageRole::User,
@@ -112,7 +112,7 @@ async fn cancel_prevents_resume_on_reactivation() -> Result<()> {
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "control-cancel-no-resume";
 
-    let log = NatsSessionLog::new(js.clone(), session_id);
+    let log = NatsSessionLog::new_with_replicas(js.clone(), session_id, 1);
     log.append_event_async(&SessionLogEntry::Message {
         id: None,
         role: harnx_core::message::MessageRole::User,

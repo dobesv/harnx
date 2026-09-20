@@ -53,6 +53,10 @@ pub(crate) struct SessionAttachmentSync {
 }
 
 impl SessionAttachmentSync {
+    pub(crate) fn replicas(&self) -> usize {
+        self.replicas
+    }
+
     pub(crate) async fn prepare(
         jetstream: jetstream::Context,
         config: crate::config::GlobalConfig,

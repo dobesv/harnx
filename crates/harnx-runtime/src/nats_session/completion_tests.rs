@@ -34,7 +34,7 @@ async fn nats_completion_reads_only_entries_after_its_successful_cursor() -> Res
         return Ok(());
     };
     let js = async_nats::jetstream::new(client.clone());
-    let log = NatsSessionLog::new(js.clone(), "incremental");
+    let log = NatsSessionLog::new_with_replicas(js.clone(), "incremental", 1);
     log.append_event_async(&SessionLogEntry::Cancel {
         fence_token: 1,
         cancellation_id: None,

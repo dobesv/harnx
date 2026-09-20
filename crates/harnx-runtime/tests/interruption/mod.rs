@@ -42,7 +42,7 @@ use std::time::Duration;
 use tokio_util::task::AbortOnDropHandle;
 
 fn log(js: &async_nats::jetstream::Context, key: &str) -> NatsSessionLog {
-    NatsSessionLog::new(js.clone(), key)
+    NatsSessionLog::new_with_replicas(js.clone(), key, 1)
 }
 
 fn user(text: &str) -> Entry {
@@ -146,7 +146,7 @@ async fn turn_writer(
         .last()
         .map_or(0, |(seq, _)| *seq);
     Ok(FencedSessionLogSink::new(
-        NatsSessionLogBackend::new(js.clone(), session_key)
+        NatsSessionLogBackend::new(js.clone(), session_key, 1)
             .with_after_seq_observer(Arc::new(AtomicU64::new(tail))),
         lease,
     ))
@@ -490,6 +490,7 @@ async fn placeholder_and_real_result_race_yields_exactly_one_tool_results_entry(
         &js,
         "local",
         &SessionActivate::new(&key).with_requested_seq(cancel_seq),
+        1,
     )
     .await?;
 
@@ -845,6 +846,7 @@ async fn no_cancel_is_resent_once_placeholders_are_durable() -> Result<()> {
         &js,
         "local",
         &SessionActivate::new(&key).with_requested_seq(cancel_seq),
+        1,
     )
     .await?;
 

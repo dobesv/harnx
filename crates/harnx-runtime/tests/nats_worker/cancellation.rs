@@ -7,7 +7,7 @@ use harnx_runtime::nats_session::InterruptOutcome;
 /// but without its control-subject hint. Only the worker's own stream watcher
 /// can notice this one.
 async fn append_cancel(js: &async_nats::jetstream::Context, session: &str) -> Result<u64> {
-    harnx_runtime::nats_session_log::NatsSessionLog::new(js.clone(), session)
+    harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(js.clone(), session, 1)
         .append_event_async(&Entry::cancel_request(
             uuid::Uuid::now_v7().to_string(),
             "client:test".into(),
@@ -28,9 +28,13 @@ fn accepted_seq(outcome: InterruptOutcome) -> Result<u64> {
 async fn await_cancel_entry(js: &async_nats::jetstream::Context, session: &str) -> Result<u64> {
     tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {
-            let entries = harnx_runtime::nats_session_log::NatsSessionLog::new(js.clone(), session)
-                .load_events_latest_async()
-                .await?;
+            let entries = harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(
+                js.clone(),
+                session,
+                1,
+            )
+            .load_events_latest_async()
+            .await?;
             if let Some(seq) = entries
                 .iter()
                 .find_map(|(seq, entry)| matches!(entry, Entry::Cancel { .. }).then_some(*seq))
@@ -133,20 +137,24 @@ async fn resume_with_cancel_winds_up_and_does_not_call_model() -> Result<()> {
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     // The turn had already made a tool call, so winding it up is something the
     // log can be checked for rather than a no-op.
-    harnx_runtime::nats_session_log::NatsSessionLog::new(js.clone(), session.storage_key())
-        .append_event_async(&Entry::ToolCalls {
-            text: String::new(),
-            thought: None,
-            calls: vec![ToolCall::new(
-                "slow_tool".into(),
-                json!({}),
-                Some("cut-off-call".into()),
-                None,
-            )],
-            timestamp: None,
-            fence_token: Some(1),
-        })
-        .await?;
+    harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(
+        js.clone(),
+        session.storage_key(),
+        1,
+    )
+    .append_event_async(&Entry::ToolCalls {
+        text: String::new(),
+        thought: None,
+        calls: vec![ToolCall::new(
+            "slow_tool".into(),
+            json!({}),
+            Some("cut-off-call".into()),
+            None,
+        )],
+        timestamp: None,
+        fence_token: Some(1),
+    })
+    .await?;
     let cancel_seq = accepted_seq(session.interrupt("client cancel").await?)?;
     let calls = Arc::new(AtomicUsize::new(0));
     let daemon = spawn_worker_daemon_with_call_fn(
@@ -163,8 +171,11 @@ async fn resume_with_cancel_winds_up_and_does_not_call_model() -> Result<()> {
         await_cancel_entry(&js, session.storage_key()).await?,
         cancel_seq
     );
-    let log =
-        harnx_runtime::nats_session_log::NatsSessionLog::new(js.clone(), session.storage_key());
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(
+        js.clone(),
+        session.storage_key(),
+        1,
+    );
     poll_until(async || {
         Ok(log
             .load_events_latest_async()

@@ -183,10 +183,11 @@ impl ConfirmationHarness {
         self.source
             .run_turn_with_tool_confirmation("start handoff", Arc::new(NullSink), None, handler)
             .await?;
-        let source_entries = NatsSessionLog::new(self.jetstream.clone(), source_key())
-            .load_events_async()
-            .await?;
-        let target_log = NatsSessionLog::new(self.jetstream.clone(), target_key());
+        let source_entries =
+            NatsSessionLog::new_with_replicas(self.jetstream.clone(), source_key(), 1)
+                .load_events_async()
+                .await?;
+        let target_log = NatsSessionLog::new_with_replicas(self.jetstream.clone(), target_key(), 1);
         let target_entries = if approved {
             wait_for_target_turn(&target_log).await?
         } else {
@@ -489,7 +490,7 @@ async fn activate_durable_text(
     jetstream: &async_nats::jetstream::Context,
     text: &str,
 ) -> Result<()> {
-    let log = NatsSessionLog::new(jetstream.clone(), source_key());
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), source_key(), 1);
     log.append_event_async(&SessionLogEntry::Message {
         id: Some(uuid::Uuid::new_v4().to_string()),
         role: MessageRole::User,
@@ -498,7 +499,7 @@ async fn activate_durable_text(
         fence_token: None,
     })
     .await?;
-    publish_session_activate(jetstream, "local", &SessionActivate::new(source_key())).await?;
+    publish_session_activate(jetstream, "local", &SessionActivate::new(source_key()), 1).await?;
     Ok(())
 }
 
@@ -509,7 +510,7 @@ async fn wait_for_source_entry<F>(
 where
     F: FnMut(&SessionLogEntry) -> bool,
 {
-    let log = NatsSessionLog::new(jetstream.clone(), source_key());
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), source_key(), 1);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let entries = log.load_events_async().await?;
@@ -532,7 +533,7 @@ async fn wait_for_source_count<F>(
 where
     F: FnMut(&SessionLogEntry) -> bool,
 {
-    let log = NatsSessionLog::new(jetstream.clone(), source_key());
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), source_key(), 1);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let entries = log.load_events_async().await?;
@@ -602,9 +603,10 @@ async fn completed_approval_does_not_authorize_reused_tool_call_id() -> Result<(
         1,
     )
     .await?;
-    wait_for_target_turn(&NatsSessionLog::new(
+    wait_for_target_turn(&NatsSessionLog::new_with_replicas(
         harness.jetstream.clone(),
         target_key(),
+        1,
     ))
     .await?;
 
@@ -649,9 +651,10 @@ async fn completed_approval_does_not_authorize_reused_tool_call_id() -> Result<(
             .await?,
         "reused provider ID must accept a fresh decision for current request"
     );
-    wait_for_target_turn(&NatsSessionLog::new(
+    wait_for_target_turn(&NatsSessionLog::new_with_replicas(
         harness.jetstream.clone(),
         harnx_core::session_identity::session_key(Some("target"), SECOND_TARGET_SESSION_ID),
+        1,
     ))
     .await?;
     Ok(())
@@ -698,9 +701,10 @@ async fn durable_hitl_duplicate_approval_has_one_decision_and_executes_after_it(
         })
         .expect("tool results");
     assert!(decision_seqs[0] < result_seq);
-    wait_for_target_turn(&NatsSessionLog::new(
+    wait_for_target_turn(&NatsSessionLog::new_with_replicas(
         harness.jetstream.clone(),
         target_key(),
+        1,
     ))
     .await?;
     Ok(())
@@ -747,9 +751,10 @@ async fn durable_hitl_denial_writes_audit_and_model_visible_tool_result() -> Res
                     && result.output["error"] == json!("Denied in durable test")
             })
     )));
-    let target_entries = NatsSessionLog::new(harness.jetstream.clone(), target_key())
-        .load_events_async()
-        .await?;
+    let target_entries =
+        NatsSessionLog::new_with_replicas(harness.jetstream.clone(), target_key(), 1)
+            .load_events_async()
+            .await?;
     assert!(target_entries.is_empty());
     Ok(())
 }
@@ -797,9 +802,10 @@ async fn durable_hitl_restart_recovers_pending_and_executes_once() -> Result<()>
             .count(),
         1
     );
-    let target_entries = wait_for_target_turn(&NatsSessionLog::new(
+    let target_entries = wait_for_target_turn(&NatsSessionLog::new_with_replicas(
         harness.jetstream.clone(),
         target_key(),
+        1,
     ))
     .await?;
     assert_eq!(
@@ -901,9 +907,10 @@ async fn queued_continuation_handoff_reuses_live_frontend_confirmation_route() -
         .await
         .context("direct turn did not finish while worker drained continuation")??;
 
-    let target_entries = wait_for_target_turn(&NatsSessionLog::new(
+    let target_entries = wait_for_target_turn(&NatsSessionLog::new_with_replicas(
         harness.jetstream.clone(),
         target_key(),
+        1,
     ))
     .await?;
     assert!(target_entries.iter().any(|(_, entry)| matches!(
@@ -975,9 +982,10 @@ async fn queued_continuation_handoff_denies_after_frontend_route_closes() -> Res
                     && result.switch_agent.is_none()
             })
     )));
-    let target_entries = NatsSessionLog::new(harness.jetstream.clone(), target_key())
-        .load_events_async()
-        .await?;
+    let target_entries =
+        NatsSessionLog::new_with_replicas(harness.jetstream.clone(), target_key(), 1)
+            .load_events_async()
+            .await?;
     assert!(
         target_entries.is_empty(),
         "dead frontend route must deny without activating target"
@@ -993,7 +1001,7 @@ async fn queued_continuation_handoff_denies_after_frontend_route_closes() -> Res
 async fn wait_for_blocked_handoff(
     jetstream: &async_nats::jetstream::Context,
 ) -> Result<Vec<(u64, SessionLogEntry)>> {
-    let log = NatsSessionLog::new(jetstream.clone(), source_key());
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), source_key(), 1);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let entries = log.load_events_async().await?;
@@ -1026,7 +1034,7 @@ fn target_key() -> String {
 }
 
 async fn seed_pending_hitl_round(harness: &ConfirmationHarness) -> Result<()> {
-    let log = NatsSessionLog::new(harness.jetstream.clone(), source_key());
+    let log = NatsSessionLog::new_with_replicas(harness.jetstream.clone(), source_key(), 1);
     log.append_event_async(&SessionLogEntry::Message {
         id: Some(uuid::Uuid::new_v4().to_string()),
         role: MessageRole::User,

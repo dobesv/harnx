@@ -18,7 +18,7 @@ async fn hitl_handoff_stale_worker_loses_decision_and_execution_race() -> Result
     let stale_lease = acquire(&jetstream, &lease_config, "stale-hitl-worker")
         .await?
         .context("stale worker acquires lease")?;
-    let log = NatsSessionLog::new(jetstream.clone(), source_key());
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), source_key(), 1);
     let stale_expected = seed_pending(&log, &stale_lease).await?;
     stale_lease.stop_renewal_for_test().await;
     let replacement_lease = replacement(&jetstream, &lease_config).await?;

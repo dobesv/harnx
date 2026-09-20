@@ -18,7 +18,7 @@ async fn fenced_append_reports_the_cancel_that_moved_the_tail() {
         return;
     };
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await.unwrap());
-    let log = NatsSessionLog::new(js, "fenced-session");
+    let log = NatsSessionLog::new_with_replicas(js, "fenced-session", 1);
     let tail = log.append_event_async(&user("go")).await.unwrap();
     // Another writer interrupts before the worker's next append.
     let cancel = SessionLogEntry::cancel_request("c-1".into(), "test".into());

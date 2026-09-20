@@ -71,10 +71,10 @@ async fn seed_and_activate(
     store
         .create(&SessionMetadata::new(session_id, initializer))
         .await?;
-    NatsSessionLog::new(jetstream.clone(), &storage_key)
+    NatsSessionLog::new_with_replicas(jetstream.clone(), &storage_key, 1)
         .append_event_async(&append_user_message_entry(message_id, message_id))
         .await?;
-    publish_session_activate(jetstream, "local", &SessionActivate::new(storage_key)).await?;
+    publish_session_activate(jetstream, "local", &SessionActivate::new(storage_key), 1).await?;
     Ok(())
 }
 
@@ -188,9 +188,10 @@ async fn missing_named_agent_fails_durably_without_calling_the_model() -> Result
         },
     )
     .await?;
-    let log = NatsSessionLog::new(
+    let log = NatsSessionLog::new_with_replicas(
         jetstream,
         harnx_core::session_identity::session_key(Some("does-not-exist"), session_id),
+        1,
     );
 
     let entries = tokio::time::timeout(CI_SAFE_TIMEOUT, async {

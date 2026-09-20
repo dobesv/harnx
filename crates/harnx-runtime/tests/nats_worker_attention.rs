@@ -122,7 +122,7 @@ async fn turn_end_bumps_attention_via_backend() -> Result<()> {
     // Append some messages to have a valid through_seq
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), session_id.clone(), 1);
     log.append_event_async(&user_message_entry("test prompt"))
         .await?;
     log.append_event_async(&assistant_message_entry("test reply"))
@@ -164,7 +164,7 @@ async fn hitl_approval_requested_bumps_attention_via_backend() -> Result<()> {
     // Append a HitlApprovalRequested without any bump (simulating lost bump)
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), session_id.clone(), 1);
     log.append_event_async(&SessionLogEntry::HitlApprovalRequested {
         tool_call_id: "test-call-123".to_string(),
         summary: "Approve this".to_string(),
@@ -206,7 +206,7 @@ async fn reconcile_attention_from_log_repairs_lost_bump() -> Result<()> {
     // Append a TurnEnd without any bump (simulating lost bump - append directly to log)
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), session_id.clone(), 1);
     log.append_event_async(&turn_end_entry(1)).await?;
 
     // Verify session is NOT unread before reconcile (no bump was done)

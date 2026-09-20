@@ -108,7 +108,7 @@ impl InterruptedTurn {
             ))
             .await
             .unwrap();
-        let log = NatsSessionLog::new(jetstream.clone(), storage_key.clone());
+        let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key.clone(), 1);
         log.append_event_async(&user("run them")).await.unwrap();
         let round = log
             .append_event_async(&SessionLogEntry::ToolCalls {
@@ -130,7 +130,7 @@ impl InterruptedTurn {
         Self {
             journal: InvocationJournal::ensure(&jetstream, 1).await.unwrap(),
             lease: test_session_authority(&jetstream, &storage_key, &metadata).await,
-            backend: NatsSessionLogBackend::new(jetstream.clone(), &storage_key),
+            backend: NatsSessionLogBackend::new(jetstream.clone(), &storage_key, 1),
             client,
             jetstream,
             log,
@@ -515,8 +515,8 @@ impl LeasedSession {
             .unwrap();
         Self {
             lease: test_session_authority(&jetstream, &storage_key, &metadata).await,
-            backend: NatsSessionLogBackend::new(jetstream.clone(), &storage_key),
-            log: NatsSessionLog::new(jetstream, storage_key),
+            backend: NatsSessionLogBackend::new(jetstream.clone(), &storage_key, 1),
+            log: NatsSessionLog::new_with_replicas(jetstream, storage_key, 1),
         }
     }
 }

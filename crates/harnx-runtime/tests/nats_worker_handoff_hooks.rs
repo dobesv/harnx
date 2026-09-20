@@ -414,9 +414,10 @@ async fn handoff_to_agent_with_hooks_starts_its_hook_enforcement() -> Result<()>
         .run_turn("start handoff", Arc::new(NullSink), None)
         .await?;
 
-    let target_log = NatsSessionLog::new(
+    let target_log = NatsSessionLog::new_with_replicas(
         js,
         harnx_core::session_identity::session_key(Some("beta"), "handoff-hooks-remote-session"),
+        1,
     );
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     let target_entries = loop {
@@ -498,9 +499,10 @@ async fn completed_agent_turn_cleans_hook_routes_before_next_handoff() -> Result
         .await?;
     assert_hook_routes_cleaned(&client).await?;
 
-    let target_log = NatsSessionLog::new(
+    let target_log = NatsSessionLog::new_with_replicas(
         js,
         harnx_core::session_identity::session_key(Some("target"), "hook-cleanup-target"),
+        1,
     );
     wait_for_successful_target_turn(&target_log).await?;
 

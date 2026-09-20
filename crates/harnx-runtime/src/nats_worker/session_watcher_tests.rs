@@ -51,7 +51,7 @@ impl WatchedSession {
         let jetstream = async_nats::jetstream::new(client.clone());
         let session_id = "watcher-s1".to_string();
 
-        let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+        let log = NatsSessionLog::new_with_replicas(jetstream.clone(), session_id.clone(), 1);
         log.append_event_async(&user("hi")).await.unwrap(); // seq 1
 
         let control_subject = "watcher-s1.control-test".to_string();
@@ -128,7 +128,8 @@ async fn foreign_cancel_interrupts_and_publishes_tool_cancels() {
     // A second connection stands in for the frontend that appends entries.
     let second_client = async_nats::connect(server.url()).await.unwrap();
     let second_js = async_nats::jetstream::new(second_client);
-    let second_log = NatsSessionLog::new(second_js.clone(), watched.session_id.clone());
+    let second_log =
+        NatsSessionLog::new_with_replicas(second_js.clone(), watched.session_id.clone(), 1);
 
     // An undecodable entry (seq 2) must be skipped, not restart the
     // consumer: the Cancel appended right after it still has to land.

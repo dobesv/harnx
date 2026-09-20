@@ -107,7 +107,7 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
 
     let js = local_test_nats(server.url()).await?;
     let session_id = "retracted-orphan-test";
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
 
     seed_session_metadata(&js, session_id).await?;
     // Deliberately NO unanswered user message in the seed: the log must contain

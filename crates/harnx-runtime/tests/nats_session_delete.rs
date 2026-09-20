@@ -31,7 +31,7 @@ impl TestSessionSetup {
         storage_key: &str,
         session_id: &str,
     ) -> Result<Self> {
-        let log = NatsSessionLog::new(jetstream.clone(), storage_key);
+        let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key, 1);
         append_user_message(&log).await?;
 
         let lease = harnx_runtime::nats_lease::NatsSessionLease::acquire(

@@ -77,7 +77,7 @@ async fn end_of_turn_reread_runs_continuation_turn_with_same_activation() -> Res
 
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "end-turn-reread";
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
 
     // CRITICAL: Create the notified future BEFORE publishing the activate
     // to avoid lost wakeup race between notify_one() and notified().await
@@ -171,7 +171,7 @@ async fn idle_concurrent_messages_fold_in_seq_order_into_single_turn() -> Result
 
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "fold-order";
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
     log.append_event_async(&append_user_message_entry("user-1", "alpha"))
         .await?;
     log.append_event_async(&append_user_message_entry("user-2", "beta"))

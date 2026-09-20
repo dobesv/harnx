@@ -18,6 +18,7 @@ fn request(session: &str, id: &str) -> InterruptRequest {
     InterruptRequest {
         session_id: session.into(),
         cluster: "local".into(),
+        replicas: 1,
         cancellation_id: id.into(),
         requested_by: "test".into(),
         reason: "test".into(),
@@ -31,7 +32,7 @@ async fn idle_session_is_not_appended_to() {
     };
     let client = async_nats::connect(server.url()).await.unwrap();
     let js = async_nats::jetstream::new(client.clone());
-    let log = NatsSessionLog::new(js.clone(), "idle-s");
+    let log = NatsSessionLog::new_with_replicas(js.clone(), "idle-s", 1);
     log.append_event_async(&user("hi")).await.unwrap();
     log.append_event_async(&SessionLogEntry::TurnEnd {
         through_seq: 1,
@@ -63,7 +64,7 @@ async fn repeated_interrupt_is_idempotent_by_cancellation_id() {
     };
     let client = async_nats::connect(server.url()).await.unwrap();
     let js = async_nats::jetstream::new(client.clone());
-    let log = NatsSessionLog::new(js.clone(), "busy-s");
+    let log = NatsSessionLog::new_with_replicas(js.clone(), "busy-s", 1);
     log.append_event_async(&user("go")).await.unwrap();
     let first = interrupt_session(
         &js,
@@ -119,7 +120,7 @@ async fn concurrent_user_message_does_not_prevent_the_cancel() {
     };
     let client = async_nats::connect(server.url()).await.unwrap();
     let js = async_nats::jetstream::new(client.clone());
-    let log = NatsSessionLog::new(js.clone(), "race-s");
+    let log = NatsSessionLog::new_with_replicas(js.clone(), "race-s", 1);
     log.append_event_async(&user("go")).await.unwrap();
     // Simulate a frontend appending between the interrupt's tail read and its CAS.
     let racer = log.clone();
@@ -269,6 +270,7 @@ async fn a_stalled_announcement_does_not_fail_an_accepted_interrupt() {
         &js,
         "slow_cluster",
         &crate::nats_worker::SessionActivate::new("unrelated"),
+        1,
     )
     .await
     .unwrap();
@@ -297,9 +299,10 @@ async fn a_stalled_announcement_does_not_fail_an_accepted_interrupt() {
     )
     .await
     .unwrap();
-    let log = NatsSessionLog::new(
+    let log = NatsSessionLog::new_with_replicas(
         session.jetstream().clone(),
         session.storage_key().to_string(),
+        1,
     );
     log.append_event_async(&user("go")).await.unwrap();
 
@@ -403,7 +406,7 @@ async fn interrupt_reads_nothing_below_the_tail() {
     };
     let client = async_nats::connect(server.url()).await.unwrap();
     let js = async_nats::jetstream::new(client.clone());
-    let log = NatsSessionLog::new(js.clone(), "tail-s");
+    let log = NatsSessionLog::new(js.clone(), "tail-s").with_replicas(1);
     log.append_event_async(&user("an earlier turn"))
         .await
         .unwrap();
