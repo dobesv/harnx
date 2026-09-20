@@ -21,8 +21,7 @@ what you need:
 | `harnx-bash-tools`      | Native toolset server exposing bash/subprocess execution with safety guards     | [Bash Toolset Server](docs/bash-mcp-server.md)   |
 | `harnx-fs-tools`        | Toolset server exposing filesystem operations with safety guards                 | [README](crates/harnx-fs-tools/README.md)       |
 | `harnx-plans-tools`     | Native toolset server exposing file-based plan/task/note management             | [README](crates/harnx-plans-tools/README.md)     |
-| `harnx-mcp-plans-github` | MCP server exposing GitHub Issues-backed plan/task/note management              | [README](crates/harnx-mcp-plans-github/README.md)|
-| `harnx-mcp-time`        | MCP server exposing time and timezone utilities                                 | [README](crates/harnx-mcp-time/README.md)        |
+| `harnx-time-tools`       | Native toolset server exposing time and timezone utilities                      | [README](crates/harnx-time-tools/README.md) |
 | `harnx-sandbox-run`     | Run commands inside the birdcage sandbox with hook support                      | [Sandbox Run](docs/sandbox-run.md)               |
 | `harnx-sandbox-exec`    | Low-level birdcage sandbox wrapper with explicit path allow-lists               | [README](crates/harnx-sandbox-common/README.md)  |
 | `harnx-aws-creds`       | Bearer-protected helper that serves AWS credentials to tools                    | [AWS Creds](docs/aws-creds.md)                   |
@@ -181,7 +180,7 @@ Harnx ships with native toolset servers and MCP servers ready to enable in your 
     *   **Filesystem sandboxing via [birdcage](https://crates.io/crates/birdcage)** (Linux/macOS), with explicit `--allow-*` paths and opt-in common, development-tool, and repository batches.
     *   Process group management (kill-on-drop) and background `spawn` + `wait` pattern.
     *   Path validation and history snapshots around mutating commands.
-*   **`harnx-mcp-time`** — Time and timezone utilities (`get_current_time`, `convert_time`, `wait`).
+*   **`harnx-time-tools`** — Time and timezone utilities (`get_current_time`, `convert_time`, `wait`, `wait_until`).
 *   **`harnx-plans-tools`** — File-based plan/task/note management (`list_plans`, `add_task`, `get_task`, etc.)
     *   YAML front-matter markdown storage for plans, tasks, and notes with rich metadata.
 

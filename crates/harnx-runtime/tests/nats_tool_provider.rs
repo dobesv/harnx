@@ -18,7 +18,7 @@ use harnx_runtime::nats_session_metadata::{
     execution_contexts, SessionInitializer, SessionMetadata, SessionMetadataStore,
 };
 use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
-use harnx_time_server::TimeToolset;
+use harnx_time_tools::TimeToolset;
 use harnx_toolset::{server_identity_token, Registration, ToolInvokeError, ToolSpec, Toolset};
 use harnx_toolset_server::{
     registration_key, serve_over_nats, TOOL_PROTOCOL_VERSION, TOOL_REGISTRY_BUCKET,

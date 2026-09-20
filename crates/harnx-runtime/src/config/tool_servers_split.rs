@@ -99,11 +99,11 @@ mod tests {
     #[test]
     fn deserializes_minimal_config_with_defaults() {
         let yaml = r#"
-command: harnx-time-server
+command: harnx-time-tools
 "#;
         let config: ToolServerConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.name, "");
-        assert_eq!(config.command, "harnx-time-server");
+        assert_eq!(config.command, "harnx-time-tools");
         assert!(config.args.is_empty());
         assert!(config.env.is_empty());
         assert!(config.enabled);
@@ -115,7 +115,7 @@ command: harnx-time-server
     #[test]
     fn deserializes_config_with_hooks() {
         let yaml = r#"
-command: harnx-time-server
+command: harnx-time-tools
 hooks:
   max_resume: 3
   entries:
@@ -123,7 +123,7 @@ hooks:
       status_message: "Checking time tool"
 "#;
         let config: ToolServerConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.command, "harnx-time-server");
+        assert_eq!(config.command, "harnx-time-tools");
         let hooks = config.hooks.as_ref().expect("hooks should be parsed");
         assert_eq!(hooks.max_resume, Some(3));
         assert_eq!(hooks.entries.len(), 1);
@@ -164,7 +164,7 @@ hooks:
         fs::create_dir_all(&tool_servers_dir).expect("create tool_servers dir");
         fs::write(
             tool_servers_dir.join("time.yaml"),
-            "command: harnx-time-server\n",
+            "command: harnx-time-tools\n",
         )
         .expect("write time.yaml");
 
@@ -180,7 +180,7 @@ hooks:
         // Verify tool_servers loaded with name = "time"
         assert_eq!(config.tool_servers.len(), 1);
         assert_eq!(config.tool_servers[0].name, "time");
-        assert_eq!(config.tool_servers[0].command, "harnx-time-server");
+        assert_eq!(config.tool_servers[0].command, "harnx-time-tools");
         assert!(config.tool_servers[0].package.is_none());
     }
 
@@ -196,7 +196,7 @@ hooks:
         fs::create_dir_all(&package_tool_servers).expect("create package tool_servers dir");
         fs::write(
             package_tool_servers.join("time.yaml"),
-            "command: harnx-time-server\n",
+            "command: harnx-time-tools\n",
         )
         .expect("write package time.yaml");
         let _env_guard = EnvGuard::new("HARNX_CONFIG_DIR", config_dir);

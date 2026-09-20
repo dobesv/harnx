@@ -75,7 +75,7 @@ async fn test_repo_lock_for_paths_in_same_repo_share_lock() {
 /// canonicalize-then-`gix::open` flow inside `HistoryManager::new`
 /// then fails to register the repo, leaving the production code
 /// without a base to diff against. That's a pre-existing Windows
-/// limitation in `harnx-mcp-history`, not something this regression
+/// limitation in `harnx-git-history`, not something this regression
 /// test introduces.
 #[cfg(unix)]
 #[tokio::test]

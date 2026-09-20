@@ -126,7 +126,7 @@ jobs:
       run: |
         $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
           -p harnx -p harnx-serve -p harnx-worker \
-          -p harnx-bash-tools -p harnx-fs-tools -p harnx-grep-tools -p harnx-plans-tools -p harnx-mcp-plans-github -p harnx-mcp-time -p harnx-mcp-bridge -p harnx-time-server \
+          -p harnx-bash-tools -p harnx-fs-tools -p harnx-grep-tools -p harnx-plans-tools -p harnx-mcp-bridge -p harnx-time-tools \
           -p harnx-aws-creds -p harnx-k8s-creds -p harnx-k8s-sandbox-tools -p harnx-pkg -p harnx-proxy-auth \
           -p harnx-sandbox-run \
           -p harnx-sandbox-common
@@ -154,10 +154,8 @@ jobs:
           "harnx-fs-tools:harnx-fs-tools"
           "harnx-grep-tools:harnx-grep-tools"
           "harnx-plans-tools:harnx-plans-tools"
-          "harnx-mcp-plans-github:harnx-mcp-plans-github"
-          "harnx-mcp-time:harnx-mcp-time"
           "harnx-mcp-bridge:harnx-mcp-bridge"
-          "harnx-time-server:harnx-time-server"
+          "harnx-time-tools:harnx-time-tools"
           "harnx-aws-creds:harnx-aws-creds"
           "harnx-k8s-creds:harnx-k8s-creds"
           "harnx-k8s-sandbox-tools:harnx-k8s-sandbox-tools"
@@ -351,11 +349,9 @@ jobs:
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-plans-tools-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
-            --pattern "harnx-mcp-time-$V-x86_64-unknown-linux-musl.tar.gz" || true
-          gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-mcp-bridge-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
-            --pattern "harnx-time-server-$V-x86_64-unknown-linux-musl.tar.gz" || true
+            --pattern "harnx-time-tools-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-aws-creds-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
@@ -386,11 +382,9 @@ jobs:
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-plans-tools-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
-            --pattern "harnx-mcp-time-$V-aarch64-unknown-linux-musl.tar.gz" || true
-          gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-mcp-bridge-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
-            --pattern "harnx-time-server-$V-aarch64-unknown-linux-musl.tar.gz" || true
+            --pattern "harnx-time-tools-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-aws-creds-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
@@ -420,7 +414,7 @@ jobs:
         run: |
           missing=0
           for dir in linux-amd64 linux-arm64; do
-            for bin in harnx harnx-serve harnx-worker harnx-bash-tools harnx-fs-tools harnx-grep-tools harnx-plans-tools harnx-mcp-plans-github harnx-mcp-time harnx-mcp-bridge harnx-time-server harnx-aws-creds harnx-k8s-creds harnx-k8s-sandbox-tools harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
+            for bin in harnx harnx-serve harnx-worker harnx-bash-tools harnx-fs-tools harnx-grep-tools harnx-plans-tools harnx-mcp-bridge harnx-time-tools harnx-aws-creds harnx-k8s-creds harnx-k8s-sandbox-tools harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
               if [ ! -f "$dir/$bin" ]; then
                 echo "ERROR: missing $dir/$bin"
                 missing=1
@@ -438,27 +432,16 @@ jobs:
       - name: Verify Web UI artifact
         run: test -f web-assets/index.html
 
-      - name: Build and push harnx-mcp-time
+      - name: Build and push harnx-plans-tools
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: docker/harnx-mcp-time.Dockerfile
+          file: docker/harnx-plans-tools.Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/dobesv/harnx-mcp-time:${{ steps.version.outputs.version }}
-            ${{ needs.release.outputs.rc == 'false' && 'ghcr.io/dobesv/harnx-mcp-time:latest' || '' }}
-
-      - name: Build and push harnx-mcp-plans
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/harnx-mcp-plans.Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/dobesv/harnx-mcp-plans:${{ steps.version.outputs.version }}
-            ${{ needs.release.outputs.rc == 'false' && 'ghcr.io/dobesv/harnx-mcp-plans:latest' || '' }}
+            ghcr.io/dobesv/harnx-plans-tools:${{ steps.version.outputs.version }}
+            ${{ needs.release.outputs.rc == 'false' && 'ghcr.io/dobesv/harnx-plans-tools:latest' || '' }}
 
       - name: Build and push harnx
         uses: docker/build-push-action@v7

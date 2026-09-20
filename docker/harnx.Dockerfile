@@ -6,7 +6,6 @@
 #   3. docker job gh release download patterns (lines ~339-407)
 #   4. "Verify extracted binaries" loop (line ~423)
 # Missing any one silently breaks the release build (COPY fails, download fails, or verify fails).
-# harnx-mcp-plans-github is intentionally NOT COPY'd here (has its own Dockerfile).
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
@@ -22,8 +21,7 @@ COPY linux-${TARGETARCH}/harnx-bash-tools /usr/local/bin/harnx-bash-tools
 COPY linux-${TARGETARCH}/harnx-fs-tools /usr/local/bin/harnx-fs-tools
 COPY linux-${TARGETARCH}/harnx-grep-tools /usr/local/bin/harnx-grep-tools
 COPY linux-${TARGETARCH}/harnx-plans-tools /usr/local/bin/harnx-plans-tools
-COPY linux-${TARGETARCH}/harnx-mcp-time /usr/local/bin/harnx-mcp-time
-COPY linux-${TARGETARCH}/harnx-time-server /usr/local/bin/harnx-time-server
+COPY linux-${TARGETARCH}/harnx-time-tools /usr/local/bin/harnx-time-tools
 COPY linux-${TARGETARCH}/harnx-mcp-bridge /usr/local/bin/harnx-mcp-bridge
 COPY linux-${TARGETARCH}/harnx-aws-creds /usr/local/bin/harnx-aws-creds
 COPY linux-${TARGETARCH}/harnx-k8s-creds /usr/local/bin/harnx-k8s-creds

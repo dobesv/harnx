@@ -11,7 +11,7 @@ use harnx_core::safety::{
     DEFAULT_GREP_LIMIT, DEFAULT_LS_LIMIT, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH,
     LS_SCAN_HARD_LIMIT, READ_MAX_FILE_BYTES, SEARCH_FILE_MAX_BYTES, WRITE_MAX_BYTES,
 };
-use harnx_mcp_history::HistoryManager;
+use harnx_git_history::HistoryManager;
 use harnx_tool_allow::{validate_path, validate_write_path, ResolvedAllowlist};
 use harnx_toolset_server::schema::object_schema_with_desc;
 

@@ -60,7 +60,7 @@ mod tests {
     fn package_server() -> ToolServerConfig {
         ToolServerConfig {
             name: "time".to_string(),
-            command: "harnx-time-server".to_string(),
+            command: "harnx-time-tools".to_string(),
             args: Vec::new(),
             env: Default::default(),
             enabled: true,

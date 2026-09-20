@@ -394,7 +394,7 @@ mod dynamic_tool_server_tests {
         std::fs::create_dir_all(&tool_servers_dir).expect("create tool_servers dir");
         std::fs::write(
             tool_servers_dir.join("time.yaml"),
-            "command: harnx-time-server\n",
+            "command: harnx-time-tools\n",
         )
         .expect("write time.yaml");
         let _env_guard = EnvGuard::new("HARNX_CONFIG_DIR", config_dir);
@@ -403,7 +403,7 @@ mod dynamic_tool_server_tests {
 
         assert_eq!(config.tool_servers.len(), 1);
         assert_eq!(config.tool_servers[0].name, "time");
-        assert_eq!(config.tool_servers[0].command, "harnx-time-server");
+        assert_eq!(config.tool_servers[0].command, "harnx-time-tools");
         assert!(config.tool_servers[0].package.is_none());
     }
 }

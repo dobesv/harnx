@@ -17,15 +17,12 @@ members = [
     "crates/harnx-tool-allow",
     "crates/harnx-sandbox-run",
     "crates/harnx-fs-tools",
-    "crates/harnx-mcp-time",
     "crates/harnx-metrics",
     "crates/harnx-healthz",
     "crates/harnx-grep-tools",
     "crates/harnx-mcp-remote",
     "crates/harnx-plans-tools",
-    "crates/harnx-mcp-plans-core",
-    "crates/harnx-mcp-plans-github",
-    "crates/harnx-mcp-history",
+    "crates/harnx-git-history",
     "crates/harnx-nats-common",
     "crates/harnx-pkg",
     "crates/harnx-rag",
@@ -35,7 +32,7 @@ members = [
     "crates/harnx-serve",
     "crates/harnx-spinner",
     "crates/harnx-test-bins",
-    "crates/harnx-time-server",
+    "crates/harnx-time-tools",
     "crates/harnx-hookset",
     "crates/harnx-hookset-server",
     "crates/harnx-claude-compatible-hook-server",
@@ -201,7 +198,7 @@ syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"
 arboard = { version = "3.3.0", default-features = false }
 harnx-session = { path = "crates/harnx-session" }
 minijinja = { version = "2.21.0", default-features = false, features = ["builtins", "debug", "serde"] }
-harnx-mcp-history = { path = "crates/harnx-mcp-history" }
+harnx-git-history = { path = "crates/harnx-git-history" }
 harnx-sandbox-common = { path = "crates/harnx-sandbox-common" }
 harnx-tool-allow = { path = "crates/harnx-tool-allow" }
 harnx-metrics = { path = "crates/harnx-metrics" }

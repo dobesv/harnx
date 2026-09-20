@@ -1,6 +1,6 @@
 //! Proves that a SIGTERM sent directly to a running `harnx-mcp-bridge`
 //! process (as Kubernetes would send to a pod) triggers deregistration.
-//! Mirrors `harnx-time-server/tests/sigterm_shutdown.rs`: before switching
+//! Mirrors `harnx-time-tools/tests/sigterm_shutdown.rs`: before switching
 //! `main.rs` from `serve_with_client` (whose shutdown token is never
 //! cancelled) to `serve_with_shutdown`, no signal reached the bridge's own
 //! cleanup at all.

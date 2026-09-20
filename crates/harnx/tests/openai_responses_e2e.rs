@@ -13,7 +13,9 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use harnx::test_utils::interrupt::{harnx_mcp_time_bin, spawn_oneshot, wait_for_exit, ConfigPaths};
+use harnx::test_utils::interrupt::{
+    harnx_time_tools_bin, spawn_oneshot, wait_for_exit, ConfigPaths,
+};
 use harnx::test_utils::mock_openai_server::{
     MockOpenAiScript, MockOpenAiServer, MockOpenAiToolCall, MockOpenAiTurn,
 };
@@ -32,17 +34,17 @@ fn wait_for_completed_turn(mut child: std::process::Child, budget: Duration) -> 
     Ok(())
 }
 
-fn write_time_tool_server(harnx_config_dir: &Path, mcp_time_bin: &Path) -> Result<()> {
+fn write_time_tool_server(harnx_config_dir: &Path, time_tools_bin: &Path) -> Result<()> {
     let tool_servers_dir = harnx_config_dir.join("tool_servers");
     std::fs::create_dir_all(&tool_servers_dir).context("failed to create tool_servers dir")?;
     let bridge_bin =
-        mcp_time_bin.with_file_name(format!("harnx-mcp-bridge{}", std::env::consts::EXE_SUFFIX));
+        time_tools_bin.with_file_name(format!("harnx-mcp-bridge{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(
         tool_servers_dir.join("time.yaml"),
         format!(
-            "command: {}\nargs:\n  - --name\n  - time\n  - --\n  - {}\n",
+            "command: {}\nargs:\n  - --name\n  - time\n  - --\n  - {}\n  - --mcp-stdio\n",
             bridge_bin.display(),
-            mcp_time_bin.display()
+            time_tools_bin.display()
         ),
     )
     .context("failed to write tool_servers/time.yaml")
@@ -53,10 +55,10 @@ fn write_time_tool_server(harnx_config_dir: &Path, mcp_time_bin: &Path) -> Resul
 fn write_responses_config_with_tool(
     dir: &Path,
     mock_base_url: &str,
-    mcp_time_bin: &Path,
+    time_tools_bin: &Path,
 ) -> Result<ConfigPaths> {
     let paths = write_responses_config(dir, mock_base_url)?;
-    write_time_tool_server(&paths.harnx_config_dir, mcp_time_bin)?;
+    write_time_tool_server(&paths.harnx_config_dir, time_tools_bin)?;
     Ok(paths)
 }
 
@@ -303,13 +305,13 @@ fn reasoning_replay_round_trips() -> Result<()> {
     let mock = MockOpenAiServer::start(script)?;
     let tmp = tempfile::tempdir()?;
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-    let mcp_time_bin = harnx_mcp_time_bin(&harnx_bin);
+    let time_tools_bin = harnx_time_tools_bin(&harnx_bin);
 
     // Config includes stream:false to use non-streaming path
     let paths = write_responses_config_with_tool(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
-        &mcp_time_bin,
+        &time_tools_bin,
     )?;
 
     let child = spawn_oneshot(&paths, &harnx_bin, "please wait one second")?;

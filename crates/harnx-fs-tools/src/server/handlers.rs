@@ -44,7 +44,7 @@ impl FsServer {
     }
 
     fn repo_lock_key_for_path(path: &Path) -> PathBuf {
-        harnx_mcp_history::discover::find_repo_for_path(path)
+        harnx_git_history::discover::find_repo_for_path(path)
             .or_else(|| path.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| path.to_path_buf())
     }
@@ -123,7 +123,7 @@ impl FsServer {
             }
         };
 
-        let Some(repo_dir) = harnx_mcp_history::discover::find_repo_for_path(path) else {
+        let Some(repo_dir) = harnx_git_history::discover::find_repo_for_path(path) else {
             return Some(String::new());
         };
 
@@ -950,7 +950,7 @@ impl FsServer {
         let commit_id = gix::ObjectId::from_hex(params.commit_id.as_bytes())
             .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
 
-        let repo_dir = harnx_mcp_history::discover::find_repo_for_path(&path).ok_or_else(|| {
+        let repo_dir = harnx_git_history::discover::find_repo_for_path(&path).ok_or_else(|| {
             ErrorData::invalid_params("path is not inside a git repository".to_string(), None)
         })?;
         validate_write_path(&repo_dir.to_string_lossy(), &self.allowlist)

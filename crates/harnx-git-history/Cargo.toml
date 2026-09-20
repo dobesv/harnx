@@ -1,11 +1,11 @@
 [package]
-name = "harnx-mcp-history"
+name = "harnx-git-history"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Git-backed local history and rollback for harnx MCP servers"
+description = "Git-backed local history and rollback for harnx tool servers"
 
 [dependencies]
 anyhow = { workspace = true }
