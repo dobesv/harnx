@@ -628,11 +628,7 @@ impl NatsSession {
         entry: &SessionLogEntry,
         message_id: &str,
     ) -> Result<u64> {
-        let mut tail = log
-            .load_events_latest_async()
-            .await?
-            .last()
-            .map_or(0, |(seq, _)| *seq);
+        let mut tail = log.last_entry_async().await?.map_or(0, |(seq, _)| seq);
         for _ in 0..16 {
             match log.append_fenced(entry, tail, message_id).await? {
                 FencedAppend::Appended(seq) => return Ok(seq),

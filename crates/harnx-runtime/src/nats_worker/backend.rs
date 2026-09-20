@@ -731,11 +731,7 @@ impl NatsSessionLogBackend {
             // left the log, so the current tail is the best expectation it can
             // form. A `Cancel` that lands after this read still stops the
             // append, through the retry that reads the conflict.
-            None => log
-                .load_events_latest_async()
-                .await?
-                .last()
-                .map_or(0, |(seq, _)| *seq),
+            None => log.last_entry_async().await?.map_or(0, |(seq, _)| seq),
         };
         self.append_event_fenced_with_lease(entry, lease, expected_tail)
             .await
@@ -871,6 +867,16 @@ impl NatsSessionLogBackend {
             self.session_id.clone(),
         );
         log.load_events_latest_async().await
+    }
+
+    pub async fn last_entry_async(
+        &self,
+    ) -> Result<Option<(u64, harnx_core::session::SessionLogEntry)>> {
+        let log = crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            self.session_id.clone(),
+        );
+        log.last_entry_async().await
     }
 }
 

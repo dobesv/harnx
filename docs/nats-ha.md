@@ -575,15 +575,18 @@ check-then-write race against a `Cancel` that lands mid-append.
 ### Requesting an interrupt
 
 `nats_session::interrupt_session` is the only way in, used by the TUI, the web
-UI through serve, the one-shot CLI and the sub-agent tool. It loads the log,
-classifies the turn, and returns an `InterruptOutcome`: `Idle` when no user
+UI through serve, the one-shot CLI and the sub-agent tool. It reads the log's
+last entry, decides, and returns an `InterruptOutcome`: `Idle` when no user
 message follows the last terminator, so there is no turn to stop and nothing is
 appended; `Accepted { cancel_seq }` when the `Cancel` landed; or
 `AlreadyInterrupted { cancel_seq }` when one already terminates this turn.
-Calling again with the same `cancellation_id` is harmless. The load reads every
-entry of the log with one JetStream direct get per sequence, although
-classification only needs the entries after the last terminator; it is the part
-of an interrupt whose cost grows with the session's length.
+Calling again with the same `cancellation_id` is harmless. The last entry is
+all it reads: a `TurnEnd` or `Error` means idle, a `Cancel` means already
+interrupted, and anything else is treated as a turn in progress and fenced on
+that sequence, so a completion that lands in between rejects the append and is
+re-read from the conflict. An idle session whose last entry is a mutation or
+control entry therefore gets a stray `Cancel`, which the protocol tolerates;
+that is the price of keeping the transcript's length off the interrupt's path.
 
 After an accepted append it fires two best-effort wake-ups and waits on neither:
 the control hint above, and a **wind-up activation** targeting

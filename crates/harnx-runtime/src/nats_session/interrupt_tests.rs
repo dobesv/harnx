@@ -316,3 +316,139 @@ async fn a_stalled_announcement_does_not_fail_an_accepted_interrupt() {
         started.elapsed()
     );
 }
+
+fn assistant(text: &str) -> SessionLogEntry {
+    SessionLogEntry::Message {
+        id: None,
+        role: MessageRole::Assistant,
+        content: MessageContent::Text(text.to_string()),
+        timestamp: None,
+        fence_token: None,
+    }
+}
+
+fn turn_end(through_seq: u64) -> SessionLogEntry {
+    SessionLogEntry::TurnEnd {
+        through_seq,
+        fence_token: 1,
+        timestamp: None,
+        usage: None,
+    }
+}
+
+fn cancel(id: &str) -> SessionLogEntry {
+    SessionLogEntry::cancel_request(id.into(), "test".into())
+}
+
+fn tool_results() -> SessionLogEntry {
+    SessionLogEntry::ToolResults {
+        results: Vec::new(),
+        timestamp: None,
+    }
+}
+
+fn numbered(entries: Vec<SessionLogEntry>) -> Vec<(u64, SessionLogEntry)> {
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| (i as u64 + 1, e))
+        .collect()
+}
+
+/// `decide` only ever sees the log's last entry plus whatever a conflict
+/// hands back, never the turn's start. A window without a terminator is a
+/// turn in progress as far as the request can tell, so it appends; the
+/// documented exception is an idle session whose last entry is a mutation
+/// or control entry, which costs one stray `Cancel` marker.
+#[test]
+fn decide_from_the_tail_window() {
+    assert_eq!(decide(&[]), Some(InterruptOutcome::Idle));
+    assert_eq!(
+        decide(&numbered(vec![turn_end(1)])),
+        Some(InterruptOutcome::Idle)
+    );
+    assert_eq!(
+        decide(&numbered(vec![cancel("c1")])),
+        Some(InterruptOutcome::AlreadyInterrupted { cancel_seq: 1 })
+    );
+    assert_eq!(decide(&numbered(vec![tool_results()])), None);
+    assert_eq!(decide(&numbered(vec![assistant("partial")])), None);
+    assert_eq!(
+        decide(&numbered(vec![tool_results(), turn_end(1)])),
+        Some(InterruptOutcome::Idle)
+    );
+    assert_eq!(
+        decide(&numbered(vec![tool_results(), turn_end(1), user("next")])),
+        None
+    );
+    assert_eq!(
+        decide(&numbered(vec![tool_results(), cancel("c1")])),
+        Some(InterruptOutcome::AlreadyInterrupted { cancel_seq: 2 })
+    );
+    assert_eq!(
+        decide(&numbered(vec![SessionLogEntry::Compress {
+            prompt: "summary".into()
+        }])),
+        None
+    );
+}
+
+/// The request reads the log's last entry and nothing else before its
+/// fenced append, so a long transcript costs it nothing. An entry below the
+/// tail that no reader can decode makes any wider read fail loudly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_reads_nothing_below_the_tail() {
+    let Some(server) = spawn_nats_server().await.unwrap() else {
+        return;
+    };
+    let client = async_nats::connect(server.url()).await.unwrap();
+    let js = async_nats::jetstream::new(client.clone());
+    let log = NatsSessionLog::new(js.clone(), "tail-s");
+    log.append_event_async(&user("an earlier turn"))
+        .await
+        .unwrap();
+    log.append_event_async(&turn_end(1)).await.unwrap();
+    plant_undecodable_entry(&js, "tail-s").await;
+    log.append_event_async(&user("go")).await.unwrap();
+    log.append_event_async(&assistant("working on it"))
+        .await
+        .unwrap();
+    assert!(log.load_events_async().await.is_err());
+
+    let outcome = interrupt_session(
+        &js,
+        &client,
+        &SessionActivationRoute::ClusterShared,
+        request("tail-s", "c1"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, InterruptOutcome::Accepted { cancel_seq: 6 });
+}
+
+/// Admitting a prompt only needs the tail to fence its append, so it must
+/// not pay for the transcript above it either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_append_reads_nothing_below_the_tail() {
+    let Some(server) = spawn_nats_server().await.unwrap() else {
+        return;
+    };
+    let (session, log) =
+        crate::nats_session::test_support::session_with_log(&server, "agent-a", "prompt-tail")
+            .await;
+    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await.unwrap());
+    log.append_event_async(&user("an earlier turn"))
+        .await
+        .unwrap();
+    plant_undecodable_entry(&js, session.storage_key()).await;
+    log.append_event_async(&turn_end(1)).await.unwrap();
+    assert!(log.load_events_async().await.is_err());
+
+    let seq = session
+        .append_prompt_entry(&log, &user("go"), "m1")
+        .await
+        .unwrap();
+
+    assert_eq!(seq, 4);
+}

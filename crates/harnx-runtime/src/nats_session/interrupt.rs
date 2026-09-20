@@ -223,10 +223,15 @@ where
 
 const MAX_CAS_ATTEMPTS: usize = 16;
 
-/// Read the session log tail, classify the current turn, and append exactly
-/// one `Cancel` entry with a fenced (expected-last-sequence) publish. A tail
-/// conflict is re-examined, never blindly retried: newer entries are folded
-/// into our view and the turn is reclassified before trying again.
+/// Read the log's last entry, decide, and append exactly one `Cancel` entry
+/// with a fenced (expected-last-sequence) publish. A tail conflict is
+/// re-examined, never blindly retried: newer entries are folded into our
+/// view and the decision is made again before trying again.
+///
+/// The last entry is all the request reads: it is the tail the append is
+/// fenced on and the entry `decide` classifies, so the transcript's length
+/// never sits on the interrupt's critical path. A conflict brings back
+/// everything appended past it, so the window only ever grows forward.
 pub async fn interrupt_session(
     js: &async_nats::jetstream::Context,
     client: &async_nats::Client,
@@ -234,9 +239,9 @@ pub async fn interrupt_session(
     request: InterruptRequest,
 ) -> Result<InterruptOutcome> {
     let log = NatsSessionLog::new(js.clone(), request.session_id.clone());
-    let mut entries = log.load_events_latest_async().await?;
+    let mut entries: Vec<_> = log.last_entry_async().await?.into_iter().collect();
     for _ in 0..MAX_CAS_ATTEMPTS {
-        if let Some(outcome) = classify(&entries) {
+        if let Some(outcome) = decide(&entries) {
             return Ok(outcome);
         }
         let tail = entries.last().map_or(0, |(seq, _)| *seq);
@@ -282,16 +287,29 @@ pub async fn interrupt_session(
 }
 
 /// `None` means "append a Cancel now".
-fn classify(entries: &[(u64, SessionLogEntry)]) -> Option<InterruptOutcome> {
-    let turn = current_turn_entries(entries);
+///
+/// `window` is the log's tail, not the log: the last entry, plus whatever a
+/// conflict appended after it. Without a terminator in view the request
+/// cannot see the turn's start and treats the turn as in progress. An idle
+/// session whose last entry is a mutation or control entry therefore gets a
+/// stray `Cancel`, which the protocol tolerates; reading further back to
+/// avoid it would put the whole transcript on the interrupt's path again.
+pub(super) fn decide(window: &[(u64, SessionLogEntry)]) -> Option<InterruptOutcome> {
+    if window.is_empty() {
+        return Some(InterruptOutcome::Idle);
+    }
+    let turn = current_turn_entries(window);
+    if turn.len() == window.len() {
+        return None;
+    }
     let has_user = turn
         .iter()
         .any(|(_, e)| matches!(e, SessionLogEntry::Message { role, .. } if role.is_user()));
     if has_user {
         return None;
     }
-    if last_terminator_is_cancel(entries) {
-        let cancel_seq = entries
+    if last_terminator_is_cancel(window) {
+        let cancel_seq = window
             .iter()
             .rev()
             .find_map(|(seq, e)| matches!(e, SessionLogEntry::Cancel { .. }).then_some(*seq))?;
