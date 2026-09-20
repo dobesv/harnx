@@ -326,7 +326,7 @@ register_client!(
 
 This macro expands to the module declaration, config enum variant, and client registry. Then:
 
-1. Add a config struct to `crates/harnx-core/src/provider_config/myprovider.rs` and export it in that dir's `mod.rs`.
+1. Add a config struct to `crates/harnx-core/src/provider_config/myprovider.rs` and export it in that dir's `mod.rs`. `register_client!` reads `models`, `model_catalog` and `system_prompt_prefix` off every config by field access, so all three must be present or the macro will not compile.
 2. Add `ClientConfig::MyProviderConfig(_)` match arms in `lib.rs` (`effective_name`/`set_name`/`set_package`) and `crates/harnx-runtime/src/config/patches_split.rs` (`apply_client_patch`).
 3. Implement `Client`:
    - Sync auth (API key): use `impl_client_trait!` macro (see `cohere.rs` for example).
@@ -334,6 +334,16 @@ This macro expands to the module declaration, config enum variant, and client re
 4. For Responses API variants, key `model.endpoint()` to `"responses"` to reuse `openai_responses.rs` helpers.
 
 Env-var field access uses `config_get_fn!` — the macro generates `${STEM}_${FIELD}` lookup where STEM is the client filename (e.g. `myprovider_api_key` → `MYPROVIDER_API_KEY`).
+
+A client inherits catalog entries from the `models.yaml` block named by its
+`model_catalog`. With that field unset the filename decides instead: the
+client's own type, `openai` for `codex`, or for `openai-compatible` the first
+provider whose name the filename stem starts with. That fallback predates the
+field and is kept only so existing configs work — prefer `model_catalog`, and
+note the filename rule is a prefix match, so it silently claims
+`deepseek-proxy` for DeepSeek and leaves `aws-prod` with nothing. The
+filename still drives env-var prefixes, `api_base` shortcuts and package patch
+matching, which are separate lookups.
 
 ### Building a rustls ClientConfig
 

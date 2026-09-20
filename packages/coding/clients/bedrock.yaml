@@ -1,9 +1,13 @@
 type: openai-compatible
+
 # AWS Bedrock OpenAI-compatible Chat Completions endpoint.
 # Change the region in api_base if you use a different one.
 api_base: https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1
 
 # Model limits, prices, and capabilities come from the shared Bedrock catalog.
+# Naming it here keeps that independent of what this file is called.
+model_catalog: bedrock
+
 # Authentication: set BEDROCK_API_KEY in ~/.local/share/harnx/.env.
 # Use an Amazon Bedrock API key (bearer token). This client does not sign
 # requests with the AWS credential chain.

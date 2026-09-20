@@ -109,8 +109,9 @@ A fallback is not a guarantee that an oversized or image-bearing request fits.
 
 Keep model limits, prices, capabilities, and request patches in
 `crates/harnx/models.yaml`. Package clients inherit them; do not duplicate
-`models:` blocks just to select an agent's model. OpenAI-compatible catalog
-matching uses the bare client filename, even inside a package.
+`models:` blocks just to select an agent's model. Each package client names its
+catalog with `model_catalog:`, so inheritance no longer depends on what the
+file is called.
 
 Update `scripts/model_variants.py` when adding generated reasoning aliases.
 Astra needs Responses for tool use. Gemini call IDs must survive parsing and

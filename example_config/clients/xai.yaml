@@ -2,5 +2,6 @@
 # Env var: XAI_API_KEY
 
 type: openai-compatible
+model_catalog: xai        # catalog block to inherit models from
 api_base: https://api.x.ai/v1
 # api_key: "..."   # or set XAI_API_KEY
