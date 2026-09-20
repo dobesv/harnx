@@ -112,14 +112,18 @@ impl SessionControlHandler {
     /// An `Interrupt` command is only a hint that a `Cancel` was appended. The
     /// log decides: abort (and acknowledge) only once it carries one for the
     /// turn in progress.
+    /// The hint names a `Cancel` that should be the log's last entry. One
+    /// already followed by other entries is still caught by the session
+    /// watcher and by this worker's next fenced append, so the hint does not
+    /// pay for a wider read.
     async fn confirm_logged_interrupt(&self, reply: Option<async_nats::Subject>) {
-        let Ok(entries) = self.backend.load_events_latest_async().await else {
+        let Ok(Some((_, harnx_core::session::SessionLogEntry::Cancel { .. }))) =
+            self.backend.last_entry_async().await
+        else {
             return;
         };
-        if harnx_core::session_reconstruct::current_turn_is_cancelled(&entries) {
-            self.abort_signal.set_ctrlc();
-            self.acknowledge(reply).await;
-        }
+        self.abort_signal.set_ctrlc();
+        self.acknowledge(reply).await;
     }
 
     /// The legacy client cancel: no `Cancel` is in the log yet, so this worker

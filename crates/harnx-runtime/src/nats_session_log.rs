@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{
     self,
-    message::PublishMessage,
+    message::{PublishMessage, StreamMessage},
     stream::{Config as StreamConfig, LastRawMessageErrorKind, RetentionPolicy},
 };
 use bytes::Bytes;
@@ -194,21 +194,43 @@ impl NatsSessionLog {
             .map(|entries| entries.into_iter().map(|(_, entry)| entry).collect())
     }
 
+    /// The log's last entry, or `None` for an empty log. One request: the tail
+    /// is all a fenced append needs, and all an interrupt request looks at
+    /// before deciding, so neither pays for the transcript above it.
+    pub async fn last_entry_async(&self) -> Result<Option<(u64, SessionLogEntry)>> {
+        let stream = self.ensure_stream().await?;
+        let Some(raw) = self.last_raw_message(&stream).await? else {
+            return Ok(None);
+        };
+        let entry = deserialize_entry(&raw.payload).with_context(|| {
+            format!(
+                "Failed to deserialize session log entry for session '{}' at stream sequence {}",
+                self.session_id, raw.sequence
+            )
+        })?;
+        Ok(Some((raw.sequence, entry)))
+    }
+
+    async fn last_raw_message(
+        &self,
+        stream: &jetstream::stream::Stream,
+    ) -> Result<Option<StreamMessage>> {
+        match stream.get_last_raw_message_by_subject(&self.subject).await {
+            Ok(raw) => Ok(Some(raw)),
+            Err(err) if matches!(err.kind(), LastRawMessageErrorKind::NoMessageFound) => Ok(None),
+            Err(err) => Err(err).with_context(|| {
+                format!(
+                    "Failed to get latest JetStream session log entry for session '{}' subject '{}'",
+                    self.session_id, self.subject
+                )
+            }),
+        }
+    }
+
     pub async fn load_events_latest_async(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
         let mut stream = self.ensure_stream().await?;
-        let latest = match stream.get_last_raw_message_by_subject(&self.subject).await {
-            Ok(raw) => raw,
-            Err(err) if matches!(err.kind(), LastRawMessageErrorKind::NoMessageFound) => {
-                return Ok(Vec::new());
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "Failed to get latest JetStream session log entry for session '{}' subject '{}'",
-                        self.session_id, self.subject
-                    )
-                });
-            }
+        let Some(latest) = self.last_raw_message(&stream).await? else {
+            return Ok(Vec::new());
         };
         let first_sequence = stream
             .info()

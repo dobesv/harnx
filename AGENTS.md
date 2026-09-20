@@ -412,6 +412,14 @@ trip per session log entry; driven from the loop, a 300-entry session's Ctrl+C
 spent 22 seconds attaching and then timed out inside its two-second append
 budget on every retry. Don't hand the loop a bare future to poll.
 
+Reads on the interrupt path stay at one entry. `interrupt_session`, the
+worker's hint check and the fenced-append tail lookups use
+`NatsSessionLog::last_entry_async` and decide from the log's last entry; the
+fenced append's conflict brings back anything newer. A whole-log read there
+costs one JetStream request per entry and put long sessions past the two-second
+append budget on remote clusters. The known cost is a stray `Cancel` when an
+idle session's last entry is a mutation or control entry.
+
 Build the workspace before cross-process tests after changing tool or hook wire
 types. Those tests launch workspace sidecars as well as linked test code; a stale
 hook or tool binary can fail decoding even when a per-crate build succeeds.
