@@ -85,6 +85,7 @@ arboard = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }
+rcgen = { workspace = true }
 pretty_assertions = "1.4.0"
 scopeguard = "1"
 tempfile = "3"

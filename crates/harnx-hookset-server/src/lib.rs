@@ -45,11 +45,7 @@ pub async fn serve_over_nats<H: Hook + 'static>(
         name: "explicit".to_string(),
         url: nats_url.to_string(),
         token: Some(token.to_string()),
-        replicas: None,
-        tls: None,
-        tls_cert: None,
-        tls_key: None,
-        tls_ca: None,
+        ..Default::default()
     };
     let client = endpoint.connect().await?;
     // This entry point takes an explicit URL/token instead of the environment,

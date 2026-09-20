@@ -738,7 +738,7 @@ async fn agent_hook_start_config(
                 token,
             )
             .with_replicas(server.replicas)
-            .with_tls(&tls_endpoint),
+            .with_broker_settings(&tls_endpoint),
         )
     }
     .await;

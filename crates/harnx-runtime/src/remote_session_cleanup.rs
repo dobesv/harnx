@@ -895,6 +895,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            ignore_discovered_servers: None,
             agents: Vec::new(),
         });
         config

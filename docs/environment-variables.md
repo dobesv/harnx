@@ -156,9 +156,14 @@ No allow variables or CLI options means deny-all for filesystem and bash tool se
 These are set for you in normal use. Tool and hook servers receive them from
 whichever process launched them.
 
-- `HARNX_NATS_URL` — NATS server or cluster URL.
+- `HARNX_NATS_URL` — NATS server or cluster URL. `nats://` and `tls://` use the
+  NATS TCP protocol; `ws://` and `wss://` use the WebSocket transport, which is
+  what traverses an HTTP load balancer.
 - `HARNX_NATS_TOKEN` — token auth for that connection.
 - `HARNX_NATS_TLS`, `HARNX_NATS_TLS_CERT`, `HARNX_NATS_TLS_KEY`, `HARNX_NATS_TLS_CA` — TLS settings, matching the keys in `nats_servers/<cluster>.yaml`.
+- `HARNX_NATS_IGNORE_DISCOVERED_SERVERS` — ignore the peers a clustered broker
+  advertises instead of adding them to the connection's server pool. Defaults to
+  on for `ws://`/`wss://` URLs and off otherwise.
 - `HARNX_NATS_REPLICAS` — JetStream replica count for buckets harnx creates.
 - `HARNX_SERVER_SCOPE` — the scope a tool or hook server registers under.
 

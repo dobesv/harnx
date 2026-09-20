@@ -394,7 +394,7 @@ pub(super) async fn build_server_reconciler(
             .context("local NATS tool servers require HARNX_NATS_TOKEN")?;
         let start = ToolServerStartConfig::new(client, instance_id.clone(), &server.url, token)
             .with_replicas(server.replicas)
-            .with_tls(&harnx_nats_common::connect::NatsEndpoint::from(&server));
+            .with_broker_settings(&harnx_nats_common::connect::NatsEndpoint::from(&server));
         anyhow::Result::<SupervisorLauncher>::Ok(SupervisorLauncher::new(start))
     }
     .await;

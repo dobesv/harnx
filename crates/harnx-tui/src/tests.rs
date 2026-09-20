@@ -8037,6 +8037,7 @@ async fn session_picker_delivery_path_carries_error() {
         tls_cert: None,
         tls_key: None,
         tls_ca: None,
+        ignore_discovered_servers: None,
         agents: vec![],
     };
 

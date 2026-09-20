@@ -41,6 +41,10 @@ pub struct HookServerStartConfig {
     pub(super) tls_cert: Option<String>,
     pub(super) tls_key: Option<String>,
     pub(super) tls_ca: Option<String>,
+    /// Discovery override for `nats_url`, mirrored alongside the TLS settings
+    /// so a child computes the same answer the worker did rather than
+    /// re-deriving a default from the URL.
+    pub(super) ignore_discovered_servers: Option<bool>,
     pub(super) process_manager: ChildProcessManager,
 }
 
@@ -61,6 +65,7 @@ impl HookServerStartConfig {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            ignore_discovered_servers: None,
             process_manager: ChildProcessManager::new(),
         }
     }
@@ -76,16 +81,17 @@ impl HookServerStartConfig {
         self
     }
 
-    /// Copy TLS/mTLS settings from `endpoint` (built from the cluster this
-    /// config connects to) so spawned hook servers are told to use the same
-    /// ones. Only `endpoint`'s TLS fields are read. Without this, a worker
-    /// discovering over TLS spawns hook children that connect plaintext and
-    /// can never reach the broker.
-    pub fn with_tls(mut self, endpoint: &NatsEndpoint) -> Self {
+    /// Copy the settings that decide *how* to reach the broker from
+    /// `endpoint` (built from the cluster this config connects to) so spawned
+    /// hook servers are told to use the same ones. Only those fields are read.
+    /// Without this, a worker discovering over TLS spawns hook children that
+    /// connect plaintext and can never reach the broker.
+    pub fn with_broker_settings(mut self, endpoint: &NatsEndpoint) -> Self {
         self.tls = endpoint.tls;
         self.tls_cert = endpoint.tls_cert.clone();
         self.tls_key = endpoint.tls_key.clone();
         self.tls_ca = endpoint.tls_ca.clone();
+        self.ignore_discovered_servers = endpoint.ignore_discovered_servers;
         self
     }
 

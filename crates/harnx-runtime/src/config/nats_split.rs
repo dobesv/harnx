@@ -4,8 +4,8 @@ use anyhow::{bail, Context, Result};
 use async_nats::jetstream;
 use harnx_core::agent_config::AgentRole;
 use harnx_nats_common::connect::{
-    NatsEndpoint, HARNX_NATS_TLS_CA_ENV, HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV,
-    HARNX_NATS_TLS_KEY_ENV,
+    parse_bool_env, NatsEndpoint, HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV, HARNX_NATS_TLS_CA_ENV,
+    HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV, HARNX_NATS_TLS_KEY_ENV,
 };
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, path::Path, sync::OnceLock};
@@ -42,6 +42,13 @@ pub struct NatsServerConfig {
     pub tls_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<String>,
+    /// Whether to ignore the peer addresses a clustered broker advertises in
+    /// its INFO. Absent defers to the transport: ignored on a `ws://`/`wss://`
+    /// URL, where those addresses bypass the WebSocket entry point, and
+    /// honoured on `nats://`/`tls://`, where discovery is how a client finds
+    /// the rest of the cluster. See `docs/nats-ha.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_discovered_servers: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<RemoteAgentEntry>,
 }
@@ -64,7 +71,7 @@ impl NatsServerConfig {
 /// of dynamic config. A complete environment handoff takes precedence; without
 /// one, details come from the auto-managed shared broker.
 pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
-    let (url, token, replicas, tls, tls_cert, tls_key, tls_ca) = match (
+    let (url, token, replicas, tls, tls_cert, tls_key, tls_ca, ignore_discovered_servers) = match (
         std::env::var(HARNX_NATS_URL_ENV).ok(),
         std::env::var(HARNX_NATS_TOKEN_ENV).ok(),
     ) {
@@ -81,13 +88,22 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
             // resolving its own discovery client and the child tool/hook
             // servers it spawns must agree on TLS, or a worker on a TLS
             // cluster spawns children that can't reach the broker.
-            let tls = std::env::var(HARNX_NATS_TLS_ENV)
-                .ok()
-                .map(|value| value == "1" || value == "true");
+            let tls = parse_bool_env(HARNX_NATS_TLS_ENV);
             let tls_cert = std::env::var(HARNX_NATS_TLS_CERT_ENV).ok();
             let tls_key = std::env::var(HARNX_NATS_TLS_KEY_ENV).ok();
             let tls_ca = std::env::var(HARNX_NATS_TLS_CA_ENV).ok();
-            (url, token, replicas, tls, tls_cert, tls_key, tls_ca)
+            let ignore_discovered_servers =
+                parse_bool_env(HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV);
+            (
+                url,
+                token,
+                replicas,
+                tls,
+                tls_cert,
+                tls_key,
+                tls_ca,
+                ignore_discovered_servers,
+            )
         }
         (None, None) => {
             let manager = LOCAL_NATS_SERVER.get_or_init(|| tokio::sync::Mutex::new(None));
@@ -105,7 +121,7 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
                 .expect("local NATS server initialized above")
                 .status();
             let (url, token) = (server.url.clone(), server.token.clone());
-            (url, token, None, None, None, None, None)
+            (url, token, None, None, None, None, None, None)
         }
         _ => bail!("{HARNX_NATS_URL_ENV} and {HARNX_NATS_TOKEN_ENV} must be set together"),
     };
@@ -119,6 +135,7 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
         tls_cert,
         tls_key,
         tls_ca,
+        ignore_discovered_servers,
         agents: vec![],
     })
 }
@@ -235,6 +252,7 @@ impl From<&NatsServerConfig> for NatsEndpoint {
             tls_cert: server.tls_cert.clone(),
             tls_key: server.tls_key.clone(),
             tls_ca: server.tls_ca.clone(),
+            ignore_discovered_servers: server.ignore_discovered_servers,
         }
     }
 }
@@ -405,6 +423,7 @@ mod tests {
             tls_cert: Some("${NATS_CERT}".into()),
             tls_key: Some("${NATS_KEY}".into()),
             tls_ca: Some("${NATS_CA}".into()),
+            ignore_discovered_servers: None,
             agents: vec![],
         };
         Config::expand_nats_server_envs(&mut server);
@@ -523,6 +542,7 @@ tls: false
             tls_cert: Some("/tmp/client-cert.pem".into()),
             tls_key: None,
             tls_ca: None,
+            ignore_discovered_servers: None,
             agents: vec![],
         };
 
