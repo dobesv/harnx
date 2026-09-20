@@ -233,3 +233,56 @@ Available fields you can set per server with jq:
 | `.args` | Replace the args list entirely |
 | `.args += [...]` | Append args after the existing args |
 | `.env.KEY = "value"` | Set an environment variable on the server process |
+
+
+---
+
+## Customizing pantheon agents for your environment
+
+Shipped Pantheon agents provide a Harnx-native baseline: they are sandbox-aware but cluster-agnostic. They omit cluster-specific infrastructure details such as internal git credential helpers, proxy endpoints, and private tool servers.
+
+To adapt agents to your deployment without forking the package, use a local patch file. See the canonical specification in [Local patch files](../../docs/packages.md#local-patch-files) in `docs/packages.md`.
+
+### Patch file location
+
+Place the patch file as a sibling to the installed package directory:
+
+```
+<config_dir>/packages/pantheon.patch.yaml
+```
+
+For example, `~/.config/harnx/packages/pantheon.patch.yaml` for a local user install, or `/etc/harnx/config/packages/pantheon.patch.yaml` in container deployments.
+
+The patch file survives `harnx-pkg update`. When applied, `harnx-pkg list` marks the package as `[patched]`.
+
+### Patch file format
+
+The patch file is a YAML document with `agents:`, `clients:`, and `tool_servers:` arrays of jaq/jq filter strings. Each filter receives the serialized JSON configuration for an item as `.` and outputs the modified object.
+
+Filters match on the bare name `.name` (for example, `"atlas"` or `"clio"`, not `"pantheon/atlas"`). If an `if` expression omits an `else` branch, unmatched items pass through unchanged.
+
+```yaml
+# <config_dir>/packages/pantheon.patch.yaml
+agents:
+  # Add a cluster tool to an agent
+  - 'if .name == "atlas" then .use_tools += ["my_cluster_tool"] end'
+
+  # Append cluster guidance to an agent prompt
+  - 'if .name == "clio" then .prompt += "\n\n## Cluster git\n<your sidecar/credential instructions>" end'
+
+  # Add an inline variable and reference it in the prompt
+  - 'if .name == "atlas" then .variables += [{"name": "cluster_notes", "description": "Cluster information", "default": "Internal docs: https://wiki.internal"}] | .prompt += "\n\n{{cluster_notes}}" end'
+```
+
+Cluster-specific git-credential guidance belongs in this patch file. Shipped agents intentionally omit git-credential instructions because credential delivery mechanisms (sidecars, volume mounts, credential helper binaries) differ across Kubernetes environments.
+
+### Caveats
+
+1. **Overriding file-backed variables**: Shipped agents use `path:` entries in `.variables` to load prompt fragments from disk. To replace a file-backed variable with inline text in a patch, set `.path = null` AND set `.default`:
+   ```yaml
+   agents:
+     - 'if .name == "atlas" then (.variables[] | select(.name == "atlas_core")) |= (.path = null | .default = "Custom instructions") end'
+   ```
+   If `.path` remains non-null, Harnx loads the file and ignores `.default`.
+2. **Literal substitution**: Text injected into `.default` is substituted literally into `{{var}}` placeholders. It is not re-evaluated as a MiniJinja template.
+3. **Fragment file path restrictions**: Fragment files referenced by `path:` must live inside the package directory (`..` path traversal is rejected). Setting an inline `.default` in your patch file is the zero-fork option.

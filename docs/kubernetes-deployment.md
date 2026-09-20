@@ -314,6 +314,46 @@ spec:
             name: harnx-config
 ```
 
+### Customizing agent packages (pantheon.patch.yaml)
+
+When running agent packages such as Pantheon in Kubernetes, agents often need cluster-specific tools, proxy settings, or git credential instructions. The package provides a cluster-agnostic baseline, while environment customizations live in a patch file sibling to the package directory: `<config_dir>/packages/pantheon.patch.yaml`.
+
+To apply this patch in Kubernetes, mount the patch file into the `harnx-worker` container via a ConfigMap volume:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: harnx-pantheon-patch
+data:
+  pantheon.patch.yaml: |
+    agents:
+      - 'if .name == "atlas" then .use_tools += ["cluster_k8s_tools"] end'
+      - 'if .name == "clio" then .prompt += "\n\n## Cluster git\nUse the credentials mounted at /etc/git-creds/helper." end'
+```
+
+Add the volume and mount to your `harnx-worker` deployment:
+
+```yaml
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/harnx/config
+              readOnly: true
+            - name: pantheon-patch
+              mountPath: /etc/harnx/config/packages/pantheon.patch.yaml
+              subPath: pantheon.patch.yaml
+              readOnly: true
+      volumes:
+        - name: config-volume
+          configMap:
+            name: harnx-config
+        - name: pantheon-patch
+          configMap:
+            name: harnx-pantheon-patch
+```
+
+See [Customizing pantheon agents for your environment](../packages/pantheon/README.md#customizing-pantheon-agents-for-your-environment) in `packages/pantheon/README.md` for full patch syntax, filter examples, and variable override rules.
+
 ---
 
 ## Tool Servers

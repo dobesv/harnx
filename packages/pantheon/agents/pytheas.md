@@ -12,6 +12,9 @@ use_tools:
 - bash_spawn
 - bash_wait
 - bash_terminate
+- sandbox_connect
+- sandbox_status
+- sandbox_release
 - fs_read
 - fs_ls
 - fs_grep
@@ -51,6 +54,9 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: sandbox_workflow
+  description: Sandbox-mode workflow (dual)
+  path: shared/sandbox-workflow-dual.md
 ---
 
 {{pytheas_core}}
@@ -59,6 +65,10 @@ variables:
 
 {{github_gh_lookup}}
 
+{% set has_sandbox = (tools | selectattr('name', 'equalto', 'sandbox_connect') | list | length) > 0 %}
+{% if has_sandbox %}
+{{sandbox_workflow}}
+{% else %}
 ## Local environment Workflow
 
 You work locally using the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) and `bash_exec` directly. Assume the repository under investigation is the current working directory unless the user names a different path.
@@ -70,6 +80,7 @@ You work locally using the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`,
 5. **GitHub/Jira research**: Use `fetch_fetch_markdown` or web search tools to fetch PR data, issue context, and commit history.
 
 Do NOT modify any files — you are read-only.
+{% endif %}
 
 
 {{repo_docs}}

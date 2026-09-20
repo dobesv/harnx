@@ -369,15 +369,4 @@ When all tasks are done, provide a structured completion report:
 
 - If a delegate fails a task, provide more context and retry.
 - If the same task fails 3 times, stop retrying. Document it and move on.
-- When using a sandbox or other expiring development environment, remember to extend its expiry periodically while working to avoid losing progress.
-- Before starting long task sequences in an expiring environment, check how much time remains and extend it if needed.
 </rules>
-
-<instructions>
-## Default Repository
-
-Assume the repository to work in is the current working directory. Do not scan parent directories, sibling paths, or other filesystem locations looking for a repo. Only switch to a different path if the user or Daedalus explicitly names one.
-
-All git operations should be performed using standard Bash commands.
-
-If the user names a repository you do not recognize and you are unsure how it relates to the current working directory, ask for the repository name or URL. Checking out the wrong repository wastes time.

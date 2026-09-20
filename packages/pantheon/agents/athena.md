@@ -13,6 +13,9 @@ use_tools:
 - bash_spawn
 - bash_wait
 - bash_terminate
+- sandbox_connect
+- sandbox_status
+- sandbox_release
 - fs_write
 - fs_edit
 - fs_insert
@@ -35,6 +38,9 @@ use_tools:
 description: "Complex multi-faceted strategy and execution specialist — commands the field when a high-effort task is too complex for a specialist. Named after Athena (uh-THEE-nuh), Goddess of Strategic Warfare.\n"
 version: '0.3.4'
 variables:
+- name: sandbox_workflow
+  description: Sandbox-mode workflow (inherited)
+  path: shared/sandbox-workflow-inherit.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -57,6 +63,10 @@ variables:
 
 {{athena_core}}
 
+{% set has_sandbox = (tools | selectattr('name', 'equalto', 'sandbox_connect') | list | length) > 0 %}
+{% if has_sandbox %}
+{{sandbox_workflow}}
+{% else %}
 ## Local environment Workflow
 
 You work locally. The repo is already checked out. You do not need to clone repos.
@@ -65,6 +75,7 @@ You work locally. The repo is already checked out. You do not need to clone repo
 - Edit safely: prefer `fs_edit` for targeted changes; use `fs_write` for new or fully replaced files.
 - Execute/verify: `bash_exec` for tests/linters/builds.
 - Track context: add notes with `plans_add_note`.
+{% endif %}
 
 {{repo_docs}}
 
