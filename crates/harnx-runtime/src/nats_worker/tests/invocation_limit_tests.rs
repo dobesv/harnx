@@ -225,7 +225,8 @@ async fn token_budget_stops_at_round_boundary_and_resets_for_next_activation() {
         async_nats::jetstream::new(client.clone()),
         "metis",
         &session_id,
-    );
+    )
+    .with_replicas(1);
     assert_budget_terminal_transcript(
         &log.load_events_async()
             .await
@@ -279,7 +280,7 @@ async fn subagent_timeout_returns_synthesized_result_and_same_session_retry_succ
     // and the turn it ended is over rather than resumable.
     let js = seeded.parent_config.nats_jetstream("local").await.unwrap();
     let storage_key = harnx_core::session_identity::session_key(Some("metis"), &session_id);
-    let entries = NatsSessionLog::new(js, &storage_key)
+    let entries = NatsSessionLog::new_with_replicas(js, &storage_key, 1)
         .load_events_latest_async()
         .await
         .unwrap();

@@ -53,8 +53,8 @@ async fn same_local_id_has_independent_history_leases_cancellation_and_deletion(
 
     let resumed = create("alpha").await?;
     assert_eq!(resumed.storage_key(), alpha.storage_key());
-    let alpha_log = NatsSessionLog::new(js.clone(), alpha.storage_key());
-    let beta_log = NatsSessionLog::new(js.clone(), beta.storage_key());
+    let alpha_log = NatsSessionLog::new_with_replicas(js.clone(), alpha.storage_key(), 1);
+    let beta_log = NatsSessionLog::new_with_replicas(js.clone(), beta.storage_key(), 1);
     assert_independent_history(&alpha_log, &beta_log).await?;
 
     let attachment_cid = upload_shared_attachment(&js, [&alpha, &beta]).await?;
@@ -203,7 +203,7 @@ async fn assert_beta_survived_deletion(
     attachment_cid: &String,
 ) -> Result<()> {
     let metadata = SessionMetadataStore::ensure(js, 1).await?;
-    let beta_log = NatsSessionLog::new(js.clone(), beta.storage_key());
+    let beta_log = NatsSessionLog::new_with_replicas(js.clone(), beta.storage_key(), 1);
     let hydrated = tempfile::tempdir()?;
     harnx_runtime::nats_attachments::hydrate_attachment_refs(
         harnx_runtime::nats_attachments::AttachmentLocation::new(js, 1, beta.storage_key()),
@@ -263,7 +263,7 @@ async fn explicit_agent_controls_completion_and_info_even_with_other_active_agen
     let (broker, metadata) =
         harnx_runtime::config::session_metadata_for_agent(&cfg, "alpha@local", "alpha-only")
             .await?;
-    let entries = NatsSessionLog::new(broker, metadata.storage_key())
+    let entries = NatsSessionLog::new_with_replicas(broker, metadata.storage_key(), 1)
         .load_events_async()
         .await?;
     assert!(serde_json::to_string(&entries)?.contains("alpha"));

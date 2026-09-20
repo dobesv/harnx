@@ -79,7 +79,7 @@ async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> 
 
     let js = local_test_nats(server.url()).await?;
     let session_id = "rewind-worker-test";
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
 
     let first_seq = log
         .append_event_async(&SessionLogEntry::Message {
@@ -157,7 +157,7 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
 
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "retract-test";
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
 
     // Append a user message and an EditEntries that retracts it.
     append_retracted_user_message(&log, "msg-to-retract", "please ignore this").await?;

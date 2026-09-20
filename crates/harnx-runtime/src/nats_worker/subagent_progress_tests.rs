@@ -26,7 +26,12 @@ async fn progress_toolset(url: &str) -> Arc<super::subagent_toolset::SubagentToo
                 "local",
                 super::SessionActivationRoute::ClusterShared,
             ),
-            super::subagent_toolset::SubagentNats::new(client.clone(), jetstream, session_metadata),
+            super::subagent_toolset::SubagentNats::new(
+                client.clone(),
+                jetstream,
+                session_metadata,
+                1,
+            ),
         )
         .with_progress_heartbeat(Duration::from_millis(50)),
     )
@@ -79,6 +84,14 @@ async fn orders_start_heartbeats_terminal_and_durable_summary() {
     );
     let parent_session_id = super::new_remote_session_id();
     let client = async_nats::connect(&url).await.expect("connect observer");
+    crate::nats_session_log::NatsSessionLog::new_with_replicas(
+        async_nats::jetstream::new(client.clone()),
+        &parent_session_id,
+        1,
+    )
+    .load_events_async()
+    .await
+    .expect("create parent transcript");
     let mut events = client
         .subscribe(crate::nats_event_sink::events_subject(&parent_session_id))
         .await

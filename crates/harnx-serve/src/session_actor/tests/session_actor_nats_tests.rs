@@ -33,7 +33,8 @@ async fn interrupted_state_is_reconstructed_from_durable_hitl_entries() {
     let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
         jetstream,
         harnx_core::session_identity::session_key(Some("plain"), &session_id),
-    );
+    )
+    .with_replicas(1);
     log.append_event_async(
         &harnx_core::session::SessionLogEntry::HitlApprovalRequested {
             tool_call_id: "derived-call".to_string(),
@@ -158,7 +159,8 @@ async fn seed_leased_pending_tool_call(
     let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
         jetstream.clone(),
         harnx_core::session_identity::session_key(Some("plain"), session_id),
-    );
+    )
+    .with_replicas(1);
     log.append_event_async(&harnx_core::session::SessionLogEntry::ToolCalls {
         text: "still working".to_string(),
         thought: None,

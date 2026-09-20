@@ -54,6 +54,7 @@ impl Fixture {
 /// Interrupt the way a frontend does: one `Cancel` appended to the log.
 async fn interrupt(jetstream: &JetstreamContext) {
     NatsSessionLog::new(jetstream.clone(), storage_key())
+        .with_replicas(1)
         .append_event_async(&SessionLogEntry::cancel_request(
             "queue-stop".into(),
             "client:test".into(),

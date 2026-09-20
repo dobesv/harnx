@@ -132,7 +132,7 @@ async fn lone_prompt_is_not_reinjected_across_tool_rounds() -> Result<()> {
 
     let js = local_test_nats(server.url()).await?;
     let session_id = "solo-turn-no-reinjection";
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
 
     log.append_event_async(&append_user_message_entry("user-1", "seed message"))
         .await?;
@@ -198,7 +198,7 @@ async fn queued_message_is_injected_once_across_many_tool_rounds() -> Result<()>
 
     let js = local_test_nats(server.url()).await?;
     let session_id = "repeated-round-injection";
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
 
     // Register the wakeup before activating so notify_one() cannot be lost.
     let ready_fut = LATE_MSG_READY.notified();
@@ -261,7 +261,7 @@ async fn worker_turn_sends_the_prompt_to_the_model_once() -> Result<()> {
 
     let js = local_test_nats(server.url()).await?;
     let session_id = "wire-prompt-once";
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
 
     log.append_event_async(&append_user_message_entry("user-1", "seed message"))
         .await?;
@@ -308,7 +308,7 @@ async fn retracted_mid_tool_round_message_is_not_injected() -> Result<()> {
 
     let js = local_test_nats(server.url()).await?;
     let session_id = "mid-round-retracted-injection";
-    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
     let ready_fut = MID_ROUND_APPEND_READY.notified();
 
     log.append_event_async(&append_user_message_entry("user-1", "seed message"))

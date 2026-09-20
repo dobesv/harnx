@@ -7789,7 +7789,8 @@ async fn session_picker_enter_loads_selected_session() {
         jetstream,
         "hermes",
         "my-session",
-    );
+    )
+    .with_replicas(1);
     for entry in [
         harnx_core::session::SessionLogEntry::Message {
             id: None,

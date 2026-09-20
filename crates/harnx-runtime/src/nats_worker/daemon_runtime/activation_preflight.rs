@@ -65,7 +65,11 @@ impl WorkerRuntime {
         message: &async_nats::jetstream::Message,
         activation: &SessionActivate,
     ) -> Result<bool> {
-        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id);
+        let backend = NatsSessionLogBackend::new(
+            self.jetstream.clone(),
+            &activation.session_id,
+            self.lease.replicas,
+        );
         let entries = backend.load_events_latest_async().await?;
         let state = harnx_core::session_reconstruct::reconstruct_state_from_nats(&entries);
         match state.turn_status {

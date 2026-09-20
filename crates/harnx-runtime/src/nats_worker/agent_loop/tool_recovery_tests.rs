@@ -119,6 +119,6 @@ async fn recovery_fixture() -> Result<(
         .await?
         .context("nats-server required")?;
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let log = crate::nats_session_log::NatsSessionLog::new(js, "parent");
+    let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(js, "parent", 1);
     Ok((server, log))
 }

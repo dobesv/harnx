@@ -31,7 +31,7 @@ async fn case_distinct_sessions_have_independent_transcripts() -> Result<()> {
         return Ok(());
     };
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let old = NatsSessionLog::new(js.clone(), "aqCV1g");
+    let old = NatsSessionLog::new_with_replicas(js.clone(), "aqCV1g", 1);
     old.append_event_async(&SessionLogEntry::Cancel {
         fence_token: 11,
         cancellation_id: None,
@@ -39,7 +39,7 @@ async fn case_distinct_sessions_have_independent_transcripts() -> Result<()> {
         timestamp: None,
     })
     .await?;
-    let new = NatsSessionLog::new(js.clone(), "aqcV1g");
+    let new = NatsSessionLog::new_with_replicas(js.clone(), "aqcV1g", 1);
     assert!(new.load_events_async().await?.is_empty());
     new.append_event_async(&SessionLogEntry::Cancel {
         fence_token: 22,

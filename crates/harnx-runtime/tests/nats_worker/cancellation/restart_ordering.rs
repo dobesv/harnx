@@ -46,7 +46,7 @@ fn log(
     js: &async_nats::jetstream::Context,
     key: &str,
 ) -> harnx_runtime::nats_session_log::NatsSessionLog {
-    harnx_runtime::nats_session_log::NatsSessionLog::new(js.clone(), key)
+    harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(js.clone(), key, 1)
 }
 
 /// Both sessions as a delegation leaves them: the root mid sub-agent call, the
@@ -134,6 +134,7 @@ async fn child_activation_after_restart_does_not_resume_under_interrupted_parent
         harnx_runtime::nats_session::InterruptRequest {
             session_id: root_key.clone(),
             cluster: "local".into(),
+            replicas: 1,
             cancellation_id: "cancel-root".into(),
             requested_by: "client:test".into(),
             reason: "user interrupt".into(),
@@ -146,7 +147,7 @@ async fn child_activation_after_restart_does_not_resume_under_interrupted_parent
     ));
     // The child's activation is queued before the replacement worker exists,
     // so it can be the first thing that worker sees.
-    publish_session_activate(&js, "local", &SessionActivate::new(&child_key)).await?;
+    publish_session_activate(&js, "local", &SessionActivate::new(&child_key), 1).await?;
 
     let calls = Arc::new(AtomicUsize::new(0));
     let daemon = spawn_worker_daemon_with_call_fn(

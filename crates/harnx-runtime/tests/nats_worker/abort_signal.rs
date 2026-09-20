@@ -100,7 +100,7 @@ async fn abort_signal_cancels_blocked_worker_and_persists_tombstone() -> Result<
         "NATS session turn should report cancellation"
     );
 
-    let log = NatsSessionLog::new(jetstream, storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(jetstream, storage_key(session_id), 1);
     let entries = wait_for_cancel(&log).await?;
     tokio::time::timeout(CI_SAFE_TIMEOUT, model_dropped.cancelled()).await?;
     let cancel_fence = entries.iter().find_map(|(_, entry)| match entry {
@@ -141,7 +141,7 @@ async fn cancel_immediately_after_activation_ack_is_not_lost() -> Result<()> {
     // Raw log writers are an internal protocol and must initialize canonical
     // metadata before the first transcript entry.
     seed_session_metadata(&jetstream, session_id).await?;
-    let log = NatsSessionLog::new(jetstream.clone(), storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(session_id), 1);
     log.append_event_async(&append_user_message_entry(
         "immediate-cancel-user",
         "block until cancelled",

@@ -30,8 +30,11 @@ async fn replacement_confirms_durable_cancel_after_dead_owners_lease_expires() -
     })
     .await?
     .context("acquire dead owner lease")?;
-    let log =
-        harnx_runtime::nats_session_log::NatsSessionLog::new(js.clone(), session.storage_key());
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(
+        js.clone(),
+        session.storage_key(),
+        1,
+    );
     seed_unanswered_round(&log, lease.fence_token()).await?;
     // Simulate a process disappearing before it writes Cancel or releases its
     // lease. Retain the test object so Drop cannot perform a graceful release.

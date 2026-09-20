@@ -182,6 +182,7 @@ impl TurnWorker {
             InterruptRequest {
                 session_id: backend.session_id().to_string(),
                 cluster: self.cluster.clone(),
+                replicas: self.replicas,
                 cancellation_id: cancellation_id
                     .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
                 requested_by: format!("parent:{parent_session}"),

@@ -185,7 +185,7 @@ async fn activate(
     jetstream: &async_nats::jetstream::Context,
     activation: &SessionActivate,
 ) -> anyhow::Result<()> {
-    publish_session_activate(jetstream, LOCAL_CLUSTER_KEY, activation).await?;
+    publish_session_activate(jetstream, LOCAL_CLUSTER_KEY, activation, 1).await?;
     Ok(())
 }
 

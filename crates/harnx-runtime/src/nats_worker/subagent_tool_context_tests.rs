@@ -120,9 +120,10 @@ async fn assert_inherited_context(metadata: &SessionMetadataStore, session_id: &
 }
 
 async fn child_log(config: &crate::config::Config, session_id: &str) -> NatsSessionLog {
-    NatsSessionLog::new(
+    NatsSessionLog::new_with_replicas(
         config.nats_jetstream("local").await.unwrap(),
         harnx_core::session_identity::session_key(Some("metis"), session_id),
+        1,
     )
 }
 

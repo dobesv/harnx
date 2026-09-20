@@ -273,7 +273,7 @@ async fn admit_source_user(
     jetstream: &async_nats::jetstream::Context,
     session: &str,
 ) -> (NatsSessionLog, u64) {
-    let log = NatsSessionLog::new(jetstream.clone(), session);
+    let log = NatsSessionLog::new(jetstream.clone(), session).with_replicas(1);
     let user_seq = log
         .append_event_async(&SessionLogEntry::Message {
             id: Some("user".into()),

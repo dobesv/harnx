@@ -150,9 +150,10 @@ async fn approval_by_owning_frontend_propagates_to_second_observer() -> Result<(
     assert_observer_matches_source(&harness, &observer, observer_attached_seq).await?;
     assert_confirmation_routing(&gate, &observer_request_count);
     drop(observer_route);
-    wait_for_target_turn(&NatsSessionLog::new(
+    wait_for_target_turn(&NatsSessionLog::new_with_replicas(
         harness.jetstream.clone(),
         harnx_core::session_identity::session_key(Some("target"), TARGET_SESSION_ID),
+        1,
     ))
     .await?;
     Ok(())

@@ -6,10 +6,10 @@ async fn seed_session_and_attach_runtime(
     session_id: &str,
 ) -> Result<NatsSessionLog> {
     let (metadata_store, metadata) = seed_session_metadata(&jetstream, session_id).await?;
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), storage_key(session_id))
+    let backend = NatsSessionLogBackend::new(jetstream.clone(), storage_key(session_id), 1)
         .with_metadata_store(Some(metadata_store));
 
-    let log = NatsSessionLog::new(jetstream, storage_key(session_id));
+    let log = NatsSessionLog::new_with_replicas(jetstream, storage_key(session_id), 1);
     let mut session = metadata.base_session();
     let runtime = std::sync::Arc::new(backend.clone())
         as std::sync::Arc<dyn harnx_runtime::config::session::SessionAppendSink>;

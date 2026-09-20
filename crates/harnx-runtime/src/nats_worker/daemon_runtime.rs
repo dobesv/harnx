@@ -243,7 +243,11 @@ impl WorkerRuntime {
         let requested_seq = activation
             .requested_seq
             .context("targeted activation is missing requested_seq")?;
-        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id);
+        let backend = NatsSessionLogBackend::new(
+            self.jetstream.clone(),
+            &activation.session_id,
+            self.lease.replicas,
+        );
         let entries = backend.load_events_latest_async().await?;
         Ok(
             crate::nats_session::requested_seq_status(&entries, requested_seq)?
@@ -357,7 +361,11 @@ impl WorkerRuntime {
             abort_signal,
             ..
         } = *ctx;
-        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id);
+        let backend = NatsSessionLogBackend::new(
+            self.jetstream.clone(),
+            &activation.session_id,
+            self.lease.replicas,
+        );
         match Self::spawn_control_listener(ControlListenerCtx {
             client: &self.client,
             jetstream: &self.jetstream,

@@ -126,9 +126,10 @@ impl HandoffFixture {
 
     async fn seed_destinations(&self) -> Result<NatsSessionLog> {
         let explicit_target = self.session("delegate-agent", EXPLICIT_TARGET_ID).await?;
-        let explicit_log = NatsSessionLog::new(
+        let explicit_log = NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             explicit_target.storage_key().to_string(),
+            1,
         );
         append_prior_turn(&explicit_log).await?;
         self.session("other-agent", OTHER_TARGET_ID).await?;
@@ -239,7 +240,7 @@ impl HandoffFixture {
     }
 
     fn log(&self, session: &NatsSession) -> NatsSessionLog {
-        NatsSessionLog::new(self.jetstream.clone(), session.storage_key())
+        NatsSessionLog::new_with_replicas(self.jetstream.clone(), session.storage_key(), 1)
     }
 
     async fn observe_target_activation(
@@ -473,9 +474,10 @@ fn spawn_activation_observer(
             if activation.session_id == source_id {
                 continue;
             }
-            let entries = NatsSessionLog::new(jetstream.clone(), &activation.session_id)
-                .load_events_async()
-                .await?;
+            let entries =
+                NatsSessionLog::new_with_replicas(jetstream.clone(), &activation.session_id, 1)
+                    .load_events_async()
+                    .await?;
             anyhow::ensure!(
                 entries.iter().any(|(_, entry)| matches!(
                     entry,

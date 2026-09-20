@@ -195,7 +195,7 @@ async fn user_message_has_client_id() -> Result<()> {
     let jetstream = async_nats::jetstream::new(client.clone());
 
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(&session_id), 1);
 
     // Create a NATS session (mirrors retract test pattern)
     let config = resumed_session_config(session_id.clone());
@@ -255,7 +255,7 @@ async fn enqueue_text_preserves_durable_sequence_after_activation_failure() -> R
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(&session_id), 1);
     let session = NatsSession::new(
         resumed_session_config(session_id),
         client,
@@ -318,7 +318,7 @@ async fn retract_queued_user_message() -> Result<()> {
     let jetstream = async_nats::jetstream::new(client.clone());
 
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(&session_id), 1);
 
     let config = resumed_session_config(session_id.clone());
     let abort_signal = harnx_runtime::utils::create_abort_signal();
@@ -423,7 +423,7 @@ async fn edit_queued_user_message_replaces_text_in_reconstructed_state() -> Resu
     let jetstream = async_nats::jetstream::new(client.clone());
 
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(&session_id), 1);
 
     let config = resumed_session_config(session_id.clone());
     let abort_signal = harnx_runtime::utils::create_abort_signal();
@@ -517,7 +517,7 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(&session_id), 1);
 
     let abort_signal = harnx_runtime::utils::create_abort_signal();
     let session = NatsSession::new(
@@ -583,7 +583,7 @@ async fn lazy_arbitrary_id_creation_precedes_the_first_user_entry() -> Result<()
         .await?
         .is_some());
 
-    let log = NatsSessionLog::new(jetstream, storage_key(&session_id));
+    let log = NatsSessionLog::new_with_replicas(jetstream, storage_key(&session_id), 1);
     assert!(log.load_events_async().await?.is_empty());
     let turn = tokio::spawn(async move {
         session
@@ -748,9 +748,10 @@ async fn transcript_without_metadata_is_rejected_without_an_append() -> Result<(
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = format!("legacy-headerless-{}", Uuid::new_v4());
-    let log = NatsSessionLog::new(
+    let log = NatsSessionLog::new_with_replicas(
         jetstream.clone(),
         harnx_core::session_identity::session_key(Some("test-agent"), &session_id),
+        1,
     );
     log.append_event_async(&SessionLogEntry::Message {
         id: Some(Uuid::new_v4().to_string()),

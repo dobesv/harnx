@@ -27,6 +27,7 @@ pub struct InterruptRequest {
     pub session_id: String,
     /// Cluster key used for a cluster-shared activation route.
     pub cluster: String,
+    pub replicas: usize,
     pub cancellation_id: String,
     pub requested_by: String,
     pub reason: String,
@@ -75,6 +76,7 @@ impl NatsSession {
         let request = InterruptRequest {
             session_id: self.storage_key.clone(),
             cluster: self.config.cluster.clone(),
+            replicas: self.attachment_replicas,
             cancellation_id: uuid::Uuid::now_v7().to_string(),
             requested_by: self.requester_label(),
             reason: reason.into(),
@@ -324,6 +326,7 @@ pub(super) fn decide(window: &[(u64, SessionLogEntry)]) -> Option<InterruptOutco
 struct Accepted {
     session_id: String,
     cluster: String,
+    replicas: usize,
     cancellation_id: String,
     cancel_seq: u64,
 }
@@ -333,6 +336,7 @@ impl Accepted {
         Self {
             session_id: request.session_id.clone(),
             cluster: request.cluster.clone(),
+            replicas: request.replicas,
             cancellation_id: request.cancellation_id.clone(),
             cancel_seq,
         }
@@ -368,7 +372,8 @@ fn announce(
             SessionActivationRoute::ClusterShared => {
                 let activation = SessionActivate::new(&accepted.session_id)
                     .with_requested_seq(accepted.cancel_seq);
-                publish_session_activate(&js, &accepted.cluster, &activation).await
+                publish_session_activate(&js, &accepted.cluster, &activation, accepted.replicas)
+                    .await
             }
             SessionActivationRoute::WorkerTargeted {
                 session_scope,

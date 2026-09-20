@@ -51,7 +51,7 @@ async fn background_failover_preserves_live_clients_leases_and_cancellation() ->
     let lease = failover_lease(&js).await?;
     // Interruption is durable state in the session log, so the broker handover
     // is what it has to survive.
-    let log = NatsSessionLog::new(js.clone(), FAILOVER_SESSION);
+    let log = NatsSessionLog::new_with_replicas(js.clone(), FAILOVER_SESSION, 1);
     let cancel_seq = log
         .append_event_async(&SessionLogEntry::cancel_request(
             "failover-cancellation".into(),

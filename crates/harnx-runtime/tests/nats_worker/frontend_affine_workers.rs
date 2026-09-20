@@ -167,9 +167,10 @@ impl TargetedFixture {
     async fn assert_retained_wakeup_survives_foreign_holder(&self) -> Result<()> {
         let session_id = "target-retained-after-lease";
         let _initialized = self.session(session_id, WORKER_B).await?;
-        let log = NatsSessionLog::new(
+        let log = NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             harnx_core::session_identity::session_key(None, session_id),
+            1,
         );
         let requested_seq = log
             .append_event_async(&append_user_message_entry("retained", "run after release"))
@@ -326,9 +327,10 @@ async fn wait_for_user_count(
     session_id: &str,
     expected: usize,
 ) -> Result<()> {
-    let log = NatsSessionLog::new(
+    let log = NatsSessionLog::new_with_replicas(
         jetstream.clone(),
         harnx_core::session_identity::session_key(None, session_id),
+        1,
     );
     tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {

@@ -15,7 +15,7 @@ async fn append_completed_transcript_fixture(config: &Config, session_id: &str) 
         ))
         .await
         .expect("create fixture metadata");
-    let log = NatsSessionLog::for_agent(jetstream, "metis", session_id);
+    let log = NatsSessionLog::for_agent(jetstream, "metis", session_id).with_replicas(1);
     log.append_event_async(&SessionLogEntry::Message {
         id: Some(uuid::Uuid::new_v4().to_string()),
         role: harnx_core::message::MessageRole::User,
@@ -212,7 +212,7 @@ async fn load_remote_transcript_for_render_keeps_tool_rows_and_compressed_prefix
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
+    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id).with_replicas(1);
     append_compressed_tool_fixture(&log).await;
 
     let session = activate_nats_session(&mut seeded, session_id).await;

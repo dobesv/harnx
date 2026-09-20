@@ -19,6 +19,7 @@ pub(super) async fn activate_session(
         jetstream,
         "local",
         &SessionActivate::new(storage_key(session_id)),
+        1,
     )
     .await?;
     Ok(())

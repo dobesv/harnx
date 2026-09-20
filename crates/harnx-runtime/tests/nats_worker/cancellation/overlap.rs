@@ -114,8 +114,11 @@ async fn foreign_follower_returns_on_root_receipt_without_transcript_or_cleanup(
     let admitted = session.admit_input(&input, None).await?;
     let client = async_nats::connect(server.url()).await?;
     let js = async_nats::jetstream::new(client);
-    let log =
-        harnx_runtime::nats_session_log::NatsSessionLog::new(js.clone(), session.storage_key());
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(
+        js.clone(),
+        session.storage_key(),
+        1,
+    );
     let before = log.load_events_latest_async().await?;
 
     // No worker is running: only the durable Cancel ends the follow.

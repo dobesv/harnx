@@ -667,7 +667,7 @@ pub(super) async fn test_subagent_toolset(
             "local",
             crate::SessionActivationRoute::ClusterShared,
         ),
-        super::subagent_toolset::SubagentNats::new(client.clone(), jetstream, session_metadata),
+        super::subagent_toolset::SubagentNats::new(client.clone(), jetstream, session_metadata, 1),
     ))
 }
 
@@ -784,7 +784,8 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         .await
         .expect("connect nats client for final session log");
     let log =
-        NatsSessionLog::for_agent(async_nats::jetstream::new(log_client), "metis", &session_id);
+        NatsSessionLog::for_agent(async_nats::jetstream::new(log_client), "metis", &session_id)
+            .with_replicas(1);
     let final_entries = wait_for_cancel_projection(&log).await;
     let cancel_fence_token = final_entries.iter().find_map(|(_, entry)| match entry {
         SessionLogEntry::Cancel { fence_token, .. } => Some(*fence_token),
@@ -1058,6 +1059,10 @@ async fn subagent_started_reaches_parent_stream_and_durable_log() {
         .await
         .expect("flush parent event subscription");
     let jetstream = async_nats::jetstream::new(client);
+    NatsSessionLog::new_with_replicas(jetstream.clone(), &parent_session_id, 1)
+        .load_events_async()
+        .await
+        .expect("create parent transcript");
     let (_, provider, _) =
         registered_agent_provider(&jetstream, &seeded.parent_config, &["metis"], None).await;
     let parent_tool_call_id = "parent-tool-call-123";
@@ -1075,7 +1080,7 @@ async fn subagent_started_reaches_parent_stream_and_durable_log() {
     assert_eq!(result["sub_agent"]["agent"], "metis");
     assert_eq!(result["sub_agent"]["session_id"], child_session_id);
 
-    let parent_log = NatsSessionLog::new(jetstream, parent_session_id);
+    let parent_log = NatsSessionLog::new_with_replicas(jetstream, parent_session_id, 1);
     let parent_entries = parent_log
         .load_events_async()
         .await
@@ -1181,13 +1186,14 @@ async fn run_subagent_cancel_case(parent_abort: bool) {
         error.to_string().contains("cancel") || error.to_string().contains("abort"),
         "unexpected cancellation error: {error}"
     );
-    let log = NatsSessionLog::new(
+    let log = NatsSessionLog::new_with_replicas(
         seeded
             .parent_config
             .nats_jetstream("local")
             .await
             .expect("cancel log jetstream"),
         harnx_core::session_identity::session_key(Some("metis"), &session_id),
+        1,
     );
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -1350,9 +1356,10 @@ async fn nested_subagent_prompt() {
     .expect("nested parent turn failed");
     assert_eq!(parent_result.response.as_deref(), Some(PARENT_FINAL));
 
-    let parent_log = NatsSessionLog::new(
+    let parent_log = NatsSessionLog::new_with_replicas(
         async_nats::jetstream::new(client.clone()),
         harnx_core::session_identity::session_key(Some("metis"), &parent_session_id),
+        1,
     );
     let parent_entries = parent_log
         .load_events_async()
@@ -1397,7 +1404,7 @@ async fn nested_subagent_prompt() {
         .get_stream(&child_stream_name)
         .await
         .expect("child SESSION_<id> JetStream log must exist");
-    let child_entries = NatsSessionLog::new(jetstream, child_session_id)
+    let child_entries = NatsSessionLog::new_with_replicas(jetstream, child_session_id, 1)
         .load_events_async()
         .await
         .expect("load child session log");
@@ -1626,7 +1633,7 @@ async fn remote_dispatch_retract_round_trip() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::for_agent(jetstream.clone(), "metis", &session_id);
+    let log = NatsSessionLog::for_agent(jetstream.clone(), "metis", &session_id).with_replicas(1);
     seed_remote_dispatch_session_log(&log, &jetstream, &session_id)
         .await
         .expect("seed remote session log");
@@ -1698,7 +1705,7 @@ async fn remote_dispatch_edit_round_trip() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::for_agent(jetstream.clone(), "metis", &session_id);
+    let log = NatsSessionLog::for_agent(jetstream.clone(), "metis", &session_id).with_replicas(1);
     seed_remote_dispatch_session_log(&log, &jetstream, &session_id)
         .await
         .expect("seed remote session log");
@@ -1788,7 +1795,7 @@ async fn remote_delete_turn_matches_local_any_role_parity() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
+    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id).with_replicas(1);
 
     seeded
         .parent_config
@@ -1875,7 +1882,7 @@ async fn remote_delete_accepts_first_transcript_row() {
         .await
         .expect("create canonical metadata");
     let message_id = uuid::Uuid::new_v4().to_string();
-    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
+    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id).with_replicas(1);
     let first_user_seq = log
         .append_event_async(&SessionLogEntry::Message {
             id: Some(message_id.clone()),
@@ -1942,7 +1949,7 @@ async fn remote_rewind_appends_mutation_without_truncating_stream() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
+    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id).with_replicas(1);
     let before_raw = log
         .load_events_async()
         .await
@@ -2035,7 +2042,7 @@ async fn remote_delete_refreshes_after_concurrent_mutation() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
+    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id).with_replicas(1);
 
     seeded
         .parent_config
@@ -2399,6 +2406,7 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
         .expect("connect to jetstream");
     let js = async_nats::jetstream::new(js);
     let raw = NatsSessionLog::for_agent(js, "metis", &session_id)
+        .with_replicas(1)
         .load_events_async()
         .await
         .expect("raw log");
@@ -2505,6 +2513,7 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
         .expect("connect to jetstream");
     let js = async_nats::jetstream::new(js);
     let raw = NatsSessionLog::for_agent(js, "metis", &session_id)
+        .with_replicas(1)
         .load_events_async()
         .await
         .expect("raw log");
@@ -2572,7 +2581,7 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         ))
         .await
         .expect("seed canonical session metadata");
-    let seed_log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
+    let seed_log = NatsSessionLog::for_agent(jetstream, "metis", &session_id).with_replicas(1);
     for text in ["leading one", "leading two"] {
         seed_log
             .append_event_async(&SessionLogEntry::Message {

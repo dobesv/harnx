@@ -11,5 +11,5 @@ pub async fn fenced_backend(
     js: &async_nats::jetstream::Context,
     session: &str,
 ) -> Result<NatsSessionLogBackend> {
-    Ok(NatsSessionLogBackend::new(js.clone(), session))
+    Ok(NatsSessionLogBackend::new(js.clone(), session, 1))
 }

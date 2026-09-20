@@ -13,7 +13,8 @@ pub(crate) async fn clear_remote_session(
     let log = NatsSessionLog::new(
         session.jetstream().clone(),
         session.storage_key().to_string(),
-    );
+    )
+    .with_replicas(session.attachment_replicas());
     log.append_event_async(&SessionLogEntry::Clear)
         .await
         .context("Failed to persist session clear in NATS")?;

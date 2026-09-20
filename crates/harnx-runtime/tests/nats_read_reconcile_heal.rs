@@ -213,11 +213,11 @@ async fn lost_attention_bump_heals_via_log_reconciliation() -> Result<()> {
         .await?;
 
     // Create backend with metadata store attached (for reconcile_attention_from_log)
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), storage_key(&session_id))
+    let backend = NatsSessionLogBackend::new(jetstream.clone(), storage_key(&session_id), 1)
         .with_metadata_store(Some(store.clone()));
 
     // Append log entries WITHOUT bumping attention (simulate crash before KV write)
-    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(&session_id), 1);
     log.append_event_async(&SessionLogEntry::Message {
         id: None,
         role: harnx_core::message::MessageRole::User,

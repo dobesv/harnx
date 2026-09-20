@@ -39,7 +39,7 @@ fn log(
     js: &async_nats::jetstream::Context,
     key: &str,
 ) -> harnx_runtime::nats_session_log::NatsSessionLog {
-    harnx_runtime::nats_session_log::NatsSessionLog::new(js.clone(), key)
+    harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(js.clone(), key, 1)
 }
 
 fn user(text: &str) -> Entry {
@@ -139,6 +139,7 @@ async fn interrupt(
         harnx_runtime::nats_session::InterruptRequest {
             session_id: session.to_string(),
             cluster: "local".into(),
+            replicas: 1,
             cancellation_id: format!("cancel-{session}"),
             requested_by: "client:test".into(),
             reason: "user interrupt".into(),
@@ -158,7 +159,7 @@ async fn interrupt(
 /// Activate one descendant and wait for the worker to refuse it, reporting the
 /// parent its `Cancel` names.
 async fn refused_under(js: &async_nats::jetstream::Context, level: &Level) -> Result<String> {
-    publish_session_activate(js, "local", &SessionActivate::new(&level.key)).await?;
+    publish_session_activate(js, "local", &SessionActivate::new(&level.key), 1).await?;
     let log = log(js, &level.key);
     tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {

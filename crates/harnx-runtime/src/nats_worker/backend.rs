@@ -206,6 +206,7 @@ impl MetadataReplacement {
 pub struct NatsSessionLogBackend {
     jetstream: jetstream::Context,
     session_id: String,
+    replicas: usize,
     /// Optional observer of the latest durable append sequence. When set, every
     /// successful append advances it via `fetch_max`, so the live-event fan-out
     /// sink (P4.1) can stamp advisories with an up-to-date `after_seq` during
@@ -414,10 +415,15 @@ impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
 }
 
 impl NatsSessionLogBackend {
-    pub fn new(jetstream: jetstream::Context, session_id: impl Into<String>) -> Self {
+    pub fn new(
+        jetstream: jetstream::Context,
+        session_id: impl Into<String>,
+        replicas: usize,
+    ) -> Self {
         Self {
             jetstream,
             session_id: session_id.into(),
+            replicas,
             after_seq_observer: None,
             metadata_store: None,
         }
@@ -578,9 +584,10 @@ impl NatsSessionLogBackend {
         expected_last_sequence: u64,
         lease: &NatsSessionLease,
     ) -> Result<Option<u64>> {
-        let log = crate::nats_session_log::NatsSessionLog::new(
+        let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             self.session_id.clone(),
+            self.replicas,
         );
         self.ensure_lease_held(lease, entry)?;
         let seq = match log
@@ -649,9 +656,10 @@ impl NatsSessionLogBackend {
         mut write: FencedWrite,
     ) -> Result<u64> {
         let entry = stamp_fence_token(entry, lease.fence_token());
-        let log = crate::nats_session_log::NatsSessionLog::new(
+        let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             self.session_id.clone(),
+            self.replicas,
         );
         // One message id for every attempt: a publish rejected for the wrong
         // tail never enters the dedupe window, while one whose ack was lost
@@ -717,9 +725,10 @@ impl NatsSessionLogBackend {
         entry: &harnx_core::session::SessionLogEntry,
         lease: Option<&NatsSessionLease>,
     ) -> Result<u64> {
-        let log = crate::nats_session_log::NatsSessionLog::new(
+        let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             self.session_id.clone(),
+            self.replicas,
         );
         let Some(lease) = lease else {
             return self.append_unfenced_entry(&log, entry).await;
@@ -829,9 +838,10 @@ impl NatsSessionLogBackend {
 
     /// Load all events, blocking on async NATS reads.
     pub fn load_events_blocking(&self) -> Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
-        let log = crate::nats_session_log::NatsSessionLog::new(
+        let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             self.session_id.clone(),
+            self.replicas,
         );
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(log.load_events_async())
@@ -852,9 +862,10 @@ impl NatsSessionLogBackend {
             .as_ref()
             .map(|o| o.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(0);
-        let log = crate::nats_session_log::NatsSessionLog::new(
+        let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             self.session_id.clone(),
+            self.replicas,
         );
         log.load_events_at_least_async(min_seq).await
     }
@@ -862,9 +873,10 @@ impl NatsSessionLogBackend {
     pub async fn load_events_latest_async(
         &self,
     ) -> Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
-        let log = crate::nats_session_log::NatsSessionLog::new(
+        let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             self.session_id.clone(),
+            self.replicas,
         );
         log.load_events_latest_async().await
     }

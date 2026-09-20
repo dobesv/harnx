@@ -15,6 +15,128 @@ use harnx_runtime::{
 };
 use serde_json::json;
 
+#[tokio::test]
+async fn session_stream_creation_uses_configured_replicas() -> Result<()> {
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+
+    let absent_session = "replicas-read-only-absent";
+    let absent_stream = stream_name_for_session(absent_session);
+    let entries = NatsSessionLog::new(jetstream.clone(), absent_session)
+        .load_events_async()
+        .await?;
+    assert!(entries.is_empty());
+    let error = match jetstream.get_stream(&absent_stream).await {
+        Ok(_) => panic!("read-only session log created absent stream '{absent_stream}'"),
+        Err(error) => error,
+    };
+    match error.kind() {
+        async_nats::jetstream::context::GetStreamErrorKind::JetStream(error) => {
+            assert_eq!(
+                error.kind(),
+                async_nats::jetstream::ErrorCode::STREAM_NOT_FOUND
+            );
+        }
+        kind => panic!("expected STREAM_NOT_FOUND after read-only load, got {kind:?}"),
+    }
+
+    let single_replica_session = "replicas-one";
+    let single_replica_stream = stream_name_for_session(single_replica_session);
+    let entries = NatsSessionLog::new_with_replicas(jetstream.clone(), single_replica_session, 1)
+        .load_events_async()
+        .await?;
+    assert!(entries.is_empty());
+    let mut stream = jetstream.get_stream(&single_replica_stream).await?;
+    let info = stream.info().await?;
+    assert_eq!(
+        info.config.num_replicas, 1,
+        "configured replica count must reach the created session stream"
+    );
+
+    let error = NatsSessionLog::new_with_replicas(jetstream, "replicas-three", 3)
+        .load_events_async()
+        .await
+        .expect_err("a three-replica stream must fail on a non-clustered server");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("with 3 replicas"),
+        "creation context must report the requested replica count: {error}"
+    );
+    assert!(
+        error.contains("replicas > 1 not supported in non-clustered mode"),
+        "server must reject the requested three replicas rather than silently creating R1: {error}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_session_log_propagates_non_not_found_errors() -> Result<()> {
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::with_prefix(client, "UNREACHABLE_JETSTREAM_API");
+    let result = NatsSessionLog::new(jetstream, "read-only-request-error")
+        .load_events_async()
+        .await;
+
+    let error = result.expect_err("a non-STREAM_NOT_FOUND lookup error must propagate");
+    assert!(
+        format!("{error:#}").contains("Failed to open existing JetStream log stream"),
+        "unexpected propagated error: {error:#}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unconfigured_append_rejects_missing_stream_without_creating_it() -> Result<()> {
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let session_id = "unconfigured-append-missing";
+    let stream_name = stream_name_for_session(session_id);
+    let log = NatsSessionLog::new(jetstream.clone(), session_id);
+
+    let error = log
+        .append_event_async(&SessionLogEntry::Cancel {
+            fence_token: 1,
+            cancellation_id: None,
+            requested_by: None,
+            timestamp: None,
+        })
+        .await
+        .expect_err("an unconfigured handle must not create a missing stream");
+    assert!(
+        format!("{error:#}").contains("without a configured creation replica count"),
+        "unexpected append policy error: {error:#}"
+    );
+
+    let error = match jetstream.get_stream(&stream_name).await {
+        Ok(_) => panic!("unconfigured append created stream '{stream_name}'"),
+        Err(error) => error,
+    };
+    match error.kind() {
+        async_nats::jetstream::context::GetStreamErrorKind::JetStream(error) => assert_eq!(
+            error.kind(),
+            async_nats::jetstream::ErrorCode::STREAM_NOT_FOUND
+        ),
+        kind => panic!("expected STREAM_NOT_FOUND after rejected append, got {kind:?}"),
+    }
+    Ok(())
+}
+
 /// Only an explicit missing-message response is a retention gap. A broker
 /// failure must not produce a successful, truncated transcript.
 #[tokio::test]
@@ -25,7 +147,7 @@ async fn nats_session_log_rejects_transport_errors_instead_of_skipping_entries()
     };
     let client = async_nats::connect(server.url()).await?;
     let js = async_nats::jetstream::new(client.clone());
-    let log = NatsSessionLog::new(js.clone(), "read-failure");
+    let log = NatsSessionLog::new_with_replicas(js.clone(), "read-failure", 1);
     log.append_event_async(&SessionLogEntry::Cancel {
         fence_token: 1,
         cancellation_id: None,
@@ -77,7 +199,7 @@ async fn nats_session_log_still_skips_confirmed_retention_gaps() -> Result<()> {
         return Ok(());
     };
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let log = NatsSessionLog::new(js.clone(), "read-gap");
+    let log = NatsSessionLog::new_with_replicas(js.clone(), "read-gap", 1);
     for fence_token in 1..=3 {
         log.append_event_async(&SessionLogEntry::Cancel {
             fence_token,
@@ -122,7 +244,7 @@ async fn nats_session_log_round_trips_and_reconstructs() -> Result<()> {
         ..Default::default()
     };
     let jetstream = config.nats_jetstream("local").await?;
-    let log = NatsSessionLog::new(jetstream.clone(), "session-roundtrip");
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), "session-roundtrip", 1);
 
     let entries = mixed_entries();
     let expected_yaml: Vec<String> = entries.iter().map(entry_yaml).collect::<Result<_>>()?;
@@ -176,7 +298,7 @@ async fn nats_session_log_orphan_repair_matches_file_replay() -> Result<()> {
         ..Default::default()
     };
     let jetstream = config.nats_jetstream("local").await?;
-    let log = NatsSessionLog::new(jetstream.clone(), "session-orphan");
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), "session-orphan", 1);
 
     let entries = orphan_entries();
     let expected_yaml: Vec<String> = entries.iter().map(entry_yaml).collect::<Result<_>>()?;

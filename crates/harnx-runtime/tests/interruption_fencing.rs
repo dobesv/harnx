@@ -72,7 +72,7 @@ impl Harness {
     async fn sink(&self) -> Result<FencedSessionLogSink> {
         let tail = self.entries().await?.last().map_or(0, |(seq, _)| *seq);
         Ok(FencedSessionLogSink::new(
-            NatsSessionLogBackend::new(self.js.clone(), "race")
+            NatsSessionLogBackend::new(self.js.clone(), "race", 1)
                 .with_after_seq_observer(Arc::new(AtomicU64::new(tail))),
             self.lease.clone(),
         ))
@@ -81,7 +81,7 @@ impl Harness {
     /// Interrupt the way a frontend does: append one `Cancel` to the log, then
     /// fire the abort signal the worker's watcher fires on seeing it.
     async fn interrupt(&self) -> Result<u64> {
-        let seq = NatsSessionLog::new(self.js.clone(), "race")
+        let seq = NatsSessionLog::new_with_replicas(self.js.clone(), "race", 1)
             .append_event_async(&SessionLogEntry::cancel_request(
                 "cancel-1".into(),
                 "client:test".into(),
@@ -92,13 +92,13 @@ impl Harness {
     }
 
     async fn entries(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
-        NatsSessionLog::new(self.js.clone(), "race")
+        NatsSessionLog::new_with_replicas(self.js.clone(), "race", 1)
             .load_events_latest_async()
             .await
     }
 
     async fn admit_prompt(&self) -> Result<harnx_core::session::Session> {
-        NatsSessionLog::new(self.js.clone(), "race")
+        NatsSessionLog::new_with_replicas(self.js.clone(), "race", 1)
             .append_event_async(&SessionLogEntry::Message {
                 id: Some("opening-prompt".into()),
                 role: MessageRole::User,
