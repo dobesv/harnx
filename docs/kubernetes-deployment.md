@@ -45,6 +45,13 @@ For TLS or mTLS clusters, set the corresponding TLS environment variables:
 - `HARNX_NATS_TLS_CERT=/etc/harnx/certs/tls.crt`
 - `HARNX_NATS_TLS_KEY=/etc/harnx/certs/tls.key`
 
+`HARNX_NATS_URL` also accepts `ws://` and `wss://`, which is what reaches a
+broker behind an HTTP load balancer such as an mTLS-gated AWS ALB. Peers the
+broker advertises are ignored on those schemes, since they address the cluster
+directly; `HARNX_NATS_IGNORE_DISCOVERED_SERVERS` overrides that either way. See
+[NATS HA deployment](nats-ha.md) for the broker-side listener and health-check
+configuration.
+
 Harnx automatically creates the required JetStream streams and KV buckets on connect. See [NATS HA deployment](nats-ha.md) for cluster topology and stream replication settings.
 
 ---

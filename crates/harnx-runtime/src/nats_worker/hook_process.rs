@@ -14,7 +14,8 @@ use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
 use harnx_hookset::{HookRegistration, HARNX_HOOK_NAME};
 use harnx_nats_common::connect::{
-    HARNX_NATS_TLS_CA_ENV, HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV, HARNX_NATS_TLS_KEY_ENV,
+    format_bool_env, HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV, HARNX_NATS_TLS_CA_ENV,
+    HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV, HARNX_NATS_TLS_KEY_ENV,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,13 +36,13 @@ pub(super) struct HookMonitor {
     pub(super) processes: Arc<Mutex<HashMap<u32, String>>>,
 }
 
-/// Mirror this config's TLS/mTLS settings into the child's environment, using
+/// Mirror this config's broker settings into the child's environment, using
 /// the exact same variable names `NatsEndpoint::from_env` reads. A spawned
 /// hook server that can't see these connects plaintext to a TLS-only broker
 /// and never reaches it.
-pub(super) fn apply_tls_env(command: &mut Command, config: &HookServerStartConfig) {
-    if let Some(tls) = config.tls {
-        command.env(HARNX_NATS_TLS_ENV, if tls { "true" } else { "false" });
+pub(super) fn apply_broker_env(command: &mut Command, config: &HookServerStartConfig) {
+    if let Some(tls) = format_bool_env(config.tls) {
+        command.env(HARNX_NATS_TLS_ENV, tls);
     }
     if let Some(cert) = &config.tls_cert {
         command.env(HARNX_NATS_TLS_CERT_ENV, cert);
@@ -51,6 +52,9 @@ pub(super) fn apply_tls_env(command: &mut Command, config: &HookServerStartConfi
     }
     if let Some(ca) = &config.tls_ca {
         command.env(HARNX_NATS_TLS_CA_ENV, ca);
+    }
+    if let Some(ignore) = format_bool_env(config.ignore_discovered_servers) {
+        command.env(HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV, ignore);
     }
 }
 
@@ -87,7 +91,7 @@ pub(super) async fn spawn_hook_server(
             HARNX_NATS_REPLICAS_ENV,
             config.resolved_replicas().to_string(),
         );
-    apply_tls_env(&mut command, config);
+    apply_broker_env(&mut command, config);
     command
         .stdin(Stdio::null())
         // Send output where our own logs go so a hook server that exits before

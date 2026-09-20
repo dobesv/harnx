@@ -15,8 +15,8 @@ use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::sink::emit_agent_event;
 use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
 use harnx_nats_common::connect::{
-    NatsEndpoint, HARNX_NATS_TLS_CA_ENV, HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV,
-    HARNX_NATS_TLS_KEY_ENV,
+    format_bool_env, NatsEndpoint, HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV, HARNX_NATS_TLS_CA_ENV,
+    HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV, HARNX_NATS_TLS_KEY_ENV,
 };
 use harnx_toolset::{server_identity_token, HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE};
 use harnx_toolset_server::registration_key;
@@ -49,6 +49,10 @@ pub struct ToolServerStartConfig {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_ca: Option<String>,
+    /// Discovery override for `nats_url`, mirrored alongside the TLS settings
+    /// so a child computes the same answer the worker did rather than
+    /// re-deriving a default from the URL.
+    ignore_discovered_servers: Option<bool>,
     /// Send tool-server output to this process's own stdout/stderr instead of
     /// the worker log. Set by foreground diagnostics, where routing a server's
     /// explanation of its own failure into a file is the opposite of useful.
@@ -73,6 +77,7 @@ impl ToolServerStartConfig {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            ignore_discovered_servers: None,
             inherit_child_output: false,
             process_manager: ChildProcessManager::new(),
         }
@@ -90,26 +95,28 @@ impl ToolServerStartConfig {
         self
     }
 
-    /// Copy TLS/mTLS settings from `endpoint` (built from the cluster this
-    /// config connects to) so spawned tool servers are told to use the same
-    /// ones. Only `endpoint`'s TLS fields are read; url/token/replicas are
-    /// already carried separately. Without this, a worker discovering over
-    /// TLS spawns children that connect plaintext and can never reach the
-    /// broker.
-    pub fn with_tls(mut self, endpoint: &NatsEndpoint) -> Self {
+    /// Copy the settings that decide *how* to reach the broker from
+    /// `endpoint` (built from the cluster this config connects to), so spawned
+    /// tool servers are told to use the same ones. Only those fields are read;
+    /// url/token/replicas are already carried separately. Without this, a
+    /// worker discovering over TLS spawns children that connect plaintext and
+    /// can never reach the broker.
+    pub fn with_broker_settings(mut self, endpoint: &NatsEndpoint) -> Self {
         self.tls = endpoint.tls;
         self.tls_cert = endpoint.tls_cert.clone();
         self.tls_key = endpoint.tls_key.clone();
         self.tls_ca = endpoint.tls_ca.clone();
+        self.ignore_discovered_servers = endpoint.ignore_discovered_servers;
         self
     }
 
-    fn tls_endpoint(&self) -> NatsEndpoint {
+    fn broker_settings_endpoint(&self) -> NatsEndpoint {
         NatsEndpoint {
             tls: self.tls,
             tls_cert: self.tls_cert.clone(),
             tls_key: self.tls_key.clone(),
             tls_ca: self.tls_ca.clone(),
+            ignore_discovered_servers: self.ignore_discovered_servers,
             ..Default::default()
         }
     }
@@ -123,7 +130,7 @@ impl ToolServerStartConfig {
         )
         .with_process_manager(self.process_manager.clone())
         .with_replicas(self.replicas)
-        .with_tls(&self.tls_endpoint())
+        .with_broker_settings(&self.broker_settings_endpoint())
     }
 }
 
@@ -504,13 +511,13 @@ fn child_output_sink(config: &ToolServerStartConfig) -> Stdio {
     }
 }
 
-/// Mirror this config's TLS/mTLS settings into the child's environment, using
+/// Mirror this config's broker settings into the child's environment, using
 /// the exact same variable names `NatsEndpoint::from_env` reads. A spawned
 /// server that can't see these connects plaintext to a TLS-only broker and
 /// never reaches it.
-fn apply_tls_env(command: &mut Command, config: &ToolServerStartConfig) {
-    if let Some(tls) = config.tls {
-        command.env(HARNX_NATS_TLS_ENV, if tls { "true" } else { "false" });
+fn apply_broker_env(command: &mut Command, config: &ToolServerStartConfig) {
+    if let Some(tls) = format_bool_env(config.tls) {
+        command.env(HARNX_NATS_TLS_ENV, tls);
     }
     if let Some(cert) = &config.tls_cert {
         command.env(HARNX_NATS_TLS_CERT_ENV, cert);
@@ -520,6 +527,9 @@ fn apply_tls_env(command: &mut Command, config: &ToolServerStartConfig) {
     }
     if let Some(ca) = &config.tls_ca {
         command.env(HARNX_NATS_TLS_CA_ENV, ca);
+    }
+    if let Some(ignore) = format_bool_env(config.ignore_discovered_servers) {
+        command.env(HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV, ignore);
     }
 }
 
@@ -545,7 +555,7 @@ async fn spawn_tool_server(
             HARNX_NATS_REPLICAS_ENV,
             config.replicas.unwrap_or(1).to_string(),
         );
-    apply_tls_env(&mut command, config);
+    apply_broker_env(&mut command, config);
     harnx_telemetry::forward_otel_env(&mut command);
     command
         .stdin(Stdio::null())

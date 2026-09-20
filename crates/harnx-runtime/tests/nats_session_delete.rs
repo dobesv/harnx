@@ -209,6 +209,7 @@ fn local_nats_config(url: &str) -> Config {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            ignore_discovered_servers: None,
             agents: vec![],
         }],
         ..Default::default()

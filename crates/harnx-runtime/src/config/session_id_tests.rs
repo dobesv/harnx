@@ -127,6 +127,7 @@ async fn isolated_session_config() -> Option<(
         tls_cert: None,
         tls_key: None,
         tls_ca: None,
+        ignore_discovered_servers: None,
         agents: Vec::new(),
     });
     config.set_remote_agent("test-agent".to_string(), TEST_CLUSTER.to_string());

@@ -460,7 +460,8 @@ only tells the worker which `nats_servers/<cluster>.yaml` to use for the
 and hook servers is a separate connection that never reads that file — it
 always resolves from `HARNX_NATS_URL`/`HARNX_NATS_TOKEN` (and, on a TLS or
 mTLS cluster, `HARNX_NATS_TLS`, `HARNX_NATS_TLS_CERT`, `HARNX_NATS_TLS_KEY`,
-`HARNX_NATS_TLS_CA`) in the worker's own environment. A worker pod must carry
+`HARNX_NATS_TLS_CA`, plus `HARNX_NATS_IGNORE_DISCOVERED_SERVERS` when that is
+set explicitly) in the worker's own environment. A worker pod must carry
 these env vars *in addition to* `--cluster`, even when `prod.yaml` already
 has the same URL and TLS settings — otherwise the worker connects fine for
 sessions but can't discover any tool or hook server, or (on a TLS cluster)
@@ -1176,7 +1177,18 @@ happened and when.
 Workers participate in OpenTelemetry distributed tracing when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Trace context propagates across process boundaries over NATS message headers for sub-agent activations and tool executions. See [OpenTelemetry Tracing](tracing.md).
 
 ## TLS Support Note
-Harnx supports TLS and mTLS for NATS connections. While token authentication and config-based TLS have been verified, automated PKI-backed integration tests for live TLS handshakes are ongoing.
+Harnx supports TLS and mTLS for NATS connections, over both the TCP protocol
+(`nats://`, `tls://`) and WebSocket (`ws://`, `wss://`). Token authentication,
+config-based TLS and the WebSocket transport are verified; automated PKI-backed
+integration tests for live TLS handshakes are ongoing, so the mTLS handshake
+itself is exercised by configuration rather than end to end.
+
+Harnx builds the rustls config for these connections itself. Leaving it to
+async-nats resolves rustls' process-default crypto provider, which this
+workspace makes ambiguous by linking both `ring` and `aws-lc-rs` — that
+resolution panics. One case is deliberately not covered: a `nats://` URL with
+no TLS settings, pointed at a server that demands TLS in its INFO. Say
+`tls: true` (or use `tls://`) for such a cluster.
 
 Config-based TLS (`tls`/`tls_cert`/`tls_key`/`tls_ca` in `nats_servers/<cluster>.yaml`)
 covers the client and worker session connection. It does **not** cover tool/hook

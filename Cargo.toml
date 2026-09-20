@@ -148,6 +148,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "client-legacy"] }
 hyperlocal = { version = "0.9.1", default-features = false, features = ["client"] }
 moka = { version = "0.12", features = ["sync"] }
 rcgen = "0.14"
+rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
 time = { version = "0.3.36", features = ["macros"] }
@@ -183,7 +184,7 @@ duct = "1.0.0"
 rmcp = { version = "3.0", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
 process-wrap = { version = "10", features = ["tokio1"] }
 libc = "0.2"
-async-nats = { version = "0.50", default-features = false, features = ["server_2_10", "server_2_11", "ring", "jetstream", "kv", "object-store"] }
+async-nats = { version = "0.50", default-features = false, features = ["server_2_10", "server_2_11", "ring", "jetstream", "kv", "object-store", "websockets"] }
 glob = "0.3"
 globset = "0.4"
 shellexpand = "3.1.0"

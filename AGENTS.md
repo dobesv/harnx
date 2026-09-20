@@ -261,6 +261,28 @@ This macro expands to the module declaration, config enum variant, and client re
 
 Env-var field access uses `config_get_fn!` — the macro generates `${STEM}_${FIELD}` lookup where STEM is the client filename (e.g. `myprovider_api_key` → `MYPROVIDER_API_KEY`).
 
+### Building a rustls ClientConfig
+
+Never call `rustls::ClientConfig::builder()`. It resolves rustls'
+*process-default* `CryptoProvider`, and this workspace compiles rustls with both
+`ring` (via async-nats/tokio-rustls) and `aws-lc-rs` (via the AWS SDK's
+hyper-rustls stack) while no binary installs a default — so that resolution
+panics at runtime with "Could not automatically determine the process-level
+CryptoProvider". Use `builder_with_provider(Arc::new(rustls::crypto::ring::
+default_provider()))` instead.
+
+This bites indirectly too. A dependency that builds its own config on your
+behalf hits the same panic, which is why `NatsEndpoint::apply_tls_options`
+(`crates/harnx-nats-common/src/connect.rs`) supplies a `tls_client_config` for
+every TLS connection rather than letting async-nats construct one.
+
+Feature unification makes this invisible to a narrow test. `harnx-nats-common`
+alone resolves rustls with `ring` and cannot reproduce the ambiguity, so tests
+covering it must live in a crate whose graph also pulls in the AWS SDK —
+`harnx-runtime`, `harnx-worker` or `harnx`. See
+`crates/harnx-runtime/tests/tls_client_config.rs`. Check with
+`cargo tree -p <crate> -e features -i rustls`.
+
 ### Tool-call argument parsing
 
 When a provider client parses tool-call arguments from LLM output, use this pattern:
