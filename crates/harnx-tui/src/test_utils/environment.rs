@@ -8,7 +8,11 @@ pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 ///
 /// Callers must hold [`ENV_LOCK`] while this guard is alive. Giving each
 /// nextest process a separate data directory prevents one test from stopping
-/// a shared broker while peer tests are still using it.
+/// a shared broker while peer tests are still using it. It also keeps the
+/// test off the port persisted in the shared directory: a broker another
+/// process stopped moments ago, or one stranded on macOS (no parent-death
+/// signal), can still hold that port, and the owner retries it on every
+/// spawn attempt, so the test fails with "exited during startup".
 pub(crate) struct TestEnvironment {
     prior: [Option<OsString>; 2],
 }

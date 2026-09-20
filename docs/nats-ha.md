@@ -575,12 +575,15 @@ check-then-write race against a `Cancel` that lands mid-append.
 ### Requesting an interrupt
 
 `nats_session::interrupt_session` is the only way in, used by the TUI, the web
-UI through serve, the one-shot CLI and the sub-agent tool. It loads the tail,
+UI through serve, the one-shot CLI and the sub-agent tool. It loads the log,
 classifies the turn, and returns an `InterruptOutcome`: `Idle` when no user
 message follows the last terminator, so there is no turn to stop and nothing is
 appended; `Accepted { cancel_seq }` when the `Cancel` landed; or
 `AlreadyInterrupted { cancel_seq }` when one already terminates this turn.
-Calling again with the same `cancellation_id` is harmless.
+Calling again with the same `cancellation_id` is harmless. The load reads every
+entry of the log with one JetStream direct get per sequence, although
+classification only needs the entries after the last terminator; it is the part
+of an interrupt whose cost grows with the session's length.
 
 After an accepted append it fires two best-effort wake-ups and waits on neither:
 the control hint above, and a **wind-up activation** targeting
@@ -604,6 +607,15 @@ processes to die.
   failed interrupt the user can retry, never silently swallowed — the log is the
   authority, so an append that did land is found by the next history read even
   if its acknowledgement was lost.
+  The TUI runs the whole request on its own task and only checks the join
+  handle from its render loop, so the budget is spent on the broker rather than
+  on 80 ms render ticks.
+- To see where a slow interrupt's time went: the cancellation id is a UUIDv7,
+  so its timestamp is when the request was minted. Compare it with the `Cancel`
+  entry's stream time (`nats stream get SESSION_<sha256 of the storage key>
+  <seq> -j`) and the frontend's log lines, which carry its pid: `abort signal
+  received`, `interrupt appended`, and `attached to session` for the attach
+  that precedes the TUI's request.
 - If the owning worker is dead, the wind-up waits for its lease to expire (30 s
   by default) and then runs on the next activation, which is NAKed with delay
   until the lease is free. There is no lease-revocation shortcut, and the user

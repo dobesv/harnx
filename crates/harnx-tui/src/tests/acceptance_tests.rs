@@ -1,4 +1,5 @@
 use super::test_config;
+use crate::test_utils::wait_exit_cancel_task_finished;
 use crate::types::{PendingMessage, Tui, TuiEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_runtime::nats_session::InterruptOutcome;
@@ -21,6 +22,9 @@ async fn accepted_root_reopens_composer_and_starts_g2_without_draining_g1() {
         Box::pin(async { Ok(InterruptOutcome::Accepted { cancel_seq: 5 }) })
     }));
     tui.start_cancellation("session".into(), "local".into());
+    // Let the spawned request finish first: the timing below is about the
+    // poll not draining G1, not about the request itself.
+    wait_exit_cancel_task_finished(&tui).await;
     let before = tokio::time::Instant::now();
     tui.poll_pending_exit_cancel().await;
     assert_eq!(tokio::time::Instant::now(), before);

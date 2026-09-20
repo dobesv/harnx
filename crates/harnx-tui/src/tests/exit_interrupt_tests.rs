@@ -1,7 +1,7 @@
 use super::{normalize_screen, test_config};
 use crate::exit_confirmation::exit_body_copy;
 use crate::remote_session::classify_exit_worker_state;
-use crate::test_utils::TuiTestHarness;
+use crate::test_utils::{settle_exit_cancel, TestEnvironment, TuiTestHarness, ENV_LOCK};
 use crate::types::{
     ExitCancelFactory, ExitCancelFuture, ExitPhase, ExitWorkerState, ModalState, Tui,
 };
@@ -113,6 +113,14 @@ fn controlled_cancel_factory(
 
 #[tokio::test]
 async fn cancellation_worker_preparation_is_not_misreported_as_request_timeout() {
+    // This test starts a real shared local broker and worker. Give it a data
+    // directory of its own: the shared directory persists the broker's port,
+    // and a broker another test process stopped moments ago (or one stranded
+    // on macOS, which has no parent-death signal) can still hold that port,
+    // which fails every spawn attempt with "exited during startup".
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = TestEnvironment::set(tmp.path());
     let config = test_config();
     let tui = Tui::init(&config).await.expect("initialize test TUI");
     let local_worker = Arc::clone(&tui.local_worker);
@@ -337,9 +345,8 @@ async fn escape_during_exit_cancellation_stays_and_preserves_request() {
     assert!(tui.app.modal.is_none());
     assert!(tui.pending_exit_cancel.is_some());
     release.notify_one();
-    tui.poll_pending_exit_cancel().await;
+    assert!(settle_exit_cancel(&mut tui, 50).await);
     assert!(!tui.app.should_quit);
-    assert!(tui.pending_exit_cancel.is_none());
 }
 
 #[tokio::test]
@@ -361,7 +368,7 @@ async fn interrupt_exit_failure_stays_with_retry_and_error() {
     assert_cancel_pending(&tui);
 
     release.notify_one();
-    tui.poll_pending_exit_cancel().await;
+    assert!(settle_exit_cancel(&mut tui, 50).await);
 
     assert!(!tui.app.should_quit);
     assert_exit_phase(&tui, ExitPhase::RequestFailed);
@@ -391,7 +398,7 @@ async fn interrupt_exit_finishes_on_durable_acceptance_before_shutdown() {
         Box::pin(async { Ok(InterruptOutcome::Accepted { cancel_seq: 7 }) })
     }));
     tui.handle_modal_key(ctrl('c')).await.unwrap();
-    tui.poll_pending_exit_cancel().await;
+    assert!(settle_exit_cancel(&mut tui, 50).await);
     assert_exit_finished(&tui);
     assert!(
         !tui.app.llm_busy,
@@ -407,8 +414,78 @@ async fn interrupt_exit_finishes_for_locally_owned_worker_on_acceptance() {
     }));
 
     tui.handle_modal_key(ctrl('c')).await.unwrap();
-    tui.poll_pending_exit_cancel().await;
+    assert!(settle_exit_cancel(&mut tui, 50).await);
 
     assert_exit_finished(&tui);
     assert!(!tui.exit_after_cancel);
+}
+
+/// A cancel whose future needs `steps` wake-ups before it resolves. The real
+/// request has this shape: attaching to the session and classifying its turn
+/// read the session log one JetStream round trip per entry, and no round trip
+/// completes inside the poll that sent it.
+fn multi_step_cancel_factory(steps: usize) -> ExitCancelFactory {
+    Arc::new(move |_, _, _, _| -> ExitCancelFuture {
+        Box::pin(async move {
+            for _ in 0..steps {
+                tokio::task::yield_now().await;
+            }
+            Ok(InterruptOutcome::Accepted { cancel_seq: 7 })
+        })
+    })
+}
+
+/// The event loop looks at the pending cancel once per 80 ms tick, and the
+/// request's own two-second append budget runs on the wall clock. If each of
+/// its wake-ups had to wait for a tick, a session a few hundred entries long
+/// would time out on every interrupt and every retry, so the request must
+/// make progress between ticks on its own.
+#[tokio::test]
+async fn interrupt_progress_is_not_paced_by_event_loop_ticks() {
+    let mut tui = prompting_exit_tui().await;
+    tui.set_exit_cancel_factory(multi_step_cancel_factory(1_000));
+
+    tui.handle_modal_key(ctrl('c')).await.unwrap();
+
+    assert!(
+        settle_exit_cancel(&mut tui, 50).await,
+        "a cancel needing 1000 wake-ups must not need 1000 event-loop ticks"
+    );
+    assert_exit_finished(&tui);
+}
+
+/// Sets a flag when dropped, so a test can tell that a cancel's future was
+/// dropped rather than left running.
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Ctrl+D during a cancellation exits without waiting for the request. The
+/// request must not keep running against the local worker while the process
+/// tears down, so leaving the loop stops it.
+#[tokio::test]
+async fn leaving_the_loop_stops_a_pending_cancel() {
+    let mut tui = prompting_exit_tui().await;
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&dropped);
+    tui.set_exit_cancel_factory(Arc::new(move |_, _, _, _| {
+        let flag = DropFlag(Arc::clone(&flag));
+        Box::pin(async move {
+            let _flag = flag;
+            std::future::pending().await
+        })
+    }));
+    tui.handle_modal_key(ctrl('c')).await.unwrap();
+    tui.handle_modal_key(ctrl('d')).await.unwrap();
+    assert!(tui.app.should_quit);
+    assert!(tui.pending_exit_cancel.is_some());
+
+    tui.abandon_pending_exit_cancel().await;
+
+    assert!(tui.pending_exit_cancel.is_none());
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }

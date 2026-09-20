@@ -51,6 +51,9 @@ pub(crate) type ExitCancelFactory = Arc<
         + Send
         + Sync,
 >;
+/// The task running an [`ExitCancelFuture`]; see `Tui::pending_exit_cancel`.
+pub(crate) type PendingExitCancel =
+    JoinHandle<anyhow::Result<harnx_runtime::nats_session::InterruptOutcome>>;
 
 pub struct Tui {
     pub(super) config: GlobalConfig,
@@ -83,13 +86,18 @@ pub struct Tui {
     /// Set in `start_prompt` and cleared when the turn completes.
     pub(super) active_remote_session: Option<(String, String)>,
     /// Builds the durable cancel operation used by interrupt-and-exit.
-    /// Injected via `start_exit_cancel`; awaited in `poll_pending_exit_cancel`.
+    /// Spawned by `start_cancellation`; its handle is checked in
+    /// `poll_pending_exit_cancel`.
     pub(crate) exit_cancel_factory: ExitCancelFactory,
-    /// In-flight durable cancel for exit paths. Must complete before `should_quit`
-    /// so process exit (which drops `LocalWorkerSupervisor` and kills the worker)
-    /// does not race the cancel request. Polling via `now_or_never` preserves the
-    /// future across ticks — dropping/consuming it would lose the cancel.
-    pub(crate) pending_exit_cancel: Option<ExitCancelFuture>,
+    /// In-flight durable cancel, running as its own task. The event loop only
+    /// checks the handle once per tick. The request awaits one JetStream round
+    /// trip per session log entry and spends a wall-clock budget on the append,
+    /// so driving it one wake-up per tick made every interrupt of a long
+    /// session time out. Must complete before `should_quit`, so process exit
+    /// (which drops `LocalWorkerSupervisor` and kills the worker) does not race
+    /// the cancel request. Dropping the handle would detach the task, not stop
+    /// it, so `run` aborts one still pending when the loop exits.
+    pub(crate) pending_exit_cancel: Option<PendingExitCancel>,
     pub(crate) cancellation: Option<crate::cancellation::CancellationTray>,
     pub(crate) exit_after_cancel: bool,
     /// Deferred warning text emitted after terminal restoration.
