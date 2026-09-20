@@ -119,12 +119,14 @@ the descriptor open for the life of the process.
 
 OpenTelemetry distributed tracing is off unless an OTLP endpoint environment variable (`OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) is set. When unset, tracing is fully inert and standard logging is unaffected. See [OpenTelemetry Tracing](tracing.md) for full operational documentation.
 
-- **OTEL_EXPORTER_OTLP_ENDPOINT**: Base URL of the OTLP HTTP collector (e.g. `http://localhost:4318`).
-- **OTEL_EXPORTER_OTLP_TRACES_ENDPOINT**: Traces-specific OTLP HTTP endpoint (e.g. `http://localhost:4318/v1/traces`). Takes precedence over `OTEL_EXPORTER_OTLP_ENDPOINT`.
-- **OTEL_EXPORTER_OTLP_PROTOCOL**: Not required or read. The exporter always uses `http/protobuf`; other values such as `grpc` are neither honored nor rejected.
+- **OTEL_EXPORTER_OTLP_ENDPOINT**: Base URL of the OTLP collector (`http://localhost:4318` for HTTP, `http://localhost:4317` for gRPC).
+- **OTEL_EXPORTER_OTLP_TRACES_ENDPOINT**: Signal-specific direct URL for trace export (e.g. `http://localhost:4318/v1/traces` or `http://localhost:4317`). Takes precedence over `OTEL_EXPORTER_OTLP_ENDPOINT` and is used as-is without appending a signal path.
+- **OTEL_EXPORTER_OTLP_PROTOCOL**: Transport protocol for OTLP export. Valid values: `http/protobuf` (default) and `grpc`. Unrecognized or unsupported values log a warning and disable trace export for that run.
+- **OTEL_EXPORTER_OTLP_TRACES_PROTOCOL**: Signal-specific protocol override. Takes precedence over `OTEL_EXPORTER_OTLP_PROTOCOL`. Valid values: `http/protobuf` and `grpc`. Unrecognized or unsupported values log a warning and disable trace export for that run.
 - **OTEL_SERVICE_NAME**: Service identifier for the root process (default `harnx`). Child tool servers name themselves independently (e.g. `harnx-fs-tools-server`).
 - **OTEL_RESOURCE_ATTRIBUTES**: Key-value resource attributes added to exported spans (e.g. `service.version=0.30.0`).
-- **OTEL_EXPORTER_OTLP_HEADERS**: Key-value header pairs for exporter authentication or routing.
+- **OTEL_EXPORTER_OTLP_HEADERS**: Key-value header pairs for exporter authentication or routing (sent as HTTP headers or gRPC metadata).
+- **OTEL_EXPORTER_OTLP_TRACES_HEADERS**: Signal-specific header pairs. Takes precedence over `OTEL_EXPORTER_OTLP_HEADERS`.
 - **OTEL_TRACES_SAMPLER**: Sampling strategy (e.g. `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`).
 - **OTEL_TRACES_SAMPLER_ARG**: Argument for the sampler (e.g. `0.1` for 10% sampling ratio).
 

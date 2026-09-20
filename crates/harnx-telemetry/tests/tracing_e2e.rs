@@ -1,11 +1,3 @@
-use std::collections::HashMap;
-use std::fmt::Write as _;
-use std::net::TcpListener as StdTcpListener;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
@@ -17,6 +9,10 @@ use harnx_client::{
 use harnx_core::provider_config::openai_compatible::OpenAICompatibleConfig;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    trace_service_server::{TraceService, TraceServiceServer},
+    ExportTraceServiceResponse,
+};
 use opentelemetry_proto::tonic::common::v1::any_value::Value as ProtoValue;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, Span as ProtoSpan};
 use prost::Message as _;
@@ -27,17 +23,31 @@ use rmcp::model::{
 use rmcp::service::RoleClient;
 use rmcp::transport::async_rw::AsyncRwTransport;
 use serde_json::json;
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::net::TcpListener as StdTcpListener;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::task::JoinHandle;
+use tonic::metadata::MetadataMap;
+use tonic::transport::server::TcpIncoming;
+use tonic::transport::Server;
 use tracing::Instrument as _;
 
 const INPUT_TOKENS: i64 = 11;
 const OUTPUT_TOKENS: i64 = 7;
-const ENV_KEYS: [&str; 5] = [
+const ENV_KEYS: [&str; 9] = [
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "OTEL_EXPORTER_OTLP_PROTOCOL",
     "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
     "OTEL_TRACES_SAMPLER",
+    // Timeout vars: cleared to prevent inherited long timeouts from slowing tests
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
 ];
 
 type CapturedResourceSpans = Arc<Mutex<Vec<ResourceSpans>>>;
@@ -48,7 +58,15 @@ struct EnvGuard {
 }
 
 impl EnvGuard {
-    fn configure(endpoint: Option<&str>) -> Self {
+    /// Common helper for configuring OTLP test environment.
+    ///
+    /// Clears all ENV_KEYS, then sets endpoint, protocol, headers, and sampler if provided.
+    /// SAFETY: nextest runs each test in a separate process, so env mutations are isolated.
+    fn configure_internal(
+        endpoint: Option<&str>,
+        protocol: Option<&str>,
+        headers: Option<&str>,
+    ) -> Self {
         let saved = ENV_KEYS
             .iter()
             .map(|key| (*key, std::env::var_os(key)))
@@ -63,12 +81,29 @@ impl EnvGuard {
             }
             if let Some(endpoint) = endpoint {
                 std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint);
-                std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf");
-                std::env::set_var("OTEL_TRACES_SAMPLER", "always_on");
             }
+            if let Some(protocol) = protocol {
+                std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", protocol);
+            }
+            if let Some(headers) = headers {
+                std::env::set_var("OTEL_EXPORTER_OTLP_HEADERS", headers);
+            }
+            std::env::set_var("OTEL_TRACES_SAMPLER", "always_on");
         }
 
         Self { saved }
+    }
+
+    fn configure(endpoint: Option<&str>) -> Self {
+        Self::configure_internal(endpoint, Some("http/protobuf"), None)
+    }
+
+    fn configure_for_grpc(endpoint: Option<&str>) -> Self {
+        Self::configure_internal(endpoint, Some("grpc"), None)
+    }
+
+    fn configure_for_grpc_with_headers(endpoint: Option<&str>, headers: &str) -> Self {
+        Self::configure_internal(endpoint, Some("grpc"), Some(headers))
     }
 }
 
@@ -147,7 +182,7 @@ struct CollectorState {
 async fn collect_traces(
     State(state): State<CollectorState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let request = ExportTraceServiceRequest::decode(body)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -162,6 +197,134 @@ async fn collect_traces(
         .expect("collector headers lock")
         .push(headers);
     Ok(StatusCode::OK)
+}
+
+// -----------------------------------------------------------------------------
+// FakeGrpcCollector: gRPC mock for OTLP trace export tests
+// -----------------------------------------------------------------------------
+
+type CapturedGrpcMetadata = Arc<Mutex<Vec<MetadataMap>>>;
+
+/// A gRPC OTLP trace collector using tonic's TraceServiceServer.
+///
+/// Captures all received ExportTraceServiceRequests and their incoming metadata
+/// (including credential headers from OTEL_EXPORTER_OTLP_HEADERS).
+struct FakeGrpcCollector {
+    resource_spans: CapturedResourceSpans,
+    metadata: CapturedGrpcMetadata,
+    task: JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct GrpcCollectorState {
+    resource_spans: CapturedResourceSpans,
+    metadata: CapturedGrpcMetadata,
+}
+
+#[tonic::async_trait]
+impl TraceService for GrpcCollectorState {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportTraceServiceRequest>,
+    ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
+        // Capture the metadata (headers) from the request
+        self.metadata
+            .lock()
+            .expect("grpc collector metadata lock")
+            .push(request.metadata().clone());
+
+        // Capture the resource spans from the request body
+        self.resource_spans
+            .lock()
+            .expect("grpc collector resource spans lock")
+            .extend(request.into_inner().resource_spans);
+
+        Ok(tonic::Response::new(ExportTraceServiceResponse {
+            partial_success: None,
+        }))
+    }
+}
+
+impl FakeGrpcCollector {
+    /// Spawns a gRPC trace collector on the given listener.
+    ///
+    /// The listener should be bound to `127.0.0.1:0` for dynamic port allocation.
+    /// Returns immediately after spawning - caller should yield to allow server to bind.
+    fn spawn(listener: StdTcpListener) -> Self {
+        let resource_spans = Arc::new(Mutex::new(Vec::new()));
+        let metadata = Arc::new(Mutex::new(Vec::new()));
+        let state = GrpcCollectorState {
+            resource_spans: Arc::clone(&resource_spans),
+            metadata: Arc::clone(&metadata),
+        };
+
+        let listener =
+            tokio::net::TcpListener::from_std(listener).expect("grpc collector listener");
+        let incoming: TcpIncoming = listener.into();
+        let task = tokio::spawn(async move {
+            let result = Server::builder()
+                .add_service(TraceServiceServer::new(state))
+                .serve_with_incoming(incoming)
+                .await;
+            if let Err(e) = result {
+                eprintln!("FakeGrpcCollector server error: {e}");
+            }
+        });
+
+        Self {
+            resource_spans,
+            metadata,
+            task,
+        }
+    }
+
+    /// Waits asynchronously for at least one export to be received.
+    async fn wait_for_export(&self, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if self.exports() > 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// Returns all captured spans across all export requests.
+    fn spans(&self) -> Vec<ProtoSpan> {
+        self.resource_spans
+            .lock()
+            .expect("grpc collector resource spans lock")
+            .iter()
+            .flat_map(|resource| &resource.scope_spans)
+            .flat_map(|scope| &scope.spans)
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the captured metadata from each export request.
+    fn metadata(&self) -> Vec<MetadataMap> {
+        self.metadata
+            .lock()
+            .expect("grpc collector metadata lock")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the number of export requests received.
+    fn exports(&self) -> usize {
+        self.metadata
+            .lock()
+            .expect("grpc collector metadata lock")
+            .len()
+    }
+}
+
+impl Drop for FakeGrpcCollector {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 struct LlmStub {
@@ -570,6 +733,182 @@ fn live_mcp_binary() -> Option<std::ffi::OsString> {
         return None;
     }
     Some(binary)
+}
+
+// =============================================================================
+// gRPC e2e tests
+// =============================================================================
+
+#[test]
+fn grpc_happy_path_exports_spans_to_fake_collector() {
+    harnx_core::require_nextest();
+    let (collector_listener, collector_endpoint) = bind_local();
+    let _env = EnvGuard::configure_for_grpc(Some(&collector_endpoint));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("grpc test runtime");
+
+    runtime.block_on(async move {
+        let collector = FakeGrpcCollector::spawn(collector_listener);
+
+        // Brief delay to ensure the gRPC server is fully bound before initializing telemetry.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let telemetry =
+            harnx_telemetry::init_telemetry("grpc-happy-path-test").expect("telemetry init");
+
+        // Emit a span with target matching the filter "harnx=info" (from DEFAULT_FILTER)
+        let span = tracing::info_span!(target: "harnx_telemetry", "grpc_test_span");
+        let _enter = span.enter();
+        drop(_enter);
+        drop(span);
+
+        telemetry.shutdown().await;
+
+        // Allow time for the collector to receive the export (shutdown flushes batch)
+        assert!(
+            collector.wait_for_export(Duration::from_secs(2)).await,
+            "grpc collector received export"
+        );
+
+        let spans = collector.spans();
+        assert!(!spans.is_empty(), "grpc collector received exported spans");
+        assert!(
+            spans.iter().any(|s| s.name == "grpc_test_span"),
+            "grpc collector received the test span"
+        );
+    });
+}
+
+#[test]
+fn grpc_credential_metadata_forwarded_on_loopback() {
+    harnx_core::require_nextest();
+    let (collector_listener, collector_endpoint) = bind_local();
+    let _env = EnvGuard::configure_for_grpc_with_headers(
+        Some(&collector_endpoint),
+        "api-key=test-secret-value",
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("grpc credentials test runtime");
+
+    runtime.block_on(async move {
+        let collector = FakeGrpcCollector::spawn(collector_listener);
+
+        // Brief delay to ensure the gRPC server is fully bound before initializing telemetry.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let telemetry =
+            harnx_telemetry::init_telemetry("grpc-credentials-test").expect("telemetry init");
+
+        // Emit a span with target matching the filter "harnx=info" (from DEFAULT_FILTER)
+        let span = tracing::info_span!(target: "harnx_telemetry", "grpc_cred_test_span");
+        let _enter = span.enter();
+        drop(_enter);
+        drop(span);
+
+        telemetry.shutdown().await;
+
+        // Allow time for the collector to receive the export
+        assert!(
+            collector.wait_for_export(Duration::from_secs(2)).await,
+            "grpc collector received export"
+        );
+
+        let metadata = collector.metadata();
+        assert!(!metadata.is_empty(), "grpc collector received metadata");
+
+        // On loopback, credentials should NOT be stripped
+        let first_metadata = &metadata[0];
+        let api_key = first_metadata
+            .get("api-key")
+            .expect("api-key header present");
+
+        // gRPC metadata values are Base64-encoded for non-ASCII, but "test-secret-value" is ASCII
+        // and should come through as-is (or as a single-value string)
+        let api_key_str = api_key
+            .to_str()
+            .expect("api-key header value is valid UTF-8");
+        assert_eq!(
+            api_key_str, "test-secret-value",
+            "credential header preserved on loopback endpoint"
+        );
+    });
+}
+
+/// Windows DNS does not resolve RFC 6761 *.localhost subdomains without local hosts file mapping.
+/// The test would time out on Windows CI because `collector.localhost` does not resolve.
+/// Unix systems implement RFC 6761 properly, resolving *.localhost to 127.0.0.1.
+#[cfg(not(windows))]
+#[test]
+fn grpc_credential_metadata_stripped_on_cleartext_non_loopback() {
+    harnx_core::require_nextest();
+    let (collector_listener, collector_endpoint) = bind_local();
+    // Get dynamic port and extract it from the endpoint string
+    let port = collector_endpoint
+        .rsplit(':')
+        .next()
+        .expect("endpoint has port");
+    // Use collector.localhost which resolves to 127.0.0.1 (RFC 6761), but is NOT
+    // recognized as loopback by should_send_headers (which checks for literal "localhost"
+    // or loopback IpAddr). This triggers the credential-stripping path.
+    // Design: ALL headers in OTEL_EXPORTER_OTLP_HEADERS are treated as credential headers
+    // and stripped on cleartext non-loopback endpoints.
+    let endpoint = format!("http://collector.localhost:{}", port);
+    let headers_env = "api-key=secret-value,authorization=token";
+
+    let _env = EnvGuard::configure_for_grpc_with_headers(Some(&endpoint), headers_env);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("grpc credentials test runtime");
+
+    runtime.block_on(async move {
+        let collector = FakeGrpcCollector::spawn(collector_listener);
+
+        // Brief delay to ensure the gRPC server is fully bound before initializing telemetry.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let telemetry =
+            harnx_telemetry::init_telemetry("grpc-cred-strip-test").expect("telemetry init");
+
+        // Emit a span with target matching the filter "harnx=info" (from DEFAULT_FILTER)
+        let span = tracing::info_span!(target: "harnx_telemetry", "grpc_cred_strip_test_span");
+        let _enter = span.enter();
+        drop(_enter);
+        drop(span);
+
+        telemetry.shutdown().await;
+
+        // Allow time for the collector to receive the export
+        assert!(
+            collector.wait_for_export(Duration::from_secs(2)).await,
+            "grpc collector received export"
+        );
+
+        let metadata = collector.metadata();
+        assert!(!metadata.is_empty(), "grpc collector received metadata");
+
+        // On cleartext non-loopback, credential headers should be stripped.
+        // All headers in OTEL_EXPORTER_OTLP_HEADERS are treated as credentials and stripped
+        // on cleartext non-loopback endpoints (no mechanism to pass non-credential headers).
+        let first_metadata = &metadata[0];
+
+        // Target host is "collector.localhost" which is NOT a loopback IP or literal "localhost"
+        // from the perspective of should_send_headers, so credentials are dropped.
+        // The api-key and authorization headers should both be absent.
+        assert!(
+            first_metadata.get("api-key").is_none(),
+            "api-key credential header should be stripped on cleartext non-loopback endpoint"
+        );
+        assert!(
+            first_metadata.get("authorization").is_none(),
+            "authorization credential header should be stripped on cleartext non-loopback endpoint"
+        );
+    });
 }
 
 #[test]
