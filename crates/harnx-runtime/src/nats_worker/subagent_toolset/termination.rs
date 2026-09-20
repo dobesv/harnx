@@ -199,6 +199,7 @@ async fn await_prompt_turn(
                 Some(cancel_rx),
                 RunTurnOptions {
                     token_budget: params.token_budget.filter(|budget| *budget > 0),
+                    ..Default::default()
                 },
             )
             .await

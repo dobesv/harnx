@@ -9,15 +9,22 @@ use serde_json::json;
 use crate::ag_ui_attach::{
     initial_attach_frame, keep_alive_frame, session_attach_boundary_frame, snapshot_event,
 };
-use crate::ag_ui_lifecycle::{frame_guarded_live_event, LiveStreamGuard};
-use crate::ag_ui_sync::{
-    frame_run_boundary_event, frame_run_error_event, pending_user_prompt, wire_message_id,
+pub use crate::ag_ui_events::frame_event;
+pub(crate) use crate::ag_ui_events::frame_terminal_after_lifecycle_closes;
+use crate::ag_ui_events::{
+    ag_ui_role_for_history, append_event_frames, build_live_event_body, frame_run_finished_event,
+    history_content_text, history_stable_base, history_tool_call_id, live_subscription_events,
+    session_state_is_active, LiveEventContext,
 };
+#[cfg(test)]
+use crate::ag_ui_events::{frame_guarded_live_event, frame_live_event, FirstRunState};
+use crate::ag_ui_lifecycle::LiveStreamGuard;
+use crate::ag_ui_sync::{frame_run_boundary_event, pending_user_prompt, wire_message_id};
 use crate::ag_ui_usage::UsagePayloadInput;
-use crate::interrupt_resume::{parse_resume_params, InterruptResumeParam};
+use crate::interrupt_resume::{parse_resume_params, InterruptResume, InterruptResumeParam};
 use crate::session_actor::{
-    PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionPromptOptions,
-    SessionRegistry, SubscribeResult,
+    PromptResult, SessionCommand, SessionHandle, SessionPromptOptions, SessionRegistry,
+    SubscribeResult,
 };
 
 #[cfg(test)]
@@ -55,6 +62,7 @@ use http::{Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
 use hyper::body::Frame;
 use tokio::sync::{broadcast, mpsc::UnboundedSender};
+#[cfg(test)]
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
@@ -158,6 +166,25 @@ const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const TEST_SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(50);
 
 pub type AppResponse = Response<BoxBody<Bytes, Infallible>>;
+pub(crate) type AgUiEventStream =
+    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>>;
+pub(crate) type SharedLiveStreamGuard = Arc<Mutex<LiveStreamGuard>>;
+
+pub(crate) struct GuardedEventStream {
+    pub(crate) stream: AgUiEventStream,
+    pub(crate) guard: SharedLiveStreamGuard,
+}
+
+impl tokio_stream::Stream for GuardedEventStream {
+    type Item = Bytes;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(cx)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgUiError {
@@ -779,26 +806,6 @@ pub struct NewMsg {
     pub content: String,
 }
 
-pub fn frame_event(event: &Event) -> Result<String, AgUiError> {
-    let json = serde_json::to_string(event)
-        .map_err(|err| AgUiError::Internal(format!("failed to serialize AG-UI event: {err}")))?;
-    Ok(format!("data: {json}\n\n"))
-}
-
-fn append_event_frames(initial: Option<Bytes>, events: Vec<Event>) -> Option<Bytes> {
-    let appended = events
-        .into_iter()
-        .filter_map(|event| frame_event(&event).ok())
-        .collect::<String>();
-    if appended.is_empty() {
-        return initial;
-    }
-
-    let mut frames = initial.map_or_else(Vec::new, |bytes| bytes.to_vec());
-    frames.extend_from_slice(appended.as_bytes());
-    Some(Bytes::from(frames))
-}
-
 fn initial_attach_frame_with_attachment_metadata(
     snapshot: Vec<AgUiMessage>,
     history_warnings: Vec<String>,
@@ -890,97 +897,6 @@ pub fn parse_run_input(body: &[u8]) -> Result<RunAgentInput<JsonValue, JsonValue
     })
 }
 
-#[derive(Clone, Copy)]
-enum FirstRunState {
-    AwaitingStarted,
-    Active,
-    Complete,
-    Errored,
-}
-
-fn frame_run_finished_event(thread_id: &str, run_id: &str, result: Option<JsonValue>) -> Bytes {
-    let mut body = serde_json::json!({
-        "type": "RUN_FINISHED",
-        "threadId": thread_id,
-        "runId": run_id,
-    });
-    if let Some(result) = result {
-        if let Some(outcome) = result.get("outcome") {
-            body["outcome"] = outcome.clone();
-        } else {
-            body["result"] = result;
-        }
-    }
-    Bytes::from(format!("data: {body}\n\n"))
-}
-
-fn frame_terminal_after_lifecycle_closes(guard: &mut LiveStreamGuard, terminal: Bytes) -> Bytes {
-    let closes = guard.finalize_open_lifecycles();
-    if closes.is_empty() {
-        return terminal;
-    }
-
-    let mut frames = Vec::with_capacity(closes.len() + terminal.len());
-    frames.extend_from_slice(&closes);
-    frames.extend_from_slice(&terminal);
-    Bytes::from(frames)
-}
-
-fn frame_live_event(
-    event: Event,
-    state: &mut FirstRunState,
-    guard: &mut LiveStreamGuard,
-    thread_id: &str,
-    run_id: &str,
-) -> Option<Bytes> {
-    match *state {
-        FirstRunState::AwaitingStarted => match event {
-            Event::RunStarted(_) => {
-                *state = FirstRunState::Active;
-                None
-            }
-            Event::RunFinished(event) => {
-                *state = FirstRunState::Complete;
-                Some(frame_terminal_after_lifecycle_closes(
-                    guard,
-                    frame_run_finished_event(thread_id, run_id, event.result),
-                ))
-            }
-            Event::RunError(err) => {
-                *state = FirstRunState::Errored;
-                Some(frame_terminal_after_lifecycle_closes(
-                    guard,
-                    Bytes::from(frame_run_error_event(thread_id, run_id, &err.message)),
-                ))
-            }
-            other => frame_guarded_live_event(other, guard),
-        },
-        FirstRunState::Active => match event {
-            Event::RunStarted(_) => None,
-            Event::RunFinished(event) => {
-                *state = FirstRunState::Complete;
-                Some(frame_terminal_after_lifecycle_closes(
-                    guard,
-                    frame_run_finished_event(thread_id, run_id, event.result),
-                ))
-            }
-            Event::RunError(err) => {
-                *state = FirstRunState::Errored;
-                Some(frame_terminal_after_lifecycle_closes(
-                    guard,
-                    Bytes::from(frame_run_error_event(thread_id, run_id, &err.message)),
-                ))
-            }
-            other => frame_guarded_live_event(other, guard),
-        },
-        FirstRunState::Complete | FirstRunState::Errored => {
-            // Terminal state: stop forwarding events. The stream must end after
-            // RUN_FINISHED/RUN_ERROR so the client's runAgent() promise resolves.
-            None
-        }
-    }
-}
-
 async fn subscribe(handle: &SessionHandle) -> SubscribeResult {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     handle
@@ -1005,16 +921,6 @@ async fn prompt(handle: &SessionHandle, text: &str, options: SessionPromptOption
     reply_rx.await.expect("recv prompt")
 }
 
-async fn get_info(handle: &SessionHandle) -> SessionInfo {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    handle
-        .tx
-        .send(SessionCommand::Get { reply: reply_tx })
-        .await
-        .expect("send get");
-    reply_rx.await.expect("recv get")
-}
-
 struct UnsubscribeOnDrop {
     handle: SessionHandle,
 }
@@ -1028,84 +934,24 @@ impl Drop for UnsubscribeOnDrop {
     }
 }
 
-/// Whether a session has local run state that blocks idle or remote-follow handling.
-///
-/// A promptless `Running` subscription follows live events. `AwaitingApproval` is
-/// also active for stream selection, but its derived outcome is replayed as
-/// terminal `RUN_FINISHED`; the client submits the decision through
-/// `session/hitl_decision`.
-fn session_state_is_active(state: &crate::session_actor::SessionState) -> bool {
-    matches!(
-        state,
-        crate::session_actor::SessionState::Running { .. }
-            | crate::session_actor::SessionState::AwaitingApproval { .. }
-    )
-}
-
-/// Frame the live broadcast body of an active run WITHOUT a leading RUN_STARTED
-/// boundary — the caller is responsible for emitting exactly one RUN_STARTED
-/// before this body. Shared by the prompted and promptless-while-active paths
-/// so a reload never sees a duplicate RUN_STARTED for the same run.
-///
-/// The body TERMINATES once the run reaches a terminal state (RUN_FINISHED /
-/// RUN_ERROR). Otherwise the body stays open on the (now idle) broadcast
-/// channel, the client's runAgent() promise never resolves, and the
-/// assistant-ui thread stays `isRunning` forever.
-///
-/// Non-terminal frames are forwarded via `take_while` (which ENDS the stream —
-/// and drops the broadcast subscription — as soon as a terminal event is seen,
-/// without waiting for any further broadcast item), stashing the terminal frame
-/// in a cell. That stashed terminal frame is then chained as the final item so
-/// the response body closes immediately after RUN_FINISHED/RUN_ERROR.
-fn build_live_event_body(
-    run_id: &str,
-    thread_id_text: &str,
-    snapshot_frame: Option<Bytes>,
-    live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
-) -> impl tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static {
-    let run_id = run_id.to_string();
-    let thread_id_text = thread_id_text.to_string();
-    let terminal_frame: std::sync::Arc<std::sync::Mutex<Option<Bytes>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let live_stream = {
-        let mut state = FirstRunState::AwaitingStarted;
-        let mut guard = LiveStreamGuard::default();
-        let terminal_frame = terminal_frame.clone();
-        let framed = tokio_stream::StreamExt::map(live_stream, move |event| {
-            let is_terminal = matches!(event, Event::RunFinished(_) | Event::RunError(_));
-            let bytes = frame_live_event(event, &mut state, &mut guard, &thread_id_text, &run_id);
-            (bytes, is_terminal)
-        });
-        // Stop when a terminal event arrives, capturing its frame to emit last.
-        let body = tokio_stream::StreamExt::take_while(framed, move |(bytes, is_terminal)| {
-            if *is_terminal {
-                *terminal_frame.lock().expect("terminal frame lock") = bytes.clone();
-                false // end the passthrough (drops the broadcast subscription)
-            } else {
-                true
-            }
-        });
-        tokio_stream::StreamExt::filter_map(body, |(bytes, _)| bytes)
-    };
-    // Terminal frame (RUN_FINISHED / RUN_ERROR), appended after the passthrough ends.
-    let terminal_stream = {
-        let terminal_frame = terminal_frame.clone();
-        tokio_stream::StreamExt::filter_map(tokio_stream::once(()), move |_| {
-            terminal_frame.lock().expect("terminal frame lock").take()
-        })
-    };
-    let live_stream = tokio_stream::StreamExt::chain(live_stream, terminal_stream);
-    tokio_stream::StreamExt::chain(tokio_stream::iter(snapshot_frame), live_stream)
-}
-
+/// Build a prompted run stream with one start boundary and terminal live body.
 fn build_prompted_event_stream(
     run_id: &str,
     thread_id_text: &str,
     initial_attach: (Option<Bytes>, u64),
     live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
-) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
+    guard: SharedLiveStreamGuard,
+) -> AgUiEventStream {
     let (snapshot_frame, attached_seq) = initial_attach;
-    let body = build_live_event_body(run_id, thread_id_text, snapshot_frame, live_stream);
+    let body = build_live_event_body(
+        LiveEventContext {
+            thread_id: thread_id_text,
+            run_id,
+        },
+        snapshot_frame,
+        live_stream,
+        guard,
+    );
     let started = tokio_stream::once(Bytes::from(frame_run_boundary_event(
         "RUN_STARTED",
         thread_id_text,
@@ -1120,6 +966,7 @@ fn build_prompted_event_stream(
     Box::pin(tokio_stream::StreamExt::chain(attached, body))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_promptless_event_stream(
     run_id: &str,
@@ -1130,7 +977,32 @@ fn build_promptless_event_stream(
     interrupt_outcome: Option<JsonValue>,
     log_entries: Option<&[(u64, harnx_core::session::SessionLogEntry)]>,
     tokens_usage: Option<UsageContextSnapshot>,
-) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
+) -> AgUiEventStream {
+    build_promptless_event_stream_with_guard(
+        run_id,
+        thread_id_text,
+        snapshot_frame,
+        live_stream,
+        is_active,
+        interrupt_outcome,
+        log_entries,
+        tokens_usage,
+        Arc::new(Mutex::new(LiveStreamGuard::default())),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_promptless_event_stream_with_guard(
+    run_id: &str,
+    thread_id_text: &str,
+    snapshot_frame: Option<Bytes>,
+    live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
+    is_active: bool,
+    interrupt_outcome: Option<JsonValue>,
+    log_entries: Option<&[(u64, harnx_core::session::SessionLogEntry)]>,
+    tokens_usage: Option<UsageContextSnapshot>,
+    guard: SharedLiveStreamGuard,
+) -> AgUiEventStream {
     let attached_seq = log_entries
         .and_then(|entries| entries.last().map(|(seq, _)| *seq))
         .unwrap_or(0);
@@ -1186,7 +1058,15 @@ fn build_promptless_event_stream(
     // until the real terminal event.
     let hydrated = tokio_stream::StreamExt::chain(attached, tokio_stream::iter(snapshot_frame));
     let hydrated = tokio_stream::StreamExt::chain(hydrated, tokio_stream::iter(control_frames));
-    let body = build_live_event_body(run_id, thread_id_text, None, live_stream);
+    let body = build_live_event_body(
+        LiveEventContext {
+            thread_id: thread_id_text,
+            run_id,
+        },
+        None,
+        live_stream,
+        guard,
+    );
     Box::pin(tokio_stream::StreamExt::chain(hydrated, body))
 }
 
@@ -1197,7 +1077,8 @@ pub(crate) fn build_ag_ui_event_stream(
     subscription: SubscribeResult,
     has_prompt: Option<&str>,
     is_active: bool,
-) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
+) -> GuardedEventStream {
+    let guard = Arc::new(Mutex::new(LiveStreamGuard::default()));
     let SubscribeResult {
         snapshot,
         history_warnings,
@@ -1226,21 +1107,8 @@ pub(crate) fn build_ag_ui_event_stream(
         log_entries.as_deref(),
         has_prompt.is_none(),
     );
-    let handle_for_lag = handle.clone();
-    let live_stream = tokio_stream::StreamExt::then(BroadcastStream::new(events), move |item| {
-        let handle = handle_for_lag.clone();
-        async move {
-            match item {
-                Ok(event) => Some(event),
-                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => {
-                    let info = get_info(&handle).await;
-                    Some(snapshot_event(info.history_snapshot))
-                }
-            }
-        }
-    });
-    let live_stream = tokio_stream::StreamExt::filter_map(live_stream, |event| event);
-    match has_prompt {
+    let live_stream = live_subscription_events(handle, events);
+    let stream = match has_prompt {
         // A prompted run is a pure delta stream (RUN_STARTED -> TEXT_MESSAGE_*/... ->
         // RUN_FINISHED). We deliberately do NOT emit MESSAGES_SNAPSHOT here: the
         // snapshot is captured before the new prompt is recorded, so it would not
@@ -1253,8 +1121,9 @@ pub(crate) fn build_ag_ui_event_stream(
             thread_id_text,
             (initial_frame, attached_seq),
             live_stream,
+            guard.clone(),
         ),
-        None => build_promptless_event_stream(
+        None => build_promptless_event_stream_with_guard(
             run_id,
             thread_id_text,
             initial_frame,
@@ -1263,8 +1132,49 @@ pub(crate) fn build_ag_ui_event_stream(
             interrupt_outcome,
             log_entries.as_deref(),
             tokens_usage,
+            guard.clone(),
         ),
+    };
+    GuardedEventStream { stream, guard }
+}
+
+async fn route_resume_decisions(
+    handle: &SessionHandle,
+    decisions: Vec<InterruptResume>,
+) -> Result<(), AgUiError> {
+    for decision in decisions {
+        crate::ag_ui_rpc::route_hitl_decision(
+            handle,
+            decision.interrupt_id,
+            matches!(
+                decision.status,
+                crate::interrupt_resume::InterruptResumeStatus::Approved
+            ),
+            decision.payload.reason,
+        )
+        .await
+        .map_err(AgUiError::Internal)?;
     }
+    Ok(())
+}
+
+fn ag_ui_event_response(
+    stream: AgUiEventStream,
+    unsubscribe_guard: UnsubscribeOnDrop,
+    thread_id: ThreadId,
+) -> Result<AppResponse, AgUiError> {
+    let stream = tokio_stream::StreamExt::map(stream, move |frame| {
+        let _guard = &unsubscribe_guard;
+        Ok::<_, Infallible>(Frame::data(frame))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .header("X-Thread-Id", thread_id.to_string())
+        .body(BodyExt::boxed(StreamBody::new(stream)))
+        .map_err(|err| AgUiError::Internal(format!("failed to build AG-UI response: {err}")))
 }
 
 pub async fn ag_ui_run_with_call_fn(
@@ -1276,8 +1186,16 @@ pub async fn ag_ui_run_with_call_fn(
     call_fn: Option<AgentCallFn>,
 ) -> Result<AppResponse, AgUiError> {
     let (target, _) = crate::resolve_agent_target(base_config, agent_ref).await?;
-    ag_ui_run_for_target_with_call_fn(base_config, registry, &target, session, req_body, call_fn)
-        .await
+    ag_ui_run_for_target_with_call_fn(
+        base_config,
+        registry,
+        &target,
+        session,
+        req_body,
+        call_fn,
+        crate::serve_shutdown::ServeShutdown::default(),
+    )
+    .await
 }
 
 pub(crate) async fn ag_ui_run_for_target_with_call_fn(
@@ -1287,6 +1205,7 @@ pub(crate) async fn ag_ui_run_for_target_with_call_fn(
     session: &str,
     req_body: &[u8],
     _call_fn: Option<AgentCallFn>,
+    shutdown: crate::serve_shutdown::ServeShutdown,
 ) -> Result<AppResponse, AgUiError> {
     let relaxed_run_input: RelaxedRunAgentInput<JsonValue> = serde_json::from_slice(req_body)
         .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI request body: {err}")))?;
@@ -1301,19 +1220,7 @@ pub(crate) async fn ag_ui_run_for_target_with_call_fn(
     let cluster = target.cluster().to_string();
     let handle = registry.get_or_spawn(key);
     let is_resume = !resume.is_empty();
-    for decision in resume {
-        crate::ag_ui_rpc::route_hitl_decision(
-            &handle,
-            decision.interrupt_id,
-            matches!(
-                decision.status,
-                crate::interrupt_resume::InterruptResumeStatus::Approved
-            ),
-            decision.payload.reason,
-        )
-        .await
-        .map_err(AgUiError::Internal)?;
-    }
+    route_resume_decisions(&handle, resume).await?;
     let subscription = subscribe(&handle).await;
     let unsubscribe_guard = UnsubscribeOnDrop {
         handle: handle.clone(),
@@ -1354,20 +1261,10 @@ pub(crate) async fn ag_ui_run_for_target_with_call_fn(
             local_is_active,
         )
     };
+    let stream =
+        crate::serve_shutdown::close_stream_on_shutdown(stream, shutdown, &thread_id_text, &run_id);
 
-    let stream = tokio_stream::StreamExt::map(stream, move |frame| {
-        let _guard = &unsubscribe_guard;
-        Ok::<_, Infallible>(Frame::data(frame))
-    });
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "keep-alive")
-        .header("X-Thread-Id", thread_id.to_string())
-        .body(BodyExt::boxed(StreamBody::new(stream)))
-        .map_err(|err| AgUiError::Internal(format!("failed to build AG-UI response: {err}")))
+    ag_ui_event_response(stream, unsubscribe_guard, thread_id)
 }
 
 #[cfg(test)]
@@ -1402,87 +1299,6 @@ pub fn build_local_input(
     let mut input = harnx_runtime::config::input::from_str(prompt_config, prompt_text, None);
     harnx_runtime::config::input::set_agent(&mut input, prompt_config, agent.into_config());
     Ok(input)
-}
-
-fn client_matches_history(client: &AgUiMessage, history: &HistoryMsg) -> bool {
-    client_role(client) == ag_ui_role_for_history(history.role)
-        && normalize_visible_text(&client_content(client).unwrap_or_default())
-            == normalize_visible_text(&history_content_text(&history.content))
-}
-
-fn normalize_visible_text(text: &str) -> String {
-    let trimmed = text.trim();
-    if let Some(stripped) = trimmed
-        .strip_prefix("<think>")
-        .and_then(|rest| rest.strip_suffix("</think>"))
-    {
-        stripped.trim().to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn ag_ui_role_for_history(role: MessageRole) -> Role {
-    match role {
-        MessageRole::System => Role::System,
-        MessageRole::Assistant => Role::Assistant,
-        MessageRole::User => Role::User,
-        MessageRole::Tool => Role::Tool,
-    }
-}
-
-fn client_role(message: &AgUiMessage) -> Role {
-    match message {
-        AgUiMessage::Developer { .. } => Role::Developer,
-        AgUiMessage::System { .. } => Role::System,
-        AgUiMessage::Assistant { .. } => Role::Assistant,
-        AgUiMessage::User { .. } => Role::User,
-        AgUiMessage::Tool { .. } => Role::Tool,
-    }
-}
-
-fn client_content(message: &AgUiMessage) -> Option<String> {
-    match message {
-        AgUiMessage::Developer { content, .. }
-        | AgUiMessage::System { content, .. }
-        | AgUiMessage::User { content, .. }
-        | AgUiMessage::Tool { content, .. } => Some(content.clone()),
-        AgUiMessage::Assistant { content, .. } => content.clone(),
-    }
-}
-
-fn history_content_text(content: &MessageContent) -> String {
-    match content {
-        MessageContent::ToolCalls(tool_calls) => tool_calls.text.clone(),
-        _ => content.to_text(),
-    }
-}
-
-fn history_tool_call_id(stable_base: &str, index: usize, persisted_id: Option<&str>) -> ToolCallId {
-    // Prefer the persisted tool-call id. When absent, derive a DETERMINISTIC id
-    // from a stable per-message base (persisted message id, else its log
-    // sequence, else its ordinal in the history) so the same tool call keeps the
-    // same id across reloads — a random message id here would break @assistant-ui
-    // re-attaching the tool result to its call on every hydration.
-    let raw_id = persisted_id
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("{stable_base}-tool-{index}"));
-    serde_json::from_value(serde_json::Value::String(raw_id))
-        .expect("tool call id should deserialize from string")
-}
-
-/// Deterministic per-message base key used to synthesize tool-call ids when no
-/// persisted id exists. Falls back through: persisted message id → `seq:{n}`
-/// (log sequence) → `ord:{n}` (position in the history slice). Never random, so
-/// the derived tool-call ids are stable across session reloads.
-fn history_stable_base(message: &HistoryMsg, ordinal: usize) -> String {
-    if let Some(id) = message.id.as_deref().filter(|id| !id.is_empty()) {
-        return id.to_string();
-    }
-    match message.log_seq {
-        Some(seq) => format!("seq:{seq}"),
-        None => format!("ord:{ordinal}"),
-    }
 }
 
 fn completed_history_tool_message(

@@ -5,6 +5,8 @@
 //! worker as its own binary keeps it out of the front-end's dep graph and lets
 //! deployments run workers without the TUI.
 
+#[cfg(any(windows, test))]
+use anyhow::Context;
 use anyhow::{bail, Result};
 use clap::{ArgGroup, Parser};
 use harnx_core::agent_config::collect_agent_variables;
@@ -129,8 +131,52 @@ impl Cli {
     }
 }
 
+// Windows MSVC default stack for thread 'main' is 1MB. The async state machine
+// for the worker daemon exceeds that in unoptimized builds, causing
+// STATUS_STACK_OVERFLOW (0xc00000fd). Run the async main in a thread with 8MB stack.
+#[cfg(any(windows, test))]
+const WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+#[cfg(any(windows, test))]
+/// Spawn a thread with 8MB stack and run a boxed async future to completion.
+/// Used on Windows to avoid stack overflow in unoptimized builds.
+fn run_with_worker_stack<F, T>(future_fn: F) -> Result<T>
+where
+    F: FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send>>
+        + Send
+        + 'static,
+    T: Send + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name("harnx-worker-main".to_string())
+        .stack_size(WORKER_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .thread_stack_size(WORKER_THREAD_STACK_SIZE)
+                .enable_all()
+                .build()
+                .context("build tokio runtime with 8MB stack")?;
+            runtime.block_on(future_fn())
+        })
+        .context("spawn harnx-worker-main thread")?;
+    match handle.join() {
+        Ok(result) => result,
+        Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+    }
+}
+
+#[cfg(not(windows))]
 #[tokio::main]
 async fn main() -> Result<()> {
+    async_main().await
+}
+
+#[cfg(windows)]
+fn main() -> Result<()> {
+    run_with_worker_stack(|| Box::pin(async_main()))
+}
+
+async fn async_main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
     cli.validate()?;
@@ -138,12 +184,42 @@ async fn main() -> Result<()> {
     let telemetry = harnx_telemetry::init_telemetry("harnx-worker")?;
     harnx_core::alloc_guard::init_from_env();
 
-    let result = run(cli).await;
+    #[cfg(unix)]
+    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
+    #[cfg(not(unix))]
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    #[cfg(unix)]
+    let deadline_guard = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown.cancelled().await;
+            tokio::time::sleep(
+                harnx_runtime::nats_worker::WORKER_SHUTDOWN_TIMEOUT
+                    + std::time::Duration::from_secs(1),
+            )
+            .await;
+            // Tokio can't stop already-running blocking work. Fail-stop here so
+            // Kubernetes never observes a synthetic terminal disposition.
+            std::process::exit(1);
+        })
+    };
+    // Box the large future to keep it on the heap rather than the stack frame.
+    let result = Box::pin(run(cli, shutdown)).await;
+    if result.as_ref().is_err_and(|error| {
+        error
+            .downcast_ref::<harnx_runtime::nats_worker::WorkerShutdownDeadlineExceeded>()
+            .is_some()
+    }) {
+        std::process::exit(1);
+    }
     telemetry.shutdown().await;
+    #[cfg(unix)]
+    deadline_guard.abort();
     result
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(cli: Cli, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
     harnx_metrics::init(&cli.metrics)?;
     let readiness = harnx_healthz::init(&cli.healthz).await?;
     let config = Arc::new(RwLock::new(
@@ -161,7 +237,17 @@ async fn run(cli: Cli) -> Result<()> {
     let daemon = cli.daemon_config()?;
     // `None` selects the agent loop's default call path
     // (`call_with_retry_and_fallback`), which is what the worker wants.
-    harnx_runtime::nats_worker::run_worker_daemon(config, daemon, None, readiness).await
+    harnx_runtime::nats_worker::run_worker_daemon_with_shutdown(
+        config,
+        daemon,
+        harnx_runtime::nats_worker::DaemonRunOptions {
+            call_fn: None,
+            readiness,
+            shutdown,
+            shutdown_timeout: harnx_runtime::nats_worker::WORKER_SHUTDOWN_TIMEOUT,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -282,5 +368,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("--session-scope __local__"));
+    }
+
+    use super::run_with_worker_stack;
+
+    #[test]
+    fn run_with_worker_stack_success() {
+        let result = run_with_worker_stack(|| Box::pin(async { Ok(42) }));
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn run_with_worker_stack_propagates_panic() {
+        let panic_result = std::panic::catch_unwind(|| {
+            let _result: Result<i32, _> =
+                run_with_worker_stack(|| Box::pin(async { panic!("worker panic") }));
+        });
+        assert!(panic_result.is_err(), "expected panic to be propagated");
     }
 }

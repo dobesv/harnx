@@ -4,6 +4,7 @@
 
 pub mod ag_ui;
 mod ag_ui_attach;
+mod ag_ui_events;
 mod ag_ui_lifecycle;
 mod ag_ui_remote_follow;
 pub mod ag_ui_rpc;
@@ -12,9 +13,13 @@ mod ag_ui_usage;
 mod agent_resolve;
 mod interrupt_resume;
 mod nats_access;
+mod serve_shutdown;
 pub mod session_actor;
 mod session_actor_types;
 pub mod session_routes;
+
+pub use serve_shutdown::StreamDrainConfig;
+
 // Not `#[cfg(test)]`: the `tests/` integration crates link the library built
 // WITHOUT the `test` cfg, so gating this out would break their
 // `harnx_serve::test_support` imports. Kept public for cross-crate test reuse.
@@ -41,7 +46,7 @@ use harnx_rag::*;
 use harnx_runtime::{client::*, config::*, utils::*};
 use log::{debug, error, info, warn};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::stream::StreamExt;
@@ -52,7 +57,10 @@ use http::{Method, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{body::Incoming, service::service_fn};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::graceful::GracefulShutdown,
+};
 use multer::Multipart;
 use parking_lot::RwLock;
 use serde::Deserialize;
@@ -63,12 +71,14 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock},
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
-use tokio::{net::TcpListener, sync::oneshot};
-use tokio_graceful::Shutdown;
+use tokio::{net::TcpListener, sync::oneshot, task::JoinSet};
 
 const DEFAULT_MODEL_NAME: &str = "default";
+
+/// Default ceiling for closing client-facing HTTP connections during shutdown.
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(25);
 
 static LOCAL_NATS_HANDLES: LazyLock<
     tokio::sync::Mutex<HashMap<PathBuf, harnx_runtime::nats_local_server::SharedNatsServer>>,
@@ -238,6 +248,35 @@ pub async fn run(
     web_assets: Option<PathBuf>,
     readiness: Option<harnx_healthz::Readiness>,
 ) -> Result<()> {
+    run_with_drain_timeout(config, addr, web_assets, readiness, DEFAULT_DRAIN_TIMEOUT).await
+}
+
+pub async fn run_with_drain_timeout(
+    config: GlobalConfig,
+    addr: Option<String>,
+    web_assets: Option<PathBuf>,
+    readiness: Option<harnx_healthz::Readiness>,
+    drain_timeout: Duration,
+) -> Result<()> {
+    run_with_shutdown_config(
+        config,
+        addr,
+        web_assets,
+        readiness,
+        drain_timeout,
+        StreamDrainConfig::default(),
+    )
+    .await
+}
+
+pub async fn run_with_shutdown_config(
+    config: GlobalConfig,
+    addr: Option<String>,
+    web_assets: Option<PathBuf>,
+    readiness: Option<harnx_healthz::Readiness>,
+    drain_timeout: Duration,
+    stream_drain: StreamDrainConfig,
+) -> Result<()> {
     log_startup_environment_diagnostics();
 
     let addr = match addr {
@@ -253,7 +292,11 @@ pub async fn run(
         None => config.read().serve_addr(),
     };
     let web_assets = resolve_web_assets(web_assets);
-    let server = Arc::new(Server::new(&config, web_assets));
+    let server = Arc::new(Server::new_with_stream_drain(
+        &config,
+        web_assets,
+        stream_drain,
+    ));
     let listener = TcpListener::bind(&addr).await?;
     // Advertise the bound address so URLs reflect the real host/port even when
     // the request used an ephemeral port (":0") or a bare port. Fall back to
@@ -269,18 +312,17 @@ pub async fn run(
     if let Some(r) = &readiness {
         r.ready();
     }
-    let stop_server = server.run(listener).await?;
+    let server_handle = server.run(listener, drain_timeout).await?;
     // Lead with the Web UI URL — that's the one you open in a browser. The
     // API endpoints below are POST-only, so they're listed for reference only.
     println!("Web UI:                {base_url}/");
     println!("Embeddings API (POST): {base_url}/v1/embeddings");
     println!("Rerank API (POST):     {base_url}/v1/rerank");
-    shutdown_signal().await;
+    harnx_nats_common::shutdown::shutdown_signal().await;
     if let Some(r) = &readiness {
         r.not_ready();
     }
-    let _ = stop_server.send(());
-    Ok(())
+    server_handle.shutdown().await
 }
 
 #[doc(hidden)]
@@ -293,9 +335,27 @@ pub struct Server {
     session_registry: SessionRegistry,
     /// Root directory for web-ui static assets served over HTTP.
     web_assets: PathBuf,
+    shutdown: serve_shutdown::ServeShutdown,
 }
 
 type RouteMatch = (String, Option<String>, AgentsRoute);
+
+struct ServerHandle {
+    stop: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+    shutdown: serve_shutdown::ServeShutdown,
+    drain_timeout: Duration,
+}
+
+impl ServerHandle {
+    async fn shutdown(self) -> Result<()> {
+        self.shutdown.begin(self.drain_timeout);
+        let _ = self.stop.send(());
+        self.task
+            .await
+            .context("HTTP server task failed during shutdown")
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentsRoute {
@@ -316,6 +376,14 @@ enum AgentsRepresentation {
 impl Server {
     #[doc(hidden)]
     pub fn new(config: &GlobalConfig, web_assets: PathBuf) -> Self {
+        Self::new_with_stream_drain(config, web_assets, StreamDrainConfig::default())
+    }
+
+    fn new_with_stream_drain(
+        config: &GlobalConfig,
+        web_assets: PathBuf,
+        stream_drain: StreamDrainConfig,
+    ) -> Self {
         let config = config.read().clone();
         let mut models = list_all_models(&config.clients);
         let mut default_model = config.model.clone();
@@ -349,6 +417,7 @@ impl Server {
             rags: Config::list_rags(),
             session_registry,
             web_assets,
+            shutdown: serve_shutdown::ServeShutdown::new(stream_drain),
         }
     }
 
@@ -373,14 +442,23 @@ impl Server {
         Ok(serde_json::from_slice(&body)?)
     }
 
-    async fn run(self: Arc<Self>, listener: TcpListener) -> Result<oneshot::Sender<()>> {
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let shutdown = Shutdown::new(async { rx.await.unwrap_or_default() });
-            let guard = shutdown.guard_weak();
+    async fn run(
+        self: Arc<Self>,
+        listener: TcpListener,
+        drain_timeout: Duration,
+    ) -> Result<ServerHandle> {
+        let (stop, mut stop_rx) = oneshot::channel();
+        let shutdown = self.shutdown.clone();
+        let task = tokio::spawn(async move {
+            let graceful = GracefulShutdown::new();
+            let mut connections = JoinSet::new();
 
             loop {
                 tokio::select! {
+                    biased;
+                    _ = &mut stop_rx => {
+                        break;
+                    }
                     res = listener.accept() => {
                         let Ok((cnx, _)) = res else {
                             continue;
@@ -388,22 +466,44 @@ impl Server {
 
                         let stream = TokioIo::new(cnx);
                         let server = self.clone();
-                        shutdown.spawn_task(async move {
+                        let watcher = graceful.watcher();
+                        connections.spawn(async move {
                             let hyper_service = service_fn(move |request: hyper::Request<Incoming>| {
                                 server.clone().handle(request)
                             });
-                            let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                                .serve_connection_with_upgrades(stream, hyper_service)
-                                .await;
+                            let builder = hyper_util::server::conn::auto::Builder::new(
+                                TokioExecutor::new(),
+                            );
+                            let connection =
+                                builder.serve_connection_with_upgrades(stream, hyper_service);
+                            let _ = watcher.watch(connection.into_owned()).await;
                         });
-                    }
-                    _ = guard.cancelled() => {
-                        break;
                     }
                 }
             }
+
+            let connection_count = graceful.count();
+            if tokio::time::timeout(drain_timeout, graceful.shutdown())
+                .await
+                .is_err()
+            {
+                warn!(
+                    "HTTP drain reached its {:.3}s deadline with connection(s) still open; closing them",
+                    drain_timeout.as_secs_f64(),
+                );
+                connections.abort_all();
+            } else if connection_count > 0 {
+                info!("drained {connection_count} HTTP connection(s)");
+            }
+
+            while connections.join_next().await.is_some() {}
         });
-        Ok(tx)
+        Ok(ServerHandle {
+            stop,
+            task,
+            shutdown,
+            drain_timeout,
+        })
     }
 
     async fn handle(
@@ -992,6 +1092,7 @@ impl Server {
             session,
             req_body,
             None,
+            self.shutdown.clone(),
         )
         .await
     }
@@ -1158,12 +1259,6 @@ struct RerankReqBody {
     query: String,
     model: String,
     top_n: Option<usize>,
-}
-
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C signal handler")
 }
 
 fn set_cors_header(res: &mut AppResponse) {
@@ -1853,6 +1948,7 @@ mod tests {
     use harnx_core::message::{ImageUrl, Message, MessageContent, MessageContentPart};
     use harnx_core::session::SessionLogEntry;
     use http::HeaderValue;
+    use tokio::{io::AsyncWriteExt, net::TcpStream};
 
     #[test]
     fn web_assets_warning_reports_missing_or_incomplete_directories() {
@@ -1945,6 +2041,54 @@ mod tests {
             advertised_base_url(None, "example.internal:9000"),
             "http://example.internal:9000"
         );
+    }
+
+    async fn server_with_incomplete_request(
+        drain_timeout: Duration,
+    ) -> Result<(ServerHandle, TcpStream)> {
+        let server = Arc::new(asset_server(PathBuf::from("web-assets")));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server_handle = server.run(listener, drain_timeout).await?;
+        let mut stream = TcpStream::connect(address).await?;
+        stream
+            .write_all(
+                b"POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{",
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        Ok((server_handle, stream))
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_in_flight_http_request() -> Result<()> {
+        let (server_handle, mut stream) =
+            server_with_incomplete_request(Duration::from_secs(1)).await?;
+        let mut shutdown = Box::pin(server_handle.shutdown());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned before the in-flight request completed"
+        );
+
+        stream.write_all(b"}").await?;
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .context("server did not finish after the request completed")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_connections_at_drain_deadline() -> Result<()> {
+        let (server_handle, _stream) =
+            server_with_incomplete_request(Duration::from_millis(25)).await?;
+
+        tokio::time::timeout(Duration::from_secs(1), server_handle.shutdown())
+            .await
+            .context("server exceeded its configured drain deadline")??;
+        Ok(())
     }
 
     #[test]
@@ -2713,7 +2857,9 @@ mod tests {
         let server = Arc::new(Server::new(&config, PathBuf::from("web-assets")));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let stop = Arc::clone(&server).run(listener).await?;
+        let server_handle = Arc::clone(&server)
+            .run(listener, DEFAULT_DRAIN_TIMEOUT)
+            .await?;
         let client = reqwest::Client::new();
         let boundary = "traversal-boundary";
         let image = b"not written";
@@ -2743,7 +2889,7 @@ mod tests {
         assert_eq!(retrieval.status(), reqwest::StatusCode::NOT_FOUND);
         assert!(!escaped_attachments.exists());
 
-        let _ = stop.send(());
+        server_handle.shutdown().await?;
         Ok(())
     }
 

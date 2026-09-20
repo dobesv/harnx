@@ -114,8 +114,10 @@ fn live_terminal_finalization_closes_every_open_lifecycle_before_run_finished() 
             }),
             &mut state,
             &mut guard,
-            &thread_id.to_string(),
-            &run_id.to_string(),
+            LiveEventContext {
+                thread_id: &thread_id.to_string(),
+                run_id: &run_id.to_string(),
+            },
         )
         .expect("terminal frame"),
     );
@@ -159,8 +161,10 @@ fn live_terminal_finalization_closes_every_open_lifecycle_before_run_error() {
             }),
             &mut state,
             &mut guard,
-            &thread_id.to_string(),
-            &run_id.to_string(),
+            LiveEventContext {
+                thread_id: &thread_id.to_string(),
+                run_id: &run_id.to_string(),
+            },
         )
         .expect("error terminal frame"),
     );
@@ -185,18 +189,13 @@ fn live_terminal_finalization_closes_every_open_lifecycle_before_run_error() {
     assert_strict_lifecycle_valid(&events);
 }
 
-#[test]
-fn live_snapshot_reconciliation_closes_and_resets_guard_before_terminal() {
-    let thread_id = ThreadId::random();
-    let run_id = RunId::random();
+fn initial_reconciliation_events(guard: &mut LiveStreamGuard) -> Vec<Bytes> {
     let message_id = MessageId::random();
-    let tool_call_id = ToolCallId::random();
     let base = || BaseEvent {
         timestamp: None,
         raw_event: None,
     };
-    let mut guard = LiveStreamGuard::default();
-    let mut chunks = vec![
+    [
         Event::TextMessageStart(TextMessageStartEvent {
             base: base(),
             message_id: message_id.clone(),
@@ -208,14 +207,26 @@ fn live_snapshot_reconciliation_closes_and_resets_guard_before_terminal() {
         }),
         Event::ToolCallStart(ToolCallStartEvent {
             base: base(),
-            tool_call_id,
+            tool_call_id: ToolCallId::random(),
             tool_call_name: "search".to_string(),
             parent_message_id: Some(message_id),
         }),
     ]
     .into_iter()
-    .filter_map(|event| frame_guarded_live_event(event, &mut guard))
-    .collect::<Vec<_>>();
+    .filter_map(|event| frame_guarded_live_event(event, guard))
+    .collect()
+}
+
+#[test]
+fn live_snapshot_reconciliation_closes_and_resets_guard_before_terminal() {
+    let thread_id = ThreadId::random();
+    let run_id = RunId::random();
+    let base = || BaseEvent {
+        timestamp: None,
+        raw_event: None,
+    };
+    let mut guard = LiveStreamGuard::default();
+    let mut chunks = initial_reconciliation_events(&mut guard);
 
     chunks.push(
         frame_guarded_live_event(
@@ -235,8 +246,10 @@ fn live_snapshot_reconciliation_closes_and_resets_guard_before_terminal() {
             }),
             &mut state,
             &mut guard,
-            &thread_id.to_string(),
-            &run_id.to_string(),
+            LiveEventContext {
+                thread_id: &thread_id.to_string(),
+                run_id: &run_id.to_string(),
+            },
         )
         .expect("terminal frame"),
     );

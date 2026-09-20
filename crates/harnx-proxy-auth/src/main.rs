@@ -208,7 +208,7 @@ async fn run_dispatch_mode(
     if let Some(temp_dir) = fs_temp_dir {
         return tokio::select! {
             result = hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx) => result,
-            _ = shutdown_signal() => {
+            _ = harnx_nats_common::shutdown::shutdown_signal() => {
                 if let Some(r) = &readiness { r.not_ready(); }
                 drop(temp_dir);
                 Ok(())
@@ -217,7 +217,7 @@ async fn run_dispatch_mode(
     }
     tokio::select! {
         result = hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx) => result,
-        _ = shutdown_signal() => {
+        _ = harnx_nats_common::shutdown::shutdown_signal() => {
             if let Some(r) = &readiness { r.not_ready(); }
             Ok(())
         }
@@ -236,25 +236,4 @@ fn nats_mode_enabled() -> bool {
     ]
     .iter()
     .all(|name| std::env::var_os(name).is_some())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        let _ = sigterm.recv().await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-    }
 }

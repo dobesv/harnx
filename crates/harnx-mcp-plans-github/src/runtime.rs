@@ -382,28 +382,7 @@ fn parse_issue_number(value: &str) -> Result<u64> {
 
 fn spawn_shutdown_handler(ct: CancellationToken, readiness: Option<Readiness>) {
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut sigterm) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = sigterm.recv() => {}
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "harnx-mcp-plans-github: failed to install SIGTERM handler ({err}); falling back to Ctrl-C only"
-                    );
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+        harnx_nats_common::shutdown::shutdown_signal().await;
 
         // Mark not-ready before cancellation
         if let Some(r) = &readiness {

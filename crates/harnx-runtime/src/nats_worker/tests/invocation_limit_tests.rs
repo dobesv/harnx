@@ -210,6 +210,7 @@ async fn token_budget_stops_at_round_boundary_and_resets_for_next_activation() {
     .expect("create budget test NATS session");
     let options = crate::RunTurnOptions {
         token_budget: Some(1),
+        ..Default::default()
     };
 
     let first = run_budget_test_turn(&session, "run one tool round", options).await;

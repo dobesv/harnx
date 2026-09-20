@@ -8,6 +8,7 @@ repository.workspace = true
 description = "MCP server that exposes a file-based plan/task/note management system"
 
 [dependencies]
+harnx-nats-common = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }

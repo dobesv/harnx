@@ -20,7 +20,9 @@ clap = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-healthz = { workspace = true }
 harnx-metrics = { workspace = true }
+harnx-nats-common = { workspace = true }
 harnx-runtime = { path = "../harnx-runtime" }
 harnx-telemetry = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }

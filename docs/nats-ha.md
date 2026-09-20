@@ -611,6 +611,32 @@ re-read from the conflict. An idle session whose last entry is a mutation or
 control entry therefore gets a stray `Cancel`, which the protocol tolerates;
 that is the price of keeping the transcript's length off the interrupt's path.
 
+### Failover vs user cancellation
+
+Worker session execution distinguishes **failover** from **user cancellation**
+because confusing them causes work loss:
+
+- **User cancellation** (`AbortSignal` with `aborted_ctrlc()` /
+  `aborted_ctrld()`): writes a durable `Cancel` to the session log and
+  requires a held lease so the `Cancel` is fenced. Turn disposition is terminal
+  ACK — the session is done and no replacement worker will resume it.
+- **Failover** (`AbortSignal` with `aborted_failover()`, or lease lost):
+  local execution aborts **without** writing `Cancel`. Turn disposition is
+  non-terminal NAK (`Nak(None)`) so a replacement worker resumes from the
+  journal. Never send terminal ACK once failover is latched.
+
+The `FinishCause` enum (`execution_control.rs`) encodes this distinction:
+`UserCancelled` vs `Failover(Shutdown|LeaseLost)`. Only `UserCancelled` and
+`Completed{settled:true, has_queued_input:false}` produce terminal ACK.
+
+**Remote tool calls must not be cancelled on failover.** When a worker receives
+a failover abort signal, `NatsToolProvider::invoke_tool`
+(`nats_tool_provider.rs:276-280`) checks `!abort.aborted_failover()` before
+publishing a remote cancellation. Abandoning only the local wait lets the
+replacement worker recover the tool result from the invocation journal. A
+remote cancel would journal an interruption the replacement mistakes for the
+tool's outcome.
+
 After an accepted append it fires two best-effort wake-ups and waits on neither:
 the control hint above, and a **wind-up activation** targeting
 `requested_seq = cancel_seq`. A live worker settles that activation as already

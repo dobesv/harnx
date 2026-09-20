@@ -168,6 +168,7 @@ pub(crate) async fn run_turn(
         None,
         RunTurnOptions {
             token_budget: options.token_budget,
+            ..Default::default()
         },
     );
     tokio::pin!(run_turn);

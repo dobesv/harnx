@@ -435,29 +435,7 @@ async fn run_http(config: HttpServeConfig) -> anyhow::Result<()> {
 
 fn spawn_shutdown_handler(ct: CancellationToken, readiness: Option<Readiness>) {
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut sigterm) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = sigterm.recv() => {}
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "harnx-plans-tools: failed to install SIGTERM handler ({e}); \
-                         falling back to Ctrl-C only"
-                    );
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+        harnx_nats_common::shutdown::shutdown_signal().await;
 
         if let Some(readiness) = &readiness {
             readiness.not_ready();

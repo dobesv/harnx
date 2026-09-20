@@ -273,7 +273,12 @@ impl NatsToolProvider {
         let response = tokio::select! {
             _ = wait_abort_signal(abort) => {
                 self.in_flight.complete(&call_id).await;
-                self.schedule_cancel(&durable, &server);
+                // Failover abandons only this worker's wait. Cancelling the
+                // remote invocation would journal an interruption that the
+                // replacement worker then mistakes for the tool's outcome.
+                if !abort.aborted_failover() {
+                    self.schedule_cancel(&durable, &server);
+                }
                 return Err(ToolError::Fatal(anyhow!("tool call aborted")));
             }
             failure = &mut supervised_failure => {

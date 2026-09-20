@@ -13,14 +13,26 @@ use tokio_util::sync::CancellationToken;
 /// than one binary needs it.
 pub async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(error) => {
+                log::warn!("failed to install Ctrl+C handler: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        let _ = sigterm.recv().await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                let _ = sigterm.recv().await;
+            }
+            Err(error) => {
+                log::warn!("failed to install SIGTERM handler; waiting for Ctrl+C: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

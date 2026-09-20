@@ -13,7 +13,7 @@ use harnx_render::render_error;
 use harnx_runtime::bootstrap::setup_logger;
 use harnx_runtime::config::{load_env_file, Config, WorkingMode};
 use parking_lot::RwLock;
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "harnx HTTP server", long_about = None)]
@@ -31,6 +31,15 @@ struct Cli {
     /// (default: ~/.local/share/harnx/web-assets, XDG-aware)
     #[clap(long, value_name = "PATH", env = "HARNX_WEB_ASSETS")]
     web_assets: Option<PathBuf>,
+    /// Maximum seconds to wait for client HTTP connections during shutdown
+    #[clap(long, value_name = "SECONDS", default_value_t = 25)]
+    drain_timeout_seconds: u64,
+    /// Minimum per-stream shutdown jitter in milliseconds
+    #[clap(long, value_name = "MILLISECONDS", default_value_t = 1_000)]
+    stream_drain_min_jitter_ms: u64,
+    /// Maximum per-stream shutdown jitter in milliseconds
+    #[clap(long, value_name = "MILLISECONDS", default_value_t = 20_000)]
+    stream_drain_max_jitter_ms: u64,
     /// Set agent variable pairs (format: --agent-variable key value or -x key value); can be repeated
     #[clap(short = 'x', long, value_names = ["KEY", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
     pub agent_variable: Vec<String>,
@@ -75,17 +84,48 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
     }
     config.write().agent_variables = collect_agent_variables(&cli.agent_variable)?;
 
-    Ok(
-        harnx_serve::run(config, cli.addr, cli.web_assets, readiness)
-            .await
-            .err(),
+    let stream_drain = harnx_serve::StreamDrainConfig::new(
+        Duration::from_millis(cli.stream_drain_min_jitter_ms),
+        Duration::from_millis(cli.stream_drain_max_jitter_ms),
+    )?;
+    Ok(harnx_serve::run_with_shutdown_config(
+        config,
+        cli.addr,
+        cli.web_assets,
+        readiness,
+        Duration::from_secs(cli.drain_timeout_seconds),
+        stream_drain,
     )
+    .await
+    .err())
 }
 
 #[cfg(test)]
 mod tests {
     use super::Cli;
     use clap::Parser;
+
+    #[test]
+    fn drain_timeout_defaults_to_25_seconds_and_is_configurable() {
+        let default_cli = Cli::try_parse_from(["harnx-serve"]).unwrap();
+        assert_eq!(default_cli.drain_timeout_seconds, 25);
+        assert_eq!(default_cli.stream_drain_min_jitter_ms, 1_000);
+        assert_eq!(default_cli.stream_drain_max_jitter_ms, 20_000);
+
+        let configured = Cli::try_parse_from([
+            "harnx-serve",
+            "--drain-timeout-seconds",
+            "7",
+            "--stream-drain-min-jitter-ms",
+            "10",
+            "--stream-drain-max-jitter-ms",
+            "50",
+        ])
+        .unwrap();
+        assert_eq!(configured.drain_timeout_seconds, 7);
+        assert_eq!(configured.stream_drain_min_jitter_ms, 10);
+        assert_eq!(configured.stream_drain_max_jitter_ms, 50);
+    }
 
     #[test]
     fn parses_agent_variables_flag() {

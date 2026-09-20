@@ -1,6 +1,6 @@
 //! Worker daemon and session activation.
 
-use super::daemon_background::launch_worker_services;
+use super::daemon_background::{launch_worker_services, WorkerServices};
 use super::daemon_runtime::WorkerRuntime;
 use crate::config::{GlobalConfig, LOCAL_CLUSTER_KEY};
 use crate::nats_lease::NatsSessionLease;
@@ -8,7 +8,7 @@ use crate::nats_session_metadata::SessionMetadataStore;
 use crate::remote_session_cleanup::{run_periodic_remote_cleanup, CleanupOutcome};
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, consumer::pull};
-use futures_util::{Stream, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
@@ -17,9 +17,28 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 const ACTIVATION_STREAM_RETRY_DELAY: Duration = Duration::from_millis(250);
 const REMOTE_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Leaves five seconds of a typical 30-second Kubernetes grace period for the
+/// container runtime and process teardown.
+pub const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Returned when graceful worker handoff did not finish before its process
+/// deadline. The binary turns this into a fail-stop exit instead of waiting for
+/// non-yielding work during Tokio runtime teardown.
+#[derive(Debug)]
+pub struct WorkerShutdownDeadlineExceeded;
+
+impl std::fmt::Display for WorkerShutdownDeadlineExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("worker shutdown deadline exceeded")
+    }
+}
+
+impl std::error::Error for WorkerShutdownDeadlineExceeded {}
 
 pub use super::activation::{
     new_remote_session_id, new_worker_id, SessionActivate, SessionActivationRoute,
@@ -289,16 +308,90 @@ fn spawn_remote_session_cleanup(
     }))
 }
 
-/// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
-/// KV lease, and execute the session (exactly one worker per session).
-pub async fn run_worker_daemon(
-    config: GlobalConfig,
-    mut daemon: WorkerDaemonConfig,
-    call_fn: Option<crate::agent_loop::AgentCallFn>,
-    readiness: Option<harnx_healthz::Readiness>,
+/// Optional execution and lifecycle controls for a worker daemon.
+pub struct DaemonRunOptions {
+    pub call_fn: Option<crate::agent_loop::AgentCallFn>,
+    pub readiness: Option<harnx_healthz::Readiness>,
+    pub shutdown: CancellationToken,
+    pub shutdown_timeout: Duration,
+}
+
+async fn await_startup_or_shutdown<T>(
+    shutdown: &CancellationToken,
+    readiness: &Option<harnx_healthz::Readiness>,
+    startup: impl Future<Output = Result<T>>,
+) -> Result<Option<T>> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            if let Some(readiness) = readiness {
+                readiness.not_ready();
+            }
+            Ok(None)
+        }
+        result = startup => result.map(Some),
+    }
+}
+
+fn spawn_shutdown_deadline(
+    shutdown: CancellationToken,
+    shutdown_timeout: Duration,
+) -> JoinHandle<Instant> {
+    tokio::spawn(async move {
+        shutdown.cancelled().await;
+        Instant::now() + shutdown_timeout
+    })
+}
+
+async fn finish_worker_shutdown(
+    runtime: &WorkerRuntime,
+    readiness: &Option<harnx_healthz::Readiness>,
+    deadline_on_shutdown: JoinHandle<Instant>,
 ) -> Result<()> {
-    let instance_id = resolve_worker_scope(daemon.manage_servers)?;
-    let startup = prepare_worker_startup(&config, &daemon).await?;
+    if let Some(readiness) = readiness {
+        readiness.not_ready();
+    }
+    log::info!("worker shutdown started; activation admission closed");
+    let deadline = deadline_on_shutdown.await.unwrap_or_else(|error| {
+        log::warn!("worker shutdown deadline task failed: {error}");
+        Instant::now()
+    });
+    if tokio::time::timeout_at(deadline, runtime.shutdown_active_sessions())
+        .await
+        .is_err()
+    {
+        return Err(anyhow::Error::new(WorkerShutdownDeadlineExceeded));
+    }
+    log::info!("worker shutdown completed");
+    Ok(())
+}
+
+struct WorkerDaemonRuntimeSetup {
+    config: GlobalConfig,
+    daemon: WorkerDaemonConfig,
+    call_fn: Option<crate::agent_loop::AgentCallFn>,
+    shutdown: CancellationToken,
+}
+
+struct PreparedWorkerDaemon {
+    runtime: Arc<WorkerRuntime>,
+    consumer: jetstream::consumer::Consumer<pull::Config>,
+}
+
+async fn prepare_worker_daemon_runtime(
+    mut setup: WorkerDaemonRuntimeSetup,
+    readiness: &Option<harnx_healthz::Readiness>,
+) -> Result<Option<PreparedWorkerDaemon>> {
+    let instance_id = resolve_worker_scope(setup.daemon.manage_servers)?;
+    let Some(startup) = await_startup_or_shutdown(
+        &setup.shutdown,
+        readiness,
+        prepare_worker_startup(&setup.config, &setup.daemon),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
     log::info!(
         "serving under server_scope='{}' session_scope={} worker_id={} pid={} build={} activation={:?}",
         instance_id.as_str(),
@@ -306,60 +399,153 @@ pub async fn run_worker_daemon(
         startup.identity.worker_id,
         startup.identity.pid,
         startup.identity.build,
-        daemon.activation_mode,
+        setup.daemon.activation_mode,
     );
-    // The daemon config has no cluster to resolve against yet, so its lease
-    // config carries the bare default; now that the connection source is
-    // resolved, the lease bucket agrees with everything else this worker
-    // creates instead of always sitting at the default.
-    daemon.lease.replicas = startup.replicas;
-    let services = launch_worker_services(&config, &daemon, &startup, &instance_id).await?;
-    if let Some(readiness) = &readiness {
-        readiness.ready();
+    setup.daemon.lease.replicas = startup.replicas;
+    let Some(services) = await_startup_or_shutdown(
+        &setup.shutdown,
+        readiness,
+        launch_worker_services(&setup.config, &setup.daemon, &startup, &instance_id),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    if setup.shutdown.is_cancelled() {
+        if let Some(readiness) = readiness {
+            readiness.not_ready();
+        }
+        return Ok(None);
     }
-    let cluster = daemon.connection_key().to_string();
-    let cleanup_retention = config.read().cleanup_remote_sessions_days;
+    let consumer = startup.consumer.clone();
+    let runtime = build_worker_runtime(setup, startup, services, instance_id);
+    Ok(Some(PreparedWorkerDaemon { runtime, consumer }))
+}
+
+fn build_worker_runtime(
+    setup: WorkerDaemonRuntimeSetup,
+    startup: WorkerStartup,
+    services: WorkerServices,
+    instance_id: harnx_core::instance::ServerScope,
+) -> Arc<WorkerRuntime> {
+    let cluster = setup.daemon.connection_key().to_string();
+    let cleanup_retention = setup.config.read().cleanup_remote_sessions_days;
     // This is deliberately outside the activation reconnect loop: a broker
     // reconnect must not create another hourly collector in the same worker.
-    let remote_cleanup =
-        spawn_remote_session_cleanup(Arc::clone(&config), cluster.clone(), cleanup_retention)
-            .map(tokio_util::task::AbortOnDropHandle::new);
-    let runtime = Arc::new(WorkerRuntime {
-        config,
+    let remote_cleanup = spawn_remote_session_cleanup(
+        Arc::clone(&setup.config),
+        cluster.clone(),
+        cleanup_retention,
+    )
+    .map(tokio_util::task::AbortOnDropHandle::new);
+    Arc::new(WorkerRuntime {
+        config: setup.config,
         instance_id,
         _remote_cleanup: remote_cleanup,
         _background_services: services.background,
         background_services_attempted: services.background_services_attempted,
         server_reconciler: services.server_reconciler,
         cluster,
-        activation_route: daemon.activation_route(),
-        activation_mode: daemon.activation_mode,
-        manage_servers: daemon.manage_servers,
-        worker_id: daemon.worker_id.clone(),
-        identity: startup.identity.clone(),
-        lease: daemon.lease,
+        activation_route: setup.daemon.activation_route(),
+        activation_mode: setup.daemon.activation_mode,
+        manage_servers: setup.daemon.manage_servers,
+        worker_id: setup.daemon.worker_id.clone(),
+        identity: startup.identity,
+        lease: setup.daemon.lease,
         jetstream: startup.jetstream,
         session_metadata: services.session_metadata,
         client: startup.client,
-        call_fn,
+        call_fn: setup.call_fn,
         generation: AtomicU64::new(1),
+        shutdown: setup.shutdown,
         active: Mutex::new(HashMap::new()),
-    });
+    })
+}
 
-    let consumer = startup.consumer;
+fn mark_worker_ready_until_shutdown(
+    readiness: &Option<harnx_healthz::Readiness>,
+    shutdown: &CancellationToken,
+) -> Option<tokio_util::task::AbortOnDropHandle<()>> {
+    let readiness = readiness.clone()?;
+    readiness.ready();
+    let shutdown = shutdown.clone();
+    Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+        async move {
+            shutdown.cancelled().await;
+            readiness.not_ready();
+        },
+    )))
+}
+
+/// Run a worker daemon with a process signal-backed lifecycle token.
+///
+/// Embedded callers that already own process lifecycle should use
+/// [`run_worker_daemon_with_shutdown`] instead.
+pub async fn run_worker_daemon(
+    config: GlobalConfig,
+    daemon: WorkerDaemonConfig,
+    call_fn: Option<crate::agent_loop::AgentCallFn>,
+    readiness: Option<harnx_healthz::Readiness>,
+) -> Result<()> {
+    run_worker_daemon_with_shutdown(
+        config,
+        daemon,
+        DaemonRunOptions {
+            call_fn,
+            readiness,
+            shutdown: harnx_nats_common::shutdown::cancel_token_on_shutdown_signal(),
+            shutdown_timeout: WORKER_SHUTDOWN_TIMEOUT,
+        },
+    )
+    .await
+}
+
+/// Run a worker daemon until `shutdown` closes admission, then hand active
+/// sessions back to JetStream before `shutdown_timeout` expires.
+pub async fn run_worker_daemon_with_shutdown(
+    config: GlobalConfig,
+    daemon: WorkerDaemonConfig,
+    options: DaemonRunOptions,
+) -> Result<()> {
+    let DaemonRunOptions {
+        call_fn,
+        readiness,
+        shutdown,
+        shutdown_timeout,
+    } = options;
+    let setup = WorkerDaemonRuntimeSetup {
+        config,
+        daemon,
+        call_fn,
+        shutdown: shutdown.clone(),
+    };
+    let Some(PreparedWorkerDaemon { runtime, consumer }) =
+        prepare_worker_daemon_runtime(setup, &readiness).await?
+    else {
+        return Ok(());
+    };
+    let _readiness_shutdown = mark_worker_ready_until_shutdown(&readiness, &shutdown);
+    let deadline_on_shutdown = spawn_shutdown_deadline(shutdown.clone(), shutdown_timeout);
+    let activation_runtime = Arc::clone(&runtime);
     reconnect_activation_stream(
         move || {
             let consumer = consumer.clone();
             async move { consumer.messages().await }
         },
         move |message| {
-            let runtime = Arc::clone(&runtime);
+            let runtime = Arc::clone(&activation_runtime);
             async move { runtime.handle_activation(message).await }
         },
+        |message: async_nats::jetstream::Message| async move {
+            message
+                .ack_with(async_nats::jetstream::AckKind::Nak(None))
+                .await
+        },
         ACTIVATION_STREAM_RETRY_DELAY,
+        &shutdown,
     )
     .await;
-    Ok(())
+    finish_worker_shutdown(&runtime, &readiness, deadline_on_shutdown).await
 }
 
 /// Keep the daemon's pull subscription alive across transient broker stalls.
@@ -379,10 +565,15 @@ async fn reconnect_activation_stream<
     Handle,
     HandleFuture,
     HandleError,
+    Reject,
+    RejectFuture,
+    RejectError,
 >(
     mut open: Open,
     mut handle: Handle,
+    mut reject: Reject,
     retry_delay: Duration,
+    shutdown: &CancellationToken,
 ) where
     Open: FnMut() -> OpenFuture,
     OpenFuture: Future<Output = std::result::Result<Messages, OpenError>>,
@@ -392,28 +583,64 @@ async fn reconnect_activation_stream<
     Handle: FnMut(Message) -> HandleFuture,
     HandleFuture: Future<Output = std::result::Result<(), HandleError>>,
     HandleError: Display,
+    Reject: FnMut(Message) -> RejectFuture,
+    RejectFuture: Future<Output = std::result::Result<(), RejectError>>,
+    RejectError: Display,
 {
     loop {
-        match open().await {
-            Ok(mut messages) => {
-                while let Some(message) = messages.next().await {
-                    let message = match message {
-                        Ok(message) => message,
-                        Err(error) => {
-                            log::warn!("worker activation stream failed; reopening: {error}");
-                            break;
+        let opened = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            opened = open() => opened,
+        };
+        match opened {
+            Ok(mut messages) => loop {
+                let message = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        // A pull response can carry several activations. Return
+                        // every response already buffered in this client before
+                        // dropping the stream so another worker can claim it now.
+                        while let Some(buffered) = messages.next().now_or_never().flatten() {
+                            match buffered {
+                                Ok(buffered) => {
+                                    if let Err(error) = reject(buffered).await {
+                                        log::warn!("failed to NAK buffered activation during shutdown: {error}");
+                                    }
+                                }
+                                Err(error) => {
+                                    log::warn!("buffered activation stream failed during shutdown: {error}");
+                                    break;
+                                }
+                            }
                         }
-                    };
-                    if let Err(error) = handle(message).await {
-                        log::warn!("worker activation handling failed: {error}");
+                        return;
+                    },
+                    message = messages.next() => message,
+                };
+                let Some(message) = message else {
+                    break;
+                };
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        log::warn!("worker activation stream failed; reopening: {error}");
+                        break;
                     }
+                };
+                if let Err(error) = handle(message).await {
+                    log::warn!("worker activation handling failed: {error}");
                 }
-            }
+            },
             Err(error) => {
                 log::warn!("failed to open worker activation stream; retrying: {error}");
             }
         }
-        tokio::time::sleep(retry_delay).await;
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
     }
 }
 
@@ -448,38 +675,48 @@ mod tests {
         let (handled_tx, handled_rx) = tokio::sync::oneshot::channel();
         let mut handled_tx = Some(handled_tx);
 
-        let task = tokio::spawn(reconnect_activation_stream(
-            {
-                let attempts = Arc::clone(&attempts);
-                move || {
-                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        let messages: BoxStream<'static, std::result::Result<u32, &'static str>> =
-                            match attempt {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let task_attempts = Arc::clone(&attempts);
+        let task = tokio::spawn(async move {
+            reconnect_activation_stream(
+                {
+                    let attempts = task_attempts;
+                    move || {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            let messages: BoxStream<
+                                'static,
+                                std::result::Result<u32, &'static str>,
+                            > = match attempt {
                                 1 => stream::iter([Err("missed idle heartbeat")]).boxed(),
                                 _ => stream::once(async { Ok(42) })
                                     .chain(stream::pending())
                                     .boxed(),
                             };
-                        if attempt == 0 {
-                            Err("broker unavailable")
-                        } else {
-                            Ok(messages)
+                            if attempt == 0 {
+                                Err("broker unavailable")
+                            } else {
+                                Ok(messages)
+                            }
                         }
                     }
-                }
-            },
-            move |message| {
-                let tx = handled_tx.take();
-                async move {
-                    if let Some(tx) = tx {
-                        let _ = tx.send(message);
+                },
+                move |message| {
+                    let tx = handled_tx.take();
+                    async move {
+                        if let Some(tx) = tx {
+                            let _ = tx.send(message);
+                        }
+                        Ok::<(), &'static str>(())
                     }
-                    Ok::<(), &'static str>(())
-                }
-            },
-            Duration::from_millis(1),
-        ));
+                },
+                |_message| async { Ok::<(), &'static str>(()) },
+                Duration::from_millis(1),
+                &task_shutdown,
+            )
+            .await;
+        });
 
         let message = tokio::time::timeout(Duration::from_secs(1), handled_rx)
             .await
@@ -491,5 +728,50 @@ mod tests {
 
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_admission_and_naks_buffered_messages() {
+        harnx_core::require_nextest();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handled = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rejected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut stream = Some(
+            stream::iter([
+                Ok::<_, &'static str>(1_u32),
+                Ok::<_, &'static str>(2_u32),
+                Ok::<_, &'static str>(3_u32),
+            ])
+            .boxed(),
+        );
+
+        reconnect_activation_stream(
+            move || {
+                let messages = stream.take().expect("stream opens once");
+                async move { Ok::<_, &'static str>(messages) }
+            },
+            {
+                let handled = Arc::clone(&handled);
+                let shutdown = shutdown.clone();
+                move |message| {
+                    handled.lock().expect("handled lock").push(message);
+                    shutdown.cancel();
+                    async { Ok::<(), &'static str>(()) }
+                }
+            },
+            {
+                let rejected = Arc::clone(&rejected);
+                move |message| {
+                    rejected.lock().expect("rejected lock").push(message);
+                    async { Ok::<(), &'static str>(()) }
+                }
+            },
+            Duration::from_millis(1),
+            &shutdown,
+        )
+        .await;
+
+        assert_eq!(*handled.lock().expect("handled lock"), vec![1]);
+        assert_eq!(*rejected.lock().expect("rejected lock"), vec![2, 3]);
     }
 }

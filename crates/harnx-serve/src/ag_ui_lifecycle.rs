@@ -1,4 +1,5 @@
 //! Per-subscriber AG-UI lifecycle validation and repair.
+#![allow(dead_code)]
 
 use std::{collections::HashSet, hash::Hash};
 
@@ -17,7 +18,7 @@ use ag_ui_core::{
 };
 use bytes::Bytes;
 
-use crate::ag_ui::frame_event;
+use crate::ag_ui_events::frame_event;
 
 #[derive(Default)]
 pub(crate) struct LiveStreamGuard {
@@ -301,26 +302,28 @@ impl LiveStreamGuard {
         );
         Some(Bytes::from(frames))
     }
-}
 
-pub(crate) fn frame_guarded_live_event(event: Event, guard: &mut LiveStreamGuard) -> Option<Bytes> {
-    match event {
-        event @ (Event::TextMessageStart(_)
-        | Event::TextMessageContent(_)
-        | Event::TextMessageEnd(_)) => guard.frame_text_event(event),
-        event @ (Event::ToolCallStart(_)
-        | Event::ToolCallArgs(_)
-        | Event::ToolCallEnd(_)
-        | Event::ToolCallResult(_)) => guard.frame_tool_event(event),
-        event @ (Event::StepStarted(_) | Event::StepFinished(_)) => guard.frame_step_event(event),
-        event @ (Event::ThinkingStart(_)
-        | Event::ThinkingEnd(_)
-        | Event::ThinkingTextMessageStart(_)
-        | Event::ThinkingTextMessageContent(_)
-        | Event::ThinkingTextMessageEnd(_)) => guard.frame_thinking_event(event),
-        event @ (Event::RunFinished(_) | Event::RunError(_)) => frame(event),
-        Event::MessagesSnapshot(event) => guard.frame_messages_snapshot(event),
-        other => frame(other),
+    pub(crate) fn frame_event(&mut self, event: Event) -> Option<Bytes> {
+        match event {
+            event @ (Event::TextMessageStart(_)
+            | Event::TextMessageContent(_)
+            | Event::TextMessageEnd(_)) => self.frame_text_event(event),
+            event @ (Event::ToolCallStart(_)
+            | Event::ToolCallArgs(_)
+            | Event::ToolCallEnd(_)
+            | Event::ToolCallResult(_)) => self.frame_tool_event(event),
+            event @ (Event::StepStarted(_) | Event::StepFinished(_)) => {
+                self.frame_step_event(event)
+            }
+            event @ (Event::ThinkingStart(_)
+            | Event::ThinkingEnd(_)
+            | Event::ThinkingTextMessageStart(_)
+            | Event::ThinkingTextMessageContent(_)
+            | Event::ThinkingTextMessageEnd(_)) => self.frame_thinking_event(event),
+            event @ (Event::RunFinished(_) | Event::RunError(_)) => frame(event),
+            Event::MessagesSnapshot(event) => self.frame_messages_snapshot(event),
+            other => frame(other),
+        }
     }
 }
 
