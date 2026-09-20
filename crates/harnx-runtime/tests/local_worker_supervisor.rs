@@ -16,6 +16,7 @@ use harnx_runtime::nats_worker::{
 use harnx_runtime::utils::create_abort_signal;
 use harnx_runtime::{NatsSession, NatsSessionConfig};
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -492,4 +493,42 @@ async fn local_supervisors_own_distinct_workers_routes_and_process_trees() {
     wait_for_process_exit(b_pid).await;
     drop(frontend_c);
     wait_for_process_exit(c_pid).await;
+}
+
+/// A worker that dies during startup is the hardest failure to explain, and a
+/// process that configured no logging — every test binary, for one — has
+/// nowhere for the worker's account of itself to land. The supervisor has to
+/// keep that evidence itself, or giving up says nothing at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_that_never_starts_reports_its_exit_status_and_output() {
+    require_nextest();
+    if !nats_server_available() {
+        eprintln!("skipping local worker supervisor test: nats-server binary not found");
+        return;
+    }
+    let root = tempfile::tempdir().expect("create isolated supervisor environment");
+    let _environment = isolated_environment(root.path());
+    let binary = root.path().join("harnx-worker");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\necho 'refusing to start: no such model catalog' >&2\nexit 3\n",
+    )
+    .expect("write failing worker fixture");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("make worker fixture executable");
+
+    let started = LocalWorkerSupervisor::start_with_worker_binary(&binary, create_abort_signal())
+        .await
+        .err();
+    let error = started.expect("a worker that exits immediately must not start successfully");
+    let report = format!("{error:#}");
+
+    assert!(
+        report.contains("exit status: 3"),
+        "giving up must name the worker's exit status, got: {report}"
+    );
+    assert!(
+        report.contains("refusing to start: no such model catalog"),
+        "giving up must quote what the worker printed, got: {report}"
+    );
 }

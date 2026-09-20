@@ -106,6 +106,18 @@ than a SIGKILL would.
 When one of these tests fails, check a passing run's timings for the same block
 before blaming the test. If the whole block is slow, the margin is the bug.
 
+### Telling a flake from a regression
+
+A failure that repeats on every attempt is not a flake. The `ci` profile retries
+three times, so one broken test prints `TRY 1 FAIL` through `TRY 4 FAIL` and
+reads in the log exactly like a timing flake. Three things separate them: did
+every attempt fail, did the other two platform jobs pass (CI runs ubuntu, macos
+and windows), and does the same test pass on `main`. Four failed attempts on one
+platform while the others are green is a platform regression, and the retries
+only make it slower to find. `gh run list --branch <branch> --workflow CI` also
+shows whether an earlier head on the same branch was green, which brackets the
+change that broke it.
+
 ### Web/Frontend Verification
 
 **Run all web/frontend commands from `web/`, never the repo root.** The root has no

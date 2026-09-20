@@ -15,11 +15,12 @@ use futures_util::StreamExt;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::sink::emit_agent_event;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
 use tokio::process::{Child, Command};
 
 const READINESS_POLL_INITIAL: Duration = Duration::from_millis(50);
@@ -29,7 +30,7 @@ const READINESS_POLL_MAX: Duration = Duration::from_millis(500);
 const WORKER_HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_SLOW_NOTICE_AFTER: Duration = Duration::from_secs(5);
 const WORKER_SLOW_NOTICE_INTERVAL: Duration = Duration::from_secs(10);
-const MAX_WORKER_CRASHES: u32 = 3;
+const MAX_WORKER_CRASHES: usize = 3;
 const WORKER_OUTPUT_TAIL_BYTES: u64 = 4096;
 
 const WORKER_BINARY: &str = if cfg!(windows) {
@@ -113,7 +114,9 @@ pub struct LocalWorkerSupervisor {
     worker_binary: PathBuf,
     route: LocalWorkerRoute,
     child: Option<Child>,
-    crashes: u32,
+    output: WorkerOutput,
+    /// How the workers owned during the current readiness wait ended.
+    exits: Vec<ExitStatus>,
 }
 
 /// Lazily start or re-check a frontend's process-lifetime local worker and
@@ -171,7 +174,8 @@ impl LocalWorkerSupervisor {
             worker_binary,
             route,
             child: None,
-            crashes: 0,
+            output: WorkerOutput::new(),
+            exits: Vec::new(),
         };
         supervisor.ensure(abort_signal).await?;
         Ok(supervisor)
@@ -205,7 +209,7 @@ impl LocalWorkerSupervisor {
             self.stop_worker();
         }
 
-        self.crashes = 0;
+        self.exits.clear();
         let expected_pid = self.spawn_worker()?;
         self.wait_for_readiness(&mut readiness, expected_pid, abort_signal)
             .await
@@ -324,15 +328,27 @@ impl LocalWorkerSupervisor {
         if self.child_is_running()? {
             return Ok(());
         }
-        if self.crashes >= MAX_WORKER_CRASHES {
+        if self.exits.len() >= MAX_WORKER_CRASHES {
             bail!(
-                "local worker exited {} times without becoming ready:\n{}",
-                self.crashes,
-                worker_output_tail()
+                "local worker exited {} times without becoming ready ({}):\n{}",
+                self.exits.len(),
+                self.exit_summary(),
+                self.output.tail()
             );
         }
         *expected_pid = self.spawn_worker()?;
         Ok(())
+    }
+
+    /// How each worker owned during this readiness wait ended, oldest first.
+    /// Worth listing rather than counting: a signal followed by a clean
+    /// non-zero exit is a different story from the same exit three times.
+    fn exit_summary(&self) -> String {
+        self.exits
+            .iter()
+            .map(ExitStatus::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     async fn subscribe_to_readiness(&self) -> Result<async_nats::Subscriber> {
@@ -372,7 +388,7 @@ impl LocalWorkerSupervisor {
                     self.route.worker_id()
                 );
                 self.child = None;
-                self.crashes = self.crashes.saturating_add(1);
+                self.exits.push(status);
                 Ok(false)
             }
         }
@@ -386,6 +402,9 @@ impl LocalWorkerSupervisor {
             &self.server.status().url,
             &self.server.status().token,
         );
+        command
+            .stdout(self.output.sink())
+            .stderr(self.output.sink());
         let child = command
             .spawn()
             .with_context(|| format!("spawn local worker from {}", self.worker_binary.display()))?;
@@ -477,18 +496,77 @@ fn worker_wait_notice(waited: Duration, worker_pid: u32) -> String {
     )
 }
 
-/// Last [`WORKER_OUTPUT_TAIL_BYTES`] of the log the worker writes into, for
-/// error messages.
+/// Where this supervisor's worker children send stdout and stderr, and the
+/// place a startup failure quotes from.
 ///
-/// When the frontend logs to a file, anything the worker writes outside the
-/// `log` facade — a panic, a `main` returning `Err`, a child process's own
-/// stderr — is otherwise easy to miss while the frontend waits for readiness.
-/// Empty when the worker inherits our streams instead: the output is already
-/// wherever the operator is looking.
-fn worker_output_tail() -> String {
-    let Some(path) = harnx_core::logging::log_file_path() else {
-        return String::new();
-    };
+/// A worker writes plenty outside the `log` facade — a panic, a `main`
+/// returning `Err`, a tool server's own stderr — and when it dies during
+/// startup that output is the only account of why. `harnx_core::logging`
+/// routes a child's streams to wherever the parent's own logs go, except for a
+/// parent that configured no logging at all, whose children are discarded
+/// rather than given an inherited pipe that would outlive them. That leaves
+/// every test binary, and any embedder that logs nothing, unable to say more
+/// than "it exited". A file of this supervisor's own keeps the account without
+/// handing anyone a pipe.
+struct WorkerOutput {
+    capture: Option<NamedTempFile>,
+}
+
+impl WorkerOutput {
+    fn new() -> Self {
+        let capture = harnx_core::logging::child_output_is_discarded()
+            .then(|| {
+                tempfile::Builder::new()
+                    .prefix("harnx-worker-")
+                    .suffix(".log")
+                    .tempfile()
+                    .inspect_err(|error| log::warn!("worker output not captured: {error}"))
+                    .ok()
+            })
+            .flatten();
+        Self { capture }
+    }
+
+    /// Stdio for one worker child. Falls back to the shared decision whenever
+    /// there is nothing of our own to capture into.
+    fn sink(&self) -> Stdio {
+        let Some(capture) = self.capture.as_ref() else {
+            return harnx_core::logging::child_output_sink();
+        };
+        match OpenOptions::new().append(true).open(capture.path()) {
+            Ok(file) => Stdio::from(file),
+            Err(error) => {
+                log::warn!(
+                    "worker output not captured to {}: {error}",
+                    capture.path().display()
+                );
+                harnx_core::logging::child_output_sink()
+            }
+        }
+    }
+
+    /// Last [`WORKER_OUTPUT_TAIL_BYTES`] of whatever the workers wrote.
+    fn tail(&self) -> String {
+        if let Some(capture) = self.capture.as_ref() {
+            return output_tail(capture.path());
+        }
+        if let Some(path) = harnx_core::logging::log_file_path() {
+            return output_tail(path);
+        }
+        // Only reachable when capturing failed, since that is the one thing
+        // that leaves a discarding process without a file of its own. Say so
+        // rather than pointing at a stderr nobody wrote to.
+        if harnx_core::logging::child_output_is_discarded() {
+            return "(worker output was discarded)".to_string();
+        }
+        format!(
+            "(worker output went to {})",
+            harnx_core::logging::child_output_destination()
+        )
+    }
+}
+
+fn output_tail(path: &Path) -> String {
     let render = |body: String| {
         if body.trim().is_empty() {
             format!("(no output in {})", path.display())
