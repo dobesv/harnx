@@ -62,7 +62,7 @@ impl ServerHandler for PlansServer {
         _pagination: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(vec![
+        let mut tools = vec![
                 Tool::new("list_plans", "List all plans with metadata and task/note counts.", Map::new())
                     .with_input_schema::<ListPlansParams>()
                     .with_meta(tool_meta(tool_templates::LIST_PLANS_CALL)),
@@ -108,7 +108,11 @@ impl ServerHandler for PlansServer {
                 Tool::new("delete_note", "Delete a note from a plan.", Map::new())
                     .with_input_schema::<DeleteNoteParams>()
                     .with_meta(tool_meta(tool_templates::DELETE_NOTE_CALL)),
-            ]))
+        ];
+        if let Some(ref filter) = self.filter {
+            tools.retain(|tool| harnx_toolset_server::tool_enabled(filter, &tool.name));
+        }
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
@@ -116,6 +120,14 @@ impl ServerHandler for PlansServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(ref filter) = self.filter {
+            if !harnx_toolset_server::tool_enabled(filter, &request.name) {
+                return Err(ErrorData::invalid_params(
+                    format!("tool '{}' is not available on this server", request.name),
+                    None,
+                ));
+            }
+        }
         let tool = request.name.clone();
         let metric_tool = metric_tool_name(&tool);
         let start = std::time::Instant::now();

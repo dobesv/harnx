@@ -110,7 +110,20 @@ Package agents and servers are automatically namespaced to avoid collisions with
 
 Package separators become `__` in tool names. Harnx keeps the server/tool separator as `_`.
 
-Add native tool servers through `tool_servers/`. To use an external MCP server, add its bridge configuration there as well; the bridge publishes the MCP tools through the same naming and routing path.
+Add native tool servers through `tool_servers/`. To use an external MCP server, add its bridge configuration there as well; the bridge publishes the MCP tools through the same naming and routing path. Pass `--enable-tool <glob>` in a server's `args:` to restrict which tools are published and callable (repeatable for multiple patterns). Patterns match against raw tool names before package prefixing:
+
+```yaml
+# packages/my-pkg/tool_servers/bash.yaml
+command: harnx-bash-tools
+args:
+  - --allow-repo-work
+  - --enable-tool
+  - deploy_*
+  - --enable-tool
+  - status
+```
+
+Without `--enable-tool`, all tools from the server are published.
 
 ### Naming Convention
 

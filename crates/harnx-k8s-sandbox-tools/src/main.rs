@@ -9,7 +9,10 @@ use harnx_k8s_sandbox_tools::{
 };
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
 use harnx_runtime::nats_session_metadata::SessionMetadataStore;
-use harnx_toolset_server::{serve_many_with_shutdown, RegistrationShutdown, ServeLifecycle};
+use harnx_toolset_server::{
+    compile_enable_globs, serve_many_with_shutdown_and_filter, FilteredToolset,
+    RegistrationShutdown, ServeLifecycle,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +51,10 @@ struct Cli {
     metrics: harnx_metrics::MetricsFlags,
     #[command(flatten)]
     healthz: harnx_healthz::HealthzFlags,
+    /// Enable only tools matching the glob pattern (repeatable).
+    /// If set, only enabled tools are registered and invocable.
+    #[arg(long = "enable-tool", action = clap::ArgAction::Append)]
+    enable_tool: Vec<String>,
 }
 
 #[tokio::main]
@@ -65,6 +72,12 @@ async fn main() -> Result<()> {
 
 async fn run(cli: Cli, readiness: Option<harnx_healthz::Readiness>) -> Result<()> {
     validate(&cli)?;
+
+    // Compile filter globs before connecting to NATS
+    let filter_set = compile_enable_globs(&cli.enable_tool)?;
+    let filter: Option<Arc<harnx_toolset_server::globset::GlobSet>> =
+        filter_set.as_ref().map(|s| Arc::new(s.clone()));
+
     let scope =
         harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::WorkerLaunched)?;
     let endpoint = NatsEndpoint::from_env()?;
@@ -89,8 +102,22 @@ async fn run(cli: Cli, readiness: Option<harnx_healthz::Readiness>) -> Result<()
         shutdown.clone(),
     );
 
+    // Apply filter to toolsets if specified
     let toolsets = sandbox_toolsets(manager, caller, metadata);
-    let result = serve_many_with_shutdown(
+    let toolsets: Vec<Arc<dyn harnx_toolset::Toolset>> = match &filter_set {
+        Some(set) => toolsets
+            .into_iter()
+            .map(|ts| {
+                Arc::new(FilteredToolset::new(
+                    harnx_toolset_server::ArcToolsetWrapper(ts),
+                    set.clone(),
+                )) as Arc<dyn harnx_toolset::Toolset>
+            })
+            .collect(),
+        None => toolsets,
+    };
+
+    let result = serve_many_with_shutdown_and_filter(
         toolsets,
         scope,
         NatsConnection {
@@ -99,6 +126,7 @@ async fn run(cli: Cli, readiness: Option<harnx_healthz::Readiness>) -> Result<()
         },
         ServeLifecycle::new(shutdown.clone(), readiness)
             .with_registration_shutdown(RegistrationShutdown::Expire),
+        filter,
     )
     .await;
     shutdown.cancel();
@@ -231,6 +259,28 @@ mod tests {
 
     fn valid_cli() -> Cli {
         Cli::try_parse_from(["harnx-k8s-sandbox-tools"]).expect("default CLI must be valid")
+    }
+
+    fn verify_enable_tool_cli(args: &[&str], expected: &[&str]) {
+        let mut cli_args = vec!["k8s-tools"];
+        cli_args.extend_from_slice(args);
+        let cli = Cli::try_parse_from(cli_args).expect("enable-tool arguments must parse");
+        assert_eq!(cli.enable_tool, expected);
+        let filters = compile_enable_globs(&cli.enable_tool)
+            .expect("enable-tool globs must compile")
+            .expect("non-empty enable-tool patterns must produce a filter");
+        for pattern in expected {
+            let name = pattern.trim_end_matches('*');
+            assert!(filters.is_match(name));
+        }
+        assert!(!filters.is_match("not-enabled"));
+    }
+
+    #[test]
+    fn enable_tool_cli_parsing() {
+        verify_enable_tool_cli(&["--enable-tool", "echo"], &["echo"]);
+        verify_enable_tool_cli(&["--enable-tool=exec*"], &["exec*"]);
+        verify_enable_tool_cli(&["--enable-tool", "a", "--enable-tool=b"], &["a", "b"]);
     }
 
     #[test]

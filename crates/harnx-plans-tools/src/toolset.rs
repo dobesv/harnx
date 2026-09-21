@@ -18,7 +18,7 @@ pub struct PlansToolset {
 impl PlansToolset {
     pub fn new(dir: PathBuf) -> Self {
         Self {
-            server: PlansServer::new(dir),
+            server: PlansServer::new(dir, None),
         }
     }
 }

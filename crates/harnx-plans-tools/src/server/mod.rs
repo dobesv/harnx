@@ -18,6 +18,7 @@ use similar::{ChangeTag, TextDiff};
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 mod handler;
@@ -50,4 +51,5 @@ fn tool_meta(call_template: &str) -> MetaObject {
 #[derive(Clone)]
 pub struct PlansServer {
     dir: PathBuf,
+    pub(crate) filter: Option<Arc<harnx_toolset_server::globset::GlobSet>>,
 }

@@ -7,8 +7,8 @@ use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{ToolReply, ToolRequest};
 use harnx_toolset_server::{
-    registration_key, serve_many_with_shutdown, RegistrationShutdown, ServeLifecycle,
-    TOOL_REGISTRY_BUCKET,
+    registration_key, serve_many_with_shutdown, serve_many_with_shutdown_and_filter,
+    RegistrationShutdown, ServeLifecycle, TOOL_REGISTRY_BUCKET,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -59,7 +59,7 @@ fn start_aggregate(
     shutdown: CancellationToken,
     readiness: harnx_healthz::Readiness,
 ) -> JoinHandle<Result<()>> {
-    tokio::spawn(serve_many_with_shutdown(
+    tokio::spawn(serve_many_with_shutdown_and_filter(
         vec![
             Arc::new(TestToolset::named("first")),
             Arc::new(TestToolset::named("second")),
@@ -70,6 +70,11 @@ fn start_aggregate(
             replicas: 1,
         },
         ServeLifecycle::new(shutdown, Some(readiness)),
+        Some(Arc::new({
+            let mut builder = harnx_toolset_server::globset::GlobSetBuilder::new();
+            builder.add(harnx_toolset_server::globset::Glob::new("echo").unwrap());
+            builder.build().unwrap()
+        })), // Filter present
     ))
 }
 

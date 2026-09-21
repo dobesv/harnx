@@ -79,7 +79,7 @@ fn plan_last_activity_falls_back_to_dir_mtime_for_empty_plan() {
 #[tokio::test]
 async fn add_and_get_task() {
     let dir = temp_test_dir("add-and-get-task");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let add = server
         .handle_add_task(AddTaskParams {
@@ -115,7 +115,7 @@ async fn add_and_get_task() {
 #[tokio::test]
 async fn add_task_with_agent_id() {
     let dir = temp_test_dir("add-task-agent-id");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     let add = server
         .handle_add_task(AddTaskParams {
@@ -143,7 +143,7 @@ async fn add_task_with_agent_id() {
 #[tokio::test]
 async fn add_task_duplicate_id_error() {
     let dir = temp_test_dir("add-task-dup-id");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_task(AddTaskParams {
@@ -188,7 +188,7 @@ async fn add_task_duplicate_id_error() {
 #[tokio::test]
 async fn add_task_invalid_id_rejected() {
     let dir = temp_test_dir("add-task-invalid-id");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     // Slash in ID
     let err = server
@@ -240,7 +240,7 @@ async fn add_task_invalid_id_rejected() {
 #[tokio::test]
 async fn add_task_auto_id_fallback() {
     let dir = temp_test_dir("add-task-auto-id");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let add = server
         .handle_add_task(AddTaskParams {
@@ -265,7 +265,7 @@ async fn add_task_auto_id_fallback() {
 #[tokio::test]
 async fn add_note_with_agent_id() {
     let dir = temp_test_dir("add-note-agent-id");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     let add = server
         .handle_add_note(AddNoteParams {
@@ -291,7 +291,7 @@ async fn add_note_with_agent_id() {
 #[tokio::test]
 async fn add_note_invalid_id_rejected() {
     let dir = temp_test_dir("add-note-invalid-id");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let err = server
         .handle_add_note(AddNoteParams {
@@ -331,7 +331,7 @@ fn validate_id_rejects_invalid() {
 #[tokio::test]
 async fn update_task_fields() {
     let dir = temp_test_dir("update-task-fields");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let add = server
         .handle_add_task(AddTaskParams {
@@ -387,7 +387,7 @@ async fn update_task_fields() {
 #[tokio::test]
 async fn append_body_via_update_task() {
     let dir = temp_test_dir("append-task-body");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let add = server
         .handle_add_task(AddTaskParams {
@@ -440,7 +440,7 @@ async fn append_body_via_update_task() {
 #[tokio::test]
 async fn delete_task() {
     let dir = temp_test_dir("delete-task");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let add = server
         .handle_add_task(AddTaskParams {
@@ -482,7 +482,7 @@ async fn delete_task() {
 async fn list_tasks_scoped_to_plan() {
     // Tasks are plan-scoped; each plan's list shows only that plan's tasks
     let dir = temp_test_dir("list-tasks-scoped");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     for plan in ["plan-a", "plan-b"] {
         server
@@ -533,7 +533,7 @@ async fn list_tasks_scoped_to_plan() {
 #[tokio::test]
 async fn list_tasks_by_tag() {
     let dir = temp_test_dir("list-tasks-by-tag");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     // Create task with "urgent" tag
     server
@@ -589,7 +589,7 @@ async fn list_tasks_by_tag() {
 async fn update_task_cross_plan_move() {
     // Tasks are scoped to a plan — update stays within the plan
     let dir = temp_test_dir("update-task-cross-plan");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     let add = server
         .handle_add_task(AddTaskParams {
@@ -653,7 +653,7 @@ async fn update_task_cross_plan_move() {
 #[tokio::test]
 async fn update_plan_append_content() {
     let dir = temp_test_dir("update-plan-append-content");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_plan(AddPlanParams {
@@ -709,7 +709,7 @@ line2"
 #[tokio::test]
 async fn update_plan_replace_in_content() {
     let dir = temp_test_dir("update-plan-replace-in-content");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_plan(AddPlanParams {
@@ -765,7 +765,7 @@ async fn update_plan_replace_in_content() {
 #[tokio::test]
 async fn update_plan_replace_in_content_not_found() {
     let dir = temp_test_dir("update-plan-replace-in-content-not-found");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_plan(AddPlanParams {
@@ -817,7 +817,7 @@ async fn update_plan_replace_in_content_not_found() {
 #[tokio::test]
 async fn update_plan_replace_in_content_empty_old_text_error() {
     let dir = temp_test_dir("update-plan-replace-in-empty-old-text");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let err = server
         .handle_update_plan(UpdatePlanParams {
@@ -852,7 +852,7 @@ async fn update_plan_replace_in_content_empty_old_text_error() {
 #[tokio::test]
 async fn update_plan_two_content_fields_error() {
     let dir = temp_test_dir("update-plan-two-content-fields-error");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let err = server
         .handle_update_plan(UpdatePlanParams {
@@ -883,7 +883,7 @@ async fn update_plan_two_content_fields_error() {
 #[tokio::test]
 async fn update_plan_no_content_preserves_body() {
     let dir = temp_test_dir("update-plan-no-content-preserves-body");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_plan(AddPlanParams {
@@ -936,7 +936,7 @@ async fn update_plan_no_content_preserves_body() {
 #[tokio::test]
 async fn update_note_fields() {
     let dir = temp_test_dir("update-note-fields");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_note(AddNoteParams {
@@ -982,7 +982,7 @@ async fn update_note_fields() {
 #[tokio::test]
 async fn update_note_not_found() {
     let dir = temp_test_dir("update-note-not-found");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let err = server
         .handle_update_note(UpdateNoteParams {
@@ -1006,7 +1006,7 @@ async fn update_note_not_found() {
 #[tokio::test]
 async fn update_plan_batch_creates_tasks() {
     let dir = temp_test_dir("update-plan-batch");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     server
         .handle_update_plan(UpdatePlanParams {
@@ -1066,7 +1066,7 @@ async fn update_plan_batch_creates_tasks() {
 #[tokio::test]
 async fn update_plan_batch_rejects_duplicate_id() {
     let dir = temp_test_dir("update-plan-batch-dup-id");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     // Pre-create a task with id "existing-id"
     server
@@ -1122,7 +1122,7 @@ async fn update_plan_batch_rejects_duplicate_id() {
 #[tokio::test]
 async fn update_plan_batch_rejects_intra_batch_duplicate_id() {
     let dir = temp_test_dir("update-plan-batch-intra-dup-id");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     // Two TaskSpecs with the same id in the same batch — should fail
     let result = server
@@ -1177,7 +1177,7 @@ async fn update_plan_batch_rejects_intra_batch_duplicate_id() {
 #[tokio::test]
 async fn update_plan_batch_creates_tasks_with_ids() {
     let dir = temp_test_dir("update-plan-batch-with-ids");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     server
         .handle_update_plan(UpdatePlanParams {
@@ -1233,7 +1233,7 @@ async fn update_plan_batch_creates_tasks_with_ids() {
 #[tokio::test]
 async fn add_note_duplicate_id_error() {
     let dir = temp_test_dir("add-note-dup-id");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_note(AddNoteParams {
@@ -1266,7 +1266,7 @@ async fn add_note_duplicate_id_error() {
 #[tokio::test]
 async fn list_tasks_by_plan() {
     let dir = temp_test_dir("list-tasks-by-plan");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     for plan in ["plan-a", "plan-b"] {
         server
@@ -1305,7 +1305,7 @@ async fn list_tasks_by_plan() {
 #[tokio::test]
 async fn add_task_creates_tasks_subdir() {
     let dir = temp_test_dir("add-task-creates-tasks-subdir");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     server
         .handle_add_task(AddTaskParams {
@@ -1330,7 +1330,7 @@ async fn add_task_creates_tasks_subdir() {
 #[tokio::test]
 async fn get_task_missing_id() {
     let dir = temp_test_dir("get-task-missing-id");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let err = server
         .handle_get_task(GetTaskParams {
@@ -1345,7 +1345,7 @@ async fn get_task_missing_id() {
 #[tokio::test]
 async fn add_and_get_plan() {
     let dir = temp_test_dir("add-and-get-plan");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_plan(AddPlanParams {
@@ -1378,7 +1378,7 @@ async fn add_and_get_plan() {
 #[tokio::test]
 async fn add_plan_duplicate_error() {
     let dir = temp_test_dir("add-plan-duplicate-error");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_plan(AddPlanParams {
@@ -1419,7 +1419,7 @@ async fn add_plan_duplicate_error() {
 #[tokio::test]
 async fn update_plan_creates_if_missing() {
     let dir = temp_test_dir("update-plan-creates-if-missing");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     server
         .handle_update_plan(UpdatePlanParams {
@@ -1456,7 +1456,7 @@ async fn update_plan_creates_if_missing() {
 #[tokio::test]
 async fn update_plan_rejects_parent_issue_for_existing_file_plan() {
     let dir = temp_test_dir("update-plan-existing-parent-issue");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
     server
         .handle_add_plan(AddPlanParams {
             name: "plan-a".to_string(),
@@ -1483,7 +1483,7 @@ async fn update_plan_rejects_parent_issue_for_existing_file_plan() {
 #[tokio::test]
 async fn update_plan_preserves_metadata() {
     let dir = temp_test_dir("update-plan-preserves-metadata");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_plan(AddPlanParams {
@@ -1536,7 +1536,7 @@ async fn update_plan_preserves_metadata() {
 #[tokio::test]
 async fn delete_plan() {
     let dir = temp_test_dir("delete-plan");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     server
         .handle_add_plan(AddPlanParams {
@@ -1568,7 +1568,7 @@ async fn delete_plan() {
 #[tokio::test]
 async fn list_plans_returns_counts() {
     let dir = temp_test_dir("list-plans-returns-counts");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_plan(AddPlanParams {
@@ -1626,7 +1626,7 @@ async fn list_plans_returns_counts() {
 #[tokio::test]
 async fn add_and_get_note() {
     let dir = temp_test_dir("add-and-get-note");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let add = server
         .handle_add_note(AddNoteParams {
@@ -1655,7 +1655,7 @@ async fn add_and_get_note() {
 #[tokio::test]
 async fn delete_note() {
     let dir = temp_test_dir("delete-note");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let add = server
         .handle_add_note(AddNoteParams {
@@ -1690,7 +1690,7 @@ async fn delete_note() {
 #[tokio::test]
 async fn plan_content_alias_round_trips_in_file_store() {
     let dir = temp_test_dir("plan-content-alias");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
     server
         .handle_add_plan(AddPlanParams {
             name: "content-alias".to_string(),
@@ -1721,7 +1721,7 @@ async fn plan_content_alias_round_trips_in_file_store() {
 #[tokio::test]
 async fn file_store_add_plan_rejects_body_with_content() {
     let dir = temp_test_dir("add-plan-content-conflict");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
     let error = server
         .handle_add_plan(AddPlanParams {
             name: "content-conflict".to_string(),
@@ -1741,7 +1741,7 @@ async fn file_store_add_plan_rejects_body_with_content() {
 #[tokio::test]
 async fn file_store_rejects_conflicting_content_alias() {
     let dir = temp_test_dir("plan-content-conflict");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
     let error = server
         .handle_update_plan(UpdatePlanParams {
             name: "content-conflict".to_string(),
@@ -1766,7 +1766,7 @@ fn file_store_argument_parser_rejects_unknown_fields() {
 #[tokio::test]
 async fn list_notes() {
     let dir = temp_test_dir("list-notes");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     for idx in 0..2 {
         server
@@ -1801,7 +1801,7 @@ async fn list_notes() {
 #[tokio::test]
 async fn add_note_creates_notes_subdir() {
     let dir = temp_test_dir("add-note-creates-notes-subdir");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     server
         .handle_add_note(AddNoteParams {
@@ -1820,7 +1820,7 @@ async fn add_note_creates_notes_subdir() {
 #[tokio::test]
 async fn get_note_returns_frontmatter() {
     let dir = temp_test_dir("get-note-returns-frontmatter");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let add = server
         .handle_add_note(AddNoteParams {
@@ -1848,7 +1848,7 @@ async fn get_note_returns_frontmatter() {
 #[tokio::test]
 async fn get_plan_legacy_raw_markdown() {
     let dir = temp_test_dir("get-plan-legacy-raw-markdown");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     let plan_dir = dir.join("plan-a");
     fs::create_dir_all(&plan_dir).unwrap();
@@ -1868,7 +1868,7 @@ async fn get_plan_legacy_raw_markdown() {
 #[tokio::test]
 async fn normalize_note_id_prefix() {
     let dir = temp_test_dir("normalize-note-id-prefix");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     let add = server
         .handle_add_note(AddNoteParams {
@@ -1896,7 +1896,7 @@ async fn normalize_note_id_prefix() {
 #[tokio::test]
 async fn list_tasks_filter() {
     let dir = temp_test_dir("list-tasks-filter");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_task(AddTaskParams {
@@ -1947,7 +1947,7 @@ async fn list_tasks_filter() {
 #[tokio::test]
 async fn task_file_in_tasks_subdir() {
     let dir = temp_test_dir("task-file-in-subdir");
-    let server = PlansServer::new(dir.clone());
+    let server = PlansServer::new(dir.clone(), None);
 
     let add = server
         .handle_add_task(AddTaskParams {
@@ -1976,7 +1976,7 @@ async fn task_file_in_tasks_subdir() {
 #[tokio::test]
 async fn get_task_wrong_plan_fails() {
     let dir = temp_test_dir("get-task-wrong-plan");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_task(AddTaskParams {
@@ -2012,7 +2012,7 @@ async fn get_task_wrong_plan_fails() {
 #[tokio::test]
 async fn update_task_wrong_plan_fails() {
     let dir = temp_test_dir("update-task-wrong-plan");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_task(AddTaskParams {
@@ -2059,7 +2059,7 @@ async fn update_task_wrong_plan_fails() {
 #[tokio::test]
 async fn append_body_wrong_plan_fails() {
     let dir = temp_test_dir("append-task-wrong-plan");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_task(AddTaskParams {
@@ -2106,7 +2106,7 @@ async fn append_body_wrong_plan_fails() {
 #[tokio::test]
 async fn delete_task_wrong_plan_fails() {
     let dir = temp_test_dir("delete-task-wrong-plan");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_task(AddTaskParams {
@@ -2142,7 +2142,7 @@ async fn delete_task_wrong_plan_fails() {
 #[tokio::test]
 async fn delete_note_wrong_plan_fails() {
     let dir = temp_test_dir("delete-note-wrong-plan");
-    let server = PlansServer::new(dir);
+    let server = PlansServer::new(dir, None);
 
     server
         .handle_add_note(AddNoteParams {
@@ -2237,8 +2237,15 @@ mod wire_tests {
     type TestClientService = RunningService<RoleClient, TestClientHandler>;
 
     async fn setup_client_server(dir: PathBuf) -> (TestClientService, TestServerService) {
+        setup_client_server_with_filter(dir, None).await
+    }
+
+    async fn setup_client_server_with_filter(
+        dir: PathBuf,
+        filter: Option<Arc<harnx_toolset_server::globset::GlobSet>>,
+    ) -> (TestClientService, TestServerService) {
         let (client_transport, server_transport) = duplex(65_536);
-        let server = PlansServer::new(dir);
+        let server = PlansServer::new(dir, filter);
 
         let server_fut = serve_server(server, server_transport);
         let client_fut = serve_client(TestClientHandler, client_transport);
@@ -2450,6 +2457,48 @@ mod wire_tests {
             }
         }
 
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn filtered_tools_are_listed_and_invocation_is_restricted() {
+        let filter = harnx_toolset_server::compile_enable_globs(&["list_plans".to_string()])
+            .unwrap()
+            .map(Arc::new);
+        let (client, _server) =
+            setup_client_server_with_filter(temp_test_dir("filter"), filter).await;
+        let listed = client.peer().list_tools(Default::default()).await.unwrap();
+        assert_eq!(listed.tools.len(), 1);
+        assert_eq!(listed.tools[0].name, "list_plans");
+        let error = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("delete_plan"))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("is not available on this server"));
+        assert!(client
+            .peer()
+            .call_tool(CallToolRequestParams::new("list_plans"))
+            .await
+            .is_ok());
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_filter_lists_all_tools() {
+        let (client, _server) = setup_client_server(temp_test_dir("no-filter")).await;
+        assert_eq!(
+            client
+                .peer()
+                .list_tools(Default::default())
+                .await
+                .unwrap()
+                .tools
+                .len(),
+            15
+        );
         client.cancel().await.unwrap();
     }
 }

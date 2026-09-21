@@ -10,6 +10,7 @@ mod cleanup_tasks;
 pub mod content;
 mod drain;
 mod execution;
+pub mod filter;
 mod invocation;
 use invocation::invoke_uncached_tool;
 #[cfg(test)]
@@ -27,9 +28,15 @@ mod subscriptions;
 mod tool_observation;
 use tool_observation::*;
 
-pub use aggregate::serve_many_with_shutdown;
+pub use aggregate::{serve_many_with_shutdown, serve_many_with_shutdown_and_filter};
+pub use filter::{
+    compile_enable_globs, enable_tools_from_args, tool_enabled, ArcToolsetWrapper, FilteredToolset,
+    ENABLE_TOOL_FLAG,
+};
 pub use lifecycle::{RegistrationShutdown, ServeLifecycle};
 pub use registration_identity::RegistrationIdentity;
+// Re-export globset for callers who need to construct filters
+pub use globset;
 
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
@@ -95,6 +102,9 @@ struct ToolRequestContext {
     /// reconciled with the connection's while the server runs.
     replicas: usize,
     cleanup: Arc<cleanup_tasks::CleanupTasks>,
+    /// Optional filter for tool admission. When set, requests for tools not
+    /// matching the filter are rejected before cache/journal lookup.
+    filter: Option<Arc<globset::GlobSet>>,
 }
 
 struct ValidatedToolRequest {
@@ -103,12 +113,22 @@ struct ValidatedToolRequest {
     parent_cx: OtelContext,
 }
 
+pub struct ServeConfig {
+    pub instance_id: ServerScope,
+    pub connection: NatsConnection,
+    pub lifecycle: ServeLifecycle,
+    pub filter: Option<Arc<globset::GlobSet>>,
+}
+
 struct ServeSettings {
     instance_id: ServerScope,
     connection: NatsConnection,
     lifecycle: ServeLifecycle,
     identity: RegistrationIdentity,
     started: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Optional filter for tool admission. When set, requests for tools not
+    /// matching the filter are rejected before cache/journal lookup.
+    filter: Option<Arc<globset::GlobSet>>,
 }
 
 /// Everything `serve_requests` needs to keep the KV registration alive, bundled
@@ -204,6 +224,7 @@ pub async fn serve_with_client_and_identity(
             lifecycle: ServeLifecycle::new(CancellationToken::new(), None),
             identity,
             started: None,
+            filter: None,
         },
     )
     .await
@@ -218,45 +239,58 @@ pub async fn serve_with_shutdown(
     connection: NatsConnection,
     lifecycle: ServeLifecycle,
 ) -> Result<()> {
-    serve_configured(
+    serve_with_config(
         toolset,
-        ServeSettings {
+        ServeConfig {
             instance_id,
             connection,
             lifecycle,
-            identity: RegistrationIdentity::from_env(),
-            started: None,
+            filter: None,
         },
     )
     .await
 }
 
-/// Serve a toolset with an existing NATS connection and configured lifecycle.
-///
-/// **Avoiding double-init (EADDRINUSE):** Callers that have already initialized healthz
-/// (via `harnx_healthz::init()`) should put the resulting `Readiness` in the lifecycle.
-/// `None` is appropriate only for entry points that do not pre-initialize healthz.
-async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) -> Result<()> {
-    let ServeSettings {
-        instance_id,
-        connection,
-        lifecycle,
-        identity,
-        started,
-    } = settings;
-    let (shutdown, readiness, registration_shutdown) = lifecycle.into_parts();
-    let NatsConnection { client, replicas } = connection;
+/// Serve a toolset using an existing NATS connection and configured lifecycle.
+pub async fn serve_with_config(toolset: Arc<dyn Toolset>, config: ServeConfig) -> Result<()> {
+    serve_configured(
+        toolset,
+        ServeSettings {
+            instance_id: config.instance_id,
+            connection: config.connection,
+            lifecycle: config.lifecycle,
+            identity: RegistrationIdentity::from_env(),
+            started: None,
+            filter: config.filter,
+        },
+    )
+    .await
+}
+
+struct SubscriptionSetup {
+    tool_requests: async_nats::Subscriber,
+    controls: async_nats::Subscriber,
+    identity_token: String,
+    registration: Registration,
+    registry: kv::Store,
+    journal: invocation_journal::InvocationJournal,
+}
+
+async fn setup_subscriptions(
+    toolset: &Arc<dyn Toolset>,
+    settings: &ServeSettings,
+    readiness: Option<&Readiness>,
+) -> Result<SubscriptionSetup> {
+    let RegistrationIdentity { package, config } = settings.identity.clone();
     let server_name = toolset.name().to_owned();
-    let RegistrationIdentity { package, config } = identity;
     let identity_token = server_identity_token(package.as_deref(), &config, &server_name);
-    let (mut tool_requests, mut controls) = subscriptions::subscribe_to_requests(
-        &client,
-        &instance_id,
+    let (tool_requests, controls) = subscriptions::subscribe_to_requests(
+        &settings.connection.client,
+        &settings.instance_id,
         &identity_token,
-        readiness.as_ref(),
+        readiness,
     )
     .await?;
-
     let registration = Registration {
         package,
         config,
@@ -265,34 +299,44 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         schema_version: TOOL_SCHEMA_VERSION,
         proto_version: TOOL_PROTOCOL_VERSION,
     };
-    let (registry, journal) = ensure_control_stores(&client, replicas).await?;
-    let mut revision = publish_registration(&registry, &instance_id, &registration).await?;
-    signal_started(started);
+    let (registry, journal) =
+        ensure_control_stores(&settings.connection.client, settings.connection.replicas).await?;
+    Ok(SubscriptionSetup {
+        tool_requests,
+        controls,
+        identity_token,
+        registration,
+        registry,
+        journal,
+    })
+}
 
-    let (active_requests, active_requests_rx) = InFlightRequests::new();
-    let request_context = request_context(
-        (&client, toolset),
-        (&instance_id, identity_token.clone()),
-        (active_requests, journal, replicas),
-    );
+struct ServeCleanup {
+    client: async_nats::Client,
+    readiness: Option<Readiness>,
+    tool_requests: async_nats::Subscriber,
+    request_context: ToolRequestContext,
+    active_requests_rx: watch::Receiver<usize>,
+    registration_shutdown: RegistrationShutdown,
+    registry: kv::Store,
+    instance_id: ServerScope,
+    identity_token: String,
+    revision: u64,
+}
 
-    let outcome = serve_requests(
-        &request_context,
-        ToolSubscriptions {
-            tool_requests: &mut tool_requests,
-            controls: &mut controls,
-            shutdown,
-        },
-        RegistrationRefresh {
-            registry: &registry,
-            instance_id: &instance_id,
-            identity_token: &identity_token,
-            registration: &registration,
-            revision: &mut revision,
-        },
-    )
-    .await;
-
+async fn finish_shutdown(cleanup: ServeCleanup, outcome: Result<()>) -> Result<()> {
+    let ServeCleanup {
+        client,
+        readiness,
+        mut tool_requests,
+        request_context,
+        active_requests_rx,
+        registration_shutdown,
+        registry,
+        instance_id,
+        identity_token,
+        revision,
+    } = cleanup;
     // Mark readiness not-ready so k8s stops routing traffic, then drain the
     // tool-request subscription so the broker removes this member from the
     // queue group (new calls route to siblings). The NATS connection stays
@@ -345,6 +389,118 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
     outcome
 }
 
+async fn initialize_server(
+    client: &async_nats::Client,
+    instance_id: &ServerScope,
+    toolset: Arc<dyn Toolset>,
+    setup: SubscriptionSetup,
+    replicas: usize,
+    filter: Option<Arc<globset::GlobSet>>,
+) -> Result<(
+    async_nats::Subscriber,
+    async_nats::Subscriber,
+    String,
+    kv::Store,
+    Registration,
+    u64,
+    ToolRequestContext,
+    watch::Receiver<usize>,
+)> {
+    let SubscriptionSetup {
+        tool_requests,
+        controls,
+        identity_token,
+        registration,
+        registry,
+        journal,
+    } = setup;
+    let revision = publish_registration(&registry, instance_id, &registration).await?;
+    let (active_requests, active_requests_rx) = InFlightRequests::new();
+    let request_context = request_context(
+        (client, toolset),
+        (instance_id, identity_token.clone()),
+        (active_requests, journal, replicas),
+        filter,
+    );
+    Ok((
+        tool_requests,
+        controls,
+        identity_token,
+        registry,
+        registration,
+        revision,
+        request_context,
+        active_requests_rx,
+    ))
+}
+
+async fn run_server_loop(
+    context: &ToolRequestContext,
+    subscriptions: ToolSubscriptions<'_>,
+    refresh: RegistrationRefresh<'_>,
+) -> Result<()> {
+    serve_requests(context, subscriptions, refresh).await
+}
+
+async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) -> Result<()> {
+    let setup = setup_subscriptions(&toolset, &settings, settings.lifecycle.readiness()).await?;
+    let ServeSettings {
+        instance_id,
+        connection,
+        lifecycle,
+        started,
+        filter,
+        ..
+    } = settings;
+    let (shutdown, readiness, registration_shutdown) = lifecycle.into_parts();
+    let NatsConnection { client, replicas } = connection;
+    let (
+        mut tool_requests,
+        mut controls,
+        identity_token,
+        registry,
+        registration,
+        mut revision,
+        request_context,
+        active_requests_rx,
+    ) = initialize_server(&client, &instance_id, toolset, setup, replicas, filter).await?;
+    signal_started(started);
+
+    let outcome = run_server_loop(
+        &request_context,
+        ToolSubscriptions {
+            tool_requests: &mut tool_requests,
+            controls: &mut controls,
+            shutdown,
+        },
+        RegistrationRefresh {
+            registry: &registry,
+            instance_id: &instance_id,
+            identity_token: &identity_token,
+            registration: &registration,
+            revision: &mut revision,
+        },
+    )
+    .await;
+
+    finish_shutdown(
+        ServeCleanup {
+            client,
+            readiness,
+            tool_requests,
+            request_context,
+            active_requests_rx,
+            registration_shutdown,
+            registry,
+            instance_id,
+            identity_token,
+            revision,
+        },
+        outcome,
+    )
+    .await
+}
+
 fn request_context(
     (client, toolset): (&async_nats::Client, Arc<dyn Toolset>),
     (instance_id, server_identity): (&ServerScope, String),
@@ -353,6 +509,7 @@ fn request_context(
         invocation_journal::InvocationJournal,
         usize,
     ),
+    filter: Option<Arc<globset::GlobSet>>,
 ) -> ToolRequestContext {
     ToolRequestContext {
         client: client.clone(),
@@ -365,6 +522,7 @@ fn request_context(
         journal,
         replicas,
         cleanup: Arc::default(),
+        filter,
     }
 }
 
@@ -546,6 +704,11 @@ async fn validate_tool_request(
         .await?;
         return Ok(None);
     }
+
+    if !check_tool_admission(context, &request, reply_subject.clone()).await? {
+        return Ok(None);
+    }
+
     let validation = async {
         prepare(context, &request).await?;
         context.journal.validate_replay(&request).await
@@ -565,6 +728,27 @@ async fn validate_tool_request(
         request,
         parent_cx,
     }))
+}
+
+async fn check_tool_admission(
+    context: &ToolRequestContext,
+    request: &ToolRequest,
+    reply_subject: harnx_nats_common::rpc::ReplyTarget,
+) -> Result<bool> {
+    let Some(filter_set) = &context.filter else {
+        return Ok(true);
+    };
+    if tool_enabled(filter_set, &request.tool) {
+        return Ok(true);
+    }
+    publish_recoverable_reply(
+        &context.client,
+        reply_subject,
+        request.call_id.clone(),
+        format!("tool '{}' is not available on this server", request.tool),
+    )
+    .await?;
+    Ok(false)
 }
 
 /// Give every call a journal row before it runs. A worker records its own
@@ -784,6 +968,9 @@ fn print_toolset_help() {
     eprintln!("  --mcp-http                Use MCP Streamable HTTP transport instead of NATS");
     eprintln!("  --host <HOST>             MCP HTTP bind host (default: 0.0.0.0)");
     eprintln!("  --port <PORT>             MCP HTTP bind port (toolset-specific default)");
+    eprintln!("  --enable-tool <glob>      Enable only tools matching the glob pattern.");
+    eprintln!("                            Repeatable. If set, only enabled tools are");
+    eprintln!("                            registered and invocable on this server.");
     eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
     eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
     eprintln!("                            Also honors HARNX_METRICS_ADDR env.");
@@ -791,6 +978,22 @@ fn print_toolset_help() {
     eprintln!("                            Blank host binds 0.0.0.0, e.g. :8457. Unset disables.");
     eprintln!("                            Also honors HARNX_HEALTHZ_ADDR env.");
     eprintln!("  --help, -h                Show this help message");
+}
+
+fn wrap_toolset_if_filtered(
+    toolset: Arc<dyn Toolset>,
+    filter_set: Option<globset::GlobSet>,
+) -> (Arc<dyn Toolset>, Option<Arc<globset::GlobSet>>) {
+    match filter_set {
+        Some(set) => {
+            let filter = Arc::new(set.clone());
+            (
+                Arc::new(FilteredToolset::new(ArcToolsetWrapper(toolset), set)),
+                Some(filter),
+            )
+        }
+        None => (toolset, None),
+    }
 }
 
 /// Run a toolset in MCP stdio or HTTP mode when selected, otherwise NATS mode.
@@ -805,6 +1008,69 @@ fn print_toolset_help() {
 /// recognize and skip both `--flag VALUE` (separate) and `--flag=VALUE` (equals) forms.
 /// Use EXACT match (`arg == "--flag"` or `arg.strip_prefix("--flag=")`), not
 /// `starts_with("--flag")`, to reject near-prefix typos like `--flag-typo`.
+async fn run_mcp_service(
+    toolset: Arc<dyn Toolset>,
+    readiness: Option<Readiness>,
+    filter_set: Option<globset::GlobSet>,
+) -> Result<()> {
+    let (toolset, filter) = wrap_toolset_if_filtered(toolset, filter_set);
+    match resolve_mcp_mode(std::env::args_os())? {
+        Some(McpMode::Stdio) => {
+            let service = McpToolsetAdapter { toolset }
+                .serve(rmcp::transport::stdio())
+                .await
+                .context("start MCP stdio server")?;
+            if let Some(readiness) = readiness.as_ref() {
+                readiness.ready();
+            }
+            let outcome = service.waiting().await.context("run MCP stdio server");
+            if let Some(readiness) = readiness.as_ref() {
+                readiness.not_ready();
+            }
+            outcome?;
+            return Ok(());
+        }
+        Some(McpMode::Http) => {
+            // Front parsers only validate/consume-and-skip these flags; the shared runner
+            // re-reads env::args to resolve host/port.
+            let args = std::env::args().collect::<Vec<_>>();
+            let host =
+                mcp_http_arg_value(&args, "--host")?.unwrap_or_else(|| "0.0.0.0".to_string());
+            let port = match mcp_http_arg_value(&args, "--port")? {
+                Some(port) => port
+                    .parse::<u16>()
+                    .with_context(|| format!("invalid --port value '{port}'"))?,
+                None => toolset.default_mcp_http_port(),
+            };
+            return run_toolset_mcp_http(toolset, host, port, readiness).await;
+        }
+        None => {}
+    }
+
+    let scope =
+        harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::McpStdio)?;
+    log::info!("serving under scope '{}'", scope.as_str());
+    let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
+    let client = endpoint.connect().await?;
+    let connection = NatsConnection {
+        client,
+        replicas: endpoint.resolved_replicas(),
+    };
+    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
+    serve_configured(
+        toolset,
+        ServeSettings {
+            instance_id: scope,
+            connection,
+            lifecycle: ServeLifecycle::new(shutdown, readiness),
+            identity: RegistrationIdentity::from_env(),
+            started: None,
+            filter,
+        },
+    )
+    .await
+}
+
 pub async fn run_toolset_main<T>(toolset: T) -> Result<()>
 where
     T: Toolset + 'static,
@@ -815,6 +1081,10 @@ where
         print_toolset_help();
         return Ok(());
     }
+
+    // Parse --enable-tool flags before other initialization
+    let enable_tools = enable_tools_from_args(&std::env::args_os().collect::<Vec<_>>())?;
+    let filter_set = compile_enable_globs(&enable_tools)?;
 
     let metrics_addr = harnx_metrics::metrics_addr_from_args(
         std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()),
@@ -829,60 +1099,7 @@ where
     let service_name = format!("harnx-{}-server", toolset.name());
     let telemetry = harnx_telemetry::init_telemetry(&service_name)?;
 
-    let result: Result<()> = async {
-        let toolset: Arc<dyn Toolset> = Arc::new(toolset);
-        match resolve_mcp_mode(std::env::args_os())? {
-            Some(McpMode::Stdio) => {
-                let service = McpToolsetAdapter { toolset }
-                    .serve(rmcp::transport::stdio())
-                    .await
-                    .context("start MCP stdio server")?;
-                if let Some(readiness) = readiness.as_ref() {
-                    readiness.ready();
-                }
-                let outcome = service.waiting().await.context("run MCP stdio server");
-                if let Some(readiness) = readiness.as_ref() {
-                    readiness.not_ready();
-                }
-                outcome?;
-                return Ok(());
-            }
-            Some(McpMode::Http) => {
-                // Front parsers only validate/consume-and-skip these flags; the shared runner
-                // re-reads env::args to resolve host/port.
-                let args = std::env::args().collect::<Vec<_>>();
-                let host =
-                    mcp_http_arg_value(&args, "--host")?.unwrap_or_else(|| "0.0.0.0".to_string());
-                let port = match mcp_http_arg_value(&args, "--port")? {
-                    Some(port) => port
-                        .parse::<u16>()
-                        .with_context(|| format!("invalid --port value '{port}'"))?,
-                    None => toolset.default_mcp_http_port(),
-                };
-                return run_toolset_mcp_http(toolset, host, port, readiness).await;
-            }
-            None => {}
-        }
-
-        let scope =
-            harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::McpStdio)?;
-        log::info!("serving under scope '{}'", scope.as_str());
-        let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
-        let client = endpoint.connect().await?;
-        let connection = NatsConnection {
-            client,
-            replicas: endpoint.resolved_replicas(),
-        };
-        let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
-        serve_with_shutdown(
-            toolset,
-            scope,
-            connection,
-            ServeLifecycle::new(shutdown, readiness),
-        )
-        .await
-    }
-    .await;
+    let result = run_mcp_service(Arc::new(toolset), readiness, filter_set).await;
 
     telemetry.shutdown().await;
     result

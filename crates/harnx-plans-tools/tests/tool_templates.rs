@@ -83,7 +83,7 @@ async fn mcp_templates(server: PlansServer) -> HashMap<String, (String, String)>
 #[tokio::test]
 async fn plans_toolset_templates_match_mcp_handler() {
     let dir = TestDir::new();
-    let advertised = mcp_templates(PlansServer::new(dir.0.clone())).await;
+    let advertised = mcp_templates(PlansServer::new(dir.0.clone(), None)).await;
     assert!(!advertised.is_empty(), "MCP server exposes no tools");
 
     let specs = PlansToolset::new(dir.0.clone()).tools();

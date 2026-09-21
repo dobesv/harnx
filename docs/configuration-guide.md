@@ -169,6 +169,22 @@ env:
 >
 >   Set the actual secret (`EXA_API_KEY=…`) in `~/.local/share/harnx/.env`.
 
+### Restricting Published Tools (`--enable-tool`)
+
+Tool servers publish all available tools by default. Pass `--enable-tool <glob>` in `args:` to restrict which tools a server publishes and makes callable. Tools that do not match are not registered and cannot be invoked. Repeat the flag to specify multiple patterns.
+
+Patterns match against raw tool names before agent prefixes (for example, `read` or `exec`, not `fs_read` or `bash_exec`). Invalid glob patterns or empty values cause the server to fail at startup. Native toolset servers and `harnx-mcp-bridge` both support this argument.
+
+```yaml
+command: harnx-bash-tools
+args:
+  - --allow-repo-work
+  - --enable-tool
+  - deploy_*
+  - --enable-tool
+  - status
+```
+
 ## NATS Servers (`nats_servers/`)
 
 Harnx supports high-availability distributed mode via NATS. Each cluster is defined in a file like `nats_servers/local.yaml`.

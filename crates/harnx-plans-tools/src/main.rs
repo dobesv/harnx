@@ -20,9 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-const PASSTHROUGH_FLAGS: [(&str, &str); 2] = [
+const PASSTHROUGH_FLAGS: [(&str, &str); 3] = [
     ("--metrics-addr", "--metrics-addr="),
     ("--healthz-addr", "--healthz-addr="),
+    ("--enable-tool", "--enable-tool="),
 ];
 
 struct ParseState<'a> {
@@ -57,6 +58,7 @@ impl ParseState<'_> {
 
 struct HttpServeConfig {
     plans_dir: PathBuf,
+    filter: Option<Arc<harnx_toolset_server::globset::GlobSet>>,
     retention_days: u64,
     host: String,
     port: u16,
@@ -85,6 +87,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
+    let enable_tools =
+        harnx_toolset_server::enable_tools_from_args(&std::env::args_os().collect::<Vec<_>>())?;
+    let filter_set = harnx_toolset_server::compile_enable_globs(&enable_tools)?;
+    let filter = filter_set.map(Arc::new);
     let Args {
         plans_dir,
         retention_days,
@@ -105,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
         return run_http(HttpServeConfig {
             plans_dir,
+            filter,
             retention_days,
             host,
             port,
@@ -164,6 +171,12 @@ fn print_help() {
     eprintln!("  --retention-days, -r <N>   Set retention period in days (default: 14)");
     eprintln!("  --mcp-http                 Serve MCP over Streamable HTTP at /mcp");
     eprintln!("  --mcp-stdio                Serve MCP over stdio instead of native NATS mode");
+    eprintln!(
+        "  --enable-tool <glob>       Enable only tools matching the glob pattern (repeatable)."
+    );
+    eprintln!(
+        "                             If set, only enabled tools are registered and invocable."
+    );
     eprintln!("  --host <addr>              Bind address for HTTP mode (default: 0.0.0.0)");
     eprintln!("  --port <N>                 Bind port for HTTP mode (default: 3000)");
     eprintln!("  --metrics-addr <ADDR>      Serve Prometheus metrics at http://ADDR/metrics.");
@@ -366,6 +379,7 @@ fn parse_args_from(args: &[impl AsRef<str>]) -> anyhow::Result<Args> {
 /// Extracts MCP service configuration for HTTP mode.
 fn build_mcp_service(
     plans_dir: PathBuf,
+    filter: Option<Arc<harnx_toolset_server::globset::GlobSet>>,
     ct: CancellationToken,
 ) -> StreamableHttpService<PlansServer, NeverSessionManager> {
     let config = StreamableHttpServerConfig::default()
@@ -377,7 +391,7 @@ fn build_mcp_service(
         // loopback-only allowlist. Deploy behind a trusted ingress/network.
         .disable_allowed_hosts();
     StreamableHttpService::new(
-        move || Ok(PlansServer::new(plans_dir.clone())),
+        move || Ok(PlansServer::new(plans_dir.clone(), filter.clone())),
         Arc::new(NeverSessionManager::default()),
         config,
     )
@@ -441,13 +455,14 @@ async fn run_http_server_loop(config: HttpServerLoop) -> anyhow::Result<()> {
 async fn run_http(config: HttpServeConfig) -> anyhow::Result<()> {
     let HttpServeConfig {
         plans_dir,
+        filter,
         retention_days,
         host,
         port,
         readiness,
     } = config;
     let ct = CancellationToken::new();
-    let mcp_service = build_mcp_service(plans_dir.clone(), ct.child_token());
+    let mcp_service = build_mcp_service(plans_dir.clone(), filter, ct.child_token());
     let app =
         axum::Router::new()
             .nest_service("/mcp", mcp_service)

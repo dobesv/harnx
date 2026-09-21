@@ -1,7 +1,9 @@
 use anyhow::Context;
-use harnx_mcp_bridge::{report_tools, Args, BridgeToolset};
+use harnx_mcp_bridge::{report_tools_filtered, Args, BridgeToolset};
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
-use harnx_toolset_server::{serve_with_shutdown, ServeLifecycle};
+use harnx_toolset_server::{
+    compile_enable_globs, serve_with_config, FilteredToolset, ServeConfig, ServeLifecycle,
+};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -22,10 +24,15 @@ async fn run() -> anyhow::Result<()> {
     harnx_metrics::init(&args.metrics)?;
     let readiness = harnx_healthz::init(&args.healthz).await?;
 
+    // Compile filter globs before starting the bridge
+    let filter_set = compile_enable_globs(&args.enable_tool)?;
+    let filter: Option<Arc<harnx_toolset_server::globset::GlobSet>> =
+        filter_set.as_ref().map(|s| Arc::new(s.clone()));
+
     if args.list_tools {
         let name = args.name.unwrap_or_else(|| "mcp-diagnostic".to_string());
         let bridge = BridgeToolset::new(name, args.child).await?;
-        print!("{}", report_tools(&bridge));
+        print!("{}", report_tools_filtered(&bridge, filter_set.as_ref()));
         return Ok(());
     }
 
@@ -42,6 +49,13 @@ async fn run() -> anyhow::Result<()> {
     // independently deployed bridge pod has no parent supervisor to clean up
     // after it, and Kubernetes terminates pods with SIGTERM.
     let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
+
+    // Apply filter to bridge toolset if specified
+    let toolset: Arc<dyn harnx_toolset::Toolset> = match &filter_set {
+        Some(set) => Arc::new(FilteredToolset::new(bridge, set.clone())),
+        None => Arc::new(bridge),
+    };
+
     // Keep the connect attempt inside the same race as the signal above:
     // a slow/unreachable NATS cluster (bad DNS, stalled TLS handshake) must
     // not block the bridge from noticing the wrapped child has already died.
@@ -52,11 +66,14 @@ async fn run() -> anyhow::Result<()> {
             client,
             replicas: endpoint.resolved_replicas(),
         };
-        serve_with_shutdown(
-            Arc::new(bridge),
-            scope,
-            connection,
-            ServeLifecycle::new(shutdown, readiness),
+        serve_with_config(
+            toolset,
+            ServeConfig {
+                instance_id: scope,
+                connection,
+                lifecycle: ServeLifecycle::new(shutdown, readiness),
+                filter,
+            },
         )
         .await
     };

@@ -65,6 +65,11 @@ pub struct Args {
     /// Healthz readiness endpoint configuration.
     #[command(flatten)]
     pub healthz: harnx_healthz::HealthzFlags,
+
+    /// Enable only tools matching the glob pattern (repeatable).
+    /// If set, only enabled tools are registered and invocable.
+    #[arg(long = "enable-tool", action = clap::ArgAction::Append)]
+    pub enable_tool: Vec<String>,
 }
 
 impl Args {
@@ -100,12 +105,25 @@ pub struct BridgeToolset {
 /// handshake, and answers `tools/list` — the three steps a registration
 /// timeout cannot distinguish between.
 pub fn report_tools(bridge: &BridgeToolset) -> String {
-    let tools = bridge.cached_tools();
-    let mut out = format!(
-        "MCP server '{}': {} tool(s)\n",
-        bridge.server_name(),
-        tools.len()
-    );
+    report_tool_specs(bridge.server_name(), bridge.cached_tools())
+}
+
+/// Render only tools matching an optional enable-tool filter.
+pub fn report_tools_filtered(
+    bridge: &BridgeToolset,
+    filter: Option<&harnx_toolset_server::globset::GlobSet>,
+) -> String {
+    let tools = bridge
+        .cached_tools()
+        .iter()
+        .filter(|tool| filter.is_none_or(|set| set.is_match(&tool.name)))
+        .cloned()
+        .collect::<Vec<_>>();
+    report_tool_specs(bridge.server_name(), &tools)
+}
+
+fn report_tool_specs(server_name: &str, tools: &[ToolSpec]) -> String {
+    let mut out = format!("MCP server '{}': {} tool(s)\n", server_name, tools.len());
     for tool in tools {
         out.push_str(&format!("\n  {}\n", tool.name));
         let description = tool.description.trim();
@@ -643,6 +661,46 @@ mod tests {
                 "traceparent {traceparent} did not carry trace ID {expected_trace_id}"
             );
         });
+    }
+
+    #[test]
+    fn args_parse_enable_tool_space_and_equals_forms() {
+        let args = Args::parse_from([
+            "mcp-bridge",
+            "--enable-tool",
+            "search",
+            "--enable-tool=exec*",
+            "echo",
+        ]);
+        assert_eq!(args.enable_tool, vec!["search", "exec*"]);
+        assert_eq!(args.child, vec!["echo"]);
+    }
+
+    #[test]
+    fn filtered_tool_specs_include_only_matching_globs() {
+        let patterns = vec!["search".to_owned(), "exec*".to_owned()];
+        let filter = harnx_toolset_server::compile_enable_globs(&patterns)
+            .unwrap()
+            .unwrap();
+        let specs = ["search", "exec", "exec_shell", "echo"]
+            .into_iter()
+            .map(|name| harnx_toolset::ToolSpec {
+                name: name.to_owned(),
+                description: String::new(),
+                input_schema: serde_json::Value::Null,
+                cancellation_guarantee: Default::default(),
+                idempotent_hint: false,
+                read_only_hint: false,
+                timeout_secs: None,
+                meta: None,
+            })
+            .collect::<Vec<_>>();
+        let enabled = specs
+            .iter()
+            .filter(|spec| filter.is_match(&spec.name))
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(enabled, ["search", "exec", "exec_shell"]);
     }
 
     #[test]

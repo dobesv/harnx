@@ -4463,6 +4463,7 @@ dependencies = [
  "async-trait",
  "axum",
  "futures-util",
+ "globset",
  "harnx-core",
  "harnx-healthz",
  "harnx-metrics",

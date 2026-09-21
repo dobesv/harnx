@@ -144,6 +144,8 @@ pub(crate) struct TestToolset {
     server_name: &'static str,
     pub(crate) idempotent: bool,
     pub(crate) echo_invocations: Arc<AtomicUsize>,
+    pub(crate) fail_invocations: Arc<AtomicUsize>,
+    pub(crate) sleep_invocations: Arc<AtomicUsize>,
     pub(crate) slow_started: Arc<Notify>,
     /// Notified once a cancelled handler has run to completion, including any
     /// cleanup it parked in.
@@ -165,11 +167,42 @@ impl TestToolset {
             server_name,
             idempotent: false,
             echo_invocations: Arc::default(),
+            fail_invocations: Arc::default(),
+            sleep_invocations: Arc::default(),
             slow_started: Arc::default(),
             slow_finished: Arc::default(),
             allow_cleanup: Arc::default(),
             last_context: Arc::default(),
             reply_barriers: None,
+        }
+    }
+}
+
+impl TestToolset {
+    async fn invoke_test_aux(
+        &self,
+        tool: &str,
+        args: Value,
+        cancel: &CancellationToken,
+    ) -> Result<Value, ToolInvokeError> {
+        match tool {
+            "fail" => {
+                self.fail_invocations.fetch_add(1, Ordering::SeqCst);
+                Err(ToolInvokeError::Recoverable(
+                    "intentional failure".to_string(),
+                ))
+            }
+            "sleep" => {
+                self.sleep_invocations.fetch_add(1, Ordering::SeqCst);
+                self.slow_started.notify_one();
+                cancel.cancelled().await;
+                if args.get("park_cleanup").and_then(Value::as_bool) == Some(true) {
+                    self.allow_cleanup.notified().await;
+                }
+                self.slow_finished.notify_one();
+                Err(ToolInvokeError::Fatal("cancelled".to_string()))
+            }
+            _ => Err(ToolInvokeError::Recoverable("unknown tool".to_string())),
         }
     }
 }
@@ -181,16 +214,38 @@ impl Toolset for TestToolset {
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec {
-            cancellation_guarantee: Default::default(),
-            name: "echo".to_string(),
-            description: "echo input".to_string(),
-            input_schema: json!({ "type": "object" }),
-            idempotent_hint: self.idempotent,
-            read_only_hint: false,
-            timeout_secs: None,
-            meta: None,
-        }]
+        vec![
+            ToolSpec {
+                cancellation_guarantee: Default::default(),
+                name: "echo".to_string(),
+                description: "echo input".to_string(),
+                input_schema: json!({ "type": "object" }),
+                idempotent_hint: self.idempotent,
+                read_only_hint: false,
+                timeout_secs: None,
+                meta: None,
+            },
+            ToolSpec {
+                cancellation_guarantee: Default::default(),
+                name: "fail".to_string(),
+                description: "always fails".to_string(),
+                input_schema: json!({ "type": "object" }),
+                idempotent_hint: false,
+                read_only_hint: false,
+                timeout_secs: None,
+                meta: None,
+            },
+            ToolSpec {
+                cancellation_guarantee: Default::default(),
+                name: "sleep".to_string(),
+                description: "sleeps and returns".to_string(),
+                input_schema: json!({ "type": "object" }),
+                idempotent_hint: false,
+                read_only_hint: false,
+                timeout_secs: None,
+                meta: None,
+            },
+        ]
     }
 
     async fn invoke(
@@ -223,6 +278,7 @@ impl Toolset for TestToolset {
                 }
                 Ok(args)
             }
+            "fail" | "sleep" => self.invoke_test_aux(tool, args, &cancel).await,
             "never" => {
                 self.slow_started.notify_one();
                 std::future::pending().await
@@ -236,7 +292,7 @@ impl Toolset for TestToolset {
                 self.slow_finished.notify_one();
                 Err(ToolInvokeError::Fatal("cancelled".to_string()))
             }
-            _ => Err(ToolInvokeError::Recoverable("unknown tool".to_string())),
+            _ => self.invoke_test_aux(tool, args, &cancel).await,
         }
     }
 
