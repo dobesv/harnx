@@ -155,13 +155,58 @@ The gateway retains one stateful MCP session per sandbox so process handles from
 `bash_spawn` remain valid for later `bash_wait`, log, and terminate calls. The
 session is replaced when the pod IP changes and closed on `sandbox_release`.
 
-Run one gateway process per Harnx server scope while the sandbox uses stdio MCP
-targets. Multiple processes would establish independent agentgateway sessions
-and therefore independent bash process registries. This does not limit the
-number of Harnx workers, agents, or sessions that can share the gateway. A
-future highly available deployment should use an in-sandbox network MCP server
-whose process state is shared independently of the frontend connection, or add
-sandbox-affine routing to the native tool protocol.
+## High-availability deployment
+
+Run multiple gateway replicas in an active/active topology behind a
+`RollingUpdate` deployment strategy. The gateway Deployment manifest lives in
+your infrastructure repository. Set `terminationGracePeriodSeconds` to at least
+the 10-second handler-drain budget so terminating pods finish in-flight work.
+
+Precondition: active/active serving requires persistent shared-state HTTP MCP
+servers in the sandbox (the agentgateway-removal migration). With shared backend
+process state, independent gateway replicas route to the same sandbox processes,
+resolving the earlier split-registry limitation.
+
+Serving routes through NATS:
+
+- **Active/active serving**: Replicas join the same NATS queue group for their
+  tool subjects (`bash`, `fs`, `sandbox`). NATS load-balances requests across
+  healthy replicas. Follower replicas report ready to Kubernetes independently
+  of leader election and actively serve traffic.
+- **Graceful rollout without dropped calls**: On graceful shutdown (such as a
+  rolling deployment), the terminating replica marks its readiness probe
+  unready, drains its NATS queue subscription (`drain()` and `flush()`), and
+  immediately leaves the queue group. New calls route to surviving siblings. The
+  terminating replica finishes dispatching buffered requests and waits for
+  in-flight handlers to complete within the 10-second drain budget.
+- **HA registration preservation**: Replicas use the
+  `RegistrationShutdown::Expire` policy on shutdown. Terminating replicas skip
+  deleting the shared registration key in the `harnx_tool_registry` KV bucket so
+  a rolling pod does not unregister tools while siblings are actively serving.
+  The registry's 90-second bucket TTL reaps the key only after the last replica
+  exits.
+- **Idle watcher election**: Exactly one idle watcher per namespace is elected
+  via a NATS lease (`harnx_leases` bucket, key
+  `sessions/k8s-sandbox-idle-watcher/{namespace}/lock`, 30s TTL, 10s renew).
+  Standbys retry acquisition every 5 seconds (with up to 2 seconds jitter) and
+  promote automatically when the leader shuts down or loses its lease. Graceful
+  shutdown explicitly releases the lease so a standby promotes immediately. If
+  a leader loses its lease mid-scan, it cancels the in-flight scan loop.
+
+### High-availability limitations
+
+- **Ungraceful crashes**: An ungraceful pod crash (such as `SIGKILL` or a node
+  failure) loses calls currently in flight on that pod. These surface to the
+  worker as transport errors or timeouts. The worker does not retry
+  automatically. New calls route to surviving replicas.
+- **Deferred lifecycle race**: A narrow race between the idle watcher's
+  scale-to-zero patch and an incoming activation request remains possible
+  (pre-existing from before leader election). Closing this race requires
+  optimistic concurrency preconditions on `resourceVersion`, tracked in
+  issue #2037.
+- **Sandbox pod restarts**: Gateway restarts and rollouts do not terminate
+  in-flight background processes in the sandbox, but a restart of the sandbox
+  pod itself still terminates in-flight background processes.
 
 ## Lifecycle behavior
 
@@ -188,10 +233,11 @@ hibernated, a recognized terminal error, or timeout.
 storage and TTL. `destroy: true` deletes the claim and its storage according to
 the claim's `Delete` shutdown policy, and clears a matching ambient binding.
 
-An in-process watcher scans claims every 15 minutes by default and hibernates
-running sandboxes whose last activity is older than 15 minutes. A two-minute
-creation grace period prevents it from racing new claims. Hibernation also
-closes the gateway's pooled MCP session for that sandbox.
+The elected idle watcher replica scans claims in the namespace every 15
+minutes by default and hibernates running sandboxes whose last activity is older
+than 15 minutes. A two-minute creation grace period prevents it from racing new
+claims. Hibernation also closes the gateway's pooled MCP session for that
+sandbox. Standby replicas do not run the scan loop while the lease is held.
 
 ## Gateway configuration
 

@@ -7,7 +7,8 @@ use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{ToolReply, ToolRequest};
 use harnx_toolset_server::{
-    registration_key, serve_many_with_shutdown, ServeLifecycle, TOOL_REGISTRY_BUCKET,
+    registration_key, serve_many_with_shutdown, RegistrationShutdown, ServeLifecycle,
+    TOOL_REGISTRY_BUCKET,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -145,6 +146,53 @@ async fn invoke_named(client: &async_nats::Client, scope: &ServerScope, name: &s
 async fn assert_registrations_removed(registry: &kv::Store, keys: &[String]) -> Result<()> {
     for key in keys {
         assert!(registry.get(key).await?.is_none());
+    }
+    Ok(())
+}
+
+/// Verify that when aggregate uses `Expire` policy, child servers DO NOT
+/// delete their registrations on shutdown. This tests propagation through
+/// `start_servers`.
+#[tokio::test(flavor = "multi_thread")]
+async fn expire_policy_propagates_to_all_children() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let server_client = connect(&server.url).await?;
+    let client = connect(&server.url).await?;
+    let instance_id = ServerScope::new();
+    let shutdown = CancellationToken::new();
+    let readiness = harnx_healthz::Readiness::default();
+
+    let task = tokio::spawn(serve_many_with_shutdown(
+        vec![
+            Arc::new(TestToolset::named("first")),
+            Arc::new(TestToolset::named("second")),
+        ],
+        instance_id.clone(),
+        NatsConnection {
+            client: server_client,
+            replicas: 1,
+        },
+        ServeLifecycle::new(shutdown.clone(), Some(readiness.clone()))
+            .with_registration_shutdown(RegistrationShutdown::Expire),
+    ));
+
+    let registry = wait_for_registry(&client).await?;
+    let keys = registration_keys(&instance_id);
+    wait_until_ready(&registry, &keys, &readiness).await?;
+
+    // Trigger shutdown
+    shutdown.cancel();
+    task.await??;
+
+    // Keys must STILL be present (Expire policy)
+    for key in &keys {
+        assert!(
+            registry.get(key).await?.is_some(),
+            "registration '{key}' must NOT be deleted with Expire policy"
+        );
     }
     Ok(())
 }

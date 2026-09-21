@@ -1,4 +1,8 @@
 mod kubernetes;
+pub mod leader_election;
+#[cfg(test)]
+#[path = "leader_election_tests.rs"]
+mod leader_election_tests;
 mod lifecycle;
 mod mcp;
 mod policy;
