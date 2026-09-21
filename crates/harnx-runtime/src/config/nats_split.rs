@@ -17,18 +17,20 @@ static LOCAL_NATS_SERVER: OnceLock<
 /// Runtime role controlling the default NATS route for front-ends.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum NatsRouting {
-    /// Front-end self-hosts a local broker and worker for `__local__`.
+    /// Worker/child routing that honors an injected local broker handoff.
     #[default]
     Default,
+    /// Front-end routing that self-hosts the managed broker and worker for `__local__`.
+    FrontendLocal,
     /// Front-end is a pure client of the named cluster; `__local__` is unavailable.
     Cluster(String),
 }
 
-/// Resolve the front-end NATS routing role from [`HARNX_NATS_SERVER_ENV`].
+/// Resolve the named-cluster selection from [`HARNX_NATS_SERVER_ENV`].
 ///
 /// This is intentionally separate from the `HARNX_NATS_URL`/`HARNX_NATS_TOKEN`
-/// handoff. Spawned workers and tool servers need that pair while retaining the
-/// default role so they can resolve the injected `__local__` connection.
+/// handoff. Unset remains [`NatsRouting::Default`]; frontend bootstrap promotes
+/// that result to [`NatsRouting::FrontendLocal`] while workers keep `Default`.
 pub fn nats_routing_from_env() -> NatsRouting {
     std::env::var(HARNX_NATS_SERVER_ENV)
         .ok()
@@ -88,6 +90,36 @@ impl NatsServerConfig {
     }
 }
 
+/// Resolve the shared auto-managed plaintext broker without consulting operator env.
+pub(crate) async fn resolve_managed_local_nats_server_config() -> Result<NatsServerConfig> {
+    let manager = LOCAL_NATS_SERVER.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut managed_server = manager.lock().await;
+    let needs_refresh = match managed_server.as_mut() {
+        Some(server) => !server.is_running(),
+        None => true,
+    };
+    if needs_refresh {
+        managed_server.take();
+        *managed_server = Some(crate::nats_local_server::LocalBroker::start().await?);
+    }
+    let server = managed_server
+        .as_ref()
+        .expect("local NATS server initialized above")
+        .status();
+    Ok(NatsServerConfig {
+        name: LOCAL_CLUSTER_KEY.to_string(),
+        url: server.url,
+        token: Some(server.token),
+        replicas: None,
+        tls: None,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca: None,
+        ignore_discovered_servers: None,
+        agents: vec![],
+    })
+}
+
 /// Resolve connection details for the reserved shared-local cluster.
 ///
 /// Front-ends and worker subprocesses use this helper as their single source
@@ -128,24 +160,7 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
                 ignore_discovered_servers,
             )
         }
-        (None, None) => {
-            let manager = LOCAL_NATS_SERVER.get_or_init(|| tokio::sync::Mutex::new(None));
-            let mut managed_server = manager.lock().await;
-            let needs_refresh = match managed_server.as_mut() {
-                Some(server) => !server.is_running(),
-                None => true,
-            };
-            if needs_refresh {
-                managed_server.take();
-                *managed_server = Some(crate::nats_local_server::LocalBroker::start().await?);
-            }
-            let server = managed_server
-                .as_ref()
-                .expect("local NATS server initialized above")
-                .status();
-            let (url, token) = (server.url.clone(), server.token.clone());
-            (url, token, None, None, None, None, None, None)
-        }
+        (None, None) => return resolve_managed_local_nats_server_config().await,
         _ => bail!("{HARNX_NATS_URL_ENV} and {HARNX_NATS_TOKEN_ENV} must be set together"),
     };
 
@@ -205,19 +220,33 @@ impl Config {
 
     /// Apply the front-end-only NATS routing role from the process environment.
     pub fn apply_frontend_nats_routing(&mut self) {
-        self.nats_routing = nats_routing_from_env();
-        if let NatsRouting::Cluster(cluster) = &self.nats_routing {
-            log::info!(
-                "routing bare agents to NATS cluster '{}'; local agents disabled",
-                cluster
-            );
+        self.nats_routing = match nats_routing_from_env() {
+            NatsRouting::Default => NatsRouting::FrontendLocal,
+            routing => routing,
+        };
+        match &self.nats_routing {
+            NatsRouting::FrontendLocal
+                if std::env::var_os(HARNX_NATS_URL_ENV).is_some()
+                    && std::env::var_os(HARNX_NATS_TOKEN_ENV).is_some() =>
+            {
+                log::info!(
+                    "{HARNX_NATS_URL_ENV}/{HARNX_NATS_TOKEN_ENV} are ignored for frontend local routing; the local worker receives the elected broker endpoint"
+                );
+            }
+            NatsRouting::Cluster(cluster) => {
+                log::info!(
+                    "routing bare agents to NATS cluster '{}'; local agents disabled",
+                    cluster
+                );
+            }
+            NatsRouting::Default | NatsRouting::FrontendLocal => {}
         }
     }
 
     /// Cluster key used when an agent reference doesn't name one explicitly.
     pub fn default_cluster_key(&self) -> &str {
         match &self.nats_routing {
-            NatsRouting::Default => LOCAL_CLUSTER_KEY,
+            NatsRouting::Default | NatsRouting::FrontendLocal => LOCAL_CLUSTER_KEY,
             NatsRouting::Cluster(cluster) => cluster,
         }
     }
@@ -239,6 +268,9 @@ impl Config {
                 NatsRouting::Default => {
                     Ok(Cow::Owned(resolve_local_nats_server_config().await?))
                 }
+                NatsRouting::FrontendLocal => Ok(Cow::Owned(
+                    resolve_managed_local_nats_server_config().await?,
+                )),
                 NatsRouting::Cluster(cluster) => bail!(
                     "local agents are unavailable when {HARNX_NATS_SERVER_ENV} is set (cluster '{cluster}'); address an agent as <agent>@{cluster} or unset {HARNX_NATS_SERVER_ENV}"
                 ),
@@ -334,6 +366,32 @@ mod tests {
         assert_eq!(actual, (LOCAL_CLUSTER_KEY, url, Some(token)));
     }
 
+    fn assert_managed_local_server(server: &NatsServerConfig, operator_url: &str) {
+        assert_ne!(server.url, operator_url);
+        assert!(server.url.starts_with("nats://"));
+        let transport = (
+            server.name.as_str(),
+            server.token.is_some(),
+            server.replicas,
+            server.tls,
+            server.tls_cert.as_deref(),
+            server.tls_key.as_deref(),
+            server.tls_ca.as_deref(),
+            server.ignore_discovered_servers,
+        );
+        assert_eq!(
+            transport,
+            (LOCAL_CLUSTER_KEY, true, None, None, None, None, None, None)
+        );
+    }
+
+    fn nats_server_available() -> bool {
+        std::env::var_os("NATS_SERVER_BIN")
+            .map(std::path::PathBuf::from)
+            .is_some_and(|path| path.is_file())
+            || which::which("nats-server").is_ok()
+    }
+
     /// Assert a resolved server is a borrowed file-backed cluster entry with
     /// the expected name/url/token. One tuple comparison plus the borrow check
     /// keeps the call site to a single logical assertion. Takes the `Cow` by
@@ -387,15 +445,81 @@ mod tests {
     }
 
     #[test]
+    fn frontend_routing_defaults_to_managed_local_and_preserves_cluster_mode() {
+        harnx_core::require_nextest();
+        let _lock = env_lock();
+        let _unset = EnvGuard::remove(HARNX_NATS_SERVER_ENV);
+        let mut config = Config::default();
+        config.apply_frontend_nats_routing();
+        assert_eq!(config.nats_routing, NatsRouting::FrontendLocal);
+
+        let _cluster = EnvGuard::new(HARNX_NATS_SERVER_ENV, "remote");
+        config.apply_frontend_nats_routing();
+        assert_eq!(
+            config.nats_routing,
+            NatsRouting::Cluster("remote".to_string())
+        );
+    }
+
+    #[test]
     fn routing_role_selects_default_cluster_key() {
         let default_config = Config::default();
         assert_eq!(default_config.default_cluster_key(), LOCAL_CLUSTER_KEY);
+
+        let frontend_config = Config {
+            nats_routing: NatsRouting::FrontendLocal,
+            ..Config::default()
+        };
+        assert_eq!(frontend_config.default_cluster_key(), LOCAL_CLUSTER_KEY);
 
         let cluster_config = Config {
             nats_routing: NatsRouting::Cluster("remote".to_string()),
             ..Config::default()
         };
         assert_eq!(cluster_config.default_cluster_key(), "remote");
+    }
+
+    #[tokio::test]
+    async fn frontend_local_ignores_operator_handoff_and_default_without_handoff_is_managed() {
+        harnx_core::require_nextest();
+        if !nats_server_available() {
+            eprintln!("skipping: nats-server binary not found");
+            return;
+        }
+        let _lock = env_lock_async().await;
+        let root = tempfile::tempdir().expect("isolated local broker environment");
+        let config_dir = root.path().join("config");
+        let data_dir = root.path().join("data");
+        let state_dir = root.path().join("state");
+        for directory in [&config_dir, &data_dir, &state_dir] {
+            std::fs::create_dir_all(directory).expect("create isolated broker directory");
+        }
+        let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", &config_dir);
+        let _data_dir = EnvGuard::new("HARNX_DATA_DIR", &data_dir);
+        let _state_dir = EnvGuard::new("HARNX_STATE_DIR", &state_dir);
+        let operator_url = "tls://operator.example:4222";
+        let _url = EnvGuard::new(HARNX_NATS_URL_ENV, operator_url);
+        let _token = EnvGuard::new(HARNX_NATS_TOKEN_ENV, "operator-token");
+        let _tls = EnvGuard::new(HARNX_NATS_TLS_ENV, "true");
+        let frontend = Config {
+            nats_routing: NatsRouting::FrontendLocal,
+            ..Config::default()
+        };
+
+        let resolved = frontend
+            .resolve_nats_server(LOCAL_CLUSTER_KEY)
+            .await
+            .expect("frontend local routing must ignore operator handoff");
+        assert_managed_local_server(&resolved, operator_url);
+
+        let _without_url = EnvGuard::remove(HARNX_NATS_URL_ENV);
+        let _without_token = EnvGuard::remove(HARNX_NATS_TOKEN_ENV);
+        let default_config = Config::default();
+        let resolved = default_config
+            .resolve_nats_server(LOCAL_CLUSTER_KEY)
+            .await
+            .expect("default routing without a handoff must use managed local broker");
+        assert_managed_local_server(&resolved, operator_url);
     }
 
     #[tokio::test]

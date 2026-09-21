@@ -1796,12 +1796,6 @@ pub async fn ensure_frontend_nats_owner(cluster: &str) -> Result<()> {
     if cluster != LOCAL_CLUSTER_KEY {
         return Ok(());
     }
-    if std::env::var_os("HARNX_NATS_URL").is_some()
-        && std::env::var_os("HARNX_NATS_TOKEN").is_some()
-    {
-        return Ok(());
-    }
-
     let key = harnx_core::config_paths::nats_runtime_ports_file();
     let mut handles = LOCAL_NATS_HANDLES.lock().await;
     if !handles.contains_key(&key) {

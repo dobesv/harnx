@@ -57,6 +57,8 @@ impl TestConfigSandbox {
             // leaking the deletion to the rest of the process.
             ("HARNX_CONFIG_FILE", std::env::var_os("HARNX_CONFIG_FILE")),
             ("HARNX_WORKER_BIN", std::env::var_os("HARNX_WORKER_BIN")),
+            ("HARNX_NATS_URL", std::env::var_os("HARNX_NATS_URL")),
+            ("HARNX_NATS_TOKEN", std::env::var_os("HARNX_NATS_TOKEN")),
         ];
         unsafe {
             std::env::set_var("HARNX_CONFIG_DIR", &root);

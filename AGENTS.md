@@ -592,14 +592,16 @@ reap in `Drop`. Keep new broker helpers in that shape.
 
 ### NATS routing role is per-binary, not derived from env
 
-`Config.nats_routing` (`NatsRouting::{Default,Cluster(name)}`) controls whether a
-process resolves the reserved `__local__` cluster locally or rejects it. The role
-MUST be set per-binary at bootstrap, never inside shared `Config::init`/
+`Config.nats_routing` (`NatsRouting::{Default,Cluster(name),FrontendLocal}`) controls
+whether a process resolves the reserved `__local__` cluster locally or rejects it.
+The role MUST be set per-binary at bootstrap, never inside shared `Config::init`/
 `init_headless`:
 
 - **Front-ends** (`harnx` CLI, `harnx-serve`): call `apply_frontend_nats_routing()`
   after `Config::init`, which reads `HARNX_NATS_SERVER` and sets the role to
-  `Cluster(name)` when present.
+  `Cluster(name)` when present, or `FrontendLocal` when unset. Under `FrontendLocal`,
+  `resolve_nats_server(__local__)` resolves to the auto-managed, file-lock-elected
+  local broker and ignores operator `HARNX_NATS_URL`/`HARNX_NATS_TOKEN`.
 - **Workers/tool servers**: `init_headless` without the call, keeping
   `NatsRouting::Default` so their injected `HARNX_NATS_URL/TOKEN` handoff reaches
   `resolve_nats_server(__local__)`.
@@ -610,7 +612,8 @@ endpoint for `__local__`, but it can inherit an operator's `HARNX_NATS_SERVER`
 from the container environment. Because the worker never calls
 `apply_frontend_nats_routing()`, it stays `Default` regardless of that env var.
 The seam is `resolve_nats_server()` at `nats_split.rs:234`:
-`NatsRouting::Default` → reads env handoff; `NatsRouting::Cluster` → bails.
+`NatsRouting::Default` → reads env handoff; `NatsRouting::Cluster` → bails;
+`NatsRouting::FrontendLocal` → resolves auto-managed local broker.
 
 ### NATS/GC tests: CI coverage and isolation
 

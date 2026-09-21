@@ -15,6 +15,10 @@ use futures_util::StreamExt;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::sink::emit_agent_event;
+use harnx_nats_common::connect::{
+    HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV, HARNX_NATS_REPLICAS_ENV, HARNX_NATS_TLS_CA_ENV,
+    HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV, HARNX_NATS_TLS_KEY_ENV,
+};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -457,6 +461,12 @@ pub fn build_local_worker_command(
         .arg("--manage-servers")
         .env(HARNX_NATS_URL_ENV, nats_url)
         .env(HARNX_NATS_TOKEN_ENV, nats_token)
+        .env_remove(HARNX_NATS_TLS_ENV)
+        .env_remove(HARNX_NATS_TLS_CERT_ENV)
+        .env_remove(HARNX_NATS_TLS_KEY_ENV)
+        .env_remove(HARNX_NATS_TLS_CA_ENV)
+        .env_remove(HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV)
+        .env_remove(HARNX_NATS_REPLICAS_ENV)
         .stdin(Stdio::null())
         .stdout(harnx_core::logging::child_output_sink())
         .stderr(harnx_core::logging::child_output_sink())
@@ -646,6 +656,47 @@ mod tests {
         validate_worker_id(first.worker_id()).expect("first worker id");
         validate_worker_id(second.worker_id()).expect("second worker id");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn local_worker_command_injects_plaintext_broker_and_clears_cluster_transport() {
+        let command = build_local_worker_command(
+            Path::new("harnx-worker"),
+            "local-worker",
+            "nats://127.0.0.1:4222",
+            "local-token",
+        );
+        let envs = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let endpoint = (
+            envs.get(HARNX_NATS_URL_ENV).cloned(),
+            envs.get(HARNX_NATS_TOKEN_ENV).cloned(),
+        );
+        assert_eq!(
+            endpoint,
+            (
+                Some(Some("nats://127.0.0.1:4222".to_string())),
+                Some(Some("local-token".to_string()))
+            )
+        );
+        for name in [
+            HARNX_NATS_TLS_ENV,
+            HARNX_NATS_TLS_CERT_ENV,
+            HARNX_NATS_TLS_KEY_ENV,
+            HARNX_NATS_TLS_CA_ENV,
+            HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV,
+            HARNX_NATS_REPLICAS_ENV,
+        ] {
+            assert_eq!(envs.get(name), Some(&None), "{name} must be removed");
+        }
     }
 
     #[test]

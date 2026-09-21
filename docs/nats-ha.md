@@ -516,7 +516,8 @@ example, `nats_servers/remote.yaml`) and runs as a pure client:
 - Local (`__local__`) agents are unavailable. Addressing a local agent returns
   an error directing you to use `<agent>@<cluster>` or unset `HARNX_NATS_SERVER`.
 - When `HARNX_NATS_SERVER` is unset (the default), the front-end self-hosts a
-  local broker and worker as before.
+  local broker and worker, ignoring operator `HARNX_NATS_URL` and `HARNX_NATS_TOKEN`
+  for `__local__` routing.
 
 Configuration files in `nats_servers/` support `${VAR}` environment variable
 expansion. You can pull transport credentials from the environment while
