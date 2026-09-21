@@ -542,6 +542,18 @@ costs one JetStream request per entry and put long sessions past the two-second
 append budget on remote clusters. The known cost is a stray `Cancel` when an
 idle session's last entry is a mutation or control entry.
 
+### One-shot timeout/abort select loop purity
+
+The CLI one-shot `run_turn_select_loop` (`crates/harnx/src/oneshot_nats.rs:188-234`)
+uses a pure-race pattern: each `tokio::select!` arm returns a `TurnLoopOutcome`
+variant without side effects. The `session.interrupt()` call that sets
+`abort_signal.set_ctrlc()` runs *after* the select completes, in the
+`run_turn` match block (`oneshot_nats.rs:275-292`). This prevents a race where
+a biased re-poll could see the signal set by an in-arm interrupt and select
+the wrong branch (#1743). When adding arms or modifying this loop, keep them
+pure signal checks — no `.await` calls, no shared-state mutations inside select
+arms.
+
 Build the workspace before cross-process tests after changing tool or hook wire
 types. Those tests launch workspace sidecars as well as linked test code; a stale
 hook or tool binary can fail decoding even when a per-crate build succeeds.
@@ -551,6 +563,9 @@ hook or tool binary can fail decoding even when a per-crate build succeeds.
 `TranscriptItem` (`harnx-tui/src/types.rs`) derives only `Clone + Debug` — it is **not** serialized to
 NATS. Adding a field or variant is a local TUI change, not a transcript-protocol change. Contrast
 with `SessionLogEntry` variants (previous section), which are protocol-versioned.
+
+New `TranscriptItem::ToolCall` fields (`start_anchor`, `final_elapsed_ms`, `id`) support tool-call
+timer display and completion correlation. These are TUI-local; no protocol change.
 
 ### Spawning long-lived child processes
 

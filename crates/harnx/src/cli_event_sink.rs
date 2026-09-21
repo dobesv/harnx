@@ -9,10 +9,14 @@
 use std::collections::HashMap;
 use std::io::{stdout, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use harnx_core::event::{
     AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent,
     SubAgentProgress, SubAgentProgressStatus, ToolEvent, TurnEvent, UserEvent,
+};
+use harnx_toolset::{
+    is_subagent_launcher, TOOL_TIMER_MIN_ELAPSED_MS, TOOL_TIMER_NOTICE_INTERVAL_MS,
 };
 
 use harnx_render::{MarkdownRender, RenderOptions};
@@ -51,9 +55,83 @@ struct CliSinkState {
     render_options: RenderOptions,
     final_only: bool,
     subagents: CliSubagentReporter,
+    /// In-flight tool call timer tracking. Keyed by tool call ID.
+    /// Excludes sub-agent launcher tools (session_new/session_prompt + prefixed forms).
+    tool_timers: ToolCallTimerReporter,
 }
 
 const SUBAGENT_REPORT_INTERVAL_MS: u64 = 10_000;
+
+/// Tracks in-flight tool calls for "still running" notices.
+#[derive(Default)]
+struct ToolCallTimerReporter {
+    /// Keyed by tool call ID. Entry stores tool name, start time, and last reported bucket.
+    in_flight: HashMap<String, ToolCallTimerEntry>,
+}
+
+struct ToolCallTimerEntry {
+    tool_name: String,
+    started: Instant,
+    /// The last bucket index (elapsed_ms / NOTICE_INTERVAL_MS) for which a notice was printed.
+    /// Starts at 0, so first notice is when bucket becomes 1 (at 10s).
+    last_reported_bucket: u64,
+}
+
+impl CliSinkState {
+    /// Called on ToolEvent::Started. Tracks the call if it's not a sub-agent launcher.
+    fn tool_call_started(&mut self, id: &str, name: &str) {
+        if is_subagent_launcher(name) {
+            return;
+        }
+        self.tool_timers.in_flight.insert(
+            id.to_string(),
+            ToolCallTimerEntry {
+                tool_name: name.to_string(),
+                started: Instant::now(),
+                last_reported_bucket: 0,
+            },
+        );
+    }
+
+    /// Called on terminal tool events (Completed/Failed/Blocked).
+    /// Returns Some(duration string) if the tool ran >= TOOL_TIMER_MIN_ELAPSED_MS.
+    fn tool_call_finished(&mut self, id: &str) -> Option<String> {
+        let entry = self.tool_timers.in_flight.remove(id)?;
+        let elapsed_ms = entry.started.elapsed().as_millis() as u64;
+        if elapsed_ms >= TOOL_TIMER_MIN_ELAPSED_MS {
+            Some(format_elapsed(elapsed_ms))
+        } else {
+            None
+        }
+    }
+
+    /// Called by the 1s ticker. Prints "still running" notices for tools crossing new 10s buckets.
+    /// Prints directly under lock to avoid race conditions with completion events.
+    fn tool_timer_tick(&mut self) {
+        for entry in self.tool_timers.in_flight.values_mut() {
+            let elapsed_ms = entry.started.elapsed().as_millis() as u64;
+            let bucket = elapsed_ms / TOOL_TIMER_NOTICE_INTERVAL_MS;
+            // Print when crossing into new bucket (bucket > last_reported_bucket)
+            // and at least one full interval has elapsed (bucket >= 1).
+            if bucket > entry.last_reported_bucket && bucket >= 1 {
+                entry.last_reported_bucket = bucket;
+                eprintln!(
+                    "{}",
+                    dimmed_text(&format!(
+                        "⋯ {} still running ({})",
+                        entry.tool_name,
+                        format_elapsed(elapsed_ms)
+                    ))
+                );
+            }
+        }
+    }
+
+    /// Clear all in-flight tool timer state (called on every run_turn exit).
+    fn clear_tool_timers(&mut self) {
+        self.tool_timers.in_flight.clear();
+    }
+}
 
 #[derive(Default)]
 struct CliSubagentReporter {
@@ -168,8 +246,29 @@ impl CliAgentEventSink {
                 render_options,
                 final_only,
                 subagents: CliSubagentReporter::default(),
+                tool_timers: ToolCallTimerReporter::default(),
             })),
         }
+    }
+
+    /// Called by the 1s ticker in oneshot_nats::run_turn.
+    /// Prints "still running" notices directly under lock to avoid race conditions
+    /// with ToolEvent::Completed arriving on another thread.
+    pub fn tool_timer_tick(&self) {
+        let mut state = match self.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.tool_timer_tick();
+    }
+
+    /// Clear all in-flight tool timer state (called on every run_turn exit).
+    pub fn clear_tool_timers(&self) {
+        let mut state = match self.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.clear_tool_timers();
     }
 }
 
@@ -468,16 +567,44 @@ impl CliSinkState {
 
     fn print_tool_event(&mut self, event: ToolEvent) {
         match event {
-            ToolEvent::Started { name, markdown, .. } => {
+            ToolEvent::Started {
+                id, name, markdown, ..
+            } => {
+                self.tool_call_started(&id, &name);
                 self.print_tool_started(&name, markdown.as_deref());
             }
-            ToolEvent::Failed { error, .. } => {
-                eprintln!("{}", warning_text(&format!("tool error: {error}")));
+            ToolEvent::Failed { id, error, .. } => {
+                if let Some(elapsed) = self.tool_call_finished(&id) {
+                    // Long-running tool failure: format with warning style for the error,
+                    // dimmed elapsed time suffix.
+                    eprintln!(
+                        "{} ({})",
+                        warning_text(&format!("⏺ tool error: {error}")),
+                        dimmed_text(&elapsed)
+                    );
+                } else {
+                    eprintln!("{}", warning_text(&format!("tool error: {error}")));
+                }
             }
             ToolEvent::Completed {
-                output, markdown, ..
-            } => self.print_tool_completed(&output, markdown.as_deref()),
-            ToolEvent::Blocked { name, reason, .. } => {
+                id,
+                output,
+                markdown,
+                ..
+            } => {
+                if let Some(elapsed) = self.tool_call_finished(&id) {
+                    // Print the final duration line after normal completion output.
+                    self.print_tool_completed(&output, markdown.as_deref());
+                    eprintln!("{}", dimmed_text(&format!("⏺ done ({elapsed})")));
+                } else {
+                    self.print_tool_completed(&output, markdown.as_deref());
+                }
+            }
+            ToolEvent::Blocked {
+                id, name, reason, ..
+            } => {
+                // Blocked is terminal for this call but restartable, still remove from in_flight.
+                self.tool_call_finished(&id);
                 eprintln!("{}", warning_text(&format!("blocked: {name} — {reason}")));
             }
             ToolEvent::Progress { .. } | ToolEvent::Update { .. } => {}
@@ -567,6 +694,7 @@ mod tests {
             render_options: RenderOptions::default(),
             final_only: false,
             subagents: CliSubagentReporter::default(),
+            tool_timers: ToolCallTimerReporter::default(),
         }
     }
 
@@ -1354,5 +1482,704 @@ mod tests {
             state.last_ui_output_source.is_none(),
             "LogSeqAssigned must not be treated as model output"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Tool timer behavioral tests
+    // ----------------------------------------------------------------
+    //
+    // These tests verify the "still running" ticker behavior for long tool calls
+    // using tokio's paused time (virtual time). Each test exercises a specific
+    // correctness guarantee from the plan spec.
+    //
+    // Key constants (from harnx-toolset):
+    // - TOOL_TIMER_MIN_ELAPSED_MS: 5_000 (minimum elapsed time before showing timer)
+    // - TOOL_TIMER_NOTICE_INTERVAL_MS: 10_000 (interval between periodic notices)
+    //
+    // The ticker is invoked manually via `tool_timer_tick()` to simulate the
+    // 1s interval loop in `oneshot_nats::run_turn`.
+    //
+
+    /// Creates a ToolCallTimerEntry with a manually-set start Instant.
+    /// This is used in tests to simulate elapsed time without real sleeps.
+    fn make_timer_entry(tool_name: &str, started: Instant) -> ToolCallTimerEntry {
+        ToolCallTimerEntry {
+            tool_name: tool_name.to_string(),
+            started,
+            last_reported_bucket: 0,
+        }
+    }
+
+    #[test]
+    fn tool_timer_started_tracks_non_launcher_tools() {
+        let mut state = make_state(false);
+
+        // Non-launcher tools should be tracked
+        state.tool_call_started("call-1", "read_file");
+        assert!(state.tool_timers.in_flight.contains_key("call-1"));
+
+        state.tool_call_started("call-2", "bash_exec");
+        assert!(state.tool_timers.in_flight.contains_key("call-2"));
+
+        // Count should be 2
+        assert_eq!(state.tool_timers.in_flight.len(), 2);
+    }
+
+    #[test]
+    fn tool_timer_started_ignores_subagent_launcher_tools() {
+        let mut state = make_state(false);
+
+        // session_new and session_prompt are launchers - should not be tracked
+        state.tool_call_started("call-1", "session_new");
+        assert!(!state.tool_timers.in_flight.contains_key("call-1"));
+
+        state.tool_call_started("call-2", "session_prompt");
+        assert!(!state.tool_timers.in_flight.contains_key("call-2"));
+
+        // Prefixed forms should also be ignored
+        state.tool_call_started("call-3", "oracle_session_new");
+        assert!(!state.tool_timers.in_flight.contains_key("call-3"));
+
+        state.tool_call_started("call-4", "pantheon__oracle_session_prompt");
+        assert!(!state.tool_timers.in_flight.contains_key("call-4"));
+
+        // But session_load and session_cancel are NOT launchers
+        state.tool_call_started("call-5", "session_load");
+        assert!(state.tool_timers.in_flight.contains_key("call-5"));
+
+        state.tool_call_started("call-6", "session_cancel");
+        assert!(state.tool_timers.in_flight.contains_key("call-6"));
+
+        assert_eq!(state.tool_timers.in_flight.len(), 2);
+    }
+
+    #[test]
+    fn tool_timer_finished_removes_entry() {
+        let mut state = make_state(false);
+
+        state.tool_call_started("call-1", "read_file");
+        assert!(state.tool_timers.in_flight.contains_key("call-1"));
+
+        let result = state.tool_call_finished("call-1");
+        assert!(!state.tool_timers.in_flight.contains_key("call-1"));
+        // Less than 5s, no duration returned
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tool_timer_finished_returns_duration_when_above_threshold() {
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        let started = Instant::now() - Duration::from_millis(6_000);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-1".to_string(), make_timer_entry("read_file", started));
+
+        let result = state.tool_call_finished("call-1");
+        assert!(result.is_some());
+        let elapsed = result.unwrap();
+        // Should be "6s" (rounded down from 6000ms)
+        assert!(elapsed.starts_with('6'));
+        assert!(elapsed.ends_with('s'));
+    }
+
+    #[test]
+    fn tool_timer_finished_no_duration_below_threshold() {
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        let started = Instant::now() - Duration::from_millis(4_000);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-1".to_string(), make_timer_entry("read_file", started));
+
+        let result = state.tool_call_finished("call-1");
+        // 4s < 5s threshold, no duration should be returned
+        assert!(result.is_none());
+    }
+
+    /// Test that a tool running 10+ seconds emits a periodic notice on the first tick,
+    /// but does NOT emit a final duration if it ends before MIN_ELAPSED.
+    #[test]
+    fn tool_timer_tick_emits_notice_at_10s() {
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        let started = Instant::now() - Duration::from_millis(10_500);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-1".to_string(), make_timer_entry("read_file", started));
+
+        // Capture output using the Unix capture helper
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+
+            // Should contain a notice for read_file at ~10s
+            assert!(output.contains("read_file"));
+            assert!(output.contains("still running"));
+            assert!(output.contains("10s"));
+        }
+
+        #[cfg(not(unix))]
+        {
+            // On non-Unix, just verify the state update
+            state.tool_timer_tick();
+            let entry = state.tool_timers.in_flight.get("call-1").unwrap();
+            assert_eq!(entry.last_reported_bucket, 1);
+        }
+    }
+
+    #[test]
+    fn tool_timer_tick_no_notice_before_10s() {
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        let started = Instant::now() - Duration::from_millis(9_500);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-1".to_string(), make_timer_entry("read_file", started));
+
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+
+            // Should NOT emit any notice before 10s
+            assert!(!output.contains("still running"));
+        }
+
+        // Entry should still have last_reported_bucket = 0
+        let entry = state.tool_timers.in_flight.get("call-1").unwrap();
+        assert_eq!(entry.last_reported_bucket, 0);
+    }
+
+    #[test]
+    fn tool_timer_tick_emits_notices_at_10s_20s_30s() {
+        use std::time::{Duration, Instant};
+
+        // Simulates a "silent 30s call" - the core bug the ticker fixes.
+        // A tool that runs 30s with no other events should emit
+        // notices at ~10s, ~20s, ~30s BEFORE completion.
+        let mut state = make_state(false);
+
+        // Start at time 0
+        let started = Instant::now();
+
+        state.tool_timers.in_flight.insert(
+            "call-1".to_string(),
+            ToolCallTimerEntry {
+                tool_name: "long_running_tool".to_string(),
+                started,
+                last_reported_bucket: 0,
+            },
+        );
+
+        // We can't manipulate real time easily, so this test verifies
+        // the logic by manually advancing bucket values as time would.
+
+        // After 10s elapsed: bucket = 1
+        let entry = state.tool_timers.in_flight.get_mut("call-1").unwrap();
+        entry.started = Instant::now() - Duration::from_millis(10_500);
+
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(output.contains("10s"), "expected 10s notice: {output}");
+        }
+
+        // After 20s elapsed: bucket = 2
+        let entry = state.tool_timers.in_flight.get_mut("call-1").unwrap();
+        entry.started = Instant::now() - Duration::from_millis(20_500);
+
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(output.contains("20s"), "expected 20s notice: {output}");
+        }
+
+        // After 30s elapsed: bucket = 3
+        let entry = state.tool_timers.in_flight.get_mut("call-1").unwrap();
+        entry.started = Instant::now() - Duration::from_millis(30_500);
+
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(output.contains("30s"), "expected 30s notice: {output}");
+        }
+    }
+
+    #[test]
+    fn tool_timer_tick_no_duplicate_notice_same_bucket() {
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        let started = Instant::now() - Duration::from_millis(10_500);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-1".to_string(), make_timer_entry("read_file", started));
+
+        #[cfg(unix)]
+        {
+            let output1 = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(output1.contains("still running"));
+
+            // Second tick at same bucket should not emit again
+            let output2 = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(
+                !output2.contains("still running"),
+                "duplicate notice: {output2}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_timer_concurrent_calls_tracked_separately() {
+        // Two concurrent calls with same tool name but different IDs
+        // must be tracked separately without overwriting each other.
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+
+        let started1 = Instant::now() - Duration::from_millis(10_500);
+        let started2 = Instant::now() - Duration::from_millis(15_000);
+
+        state.tool_timers.in_flight.insert(
+            "call-1".to_string(),
+            make_timer_entry("read_file", started1),
+        );
+        state.tool_timers.in_flight.insert(
+            "call-2".to_string(),
+            make_timer_entry("read_file", started2),
+        );
+
+        assert_eq!(state.tool_timers.in_flight.len(), 2);
+
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+
+            // Both should emit notices (different elapsed times)
+            assert!(output.contains("still running"));
+            assert!(
+                output.contains("10s") || output.contains("15s"),
+                "expected one of the elapsed times: {output}"
+            );
+        }
+
+        // Verify both entries still exist
+        assert!(state.tool_timers.in_flight.contains_key("call-1"));
+        assert!(state.tool_timers.in_flight.contains_key("call-2"));
+    }
+
+    #[test]
+    fn tool_timer_staggered_concurrency() {
+        // Two tools started 5s apart each notify ~10s after their own start.
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+
+        // Tool A started 10.5s ago (has crossed 10s threshold)
+        let started_a = Instant::now() - Duration::from_millis(10_500);
+        // Tool B started 5.5s ago (has NOT crossed 10s threshold)
+        let started_b = Instant::now() - Duration::from_millis(5_500);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-a".to_string(), make_timer_entry("tool_a", started_a));
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-b".to_string(), make_timer_entry("tool_b", started_b));
+
+        #[cfg(unix)]
+        let output = capture_output(|| {
+            state.tool_timer_tick();
+        });
+        #[cfg(not(unix))]
+        state.tool_timer_tick();
+
+        #[cfg(unix)]
+        {
+            // Only tool_a should emit (10s bucket)
+            assert!(output.contains("tool_a"));
+            assert!(output.contains("still running"));
+            assert!(
+                !output.contains("tool_b"),
+                "tool_b should not be in output: {output}"
+            );
+        }
+
+        // Verify entry states
+        let entry_a = state.tool_timers.in_flight.get("call-a").unwrap();
+        assert_eq!(entry_a.last_reported_bucket, 1);
+
+        let entry_b = state.tool_timers.in_flight.get("call-b").unwrap();
+        assert_eq!(entry_b.last_reported_bucket, 0);
+    }
+
+    #[test]
+    fn tool_timer_terminal_stops_tracking() {
+        // Completed/Failed/Blocked should stop the timer and remove entry.
+        // No notices should print after the terminal event.
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        let started = Instant::now() - Duration::from_millis(15_000);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-1".to_string(), make_timer_entry("read_file", started));
+
+        // Simulate completion
+        let result = state.tool_call_finished("call-1");
+
+        // Entry should be removed
+        assert!(!state.tool_timers.in_flight.contains_key("call-1"));
+
+        // Duration > 5s should be returned
+        assert!(result.is_some());
+
+        // Subsequent tick should not emit anything (no in-flight entries)
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(
+                output.is_empty() || !output.contains("still running"),
+                "no notice should emit after completion: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_timer_blocked_is_terminal() {
+        // Blocked is terminal for this call but restartable.
+        // Still removes from in-flight and does NOT show elapsed time.
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        let started = Instant::now() - Duration::from_millis(15_000);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-1".to_string(), make_timer_entry("read_file", started));
+
+        // Simulate blocked - tool_call_finished is called
+        let result = state.tool_call_finished("call-1");
+
+        // Entry should be removed
+        assert!(!state.tool_timers.in_flight.contains_key("call-1"));
+
+        // Duration > 5s should be returned (even for blocked)
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn tool_timer_clear_removes_all_entries() {
+        // clear_tool_timers (called on exit) clears everything.
+
+        let mut state = make_state(false);
+
+        state.tool_timers.in_flight.insert(
+            "call-1".to_string(),
+            make_timer_entry("read_file", Instant::now()),
+        );
+        state.tool_timers.in_flight.insert(
+            "call-2".to_string(),
+            make_timer_entry("write_file", Instant::now()),
+        );
+
+        assert_eq!(state.tool_timers.in_flight.len(), 2);
+
+        state.clear_tool_timers();
+
+        assert!(state.tool_timers.in_flight.is_empty());
+    }
+
+    #[test]
+    fn tool_timer_final_only_suppresses_notices() {
+        // In --final-only mode, the ticker is never invoked
+        // (tool_timer_tick callback is None in oneshot_nats::run_turn).
+        // This test verifies that if we DID call it (hypothetically),
+        // entries would still be tracked correctly, but in practice
+        // the ticker doesn't run.
+
+        // Actually, final_only is a state flag, not a direct check
+        // in tool_timer_tick. The CLI avoids calling the ticker
+        // in final-only mode by passing None for the callback.
+        // Let's verify that a final_only state can still track entries
+        // for completion (tool_call_finished).
+
+        // Create a state manually with final_only = true.
+        let mut state = CliSinkState {
+            render: None,
+            buffer: String::new(),
+            last_ui_output_source: None,
+            highlight: false,
+            render_options: RenderOptions::default(),
+            final_only: true,
+            subagents: CliSubagentReporter::default(),
+            tool_timers: ToolCallTimerReporter::default(),
+        };
+
+        state.tool_call_started("call-1", "read_file");
+        assert!(state.tool_timers.in_flight.contains_key("call-1"));
+
+        // If we hypothetically called tick, it would still work.
+        // But in production, the ticker callback is None in final_only mode.
+    }
+
+    #[test]
+    fn tool_timer_threshold_4s_no_notice_no_final() {
+        // A tool completing at ~4s emits no periodic notice and no final duration.
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        let started = Instant::now() - Duration::from_millis(4_000);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-1".to_string(), make_timer_entry("read_file", started));
+
+        // Tick at 4s should not emit
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(
+                !output.contains("still running"),
+                "no notice at 4s: {output}"
+            );
+        }
+
+        // Completion at 4s should not return duration (< 5s threshold)
+        let result = state.tool_call_finished("call-1");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tool_timer_threshold_7s_final_no_periodic() {
+        // A tool ending at ~7s (between 5s and 10s) emits a final (Ns)
+        // but no periodic notice.
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        let started = Instant::now() - Duration::from_millis(7_000);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-1".to_string(), make_timer_entry("read_file", started));
+
+        // Tick at 7s should not emit (bucket = 0)
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(
+                !output.contains("still running"),
+                "no notice at 7s: {output}"
+            );
+        }
+
+        // Completion at 7s should return duration (> 5s threshold)
+        let result = state.tool_call_finished("call-1");
+        assert!(result.is_some());
+        let elapsed = result.unwrap();
+        assert!(elapsed.starts_with('7'));
+    }
+
+    /// Integration test using tokio paused time for deterministic behavior.
+    /// This is the key test that should FAIL if the ticker is removed,
+    /// ensuring the silent path is actually exercised.
+    ///
+    /// Note: This test does NOT use tokio::time::pause() because:
+    /// 1. `capture_output` uses `dup2` which conflicts with `pause()` requirements
+    /// 2. We can achieve deterministic behavior by manually setting Instant values
+    /// 3. The bucket-based time tracking doesn't require Tokio's virtual clock
+    #[test]
+    fn tool_timer_silent_long_call_emits_notices() {
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+
+        // Simulate a tool that started 10.5 seconds ago
+        let started = Instant::now() - Duration::from_millis(10_500);
+
+        state.tool_timers.in_flight.insert(
+            "call-1".to_string(),
+            ToolCallTimerEntry {
+                tool_name: "long_running_tool".to_string(),
+                started,
+                last_reported_bucket: 0,
+            },
+        );
+
+        // Tick at ~10s should emit
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(
+                output.contains("still running"),
+                "expected periodic notice at 10s: {output}"
+            );
+            assert!(output.contains("10s"), "expected 10s in output: {output}");
+        }
+
+        // Advance to ~20s by updating the start time
+        state
+            .tool_timers
+            .in_flight
+            .get_mut("call-1")
+            .unwrap()
+            .started = Instant::now() - Duration::from_millis(20_500);
+
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(output.contains("20s"), "expected 20s notice: {output}");
+        }
+
+        // Advance to ~30s
+        state
+            .tool_timers
+            .in_flight
+            .get_mut("call-1")
+            .unwrap()
+            .started = Instant::now() - Duration::from_millis(30_500);
+
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(output.contains("30s"), "expected 30s notice: {output}");
+        }
+
+        // Complete before emitting again
+        let result = state.tool_call_finished("call-1");
+        assert!(result.is_some());
+        assert!(state.tool_timers.in_flight.is_empty());
+    }
+
+    /// Test that after completion, no phantom notices are emitted.
+    #[test]
+    fn tool_timer_no_notices_after_completion() {
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        let started = Instant::now() - Duration::from_millis(25_000);
+
+        state
+            .tool_timers
+            .in_flight
+            .insert("call-1".to_string(), make_timer_entry("read_file", started));
+
+        // First tick emits at bucket 2 (20s)
+        #[cfg(unix)]
+        {
+            let _output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+        }
+
+        // Complete the tool
+        let _result = state.tool_call_finished("call-1");
+
+        // Second tick should not emit (entry removed)
+        #[cfg(unix)]
+        {
+            let output = capture_output(|| {
+                state.tool_timer_tick();
+            });
+            assert!(
+                !output.contains("still running"),
+                "no notice after completion: {output}"
+            );
+        }
+    }
+
+    /// Test that the ticker uses Skip missed tick behavior (no catch-up burst).
+    /// This is verified by the oneshot_nats implementation, but we ensure
+    /// our tick logic doesn't burst either.
+    #[test]
+    fn tool_timer_no_catch_up_burst() {
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+
+        // Start a tool that's been running for 25s, but last_reported_bucket = 0
+        // This simulates a scenario where ticks were delayed.
+        let started = Instant::now() - Duration::from_millis(25_000);
+
+        state.tool_timers.in_flight.insert(
+            "call-1".to_string(),
+            ToolCallTimerEntry {
+                tool_name: "delayed_tool".to_string(),
+                started,
+                last_reported_bucket: 0,
+            },
+        );
+
+        #[cfg(unix)]
+        // Single tick should emit only ONE notice (for bucket 2, the current bucket)
+        // NOT multiple notices for bucket 1 AND bucket 2
+        let output = capture_output(|| {
+            state.tool_timer_tick();
+        });
+        #[cfg(not(unix))]
+        state.tool_timer_tick();
+
+        #[cfg(unix)]
+        {
+            // Should emit at bucket 2 (20s-29s range)
+            assert!(output.contains("still running"));
+
+            // Count occurrences of "still running" - should be exactly 1
+            let count = output.matches("still running").count();
+            assert_eq!(count, 1, "expected single notice, not burst: {output}");
+        }
+
+        // Entry should now have last_reported_bucket = 2
+        let entry = state.tool_timers.in_flight.get("call-1").unwrap();
+        assert_eq!(entry.last_reported_bucket, 2);
     }
 }

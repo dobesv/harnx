@@ -82,6 +82,7 @@ harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
 harnx-spinner = { path = "../harnx-spinner" }
 harnx-telemetry = { workspace = true }
+harnx-toolset = { path = "../harnx-toolset" }
 harnx-tui = { path = "../harnx-tui" }
 shellexpand = { workspace = true }
 schemars = { workspace = true }
@@ -90,6 +91,7 @@ ratatui_widget_scrolling = { workspace = true }
 jiff = { workspace = true }
 reqwest = { workspace = true }
 syntect = { workspace = true }
+scopeguard = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 crossterm = { workspace = true, features = ["use-dev-tty"] }

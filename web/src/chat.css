@@ -1049,6 +1049,10 @@ body {
   font-size: 0.8rem;
   color: var(--text-h);
 }
+.aui-tool-call-elapsed {
+  opacity: 0.7;
+  font-weight: normal;
+}
 .aui-tool-call-chevron {
   flex-shrink: 0;
   font-size: 0.85rem;

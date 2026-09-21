@@ -317,6 +317,39 @@ pub const SUBAGENT_SESSION_LOAD_TOOL: &str = "session_load";
 /// Raw tool name for cancelling a sub-agent session.
 pub const SUBAGENT_SESSION_CANCEL_TOOL: &str = "session_cancel";
 
+/// Minimum elapsed time in milliseconds before showing a tool-call timer.
+/// Tools running less than this duration show no elapsed-time display.
+pub const TOOL_TIMER_MIN_ELAPSED_MS: u64 = 5_000;
+
+/// Interval in milliseconds for CLI tool-call "still running" notices.
+/// In append-only mode, a notice is printed each time this interval elapses.
+pub const TOOL_TIMER_NOTICE_INTERVAL_MS: u64 = 10_000;
+
+/// Returns `true` if the given tool name is a sub-agent launcher.
+///
+/// Launcher tools are `session_new` and `session_prompt` (and their agent/package-prefixed forms).
+/// They are excluded from the generic tool-call timer because they already emit periodic progress.
+///
+/// # Examples
+/// ```
+/// # use harnx_toolset::is_subagent_launcher;
+/// assert!(is_subagent_launcher("session_new"));
+/// assert!(is_subagent_launcher("session_prompt"));
+/// assert!(is_subagent_launcher("oracle_session_prompt"));
+/// assert!(is_subagent_launcher("pantheon__oracle_session_prompt"));
+///
+/// assert!(!is_subagent_launcher("session_load"));
+/// assert!(!is_subagent_launcher("session_cancel"));
+/// assert!(!is_subagent_launcher("read_file"));
+/// assert!(!is_subagent_launcher(""));
+/// ```
+pub fn is_subagent_launcher(name: &str) -> bool {
+    name == SUBAGENT_SESSION_NEW_TOOL
+        || name == SUBAGENT_SESSION_PROMPT_TOOL
+        || name.ends_with(&format!("_{}", SUBAGENT_SESSION_NEW_TOOL))
+        || name.ends_with(&format!("_{}", SUBAGENT_SESSION_PROMPT_TOOL))
+}
+
 /// Serializable error returned in a [`ToolReply`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
@@ -479,6 +512,43 @@ mod tests {
             .cloned();
 
         assert_round_trip(spec);
+    }
+
+    #[test]
+    fn is_subagent_launcher_true_cases() {
+        // Bare names
+        assert!(is_subagent_launcher("session_new"));
+        assert!(is_subagent_launcher("session_prompt"));
+
+        // Agent-prefixed (single underscore)
+        assert!(is_subagent_launcher("oracle_session_new"));
+        assert!(is_subagent_launcher("oracle_session_prompt"));
+        assert!(is_subagent_launcher("pantheon_session_new"));
+        assert!(is_subagent_launcher("pantheon_session_prompt"));
+
+        // Package-prefixed (double underscore per package_namespace.rs)
+        assert!(is_subagent_launcher("pantheon__oracle_session_new"));
+        assert!(is_subagent_launcher("pantheon__oracle_session_prompt"));
+    }
+
+    #[test]
+    fn is_subagent_launcher_false_cases() {
+        // Other sub-agent control tools (NOT launchers)
+        assert!(!is_subagent_launcher("session_load"));
+        assert!(!is_subagent_launcher("session_cancel"));
+
+        // Ordinary tools
+        assert!(!is_subagent_launcher("read_file"));
+        assert!(!is_subagent_launcher("bash_exec"));
+        assert!(!is_subagent_launcher("web_search"));
+
+        // Edge cases
+        assert!(!is_subagent_launcher(""));
+
+        // False positives to reject: names containing but not ending correctly
+        assert!(!is_subagent_launcher("session_newer")); // prefix, not suffix
+        assert!(!is_subagent_launcher("my_session_prompt_extra")); // has suffix after
+        assert!(!is_subagent_launcher("session_prompting")); // different suffix
     }
 
     #[test]

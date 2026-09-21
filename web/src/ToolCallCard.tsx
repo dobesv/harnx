@@ -1,12 +1,15 @@
-import React, { useContext, useMemo, useState } from 'react';
+import React, { useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ToolCallMessagePartProps } from '@assistant-ui/react';
 import { JsonView, darkStyles, defaultStyles } from 'react-json-view-lite';
 import 'react-json-view-lite/dist/index.css';
 import { UsageContext } from './UsageContext';
 import {
+  classifyToolCallStatus,
   extractResultContent,
+  formatElapsedMs,
   getToolCallPresentation,
   isSubAgentTool,
+  TOOL_TIMER_MIN_ELAPSED_MS,
   type ResultExtraction,
 } from './toolCallPresentation';
 import { MarkdownLink } from './markdownLink';
@@ -202,6 +205,7 @@ interface ToolCallHeaderProps {
   onToggle: () => void;
   headerSummaryMarkdown: string | null;
   fallbackPreview: string | null;
+  elapsedText?: string | null;
 }
 
 const ToolCallHeader: React.FC<ToolCallHeaderProps> = ({
@@ -211,9 +215,10 @@ const ToolCallHeader: React.FC<ToolCallHeaderProps> = ({
   onToggle,
   headerSummaryMarkdown,
   fallbackPreview,
+  elapsedText,
 }) => (
-  <div 
-    className="aui-tool-call-header" 
+  <div
+    className="aui-tool-call-header"
     onClick={onToggle}
     onKeyDown={(e) => {
       if (e.target !== e.currentTarget) return;
@@ -231,6 +236,7 @@ const ToolCallHeader: React.FC<ToolCallHeaderProps> = ({
         <span className="aui-tool-call-icon">{icon}</span>
         <span className="aui-tool-call-label">
           <strong>{toolName}</strong>
+          {elapsedText && <span className="aui-tool-call-elapsed"> ({elapsedText})</span>}
         </span>
       </div>
       {headerSummaryMarkdown ? (
@@ -416,6 +422,46 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const [viewSource, setViewSource] = useState(false);
 
+  // Timer logic for showing elapsed time on long-running non-sub-agent tool calls.
+  // This start anchor is captured on first render where status is running (pending).
+  // It uses client-side time which may under-count on late hydration/reconnect — acceptable for v1.
+  // `status.type === 'requires-action'` with `reason === 'tool-calls'` indicates pending concurrent
+  // tool calls in assistant-ui; classifyToolCallStatus().isPending handles both that and 'running'.
+  const isPending = classifyToolCallStatus(status).isPending;
+  // Suppression is strictly name-based per issue #1743 spec and plan constraints.
+  // Using isSubAgentTool(toolName) avoids over-suppressing ordinary tools that happen to have
+  // session_id/message arguments (which checkIsSubAgent() would match).
+  const suppressTimer = isSubAgentTool(toolName);
+  const startedAtMsRef = useRef<number | null>(null);
+  const finalElapsedMsRef = useRef<number | null>(null);
+  const [clockMs, setClockMs] = useState(0);
+
+  // Capture start anchor on first running render (client-side; may under-count on late hydration)
+  if (isPending && startedAtMsRef.current === null) {
+    startedAtMsRef.current = Date.now();
+  }
+
+  // Freeze final elapsed value transitioning from running to done
+  if (!isPending && startedAtMsRef.current !== null && finalElapsedMsRef.current === null) {
+    finalElapsedMsRef.current = Math.max(0, Date.now() - startedAtMsRef.current);
+  }
+
+  // 1s interval clock gated on running state and not suppressed
+  useEffect(() => {
+    if (!isPending || suppressTimer) return undefined;
+    const timer = window.setInterval(() => setClockMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isPending, suppressTimer]);
+
+  // Compute elapsed text for display
+  const elapsedMs = isPending
+    ? startedAtMsRef.current !== null
+      ? Math.max(0, clockMs - startedAtMsRef.current)
+      : 0
+    : finalElapsedMsRef.current ?? 0;
+  const showTimer = !suppressTimer && elapsedMs >= TOOL_TIMER_MIN_ELAPSED_MS;
+  const elapsedText = showTimer ? formatElapsedMs(elapsedMs) : null;
+
   const fallbackPreview = getFallbackPreview(summaryMarkdown, parsedArgs, isSubAgent, promptText);
   const headerSummaryMarkdown = useMemo(
     () => formatHeaderSummary(summaryMarkdown, isSubAgent, expanded, promptText),
@@ -434,10 +480,11 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
         onToggle={() => setExpanded(!expanded)}
         headerSummaryMarkdown={headerSummaryMarkdown}
         fallbackPreview={fallbackPreview}
+        elapsedText={elapsedText}
       />
 
       {expanded && (
-        <ToolCallDetails 
+        <ToolCallDetails
           effectiveId={effectiveId}
           viewSource={viewSource}
           setViewSource={setViewSource}

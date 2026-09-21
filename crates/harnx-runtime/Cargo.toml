@@ -87,7 +87,7 @@ arboard = { workspace = true }
 insta = { version = "1", features = ["yaml"] }
 rcgen = { workspace = true }
 pretty_assertions = "1.4.0"
-scopeguard = "1"
+scopeguard = { workspace = true }
 tempfile = "3"
 tokio-test = "0.4"
 harnx-test-bins = { path = "../harnx-test-bins" }

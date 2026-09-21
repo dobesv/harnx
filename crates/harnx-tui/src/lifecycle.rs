@@ -927,6 +927,11 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                             body,
                             seq: msg.log_seq,
                             timestamp: msg.log_timestamp,
+                            // Historical tool calls from session history are already complete.
+                            // Set final_elapsed_ms to 0 so no timer is shown.
+                            id: None,
+                            start_anchor: std::time::Instant::now(),
+                            final_elapsed_ms: Some(0),
                             rendered_cache: None,
                         });
                         if let Some(key) =

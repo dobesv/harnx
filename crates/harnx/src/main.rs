@@ -697,7 +697,7 @@ async fn run_one_shot(
         let cfg = config.read();
         (cfg.highlight, cfg.render_options().unwrap_or_default())
     };
-    agent_event_sink::install_cli_agent_event_sink(
+    let sink_handles = agent_event_sink::install_cli_agent_event_sink(
         highlight,
         render_options,
         abort_signal.clone(),
@@ -716,7 +716,7 @@ async fn run_one_shot(
         cli.timeout_secs,
         cli.token_budget,
     );
-    let result = start_directive(config, input, options).await;
+    let result = start_directive(config, input, options, sink_handles).await;
     exit_session(config, !cli.final_only)?;
     classify_one_shot_exit(result, aborted_check.aborted())
 }
@@ -864,6 +864,7 @@ async fn start_directive(
     config: &GlobalConfig,
     mut input: Input,
     options: oneshot_nats::InvocationOptions,
+    sink_handles: agent_event_sink::CliSinkHandles,
 ) -> Result<()> {
     crate::config::input::use_embeddings(&mut input, config, options.abort_signal().clone())
         .await?;
@@ -919,8 +920,23 @@ async fn start_directive(
         buffering_sink.clone(),
     ));
     let input_text = input.text();
-    let result =
-        oneshot_nats::run_turn(&session, &input_text, tracking_sink.clone(), &options).await?;
+    // Pass the tool timer tick callback only when not in final_only mode.
+    let tool_timer_tick = if options.final_only() {
+        None
+    } else {
+        Some(sink_handles.tool_timer_tick.clone())
+    };
+    // clear_tool_timers is now handled by RAII guard inside run_turn.
+    let result = oneshot_nats::run_turn(
+        &session,
+        &input_text,
+        tracking_sink.clone(),
+        &options,
+        tool_timer_tick,
+        sink_handles.clear_tool_timers.clone(),
+    )
+    .await;
+    let result = result?;
     oneshot_nats::finish_turn(
         result,
         oneshot_nats::TurnOutput {

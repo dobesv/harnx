@@ -1,5 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { extractResultContent, getToolCallPresentation, isSubAgentTool } from './toolCallPresentation';
+import { extractResultContent, formatElapsedMs, getToolCallPresentation, isSubAgentTool } from './toolCallPresentation';
+
+describe('formatElapsedMs', () => {
+  it('formats milliseconds as seconds with s suffix', () => {
+    expect(formatElapsedMs(0)).toBe('0s');
+    expect(formatElapsedMs(999)).toBe('0s');
+    expect(formatElapsedMs(1000)).toBe('1s');
+    expect(formatElapsedMs(5500)).toBe('5s');
+    expect(formatElapsedMs(10000)).toBe('10s');
+    expect(formatElapsedMs(65000)).toBe('65s');
+  });
+});
 
 describe('getToolCallPresentation', () => {
   const cases = [

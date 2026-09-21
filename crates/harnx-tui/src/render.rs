@@ -402,13 +402,27 @@ impl Tui {
                 body,
                 seq,
                 timestamp,
+                start_anchor,
+                final_elapsed_ms,
+                id: _,
                 rendered_cache,
             } => {
-                if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
-                    if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
-                        return cached.clone();
+                // Determine if we should bypass cache: running tool that may need timer update.
+                let is_running = final_elapsed_ms.is_none();
+                let show_timer = is_running
+                    && !harnx_toolset::is_subagent_launcher(tool_name)
+                    && start_anchor.elapsed().as_millis()
+                        >= harnx_toolset::TOOL_TIMER_MIN_ELAPSED_MS as u128;
+
+                // Use cache only when no timer conditions apply
+                if !is_running || !show_timer {
+                    if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
+                        if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
+                            return cached.clone();
+                        }
                     }
                 }
+
                 let mut entry = Self::render_tool_call(tool_name, body.as_ref(), width, theme);
                 if let Some(suffix) =
                     Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
@@ -424,7 +438,47 @@ impl Tui {
                         },
                     );
                 }
-                if !state.skip_cache {
+
+                // Append elapsed timer if running and past threshold
+                if show_timer {
+                    let elapsed_ms = start_anchor.elapsed().as_millis() as u64;
+                    let seconds = elapsed_ms / 1_000;
+                    // Append dim " (Ns)" to the last line
+                    if let Some(MarkdownBlockData::Paragraph { lines, .. }) =
+                        entry.blocks.last_mut()
+                    {
+                        if let Some(last_line) = lines.last_mut() {
+                            last_line.spans.push(Span::styled(
+                                format!(" ({seconds}s)"),
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::DIM),
+                            ));
+                        }
+                    }
+                } else if let Some(elapsed_ms) = final_elapsed_ms {
+                    // Completed tool that ran >5s: show frozen final elapsed
+                    if *elapsed_ms >= harnx_toolset::TOOL_TIMER_MIN_ELAPSED_MS
+                        && !harnx_toolset::is_subagent_launcher(tool_name)
+                    {
+                        let seconds = *elapsed_ms / 1_000;
+                        if let Some(MarkdownBlockData::Paragraph { lines, .. }) =
+                            entry.blocks.last_mut()
+                        {
+                            if let Some(last_line) = lines.last_mut() {
+                                last_line.spans.push(Span::styled(
+                                    format!(" ({seconds}s)"),
+                                    Style::default()
+                                        .fg(Color::DarkGray)
+                                        .add_modifier(Modifier::DIM),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Only cache when not running (timer stable)
+                if !is_running && !state.skip_cache {
                     *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
                 }
                 entry
@@ -1118,6 +1172,9 @@ impl Tui {
                 seq,
                 timestamp,
                 rendered_cache: _,
+                start_anchor: _,
+                final_elapsed_ms: _,
+                id: _,
             } => {
                 lines.push(Line::from(Span::styled("── tool call ──", label_style)));
                 if let Some(s) = seq {

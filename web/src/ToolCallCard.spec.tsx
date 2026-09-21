@@ -1,5 +1,5 @@
-import { render, screen, fireEvent } from '@testing-library/react';
-import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent, act } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ToolCallCard } from './ToolCallCard';
 import { UsageContext } from './UsageContext';
 
@@ -539,5 +539,209 @@ describe('ToolCallCard', () => {
         expect(card.style.borderLeft).toBe(expectedBorder);
       },
     );
+  });
+
+  describe('elapsed timer', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('hides timer when elapsed < 5s', () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_timer_1',
+        status: { type: 'running' },
+      } as any;
+
+      renderWithContext(props);
+      // Started now, elapsed = 0s
+      expect(screen.queryByText('(0s)')).not.toBeInTheDocument();
+      expect(screen.queryByText('(1s)')).not.toBeInTheDocument();
+    });
+
+    it('shows live timer when elapsed >= 5s', () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_timer_2',
+        status: { type: 'running' },
+      } as any;
+
+      renderWithContext(props);
+      
+      // Fast-forward 6 seconds
+      act(() => {
+        vi.advanceTimersByTime(6000);
+      });
+
+      // Timer should now show (6s)
+      expect(screen.getByText(/\(6s\)/)).toBeInTheDocument();
+    });
+
+    it('suppresses timer for sub-agent tools', () => {
+      const props = {
+        toolName: 'pantheon_pytheas_session_prompt',
+        toolCallId: 'call_timer_3',
+        status: { type: 'running' },
+      } as any;
+
+      renderWithContext(props);
+      
+      // Fast-forward 10 seconds
+      act(() => {
+        vi.advanceTimersByTime(10000);
+      });
+
+      // Timer should NOT show for sub-agent tools
+      expect(screen.queryByText(/\(10s\)/)).not.toBeInTheDocument();
+    });
+
+    it('freezes final value upon completion', async () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_timer_4',
+        status: { type: 'running' },
+      } as any;
+
+      const { rerender } = renderWithContext(props);
+      
+      // Fast-forward 8 seconds
+      act(() => {
+        vi.advanceTimersByTime(8000);
+      });
+
+      // Timer shows (8s)
+      expect(screen.getByText(/\(8s\)/)).toBeInTheDocument();
+
+      // Complete the tool call
+      rerender(
+        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map() }}>
+          <ToolCallCard {...props} status={{ type: 'complete' }} />
+        </UsageContext.Provider>
+      );
+
+      // Fast-forward more time - timer should stay frozen
+      act(() => {
+        vi.advanceTimersByTime(5000);
+      });
+
+      // Timer should still show the last running value (around 8s)
+      const elapsedText = screen.queryByText(/\(\d+s\)/);
+      expect(elapsedText).toBeInTheDocument();
+      // Should NOT have continued ticking to (13s)
+      expect(screen.queryByText(/\(13s\)/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/\(12s\)/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/\(11s\)/)).not.toBeInTheDocument();
+    });
+
+    it('clears interval on unmount', () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_timer_5',
+        status: { type: 'running' },
+      } as any;
+
+      const { unmount } = renderWithContext(props);
+      
+      // Advance a bit
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      // Unmount should not throw or leak interval
+      unmount();
+
+      // Advance timers more - no exception means interval was cleared
+      act(() => {
+        vi.advanceTimersByTime(10000);
+      });
+
+      // Pass - no memory leak assertion possible directly, but no error = good
+      expect(true).toBe(true);
+    });
+
+    it('shows no timer on completion if tool ran <5s', () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_timer_6',
+        status: { type: 'running' },
+      } as any;
+
+      const { rerender } = renderWithContext(props);
+
+      // Fast-forward 3 seconds (under threshold)
+      act(() => {
+        vi.advanceTimersByTime(3000);
+      });
+
+      // Timer should NOT show yet
+      expect(screen.queryByText(/\(3s\)/)).not.toBeInTheDocument();
+
+      // Complete the tool call
+      rerender(
+        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map() }}>
+          <ToolCallCard {...props} status={{ type: 'complete' }} />
+        </UsageContext.Provider>
+      );
+
+      // Timer should NOT show on completion since it was <5s
+      expect(screen.queryByText(/\(\d+s\)/)).not.toBeInTheDocument();
+    });
+
+    it('shows timer for requires-action status with tool-calls reason', () => {
+      // assistant-ui uses { type: 'requires-action', reason: 'tool-calls' } for pending concurrent tools
+      const props = {
+        toolName: 'bash_exec',
+        toolCallId: 'call_requires_action_1',
+        status: { type: 'requires-action', reason: 'tool-calls' },
+      } as any;
+
+      renderWithContext(props);
+
+      // Fast-forward 6 seconds
+      act(() => {
+        vi.advanceTimersByTime(6000);
+      });
+
+      // Timer should show (6s) for requires-action status with tool-calls reason
+      expect(screen.getByText(/\(6s\)/)).toBeInTheDocument();
+    });
+
+    it('freezes timer on transition from requires-action to complete', () => {
+      const props = {
+        toolName: 'bash_exec',
+        toolCallId: 'call_requires_action_2',
+        status: { type: 'requires-action', reason: 'tool-calls' },
+      } as any;
+
+      const { rerender } = renderWithContext(props);
+
+      // Fast-forward 8 seconds
+      act(() => {
+        vi.advanceTimersByTime(8000);
+      });
+
+      // Timer shows (8s)
+      expect(screen.getByText(/\(8s\)/)).toBeInTheDocument();
+
+      // Complete the tool call
+      rerender(
+        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map() }}>
+          <ToolCallCard {...props} status={{ type: 'complete' }} />
+        </UsageContext.Provider>
+      );
+
+      // Timer should stay frozen, not continue ticking
+      act(() => {
+        vi.advanceTimersByTime(5000);
+      });
+
+      // Timer should still show the frozen value (around 8s), not (13s)
+      expect(screen.getByText(/\(8s\)/)).toBeInTheDocument();
+      expect(screen.queryByText(/\(13s\)/)).not.toBeInTheDocument();
+    });
   });
 });
