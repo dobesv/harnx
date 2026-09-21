@@ -68,12 +68,13 @@ macro_rules! register_client {
 
                 pub fn list_models(local_config: &$config) -> Vec<Model> {
                     let client_name = Self::name(local_config);
-                    $crate::models_for_client_config(
-                        $name,
+                    $crate::models_for_client_config($crate::ClientModelSources {
+                        client_type: $name,
                         client_name,
-                        &local_config.models,
-                        local_config.system_prompt_prefix.as_deref(),
-                    )
+                        model_catalog: local_config.model_catalog.as_deref(),
+                        local_models: &local_config.models,
+                        system_prompt_prefix: local_config.system_prompt_prefix.as_deref(),
+                    })
                 }
 
                 pub fn name(local_config: &$config) -> &str {

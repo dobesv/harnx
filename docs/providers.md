@@ -21,6 +21,30 @@ All clients support these common fields:
 
 Clients can override model defaults or supply custom model entries using the `models` list field in client configuration files. Default model metadata and prices are loaded from Harnx's built-in model catalog (auto-generated from LiteLLM).
 
+### Choosing a Model Catalog
+
+`model_catalog` names the catalog block a client inherits, by provider name. It
+works for any client type and is independent of what the file is called:
+
+```yaml
+type: openai-compatible
+model_catalog: bedrock
+api_base: https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1
+```
+
+Leave it out and the filename decides instead. A client inherits the block
+matching its own `type`; `codex` borrows OpenAI's; and an `openai-compatible`
+client matches a provider whose name its filename stem starts with, so
+`clients/groq.yaml` inherits Groq. That fallback predates `model_catalog` and
+stays for compatibility, but it makes the filename load-bearing in ways that
+are easy to trip over — `deepseek-proxy.yaml` inherits DeepSeek whether or not
+you meant it to, and `aws-prod.yaml` inherits nothing at all. Prefer naming the
+catalog.
+
+Naming a catalog that does not exist logs a warning and inherits nothing, so a
+typo shows up rather than silently falling back to the filename. Your own
+`models:` entries still apply either way.
+
 ### Model Configuration Fields
 
 | Field | Type | Description |
@@ -331,6 +355,6 @@ api_base: https://api.groq.com/openai/v1
 # api_key: "..."   # or set GROQ_API_KEY
 ```
 
-> **Note:** The shorthand names (e.g., `groq`, `deepseek`, `xai`) must be used as the **filename** (e.g., `groq.yaml`), not the `type` field. The `type` must always be `openai-compatible`. The `api_base` is pre-configured by harnx when the filename stem matches a known provider, so you can omit it if using a standard provider name.
+> **Note:** The shorthand names (e.g., `groq`, `deepseek`, `xai`) must be used as the **filename** (e.g., `groq.yaml`), not the `type` field. The `type` must always be `openai-compatible`. The `api_base` is pre-configured by harnx when the filename stem matches a known provider, so you can omit it if using a standard provider name. This lookup is separate from the model catalog: set `api_base` to opt out of it, and `model_catalog` to choose models independently of the filename.
 >
 > ² Cloudflare's URL contains a literal `{ACCOUNT_ID}` placeholder. You must supply the correct URL explicitly via `api_base` in your config file — the placeholder is not substituted automatically.

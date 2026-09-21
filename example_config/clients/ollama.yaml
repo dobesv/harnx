@@ -1,3 +1,5 @@
+# Ollama serves local models that no shared catalog describes, so no
+# `model_catalog:` here — every model is declared explicitly below.
 type: openai-compatible
 api_base: http://localhost:11434/v1
 models:

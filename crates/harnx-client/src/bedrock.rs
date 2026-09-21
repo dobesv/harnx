@@ -1047,6 +1047,7 @@ mod tests {
             region: region.map(Into::into),
             session_token: session_token.map(Into::into),
             profile: None,
+            model_catalog: None,
             models: vec![],
             patches: None,
             extra: None,

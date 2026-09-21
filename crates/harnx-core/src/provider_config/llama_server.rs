@@ -18,6 +18,11 @@ pub struct LlamaServerConfig {
 
     /// Models served by this provider. Each model specifies its own
     /// GGUF path and tuning knobs; selecting a model spawns its subprocess.
+    /// Catalog block in `models.yaml` to inherit models from, by provider
+    /// name (e.g. `bedrock`). Omit it and the client's filename decides,
+    /// which is the older behaviour kept for compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
 

@@ -402,6 +402,7 @@ fn test_client(api_base: String) -> OpenAICompatibleClient {
         name: "trace-test".to_string(),
         api_base: Some(api_base),
         api_key: Some("local-test-key".to_string()),
+        model_catalog: None,
         models: Vec::new(),
         patches: None,
         extra: None,
