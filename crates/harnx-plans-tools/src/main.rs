@@ -71,6 +71,7 @@ struct HttpServerLoop {
     cancellation: CancellationToken,
 }
 
+#[derive(Debug)]
 struct Args {
     plans_dir: PathBuf,
     retention_days: u64,
@@ -161,7 +162,7 @@ fn print_help() {
     eprintln!("Options:");
     eprintln!("  --dir, -d <path>           Set the plans directory (default: .agent/plans)");
     eprintln!("  --retention-days, -r <N>   Set retention period in days (default: 14)");
-    eprintln!("  --http                     Serve MCP over Streamable HTTP at /mcp");
+    eprintln!("  --mcp-http                 Serve MCP over Streamable HTTP at /mcp");
     eprintln!("  --mcp-stdio                Serve MCP over stdio instead of native NATS mode");
     eprintln!("  --host <addr>              Bind address for HTTP mode (default: 0.0.0.0)");
     eprintln!("  --port <N>                 Bind port for HTTP mode (default: 3000)");
@@ -180,9 +181,15 @@ fn print_help() {
 
 fn parse_args() -> anyhow::Result<Args> {
     let args: Vec<String> = std::env::args().collect();
+    parse_args_from(&args)
+}
+
+fn parse_args_from(args: &[impl AsRef<str>]) -> anyhow::Result<Args> {
+    let args: Vec<String> = args.iter().map(|s| s.as_ref().to_string()).collect();
     let mut plans_dir: Option<PathBuf> = None;
     let mut retention_days: Option<u64> = None;
     let mut http = false;
+    let mut mcp_stdio = false;
     let mut host = None::<String>;
     let mut port = None::<u16>;
     let mut state = ParseState {
@@ -193,7 +200,44 @@ fn parse_args() -> anyhow::Result<Args> {
         if state.consume_passthrough() {
             continue;
         }
-        match state.current() {
+        let current = state.current();
+        if let Some(val) = current.strip_prefix("--host=") {
+            host = Some(val.to_string());
+            state.index += 1;
+            continue;
+        }
+        if let Some(val) = current.strip_prefix("--port=") {
+            match val.parse::<u16>() {
+                Ok(p) => {
+                    port = Some(p);
+                    state.index += 1;
+                    continue;
+                }
+                Err(_) => {
+                    anyhow::bail!("harnx-plans-tools: --port requires a port number (got: {val})");
+                }
+            }
+        }
+        if let Some(val) = current.strip_prefix("--dir=") {
+            plans_dir = Some(PathBuf::from(val));
+            state.index += 1;
+            continue;
+        }
+        if let Some(val) = current.strip_prefix("--retention-days=") {
+            match val.parse::<u64>() {
+                Ok(days) => {
+                    retention_days = Some(days);
+                    state.index += 1;
+                    continue;
+                }
+                Err(_) => {
+                    anyhow::bail!(
+                        "harnx-plans-tools: --retention-days requires a non-negative integer (got: {val})"
+                    );
+                }
+            }
+        }
+        match current {
             "--dir" | "-d" => {
                 if state.index + 1 < args.len() {
                     plans_dir = Some(PathBuf::from(&args[state.index + 1]));
@@ -220,11 +264,12 @@ fn parse_args() -> anyhow::Result<Args> {
                     anyhow::bail!("harnx-plans-tools: --retention-days requires a number argument");
                 }
             }
-            "--http" => {
+            "--mcp-http" => {
                 http = true;
                 state.index += 1;
             }
             "--mcp-stdio" => {
+                mcp_stdio = true;
                 state.index += 1;
             }
             "--host" => {
@@ -261,6 +306,10 @@ fn parse_args() -> anyhow::Result<Args> {
                 "harnx-plans-tools: unknown argument: {unknown}\nTry: harnx-plans-tools --help"
             ),
         }
+    }
+
+    if http && mcp_stdio {
+        anyhow::bail!("choose one of --mcp-stdio or --mcp-http, not both");
     }
 
     // Use shared helper for metrics-addr (supports both --metrics-addr VAL and --metrics-addr=VAL)
@@ -442,4 +491,60 @@ fn spawn_shutdown_handler(ct: CancellationToken, readiness: Option<Readiness>) {
         }
         ct.cancel();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_accepts_equals_syntax() {
+        let args = parse_args_from(&[
+            "harnx-plans-tools",
+            "--mcp-http",
+            "--host=127.0.0.1",
+            "--port=3999",
+            "--dir=/custom/plans",
+            "--retention-days=7",
+        ])
+        .unwrap();
+
+        assert!(args.http);
+        assert_eq!(args.host, "127.0.0.1");
+        assert_eq!(args.port, 3999);
+        assert_eq!(args.plans_dir, PathBuf::from("/custom/plans"));
+        assert_eq!(args.retention_days, 7);
+    }
+
+    #[test]
+    fn parse_args_accepts_space_syntax() {
+        let args = parse_args_from(&[
+            "harnx-plans-tools",
+            "--mcp-http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "3999",
+        ])
+        .unwrap();
+
+        assert!(args.http);
+        assert_eq!(args.host, "127.0.0.1");
+        assert_eq!(args.port, 3999);
+    }
+
+    #[test]
+    fn parse_args_rejects_stdio_and_http_conflict() {
+        let err = parse_args_from(&["harnx-plans-tools", "--mcp-stdio", "--mcp-http"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "choose one of --mcp-stdio or --mcp-http, not both"
+        );
+    }
+
+    #[test]
+    fn parse_args_stdio_only() {
+        let args = parse_args_from(&["harnx-plans-tools", "--mcp-stdio"]).unwrap();
+        assert!(!args.http);
+    }
 }

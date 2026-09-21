@@ -239,7 +239,17 @@ trusting a refresh, and see issue #2025 for reconciling the catalog against
 
 ## Tool Servers
 
-Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `harnx-bash-tools`, `harnx-time-tools`, `harnx-plans-tools`). They run `harnx_toolset_server::run_toolset_main(toolset)` and default to NATS mode. When launching behind `harnx-mcp-bridge` for stdio MCP compatibility, pass `--mcp-stdio` — without it, the server waits for NATS and the bridge handshake times out.
+Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `harnx-bash-tools`, `harnx-time-tools`, `harnx-plans-tools`). They run `harnx_toolset_server::run_toolset_main(toolset)` and default to NATS mode. For Streamable HTTP MCP mode, pass `--mcp-http`; `--host` defaults to `0.0.0.0` and `--port` selects the listening port. Default HTTP ports are:
+
+| Server | Port |
+| --- | ---: |
+| plans | 3000 |
+| time | 3001 |
+| bash | 3002 |
+| fs | 3003 |
+| grep | 3004 |
+
+When launching behind `harnx-mcp-bridge` for stdio MCP compatibility, pass `--mcp-stdio` — without it, the server waits for NATS and the bridge handshake times out.
 
 Binaries with `-mcp-` in the name are genuine MCP infrastructure (`harnx-mcp-bridge`, `harnx-mcp-remote`) or test fixtures (`harnx-mock-mcp`), not native toolsets.
 

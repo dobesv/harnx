@@ -40,6 +40,7 @@ use harnx_core::execution_context::{
     ToolObservationProvenance, EXECUTION_CONTEXT_NAMESPACE,
 };
 use harnx_core::instance::ServerScope;
+use harnx_healthz::Readiness;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
     server_identity_token, ControlMessage, Registration, ToolErrorPayload, ToolInvocation,
@@ -53,6 +54,8 @@ use rmcp::model::{
     ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
+use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, ServiceExt};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -681,9 +684,106 @@ async fn publish_registration(
         .with_context(|| format!("publish tool registration '{key}'"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpMode {
+    Stdio,
+    Http,
+}
+
+pub(crate) fn resolve_mcp_mode(
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> Result<Option<McpMode>> {
+    let mut mcp_stdio = false;
+    let mut mcp_http = false;
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == "--mcp-stdio" {
+            mcp_stdio = true;
+        } else if arg == "--mcp-http" {
+            mcp_http = true;
+        }
+    }
+    if mcp_stdio && mcp_http {
+        anyhow::bail!("choose one of --mcp-stdio or --mcp-http, not both");
+    }
+    if mcp_stdio {
+        Ok(Some(McpMode::Stdio))
+    } else if mcp_http {
+        Ok(Some(McpMode::Http))
+    } else {
+        Ok(None)
+    }
+}
+
+fn mcp_http_arg_value(args: &[String], flag: &str) -> Result<Option<String>> {
+    let assignment = format!("{flag}=");
+    for (index, arg) in args.iter().enumerate() {
+        if arg == flag {
+            let value = args
+                .get(index + 1)
+                .with_context(|| format!("missing value for {flag}"))?;
+            return Ok(Some(value.clone()));
+        }
+        if let Some(value) = arg.strip_prefix(&assignment) {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Serve a toolset over MCP Streamable HTTP at `/mcp`.
+pub async fn run_toolset_mcp_http(
+    toolset: Arc<dyn Toolset>,
+    host: String,
+    port: u16,
+    readiness: Option<Readiness>,
+) -> Result<()> {
+    let ct = CancellationToken::new();
+    let adapter = McpToolsetAdapter { toolset };
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_cancellation_token(ct.child_token())
+        .disable_allowed_hosts();
+    let service = StreamableHttpService::new(
+        move || Ok(adapter.clone()),
+        Arc::new(NeverSessionManager::default()),
+        config,
+    );
+    let app = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            harnx_metrics::http_metrics_middleware,
+        ));
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port))
+        .await
+        .with_context(|| format!("failed to bind {host}:{port}"))?;
+    if let Some(readiness) = readiness.as_ref() {
+        readiness.ready();
+    }
+
+    let shutdown_ct = ct.clone();
+    tokio::spawn(async move {
+        harnx_nats_common::shutdown::shutdown_signal().await;
+        if let Some(readiness) = readiness.as_ref() {
+            readiness.not_ready();
+        }
+        shutdown_ct.cancel();
+    });
+
+    log::info!("serving MCP HTTP at http://{host}:{port}/mcp");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { ct.cancelled().await })
+        .await
+        .context("run MCP HTTP server")
+}
+
 fn print_toolset_help() {
     eprintln!("Options:");
     eprintln!("  --mcp-stdio               Use MCP stdio transport instead of NATS");
+    eprintln!("  --mcp-http                Use MCP Streamable HTTP transport instead of NATS");
+    eprintln!("  --host <HOST>             MCP HTTP bind host (default: 0.0.0.0)");
+    eprintln!("  --port <PORT>             MCP HTTP bind port (toolset-specific default)");
     eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
     eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
     eprintln!("                            Also honors HARNX_METRICS_ADDR env.");
@@ -693,8 +793,7 @@ fn print_toolset_help() {
     eprintln!("  --help, -h                Show this help message");
 }
 
-/// Run a toolset in MCP stdio mode when `--mcp-stdio` is present, otherwise
-/// NATS mode.
+/// Run a toolset in MCP stdio or HTTP mode when selected, otherwise NATS mode.
 ///
 /// In NATS mode, wires SIGTERM/Ctrl+C to a graceful stop so a pod killed by
 /// Kubernetes gets a chance to remove its own registration instead of
@@ -732,20 +831,37 @@ where
 
     let result: Result<()> = async {
         let toolset: Arc<dyn Toolset> = Arc::new(toolset);
-        if std::env::args_os().any(|arg| arg == "--mcp-stdio") {
-            let service = McpToolsetAdapter { toolset }
-                .serve(rmcp::transport::stdio())
-                .await
-                .context("start MCP stdio server")?;
-            if let Some(readiness) = readiness.as_ref() {
-                readiness.ready();
+        match resolve_mcp_mode(std::env::args_os())? {
+            Some(McpMode::Stdio) => {
+                let service = McpToolsetAdapter { toolset }
+                    .serve(rmcp::transport::stdio())
+                    .await
+                    .context("start MCP stdio server")?;
+                if let Some(readiness) = readiness.as_ref() {
+                    readiness.ready();
+                }
+                let outcome = service.waiting().await.context("run MCP stdio server");
+                if let Some(readiness) = readiness.as_ref() {
+                    readiness.not_ready();
+                }
+                outcome?;
+                return Ok(());
             }
-            let outcome = service.waiting().await.context("run MCP stdio server");
-            if let Some(readiness) = readiness.as_ref() {
-                readiness.not_ready();
+            Some(McpMode::Http) => {
+                // Front parsers only validate/consume-and-skip these flags; the shared runner
+                // re-reads env::args to resolve host/port.
+                let args = std::env::args().collect::<Vec<_>>();
+                let host =
+                    mcp_http_arg_value(&args, "--host")?.unwrap_or_else(|| "0.0.0.0".to_string());
+                let port = match mcp_http_arg_value(&args, "--port")? {
+                    Some(port) => port
+                        .parse::<u16>()
+                        .with_context(|| format!("invalid --port value '{port}'"))?,
+                    None => toolset.default_mcp_http_port(),
+                };
+                return run_toolset_mcp_http(toolset, host, port, readiness).await;
             }
-            outcome?;
-            return Ok(());
+            None => {}
         }
 
         let scope =

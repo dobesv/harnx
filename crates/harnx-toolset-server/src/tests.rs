@@ -4,6 +4,65 @@ use rmcp::model::RequestParamsMeta;
 use super::*;
 
 #[test]
+fn mcp_http_args_accept_separate_and_equals_values() {
+    let separate = vec![
+        "server".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        "3999".to_string(),
+    ];
+    assert_eq!(
+        mcp_http_arg_value(&separate, "--host").unwrap(),
+        Some("127.0.0.1".to_string())
+    );
+    assert_eq!(
+        mcp_http_arg_value(&separate, "--port").unwrap(),
+        Some("3999".to_string())
+    );
+
+    let equals = vec![
+        "server".to_string(),
+        "--host=0.0.0.0".to_string(),
+        "--port=3001".to_string(),
+    ];
+    assert_eq!(
+        mcp_http_arg_value(&equals, "--host").unwrap(),
+        Some("0.0.0.0".to_string())
+    );
+    assert_eq!(
+        mcp_http_arg_value(&equals, "--port").unwrap(),
+        Some("3001".to_string())
+    );
+}
+
+#[test]
+fn resolve_mcp_mode_mutual_exclusion() {
+    let err = resolve_mcp_mode(["server", "--mcp-stdio", "--mcp-http"]).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "choose one of --mcp-stdio or --mcp-http, not both"
+    );
+
+    assert_eq!(
+        resolve_mcp_mode(["server", "--mcp-stdio"]).unwrap(),
+        Some(McpMode::Stdio)
+    );
+    assert_eq!(
+        resolve_mcp_mode(["server", "--mcp-http"]).unwrap(),
+        Some(McpMode::Http)
+    );
+    assert_eq!(resolve_mcp_mode(["server"]).unwrap(), None);
+}
+
+#[test]
+fn mcp_http_arg_requires_separate_value() {
+    let args = vec!["server".to_string(), "--port".to_string()];
+    let error = mcp_http_arg_value(&args, "--port").unwrap_err();
+    assert_eq!(error.to_string(), "missing value for --port");
+}
+
+#[test]
 fn parent_session_argument_only_uses_transport_context() {
     let mut untrusted = serde_json::json!({
         "__harnx_parent_session_id": "other-session",
@@ -217,6 +276,123 @@ impl Toolset for MetricsTestToolset {
         _cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
         unreachable!("metric label test does not invoke tools")
+    }
+}
+
+mod adapter_wire_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rmcp::handler::client::ClientHandler;
+    use rmcp::model::{ClientCapabilities, ErrorCode, InitializeRequestParams};
+    use rmcp::service::{
+        serve_client, serve_server, RoleClient, RoleServer, RunningService, ServiceError,
+    };
+    use tokio::io::duplex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct AdapterTestToolset {
+        invocations: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Toolset for AdapterTestToolset {
+        fn name(&self) -> &str {
+            "adapter-test"
+        }
+
+        fn tools(&self) -> Vec<harnx_toolset::ToolSpec> {
+            vec![harnx_toolset::ToolSpec {
+                cancellation_guarantee: Default::default(),
+                name: "known".to_owned(),
+                description: "known failing test tool".to_owned(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                idempotent_hint: false,
+                read_only_hint: true,
+                timeout_secs: None,
+                meta: None,
+            }]
+        }
+
+        async fn invoke(
+            &self,
+            _tool: &str,
+            _args: Value,
+            _cancel: CancellationToken,
+        ) -> Result<Value, ToolInvokeError> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Err(ToolInvokeError::Recoverable(
+                "known tool execution failed".to_owned(),
+            ))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestClientHandler;
+
+    impl ClientHandler for TestClientHandler {
+        fn get_info(&self) -> InitializeRequestParams {
+            InitializeRequestParams::new(
+                ClientCapabilities::builder().build(),
+                Implementation::new("adapter-test-client", "0.1"),
+            )
+        }
+    }
+
+    type TestServerService = RunningService<RoleServer, McpToolsetAdapter>;
+    type TestClientService = RunningService<RoleClient, TestClientHandler>;
+
+    async fn setup_client_server(
+        toolset: Arc<AdapterTestToolset>,
+    ) -> (TestClientService, TestServerService) {
+        let (client_transport, server_transport) = duplex(65_536);
+        let adapter = McpToolsetAdapter { toolset };
+        let server_fut = serve_server(adapter, server_transport);
+        let client_fut = serve_client(TestClientHandler, client_transport);
+        let (server, client) = tokio::join!(server_fut, client_fut);
+        (client.unwrap(), server.unwrap())
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_returns_invalid_params_protocol_error() {
+        let toolset = Arc::new(AdapterTestToolset::default());
+        let (client, _server) = setup_client_server(toolset.clone()).await;
+
+        let error = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("missing"))
+            .await
+            .expect_err("unknown tool must return a JSON-RPC error");
+
+        match error {
+            ServiceError::McpError(error) => {
+                assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+                assert_eq!(error.message, "unknown tool: missing");
+            }
+            other => panic!("expected MCP invalid_params error, got {other:?}"),
+        }
+        assert_eq!(toolset.invocations.load(Ordering::SeqCst), 0);
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn known_tool_execution_failure_returns_is_error_result() {
+        let toolset = Arc::new(AdapterTestToolset::default());
+        let (client, _server) = setup_client_server(toolset.clone()).await;
+
+        let result = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("known"))
+            .await
+            .expect("known tool failure must remain a tool result");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(serde_json::to_string(&result.content)
+            .unwrap()
+            .contains("known tool execution failed"));
+        assert_eq!(toolset.invocations.load(Ordering::SeqCst), 1);
+        client.cancel().await.unwrap();
     }
 }
 

@@ -14,6 +14,8 @@ cargo install --path crates/harnx-grep-tools
 
 The resulting binary is `harnx-grep-tools`, which runs in native toolset mode by default. No external runtime (Python, uvx) needed.
 
+For Streamable HTTP MCP mode, pass `--mcp-http`. `--host` defaults to `0.0.0.0`; `--port` defaults to `3004` and serves MCP at `/mcp`.
+
 ## Tool
 
 ### `grep_query`

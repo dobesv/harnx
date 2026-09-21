@@ -22,6 +22,9 @@ cargo install --path crates/harnx-fs-tools
 | `--allow-dev-tools` | Allow development tool and cache paths. |
 | `--allow-repo-work` | Allow detected project roots and current directory. |
 | `--allow-all` | Allow all filesystem paths. |
+| `--mcp-http` | Serve MCP over Streamable HTTP at `/mcp`. |
+| `--host <ADDR>` | Bind address for HTTP mode (default: `0.0.0.0`). |
+| `--port <N>` | Bind port for HTTP mode (default: `3003`). |
 | `--mcp-stdio` | Run in stdio MCP backward-compatibility mode. |
 | `--help`, `-h` | Show help. |
 

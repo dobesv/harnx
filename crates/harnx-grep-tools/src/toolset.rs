@@ -58,6 +58,10 @@ impl Toolset for GrepToolset {
         "grep"
     }
 
+    fn default_mcp_http_port(&self) -> u16 {
+        3004
+    }
+
     fn tools(&self) -> Vec<ToolSpec> {
         vec![ToolSpec {
             cancellation_guarantee: Default::default(),

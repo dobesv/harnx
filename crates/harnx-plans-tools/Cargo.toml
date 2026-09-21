@@ -31,7 +31,10 @@ similar = { workspace = true }
 
 [dev-dependencies]
 filetime = "0.2"
+reqwest = { workspace = true }
+rmcp = { workspace = true }
 tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [[bin]]
 name = "harnx-plans-tools"
