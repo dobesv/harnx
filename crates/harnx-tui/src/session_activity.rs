@@ -2,8 +2,6 @@ use crate::event_isolation::{EventStamp, SessionObservation};
 use crate::types::{ModalState, Tui, TuiEvent};
 use harnx_core::event::{AgentEvent, SessionEvent, TurnEvent};
 
-use harnx_runtime::config::LOCAL_CLUSTER_KEY;
-
 mod monitor;
 use monitor::spawn_session_activity_monitor;
 pub(super) use monitor::{attach_session_event_stream_with_state, history_has_pending_turn};
@@ -182,7 +180,7 @@ impl Tui {
             .remote_agent
             .as_ref()
             .map(|(_, cluster)| cluster.clone())
-            .unwrap_or_else(|| LOCAL_CLUSTER_KEY.to_string());
+            .unwrap_or_else(|| config.default_cluster_key().to_string());
         Some((session_id, cluster))
     }
 

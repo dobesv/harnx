@@ -162,6 +162,7 @@ whichever process launched them.
   NATS TCP protocol; `ws://` and `wss://` use the WebSocket transport, which is
   what traverses an HTTP load balancer.
 - `HARNX_NATS_TOKEN` — token auth for that connection.
+- `HARNX_NATS_SERVER` — names a cluster from `nats_servers/<name>.yaml` for front-ends (`harnx`, `harnx-serve`). Runs the front-end as a pure client without starting a local `nats-server`, worker, or tool servers. Bare agent names route to that cluster as `<agent>@<name>`. Local (`__local__`) agents are unavailable in this mode. When unset, front-ends self-host a local broker and worker as before.
 - `HARNX_NATS_TLS`, `HARNX_NATS_TLS_CERT`, `HARNX_NATS_TLS_KEY`, `HARNX_NATS_TLS_CA` — TLS settings, matching the keys in `nats_servers/<cluster>.yaml`.
 - `HARNX_NATS_IGNORE_DISCOVERED_SERVERS` — ignore the peers a clustered broker
   advertises instead of adding them to the connection's server pool. Defaults to

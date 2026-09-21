@@ -3,6 +3,7 @@ use crate::test_utils::{TestEnvironment, ENV_LOCK};
 use crate::types::{MonitoredSessionKey, SubAgentStatus, TranscriptItem};
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_runtime::config::Config;
+use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 use harnx_runtime::nats_event_sink::{events_subject, AdvisoryEnvelope};
 use harnx_runtime::nats_session_log::NatsSessionLog;
 

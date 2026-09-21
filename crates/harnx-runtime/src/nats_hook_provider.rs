@@ -64,6 +64,7 @@ pub async fn dispatch_hook_event(params: HookEventDispatch<'_>) -> HookOutcome {
 /// Frontends without `HARNX_SERVER_SCOPE` use no-op hook dispatch.
 pub async fn discover_process_nats_hook_provider(config: &Config) -> Option<Arc<NatsHookProvider>> {
     let instance_id = std::env::var(harnx_core::instance::HARNX_SERVER_SCOPE).ok()?;
+    // Cluster roles reject the `__local__` client, so discovery correctly degrades to no-op.
     NatsHookProvider::discover(config, ServerScope::from_string(instance_id))
         .await
         .ok()

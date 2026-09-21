@@ -1208,6 +1208,29 @@ async fn resolve_agent_uses_declared_remote_cluster_without_connecting() {
 }
 
 #[tokio::test]
+async fn resolve_agent_routes_bare_name_to_cluster_mode_before_local_validation() {
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_nats_server(
+        "remote",
+        "url: nats://127.0.0.1:65535\nagents:\n  - name: cluster-only\n",
+    );
+    let mut config = sandbox.config();
+    config.nats_routing = harnx_runtime::config::NatsRouting::Cluster("remote".to_string());
+
+    let (target, scoped) = crate::resolve_agent_target(&config, "cluster-only")
+        .await
+        .expect("bare cluster agent should not require a local agent file");
+
+    assert_eq!(config.default_cluster_key(), "remote");
+    assert_eq!(target.agent(), "cluster-only");
+    assert_eq!(target.cluster(), "remote");
+    assert_eq!(
+        scoped.read().remote_agent.as_ref(),
+        Some(&("cluster-only".to_string(), "remote".to_string()))
+    );
+}
+
+#[tokio::test]
 async fn resolve_agent_rejects_unsafe_bare_names_and_accepts_safe_local_and_remote_names() {
     let sandbox = TestConfigSandbox::new();
     sandbox.write_agent("hephaestus", "You are Hephaestus.");

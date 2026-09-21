@@ -180,14 +180,18 @@ impl Config {
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
 
+    fn session_completion_target(&self, agent_ref: &str) -> (String, String) {
+        use harnx_core::agent_ref::AgentRef;
+        match AgentRef::parse(agent_ref) {
+            AgentRef::Local(agent) => (agent.into_owned(), self.default_cluster_key().to_string()),
+            AgentRef::Remote { agent, cluster } => (agent.into_owned(), cluster.into_owned()),
+        }
+    }
+
     /// Complete session IDs owned by an explicit agent selector, with a short
     /// timeout so an unreachable broker cannot block interactive completion.
     pub async fn list_sessions_for_completion(&self, agent_ref: &str) -> Vec<String> {
-        use harnx_core::agent_ref::AgentRef;
-        let (agent, cluster) = match AgentRef::parse(agent_ref) {
-            AgentRef::Local(agent) => (agent, super::LOCAL_CLUSTER_KEY.into()),
-            AgentRef::Remote { agent, cluster } => (agent, cluster),
-        };
+        let (agent, cluster) = self.session_completion_target(agent_ref);
         match tokio::time::timeout(
             std::time::Duration::from_millis(500),
             self.list_remote_sessions_with_meta(&cluster),
@@ -196,7 +200,7 @@ impl Config {
         {
             Ok(Ok(sessions)) => sessions
                 .into_iter()
-                .filter(|session| session.agent_name.as_deref() == Some(agent.as_ref()))
+                .filter(|session| session.agent_name.as_deref() == Some(agent.as_str()))
                 .map(|session| session.id)
                 .collect(),
             Ok(Err(e)) => {
@@ -218,6 +222,28 @@ fn complete_bool(value: bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_completion_uses_default_cluster_for_bare_agent() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.session_completion_target("assistant"),
+            ("assistant".to_string(), LOCAL_CLUSTER_KEY.to_string())
+        );
+
+        let cluster_config = Config {
+            nats_routing: NatsRouting::Cluster("remote".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            cluster_config.session_completion_target("assistant"),
+            ("assistant".to_string(), "remote".to_string())
+        );
+        assert_eq!(
+            cluster_config.session_completion_target("assistant@prod"),
+            ("assistant".to_string(), "prod".to_string())
+        );
+    }
 
     #[test]
     fn session_first_argument_completes_agents() {

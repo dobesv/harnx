@@ -307,7 +307,7 @@ impl ToolProvider for SessionHistoryProvider {
                 .remote_agent
                 .as_ref()
                 .map(|(_, cluster)| cluster.clone())
-                .unwrap_or_else(|| crate::config::LOCAL_CLUSTER_KEY.to_string());
+                .unwrap_or_else(|| guard.default_cluster_key().to_string());
             (guard.clone(), session.storage_key(), cluster)
         };
         let operation = async {

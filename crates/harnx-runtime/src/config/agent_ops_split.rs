@@ -268,7 +268,26 @@ impl Config {
     ) -> Result<()> {
         match AgentRef::parse(agent_name) {
             AgentRef::Local(agent_name) => {
-                Self::use_local_agent(config, agent_name.as_ref(), session_name, abort_signal).await
+                let default_cluster = {
+                    let config = config.read();
+                    match &config.nats_routing {
+                        NatsRouting::Default => None,
+                        NatsRouting::Cluster(cluster) => Some(cluster.clone()),
+                    }
+                };
+                if let Some(cluster) = default_cluster {
+                    Self::use_remote_agent(UseRemoteAgentParams {
+                        config,
+                        agent: &agent_name,
+                        cluster: &cluster,
+                        session_name,
+                        _abort_signal: abort_signal,
+                    })
+                    .await
+                } else {
+                    Self::use_local_agent(config, agent_name.as_ref(), session_name, abort_signal)
+                        .await
+                }
             }
             AgentRef::Remote { agent, cluster } => {
                 Self::use_remote_agent(UseRemoteAgentParams {

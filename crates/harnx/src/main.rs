@@ -71,12 +71,17 @@ enum ListSessionsTarget {
 ///
 /// This function encapsulates the branch selection logic so it can be unit-tested
 /// without requiring a live NATS cluster or mocking async I/O.
-fn resolve_list_sessions_target(remote_agent: Option<&(String, String)>) -> ListSessionsTarget {
-    match remote_agent {
+fn resolve_list_sessions_target(config: &Config) -> ListSessionsTarget {
+    match config.remote_agent.as_ref() {
         Some((_, cluster)) => ListSessionsTarget::Remote {
             cluster: cluster.clone(),
         },
-        None => ListSessionsTarget::Local,
+        None if config.default_cluster_key() == harnx_runtime::config::LOCAL_CLUSTER_KEY => {
+            ListSessionsTarget::Local
+        }
+        None => ListSessionsTarget::Remote {
+            cluster: config.default_cluster_key().to_string(),
+        },
     }
 }
 
@@ -145,6 +150,12 @@ async fn main() -> Result<std::process::ExitCode> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+async fn init_frontend_config(working_mode: WorkingMode, info_flag: bool) -> Result<Config> {
+    let mut config = Config::init(working_mode, info_flag).await?;
+    config.apply_frontend_nats_routing();
+    Ok(config)
+}
+
 async fn run_main(cli: Cli) -> Result<Option<anyhow::Error>> {
     match &cli.command {
         Some(
@@ -165,7 +176,9 @@ async fn run_main(cli: Cli) -> Result<Option<anyhow::Error>> {
         _ => WorkingMode::Tui,
     };
     let info_flag = legacy_info_flag(&cli);
-    let config = Arc::new(RwLock::new(Config::init(working_mode, info_flag).await?));
+    let config = Arc::new(RwLock::new(
+        init_frontend_config(working_mode, info_flag).await?,
+    ));
     Ok(run(config, cli, text).await.err())
 }
 
@@ -182,7 +195,7 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<()> {
 async fn run_info_command(info_args: &crate::cli::InfoArgs, _cli: &Cli) -> Result<()> {
     match &info_args.command {
         InfoSubcommands::Agent { name } => {
-            let config = Config::init(WorkingMode::Cmd, true).await?;
+            let config = init_frontend_config(WorkingMode::Cmd, true).await?;
             let out = render_agent_dump(&config, name)?;
             println!("{out}");
             Ok(())
@@ -201,10 +214,10 @@ async fn run_info_session(
     format: &harnx_runtime::config::SessionFormat,
 ) -> Result<()> {
     use harnx_runtime::config::SessionFormat;
-    let config = Config::init(WorkingMode::Cmd, true).await?;
+    let config = init_frontend_config(WorkingMode::Cmd, true).await?;
     match format {
         SessionFormat::Text => {
-            let (agent, cluster) = harnx_runtime::config::resolve_session_agent(agent_name)?;
+            let (agent, cluster) = config.resolve_session_agent(agent_name)?;
             let session = harnx_runtime::config::load_session_for_render(
                 &config,
                 Some(&cluster),
@@ -261,7 +274,7 @@ async fn run_dump_session_once(
     agent_name: &str,
     format: &harnx_runtime::config::SessionFormat,
 ) -> Result<()> {
-    let config = Config::init(WorkingMode::Cmd, true).await?;
+    let config = init_frontend_config(WorkingMode::Cmd, true).await?;
 
     let (jetstream, metadata) =
         harnx_runtime::config::session_metadata_for_agent(&config, agent_name, session_id).await?;
@@ -281,8 +294,8 @@ async fn run_dump_session_follow(
 ) -> Result<()> {
     use std::io::Write;
 
-    let config = Config::init(WorkingMode::Cmd, true).await?;
-    let (_, cluster) = harnx_runtime::config::resolve_session_agent(agent_name)?;
+    let config = init_frontend_config(WorkingMode::Cmd, true).await?;
+    let (_, cluster) = config.resolve_session_agent(agent_name)?;
     let (jetstream, metadata) =
         harnx_runtime::config::session_metadata_for_agent(&config, agent_name, session_id).await?;
     let client = config.nats_client(&cluster).await?;
@@ -389,7 +402,7 @@ async fn run_list_command(list_args: &crate::cli::ListArgs, cli: &Cli) -> Result
 }
 
 async fn run_list_sessions(cli: &Cli) -> Result<()> {
-    let mut config = Config::init(WorkingMode::Cmd, true).await?;
+    let mut config = init_frontend_config(WorkingMode::Cmd, true).await?;
 
     // Activate remote agent if specified via --agent
     if let Some(agent_str) = &cli.agent {
@@ -399,7 +412,7 @@ async fn run_list_sessions(cli: &Cli) -> Result<()> {
         }
     }
 
-    let target = resolve_list_sessions_target(config.remote_agent.as_ref());
+    let target = resolve_list_sessions_target(&config);
     match target {
         ListSessionsTarget::Remote { cluster } => {
             let result = config.list_remote_sessions_with_meta(&cluster).await;
@@ -414,9 +427,8 @@ async fn run_list_sessions(cli: &Cli) -> Result<()> {
             }
         }
         ListSessionsTarget::Local => {
-            let sessions = config
-                .list_remote_sessions_with_meta(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-                .await?;
+            let cluster = config.default_cluster_key().to_string();
+            let sessions = config.list_remote_sessions_with_meta(&cluster).await?;
             println!("{}", format_sessions_for_output(&sessions));
         }
     }
@@ -424,7 +436,7 @@ async fn run_list_sessions(cli: &Cli) -> Result<()> {
 }
 
 async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<()> {
-    let config = Config::init(WorkingMode::Cmd, true).await?;
+    let config = init_frontend_config(WorkingMode::Cmd, true).await?;
     let agent = delete_args.agent_name()?;
     let result = harnx_runtime::nats_admin::delete_remote_session(
         &config,
@@ -668,6 +680,13 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     run_mode(&config, &cli, text, &abort_signal).await
 }
 
+fn ensure_active_agent(config: &Config) -> Result<()> {
+    if config.agent.is_none() && config.remote_agent.is_none() {
+        bail!("No agent selected. Use --agent/-a to specify an agent.");
+    }
+    Ok(())
+}
+
 async fn run_one_shot(
     config: &GlobalConfig,
     cli: &Cli,
@@ -684,9 +703,7 @@ async fn run_one_shot(
         abort_signal.clone(),
         cli.final_only,
     );
-    if config.read().agent.is_none() {
-        bail!("No agent selected. Use --agent/-a to specify an agent.");
-    }
+    ensure_active_agent(&config.read())?;
     if config.read().session.is_none() {
         let session_id = Config::reserve_new_session_id(config).await?;
         config.write().use_session(Some(&session_id))?;
@@ -709,12 +726,22 @@ fn session_resume_command(config: &GlobalConfig) -> Option<String> {
     let session = config_read.session.as_ref()?;
     let session_name = session.id();
 
-    let agent_name = config_read.agent.as_ref().map(|a| a.name());
+    // Keep remote resumes independent of HARNX_NATS_SERVER in the next shell.
+    let agent_ref = config_read
+        .remote_agent
+        .as_ref()
+        .map(|(agent, cluster)| format!("{agent}@{cluster}"))
+        .or_else(|| {
+            config_read
+                .agent
+                .as_ref()
+                .map(|agent| agent.name().to_string())
+        });
 
     let mut args = vec!["harnx".to_string()];
-    if let Some(agent) = agent_name {
+    if let Some(agent) = agent_ref {
         args.push("-a".to_string());
-        args.push(agent.to_string());
+        args.push(agent);
     }
     args.push("-s".to_string());
     args.push(session_name.to_string());
@@ -849,7 +876,7 @@ async fn start_directive(
                     .as_ref()
                     .map(|agent| agent.name().to_string())
                     .unwrap_or_default(),
-                harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+                cfg.default_cluster_key().to_string(),
             )
         });
         let session_id = cfg.session.as_ref().map(|session| session.id().to_string());
@@ -954,6 +981,28 @@ use harnx_runtime::bootstrap::setup_logger;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_shot_accepts_cluster_mode_bare_agent_selection() {
+        let config = Config {
+            agent: None,
+            remote_agent: Some(("assistant".to_string(), "remote".to_string())),
+            nats_routing: harnx_runtime::config::NatsRouting::Cluster("remote".to_string()),
+            ..Config::default()
+        };
+
+        ensure_active_agent(&config).expect("remote selection must satisfy one-shot gate");
+    }
+
+    #[test]
+    fn one_shot_rejects_missing_agent_selection() {
+        let error = ensure_active_agent(&Config::default())
+            .expect_err("missing local and remote agents must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "No agent selected. Use --agent/-a to specify an agent."
+        );
+    }
 
     #[test]
     fn classify_one_shot_exit_passes_an_invocation_limit_error_through_unchanged() {
@@ -1169,6 +1218,21 @@ mod resume_tests {
     }
 
     #[test]
+    fn remote_session_resume_command_keeps_explicit_cluster() {
+        let config = Config {
+            remote_agent: Some(("reviewer".to_string(), "prod".to_string())),
+            session: Some(session_with_message("review-12345")),
+            ..Config::default()
+        };
+        let config = Arc::new(RwLock::new(config));
+
+        assert_eq!(
+            session_resume_command(&config).unwrap(),
+            "harnx -a reviewer@prod -s review-12345"
+        );
+    }
+
+    #[test]
     fn returns_agent_and_session_in_resume_command() {
         // Test with UUID-like anonymous session and agent
         let session = session_with_message("550e8400-e29b-41d4-a716-446655440000");
@@ -1212,6 +1276,40 @@ mod resume_tests {
 mod tests_list_sessions_routing {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set_nats_server(value: Option<&str>) -> Self {
+            let previous = std::env::var_os(harnx_runtime::config::HARNX_NATS_SERVER_ENV);
+            unsafe {
+                match value {
+                    Some(value) => {
+                        std::env::set_var(harnx_runtime::config::HARNX_NATS_SERVER_ENV, value)
+                    }
+                    None => std::env::remove_var(harnx_runtime::config::HARNX_NATS_SERVER_ENV),
+                }
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => {
+                        std::env::set_var(harnx_runtime::config::HARNX_NATS_SERVER_ENV, value)
+                    }
+                    None => std::env::remove_var(harnx_runtime::config::HARNX_NATS_SERVER_ENV),
+                }
+            }
+        }
+    }
+
     fn session_meta(id: &str) -> SessionMeta {
         SessionMeta {
             id: id.to_string(),
@@ -1228,8 +1326,46 @@ mod tests_list_sessions_routing {
     /// This test will fail if routing logic regresses to unconditionally use remote.
     #[test]
     fn test_routing_local_when_no_remote_agent() {
-        let target = resolve_list_sessions_target(None);
+        harnx_core::require_nextest();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvGuard::set_nats_server(None);
+        let config = Config {
+            nats_routing: harnx_runtime::config::nats_routing_from_env(),
+            ..Config::default()
+        };
+        let target = resolve_list_sessions_target(&config);
+        assert_eq!(config.default_cluster_key(), "__local__");
         assert_eq!(target, ListSessionsTarget::Local);
+    }
+
+    #[test]
+    fn cluster_mode_routes_bare_agents_to_configured_default_cluster() {
+        harnx_core::require_nextest();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvGuard::set_nats_server(Some("remote"));
+        let root = tempfile::tempdir().expect("temp config dir");
+        let servers_dir = root.path().join("nats_servers");
+        std::fs::create_dir(&servers_dir).expect("create nats_servers dir");
+        std::fs::write(
+            servers_dir.join("remote.yaml"),
+            "url: nats://127.0.0.1:65535\n",
+        )
+        .expect("write remote cluster config");
+        let config = Config {
+            nats_servers: Config::load_nats_servers_from_dir(&servers_dir)
+                .expect("load remote cluster config"),
+            nats_routing: harnx_runtime::config::nats_routing_from_env(),
+            ..Config::default()
+        };
+
+        assert_eq!(config.default_cluster_key(), "remote");
+        assert_eq!(config.nats_server("remote").unwrap().name, "remote");
+        assert_eq!(
+            resolve_list_sessions_target(&config),
+            ListSessionsTarget::Remote {
+                cluster: "remote".to_string()
+            }
+        );
     }
 
     /// Routing decision: remote agent set → Remote with correct cluster
@@ -1237,8 +1373,11 @@ mod tests_list_sessions_routing {
     /// or if cluster extraction is broken.
     #[test]
     fn test_routing_remote_when_remote_agent_set() {
-        let remote_agent = Some(("my-agent".to_string(), "my-cluster".to_string()));
-        let target = resolve_list_sessions_target(remote_agent.as_ref());
+        let config = Config {
+            remote_agent: Some(("my-agent".to_string(), "my-cluster".to_string())),
+            ..Config::default()
+        };
+        let target = resolve_list_sessions_target(&config);
         assert_eq!(
             target,
             ListSessionsTarget::Remote {
@@ -1257,8 +1396,11 @@ mod tests_list_sessions_routing {
         ];
 
         for (agent, cluster) in test_cases {
-            let remote_agent = Some((agent.to_string(), cluster.to_string()));
-            let target = resolve_list_sessions_target(remote_agent.as_ref());
+            let config = Config {
+                remote_agent: Some((agent.to_string(), cluster.to_string())),
+                ..Config::default()
+            };
+            let target = resolve_list_sessions_target(&config);
             match target {
                 ListSessionsTarget::Remote { cluster: extracted } => {
                     assert_eq!(extracted, cluster, "cluster mismatch for agent '{agent}'");

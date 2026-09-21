@@ -29,7 +29,9 @@ mod tool_servers_split;
 
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;
-pub use self::nats_split::{resolve_local_nats_server_config, NatsServerConfig};
+pub use self::nats_split::{
+    nats_routing_from_env, resolve_local_nats_server_config, NatsRouting, NatsServerConfig,
+};
 pub use self::paths_split::SessionAttachmentPath;
 pub use self::tool_servers_split::ToolServerConfig;
 
@@ -42,6 +44,8 @@ pub const LOCAL_CLUSTER_KEY: &str = "__local__";
 pub const HARNX_NATS_URL_ENV: &str = "HARNX_NATS_URL";
 /// Worker handoff variable containing shared local NATS authentication token.
 pub const HARNX_NATS_TOKEN_ENV: &str = "HARNX_NATS_TOKEN";
+/// Front-end routing role selecting a configured NATS cluster by name.
+pub const HARNX_NATS_SERVER_ENV: &str = "HARNX_NATS_SERVER";
 /// Worker handoff variable containing the JetStream replica count for buckets
 /// harnx creates on the shared local cluster. Only meaningful when a complete
 /// environment handoff (see `resolve_local_nats_server_config`) points that
@@ -336,6 +340,9 @@ pub struct Config {
     /// Agent and cluster when the active agent ref names one
     /// (`agent@cluster`). When unset, turns run against the local cluster.
     pub remote_agent: Option<(String, String)>, // (agent_name, cluster)
+    /// Runtime-only role controlling how bare agent names route to NATS.
+    /// Cluster mode disables the reserved local route without changing named routes.
+    pub nats_routing: NatsRouting,
     pub tui_before_editor: Option<Box<dyn FnMut() + Send + Sync>>,
     pub tui_after_editor: Option<Box<dyn FnMut() + Send + Sync>>,
     /// Runtime-only override for tool-use confirmation prompts. When set (the
@@ -407,6 +414,7 @@ impl Clone for Config {
             rag: self.rag.clone(),
             agent: self.agent.clone(),
             remote_agent: self.remote_agent.clone(),
+            nats_routing: self.nats_routing.clone(),
             tui_before_editor: None,
             tui_after_editor: None,
             tui_confirm_tool_use: self.tui_confirm_tool_use.clone(),
@@ -452,6 +460,7 @@ impl Config {
             rag: self.rag.clone(),
             agent: self.agent.clone(),
             remote_agent: self.remote_agent.clone(),
+            nats_routing: self.nats_routing.clone(),
             // Server prompt paths never invoke editor hooks. Drop them so
             // forked prompt configs can own isolated session state without
             // trying to clone `FnMut` trait objects.
@@ -490,6 +499,7 @@ impl Default for Config {
             rag: None,
             agent: None,
             remote_agent: None,
+            nats_routing: NatsRouting::default(),
             tui_before_editor: None,
             tui_after_editor: None,
             tui_confirm_tool_use: None,
