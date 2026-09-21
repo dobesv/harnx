@@ -552,6 +552,17 @@ pub enum TranscriptItem {
         body: Option<ToolCallBody>,
         seq: Option<usize>,
         timestamp: Option<DateTime<Utc>>,
+        /// Tool-call ID from `ToolEvent::Started { id, .. }`.
+        /// Used to correlate completion/failure events with the correct running tool call
+        /// when tools execute concurrently and may complete out of order.
+        id: Option<String>,
+        /// Monotonic start anchor for live elapsed display.
+        /// Uses `Instant` instead of `DateTime<Utc>` to avoid wall-clock skew.
+        start_anchor: std::time::Instant,
+        /// Final duration in milliseconds, set when the tool completes.
+        /// When `Some`, the tool has finished and the timer should show the
+        /// frozen final value instead of ticking.
+        final_elapsed_ms: Option<u64>,
         rendered_cache: RenderedCache,
     },
     AttachmentHeader(String),

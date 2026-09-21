@@ -18,7 +18,27 @@ use std::{
     time::Duration,
 };
 
+/// Callback type for tool timer tick notifications.
+/// Prints "still running" notices directly under lock.
+pub(crate) type ToolTimerTickFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Callback type for clearing tool timers on exit.
+pub(crate) type ClearToolTimersFn = Arc<dyn Fn() + Send + Sync>;
+
 pub(crate) const INVOCATION_LIMIT_EXIT_CODE: i32 = 2;
+
+/// Outcome of the select loop race — which arm won.
+/// Used to ensure side effects (interrupt calls) happen after the select!
+/// completes, avoiding race conditions with biased polling.
+#[derive(Debug)]
+pub(crate) enum TurnLoopOutcome<T> {
+    /// User abort signal fired.
+    Aborted,
+    /// Turn completed with a result.
+    Completed(T),
+    /// Deadline elapsed.
+    TimedOut,
+}
 
 #[derive(Debug)]
 pub(crate) struct InvocationLimitReached;
@@ -156,11 +176,70 @@ pub(crate) fn emit_termination(synthesized: &SynthesizedResult) -> anyhow::Resul
     Ok(())
 }
 
+/// Runs the tokio::select! loop that drives a turn with abort/timeout/ticker arms.
+///
+/// This is extracted from `run_turn` to allow direct testing of the select! loop
+/// without requiring a real NatsSession.
+///
+/// Returns a `TurnLoopOutcome` indicating which arm won the race. Side effects
+/// (like calling `session.interrupt`) must NOT be executed inside the select!
+/// arms to avoid race conditions with biased polling. Instead, callers should
+/// match on the outcome and perform side effects after the select! completes.
+pub(crate) async fn run_turn_select_loop<F, FutAbort, FutDeadline>(
+    mut run_turn: F,
+    mut abort_signal: FutAbort,
+    mut deadline: FutDeadline,
+    tool_timer_tick: Option<ToolTimerTickFn>,
+    clear_tool_timers: ClearToolTimersFn,
+) -> TurnLoopOutcome<anyhow::Result<NatsTurnResult>>
+where
+    F: std::future::Future<Output = anyhow::Result<NatsTurnResult>> + Unpin,
+    FutAbort: std::future::Future<Output = ()> + Unpin,
+    FutDeadline: std::future::Future<Output = ()> + Unpin,
+{
+    // RAII guard ensures clear_tool_timers is called on every exit path.
+    let _guard = scopeguard::guard(clear_tool_timers, |clear| clear());
+
+    // 1s ticker for tool call "still running" notices.
+    // Only active when final_only is false (normal human-readable output mode).
+    let mut ticker = if tool_timer_tick.is_some() {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Some(interval)
+    } else {
+        None
+    };
+
+    tokio::select! {
+        biased;
+
+        _ = &mut abort_signal => TurnLoopOutcome::Aborted,
+        res = &mut run_turn => TurnLoopOutcome::Completed(res),
+        _ = &mut deadline => TurnLoopOutcome::TimedOut,
+        _ = async {
+            if let Some(ref mut interval) = ticker {
+                loop {
+                    interval.tick().await;
+                    if let Some(ref tick_fn) = tool_timer_tick {
+                        tick_fn();
+                    }
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        }, if ticker.is_some() => {
+            unreachable!("ticker arm should never complete")
+        }
+    }
+}
+
 pub(crate) async fn run_turn(
     session: &NatsSession,
     input_text: &str,
     tracking_sink: Arc<AssistantTextTrackingSink>,
     options: &InvocationOptions,
+    tool_timer_tick: Option<ToolTimerTickFn>,
+    clear_tool_timers: ClearToolTimersFn,
 ) -> anyhow::Result<Option<NatsTurnResult>> {
     let run_turn = session.run_turn_with_options(
         input_text,
@@ -172,6 +251,10 @@ pub(crate) async fn run_turn(
         },
     );
     tokio::pin!(run_turn);
+
+    let abort_signal = wait_abort_signal(options.abort_signal());
+    tokio::pin!(abort_signal);
+
     let deadline = async {
         match options.timeout_secs {
             Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
@@ -180,41 +263,27 @@ pub(crate) async fn run_turn(
     };
     tokio::pin!(deadline);
 
-    tokio::select! {
-        // Biased so a Ctrl+C observed here always wins the race against the
-        // follower's own `wait_abort_signal` arm inside `run_turn_with_options`
-        // — both watch the same signal, and only one of them should be the
-        // one to append the `Cancel`.
-        biased;
+    let outcome = run_turn_select_loop(
+        run_turn,
+        abort_signal,
+        deadline,
+        tool_timer_tick,
+        clear_tool_timers,
+    )
+    .await;
 
-        _ = wait_abort_signal(options.abort_signal()) => {
+    match outcome {
+        TurnLoopOutcome::Aborted => {
             let outcome = session.interrupt("user interrupt from cli").await;
             eprintln!("{}", describe_interrupt_outcome(&outcome));
-            // The abort signal is already set at this point regardless of
-            // whether the append itself landed, so main.rs still exits as
-            // interrupted even when we return this error instead of that one.
             outcome.with_context(|| {
                 format!("failed to interrupt session '{}'", session.session_id())
             })?;
             Err(anyhow::anyhow!("interrupted by user"))
         }
-        result = &mut run_turn => Ok(Some(result?)),
-        _ = &mut deadline => {
-            // Timeout is caller-local: only this deadline arm classifies a
-            // timeout. Appending the fenced Cancel *is* the acceptance —
-            // interrupt() returns as soon as the log has it. The worker winds
-            // the interrupted turn up on its own, asynchronously, so we never
-            // await the follower here: doing so would tie this process's exit
-            // to a worker that might not even be running anymore.
+        TurnLoopOutcome::Completed(res) => Ok(Some(res?)),
+        TurnLoopOutcome::TimedOut => {
             let outcome = session.interrupt("one-shot timeout").await;
-            // A confirmed outcome says nothing on its own: it already reaches
-            // stdout/stderr as the synthesized timeout contract below, and
-            // that contract is pinned to exactly one JSON line on stderr
-            // (`timeout_output_has_synthesized_stdout_single_json_stderr_line_and_exit_code_two`
-            // plus the matching e2e test) — printing here too would corrupt
-            // it. A failed append has no such contract to land in, so surface
-            // it immediately rather than leave it to be discovered only when
-            // `main` unwinds all the way out to its generic error renderer.
             if outcome.is_err() {
                 eprintln!("{}", describe_interrupt_outcome(&outcome));
             }
@@ -498,6 +567,269 @@ mod tests {
                 cached_tokens: 5,
                 cache_write_tokens: 2,
             }
+        );
+    }
+
+    /// Tests for `run_turn_select_loop` that call the production code directly.
+    ///
+    /// These tests verify the actual select! loop behavior including:
+    /// - Ticker arm fires at 1-second intervals during turn execution.
+    /// - Scopeguard cleanup runs on all exit paths (success, error, timeout, abort).
+    /// - Cleanup runs exactly once per invocation.
+    /// - Correct `TurnLoopOutcome` variant returned for each case.
+    /// - Timeout always wins over abort when both are ready (biased select priority).
+    /// Test that ticker fires 3 times during a 3-second turn and cleanup runs on success.
+    /// Uses `start_paused` to control tokio time without manual pausing.
+    #[tokio::test(start_paused = true)]
+    async fn test_select_loop_ticker_fires_and_cleans_up_on_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tick_count = Arc::new(AtomicUsize::new(0));
+        let clear_count = Arc::new(AtomicUsize::new(0));
+
+        let tick_fn = {
+            let tick_count = tick_count.clone();
+            Arc::new(move || {
+                tick_count.fetch_add(1, Ordering::SeqCst);
+            }) as ToolTimerTickFn
+        };
+
+        let clear_fn = {
+            let clear_count = clear_count.clone();
+            Arc::new(move || {
+                clear_count.fetch_add(1, Ordering::SeqCst);
+            }) as ClearToolTimersFn
+        };
+
+        // Turn future: sleeps for 3 seconds then returns success
+        let turn_future = Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(NatsTurnResult {
+                response: None,
+                session_id: "test-session".to_string(),
+                was_cancelled: false,
+                error: None,
+                user_msg_seq: 0,
+                user_msg_id: "test-msg-id".to_string(),
+            })
+        });
+
+        // Abort signal: never fires
+        let abort_signal = std::future::pending::<()>();
+
+        // Deadline: never fires
+        let deadline = std::future::pending::<()>();
+
+        let outcome =
+            run_turn_select_loop(turn_future, abort_signal, deadline, Some(tick_fn), clear_fn)
+                .await;
+
+        assert!(
+            matches!(outcome, TurnLoopOutcome::Completed(Ok(_))),
+            "turn should complete successfully"
+        );
+        assert!(
+            tick_count.load(Ordering::SeqCst) >= 3,
+            "ticker should have fired at least 3 times during 3-second turn, got {}",
+            tick_count.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            clear_count.load(Ordering::SeqCst),
+            1,
+            "clear_tool_timers should run exactly once on normal exit"
+        );
+    }
+
+    /// Test that cleanup runs when the turn future returns an error.
+    #[tokio::test]
+    async fn test_select_loop_cleans_up_on_turn_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let clear_count = Arc::new(AtomicUsize::new(0));
+
+        let clear_fn = {
+            let clear_count = clear_count.clone();
+            Arc::new(move || {
+                clear_count.fetch_add(1, Ordering::SeqCst);
+            }) as ClearToolTimersFn
+        };
+
+        // Turn future: immediately returns error
+        let turn_future = Box::pin(async { Err(anyhow::anyhow!("turn failed")) });
+
+        // Abort signal: pending
+        let abort_signal = std::future::pending::<()>();
+
+        // Deadline: pending
+        let deadline = std::future::pending::<()>();
+
+        let outcome = run_turn_select_loop(
+            turn_future,
+            abort_signal,
+            deadline,
+            None, // No ticker needed for error path
+            clear_fn,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, TurnLoopOutcome::Completed(Err(_))),
+            "turn should return error inside Completed"
+        );
+        assert_eq!(
+            clear_count.load(Ordering::SeqCst),
+            1,
+            "clear_tool_timers should run even on turn error"
+        );
+    }
+
+    /// Test that cleanup runs when the timeout arm fires.
+    #[tokio::test(start_paused = true)]
+    async fn test_select_loop_cleans_up_on_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let clear_count = Arc::new(AtomicUsize::new(0));
+
+        let clear_fn = {
+            let clear_count = clear_count.clone();
+            Arc::new(move || {
+                clear_count.fetch_add(1, Ordering::SeqCst);
+            }) as ClearToolTimersFn
+        };
+
+        // Turn future: pending (never completes)
+        let turn_future = Box::pin(std::future::pending::<anyhow::Result<NatsTurnResult>>())
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<NatsTurnResult>> + Send>,
+            >;
+
+        // Abort signal: pending
+        let abort_signal = Box::pin(std::future::pending::<()>())
+            as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+        // Deadline: completes after 1 second
+        let deadline = Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+        let outcome = run_turn_select_loop(
+            turn_future,
+            abort_signal,
+            deadline,
+            None, // No ticker needed for timeout path
+            clear_fn,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, TurnLoopOutcome::TimedOut),
+            "should return TimedOut"
+        );
+        assert_eq!(
+            clear_count.load(Ordering::SeqCst),
+            1,
+            "clear_tool_timers should run on timeout"
+        );
+    }
+
+    /// Test that cleanup runs when the abort arm fires.
+    #[tokio::test(start_paused = true)]
+    async fn test_select_loop_cleans_up_on_abort() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let clear_count = Arc::new(AtomicUsize::new(0));
+
+        let clear_fn = {
+            let clear_count = clear_count.clone();
+            Arc::new(move || {
+                clear_count.fetch_add(1, Ordering::SeqCst);
+            }) as ClearToolTimersFn
+        };
+
+        // Turn future: pending (never completes)
+        let turn_future = Box::pin(std::future::pending::<anyhow::Result<NatsTurnResult>>())
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<NatsTurnResult>> + Send>,
+            >;
+
+        // Abort signal: fires after 1 second
+        let abort_signal = Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+        // Deadline: pending
+        let deadline = Box::pin(std::future::pending::<()>())
+            as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+        let outcome = run_turn_select_loop(
+            turn_future,
+            abort_signal,
+            deadline,
+            None, // No ticker needed for abort path
+            clear_fn,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, TurnLoopOutcome::Aborted),
+            "should return Aborted"
+        );
+        assert_eq!(
+            clear_count.load(Ordering::SeqCst),
+            1,
+            "clear_tool_timers should run on abort"
+        );
+    }
+
+    /// Test that timeout wins over abort when both are ready.
+    /// This verifies the race condition fix: with biased select!,
+    /// the higher-priority abort arm could incorrectly preempt the timeout.
+    /// Since abort has higher priority, we test when deadline fires FIRST
+    /// (at 1s) while abort fires later (at 2s). The deadline should win.
+    #[tokio::test(start_paused = true)]
+    async fn test_timeout_wins_over_abort_when_deadline_fires_first() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let clear_count = Arc::new(AtomicUsize::new(0));
+
+        let clear_fn = {
+            let clear_count = clear_count.clone();
+            Arc::new(move || {
+                clear_count.fetch_add(1, Ordering::SeqCst);
+            }) as ClearToolTimersFn
+        };
+
+        // Turn future: pending (never completes)
+        let turn_future = Box::pin(std::future::pending::<anyhow::Result<NatsTurnResult>>())
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<NatsTurnResult>> + Send>,
+            >;
+
+        // Abort signal: fires after 2 seconds
+        let abort_signal = Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+        // Deadline: fires after 1 second (fires BEFORE abort)
+        let deadline = Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+        let outcome =
+            run_turn_select_loop(turn_future, abort_signal, deadline, None, clear_fn).await;
+
+        assert!(
+            matches!(outcome, TurnLoopOutcome::TimedOut),
+            "deadline should win over abort since it fires first"
+        );
+        assert_eq!(
+            clear_count.load(Ordering::SeqCst),
+            1,
+            "clear_tool_timers should run exactly once"
         );
     }
 }

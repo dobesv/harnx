@@ -964,8 +964,90 @@ impl Tui {
                 }]
             }
             AgentEvent::Tool(ToolEvent::Completed {
-                output, markdown, ..
-            }) => tool_completed_to_transcript_items(&output, markdown.as_deref()),
+                id,
+                output,
+                markdown,
+                ..
+            }) => {
+                // Capture elapsed for the matching running ToolCall by ID.
+                // If no matching ID is found, fall back to the most recent running tool.
+                let transcript = &mut self.app.transcript;
+                let matched_idx = transcript.iter_mut().rev().position(|item| {
+                    matches!(
+                        item,
+                        TranscriptItem::ToolCall {
+                            final_elapsed_ms: None,
+                            id: Some(ref i),
+                            ..
+                        } if i == &id
+                    )
+                });
+                let fallback_idx = if matched_idx.is_none() {
+                    transcript.iter_mut().rev().position(|item| {
+                        matches!(
+                            item,
+                            TranscriptItem::ToolCall {
+                                final_elapsed_ms: None,
+                                ..
+                            }
+                        )
+                    })
+                } else {
+                    None
+                };
+                if let Some(idx) = matched_idx.or(fallback_idx) {
+                    let actual_idx = transcript.len().saturating_sub(1).saturating_sub(idx);
+                    if let TranscriptItem::ToolCall {
+                        start_anchor,
+                        final_elapsed_ms,
+                        ..
+                    } = &mut transcript[actual_idx]
+                    {
+                        *final_elapsed_ms = Some(start_anchor.elapsed().as_millis() as u64);
+                    }
+                }
+                tool_completed_to_transcript_items(&output, markdown.as_deref())
+            }
+            AgentEvent::Tool(ToolEvent::Failed { id, error }) => {
+                // Capture elapsed for the matching running ToolCall by ID.
+                // If no matching ID is found, fall back to the most recent running tool.
+                let transcript = &mut self.app.transcript;
+                let matched_idx = transcript.iter_mut().rev().position(|item| {
+                    matches!(
+                        item,
+                        TranscriptItem::ToolCall {
+                            final_elapsed_ms: None,
+                            id: Some(ref i),
+                            ..
+                        } if i == &id
+                    )
+                });
+                let fallback_idx = if matched_idx.is_none() {
+                    transcript.iter_mut().rev().position(|item| {
+                        matches!(
+                            item,
+                            TranscriptItem::ToolCall {
+                                final_elapsed_ms: None,
+                                ..
+                            }
+                        )
+                    })
+                } else {
+                    None
+                };
+                if let Some(idx) = matched_idx.or(fallback_idx) {
+                    let actual_idx = transcript.len().saturating_sub(1).saturating_sub(idx);
+                    if let TranscriptItem::ToolCall {
+                        start_anchor,
+                        final_elapsed_ms,
+                        ..
+                    } = &mut transcript[actual_idx]
+                    {
+                        *final_elapsed_ms = Some(start_anchor.elapsed().as_millis() as u64);
+                    }
+                }
+                vec![TranscriptItem::ErrorText(format!("tool failed: {error}"))]
+            }
             AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
                 self.append_streaming_assistant_chunk(&concat_text_blocks(&blocks), is_sub_agent);
                 vec![]
@@ -1017,6 +1099,7 @@ impl Tui {
             }
             AgentEvent::Plan { entries } => vec![TranscriptItem::Plan(entries)],
             AgentEvent::Tool(ToolEvent::Started {
+                id,
                 name,
                 markdown,
                 input,
@@ -1027,10 +1110,14 @@ impl Tui {
                     body: tool_call_body(markdown.as_deref(), &input),
                     seq: self.app.pending_tool_seq,
                     timestamp: Some(chrono::Utc::now()),
+                    id: Some(id),
+                    start_anchor: std::time::Instant::now(),
+                    final_elapsed_ms: None,
                     rendered_cache: None,
                 }]
             }
             AgentEvent::Tool(ToolEvent::Blocked {
+                id,
                 name,
                 input,
                 reason,
@@ -1048,11 +1135,16 @@ impl Tui {
                     let full = format!("{input_text}{reason_text}");
                     Some(crate::types::ToolCallBody::Markdown(full))
                 };
+                // Blocked tools are already complete at creation time.
+                // Set final_elapsed_ms to 0 so the timer never shows.
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
                     body,
                     seq: self.app.pending_tool_seq,
                     timestamp: Some(chrono::Utc::now()),
+                    id: Some(id),
+                    start_anchor: std::time::Instant::now(),
+                    final_elapsed_ms: Some(0),
                     rendered_cache: None,
                 }]
             }

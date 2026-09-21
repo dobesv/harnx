@@ -23,6 +23,17 @@ use crate::cli_event_sink::CliAgentEventSink;
 use harnx_core::abort::AbortSignal;
 use harnx_render::RenderOptions;
 
+/// Return type from `install_cli_agent_event_sink` containing:
+/// - A ticker callback for "still running" notices (invoked from `oneshot_nats::run_turn`)
+/// - A clear callback for cleanup on exit (invoked from all `run_turn` exit paths)
+pub struct CliSinkHandles {
+    /// Tick callback for tool timer notices. Called every ~1s.
+    /// Prints "still running" notices directly under lock to avoid race conditions.
+    pub tool_timer_tick: Arc<dyn Fn() + Send + Sync>,
+    /// Clear all in-flight tool timer state.
+    pub clear_tool_timers: Arc<dyn Fn() + Send + Sync>,
+}
+
 /// Install the stderr-backed `CliAgentEventSink`. Used by the CLI
 /// (`Cmd`) working mode at process startup. Takes a `highlight` flag
 /// and `RenderOptions` snapshot so the sink can render streaming
@@ -30,20 +41,33 @@ use harnx_render::RenderOptions;
 /// markdown rendering + raw-mode cursor manipulation on terminals).
 /// The `abort_signal` is used to forward Ctrl-C / Ctrl-D key events
 /// captured during crossterm raw mode back to the running command.
+///
+/// Returns `CliSinkHandles` with callbacks for tool timer updates and cleanup.
 pub fn install_cli_agent_event_sink(
     highlight: bool,
     render_options: RenderOptions,
     abort_signal: AbortSignal,
     final_only: bool,
-) {
+) -> CliSinkHandles {
     let sink = if final_only {
         CliAgentEventSink::new_with_final_only(highlight, render_options, abort_signal)
     } else {
         CliAgentEventSink::new(highlight, render_options, abort_signal)
+    };
+    let handles = CliSinkHandles {
+        tool_timer_tick: Arc::new({
+            let sink = sink.clone();
+            move || sink.tool_timer_tick()
+        }),
+        clear_tool_timers: Arc::new({
+            let sink = sink.clone();
+            move || sink.clear_tool_timers()
+        }),
     };
     install_agent_event_sink(Arc::new(sink));
     debug_assert!(
         has_agent_event_sink(),
         "CLI AgentEventSink must be installed after startup call"
     );
+    handles
 }

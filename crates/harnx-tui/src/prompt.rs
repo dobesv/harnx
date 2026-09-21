@@ -375,6 +375,7 @@ impl Tui {
     }
 
     pub(super) async fn complete_main_prompt(&mut self) {
+        self.freeze_main_unfinished_tool_timers();
         self.current_prompt_abort = None;
         self.app.llm_busy = false;
         self.active_remote_session = None;
@@ -389,6 +390,23 @@ impl Tui {
                     .transcript
                     .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
                 self.pin_transcript_to_bottom();
+            }
+        }
+    }
+
+    /// Freeze any running tool timers on the main transcript that lack a final elapsed value.
+    /// Called when the main session's turn ends or is interrupted.
+    fn freeze_main_unfinished_tool_timers(&mut self) {
+        for item in self.app.transcript.iter_mut() {
+            if let TranscriptItem::ToolCall {
+                start_anchor,
+                ref mut final_elapsed_ms,
+                ..
+            } = item
+            {
+                if final_elapsed_ms.is_none() {
+                    *final_elapsed_ms = Some(start_anchor.elapsed().as_millis() as u64);
+                }
             }
         }
     }

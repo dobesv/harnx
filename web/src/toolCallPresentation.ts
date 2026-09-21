@@ -91,7 +91,7 @@ export function extractResultContent(result: any): ResultExtraction {
   return { text: String(result), isStructuredObject: false, structuredData: { result } };
 }
 
-function classifyToolCallStatus(status: ToolCallStatusInput): ToolCallStatusFlags {
+export function classifyToolCallStatus(status: ToolCallStatusInput): ToolCallStatusFlags {
   const type = status?.type;
   const reason = status?.reason;
   const isActionRequired = type === 'requires-action' && reason === 'interrupt';
@@ -133,4 +133,19 @@ export function getToolCallPresentation(
     borderColor: toolCallBorderColor(status, flags, isError),
     defaultExpanded: flags.isActionRequired || isSubAgent,
   };
+}
+
+/**
+ * Minimum elapsed time (in milliseconds) before showing a tool-call timer.
+ * Timer hides for durations below this threshold, then shows final value on completion.
+ */
+export const TOOL_TIMER_MIN_ELAPSED_MS = 5000;
+
+/**
+ * Format elapsed milliseconds as `{seconds}s` for display.
+ * Used by tool-call timers and sub-agent session elapsed displays.
+ */
+export function formatElapsedMs(valueMs: number): string {
+  const seconds = Math.floor(valueMs / 1000);
+  return `${seconds}s`;
 }

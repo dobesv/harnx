@@ -1,5 +1,6 @@
 import { cancel, sessionControl } from './api';
 import { isAbortError } from './httpClient';
+import { formatElapsedMs } from './toolCallPresentation';
 import { useEffect, useRef, useState } from 'react';
 import { LinkButton } from './LinkButton';
 import { OpenInNewIcon } from './icons';
@@ -29,10 +30,7 @@ function elapsedMs(note: SubAgentNote, nowMs: number) {
     : note.elapsedMs + Math.max(0, nowMs - note.updatedAtMs);
 }
 
-function formatElapsed(value: number) {
-  const seconds = Math.floor(value / 1000);
-  return `${seconds}s`;
-}
+// Use shared formatElapsedMs from toolCallPresentation
 
 function formatTokens(value: number) {
   return value.toLocaleString();
@@ -157,7 +155,7 @@ export function SubAgentRow({ note, nowMs, onOpen }: { note: SubAgentNote; nowMs
                   </span>
                 ) : null}
                 <span className="aui-sub-agent-metrics">
-                  <span>{formatElapsed(displayedElapsedMs)}</span>
+                  <span>{formatElapsedMs(displayedElapsedMs)}</span>
                   <span>in {formatTokens(note.inputTokens)}</span>
                   <span>out {formatTokens(note.outputTokens)}</span>
                   <span>cache {formatTokens(note.cachedTokens)}</span>

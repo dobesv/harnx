@@ -42,6 +42,7 @@ pub(super) fn apply_child_event(
     match event {
         AgentEvent::Turn(TurnEvent::Started) => start_child_turn(state),
         AgentEvent::Turn(TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. }) => {
+            freeze_unfinished_tool_timers(state);
             finish_child_turn(state)
         }
         AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
@@ -58,6 +59,7 @@ pub(super) fn apply_child_event(
         }
         AgentEvent::Model(ModelEvent::Error(error)) => fail_child(state, error),
         AgentEvent::Tool(ToolEvent::Started {
+            id,
             name,
             markdown,
             input,
@@ -69,21 +71,104 @@ pub(super) fn apply_child_event(
                 body: tool_call_body(markdown.as_deref(), &input),
                 seq: None,
                 timestamp: Some(chrono::Utc::now()),
+                id: Some(id),
+                start_anchor: std::time::Instant::now(),
+                final_elapsed_ms: None,
                 rendered_cache: None,
             });
             None
         }
         AgentEvent::Tool(ToolEvent::Completed {
-            output, markdown, ..
+            id,
+            output,
+            markdown,
+            ..
         }) => {
+            // Capture elapsed for the matching running ToolCall by ID.
+            // If no matching ID is found, fall back to the most recent running tool.
+            let transcript = &mut state.transcript;
+            let matched_idx = transcript.iter_mut().rev().position(|item| {
+                matches!(
+                    item,
+                    TranscriptItem::ToolCall {
+                        final_elapsed_ms: None,
+                        id: Some(ref i),
+                        ..
+                    } if i == &id
+                )
+            });
+            let fallback_idx = if matched_idx.is_none() {
+                transcript.iter_mut().rev().position(|item| {
+                    matches!(
+                        item,
+                        TranscriptItem::ToolCall {
+                            final_elapsed_ms: None,
+                            ..
+                        }
+                    )
+                })
+            } else {
+                None
+            };
+            if let Some(idx) = matched_idx.or(fallback_idx) {
+                let actual_idx = transcript.len().saturating_sub(1).saturating_sub(idx);
+                if let TranscriptItem::ToolCall {
+                    start_anchor,
+                    final_elapsed_ms,
+                    ..
+                } = &mut transcript[actual_idx]
+                {
+                    *final_elapsed_ms = Some(start_anchor.elapsed().as_millis() as u64);
+                }
+            }
             state.transcript.extend(tool_completed_to_transcript_items(
                 &output,
                 markdown.as_deref(),
             ));
             None
         }
-        AgentEvent::Tool(ToolEvent::Failed { error, .. })
-        | AgentEvent::Notice(NoticeEvent::Error(error)) => {
+        AgentEvent::Tool(ToolEvent::Failed { id, error }) => {
+            // Capture elapsed for the matching running ToolCall by ID.
+            // If no matching ID is found, fall back to the most recent running tool.
+            let transcript = &mut state.transcript;
+            let matched_idx = transcript.iter_mut().rev().position(|item| {
+                matches!(
+                    item,
+                    TranscriptItem::ToolCall {
+                        final_elapsed_ms: None,
+                        id: Some(ref i),
+                        ..
+                    } if i == &id
+                )
+            });
+            let fallback_idx = if matched_idx.is_none() {
+                transcript.iter_mut().rev().position(|item| {
+                    matches!(
+                        item,
+                        TranscriptItem::ToolCall {
+                            final_elapsed_ms: None,
+                            ..
+                        }
+                    )
+                })
+            } else {
+                None
+            };
+            if let Some(idx) = matched_idx.or(fallback_idx) {
+                let actual_idx = transcript.len().saturating_sub(1).saturating_sub(idx);
+                if let TranscriptItem::ToolCall {
+                    start_anchor,
+                    final_elapsed_ms,
+                    ..
+                } = &mut transcript[actual_idx]
+                {
+                    *final_elapsed_ms = Some(start_anchor.elapsed().as_millis() as u64);
+                }
+            }
+            state.transcript.push(TranscriptItem::ErrorText(error));
+            None
+        }
+        AgentEvent::Notice(NoticeEvent::Error(error)) => {
             state.transcript.push(TranscriptItem::ErrorText(error));
             None
         }
@@ -184,4 +269,21 @@ fn fail_child(state: &mut MonitoredSessionState, error: String) -> Option<SubAge
     state.status = SubAgentStatus::Failed;
     state.streaming_open = false;
     Some(SubAgentStatus::Failed)
+}
+
+/// Freeze any running tool timers that lack a final elapsed value.
+/// Called when a turn ends or is interrupted to stop timers from ticking.
+pub(super) fn freeze_unfinished_tool_timers(state: &mut MonitoredSessionState) {
+    for item in state.transcript.iter_mut() {
+        if let TranscriptItem::ToolCall {
+            start_anchor,
+            ref mut final_elapsed_ms,
+            ..
+        } = item
+        {
+            if final_elapsed_ms.is_none() {
+                *final_elapsed_ms = Some(start_anchor.elapsed().as_millis() as u64);
+            }
+        }
+    }
 }

@@ -207,6 +207,7 @@ similar = "3"
 jaq-core = "3.0.0"
 jaq-std = "3.0.0"
 jaq-json = "2.0.0"
+scopeguard = "1"
 
 [patch.crates-io]
 ratatui_widget_scrolling = { path = "crates/ratatui-widget-scrolling" }

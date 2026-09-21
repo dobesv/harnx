@@ -6039,6 +6039,9 @@ async fn tool_call_display_format() {
         )),
         seq: None,
         timestamp: None,
+        id: None,
+        start_anchor: std::time::Instant::now(),
+        final_elapsed_ms: Some(0),
         rendered_cache: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
@@ -6048,6 +6051,9 @@ async fn tool_call_display_format() {
         )),
         seq: None,
         timestamp: None,
+        id: None,
+        start_anchor: std::time::Instant::now(),
+        final_elapsed_ms: Some(0),
         rendered_cache: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
@@ -6055,6 +6061,9 @@ async fn tool_call_display_format() {
         body: None,
         seq: None,
         timestamp: None,
+        id: None,
+        start_anchor: std::time::Instant::now(),
+        final_elapsed_ms: Some(0),
         rendered_cache: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
@@ -6064,6 +6073,9 @@ async fn tool_call_display_format() {
         )),
         seq: None,
         timestamp: None,
+        id: None,
+        start_anchor: std::time::Instant::now(),
+        final_elapsed_ms: Some(0),
         rendered_cache: None,
     });
     harness.render();
@@ -6081,6 +6093,9 @@ fn render_tool_call_markdown_body_suppresses_header() {
             )),
             seq: None,
             timestamp: None,
+            id: None,
+            start_anchor: std::time::Instant::now(),
+            final_elapsed_ms: Some(0),
             rendered_cache: None,
         },
         false,
@@ -6101,6 +6116,9 @@ fn render_tool_call_yaml_body_keeps_header() {
             body: Some(ToolCallBody::Yaml("path: /tmp/foo.txt\n".to_string())),
             seq: None,
             timestamp: None,
+            id: None,
+            start_anchor: std::time::Instant::now(),
+            final_elapsed_ms: Some(0),
             rendered_cache: None,
         },
         false,
@@ -6123,6 +6141,9 @@ fn render_tool_call_meta_line_precedes_markdown_body() {
             body: Some(ToolCallBody::Markdown("write hello.txt".to_string())),
             seq: Some(3),
             timestamp: Some(timestamp),
+            id: None,
+            start_anchor: std::time::Instant::now(),
+            final_elapsed_ms: Some(0),
             rendered_cache: None,
         },
         true,
@@ -6146,6 +6167,9 @@ async fn tool_call_with_seq_number() {
         body: Some(ToolCallBody::Yaml("path: /tmp/foo.txt\n".to_string())),
         seq: Some(7),
         timestamp: None,
+        id: None,
+        start_anchor: std::time::Instant::now(),
+        final_elapsed_ms: Some(0),
         rendered_cache: None,
     });
     harness.render();
@@ -6604,6 +6628,9 @@ async fn test_d4_key_i_copies_tool_call() {
         body: Some(crate::types::ToolCallBody::Yaml("query: rust".to_string())),
         seq: Some(9),
         timestamp: None,
+        id: None,
+        start_anchor: std::time::Instant::now(),
+        final_elapsed_ms: Some(0),
         rendered_cache: None,
     });
     harness.tui().app.transcript_focus = Some(0);
@@ -9691,4 +9718,710 @@ async fn session_picker_toggle_unread_preserves_origin_and_tracks_selection() {
         *new_selected, expected_selected,
         "selected must track session-a's new position, not reuse stale index"
     );
+}
+
+// =============================================================================
+// Tool call timer tests
+// =============================================================================
+
+fn make_running_tool_call(tool_name: &str, elapsed_ms: u64) -> TranscriptItem {
+    use std::time::{Duration, Instant};
+    TranscriptItem::ToolCall {
+        tool_name: tool_name.to_string(),
+        body: Some(ToolCallBody::Markdown("test input".to_string())),
+        seq: None,
+        timestamp: None,
+        id: None,
+        start_anchor: Instant::now()
+            .checked_sub(Duration::from_millis(elapsed_ms))
+            .expect("elapsed should be valid"),
+        final_elapsed_ms: None,
+        rendered_cache: None,
+    }
+}
+
+#[allow(dead_code)]
+fn make_running_tool_call_with_id(tool_name: &str, elapsed_ms: u64, id: &str) -> TranscriptItem {
+    use std::time::{Duration, Instant};
+    TranscriptItem::ToolCall {
+        tool_name: tool_name.to_string(),
+        body: Some(ToolCallBody::Markdown("test input".to_string())),
+        seq: None,
+        timestamp: None,
+        id: Some(id.to_string()),
+        start_anchor: Instant::now()
+            .checked_sub(Duration::from_millis(elapsed_ms))
+            .expect("elapsed should be valid"),
+        final_elapsed_ms: None,
+        rendered_cache: None,
+    }
+}
+
+fn make_completed_tool_call(tool_name: &str, final_elapsed_ms: u64) -> TranscriptItem {
+    use std::time::Instant;
+    TranscriptItem::ToolCall {
+        tool_name: tool_name.to_string(),
+        body: Some(ToolCallBody::Markdown("test input".to_string())),
+        seq: None,
+        timestamp: None,
+        id: None,
+        start_anchor: Instant::now(),
+        final_elapsed_ms: Some(final_elapsed_ms),
+        rendered_cache: None,
+    }
+}
+
+#[test]
+fn tool_call_timer_hidden_when_under_5_seconds_running() {
+    // Running tool with 4s elapsed should not show timer
+    let item = make_running_tool_call("read_file", 4_000);
+    let lines = render_entry_lines(&item, false, false, false);
+    let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
+    // Timer suffix "(4s)" should NOT appear
+    assert!(
+        !plain.iter().any(|l| l.contains("(4s)")),
+        "timer should not show for running tool under 5s: {:?}",
+        plain
+    );
+}
+
+#[test]
+fn tool_call_timer_shown_when_5_seconds_or_more_running() {
+    // Running tool with exactly 5s elapsed should show timer
+    let item = make_running_tool_call("read_file", 5_000);
+    let lines = render_entry_lines(&item, false, false, false);
+    let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
+    // Timer suffix "(5s)" should appear
+    assert!(
+        plain.iter().any(|l| l.contains("(5s)")),
+        "timer should show for running tool at 5s: {:?}",
+        plain
+    );
+}
+
+#[test]
+fn tool_call_timer_shown_when_12_seconds_running() {
+    // Running tool with 12s elapsed should show timer
+    let item = make_running_tool_call("bash_exec", 12_000);
+    let lines = render_entry_lines(&item, false, false, false);
+    let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
+    assert!(
+        plain.iter().any(|l| l.contains("(12s)")),
+        "timer should show for running tool at 12s: {:?}",
+        plain
+    );
+}
+
+#[test]
+fn tool_call_timer_suppressed_for_subagent_launcher_tools() {
+    // session_prompt is a launcher tool, should never show timer
+    let item = make_running_tool_call("session_prompt", 10_000);
+    let lines = render_entry_lines(&item, false, false, false);
+    let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
+    assert!(
+        !plain.iter().any(|l| l.contains("(10s)")),
+        "timer should not show for session_prompt launcher: {:?}",
+        plain
+    );
+
+    // session_new is also a launcher
+    let item = make_running_tool_call("session_new", 10_000);
+    let lines = render_entry_lines(&item, false, false, false);
+    let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
+    assert!(
+        !plain.iter().any(|l| l.contains("(10s)")),
+        "timer should not show for session_new launcher: {:?}",
+        plain
+    );
+
+    // Prefixed form also suppressed
+    let item = make_running_tool_call("oracle_session_prompt", 10_000);
+    let lines = render_entry_lines(&item, false, false, false);
+    let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
+    assert!(
+        !plain.iter().any(|l| l.contains("(10s)")),
+        "timer should not show for oracle_session_prompt launcher: {:?}",
+        plain
+    );
+}
+
+#[test]
+fn tool_call_timer_hidden_when_completed_under_5_seconds() {
+    // Completed tool that ran 3s should not show timer
+    let item = make_completed_tool_call("read_file", 3_000);
+    let lines = render_entry_lines(&item, false, false, false);
+    let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
+    assert!(
+        !plain.iter().any(|l| l.contains("(3s)")),
+        "timer should not show for completed tool under 5s: {:?}",
+        plain
+    );
+}
+
+#[test]
+fn tool_call_timer_frozen_when_completed_over_5_seconds() {
+    // Completed tool that ran 10s should show frozen timer
+    let item = make_completed_tool_call("bash_exec", 10_000);
+    let lines = render_entry_lines(&item, false, false, false);
+    let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
+    assert!(
+        plain.iter().any(|l| l.contains("(10s)")),
+        "timer should show frozen for completed tool 10s: {:?}",
+        plain
+    );
+}
+
+#[test]
+fn tool_call_timer_suppressed_for_completed_launcher_tools() {
+    // Completed launcher tool should not show timer even if >5s
+    let item = make_completed_tool_call("session_prompt", 20_000);
+    let lines = render_entry_lines(&item, false, false, false);
+    let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
+    assert!(
+        !plain.iter().any(|l| l.contains("(20s)")),
+        "timer should not show for completed session_prompt even at 20s: {:?}",
+        plain
+    );
+}
+
+// =============================================================================
+// Event handling tests for tool call timer
+// =============================================================================
+
+#[tokio::test]
+async fn tool_call_timer_completion_correlates_by_id() {
+    use harnx_core::event::{AgentEvent, ToolEvent, ToolKind};
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let mut harness = TuiTestHarness::new().await;
+
+    // Emit two tool calls with different IDs
+    let event1 = AgentEvent::Tool(ToolEvent::Started {
+        id: "tool-1".to_string(),
+        name: "read_file".to_string(),
+        kind: ToolKind::Read,
+        markdown: None,
+        input: serde_json::json!({"path": "/a"}),
+        locations: vec![],
+    });
+    harness.tui().render_agent_event(event1).await;
+
+    // Wait a bit so the tools have different elapsed times
+    sleep(Duration::from_millis(100)).await;
+
+    let event2 = AgentEvent::Tool(ToolEvent::Started {
+        id: "tool-2".to_string(),
+        name: "write_file".to_string(),
+        kind: ToolKind::Edit,
+        markdown: None,
+        input: serde_json::json!({"path": "/b"}),
+        locations: vec![],
+    });
+    harness.tui().render_agent_event(event2).await;
+
+    // Complete tool-2 first (out of order)
+    sleep(Duration::from_millis(100)).await;
+    let complete2 = AgentEvent::Tool(ToolEvent::Completed {
+        id: "tool-2".to_string(),
+        output: serde_json::json!({"status": "ok"}),
+        markdown: None,
+    });
+    harness.tui().render_agent_event(complete2).await;
+
+    // Verify tool-2 is completed (final_elapsed_ms is set)
+    let tool_2 = harness.tui().app.transcript.iter().find(|item| {
+        matches!(
+            item,
+            TranscriptItem::ToolCall {
+                id: Some(ref i),
+                ..
+            } if i == "tool-2"
+        )
+    });
+    assert!(
+        matches!(
+            tool_2,
+            Some(TranscriptItem::ToolCall {
+                final_elapsed_ms: Some(_),
+                ..
+            })
+        ),
+        "tool-2 should be completed with final_elapsed_ms set"
+    );
+
+    // Verify tool-1 is still running (final_elapsed_ms is None)
+    let tool_1 = harness.tui().app.transcript.iter().find(|item| {
+        matches!(
+            item,
+            TranscriptItem::ToolCall {
+                id: Some(ref i),
+                ..
+            } if i == "tool-1"
+        )
+    });
+    assert!(
+        matches!(
+            tool_1,
+            Some(TranscriptItem::ToolCall {
+                final_elapsed_ms: None,
+                ..
+            })
+        ),
+        "tool-1 should still be running (final_elapsed_ms = None)"
+    );
+
+    // Complete tool-1
+    let complete1 = AgentEvent::Tool(ToolEvent::Completed {
+        id: "tool-1".to_string(),
+        output: serde_json::json!({"status": "ok"}),
+        markdown: None,
+    });
+    harness.tui().render_agent_event(complete1).await;
+
+    // Verify tool-1 is now completed
+    let tool_1 = harness.tui().app.transcript.iter().find(|item| {
+        matches!(
+            item,
+            TranscriptItem::ToolCall {
+                id: Some(ref i),
+                ..
+            } if i == "tool-1"
+        )
+    });
+    assert!(
+        matches!(
+            tool_1,
+            Some(TranscriptItem::ToolCall {
+                final_elapsed_ms: Some(_),
+                ..
+            })
+        ),
+        "tool-1 should be completed after ToolEvent::Completed"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_timer_failed_stops_timer() {
+    use harnx_core::event::{AgentEvent, ToolEvent, ToolKind};
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let mut harness = TuiTestHarness::new().await;
+
+    // Emit tool call
+    let event = AgentEvent::Tool(ToolEvent::Started {
+        id: "failing-tool".to_string(),
+        name: "bash_exec".to_string(),
+        kind: ToolKind::Execute,
+        markdown: None,
+        input: serde_json::json!({"command": "false"}),
+        locations: vec![],
+    });
+    harness.tui().render_agent_event(event).await;
+
+    // Verify tool is running
+    let tool = harness.tui().app.transcript.iter().find(|item| {
+        matches!(
+            item,
+            TranscriptItem::ToolCall {
+                id: Some(ref i),
+                ..
+            } if i == "failing-tool"
+        )
+    });
+    assert!(
+        matches!(
+            tool,
+            Some(TranscriptItem::ToolCall {
+                final_elapsed_ms: None,
+                ..
+            })
+        ),
+        "tool should initially be running"
+    );
+
+    // Tool fails
+    sleep(Duration::from_millis(50)).await;
+    let fail_event = AgentEvent::Tool(ToolEvent::Failed {
+        id: "failing-tool".to_string(),
+        error: "command failed".to_string(),
+    });
+    harness.tui().render_agent_event(fail_event).await;
+
+    // Verify tool is completed (timer stopped)
+    let tool = harness.tui().app.transcript.iter().find(|item| {
+        matches!(
+            item,
+            TranscriptItem::ToolCall {
+                id: Some(ref i),
+                ..
+            } if i == "failing-tool"
+        )
+    });
+    assert!(
+        matches!(
+            tool,
+            Some(TranscriptItem::ToolCall {
+                final_elapsed_ms: Some(_),
+                ..
+            })
+        ),
+        "tool should be completed (timer stopped) after ToolEvent::Failed"
+    );
+}
+
+// -------------------------------------------------------------------------
+// Tests for subagent transcript tool timer handling (apply_child_event)
+// -------------------------------------------------------------------------
+
+#[cfg(test)]
+mod subagent_tool_timer_tests {
+    use super::*;
+    use crate::subagent_transcript::apply_child_event;
+    use crate::types::{MonitoredSessionState, SubAgentStatus};
+    use harnx_core::event::{AgentEvent, ToolKind, TurnEvent};
+    use std::time::Duration;
+
+    fn make_child_session_state() -> MonitoredSessionState {
+        MonitoredSessionState::new(SubAgentStatus::Running)
+    }
+
+    #[test]
+    fn child_tool_started_creates_call_with_start_anchor() {
+        let mut state = make_child_session_state();
+        let event = AgentEvent::Tool(ToolEvent::Started {
+            id: "tool-1".into(),
+            name: "bash_exec".into(),
+            kind: ToolKind::Execute,
+            markdown: None,
+            input: serde_json::json!({"command": "echo test"}),
+            locations: vec![],
+        });
+
+        apply_child_event(&mut state, event);
+
+        assert_eq!(state.transcript.len(), 1);
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                id,
+                tool_name,
+                final_elapsed_ms,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("tool-1"));
+                assert_eq!(tool_name, "bash_exec");
+                assert!(final_elapsed_ms.is_none());
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn child_tool_completed_matches_by_id_records_elapsed() {
+        let mut state = make_child_session_state();
+
+        // Start a tool
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "tool-2".into(),
+                name: "read_file".into(),
+                kind: ToolKind::Read,
+                markdown: None,
+                input: serde_json::json!({"path": "/tmp/test"}),
+                locations: vec![],
+            }),
+        );
+
+        // Simulate passage of time
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Complete the tool
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Completed {
+                id: "tool-2".into(),
+                output: serde_json::json!({"content": "data"}),
+                markdown: None,
+            }),
+        );
+
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                final_elapsed_ms, ..
+            } => {
+                assert!(final_elapsed_ms.is_some());
+                assert!(*final_elapsed_ms.as_ref().unwrap() >= 50);
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn child_tool_failed_matches_by_id_records_elapsed() {
+        let mut state = make_child_session_state();
+
+        // Start a tool
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "tool-3".into(),
+                name: "bash_exec".into(),
+                kind: ToolKind::Execute,
+                markdown: None,
+                input: serde_json::json!({"command": "false"}),
+                locations: vec![],
+            }),
+        );
+
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Tool fails
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Failed {
+                id: "tool-3".into(),
+                error: "command failed".into(),
+            }),
+        );
+
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                final_elapsed_ms, ..
+            } => {
+                assert!(final_elapsed_ms.is_some());
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn child_tool_completed_fallback_matches_latest_running() {
+        let mut state = make_child_session_state();
+
+        // Start a tool without ID matching
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "tool-4".into(),
+                name: "grep".into(),
+                kind: ToolKind::Other,
+                markdown: None,
+                input: serde_json::json!({"pattern": "test"}),
+                locations: vec![],
+            }),
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Complete with a different ID (fallback should match)
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Completed {
+                id: "unknown-id".into(),
+                output: serde_json::json!({"matches": []}),
+                markdown: None,
+            }),
+        );
+
+        // The first tool should have been completed anyway
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                final_elapsed_ms, ..
+            } => {
+                assert!(final_elapsed_ms.is_some());
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn child_tool_out_of_order_completion_correlates_by_id() {
+        let mut state = make_child_session_state();
+
+        // Start two tools concurrently
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "tool-a".into(),
+                name: "read_file".into(),
+                kind: ToolKind::Read,
+                markdown: None,
+                input: serde_json::json!({"path": "/a"}),
+                locations: vec![],
+            }),
+        );
+
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "tool-b".into(),
+                name: "read_file".into(),
+                kind: ToolKind::Read,
+                markdown: None,
+                input: serde_json::json!({"path": "/b"}),
+                locations: vec![],
+            }),
+        );
+
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Complete tool-b first (out of order)
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Completed {
+                id: "tool-b".into(),
+                output: serde_json::json!({"content": "b"}),
+                markdown: None,
+            }),
+        );
+
+        // tool-b should be completed, tool-a should still be running
+        let tool_a = state.transcript.iter().find(|item| {
+            matches!(item, TranscriptItem::ToolCall { id: Some(ref i), .. } if i == "tool-a")
+        });
+        let tool_b = state.transcript.iter().find(|item| {
+            matches!(item, TranscriptItem::ToolCall { id: Some(ref i), .. } if i == "tool-b")
+        });
+
+        match (tool_a, tool_b) {
+            (
+                Some(TranscriptItem::ToolCall {
+                    final_elapsed_ms: None,
+                    ..
+                }),
+                Some(TranscriptItem::ToolCall {
+                    final_elapsed_ms: Some(_),
+                    ..
+                }),
+            ) => {}
+            _ => panic!("expected tool-a running and tool-b completed"),
+        }
+    }
+
+    #[test]
+    fn child_turn_ended_freezes_unfinished_tool_timers() {
+        let mut state = make_child_session_state();
+
+        // Start a tool
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "tool-running".into(),
+                name: "bash_exec".into(),
+                kind: ToolKind::Execute,
+                markdown: None,
+                input: serde_json::json!({"command": "sleep 60"}),
+                locations: vec![],
+            }),
+        );
+
+        std::thread::sleep(Duration::from_millis(40));
+
+        // Turn ends before tool completes
+        apply_child_event(
+            &mut state,
+            AgentEvent::Turn(TurnEvent::Ended {
+                outcome: Default::default(),
+            }),
+        );
+
+        // The running tool should now have a frozen elapsed time
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                final_elapsed_ms, ..
+            } => {
+                assert!(
+                    final_elapsed_ms.is_some(),
+                    "timer should be frozen after turn ended"
+                );
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn child_turn_interrupted_freezes_unfinished_tool_timers() {
+        let mut state = make_child_session_state();
+
+        // Start a tool
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "tool-interrupted".into(),
+                name: "bash_exec".into(),
+                kind: ToolKind::Execute,
+                markdown: None,
+                input: serde_json::json!({"command": "long-process"}),
+                locations: vec![],
+            }),
+        );
+
+        std::thread::sleep(Duration::from_millis(25));
+
+        // Turn is interrupted
+        apply_child_event(
+            &mut state,
+            AgentEvent::Turn(TurnEvent::Interrupted {
+                cancellation_id: "cancel-1".into(),
+            }),
+        );
+
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                final_elapsed_ms, ..
+            } => {
+                assert!(
+                    final_elapsed_ms.is_some(),
+                    "timer should be frozen after turn interrupted"
+                );
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+}
+
+// Tests for freeze_main_unfinished_tool_timers (prompt.rs)
+// ---------------------------------------------------------
+
+#[tokio::test]
+async fn freeze_main_unfinished_tool_timers_freezes_running_tools_on_turn_complete() {
+    use std::time::Instant;
+
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+
+    // Add a running tool call (no final_elapsed_ms)
+    tui.app.transcript.push(TranscriptItem::ToolCall {
+        id: Some("tool-running".into()),
+        tool_name: "bash_exec".into(),
+        body: Some(ToolCallBody::Yaml("command: echo test".to_string())),
+        seq: None,
+        timestamp: Some(chrono::Utc::now()),
+        start_anchor: Instant::now(),
+        final_elapsed_ms: None,
+        rendered_cache: None,
+    });
+
+    // Simulate turn completion by calling freeze_main_unfinished_tool_timers indirectly
+    // via complete_main_prompt (which calls it internally)
+    tui.complete_main_prompt().await;
+
+    // Verify the running tool now has a frozen final_elapsed_ms
+    let tool = tui.app.transcript.iter().find(|item| {
+        matches!(item, TranscriptItem::ToolCall { id: Some(ref i), .. } if i == "tool-running")
+    });
+
+    match tool {
+        Some(TranscriptItem::ToolCall {
+            final_elapsed_ms, ..
+        }) => {
+            assert!(
+                final_elapsed_ms.is_some(),
+                "running tool should have frozen final_elapsed_ms after turn completion"
+            );
+        }
+        _ => panic!("expected ToolCall with id 'tool-running', got: {:?}", tool),
+    }
 }
