@@ -1,6 +1,7 @@
 use crate::{ag_ui::AgUiError, session_actor::ResolvedAgentTarget};
 use harnx_core::{abort::create_abort_signal, agent_ref::AgentRef};
-use harnx_runtime::config::{AgentConfig, Config, GlobalConfig};
+use harnx_runtime::config::{AgentConfig, Config, GlobalConfig, NatsRouting};
+use std::borrow::Cow;
 
 pub(crate) fn is_safe_path_segment(value: &str) -> bool {
     !value.is_empty()
@@ -18,15 +19,25 @@ pub(crate) async fn resolve_agent_target(
     config: &Config,
     agent_ref: &str,
 ) -> Result<(ResolvedAgentTarget, GlobalConfig), AgUiError> {
-    validate_agent_reference(config, agent_ref)?;
+    let normalized = normalize_agent_reference(config, agent_ref);
+    validate_agent_reference(config, &normalized)?;
     let scoped = harnx_session::fork_prompt_config(config);
-    Config::use_agent(&scoped, agent_ref, None, create_abort_signal())
+    Config::use_agent(&scoped, &normalized, None, create_abort_signal())
         .await
         .map_err(|err| {
-            AgUiError::Internal(format!("failed to resolve agent '{agent_ref}': {err:#}"))
+            AgUiError::Internal(format!("failed to resolve agent '{normalized}': {err:#}"))
         })?;
-    let target = resolved_target(&scoped, agent_ref)?;
+    let target = resolved_target(&scoped, &normalized)?;
     Ok((target, scoped))
+}
+
+fn normalize_agent_reference<'a>(config: &Config, agent_ref: &'a str) -> Cow<'a, str> {
+    match (AgentRef::parse(agent_ref), &config.nats_routing) {
+        (AgentRef::Local(_), NatsRouting::Cluster(cluster)) => {
+            Cow::Owned(format!("{agent_ref}@{cluster}"))
+        }
+        _ => Cow::Borrowed(agent_ref),
+    }
 }
 
 fn resolved_target(

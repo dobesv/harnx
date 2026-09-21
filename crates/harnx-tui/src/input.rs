@@ -1898,7 +1898,7 @@ impl Tui {
         let (agent_name, session_id, format) =
             self.resolve_session_target_and_format(tokens, SessionInspectionCommand::Info)?;
         let cfg = self.config.read().clone();
-        let (agent, cluster) = harnx_runtime::config::resolve_session_agent(&agent_name)?;
+        let (agent, cluster) = cfg.resolve_session_agent(&agent_name)?;
         match format {
             SessionFormat::Text => {
                 let session =
@@ -2423,13 +2423,14 @@ impl Tui {
                 *selected,
             )
         };
-        let cluster = self
-            .config
-            .read()
-            .remote_agent
-            .as_ref()
-            .map(|(_, cluster)| cluster.clone())
-            .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
+        let cluster = {
+            let config = self.config.read();
+            config
+                .remote_agent
+                .as_ref()
+                .map(|(_, cluster)| cluster.clone())
+                .unwrap_or_else(|| config.default_cluster_key().to_string())
+        };
         let Some(store) = self.picker_session_metadata_store(&cluster).await else {
             return;
         };

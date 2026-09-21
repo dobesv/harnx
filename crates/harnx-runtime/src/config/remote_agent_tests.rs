@@ -200,3 +200,34 @@ fn agent_switches_drop_the_old_session_and_preserve_new_remote_identity() {
     config.use_session(Some("review-12345")).unwrap();
     assert_eq!(config.session.as_ref().unwrap().storage_key(), alpha_key);
 }
+
+#[tokio::test]
+async fn cluster_routing_activates_bare_agent_as_remote() {
+    harnx_core::require_nextest();
+    let config = Config {
+        nats_servers: vec![serde_yaml::from_str(
+            "name: remote\nurl: nats://127.0.0.1:65535\nagents:\n  - name: reviewer\n",
+        )
+        .unwrap()],
+        nats_routing: NatsRouting::Cluster("remote".to_string()),
+        ..Config::default()
+    };
+    let config = Arc::new(RwLock::new(config));
+
+    Config::use_agent(
+        &config,
+        "reviewer",
+        None,
+        crate::utils::create_abort_signal(),
+    )
+    .await
+    .unwrap();
+
+    let config = config.read();
+    assert_eq!(config.default_cluster_key(), "remote");
+    assert_eq!(
+        config.remote_agent.as_ref(),
+        Some(&("reviewer".to_string(), "remote".to_string()))
+    );
+    assert!(config.agent.is_none());
+}

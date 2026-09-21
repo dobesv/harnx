@@ -138,11 +138,26 @@ pub fn resolve_session_agent(agent_ref: &str) -> Result<(String, String)> {
         AgentRef::Remote { agent, cluster } => (agent, cluster),
     };
     anyhow::ensure!(
-        !agent.trim().is_empty() && agent != harnx_core::agent_config::TEMP_AGENT_NAME,
+        !agent.trim().is_empty()
+            && agent != harnx_core::agent_config::TEMP_AGENT_NAME
+            && agent != "__temp__",
         "an explicit named agent is required"
     );
     anyhow::ensure!(!cluster.trim().is_empty(), "cluster must not be empty");
     Ok((agent.into_owned(), cluster.into_owned()))
+}
+
+impl Config {
+    /// Resolve an explicit agent selector using this frontend's default route.
+    pub fn resolve_session_agent(&self, agent_ref: &str) -> Result<(String, String)> {
+        use harnx_core::agent_ref::AgentRef;
+        let (agent, cluster) = resolve_session_agent(agent_ref)?;
+        let cluster = match AgentRef::parse(agent_ref) {
+            AgentRef::Local(_) => self.default_cluster_key().to_string(),
+            AgentRef::Remote { .. } => cluster,
+        };
+        Ok((agent, cluster))
+    }
 }
 
 /// Read one explicitly named agent's metadata and return its broker context.
@@ -151,7 +166,7 @@ pub async fn session_metadata_for_agent(
     agent_ref: &str,
     session_id: &str,
 ) -> Result<(async_nats::jetstream::Context, SessionMetadata)> {
-    let (agent, cluster) = resolve_session_agent(agent_ref)?;
+    let (agent, cluster) = config.resolve_session_agent(agent_ref)?;
     let jetstream = config.nats_jetstream(&cluster).await?;
     let replicas = config
         .resolve_nats_server(&cluster)
@@ -168,14 +183,14 @@ pub async fn session_metadata_for_agent(
 
 /// Load a named session with its resolved model and transcript-derived token counts.
 /// Pass the result to [`super::session::render`] for the runtime metadata view.
-/// `None` selects the shared local NATS cluster. Inline agents are unsupported.
+/// `None` selects the config's default NATS cluster. Inline agents are unsupported.
 pub async fn load_session_for_render(
     config: &Config,
     cluster: Option<&str>,
     session_id: &str,
     expected_agent: &str,
 ) -> Result<Session> {
-    let cluster = cluster.unwrap_or(LOCAL_CLUSTER_KEY);
+    let cluster = cluster.unwrap_or_else(|| config.default_cluster_key());
     let jetstream = config.nats_jetstream(cluster).await?;
     let replicas = config
         .resolve_nats_server(cluster)
@@ -214,12 +229,63 @@ pub async fn load_session_for_render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::NatsRouting;
     use crate::nats_session_metadata::SessionInitializer;
     use harnx_core::message::{MessageContent, MessageRole};
     use harnx_core::session::ToolOutput;
     use harnx_core::tool::ToolCall;
     use serde::Deserialize;
     use serde_json::{json, Value};
+
+    #[test]
+    fn resolve_session_agent_uses_default_route_and_preserves_explicit_cluster() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.resolve_session_agent("assistant").unwrap(),
+            ("assistant".to_string(), LOCAL_CLUSTER_KEY.to_string())
+        );
+        assert_eq!(
+            default_config
+                .resolve_session_agent("assistant@prod")
+                .unwrap(),
+            ("assistant".to_string(), "prod".to_string())
+        );
+
+        let cluster_config = Config {
+            nats_routing: NatsRouting::Cluster("remote".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            cluster_config.resolve_session_agent("assistant").unwrap(),
+            ("assistant".to_string(), "remote".to_string())
+        );
+        assert_eq!(
+            cluster_config
+                .resolve_session_agent("assistant@prod")
+                .unwrap(),
+            ("assistant".to_string(), "prod".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_session_agent_rejects_invalid_agent_and_cluster() {
+        let config = Config {
+            nats_routing: NatsRouting::Cluster("remote".to_string()),
+            ..Config::default()
+        };
+        for agent_ref in [
+            "",
+            "__temp__",
+            harnx_core::agent_config::TEMP_AGENT_NAME,
+            "@prod",
+        ] {
+            assert!(
+                config.resolve_session_agent(agent_ref).is_err(),
+                "agent ref {agent_ref:?} must be rejected"
+            );
+        }
+        assert!(config.resolve_session_agent("assistant@").is_err());
+    }
 
     #[test]
     fn inspection_arguments_require_agent_and_validate_options() {

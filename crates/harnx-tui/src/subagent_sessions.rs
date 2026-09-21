@@ -156,12 +156,12 @@ impl Tui {
     }
 
     pub(super) fn current_session_cluster(&self) -> String {
-        self.config
-            .read()
+        let config = self.config.read();
+        config
             .remote_agent
             .as_ref()
             .map(|(_, cluster)| cluster.clone())
-            .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string())
+            .unwrap_or_else(|| config.default_cluster_key().to_string())
     }
 
     pub(super) fn handle_subagent_snapshot(

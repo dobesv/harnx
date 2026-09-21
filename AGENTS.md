@@ -580,6 +580,28 @@ turns one flake into several. `spawn_test_nats` returns `TestNatsServer`
 returns `NatsServerHandle` (`crates/harnx-runtime/tests/common/mod.rs`); both
 reap in `Drop`. Keep new broker helpers in that shape.
 
+### NATS routing role is per-binary, not derived from env
+
+`Config.nats_routing` (`NatsRouting::{Default,Cluster(name)}`) controls whether a
+process resolves the reserved `__local__` cluster locally or rejects it. The role
+MUST be set per-binary at bootstrap, never inside shared `Config::init`/
+`init_headless`:
+
+- **Front-ends** (`harnx` CLI, `harnx-serve`): call `apply_frontend_nats_routing()`
+  after `Config::init`, which reads `HARNX_NATS_SERVER` and sets the role to
+  `Cluster(name)` when present.
+- **Workers/tool servers**: `init_headless` without the call, keeping
+  `NatsRouting::Default` so their injected `HARNX_NATS_URL/TOKEN` handoff reaches
+  `resolve_nats_server(__local__)`.
+
+Deriving the role from `HARNX_NATS_SERVER` inside shared init would break
+workers: a worker must read its parent's injected `HARNX_NATS_URL/TOKEN`
+endpoint for `__local__`, but it can inherit an operator's `HARNX_NATS_SERVER`
+from the container environment. Because the worker never calls
+`apply_frontend_nats_routing()`, it stays `Default` regardless of that env var.
+The seam is `resolve_nats_server()` at `nats_split.rs:234`:
+`NatsRouting::Default` → reads env handoff; `NatsRouting::Cluster` → bails.
+
 ### NATS/GC tests: CI coverage and isolation
 
 CI runs integration tests against an isolated `nats-server` per test file via

@@ -498,6 +498,41 @@ agent combines both, e.g. `/v1/agents/coding%2Fcoder%40shared`. A remote agent
 runs its turns on a worker in the target cluster, and a server addressing only
 remote agents never starts a local broker or worker.
 
+### Running a front-end as a cluster client
+
+To connect a front-end (`harnx` CLI/TUI or `harnx-serve`) to an existing NATS
+cluster instead of self-hosting a local broker and worker, set `HARNX_NATS_SERVER`:
+
+```bash
+export HARNX_NATS_SERVER=remote
+```
+
+The front-end reads connection settings from `nats_servers/<name>.yaml` (in this
+example, `nats_servers/remote.yaml`) and runs as a pure client:
+
+- It does not start a local `nats-server`, worker, or tool/hook servers.
+- Bare agent names (for example, `assistant`) automatically route to that named
+  cluster as if addressed as `assistant@remote`.
+- Local (`__local__`) agents are unavailable. Addressing a local agent returns
+  an error directing you to use `<agent>@<cluster>` or unset `HARNX_NATS_SERVER`.
+- When `HARNX_NATS_SERVER` is unset (the default), the front-end self-hosts a
+  local broker and worker as before.
+
+Configuration files in `nats_servers/` support `${VAR}` environment variable
+expansion. You can pull transport credentials from the environment while
+keeping cluster topology in the file:
+
+`nats_servers/remote.yaml`:
+```yaml
+url: "${HARNX_NATS_URL}"
+token: "${HARNX_NATS_TOKEN}"
+```
+
+Note that `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` configure transport credentials
+for workers, standalone tool/hook servers, or `${VAR}` expansion in cluster configs.
+Setting them on a front-end does not join an external cluster on its own; use
+`HARNX_NATS_SERVER` with a corresponding `nats_servers/<name>.yaml` file.
+
 - **New Sessions**: Canonical metadata and activity are reserved before the
   first user row is appended. The worker creates a lease only when activated.
 - **Resuming Sessions**: Clients attach with an explicit agent and local session ID. Multiple clients can attach to the same session simultaneously (Multiplayer Mode).

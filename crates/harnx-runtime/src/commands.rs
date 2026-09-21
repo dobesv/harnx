@@ -921,7 +921,7 @@ async fn ask(
                     .as_ref()
                     .map(|agent| agent.name().to_string())
                     .unwrap_or_default(),
-                crate::config::LOCAL_CLUSTER_KEY.to_string(),
+                cfg.default_cluster_key().to_string(),
             )
         });
         let session_id = cfg.session.as_ref().map(|session| session.id().to_string());
@@ -1833,7 +1833,7 @@ async fn explicit_session_info(config: &GlobalConfig, args: &str) -> Result<Stri
     let snapshot = config.read().clone();
     match format {
         SessionFormat::Text => {
-            let (agent, cluster) = crate::config::resolve_session_agent(&agent)?;
+            let (agent, cluster) = snapshot.resolve_session_agent(&agent)?;
             let session =
                 crate::config::load_session_for_render(&snapshot, Some(&cluster), &session, &agent)
                     .await?;

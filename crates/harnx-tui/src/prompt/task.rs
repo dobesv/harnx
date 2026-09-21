@@ -32,7 +32,7 @@ impl Tui {
                         .as_ref()
                         .map(|agent| agent.name().to_string())
                         .unwrap_or_default(),
-                    harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+                    guard.default_cluster_key().to_string(),
                 )
             });
             let session_id = guard.session.as_ref().map(|session| session.storage_key());

@@ -319,7 +319,7 @@ async fn remote_nats_session(
                     .as_ref()
                     .map(|agent| agent.name().to_string())
                     .unwrap_or_default(),
-                super::LOCAL_CLUSTER_KEY.to_string(),
+                cfg.default_cluster_key().to_string(),
             )
         });
         let session_id = cfg

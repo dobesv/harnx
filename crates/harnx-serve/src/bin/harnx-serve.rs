@@ -70,11 +70,11 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
     harnx_metrics::init(&cli.metrics)?;
 
     let readiness = harnx_healthz::init(&cli.healthz).await?;
-    let config = Arc::new(RwLock::new(
-        Config::init_headless(WorkingMode::Serve, false)
-            .await
-            .context("Failed to init Config")?,
-    ));
+    let mut config = Config::init_headless(WorkingMode::Serve, false)
+        .await
+        .context("Failed to init Config")?;
+    config.apply_frontend_nats_routing();
+    let config = Arc::new(RwLock::new(config));
 
     if cli.dry_run {
         config.write().dry_run = true;

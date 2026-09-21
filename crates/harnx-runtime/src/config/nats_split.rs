@@ -14,6 +14,29 @@ static LOCAL_NATS_SERVER: OnceLock<
     tokio::sync::Mutex<Option<crate::nats_local_server::LocalBroker>>,
 > = OnceLock::new();
 
+/// Runtime role controlling the default NATS route for front-ends.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum NatsRouting {
+    /// Front-end self-hosts a local broker and worker for `__local__`.
+    #[default]
+    Default,
+    /// Front-end is a pure client of the named cluster; `__local__` is unavailable.
+    Cluster(String),
+}
+
+/// Resolve the front-end NATS routing role from [`HARNX_NATS_SERVER_ENV`].
+///
+/// This is intentionally separate from the `HARNX_NATS_URL`/`HARNX_NATS_TOKEN`
+/// handoff. Spawned workers and tool servers need that pair while retaining the
+/// default role so they can resolve the injected `__local__` connection.
+pub fn nats_routing_from_env() -> NatsRouting {
+    std::env::var(HARNX_NATS_SERVER_ENV)
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .map_or(NatsRouting::Default, NatsRouting::Cluster)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteAgentEntry {
     pub name: String,
@@ -180,6 +203,25 @@ impl Config {
             })
     }
 
+    /// Apply the front-end-only NATS routing role from the process environment.
+    pub fn apply_frontend_nats_routing(&mut self) {
+        self.nats_routing = nats_routing_from_env();
+        if let NatsRouting::Cluster(cluster) = &self.nats_routing {
+            log::info!(
+                "routing bare agents to NATS cluster '{}'; local agents disabled",
+                cluster
+            );
+        }
+    }
+
+    /// Cluster key used when an agent reference doesn't name one explicitly.
+    pub fn default_cluster_key(&self) -> &str {
+        match &self.nats_routing {
+            NatsRouting::Default => LOCAL_CLUSTER_KEY,
+            NatsRouting::Cluster(cluster) => cluster,
+        }
+    }
+
     /// Resolve one cluster's config, whether it's a reserved dynamic identity
     /// (`LOCAL_CLUSTER_KEY`) or a `nats_servers/<cluster_key>.yaml` entry.
     ///
@@ -191,8 +233,16 @@ impl Config {
     ) -> Result<Cow<'a, NatsServerConfig>> {
         if cluster_key == LOCAL_CLUSTER_KEY {
             // Reserved dynamic identity wins even if a file named
-            // nats_servers/__local__.yaml was loaded.
-            return Ok(Cow::Owned(resolve_local_nats_server_config().await?));
+            // nats_servers/__local__.yaml was loaded. Workers keep the default
+            // role so their injected HARNX_NATS_URL/TOKEN handoff reaches this path.
+            return match &self.nats_routing {
+                NatsRouting::Default => {
+                    Ok(Cow::Owned(resolve_local_nats_server_config().await?))
+                }
+                NatsRouting::Cluster(cluster) => bail!(
+                    "local agents are unavailable when {HARNX_NATS_SERVER_ENV} is set (cluster '{cluster}'); address an agent as <agent>@{cluster} or unset {HARNX_NATS_SERVER_ENV}"
+                ),
+            };
         }
         self.nats_server(cluster_key).map(Cow::Borrowed)
     }
@@ -284,6 +334,28 @@ mod tests {
         assert_eq!(actual, (LOCAL_CLUSTER_KEY, url, Some(token)));
     }
 
+    /// Assert a resolved server is a borrowed file-backed cluster entry with
+    /// the expected name/url/token. One tuple comparison plus the borrow check
+    /// keeps the call site to a single logical assertion. Takes the `Cow` by
+    /// value so it can check the borrow without a `&Cow` (clippy::ptr_arg).
+    fn assert_borrowed_named_server(
+        server: Cow<'_, NatsServerConfig>,
+        name: &str,
+        url: &str,
+        token: &str,
+    ) {
+        assert!(
+            matches!(server, Cow::Borrowed(_)),
+            "named cluster must borrow the loaded config, not own a dynamic one"
+        );
+        let actual = (
+            server.name.as_str(),
+            server.url.as_str(),
+            server.token.as_deref(),
+        );
+        assert_eq!(actual, (name, url, Some(token)));
+    }
+
     /// Assert an error message mentions each expected substring. Keeps the
     /// per-test assertion blocks small and states intent in one call.
     fn assert_error_mentions(error: &str, expected: &[&str]) {
@@ -293,6 +365,96 @@ mod tests {
                 "expected error to mention {needle:?}, got: {error}"
             );
         }
+    }
+
+    #[test]
+    fn routing_role_resolves_from_environment() {
+        harnx_core::require_nextest();
+        let _lock = env_lock();
+        let _unset = EnvGuard::remove(HARNX_NATS_SERVER_ENV);
+        assert_eq!(nats_routing_from_env(), NatsRouting::Default);
+
+        {
+            let _remote = EnvGuard::new(HARNX_NATS_SERVER_ENV, "  remote  ");
+            assert_eq!(
+                nats_routing_from_env(),
+                NatsRouting::Cluster("remote".to_string())
+            );
+        }
+
+        let _whitespace = EnvGuard::new(HARNX_NATS_SERVER_ENV, " \t ");
+        assert_eq!(nats_routing_from_env(), NatsRouting::Default);
+    }
+
+    #[test]
+    fn routing_role_selects_default_cluster_key() {
+        let default_config = Config::default();
+        assert_eq!(default_config.default_cluster_key(), LOCAL_CLUSTER_KEY);
+
+        let cluster_config = Config {
+            nats_routing: NatsRouting::Cluster("remote".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(cluster_config.default_cluster_key(), "remote");
+    }
+
+    #[tokio::test]
+    async fn local_cluster_resolution_obeys_routing_role() {
+        harnx_core::require_nextest();
+        let cluster_config = Config {
+            nats_routing: NatsRouting::Cluster("remote".to_string()),
+            ..Config::default()
+        };
+        let error = cluster_config
+            .resolve_nats_server(LOCAL_CLUSTER_KEY)
+            .await
+            .expect_err("cluster routing must disable the reserved local route");
+        assert_error_mentions(&error.to_string(), &["remote", "<agent>@remote"]);
+
+        let _lock = env_lock_async().await;
+        let _url = EnvGuard::new(HARNX_NATS_URL_ENV, "nats://127.0.0.1:4555");
+        let _token = EnvGuard::new(HARNX_NATS_TOKEN_ENV, "handoff-token");
+        let _replicas = EnvGuard::remove(HARNX_NATS_REPLICAS_ENV);
+        let default_config = Config::default();
+        let local = default_config
+            .resolve_nats_server(LOCAL_CLUSTER_KEY)
+            .await
+            .expect("default routing must retain dynamic local resolution");
+        assert_authenticated_local_server(&local, "nats://127.0.0.1:4555", "handoff-token");
+    }
+
+    #[tokio::test]
+    async fn named_cluster_resolution_is_unaffected_by_routing_role() {
+        harnx_core::require_nextest();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("other.yaml"),
+            "url: nats://other.example:4222\ntoken: other-token\n",
+        )
+        .unwrap();
+        let config = Config {
+            nats_servers: Config::load_nats_servers_from_dir(directory.path()).unwrap(),
+            nats_routing: NatsRouting::Cluster("remote".to_string()),
+            ..Config::default()
+        };
+
+        let server = config.resolve_nats_server("other").await.unwrap();
+
+        assert_borrowed_named_server(server, "other", "nats://other.example:4222", "other-token");
+    }
+
+    #[test]
+    fn clone_and_session_fork_inherit_routing_role() {
+        let config = Config {
+            nats_routing: NatsRouting::Cluster("remote".to_string()),
+            ..Config::default()
+        };
+
+        assert_eq!(config.clone().nats_routing, config.nats_routing);
+        assert_eq!(
+            config.fork_session_scope().nats_routing,
+            config.nats_routing
+        );
     }
 
     #[tokio::test]

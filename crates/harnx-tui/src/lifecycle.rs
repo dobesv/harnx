@@ -302,7 +302,7 @@ impl Tui {
                 .remote_agent
                 .as_ref()
                 .map(|(_, c)| c.clone())
-                .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
+                .unwrap_or_else(|| cfg.default_cluster_key().to_string());
             (storage_key, cluster)
         };
 
@@ -337,7 +337,7 @@ impl Tui {
                 .remote_agent
                 .as_ref()
                 .map(|(_, cluster)| cluster.clone())
-                .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
+                .unwrap_or_else(|| cfg.default_cluster_key().to_string());
             let agent_name = cfg
                 .remote_agent
                 .as_ref()
@@ -1217,7 +1217,7 @@ fn prepare_session_history(config: &GlobalConfig) -> Option<SessionHistoryContex
         cfg.agent.as_ref().map(|agent| {
             (
                 agent.name().to_string(),
-                harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+                cfg.default_cluster_key().to_string(),
             )
         })
     });
