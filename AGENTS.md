@@ -198,6 +198,38 @@ When attributing the bot's commits, its noreply address takes the bot *user*
 id (`gh api /users/<app-slug>[bot] --jq .id`), not the installation id the
 token action exposes.
 
+### What the weekly models.yaml refresh does and does not maintain
+
+`.github/workflows/update-models.yml` runs `scripts/update_models.py` against
+the LiteLLM registry every Monday. Know what it does not maintain before
+trusting a price or adding a model.
+
+A model the registry does not list is kept verbatim, never refreshed, and
+reported in the run summary as `provider <name>: preserving models not present
+in LiteLLM: ...`. That line is the only signal that an entry's price is frozen,
+so read it rather than skimming the diff. Fields in `HARNX_ONLY_FIELDS`, such
+as `patches` and `require_max_tokens`, describe harnx's own request handling,
+are never supplied upstream, and must stay in that list or a refresh resets
+them. Any new field of that kind belongs there too.
+
+LiteLLM records a capability only where it holds, so an omission is silence
+rather than a denial. `CURATED_CAPABILITY_FLAGS` lets a curated `true` survive
+a refresh that says nothing; a refresh can still switch one on. Without it,
+Llama 4 on Bedrock quietly loses `supports_vision` and starts refusing images.
+
+Vendor prefixes are deliberately not allowlisted. Screening Bedrock ids on
+shape instead is what keeps each vendor AWS adds from being dropped until
+someone edits the script.
+
+The registry is unreliable for Bedrock in particular, and its errors run in
+the dangerous direction — it put GLM 4.7 Flash's 4K output ceiling at 128K and
+MiniMax M2.5's 196K context at 1M, either of which has harnx ask for more than
+the model accepts. `BEDROCK_CARD_CORRECTIONS` pins such values against the AWS
+model card; add an entry with the card name in a comment, and delete it once
+upstream agrees. Verify a Bedrock model's limits against its card rather than
+trusting a refresh, and see issue #2025 for reconciling the catalog against
+`ListFoundationModels`.
+
 ## Key Patterns
 
 - **Error handling:** Use `anyhow::Result` / `anyhow::bail!` throughout.
@@ -237,6 +269,48 @@ never mutates stored history). Each builder calls
 
 When modifying provider client code: tag provenance at capture (streaming/non-streaming extraction), check compatibility before replay, and allocate correlation IDs for imported anonymous tool calls (Gemini doesn't return IDs; use `ToolCallIdAllocator` in each `build_body`). Do NOT add a shared pre-pass — each provider knows its own
 protocol and import-handling rules.
+
+#### Replayed reasoning across the two Bedrock clients
+
+Replaying the previous turn's reasoning is the default, and it is load-bearing:
+a model handed tool results with no record of its own thinking reads the calls
+as somebody else's and narrates a session boundary. That failure is why the
+echo exists, so do not strip reasoning wholesale, per provider or globally.
+
+Which Bedrock client you configure decides whether replay happens at all, and
+the two differ in more than wire format:
+
+- `type: bedrock` speaks Converse and signs with the AWS credential chain, so
+  it is the one that works with rotating credentials such as IRSA in
+  Kubernetes. It is the only path that replays reasoning.
+- `type: openai-compatible` against `bedrock-runtime.../openai/v1`
+  authenticates with a `BEDROCK_API_KEY` bearer token and cannot use the
+  credential chain. `openai.rs` discards the stored thought when building a
+  request, so nothing is replayed. Both shipped packages ship this variant.
+
+On the Converse path the replay is gated on having captured a signature, and
+that gate is what keeps a hostile model safe rather than any per-model
+setting. A model that returns `reasoningContent` without a signature leaves
+`thought_signature` empty, `compatible_signature` returns `None`, and the
+block is omitted. Kimi K3 behaves exactly that way, verified on 2026-09-20 by
+tracing `HARNX_LLM_TRACE`: across a two-turn tool-calling session with the
+suppression removed, harnx sent no `reasoningContent` at all.
+
+AWS's Kimi K3 card warns that Converse answers an `InternalServerException`
+when a multi-turn request carries earlier reasoning. That did not reproduce —
+replaying the block by hand through the Converse API was accepted with
+`stopReason: end_turn`. Treat the warning as unconfirmed for this
+configuration rather than disproven; it may need a signed block, a longer
+reasoning span or another region.
+
+A model that both emits a *signed* reasoning block and rejects the replay
+would defeat the signature gate and need real per-model suppression. None is
+known, so none is implemented — add it when a probe finds one, not before.
+
+Read a Bedrock model card's "Usage Considerations and Limitations" before
+adopting it, and probe a *two-turn tool-calling* exchange against the client
+type you actually deploy. A single-turn smoke test cannot reproduce this class
+of failure, and a probe on one client type says nothing about the other.
 
 
 ### Adding a Provider Client

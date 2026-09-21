@@ -14,6 +14,12 @@ from collections import OrderedDict
 # Import the module under test
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 import update_models as um
+from update_models_bedrock_tests import (
+    TestBedrockCardCorrections,
+    TestCuratedCapabilityFlags,
+    TestDropBedrockInRegionDuplicates,
+    TestIsValidBedrockModelName,
+)
 from update_models_variant_tests import (
     TestOpenAIEffortVariants,
     TestProviderModelRegeneration,
@@ -54,15 +60,25 @@ class TestProviderMapping(unittest.TestCase):
     def test_vertex_ai_maps_to_vertexai(self) -> None:
         self.assertEqual(um.LITELLM_TO_HARNX_PROVIDER["vertex_ai"], "vertexai")
 
-    def test_all_24_providers_present(self) -> None:
+    def test_all_25_providers_present(self) -> None:
         expected = {
             "openai", "anthropic", "google_ai", "vertex_ai", "bedrock",
-            "mistral", "cohere", "groq", "perplexity", "deepseek", "voyage",
-            "cloudflare", "openrouter", "ai21", "x_ai", "zhipu",
-            "alibaba_cloud", "baidu", "tencent", "minimax", "moonshot",
-            "deepinfra", "github", "jina_ai",
+            "bedrock_converse", "mistral", "cohere", "groq", "perplexity",
+            "deepseek", "voyage", "cloudflare", "openrouter", "ai21", "x_ai",
+            "zhipu", "alibaba_cloud", "baidu", "tencent", "minimax",
+            "moonshot", "deepinfra", "github", "jina_ai",
         }
         self.assertEqual(set(um.LITELLM_TO_HARNX_PROVIDER.keys()), expected)
+
+    def test_both_bedrock_tags_map_to_bedrock(self) -> None:
+        # LiteLLM tags most of the live Bedrock catalog `bedrock_converse`,
+        # so treating only `bedrock` as Bedrock loses nearly all of it.
+        self.assertEqual(um.LITELLM_TO_HARNX_PROVIDER["bedrock"], "bedrock")
+        self.assertEqual(um.LITELLM_TO_HARNX_PROVIDER["bedrock_converse"], "bedrock")
+
+    def test_bedrock_mantle_is_not_mapped(self) -> None:
+        # A separate endpoint the Bedrock client does not call.
+        self.assertNotIn("bedrock_mantle", um.LITELLM_TO_HARNX_PROVIDER)
 
 
 class TestOpusVersionDetection(unittest.TestCase):
@@ -289,25 +305,6 @@ class TestAdaptiveEffortVariants(unittest.TestCase):
         model = self._base("us.anthropic.claude-opus-4-8")
         um.apply_base_thinking(model, "bedrock")
         self.assertNotIn("patches", model)
-
-
-class TestIsValidBedrockModelName(unittest.TestCase):
-    def test_direct_open_weight_model_ids_accepted(self) -> None:
-        for name in ("zai.glm-5", "zai.glm-4.7-flash", "minimax.minimax-m2.5"):
-            with self.subTest(name=name):
-                self.assertTrue(um.is_valid_bedrock_model_name(name))
-
-    def test_canonical_us_format_accepted(self) -> None:
-        self.assertTrue(um.is_valid_bedrock_model_name("us.anthropic.claude-opus-4-7"))
-
-    def test_region_prefixed_rejected(self) -> None:
-        self.assertFalse(um.is_valid_bedrock_model_name("ap-northeast-1/anthropic.claude-v2"))
-
-    def test_slash_in_name_rejected(self) -> None:
-        self.assertFalse(um.is_valid_bedrock_model_name("us.anthropic/claude-opus-4-7"))
-
-    def test_non_us_rejected(self) -> None:
-        self.assertFalse(um.is_valid_bedrock_model_name("eu.anthropic.claude-opus-4-7"))
 
 
 class TestShouldSkipModel(unittest.TestCase):

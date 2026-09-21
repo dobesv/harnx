@@ -71,6 +71,15 @@ HARNX_ONLY_FIELDS = [
     "max_batch_size",
 ]
 
+# LiteLLM records a capability only where it holds, so an entry that omits one
+# is silent rather than negative. A curated `true` therefore outlives a refresh
+# that has nothing to say about it — Llama 4 is multimodal on Bedrock whether
+# or not the registry mentions it. A refresh can still turn one on.
+CURATED_CAPABILITY_FLAGS = [
+    "supports_vision",
+    "supports_tool_use",
+]
+
 INCLUDED_MODES = {"chat", "embedding", "reranker"}
 EXCLUDED_MODES = {
     "image_generation",
@@ -115,6 +124,13 @@ LITELLM_TO_HARNX_PROVIDER = {
     "google_ai": "gemini",
     "vertex_ai": "vertexai",
     "bedrock": "bedrock",
+    # LiteLLM tags most of the current Bedrock catalog `bedrock_converse`
+    # rather than `bedrock`, and that is the API the Bedrock client calls.
+    # Without this entry the whole modern catalog — every Qwen3 model, GLM
+    # 4.7, the Claude 5 family — is discarded before any other check runs.
+    # `bedrock_mantle` is deliberately absent: it is a separate endpoint
+    # harnx does not call.
+    "bedrock_converse": "bedrock",
     "mistral": "mistral",
     "cohere": "cohere",
     "groq": "groq",
@@ -425,12 +441,68 @@ def provider_prefix_and_model_name(
     return None
 
 
+# Corrections for Bedrock entries the LiteLLM registry states and the AWS
+# model card contradicts. LiteLLM is the general source and is usually the
+# fresher of the two, but it is unreliable for Bedrock specifically: it puts
+# GLM 4.7 Flash's 4K output ceiling at 128K, which would have harnx request
+# thirty times what the model accepts. Cite the card, and delete an entry once
+# upstream agrees with it.
+BEDROCK_CARD_CORRECTIONS: dict[str, dict[str, Any]] = {
+    # model-card-zai-glm-4-7-flash: 203K context, 4K max output.
+    "zai.glm-4.7-flash": {"max_input_tokens": 203000, "max_output_tokens": 4096},
+    # model-card-minimax-minimax-m2-5: 196K context, 8K max output.
+    "minimax.minimax-m2.5": {"max_input_tokens": 196000, "max_output_tokens": 8192},
+}
+
+
+def apply_bedrock_card_corrections(
+    models: dict[str, dict[str, Any]], warnings: list[str]
+) -> None:
+    for name, corrections in BEDROCK_CARD_CORRECTIONS.items():
+        if name in models:
+            models[name].update(corrections)
+        else:
+            # Dead config pinning a model that no longer arrives is the same
+            # silent staleness the corrections exist to prevent.
+            warnings.append(f"bedrock correction for absent model: {name}")
+
+
+# AWS cross-Region inference profiles, one per geography. harnx standardises
+# on the US profile, so `us.` survives and the other geographies are dropped
+# rather than listed as separate models of the same weights.
+BEDROCK_GEO_PREFIXES = ("us.", "eu.", "apac.", "au.", "jp.", "global.", "us-gov.")
+BEDROCK_KEPT_GEO_PREFIX = "us."
+
+
 def is_valid_bedrock_model_name(model_name: str) -> bool:
-    if not model_name.startswith(("us.", "zai.", "minimax.")):
-        return False
+    """Accept the canonical Bedrock id for a model, rejecting its variants.
+
+    Screening on shape rather than on a list of vendors: an allowlist of
+    known prefixes silently drops every vendor AWS adds next, which is how
+    the catalog came to omit Qwen, Moonshot and DeepSeek entirely.
+    """
+    # `{region}/id` and `{region}/{commitment}/id` keys are per-Region price
+    # variants of a model that LiteLLM also lists under its bare id.
     if "/" in model_name:
         return False
-    return True
+    # Bedrock ids are always `vendor.model`. Bare keys such as
+    # `claude-sonnet-4-5-20250929-v1:0` are LiteLLM aliases, and an `@`
+    # version pin is Vertex's id format rather than Bedrock's.
+    if "." not in model_name or "@" in model_name:
+        return False
+    geo = next((p for p in BEDROCK_GEO_PREFIXES if model_name.startswith(p)), None)
+    return geo is None or geo == BEDROCK_KEPT_GEO_PREFIX
+
+
+def drop_bedrock_in_region_duplicates(models: dict[str, dict[str, Any]]) -> None:
+    """Drop `vendor.model` where the `us.vendor.model` twin is also present.
+
+    Both ids resolve to the same weights — the bare one in-Region, the `us.`
+    one through the US cross-Region profile. Listing both doubles the catalog
+    and makes a fallback chain ambiguous about which it selected.
+    """
+    for name in [name for name in models if f"us.{name}" in models]:
+        del models[name]
 
 
 def infer_mode(prefix: str, payload: dict[str, Any]) -> str | None:
@@ -534,10 +606,23 @@ def merge_old_fields(new_model: dict[str, Any], old_model: dict[str, Any] | None
     if not old_model:
         return new_model
     merged = copy.deepcopy(new_model)
+    _carry_harnx_only_fields(merged, old_model)
+    _carry_curated_capabilities(merged, old_model)
+    return merged
+
+
+def _carry_harnx_only_fields(merged: dict[str, Any], old_model: dict[str, Any]) -> None:
     for field in HARNX_ONLY_FIELDS:
         if field in old_model and field not in merged:
             merged[field] = copy.deepcopy(old_model[field])
-    return merged
+
+
+def _carry_curated_capabilities(
+    merged: dict[str, Any], old_model: dict[str, Any]
+) -> None:
+    for field in CURATED_CAPABILITY_FLAGS:
+        if field not in merged and old_model.get(field):
+            merged[field] = True
 
 
 def render_provider_block(provider: str, models: list[dict[str, Any]]) -> str:
@@ -775,6 +860,9 @@ def main() -> int:
         model = merge_old_fields(model, old_model)
         apply_openai_endpoint_default(model, provider, payload)
         new_provider_models[provider][model_name] = model
+
+    drop_bedrock_in_region_duplicates(new_provider_models["bedrock"])
+    apply_bedrock_card_corrections(new_provider_models["bedrock"], warnings)
 
     final_provider_models: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
     provider_order = ordered_providers(new_provider_models, old_by_provider)
