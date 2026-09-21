@@ -22,38 +22,43 @@ fn parse_args() -> anyhow::Result<bool> {
     parse_args_from(&args)
 }
 
+fn handle_enable_tool_arg(
+    arg: &str,
+    args: &mut impl Iterator<Item = String>,
+) -> anyhow::Result<bool> {
+    if arg == "--enable-tool" {
+        args.next()
+            .ok_or_else(|| anyhow::anyhow!("--enable-tool requires a glob pattern argument"))?;
+    }
+    Ok(true)
+}
+
+fn is_value_option(arg: &str) -> bool {
+    ["--metrics-addr", "--healthz-addr", "--host", "--port"]
+        .iter()
+        .any(|flag| arg == *flag || arg.strip_prefix(&format!("{flag}=")).is_some())
+}
+
+fn consume_value(arg: &str, args: &mut impl Iterator<Item = String>) {
+    if !arg.contains('=') {
+        args.next();
+    }
+}
+
 fn parse_args_from(args: &[String]) -> anyhow::Result<bool> {
     let mut help = false;
-    let mut args = args.iter().skip(1);
-
+    let mut args = args.iter().skip(1).cloned();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => help = true,
             "--mcp-stdio" | "--mcp-http" => {}
-            arg if arg == "--metrics-addr" || arg.strip_prefix("--metrics-addr=").is_some() => {
-                if arg == "--metrics-addr" {
-                    args.next();
-                }
-            }
-            arg if arg == "--healthz-addr" || arg.strip_prefix("--healthz-addr=").is_some() => {
-                if arg == "--healthz-addr" {
-                    args.next();
-                }
-            }
-            arg if arg == "--host" || arg.strip_prefix("--host=").is_some() => {
-                if arg == "--host" {
-                    args.next();
-                }
-            }
-            arg if arg == "--port" || arg.strip_prefix("--port=").is_some() => {
-                if arg == "--port" {
-                    args.next();
-                }
+            arg if is_value_option(arg) => consume_value(arg, &mut args),
+            arg if arg == "--enable-tool" || arg.strip_prefix("--enable-tool=").is_some() => {
+                handle_enable_tool_arg(arg, &mut args)?;
             }
             _ => anyhow::bail!("harnx-grep-tools: unknown argument: {arg}"),
         }
     }
-
     Ok(help)
 }
 
@@ -67,18 +72,30 @@ fn print_help() {
     eprintln!("  --mcp-http              Serve MCP over Streamable HTTP instead of toolset mode");
     eprintln!("  --host <HOST>           MCP HTTP bind host (default: 0.0.0.0)");
     eprintln!("  --port <PORT>           MCP HTTP bind port (default: 3004)");
+    eprintln!(
+        "  --enable-tool <glob>    Enable only tools matching the glob pattern (repeatable)."
+    );
+    eprintln!("                          If set, only enabled tools are registered and invocable.");
     eprintln!("  --metrics-addr <ADDR>   Serve Prometheus metrics at http://ADDR/metrics.");
-    eprintln!("                        Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
-    eprintln!("                        Also honors HARNX_METRICS_ADDR env.");
+    eprintln!("                          Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
+    eprintln!("                          Also honors HARNX_METRICS_ADDR env.");
     eprintln!("  --healthz-addr <ADDR>   Serve readiness checks at http://ADDR/healthz.");
-    eprintln!("                        Blank host binds 0.0.0.0, e.g. :8457. Unset disables.");
-    eprintln!("                        Also honors HARNX_HEALTHZ_ADDR env.");
+    eprintln!("                          Blank host binds 0.0.0.0, e.g. :8457. Unset disables.");
+    eprintln!("                          Also honors HARNX_HEALTHZ_ADDR env.");
     eprintln!("  --help, -h              Show this help message");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(arguments: &[&str]) -> anyhow::Result<bool> {
+        let args = std::iter::once("harnx-grep-tools")
+            .chain(arguments.iter().copied())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        parse_args_from(&args)
+    }
 
     #[test]
     fn accepts_mcp_http_listener_flags_in_both_forms() {
@@ -103,5 +120,35 @@ mod tests {
                 .to_string()
                 .contains(&format!("unknown argument: {flag}")));
         }
+    }
+
+    #[test]
+    fn accepts_enable_tool_space_form_without_help_or_unknown_error() {
+        assert!(!parse(&["--enable-tool", "pattern"]).unwrap());
+    }
+
+    #[test]
+    fn accepts_enable_tool_equals_form() {
+        assert!(!parse(&["--enable-tool=pattern"]).unwrap());
+    }
+
+    #[test]
+    fn accepts_repeatable_enable_tool_flags() {
+        assert!(!parse(&[
+            "--enable-tool",
+            "pattern",
+            "--enable-tool=other-pattern",
+            "--enable-tool",
+            "third-pattern",
+        ])
+        .unwrap());
+    }
+
+    #[test]
+    fn rejects_trailing_enable_tool_flag() {
+        let error = parse(&["--enable-tool"]).expect_err("missing pattern should be rejected");
+        assert!(error
+            .to_string()
+            .contains("--enable-tool requires a glob pattern argument"));
     }
 }

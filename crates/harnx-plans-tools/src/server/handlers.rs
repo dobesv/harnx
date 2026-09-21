@@ -192,8 +192,8 @@ fn build_update_plan_tasks(
 }
 
 impl PlansServer {
-    pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+    pub fn new(dir: PathBuf, filter: Option<Arc<harnx_toolset_server::globset::GlobSet>>) -> Self {
+        Self { dir, filter }
     }
 
     pub(crate) async fn handle_list_tasks(

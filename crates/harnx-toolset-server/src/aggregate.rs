@@ -25,6 +25,16 @@ pub async fn serve_many_with_shutdown(
     connection: NatsConnection,
     lifecycle: ServeLifecycle,
 ) -> Result<()> {
+    serve_many_with_shutdown_and_filter(toolsets, instance_id, connection, lifecycle, None).await
+}
+
+pub async fn serve_many_with_shutdown_and_filter(
+    toolsets: Vec<Arc<dyn Toolset>>,
+    instance_id: ServerScope,
+    connection: NatsConnection,
+    lifecycle: ServeLifecycle,
+    filter: Option<Arc<globset::GlobSet>>,
+) -> Result<()> {
     validate_toolsets(&toolsets)?;
     let (shutdown, readiness, registration_shutdown) = lifecycle.into_parts();
     let child_shutdown = CancellationToken::new();
@@ -34,6 +44,7 @@ pub async fn serve_many_with_shutdown(
         connection,
         child_shutdown.clone(),
         registration_shutdown,
+        filter,
     );
 
     let outcome = run_aggregate(&shutdown, readiness.as_ref(), &mut servers, started).await;
@@ -63,6 +74,7 @@ fn start_servers(
     connection: NatsConnection,
     shutdown: CancellationToken,
     registration_shutdown: RegistrationShutdown,
+    filter: Option<Arc<globset::GlobSet>>,
 ) -> (JoinSet<Result<()>>, Vec<oneshot::Receiver<()>>) {
     let identity = RegistrationIdentity::from_env();
     let mut servers = JoinSet::new();
@@ -79,6 +91,7 @@ fn start_servers(
                     .with_registration_shutdown(registration_shutdown),
                 identity: identity.clone(),
                 started: Some(started_tx),
+                filter: filter.clone(),
             },
         ));
     }

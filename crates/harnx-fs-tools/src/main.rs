@@ -71,11 +71,12 @@ fn initial_allow_inputs() -> AllowInputs {
     }
 }
 
-const PASSTHROUGH_FLAGS: [(&str, &str); 4] = [
+const PASSTHROUGH_FLAGS: [(&str, &str); 5] = [
     ("--metrics-addr", "--metrics-addr="),
     ("--healthz-addr", "--healthz-addr="),
     ("--host", "--host="),
     ("--port", "--port="),
+    ("--enable-tool", "--enable-tool="),
 ];
 
 struct ParseState<'a> {
@@ -176,6 +177,12 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --mcp-http                Serve MCP over Streamable HTTP instead of toolset mode");
     eprintln!("  --host <HOST>             MCP HTTP bind host (default: 0.0.0.0)");
     eprintln!("  --port <PORT>             MCP HTTP bind port (default: 3003)");
+    eprintln!(
+        "  --enable-tool <glob>      Enable only tools matching the glob pattern (repeatable)."
+    );
+    eprintln!(
+        "                            If set, only enabled tools are registered and invocable."
+    );
     eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
     eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
     eprintln!("                            Also honors HARNX_METRICS_ADDR env.");

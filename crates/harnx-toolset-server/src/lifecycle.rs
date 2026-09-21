@@ -52,6 +52,10 @@ impl ServeLifecycle {
         self
     }
 
+    pub(super) fn readiness(&self) -> Option<&harnx_healthz::Readiness> {
+        self.readiness.as_ref()
+    }
+
     pub(super) fn into_parts(
         self,
     ) -> (
