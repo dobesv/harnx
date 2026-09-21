@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use harnx_k8s_sandbox_tools::leader_election::{
+    run_lease_gated_idle_watcher, IdleWatcher, LeaseGatedWatcherConfig, SessionDisconnect,
+};
 use harnx_k8s_sandbox_tools::{
     sandbox_toolsets, KubernetesSandboxApi, McpCaller, McpCallerConfig, SandboxManager,
     SandboxManagerConfig, StreamableHttpMcpCaller,
 };
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
 use harnx_runtime::nats_session_metadata::SessionMetadataStore;
-use harnx_toolset_server::{serve_many_with_shutdown, ServeLifecycle};
+use harnx_toolset_server::{serve_many_with_shutdown, RegistrationShutdown, ServeLifecycle};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,8 +75,20 @@ async fn run(cli: Cli, readiness: Option<harnx_healthz::Readiness>) -> Result<()
     let manager = build_manager(&cli, &retry, kube::Client::try_default().await?)?;
     let caller = build_caller(&cli, &retry)?;
     let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
-    let (watcher, session_cleanup) =
-        spawn_idle_watcher(manager.clone(), caller.clone(), shutdown.clone());
+
+    // Spawn lease-gated idle watcher (elects single leader per namespace).
+    let watcher_config = LeaseGatedWatcherConfig {
+        namespace: cli.sandbox_namespace.clone(),
+        scan_interval: minutes(cli.sandbox_scan_interval_minutes)?,
+    };
+    let watcher = spawn_lease_gated_idle_watcher(
+        jetstream,
+        watcher_config,
+        manager.clone(),
+        caller.clone(),
+        shutdown.clone(),
+    );
+
     let toolsets = sandbox_toolsets(manager, caller, metadata);
     let result = serve_many_with_shutdown(
         toolsets,
@@ -82,12 +97,12 @@ async fn run(cli: Cli, readiness: Option<harnx_healthz::Readiness>) -> Result<()
             client,
             replicas: endpoint.resolved_replicas(),
         },
-        ServeLifecycle::new(shutdown.clone(), readiness),
+        ServeLifecycle::new(shutdown.clone(), readiness)
+            .with_registration_shutdown(RegistrationShutdown::Expire),
     )
     .await;
     shutdown.cancel();
     let _ = watcher.await;
-    let _ = session_cleanup.await;
     result
 }
 
@@ -173,24 +188,23 @@ fn build_caller(cli: &Cli, retry: &RetrySettings) -> Result<Arc<dyn McpCaller>> 
     Ok(Arc::new(caller))
 }
 
-fn spawn_idle_watcher(
-    manager: SandboxManager,
-    caller: Arc<dyn McpCaller>,
+/// Spawn a lease-gated idle watcher task.
+///
+/// Returns a join handle for the watcher task.
+fn spawn_lease_gated_idle_watcher<M, C>(
+    jetstream: async_nats::jetstream::Context,
+    config: LeaseGatedWatcherConfig,
+    manager: M,
+    caller: C,
     shutdown: tokio_util::sync::CancellationToken,
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
-    let watcher_shutdown = shutdown.clone();
-    let (hibernated_tx, mut hibernated_rx) = tokio::sync::mpsc::unbounded_channel();
-    let watcher = tokio::spawn(async move {
-        manager
-            .run_idle_watcher(watcher_shutdown, hibernated_tx)
-            .await;
-    });
-    let session_cleanup = tokio::spawn(async move {
-        while let Some(sandbox_id) = hibernated_rx.recv().await {
-            caller.disconnect(&sandbox_id).await;
-        }
-    });
-    (watcher, session_cleanup)
+) -> tokio::task::JoinHandle<()>
+where
+    M: IdleWatcher + Clone + Send + 'static,
+    C: SessionDisconnect + Clone + Send + 'static,
+{
+    tokio::spawn(async move {
+        run_lease_gated_idle_watcher(jetstream, config, manager, caller, shutdown).await;
+    })
 }
 
 fn mcp_response_timeout(seconds: u64) -> Option<Duration> {

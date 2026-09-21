@@ -1,4 +1,6 @@
-use super::{serve_configured, RegistrationIdentity, ServeLifecycle, ServeSettings};
+use super::{
+    serve_configured, RegistrationIdentity, RegistrationShutdown, ServeLifecycle, ServeSettings,
+};
 use anyhow::Result;
 use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
@@ -24,10 +26,15 @@ pub async fn serve_many_with_shutdown(
     lifecycle: ServeLifecycle,
 ) -> Result<()> {
     validate_toolsets(&toolsets)?;
-    let (shutdown, readiness) = lifecycle.into_parts();
+    let (shutdown, readiness, registration_shutdown) = lifecycle.into_parts();
     let child_shutdown = CancellationToken::new();
-    let (mut servers, started) =
-        start_servers(toolsets, instance_id, connection, child_shutdown.clone());
+    let (mut servers, started) = start_servers(
+        toolsets,
+        instance_id,
+        connection,
+        child_shutdown.clone(),
+        registration_shutdown,
+    );
 
     let outcome = run_aggregate(&shutdown, readiness.as_ref(), &mut servers, started).await;
     if let Some(readiness) = readiness.as_ref() {
@@ -55,6 +62,7 @@ fn start_servers(
     instance_id: ServerScope,
     connection: NatsConnection,
     shutdown: CancellationToken,
+    registration_shutdown: RegistrationShutdown,
 ) -> (JoinSet<Result<()>>, Vec<oneshot::Receiver<()>>) {
     let identity = RegistrationIdentity::from_env();
     let mut servers = JoinSet::new();
@@ -67,7 +75,8 @@ fn start_servers(
             ServeSettings {
                 instance_id: instance_id.clone(),
                 connection: connection.clone(),
-                lifecycle: ServeLifecycle::new(shutdown.clone(), None),
+                lifecycle: ServeLifecycle::new(shutdown.clone(), None)
+                    .with_registration_shutdown(registration_shutdown),
                 identity: identity.clone(),
                 started: Some(started_tx),
             },

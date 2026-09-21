@@ -1,5 +1,7 @@
 //! Server-side adapters for hosting a [`harnx_toolset::Toolset`].
 
+use std::time::Duration;
+
 pub mod cancellation_client;
 mod control;
 use control::handle_control;
@@ -26,7 +28,7 @@ mod tool_observation;
 use tool_observation::*;
 
 pub use aggregate::serve_many_with_shutdown;
-pub use lifecycle::ServeLifecycle;
+pub use lifecycle::{RegistrationShutdown, ServeLifecycle};
 pub use registration_identity::RegistrationIdentity;
 
 use anyhow::{Context, Result};
@@ -55,7 +57,7 @@ use rmcp::{ServerHandler, ServiceExt};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::{watch, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -239,7 +241,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         identity,
         started,
     } = settings;
-    let (shutdown, readiness) = lifecycle.into_parts();
+    let (shutdown, readiness, registration_shutdown) = lifecycle.into_parts();
     let NatsConnection { client, replicas } = connection;
     let server_name = toolset.name().to_owned();
     let RegistrationIdentity { package, config } = identity;
@@ -288,8 +290,40 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
     )
     .await;
 
+    // Mark readiness not-ready so k8s stops routing traffic, then drain the
+    // tool-request subscription so the broker removes this member from the
+    // queue group (new calls route to siblings). The NATS connection stays
+    // alive so in-flight handlers can still reply.
     if let Some(readiness) = readiness.as_ref() {
         readiness.not_ready();
+    }
+
+    // Drain the subscription: broker removes this member from the queue group
+    // so new calls route to siblings, but the local receiver stays open to
+    // deliver any messages already in flight. Log errors but continue so we
+    // still run handler-drain and registration cleanup.
+    let drain_succeeded = tool_requests.drain().await.is_ok();
+    if !drain_succeeded {
+        log::warn!("failed to drain tool request subscription");
+    }
+    if let Err(error) = client.flush().await {
+        log::warn!("failed to flush after draining tool request subscription: {error}");
+    }
+
+    // Only process buffered messages if drain succeeded.
+    // If drain failed, the subscription may still be registered with the broker,
+    // and waiting for messages could block indefinitely.
+    if drain_succeeded {
+        // Continue dispatching any tool requests that were already buffered in
+        // the subscription receiver when we initiated drain. The stream closes
+        // once all queued messages have been delivered.
+        // Bound the wait so a slow stream termination cannot stall shutdown.
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(request) = tool_requests.next().await {
+                spawn_tool_request(request_context.clone(), request);
+            }
+        })
+        .await;
     }
 
     // Give callers already waiting on a reply a chance to get one: wait for
@@ -299,8 +333,12 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
     drain::drain(active_requests_rx).await;
 
     // Best-effort: the TTL is the backstop when this cannot run.
+    // In HA mode (RegistrationShutdown::Expire), skip deletion and let the
+    // bucket TTL reap the key after the last replica exits.
     let key = registration_key(&instance_id, &identity_token);
-    delete_own_registration(&registry, &key, revision).await;
+    if registration_shutdown == RegistrationShutdown::DeleteIfCurrent {
+        delete_own_registration(&registry, &key, revision).await;
+    }
     outcome
 }
 
