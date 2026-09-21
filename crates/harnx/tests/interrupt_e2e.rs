@@ -312,11 +312,11 @@ fn interrupt_tui_during_tool() -> Result<()> {
     let mock = MockOpenAiServer::start(script_call_wait_tool(30))?;
     let tmp = tempfile::tempdir()?;
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-    let mcp_time_bin = harnx::test_utils::interrupt::harnx_mcp_time_bin(&harnx_bin);
+    let time_tools_bin = harnx::test_utils::interrupt::harnx_time_tools_bin(&harnx_bin);
     let paths = write_with_wait_tool(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
-        &mcp_time_bin,
+        &time_tools_bin,
     )?;
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let tmux = spawn_tui(&paths, &harnx_bin, &repo_root)?;
@@ -346,11 +346,11 @@ fn interrupt_tui_during_hook() -> Result<()> {
     let mock = MockOpenAiServer::start(script_call_trivial_tool())?;
     let tmp = tempfile::tempdir()?;
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-    let mcp_time_bin = harnx::test_utils::interrupt::harnx_mcp_time_bin(&harnx_bin);
+    let time_tools_bin = harnx::test_utils::interrupt::harnx_time_tools_bin(&harnx_bin);
     let paths = write_with_blocking_hook(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
-        &mcp_time_bin,
+        &time_tools_bin,
     )?;
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let tmux = spawn_tui(&paths, &harnx_bin, &repo_root)?;
@@ -400,11 +400,11 @@ fn interrupt_oneshot_during_tool() -> Result<()> {
     let mock = MockOpenAiServer::start(script_call_wait_tool(30))?;
     let tmp = tempfile::tempdir()?;
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-    let mcp_time_bin = harnx::test_utils::interrupt::harnx_mcp_time_bin(&harnx_bin);
+    let time_tools_bin = harnx::test_utils::interrupt::harnx_time_tools_bin(&harnx_bin);
     let paths = write_with_wait_tool(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
-        &mcp_time_bin,
+        &time_tools_bin,
     )?;
     let mut child = spawn_oneshot(&paths, &harnx_bin, "wait please")?;
 
@@ -424,11 +424,11 @@ fn interrupt_oneshot_during_hook() -> Result<()> {
     let mock = MockOpenAiServer::start(script_call_trivial_tool())?;
     let tmp = tempfile::tempdir()?;
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-    let mcp_time_bin = harnx::test_utils::interrupt::harnx_mcp_time_bin(&harnx_bin);
+    let time_tools_bin = harnx::test_utils::interrupt::harnx_time_tools_bin(&harnx_bin);
     let paths = write_with_blocking_hook(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
-        &mcp_time_bin,
+        &time_tools_bin,
     )?;
     let mut child = spawn_oneshot(&paths, &harnx_bin, "call a tool")?;
 

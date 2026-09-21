@@ -14,7 +14,7 @@ fancy-regex = { workspace = true }
 gix = { workspace = true }
 glob = { workspace = true }
 harnx-core = { path = "../harnx-core" }
-harnx-mcp-history = { workspace = true }
+harnx-git-history = { workspace = true }
 harnx-tool-allow = { path = "../harnx-tool-allow" }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }

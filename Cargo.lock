@@ -3591,7 +3591,7 @@ dependencies = [
  "fancy-regex 0.19.1",
  "gix",
  "harnx-core",
- "harnx-mcp-history",
+ "harnx-git-history",
  "harnx-sandbox-common",
  "harnx-tool-allow",
  "harnx-toolset",
@@ -3767,7 +3767,7 @@ dependencies = [
  "gix",
  "glob",
  "harnx-core",
- "harnx-mcp-history",
+ "harnx-git-history",
  "harnx-tool-allow",
  "harnx-toolset",
  "harnx-toolset-server",
@@ -3780,6 +3780,18 @@ dependencies = [
  "tokio-util",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "harnx-git-history"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "gix",
+ "log",
+ "shell-words",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -3966,68 +3978,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "harnx-mcp-history"
-version = "0.33.4"
-dependencies = [
- "anyhow",
- "gix",
- "log",
- "shell-words",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "harnx-mcp-plans-core"
-version = "0.33.4"
-dependencies = [
- "anyhow",
- "async-trait",
- "harnx-metrics",
- "jiff",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "serde_yaml",
- "similar 3.2.0",
- "thiserror 2.0.20",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "harnx-mcp-plans-github"
-version = "0.33.4"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64 0.23.1",
- "chrono",
- "harnx-healthz",
- "harnx-mcp-plans-core",
- "harnx-metrics",
- "harnx-nats-common",
- "harnx-telemetry",
- "http 1.5.0",
- "jiff",
- "jsonwebtoken 11.1.0",
- "regex",
- "reqwest",
- "rmcp",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "tokio",
- "tokio-util",
- "uuid",
- "wait-timeout",
- "wiremock",
-]
-
-[[package]]
 name = "harnx-mcp-remote"
 version = "0.33.4"
 dependencies = [
@@ -4049,30 +3999,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
-]
-
-[[package]]
-name = "harnx-mcp-time"
-version = "0.33.4"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "chrono-tz",
- "harnx-core",
- "harnx-healthz",
- "harnx-metrics",
- "harnx-nats-common",
- "harnx-telemetry",
- "iana-time-zone",
- "jiff",
- "log",
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower",
 ]
 
 [[package]]
@@ -4289,7 +4215,7 @@ dependencies = [
  "harnx-spinner",
  "harnx-telemetry",
  "harnx-test-bins",
- "harnx-time-server",
+ "harnx-time-tools",
  "harnx-toolset",
  "harnx-toolset-server",
  "http 1.5.0",
@@ -4467,7 +4393,6 @@ version = "0.33.4"
 dependencies = [
  "anyhow",
  "async-trait",
- "harnx-mcp-plans-core",
  "jiff",
  "libc",
  "ratatui",
@@ -4479,7 +4404,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "harnx-time-server"
+name = "harnx-time-tools"
 version = "0.33.4"
 dependencies = [
  "anyhow",
@@ -4488,6 +4413,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "harnx-core",
+ "harnx-nats-common",
  "harnx-toolset",
  "harnx-toolset-server",
  "iana-time-zone",
@@ -5470,24 +5396,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsonwebtoken"
-version = "11.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
-dependencies = [
- "aws-lc-rs",
- "base64 0.22.1",
- "getrandom 0.2.17",
- "js-sys",
- "pem 3.0.6",
- "serde",
- "serde_json",
- "signature",
- "simple_asn1",
- "zeroize",
-]
-
-[[package]]
 name = "k8s-openapi"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6339,7 +6247,7 @@ dependencies = [
  "hex",
  "http 1.5.0",
  "http-auth",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken",
  "lazy_static",
  "oci-spec",
  "olpc-cjson",
@@ -8353,18 +8261,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "simple_asn1"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
-dependencies = [
- "num-bigint",
- "num-traits",
- "thiserror 2.0.20",
- "time",
-]
-
-[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9473,15 +9369,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0"
 dependencies = [
  "utf8parse",
-]
-
-[[package]]
-name = "wait-timeout"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
-dependencies = [
- "libc",
 ]
 
 [[package]]

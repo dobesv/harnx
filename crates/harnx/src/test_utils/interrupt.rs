@@ -13,18 +13,18 @@ use std::time::{Duration, Instant};
 /// the TUI is currently busy.
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// Locate the `harnx-mcp-time` binary given the already-resolved `harnx`
+/// Locate the `harnx-time-tools` binary given the already-resolved `harnx`
 /// binary path.
 ///
-/// The `harnx-mcp-time` binary lives in its own crate, so
-/// `CARGO_BIN_EXE_harnx-mcp-time` isn't visible from `harnx`'s test context.
+/// The `harnx-time-tools` binary lives in its own crate, so
+/// `CARGO_BIN_EXE_harnx-time-tools` isn't visible from `harnx`'s test context.
 /// Because Cargo builds every workspace member into the same target dir, the
 /// binary sits next to the `harnx` binary. Callers are responsible for
 /// ensuring it has been built (e.g. via `cargo build --workspace` or
 /// `cargo nextest run --workspace`, which is what CI uses).
-pub fn harnx_mcp_time_bin(harnx_bin: &Path) -> PathBuf {
+pub fn harnx_time_tools_bin(harnx_bin: &Path) -> PathBuf {
     let ext = std::env::consts::EXE_SUFFIX;
-    harnx_bin.with_file_name(format!("harnx-mcp-time{ext}"))
+    harnx_bin.with_file_name(format!("harnx-time-tools{ext}"))
 }
 
 /// Locate the `harnx-mcp-repro249` binary given the already-resolved `harnx`
@@ -177,28 +177,27 @@ pub fn script_call_trivial_tool() -> MockOpenAiScript {
 /// Like `write_minimal_config`, but also registers the workspace-built
 /// time server through the NATS MCP bridge so the `wait` tool is available.
 ///
-/// `mcp_time_bin` should be the path to the compiled `harnx-mcp-time` binary,
-/// typically obtained via the `harnx_mcp_time_bin(harnx_bin)` helper in the
-/// calling test. (The `env!("CARGO_BIN_EXE_harnx-mcp-time")` macro is not
-/// available here because `harnx-mcp-time` lives in a separate workspace
-/// crate; the helper computes the sibling path from the resolved `harnx`
-/// binary instead.)
+/// `time_tools_bin` should be the path to the compiled `harnx-time-tools`
+/// binary, typically obtained via the `harnx_time_tools_bin(harnx_bin)` helper
+/// in the calling test. The helper computes the sibling path from the resolved
+/// `harnx` binary because Cargo doesn't expose another package's binary through
+/// `CARGO_BIN_EXE_*`.
 pub fn write_with_wait_tool(
     dir: &Path,
     mock_base_url: &str,
-    mcp_time_bin: &Path,
+    time_tools_bin: &Path,
 ) -> Result<ConfigPaths> {
     let paths = write_minimal_config(dir, mock_base_url)?;
     let tool_servers_dir = paths.harnx_config_dir.join("tool_servers");
     std::fs::create_dir_all(&tool_servers_dir).context("failed to create tool_servers dir")?;
     let bridge_bin =
-        mcp_time_bin.with_file_name(format!("harnx-mcp-bridge{}", std::env::consts::EXE_SUFFIX));
+        time_tools_bin.with_file_name(format!("harnx-mcp-bridge{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(
         tool_servers_dir.join("time.yaml"),
         format!(
-            "command: {}\nargs:\n  - --name\n  - time\n  - --\n  - {}\n",
+            "command: {}\nargs:\n  - --name\n  - time\n  - --\n  - {}\n  - --mcp-stdio\n",
             bridge_bin.display(),
-            mcp_time_bin.display()
+            time_tools_bin.display()
         ),
     )
     .context("failed to write tool_servers/time.yaml")?;
@@ -213,9 +212,9 @@ pub fn write_with_wait_tool(
 pub fn write_with_blocking_hook(
     dir: &Path,
     mock_base_url: &str,
-    mcp_time_bin: &Path,
+    time_tools_bin: &Path,
 ) -> Result<ConfigPaths> {
-    let paths = write_with_wait_tool(dir, mock_base_url, mcp_time_bin)?;
+    let paths = write_with_wait_tool(dir, mock_base_url, time_tools_bin)?;
     let block_sh = paths.dir.join("block.sh");
     let sentinel = paths.dir.join("hook_fired");
     std::fs::write(

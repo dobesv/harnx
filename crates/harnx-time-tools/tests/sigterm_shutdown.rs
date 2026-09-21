@@ -1,4 +1,4 @@
-//! Proves that a SIGTERM sent directly to a running `harnx-time-server`
+//! Proves that a SIGTERM sent directly to a running `harnx-time-tools`
 //! process (as Kubernetes would send to a pod) triggers deregistration, not
 //! just that the plumbing between a `CancellationToken` and the serve loop
 //! is wired correctly. `harnx-toolset-server`'s own tests cover the latter;
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const TOKEN: &str = "time-server-sigterm-test-token";
-// harnx-time-server's `TimeToolset::name()` is "time", with no package or
+// harnx-time-tools's `TimeToolset::name()` is "time", with no package or
 // config-file stem set, giving the identity token `server_identity_token`
 // would produce for `(None, "", "time")`.
 const IDENTITY_TOKEN: &str = "____time";
@@ -159,7 +159,7 @@ async fn sigterm_removes_the_registration() -> Result<()> {
     };
 
     let instance_id = ServerScope::new();
-    let child = Command::new(env!("CARGO_BIN_EXE_harnx-time-server"))
+    let child = Command::new(env!("CARGO_BIN_EXE_harnx-time-tools"))
         .env(HARNX_SERVER_SCOPE, instance_id.as_str())
         .env("HARNX_NATS_URL", &server.url)
         .env("HARNX_NATS_TOKEN", TOKEN)
@@ -173,7 +173,7 @@ async fn sigterm_removes_the_registration() -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("spawn harnx-time-server")?;
+        .context("spawn harnx-time-tools")?;
     let pid = child.id();
     let mut time_server = TimeServerHandle(child);
 
@@ -198,7 +198,7 @@ async fn sigterm_removes_the_registration() -> Result<()> {
     // `ToolServerSupervisor` (which only ever `abort()`s/SIGKILLs) — this is
     // the pod-lifecycle path this task exists for.
     let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    assert_eq!(killed, 0, "failed to send SIGTERM to harnx-time-server");
+    assert_eq!(killed, 0, "failed to send SIGTERM to harnx-time-tools");
 
     wait_for_key_presence(
         &jetstream,

@@ -46,7 +46,6 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   │       ├── utils/          # Shared utilities
 │   │       └── bin/            # Bins that share harnx library code (mcp-bash, mcp-fs)
 │   ├── harnx-plans-tools/        # MCP server: file-based plan and todo management (standalone crate)
-│   ├── harnx-mcp-time/         # MCP server: time/timezone utilities (standalone crate)
 │   └── harnx-test-bins/        # Internal dev/test binaries (publish = false)
 ├── example_config/             # Example user configuration
 ├── docs/                       # User-facing documentation
@@ -238,6 +237,11 @@ trusting a refresh, and see issue #2025 for reconciling the catalog against
 - **Configuration:** `config.yaml` holds global settings. Clients and MCP servers use individual YAML files; agents are Markdown files with YAML front matter in `agents/`.
 - **Dual license:** MIT OR Apache-2.0. Preserve license headers where present.
 
+## Tool Servers
+
+Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `harnx-bash-tools`, `harnx-time-tools`, `harnx-plans-tools`). They run `harnx_toolset_server::run_toolset_main(toolset)` and default to NATS mode. When launching behind `harnx-mcp-bridge` for stdio MCP compatibility, pass `--mcp-stdio` — without it, the server waits for NATS and the bridge handshake times out.
+
+Binaries with `-mcp-` in the name are genuine MCP infrastructure (`harnx-mcp-bridge`, `harnx-mcp-remote`) or test fixtures (`harnx-mock-mcp`), not native toolsets.
 
 ### Reasoning-signature compatibility across providers (issue #1804)
 
@@ -425,7 +429,7 @@ reserved for unknown JSON-RPC methods. Unknown tool requests must return `invali
 
 Per SEP-1303 and the MCP specification, client agents use `is_error: true` results to see error text
 and self-correct. Returning JSON-RPC error frames for domain or argument errors causes client SDKs to
-abort the session. See `crates/harnx-mcp-plans-core` for the reference implementation.
+abort the session.
 
 ### Session log entries and transcript protocol
 

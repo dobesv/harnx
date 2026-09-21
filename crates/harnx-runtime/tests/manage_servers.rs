@@ -137,7 +137,7 @@ async fn a_consuming_worker_launches_no_child_servers() {
         config.use_tools = Some(vec!["*".to_string()]);
         config.tool_servers = vec![harnx_runtime::config::ToolServerConfig {
             name: "time".to_string(),
-            command: "harnx-time-server".to_string(),
+            command: "harnx-time-tools".to_string(),
             args: Vec::new(),
             env: Default::default(),
             enabled: true,

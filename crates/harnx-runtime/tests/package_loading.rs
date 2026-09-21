@@ -68,7 +68,7 @@ You work.",
             ),
             (
                 "tool_servers/time.yaml",
-                "command: harnx-time-server
+                "command: harnx-time-tools
 description: original
 ",
             ),

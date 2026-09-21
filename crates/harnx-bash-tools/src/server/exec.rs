@@ -192,7 +192,7 @@ impl BashServer {
         let commit_id = ObjectId::from_hex(params.commit_id.as_bytes())
             .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
 
-        let repo_dir = harnx_mcp_history::discover::find_repo_for_path(&path).ok_or_else(|| {
+        let repo_dir = harnx_git_history::discover::find_repo_for_path(&path).ok_or_else(|| {
             ErrorData::invalid_params("path is not inside a git repository".to_string(), None)
         })?;
         validate_write_path(&repo_dir.to_string_lossy(), &self.inner.allowlist)

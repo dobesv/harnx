@@ -47,7 +47,7 @@ jobs:
         tool: cargo-nextest
 
     # harnx's integration tests (tests/interrupt_e2e.rs, tests/tmux_e2e.rs)
-    # spawn sibling bins (harnx-mcp-time, harnx-mcp-repro249) via a
+    # spawn sibling bins (harnx-time-tools, harnx-mcp-repro249) via a
     # sibling-path lookup in src/test_utils/interrupt.rs. Those bins live in
     # separate workspace crates that harnx doesn't depend on, so
     # `cargo nextest run --all` alone won't build them. Build the whole
@@ -181,11 +181,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Check harnx-mcp-time Dockerfile
-        run: docker buildx build --check -f docker/harnx-mcp-time.Dockerfile .
-
-      - name: Check harnx-mcp-plans Dockerfile
-        run: docker buildx build --check -f docker/harnx-mcp-plans.Dockerfile .
+      - name: Check harnx-plans-tools Dockerfile
+        run: docker buildx build --check -f docker/harnx-plans-tools.Dockerfile .
 
       - name: Check harnx Dockerfile
         run: docker buildx build --check -f docker/harnx.Dockerfile .

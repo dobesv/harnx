@@ -385,7 +385,7 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         return Ok(());
     };
 
-    let time_binary = resolve_binary("harnx-time-server")?;
+    let time_binary = resolve_binary("harnx-time-tools")?;
     let plans_binary = resolve_binary("harnx-plans-tools")?;
 
     const AGENT_TIME: AgentFixture = AgentFixture {
@@ -493,7 +493,7 @@ async fn first_request_after_activation_sees_newly_started_server() -> anyhow::R
         ("HARNX_CONFIG_DIR", &config_root.path().to_string_lossy()),
     ]);
 
-    let config = single_time_server_config(resolve_binary("harnx-time-server")?);
+    let config = single_time_server_config(resolve_binary("harnx-time-tools")?);
     let (worker, client, mut selected_rx) = spawn_capturing_worker(config, nats.url()).await?;
 
     run_agent_turn(
@@ -554,7 +554,7 @@ async fn stopping_a_server_actually_removes_its_registration() -> anyhow::Result
         return Ok(());
     };
 
-    let time_binary = resolve_binary("harnx-time-server")?;
+    let time_binary = resolve_binary("harnx-time-tools")?;
     let client = async_nats::ConnectOptions::new()
         .token(E2E_TOKEN.to_string())
         .connect(nats.url())

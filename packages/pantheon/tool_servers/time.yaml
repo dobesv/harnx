@@ -1,2 +1,2 @@
-command: harnx-time-server
+command: harnx-time-tools
 description: Time and timezone utilities — lets agents check the current time and wait.

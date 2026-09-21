@@ -92,7 +92,7 @@ tempfile = "3"
 tokio-test = "0.4"
 harnx-test-bins = { path = "../harnx-test-bins" }
 harnx-telemetry = { workspace = true, features = ["testing"] }
-harnx-time-server = { path = "../harnx-time-server" }
+harnx-time-tools = { path = "../harnx-time-tools" }
 metrics-util = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }

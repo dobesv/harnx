@@ -1,4 +1,4 @@
-use harnx_time_server::TimeToolset;
+use harnx_time_tools::TimeToolset;
 use harnx_toolset_server::run_toolset_main;
 
 #[tokio::main]

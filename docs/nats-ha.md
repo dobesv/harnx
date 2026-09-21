@@ -447,7 +447,7 @@ every process the same `HARNX_SERVER_SCOPE` and leave `--manage-servers` off:
 ```bash
 # Tool server container
 HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
-  HARNX_SERVER_SCOPE=shared harnx-time-server
+  HARNX_SERVER_SCOPE=shared harnx-time-tools
 
 # Worker container
 HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \

@@ -17,7 +17,7 @@ Browser / API client
   [harnx-worker] (scalable pool, --cluster prod)
         |
         v calls via NATS
-  [tool servers] (harnx-time-server, harnx-k8s-sandbox-tools, etc.)
+  [tool servers] (harnx-time-tools, harnx-k8s-sandbox-tools, etc.)
 ```
 
 `harnx-serve` does not run LLM loops. Instead, it accepts client requests and coordinates with NATS JetStream. One or more `harnx-worker` pods lease active sessions over NATS and execute agent turns. Workers call tool servers that register themselves as NATS consumers in a shared scope.
@@ -372,7 +372,7 @@ To deploy a tool server in Kubernetes:
 2. Provide the same `HARNX_SERVER_SCOPE=shared`.
 3. Do not pass `--manage-servers` on either worker or tool server.
 
-### Stateless tools: harnx-time-server
+### Stateless tools: harnx-time-tools
 
 Stateless tool servers run cleanly as standalone Deployments:
 
@@ -380,24 +380,24 @@ Stateless tool servers run cleanly as standalone Deployments:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: harnx-time-server
+  name: harnx-time-tools
   labels:
-    app: harnx-time-server
+    app: harnx-time-tools
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: harnx-time-server
+      app: harnx-time-tools
   template:
     metadata:
       labels:
-        app: harnx-time-server
+        app: harnx-time-tools
     spec:
       containers:
         - name: time-server
           image: ghcr.io/dobesv/harnx:0.1.0
           command:
-            - harnx-time-server
+            - harnx-time-tools
             - --healthz-addr
             - :8081
             - --metrics-addr

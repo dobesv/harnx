@@ -751,7 +751,7 @@ mod tests {
         harnx_core::require_nextest();
         use harnx_toolset::Toolset;
 
-        let specs = harnx_time_server::TimeToolset::new().tools();
+        let specs = harnx_time_tools::TimeToolset::new().tools();
         assert!(!specs.is_empty());
         let registration = Registration {
             package: None,

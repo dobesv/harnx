@@ -91,7 +91,7 @@ impl Drop for EnvGuard {
 }
 
 fn time_server_binary() -> Result<PathBuf> {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_harnx-time-server") {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_harnx-time-tools") {
         return Ok(PathBuf::from(path));
     }
     let mut path = std::env::current_exe().context("resolve test executable")?;
@@ -100,9 +100,9 @@ fn time_server_binary() -> Result<PathBuf> {
         path.pop();
     }
     path.push(if cfg!(windows) {
-        "harnx-time-server.exe"
+        "harnx-time-tools.exe"
     } else {
-        "harnx-time-server"
+        "harnx-time-tools"
     });
     if path.is_file() {
         return Ok(path);
@@ -116,14 +116,14 @@ fn time_server_binary() -> Result<PathBuf> {
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .arg("build")
         .arg("-p")
-        .arg("harnx-time-server")
+        .arg("harnx-time-tools")
         .current_dir(workspace)
         .status()
-        .context("build harnx-time-server for supervisor test")?;
-    anyhow::ensure!(status.success(), "building harnx-time-server failed");
+        .context("build harnx-time-tools for supervisor test")?;
+    anyhow::ensure!(status.success(), "building harnx-time-tools failed");
     anyhow::ensure!(
         path.is_file(),
-        "harnx-time-server not found at {}",
+        "harnx-time-tools not found at {}",
         path.display()
     );
     Ok(path)

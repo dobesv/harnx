@@ -9,5 +9,5 @@ with `HARNX_LOG_PATH`. Servers and subprocesses always log to stderr, and a
 parent that logs to a file redirects their output there — so the worker and its
 tool and hook servers land in the front-end's log instead of a separate
 `harnx_worker.log`. `harnx-pkg`, `harnx-proxy-auth`, `harnx-sandbox-run`,
-`harnx-mcp-remote`, and `harnx-mcp-time` previously ignored `HARNX_LOG_LEVEL`
-entirely; `nats-server` output was discarded.
+and `harnx-mcp-remote` previously ignored `HARNX_LOG_LEVEL` entirely;
+`nats-server` output was discarded.

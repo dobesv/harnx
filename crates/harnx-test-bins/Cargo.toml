@@ -11,7 +11,6 @@ publish = false
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-harnx-mcp-plans-core = { path = "../harnx-mcp-plans-core" }
 jiff = { workspace = true }
 libc = { workspace = true }
 ratatui = { workspace = true }
@@ -36,10 +35,6 @@ path = "src/bin/harnx-mock-mcp/main.rs"
 [[bin]]
 name = "harnx-test-ratatui"
 path = "src/bin/harnx-test-ratatui.rs"
-
-[[bin]]
-name = "harnx-mcp-plans-hermetic"
-path = "src/bin/harnx-mcp-plans-hermetic/main.rs"
 
 [dev-dependencies]
 rmcp = { workspace = true }

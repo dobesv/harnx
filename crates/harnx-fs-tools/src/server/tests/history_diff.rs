@@ -33,7 +33,7 @@ fn seed_committed_file(dir: &Path, name: &str, contents: &str) -> bool {
 /// canonicalize-then-`gix::open` flow inside `HistoryManager::new`
 /// then fails to register the repo, leaving the production code
 /// without a base to diff against. That's a pre-existing Windows
-/// limitation in `harnx-mcp-history`, not something this PR
+/// limitation in `harnx-git-history`, not something this PR
 /// introduces — the meta-shape regression test
 /// (`fs_tools_advertise_call_template_only`) still runs everywhere.
 #[cfg(unix)]

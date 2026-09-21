@@ -5,8 +5,8 @@ use harnx_core::safety::{format_size, sanitize_output_text, truncate_output, Tru
 
 use fancy_regex::Regex;
 use gix::ObjectId;
-use harnx_mcp_history::classify::{classify_command, SnapshotDecision};
-use harnx_mcp_history::HistoryManager;
+use harnx_git_history::classify::{classify_command, SnapshotDecision};
+use harnx_git_history::HistoryManager;
 #[cfg(unix)]
 use harnx_sandbox_common::build_default_sandbox_args;
 use harnx_sandbox_common::SandboxConfig;
