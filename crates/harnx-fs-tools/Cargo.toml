@@ -28,8 +28,10 @@ tokio-util = { workspace = true }
 
 [dev-dependencies]
 async-nats = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 uuid = { workspace = true }
 which = { workspace = true }
 

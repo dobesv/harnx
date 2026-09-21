@@ -26,7 +26,7 @@ args:
 | :--- | :--- | :--- | :--- | :--- |
 | `--dir <path>` | `-d` | `AGENT_PLANS_PATH` | `.agent/plans` | Path to the plans directory. |
 | `--retention-days <N>` | `-r` | `AGENT_PLANS_RETENTION_DAYS` | `14` | Retention period in days. |
-| `--http` | | | | Serve MCP over Streamable HTTP at /mcp. |
+| `--mcp-http` | | | | Serve MCP over Streamable HTTP at /mcp. |
 | `--host <addr>` | | | `0.0.0.0` | Bind address for HTTP mode. |
 | `--port <N>` | | | `3000` | Bind port for HTTP mode. |
 | `--mcp-stdio` | | | | Serve MCP over stdio instead of native NATS mode. |

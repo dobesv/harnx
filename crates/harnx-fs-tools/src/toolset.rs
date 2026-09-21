@@ -92,6 +92,10 @@ impl Toolset for FsToolset {
         "fs"
     }
 
+    fn default_mcp_http_port(&self) -> u16 {
+        3003
+    }
+
     fn tools(&self) -> Vec<ToolSpec> {
         builtin_tool_specs()
     }

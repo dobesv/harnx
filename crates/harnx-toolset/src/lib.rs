@@ -222,6 +222,12 @@ pub struct ToolInvocation {
 #[async_trait]
 pub trait Toolset: Send + Sync {
     fn name(&self) -> &str;
+
+    /// Default TCP port for the MCP Streamable HTTP transport.
+    fn default_mcp_http_port(&self) -> u16 {
+        3000
+    }
+
     fn tools(&self) -> Vec<ToolSpec>;
     async fn invoke(
         &self,

@@ -25,6 +25,8 @@ cargo install --path crates/harnx-bash-tools
 
 Other options include `--tool <PATH>` (load one YAML command template; repeatable), `--tools-dir <PATH>` (load every `.yaml` command template in a directory; repeatable), `--no-sandbox`, `--sandbox-run <PATH>`, `--env`/`-e`, `--mcp-stdio`, and `--help`/`-h`.
 
+For Streamable HTTP MCP mode, pass `--mcp-http`. `--host` defaults to `0.0.0.0`; `--port` defaults to `3002` and serves MCP at `/mcp`.
+
 ## Environment variables
 
 Path-list variables use platform path-list syntax:

@@ -149,6 +149,10 @@ impl Toolset for TimeToolset {
         "time"
     }
 
+    fn default_mcp_http_port(&self) -> u16 {
+        3001
+    }
+
     fn tools(&self) -> Vec<ToolSpec> {
         tool_specs::all()
     }

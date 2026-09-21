@@ -146,6 +146,9 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --env, -e <VAR>           Pass VAR from host env to child (repeatable)");
     eprintln!("  --env, -e <VAR=VALUE>     Set VAR=VALUE in child env (repeatable)");
     eprintln!("  --mcp-stdio               Use MCP stdio transport instead of NATS");
+    eprintln!("  --mcp-http                Use MCP Streamable HTTP transport instead of NATS");
+    eprintln!("  --host <HOST>             MCP HTTP bind host (default: 0.0.0.0)");
+    eprintln!("  --port <PORT>             MCP HTTP bind port (default: 3002)");
     eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
     eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
     eprintln!("                            Also honors HARNX_METRICS_ADDR env.");
@@ -182,9 +185,11 @@ fn initial_sandbox_config() -> SandboxConfig {
     }
 }
 
-const PASSTHROUGH_FLAGS: [(&str, &str); 2] = [
+const PASSTHROUGH_FLAGS: [(&str, &str); 4] = [
     ("--metrics-addr", "--metrics-addr="),
     ("--healthz-addr", "--healthz-addr="),
+    ("--host", "--host="),
+    ("--port", "--port="),
 ];
 
 struct ParseState<'a> {
@@ -204,7 +209,7 @@ impl ParseState<'_> {
                 self.index += 2;
                 return true;
             }
-            if arg.starts_with(assignment) {
+            if arg.strip_prefix(assignment).is_some() {
                 self.index += 1;
                 return true;
             }
@@ -277,7 +282,7 @@ fn parse_cli_args(
                 state.index += 2;
             }
             "--env" | "-e" => parse_env_option(args, &mut state.index, config),
-            "--mcp-stdio" => state.index += 1,
+            "--mcp-stdio" | "--mcp-http" => state.index += 1,
             "--help" | "-h" => print_help_and_exit(),
             other => {
                 return Err(format!(
@@ -411,6 +416,55 @@ mod tests {
             [PathBuf::from("one.yaml"), PathBuf::from("two.yaml")]
         );
         assert_eq!(cli_dirs, [PathBuf::from("templates")]);
+    }
+
+    #[test]
+    fn accepts_mcp_http_listener_flags() {
+        let args = [
+            "harnx-bash-tools",
+            "--mcp-http",
+            "--host",
+            "127.0.0.1",
+            "--port=0",
+            "--allow-all",
+        ]
+        .map(str::to_string);
+        let mut inputs = AllowInputs::default();
+        let mut config = initial_sandbox_config();
+        let mut cli_files = Vec::new();
+        let mut cli_dirs = Vec::new();
+
+        parse_cli_args(
+            &args,
+            &mut inputs,
+            &mut config,
+            &mut cli_files,
+            &mut cli_dirs,
+        )
+        .expect("MCP HTTP listener flags should parse");
+
+        assert!(inputs.all, "boolean flag after --mcp-http was swallowed");
+    }
+
+    #[test]
+    fn rejects_near_prefix_passthrough_flags() {
+        for flag in ["--mcp-http-typo", "--metrics-addr-typo"] {
+            let args = ["harnx-bash-tools", flag].map(str::to_string);
+            let mut inputs = AllowInputs::default();
+            let mut config = initial_sandbox_config();
+            let mut cli_files = Vec::new();
+            let mut cli_dirs = Vec::new();
+
+            let error = parse_cli_args(
+                &args,
+                &mut inputs,
+                &mut config,
+                &mut cli_files,
+                &mut cli_dirs,
+            )
+            .expect_err("near-prefix flag should be rejected");
+            assert!(error.contains(&format!("unknown argument: {flag}")));
+        }
     }
 
     #[test]

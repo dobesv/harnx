@@ -49,7 +49,7 @@ fn env_toggle(name: &str) -> bool {
 }
 
 /// Parse filesystem-specific CLI arguments. Shared server runner consumes
-/// `--mcp-stdio`, so this parser accepts it without changing allowlist setup.
+/// MCP transport arguments, so this parser accepts them without changing allowlist setup.
 fn parse_args() -> AllowInputs {
     let args: Vec<String> = std::env::args().collect();
     parse_args_from(&args, initial_allow_inputs()).unwrap_or_else(|error| {
@@ -71,9 +71,11 @@ fn initial_allow_inputs() -> AllowInputs {
     }
 }
 
-const PASSTHROUGH_FLAGS: [(&str, &str); 2] = [
+const PASSTHROUGH_FLAGS: [(&str, &str); 4] = [
     ("--metrics-addr", "--metrics-addr="),
     ("--healthz-addr", "--healthz-addr="),
+    ("--host", "--host="),
+    ("--port", "--port="),
 ];
 
 struct ParseState<'a> {
@@ -93,7 +95,7 @@ impl ParseState<'_> {
                 self.index += 2;
                 return true;
             }
-            if arg.starts_with(assignment) {
+            if arg.strip_prefix(assignment).is_some() {
                 self.index += 1;
                 return true;
             }
@@ -130,7 +132,7 @@ fn parse_args_from(args: &[String], mut inputs: AllowInputs) -> Result<AllowInpu
                 inputs.all = true;
                 None
             }
-            "--mcp-stdio" => None,
+            "--mcp-stdio" | "--mcp-http" => None,
             "--help" | "-h" => print_help_and_exit(),
             other => {
                 return Err(format!(
@@ -171,6 +173,9 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --allow-repo-work         Allow detected project roots and current directory");
     eprintln!("  --allow-all               Allow all filesystem paths");
     eprintln!("  --mcp-stdio               Serve MCP over stdio instead of toolset mode");
+    eprintln!("  --mcp-http                Serve MCP over Streamable HTTP instead of toolset mode");
+    eprintln!("  --host <HOST>             MCP HTTP bind host (default: 0.0.0.0)");
+    eprintln!("  --port <PORT>             MCP HTTP bind port (default: 3003)");
     eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
     eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
     eprintln!("                            Also honors HARNX_METRICS_ADDR env.");
@@ -184,6 +189,33 @@ fn print_help_and_exit() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_mcp_http_listener_flags() {
+        let args = [
+            "harnx-fs-tools",
+            "--mcp-http",
+            "--host",
+            "127.0.0.1",
+            "--port=0",
+            "--allow-all",
+        ]
+        .map(str::to_string);
+
+        let inputs = parse_args_from(&args, AllowInputs::default())
+            .expect("MCP HTTP listener flags should parse");
+        assert!(inputs.all, "boolean flag after --mcp-http was swallowed");
+    }
+
+    #[test]
+    fn rejects_near_prefix_passthrough_flags() {
+        for flag in ["--mcp-http-typo", "--metrics-addr-typo"] {
+            let args = ["harnx-fs-tools", flag].map(str::to_string);
+            let error = parse_args_from(&args, AllowInputs::default())
+                .expect_err("near-prefix flag should be rejected");
+            assert!(error.contains(&format!("unknown argument: {flag}")));
+        }
+    }
 
     #[test]
     fn rejects_legacy_allowlist_flags() {

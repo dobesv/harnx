@@ -30,5 +30,9 @@ path = "src/main.rs"
 async-nats = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 libc = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 which = { workspace = true }

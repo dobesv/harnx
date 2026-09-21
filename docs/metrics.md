@@ -39,7 +39,7 @@ All exported metrics use the `harnx_` prefix.
 |-------------|------|--------|-------------|----------|
 | `harnx_llm_tokens_total` | Counter | `agent`, `client`, `provider`, `model`, `type` | Chat-completion token count (`type` is `input`, `output`, `cache_read`, `cache_write`, or deprecated alias `cached`). | `harnx-worker` |
 | `harnx_llm_cost_dollars` | Gauge | `agent`, `client`, `provider`, `model` | Cumulative estimated LLM cost in USD. Monotonically increases over process lifetime. | `harnx-worker` |
-| `harnx_http_requests_total` | Counter | `method`, `route`, `status` | HTTP request count. `route` uses template patterns or static names. | HTTP servers (`harnx-serve`, `aws-creds`, `k8s-creds`, `proxy-auth`, rmcp `--http` servers) |
+| `harnx_http_requests_total` | Counter | `method`, `route`, `status` | HTTP request count. `route` uses template patterns or static names. | HTTP servers (`harnx-serve`, `aws-creds`, `k8s-creds`, `proxy-auth`, rmcp `--mcp-http` servers) |
 | `harnx_http_request_duration_seconds` | Histogram | `method`, `route` | HTTP request latency histogram (buckets: 0.005s to 10s). | HTTP servers |
 | `harnx_tool_calls_total` | Counter | `tool`, `status` | Tool execution count (`status` is `ok` or `error`). | Tool & MCP servers |
 | `harnx_tool_call_duration_seconds` | Histogram | `tool` | Tool execution duration histogram. | Tool & MCP servers |
@@ -73,7 +73,7 @@ To add per-call LLM instrumentation (billing, cost attribution, audit), add it a
 - **NATS mode** → `invoke_uncached_tool` (shared entrypoint)
 - **MCP stdio mode** → `McpToolsetAdapter::dispatch_call_tool` (calls `toolset.invoke` directly)
 
-Any cross-cutting concern (metrics, tracing, auth) added at one seam does **not** automatically cover the other. rmcp `--http` servers use their own `ServerHandler::call_tool` method, a third seam. When adding instrumentation, check all relevant paths.
+Any cross-cutting concern (metrics, tracing, auth) added at one seam does **not** automatically cover the other. rmcp `--mcp-http` servers use their own `ServerHandler::call_tool` method, a third seam. When adding instrumentation, check all relevant paths.
 
 ### Float accumulators
 

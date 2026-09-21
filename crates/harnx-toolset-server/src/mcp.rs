@@ -66,9 +66,9 @@ impl McpToolsetAdapter {
     /// `CallToolResult`.
     ///
     /// Tool dispatch forks: `run_toolset_main` has two mutually exclusive paths:
-    /// NATS → `invoke_uncached_tool`, and MCP stdio → this method (calls
+    /// NATS → `invoke_uncached_tool`, and MCP stdio/HTTP → this method (calls
     /// `toolset.invoke_with_context` directly). Any cross-cutting concern (metrics, tracing, auth)
-    /// added at one seam does NOT automatically cover the other. rmcp `--http` servers
+    /// added at one seam does NOT automatically cover the other. Bespoke rmcp servers
     /// use their own `ServerHandler::call_tool`, a third seam.
     async fn dispatch_call_tool(
         &self,
@@ -76,6 +76,17 @@ impl McpToolsetAdapter {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let tool_name = request.name.clone();
+        if !self
+            .toolset
+            .tools()
+            .iter()
+            .any(|tool| tool.name == tool_name)
+        {
+            return Err(ErrorData::invalid_params(
+                format!("unknown tool: {tool_name}"),
+                None,
+            ));
+        }
         let args = Value::Object(request.arguments.unwrap_or_default());
         let capabilities = context
             .meta
@@ -87,8 +98,8 @@ impl McpToolsetAdapter {
             call_id: format!("{:?}", context.id),
             invoking_session_id: None,
             capabilities,
-            // stdio has no journal to record a checkpoint in, and no control
-            // subject a later cancel could arrive on.
+            // MCP transports have no journal to record a checkpoint in, and no
+            // control subject a later cancel could arrive on.
             checkpoint: None,
             checkpoint_store: None,
         };

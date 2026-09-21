@@ -125,6 +125,10 @@ impl Toolset for BashToolset {
         "bash"
     }
 
+    fn default_mcp_http_port(&self) -> u16 {
+        3002
+    }
+
     fn tools(&self) -> Vec<ToolSpec> {
         let mut tools = builtin_tool_specs();
         tools.extend(self.server.tool_templates().map(|(name, registered)| {
