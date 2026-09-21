@@ -271,7 +271,7 @@ impl Config {
                 let default_cluster = {
                     let config = config.read();
                     match &config.nats_routing {
-                        NatsRouting::Default => None,
+                        NatsRouting::Default | NatsRouting::FrontendLocal => None,
                         NatsRouting::Cluster(cluster) => Some(cluster.clone()),
                     }
                 };

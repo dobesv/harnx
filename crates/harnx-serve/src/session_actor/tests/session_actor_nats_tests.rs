@@ -192,14 +192,17 @@ async fn seed_leased_pending_tool_call(
     )
 }
 
-fn live_worker_binary() -> Option<std::path::PathBuf> {
-    if std::process::Command::new(
+fn nats_server_available() -> bool {
+    std::process::Command::new(
         std::env::var_os("NATS_SERVER_BIN").unwrap_or_else(|| "nats-server".into()),
     )
     .arg("--version")
     .output()
-    .is_err()
-    {
+    .is_ok()
+}
+
+fn live_worker_binary() -> Option<std::path::PathBuf> {
+    if !nats_server_available() {
         eprintln!("skipping serve NATS smoke: nats-server not available");
         return None;
     }
@@ -252,7 +255,7 @@ async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
 
 struct ServeSmokeOpenAi {
     api_base: String,
-    first_request: tokio::sync::oneshot::Receiver<()>,
+    first_request: tokio::sync::oneshot::Receiver<Vec<u8>>,
     release_first: tokio::sync::oneshot::Sender<()>,
     second_request: tokio::sync::oneshot::Receiver<Vec<u8>>,
     task: tokio::task::JoinHandle<()>,
@@ -269,8 +272,8 @@ async fn start_serve_smoke_openai() -> ServeSmokeOpenAi {
     let (second_tx, second_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let (mut first, _) = listener.accept().await.expect("first model request");
-        read_http_request(&mut first).await;
-        let _ = first_tx.send(());
+        let request = read_http_request(&mut first).await;
+        let _ = first_tx.send(request);
         let _ = release_rx.await;
         let body = concat!(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"serve worker completed\"},\"finish_reason\":null}]}\n\n",
@@ -352,6 +355,105 @@ async fn serve_replays_prompt_queued_during_active_run() {
         "second model request did not contain queued prompt"
     );
     cancel(&handle).await;
+    mock.task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_owner_elects_local_broker_despite_operator_env() {
+    harnx_core::require_nextest();
+    if !nats_server_available() {
+        eprintln!("skipping serve NATS owner test: nats-server not available");
+        return;
+    }
+    let _sandbox = TestConfigSandbox::new();
+    // SAFETY: TestConfigSandbox serializes environment-mutating serve tests and
+    // restores both variables when dropped.
+    unsafe {
+        std::env::set_var("HARNX_NATS_URL", "tls://operator.invalid:4222");
+        std::env::set_var("HARNX_NATS_TOKEN", "operator-token");
+    }
+    let ports_file = harnx_core::config_paths::nats_runtime_ports_file();
+    assert!(
+        !ports_file.exists(),
+        "isolated sandbox unexpectedly contains a NATS ports file"
+    );
+
+    crate::ensure_frontend_nats_owner(LOCAL_CLUSTER_KEY)
+        .await
+        .expect("elect frontend-owned local NATS broker");
+    assert!(
+        ports_file.is_file(),
+        "frontend owner election did not write the local NATS ports file"
+    );
+
+    let server = harnx_runtime::nats_local_server::ensure_shared_server()
+        .await
+        .expect("join elected local NATS broker");
+    assert!(
+        server.url.starts_with("nats://"),
+        "elected broker was not a local plaintext endpoint: {}",
+        server.url
+    );
+    assert_ne!(server.url, "tls://operator.invalid:4222");
+    let client = async_nats::ConnectOptions::new()
+        .token(server.token.clone())
+        .connect(&server.url)
+        .await
+        .expect("connect to elected local NATS broker");
+    client
+        .flush()
+        .await
+        .expect("flush elected local NATS broker connection");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_local_turn_completes_with_operator_env_present() {
+    harnx_core::require_nextest();
+    let Some(binary) = live_worker_binary() else {
+        return;
+    };
+    let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    // SAFETY: TestConfigSandbox serializes environment-mutating serve tests and
+    // restores both variables when dropped.
+    unsafe {
+        std::env::set_var("HARNX_NATS_URL", "tls://operator.invalid:4222");
+        std::env::set_var("HARNX_NATS_TOKEN", "operator-token");
+    }
+    let mock = start_serve_smoke_openai().await;
+    sandbox.write_mock_openai_client(&mock.api_base);
+    sandbox.write_agent_with_front_matter(
+        "plain",
+        "model: mock:test\nstream: true",
+        "Complete the turn.",
+    );
+    let mut config = sandbox.config();
+    config.apply_frontend_nats_routing();
+    // This pre-seeded supervisor path covers an end-to-end __local__ turn with
+    // operator env present. Lazy serve owner election is tested separately above.
+    let supervisor = LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal())
+        .await
+        .expect("start local worker");
+    let registry = SessionRegistry::new_with_local_worker_for_tests(config, supervisor);
+    let session_id = format!("serve-local-operator-env-{}", uuid::Uuid::new_v4());
+    let handle = registry.get_or_spawn(key("plain", &session_id));
+    let mut events = subscribe(&handle).await.events;
+
+    assert!(matches!(
+        prompt(&handle, "operator env must be ignored").await,
+        PromptResult::Accepted { .. }
+    ));
+    let request = tokio::time::timeout(Duration::from_secs(15), mock.first_request)
+        .await
+        .expect("local NATS session turn did not reach worker")
+        .expect("first mock request notifier dropped");
+    assert!(
+        String::from_utf8_lossy(&request).contains("operator env must be ignored"),
+        "model request did not contain prompt"
+    );
+
+    let _ = mock.release_first.send(());
+    assert_first_turn_streamed_and_finished(&mut events).await;
     mock.task.abort();
 }
 

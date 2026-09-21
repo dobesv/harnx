@@ -350,6 +350,47 @@ async fn await_background_broker_recovery(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_broker_environment_cannot_poison_local_worker_transport() {
+    require_nextest();
+    let Some(binary) = skip_without_binaries() else {
+        return;
+    };
+    let root = tempfile::tempdir().expect("create isolated supervisor environment");
+    let _environment = isolated_environment(root.path());
+    let operator_url = "tls://operator.example:4222";
+    let _operator_environment = [
+        EnvGuard::set("HARNX_NATS_URL", Path::new(operator_url)),
+        EnvGuard::set("HARNX_NATS_TOKEN", Path::new("operator-token")),
+        EnvGuard::set("HARNX_NATS_TLS", Path::new("true")),
+        EnvGuard::set("HARNX_NATS_TLS_CERT", Path::new("/operator/client.crt")),
+        EnvGuard::set("HARNX_NATS_TLS_KEY", Path::new("/operator/client.key")),
+        EnvGuard::set("HARNX_NATS_TLS_CA", Path::new("/operator/ca.crt")),
+        EnvGuard::set("HARNX_NATS_IGNORE_DISCOVERED_SERVERS", Path::new("true")),
+        EnvGuard::set("HARNX_NATS_REPLICAS", Path::new("3")),
+    ];
+    write_trivial_agent_config(root.path(), "http://127.0.0.1:1/v1");
+
+    let supervisor = LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal())
+        .await
+        .expect("local worker must start with clean elected broker transport");
+    let worker_pid = supervisor.worker_pid().expect("worker PID");
+    let local = supervisor.server();
+
+    assert_ne!(local.url, operator_url);
+    assert!(local.url.starts_with("nats://"));
+    async_nats::ConnectOptions::new()
+        .token(local.token)
+        .connect(&local.url)
+        .await
+        .expect("connect to elected local broker")
+        .flush()
+        .await
+        .expect("flush elected local broker connection");
+
+    drop(supervisor);
+    wait_for_process_exit(worker_pid).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_worker_without_readiness_heartbeats_is_replaced() {
     require_nextest();
     let Some(binary) = skip_without_binaries() else {

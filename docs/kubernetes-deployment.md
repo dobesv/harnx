@@ -37,7 +37,7 @@ Browser / API client
 
 ## NATS Connection Configuration
 
-All Harnx components connect to NATS. Set `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` together in the container environment. For high-availability JetStream clusters, set `HARNX_NATS_REPLICAS=3`.
+All Harnx components communicate over NATS. Workers and standalone tool servers connect directly using `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` from their environment. Front-ends (`harnx-serve`) connect as cluster clients by setting `HARNX_NATS_SERVER=<name>` pointing to a cluster definition under `nats_servers/<name>.yaml`, which can expand `${HARNX_NATS_URL}` and `${HARNX_NATS_TOKEN}`. For high-availability JetStream clusters, set `HARNX_NATS_REPLICAS=3`.
 
 For TLS or mTLS clusters, set the corresponding TLS environment variables:
 - `HARNX_NATS_TLS=true`
@@ -62,7 +62,27 @@ Harnx automatically creates the required JetStream streams and KV buckets on con
 
 In Kubernetes, pass `--addr 0.0.0.0:8000` so pods and ingress controllers can reach the server (it defaults to `127.0.0.1:8000`).
 
-Both `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` must be set in the environment. When both variables are present, `harnx-serve` connects to your external NATS cluster. If either variable is missing, `harnx-serve` attempts to spawn a local `nats-server` binary, which fails in containers where `nats-server` is not installed.
+To run `harnx-serve` against your external cluster, set `HARNX_NATS_SERVER=<name>` (e.g. `remote`) and mount `nats_servers/<name>.yaml` into the configuration directory (`HARNX_CONFIG_DIR`). The server reads connection parameters from that file, which can use `${HARNX_NATS_URL}` and `${HARNX_NATS_TOKEN}` expansion.
+
+Setting only `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` on a front-end no longer joins the cluster. When `HARNX_NATS_SERVER` is unset, `harnx-serve` treats sessions as local (`__local__`), ignores operator `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` for its own routing, and self-hosts a local broker instead. In container environments without `nats-server` installed, that startup fails. Even if a local broker binary were present, sessions would stay confined to the pod instead of routing to your shared `harnx-worker` pool.
+
+### Cluster configuration ConfigMap
+
+The `config-volume` mounts `/etc/harnx/config` from the `harnx-config` ConfigMap. Provide `nats_servers/remote.yaml` inside that directory (matching `HARNX_NATS_SERVER=remote`). Using `${VAR}` expansion keeps credentials in secrets:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: harnx-config
+data:
+  # Mounts into /etc/harnx/config/nats_servers/remote.yaml
+  remote.yaml: |
+    url: "${HARNX_NATS_URL}"
+    token: "${HARNX_NATS_TOKEN}"
+```
+
+Keep `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` in `env:` on the deployment: `remote.yaml` expands them at connection time, and child worker/tool-server processes still rely on them for transport.
 
 ### Deployment and Service manifest (Baked image)
 
@@ -97,6 +117,8 @@ spec:
             - --metrics-addr
             - :8456
           env:
+            - name: HARNX_NATS_SERVER
+              value: remote
             - name: HARNX_NATS_URL
               value: nats://nats.default.svc.cluster.local:4222
             - name: HARNX_NATS_TOKEN
@@ -127,6 +149,9 @@ spec:
         - name: config-volume
           configMap:
             name: harnx-config
+            items:
+              - key: remote.yaml
+                path: nats_servers/remote.yaml
 ---
 apiVersion: v1
 kind: Service
@@ -192,6 +217,8 @@ spec:
           env:
             - name: HARNX_WEB_ASSETS
               value: /web-assets
+            - name: HARNX_NATS_SERVER
+              value: remote
             - name: HARNX_NATS_URL
               value: nats://nats.default.svc.cluster.local:4222
             - name: HARNX_NATS_TOKEN
@@ -229,6 +256,9 @@ spec:
         - name: config-volume
           configMap:
             name: harnx-config
+            items:
+              - key: remote.yaml
+                path: nats_servers/remote.yaml
 ```
 
 ---
