@@ -166,7 +166,7 @@ overrides:
   '@ag-ui/client': 0.0.59
   '@assistant-ui/core': 0.3.18
   '@assistant-ui/store': 0.3.13
-  assistant-stream: 0.3.43
+  assistant-stream: 0.3.44
 
 importers:
 
@@ -1499,6 +1499,9 @@ packages:
   '@types/hast@3.0.5':
     resolution: {integrity: sha512-rp/ezSWaD1m44dPKICGhiskI13nVr7qTloFwDa/IYkhhf5nzwP+zIQcIJh3WIFSBOy/H1PzB40jPjMDksN4F+g==}
 
+  '@types/json-schema@7.0.15':
+    resolution: {integrity: sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA==}
+
   '@types/mdast@4.0.4':
     resolution: {integrity: sha512-kGaNbPh1k7AFzgpud/gMdvIm5xuECykRR+JnWKQno9TAXVa6WIVCGTPvYGekIDL4uwCZQSYbUxNBSb1aUo79oA==}
 
@@ -1731,8 +1734,8 @@ packages:
       '@opentelemetry/sdk-trace-base':
         optional: true
 
-  assistant-stream@0.3.43:
-    resolution: {integrity: sha512-spQk/1g6f1CNN1Lkxt1AQBuphLMHIA/o8I+RpQhQLJ6R0KsDYXSMEpVwXNxNJN2fAUUYvA2xESJv/5cBqV+4+Q==}
+  assistant-stream@0.3.44:
+    resolution: {integrity: sha512-418FRutG6g6WUd8EckGG+ZVOn/rmgop36oyzAMk1bRqktZOlY2RdtBl0yoUpDM/IDPWVNe7baYtSKN3UvjQzoA==}
     peerDependencies:
       ioredis: ^5.10.1 || ^6.0.0
       redis: ^5.12.1
@@ -2846,7 +2849,7 @@ snapshots:
     dependencies:
       '@assistant-ui/store': 0.3.13(@assistant-ui/tap@0.9.17(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
       '@assistant-ui/tap': 0.9.17(@types/react@19.3.0)(react@19.3.0)
-      assistant-stream: 0.3.43
+      assistant-stream: 0.3.44
       nanoid: 6.0.1
     optionalDependencies:
       '@types/react': 19.3.0
@@ -2862,7 +2865,7 @@ snapshots:
       '@assistant-ui/core': 0.3.18(@assistant-ui/store@0.3.13(@assistant-ui/tap@0.9.17(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0))(@assistant-ui/tap@0.9.17(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(assistant-cloud@0.2.0)(react@19.3.0)
       '@assistant-ui/react-generative-ui': 0.0.18(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)(zod@4.5.4)
       '@assistant-ui/store': 0.3.13(@assistant-ui/tap@0.9.17(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
-      assistant-stream: 0.3.43
+      assistant-stream: 0.3.44
       fast-json-patch: 3.1.1
       react: 19.3.0
     optionalDependencies:
@@ -2878,7 +2881,7 @@ snapshots:
   '@assistant-ui/react-generative-ui@0.0.18(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)(zod@4.5.4)':
     dependencies:
       '@assistant-ui/react': 0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
-      assistant-stream: 0.3.43
+      assistant-stream: 0.3.44
       react: 19.3.0
       zod: 4.5.4
     optionalDependencies:
@@ -2918,7 +2921,7 @@ snapshots:
       '@assistant-ui/store': 0.3.13(@assistant-ui/tap@0.9.17(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
       '@assistant-ui/tap': 0.9.17(@types/react@19.3.0)(react@19.3.0)
       assistant-cloud: 0.2.0
-      assistant-stream: 0.3.43
+      assistant-stream: 0.3.44
       radix-ui: 1.6.7(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       react: 19.3.0
       react-dom: 19.3.0(react@19.3.0)
@@ -3986,6 +3989,8 @@ snapshots:
     dependencies:
       '@types/unist': 3.0.3
 
+  '@types/json-schema@7.0.15': {}
+
   '@types/mdast@4.0.4':
     dependencies:
       '@types/unist': 3.0.3
@@ -4123,14 +4128,15 @@ snapshots:
 
   assistant-cloud@0.2.0:
     dependencies:
-      assistant-stream: 0.3.43
+      assistant-stream: 0.3.44
     transitivePeerDependencies:
       - ioredis
       - redis
 
-  assistant-stream@0.3.43:
+  assistant-stream@0.3.44:
     dependencies:
       '@standard-schema/spec': 1.1.0
+      '@types/json-schema': 7.0.15
       nanoid: 6.0.1
       secure-json-parse: 4.1.0
 
