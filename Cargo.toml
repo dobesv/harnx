@@ -128,7 +128,7 @@ async-recursion = "1.1.1"
 http = "1.1.0"
 http-body = "1"
 http-body-util = "0.1"
-opentelemetry = "0.32"
+opentelemetry = "0.32"  # Cannot bump to 0.33 until tracing-opentelemetry 0.34 ships (0.33 depends on otel ^0.32)
 opentelemetry-http = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false }
 opentelemetry-proto = { version = "0.32", default-features = false }

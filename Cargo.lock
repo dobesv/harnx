@@ -187,7 +187,7 @@ dependencies = [
  "objc2-foundation",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
  "wl-clipboard-rs",
  "x11rb",
 ]
@@ -1855,7 +1855,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2023,7 +2023,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2096,9 +2096,9 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
-version = "0.19.1"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52e0387578e845beb7a1acff126228499f26cb18edf12919cc513bb863266464"
+checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
 dependencies = [
  "bit-set 0.8.0",
  "regex-automata",
@@ -2853,7 +2853,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c91d8cffac8849493a82233811bd02b2b183b8cf39bf704de0fa0841b737595"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -3493,7 +3493,7 @@ dependencies = [
  "crossterm",
  "dirs 7.0.0",
  "duct",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "futures-util",
  "fuzzy-matcher",
  "glob",
@@ -3589,7 +3589,7 @@ version = "0.33.4"
 dependencies = [
  "anyhow",
  "async-trait",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "gix",
  "harnx-core",
  "harnx-git-history",
@@ -3690,7 +3690,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs 7.0.0",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "futures-util",
  "hmac",
  "indexmap",
@@ -3740,7 +3740,7 @@ name = "harnx-fetch"
 version = "0.33.4"
 dependencies = [
  "anyhow",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "futures-util",
  "harnx-core",
  "html_to_markdown",
@@ -3765,7 +3765,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "base64 0.23.1",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "gix",
  "glob",
  "harnx-core",
@@ -3803,7 +3803,7 @@ version = "0.33.4"
 dependencies = [
  "anyhow",
  "async-trait",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "harnx-core",
  "harnx-metrics",
  "harnx-toolset",
@@ -3835,7 +3835,7 @@ name = "harnx-hooks"
 version = "0.33.4"
 dependencies = [
  "anyhow",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "harnx-core",
  "inquire",
  "log",
@@ -4201,7 +4201,7 @@ dependencies = [
  "crossterm",
  "dirs 7.0.0",
  "duct",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "futures-util",
  "fuzzy-matcher",
  "globset",
@@ -4495,7 +4495,7 @@ dependencies = [
  "bincode 2.0.1",
  "chrono",
  "crossterm",
- "fancy-regex 0.19.1",
+ "fancy-regex 0.19.2",
  "futures-util",
  "harnx-core",
  "harnx-render",
@@ -5146,7 +5146,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5255,9 +5255,9 @@ dependencies = [
 
 [[package]]
 name = "jiff"
-version = "0.2.35"
+version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "668b7183bd07af9a4885f5c35b0cc5c83c4607a913c16b7e17291832910d2dcc"
+checksum = "0ab1baf72f08796de0260609515130699b890ac25f30e610ad894bc5856cafdb"
 dependencies = [
  "defmt",
  "jiff-core",
@@ -5281,9 +5281,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "0.2.35"
+version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a69dcb3a21cfb32ce1cd056169337ca284af0766dd766e7878819b251a49204"
+checksum = "378268a1116ad67ae6228701118ac9f491d78fda38a40a1f1a9e1348de6f7212"
 dependencies = [
  "jiff-core",
  "proc-macro2",
@@ -5991,7 +5991,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6470,7 +6470,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7072,7 +7072,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7539,9 +7539,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.3.0"
+version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b88db56b8ae316560e9e868b6b978ea940f27cb883323fc90e07435e44158f5c"
+checksum = "b23c62fe489ac1d401ab32688cfacac3737a8978dc3343e5361464c7724fd3cb"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7573,9 +7573,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.3.0"
+version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "873b730df6f0a9b74b13eb514e0dca4c2db0d8b68b74af98a2e9bf3f9d436585"
+checksum = "cd740c45d66ceb87e5579082abc27bd771665e464e9660a17a048c721b2a6025"
 dependencies = [
  "darling 0.24.0",
  "proc-macro2",
@@ -7641,7 +7641,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7709,7 +7709,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8547,7 +8547,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9689,7 +9689,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

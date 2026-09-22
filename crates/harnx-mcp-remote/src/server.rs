@@ -3,7 +3,7 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, InitializeRequestParams,
     ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerInfo,
+    ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer, RunningService};
 use rmcp::Peer;
@@ -63,8 +63,8 @@ impl RemoteProxyServer {
 }
 
 impl ServerHandler for RemoteProxyServer {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()

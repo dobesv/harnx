@@ -11,8 +11,8 @@ fn domain_result(result: Result<CallToolResult, ErrorData>) -> Result<CallToolRe
 }
 
 impl ServerHandler for BashServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "harnx-bash-tools",
                 env!("CARGO_PKG_VERSION"),
