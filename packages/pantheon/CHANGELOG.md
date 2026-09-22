@@ -1,6 +1,263 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.0 (2026-09-22)
+
+### Breaking Changes
+
+- HARNX_INSTANCE_ID is now HARNX_SERVER_SCOPE. It is set
+automatically in normal use; set it explicitly only when deploying tool
+or hook servers independently of a worker.
+
+* feat(worker): add --manage-servers instead of inferring topology from the cluster key
+
+Three gates decided whether the worker launches its own tool and hook
+servers by comparing the cluster key to __local__, so pointing a worker at
+any other cluster silently left it with no tools and no hooks. Make it an
+explicit flag and let a worker discover independently deployed servers
+under a configured scope.
+
+Also fixes two silent-degradation gaps from the previous task's review:
+a failed NATS tool-registration discovery now logs a warning naming the
+scope instead of vanishing, and two comments describing a worker-owns-this
+framing the project discarded (a scope can belong to an independently
+deployed set with no worker at all) are reworded.
+
+* fix(worker): skip local NATS resolution when there is nothing to spawn
+
+start_local_tool_servers had no servers.is_empty() short-circuit, unlike
+start_global_hooks's hooks.entries.is_empty() check, so a manage_servers
+worker with nothing configured still resolved a local NATS server (and,
+with no broker address handed down, spawned a real shared nats-server
+child) on every call. agent_hook_start_config had the same gap at the
+per-activation level: it ran the identical resolution once per turn
+regardless of whether the active agent had any hooks to launch.
+
+Add the missing empty checks, mirroring the hooks path. This is what was
+driving the stress-run flakiness in unrelated tests that switched to
+
+### Features
+
+- introduce AgentEvent::SubAgent for structural routing (#1233)
+- add natural-writing style guidance to agent prompts (#1249)
+- route local front-ends to worker via shared NATS broker (#1250)
+- add instance-scoped tool servers over NATS with time pilot (#1274)
+- generalize tool-server bootstrap with config-driven lifecycle (#1284)
+- add native harnx-vercel-grep-server MCP server (#1277)
+- migrate fs and bash MCP servers to run bridged over NATS (#1299)
+- migrate sub-agents to NATS agent sessions and delete ACP (#1306)
+- convert fs to a toolset server and rename to harnx-fs-tools (#1310)
+- add core hooks-over-NATS infrastructure and dual dispatch (#1314)
+- launch and dispatch hooks over NATS (#1324)
+- remove inline hook dispatch and migrate proxy-auth to NATS (#1325)
+- make hook config command-only with supervisor nonces (#1224) (#1330)
+- convert bash/plans/grep servers to native NATS toolsets (#1224) (#1339)
+- harmonize fs and bash allowlists and deprecate roots (#1224) (#1343)
+- propagate tool _meta over bridge, relocate shared utils, fix release.yaml (#1224, #1349) (#1352)
+- remove direct MCP path (McpManager + mcp_servers/), delete harnx-mcp (#1224) (#1353)
+- split the NATS worker into its own harnx-worker binary (#1401)
+- run tool and hook servers as independent deployments (#1415)
+- reconcile repository knowledge (#1460)
+- standardize log outputs across all binaries (#1461)
+- make one-shot prompts explicit (#1496)
+- add frontend-affine local NATS workers (#1508)
+- add shell command template support for MCP tools (#1546)
+- add canonical NATS session metadata (#1545)
+- make agent handoffs durable and monitor sub-agents (#1552)
+- support embedded jaq expressions (#1567)
+- add OpenTelemetry distributed tracing (#1577)
+- retain tool-observed execution context (#1580)
+- add opt-in Prometheus metrics endpoint (#1558) (#1593)
+- add --healthz-addr readiness endpoint to server binaries (#1614)
+- report per-invocation progress (#1619)
+- wait for pull request stability (#1624)
+- add cached-token cost accounting (#1637)
+- add per-invocation timeout and token budget controls (#1644)
+- emit canonical provider label on LLM metrics (#1749)
+- regenerate session titles mid-loop during tool execution (#1754)
+- add ChatGPT subscription auth via Codex client (#1769)
+- add Kubernetes sandbox tool gateway (#1793)
+- refresh agent models and complete provider fallbacks (#1806)
+- make advisory events durable and unify HITL handling (#1797)
+- make session cancellation durable and hierarchical (#1817)
+- add connection coordinator and test suite (#1841)
+- harden retry and timeout policy (#1851)
+- replace the execution-control gate with log-fenced interruption (#1949)
+- move session garbage collection into worker daemon (#2000)
+- support remote agent@cluster agents (#1999)
+- ship Web UI assets to container deployments (#1998)
+- support the WebSocket transport for mTLS-gated load balancers (#2022)
+- restore Bedrock catalog coverage and adopt Kimi K3 (#2027)
+- add HARNX_NATS_SERVER cluster-client mode (#2028)
+- let a client name the model catalog it inherits (#2030)
+- Teach Clio to report an existing pull request's link and status after pushing, falling back to a compare link only when the branch has no open pull request.
+- Daedalus can read GitHub issues/PRs and Jira via scoped command-template tools without shell access
+- Keep PR delivery sessions active while waiting for the pull request and its checks and review activity to stabilize. Also allow GitHub command templates to use `GITHUB_TOKEN` and let Jira templates access local keychain credentials.
+- Replace append-only solution capture with evidence-backed repository knowledge retrieval and reconciliation.
+
+#### Refresh package agent models by workload and provide Gemini, Claude, Codex,
+
+OpenAI API, and non-Anthropic Bedrock fallbacks for every agent, including
+compaction. Prefer Codex immediately before the equivalent OpenAI API model.
+
+Use GPT-6 Astra at maximum effort for Oracle and Plato, with Claude Fable 5.1
+as their Claude alternative. Move Atlas and general Gemini workers to Gemini
+3.8 Flash, keep Opus 4.8 for Sisyphus and Daedalus, and use cheaper models for
+routine work and compaction. No package agent selects newer Opus versions.
+
+Package-qualified OpenAI-compatible clients now inherit shared provider model
+metadata. Add the Bedrock GLM/MiniMax and direct Gemini 3.8 entries, and generate
+Astra/Fable reasoning aliases with the required request settings. Preserve
+Gemini function-call IDs through tool-result replay and configure Fable 5.1
+to tolerate thinking invalidated by conversation compaction. Packages
+require harnx 0.34.0 or a development build containing these changes.
+
+### Fixes
+
+- resolve title agent at top level for package agents (#103) (#1164)
+- surface background title-generation failures for broken agents (#1172)
+- accept content param, reject unknown params, and nest plans as GitHub sub-issues (#1181)
+- set require_max_tokens for adaptive-only Opus base models (#1238)
+- apply agent variable defaults to restored sessions (#1258)
+- update dependency @assistant-ui/react to v0.14.28 (#1270)
+- update dependency @assistant-ui/react-markdown to v0.14.7 (#1272)
+- update dependency @assistant-ui/react-ag-ui to v0.0.46 (#1271)
+- update dependency @assistant-ui/react-syntax-highlighter to v0.14.3 (#1273)
+- update dependency @assistant-ui/react to v0.14.29 (#1300)
+- update dependency @assistant-ui/react-markdown to v0.14.8 (#1302)
+- update dependency @assistant-ui/react-ag-ui to v0.0.47 (#1301)
+- update dependency @assistant-ui/react-syntax-highlighter to v0.14.4 (#1303)
+- update dependency @assistant-ui/react to v0.15.0 (#1304)
+- update dependency @assistant-ui/react to v0.15.1 (#1313)
+- update dependency @assistant-ui/react-ag-ui to v0.0.49 (#1327)
+- wire tool discovery and restore package tool-naming (#1360)
+- dispatch SessionStart from the worker and drop SessionEnd (#1369)
+- surface worker turn failures instead of hanging the client (#1371)
+- name the unsupplied variable instead of failing to render (#1372)
+- unblock local worker startup and run hook commands as argv (#1376)
+- install a logger in spawned server processes (#1377)
+- report failing request patches and fix the effort aliases (#1378)
+- stop passing the worker's NATS identity to wrapped servers (#1379)
+- update dependency @assistant-ui/react to v0.15.2 (#1380)
+- update dependency @assistant-ui/react-ag-ui to v0.0.50 (#1383)
+- update dependency @assistant-ui/react to v0.15.4 (#1384)
+- grant allowlist paths as written, resolve only when checking (#1386)
+- move to the useAui hooks in assistant-ui 0.15 (#1393)
+- decouple Command.name from usage hints to fix tab completion (#1201)
+- update dependency @assistant-ui/react to v0.15.5 (#1407)
+- update dependency @assistant-ui/react-ag-ui to v0.0.51 (#1408)
+- update dependency @assistant-ui/react to v0.15.8 (#1411)
+- update dependency @assistant-ui/react-markdown to v0.14.9 (#1412)
+- update dependency @assistant-ui/react-ag-ui to v0.0.52 (#1418)
+- update dependency @assistant-ui/react to v0.15.9 (#1417)
+- update dependency @assistant-ui/react-markdown to v0.14.10 (#1422)
+- update dependency @assistant-ui/react-ag-ui to v0.0.53 (#1421)
+- update dependency @assistant-ui/react-syntax-highlighter to v0.14.5 (#1423)
+- update dependency @assistant-ui/react to v0.15.12 (#1424)
+- update dependency @assistant-ui/react to v0.15.13 (#1432)
+- load sessions from NATS (#1430)
+- stop update_models regenerating the broken effort patches (#1427)
+- publish advisories in emission order (#1444)
+- let the shared local server pick its own port (#1442)
+- reap nats-server on startup failure and stop blocking the runtime (#1440)
+- flush queued advisories before reporting a turn's outcome (#1443)
+- align assistant UI dependencies (#1452)
+- update dependency @assistant-ui/react to v0.15.14 (#1454)
+- update dependency @assistant-ui/react-ag-ui to v0.0.54 (#1455)
+- persist local sessions exclusively in NATS (#1451)
+- make web asset setup reliable and concise (#1475)
+- update dependency @ag-ui/client to v0.0.58 (#1479)
+- keep managed servers alive across thread retirement (#1477)
+- restore custom markdown rendering for tool calls (#1487)
+- finalize events after complete agent turns (#1490)
+- expose sub-agent session tools (#1492)
+- harden sub-agent tool registration (#1494)
+- harden model resolution and local worker reuse (#1497)
+- abort orphaned turn task on session actor drop (#1502)
+- stop the worker re-feeding a turn its own user messages (#1506)
+- update dependency @assistant-ui/react to v0.15.15 (#1511)
+- update dependency @assistant-ui/react-markdown to v0.14.11 (#1512)
+- preserve compacted message order (#1513)
+- prevent terminal probes from stopping workers (#1518)
+- update dependency @assistant-ui/react-ag-ui to v0.0.56 (#1524)
+- synchronize concurrent clients reliably (#1526)
+- update dependency @assistant-ui/react to v0.15.16 (#1523)
+- clean up stale direct MCP references (#1530)
+- update dependency @assistant-ui/react-markdown to v0.14.12 (#1532)
+- regenerate provider-owned model aliases (#1533)
+- recover workers after local broker exit (#1538)
+- persist session attachments in object storage (#1556)
+- clear activity from durable turn end (#1562)
+- refresh tools after server activation (#1574)
+- recover queued multi-round turns (#1575)
+- preserve leased tool calls for observers (#1578)
+- initialize local metadata during discovery (#1581)
+- clean up agent routes after turns (#1590)
+- recover activation stream after broker stalls (#1594)
+- update dependency @ag-ui/client to v0.0.59 (#1598)
+- use lease-backed subagent liveness (#1599)
+- show sub-agent session notes (#1608)
+- update dependency @assistant-ui/react to v0.15.17 (#1612)
+- update dependency @assistant-ui/react-ag-ui to v0.0.57 (#1616)
+- update dependency @assistant-ui/react-markdown to v0.14.13 (#1617)
+- keep CA temp dir alive for full proxy lifetime (#1623)
+- widen transcript area and switch to divider message layout (#1632)
+- route worker tool approvals to confirmation modal (#1638)
+- recover stalled local workers (#1639)
+- propagate malformed OpenAI responses tool arguments (#1643)
+- show sub-agent prompt tool final reply in parent transcript (#1645)
+- print Web UI URL on startup (#1650)
+- fix agent handoff confirmation rendering and turn routing (#1653)
+- use canonical agent name in subagent tool call templates (#1654)
+- render tool name and arguments for command templates (#1660)
+- map native toolset errors to recoverable instead of fatal (#1661)
+- sync multi-client busy state and trailing tool calls (#1663)
+- update dependency @assistant-ui/react-ag-ui to v0.0.58 (#1699)
+- update dependency @assistant-ui/react-markdown to v0.14.14 (#1702)
+- update dependency @assistant-ui/react to v0.15.18 (#1698)
+- gate Renovate updates with Mergify (#1745)
+- use short session IDs for sub-agent and handoff sessions (#1748)
+- suppress replica count warning when requested equals current (#1755)
+- grant exec on the Corepack cache by default (#1766)
+- record sub-agent session ID durably on delegation start (#1768)
+- honor default() filter in tool templates on error results (#1779)
+- show full tool result in transcript detail view (#1781)
+- normalize token usage output to single per-turn line (#1784)
+- accept successful streams without a content type (#1808)
+- prevent incompatible reasoning signatures when switching providers (#1816)
+- address durable session review follow-ups (#1819)
+- prepare pinned pnpm from web project (#1836)
+- scope tool discovery cache by execution (#1840)
+- bound NATS discovery cache growth (#1846)
+- recover sessions after unconfirmed interrupts (#1849)
+- recover active sessions across local broker failover (#1857)
+- recover sub-agent progress and keep cancellation responsive (#1864)
+- wait indefinitely for TUI tool approval (#1870)
+- recover durable tool invocations after restart (#1875)
+- bootstrap native pnpm before invoking sandbox shim (#1892)
+- surface server-side run failures (#1899)
+- prevent session transcript name collisions (#1894)
+- update dependency @assistant-ui/react-ag-ui to v0.0.59 (#1912)
+- update dependency @assistant-ui/react to v0.15.19 (#1907)
+- update dependency @assistant-ui/react-markdown to v0.14.15 (#1913)
+- stop leaking llama-server processes on exit (#1916)
+- restore terminal title updates during a session (#1974)
+- run the interrupt request on its own task (#2007)
+- decide interrupts from the log's last entry (#2015)
+- say why the local worker never became ready (#2020)
+- stop frontend/worker broker split for local sessions (#2031)
+- update dependency @assistant-ui/react-ag-ui to v0.0.60 (#2040)
+- update dependency @assistant-ui/react-syntax-highlighter to v0.14.6 (#2044)
+- update dependency @assistant-ui/react-markdown to v0.14.16 (#2042)
+- Add embedded jaq expressions to the generic hook server, use them for concise tool-confirmation examples, and require approval before Daedalus hands a plan to Atlas.
+- Replace filesystem roots and per-tool extra path flags with shared explicit allow paths and opt-in batches. Existing tool-server YAML and sandbox-run invocations must migrate to the new flags and environment variables.
+
+#### Convert the pantheon and coding `bash.yaml` proxy-auth hooks to the command-only
+
+config model. Hook entries now specify only `command` (plus optional
+`status_message` and `async`); the native `harnx-proxy-auth` hook self-declares
+its event and matcher, so those fields are no longer set in the package config.
+
 ## 0.3.4 (2026-07-23)
 
 ### Fixes

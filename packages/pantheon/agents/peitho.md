@@ -36,7 +36,7 @@ use_tools:
 - pytheas_session_prompt
 - harnx_agent_session_history_read
 description: "Peitho (PY-thoh) - Goddess of Persuasion. She turns technical jargon into eloquent, human-readable documentation. Specialist in documentation, release notes, and user communication.\n"
-version: '0.3.4'
+version: '0.4.0'
 variables:
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)

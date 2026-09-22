@@ -11,6 +11,710 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.34.0 (2026-09-22)
+
+### Breaking Changes
+
+- HARNX_INSTANCE_ID is now HARNX_SERVER_SCOPE. It is set
+automatically in normal use; set it explicitly only when deploying tool
+or hook servers independently of a worker.
+
+* feat(worker): add --manage-servers instead of inferring topology from the cluster key
+
+Three gates decided whether the worker launches its own tool and hook
+servers by comparing the cluster key to __local__, so pointing a worker at
+any other cluster silently left it with no tools and no hooks. Make it an
+explicit flag and let a worker discover independently deployed servers
+under a configured scope.
+
+Also fixes two silent-degradation gaps from the previous task's review:
+a failed NATS tool-registration discovery now logs a warning naming the
+scope instead of vanishing, and two comments describing a worker-owns-this
+framing the project discarded (a scope can belong to an independently
+deployed set with no worker at all) are reworded.
+
+* fix(worker): skip local NATS resolution when there is nothing to spawn
+
+start_local_tool_servers had no servers.is_empty() short-circuit, unlike
+start_global_hooks's hooks.entries.is_empty() check, so a manage_servers
+worker with nothing configured still resolved a local NATS server (and,
+with no broker address handed down, spawned a real shared nats-server
+child) on every call. agent_hook_start_config had the same gap at the
+per-activation level: it ran the identical resolution once per turn
+regardless of whether the active agent had any hooks to launch.
+
+Add the missing empty checks, mirroring the hooks path. This is what was
+driving the stress-run flakiness in unrelated tests that switched to
+- Replace filesystem roots and per-tool extra path flags with shared explicit allow paths and opt-in batches. Existing tool-server YAML and sandbox-run invocations must migrate to the new flags and environment variables.
+- **Breaking:** `HARNX_INSTANCE_ID` is renamed to `HARNX_SERVER_SCOPE`; the old name is no longer read at all. If you set `HARNX_INSTANCE_ID` by hand anywhere (a deployment manifest, a wrapper script, an independently deployed tool/hook server pod), rename it to `HARNX_SERVER_SCOPE`. What happens if you don't depends on the process: `harnx-toolset-server`, `harnx-hookset-server`, `harnx-mcp-bridge`, and a worker run without `--manage-servers` all fail to start, since none of them ever fell back to minting a scope of their own. A worker run *with* `--manage-servers` is unaffected either way — it always mints its own scope for the tool/hook servers it launches and never reads this variable. It is set automatically in normal use; set it explicitly only when deploying tool or hook servers independently of a worker.
+
+#### Local runs no longer fail with "local worker did not publish readiness within 15s" when a tool server is slow or misconfigured. The worker announces readiness before it starts tool servers, hooks and sub-agent toolsets, and the front-end now waits with backoff and a progress notice instead of a fixed deadline. Worker, tool-server and hook-server output is captured to `harnx_worker.log` in the state dir so a server that dies during startup explains itself.
+
+Hook servers take their command as trailing arguments after `--` and run it directly instead of through a shell, matching what the hooks guide already documented. A hook that needs pipes, redirection or variable expansion asks for a shell explicitly: `-- sh -c '...'`.
+
+#### Standardize MCP Streamable HTTP options across the `time`, `bash`, `fs`, `grep`, and `plans` tool servers. Each server now accepts `--mcp-http`, `--host`, and `--port`, with documented default ports. The plans server no longer accepts `--http`, which is a breaking change for users of that flag.
+
+The MCP adapter now reports unknown tools as JSON-RPC `-32602 invalid_params` instead of `method_not_found`.
+
+#### feat(nats): migrate sub-agent delegation to NATS agent sessions and remove ACP.
+
+Sub-agents now run as standard NATS agent sessions via worker-hosted toolsets rather than stdio ACP child processes. Agents are defined exclusively by `agents/*.md` files (Markdown system prompt with YAML front matter).
+
+Key changes:
+- ACP (Agent Client Protocol) and `acp_servers/*.yaml` configuration have been removed.
+- For every configured agent, the worker automatically registers four NATS tools: `{agent}_session_new`, `{agent}_session_prompt`, `{agent}_session_load`, and `{agent}_session_cancel`.
+- Tool responses for `{agent}_session_new` and `{agent}_session_prompt` include a structured `{ agent, session_id }` marker (`sub_agent`), and an early `SubAgentStarted` event is published on the parent session stream (`sessions.{parent_id}.events`) so user interfaces can attach to `sessions.{session_id}.events` for real-time live event streaming.
+- Sub-agent turns route via standard NATS JetStream WorkQueue subjects and acquire distributed KV locks, enabling worker-agnostic execution in multi-worker deployments.
+
+### Features
+
+- introduce AgentEvent::SubAgent for structural routing (#1233)
+- add natural-writing style guidance to agent prompts (#1249)
+- route local front-ends to worker via shared NATS broker (#1250)
+- add instance-scoped tool servers over NATS with time pilot (#1274)
+- generalize tool-server bootstrap with config-driven lifecycle (#1284)
+- add native harnx-vercel-grep-server MCP server (#1277)
+- migrate fs and bash MCP servers to run bridged over NATS (#1299)
+- migrate sub-agents to NATS agent sessions and delete ACP (#1306)
+- convert fs to a toolset server and rename to harnx-fs-tools (#1310)
+- add core hooks-over-NATS infrastructure and dual dispatch (#1314)
+- launch and dispatch hooks over NATS (#1324)
+- remove inline hook dispatch and migrate proxy-auth to NATS (#1325)
+- make hook config command-only with supervisor nonces (#1224) (#1330)
+- convert bash/plans/grep servers to native NATS toolsets (#1224) (#1339)
+- harmonize fs and bash allowlists and deprecate roots (#1224) (#1343)
+- propagate tool _meta over bridge, relocate shared utils, fix release.yaml (#1224, #1349) (#1352)
+- remove direct MCP path (McpManager + mcp_servers/), delete harnx-mcp (#1224) (#1353)
+- split the NATS worker into its own harnx-worker binary (#1401)
+- run tool and hook servers as independent deployments (#1415)
+- reconcile repository knowledge (#1460)
+- standardize log outputs across all binaries (#1461)
+- make one-shot prompts explicit (#1496)
+- add frontend-affine local NATS workers (#1508)
+- add shell command template support for MCP tools (#1546)
+- add canonical NATS session metadata (#1545)
+- make agent handoffs durable and monitor sub-agents (#1552)
+- support embedded jaq expressions (#1567)
+- add OpenTelemetry distributed tracing (#1577)
+- retain tool-observed execution context (#1580)
+- add opt-in Prometheus metrics endpoint (#1558) (#1593)
+- add --healthz-addr readiness endpoint to server binaries (#1614)
+- report per-invocation progress (#1619)
+- wait for pull request stability (#1624)
+- add cached-token cost accounting (#1637)
+- add per-invocation timeout and token budget controls (#1644)
+- emit canonical provider label on LLM metrics (#1749)
+- regenerate session titles mid-loop during tool execution (#1754)
+- add ChatGPT subscription auth via Codex client (#1769)
+- add Kubernetes sandbox tool gateway (#1793)
+- refresh agent models and complete provider fallbacks (#1806)
+- make advisory events durable and unify HITL handling (#1797)
+- make session cancellation durable and hierarchical (#1817)
+- add connection coordinator and test suite (#1841)
+- harden retry and timeout policy (#1851)
+- replace the execution-control gate with log-fenced interruption (#1949)
+- move session garbage collection into worker daemon (#2000)
+- support remote agent@cluster agents (#1999)
+- ship Web UI assets to container deployments (#1998)
+- support the WebSocket transport for mTLS-gated load balancers (#2022)
+- restore Bedrock catalog coverage and adopt Kimi K3 (#2027)
+- add HARNX_NATS_SERVER cluster-client mode (#2028)
+- let a client name the model catalog it inherits (#2030)
+- Add per-invocation timeout and token budget controls (`--timeout-secs`, `--token-budget`) to CLI one-shot prompts and sub-agent tool calls (`{agent}_session_prompt`). The two limits end the turn differently: a timeout interrupts it with a durable `Cancel`, while an exhausted token budget is caught worker-side at a round boundary and ends the turn with an error. Either way the invocation returns a synthesized explanation alongside machine-readable termination details, leaving the session consistent for same-session retries. Interactive TUI and Web UI paths remain unbounded by design.
+- Let foreground bash commands and command templates run for 24 hours by default, accept a per-call timeout override with zero meaning unlimited, and terminate cleanly when cancelled.
+- Add embedded jaq expressions to the generic hook server, use them for concise tool-confirmation examples, and require approval before Daedalus hands a plan to Atlas.
+- Add an explicit `prompt` CLI subcommand and require `--` before root-level prompt text, provide sober one-shot output with a `--final-only` mode, and always show the generated session resume command after standard one-shot runs.
+- Add bounded Kubernetes and sandbox MCP waits, cancellation-aware lifecycle polling, jittered retry policy, and categorized gateway metrics.
+- Add opt-in --healthz-addr flag exposing a /healthz readiness endpoint across the 15 supported long-running server binaries.
+- Run configured hooks fully over NATS. Adds a generic `harnx-claude-compatible-hook-server` that runs `claude-command` and `claude-command-persistent` hooks over NATS, a native NATS hook mode for `harnx-proxy-auth`, a `hooks:` field on tool-server configs, and a worker-side supervisor that launches configured hooks scoped by where they're defined (global, tool-server, or agent). NATS now dispatches lifecycle, prompt, stop, and tool-use events that have runtime call sites; `InstructionsLoaded` and `CwdChanged` are supported by the protocol but aren't fired by the runtime yet. PreToolUse context injection and Ask approvals work over NATS. The inline dispatch path remains as a fallback for now.
+- Add a native Kubernetes Agent Sandbox gateway with ambient per-session routing and inherited sub-agent context.
+- Add a `provider` label to the `harnx_llm_tokens_total` and `harnx_llm_cost_dollars` metrics carrying the canonical backend kind (`openai`, `claude`, `bedrock`, `openai-compatible`, …), resolved from the selected model's configured client. The existing `client` label is unchanged; `provider` is additive and empty (`""`) when the client cannot be resolved. Note for dashboard operators: adding a label starts new Prometheus time series, so series that existed before the upgrade stop updating; queries that don't group by `provider` are unaffected.
+- Interruption is now one durable `Cancel` entry in the session log. Ctrl+C returns control as soon as that append is acknowledged; workers watch their own session stream, abort model and tool calls, and cancel running tools, hooks and sub-agents through the tool protocol. Interrupted tool calls get placeholder results and a runtime note so the model knows why they ended. The execution-control KV bucket (`harnx_execution_control`) is no longer used and can be deleted; the "unconfirmed cancellation" and "resume anyway" flows and the `--resume-anyway` flag are removed. Tool protocol is v5: deploy workers, tool servers, hook servers and frontends together.
+- `harnx-mcp-bridge --list-tools -- <command>` starts a wrapped MCP server, prints the tools it advertises, and exits without touching NATS. Reaching the listing proves the child spawns, completes the MCP handshake and answers `tools/list`; when it does not, the error distinguishes a child that failed to spawn, one that died during startup, and one that never finished the handshake — three cases a registration timeout in the worker cannot tell apart. `--name` is now only required when actually serving over NATS.
+- feat(nats): add instance-scoped Core NATS tool invocation and the `harnx-time-tools` pilot. NATS tools coexist with existing stdio tools during migration, and configured tool and sub-agent children now inherit local broker credentials by design. References #1224.
+- Make the shared-local-nats-server front-end/back-end split the only local execution path. TUI, one-shot CLI, serve, and ACP sessions now run every local turn front-end → NATS → worker; the old in-process local path is removed. This architectural change enables future work on tool servers and sub-agents over NATS (Phase 2). References issue #1224.
+- feat(nats): add `harnx-mcp-bridge`, a generic MCP→NATS bridge that wraps any stdio MCP server and re-exposes its tools over NATS. Migrate the `plans` tool server to run over NATS via the bridge; the `harnx-plans-tools` binary still works standalone as an MCP server (`--mcp-stdio`) for external MCP clients. References #1224.
+- feat(nats): migrate roots-free MCP servers (`context7`, `exa`, `fetch`, `grep`, `plans-github`, `wet`, `dev`) to run over NATS via `harnx-mcp-bridge`. Their configurations move from `mcp_servers/` to `tool_servers/`; `fs` and `bash` remain stdio pending roots support. References #1224.
+- Tool and hook server registrations now expire: the registry and expectations buckets carry a 90s TTL (three refresh intervals), so a registration can no longer outlive the process that published it and grow the bucket without bound. Servers also deregister themselves on graceful shutdown, including SIGTERM/Ctrl+C — independently deployed tool/hook server pods have no parent supervisor to clean up after them, and Kubernetes terminates pods with SIGTERM. Without the SIGTERM wiring, a terminated pod's registration would keep being routed to until the TTL expired.
+- NATS cluster config accepts `replicas` to set the JetStream replica count for buckets harnx creates: the tool/hook registries (including the hook expectations bucket), session leases (`harnx_leases`), and the session index (`harnx_sessions`). Buckets created before `replicas` was set (or before it was raised) now get their live replica count reconciled up to match, alongside the existing TTL reconcile; a reconcile that a cluster can't satisfy is logged and skipped rather than stopping harnx from starting. Reconcile only ever raises a bucket's replica count, never lowers it, since a caller that doesn't know the cluster's actual configured value could otherwise silently downgrade an already-correctly-replicated bucket. A brand-new bucket requested with a replica count the cluster can't provide still fails to create, by design — this only changed the fix-in-place path for buckets that already exist.
+- Tool and hook servers accept TLS settings for their NATS connection.
+- feat(nats): declare NATS tool servers in `tool_servers/*.yaml` across user and package configuration directories instead of using a hardcoded server list. Tool servers are lazy-spawned based on the active agent's `use_tools` patterns, and a missing or crashing server emits a UI warning while worker execution continues. The `time` tool now ships as `harnx-time-tools` under `tool_servers/`. References #1224.
+- Add OpenTelemetry distributed tracing. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export OTLP traces covering agent turns, LLM calls with token count attributes, and cross-process tool calls; off by default.
+- Add opt-in Prometheus /metrics endpoint via --metrics-addr.
+- Make agent handoffs durably activate independent target sessions and restore fullscreen TUI monitoring for nested sub-agent transcripts.
+- Remove the direct MCP integration path. External MCP servers are now added only as `tool_servers/` entries that run through `harnx-mcp-bridge`; the old top-level `mcp_servers/` config directory, `McpManager`, and the `harnx-mcp` crate are gone. Existing `mcp_servers/*.yaml` files are no longer loaded — declare external stdio MCP servers as `tool_servers/*.yaml` launching `harnx-mcp-bridge` instead (see the configuration guide). Tool call/result templates (`_meta.call_template`/`_meta.result_template`) are preserved for bridged tools.
+- Remove hook config fields `type`, `event`, `matcher`, and `timeout`. Hooks now use a command-only model: the `command` field specifies a hook server binary (e.g., `harnx-claude-compatible-hook-server --event <E> --matcher <M> [--persistent] -- <child>` for generic hooks, or `harnx-proxy-auth ...` for native hooks that self-declare their event/matcher).
+- Remove inline runtime hook dispatch so hooks run fully over NATS. Delete the `harnx-mcp-hooks-proxy` crate and launch bash proxy-auth injection as a co-located NATS hook.
+- Session garbage collection moved from the `harnx` CLI into the worker daemon, so headless `harnx-serve` + `harnx-worker` deployments now collect expired sessions; workers log a warning when retention (`cleanup_remote_sessions_days`) is unset.
+- Add YAML-defined shell command templates with typed input schemas and sandboxed execution for harnx-bash-tools.
+- Give every frontend its own supervised local worker while preserving the shared local NATS broker, session history, events, and session leases. Local activations now target the owning frontend's worker, including nested sub-agents, and `harnx-worker` replaces `--cluster __local__` with the frontend-managed `--session-scope __local__` mode. Worker diagnostics now also require `--session-scope __local__` instead of a configured `--cluster`.
+- Show per-invocation sub-agent progress, token and tool metrics, elapsed time, and CLI proof-of-life status across the TUI, Web UI, and one-shot CLI.
+- Session titles now regenerate during the tool-call loop in addition to turn end, triggered by token growth (`title_update_threshold`) or an optional time interval (`title_update_interval_secs`). The title agent also sees the current turn's in-progress thinking and tool calls.
+- Show elapsed time for running tool calls that exceed 5s across TUI, Web UI, and CLI, while suppressing the timer for sub-agent launcher calls.
+- Track tool-observed repository and branch context across local and remote sessions, and use it to rank and enrich interactive session picker rows without exposing worker paths.
+- Add a responsive full-width TUI exit tray that shows the outcome of an interrupt and exits once it is accepted, holding on a static state with a retry when the request fails. Add direct cancellation controls for a selected child session, and carry an interrupt through tools, hooks and nested sub-agents.
+- Prompt before quitting the TUI while the agent is still working. Ctrl+D, `.exit`, and picker exits now open a confirmation modal when a turn is in flight: Ctrl+D exits without interrupting (work continues or resumes on reopen), Ctrl+C durably interrupts the session and then exits, and Esc stays. The modal copy reflects how the session runs (remote, local worker owned by this client, or owned by another client). Ctrl+C waits for the interrupt to be durably accepted before shutting down, so the interrupt can't be lost to the local worker being torn down. If the interrupt fails to land, the TUI says so and leaves the choice to you — Ctrl+C retries, Ctrl+D exits anyway, Esc returns to the editor — and an exit that leaves a failed interrupt behind prints a warning to stderr. Idle exit is unchanged.
+- Allow `harnx-serve` to read its web asset directory from `HARNX_WEB_ASSETS` and warn at startup when the resolved directory has no `index.html`.
+- `harnx-worker --session-scope __local__ --diagnose` starts this configuration's tool servers, reports which ones registered and how many tools each advertises, and exits without serving sessions. It applies the same selection and startup the worker uses, so it shows what a real run would do — including servers pulled in from packages the active agent cannot use — without racing a front-end that exits after its turn.
+- `harnx-worker` takes `--manage-servers` to launch its own tool and hook servers. Without it, the worker discovers independently deployed servers under `HARNX_SERVER_SCOPE`.
+
+#### Restore Bedrock coverage in the weekly `models.yaml` refresh, and move the
+
+reasoning-heavy package agents onto Kimi K3 as their Bedrock fallback.
+
+The updater recognised only LiteLLM's `bedrock` provider tag, but most of the
+live Bedrock catalog is tagged `bedrock_converse` — the very API the Bedrock
+client calls. A second filter then admitted only `us.`, `zai.` and `minimax.`
+model ids. Between them the refresh yielded 18 legacy models, so every Bedrock
+entry the packages actually select had been added by hand and its price frozen
+ever since. Selecting on id shape rather than on a list of known vendors brings
+the count to 117 and picks up Qwen3, Kimi K2.5, GLM 4.7, DeepSeek V3.2,
+Nemotron, gpt-oss and the Claude 5 family on Bedrock. Capability flags that a
+curated entry asserted and LiteLLM omits, such as vision on Llama 4, now
+survive a refresh rather than silently switching off.
+
+Two figures the registry states and the AWS model cards contradict are now
+pinned with a citation: GLM 4.7 Flash caps output at 4K rather than the
+reported 128K, and MiniMax M2.5 takes 196K of context rather than 1M. Both
+were wrong in the direction that makes harnx ask for more than the model
+accepts.
+
+Kimi K3 (`us.moonshotai.kimi-k3`) is added by hand because LiteLLM carries no
+Bedrock listing for it yet, and becomes the Bedrock fallback for Oracle, Plato,
+Hephaestus, Daedalus, Sisyphus, Melpomene, Momus, Polyhymnia and Zosimus. It is
+the only frontier-class open-weight model on Bedrock, and its 1M context and
+vision close gaps the other Bedrock choices cannot. It costs about three times
+GLM 5 on input and five times on output, which is acceptable only because it
+sits last in every chain selecting it; the mid-tier agents keep GLM 5.
+
+AWS documents Kimi K3 rejecting a Converse request that replays earlier
+reasoning. That does not reach harnx: the model returns reasoning without a
+signature, so the existing signature gate already omits the block, and both
+packages reach Bedrock through the OpenAI-compatible endpoint, which never
+replays reasoning at all. Both paths were verified with two-turn tool-calling
+sessions against a live account.
+
+#### Add cached-token cost accounting. Every provider now normalizes token usage to
+
+the OpenTelemetry-subset convention (`input_tokens` includes cache tokens;
+cache-read and cache-write are subsets), and cost is computed with a single
+formula that prices uncached input, cache-read, cache-write, and output
+separately. Cache prices (`cache_read_price`/`cache_write_price`) are
+auto-generated from LiteLLM. Prometheus gains `harnx_llm_tokens_total{type=cache_read|cache_write}`
+and cache-inclusive `harnx_llm_cost_dollars`; OTel spans gain
+`gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens`,
+and `harnx.gen_ai.cost.usd`. A per-model `cache_accounting: subset|disjoint`
+flag lets an OpenAI-compatible proxy fronting a disjoint backend be priced
+correctly.
+
+#### Replace NATS transcript headers and denormalized session indexes with canonical KV session metadata and activity records, including redacted metadata HTTP APIs.
+
+This is a hard protocol cut: pre-upgrade NATS sessions are not migrated and
+must be cleared before upgrading all frontends and workers together.
+
+#### Add a `codex` client type that authenticates with a ChatGPT Pro/Plus/Team subscription instead of a metered `OPENAI_API_KEY`.
+
+After you run the official `codex` CLI's `codex login` once, harnx reads the OAuth credentials from `~/.codex/auth.json`, refreshes the access token automatically when it expires, and sends requests to OpenAI's Codex backend using the Responses API. Configure it with a `clients/codex.yaml` file (`type: codex`) and select models like `codex:gpt-5`. The client reuses OpenAI's built-in model catalog, so new models arrive automatically as you update harnx. Tokens are held in memory only — harnx never writes back to `auth.json`, so it won't interfere with the Codex CLI. See `docs/providers.md` for setup. This uses the same first-party client path as the Codex CLI and depends on endpoints OpenAI hasn't published as a stable public API, so treat it as best-effort for personal subscription use.
+
+#### Sub-agent delegations now record a durable start entry in the parent session log
+
+carrying the child session_id, so a parent agent can resume or inspect a sub-agent
+session even when the delegation is interrupted before returning. This adds a new
+`sub_agent_started` transcript entry; in multi-instance clusters, deploy readers
+that understand it before workers that write it.
+
+#### Let a client name the model catalog it inherits, instead of deriving it from
+
+the filename.
+
+Client configs gain `model_catalog:`, naming a provider block in the shared
+`models.yaml`:
+
+```yaml
+type: openai-compatible
+model_catalog: bedrock
+api_base: https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1
+```
+
+Until now the filename decided, and for `openai-compatible` clients it did so
+by prefix. That made the file's name load-bearing in ways that were easy to
+trip over: `deepseek-proxy.yaml` inherited the DeepSeek catalog whether or not
+that was intended, and a sensibly-named `aws-prod.yaml` inherited nothing at
+all, leaving its models with no context limits, prices or capabilities. The
+field also works for native client types, so a `claude` client can borrow a
+different block without being renamed.
+
+The filename fallback is unchanged and still applies when `model_catalog` is
+absent, so existing configurations keep working. Naming a catalog that does
+not exist logs a warning and inherits nothing rather than quietly falling back
+to the filename, so a typo surfaces instead of substituting models nobody
+asked for; explicitly listed `models:` entries still apply.
+
+The shipped package clients, the example configs and the provider and package
+docs now name their catalog.
+
+#### Stop the front-end and worker broker split for local sessions by making the deployment model unambiguous. When `HARNX_NATS_SERVER` is unset, front-ends (`harnx`, `harnx-serve`) always self-host a local broker and worker for `__local__` sessions and ignore operator `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` for local session routing. This fixes issue #2021, where front-ends given external NATS credentials connected their session side to the external cluster while the spawned worker ran against an elected pod-local broker, causing sessions to silently hang.
+
+If you set `HARNX_NATS_URL`/`HARNX_NATS_TOKEN` on `harnx-serve` (or the CLI/TUI) to reach an external NATS cluster, that no longer joins the cluster — the front-end self-hosts a local broker. Set `HARNX_NATS_SERVER=<name>` and add `nats_servers/<name>.yaml` (which can use `${HARNX_NATS_URL}`/`${HARNX_NATS_TOKEN}`).
+
+#### feat(nats): introduce core hooks-over-NATS protocol and worker dual dispatch.
+
+Adds the `harnx-hookset` protocol crate and `harnx-hookset-server` daemon for NATS hook registration and request/reply execution. Worker dual dispatch runs NATS hooks alongside existing inline hooks, while hook supervision and config migration are deferred to future slices. References #1224.
+
+#### MCP servers now return recoverable tool failures and argument validation errors as `CallToolResult` with `is_error: true` instead of JSON-RPC protocol error frames (`Err(ErrorData)` / `McpError`), allowing client agents to self-correct without terminating the session (#1862).
+
+Note for client authors (such as kagent or other MCP client consumers): domain failures and argument validation errors are now returned as `CallToolResult` with `is_error: true` rather than JSON-RPC error frames (`Err(ErrorData)` / `McpError`). Client agents receive the error as tool result content and can self-correct instead of encountering a fatal protocol exception. JSON-RPC error frames are reserved for protocol violations, unknown tool names, and broken transport state.
+
+#### feat(nats): convert `bash`, `plans`, and `grep` to native toolset servers with binaries named `harnx-bash-tools`, `harnx-plans-tools`, and `harnx-grep-tools`.
+
+These three tool servers now implement the `Toolset` trait and run directly, dropping the `harnx-mcp-bridge` wrapper process. `--mcp-stdio` mode is retained on all three for backward compatibility. `harnx-mcp-bridge` stays as the adapter for external stdio MCP servers (fetch/exa/context7). The bash sandbox, git-snapshot history, proxy-auth hook, and the plans retention loop are unchanged. References #1224.
+
+#### feat(nats): convert `fs` to a toolset server and rename crate/binary `harnx-mcp-fs` → `harnx-fs-tools`.
+
+The `fs` tool server now implements the `Toolset` trait and runs directly, removing the `harnx-mcp-bridge` wrapper process. `--mcp-stdio` mode is retained for backward compatibility. References #1224.
+
+#### feat(nats): migrate `fs` and `bash` MCP servers to run bridged over NATS via `harnx-mcp-bridge`. Add `--default-root-cwd` to `harnx-mcp-fs` and `harnx-bash-tools` to seed allowed roots from process CWD with `$HOME`-ancestor protection. Export ambient `HARNX_PACKAGE_DIR` to NATS tool servers so bundled hooks resolve when wrapped in `harnx-mcp-hooks-proxy`.
+
+**Behavior change**: Running fs/bash from `$HOME` (or a `$HOME`-ancestor directory) now denies access with a warning — the `$HOME`-ancestor guard blocks the CWD default. To allow operations from `$HOME`, pass `--root $HOME` explicitly. References #1224.
+
+#### Support the NATS WebSocket transport (`ws://`, `wss://`) in `nats_servers/<cluster>.yaml`
+
+and `HARNX_NATS_URL`, so harnx can reach a broker behind an HTTP load balancer such as an
+AWS ALB that requires x509 client certificates. `tls_ca` and `tls_cert`/`tls_key` can now
+also be used together, and a new `ignore_discovered_servers` setting controls whether the
+peers a clustered broker advertises are added to the connection's server pool.
+
+#### A worker launching its own tool servers now starts them per session based on the session's agent, instead of one fixed set at startup. A session whose agent uses different tools than the worker's own config gets the right servers, and a worker with several agents no longer pays for tool servers a given session never calls. A server with no active session using it lingers briefly (to survive back-to-back sessions reusing it) before it actually stops.
+
+One consequence: a tool server that failed to register no longer gets retried by a background loop for the lifetime of the worker process. It now retries the next time some session's agent asks for it — so a server fixed while a long-running session is already active will not come back for that session, only for a new one.
+
+#### Add OTLP/gRPC trace export to `harnx-telemetry` alongside the existing HTTP exporter. Honors `OTEL_EXPORTER_OTLP_PROTOCOL` and `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` (`grpc` or `http/protobuf`).
+
+**Operator note**: Explicit endpoints like `http://localhost:4318` are preserved as configured. The default port 4317 applies only when no endpoint is configured and `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`. If `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` was previously configured in an environment pointing to an HTTP-only OTLP collector on port 4318, trace export will now attempt gRPC to port 4317. Update endpoint configuration to match the desired collector transport.
+
+#### Support remote `agent@cluster` agents in `harnx-serve` (the HTTP API and Web UI), matching the CLI and TUI.
+
+Agents declared in `nats_servers/<cluster>.yaml` now appear in `GET /v1/agents` (respecting the `role: assistant` picker filter) and can be addressed over HTTP as `/v1/agents/sisyphus%40shared`. Sessions against a remote agent are created, prompted, streamed, cancelled and resumed through the server, with turns running on a worker in the target cluster. A server that only talks to a remote cluster no longer starts a local broker or worker. A declared but unreachable cluster now returns a clear transport error naming the cluster instead of a misleading 404, and remote agents no longer vanish from the listing when their config can't be loaded as a local file. The internal `::__status=` marker no longer leaks into user-facing error messages.
+
+#### Split session inspection into action-entity CLI commands and TUI parity:
+
+- `harnx info session <agent> <id> [--format text|yaml|json]` now displays session metadata only (behavior change).
+- `harnx dump session <agent> <id> [--format text|yaml|json] [--follow]` dumps the session transcript (with JSONL for json format, and live streaming via `--follow`).
+- Renamed `harnx session delete` to `harnx delete session` and `--list-sessions` to `harnx list sessions`.
+- Added `.dump session` and updated `.info session` in the TUI overlay.
+
+#### Standardize logging across every binary. `HARNX_LOG_LEVEL` now configures all of
+
+them (default `info`) and is inherited by subprocesses; `HARNX_LOG_FORMAT=json`
+switches every process to one JSON object per line. The `harnx` CLI and TUI log
+to `<state dir>/harnx.log` (was `harnx_runtime.log`, a name bug), overridable
+with `HARNX_LOG_PATH`. Servers and subprocesses always log to stderr, and a
+parent that logs to a file redirects their output there — so the worker and its
+tool and hook servers land in the front-end's log instead of a separate
+`harnx_worker.log`. `harnx-pkg`, `harnx-proxy-auth`, `harnx-sandbox-run`,
+and `harnx-mcp-remote` previously ignored `HARNX_LOG_LEVEL` entirely;
+`nats-server` output was discarded.
+
+#### Rename the native time toolset from `harnx-time-server` to `harnx-time-tools` and rename the Git history library from `harnx-mcp-history` to `harnx-git-history`.
+
+Remove the redundant `harnx-mcp-time` server; use `harnx-time-tools --mcp-stdio` for standalone MCP. Remove `harnx-mcp-plans-github` and its internal `harnx-mcp-plans-core` library and `harnx-mcp-plans-hermetic` test binary.
+
+This release includes breaking container packaging changes: the `harnx-mcp-time` GHCR image is no longer published, and `ghcr.io/dobesv/harnx-mcp-plans` is now `ghcr.io/dobesv/harnx-plans-tools`. The plans Dockerfile and CI/release jobs now use the `harnx-plans-tools` name.
+
+#### Fire `SessionStart` hooks from the worker and drop `SessionEnd` support.
+
+`SessionStart` was dispatched by the CLI/TUI frontend, which never has a NATS
+hook provider, so the event went nowhere and only logged "NATS hook provider
+unavailable". The worker now fires it once per session, on the activation that
+creates the session, where the hook servers it launched are reachable. Any
+`additionalContext` a `SessionStart` hook returns is injected into the first
+turn.
+
+`SessionEnd` is removed. Only the frontend knows a session ended, and worker
+activations happen per turn, so there was no place to fire it correctly. Hooks
+registered for `SessionEnd` no longer match any event.
+
+#### The NATS worker is now a separate `harnx-worker` binary, and the `harnx worker`
+
+subcommand is gone. Run `harnx-worker --cluster <key>` where you used to run
+`harnx worker --cluster <key>`.
+
+Front-ends spawn the worker for the local cluster, so `harnx-worker` must be
+installed alongside `harnx` / `harnx-serve` — releases publish it as its own
+archive, and it ships in the Docker image. Discovery checks
+`HARNX_WORKER_BIN`, then a sibling of the running front-end, then `PATH`.
+`HARNX_BIN` no longer plays a part in it.
+
+### Fixes
+
+- resolve title agent at top level for package agents (#103) (#1164)
+- surface background title-generation failures for broken agents (#1172)
+- accept content param, reject unknown params, and nest plans as GitHub sub-issues (#1181)
+- set require_max_tokens for adaptive-only Opus base models (#1238)
+- apply agent variable defaults to restored sessions (#1258)
+- update dependency @assistant-ui/react to v0.14.28 (#1270)
+- update dependency @assistant-ui/react-markdown to v0.14.7 (#1272)
+- update dependency @assistant-ui/react-ag-ui to v0.0.46 (#1271)
+- update dependency @assistant-ui/react-syntax-highlighter to v0.14.3 (#1273)
+- update dependency @assistant-ui/react to v0.14.29 (#1300)
+- update dependency @assistant-ui/react-markdown to v0.14.8 (#1302)
+- update dependency @assistant-ui/react-ag-ui to v0.0.47 (#1301)
+- update dependency @assistant-ui/react-syntax-highlighter to v0.14.4 (#1303)
+- update dependency @assistant-ui/react to v0.15.0 (#1304)
+- update dependency @assistant-ui/react to v0.15.1 (#1313)
+- update dependency @assistant-ui/react-ag-ui to v0.0.49 (#1327)
+- wire tool discovery and restore package tool-naming (#1360)
+- dispatch SessionStart from the worker and drop SessionEnd (#1369)
+- surface worker turn failures instead of hanging the client (#1371)
+- name the unsupplied variable instead of failing to render (#1372)
+- unblock local worker startup and run hook commands as argv (#1376)
+- install a logger in spawned server processes (#1377)
+- report failing request patches and fix the effort aliases (#1378)
+- stop passing the worker's NATS identity to wrapped servers (#1379)
+- update dependency @assistant-ui/react to v0.15.2 (#1380)
+- update dependency @assistant-ui/react-ag-ui to v0.0.50 (#1383)
+- update dependency @assistant-ui/react to v0.15.4 (#1384)
+- grant allowlist paths as written, resolve only when checking (#1386)
+- move to the useAui hooks in assistant-ui 0.15 (#1393)
+- decouple Command.name from usage hints to fix tab completion (#1201)
+- update dependency @assistant-ui/react to v0.15.5 (#1407)
+- update dependency @assistant-ui/react-ag-ui to v0.0.51 (#1408)
+- update dependency @assistant-ui/react to v0.15.8 (#1411)
+- update dependency @assistant-ui/react-markdown to v0.14.9 (#1412)
+- update dependency @assistant-ui/react-ag-ui to v0.0.52 (#1418)
+- update dependency @assistant-ui/react to v0.15.9 (#1417)
+- update dependency @assistant-ui/react-markdown to v0.14.10 (#1422)
+- update dependency @assistant-ui/react-ag-ui to v0.0.53 (#1421)
+- update dependency @assistant-ui/react-syntax-highlighter to v0.14.5 (#1423)
+- update dependency @assistant-ui/react to v0.15.12 (#1424)
+- update dependency @assistant-ui/react to v0.15.13 (#1432)
+- load sessions from NATS (#1430)
+- stop update_models regenerating the broken effort patches (#1427)
+- publish advisories in emission order (#1444)
+- let the shared local server pick its own port (#1442)
+- reap nats-server on startup failure and stop blocking the runtime (#1440)
+- flush queued advisories before reporting a turn's outcome (#1443)
+- align assistant UI dependencies (#1452)
+- update dependency @assistant-ui/react to v0.15.14 (#1454)
+- update dependency @assistant-ui/react-ag-ui to v0.0.54 (#1455)
+- persist local sessions exclusively in NATS (#1451)
+- make web asset setup reliable and concise (#1475)
+- update dependency @ag-ui/client to v0.0.58 (#1479)
+- keep managed servers alive across thread retirement (#1477)
+- restore custom markdown rendering for tool calls (#1487)
+- finalize events after complete agent turns (#1490)
+- expose sub-agent session tools (#1492)
+- harden sub-agent tool registration (#1494)
+- harden model resolution and local worker reuse (#1497)
+- abort orphaned turn task on session actor drop (#1502)
+- stop the worker re-feeding a turn its own user messages (#1506)
+- update dependency @assistant-ui/react to v0.15.15 (#1511)
+- update dependency @assistant-ui/react-markdown to v0.14.11 (#1512)
+- preserve compacted message order (#1513)
+- prevent terminal probes from stopping workers (#1518)
+- update dependency @assistant-ui/react-ag-ui to v0.0.56 (#1524)
+- synchronize concurrent clients reliably (#1526)
+- update dependency @assistant-ui/react to v0.15.16 (#1523)
+- clean up stale direct MCP references (#1530)
+- update dependency @assistant-ui/react-markdown to v0.14.12 (#1532)
+- regenerate provider-owned model aliases (#1533)
+- recover workers after local broker exit (#1538)
+- persist session attachments in object storage (#1556)
+- clear activity from durable turn end (#1562)
+- refresh tools after server activation (#1574)
+- recover queued multi-round turns (#1575)
+- preserve leased tool calls for observers (#1578)
+- initialize local metadata during discovery (#1581)
+- clean up agent routes after turns (#1590)
+- recover activation stream after broker stalls (#1594)
+- update dependency @ag-ui/client to v0.0.59 (#1598)
+- use lease-backed subagent liveness (#1599)
+- show sub-agent session notes (#1608)
+- update dependency @assistant-ui/react to v0.15.17 (#1612)
+- update dependency @assistant-ui/react-ag-ui to v0.0.57 (#1616)
+- update dependency @assistant-ui/react-markdown to v0.14.13 (#1617)
+- keep CA temp dir alive for full proxy lifetime (#1623)
+- widen transcript area and switch to divider message layout (#1632)
+- route worker tool approvals to confirmation modal (#1638)
+- recover stalled local workers (#1639)
+- propagate malformed OpenAI responses tool arguments (#1643)
+- show sub-agent prompt tool final reply in parent transcript (#1645)
+- print Web UI URL on startup (#1650)
+- fix agent handoff confirmation rendering and turn routing (#1653)
+- use canonical agent name in subagent tool call templates (#1654)
+- render tool name and arguments for command templates (#1660)
+- map native toolset errors to recoverable instead of fatal (#1661)
+- sync multi-client busy state and trailing tool calls (#1663)
+- update dependency @assistant-ui/react-ag-ui to v0.0.58 (#1699)
+- update dependency @assistant-ui/react-markdown to v0.14.14 (#1702)
+- update dependency @assistant-ui/react to v0.15.18 (#1698)
+- gate Renovate updates with Mergify (#1745)
+- use short session IDs for sub-agent and handoff sessions (#1748)
+- suppress replica count warning when requested equals current (#1755)
+- grant exec on the Corepack cache by default (#1766)
+- record sub-agent session ID durably on delegation start (#1768)
+- honor default() filter in tool templates on error results (#1779)
+- show full tool result in transcript detail view (#1781)
+- normalize token usage output to single per-turn line (#1784)
+- accept successful streams without a content type (#1808)
+- prevent incompatible reasoning signatures when switching providers (#1816)
+- address durable session review follow-ups (#1819)
+- prepare pinned pnpm from web project (#1836)
+- scope tool discovery cache by execution (#1840)
+- bound NATS discovery cache growth (#1846)
+- recover sessions after unconfirmed interrupts (#1849)
+- recover active sessions across local broker failover (#1857)
+- recover sub-agent progress and keep cancellation responsive (#1864)
+- wait indefinitely for TUI tool approval (#1870)
+- recover durable tool invocations after restart (#1875)
+- bootstrap native pnpm before invoking sandbox shim (#1892)
+- surface server-side run failures (#1899)
+- prevent session transcript name collisions (#1894)
+- update dependency @assistant-ui/react-ag-ui to v0.0.59 (#1912)
+- update dependency @assistant-ui/react to v0.15.19 (#1907)
+- update dependency @assistant-ui/react-markdown to v0.14.15 (#1913)
+- stop leaking llama-server processes on exit (#1916)
+- restore terminal title updates during a session (#1974)
+- run the interrupt request on its own task (#2007)
+- decide interrupts from the log's last entry (#2015)
+- say why the local worker never became ready (#2020)
+- stop frontend/worker broker split for local sessions (#2031)
+- update dependency @assistant-ui/react-ag-ui to v0.0.60 (#2040)
+- update dependency @assistant-ui/react-syntax-highlighter to v0.14.6 (#2044)
+- update dependency @assistant-ui/react-markdown to v0.14.16 (#2042)
+- Add durable handoff sequence markers and AG-UI session attach boundaries so clients can reject stale handoff navigation events.
+- Keep AG-UI lifecycle events balanced when attaching to active local or remote sessions. Open text, tool, step, and thinking segments now close before run terminals, including after local broadcast lag and remote poll-based completion. Fixes #1043, #1837, and #1830.
+- Apply agent variable defaults when restoring sessions so newly added variables with defaults do not cause strict-mode template rendering errors.
+- Templated bash tools now render the tool name and supplied arguments in the TUI/CLI transcript instead of just the tool name (#1630).
+- Fix macOS bash command timeouts failing with "Operation not permitted" when a process group has already exited. Continue cleanup after failed SIGTERM and tolerate kill errors for exited processes while preserving process identity checks.
+- Bridged MCP tools now keep their `_meta.call_template` and `_meta.result_template`, so custom tool call/result templates render again for tools reached through `harnx-mcp-bridge` (#1349). `ToolSpec` gained an optional `meta` field carrying the tool's `_meta`, and the bridge, toolset-server adapter, and NATS tool provider thread it end to end.
+- Keep the user's prompt in session history when a model turn is cancelled before its response is accepted. Persist input before model work without accepting late model or tool output.
+- Clean up agent hook routes after each completed NATS-backed turn so stale fail-closed hooks cannot block later tool calls.
+- Accept successful Codex subscription streams with a missing Content-Type header instead of discarding completions and falling back to an API-key provider. Preserve HTTP status and retry hints for non-JSON streaming errors, and show underlying causes in retry warnings without dumping invalid-stream response bodies.
+- Fix web UI showing an alert icon on an in-flight tool call when a session is opened in a second tab. A pending (running, result-less) tool call now renders the pending spinner instead of the amber alert used for approval interrupts.
+- Keep managed tool and hook servers alive when Tokio retires the runtime thread that requested their launch.
+- Deliver queued TUI follow-ups at the next tool round and make interrupted multi-round sessions resume once without orphan-repair loops or a stuck busy state.
+- Route interactive tool approval requests from NATS workers back to the TUI instead of automatically denying them.
+- Fix auth-proxy CA bundle paths going stale. The CA temp dir was dropped when `build_runtime` returned, deleting `ca.pem` while the proxy kept running. This left `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, and similar variables pointing at a missing file, which caused tools such as `gh`, `curl`, and Git to report TLS errors. The CA temp dir now lives for the full proxy lifetime.
+- Stop the TUI busy spinner after a completed turn when its durable completion boundary arrives just after the live response.
+- Expose package-relative sub-agent session tools to agents and wait for their initial NATS registrations before starting the first turn.
+- Emit one final model/turn boundary after the complete agent loop and keep attached TUI and web clients in sync with shared session activity.
+- Fix Web UI parity for queued messages (#1741) and tool-approval confirmations (#1742). Queued messages in the web UI can now be viewed, edited (restored to composer), or cancelled. Tool approval and session handoff confirmations now display in the web UI, accept approve/deny decisions, and reappear for clients that reconnect while an approval is pending. Mid-turn injection timing for queued messages and NATS tool-approval fanout redesign remain deferred.
+- Stop the NATS worker from re-feeding a turn's own user messages back into itself. The header-insert migration re-maps a headerless session's leading user block onto the migration's log seq, which sits above the turn's seed cursor, so the mid-round injection callback read the prompt the turn was already answering as a new message. Injected text was also persisted as a fresh user log entry, so every injection guaranteed another one on the next tool round and left a leftover message the end-of-turn drain ran as another turn — the TUI kept spinning and queued replies never started a loop. Worker turns no longer send their prompt to the model twice either.
+- Keep `harnx dump session --follow` tailing when a transient JetStream history refresh fails.
+- Fix the agent-handoff tool confirmation modal so the allow/deny options stay visible, the input preview is markdown-rendered and no longer clipped, and the prompt renders as a full-width panel.
+- Prevent test environment races from overwriting user configuration, preserve embedded model metadata alongside custom client models, and validate shipped agent model references. Model-list APIs now evaluate the current client configuration on every call and return owned values. Add the missing Gemini client used by the coding package's compaction agent.
+- Return successful tool-approval decisions when a worker's acknowledgement is lost but the decision is already durable. Repeating the same approval or denial is idempotent and does not execute the tool twice.
+- Interrupt requests and prompt appends read only the session log's last entry before their fenced append instead of the whole transcript, so their latency no longer grows with the session's length. The worker's interrupt hint check and its tail lookup for fenced appends read the same single entry.
+- Show pending tool responses when a remote session still has an active worker lease.
+- Fence live session events against interruption so buffered output from a turn that was already stopped cannot change the TUI's current turn, while committed transcript history stays visible.
+- Stop leaking `llama-server` subprocesses on Linux. The process registry kept each server alive in a `static`, which Rust never drops at process exit, so `kill_on_drop` never fired and every exit stranded a running server. Servers are now tied to their parent by the kernel and exit with it. macOS and Windows have no equivalent parent-death signal and still strand a server on exit.
+- Initialize canonical session metadata when opening the local TUI session picker so a fresh broker shows an empty picker instead of an availability error.
+- The MCP bridge no longer passes the worker's NATS identity (`HARNX_INSTANCE_ID`, `HARNX_NATS_URL`, `HARNX_NATS_TOKEN`) to the server it wraps. The bridge is the process that registers over NATS; everything below it speaks MCP on stdio. Leaking those let a descendant conclude it had been launched by a worker and switch protocols — a sandbox shim running `harnx-proxy-auth` as a stdio hook did exactly that, then served NATS instead of answering the stdio handshake, so the wrapped server was never launched and the bridge timed out after 30s. Servers wrapped in a sandbox shim now start under a worker as they already did from a shell.
+- Keep tool calls shown as running when the Web UI monitors a session whose worker lease is active, and ignore redundant persisted results for calls that already completed.
+- Support file and pasted-text attachments in NATS-backed TUI and web sessions.
+- Route `harnx-serve` session discovery and restoration through the canonical NATS session store instead of legacy session YAML files.
+- Create session transcript and cluster activation streams with the configured NATS replica count.
+- Keep nested and concurrent agent tool calls attached to their own session execution.
+- Keep local sessions exclusively in NATS and restore their transcripts in the TUI across restarts and session switches.
+- Plans, bash, and grep tool servers now return filesystem and validation errors as recoverable tool results instead of fatal errors, so a failed tool call no longer halts the agent session.
+- Preserve chronological message order when a compacted session keeps one live message.
+- Fix provider switching and fallback replaying incompatible reasoning signatures, which caused HTTP 400 responses and wedged affected sessions. Tool calls now retain reasoning provenance, request builders apply destination-specific import handling, and imported anonymous calls receive request-local correlation IDs. Fixes #1804.
+- Keep TUI tool-confirmation routing alive for queued continuation turns and deny promptly when the frontend detaches.
+- Recover frontend-owned local workers when the shared local NATS broker's owning frontend exits.
+- Recover local sessions when a worker process remains alive but stops responding, confirm cancellation durably across worker replacement, and stop orphaned sub-agent rows from spinning indefinitely.
+- Keep workers available for pending session reactivation after transient NATS activation-stream heartbeat failures.
+- Refresh NATS tool discovery after activating on-demand tool servers so the first model request includes their declarations.
+- Remove stale direct-MCP command completions and document package tool-server patching.
+- Stop logging a spurious "declining to lower" replica-count notice when a NATS KV bucket already has exactly the requested number of replicas. Only a request that would genuinely lower the count is logged now; an equal request is a silent no-op.
+- Prevent local workers from being stopped by inherited terminal theme queries, and include the worker PID in slow-start notices for easier diagnostics.
+- NATS tool discovery now reaches the LLM schema, package-aware `<server>_<tool>` naming is restored through one worker `ServerIdentity` module, and package/config identities prevent the #1350 server collision.
+- Restore automatic terminal and browser title updates during a session. Title and compaction completion events emitted from detached maintenance tasks now reach the owning session's event sink instead of being lost to the worker's process-global sink.
+- Show token usage once per completed turn instead of after every model call. The turn-end usage line now sums the whole tool loop, renders on its own line in the CLI (no longer appended to streamed text), and uses the same 📥/📤/💾 format as the status bar. Removes the inconsistent inline per-call usage lines in both the TUI and CLI.
+- Keep session actors responsive to commands during periodic cancellation status refreshes from NATS, and prevent delayed poll results from overwriting newer command state.
+- Abort a session actor's in-flight turn task when the actor stops, including on panic. Dropping the actor requests cancellation through `JoinHandle::abort()`, so a pending write may be dropped and a replacement actor may overlap until the old task terminates. This bounds the double-writer window instead of eliminating it; a strict single-writer guarantee would require a registry-side join or actor-mediated writes.
+- Announce web approval notices and errors to screen readers and prevent approval buttons from submitting enclosing forms. Consolidate session usage context and document durable approval and cancellation behavior.
+- Scope sessions by the exact agent name and local session ID, allowing different agents to reuse IDs such as `review-12345` independently. Use SHA-256 storage and stream names to preserve case sensitivity on all filesystems. Require an explicit agent for session commands. Start fresh sessions after upgrading; earlier stream names are not migrated. Remove unavailable or incorrectly named tool suggestions from sub-agent errors and runtime notes while retaining the child session ID.
+- Keep successful persistent-hook startup output out of warning logs, make proxy-auth stdout strictly JSONL when launched as a persistent hook, and stop printing AWS credential bearer tokens.
+- The `sub_agent_progress` custom event now carries an optional `title` field when the sub-agent session has a title, enabling UIs to display meaningful names for delegated tasks.
+- Recover completed sub-agent status and counters in attached TUI sessions while the parent continues working, including across compaction. Preserve queued live events and handoffs during recovery, and preserve live counters when start events are repeated.
+- Recover the shared local NATS broker in the background while preserving its endpoint and surviving workers. Share bounded read/CAS recovery, lease-safe retries and acknowledged tool/hook replies across the runtime. Report a sub-agent whose completion cannot be established instead of waiting on it indefinitely, and restore missed sub-agent completion from durable results. Restart all local frontends and update worker/tool/hook binaries together to enable the recovery contract.
+- Reword the sub-agent `session_prompt` tool and `session_id` parameter descriptions so agents stop inventing custom session IDs. The old copy suggested "an unused ID such as review-12345 to create that exact session", which led models to make up an ID for every delegation and risked reusing sessions unexpectedly. The descriptions now lead with omitting `session_id` to get a generated ID (the default for a new delegation), explain that continuing a session requires the exact ID returned by a prior `session_prompt`/`session_new` call, and warn not to invent an ID.
+- Sub-agent delegation and handoff now use short session IDs instead of full UUIDs.
+- TUI: show a packaged sub-agent's canonical name (e.g. `@ pantheon/momus`) in the delegation tool-call line instead of the sanitized tool-name form (`@ pantheon__momus`).
+- Restore the custom markdown rendering of tool calls for the bash, fs, plans, time, and sub-agent tool servers. Their native toolsets never advertised the display templates, so the TUI fell back to a generic YAML dump of the arguments.
+- TUI transcript detail view now shows the full, untruncated tool result the agent sees. Previously pressing ENTER on a tool call only re-showed the collapsed user-facing summary; it now includes all content parts (including assistant-audience text) that were hidden or truncated in the inline row.
+- Fix TUI Ctrl+C reporting "timed out appending the interrupt" on long sessions. The interrupt request now runs as its own task instead of being advanced one broker round trip per render tick, so it is no longer paced by the render loop. Broker read time still grows with the session's length.
+- Fix the TUI incorrectly switching to idle state while a prompt task is still active. Sub-agent events are now represented using a structural `AgentEvent::SubAgent` variant, replacing out-of-band source tracking. When a nested sub-agent completes or fails, its output is rendered under its own source heading without clearing the main task's busy spinner.
+- Let long-running sub-agent calls wait for lease-backed completion without implicit idle or one-hour deadlines, while detecting unavailable NATS tool servers through their registrations.
+- Web UI: send subsequent messages via JSON-RPC session/prompt and follow the AG-UI stream instead of a streaming run per message; remove the client-local queue.
+- Show running, completed, and failed sub-agent sessions in the Web transcript and open their child transcripts with browser-history navigation.
+- Replace the web UI placeholder favicon with the Harnx icon and adapt its colors to the browser's light or dark theme.
+- Show server-side run failures, including missing local worker binaries, in the Web UI and log their full cause in harnx-serve.
+- Surface worker session failures in the UI instead of hanging, and load file-backed agent variables in the NATS worker.
+- The NATS worker fails with the variable's name and description when an agent declares a variable nobody supplied, instead of an opaque template error.
+
+#### Fix ACP `session_prompt` failing with a bare "Invalid params" when a sub-agent model passes an empty or made-up `session_id`.
+
+Empty or whitespace-only `session_id` values are now treated as omitted and start a new session instead of being forwarded verbatim. Unknown session IDs (in both `prompt` and `cancel`) now return an actionable error telling the model to use a real ID or omit it to start a new session. The `session_prompt` tool and `session_id` parameter descriptions now spell out how to continue a conversation versus start a new one, and warn against inventing session IDs.
+
+#### Sandbox allowlist entries now keep the symlinks they were written with. A relative entry is still made absolute against the working directory, but nothing beyond that is resolved; symlinks are followed only when checking a path against a grant.
+
+Grants were previously canonicalised at insertion, which had two consequences. It widened a grant to wherever a symlink pointed, so allowing a link could hand over its target. And it lost the path callers actually use: on merged-`/usr` systems `/lib64` collapsed into the `/usr/lib64` entry already present, so the sandbox never mounted `/lib64` and every dynamically linked binary failed to start, because loaders are named absolutely as `/lib64/ld-linux-x86-64.so.2`. That surfaced as `bash_exec` failing every command with `sandboxing failure: No such file or directory`.
+
+A leading `~` in an allowlist entry now resolves against the home directory too. Config files and tool-server arguments are read without a shell, so `--allow-read ~/.config/foo` arrived literally and was treated as relative to the working directory. `~user` is left alone, since resolving another account's home would need a passwd lookup.
+
+#### Fix the web build against `@assistant-ui/react` 0.15, which removed the `useThread`, `useMessage`, `useComposerRuntime` and `useThreadRuntime` hooks.
+
+State reads move to `useAuiState`, which takes a selector over one combined state object, so `useThread(s => s.isRunning)` becomes `useAuiState(s => s.thread.isRunning)` and `useMessage(s => s.role)` becomes `useAuiState(s => s.message.role)`. The two runtime handles come off `useAui()` instead, as `aui.composer` and `aui.thread`, and keep the same methods.
+
+#### Bootstrap pnpm's native executable through Corepack before using a sandboxed pnpm
+
+shim during `cargo xtask install`, preventing read-only cache errors after pnpm
+version updates.
+
+#### Package managers launched through Corepack now run inside the sandbox without extra flags. `~/.cache/node/corepack` is granted exec by default.
+
+Corepack spawns the pinned package manager straight out of that cache. Through pnpm 11 it spawned a script and ran it via `node`, which the existing exec grant on `node` covered. pnpm 12 ships a native binary instead, and `~/.cache` is a read+write default with no exec, so the download succeeded and the spawn failed with `Could not run the pnpm binary at ~/.cache/node/corepack/v1/pnpm/<version>/pnpm-native: EACCES`. Until now the only way past it was to patch your own shim.
+
+The cache is listed under exec rather than read/write/exec on purpose. A more specific grant replaces the one it sits inside, so the exec entry also revokes the write this subtree used to inherit from `~/.cache`: sandboxed code can run the cached package manager but can no longer replace it with something the host will execute later. That makes this a tightening of the default posture, not a relaxation.
+
+Two consequences worth knowing. Corepack can no longer download a *new* package manager version from inside the sandbox, so run `corepack install` on the host after changing a `packageManager` field. And defaults are skipped when the path does not exist, so on a machine that has never run Corepack the first sandboxed invocation still fails and the next one succeeds. Grant `--allow-rwx ~/.cache/node/corepack` if you would rather let the sandbox fetch releases itself.
+
+#### Drop the `fs4` dependency and lock files through `std::fs::File` instead.
+
+`File::try_lock` and `File::unlock` were stabilised in Rust 1.89, and the inherent methods shadow `fs4`'s extension trait, so the crate was already being bypassed at every call site. Contention and I/O errors now arrive as one `TryLockError`, and a small helper keeps them apart: another process holding the lock makes this one a follower, while an I/O error has to surface rather than be read as a lost election.
+
+#### Make committed-handoff navigation, token usage, sub-agent progress, and
+
+tool-approval state durable in the session log so every client recovers them by
+replay. Previously these were advisory-only fan-out events, so a client that
+wasn't attached when they fired (reconnect, a second client, a backend restart,
+or a different harnx-serve process) never saw them.
+
+- Handoff, usage, and sub-agent start are recorded as durable session-log
+  entries and rehydrated on attach; clients dedupe live vs. hydrated events by
+  marker id.
+- Tool approvals are now a worker-owned durable protocol. The lease-holding
+  worker is the single writer of the approval request and decision; any
+  harnx-serve routes a decision to it, and lease+fence gives single-winner
+  semantics (no double-apply under concurrent or duplicate submissions). Pending
+  approvals survive reconnect and backend restart, and the web and TUI clients
+  use the same worker-routed path. The web approval UI now reviews one tool call
+  at a time.
+- Loading pre-change sessions still works (additive schema).
+
+#### Keep web and TUI clients synchronized on canonical session IDs, live session activity, and complete reloaded assistant replies. Prevent hydration from duplicating externally submitted prompts, keep title maintenance inside its session lease, distinguish message roles, report unavailable session discovery, and recover damaged tool transcripts with visible warnings.
+
+Keep the web installer lockfile and Assistant UI dependency family aligned so frozen installs and production builds succeed.
+
+#### Fix request patches for the Opus 4.7/4.8 effort aliases and the `gpt-5.6-*:high` aliases, which silently did nothing. jaq (unlike jq) won't create a missing parent object for a nested path assignment, so `.body.output_config.effort = "high"` failed at runtime and took the rest of the patch with it — those models were sent `temperature`/`top_p` and no thinking or effort config.
+
+A failing request patch is now reported as an error naming the patch source, the expression, and the jaq message, instead of only a `warn!` that needed debug logging to see.
+
+#### Say why the local worker died when it never becomes ready.
+
+`LocalWorkerSupervisor` gave up after three worker exits with `local worker
+exited 3 times without becoming ready:` and nothing after the colon. The exit
+status was available and only logged, and the message tailed a log file that a
+process without a configured logger never opens — so every test binary, and
+every embedder that logs nothing, reported a startup failure with no evidence in
+it.
+
+The message now names each exit status and quotes what the worker printed. When
+the parent has no log file to share, the supervisor captures the worker's output
+into a temporary file of its own rather than discarding it.
+
+#### Fix a panic on every TLS connection to a NATS broker that did not set `tls_ca`, including
+
+plain `tls: true` and the client-certificate mTLS configuration. Harnx now builds the rustls
+config itself, naming the crypto provider, instead of leaving async-nats to resolve a
+process default that this workspace makes ambiguous.
+
+#### Make `cargo xtask install` disable Corepack's pnpm download prompt so web asset
+
+installation can run unattended, and synchronize the pnpm lockfile with the
+current workspace overrides and package manifest. Keep web builds concise by
+hiding Vite's per-asset size report while preserving build warnings.
+
+#### Refresh package agent models by workload and provide Gemini, Claude, Codex,
+
+OpenAI API, and non-Anthropic Bedrock fallbacks for every agent, including
+compaction. Prefer Codex immediately before the equivalent OpenAI API model.
+
+Use GPT-6 Astra at maximum effort for Oracle and Plato, with Claude Fable 5.1
+as their Claude alternative. Move Atlas and general Gemini workers to Gemini
+3.8 Flash, keep Opus 4.8 for Sisyphus and Daedalus, and use cheaper models for
+routine work and compaction. No package agent selects newer Opus versions.
+
+Package-qualified OpenAI-compatible clients now inherit shared provider model
+metadata. Add the Bedrock GLM/MiniMax and direct Gemini 3.8 entries, and generate
+Astra/Fable reasoning aliases with the required request settings. Preserve
+Gemini function-call IDs through tool-result replay and configure Fable 5.1
+to tolerate thinking invalidated by conversation compaction. Packages
+require harnx 0.34.0 or a development build containing these changes.
+
+#### Make `cargo xtask install` prepare the pnpm version pinned by the web project
+
+with Corepack, and run every pnpm command from `web/` so Corepack always finds
+that version before building the web UI.
+
+#### Fix promptless AG-UI run showing idle when remote worker is active
+
+When a Web UI client opens a promptless `/run` against a session whose local `SessionActor` is `Idle` but a remote NATS worker holds the lease, the AG-UI endpoint now follows the remote worker's advisory stream instead of terminating immediately with a synthetic `RUN_FINISHED`. This prevents the Web UI from showing an idle (Send button, no spinner) state while a remote worker is actively processing a turn.
+
+The remote-follow path:
+- Emits `RUN_STARTED` (exactly one)
+- Hydrates history snapshot (MessagesSnapshot)
+- Attaches to the session's NATS advisory stream and translates events to AG-UI frames
+- Terminates with `RUN_FINISHED` when a matching durable `TurnEnd` is observed; sustained lease absence is handled separately as crash detection
+- Handles worker crash (lease absent for sustained interval with no `TurnEnd`) by forcing finish
+- Handles race condition (turn ended between lease sample and stream attach) by checking for existing `TurnEnd` and finishing immediately
+
+#### The OpenAI Responses parser now surfaces an error when a streamed tool call has non-empty but malformed JSON arguments, instead of silently replacing them with an empty object `{}`.
+
+Both the non-streaming (`openai_extract_responses`) and streaming (`responses_finalize_tool_call`) paths previously did `serde_json::from_str(..).unwrap_or_else(|_| json!({}))`, so a truncated or invalid arguments buffer produced a tool call with no arguments rather than reporting the failure. They now propagate the parse error with the tool name and raw arguments, matching the chat parser. An empty arguments string still defaults to `{}`.
+
+#### Update `rmcp` to 3.x.
+
+The MCP server trait now returns `CallToolResponse`, an enum whose other variants cover elicitation and long-running tasks. Every server here answers in one step, so tool dispatch moved to its own method returning a plain `CallToolResult` and `call_tool` converts. `ListToolsResult` gained the SEP-2549 caching fields and is built with `ListToolsResult::with_all_items`, which fills them in and marks the result complete. `Meta` is now `MetaObject`, and `StreamableHttpServerConfig::with_stateful_mode` is `with_legacy_session_mode`.
+
+#### Print the Web UI URL on `harnx-serve` startup and label the API endpoints as POST-only.
+
+Startup previously advertised only the `/v1/embeddings` and `/v1/rerank` endpoints, which are POST-only and can't be opened in a browser, and never showed the Web UI URL served from `/`. The startup banner now leads with the Web UI URL and derives the advertised host/port from the socket's real bound address, so wildcard binds (`0.0.0.0`, `::`) map to loopback and ephemeral ports (`:0`) resolve to the actual port.
+
+#### Spawned server processes — tool servers, hook servers and the MCP bridge — now install a logger, so the diagnostics they already emit reach the worker log instead of being discarded. The MCP bridge forwards its wrapped child's stderr line by line, which previously went nowhere: a `context7` or `exa` server failing on a missing API key produced no output anywhere. The bridge also logs the command it is starting and the tool count once ready, so a server still initialising is identifiable rather than silent. Set `HARNX_LOG_LEVEL=debug` to see the wrapped child's own output.
+
+A tool server that has not registered but whose process is still running is now reported as possibly still starting, naming the log to look in, rather than as having failed to start.
+
+#### Fix spurious 503s from `harnx-serve` when a request lands on a session whose actor is reaping itself.
+
+An idle session actor stops after 5 seconds and removes itself from the registry. It used to do that without regard for callers, so a request that had already picked up its handle sent commands into a closed channel and got `session actor unavailable` or `session actor dropped ... reply` back as a JSON-RPC 503 — for a session that was perfectly resumable. The reap now happens atomically with the liveness check: an actor only removes itself while the registry holds the last handle to it, so no in-flight request can be talking to it, and otherwise it waits another interval. Handing out a handle also treats an entry whose channel is closed as no actor at all and spawns a replacement, so a session survives an actor task dying on its own (a panic) instead of failing every later request for that key.
+
+#### Stop the non-interactive CLI from printing raw `[event] LogSeqAssigned { seq: N }` debug lines on stderr during `prompt` runs.
+
+`SessionEvent::LogSeqAssigned` is persistence bookkeeping: the TUI patches transcript rows with the assigned log sequence so edit/delete/rewind can target the right entry, but the CLI makes no use of it. It had no explicit match arm in the CLI event sink, so it fell through to the `[event] {other:?}` debug catch-all and printed once per log write. It's now dropped silently, matching how the sink already ignores other internal-only events.
+
+#### Fix automatic session-title generation when running a package agent (e.g. `pantheon/sisyphus`).
+
+A globally-configured `title_agent` was resolved relative to the active agent's package, so a top-level `title-agent` was looked up as `<package>/title-agent` and never found — title generation was silently disabled. Global title agents now resolve at the top level, while an agent's own `title_agent` frontmatter still resolves package-relative.
+
+Also surface title-generation failures instead of failing silently: a new `TitleGenerationFailed` event is shown in the TUI, CLI, server (AG-UI), and web client, carrying the full error chain. Background title-agent output is isolated from the main transcript. Adds a `.title` command to view the current title and guard state and `.title generate` to (re)generate on demand, shows the title in `.info session`, and adds logging to the title-generation path.
+
+#### Keep TUI tool approvals pending until the user responds instead of automatically denying them after 30 minutes. Cancellation and frontend shutdown still end the approval wait.
+
+Preserve synchronous confirmation support on both current-thread and multithreaded Tokio runtimes.
+
+#### Recover pending tool invocations automatically after a worker restart. Tool servers can return saved replies, retry idempotent operations, or reattach sub-agent turns without duplicating their prompts. Fix a lease-release race that could delay restart recovery and false cancellation failures when completed execution records are pruned concurrently. This upgrades the internal tool protocol; restart all frontend, worker, and tool-server instances together.
+
+Preserve completed child results and tool-call order during replay, and verify the original logical tool-server identity and current worker ownership before redispatch.
+
+Reduce worker stack usage during session activation to prevent stack overflows exposed by nested sub-agent execution on Windows debug builds.
+
+#### Stop logging spurious `template error in tool '...' result_template: undefined value` warnings (#1537).
+
+Tool call/result display templates rendered under MiniJinja's Lenient undefined mode, which still raises on attribute/index access into an undefined intermediate. The shared plans result template `{{ result.content[0].text | default('') }}` walks into `result.content`, which is absent on recoverable-error results (`{"is_error": true, "error": ...}`), so it raised before `default('')` could apply and every plans/time tool logged a warning on its error path. Templates now render with Chainable undefined behavior so `default()` is honored; syntax errors and other hard failures still surface.
+
 ## 0.33.4 (2026-07-23)
 
 ### Features

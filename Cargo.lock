@@ -3474,7 +3474,7 @@ dependencies = [
 
 [[package]]
 name = "harnx"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "ansi_colours",
  "anyhow",
@@ -3566,7 +3566,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-aws-creds"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -3585,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-bash-tools"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3616,7 +3616,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-claude-compatible-hook-server"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -3638,7 +3638,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-client"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3681,7 +3681,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-core"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -3717,7 +3717,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-engine"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3737,7 +3737,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-fetch"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "fancy-regex 0.19.2",
@@ -3759,7 +3759,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-fs-tools"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -3787,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-git-history"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "gix",
@@ -3799,7 +3799,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-grep-tools"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3820,7 +3820,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-healthz"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3832,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-hooks"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "fancy-regex 0.19.2",
@@ -3847,7 +3847,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-hookset"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3858,7 +3858,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-hookset-server"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-k8s-creds"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3904,7 +3904,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-k8s-sandbox-tools"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -3950,7 +3950,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-bridge"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -3983,7 +3983,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-remote"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4007,7 +4007,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-metrics"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4042,7 +4042,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-pkg"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4073,7 +4073,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-plans-tools"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4102,7 +4102,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-proxy-auth"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4145,7 +4145,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-rag"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4171,7 +4171,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-render"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "ansi_colours",
  "anyhow",
@@ -4186,7 +4186,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-runtime"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4268,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-sandbox-common"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "birdcage",
@@ -4281,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-sandbox-run"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4297,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-serve"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "ag-ui-core",
  "anyhow",
@@ -4342,7 +4342,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-session"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "harnx-core",
@@ -4353,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-spinner"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -4363,7 +4363,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-telemetry"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4394,7 +4394,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-test-bins"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4410,7 +4410,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-time-tools"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4436,7 +4436,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-tool-allow"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "gix",
  "tempfile",
@@ -4444,7 +4444,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-toolset"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4456,7 +4456,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-toolset-server"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4487,7 +4487,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-tui"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4530,7 +4530,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-worker"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -10156,7 +10156,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "0.33.4"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",

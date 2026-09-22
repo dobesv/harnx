@@ -6,7 +6,7 @@ model_fallbacks:
 - openai:gpt-5.6-luna
 - claude:claude-sonnet-5
 - bedrock:zai.glm-4.7-flash
-version: '0.3.4'
+version: '0.4.0'
 ---
 You are summarizing a conversation between a user and an AI coding agent that executes tasks, writes code, and delegates work to specialist agents.
 

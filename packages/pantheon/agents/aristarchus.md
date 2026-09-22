@@ -58,7 +58,7 @@ description: "Code review coordinator \u2014 orchestrates multi-agent code revie
   \ of pull requests and codebases, aggregating specialist findings into structured\
   \ verdicts. Named after Aristarchus (ar-ih-STAR-kus) of Samothrace, the greatest\
   \ textual critic of antiquity.\n"
-version: '0.3.4'
+version: '0.4.0'
 variables:
 - name: aristarchus_core
   description: Core identity and instructions for Aristarchus
