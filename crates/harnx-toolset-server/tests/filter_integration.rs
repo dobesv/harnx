@@ -106,20 +106,27 @@ impl FilteredHarness {
     }
 }
 
-// Test 1: Registration filtering
+// Registration exposes exactly tools selected by each filter shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn registration_filters_tools_by_glob() -> Result<()> {
-    let mut harness = setup_test_context(&["echo"])
-        .await?
-        .context("nats-server required")?;
-
-    let registration = wait_for_registration(&harness.client, &harness.instance_id).await?;
-    let tool_names: Vec<_> = registration.tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(tool_names, vec!["echo"]);
-    assert!(!tool_names.contains(&"fail"));
-    assert!(!tool_names.contains(&"sleep"));
-
-    harness.shutdown().await;
+async fn test_registration_tool_filtering() -> Result<()> {
+    let cases: &[(&[&str], &[&str])] = &[
+        (&[], &["echo", "fail", "sleep"]),
+        (&["echo"], &["echo"]),
+        (&["e*"], &["echo"]),
+    ];
+    for (patterns, expected) in cases {
+        let mut harness = setup_test_context(patterns)
+            .await?
+            .context("nats-server required")?;
+        let registration = wait_for_registration(&harness.client, &harness.instance_id).await?;
+        let names: std::collections::BTreeSet<_> = registration
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, expected.iter().copied().collect());
+        harness.shutdown().await;
+    }
     Ok(())
 }
 
@@ -357,42 +364,6 @@ async fn enabled_tool_works_normally_with_durable_replay() -> Result<()> {
         .echo_invocations
         .load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(invocations_after, 1);
-
-    harness.shutdown().await;
-    Ok(())
-}
-
-// Additional test: Registration with no filter shows all tools
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn registration_shows_all_tools_when_no_filter() -> Result<()> {
-    let mut harness = FilteredHarness::start(None)
-        .await?
-        .context("nats-server required")?;
-
-    let registration = wait_for_registration(&harness.client, &harness.instance_id).await?;
-    let tool_names: std::collections::BTreeSet<_> =
-        registration.tools.iter().map(|t| t.name.as_str()).collect();
-    assert!(tool_names.contains("echo"));
-    assert!(tool_names.contains("fail"));
-    assert!(tool_names.contains("sleep"));
-
-    harness.shutdown().await;
-    Ok(())
-}
-
-// Test: Glob pattern filtering for tools list
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn registration_filters_by_glob_pattern() -> Result<()> {
-    let mut harness = setup_test_context(&["*e*"])
-        .await?
-        .context("nats-server required")?;
-
-    let registration = wait_for_registration(&harness.client, &harness.instance_id).await?;
-    let tool_names: Vec<_> = registration.tools.iter().map(|t| t.name.as_str()).collect();
-    // "echo" and "sleep" contain 'e', "fail" does not
-    assert!(tool_names.contains(&"echo"));
-    assert!(tool_names.contains(&"sleep"));
-    assert!(!tool_names.contains(&"fail"));
 
     harness.shutdown().await;
     Ok(())
