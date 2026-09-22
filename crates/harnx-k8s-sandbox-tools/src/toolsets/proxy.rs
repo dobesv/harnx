@@ -9,6 +9,7 @@ pub(super) struct ProxyToolset {
     name: &'static str,
     specs: Vec<ToolSpec>,
     gateway: Gateway,
+    port: u16,
 }
 
 struct ResolvedInvocation {
@@ -21,11 +22,17 @@ struct ResolvedInvocation {
 }
 
 impl ProxyToolset {
-    pub(super) fn new(name: &'static str, specs: Vec<ToolSpec>, gateway: Gateway) -> Self {
+    pub(super) fn new(
+        name: &'static str,
+        specs: Vec<ToolSpec>,
+        gateway: Gateway,
+        port: u16,
+    ) -> Self {
         Self {
             name,
             specs: specs.into_iter().map(proxy_spec).collect(),
             gateway,
+            port,
         }
     }
 
@@ -58,8 +65,8 @@ impl ProxyToolset {
             .map_err(lifecycle_error)?;
         Ok(ResolvedInvocation {
             sandbox_id,
-            endpoint: mcp_endpoint(&pod_ip),
-            tool: format!("{}_{}", self.name, tool),
+            endpoint: mcp_endpoint(&pod_ip, self.port),
+            tool,
             args,
             capabilities: context.capabilities,
             cancel,

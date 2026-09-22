@@ -95,7 +95,7 @@ async fn clone_once(
         .call_remote(
             request.sandbox_id,
             request.endpoint,
-            "bash_exec",
+            "exec",
             Map::from_iter([
                 (
                     "command".to_string(),

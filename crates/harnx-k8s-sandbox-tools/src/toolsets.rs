@@ -22,8 +22,23 @@ use lifecycle_toolset::lifecycle_specs;
 #[cfg(test)]
 use proxy::proxy_spec;
 
+/// MCP ports for bash and fs services in a sandbox.
+#[derive(Clone, Copy, Debug)]
+pub struct SandboxPorts {
+    pub bash: u16,
+    pub fs: u16,
+}
+
+impl Default for SandboxPorts {
+    fn default() -> Self {
+        Self {
+            bash: 3002,
+            fs: 3003,
+        }
+    }
+}
+
 pub const SANDBOX_CONTEXT_KEY: &str = "sandbox";
-const MCP_PORT: u16 = 8080;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,28 +52,33 @@ struct Gateway {
     manager: SandboxManager,
     caller: Arc<dyn McpCaller>,
     metadata: SessionMetadataStore,
+    bash_mcp_port: u16,
 }
 
 pub fn sandbox_toolsets(
     manager: SandboxManager,
     caller: Arc<dyn McpCaller>,
     metadata: SessionMetadataStore,
+    ports: SandboxPorts,
 ) -> Vec<Arc<dyn Toolset>> {
     let gateway = Gateway {
         manager,
         caller,
         metadata,
+        bash_mcp_port: ports.bash,
     };
     vec![
         Arc::new(ProxyToolset::new(
             "bash",
             harnx_bash_tools::builtin_tool_specs(),
             gateway.clone(),
+            ports.bash,
         )),
         Arc::new(ProxyToolset::new(
             "fs",
             harnx_fs_tools::builtin_tool_specs(),
             gateway.clone(),
+            ports.fs,
         )),
         Arc::new(LifecycleToolset { gateway }),
     ]
@@ -203,11 +223,11 @@ impl Gateway {
         }
     }
 }
-fn mcp_endpoint(ip: &str) -> String {
+fn mcp_endpoint(ip: &str, port: u16) -> String {
     if ip.contains(':') {
-        format!("http://[{ip}]:{MCP_PORT}/mcp")
+        format!("http://[{ip}]:{port}/mcp")
     } else {
-        format!("http://{ip}:{MCP_PORT}/mcp")
+        format!("http://{ip}:{port}/mcp")
     }
 }
 

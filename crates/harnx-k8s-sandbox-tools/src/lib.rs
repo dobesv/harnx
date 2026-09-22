@@ -17,4 +17,4 @@ pub use mcp::{
     McpCallError, McpCallErrorKind, McpCaller, McpCallerConfig, StreamableHttpMcpCaller,
 };
 pub use policy::{EndReason, FailureKind, TerminalClass, TerminalError};
-pub use toolsets::{sandbox_toolsets, SandboxBinding, SANDBOX_CONTEXT_KEY};
+pub use toolsets::{sandbox_toolsets, SandboxBinding, SandboxPorts, SANDBOX_CONTEXT_KEY};

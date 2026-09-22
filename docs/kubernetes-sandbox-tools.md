@@ -11,14 +11,15 @@ given session normally stays attached to one sandbox.
 Harnx worker -- native tool request --> harnx-k8s-sandbox-tools
                                            |
                                            | Kubernetes API: create/wake/hibernate
-                                           | HTTP MCP: bash_* / fs_*
+                                           | HTTP MCP: bash (:3002) / fs (:3003)
                                            v
                                     Agent Sandbox pod
-                                    +------------------+
-                                    | agentgateway:8080|
-                                    |  |- bash stdio MCP
-                                    |  `- fs stdio MCP
-                                    +------------------+
+                                    +--------------------------------+
+                                    | harnx-bash-tools --mcp-http   |
+                                    |   port 3002 (/mcp)             |
+                                    | harnx-fs-tools --mcp-http     |
+                                    |   port 3003 (/mcp)             |
+                                    +--------------------------------+
 ```
 
 Only the central gateway connects to the Harnx NATS cluster. Sandboxes have no
@@ -89,7 +90,7 @@ outside this gateway's scope and need separate Harnx services or toolsets.
 Tartarus and this gateway can use the same existing sandbox images and claims
 during a migration when they target the same namespace and template. Both use
 the Agent Sandbox CRDs, the `kagent/last-activity` annotation, and streamable
-HTTP MCP at port `8080`, path `/mcp`. Claim naming does not collide: Tartarus
+HTTP MCP. Claim naming does not collide: Tartarus
 uses Kubernetes-generated `sandbox-*` names, while this gateway derives a name
 from the Harnx tool-call ID.
 
@@ -101,59 +102,27 @@ namespaces if both lifecycle owners must remain active. Likewise, do not issue
 concurrent release or destroy operations for the same claim.
 
 Image compatibility depends on the in-sandbox MCP contract, not which gateway
-created the claim. The image must expose the expected `bash_*` and `fs_*` names
-and accept the schemas advertised by the gateway. Tartarus loads a schema
-snapshot from deployment configuration, while this gateway compiles schemas
-from its Harnx bash/fs crates, so upgrade the gateway and sandbox image together
+created the claim. The image must run the expected native MCP servers
+(ports 3002 and 3003) and accept the schemas advertised by the gateway.
+Tartarus loads a schema snapshot from deployment configuration, while this gateway
+compiles schemas from its Harnx bash/fs crates, so upgrade the gateway and sandbox image together
 when those tool schemas change. Harnx session bindings are private NATS metadata
 and are not visible to Tartarus; calls through Tartarus still need its explicit
 or kagent-derived sandbox context.
 
-## Sandbox MCP endpoint
+## Sandbox MCP endpoints
 
-Each sandbox must expose streamable HTTP MCP at port `8080`, path `/mcp`.
-[agentgateway](https://github.com/agentgateway/agentgateway) can host the two
-Harnx stdio MCP servers with this configuration:
+Each sandbox must expose streamable HTTP MCP at path `/mcp` on two ports:
+- `harnx-bash-tools --mcp-http` on port 3002, exposing raw tools (`exec`, `spawn`, `wait`, `terminate`, `read_exec_log`, `rollback_file`).
+- `harnx-fs-tools --mcp-http` on port 3003, exposing raw tools (`read`, `write`, `edit`, `insert`, `re_replace`, `ls`, `grep`, `find`, `rollback_file`).
 
-```yaml
-binds:
-  - port: 8080
-    listeners:
-      - routes:
-          - backends:
-              - mcp:
-                  statefulMode: stateful
-                  targets:
-                    - name: bash
-                      stdio:
-                        cmd: harnx-bash-tools
-                        args:
-                          - --mcp-stdio
-                          - --allow-rwx
-                          - /workspace
-                          - --no-sandbox
-                    - name: fs
-                      stdio:
-                        cmd: harnx-fs-tools
-                        args:
-                          - --mcp-stdio
-                          - --allow-rwx
-                          - /workspace
-```
+Run the sandbox container with `/workspace` as its working directory. Pass `--allow-rwx /workspace` and `--no-sandbox` to `harnx-bash-tools`. Disabling the bash process sandbox here is intentional only when the Kubernetes pod is itself the security boundary. The filesystem server remains limited to `/workspace` via `--allow-rwx /workspace`.
 
-Run the sandbox container with `/workspace` as its working directory. Disabling
-the bash process sandbox here is intentional only when the Kubernetes pod is
-itself the security boundary. The filesystem server remains limited to
-`/workspace`. Agentgateway prefixes target names, producing the `bash_exec` and
-`fs_read` names the central gateway calls.
+Configure the central gateway's connection ports using the CLI flags `--bash-mcp-port` (env `BASH_MCP_PORT`, default `3002`) and `--fs-mcp-port` (env `FS_MCP_PORT`, default `3003`).
 
-The gateway forwards Harnx execution-context capability metadata through MCP,
-so repository/branch observations made inside the sandbox still update the
-central session picker. W3C trace context is forwarded as well. Cancellation is
-sent to the in-sandbox MCP request without closing unrelated concurrent calls.
-The gateway retains one stateful MCP session per sandbox so process handles from
-`bash_spawn` remain valid for later `bash_wait`, log, and terminate calls. The
-session is replaced when the pod IP changes and closed on `sandbox_release`.
+Agent-visible tool names remain prefixed (`bash_exec`, `fs_read`), auto-prefixed by the runtime layer from the NATS server name. The gateway connects to each server's `/mcp` endpoint and invokes the corresponding raw tool name.
+
+The gateway forwards Harnx execution-context capability metadata through MCP, so repository/branch observations made inside the sandbox still update the central session picker. W3C trace context is forwarded as well. Cancellation is sent to the in-sandbox MCP request without closing unrelated concurrent calls. The gateway retains one stateful MCP session per `(sandbox_id, endpoint)` tuple so process handles from `bash_spawn` remain valid for later `bash_wait`, log, and terminate calls. Sessions are replaced when the pod IP changes and closed on `sandbox_release`.
 
 ## High-availability deployment
 
@@ -162,10 +131,10 @@ Run multiple gateway replicas in an active/active topology behind a
 your infrastructure repository. Set `terminationGracePeriodSeconds` to at least
 the 10-second handler-drain budget so terminating pods finish in-flight work.
 
-Precondition: active/active serving requires persistent shared-state HTTP MCP
-servers in the sandbox (the agentgateway-removal migration). With shared backend
-process state, independent gateway replicas route to the same sandbox processes,
-resolving the earlier split-registry limitation.
+Precondition: active/active serving requires the two native HTTP MCP servers
+in the sandbox. Because each server maintains independent in-sandbox state per
+endpoint, independent gateway replicas route to the same sandbox processes
+without requiring central proxy state.
 
 Serving routes through NATS:
 
@@ -213,8 +182,8 @@ Serving routes through NATS:
 `sandbox_connect` without an ID creates a `SandboxClaim` from the configured
 template. The claim name is derived from the Harnx tool-call ID, making a
 redelivered creation request converge on the same claim. Optional `repos` are
-cloned through `bash_exec` after the sandbox is ready; each result reports its
-path, checked-out branch, or an error. Clone destinations must be below
+cloned through the bash server's `exec` tool after the sandbox is ready; each
+result reports its path, checked-out branch, or an error. Clone destinations must be below
 `/workspace`, and authentication/network-shaped failures are retried up to
 three times.
 
@@ -299,11 +268,12 @@ the gateway service account with a `RoleBinding` in `agent-sandboxes`.
 ## Network and credential boundary
 
 NetworkPolicy should allow gateway egress to the Kubernetes API, central NATS,
-telemetry endpoints, and sandbox pods on TCP 8080. Sandbox ingress on TCP 8080
-should accept only the gateway pod selector/namespace. Sandbox egress may allow
-source control, package registries, and approved proxies, but does not need
-central NATS. Do not mount NATS tokens, model-provider credentials, or the
-gateway service-account token into sandbox pods.
+telemetry endpoints, and sandbox pods on TCP 3002 and TCP 3003. Sandbox ingress
+on TCP 3002 and TCP 3003 should accept only the gateway pod selector/namespace.
+Sandbox egress may allow source control, package registries, and approved
+proxies, but does not need central NATS. Do not mount NATS tokens,
+model-provider credentials, or the gateway service-account token into sandbox
+pods.
 
 The sandbox ID is a routing hint, not an authorization credential. NATS account
 permissions, gateway Kubernetes RBAC, namespace isolation, and NetworkPolicy

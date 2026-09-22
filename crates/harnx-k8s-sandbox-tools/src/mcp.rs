@@ -189,14 +189,16 @@ pub trait McpCaller: Send + Sync {
     async fn disconnect(&self, _sandbox_id: &str) {}
 }
 
+type SessionKey = (String, String);
+
 #[derive(Clone)]
 pub struct StreamableHttpMcpCaller {
     client: reqwest::Client,
     config: McpCallerConfig,
     backoff: BackoffConfig,
-    // Agentgateway creates stdio targets per frontend MCP session. Pool by
-    // sandbox so bash process handles survive from spawn to later wait/log calls.
-    sessions: Arc<Mutex<HashMap<String, Arc<SessionSlot>>>>,
+    // Native HTTP MCP servers run per endpoint (bash:3002, fs:3003). Pool by
+    // (sandbox_id, endpoint) so separate service connections coexist.
+    sessions: Arc<Mutex<HashMap<SessionKey, Arc<SessionSlot>>>>,
 }
 
 struct ConnectRequest<'a> {
@@ -255,7 +257,7 @@ impl StreamableHttpMcpCaller {
         sandbox_id: &str,
         endpoint: &str,
     ) -> Result<Arc<RunningService<RoleClient, ()>>, McpCallError> {
-        let slot = self.reserve_slot(sandbox_id).await;
+        let slot = self.reserve_slot(sandbox_id, endpoint).await;
         let mut current = slot.current.lock().await;
         if let Some(service) = current
             .as_ref()
@@ -276,11 +278,11 @@ impl StreamableHttpMcpCaller {
         Ok(service)
     }
 
-    async fn reserve_slot(&self, sandbox_id: &str) -> Arc<SessionSlot> {
+    async fn reserve_slot(&self, sandbox_id: &str, endpoint: &str) -> Arc<SessionSlot> {
         let mut sessions = self.sessions.lock().await;
         sessions.retain(|_, slot| retain_session_slot(slot));
         sessions
-            .entry(sandbox_id.to_string())
+            .entry((sandbox_id.to_string(), endpoint.to_string()))
             .or_insert_with(|| {
                 Arc::new(SessionSlot {
                     current: Mutex::new(None),
@@ -399,8 +401,14 @@ impl StreamableHttpMcpCaller {
         }
     }
 
-    async fn invalidate(&self, sandbox_id: &str, failed: &Arc<RunningService<RoleClient, ()>>) {
-        let slot = self.sessions.lock().await.get(sandbox_id).cloned();
+    async fn invalidate(
+        &self,
+        sandbox_id: &str,
+        endpoint: &str,
+        failed: &Arc<RunningService<RoleClient, ()>>,
+    ) {
+        let key = (sandbox_id.to_string(), endpoint.to_string());
+        let slot = self.sessions.lock().await.get(&key).cloned();
         let Some(slot) = slot else {
             return;
         };
@@ -486,7 +494,7 @@ impl McpCaller for StreamableHttpMcpCaller {
             result = submission => match result {
                 Ok(handle) => handle,
                 Err(error) => {
-                    self.invalidate(sandbox_id, &service).await;
+                    self.invalidate(sandbox_id, endpoint, &service).await;
                     operation_metric("mcp", tool, "transport_error");
                     return Err(service_error("dispatch", tool, error));
                 }
@@ -522,7 +530,7 @@ impl McpCaller for StreamableHttpMcpCaller {
             result = &mut handle.rx => match result.unwrap_or(Err(ServiceError::TransportClosed)) {
                 Ok(response) => response,
                 Err(error) => {
-                    self.invalidate(sandbox_id, &service).await;
+                    self.invalidate(sandbox_id, endpoint, &service).await;
                     let outcome = if matches!(error, ServiceError::TransportClosed) {
                         "transport_error"
                     } else {
@@ -536,7 +544,7 @@ impl McpCaller for StreamableHttpMcpCaller {
         let result: CallToolResult = match response {
             ServerResult::CallToolResult(result) => result,
             _ => {
-                self.invalidate(sandbox_id, &service).await;
+                self.invalidate(sandbox_id, endpoint, &service).await;
                 operation_metric("mcp", tool, "permanent_error");
                 return Err(McpCallError::call(
                     FailureKind::Internal,
@@ -573,10 +581,18 @@ impl McpCaller for StreamableHttpMcpCaller {
     }
 
     async fn disconnect(&self, sandbox_id: &str) {
-        let slot = self.sessions.lock().await.remove(sandbox_id);
-        if let Some(slot) = slot {
-            if let Some(session) = slot.current.lock().await.take() {
-                session.service.cancellation_token().cancel();
+        let mut sessions = self.sessions.lock().await;
+        // Collect all slots for this sandbox across all endpoints
+        let to_remove: Vec<_> = sessions
+            .keys()
+            .filter(|(id, _)| id == sandbox_id)
+            .cloned()
+            .collect();
+        for key in to_remove {
+            if let Some(slot) = sessions.remove(&key) {
+                if let Some(session) = slot.current.lock().await.take() {
+                    session.service.cancellation_token().cancel();
+                }
             }
         }
     }

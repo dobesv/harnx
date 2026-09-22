@@ -111,9 +111,11 @@ async fn connect_clones_after_a_retry_and_binds_the_session() -> Result<()> {
     {
         let calls = fixture.caller.calls.lock();
         assert_eq!(calls.len(), 2);
-        assert!(calls
-            .iter()
-            .all(|call| call.tool == "bash_exec" && call.sandbox_id == "claim-clone"));
+        assert!(calls.iter().all(|call| {
+            call.tool == "exec"
+                && call.sandbox_id == "claim-clone"
+                && call.endpoint == "http://10.0.0.8:3002/mcp"
+        }));
     }
     let binding = bound_sandbox(&fixture.metadata, "session-clone").await?;
     assert_eq!(binding.sandbox_id, "claim-clone");

@@ -58,7 +58,7 @@ impl LifecycleToolset {
             .ensure_active(&sandbox_id, &cancel)
             .await
             .map_err(lifecycle_error)?;
-        let endpoint = mcp_endpoint(&pod_ip);
+        let endpoint = mcp_endpoint(&pod_ip, self.gateway.bash_mcp_port);
         self.bind_ready_sandbox(session_id, &sandbox_id).await?;
 
         let mut repos = Vec::with_capacity(args.repos.len());

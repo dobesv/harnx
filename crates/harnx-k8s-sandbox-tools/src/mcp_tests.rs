@@ -284,7 +284,7 @@ async fn already_cancelled_call_skips_connection_attempt() -> Result<()> {
         .call(
             "cancelled",
             "http://127.0.0.1:1/mcp",
-            "bash_exec",
+            "increment",
             Map::new(),
             BTreeSet::new(),
             cancel,
@@ -308,12 +308,103 @@ async fn connection_retry_exhaustion_reports_exact_attempt_count() -> Result<()>
             ..McpCallerConfig::default()
         },
         "retry-count",
-        "bash_exec",
+        "increment",
     )
     .await?;
 
     assert_eq!(error.kind, McpCallErrorKind::Connect);
     assert_eq!(error.attempts, 2);
     assert!(error.message.contains("connect to sandbox MCP"));
+    Ok(())
+}
+
+async fn spawn_counter_server(
+    shutdown: CancellationToken,
+) -> Result<(String, tokio::task::JoinHandle<()>)> {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let service: StreamableHttpService<CounterServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(CounterServer::new(started.clone())),
+            Default::default(),
+            StreamableHttpServerConfig::default()
+                .with_json_response(true)
+                .with_cancellation_token(shutdown.child_token())
+                .disable_allowed_hosts(),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+    let server_shutdown = shutdown.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+            .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
+            .await
+            .unwrap();
+    });
+    Ok((endpoint, server))
+}
+
+#[tokio::test]
+async fn interleaved_calls_to_two_endpoints_preserve_both_sessions() -> Result<()> {
+    harnx_core::require_nextest();
+    // Test that calling endpoint A then endpoint B for the same sandbox_id
+    // does NOT cancel the session on endpoint A.
+    let shutdown = CancellationToken::new();
+    let (endpoint1, server1) = spawn_counter_server(shutdown.child_token()).await?;
+    let (endpoint2, server2) = spawn_counter_server(shutdown.child_token()).await?;
+
+    let caller = StreamableHttpMcpCaller::new()?;
+
+    // Call endpoint1 first
+    let result1 = caller
+        .call(
+            "sandbox-shared",
+            &endpoint1,
+            "increment",
+            Map::new(),
+            BTreeSet::new(),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(response_text(&result1), "1");
+
+    // Call endpoint2 - this should NOT cancel endpoint1's session
+    let result2 = caller
+        .call(
+            "sandbox-shared",
+            &endpoint2,
+            "increment",
+            Map::new(),
+            BTreeSet::new(),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(response_text(&result2), "1");
+
+    // Call endpoint1 again - should reuse session (counter still 1, increments to 2)
+    let result1_again = caller
+        .call(
+            "sandbox-shared",
+            &endpoint1,
+            "increment",
+            Map::new(),
+            BTreeSet::new(),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        response_text(&result1_again),
+        "2",
+        "endpoint1 session should still be alive after endpoint2 call"
+    );
+
+    // Verify both sessions are in the pool
+    let sessions = caller.sessions.lock().await;
+    assert_eq!(sessions.len(), 2, "should have two sessions in pool");
+    assert!(sessions.contains_key(&("sandbox-shared".to_string(), endpoint1.clone())));
+    assert!(sessions.contains_key(&("sandbox-shared".to_string(), endpoint2.clone())));
+
+    shutdown.cancel();
+    server1.await?;
+    server2.await?;
     Ok(())
 }

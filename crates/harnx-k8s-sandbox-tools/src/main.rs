@@ -5,7 +5,7 @@ use harnx_k8s_sandbox_tools::leader_election::{
 };
 use harnx_k8s_sandbox_tools::{
     sandbox_toolsets, KubernetesSandboxApi, McpCaller, McpCallerConfig, SandboxManager,
-    SandboxManagerConfig, StreamableHttpMcpCaller,
+    SandboxManagerConfig, SandboxPorts, StreamableHttpMcpCaller,
 };
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
 use harnx_runtime::nats_session_metadata::SessionMetadataStore;
@@ -47,6 +47,10 @@ struct Cli {
     retry_backoff_cap_ms: u64,
     #[arg(long, env = "RETRY_MAX_ATTEMPTS", default_value_t = 5)]
     retry_max_attempts: usize,
+    #[arg(long, env = "BASH_MCP_PORT", default_value_t = 3002)]
+    bash_mcp_port: u16,
+    #[arg(long, env = "FS_MCP_PORT", default_value_t = 3003)]
+    fs_mcp_port: u16,
     #[command(flatten)]
     metrics: harnx_metrics::MetricsFlags,
     #[command(flatten)]
@@ -103,7 +107,15 @@ async fn run(cli: Cli, readiness: Option<harnx_healthz::Readiness>) -> Result<()
     );
 
     // Apply filter to toolsets if specified
-    let toolsets = sandbox_toolsets(manager, caller, metadata);
+    let toolsets = sandbox_toolsets(
+        manager,
+        caller,
+        metadata,
+        SandboxPorts {
+            bash: cli.bash_mcp_port,
+            fs: cli.fs_mcp_port,
+        },
+    );
     let toolsets: Vec<Arc<dyn harnx_toolset::Toolset>> = match &filter_set {
         Some(set) => toolsets
             .into_iter()
