@@ -19,7 +19,7 @@ use fancy_regex::Regex;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, ListToolsResult, MetaObject, PaginatedRequestParams, Role, ServerCapabilities,
-    ServerInfo, Tool, ToolAnnotations,
+    ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{RequestContext, RoleServer};

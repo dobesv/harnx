@@ -10,7 +10,7 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ClientCapabilities, ContentBlock, ErrorData, Implementation,
-    InitializeRequestParams, ServerInfo,
+    InitializeRequestParams, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -88,8 +88,8 @@ impl TestHttpServer {
 
 #[tool_handler]
 impl ServerHandler for TestHttpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build(),

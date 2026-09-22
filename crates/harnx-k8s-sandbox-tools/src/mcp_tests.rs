@@ -2,7 +2,7 @@ use super::*;
 use anyhow::Result;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{ContentBlock, ErrorData, ServerCapabilities, ServerInfo};
+use rmcp::model::{ContentBlock, ErrorData, ServerCapabilities, ServerConfig};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
@@ -86,8 +86,8 @@ impl CounterServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CounterServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 }
 
