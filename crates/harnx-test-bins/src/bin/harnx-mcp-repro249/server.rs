@@ -1,6 +1,7 @@
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
+    Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
@@ -21,8 +22,8 @@ fn process_pid() -> &'static str {
 pub struct Repro249Server;
 
 impl ServerHandler for Repro249Server {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "harnx-mcp-repro249",
                 env!("CARGO_PKG_VERSION"),

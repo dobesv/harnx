@@ -28,7 +28,7 @@
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, ListToolsResult, MetaObject, PaginatedRequestParams, ServerCapabilities,
-    ServerInfo, Tool,
+    ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
@@ -142,8 +142,8 @@ impl MockMcpServer {
 }
 
 impl ServerHandler for MockMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "harnx-mock-mcp",
                 env!("CARGO_PKG_VERSION"),

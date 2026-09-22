@@ -9,6 +9,11 @@
   "internalChecksFilter": "strict",
   "packageRules": [
     {
+      "description": "Group assistant-ui packages — they are version-coupled and must be bumped together",
+      "matchPackageNames": ["@assistant-ui/react", "@assistant-ui/core", "@assistant-ui/store", "@assistant-ui/tap", "assistant-stream"],
+      "groupName": "assistant-ui"
+    },
+    {
       "description": "Queue non-major updates for Mergify",
       "matchUpdateTypes": ["minor", "patch", "digest", "pin"],
       "addLabels": ["automerge"]

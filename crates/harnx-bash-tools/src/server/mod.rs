@@ -20,7 +20,7 @@ use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, ListToolsResult, MetaObject, PaginatedRequestParams, Role, ServerCapabilities,
-    ServerInfo, Tool,
+    ServerConfig, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};

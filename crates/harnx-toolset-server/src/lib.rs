@@ -58,7 +58,7 @@ use opentelemetry::Context as OtelContext;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, ListToolsResult, MetaObject, PaginatedRequestParams, ServerCapabilities,
-    ServerInfo, Tool, ToolAnnotations,
+    ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;

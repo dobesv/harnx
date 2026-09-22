@@ -7,7 +7,7 @@
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, ListToolsResult, MetaObject, PaginatedRequestParams, ServerCapabilities,
-    ServerInfo, Tool,
+    ServerConfig, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{RequestContext, RoleServer};
