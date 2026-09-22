@@ -49,8 +49,8 @@ async fn proxy_requires_or_resolves_an_ambient_session_binding() -> Result<()> {
         let calls = fixture.caller.calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].sandbox_id, "claim-ambient");
-        assert_eq!(calls[0].endpoint, "http://10.0.0.8:8080/mcp");
-        assert_eq!(calls[0].tool, "bash_exec");
+        assert_eq!(calls[0].endpoint, "http://10.0.0.8:3002/mcp");
+        assert_eq!(calls[0].tool, "exec");
         assert_eq!(
             calls[0].args,
             Map::from_iter([("command".to_string(), json!("pwd"))])
@@ -160,6 +160,7 @@ async fn heartbeat_cancellation_does_not_drop_mcp_stop_waiter() -> Result<()> {
         manager: SandboxManager::new(fixture.api.clone(), SandboxManagerConfig::default()),
         caller: fixture.caller.clone(),
         metadata: fixture.metadata.clone(),
+        bash_mcp_port: 3002,
     };
     let cancel = CancellationToken::new();
     let call_cancel = cancel.clone();
@@ -167,8 +168,8 @@ async fn heartbeat_cancellation_does_not_drop_mcp_stop_waiter() -> Result<()> {
         gateway
             .call_with_activity_heartbeat(
                 "claim-heartbeat",
-                "http://10.0.0.8:8080/mcp",
-                "bash_exec",
+                "http://10.0.0.8:3002/mcp",
+                "exec",
                 Map::new(),
                 BTreeSet::new(),
                 call_cancel,
@@ -190,5 +191,72 @@ async fn heartbeat_cancellation_does_not_drop_mcp_stop_waiter() -> Result<()> {
     fixture.caller.finish_cancelled_call.notify_one();
     let error = call.await?.unwrap_err();
     assert_eq!(error.kind, McpCallErrorKind::Cancelled);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bash_routes_to_3002_and_fs_routes_to_3003() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(fixture) = ToolsetFixture::start("session-routing", Some("claim-routing")).await?
+    else {
+        return Ok(());
+    };
+
+    // Call bash tool "exec"
+    fixture
+        .bash
+        .invoke_with_context(ToolInvocation {
+            tool: "exec".to_string(),
+            args: json!({"command": "pwd"}),
+            context: ToolInvocationContext {
+                call_id: "call-bash".to_string(),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-routing",
+                )),
+                capabilities: BTreeSet::new(),
+                checkpoint: None,
+                checkpoint_store: None,
+            },
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+
+    // Call fs tool "ls"
+    fixture
+        .fs
+        .invoke_with_context(ToolInvocation {
+            tool: "ls".to_string(),
+            args: json!({"path": "/workspace"}),
+            context: ToolInvocationContext {
+                call_id: "call-fs".to_string(),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-routing",
+                )),
+                capabilities: BTreeSet::new(),
+                checkpoint: None,
+                checkpoint_store: None,
+            },
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+
+    // Verify routing
+    let calls = fixture.caller.calls.lock();
+    assert_eq!(calls.len(), 2);
+
+    // Bash call
+    assert_eq!(calls[0].sandbox_id, "claim-routing");
+    assert_eq!(calls[0].endpoint, "http://10.0.0.8:3002/mcp");
+    assert_eq!(calls[0].tool, "exec");
+
+    // FS call
+    assert_eq!(calls[1].sandbox_id, "claim-routing");
+    assert_eq!(calls[1].endpoint, "http://10.0.0.8:3003/mcp");
+    assert_eq!(calls[1].tool, "ls");
+
     Ok(())
 }

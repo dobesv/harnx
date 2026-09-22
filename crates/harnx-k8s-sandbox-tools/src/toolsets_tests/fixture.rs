@@ -1,4 +1,4 @@
-use super::*;
+use super::{SandboxPorts, *};
 
 pub(super) struct ToolsetFixture {
     pub(super) _nats: TestNats,
@@ -6,6 +6,7 @@ pub(super) struct ToolsetFixture {
     pub(super) caller: Arc<RecordingCaller>,
     pub(super) metadata: SessionMetadataStore,
     pub(super) bash: Arc<dyn Toolset>,
+    pub(super) fs: Arc<dyn Toolset>,
     pub(super) sandbox: Arc<dyn Toolset>,
 }
 
@@ -43,6 +44,7 @@ impl ToolsetFixture {
             SandboxManager::new(api.clone(), Default::default()),
             caller.clone(),
             metadata.clone(),
+            SandboxPorts::default(),
         );
         let find = |name| {
             toolsets
@@ -57,6 +59,7 @@ impl ToolsetFixture {
             caller,
             metadata,
             bash: find("bash"),
+            fs: find("fs"),
             sandbox: find("sandbox"),
         }))
     }

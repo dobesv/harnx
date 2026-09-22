@@ -67,8 +67,13 @@ fn proxy_tool_surface_matches_tartarus() {
 
 #[test]
 fn endpoint_formats_ipv4_and_ipv6_addresses() {
-    assert_eq!(mcp_endpoint("10.0.0.8"), "http://10.0.0.8:8080/mcp");
-    assert_eq!(mcp_endpoint("fd00::8"), "http://[fd00::8]:8080/mcp");
+    // Bash endpoint (port 3002)
+    assert_eq!(mcp_endpoint("10.0.0.8", 3002), "http://10.0.0.8:3002/mcp");
+    assert_eq!(mcp_endpoint("fd00::8", 3002), "http://[fd00::8]:3002/mcp");
+
+    // FS endpoint (port 3003)
+    assert_eq!(mcp_endpoint("10.0.0.8", 3003), "http://10.0.0.8:3003/mcp");
+    assert_eq!(mcp_endpoint("fd00::8", 3003), "http://[fd00::8]:3003/mcp");
 }
 
 #[test]
