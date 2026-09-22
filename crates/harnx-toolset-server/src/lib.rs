@@ -390,12 +390,9 @@ async fn finish_shutdown(cleanup: ServeCleanup, outcome: Result<()>) -> Result<(
 }
 
 async fn initialize_server(
-    client: &async_nats::Client,
-    instance_id: &ServerScope,
     toolset: Arc<dyn Toolset>,
     setup: SubscriptionSetup,
-    replicas: usize,
-    filter: Option<Arc<globset::GlobSet>>,
+    settings: &ServeSettings,
 ) -> Result<(
     async_nats::Subscriber,
     async_nats::Subscriber,
@@ -414,13 +411,13 @@ async fn initialize_server(
         registry,
         journal,
     } = setup;
-    let revision = publish_registration(&registry, instance_id, &registration).await?;
+    let revision = publish_registration(&registry, &settings.instance_id, &registration).await?;
     let (active_requests, active_requests_rx) = InFlightRequests::new();
     let request_context = request_context(
-        (client, toolset),
-        (instance_id, identity_token.clone()),
-        (active_requests, journal, replicas),
-        filter,
+        (&settings.connection.client, toolset),
+        (&settings.instance_id, identity_token.clone()),
+        (active_requests, journal, settings.connection.replicas),
+        settings.filter.clone(),
     );
     Ok((
         tool_requests,
@@ -444,16 +441,6 @@ async fn run_server_loop(
 
 async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) -> Result<()> {
     let setup = setup_subscriptions(&toolset, &settings, settings.lifecycle.readiness()).await?;
-    let ServeSettings {
-        instance_id,
-        connection,
-        lifecycle,
-        started,
-        filter,
-        ..
-    } = settings;
-    let (shutdown, readiness, registration_shutdown) = lifecycle.into_parts();
-    let NatsConnection { client, replicas } = connection;
     let (
         mut tool_requests,
         mut controls,
@@ -463,7 +450,16 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         mut revision,
         request_context,
         active_requests_rx,
-    ) = initialize_server(&client, &instance_id, toolset, setup, replicas, filter).await?;
+    ) = initialize_server(toolset, setup, &settings).await?;
+    let ServeSettings {
+        instance_id,
+        connection,
+        lifecycle,
+        started,
+        ..
+    } = settings;
+    let (shutdown, readiness, registration_shutdown) = lifecycle.into_parts();
+    let NatsConnection { client, .. } = connection;
     signal_started(started);
 
     let outcome = run_server_loop(
