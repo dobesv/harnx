@@ -73,7 +73,7 @@ fn clone_result_parser_uses_the_last_stdout_line_as_the_branch() {
 }
 
 #[test]
-fn clone_error_classifiers_match_tartarus() {
+fn clone_error_classifiers_handle_network_failures() {
     for error in [
         "remote: Repository not found.",
         "fatal: Authentication failed",

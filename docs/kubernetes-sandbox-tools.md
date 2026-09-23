@@ -5,6 +5,14 @@ and shell tools inside per-workload Kubernetes Agent Sandboxes. It is designed
 for the common topology where several agents may work in one sandbox, while a
 given session normally stays attached to one sandbox.
 
+The gateway uses the `v1beta1` Sandbox and SandboxClaim APIs served by Agent
+Sandbox v1.0.3. Install the core and extensions CRDs; a core-only installation
+does not provide SandboxClaims. Agent Sandbox v1 removed the `v1alpha1` APIs.
+Create a `SandboxWarmPool` backed by a `SandboxTemplate` with the Harnx MCP
+servers before starting the gateway. Set `--sandbox-warm-pool` to that pool's
+name; the v1beta1 claim API requires `warmPoolRef` and no longer accepts a
+template reference on the claim.
+
 ## Architecture
 
 ```text
@@ -66,55 +74,14 @@ having to repeat the ID. Existing child sessions keep their own snapshot if a
 parent later connects elsewhere. Several independent sessions can deliberately
 bind to the same sandbox.
 
-### Migrating from Tartarus
-
-The gateway preserves Tartarus's sandbox lifecycle and bash/filesystem tool
-capabilities, but it is not a drop-in MCP endpoint. Update agent definitions
-and prompts for these intentional native-Harnx contract changes:
-
-- `get_sandbox_status` is named `sandbox_status`.
-- The optional status wait argument is `timeout_secs` instead of `timeout`.
-- `sandbox_status` is observational and may report `hibernated`; unlike
-  Tartarus status lookup, it does not wake the sandbox, extend its TTL, or
-  update its activity timestamp.
-- `sandbox_id` is optional after `sandbox_connect` binds the invoking Harnx
-  session, including for newly created sub-agents. Explicit IDs still provide
-  a one-call override.
-- `sandbox_connect` gets the invoking session from attested native-tool
-  context. The Tartarus `session_id` and `app_name` arguments and their
-  `kagent/*` claim annotations are not used.
-
-Tartarus's Prow, media publishing, report, plan, and session-storage tools are
-outside this gateway's scope and need separate Harnx services or toolsets.
-
-Tartarus and this gateway can use the same existing sandbox images and claims
-during a migration when they target the same namespace and template. Both use
-the Agent Sandbox CRDs, the `kagent/last-activity` annotation, and streamable
-HTTP MCP. Claim naming does not collide: Tartarus
-uses Kubernetes-generated `sandbox-*` names, while this gateway derives a name
-from the Harnx tool-call ID.
-
-Do not run both idle watchers against the same namespace. Each watcher scans
-every claim rather than only claims created by its own gateway, so both may
-patch the same sandbox and the shorter configured idle timeout effectively
-wins. Prefer one active watcher during a rolling migration; use separate
-namespaces if both lifecycle owners must remain active. Likewise, do not issue
-concurrent release or destroy operations for the same claim.
-
-Image compatibility depends on the in-sandbox MCP contract, not which gateway
-created the claim. The image must run the expected native MCP servers
-(ports 3002 and 3003) and accept the schemas advertised by the gateway.
-Tartarus loads a schema snapshot from deployment configuration, while this gateway
-compiles schemas from its Harnx bash/fs crates, so upgrade the gateway and sandbox image together
-when those tool schemas change. Harnx session bindings are private NATS metadata
-and are not visible to Tartarus; calls through Tartarus still need its explicit
-or kagent-derived sandbox context.
-
 ## Sandbox MCP endpoints
 
 Each sandbox must expose streamable HTTP MCP at path `/mcp` on two ports:
 - `harnx-bash-tools --mcp-http` on port 3002, exposing raw tools (`exec`, `spawn`, `wait`, `terminate`, `read_exec_log`, `rollback_file`).
 - `harnx-fs-tools --mcp-http` on port 3003, exposing raw tools (`read`, `write`, `edit`, `insert`, `re_replace`, `ls`, `grep`, `find`, `rollback_file`).
+
+The gateway compiles tool schemas from its Harnx bash and filesystem crates.
+Upgrade the gateway and sandbox image together when those schemas change.
 
 Run the sandbox container with `/workspace` as its working directory. Pass `--allow-rwx /workspace` and `--no-sandbox` to `harnx-bash-tools`. Disabling the bash process sandbox here is intentional only when the Kubernetes pod is itself the security boundary. The filesystem server remains limited to `/workspace` via `--allow-rwx /workspace`.
 
@@ -180,7 +147,7 @@ Serving routes through NATS:
 ## Lifecycle behavior
 
 `sandbox_connect` without an ID creates a `SandboxClaim` from the configured
-template. The claim name is derived from the Harnx tool-call ID, making a
+warm pool. The claim name is derived from the Harnx tool-call ID, making a
 redelivered creation request converge on the same claim. Optional `repos` are
 cloned through the bash server's `exec` tool after the sandbox is ready; each
 result reports its path, checked-out branch, or an error. Clone destinations must be below
@@ -190,7 +157,7 @@ three times.
 Before every proxied bash/fs call, the gateway:
 
 1. loads the claim and best-effort extends a nearly expired shutdown time;
-2. scales a hibernated backing `Sandbox` from zero to one replica;
+2. changes a suspended backing `Sandbox` to `spec.operatingMode: Running`;
 3. waits for the claim's `Ready=True` condition and a pod IP; and
 4. updates the last-activity annotation.
 
@@ -198,7 +165,7 @@ Before every proxied bash/fs call, the gateway:
 TTL, nor updates activity. With `timeout_secs`, it polls until ready, deleted,
 hibernated, a recognized terminal error, or timeout.
 
-`sandbox_release` defaults to hibernating (`replicas: 0`) while retaining
+`sandbox_release` defaults to hibernating (`spec.operatingMode: Suspended`) while retaining
 storage and TTL. `destroy: true` deletes the claim and its storage according to
 the claim's `Delete` shutdown policy, and clears a matching ambient binding.
 
@@ -215,7 +182,7 @@ All flags have environment-variable equivalents:
 | Flag | Environment | Default |
 | --- | --- | --- |
 | `--sandbox-namespace` | `SANDBOX_NAMESPACE` | `agent-sandboxes` |
-| `--sandbox-template` | `SANDBOX_TEMPLATE` | `formative-buildbox` |
+| `--sandbox-warm-pool` | `SANDBOX_WARM_POOL` | `formative-buildbox` |
 | `--default-ttl-minutes` | `DEFAULT_TTL_MINUTES` | `4320` (72 hours) |
 | `--sandbox-scan-interval-minutes` | `SANDBOX_SCAN_INTERVAL_MINUTES` | `15` |
 | `--idle-timeout-minutes` | `IDLE_TIMEOUT_MINUTES` | `15` |

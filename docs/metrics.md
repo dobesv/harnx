@@ -43,7 +43,7 @@ All exported metrics use the `harnx_` prefix.
 | `harnx_http_request_duration_seconds` | Histogram | `method`, `route` | HTTP request latency histogram (buckets: 0.005s to 10s). | HTTP servers |
 | `harnx_tool_calls_total` | Counter | `tool`, `status` | Tool execution count (`status` is `ok` or `error`). | Tool & MCP servers |
 | `harnx_tool_call_duration_seconds` | Histogram | `tool` | Tool execution duration histogram. | Tool & MCP servers |
-| `harnx_sandbox_wakes_total` | Counter | none | Kubernetes sandboxes resumed from zero replicas. | `harnx-k8s-sandbox-tools` |
+| `harnx_sandbox_wakes_total` | Counter | none | Kubernetes sandboxes resumed from `Suspended` mode. | `harnx-k8s-sandbox-tools` |
 | `harnx_sandbox_hibernations_total` | Counter | `reason` | Kubernetes sandboxes suspended explicitly or after idle timeout. | `harnx-k8s-sandbox-tools` |
 
 Histogram buckets for duration metrics use default boundaries: `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` seconds.

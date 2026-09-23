@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn lifecycle_state_assessment_matches_tartarus_and_represents_hibernation() {
+fn lifecycle_state_assessment_represents_hibernation() {
     let pending = pending_record("pending");
     let pending_status = assess(&pending);
     assert_status(&pending_status, ("pending", false, false, false));

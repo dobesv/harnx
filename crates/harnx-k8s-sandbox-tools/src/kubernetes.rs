@@ -81,11 +81,11 @@ impl KubernetesSandboxApi {
         composite_timeout: Duration,
     ) -> Self {
         let claim = ApiResource::from_gvk_with_plural(
-            &GroupVersionKind::gvk("extensions.agents.x-k8s.io", "v1alpha1", "SandboxClaim"),
+            &GroupVersionKind::gvk("extensions.agents.x-k8s.io", "v1beta1", "SandboxClaim"),
             "sandboxclaims",
         );
         let sandbox = ApiResource::from_gvk_with_plural(
-            &GroupVersionKind::gvk("agents.x-k8s.io", "v1alpha1", "Sandbox"),
+            &GroupVersionKind::gvk("agents.x-k8s.io", "v1beta1", "Sandbox"),
             "sandboxes",
         );
         Self {
@@ -162,10 +162,15 @@ impl KubernetesSandboxApi {
             .collect();
         let replicas = if let Some(name) = sandbox_name.as_deref() {
             match self.request("get_sandbox", self.sandboxes.get(name)).await {
-                Ok(sandbox) => sandbox
+                Ok(sandbox) => match sandbox
                     .data
-                    .pointer("/spec/replicas")
-                    .and_then(Value::as_i64),
+                    .pointer("/spec/operatingMode")
+                    .and_then(Value::as_str)
+                {
+                    Some("Suspended") => Some(0),
+                    Some("Running") | None => Some(1),
+                    Some(_) => None,
+                },
                 Err(error) if is_absent_resource(&error, name) => None,
                 Err(error) => return Err(error).with_context(|| format!("get Sandbox '{name}'")),
             }
@@ -438,7 +443,7 @@ impl SandboxApi for KubernetesSandboxApi {
                     .insert("kubernetes.io/description".to_string(), description);
             }
             claim.data = json!({"spec": {
-                "sandboxTemplateRef": {"name": request.template},
+                "warmPoolRef": {"name": request.warm_pool},
                 "lifecycle": {"shutdownTime": request.shutdown_time.to_rfc3339(), "shutdownPolicy": "Delete"}
             }});
             match self.request(operation, self.claims.create(&PostParams::default(), &claim)).await {
@@ -490,13 +495,18 @@ impl SandboxApi for KubernetesSandboxApi {
     async fn set_replicas(&self, id: &str, replicas: i64) -> Result<()> {
         let operation = "set_replicas";
         let result = async {
+            let operating_mode = match replicas {
+                0 => "Suspended",
+                1 => "Running",
+                _ => anyhow::bail!("unsupported Sandbox replica count: {replicas}"),
+            };
             let name = self.sandbox_name(id).await?;
             self.request(
                 operation,
                 self.sandboxes.patch(
                     &name,
                     &PatchParams::default(),
-                    &Patch::Merge(json!({"spec": {"replicas": replicas}})),
+                    &Patch::Merge(json!({"spec": {"operatingMode": operating_mode}})),
                 ),
             )
             .await
