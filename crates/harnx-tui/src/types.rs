@@ -242,6 +242,12 @@ pub(super) struct App {
     /// Cached unread state of the current session. Updated on session change
     /// and when read-invalidation events arrive. Used to show indicator in
     /// input title and to gate mark-read calls (only emit when unread).
+    ///
+    /// Can be stale relative to durable KV because: (1) `run_loop_inner` drains
+    /// `event_rx` after handling key input, so queued invalidations haven't been
+    /// applied yet; (2) the session activity monitor stops during prompt execution,
+    /// dropping non-durable read-invalidations. Terminal exit paths (idle Ctrl+D)
+    /// should bypass this cache and mark read directly via `mark_current_session_read(true)`.
     pub(super) current_session_unread: bool,
     pub(super) detail_view_scroll: ratatui_widget_scrolling::ScrollState,
     pub(super) detail_view_open: bool,
