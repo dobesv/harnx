@@ -731,6 +731,26 @@
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max"}
       endpoint: responses
+    - name: gpt-6-luna
+      max_input_tokens: 922000
+      max_output_tokens: 128000
+      input_price: 0.1
+      output_price: 0.5
+      cache_read_price: 0.01
+      cache_write_price: 0.125
+      supports_vision: true
+      supports_tool_use: true
+      endpoint: responses
+    - name: gpt-6-sol
+      max_input_tokens: 922000
+      max_output_tokens: 128000
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.2
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      endpoint: responses
     - name: gpt-audio
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -1512,6 +1532,28 @@
       output_price: 25
       cache_read_price: 0.5
       cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+    - name: claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-opus-5-5:thinking
+      real_name: claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -3224,6 +3266,50 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+    - name: claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-opus-5-5:thinking
+      real_name: claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+    - name: claude-opus-5-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-opus-5-5@default:thinking
+      real_name: claude-opus-5-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
     - name: claude-opus-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3461,13 +3547,18 @@
       max_output_tokens: 32768
       input_price: 0.6
       output_price: 1.7
+      cache_read_price: 0.06
       supports_tool_use: true
     - name: deepseek-ai/deepseek-v3.2-maas
       max_input_tokens: 163840
       max_output_tokens: 32768
       input_price: 0.56
       output_price: 1.68
+      cache_read_price: 0.056
       supports_tool_use: true
+    - name: gemini-2.0-flash
+      input_price: 0.15
+      output_price: 0.6
     - name: gemini-2.0-flash-001
       max_input_tokens: 1048576
       max_output_tokens: 8192
@@ -3475,6 +3566,9 @@
       output_price: 0.6
       supports_vision: true
       supports_tool_use: true
+    - name: gemini-2.0-flash-lite
+      input_price: 0.075
+      output_price: 0.3
     - name: gemini-2.0-flash-lite-001
       max_input_tokens: 1048576
       max_output_tokens: 8192
@@ -3602,6 +3696,12 @@
     - name: gemini-omni-1.1-flash
       input_price: 1.5
       output_price: 9
+    - name: gemini-omni-1.1-flash-preview
+      max_input_tokens: 57920
+      max_output_tokens: 57920
+      input_price: 1.5
+      output_price: 9
+      supports_vision: true
     - name: gemini-robotics-er-2
       input_price: 1
       output_price: 5
@@ -3710,6 +3810,7 @@
       max_output_tokens: 196608
       input_price: 0.3
       output_price: 1.2
+      cache_read_price: 0.03
       supports_tool_use: true
     - name: mistral-large-2411
       max_input_tokens: 128000
@@ -3801,6 +3902,7 @@
       max_output_tokens: 256000
       input_price: 0.6
       output_price: 2.5
+      cache_read_price: 0.06
       supports_tool_use: true
     - name: openai/gpt-oss-120b-maas
       max_input_tokens: 131072
@@ -3824,6 +3926,7 @@
       max_output_tokens: 32768
       input_price: 0.22
       output_price: 1.8
+      cache_read_price: 0.022
       supports_tool_use: true
     - name: qwen/qwen3-next-80b-a3b-instruct-maas
       max_input_tokens: 262144
@@ -3904,6 +4007,7 @@
       max_output_tokens: 128000
       input_price: 0.6
       output_price: 2.2
+      cache_read_price: 0.06
       supports_tool_use: true
     - name: zai-org/glm-5-maas
       max_input_tokens: 200000
@@ -3911,6 +4015,13 @@
       input_price: 1
       output_price: 3.2
       cache_read_price: 0.1
+      supports_tool_use: true
+    - name: zai-org/glm-5.2-maas
+      max_input_tokens: 1000000
+      max_output_tokens: 64000
+      input_price: 1.4
+      output_price: 4.4
+      cache_read_price: 0.14
       supports_tool_use: true
 
 # Links:
@@ -4019,7 +4130,7 @@
     - name: cohere.command-text-v14
       max_input_tokens: 4096
       max_output_tokens: 4096
-      input_price: 1.5
+      input_price: 1
       output_price: 2
     - name: cohere.embed-english-v3
       max_input_tokens: 512
@@ -4043,22 +4154,25 @@
       supports_tool_use: true
     - name: google.gemma-3-12b-it
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 8000
       input_price: 0.09
       output_price: 0.29
       supports_vision: true
+      supports_tool_use: true
     - name: google.gemma-3-27b-it
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 8000
       input_price: 0.23
       output_price: 0.38
       supports_vision: true
+      supports_tool_use: true
     - name: google.gemma-3-4b-it
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 8000
       input_price: 0.04
       output_price: 0.08
       supports_vision: true
+      supports_tool_use: true
     - name: meta.llama2-13b-chat-v1
       max_input_tokens: 4096
       max_output_tokens: 4096
@@ -4080,51 +4194,60 @@
       input_price: 0.3
       output_price: 0.6
     - name: minimax.minimax-m2
-      max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_input_tokens: 1000000
+      max_output_tokens: 8000
       input_price: 0.3
       output_price: 1.2
+      supports_vision: false
+      supports_tool_use: true
     - name: minimax.minimax-m2.1
       max_input_tokens: 196000
-      max_output_tokens: 8192
+      max_output_tokens: 8000
       input_price: 0.3
       output_price: 1.2
+      supports_vision: false
       supports_tool_use: true
     - name: minimax.minimax-m2.5
       max_input_tokens: 196000
       max_output_tokens: 8192
       input_price: 0.3
       output_price: 1.2
+      supports_vision: false
       supports_tool_use: true
     - name: mistral.devstral-2-123b
       max_input_tokens: 256000
-      max_output_tokens: 8192
+      max_output_tokens: 32000
       input_price: 0.4
       output_price: 2
+      supports_vision: false
       supports_tool_use: true
     - name: mistral.magistral-small-2509
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 40000
       input_price: 0.5
       output_price: 1.5
+      supports_vision: true
       supports_tool_use: true
     - name: mistral.ministral-3-14b-instruct
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 8000
       input_price: 0.2
       output_price: 0.2
+      supports_vision: true
       supports_tool_use: true
     - name: mistral.ministral-3-3b-instruct
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 8000
       input_price: 0.1
       output_price: 0.1
+      supports_vision: true
       supports_tool_use: true
     - name: mistral.ministral-3-8b-instruct
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 8000
       input_price: 0.15
       output_price: 0.15
+      supports_vision: true
       supports_tool_use: true
     - name: mistral.mistral-7b-instruct-v0:2
       max_input_tokens: 32000
@@ -4134,8 +4257,8 @@
     - name: mistral.mistral-large-2402-v1:0
       max_input_tokens: 32000
       max_output_tokens: 8191
-      input_price: 8
-      output_price: 24
+      input_price: 4
+      output_price: 12
       supports_tool_use: true
     - name: mistral.mistral-large-2407-v1:0
       max_input_tokens: 128000
@@ -4144,10 +4267,11 @@
       output_price: 9
       supports_tool_use: true
     - name: mistral.mistral-large-3-675b-instruct
-      max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_input_tokens: 256000
+      max_output_tokens: 32000
       input_price: 0.5
       output_price: 1.5
+      supports_vision: true
       supports_tool_use: true
     - name: mistral.mistral-small-2402-v1:0
       max_input_tokens: 32000
@@ -4171,10 +4295,12 @@
       input_price: 0.1
       output_price: 0.3
     - name: moonshot.kimi-k2-thinking
-      max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_input_tokens: 256000
+      max_output_tokens: 16000
       input_price: 0.6
       output_price: 2.5
+      supports_vision: false
+      supports_tool_use: true
     - name: moonshotai.kimi-k2-thinking
       max_input_tokens: 262144
       max_output_tokens: 262144
@@ -4182,34 +4308,39 @@
       output_price: 3.03
       supports_tool_use: true
     - name: moonshotai.kimi-k2.5
-      max_input_tokens: 262144
-      max_output_tokens: 262144
+      max_input_tokens: 256000
+      max_output_tokens: 16000
       input_price: 0.6
       output_price: 3
       supports_vision: true
       supports_tool_use: true
     - name: nvidia.nemotron-nano-12b-v2
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 8000
       input_price: 0.2
       output_price: 0.6
       supports_vision: true
+      supports_tool_use: true
     - name: nvidia.nemotron-nano-3-30b
-      max_input_tokens: 262144
-      max_output_tokens: 8192
+      max_input_tokens: 256000
+      max_output_tokens: 8000
       input_price: 0.06
       output_price: 0.24
+      supports_vision: false
       supports_tool_use: true
     - name: nvidia.nemotron-nano-9b-v2
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 8000
       input_price: 0.06
       output_price: 0.23
+      supports_vision: false
+      supports_tool_use: true
     - name: nvidia.nemotron-super-3-120b
       max_input_tokens: 256000
-      max_output_tokens: 32768
+      max_output_tokens: 32000
       input_price: 0.15
       output_price: 0.65
+      supports_vision: false
       supports_tool_use: true
     - name: openai.gpt-oss-120b-1:0
       max_input_tokens: 128000
@@ -4225,14 +4356,18 @@
       supports_tool_use: true
     - name: openai.gpt-oss-safeguard-120b
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 16000
       input_price: 0.15
       output_price: 0.6
+      supports_vision: false
+      supports_tool_use: true
     - name: openai.gpt-oss-safeguard-20b
       max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_output_tokens: 16000
       input_price: 0.07
       output_price: 0.2
+      supports_vision: false
+      supports_tool_use: true
     - name: qwen.qwen3-235b-a22b-2507-v1:0
       max_input_tokens: 262144
       max_output_tokens: 131072
@@ -4258,20 +4393,22 @@
       output_price: 1.8
       supports_tool_use: true
     - name: qwen.qwen3-coder-next
-      max_input_tokens: 262144
-      max_output_tokens: 8192
+      max_input_tokens: 256000
+      max_output_tokens: 16000
       input_price: 0.5
       output_price: 1.2
+      supports_vision: false
       supports_tool_use: true
     - name: qwen.qwen3-next-80b-a3b
-      max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_input_tokens: 256000
+      max_output_tokens: 8000
       input_price: 0.15
       output_price: 1.2
+      supports_vision: false
       supports_tool_use: true
     - name: qwen.qwen3-vl-235b-a22b
-      max_input_tokens: 128000
-      max_output_tokens: 8192
+      max_input_tokens: 256000
+      max_output_tokens: 8000
       input_price: 0.53
       output_price: 2.66
       supports_vision: true
@@ -4653,6 +4790,28 @@
       supports_tool_use: true
       patches:
       - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
+    - name: us.anthropic.claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 4.4
+      output_price: 22
+      cache_read_price: 0.22
+      cache_write_price: 5.5
+      supports_vision: true
+      supports_tool_use: true
+    - name: us.anthropic.claude-opus-5-5:thinking
+      real_name: us.anthropic.claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 4.4
+      output_price: 22
+      cache_read_price: 0.22
+      cache_write_price: 5.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
     - name: us.anthropic.claude-sonnet-4-20250514-v1:0
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -4758,6 +4917,7 @@
       max_output_tokens: 163840
       input_price: 0.62
       output_price: 1.85
+      supports_vision: false
       supports_tool_use: true
     - name: us.meta.llama3-1-405b-instruct-v1:0
       max_input_tokens: 128000
@@ -4834,6 +4994,7 @@
       supports_tool_use: true
     - name: us.moonshotai.kimi-k3
       max_input_tokens: 1000000
+      max_output_tokens: 131072
       input_price: 3.3
       output_price: 16.5
       cache_read_price: 0.33
@@ -4911,22 +5072,25 @@
       output_price: 0.6
       supports_vision: true
     - name: zai.glm-4.7
-      max_input_tokens: 200000
-      max_output_tokens: 128000
+      max_input_tokens: 203000
+      max_output_tokens: 4000
       input_price: 0.6
       output_price: 2.2
+      supports_vision: false
       supports_tool_use: true
     - name: zai.glm-4.7-flash
       max_input_tokens: 203000
       max_output_tokens: 4096
       input_price: 0.07
       output_price: 0.4
+      supports_vision: false
       supports_tool_use: true
     - name: zai.glm-5
       max_input_tokens: 200000
       max_output_tokens: 128000
       input_price: 1
       output_price: 3.2
+      supports_vision: false
       supports_tool_use: true
 
 # Links:
@@ -5494,6 +5658,7 @@
       max_output_tokens: 4096
       input_price: 0.14
       output_price: 0.28
+      cache_read_price: 0.014
       supports_tool_use: true
     - name: deepseek-flash
       max_input_tokens: 1000000
@@ -5509,6 +5674,7 @@
       max_output_tokens: 8192
       input_price: 0.55
       output_price: 2.19
+      cache_read_price: 0.14
       supports_tool_use: true
     - name: deepseek-reasoner
       max_input_tokens: 131072
@@ -5530,6 +5696,7 @@
       max_output_tokens: 163840
       input_price: 0.28
       output_price: 0.4
+      cache_read_price: 0.028
       supports_tool_use: true
     - name: deepseek-v4-flash
       max_input_tokens: 1000000
@@ -5708,6 +5875,22 @@
       supports_tool_use: true
     - name: aion-labs/aion-3.0-mini
       max_input_tokens: 131072
+      max_output_tokens: 32768
+      input_price: 0.7
+      output_price: 1.4
+      cache_read_price: 0.18
+      supports_vision: false
+      supports_tool_use: true
+    - name: aion-labs/aion-3.5
+      max_input_tokens: 262144
+      max_output_tokens: 32768
+      input_price: 3
+      output_price: 6
+      cache_read_price: 0.75
+      supports_vision: false
+      supports_tool_use: true
+    - name: aion-labs/aion-3.5-mini
+      max_input_tokens: 262144
       max_output_tokens: 32768
       input_price: 0.7
       output_price: 1.4
@@ -5953,6 +6136,24 @@
       cache_write_price: 6.25
       supports_vision: true
       supports_tool_use: true
+    - name: anthropic/claude-opus-5.5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+    - name: anthropic/claude-opus-5.5:batch
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.1
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
     - name: anthropic/claude-opus-5:batch
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5963,7 +6164,7 @@
       supports_vision: true
       supports_tool_use: true
     - name: anthropic/claude-sonnet-4
-      max_input_tokens: 1000000
+      max_input_tokens: 200000
       max_output_tokens: 64000
       input_price: 3
       output_price: 15
@@ -6106,6 +6307,14 @@
       output_price: 10
       supports_vision: false
       supports_tool_use: false
+    - name: cohere/command-a-plus
+      max_input_tokens: 192000
+      max_output_tokens: 64000
+      input_price: 0.3
+      output_price: 1.5
+      cache_read_price: 0.15
+      supports_vision: true
+      supports_tool_use: true
     - name: cohere/command-r-08-2024
       max_input_tokens: 128000
       max_output_tokens: 4000
@@ -6161,6 +6370,7 @@
       max_output_tokens: 16000
       input_price: 0.7
       output_price: 2.5
+      cache_read_price: 0.14
       supports_vision: false
       supports_tool_use: true
     - name: deepseek/deepseek-r1-0528
@@ -6199,21 +6409,22 @@
       max_output_tokens: 65536
       input_price: 0.27
       output_price: 0.41
+      cache_read_price: 0.02
       supports_vision: false
       supports_tool_use: true
     - name: deepseek/deepseek-v4-flash
       max_input_tokens: 1048576
       max_output_tokens: 384000
-      input_price: 0.088606
-      output_price: 0.177212
-      cache_read_price: 0.017721
+      input_price: 0.049
+      output_price: 0.098
+      cache_read_price: 0.0098
       supports_vision: false
       supports_tool_use: true
     - name: deepseek/deepseek-v4-flash-0731
       max_input_tokens: 1310720
       max_output_tokens: 943718
       input_price: 0.04
-      output_price: 0.16
+      output_price: 0.64
       cache_read_price: 0.016
       supports_vision: false
       supports_tool_use: true
@@ -6251,9 +6462,9 @@
     - name: deepseek/deepseek-v4-pro
       max_input_tokens: 1048576
       max_output_tokens: 384000
-      input_price: 0.95526
-      output_price: 1.91052
-      cache_read_price: 0.079605
+      input_price: 0.88044
+      output_price: 1.76088
+      cache_read_price: 0.07337
       supports_vision: false
       supports_tool_use: true
     - name: deepseek/deepseek-v4-pro-0813
@@ -6274,10 +6485,18 @@
       supports_tool_use: true
     - name: deepseek/deepseek-v4.1-flash
       max_input_tokens: 1048576
-      max_output_tokens: 384000
+      max_output_tokens: 943718
       input_price: 0.3
       output_price: 1.2
       cache_read_price: 0.006
+      supports_vision: true
+      supports_tool_use: true
+    - name: deepseek/deepseek-v4.1-flash:batch
+      max_input_tokens: 1048576
+      max_output_tokens: 131072
+      input_price: 0.112
+      output_price: 0.336
+      cache_read_price: 0.00336
       supports_vision: true
       supports_tool_use: true
     - name: dots-studio/dots-3-note-preview:free
@@ -6656,9 +6875,9 @@
     - name: ibm-granite/granite-4.2-8b
       max_input_tokens: 131072
       max_output_tokens: 117964
-      input_price: 0.1
-      output_price: 0.15
-      cache_read_price: 0.05
+      input_price: 0.06
+      output_price: 0.25
+      cache_read_price: 0.015
       supports_vision: false
       supports_tool_use: true
     - name: inception/mercury-2
@@ -6783,9 +7002,9 @@
       output_price: 0.79
     - name: meta-llama/llama-3.1-70b-instruct
       max_input_tokens: 131072
-      max_output_tokens: 8192
-      input_price: 0.72
-      output_price: 0.72
+      max_output_tokens: 16384
+      input_price: 0.4
+      output_price: 0.4
       supports_vision: false
       supports_tool_use: true
     - name: meta-llama/llama-3.1-8b-instruct
@@ -6820,8 +7039,8 @@
     - name: meta-llama/llama-4-maverick
       max_input_tokens: 1048576
       max_output_tokens: 16384
-      input_price: 0.2
-      output_price: 0.8
+      input_price: 0.1875
+      output_price: 0.6525
       supports_vision: true
       supports_tool_use: true
     - name: meta-llama/llama-4-scout
@@ -7238,24 +7457,24 @@
       max_input_tokens: 262144
       max_output_tokens: 235929
       input_price: 0.7062
-      output_price: 3.21
+      output_price: 3.3
       cache_read_price: 0.18
       supports_vision: true
       supports_tool_use: true
     - name: moonshotai/kimi-k3
       max_input_tokens: 1048576
       max_output_tokens: 943718
-      input_price: 1.7
-      output_price: 8.5
-      cache_read_price: 0.17
+      input_price: 3
+      output_price: 15
+      cache_read_price: 0.3
       supports_vision: true
       supports_tool_use: true
     - name: moonshotai/kimi-k3:batch
       max_input_tokens: 1048576
-      max_output_tokens: 943718
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
+      max_output_tokens: 16384
+      input_price: 2.28
+      output_price: 11.4
+      cache_read_price: 0.228
       supports_vision: true
       supports_tool_use: true
     - name: morph/morph-v3-fast
@@ -7272,11 +7491,27 @@
       output_price: 1.9
       supports_vision: false
       supports_tool_use: false
+    - name: nex-agi/nex-n2.5-mini
+      max_input_tokens: 262144
+      max_output_tokens: 235929
+      input_price: 0.025
+      output_price: 0.1
+      cache_read_price: 0.0025
+      supports_vision: true
+      supports_tool_use: false
     - name: nex-agi/nex-n2.5-mini:free
       max_input_tokens: 262144
       max_output_tokens: 235929
       input_price: 0
       output_price: 0
+      supports_vision: true
+      supports_tool_use: true
+    - name: nex-agi/nex-n2.5-pro
+      max_input_tokens: 262144
+      max_output_tokens: 235929
+      input_price: 0.075
+      output_price: 0.25
+      cache_read_price: 0.015
       supports_vision: true
       supports_tool_use: true
     - name: nex-agi/nex-n2.5-pro:free
@@ -7310,8 +7545,8 @@
     - name: nvidia/nemotron-3-nano-30b-a3b
       max_input_tokens: 262144
       max_output_tokens: 235929
-      input_price: 0.06
-      output_price: 0.24
+      input_price: 0.05
+      output_price: 0.2
       cache_read_price: 0.03
       supports_vision: false
       supports_tool_use: true
@@ -7978,6 +8213,78 @@
       cache_write_price: 6.25
       supports_vision: true
       supports_tool_use: true
+    - name: openai/gpt-6-luna
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 0.1
+      output_price: 0.5
+      cache_read_price: 0.01
+      cache_write_price: 0.125
+      supports_vision: true
+      supports_tool_use: true
+    - name: openai/gpt-6-luna-pro
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 0.1
+      output_price: 0.5
+      cache_read_price: 0.01
+      cache_write_price: 0.125
+      supports_vision: true
+      supports_tool_use: true
+    - name: openai/gpt-6-luna-pro:batch
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 0.05
+      output_price: 0.25
+      cache_read_price: 0.005
+      cache_write_price: 0.0625
+      supports_vision: true
+      supports_tool_use: true
+    - name: openai/gpt-6-luna:batch
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 0.05
+      output_price: 0.25
+      cache_read_price: 0.005
+      cache_write_price: 0.0625
+      supports_vision: true
+      supports_tool_use: true
+    - name: openai/gpt-6-sol
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.2
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+    - name: openai/gpt-6-sol-pro
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.2
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+    - name: openai/gpt-6-sol-pro:batch
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 1
+      output_price: 5
+      cache_read_price: 0.1
+      cache_write_price: 1.25
+      supports_vision: true
+      supports_tool_use: true
+    - name: openai/gpt-6-sol:batch
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 1
+      output_price: 5
+      cache_read_price: 0.1
+      cache_write_price: 1.25
+      supports_vision: true
+      supports_tool_use: true
     - name: openai/gpt-audio
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -8017,10 +8324,17 @@
       supports_tool_use: true
     - name: openai/gpt-oss-20b
       max_input_tokens: 131072
-      max_output_tokens: 117964
-      input_price: 0.03
-      output_price: 0.13
+      max_output_tokens: 32768
+      input_price: 0.018
+      output_price: 0.09
       cache_read_price: 0.03
+      supports_vision: false
+      supports_tool_use: true
+    - name: openai/gpt-oss-20b:batch
+      max_input_tokens: 131072
+      max_output_tokens: 117964
+      input_price: 0.024
+      output_price: 0.112
       supports_vision: false
       supports_tool_use: true
     - name: openai/gpt-oss-safeguard-20b
@@ -8400,7 +8714,7 @@
       supports_tool_use: true
     - name: qwen/qwen3-next-80b-a3b-thinking
       max_input_tokens: 262144
-      max_output_tokens: 32768
+      max_output_tokens: 235929
       input_price: 0.15
       output_price: 1.2
       supports_vision: false
@@ -8523,10 +8837,10 @@
       supports_tool_use: true
     - name: qwen/qwen3.6-27b
       max_input_tokens: 262144
-      max_output_tokens: 65536
-      input_price: 0.3
-      output_price: 2
-      cache_read_price: 0.03
+      max_output_tokens: 262140
+      input_price: 0.32
+      output_price: 2.7
+      cache_read_price: 0.15
       supports_vision: true
       supports_tool_use: true
     - name: qwen/qwen3.6-35b-a3b
@@ -8607,9 +8921,9 @@
     - name: qwen/qwen3.8-27b
       max_input_tokens: 1000000
       max_output_tokens: 131072
-      input_price: 0.2
-      output_price: 2.5
-      cache_read_price: 0.05
+      input_price: 0.42
+      output_price: 3
+      cache_read_price: 0.085
       supports_vision: true
       supports_tool_use: true
     - name: qwen/qwen3.8-27b:free
@@ -8644,6 +8958,14 @@
       output_price: 6
       cache_read_price: 0.25
       cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+    - name: qwen/qwen3.8-omni-flash
+      max_input_tokens: 1000000
+      max_output_tokens: 131072
+      input_price: 0.15
+      output_price: 0.47
+      cache_read_price: 0.016
       supports_vision: true
       supports_tool_use: true
     - name: rekaai/reka-edge
@@ -8882,6 +9204,14 @@
       output_price: 0.65
       supports_vision: false
       supports_tool_use: false
+    - name: upstage/solar-mini4
+      max_input_tokens: 524288
+      max_output_tokens: 131072
+      input_price: 0.05
+      output_price: 0.2
+      cache_read_price: 0.005
+      supports_vision: false
+      supports_tool_use: true
     - name: upstage/solar-pro-3
       max_input_tokens: 131072
       max_output_tokens: 117964
@@ -8964,6 +9294,14 @@
       cache_read_price: 0.5
       supports_vision: true
       supports_tool_use: true
+    - name: x-ai/grok-4.7
+      max_input_tokens: 500000
+      max_output_tokens: 450000
+      input_price: 1.6
+      output_price: 4.8
+      cache_read_price: 0.4
+      supports_vision: true
+      supports_tool_use: true
     - name: x-ai/grok-build-0.1
       max_input_tokens: 256000
       max_output_tokens: 230400
@@ -9003,6 +9341,30 @@
       cache_read_price: 0.0036
       cache_write_price: 0
       supports_vision: false
+      supports_tool_use: true
+    - name: xiaomi/mimo-v2.6-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 131072
+      input_price: 0.14
+      output_price: 0.28
+      cache_read_price: 0.0028
+      supports_vision: true
+      supports_tool_use: true
+    - name: xiaomi/mimo-v2.6-pro
+      max_input_tokens: 1048576
+      max_output_tokens: 131072
+      input_price: 0.435
+      output_price: 0.87
+      cache_read_price: 0.0036
+      supports_vision: true
+      supports_tool_use: true
+    - name: xiaomi/mimo-v2.6-pro-ultraspeed
+      max_input_tokens: 1048576
+      max_output_tokens: 131072
+      input_price: 4.35
+      output_price: 8.7
+      cache_read_price: 0.036
+      supports_vision: true
       supports_tool_use: true
     - name: z-ai/glm-4.5
       max_input_tokens: 131072
@@ -9119,25 +9481,25 @@
     - name: z-ai/glm-5.3
       max_input_tokens: 1310720
       max_output_tokens: 131072
-      input_price: 0.91
-      output_price: 2.86
-      cache_read_price: 0.169
+      input_price: 0.6538
+      output_price: 2.0548
+      cache_read_price: 0.12142
       supports_vision: false
       supports_tool_use: true
     - name: z-ai/glm-5.3-flash
       max_input_tokens: 1310720
-      max_output_tokens: 131072
-      input_price: 0.09
-      output_price: 0.3
-      cache_read_price: 0.018
+      max_output_tokens: 943718
+      input_price: 0.15
+      output_price: 0.5
+      cache_read_price: 0.05
       supports_vision: true
       supports_tool_use: true
     - name: z-ai/glm-5.3-flash:batch
       max_input_tokens: 1048576
-      max_output_tokens: 943718
-      input_price: 0.075
-      output_price: 0.25
-      cache_read_price: 0.015
+      max_output_tokens: 131072
+      input_price: 0.06
+      output_price: 0.2
+      cache_read_price: 0.012
       supports_vision: true
       supports_tool_use: true
     - name: z-ai/glm-5.3-flashx
@@ -9150,10 +9512,10 @@
       supports_tool_use: true
     - name: z-ai/glm-5.3:batch
       max_input_tokens: 1048576
-      max_output_tokens: 943718
-      input_price: 0.7
-      output_price: 2.2
-      cache_read_price: 0.13
+      max_output_tokens: 131072
+      input_price: 0.72
+      output_price: 2.4
+      cache_read_price: 0.12
       supports_vision: false
       supports_tool_use: true
     - name: z-ai/glm-5v-turbo
@@ -9185,10 +9547,10 @@
     - name: ~anthropic/claude-opus-latest
       max_input_tokens: 1000000
       max_output_tokens: 128000
-      input_price: 5
-      output_price: 25
-      cache_read_price: 0.5
-      cache_write_price: 6.25
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
       supports_vision: true
       supports_tool_use: true
     - name: ~anthropic/claude-sonnet-latest
@@ -9202,7 +9564,7 @@
       supports_tool_use: true
     - name: ~deepseek/deepseek-flash-latest
       max_input_tokens: 1048576
-      max_output_tokens: 384000
+      max_output_tokens: 943718
       input_price: 0.3
       output_price: 1.2
       cache_read_price: 0.006
@@ -9220,7 +9582,7 @@
       max_input_tokens: 1310720
       max_output_tokens: 943718
       input_price: 0.04
-      output_price: 0.16
+      output_price: 0.64
       cache_read_price: 0.016
       supports_vision: false
       supports_tool_use: true
@@ -9245,9 +9607,9 @@
     - name: ~moonshotai/kimi-latest
       max_input_tokens: 1048576
       max_output_tokens: 943718
-      input_price: 1.7
-      output_price: 8.5
-      cache_read_price: 0.17
+      input_price: 3
+      output_price: 15
+      cache_read_price: 0.3
       supports_vision: true
       supports_tool_use: true
     - name: ~openai/gpt-astra-latest
@@ -9262,10 +9624,10 @@
     - name: ~openai/gpt-luna-latest
       max_input_tokens: 1050000
       max_output_tokens: 128000
-      input_price: 0.2
-      output_price: 1.2
-      cache_read_price: 0.02
-      cache_write_price: 0.25
+      input_price: 0.1
+      output_price: 0.5
+      cache_read_price: 0.01
+      cache_write_price: 0.125
       supports_vision: true
       supports_tool_use: true
     - name: ~openai/gpt-mini-latest
@@ -9297,25 +9659,25 @@
     - name: ~x-ai/grok-latest
       max_input_tokens: 500000
       max_output_tokens: 450000
-      input_price: 2
-      output_price: 6
-      cache_read_price: 0.5
+      input_price: 1.6
+      output_price: 4.8
+      cache_read_price: 0.4
       supports_vision: true
       supports_tool_use: true
     - name: ~z-ai/glm-flash-latest
       max_input_tokens: 1310720
-      max_output_tokens: 131072
-      input_price: 0.09
-      output_price: 0.3
-      cache_read_price: 0.018
+      max_output_tokens: 943718
+      input_price: 0.15
+      output_price: 0.5
+      cache_read_price: 0.05
       supports_vision: true
       supports_tool_use: true
     - name: ~z-ai/glm-latest
       max_input_tokens: 1310720
       max_output_tokens: 131072
-      input_price: 0.91
-      output_price: 2.86
-      cache_read_price: 0.169
+      input_price: 0.6538
+      output_price: 2.0548
+      cache_read_price: 0.12142
       supports_vision: false
       supports_tool_use: true
 
