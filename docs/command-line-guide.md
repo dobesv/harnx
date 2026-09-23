@@ -11,6 +11,7 @@ Commands:
   dump    Dump session transcript (full history)
   delete  Delete resources
   list    List resources
+  compact Compact session logs to reduce history size
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -42,6 +43,7 @@ harnx info session agent1 session1             # View session metadata
 harnx dump session agent1 session1             # Dump session transcript
 harnx dump session agent1 session1 --follow    # Follow transcript live
 harnx list sessions                            # List sessions
+harnx compact session agent1 session1          # Compact session log
 harnx delete session session1 --agent myagent --cluster local  # Delete session
 harnx --info                                   # View system info
 harnx --rag rag1 --info                        # View RAG info
@@ -241,3 +243,17 @@ Lists available sessions as tab-separated agent names and session IDs, one sessi
 ### `harnx delete session <session-id> --agent <agent> --cluster <cluster>`
 
 Deletes the specified agent’s NATS session from the specified cluster. If the agent selector includes `@cluster`, it must match `--cluster`. (Replaces the old `harnx session delete` command.)
+
+### `harnx compact session <agent-name> <session-id> [--timeout <seconds>]`
+
+Submits a manual compaction request for a session and blocks until it completes, streaming progress advisories.
+
+If compaction is already in progress, the command attaches to the existing operation and waits for its outcome.
+
+Options:
+- `--timeout <seconds>`: Maximum seconds to wait for compaction completion (default: `60`, pass `0` to wait indefinitely).
+
+Exit status:
+- Exits **0** on successful compaction.
+- Exits **0** when there is nothing to compact (the session does not have enough uncompacted messages or tokens to warrant summarization).
+- Exits **nonzero** if compaction fails or the timeout expires.

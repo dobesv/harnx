@@ -168,9 +168,20 @@ pub enum SessionEvent {
     Saved {
         path: PathBuf,
     },
-    CompactingStarted,
-    CompactingCompleted,
-    CompactingFailed(String),
+    CompactingStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
+    },
+    CompactingCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
+        outcome: crate::session::CompactOutcome,
+    },
+    CompactingFailed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
+        error: String,
+    },
     AgentInitializing {
         agent: String,
     },

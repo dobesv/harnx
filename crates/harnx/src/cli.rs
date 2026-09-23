@@ -112,6 +112,53 @@ pub enum Commands {
     Delete(DeleteArgs),
     /// List resources
     List(ListArgs),
+    /// Compact session logs to reduce history size.
+    ///
+    /// Blocks until compaction finishes and streams progress. A "nothing to compact"
+    /// result is normal and reported as success (exit 0).
+    Compact(CompactArgs),
+}
+
+/// Compact session logs to reduce history size.
+///
+/// Blocks until compaction finishes and streams progress. A "nothing to compact"
+/// result is normal and reported as success (exit 0).
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct CompactArgs {
+    #[command(subcommand)]
+    pub command: CompactCommands,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum CompactCommands {
+    /// Compact a specific session's log.
+    ///
+    /// Submits a compaction request, blocks until finished, and streams progress
+    /// events until completion. If compaction is already in progress, attaches to
+    /// the existing operation.
+    ///
+    /// Exits 0 on success (including when there is nothing to compact), and nonzero
+    /// on failure.
+    Session(CompactSessionArgs),
+}
+
+/// Compact a specific session.
+///
+/// Submits a compaction request, blocks until finished, and streams progress
+/// events until completion. If compaction is already in progress, attaches to
+/// the existing operation.
+///
+/// Exits 0 on success (including when there is nothing to compact), and nonzero
+/// on failure.
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct CompactSessionArgs {
+    /// Agent that owns the session (e.g., "agent-name" or "agent-name@cluster")
+    pub agent: String,
+    /// Session ID to compact
+    pub session: String,
+    /// Timeout in seconds to wait for compaction completion (0 = no timeout)
+    #[arg(long, default_value = "60")]
+    pub timeout: u64,
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -544,5 +591,70 @@ mod agent_ref_tests {
                 cluster: "foo".into(),
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_command_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_compact_session_command() {
+        let cli = Cli::try_parse_from(["harnx", "compact", "session", "my-agent", "session-123"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Compact(CompactArgs {
+                command: CompactCommands::Session(args),
+            })) => {
+                assert_eq!(args.agent, "my-agent");
+                assert_eq!(args.session, "session-123");
+                assert_eq!(args.timeout, 60); // default
+            }
+            _ => panic!("expected Compact Session command"),
+        }
+    }
+
+    #[test]
+    fn parses_compact_session_with_timeout() {
+        let cli = Cli::try_parse_from([
+            "harnx",
+            "compact",
+            "session",
+            "--timeout",
+            "120",
+            "my-agent@cluster",
+            "session-456",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Compact(CompactArgs {
+                command: CompactCommands::Session(args),
+            })) => {
+                assert_eq!(args.agent, "my-agent@cluster");
+                assert_eq!(args.session, "session-456");
+                assert_eq!(args.timeout, 120);
+            }
+            _ => panic!("expected Compact Session command"),
+        }
+    }
+
+    #[test]
+    fn compact_session_shows_help_for_missing_args() {
+        let result = Cli::try_parse_from(["harnx", "compact", "session"]);
+        assert!(result.is_err(), "should require agent and session args");
+    }
+
+    #[test]
+    fn compact_help_works() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        cmd.build();
+        let compact_cmd = cmd
+            .find_subcommand_mut("compact")
+            .expect("compact subcommand");
+        let help = compact_cmd.render_long_help().to_string();
+        assert!(help.contains("Compact session logs"));
+        assert!(help.contains("session"));
     }
 }

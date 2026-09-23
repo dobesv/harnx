@@ -2,6 +2,8 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './AgentSessionMenu';
 import { vi, describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { CompactionContext } from '../CompactionContext';
+import { PendingContext } from '../PendingContext';
 
 // Polyfills for Radix in jsdom
 beforeAll(() => {
@@ -23,6 +25,47 @@ beforeAll(() => {
     disconnect() {}
   };
 });
+
+// Mock compactSession while preserving other exports (e.g. formatUnchangedReason)
+vi.mock('../compactionApi', async importOriginal => {
+  const actual = await importOriginal<typeof import('../compactionApi')>();
+  return {
+    ...actual,
+    compactSession: vi.fn(),
+  };
+});
+
+import { compactSession } from '../compactionApi';
+const mockCompactSession = vi.mocked(compactSession);
+
+const defaultPendingContext = {
+  statusText: null as string | null,
+  setStatusText: vi.fn(),
+  errorText: null as string | null,
+  setErrorText: vi.fn(),
+  statusMessage: null as string | null,
+  setStatusMessage: vi.fn(),
+  hydratedApprovals: [] as Array<{ toolCallId: string; summary: string }>,
+  addHydratedApproval: vi.fn(),
+  clearHydratedApprovals: vi.fn(),
+  removeHydratedApproval: vi.fn(),
+};
+
+const defaultCompactionContext = {
+  phase: 'idle' as const,
+  compactionId: undefined,
+};
+
+function renderWithProviders(
+  ui: React.ReactElement,
+  compaction: { phase: 'idle' | 'compacting' | 'failed'; compactionId?: string } = defaultCompactionContext
+) {
+  return render(
+    <PendingContext.Provider value={defaultPendingContext}>
+      <CompactionContext.Provider value={compaction}>{ui}</CompactionContext.Provider>
+    </PendingContext.Provider>
+  );
+}
 
 describe('AgentSessionMenu', () => {
   const defaultProps = {
@@ -109,8 +152,8 @@ describe('AgentSessionMenu', () => {
     render(<AgentSessionMenu {...defaultProps} />);
 
     const trigger = screen.getByRole('button', { name: 'Agent and session options' });
-    
-    await user.click(trigger);
+    trigger.focus();
+    await user.keyboard('{ArrowDown}');
 
     const menu = screen.getByRole('menu');
     expect(menu).toHaveTextContent('coding/coder');
@@ -147,5 +190,108 @@ describe('AgentSessionMenu', () => {
     expect(mobileDot).toBeInTheDocument();
     expect(mobileDot).toHaveAttribute('aria-hidden', 'true');
     expect(screen.getByRole('button', { name: 'Agent and session options (unread)' })).toBeInTheDocument();
+  });
+});
+
+describe('CompactSessionItem', () => {
+  const defaultProps = {
+    agentName: 'coding/coder',
+    sessionId: 'test-session-id',
+    switchAgentHref: '/',
+    switchSessionHref: `/agents/${encodeURIComponent('coding/coder')}`,
+    onSwitchAgent: vi.fn(),
+    onSwitchSession: vi.fn(),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders "Compact session" menuitem in SessionDropdown', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<SessionDropdown {...defaultProps} />);
+
+    const trigger = screen.getByRole('button', { name: 'Session: test-session-id' });
+    trigger.focus();
+    await user.keyboard('{ArrowDown}');
+
+    const compactItem = screen.getByRole('menuitem', { name: /compact session/i });
+    expect(compactItem).toBeInTheDocument();
+  });
+
+  it('calls compactSession when clicking "Compact session"', async () => {
+    mockCompactSession.mockResolvedValueOnce({ status: 'submitted', compaction_id: 'c1' });
+    const user = userEvent.setup();
+    renderWithProviders(<SessionDropdown {...defaultProps} />);
+
+    const trigger = screen.getByRole('button', { name: 'Session: test-session-id' });
+    trigger.focus();
+    await user.keyboard('{ArrowDown}');
+
+    const compactItem = screen.getByRole('menuitem', { name: /compact session/i });
+    await user.click(compactItem);
+
+    expect(mockCompactSession).toHaveBeenCalledWith('coding/coder', 'test-session-id');
+  });
+
+  it('is disabled when compaction is in progress', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<SessionDropdown {...defaultProps} />, { phase: 'compacting' });
+
+    const trigger = screen.getByRole('button', { name: 'Session: test-session-id' });
+    trigger.focus();
+    await user.keyboard('{ArrowDown}');
+
+    const compactItem = screen.getByRole('menuitem', { name: /compact session/i });
+    expect(compactItem).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('shows spinner when compaction is in progress', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<SessionDropdown {...defaultProps} />, { phase: 'compacting' });
+
+    const trigger = screen.getByRole('button', { name: 'Session: test-session-id' });
+    trigger.focus();
+    await user.keyboard('{ArrowDown}');
+
+    const spinner = screen.getByRole('menuitem', { name: /compact session/i }).querySelector('.aui-spinner');
+    expect(spinner).toBeInTheDocument();
+  });
+
+  it('shows "Compaction already in progress" message when already_in_flight', async () => {
+    mockCompactSession.mockResolvedValueOnce({ status: 'already_in_flight', compaction_id: 'c1' });
+    const user = userEvent.setup();
+    renderWithProviders(<SessionDropdown {...defaultProps} />);
+
+    const trigger = screen.getByRole('button', { name: 'Session: test-session-id' });
+    trigger.focus();
+    await user.keyboard('{ArrowDown}');
+
+    const compactItem = screen.getByRole('menuitem', { name: /compact session/i });
+    await user.click(compactItem);
+
+    await waitFor(() => {
+      expect(defaultPendingContext.setStatusMessage).toHaveBeenCalledWith('Compaction already in progress');
+    });
+  });
+
+  it('shows formatted message when nothing_to_do with unchanged outcome', async () => {
+    mockCompactSession.mockResolvedValueOnce({
+      status: 'nothing_to_do',
+      outcome: { status: 'unchanged', detail: 'no_user_messages' },
+    });
+    const user = userEvent.setup();
+    renderWithProviders(<SessionDropdown {...defaultProps} />);
+
+    const trigger = screen.getByRole('button', { name: 'Session: test-session-id' });
+    trigger.focus();
+    await user.keyboard('{ArrowDown}');
+
+    const compactItem = screen.getByRole('menuitem', { name: /compact session/i });
+    await user.click(compactItem);
+
+    await waitFor(() => {
+      expect(defaultPendingContext.setStatusMessage).toHaveBeenCalledWith('No user messages to compact');
+    });
   });
 });

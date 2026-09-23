@@ -8543,7 +8543,9 @@ async fn render_agent_event_compacting_started_produces_transcript_entry() {
 
     // Emit CompactingStarted event
     tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
-        SessionEvent::CompactingStarted,
+        SessionEvent::CompactingStarted {
+            compaction_id: None,
+        },
     )))
     .await
     .unwrap();
@@ -8589,7 +8591,9 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
     tui.app.transcript_selection_anchor = Some(88);
 
     tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
-        SessionEvent::CompactingStarted,
+        SessionEvent::CompactingStarted {
+            compaction_id: None,
+        },
     )))
     .await
     .unwrap();
@@ -8597,7 +8601,10 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
     seed_compressed_session(&config);
 
     tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
-        SessionEvent::CompactingCompleted,
+        SessionEvent::CompactingCompleted {
+            compaction_id: None,
+            outcome: harnx_core::session::CompactOutcome::Compacted,
+        },
     )))
     .await
     .unwrap();
@@ -8882,14 +8889,19 @@ async fn render_agent_event_compacting_failed_produces_error_transcript_entry() 
 
     // First emit CompactingStarted
     tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
-        SessionEvent::CompactingStarted,
+        SessionEvent::CompactingStarted {
+            compaction_id: None,
+        },
     )))
     .await
     .unwrap();
 
     // Then emit CompactingFailed
     tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
-        SessionEvent::CompactingFailed("test error".to_string()),
+        SessionEvent::CompactingFailed {
+            compaction_id: None,
+            error: "test error".to_string(),
+        },
     )))
     .await
     .unwrap();
@@ -8915,6 +8927,128 @@ async fn render_agent_event_compacting_failed_produces_error_transcript_entry() 
             .iter()
             .any(|s| s.contains("Compaction failed: test error")),
         "Expected 'Compaction failed: test error' in transcript"
+    );
+}
+
+#[tokio::test]
+async fn render_agent_event_compacting_completed_unchanged_produces_neutral_system_text() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+
+    // Emit CompactingCompleted with Unchanged outcome
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
+        SessionEvent::CompactingCompleted {
+            compaction_id: None,
+            outcome: harnx_core::session::CompactOutcome::Unchanged(
+                harnx_core::session::UnchangedReason::NoUserMessages,
+            ),
+        },
+    )))
+    .await
+    .unwrap();
+
+    // Should produce a neutral SystemText, NOT an error
+    let has_neutral_msg = tui.app.transcript.iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::SystemText(text) if text == "No user messages to compact"
+        )
+    });
+    assert!(
+        has_neutral_msg,
+        "Expected 'No user messages to compact' in transcript after CompactingCompleted Unchanged event"
+    );
+
+    // Ensure it's NOT an ErrorText
+    let has_error = tui.app.transcript.iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::ErrorText(text) if text.contains("No user messages to compact")
+        )
+    });
+    assert!(!has_error, "Unchanged outcome should NOT produce ErrorText");
+}
+
+#[tokio::test]
+async fn render_agent_event_compacting_completed_unchanged_nothing_eligible() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
+        SessionEvent::CompactingCompleted {
+            compaction_id: None,
+            outcome: harnx_core::session::CompactOutcome::Unchanged(
+                harnx_core::session::UnchangedReason::NothingEligible,
+            ),
+        },
+    )))
+    .await
+    .unwrap();
+
+    let has_neutral_msg = tui.app.transcript.iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::SystemText(text) if text == "Nothing eligible for compaction"
+        )
+    });
+    assert!(
+        has_neutral_msg,
+        "Expected 'Nothing eligible for compaction' in transcript"
+    );
+}
+
+#[tokio::test]
+async fn render_agent_event_compacting_completed_unchanged_already_compacted() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
+        SessionEvent::CompactingCompleted {
+            compaction_id: None,
+            outcome: harnx_core::session::CompactOutcome::Unchanged(
+                harnx_core::session::UnchangedReason::AlreadyCompacted,
+            ),
+        },
+    )))
+    .await
+    .unwrap();
+
+    let has_neutral_msg = tui.app.transcript.iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::SystemText(text) if text == "Session already compacted"
+        )
+    });
+    assert!(
+        has_neutral_msg,
+        "Expected 'Session already compacted' in transcript"
+    );
+}
+
+#[tokio::test]
+async fn render_agent_event_generic_produces_system_text() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+
+    // Emit Generic session event (used for "Compaction already in progress", etc.)
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
+        SessionEvent::Generic {
+            text: "Compaction already in progress".to_string(),
+        },
+    )))
+    .await
+    .unwrap();
+
+    // Should produce a SystemText transcript item
+    let has_system_msg = tui.app.transcript.iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::SystemText(text) if text == "Compaction already in progress"
+        )
+    });
+    assert!(
+        has_system_msg,
+        "Expected 'Compaction already in progress' SystemText in transcript after Generic event"
     );
 }
 

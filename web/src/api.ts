@@ -201,3 +201,5 @@ export async function markUnread(
 }
 
 export { cancel, sessionControl, CANCELLATION_TIMEOUT_MS } from './cancellationApi';
+export { compactSession, COMPACTION_TIMEOUT_MS, type CompactSubmit, type CompactOutcome } from './compactionApi';
+

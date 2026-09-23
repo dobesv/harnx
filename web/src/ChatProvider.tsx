@@ -1,5 +1,6 @@
 import { CancellationContext } from './CancellationContext';
 import { useCancellation } from './useCancellation';
+import { CompactionContext, type CompactionPhase } from './CompactionContext';
 import React, { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
 import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
@@ -10,13 +11,14 @@ import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
 import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
-import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type MessageAttachmentMeta } from './harnxCustomEvents';
+import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type MessageAttachmentMeta, type CompactionOutcome } from './harnxCustomEvents';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
 import { MessageAttachmentsContext } from './MessageAttachmentsContext';
 import { reduceMessageAttachments } from './messageAttachments';
 import { isAbortError, observedFetch } from './httpClient';
 import { connection } from './connection';
+import { formatUnchangedReason } from './compactionApi';
 
 export interface ChatProviderProps {
   agentName: string;
@@ -100,6 +102,9 @@ export interface HarnxHttpAgentOptions {
   onSubAgentEvent: (event: unknown) => void;
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
   onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
+  onCompactingStarted?: (compactionId?: string) => void;
+  onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
+  onCompactingFailed?: (error: string, compactionId?: string) => void;
   isForeground?: boolean;
 }
 
@@ -130,6 +135,9 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onSubAgentEvent: (event: unknown) => void;
   private readonly onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
   private readonly onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
+  private readonly onCompactingStarted?: (compactionId?: string) => void;
+  private readonly onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
+  private readonly onCompactingFailed?: (error: string, compactionId?: string) => void;
   private readonly isForeground: boolean;
   private handoffBoundarySeq?: number;
 
@@ -143,6 +151,9 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onSubAgentEvent = options.onSubAgentEvent;
     this.onHitlPendingApproval = options.onHitlPendingApproval;
     this.onMessageAttachments = options.onMessageAttachments;
+    this.onCompactingStarted = options.onCompactingStarted;
+    this.onCompactingCompleted = options.onCompactingCompleted;
+    this.onCompactingFailed = options.onCompactingFailed;
     this.isForeground = options.isForeground !== false;
   }
 
@@ -163,6 +174,9 @@ export class HarnxHttpAgent extends HttpAgent {
       },
       onHitlPendingApproval: this.onHitlPendingApproval,
       onMessageAttachments: this.onMessageAttachments,
+      onCompactingStarted: this.onCompactingStarted,
+      onCompactingCompleted: this.onCompactingCompleted,
+      onCompactingFailed: this.onCompactingFailed,
       isForeground: this.isForeground,
     });
   }
@@ -248,8 +262,10 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   const cancellation = useCancellation(agentName, sessionId);
   const [statusText, setStatusText] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [usage, setUsage] = useState<UsageData | null>(null);
   const [toolSummaries, setToolSummaries] = useState<Map<string, string>>(new Map());
+  const [compactionPhase, setCompactionPhase] = useState<{ phase: CompactionPhase; compactionId?: string }>({ phase: 'idle' });
   const [subAgentState, dispatchSubAgentEvent] = useReducer(
     reduceSubAgentNotes,
     INITIAL_SUB_AGENT_NOTES_STATE,
@@ -356,6 +372,19 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       });
     },
     onSubAgentEvent: (event: any) => dispatchSubAgentEvent(event),
+    onCompactingStarted: (compactionId) => {
+      setCompactionPhase({ phase: 'compacting', compactionId });
+    },
+    onCompactingCompleted: (outcome, _compactionId) => {
+      setCompactionPhase({ phase: 'idle' });
+      if (outcome.status === 'unchanged') {
+        setStatusMessage(formatUnchangedReason(outcome.detail));
+      }
+    },
+    onCompactingFailed: (error, _compactionId) => {
+      setCompactionPhase({ phase: 'failed' });
+      setErrorText(error);
+    },
   }), [agentName, sessionId, onHandoff, addHydratedApproval]);
 
   const runtime = useAgUiRuntime({
@@ -368,6 +397,8 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   useEffect(() => {
     setStatusText(null);
     setErrorText(null);
+    setStatusMessage(null);
+    setCompactionPhase({ phase: 'idle' });
     dispatchSubAgentEvent({ type: 'RESET' });
     dispatchAttachments({ type: 'RESET', agent: agentName, session: sessionId });
     clearHydratedApprovals();
@@ -387,10 +418,12 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
 
   return (
     <CancellationContext.Provider value={cancellation}>
+    <CompactionContext.Provider value={compactionPhase}>
     <SubAgentNotesContext.Provider value={subAgentContext}>
     <MessageAttachmentsContext.Provider value={messageAttachmentsContext}>
       <PendingContext.Provider value={{ 
         statusText, setStatusText, errorText, setErrorText,
+        statusMessage, setStatusMessage,
         hydratedApprovals, addHydratedApproval, clearHydratedApprovals, removeHydratedApproval
       }}>
         <UsageContext.Provider value={{ usage, toolSummaries }}>
@@ -409,6 +442,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       </PendingContext.Provider>
     </MessageAttachmentsContext.Provider>
     </SubAgentNotesContext.Provider>
+    </CompactionContext.Provider>
     </CancellationContext.Provider>
   );
 };

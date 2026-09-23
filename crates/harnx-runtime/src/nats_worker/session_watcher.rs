@@ -23,11 +23,17 @@
 //! abort signal; the actual publish fan-out runs on its own detached task so
 //! it keeps going even if this watcher is aborted moments later — which is
 //! exactly what `execute_session` does as soon as the abort signal wakes it.
+//!
+//! Manual compaction requests are also detected here. A `CompactRequest`
+//! without a matching `CompactResult` sets a pending compaction flag that
+//! triggers execution at the post-turn safe boundary. This mirrors the Cancel
+//! detection but without firing the abort signal.
 
 use crate::nats_tool_provider::{publish_tool_cancel, NatsInFlightCalls};
 use async_nats::jetstream::consumer::{push::OrderedConfig, DeliverPolicy};
 use futures_util::StreamExt;
 use harnx_core::session::SessionLogEntry;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -49,7 +55,10 @@ pub(super) struct SessionWatcherCtx {
     /// sequences <= this were written by this worker, not a foreign writer.
     pub own_appends: Arc<AtomicU64>,
     pub pending_input: Arc<AtomicBool>,
-    pub interrupted: Arc<parking_lot::Mutex<Option<InterruptNotice>>>,
+    pub interrupted: Arc<Mutex<Option<InterruptNotice>>>,
+    /// Pending manual compaction request. Set when a `CompactRequest` is
+    /// detected; cleared when worker handles it at safe boundary.
+    pub pending_compaction: Arc<Mutex<Option<String>>>,
 }
 
 /// Recorded when a foreign `Cancel` interrupts the turn: which log sequence
@@ -169,6 +178,12 @@ async fn watch_from(ctx: &SessionWatcherCtx, cursor: &mut u64) -> anyhow::Result
                     ctx.session_id
                 );
             }
+            SessionLogEntry::CompactRequest { compaction_id, .. } => {
+                handle_compact_request(ctx, compaction_id);
+            }
+            SessionLogEntry::CompactResult { compaction_id, .. } => {
+                handle_compact_result(ctx, compaction_id);
+            }
             SessionLogEntry::Message { role, .. } if role.is_user() => {
                 ctx.pending_input.store(true, Ordering::Relaxed);
             }
@@ -176,6 +191,34 @@ async fn watch_from(ctx: &SessionWatcherCtx, cursor: &mut u64) -> anyhow::Result
         }
     }
     Ok(())
+}
+
+fn handle_compact_request(ctx: &SessionWatcherCtx, compaction_id: String) {
+    // Compaction runs at a safe turn boundary and doesn't abort active work.
+    let mut pending = ctx.pending_compaction.lock();
+    if pending.is_none() {
+        log::info!(
+            "session watcher detected pending compaction: session_id={} compaction_id={compaction_id}",
+            ctx.session_id
+        );
+        *pending = Some(compaction_id);
+    } else {
+        log::debug!(
+            "session watcher ignoring duplicate compaction request: session_id={} compaction_id={compaction_id}",
+            ctx.session_id
+        );
+    }
+}
+
+fn handle_compact_result(ctx: &SessionWatcherCtx, compaction_id: String) {
+    let mut pending = ctx.pending_compaction.lock();
+    if pending.as_deref() == Some(compaction_id.as_str()) {
+        log::debug!(
+            "session watcher clearing resolved compaction: session_id={} compaction_id={compaction_id}",
+            ctx.session_id
+        );
+        *pending = None;
+    }
 }
 
 /// Snapshot the calls in flight for this session, then hand the actual

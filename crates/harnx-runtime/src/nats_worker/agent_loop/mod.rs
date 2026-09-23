@@ -71,6 +71,38 @@ pub(crate) struct PendingHitlApproval {
     pub summary: String,
 }
 
+/// Detect an unresolved `CompactRequest` in the session log.
+///
+/// An unresolved request is one without a subsequent `CompactResult`
+/// for the same `compaction_id`. Returns the compaction_id if found.
+///
+/// Scans backward from the most recent entry. Returns the `compaction_id` of the first
+/// `CompactRequest` that has no corresponding `CompactResult`. This fixes both the dead-code
+/// issue in forward scan (entries chronologically can't have a result before its request)
+/// and correctly handles multiple pending requests by prioritizing the most recent.
+///
+/// See also: frontend tail guard in `nats_session/compaction_request.rs` (`decide_compact_submit`).
+pub(crate) fn derive_pending_compaction(entries: &[(u64, SessionLogEntry)]) -> Option<String> {
+    let mut resolved_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for (_, entry) in entries.iter().rev() {
+        match entry {
+            SessionLogEntry::CompactResult { compaction_id, .. } => {
+                resolved_ids.insert(compaction_id.as_str());
+            }
+            SessionLogEntry::CompactRequest { compaction_id, .. }
+                if !resolved_ids.contains(compaction_id.as_str()) =>
+            {
+                return Some(compaction_id.clone());
+            }
+            SessionLogEntry::CompactRequest { .. } => {}
+            _ => {}
+        }
+    }
+
+    None
+}
+
 pub(crate) fn derive_pending_hitl_approvals(
     entries: &[(u64, SessionLogEntry)],
 ) -> Result<Vec<PendingHitlApproval>> {
@@ -1299,6 +1331,14 @@ pub(super) fn tool_can_rerun(
 }
 
 /// Find orphan tool calls in session log entries (trailing ToolCalls without matching ToolResults).
+/// Returns true if there are any orphan tool calls in the effective entries.
+pub(crate) fn has_orphan_tool_calls(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+) -> bool {
+    !find_orphan_tool_calls(entries).is_empty()
+}
+
+/// Find orphan tool calls in session log entries (trailing ToolCalls without matching ToolResults).
 fn find_orphan_tool_calls(
     entries: &[(u64, harnx_core::session::SessionLogEntry)],
 ) -> Vec<PendingToolCalls> {
@@ -1535,9 +1575,9 @@ fn rerun_failure_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_resolved_hooks, derive_hitl_tool_round_continuation, derive_pending_hitl_approvals,
-        dispatch_session_start, find_orphan_tool_calls, fold_new_user_messages_since,
-        SessionOrigin, SessionStartDispatch,
+        agent_resolved_hooks, derive_hitl_tool_round_continuation, derive_pending_compaction,
+        derive_pending_hitl_approvals, dispatch_session_start, find_orphan_tool_calls,
+        fold_new_user_messages_since, SessionOrigin, SessionStartDispatch,
     };
     use crate::config::Config;
     use crate::nats_hook_provider::{DiscoveredHook, NatsHookProvider};
@@ -1549,6 +1589,141 @@ mod tests {
     use harnx_hookset::{FailPolicy, HookSpec};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn derive_pending_compaction_returns_none_for_empty_entries() {
+        let entries: Vec<(u64, SessionLogEntry)> = vec![];
+        assert!(derive_pending_compaction(&entries).is_none());
+    }
+
+    #[test]
+    fn derive_pending_compaction_detects_unresolved_request() {
+        let entries = vec![(
+            1u64,
+            SessionLogEntry::compact_request("comp-1", Some("test".into())),
+        )];
+        assert_eq!(
+            derive_pending_compaction(&entries),
+            Some("comp-1".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_pending_compaction_returns_none_when_result_matches() {
+        let entries = vec![
+            (
+                1u64,
+                SessionLogEntry::compact_request("comp-1", Some("test".into())),
+            ),
+            (
+                2u64,
+                SessionLogEntry::compact_result(
+                    "comp-1",
+                    harnx_core::session::CompactOutcome::Compacted,
+                ),
+            ),
+        ];
+        assert!(derive_pending_compaction(&entries).is_none());
+    }
+
+    #[test]
+    fn derive_pending_compaction_keeps_request_when_result_is_for_different_id() {
+        let entries = vec![
+            (
+                1u64,
+                SessionLogEntry::compact_request("comp-1", Some("test".into())),
+            ),
+            (
+                2u64,
+                SessionLogEntry::compact_result(
+                    "comp-2",
+                    harnx_core::session::CompactOutcome::Compacted,
+                ),
+            ),
+        ];
+        assert_eq!(
+            derive_pending_compaction(&entries),
+            Some("comp-1".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_pending_compaction_returns_most_recent_unresolved_request() {
+        let entries = vec![
+            (
+                1u64,
+                SessionLogEntry::compact_request("comp-1", Some("test".into())),
+            ),
+            (
+                2u64,
+                SessionLogEntry::compact_request("comp-2", Some("test".into())),
+            ),
+        ];
+        assert_eq!(
+            derive_pending_compaction(&entries),
+            Some("comp-2".to_string())
+        );
+    }
+
+    /// Multiple requests where only the older one is resolved:
+    /// reverse scan should still find the later unresolved request.
+    #[test]
+    fn derive_pending_compaction_handles_partially_resolved_multiple_requests() {
+        let entries = vec![
+            (
+                1u64,
+                SessionLogEntry::compact_request("comp-1", Some("test".into())),
+            ),
+            (
+                2u64,
+                SessionLogEntry::compact_request("comp-2", Some("test".into())),
+            ),
+            (
+                3u64,
+                SessionLogEntry::compact_result(
+                    "comp-1",
+                    harnx_core::session::CompactOutcome::Compacted,
+                ),
+            ),
+        ];
+        // comp-2 is still unresolved, comp-1 is resolved
+        assert_eq!(
+            derive_pending_compaction(&entries),
+            Some("comp-2".to_string())
+        );
+    }
+
+    /// Reverse scan exits early when it finds the first unresolved request.
+    /// Verify interleaved requests and results are handled correctly.
+    #[test]
+    fn derive_pending_compaction_handles_interleaved_requests_and_results() {
+        let entries = vec![
+            (
+                1u64,
+                SessionLogEntry::compact_request("comp-1", Some("test".into())),
+            ),
+            (
+                2u64,
+                SessionLogEntry::compact_result(
+                    "comp-1",
+                    harnx_core::session::CompactOutcome::Compacted,
+                ),
+            ),
+            (
+                3u64,
+                SessionLogEntry::compact_request("comp-2", Some("test".into())),
+            ),
+            (
+                4u64,
+                SessionLogEntry::compact_request("comp-3", Some("test".into())),
+            ),
+        ];
+        // comp-2 and comp-3 are unresolved; reverse scan finds comp-3 first
+        assert_eq!(
+            derive_pending_compaction(&entries),
+            Some("comp-3".to_string())
+        );
+    }
 
     /// A provider whose only route is a SessionStart hook recording every
     /// payload it receives.

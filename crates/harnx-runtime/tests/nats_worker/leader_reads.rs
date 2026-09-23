@@ -165,16 +165,23 @@ fn injection_decision_points_use_leader_authoritative_read() {
     .collect::<Vec<_>>()
     .join("\n");
 
-    // Five leader reads: reconstruction and the continuation drain in
-    // daemon_turn_input, the session watcher's start sequence in
-    // daemon_session_exec, and the pending-HITL and drain checks in session_turn.
+    // Eight leader reads in the daemon_family files:
+    // - daemon_turn_input.rs: reconstruction (line ~39)
+    // - daemon_turn_input.rs: continuation drain (line ~67)
+    // - session_turn.rs: prepare_turn (line ~164)
+    // - session_turn.rs: finish_if_drained drain check (line ~321)
+    // - session_turn.rs: maybe_execute_pending_compaction safety check (sibling tool/HITL check)
+    // - session_turn.rs: execute_manual_compaction dedupe check (cached entries)
+    // - session_turn.rs: execute_manual_compaction fallback load (when no cached entries)
+    // - daemon_session_exec.rs: session watcher start sequence (line ~196)
+    // Note: daemon.rs has 0 load_events_latest_async calls.
     assert_eq!(
         daemon_family
             .lines()
             .filter(|line| line.contains("load_events_latest_async()"))
             .count(),
-        5,
-        "turn decisions use leader reads; failure coverage uses its exact committed Error sequence"
+        8,
+        "turn decisions use leader reads in daemon_family; session_turn has prepare_turn + drain + compaction safety + dedupe + fallback"
     );
     assert_eq!(
         daemon_family

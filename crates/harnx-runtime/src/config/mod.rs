@@ -18,7 +18,7 @@ pub mod session;
 pub(crate) mod session_externalize;
 mod session_format;
 pub mod session_meta;
-mod session_ops_compaction;
+pub(crate) mod session_ops_compaction;
 mod session_ops_core;
 mod session_ops_split;
 pub mod session_ops_title;
@@ -34,6 +34,9 @@ pub use self::nats_split::{
 };
 pub use self::paths_split::SessionAttachmentPath;
 pub use self::tool_servers_split::ToolServerConfig;
+
+// Re-export for test access to classify_compaction_error
+pub use self::session_ops_compaction::classify_compaction_error;
 
 /// Reserved cluster identity for the auto-managed shared local NATS broker.
 ///

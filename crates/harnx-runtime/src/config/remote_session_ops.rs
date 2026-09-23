@@ -307,7 +307,7 @@ pub(crate) async fn rewind_remote_session(
     Ok(())
 }
 
-async fn remote_nats_session(
+pub(crate) async fn remote_nats_session(
     config: &GlobalConfig,
     abort_signal: &AbortSignal,
 ) -> Result<NatsSession> {

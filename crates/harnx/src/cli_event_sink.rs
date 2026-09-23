@@ -15,6 +15,7 @@ use harnx_core::event::{
     AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent,
     SubAgentProgress, SubAgentProgressStatus, ToolEvent, TurnEvent, UserEvent,
 };
+use harnx_core::session::{CompactOutcome, UnchangedReason};
 use harnx_toolset::{
     is_subagent_launcher, TOOL_TIMER_MIN_ELAPSED_MS, TOOL_TIMER_NOTICE_INTERVAL_MS,
 };
@@ -613,14 +614,29 @@ impl CliSinkState {
 
     fn print_session_event(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::CompactingStarted => {
+            SessionEvent::CompactingStarted { .. } => {
                 eprintln!("{}", dimmed_text("Compacting the session..."));
             }
-            SessionEvent::CompactingCompleted => {
+            SessionEvent::CompactingCompleted { outcome, .. } => {
                 self.cleanup_or_warn();
-                eprintln!("{}", dimmed_text("✓ Compacted the session."));
+                match outcome {
+                    CompactOutcome::Compacted => {
+                        eprintln!("{}", dimmed_text("✓ Compacted the session."));
+                    }
+                    CompactOutcome::Unchanged(reason) => {
+                        let message = match reason {
+                            UnchangedReason::NoUserMessages => "No user messages to compact",
+                            UnchangedReason::NothingEligible => "Nothing eligible for compaction",
+                            UnchangedReason::AlreadyCompacted => "Session already compacted",
+                        };
+                        eprintln!("{}", dimmed_text(message));
+                    }
+                    CompactOutcome::Failed(error) => {
+                        eprintln!("{}", warning_text(&format!("compaction failed: {error}")));
+                    }
+                }
             }
-            SessionEvent::CompactingFailed(error) => {
+            SessionEvent::CompactingFailed { error, .. } => {
                 self.cleanup_or_warn();
                 eprintln!("{}", warning_text(&format!("compaction failed: {error}")));
             }
@@ -1448,11 +1464,17 @@ mod tests {
             RenderOptions::default(),
             harnx_core::abort::create_abort_signal(),
         );
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted));
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted));
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingFailed(
-            "something went wrong".to_string(),
-        )));
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted {
+            compaction_id: None,
+        }));
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted {
+            compaction_id: None,
+            outcome: harnx_core::session::CompactOutcome::Compacted,
+        }));
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingFailed {
+            compaction_id: None,
+            error: "something went wrong".to_string(),
+        }));
     }
 
     // ----------------------------------------------------------------

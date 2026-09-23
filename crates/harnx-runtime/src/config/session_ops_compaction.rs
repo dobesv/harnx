@@ -1,8 +1,153 @@
 use super::*;
+use std::io::Write;
+
+use crate::utils::AbortSignal;
 
 /// Rendered transcript of the messages to compact, plus the split index, the
 /// covered log-seq range `(from, to, count)`, and the session id.
 type CompactionTranscript = (String, usize, (Option<usize>, Option<usize>, usize), String);
+
+enum CompactionClaim {
+    Claimed,
+    AlreadyCompacting,
+    NoSession,
+}
+
+pub(crate) async fn handle_compact_session_command(
+    config: &GlobalConfig,
+    abort_signal: &AbortSignal,
+    output: &mut (dyn Write + Send),
+) -> Result<()> {
+    // Determine if this is a NATS-backed session by checking if remote_agent is set
+    // or if nats_servers are configured (mirrors logic in remote_nats_session).
+    let is_nats_session = {
+        let cfg = config.read();
+        cfg.remote_agent.is_some() || !cfg.nats_servers.is_empty()
+    };
+
+    if is_nats_session {
+        // For NATS-backed sessions, route through remote_nats_session.
+        // If that fails (e.g., NATS connection error), emit the error.
+        match remote_session_ops::remote_nats_session(config, abort_signal).await {
+            Ok(session) => emit_compaction_submit_result(session.request_compaction(None).await),
+            Err(error) => {
+                emit_compaction_submit_result(Err(error));
+            }
+        }
+    } else {
+        // Only fall back to local compaction for truly local (in-memory) sessions.
+        compact_local_session(config, output).await?;
+    }
+    Ok(())
+}
+
+fn emit_compaction_submit_result(result: Result<crate::nats_session::CompactSubmit>) {
+    use crate::nats_session::CompactSubmit;
+    use harnx_core::event::{AgentEvent, SessionEvent};
+
+    let event = match result {
+        Ok(CompactSubmit::Submitted { .. }) => return,
+        Ok(CompactSubmit::AlreadyInFlight { .. }) => SessionEvent::Generic {
+            text: "Compaction already in progress".to_string(),
+        },
+        Ok(CompactSubmit::NothingToDo { outcome }) => SessionEvent::Generic {
+            text: compact_outcome_message(outcome).to_string(),
+        },
+        Err(error) => SessionEvent::CompactingFailed {
+            compaction_id: None,
+            error: error.to_string(),
+        },
+    };
+    harnx_core::sink::emit_agent_event(AgentEvent::Session(event));
+}
+
+fn compact_outcome_message(outcome: harnx_core::session::CompactOutcome) -> &'static str {
+    use harnx_core::session::{CompactOutcome, UnchangedReason};
+
+    match outcome {
+        CompactOutcome::Compacted | CompactOutcome::Failed(_) => "Nothing to compact",
+        CompactOutcome::Unchanged(UnchangedReason::NoUserMessages) => "No user messages to compact",
+        CompactOutcome::Unchanged(UnchangedReason::NothingEligible) => {
+            "Nothing eligible for compaction"
+        }
+        CompactOutcome::Unchanged(UnchangedReason::AlreadyCompacted) => "Session already compacted",
+    }
+}
+
+async fn compact_local_session(
+    config: &GlobalConfig,
+    output: &mut (dyn Write + Send),
+) -> Result<()> {
+    use harnx_core::event::{AgentEvent, SessionEvent};
+    use harnx_core::session::CompactOutcome;
+
+    match claim_local_compaction(config) {
+        CompactionClaim::NoSession => {
+            writeln!(output, "No active session to compact.")?;
+            return Ok(());
+        }
+        CompactionClaim::AlreadyCompacting => {
+            writeln!(output, "Compaction already in progress.")?;
+            return Ok(());
+        }
+        CompactionClaim::Claimed => {}
+    }
+
+    harnx_core::sink::emit_agent_event(AgentEvent::Session(SessionEvent::CompactingStarted {
+        compaction_id: None,
+    }));
+    let result = Config::compact_session(config).await;
+    if let Some(session) = config.write().session.as_mut() {
+        session.set_compressing(false);
+    }
+
+    let event = match result {
+        Ok(()) => SessionEvent::CompactingCompleted {
+            compaction_id: None,
+            outcome: CompactOutcome::Compacted,
+        },
+        Err(error) => match classify_compaction_error(&error) {
+            CompactOutcome::Failed(_) => SessionEvent::CompactingFailed {
+                compaction_id: None,
+                error: error.to_string(),
+            },
+            outcome => SessionEvent::CompactingCompleted {
+                compaction_id: None,
+                outcome,
+            },
+        },
+    };
+    harnx_core::sink::emit_agent_event(AgentEvent::Session(event));
+    Ok(())
+}
+
+fn claim_local_compaction(config: &GlobalConfig) -> CompactionClaim {
+    match config.write().session.as_mut() {
+        None => CompactionClaim::NoSession,
+        Some(session) if session.compressing() => CompactionClaim::AlreadyCompacting,
+        Some(session) => {
+            session.set_compressing(true);
+            CompactionClaim::Claimed
+        }
+    }
+}
+
+/// Classify a compaction error into an outcome for event emission.
+/// Used by both the TUI command handler and the worker-side turn handler.
+pub fn classify_compaction_error(err: &anyhow::Error) -> harnx_core::session::CompactOutcome {
+    let msg = format!("{err:#}");
+    if msg.contains("No need to compact") || msg.contains("no messages in the session") {
+        harnx_core::session::CompactOutcome::Unchanged(
+            harnx_core::session::UnchangedReason::NoUserMessages,
+        )
+    } else if msg.contains("Nothing to compact") {
+        harnx_core::session::CompactOutcome::Unchanged(
+            harnx_core::session::UnchangedReason::NothingEligible,
+        )
+    } else {
+        harnx_core::session::CompactOutcome::Failed(msg)
+    }
+}
 
 impl Config {
     /// Handle the outcome of a spawned `compact_session`: emit
@@ -32,7 +177,10 @@ impl Config {
                     started.elapsed()
                 );
                 emit(harnx_core::event::AgentEvent::Session(
-                    harnx_core::event::SessionEvent::CompactingCompleted,
+                    harnx_core::event::SessionEvent::CompactingCompleted {
+                        compaction_id: None,
+                        outcome: harnx_core::session::CompactOutcome::Compacted,
+                    },
                 ));
             }
             Err(err) => {
@@ -41,7 +189,10 @@ impl Config {
                     started.elapsed()
                 );
                 emit(harnx_core::event::AgentEvent::Session(
-                    harnx_core::event::SessionEvent::CompactingFailed(format!("{err:#}")),
+                    harnx_core::event::SessionEvent::CompactingFailed {
+                        compaction_id: None,
+                        error: format!("{err:#}"),
+                    },
                 ));
             }
         }
@@ -80,7 +231,9 @@ impl Config {
             .as_ref()
             .map(|session| session.id.clone());
         harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
-            harnx_core::event::SessionEvent::CompactingStarted,
+            harnx_core::event::SessionEvent::CompactingStarted {
+                compaction_id: None,
+            },
         ));
         let event_sink = harnx_core::sink::current_agent_event_sink();
         tokio::spawn(async move {
@@ -302,7 +455,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            AgentEvent::Session(SessionEvent::CompactingCompleted)
+            AgentEvent::Session(SessionEvent::CompactingCompleted { .. })
         ));
     }
 
@@ -329,9 +482,9 @@ mod tests {
         let events = scoped.events.lock().unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            AgentEvent::Session(SessionEvent::CompactingFailed(message)) => {
-                assert!(message.contains("outer"));
-                assert!(message.contains("boom"));
+            AgentEvent::Session(SessionEvent::CompactingFailed { error, .. }) => {
+                assert!(error.contains("outer"));
+                assert!(error.contains("boom"));
             }
             other => panic!("unexpected event: {other:?}"),
         }

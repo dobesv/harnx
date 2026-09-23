@@ -1153,6 +1153,33 @@ user row. Each targeted recovery attempt has a distinct JetStream message ID,
 so an activation already acknowledged by a worker that later stalled cannot
 suppress the replacement worker's wakeup during the duplicate window.
 
+## Manual Compaction
+
+Manual compaction summarizes older conversation history into a single summary entry while preserving recent turns and active context.
+
+In NATS mode, compaction execution routes to the worker holding the session lease:
+1. The client appends a durable `CompactRequest` entry to the session log stream (or submits `session/compact` via JSON-RPC). Frontends check the tail first: if already in flight or recently compacted, skip and report status.
+2. The leased worker detects the request, executes the configured `compaction_agent` (or the default summarizer), appends a durable `CompactResult`, and publishes progress advisories.
+3. Manual and automatic compaction serialize via the `compressing` flag. If already compacting, the worker skips redundant execution and reports `AlreadyCompacted`.
+4. If the transcript has too few uncompacted messages or tokens to warrant summarization, the worker yields `Unchanged` (`Nothing to compact`). This is treated across all interfaces as a neutral success (exit 0 / status message), not an error.
+
+Log layout: `CompactRequest` → `Compress` marker → re-logged suffix messages → `CompactResult`. The `Compress` marker is not the tail entry; suffix messages follow it so replay can reconstruct the transcript without stored indices. The `CompactResult` receipt is the deterministic final entry for manual compaction.
+
+### Triggering Manual Compaction
+
+- **CLI**:
+  ```bash
+  harnx compact session <agent> <session> [--timeout <seconds>]
+  ```
+  Submits the request, streams progress advisories to stdout, and blocks until finished (default 60s timeout). Exits 0 on success or when there is nothing to compact.
+- **TUI**:
+  ```
+  .compact session
+  ```
+  Triggers compaction for the active session. The TUI displays progress notifications and updates the transcript once the worker commits the result.
+- **Web UI**:
+  Select **Compact session** from the session dropdown menu next to the session ID in the header. Shows a spinner while compaction runs, followed by a status message if there was nothing to compact.
+
 ## Cleanup
 
 Session logs, leases, canonical metadata, and attachment blobs persist in

@@ -2,7 +2,9 @@ use ag_ui_core::types::ids::RunId;
 use ag_ui_core::{event::Event, types::message::Message as AgUiMessage};
 use chrono::{DateTime, Utc};
 use harnx_core::abort::AbortSignal;
-use harnx_runtime::{config::LOCAL_CLUSTER_KEY, nats_session::InterruptOutcome};
+use harnx_runtime::{
+    config::LOCAL_CLUSTER_KEY, nats_session::CompactSubmit, nats_session::InterruptOutcome,
+};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -135,6 +137,9 @@ pub enum SessionCommand {
     },
     Cancel {
         reply: oneshot::Sender<Result<InterruptOutcome, String>>,
+    },
+    Compact {
+        reply: oneshot::Sender<Result<CompactSubmit, String>>,
     },
     HitlApprovalDecision {
         tool_call_id: String,

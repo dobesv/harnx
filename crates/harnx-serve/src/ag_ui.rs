@@ -735,15 +735,33 @@ impl AgUiSink {
                 }
                 self.emit_custom("session_handoff", value);
             }
-            SessionEvent::CompactingStarted => {
-                self.emit_custom("session_compacting_started", json!({}));
+            SessionEvent::CompactingStarted { compaction_id } => {
+                let mut payload = json!({});
+                if let Some(id) = compaction_id {
+                    payload["compaction_id"] = json!(id);
+                }
+                self.emit_custom("session_compacting_started", payload);
             }
-            SessionEvent::CompactingCompleted => {
-                self.emit_custom("session_compacting_completed", json!({}));
+            SessionEvent::CompactingCompleted {
+                compaction_id,
+                outcome,
+            } => {
+                let mut payload = json!({ "outcome": outcome });
+                if let Some(id) = compaction_id {
+                    payload["compaction_id"] = json!(id);
+                }
+                self.emit_custom("session_compacting_completed", payload);
                 self.emit_history_snapshot();
             }
-            SessionEvent::CompactingFailed(error) => {
-                self.emit_custom("session_compacting_failed", json!({ "error": error }));
+            SessionEvent::CompactingFailed {
+                compaction_id,
+                error,
+            } => {
+                let mut payload = json!({ "error": error });
+                if let Some(id) = compaction_id {
+                    payload["compaction_id"] = json!(id);
+                }
+                self.emit_custom("session_compacting_failed", payload);
             }
             SessionEvent::TitleGenerationFailed(error) => {
                 self.emit_custom("session_title_generation_failed", json!({ "error": error }));

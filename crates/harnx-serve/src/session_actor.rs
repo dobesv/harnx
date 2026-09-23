@@ -6,6 +6,7 @@ mod test_executor;
 mod test_log;
 
 mod cancellation;
+mod compaction;
 mod handoff;
 mod registry;
 
@@ -428,6 +429,7 @@ impl SessionActor {
                 let _ = reply.send(result);
             }
             SessionCommand::Cancel { reply } => self.answer_interrupt(reply).await,
+            SessionCommand::Compact { reply } => self.answer_compact(reply).await,
             SessionCommand::HitlApprovalDecision {
                 tool_call_id,
                 approved,

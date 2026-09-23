@@ -21,6 +21,11 @@ export interface MessageAttachmentMeta {
   kind: 'image';
 }
 
+/** Compaction outcome from session_compacting_completed event. */
+export type CompactionOutcome =
+  | { status: 'compacted' }
+  | { status: 'unchanged'; detail?: string };
+
 export interface HarnxCustomEventCallbacks {
   onStatus: (text: string | null) => void;
   onRunFailed: (message: string) => void;
@@ -32,6 +37,12 @@ export interface HarnxCustomEventCallbacks {
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
   /** Called when a message_attachments CUSTOM event is received. */
   onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
+  /** Called when session_compacting_started is received. */
+  onCompactingStarted?: (compactionId?: string) => void;
+  /** Called when session_compacting_completed is received. */
+  onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
+  /** Called when session_compacting_failed is received. */
+  onCompactingFailed?: (error: string, compactionId?: string) => void;
   /**
    * Whether events belong to the session currently shown in the foreground.
    * When `false`, the `session_title_updated` handler skips `setDocumentTitle`
@@ -130,6 +141,17 @@ function handoffTarget(value: unknown): {
   return agent && sessionId ? { agent, sessionId, toolCallId, afterSeq } : undefined;
 }
 
+function parseCompactionOutcome(value: unknown): CompactionOutcome | undefined {
+  const rec = eventRecord(value);
+  const status = stringField(rec.outcome, 'status');
+  if (status === 'compacted') return { status: 'compacted' };
+  if (status === 'unchanged') {
+    const detail = stringField(rec.outcome, 'detail');
+    return { status: 'unchanged', detail };
+  }
+  return undefined;
+}
+
 const handlers: Record<string, CustomEventHandler> = {
   status: (callbacks, value) => callbacks.onStatus(stringField(value, 'text') || null),
   usage: (callbacks, value) => {
@@ -176,6 +198,21 @@ const handlers: Record<string, CustomEventHandler> = {
     const parsed = parseMessageAttachments(value);
     if (!parsed) return;
     callbacks.onMessageAttachments?.(parsed.messageId, parsed.attachments);
+  },
+  session_compacting_started: (callbacks, value) => {
+    const compactionId = stringField(value, 'compaction_id');
+    callbacks.onCompactingStarted?.(compactionId);
+  },
+  session_compacting_completed: (callbacks, value) => {
+    const outcome = parseCompactionOutcome(value);
+    if (!outcome) return;
+    const compactionId = stringField(value, 'compaction_id');
+    callbacks.onCompactingCompleted?.(outcome, compactionId);
+  },
+  session_compacting_failed: (callbacks, value) => {
+    const error = stringField(value, 'error') || 'Compaction failed';
+    const compactionId = stringField(value, 'compaction_id');
+    callbacks.onCompactingFailed?.(error, compactionId);
   },
 };
 

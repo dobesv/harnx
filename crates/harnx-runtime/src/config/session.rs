@@ -388,6 +388,9 @@ fn replay_log_entries_into_session(
             SessionLogEntry::HandoffCommitted { .. }
             | SessionLogEntry::HitlApprovalRequested { .. }
             | SessionLogEntry::HitlApprovalDecision { .. } => {}
+            // Compaction request/result are non-mutating markers. They are
+            // processed by the worker, not during transcript replay.
+            SessionLogEntry::CompactRequest { .. } | SessionLogEntry::CompactResult { .. } => {}
             SessionLogEntry::EditEntries { .. } | SessionLogEntry::Rewind { .. } => {}
             SessionLogEntry::Unknown => anyhow::ensure!(
                 allow_embedded_metadata,
@@ -640,6 +643,11 @@ pub fn compress(session: &mut Session, prompt: String) {
 /// Compact only the prefix `messages[..keep_from]`, keeping `messages[keep_from..]`
 /// verbatim. The prefix moves to `compressed_messages`; the new message list is
 /// just preserved suffix, while summary stays in `session.compaction_summary`.
+///
+/// Log layout: `Compress` marker → re-logged suffix messages → `CompactResult`.
+/// The `Compress` entry is NOT the final entry; suffix messages follow it so replay
+/// can reconstruct the active transcript without stored indices. `CompactResult`
+/// (manual) or `TurnEnd` (automatic) terminates the compaction span.
 pub fn compress_keeping_recent(session: &mut Session, prompt: String, keep_from: usize) {
     let keep_from = keep_from.min(session.messages.len());
     // Split off the recent suffix to keep verbatim; the remainder is the prefix.
@@ -1269,6 +1277,51 @@ mod tests {
                 .expect_err("canonical NATS replay must reject embedded legacy metadata");
 
         assert!(error.to_string().contains("unsupported or legacy entry"));
+    }
+
+    #[test]
+    fn compact_entries_do_not_mutate_messages_on_replay() {
+        // Build entries including CompactRequest and CompactResult
+        let entries: Vec<(usize, SessionLogEntry)> = vec![
+            (
+                1,
+                SessionLogEntry::Message {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text("hello world".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                2,
+                SessionLogEntry::compact_request("comp-1", Some("test".into())),
+            ),
+            (
+                3,
+                SessionLogEntry::compact_result(
+                    "comp-1",
+                    harnx_core::session::CompactOutcome::Compacted,
+                ),
+            ),
+        ];
+
+        // Replay entries into a default session - use TrailingToolCallPolicy::Interrupted
+        let session = super::replay_log_entries_into_session(
+            &entries,
+            "test-session",
+            Session::default(),
+            false,
+            super::TrailingToolCallPolicy::Interrupted,
+        )
+        .expect("replay should succeed");
+
+        // Session should have exactly one message (the original user message)
+        assert_eq!(session.messages.len(), 1);
+        assert!(matches!(
+            &session.messages[0].content,
+            MessageContent::Text(t) if t == "hello world"
+        ));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 mod cancellation;
+mod compaction;
 
 pub const JSON_RPC_UNKNOWN_SESSION_CODE: i64 = -32001;
 
@@ -161,6 +162,7 @@ async fn handle_ag_ui_rpc_bytes_for_target(
             handle_hitl_decision(rpc.id, rpc.params, config, registry, key).await
         }
         "session/cancel" => cancellation::handle(rpc.id, (config, registry, key)).await,
+        "session/compact" => compaction::handle(rpc.id, (config, registry, key)).await,
         "session/mark_read" => handle_mark_read(rpc.id, config, key).await,
         "session/mark_unread" => handle_mark_unread(rpc.id, config, key).await,
         _ => json_rpc_response(
