@@ -287,7 +287,7 @@ jobs:
           test -s "harnx-web-assets-$VERSION.zip"
           tar -tzf "harnx-web-assets-$VERSION.tar.gz" | grep -x './index.html' > /dev/null
           tar -tzf "harnx-web-assets-$VERSION.tar.gz" | grep -E '^\./assets/.*\.js$' > /dev/null
-          unzip -Z1 "harnx-web-assets-$VERSION.zip" | grep -x 'index.html' > /dev/null
+          unzip -Z1 "harnx-web-assets-$VERSION.zip" | grep -Ex '(\./)?index\.html' > /dev/null
 
       - name: Publish Web UI assets
         uses: softprops/action-gh-release@v3
