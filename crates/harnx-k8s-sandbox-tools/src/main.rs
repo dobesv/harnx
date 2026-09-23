@@ -21,8 +21,8 @@ use std::time::Duration;
 struct Cli {
     #[arg(long, env = "SANDBOX_NAMESPACE", default_value = "agent-sandboxes")]
     sandbox_namespace: String,
-    #[arg(long, env = "SANDBOX_TEMPLATE", default_value = "formative-buildbox")]
-    sandbox_template: String,
+    #[arg(long, env = "SANDBOX_WARM_POOL", default_value = "formative-buildbox")]
+    sandbox_warm_pool: String,
     #[arg(long, env = "DEFAULT_TTL_MINUTES", default_value_t = 4320)]
     default_ttl_minutes: u64,
     #[arg(long, env = "SANDBOX_SCAN_INTERVAL_MINUTES", default_value_t = 15)]
@@ -202,7 +202,7 @@ fn build_manager(
         operation_timeout,
     );
     let config = SandboxManagerConfig {
-        template: cli.sandbox_template.clone(),
+        warm_pool: cli.sandbox_warm_pool.clone(),
         default_ttl: minutes(cli.default_ttl_minutes)?,
         scan_interval: minutes(cli.sandbox_scan_interval_minutes)?,
         idle_timeout: minutes(cli.idle_timeout_minutes)?,

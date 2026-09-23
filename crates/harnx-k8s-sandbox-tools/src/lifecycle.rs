@@ -18,8 +18,7 @@ mod wait;
 use status::{assess, deleted_status, ensure_waitable, pending_status};
 use wait::{is_deadline, WaitContext};
 
-// Retain Tartarus's annotation during migration so either watcher observes
-// activity written by the other implementation.
+// Keep the existing activity annotation so upgraded gateways retain idle history.
 pub const LAST_ACTIVITY_ANNOTATION: &str = "kagent/last-activity";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,7 +61,7 @@ pub struct SandboxStatus {
 #[derive(Clone)]
 pub struct CreateSandboxClaim {
     pub name: String,
-    pub template: String,
+    pub warm_pool: String,
     pub shutdown_time: DateTime<Utc>,
     pub description: Option<String>,
 }
@@ -80,7 +79,7 @@ pub trait SandboxApi: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct SandboxManagerConfig {
-    pub template: String,
+    pub warm_pool: String,
     pub default_ttl: Duration,
     pub activation_timeout: Duration,
     pub pod_ip_timeout: Duration,
@@ -97,7 +96,7 @@ pub struct SandboxManagerConfig {
 impl Default for SandboxManagerConfig {
     fn default() -> Self {
         Self {
-            template: "formative-buildbox".to_string(),
+            warm_pool: "formative-buildbox".to_string(),
             default_ttl: Duration::from_secs(72 * 60 * 60),
             activation_timeout: Duration::from_secs(30 * 60),
             pod_ip_timeout: Duration::from_secs(15),
@@ -148,7 +147,7 @@ impl SandboxManager {
                 .context("default sandbox TTL is out of range")?;
         let request = CreateSandboxClaim {
             name: claim_name(call_id),
-            template: self.config.template.clone(),
+            warm_pool: self.config.warm_pool.clone(),
             shutdown_time,
             description: description.map(str::to_string),
         };

@@ -26,7 +26,7 @@ fn proxy_schema_adds_an_optional_sandbox_override() {
 }
 
 #[test]
-fn proxy_tool_surface_matches_tartarus() {
+fn proxy_tool_surface_includes_bash_and_filesystem_tools() {
     let bash = harnx_bash_tools::builtin_tool_specs()
         .into_iter()
         .map(proxy_spec)

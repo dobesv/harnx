@@ -62,7 +62,7 @@ fn claim(name: &str, sandbox_name: Option<&str>, last_activity: Option<&str>) ->
         );
     }
     json!({
-        "apiVersion": "extensions.agents.x-k8s.io/v1alpha1",
+        "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
         "kind": "SandboxClaim",
         "metadata": {
             "name": name,
@@ -71,7 +71,7 @@ fn claim(name: &str, sandbox_name: Option<&str>, last_activity: Option<&str>) ->
             "annotations": annotations,
         },
         "spec": {
-            "sandboxTemplateRef": {"name": "formative-buildbox"},
+            "warmPoolRef": {"name": "formative-buildbox"},
             "lifecycle": {
                 "shutdownTime": "2026-09-12T00:00:00Z",
                 "shutdownPolicy": "Delete"
@@ -94,10 +94,10 @@ fn claim(name: &str, sandbox_name: Option<&str>, last_activity: Option<&str>) ->
 
 fn sandbox(name: &str, replicas: i64) -> Value {
     json!({
-        "apiVersion": "agents.x-k8s.io/v1alpha1",
+        "apiVersion": "agents.x-k8s.io/v1beta1",
         "kind": "Sandbox",
         "metadata": {"name": name, "namespace": "test-ns"},
-        "spec": {"replicas": replicas}
+        "spec": {"operatingMode": if replicas == 0 { "Suspended" } else { "Running" }}
     })
 }
 
@@ -129,13 +129,13 @@ fn assert_create_request(request: &RecordedRequest) {
             request.path.as_str(),
             &body["metadata"]["name"],
             &body["metadata"]["annotations"]["kubernetes.io/description"],
-            &body["spec"]["sandboxTemplateRef"]["name"],
+            &body["spec"]["warmPoolRef"]["name"],
             &body["spec"]["lifecycle"]["shutdownPolicy"],
             &body["spec"]["lifecycle"]["shutdownTime"],
         ),
         (
             &Method::POST,
-            "/apis/extensions.agents.x-k8s.io/v1alpha1/namespaces/test-ns/sandboxclaims",
+            "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxclaims",
             &json!("claim-a"),
             &json!("review change"),
             &json!("formative-buildbox"),
@@ -185,8 +185,15 @@ fn assert_claim_record(record: &SandboxRecord) {
 fn assert_replicas_patch(requests: &[RecordedRequest]) {
     assert!(requests.iter().any(|request| {
         request.method == Method::PATCH
-            && request.path.ends_with("/sandboxes/sandbox-a")
-            && request.body.as_ref().unwrap()["spec"]["replicas"] == 0
+            && request.path
+                == "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes/sandbox-a"
+            && request.body.as_ref().unwrap()["spec"]["operatingMode"] == "Suspended"
+    }));
+    assert!(requests.iter().any(|request| {
+        request.method == Method::PATCH
+            && request.path
+                == "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes/sandbox-a"
+            && request.body.as_ref().unwrap()["spec"]["operatingMode"] == "Running"
     }));
 }
 
@@ -222,7 +229,7 @@ async fn create_claim_uses_the_agent_sandbox_wire_contract() {
     let id = api
         .create_claim(CreateSandboxClaim {
             name: "claim-a".to_string(),
-            template: "formative-buildbox".to_string(),
+            warm_pool: "formative-buildbox".to_string(),
             shutdown_time,
             description: Some("review change".to_string()),
         })
@@ -246,7 +253,7 @@ async fn create_conflict_and_delete_not_found_are_idempotent() {
     assert_eq!(
         api.create_claim(CreateSandboxClaim {
             name: "claim-retry".to_string(),
-            template: "template".to_string(),
+            warm_pool: "pool".to_string(),
             shutdown_time,
             description: None,
         })
@@ -270,6 +277,7 @@ async fn get_and_patches_use_compatible_status_paths_and_payloads() {
     assert_claim_record(&record);
 
     api.set_replicas("claim-a", 0).await.unwrap();
+    api.set_replicas("claim-a", 1).await.unwrap();
     api.update_shutdown_time(
         "claim-a",
         DateTime::parse_from_rfc3339("2026-09-13T00:00:00Z")
@@ -294,13 +302,22 @@ async fn get_and_patches_use_compatible_status_paths_and_payloads() {
 }
 
 #[tokio::test]
+async fn unsupported_replica_count_does_not_patch_a_sandbox() {
+    let (api, requests) = test_api(|request| panic!("unexpected request: {request:?}"));
+
+    assert!(api.set_replicas("claim-a", -1).await.is_err());
+    assert!(api.set_replicas("claim-a", 2).await.is_err());
+    assert!(requests.lock().is_empty());
+}
+
+#[tokio::test]
 async fn list_isolates_backing_sandbox_failures_and_ignores_bad_activity_timestamps() {
     let (api, _) = test_api(
         |request| match (request.method.clone(), request.path.as_str()) {
             (Method::GET, path) if path.ends_with("/sandboxclaims") => (
                 StatusCode::OK,
                 json!({
-                    "apiVersion": "extensions.agents.x-k8s.io/v1alpha1",
+                    "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
                     "kind": "SandboxClaimList",
                     "metadata": {"resourceVersion": "1"},
                     "items": [
