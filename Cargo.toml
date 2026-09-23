@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/harnx",
+    "crates/harnx-acp-server",
     "crates/harnx-client",
     "crates/harnx-core",
     "crates/harnx-engine",
@@ -99,6 +100,8 @@ tonic = { version = "0.14", default-features = false }
 tokio-graceful = "0.2.2"
 tokio-stream = { version = "0.1.15", default-features = false, features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+agent-client-protocol = "2.2.0"
 tower = { version = "0.5" }
 crossterm = "0.29"
 chrono = { version = "0.4.23", features = ["serde"] }
