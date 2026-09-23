@@ -19,7 +19,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// Default live-heap ceiling (MiB) when `HARNX_HEAP_LIMIT_MB` is unset. Sits far
 /// above any healthy session yet far below the ~41 GiB #842 blow-up, so a
 /// runaway trips here — with a backtrace — long before the machine is exhausted.
-pub const DEFAULT_LIMIT_MB: usize = 4096;
+pub const DEFAULT_LIMIT_MB: usize = if cfg!(target_pointer_width = "32") {
+    2048
+} else {
+    4096
+};
 
 /// Live (allocated − freed) byte ceiling; `0` means disarmed. Initialised to the
 /// default so the guard is armed from the very first allocation. Counting from
@@ -169,9 +173,14 @@ mod tests {
 
     #[test]
     fn trip_header_reports_sizes_and_env_var() {
-        let header = trip_header(5_000 * 1024 * 1024, 4096 * 1024 * 1024);
-        assert!(header.contains("~5000 MiB"));
-        assert!(header.contains("limit of 4096 MiB"));
+        let header = trip_header(2000 * 1024 * 1024, 1024 * 1024 * 1024);
+        assert!(header.contains("~2000 MiB"));
+        assert!(header.contains("limit of 1024 MiB"));
         assert!(header.contains("HARNX_HEAP_LIMIT_MB"));
+    }
+
+    #[test]
+    fn default_limit_fits_the_target_pointer_width() {
+        assert!(DEFAULT_LIMIT_MB.checked_mul(1024 * 1024).is_some());
     }
 }

@@ -285,9 +285,9 @@ jobs:
           # than publish a broken/empty asset bundle.
           test -s "harnx-web-assets-$VERSION.tar.gz"
           test -s "harnx-web-assets-$VERSION.zip"
-          tar -tzf "harnx-web-assets-$VERSION.tar.gz" | grep -qx './index.html'
-          tar -tzf "harnx-web-assets-$VERSION.tar.gz" | grep -qE '^\./assets/.*\.js$'
-          unzip -l "harnx-web-assets-$VERSION.zip" | grep -q ' index.html$'
+          tar -tzf "harnx-web-assets-$VERSION.tar.gz" | grep -x './index.html' > /dev/null
+          tar -tzf "harnx-web-assets-$VERSION.tar.gz" | grep -E '^\./assets/.*\.js$' > /dev/null
+          unzip -Z1 "harnx-web-assets-$VERSION.zip" | grep -x 'index.html' > /dev/null
 
       - name: Publish Web UI assets
         uses: softprops/action-gh-release@v3
