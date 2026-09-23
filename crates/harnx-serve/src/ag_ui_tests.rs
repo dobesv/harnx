@@ -1034,12 +1034,16 @@ fn ag_ui_sink_maps_compaction_completed_to_custom_and_snapshot() {
     });
     let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), true, Some(snapshot));
 
-    sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted));
+    sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted {
+        compaction_id: None,
+        outcome: harnx_core::session::CompactOutcome::Compacted,
+    }));
 
     match rx.try_recv().expect("compaction custom") {
         Event::Custom(event) => {
             assert_eq!(event.name, "session_compacting_completed");
-            assert_eq!(event.value, json!({}));
+            // Automatic compaction: compaction_id is None, outcome is Compacted
+            assert_eq!(event.value, json!({ "outcome": { "status": "compacted" } }));
         }
         other => panic!("expected compaction custom, got: {other:?}"),
     }
@@ -1073,6 +1077,64 @@ fn parse_run_input_preserves_tool_message_tool_call_id() {
             assert_eq!(tool_call_id.to_string(), "tool-call-123")
         }
         other => panic!("expected tool message, got {other:?}"),
+    }
+}
+
+#[test]
+fn ag_ui_sink_maps_compaction_events_with_compaction_id_and_outcome() {
+    use harnx_core::session::{CompactOutcome, UnchangedReason};
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let snapshot = Arc::new(Vec::new);
+    let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), true, Some(snapshot));
+
+    // Manual compaction with compaction_id and Compacted outcome
+    sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted {
+        compaction_id: Some("comp-123".to_string()),
+    }));
+    match rx.try_recv().expect("started custom") {
+        Event::Custom(event) => {
+            assert_eq!(event.name, "session_compacting_started");
+            assert_eq!(event.value, json!({ "compaction_id": "comp-123" }));
+        }
+        other => panic!("expected started custom, got: {other:?}"),
+    }
+
+    // Completed with compaction_id and Unchanged outcome
+    sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted {
+        compaction_id: Some("comp-123".to_string()),
+        outcome: CompactOutcome::Unchanged(UnchangedReason::NoUserMessages),
+    }));
+    match rx.try_recv().expect("completed custom") {
+        Event::Custom(event) => {
+            assert_eq!(event.name, "session_compacting_completed");
+            assert_eq!(
+                event.value,
+                json!({ "compaction_id": "comp-123", "outcome": { "status": "unchanged", "detail": "no_user_messages" } })
+            );
+        }
+        other => panic!("expected completed custom, got: {other:?}"),
+    }
+    // Snapshot follows completed
+    match rx.try_recv().expect("snapshot") {
+        Event::MessagesSnapshot(_) => {}
+        other => panic!("expected MessagesSnapshot, got: {other:?}"),
+    }
+
+    // Failed with compaction_id
+    sink.emit(AgentEvent::Session(SessionEvent::CompactingFailed {
+        compaction_id: Some("comp-456".to_string()),
+        error: "test failure".to_string(),
+    }));
+    match rx.try_recv().expect("failed custom") {
+        Event::Custom(event) => {
+            assert_eq!(event.name, "session_compacting_failed");
+            assert_eq!(
+                event.value,
+                json!({ "compaction_id": "comp-456", "error": "test failure" })
+            );
+        }
+        other => panic!("expected failed custom, got: {other:?}"),
     }
 }
 

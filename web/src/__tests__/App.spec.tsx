@@ -34,6 +34,8 @@ const defaultPendingContext = {
   setStatusText: vi.fn(),
   errorText: null,
   setErrorText: vi.fn(),
+  statusMessage: null,
+  setStatusMessage: vi.fn(),
   hydratedApprovals: [],
   addHydratedApproval: vi.fn(),
   clearHydratedApprovals: vi.fn(), removeHydratedApproval: vi.fn(),

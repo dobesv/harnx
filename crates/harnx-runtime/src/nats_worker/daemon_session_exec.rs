@@ -74,6 +74,7 @@ struct PreparedSessionRuntime {
     after_seq_observer: Arc<AtomicU64>,
     pending_input: Arc<std::sync::atomic::AtomicBool>,
     interrupted: Arc<parking_lot::Mutex<Option<super::session_watcher::InterruptNotice>>>,
+    pending_compaction: Arc<parking_lot::Mutex<Option<String>>>,
     in_flight: crate::nats_tool_provider::NatsInFlightCalls,
     session_watcher: JoinHandle<()>,
     agent_setup: Result<()>,
@@ -187,6 +188,7 @@ impl WorkerRuntime {
     ) -> Result<PreparedSessionRuntime> {
         let pending_input = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let interrupted = Arc::new(parking_lot::Mutex::new(None));
+        let pending_compaction = Arc::new(parking_lot::Mutex::new(None));
         let in_flight =
             crate::nats_tool_provider::NatsInFlightCalls::for_instance(&self.instance_id);
         let watcher_start_after = startup
@@ -206,6 +208,7 @@ impl WorkerRuntime {
                 own_appends: Arc::clone(&startup.after_seq_observer),
                 pending_input: Arc::clone(&pending_input),
                 interrupted: Arc::clone(&interrupted),
+                pending_compaction: Arc::clone(&pending_compaction),
             },
         );
         Ok(PreparedSessionRuntime {
@@ -224,6 +227,7 @@ impl WorkerRuntime {
             after_seq_observer: startup.after_seq_observer,
             pending_input,
             interrupted,
+            pending_compaction,
             in_flight,
             session_watcher,
             agent_setup: startup.agent_setup,
@@ -257,6 +261,8 @@ impl WorkerRuntime {
             event_sink: prepared.event_sink,
             after_seq_observer: prepared.after_seq_observer,
             pending_input: prepared.pending_input,
+            pending_compaction: prepared.pending_compaction,
+            prepare_turn_entries: None,
             agent_setup: prepared.agent_setup,
         };
         RunningSessionRuntime {

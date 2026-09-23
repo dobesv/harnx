@@ -92,3 +92,83 @@ describe('harnx message_attachments event', () => {
     expect(NAVIGATION_CONTROL_EVENTS).toContain('message_attachments');
   });
 });
+
+describe('harnx compaction events', () => {
+  it('calls onCompactingStarted with compaction_id', () => {
+    const onCompactingStarted = vi.fn();
+    handleHarnxCustomEvent(
+      'session_compacting_started',
+      { compaction_id: 'compact-123' },
+      { ...callbacks(true), onCompactingStarted },
+    );
+
+    expect(onCompactingStarted).toHaveBeenCalledWith('compact-123');
+  });
+
+  it('calls onCompactingStarted without compaction_id (automatic compaction)', () => {
+    const onCompactingStarted = vi.fn();
+    handleHarnxCustomEvent(
+      'session_compacting_started',
+      {},
+      { ...callbacks(true), onCompactingStarted },
+    );
+
+    expect(onCompactingStarted).toHaveBeenCalledWith(undefined);
+  });
+
+  it('calls onCompactingCompleted with compacted outcome', () => {
+    const onCompactingCompleted = vi.fn();
+    handleHarnxCustomEvent(
+      'session_compacting_completed',
+      { outcome: { status: 'compacted' }, compaction_id: 'compact-123' },
+      { ...callbacks(true), onCompactingCompleted },
+    );
+
+    expect(onCompactingCompleted).toHaveBeenCalledWith({ status: 'compacted' }, 'compact-123');
+  });
+
+  it('calls onCompactingCompleted with unchanged outcome and detail', () => {
+    const onCompactingCompleted = vi.fn();
+    handleHarnxCustomEvent(
+      'session_compacting_completed',
+      { outcome: { status: 'unchanged', detail: 'Nothing to compact' } },
+      { ...callbacks(true), onCompactingCompleted },
+    );
+
+    expect(onCompactingCompleted).toHaveBeenCalledWith({ status: 'unchanged', detail: 'Nothing to compact' }, undefined);
+  });
+
+  it('ignores completed event with invalid outcome', () => {
+    const onCompactingCompleted = vi.fn();
+    const cbs = { ...callbacks(true), onCompactingCompleted };
+
+    // Missing outcome
+    handleHarnxCustomEvent('session_compacting_completed', {}, cbs);
+    // Invalid status
+    handleHarnxCustomEvent('session_compacting_completed', { outcome: { status: 'invalid' } }, cbs);
+
+    expect(onCompactingCompleted).not.toHaveBeenCalled();
+  });
+
+  it('calls onCompactingFailed with error and compaction_id', () => {
+    const onCompactingFailed = vi.fn();
+    handleHarnxCustomEvent(
+      'session_compacting_failed',
+      { error: 'Compaction failed: no messages', compaction_id: 'compact-123' },
+      { ...callbacks(true), onCompactingFailed },
+    );
+
+    expect(onCompactingFailed).toHaveBeenCalledWith('Compaction failed: no messages', 'compact-123');
+  });
+
+  it('uses default error message for failed event', () => {
+    const onCompactingFailed = vi.fn();
+    handleHarnxCustomEvent(
+      'session_compacting_failed',
+      {},
+      { ...callbacks(true), onCompactingFailed },
+    );
+
+    expect(onCompactingFailed).toHaveBeenCalledWith('Compaction failed', undefined);
+  });
+});

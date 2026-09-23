@@ -1,6 +1,7 @@
 mod agent_event_sink;
 mod cli;
 mod cli_event_sink;
+mod compact;
 mod oneshot_nats;
 
 /// Heap-usage guard installed as the process allocator: aborts with a backtrace
@@ -135,7 +136,8 @@ async fn main() -> Result<std::process::ExitCode> {
 
     let result = run_main(cli).await;
     telemetry.shutdown().await;
-    if let Some(error) = result? {
+    let (error, exit_code) = result?;
+    if let Some(error) = error {
         if invocation_limit_reached(&error) {
             return Ok(std::process::ExitCode::from(
                 oneshot_nats::INVOCATION_LIMIT_EXIT_CODE as u8,
@@ -147,7 +149,7 @@ async fn main() -> Result<std::process::ExitCode> {
     // Returning drops the Tokio runtime and its broker supervision tasks.
     // process::exit bypasses that cleanup, leaving a broker bound on platforms
     // without Linux's parent-death signal and preventing immediate restart.
-    Ok(std::process::ExitCode::SUCCESS)
+    Ok(std::process::ExitCode::from(exit_code))
 }
 
 async fn init_frontend_config(working_mode: WorkingMode, info_flag: bool) -> Result<Config> {
@@ -156,16 +158,17 @@ async fn init_frontend_config(working_mode: WorkingMode, info_flag: bool) -> Res
     Ok(config)
 }
 
-async fn run_main(cli: Cli) -> Result<Option<anyhow::Error>> {
+async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
     match &cli.command {
         Some(
             command @ (Commands::Info(_)
             | Commands::Dump(_)
             | Commands::Delete(_)
-            | Commands::List(_)),
+            | Commands::List(_)
+            | Commands::Compact(_)),
         ) => {
-            run_command(command, &cli).await?;
-            return Ok(None);
+            let exit_code = run_command(command, &cli).await?;
+            return Ok((None, exit_code));
         }
         Some(Commands::Prompt(_)) | None => {}
     }
@@ -179,16 +182,17 @@ async fn run_main(cli: Cli) -> Result<Option<anyhow::Error>> {
     let config = Arc::new(RwLock::new(
         init_frontend_config(working_mode, info_flag).await?,
     ));
-    Ok(run(config, cli, text).await.err())
+    Ok((run(config, cli, text).await.err(), 0))
 }
 
-async fn run_command(command: &Commands, cli: &Cli) -> Result<()> {
+async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
     match command {
         Commands::Prompt(_) => bail!("prompt commands use the one-shot execution path"),
-        Commands::Info(info_args) => run_info_command(info_args, cli).await,
-        Commands::Dump(dump_args) => run_dump_command(dump_args).await,
-        Commands::Delete(delete_args) => run_delete_command(delete_args).await,
-        Commands::List(list_args) => run_list_command(list_args, cli).await,
+        Commands::Info(info_args) => run_info_command(info_args, cli).await.map(|()| 0),
+        Commands::Dump(dump_args) => run_dump_command(dump_args).await.map(|()| 0),
+        Commands::Delete(delete_args) => run_delete_command(delete_args).await.map(|()| 0),
+        Commands::List(list_args) => run_list_command(list_args, cli).await.map(|()| 0),
+        Commands::Compact(compact_args) => compact::run_compact_command(compact_args, cli).await,
     }
 }
 

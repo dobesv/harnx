@@ -48,6 +48,8 @@ mod tool_supervisor;
 mod wind_up;
 
 #[cfg(test)]
+mod compaction_tests;
+#[cfg(test)]
 mod session_start_hook_tests;
 #[cfg(test)]
 mod session_watcher_tests;

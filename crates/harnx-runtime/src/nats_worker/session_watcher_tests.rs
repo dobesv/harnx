@@ -74,6 +74,8 @@ impl WatchedSession {
         let pending_input = Arc::new(AtomicBool::new(false));
         let interrupted: Arc<parking_lot::Mutex<Option<InterruptNotice>>> =
             Arc::new(parking_lot::Mutex::new(None));
+        let pending_compaction: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
         let watcher = spawn_session_watcher(SessionWatcherCtx {
             jetstream,
             client,
@@ -84,6 +86,7 @@ impl WatchedSession {
             own_appends: Arc::new(AtomicU64::new(0)),
             pending_input: Arc::clone(&pending_input),
             interrupted: Arc::clone(&interrupted),
+            pending_compaction,
         });
 
         Self {

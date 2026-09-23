@@ -35,6 +35,9 @@ pub enum ControlCommand {
         approved: bool,
         note: Option<String>,
     },
+    /// Latency hint that a `CompactRequest` entry was appended to this session's log.
+    /// The log is authoritative; the worker detects and runs compaction at a safe boundary.
+    Compact { compaction_id: String },
 }
 
 impl ControlCommand {
@@ -105,6 +108,11 @@ impl SessionControlHandler {
             } => {
                 self.apply_hitl_decision(tool_call_id, approved, note, reply)
                     .await
+            }
+            ControlCommand::Compact { .. } => {
+                // Compact is a hint only; worker detects pending requests via session watcher.
+                // Acknowledge receipt but don't trigger compaction here - T4 handles execution.
+                self.acknowledge(reply).await;
             }
         }
     }

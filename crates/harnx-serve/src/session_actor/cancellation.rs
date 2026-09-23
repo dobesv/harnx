@@ -30,7 +30,7 @@ impl SessionActor {
             .await
     }
 
-    async fn control_session(&self) -> anyhow::Result<NatsSession> {
+    pub(super) async fn control_session(&self) -> anyhow::Result<NatsSession> {
         let abort = create_abort_signal();
         let config = self.prompt_config().await;
         let initializer = harnx_runtime::SessionInitializer::named_from_config(

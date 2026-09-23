@@ -1263,3 +1263,6 @@ async fn concurrent_prompted_sse_runs_do_not_cross_streams() {
 
 #[path = "ag_ui_control_plane/cancellation.rs"]
 mod cancellation;
+
+#[path = "ag_ui_control_plane/compaction.rs"]
+mod compaction;

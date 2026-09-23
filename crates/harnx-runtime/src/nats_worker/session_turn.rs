@@ -1,7 +1,7 @@
 //! Turn-local state. No session dispatcher, active-map or lease-release authority.
 use super::agent_loop::{
-    build_mid_turn_injection_callback, run_agent_loop_with_nats_outcome, NatsAgentLoopOutcome,
-    RunAgentLoopArgs,
+    build_mid_turn_injection_callback, has_orphan_tool_calls, run_agent_loop_with_nats_outcome,
+    NatsAgentLoopOutcome, RunAgentLoopArgs,
 };
 use super::backend::NatsSessionLogBackend;
 use super::control::AppliedHitlDecision;
@@ -9,10 +9,13 @@ use super::daemon::SessionActivate;
 use super::daemon_runtime::WorkerRuntime;
 use super::daemon_session_exec::{build_durable_tool_round_callback, ToolRoundAttachmentSync};
 use super::daemon_turn_input::TurnInputCtx;
+use crate::config::session::SessionAppendSink;
 use crate::config::{GlobalConfig, Input};
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_lease::NatsSessionLease;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use harnx_core::event::AgentEventSink;
+use parking_lot::Mutex;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -64,6 +67,11 @@ pub(super) struct SessionTurn {
     /// Set by the session watcher the moment a user message lands. The turn
     /// boundary consumes it so queued input runs without a new activation.
     pub pending_input: Arc<AtomicBool>,
+    /// Pending manual compaction request detected on activation or mid-turn.
+    /// Stores the compaction_id from the CompactRequest that needs resolution.
+    pub pending_compaction: Arc<Mutex<Option<String>>>,
+    /// Cached entries from prepare_turn() for reuse in execute_manual_compaction().
+    pub(super) prepare_turn_entries: Option<Vec<(u64, harnx_core::session::SessionLogEntry)>>,
     pub agent_setup: Result<()>,
 }
 
@@ -88,7 +96,18 @@ impl SessionTurn {
         // Includes both folded input and mid-round injections. Drain checks only
         // detect new messages; only consumed messages advance this cursor.
         let mut activation_high_water = None;
-        while let Some((input, seed_cursor)) = self.next_turn_input(activation_high_water).await? {
+        loop {
+            // First hydrate and prepare turn - this may set pending_compaction
+            // via prepare_turn -> derive_pending_compaction.
+            let Some((input, seed_cursor)) = self.next_turn_input(activation_high_water).await?
+            else {
+                // No user turn to run. Check for pending maintenance (manual compaction)
+                // before exiting - idle sessions must still execute compaction.
+                self.maybe_execute_pending_compaction().await?;
+                break;
+            };
+            // Check for pending maintenance that arrived mid-turn or during prepare.
+            self.maybe_execute_pending_compaction().await?;
             log::info!(
                 "execute_session turn: session_id={} seed_cursor={:?}",
                 self.activation.session_id,
@@ -137,10 +156,25 @@ impl SessionTurn {
     }
 
     async fn prepare_turn(&mut self) -> Result<bool> {
-        let entries = self.backend.load_events_latest_async().await?;
+        // Store entries for reuse in execute_manual_compaction() to avoid duplicate leader read.
+        self.prepare_turn_entries = Some(self.backend.load_events_latest_async().await?);
+        let entries = self
+            .prepare_turn_entries
+            .as_ref()
+            .expect("entries just stored");
         // Repair attention bumps lost after their durable transcript append.
-        self.backend.reconcile_attention_from_log(&entries).await?;
-        let pending_hitl = super::agent_loop::derive_pending_hitl_approvals(&entries)?;
+        self.backend.reconcile_attention_from_log(entries).await?;
+
+        // Check for pending manual compaction and record it for execution.
+        if let Some(compaction_id) = super::agent_loop::derive_pending_compaction(entries) {
+            log::info!(
+                "prepare_turn detected pending compaction: session_id={} compaction_id={compaction_id}",
+                self.activation.session_id
+            );
+            *self.pending_compaction.lock() = Some(compaction_id);
+        }
+
+        let pending_hitl = super::agent_loop::derive_pending_hitl_approvals(entries)?;
         if pending_hitl.is_empty() {
             return Ok(true);
         }
@@ -277,6 +311,10 @@ impl SessionTurn {
         if self.pending_input.swap(false, Ordering::Relaxed) {
             return Ok(false);
         }
+        // Pending compaction maintenance must block drain.
+        if self.has_pending_compaction() {
+            return Ok(false);
+        }
         // A fresh leader-authoritative read sees our completion boundary and
         // concurrent edits/retractions. Reconstruction preserves NATS sequences.
         let tail = self.backend.load_events_latest_async().await?;
@@ -295,8 +333,550 @@ impl SessionTurn {
         // messages. Advancing on detection would derive empty continuation input.
         Ok(new_messages.is_empty() && !has_resumable)
     }
+
+    /// Check whether there's a pending manual compaction request.
+    fn has_pending_compaction(&self) -> bool {
+        self.pending_compaction.lock().is_some()
+    }
+
+    async fn maybe_execute_pending_compaction(&self) -> Result<()> {
+        if self.has_pending_compaction() {
+            // SAFETY CHECK: Do not compact while there are orphan tool calls or pending HITL.
+            // This prevents compaction from dropping pending tool round state or feeding
+            // placeholder tool results to the model. Reload entries to get authoritative state.
+            let entries = self.backend.load_events_latest_async().await?;
+            let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
+
+            if should_defer_compaction(&effective, &entries)? {
+                log::info!(
+                    "defer manual compaction: session has pending tool round: session_id={}",
+                    self.activation.session_id
+                );
+                // Keep pending_compaction set for next safe boundary
+                return Ok(());
+            }
+
+            self.execute_manual_compaction().await?;
+        }
+        Ok(())
+    }
+}
+
+/// Check whether compaction should be deferred due to pending tool round state.
+/// Returns true if there are orphan tool calls or pending HITL approvals.
+///
+/// This is extracted as a pure function to allow unit testing of the deferral decision.
+pub(crate) fn should_defer_compaction(
+    effective_entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    raw_entries: &[(u64, harnx_core::session::SessionLogEntry)],
+) -> Result<bool> {
+    // Check for orphan tool calls (unmatched ToolCalls awaiting ToolResults)
+    let has_orphans = has_orphan_tool_calls(effective_entries);
+
+    // Check for pending HITL approvals
+    let pending_hitl = super::agent_loop::derive_pending_hitl_approvals(raw_entries)?;
+    let has_pending_hitl = !pending_hitl.is_empty();
+
+    Ok(has_orphans || has_pending_hitl)
+}
+
+impl SessionTurn {
+    /// Execute pending manual compaction at a safe boundary.
+    ///
+    /// This runs the existing `compact_session` code but with compaction_id tracking:
+    /// - Emits `CompactingStarted { compaction_id: Some(id) }`
+    /// - Runs compaction
+    /// - Emits `CompactingCompleted/CompactingFailed` with outcome
+    /// - Appends `CompactResult` via the fenced log sink
+    ///
+    /// SAFETY: This is only called after `record_turn_end` completes (turn boundary)
+    /// or when `next_turn_input` returns None (idle session with no orphan tool calls
+    /// or pending HITL approvals). Both cases guarantee no pending tool round state.
+    async fn execute_manual_compaction(&self) -> Result<()> {
+        let compaction_id = match self.pending_compaction.lock().take() {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+
+        if !self.lease.is_held() {
+            log::warn!(
+                "manual compaction skipped: lease lost: session_id={} compaction_id={compaction_id}",
+                self.activation.session_id
+            );
+            return Ok(());
+        }
+
+        log::info!(
+            "manual compaction starting: session_id={} compaction_id={compaction_id}",
+            self.activation.session_id
+        );
+
+        if let Some(outcome) = self.cached_compaction_outcome(&compaction_id) {
+            self.emit_and_record_result(&compaction_id, outcome).await?;
+            return Ok(());
+        }
+
+        let entries = match &self.prepare_turn_entries {
+            Some(entries) => entries.clone(),
+            None => self.backend.load_events_latest_async().await?,
+        };
+        self.hydrate_session_from_entries(&entries).await?;
+
+        if self.session_is_compacting() {
+            return self.resolve_coalesced_compaction(&compaction_id).await;
+        }
+
+        self.run_compaction_with_id(&compaction_id, entries).await?;
+        log::info!(
+            "manual compaction complete: session_id={} compaction_id={compaction_id}",
+            self.activation.session_id
+        );
+        Ok(())
+    }
+
+    fn cached_compaction_outcome(
+        &self,
+        compaction_id: &str,
+    ) -> Option<harnx_core::session::CompactOutcome> {
+        self.prepare_turn_entries
+            .as_deref()
+            .and_then(|entries| detect_already_compacted(entries, compaction_id))
+    }
+
+    fn session_is_compacting(&self) -> bool {
+        self.per_session
+            .read()
+            .session
+            .as_ref()
+            .is_some_and(|session| session.compressing())
+    }
+
+    async fn resolve_coalesced_compaction(&self, compaction_id: &str) -> Result<()> {
+        log::info!(
+            "manual compaction coalesced with in-progress automatic: session_id={} compaction_id={compaction_id}",
+            self.activation.session_id
+        );
+        WorkerRuntime::wait_for_post_turn_maintenance(&self.per_session, &self.lease).await;
+
+        let entries = self.backend.load_events_latest_async().await?;
+        if let Some(outcome) = detect_already_compacted(&entries, compaction_id) {
+            self.emit_and_record_result(compaction_id, outcome).await?;
+            return Ok(());
+        }
+
+        log::info!(
+            "manual compaction: auto compaction finished but no Compress found, running manually: session_id={}",
+            self.activation.session_id
+        );
+        self.run_compaction_with_id(compaction_id, entries).await
+    }
+
+    async fn prepare_compaction_run(
+        &self,
+        compaction_id: &str,
+        entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    ) -> Result<()> {
+        self.hydrate_session_from_entries(entries).await?;
+        if let Some(session) = self.per_session.write().session.as_mut() {
+            session.set_compressing(true);
+        }
+        harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+            harnx_core::event::SessionEvent::CompactingStarted {
+                compaction_id: Some(compaction_id.to_string()),
+            },
+        ));
+        Ok(())
+    }
+
+    fn clear_compacting(&self) {
+        if let Some(session) = self.per_session.write().session.as_mut() {
+            session.set_compressing(false);
+        }
+    }
+
+    async fn run_compaction_with_id(
+        &self,
+        compaction_id: &str,
+        entries: Vec<(u64, harnx_core::session::SessionLogEntry)>,
+    ) -> Result<()> {
+        self.prepare_compaction_run(compaction_id, &entries).await?;
+        let result = crate::config::Config::compact_session(&self.per_session).await;
+        self.clear_compacting();
+
+        let outcome = self.compaction_outcome_from_result(&result);
+        self.emit_and_record_result(compaction_id, outcome).await
+    }
+}
+
+/// Check if a Compress marker already landed after the CompactRequest.
+/// Returns Some(outcome) if we should skip running compaction.
+///
+/// `derive_pending_compaction` only returns a request ID if there's NO matching
+/// `CompactResult` for that ID in the log. So we check: did a `Compress` marker
+/// appear after our request? If so, compaction may have already run (e.g., automatic
+/// compaction coalesced with our request). Any user message that appears after
+/// ANY `CompactResult` (or after a `TurnEnd` following `Compress`) is new user content.
+pub(crate) fn detect_already_compacted(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    compaction_id: &str,
+) -> Option<harnx_core::session::CompactOutcome> {
+    let mut found_request = false;
+    let mut found_compress = false;
+    // Track ANY CompactResult after Compress (automatic compaction may have different ID)
+    let mut found_any_compact_result_after_compress = false;
+    // Track TurnEnd after Compress as another boundary for new user content
+    let mut found_turn_end_after_compress = false;
+    let mut has_new_user_content = false;
+
+    for (_, entry) in entries {
+        match entry {
+            harnx_core::session::SessionLogEntry::CompactRequest {
+                compaction_id: id, ..
+            } => {
+                if id == compaction_id {
+                    found_request = true;
+                }
+            }
+            harnx_core::session::SessionLogEntry::Compress { .. } => {
+                if found_request {
+                    found_compress = true;
+                }
+            }
+            harnx_core::session::SessionLogEntry::CompactResult { .. } => {
+                // ANY CompactResult after Compress marks compaction as done
+                if found_compress {
+                    found_any_compact_result_after_compress = true;
+                }
+            }
+            harnx_core::session::SessionLogEntry::TurnEnd { .. } => {
+                if found_compress {
+                    found_turn_end_after_compress = true;
+                }
+            }
+            harnx_core::session::SessionLogEntry::Message { role, .. }
+                if role.is_user()
+                    && (found_any_compact_result_after_compress
+                        || found_turn_end_after_compress) =>
+            {
+                // New user content after compaction completed or turn ended
+                has_new_user_content = true;
+            }
+            _ => {}
+        }
+    }
+
+    // AlreadyCompacted if we found Compress after our request and no new user content.
+    // The re-logged suffix messages between Compress and CompactResult/TurnEnd don't count as new.
+    if found_request && found_compress && !has_new_user_content {
+        Some(harnx_core::session::CompactOutcome::Unchanged(
+            harnx_core::session::UnchangedReason::AlreadyCompacted,
+        ))
+    } else {
+        None
+    }
+}
+
+impl SessionTurn {
+    /// Hydrate per_session.session from log entries if not already set.
+    async fn hydrate_session_from_entries(
+        &self,
+        entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    ) -> Result<()> {
+        // Check if session is already hydrated
+        {
+            let guard = self.per_session.read();
+            if guard.session.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Get metadata store from backend - use public accessor
+        let store = self
+            .backend
+            .metadata_store_opt()
+            .context("No metadata store on backend")?;
+        let metadata = store
+            .get(&self.activation.session_id)
+            .await?
+            .context("Session metadata not found")?;
+
+        // Build base session from metadata
+        let mut session = crate::config::session::new(
+            &self.per_session.read(),
+            &metadata.metadata.session_id,
+            None,
+        )?;
+        session.id = metadata.metadata.session_id.clone();
+        session.session_id = Some(metadata.metadata.session_id.clone());
+        session.working_dir = None;
+        session.git_branch = None;
+        session.git_remote = None;
+        session.terminal_session_id = None;
+        session.agent_variables = metadata.metadata.variables.clone();
+        session.title = metadata.metadata.title.value.clone();
+        session.title_last_updated_tokens = if metadata.metadata.title.manual {
+            usize::MAX
+        } else {
+            metadata.metadata.title.last_updated_tokens
+        };
+
+        // Replay entries into session - entries are already (u64, SessionLogEntry)
+        let entries_vec: Vec<(u64, harnx_core::session::SessionLogEntry)> = entries.to_vec();
+
+        let session =
+            crate::nats_session_log::load_session_from_entries_with_metadata_preserving_pending(
+                &entries_vec,
+                &self.activation.session_id,
+                session,
+            )?;
+
+        // Set the hydrated session with a persistence sink for compaction.
+        // Without session.runtime, the Compress marker and re-logged suffix messages
+        // would be dropped ("no persistence sink attached").
+        {
+            let mut guard = self.per_session.write();
+            guard.session = Some(session);
+            // Attach a fenced sink for compaction's Compress + suffix re-logging.
+            if let Some(session) = guard.session.as_mut() {
+                let sink: Arc<dyn crate::config::session::SessionAppendSink> =
+                    Arc::new(super::backend::FencedSessionLogSink::new(
+                        self.backend.clone(),
+                        Arc::clone(&self.lease),
+                    ));
+                session.runtime = Some(Arc::new(sink));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convert compaction result to outcome.
+    fn compaction_outcome_from_result(
+        &self,
+        result: &anyhow::Result<()>,
+    ) -> harnx_core::session::CompactOutcome {
+        match result {
+            Ok(()) => harnx_core::session::CompactOutcome::Compacted,
+            Err(error) => crate::config::session_ops_compaction::classify_compaction_error(error),
+        }
+    }
+
+    /// Emit the completion event and append CompactResult.
+    async fn emit_and_record_result(
+        &self,
+        compaction_id: &str,
+        outcome: harnx_core::session::CompactOutcome,
+    ) -> Result<()> {
+        match &outcome {
+            harnx_core::session::CompactOutcome::Compacted => {
+                self.event_sink.emit(harnx_core::event::AgentEvent::Session(
+                    harnx_core::event::SessionEvent::CompactingCompleted {
+                        compaction_id: Some(compaction_id.to_string()),
+                        outcome: harnx_core::session::CompactOutcome::Compacted,
+                    },
+                ));
+            }
+            harnx_core::session::CompactOutcome::Unchanged(reason) => {
+                harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+                    harnx_core::event::SessionEvent::CompactingCompleted {
+                        compaction_id: Some(compaction_id.to_string()),
+                        outcome: harnx_core::session::CompactOutcome::Unchanged(reason.clone()),
+                    },
+                ));
+            }
+            harnx_core::session::CompactOutcome::Failed(error) => {
+                harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+                    harnx_core::event::SessionEvent::CompactingFailed {
+                        compaction_id: Some(compaction_id.to_string()),
+                        error: error.clone(),
+                    },
+                ));
+            }
+        }
+        self.append_compact_result(compaction_id, outcome).await
+    }
+
+    /// Append CompactResult entry to the log via the fenced sink.
+    async fn append_compact_result(
+        &self,
+        compaction_id: &str,
+        outcome: harnx_core::session::CompactOutcome,
+    ) -> Result<()> {
+        let sink = super::backend::FencedSessionLogSink::new(
+            self.backend.clone(),
+            Arc::clone(&self.lease),
+        );
+
+        let entry = harnx_core::session::SessionLogEntry::compact_result(
+            compaction_id.to_string(),
+            outcome,
+        );
+
+        sink.append(&entry)?;
+        Ok(())
+    }
 }
 
 fn advance_high_water(high_water: &mut Option<u64>, consumed: u64) {
     *high_water = Some(high_water.map_or(consumed, |previous| previous.max(consumed)));
+}
+
+#[cfg(test)]
+mod compaction_deferral_tests {
+    use super::*;
+    use harnx_core::session::SessionLogEntry;
+
+    /// Test that compaction is deferred when there are orphan tool calls
+    /// (ToolCalls without matching ToolResults).
+    #[test]
+    fn defers_when_orphan_tool_calls_exist() {
+        // Create entries with orphan tool calls
+        let entries = vec![(
+            1u64,
+            SessionLogEntry::ToolCalls {
+                text: "calling tools".to_string(),
+                thought: None,
+                calls: vec![],
+                timestamp: None,
+                fence_token: None,
+            },
+        )];
+
+        // Apply log mutations to get effective entries
+        let effective =
+            harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).unwrap();
+
+        // Should defer because there's an orphan tool call
+        let should_defer = should_defer_compaction(&effective, &entries).unwrap();
+        assert!(
+            should_defer,
+            "should defer compaction when orphan tool calls exist"
+        );
+    }
+
+    /// Test that compaction is NOT deferred when tool round is settled.
+    #[test]
+    fn does_not_defer_when_tool_round_settled() {
+        // Create entries with matched ToolCalls and ToolResults
+        let entries = vec![
+            (
+                1u64,
+                SessionLogEntry::ToolCalls {
+                    text: "calling tools".to_string(),
+                    thought: None,
+                    calls: vec![],
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                2u64,
+                SessionLogEntry::ToolResults {
+                    results: vec![],
+                    timestamp: None,
+                },
+            ),
+        ];
+
+        // Apply log mutations to get effective entries
+        let effective =
+            harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).unwrap();
+
+        // Should NOT defer because tool round is settled
+        let should_defer = should_defer_compaction(&effective, &entries).unwrap();
+        assert!(
+            !should_defer,
+            "should NOT defer compaction when tool round is settled"
+        );
+    }
+
+    /// Test that compaction is deferred when there's a pending HITL approval.
+    #[test]
+    fn defers_when_pending_hitl_approval() {
+        // Create entries with orphan tool call and pending HITL approval
+        let entries = vec![
+            (
+                1u64,
+                SessionLogEntry::ToolCalls {
+                    text: "calling tools".to_string(),
+                    thought: None,
+                    calls: vec![],
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                2u64,
+                SessionLogEntry::HitlApprovalRequested {
+                    tool_call_id: "call-1".to_string(),
+                    summary: "Approve this tool".to_string(),
+                    fence_token: 0,
+                },
+            ),
+        ];
+
+        // Apply log mutations to get effective entries
+        let effective =
+            harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).unwrap();
+
+        // Should defer because there's a pending HITL approval
+        let should_defer = should_defer_compaction(&effective, &entries).unwrap();
+        assert!(
+            should_defer,
+            "should defer compaction when pending HITL approval exists"
+        );
+    }
+
+    /// Test that compaction is NOT deferred when HITL approval was decided.
+    #[test]
+    fn does_not_defer_when_hitl_decision_made() {
+        // Create entries with tool call, HITL request, and decision
+        let entries = vec![
+            (
+                1u64,
+                SessionLogEntry::ToolCalls {
+                    text: "calling tools".to_string(),
+                    thought: None,
+                    calls: vec![],
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                2u64,
+                SessionLogEntry::HitlApprovalRequested {
+                    tool_call_id: "call-1".to_string(),
+                    summary: "Approve this tool".to_string(),
+                    fence_token: 0,
+                },
+            ),
+            (
+                3u64,
+                SessionLogEntry::HitlApprovalDecision {
+                    tool_call_id: "call-1".to_string(),
+                    approved: true,
+                    note: None,
+                    fence_token: 0,
+                },
+            ),
+            (
+                4u64,
+                SessionLogEntry::ToolResults {
+                    results: vec![],
+                    timestamp: None,
+                },
+            ),
+        ];
+
+        // Apply log mutations to get effective entries
+        let effective =
+            harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).unwrap();
+
+        // Should NOT defer because HITL decision was made and tool round settled
+        let should_defer = should_defer_compaction(&effective, &entries).unwrap();
+        assert!(
+            !should_defer,
+            "should NOT defer compaction when HITL decision made and tool round settled"
+        );
+    }
 }

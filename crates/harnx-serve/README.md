@@ -202,6 +202,18 @@ Same canonical session URL, negotiated into programmatic control.
     log sequence.
   - `{ "outcome": "already_interrupted", "cancel_seq": 12 }` — a `Cancel`
     already terminates this turn. Repeating the call is harmless.
+- **`session/compact`**: Requests manual compaction of the session's conversation history.
+  Takes no parameters.
+  ```json
+  { "jsonrpc": "2.0", "id": 4, "method": "session/compact" }
+  ```
+  **Result:** one of
+  - `{ "status": "submitted", "compaction_id": "..." }` — compaction request submitted to the session log.
+  - `{ "status": "already_in_flight", "compaction_id": "..." }` — attached to an existing compaction operation.
+  - `{ "status": "nothing_to_do", "outcome": { ... } }` — tail log indicates compaction is unnecessary. `outcome` is an adjacent-tagged `CompactOutcome`:
+    - `{ "status": "compacted" }` — session was recently compacted.
+    - `{ "status": "unchanged", "detail": "no_user_messages" | "nothing_eligible" | "already_compacted" }` — nothing to compact for the given reason.
+    - `{ "status": "failed", "detail": "..." }` — prior compaction attempt failed with the error message in `detail`.
 
 **Error Codes:**
 - `-32001`: Unknown session (HTTP 404)

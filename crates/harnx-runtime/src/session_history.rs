@@ -46,6 +46,8 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::HitlApprovalDecision { .. } => "hitl_approval_decision",
         SessionLogEntry::EditEntries { .. } => "edit_entries",
         SessionLogEntry::Rewind { .. } => "rewind",
+        SessionLogEntry::CompactRequest { .. } => "compact_request",
+        SessionLogEntry::CompactResult { .. } => "compact_result",
         SessionLogEntry::Unknown => "unknown",
     }
 }

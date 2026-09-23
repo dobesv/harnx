@@ -84,12 +84,14 @@ openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
 .session                 Open the session picker
 .session <agent> <id>    Switch to an explicitly identified agent session
 .empty session           Clear session messages
-.compact session         Compact session messages using configured compaction agent
+.compact session         Compact session messages using configured compaction agent (local and NATS-backed sessions)
 .info session <agent> <id> [--format text|yaml|json] Show session metadata in overlay
 .dump session <agent> <id> [--format text|yaml|json] Show session transcript dump in overlay
 .edit session            Modify current session
 .save session            Save current session to file
 ```
+
+Use `.compact session` to summarize earlier messages and reduce transcript size. On NATS-backed sessions, it delegates compaction to the leased worker and updates the view once committed.
 
 ### `.agent` - agent management
 

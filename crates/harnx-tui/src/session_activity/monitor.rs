@@ -344,9 +344,9 @@ fn event_activity(event: &AgentEvent) -> Option<bool> {
         | AgentEvent::Model(_)
         | AgentEvent::Tool(_)
         | AgentEvent::Status(_) => Some(true),
-        AgentEvent::Session(SessionEvent::CompactingStarted) => Some(true),
+        AgentEvent::Session(SessionEvent::CompactingStarted { .. }) => Some(true),
         AgentEvent::Session(
-            SessionEvent::CompactingCompleted | SessionEvent::CompactingFailed(_),
+            SessionEvent::CompactingCompleted { .. } | SessionEvent::CompactingFailed { .. },
         ) => Some(false),
         // Nested activity keeps the parent turn busy. A nested Ended event is
         // not the parent session's terminal boundary.

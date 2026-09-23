@@ -23,6 +23,7 @@ import { SubAgentSessionNotes } from './SubAgentSessionNotes';
 import { MessageAttachments } from './MessageAttachments';
 import { sendPrompt, submitHitlDecision, uploadAttachment, markRead, markUnread } from './api';
 import { CancellationContext, type CancellationControl } from './CancellationContext';
+import { CompactionContext } from './CompactionContext';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import { AttachIcon, SendIcon, StopIcon } from './icons';
@@ -477,18 +478,46 @@ const RunStateMonitor = ({ onRunFinish }: { onRunFinish: () => void }) => {
   return null;
 };
 
+type StatusIndicatorTextArgs = {
+  compacting: boolean;
+  phase: CancellationControl['phase'];
+  isRunning: boolean;
+  statusText: string | null;
+  statusMessage: string | null;
+};
+
+function statusIndicatorText({
+  compacting,
+  phase,
+  isRunning,
+  statusText,
+  statusMessage,
+}: StatusIndicatorTextArgs): string | undefined {
+  if (compacting) return 'Compacting…';
+  if (phase === 'requesting') return 'Interrupting…';
+  if (isRunning) return statusText || 'Running…';
+  return statusMessage || statusText || undefined;
+}
+
 export const StatusIndicator = ({ isRunning, statusText }: { isRunning: boolean, statusText: string | null }) => {
   const { phase } = useContext(CancellationContext);
+  const compaction = useContext(CompactionContext);
+  const { statusMessage } = useContext(PendingContext);
+
+  const compacting = compaction.phase === 'compacting';
+  const showSpinner = compacting || (isRunning && phase !== 'failed');
+  const text = statusIndicatorText({ compacting, phase, isRunning, statusText, statusMessage });
+
   return (
-  <div className="aui-status-left">
-    {isRunning && phase !== 'failed' ? (
-      <span className="aui-spinner"><span></span></span>
-    ) : (
-      <span className="aui-idle-dot"></span>
-    )}
-    <span className="aui-status-text">{phase === 'requesting' ? 'Interrupting…' : statusText || (isRunning ? 'Running...' : 'Idle')}</span>
-  </div>
-);
+    <div className="aui-status-left">
+      {showSpinner ? (
+        <span className="aui-spinner"><span></span></span>
+      ) : (
+        <span className="aui-idle-dot"></span>
+      )}
+      <span className="aui-status-text">{text}</span>
+    </div>
+  );
 };
 
 const UsageItem = ({ icon, label, value }: { icon: string, label: string, value: string }) => (
@@ -518,13 +547,14 @@ const UsageIndicator = ({ usage }: { usage: UsageData }) => {
 };
 
 export const StatusBar = () => {
-  const { statusText } = useContext(PendingContext);
+  const { statusText, statusMessage } = useContext(PendingContext);
   const { usage } = useContext(UsageContext);
+  const compaction = useContext(CompactionContext);
   const isRunning = useAuiState(s => s.thread.isRunning);
 
   return (
     <div role="status" aria-live="polite" aria-atomic="true">
-      {(isRunning || usage || statusText) && (
+      {(isRunning || usage || statusText || statusMessage || compaction.phase === 'compacting') && (
         <div className="aui-status-bar">
           <StatusIndicator isRunning={isRunning} statusText={statusText} />
           {usage && <UsageIndicator usage={usage} />}

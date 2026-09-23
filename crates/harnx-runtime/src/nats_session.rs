@@ -54,9 +54,13 @@ use crate::nats_worker::{
     SessionActivationRoute,
 };
 use crate::utils::AbortSignal;
+mod compaction_request;
+#[cfg(test)]
+mod compaction_request_tests;
 mod completion;
 mod hitl;
 pub mod interrupt;
+pub use compaction_request::{request_compaction_session, CompactSubmit, CompactionRequest};
 pub use completion::completed_subagent_progress;
 pub use interrupt::{interrupt_session, InterruptOutcome, InterruptRequest};
 #[cfg(test)]
@@ -1740,6 +1744,8 @@ fn render_log_entry_to_sink(
         | SessionLogEntry::Clear
         | SessionLogEntry::EditEntries { .. }
         | SessionLogEntry::Rewind { .. }
+        | SessionLogEntry::CompactRequest { .. }
+        | SessionLogEntry::CompactResult { .. }
         | SessionLogEntry::Unknown => false,
     };
     if rendered {

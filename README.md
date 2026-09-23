@@ -149,6 +149,10 @@ and a committed decision is not revoked. See the
 When upgrading a cluster, deploy readers that understand new session-log entry
 types before enabling writers that emit them; older readers reject unknown entries.
 
+Manual compaction summarizes earlier history into a single entry while keeping recent context.
+Trigger it via the CLI (`harnx compact session <agent> <session>`), TUI (`.compact session`),
+or Web UI ("Compact session" in the session dropdown). See [Manual Compaction](docs/nats-ha.md#manual-compaction).
+
 ### Macro
 
 Streamline repetitive tasks by combining a series of dot-commands into a custom macro.

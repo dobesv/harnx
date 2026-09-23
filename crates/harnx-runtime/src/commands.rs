@@ -63,7 +63,7 @@ pub static COMMANDS: LazyLock<[Command; 49]> = LazyLock::new(|| {
         Command::new(".reset repl", "Alias for .reset session"),
         Command::new(
             ".compact session",
-            "Compact session messages using configured compaction agent",
+            "Compact session messages using configured compaction agent (supports NATS-backed sessions)",
         ),
         Command::with_usage(
             ".info session",
@@ -536,74 +536,12 @@ pub async fn run_command_with_output_and_local_worker(
             }
             ".compact" => match args {
                 Some("session") => {
-                    // Atomically guard against concurrent compaction (auto or
-                    // manual) and claim the compacting flag under a single write
-                    // lock. The agent loop and auto-compaction both consult
-                    // `is_compacting_session()` (the `compressing` flag), so we
-                    // must set it here for the duration of the manual run.
-                    enum Claim {
-                        Claimed,
-                        AlreadyCompacting,
-                        NoSession,
-                    }
-                    let claim = {
-                        let mut cfg = config.write();
-                        match cfg.session.as_mut() {
-                            None => Claim::NoSession,
-                            Some(session) if session.compressing() => Claim::AlreadyCompacting,
-                            Some(session) => {
-                                session.set_compressing(true);
-                                Claim::Claimed
-                            }
-                        }
-                    };
-                    match claim {
-                        Claim::NoSession => {
-                            writeln!(output, "No active session to compact.")?;
-                            return Ok(CommandOutcome::Continue);
-                        }
-                        Claim::AlreadyCompacting => {
-                            writeln!(output, "Compaction already in progress.")?;
-                            return Ok(CommandOutcome::Continue);
-                        }
-                        Claim::Claimed => {}
-                    }
-                    // Emit start event, run compaction, then emit completion or
-                    // failure. Always clear the compacting flag afterwards. All
-                    // user-visible feedback flows through the SessionEvents
-                    // (rendered by the TUI transcript / CLI spinner sink) so we
-                    // do NOT also write to `output` — that would double-render
-                    // the message in the TUI/CLI.
-                    harnx_core::sink::emit_agent_event(
-                        harnx_core::event::AgentEvent::Session(
-                            harnx_core::event::SessionEvent::CompactingStarted,
-                        ),
-                    );
-                    let result = Config::compact_session(config).await;
-                    if let Some(session) = config.write().session.as_mut() {
-                        session.set_compressing(false);
-                    }
-                    match result {
-                        Ok(()) => {
-                            harnx_core::sink::emit_agent_event(
-                                harnx_core::event::AgentEvent::Session(
-                                    harnx_core::event::SessionEvent::CompactingCompleted,
-                                ),
-                            );
-                        }
-                        Err(err) => {
-                            // Emit the failure event only. Do NOT propagate the
-                            // error or write to `output` — either would render
-                            // the failure a second time.
-                            harnx_core::sink::emit_agent_event(
-                                harnx_core::event::AgentEvent::Session(
-                                    harnx_core::event::SessionEvent::CompactingFailed(
-                                        err.to_string(),
-                                    ),
-                                ),
-                            );
-                        }
-                    }
+                    crate::config::session_ops_compaction::handle_compact_session_command(
+                        config,
+                        &abort_signal,
+                        output,
+                    )
+                    .await?;
                 }
                 _ => writeln!(output, r#"Usage: .compact session"#)?,
             },
@@ -1821,6 +1759,84 @@ mod session_target_tests {
         assert_eq!(
             super::explicit_session_target("alpha review-12345", ".session").unwrap(),
             ("alpha".into(), "review-12345".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_session_tests {
+    use super::*;
+    use crate::config::WorkingMode;
+
+    fn command_config() -> GlobalConfig {
+        Arc::new(parking_lot::RwLock::new(Config {
+            working_mode: WorkingMode::Cmd,
+            ..Default::default()
+        }))
+    }
+
+    async fn run_compact_for_test(
+        config: &GlobalConfig,
+        command: &str,
+    ) -> (Result<CommandOutcome>, String) {
+        let mut output = Vec::new();
+        let abort_signal = crate::utils::create_abort_signal();
+        let result = run_command_with_output(config, abort_signal, command, &mut output).await;
+        let output = String::from_utf8(output).expect("utf8 output");
+        (result, output)
+    }
+
+    /// Verify that `.compact session` usage string is printed for invalid args.
+    #[tokio::test]
+    async fn compact_session_shows_usage_for_invalid_args() {
+        let config = command_config();
+        let (result, out) = run_compact_for_test(&config, ".compact").await;
+        result.expect("command succeeds");
+        assert!(out.contains("Usage: .compact session"), "got: {out:?}");
+    }
+
+    /// Verify that `.compact session` with no active session prints a helpful message.
+    #[tokio::test]
+    async fn compact_session_no_active_session() {
+        let config = command_config();
+        let (result, out) = run_compact_for_test(&config, ".compact session").await;
+        result.expect("command succeeds");
+        assert!(
+            out.contains("No active session to compact."),
+            "got: {out:?}"
+        );
+    }
+
+    /// Verify that `.compact session` on a truly local (no-session) configuration
+    /// outputs the correct "No active session to compact" message to stdout.
+    ///
+    /// This test focuses on the no-session code path that we can genuinely test
+    /// without NATS. The NATS-backed session compaction is tested in the worker
+    /// integration tests.
+    #[tokio::test]
+    async fn compact_session_no_active_session_message() {
+        // Set up an agent so the configuration is valid
+        let mut cfg = Config {
+            working_mode: WorkingMode::Cmd,
+            // Set up minimal NATS config to make remote_nats_session fail
+            nats_servers: vec![],
+            // Ensure no remote agent is set
+            remote_agent: None,
+            ..Default::default()
+        };
+        let mut agent = crate::config::Agent::default();
+        agent.set_name("test-agent");
+        cfg.use_agent_obj(agent).expect("agent created");
+        // No session created - this tests the "No active session" path
+        let config = Arc::new(parking_lot::RwLock::new(cfg));
+
+        let (result, output_str) = run_compact_for_test(&config, ".compact session").await;
+        assert!(result.is_ok(), "command should succeed: {:?}", result);
+
+        assert!(
+            output_str.contains("No active session to compact"),
+            "expected 'No active session to compact' message, got: {}",
+            output_str
         );
     }
 }

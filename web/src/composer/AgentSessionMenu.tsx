@@ -1,6 +1,10 @@
+import { useContext } from 'react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { ChevronDownIcon, MenuIcon } from '../icons';
 import { LinkButton } from '../LinkButton';
+import { CompactionContext } from '../CompactionContext';
+import { compactSession, formatUnchangedReason } from '../compactionApi';
+import { PendingContext } from '../PendingContext';
 
 export interface AgentSessionMenuProps {
   agentName: string;
@@ -35,6 +39,40 @@ export function AgentDropdown(props: AgentSessionMenuProps) {
   );
 }
 
+function CompactSessionItem({ agentName, sessionId }: { agentName: string; sessionId: string }) {
+  const compaction = useContext(CompactionContext);
+  const { setStatusMessage, setErrorText } = useContext(PendingContext);
+
+  const handleCompact = async () => {
+    try {
+      const result = await compactSession(agentName, sessionId);
+      if (result.status === 'already_in_flight') {
+        setStatusMessage('Compaction already in progress');
+      } else if (result.status === 'nothing_to_do') {
+        setStatusMessage(formatUnchangedReason(result.outcome.detail));
+      }
+      // submitted: spinner will show via CompactionContext
+    } catch (err) {
+      setErrorText(err instanceof Error ? err.message : 'Failed to compact session');
+    }
+  };
+
+  const isCompacting = compaction.phase === 'compacting';
+
+  return (
+    <DropdownMenu.Item
+      className="aui-composer-menu-item"
+      onSelect={handleCompact}
+      disabled={isCompacting}
+    >
+      {isCompacting ? (
+        <span className="aui-spinner"><span></span></span>
+      ) : null}
+      Compact session
+    </DropdownMenu.Item>
+  );
+}
+
 export function SessionDropdown(props: AgentSessionMenuProps) {
   const sessionLabel = `Session: ${props.sessionId}${props.unread ? ' (unread)' : ''}`;
   return (
@@ -60,6 +98,7 @@ export function SessionDropdown(props: AgentSessionMenuProps) {
               Switch session…
             </LinkButton>
           </DropdownMenu.Item>
+          <CompactSessionItem agentName={props.agentName} sessionId={props.sessionId} />
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
@@ -101,6 +140,7 @@ export function AgentSessionMenu(props: AgentSessionMenuProps) {
                 Switch session…
               </LinkButton>
             </DropdownMenu.Item>
+            <CompactSessionItem agentName={props.agentName} sessionId={props.sessionId} />
           </DropdownMenu.Group>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>

@@ -5,6 +5,8 @@
 #[path = "nats_worker/cancellation.rs"]
 mod cancellation;
 mod common;
+#[path = "nats_worker/manual_compaction.rs"]
+mod manual_compaction;
 use harnx_runtime::nats_session_log::NatsSessionLog;
 #[allow(dead_code)]
 #[path = "common/generation.rs"]

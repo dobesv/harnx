@@ -5,7 +5,7 @@ use crate::types::{ExitPhase, ModalState, TranscriptItem, Tui};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use crossterm::ExecutableCommand;
-use harnx_core::event::{AgentEvent, AgentSource};
+use harnx_core::event::{AgentEvent, AgentSource, SessionEvent};
 use harnx_render::pretty_error_string;
 use harnx_runtime::config::{
     dump_entries_jsonl, dump_entries_yaml, list_assistant_agents, load_session_for_render,
@@ -850,8 +850,67 @@ impl Tui {
         self.flush_pending_thought();
     }
 
+    async fn render_compaction_event(&mut self, event: SessionEvent) -> Vec<TranscriptItem> {
+        match event {
+            SessionEvent::CompactingStarted { .. } => vec![TranscriptItem::SystemText(
+                "Compacting session…".to_string(),
+            )],
+            SessionEvent::CompactingCompleted { outcome, .. } => match outcome {
+                harnx_core::session::CompactOutcome::Compacted => {
+                    // Normal completion - reload transcript
+                    self.app.transcript = session_history_transcript_items(&self.config).await;
+                    self.subagent_rows_dirty = true;
+                    self.app.streaming_open = false;
+                    // A compaction can land mid-turn after some assistant text has
+                    // already streamed. The rebuild drops the parent streamed row, so its
+                    // replacement index must also be cleared before the eventual Final event.
+                    self.app.main_streamed_text_idx = None;
+                    // The rebuild drops all SourceHeading entries, so the next
+                    // output must re-emit its heading even if it shares the prior
+                    // source. Without this, the first post-compaction message would
+                    // render without an agent label.
+                    self.app.last_ui_output_source = None;
+                    // The transcript is entirely rebuilt, so any prior focus/anchor
+                    // indices reference now-different items even when still in
+                    // bounds. Clear selection/detail state unconditionally.
+                    self.app.transcript_focus = None;
+                    self.app.transcript_selection_anchor = None;
+                    self.pin_transcript_to_bottom();
+                    vec![]
+                }
+                harnx_core::session::CompactOutcome::Unchanged(reason) => {
+                    // Nothing was compacted - neutral system message, NOT an error.
+                    // Clear any spinner state (CompactingStarted may have shown one).
+                    let text = match reason {
+                        harnx_core::session::UnchangedReason::NoUserMessages => {
+                            "No user messages to compact"
+                        }
+                        harnx_core::session::UnchangedReason::NothingEligible => {
+                            "Nothing eligible for compaction"
+                        }
+                        harnx_core::session::UnchangedReason::AlreadyCompacted => {
+                            "Session already compacted"
+                        }
+                    };
+                    vec![TranscriptItem::SystemText(text.to_string())]
+                }
+                harnx_core::session::CompactOutcome::Failed(err) => {
+                    // Treat as error - this shouldn't normally come through Completed,
+                    // but handle it defensively.
+                    vec![TranscriptItem::ErrorText(format!(
+                        "Compaction failed: {err}"
+                    ))]
+                }
+            },
+            SessionEvent::CompactingFailed { error, .. } => vec![TranscriptItem::ErrorText(
+                format!("Compaction failed: {error}"),
+            )],
+            _ => vec![],
+        }
+    }
+
     pub(super) async fn render_agent_event(&mut self, event: AgentEvent) {
-        use harnx_core::event::{ModelEvent, NoticeEvent, SessionEvent, ToolEvent, UserEvent};
+        use harnx_core::event::{ModelEvent, NoticeEvent, ToolEvent, UserEvent};
 
         let (source, event, is_sub_agent) = match event {
             AgentEvent::SubAgent { source, event } => (Some(source), *event, true),
@@ -1148,38 +1207,11 @@ impl Tui {
                     rendered_cache: None,
                 }]
             }
-            AgentEvent::Session(SessionEvent::CompactingStarted) => {
-                vec![TranscriptItem::SystemText(
-                    "Compacting session…".to_string(),
-                )]
-            }
-            AgentEvent::Session(SessionEvent::CompactingCompleted) => {
-                self.app.transcript = session_history_transcript_items(&self.config).await;
-                self.subagent_rows_dirty = true;
-                self.app.streaming_open = false;
-                // A compaction can land mid-turn after some assistant text has
-                // already streamed. The rebuild drops that streamed row, so the
-                // The rebuild drops the parent streamed row, so its replacement
-                // index must also be cleared before the eventual Final event.
-                self.app.main_streamed_text_idx = None;
-                // The rebuild drops all SourceHeading entries, so the next
-                // output must re-emit its heading even if it shares the prior
-                // source. Without this, the first post-compaction message would
-                // render without an agent label.
-                self.app.last_ui_output_source = None;
-                // The transcript is entirely rebuilt, so any prior focus/anchor
-                // indices reference now-different items even when still in
-                // bounds. Clear selection/detail state unconditionally.
-                self.app.transcript_focus = None;
-                self.app.transcript_selection_anchor = None;
-                self.pin_transcript_to_bottom();
-                vec![]
-            }
-            AgentEvent::Session(SessionEvent::CompactingFailed(err)) => {
-                vec![TranscriptItem::ErrorText(format!(
-                    "Compaction failed: {err}"
-                ))]
-            }
+            AgentEvent::Session(
+                session_event @ (SessionEvent::CompactingStarted { .. }
+                | SessionEvent::CompactingCompleted { .. }
+                | SessionEvent::CompactingFailed { .. }),
+            ) => self.render_compaction_event(session_event).await,
             AgentEvent::Session(SessionEvent::TitleGenerationFailed(err)) => {
                 vec![TranscriptItem::ErrorText(format!(
                     "Title generation failed: {err}"
@@ -1188,6 +1220,11 @@ impl Tui {
             AgentEvent::Session(SessionEvent::TitleUpdated(title)) => {
                 let _ = std::io::stdout().execute(crossterm::terminal::SetTitle(&title));
                 vec![]
+            }
+            AgentEvent::Session(SessionEvent::Generic { text }) => {
+                // Generic system message from frontend (e.g., compaction already in progress,
+                // nothing to compact). Render as neutral SystemText.
+                vec![TranscriptItem::SystemText(text)]
             }
             _ => vec![],
         };

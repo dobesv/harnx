@@ -11,6 +11,9 @@ export const PendingContext = createContext<{
   setStatusText: (t: string | null) => void;
   errorText: string | null;
   setErrorText: (t: string | null) => void;
+  /** Status message for neutral feedback (e.g., "Nothing to compact"). */
+  statusMessage: string | null;
+  setStatusMessage: (t: string | null) => void;
   /** Hydrated pending approvals from hitl_pending_approval CUSTOM events. */
   hydratedApprovals: HydratedPendingApproval[];
   /** Add a hydrated approval (from hitl_pending_approval CUSTOM event). */
@@ -18,11 +21,13 @@ export const PendingContext = createContext<{
   /** Clear hydrated approvals (e.g., when session changes). */
   clearHydratedApprovals: () => void;
   removeHydratedApproval: (toolCallId: string) => void;
-}>({ 
+}>({
   statusText: null,
   setStatusText: () => {},
   errorText: null,
   setErrorText: () => {},
+  statusMessage: null,
+  setStatusMessage: () => {},
   hydratedApprovals: [],
   addHydratedApproval: () => {},
   clearHydratedApprovals: () => {},
