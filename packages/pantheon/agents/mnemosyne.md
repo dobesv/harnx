@@ -33,7 +33,7 @@ description: "Repository knowledge curator \u2014 reconciles verified learnings 
   \ current docs, scoped instructions, code comments, or tests so future\
   \ work can retrieve them. Named after Mnemosyne (neh-MOZ-ih-nee), Titan of Memory\
   \ and mother of the Muses.\n"
-version: '0.4.1'
+version: '0.4.2'
 variables:
 - name: mnemosyne_core
   description: Core identity and instructions for Mnemosyne

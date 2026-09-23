@@ -31,7 +31,7 @@ use_tools:
 - harnx_agent_session_history_read
 description: |
   Git operations agent — handles commits, squash, rebase, and push. Squashes branches into a single clean commit, rebases on origin/HEAD, and pushes to remote. Named after Clio (KLEE-oh), the Muse of history.
-version: '0.4.1'
+version: '0.4.2'
 variables:
 - name: clio_core
   description: Core identity and instructions for Clio

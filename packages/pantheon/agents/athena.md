@@ -36,7 +36,7 @@ use_tools:
 - pytheas_session_prompt
 - harnx_agent_session_history_read
 description: "Complex multi-faceted strategy and execution specialist — commands the field when a high-effort task is too complex for a specialist. Named after Athena (uh-THEE-nuh), Goddess of Strategic Warfare.\n"
-version: '0.4.1'
+version: '0.4.2'
 variables:
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)

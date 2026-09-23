@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.4.2 (2026-09-23)
+
+### Fixes
+
+- restore Windows x86 and Web UI assets (#2073)
+
 ## 0.4.1 (2026-09-23)
 
 ### Fixes
