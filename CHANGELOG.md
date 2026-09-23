@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.34.1 (2026-09-23)
+
+### Fixes
+
+- support Agent Sandbox v1 APIs (#2067)
+- Use the Agent Sandbox v1beta1 APIs, warm pool claims, and operating mode lifecycle so the Kubernetes sandbox gateway works with Agent Sandbox v1 releases.
+
 ## 0.34.0 (2026-09-22)
 
 ### Breaking Changes

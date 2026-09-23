@@ -36,7 +36,7 @@ use_tools:
 - pytheas_session_prompt
 - harnx_agent_session_history_read
 description: "Maintenance, stability, and routine tasks specialist — keeps the codebase warm, clean, and stable for day-to-day operations. Named after Hestia (HES-tee-uh), Guardian of the Hearth.\n"
-version: '0.4.0'
+version: '0.4.1'
 variables:
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)

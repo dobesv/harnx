@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.1 (2026-09-23)
+
+### Fixes
+
+- support Agent Sandbox v1 APIs (#2067)
+
 ## 0.4.0 (2026-09-22)
 
 ### Breaking Changes
