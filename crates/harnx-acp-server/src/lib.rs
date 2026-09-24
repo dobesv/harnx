@@ -44,6 +44,7 @@ pub mod session_context;
 pub use event_sink::{AcpEventSink, AcpMessage, SignalHandle};
 pub use handoff::HandoffTarget;
 pub use server_main::run;
+use session_context::BeginTurnError;
 pub use session_context::{SessionContext, SESSION_IDLE_TTL};
 
 /// Connection to ACP client for sending notifications and permission requests.
@@ -236,16 +237,19 @@ impl HarnxAgent {
     pub async fn prompt(&self, request: PromptRequest) -> acp::Result<PromptResponse> {
         let session_id = request.session_id.0.to_string();
         let session_ctx = self.get_session(&session_id).await?;
-        if let Some(target) = session_ctx.handoff_target() {
-            return Err(acp_error(anyhow::anyhow!(target.prompt_rejection())));
-        }
+        let (turn_guard, cancel_rx) = match session_ctx.begin_turn() {
+            Ok(turn) => turn,
+            Err(BeginTurnError::Active) => {
+                session_ctx.touch();
+                return Err(acp_error(anyhow::anyhow!(
+                    "session already has an in-flight turn: {session_id}"
+                )));
+            }
+            Err(BeginTurnError::HandedOff(target)) => {
+                return Err(acp_error(anyhow::anyhow!(target.prompt_rejection())));
+            }
+        };
         session_ctx.touch();
-
-        let (turn_guard, cancel_rx) = session_ctx.begin_turn().ok_or_else(|| {
-            acp_error(anyhow::anyhow!(
-                "session already has an in-flight turn: {session_id}"
-            ))
-        })?;
         let input = Input::new(
             parse_prompt_content(&request),
             (String::new(), vec![]),

@@ -27,6 +27,21 @@ struct InFlightTurn {
     cancel_tx: mpsc::Sender<()>,
 }
 
+#[derive(Default)]
+struct SessionState {
+    active_turn: Option<InFlightTurn>,
+    handoff_target: Option<HandoffTarget>,
+}
+
+/// Reason a prompt cannot acquire the session turn gate.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum BeginTurnError {
+    /// Another prompt is still running or cancelling.
+    Active,
+    /// Source stopped accepting prompts after this committed handoff.
+    HandedOff(HandoffTarget),
+}
+
 /// Releases one session's active-turn gate on every exit path.
 ///
 /// `finish()` handles normal completion before `prompt()` returns. `Drop` is the
@@ -57,11 +72,9 @@ pub struct SessionContext {
     /// Milliseconds since `created_at`, stored atomically for idle checks.
     last_active_ms: AtomicU64,
     created_at: Instant,
-    /// Remains occupied while a turn is running or cancelling. Cancellation
-    /// signals the sender but only `TurnGuard` releases this gate.
-    active_turn: Mutex<Option<InFlightTurn>>,
-    /// Authoritative target once this source commits a handoff.
-    handoff_target: Mutex<Option<HandoffTarget>>,
+    /// One lock linearizes handoff commit, turn admission, finish, and cancel.
+    /// No session-state operation acquires a second mutex.
+    state: Mutex<SessionState>,
 }
 
 impl SessionContext {
@@ -75,8 +88,7 @@ impl SessionContext {
             backend,
             last_active_ms: AtomicU64::new(0),
             created_at: Instant::now(),
-            active_turn: Mutex::new(None),
-            handoff_target: Mutex::new(None),
+            state: Mutex::new(SessionState::default()),
         }
     }
 
@@ -116,28 +128,33 @@ impl SessionContext {
 
     /// Record first authoritative target. Later duplicate commits have no effect.
     pub(crate) fn commit_handoff(&self, target: HandoffTarget) -> bool {
-        let mut committed = self.handoff_target.lock();
-        if committed.is_some() {
+        let mut state = self.state.lock();
+        if state.handoff_target.is_some() {
             return false;
         }
-        *committed = Some(target);
+        state.handoff_target = Some(target);
         true
     }
 
     /// Return committed target when source no longer accepts prompts.
     pub fn handoff_target(&self) -> Option<HandoffTarget> {
-        self.handoff_target.lock().clone()
+        self.state.lock().handoff_target.clone()
     }
 
-    /// Register a new in-flight turn and return its cleanup guard and cancel receiver.
-    pub(crate) fn begin_turn(self: &Arc<Self>) -> Option<(TurnGuard, mpsc::Receiver<()>)> {
-        let mut active_turn = self.active_turn.lock();
-        if active_turn.is_some() {
-            return None;
+    /// Atomically reject handed-off/active sessions or acquire turn ownership.
+    pub(crate) fn begin_turn(
+        self: &Arc<Self>,
+    ) -> Result<(TurnGuard, mpsc::Receiver<()>), BeginTurnError> {
+        let mut state = self.state.lock();
+        if let Some(target) = &state.handoff_target {
+            return Err(BeginTurnError::HandedOff(target.clone()));
+        }
+        if state.active_turn.is_some() {
+            return Err(BeginTurnError::Active);
         }
         let (cancel_tx, cancel_rx) = mpsc::channel(1);
-        *active_turn = Some(InFlightTurn { cancel_tx });
-        Some((
+        state.active_turn = Some(InFlightTurn { cancel_tx });
+        Ok((
             TurnGuard {
                 session: Arc::clone(self),
                 finished: false,
@@ -148,14 +165,14 @@ impl SessionContext {
 
     /// Clear the active-turn gate after the prompt follower has finished unwinding.
     fn finish_turn(&self) {
-        self.active_turn.lock().take();
+        self.state.lock().active_turn.take();
         self.touch();
     }
 
     /// Wake the in-process prompt follower without releasing the active-turn gate.
     pub(crate) fn cancel_local_turn(&self) -> bool {
-        let active_turn = self.active_turn.lock();
-        let Some(turn) = active_turn.as_ref() else {
+        let state = self.state.lock();
+        let Some(turn) = state.active_turn.as_ref() else {
             return false;
         };
         match turn.cancel_tx.try_send(()) {
@@ -206,28 +223,36 @@ mod tests {
     fn cancelled_turn_stays_in_flight_until_guard_drops() {
         let context = Arc::new(SessionContext::new_for_test());
         let (guard, mut cancel_rx) = context.begin_turn().expect("first turn starts");
-        assert!(context.begin_turn().is_none(), "overlap must be rejected");
+        assert!(matches!(context.begin_turn(), Err(BeginTurnError::Active)));
 
         assert!(context.cancel_local_turn());
         assert_eq!(cancel_rx.try_recv(), Ok(()));
         assert!(
-            context.begin_turn().is_none(),
+            matches!(context.begin_turn(), Err(BeginTurnError::Active)),
             "cancel signal must not release active-turn gate"
         );
 
         drop(guard);
-        assert!(context.begin_turn().is_some(), "guard drop releases gate");
+        assert!(context.begin_turn().is_ok(), "guard drop releases gate");
     }
 
     #[test]
-    fn first_committed_handoff_deactivates_source_and_wins_duplicates() {
-        let context = SessionContext::new_for_test();
+    fn committed_handoff_at_admission_boundary_rejects_source_turn() {
+        let context = Arc::new(SessionContext::new_for_test());
         let first = HandoffTarget::from_committed("atlas@prod", "target-1", "source")
             .expect("valid target");
         let duplicate = HandoffTarget::from_committed("other@prod", "target-2", "source")
             .expect("valid target");
 
+        // Reproduce the old race: prompt observed active source, then commit won
+        // immediately before admission. `begin_turn` must make the final decision.
+        assert!(context.handoff_target().is_none());
         assert!(context.commit_handoff(first.clone()));
+        assert!(matches!(
+            context.begin_turn(),
+            Err(BeginTurnError::HandedOff(target)) if target == first
+        ));
+        assert!(!context.cancel_local_turn(), "no source turn was admitted");
         assert!(!context.commit_handoff(duplicate));
         assert_eq!(context.handoff_target(), Some(first));
     }
@@ -239,7 +264,7 @@ mod tests {
 
         guard.finish();
 
-        assert!(context.begin_turn().is_some());
+        assert!(context.begin_turn().is_ok());
     }
 
     #[test]
@@ -255,6 +280,6 @@ mod tests {
         }));
 
         assert!(panic.is_err());
-        assert!(context.begin_turn().is_some(), "unwind must release gate");
+        assert!(context.begin_turn().is_ok(), "unwind must release gate");
     }
 }
