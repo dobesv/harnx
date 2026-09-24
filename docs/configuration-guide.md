@@ -118,7 +118,7 @@ patches:
 
 ## Tool Servers (`tool_servers/`)
 
-Tool servers provide external tools to Harnx. Native toolset servers (such as `harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, and `harnx-grep-tools`) run directly without a bridge wrapper, while external stdio MCP servers run via `harnx-mcp-bridge`. Each server is defined in a file under `tool_servers/` (such as `tool_servers/fs.yaml` or `tool_servers/exa.yaml`).
+Tool servers provide external tools to Harnx. Native toolset servers (such as `harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, `harnx-exa-tools`, and `harnx-grep-tools`) run directly without a bridge wrapper, while external stdio MCP servers run via `harnx-mcp-bridge`. Each server is defined in a file under `tool_servers/` (such as `tool_servers/fs.yaml` or `tool_servers/exa.yaml`).
 
 The **filename** (without `.yaml`) is used as the server name.
 
@@ -140,7 +140,7 @@ Filesystem and bash tool servers deny filesystem access when no allow inputs are
 
 ### External MCP Server Example (`harnx-mcp-bridge`)
 
-To configure an external stdio MCP server, define a server in `tool_servers/` that launches `harnx-mcp-bridge`:
+To configure an external stdio MCP server, define a server in `tool_servers/` that launches `harnx-mcp-bridge`. The bundled Exa server runs natively as `harnx-exa-tools`; this example shows how to bridge an external stdio alternative:
 
 ```yaml
 command: harnx-mcp-bridge

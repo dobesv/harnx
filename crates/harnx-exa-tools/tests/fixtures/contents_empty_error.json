@@ -1,0 +1,19 @@
+{
+  "results": [],
+  "statuses": [
+    {
+      "id": "https://missing.test",
+      "status": "error",
+      "error": { "tag": "CRUX_ERROR" }
+    },
+    {
+      "id": "https://unknown.test",
+      "status": "error",
+      "error": {}
+    },
+    {
+      "id": "https://ok.test",
+      "status": "success"
+    }
+  ]
+}

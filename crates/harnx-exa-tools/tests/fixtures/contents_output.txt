@@ -1,0 +1,14 @@
+# Async Rust
+URL: https://example.com/async-rust
+Published: 2025-02-03
+Author: Ferris
+
+First extracted document.
+Second line.
+
+# (no title)
+URL: https://example.com/untitled
+
+Untitled extracted document.
+
+Error fetching https://example.com/failed: CRAWL_TIMEOUT

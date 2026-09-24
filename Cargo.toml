@@ -21,6 +21,7 @@ members = [
     "crates/harnx-metrics",
     "crates/harnx-healthz",
     "crates/harnx-grep-tools",
+    "crates/harnx-exa-tools",
     "crates/harnx-mcp-remote",
     "crates/harnx-plans-tools",
     "crates/harnx-git-history",

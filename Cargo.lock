@@ -3945,6 +3945,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-exa-tools"
+version = "0.34.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "fancy-regex 0.19.2",
+ "harnx-core",
+ "harnx-metrics",
+ "harnx-toolset",
+ "harnx-toolset-server",
+ "log",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "wiremock",
+]
+
+[[package]]
 name = "harnx-fetch"
 version = "0.34.3"
 dependencies = [

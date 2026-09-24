@@ -110,6 +110,8 @@ Package agents and servers are automatically namespaced to avoid collisions with
 
 Package separators become `__` in tool names. Harnx keeps the server/tool separator as `_`.
 
+Tool names are prefixed `<server_name>_<tool_name>` at registration, where `server_name` is the config filename stem (e.g., `tool_servers/exa.yaml` → `exa`). A native port replacing an external MCP server must keep the same server name and tool names to remain a drop-in — agents reference the prefixed names directly (e.g., `exa_web_search_exa`).
+
 Add native tool servers through `tool_servers/`. To use an external MCP server, add its bridge configuration there as well; the bridge publishes the MCP tools through the same naming and routing path. Pass `--enable-tool <glob>` in a server's `args:` to restrict which tools are published and callable (repeatable for multiple patterns). Patterns match against raw tool names before package prefixing:
 
 ```yaml

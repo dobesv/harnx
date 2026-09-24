@@ -1,0 +1,23 @@
+{
+  "results": [
+    {
+      "title": "Async Rust",
+      "url": "https://example.com/async-rust",
+      "publishedDate": "2025-02-03T08:15:30.000Z",
+      "author": "Ferris",
+      "text": "First extracted document.\nSecond line."
+    },
+    {
+      "url": "https://example.com/untitled",
+      "text": "Untitled extracted document."
+    }
+  ],
+  "statuses": [
+    {
+      "id": "https://example.com/failed",
+      "status": "error",
+      "error": { "tag": "CRAWL_TIMEOUT" }
+    }
+  ],
+  "searchTime": 18.2
+}
