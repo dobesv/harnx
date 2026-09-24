@@ -9698,6 +9698,81 @@ async fn session_picker_u_key_does_not_filter_query() {
     );
 }
 
+// --- Ctrl+D durable read state -------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_ctrl_d_marks_durably_unread_session_read_with_stale_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = TestEnvironment::set(tmp.path());
+
+    let agent = "hermes";
+    let session_id = format!("ctrl-d-read-{}", uuid::Uuid::now_v7());
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        let model = MockClient::builder().build().model().clone();
+        let mut configured_agent =
+            harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
+        configured_agent.set_name(agent);
+        configured_agent.set_model(model);
+        guard.agent = Some(configured_agent);
+        guard.remote_agent = Some((
+            agent.to_string(),
+            harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+        ));
+        let session = harnx_runtime::config::session::new(&guard, &session_id, None).unwrap();
+        guard.session = Some(session);
+    }
+
+    let nats_config = config.read().clone();
+    let Ok(jetstream) = nats_config
+        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+        .await
+    else {
+        eprintln!("skipping: local nats-server is unavailable");
+        return;
+    };
+    let store = harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+        .await
+        .expect("create metadata store");
+    store
+        .create(&harnx_runtime::nats_session_metadata::SessionMetadata::new(
+            &session_id,
+            harnx_runtime::SessionInitializer::named(agent, Default::default()),
+        ))
+        .await
+        .expect("create session metadata fixture");
+    let storage_key = harnx_core::session_identity::session_key(Some(agent), &session_id);
+    store
+        .mark_unread(&storage_key)
+        .await
+        .expect("mark session unread");
+    assert!(store
+        .get_read_state(&storage_key)
+        .await
+        .expect("read unread session state")
+        .is_unread());
+
+    let mut tui = Tui::init(&config).await.unwrap();
+    // Simulate Ctrl+D winning the event-loop race with the queued read invalidation.
+    tui.app.current_session_unread = false;
+
+    tui.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(tui.app.should_quit);
+    let state = store
+        .get_read_state(&storage_key)
+        .await
+        .expect("read state after Ctrl+D");
+    assert!(
+        !state.is_unread(),
+        "Ctrl+D should durably mark session read"
+    );
+}
+
 // --- SessionPicker u/U toggle preserves origin and tracks selection -----------------
 
 /// Test that toggling unread in SessionPicker preserves origin context and

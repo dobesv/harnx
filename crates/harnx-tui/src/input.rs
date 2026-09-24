@@ -16,6 +16,14 @@ use harnx_runtime::nats_session_metadata::SessionMetadataStore;
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
+use std::time::Duration;
+
+/// Upper bound on the durable mark-read performed while exiting via idle Ctrl+D.
+/// The NATS client retries an unavailable connection for up to its recovery
+/// deadline (~15s), and the event loop can't observe the Ctrl+D abort until this
+/// handler returns, so an unbounded mark-read would stall the exit. Ctrl+D means
+/// "quit now": mark read best-effort, then exit regardless.
+const CTRL_D_MARK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Types of overlay content for info/dump commands.
 enum InfoOverlayType {
@@ -227,11 +235,28 @@ impl Tui {
 
     async fn handle_ctrl_d(&mut self) {
         // Preserve Ctrl+D's existing idle abort; busy exit defers it to modal confirmation.
-        if !self.app.llm_busy {
+        let idle_exit = !self.app.llm_busy;
+        if idle_exit {
             self.abort_signal.set_ctrld();
         }
-        // Mark current session as read before exiting (if unread)
-        self.mark_current_session_read_if_unread().await;
+        // Idle exit is terminal, so a queued or dropped invalidation may leave the cached flag
+        // stale. The durable mark-read operation is idempotent; don't gate it on the cache.
+        // Bound it so a degraded NATS connection can't stall the exit past the timeout.
+        if idle_exit {
+            if tokio::time::timeout(
+                CTRL_D_MARK_READ_TIMEOUT,
+                self.mark_current_session_read(true),
+            )
+            .await
+            .is_err()
+            {
+                log::warn!(
+                    "mark-read timed out after {CTRL_D_MARK_READ_TIMEOUT:?} on Ctrl+D exit; exiting anyway"
+                );
+            }
+        } else {
+            self.mark_current_session_read(false).await;
+        }
         self.request_exit().await;
     }
 
@@ -263,7 +288,7 @@ impl Tui {
             self.active_remote_session = None;
         }
         // Mark current session as read before clearing state (if unread)
-        self.mark_current_session_read_if_unread().await;
+        self.mark_current_session_read(false).await;
     }
 
     async fn handle_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -375,12 +400,12 @@ impl Tui {
                     self.app.transcript_browsing = false;
                     self.app.scroll_state.follow = true;
                     // Mark read on exit from transcript focus (if unread)
-                    self.mark_current_session_read_if_unread().await;
+                    self.mark_current_session_read(false).await;
                 } else if !self.app.completions.is_empty() {
                     self.app.completions.clear();
                 } else {
                     // ESC with no special state: mark read (if unread)
-                    self.mark_current_session_read_if_unread().await;
+                    self.mark_current_session_read(false).await;
                 }
             }
             // D4: Keyboard actions on selected transcript item(s)
@@ -442,7 +467,7 @@ impl Tui {
                     return Ok(());
                 }
                 // First character typed marks the current session read when needed.
-                self.mark_current_session_read_if_unread().await;
+                self.mark_current_session_read(false).await;
                 // Exit history preview on any editing key — keep current content as new draft
                 if self.app.history_preview {
                     self.app.history_index = None;
@@ -483,7 +508,7 @@ impl Tui {
         if text.trim().is_empty() && self.app.attachments.is_empty() {
             return Ok(());
         }
-        self.mark_current_session_read_if_unread().await;
+        self.mark_current_session_read(false).await;
         self.abort_signal.reset();
         self.push_history(text.clone());
         if self.app.llm_busy {
@@ -2700,16 +2725,25 @@ impl Tui {
         }
     }
 
-    /// Mark the current session as read if it's currently marked unread.
-    /// Called on user presence actions: ESC, CTRL-C, CTRL-D, Enter (submit), first text input.
+    /// Mark the current session as read, using the cached unread flag as a fast path unless
+    /// `force` is set for a terminal action.
+    ///
+    /// The cache can be stale because: (1) `run_loop_inner` handles key input before draining
+    /// `event_rx`, so a queued `SessionReadInvalidation` hasn't updated the flag yet, and
+    /// (2) the session activity monitor stops while a prompt is in-flight, so non-durable
+    /// read-invalidations published at TurnEnd can be dropped. Callers on terminal exit
+    /// paths (idle Ctrl+D) should pass `force=true` to bypass the cache and hit durable KV
+    /// directly; `mark_read` is idempotent. Non-exit presence actions (Esc, first keystroke,
+    /// Ctrl+C) use `force=false` since they fire repeatedly and self-correct.
     ///
     /// Boxed to keep `handle_key`'s future frame compact and avoid stack overflow in tests
     /// (the async body contains await chains that inflate the stack size).
-    fn mark_current_session_read_if_unread(
+    fn mark_current_session_read(
         &mut self,
+        force: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            if !self.app.current_session_unread {
+            if !force && !self.app.current_session_unread {
                 return;
             }
             // Use session_activity_destination to resolve the current session even when idle
