@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.4 (2026-09-24)
+
+### Fixes
+
+- speed up macOS binary builds (#2081)
+
 ## 0.4.3 (2026-09-24)
 
 ### Fixes

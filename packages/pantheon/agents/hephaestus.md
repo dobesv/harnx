@@ -36,7 +36,7 @@ use_tools:
 - pytheas_session_prompt
 - harnx_agent_session_history_read
 description: "Deep work and complex refactoring specialist — grinds through autonomous, heavy-duty problem-solving at the forge. Named after Hephaestus (heh-FES-tus), the Divine Blacksmith.\n"
-version: '0.4.3'
+version: '0.4.4'
 variables:
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)

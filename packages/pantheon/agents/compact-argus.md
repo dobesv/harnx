@@ -6,7 +6,7 @@ model_fallbacks:
 - openai:gpt-5.6-luna
 - claude:claude-sonnet-5
 - bedrock:zai.glm-4.7-flash
-version: '0.4.3'
+version: '0.4.4'
 ---
 You are summarizing a conversation between a user and an AI verification agent that checks whether tasks completed by other agents meet their requirements.
 
