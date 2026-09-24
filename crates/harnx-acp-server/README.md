@@ -8,14 +8,14 @@ ACP (Agent Client Protocol) server front-end for harnx agents.
 
 ## Status
 
-**Phase 3**: NATS-backed prompt turns with ACP event fidelity.
+**Phase 4**: NATS-backed prompt turns with ACP event fidelity, cancellation, and tool permission requests.
 - `initialize` — negotiates protocol version 1 and advertises minimal capabilities.
 - `session/new` — creates a NATS-backed harnx session and accepts IDE-injected MCP server entries.
 - `session/prompt` — streams ordered assistant, thought, tool-call, tool-result, notice, and flagged model-error updates.
 - `session/cancel` — stops the local prompt follower and durably cancels the NATS turn.
 - All logging goes to stderr; stdout carries only protocol frames.
 
-Later phases add permission handling, persistence, and handoffs.
+Later phases add persistence and handoffs.
 
 ## Installation
 
@@ -44,7 +44,8 @@ Supported methods:
 - `authenticate` — No-op placeholder for future authentication.
 - `session/new` — Creates a NATS-backed session and returns its ID.
 - `session/prompt` — Runs a turn and streams assistant text updates.
-- `session/cancel` — Cancels an in-flight turn.
+- `session/request_permission` — Requests a per-turn allow or reject decision for gated tools.
+- `session/cancel` — Cancels an in-flight turn, including a pending permission request.
 
 ## Client Configuration
 
@@ -98,10 +99,15 @@ Add the agent to `~/.jetbrains/acp.json`:
 }
 ```
 
-Replace `/home/you/.cargo/bin/harnx-acp-server` with an absolute path. WebStorm
-and Air can pass configured or integrated IDE MCP servers in `session/new`;
-the ACP bridge accepts those entries while harnx continues to use tool servers
-from its own agent configuration.
+Replace `/home/you/.cargo/bin/harnx-acp-server` with an absolute path.
+
+### MCP toolsets supplied by IDE clients
+
+Zed, WebStorm, and Air may inject client MCP servers into
+`session/new.mcpServers`. The ACP server accepts these fields for protocol
+compatibility, but it does not launch or route tools through those client MCP
+servers. Harnx executes turns with backend toolsets from its own agent
+configuration.
 
 ## Development
 
