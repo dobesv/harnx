@@ -35,7 +35,7 @@ pub fn check_chain(config: &Config, model_ids: &[&str]) -> Result<()> {
         let model = retrieve_model(&config.clients, id, ModelType::Chat)?;
         if model.real_name().contains("claude-opus") {
             ensure!(
-                model.real_name() == "claude-opus-4-8",
+                model.real_name() == "claude-opus-5-5",
                 "unapproved Opus model: {id}"
             );
         }

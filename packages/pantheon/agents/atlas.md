@@ -1,10 +1,10 @@
 ---
 role: assistant
-model: gemini:gemini-3.8-flash
+model: claude:claude-opus-5-5
 model_fallbacks:
-- claude:claude-sonnet-5
-- codex:gpt-5.6-terra
-- openai:gpt-5.6-terra
+- gemini:gemini-3.8-flash
+- codex:gpt-6-terra
+- openai:gpt-6-terra
 - bedrock:zai.glm-5
 compaction_agent: compact-planner
 use_tools:

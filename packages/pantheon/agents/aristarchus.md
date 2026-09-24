@@ -2,8 +2,8 @@
 role: assistant
 model: claude:claude-sonnet-5
 model_fallbacks:
-- codex:gpt-5.6-terra
-- openai:gpt-5.6-terra
+- codex:gpt-6-terra
+- openai:gpt-6-terra
 - gemini:gemini-3.8-flash
 - bedrock:zai.glm-5
 compaction_agent: compact-reviewer

@@ -49,8 +49,7 @@ OpenAI API model:
 
 Terra balances everyday coding cost and quality; Luna and Flash-Lite keep
 compaction inexpensive. Sonnet 5 is the Claude compaction fallback because its
-1M context window can summarize long coding sessions. Opus overrides should
-remain pinned to 4.8; newer Opus versions are deliberately excluded.
+1M context window can summarize long coding sessions. Opus overrides use 5.5.
 
 The five `clients/*.yaml` files inherit model metadata from harnx's shared
 catalog. The Bedrock client uses the OpenAI-compatible endpoint in `us-east-1`
@@ -81,7 +80,7 @@ update), use a patch file placed next to the installed package directory:
 
 ```yaml
 agents:
-  - 'if .name == "coder" then .model = "codex:gpt-5.6-terra" end'
+  - 'if .name == "coder" then .model = "codex:gpt-6-terra" end'
   - 'if .name == "compact-coder" then .model = "gemini:gemini-3.5-flash-lite" end'
 ```
 
@@ -89,7 +88,7 @@ To use Claude Opus for harder problems:
 
 ```yaml
 agents:
-  - 'if .name == "coder" then .model = "claude:claude-opus-4-8" end'
+  - 'if .name == "coder" then .model = "claude:claude-opus-5-5" end'
 ```
 
 ## Tool servers
