@@ -1,9 +1,9 @@
 ---
 role: subagent
-model: codex:gpt-5.6-sol:high
+model: codex:gpt-6-sol:high
 model_fallbacks:
-- openai:gpt-5.6-sol:high
-- claude:claude-opus-4-8
+- openai:gpt-6-sol:high
+- claude:claude-opus-5-5
 - gemini:gemini-3.8-flash
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-dev
