@@ -62,7 +62,7 @@ long conversations within token limits.
 Install from GHCR (replace `v0.1.0` with the current release):
 
 ```sh
-harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.4.3
+harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.4.4
 ```
 
 Use harnx 0.34.0 or a development build containing the package model updates.
