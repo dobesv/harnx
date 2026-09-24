@@ -81,8 +81,9 @@ pub fn sort_sessions_for_picker(mut sessions: Vec<SessionMeta>) -> Vec<SessionMe
 /// Context-aware interactive picker ordering. Contexts are also reordered so
 /// the first one is the safe context rendered for that row.
 ///
-/// Unread sessions always sort above read sessions, regardless of context tier.
-/// Within unread and read groups, the original tier/recency ordering applies.
+/// Context match tier is the primary signal, so a session matching the current
+/// repo/branch/working-directory sorts above a better-unread-but-unrelated one.
+/// Unread is a secondary tiebreaker within a tier, then recency.
 pub fn sort_sessions_for_picker_with_context(
     mut sessions: Vec<SessionMeta>,
     query: &PickerQueryContext,
@@ -95,13 +96,13 @@ pub fn sort_sessions_for_picker_with_context(
         });
     }
     sessions.sort_by(|left, right| {
-        // Unread sessions sort first (false < true, so unread=true comes before unread=false)
-        right
-            .unread
-            .cmp(&left.unread)
-            // Then by context tier
-            .then_with(|| session_match_tier(left, query).cmp(&session_match_tier(right, query)))
-            // Then by recency
+        // Context match tier is the primary signal (lower tier = better match).
+        session_match_tier(left, query)
+            .cmp(&session_match_tier(right, query))
+            // Unread is a secondary tiebreaker within the same tier
+            // (false < true, so unread=true comes before unread=false).
+            .then_with(|| right.unread.cmp(&left.unread))
+            // Then by recency.
             .then_with(|| session_recency_key(left).cmp(&session_recency_key(right)))
     });
     sessions
@@ -396,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_session_sorts_above_read_session_with_better_context() {
+    fn context_match_sorts_above_unread_without_match() {
         // Setup: query context looking for github.com/acme/repo @ main
         let query = PickerQueryContext {
             observation: context(Some("github.com/acme/repo"), Some("main"), "/query", 0),
@@ -417,16 +418,54 @@ mod tests {
             0,
         ));
 
-        // Sort with unread-first: unread_no_context should come first
+        // Context-first: read_exact_context should come first despite unread status.
         let sorted = sort_sessions_for_picker_with_context(
             vec![read_exact_context, unread_no_context.clone()],
             &query,
         );
         assert_eq!(
-            sorted[0].id, "unread-no-context",
-            "unread session should sort above read session with better context"
+            sorted[0].id, "read-exact-context",
+            "matching context should sort above unrelated unread session"
         );
-        assert_eq!(sorted[1].id, "read-exact-context");
+        assert_eq!(sorted[1].id, "unread-no-context");
+    }
+
+    #[test]
+    fn unread_breaks_ties_within_same_context_tier() {
+        let query = PickerQueryContext {
+            observation: context(Some("github.com/acme/repo"), Some("main"), "/query", 0),
+            mode: PickerMatchMode::Remote,
+        };
+
+        // Two sessions in the SAME tier (both exact match, tier 0). The read one
+        // is newer, so only the unread tiebreaker can lift the older unread above it.
+        let mut read_newer = session_meta("read-newer");
+        read_newer.unread = false;
+        read_newer.modified = Some(UNIX_EPOCH + Duration::from_secs(2));
+        read_newer.contexts.push(context(
+            Some("github.com/acme/repo"),
+            Some("main"),
+            "/match",
+            0,
+        ));
+
+        let mut unread_older = session_meta("unread-older");
+        unread_older.unread = true;
+        unread_older.modified = Some(UNIX_EPOCH + Duration::from_secs(1));
+        unread_older.contexts.push(context(
+            Some("github.com/acme/repo"),
+            Some("main"),
+            "/match",
+            0,
+        ));
+
+        let sorted =
+            sort_sessions_for_picker_with_context(vec![read_newer, unread_older.clone()], &query);
+        assert_eq!(
+            sorted[0].id, "unread-older",
+            "within the same context tier, unread should sort above read"
+        );
+        assert_eq!(sorted[1].id, "read-newer");
     }
 
     #[test]
