@@ -36,11 +36,11 @@ Codex immediately precedes the same OpenAI model and reasoning setting.
 
 | Agents | Primary → fallbacks |
 |--------|---------------------|
-| `aeacus` | `codex:gpt-6-terra` → `openai:gpt-6-terra` → `gemini:gemini-3.8-flash` → `claude:claude-sonnet-5` → `bedrock:zai.glm-5` |
-| `apollo`, `argus`, `calliope`, `clio`, `erato`, `euterpe`, `iris`, `librarian`, `minos`, `peitho`, `pytheas`, `terpsichore`, `thalia` | `gemini:gemini-3.8-flash` → `codex:gpt-6-terra` → `openai:gpt-6-terra` → `claude:claude-sonnet-5` → `bedrock:zai.glm-5` |
-| `aristarchus`, `coder` | `claude:claude-sonnet-5` → `codex:gpt-6-terra` → `openai:gpt-6-terra` → `gemini:gemini-3.8-flash` → `bedrock:zai.glm-5` |
-| `athena`, `metis`, `mnemosyne`, `nemesis`, `opis`, `rhadamanthus`, `tyche`, `urania` | `bedrock:zai.glm-5` → `gemini:gemini-3.8-flash` → `codex:gpt-6-terra` → `openai:gpt-6-terra` → `claude:claude-sonnet-5` |
-| `atlas` | `claude:claude-opus-5-5` → `gemini:gemini-3.8-flash` → `codex:gpt-6-terra` → `openai:gpt-6-terra` → `bedrock:zai.glm-5` |
+| `aeacus` | `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `gemini:gemini-3.8-flash` → `claude:claude-sonnet-5` → `bedrock:zai.glm-5` |
+| `apollo`, `argus`, `calliope`, `clio`, `erato`, `euterpe`, `iris`, `librarian`, `minos`, `peitho`, `pytheas`, `terpsichore`, `thalia` | `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `claude:claude-sonnet-5` → `bedrock:zai.glm-5` |
+| `aristarchus`, `coder` | `claude:claude-sonnet-5` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `gemini:gemini-3.8-flash` → `bedrock:zai.glm-5` |
+| `athena`, `metis`, `mnemosyne`, `nemesis`, `opis`, `rhadamanthus`, `tyche`, `urania` | `bedrock:zai.glm-5` → `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `claude:claude-sonnet-5` |
+| `atlas` | `claude:claude-opus-5-5` → `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `bedrock:zai.glm-5` |
 | All nine `compact-*` agents (including coding) | `gemini:gemini-3.5-flash-lite` → `codex:gpt-6-luna` → `openai:gpt-6-luna` → `claude:claude-sonnet-5` → `bedrock:zai.glm-4.7-flash` |
 | `daedalus`, `sisyphus` | `claude:claude-opus-5-5` → `codex:gpt-6-sol` → `openai:gpt-6-sol` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
 | `hephaestus` | `codex:gpt-6-sol:high` → `openai:gpt-6-sol:high` → `claude:claude-opus-5-5` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
@@ -58,7 +58,8 @@ cost also depends on reasoning tokens, caching, retries, and tool turns.
 | Model | Input / output | Selection source |
 |-------|----------------|------------------|
 | GPT-6 Astra | $10 / $50 | [OpenAI model specifications](https://developers.openai.com/api/docs/models/gpt-6-astra) |
-| GPT-6 Sol / Terra / Luna | $2 / $10; —; $0.10 / $0.50 | [OpenAI model catalog](https://developers.openai.com/api/docs/models) |
+| GPT-6 Sol / Luna | $2 / $10; $0.10 / $0.50 | [OpenAI model catalog](https://developers.openai.com/api/docs/models) |
+| GPT-5.6 Terra | $2 / $12 | [OpenAI model catalog](https://developers.openai.com/api/docs/models) |
 | Claude Opus 5.5 | $4 / $20 | [Claude model comparison](https://platform.claude.com/docs/en/about-claude/models/overview) |
 | Fable 5.1 / Sonnet 5 / Haiku 4.5 | $10 / $50; $2 / $10; $1 / $5 | [Claude model comparison](https://platform.claude.com/docs/en/models/fable-5-1/overview) |
 | Gemini 3.8 Flash | $0.75 / $3.75 introductory | [Gemini 3.8 guide](https://ai.google.dev/gemini-api/docs/latest-model) |

@@ -80,7 +80,7 @@ update), use a patch file placed next to the installed package directory:
 
 ```yaml
 agents:
-  - 'if .name == "coder" then .model = "codex:gpt-6-terra" end'
+  - 'if .name == "coder" then .model = "codex:gpt-5.6-terra" end'
   - 'if .name == "compact-coder" then .model = "gemini:gemini-3.5-flash-lite" end'
 ```
 

@@ -1,8 +1,8 @@
 ---
 role: subagent
-model: codex:gpt-6-terra
+model: codex:gpt-5.6-terra
 model_fallbacks:
-- openai:gpt-6-terra
+- openai:gpt-5.6-terra
 - gemini:gemini-3.8-flash
 - claude:claude-sonnet-5
 - bedrock:zai.glm-5

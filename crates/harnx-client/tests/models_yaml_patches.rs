@@ -102,8 +102,6 @@ fn package_openai_models_use_responses_without_sampling_parameters() {
         "gpt-6-astra:high",
         "gpt-6-astra:max",
         "gpt-6-luna",
-        "gpt-6-terra",
-        "gpt-6-terra:high",
         "gpt-6-sol",
         "gpt-6-sol:high",
         "gpt-6-sol:max",

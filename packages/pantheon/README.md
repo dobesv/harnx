@@ -141,7 +141,7 @@ Override per-agent or set all at once:
 ```yaml
 # ~/.config/harnx/packages/pantheon.patch.yaml
 agents:
-  - '.model = "codex:gpt-6-terra"'   # replace every agent's model
+  - '.model = "codex:gpt-5.6-terra"'   # replace every agent's model
 ```
 
 ### Using the Bedrock client

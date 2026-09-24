@@ -49,7 +49,6 @@ class TestOpenAIEffortVariants(unittest.TestCase):
             "gpt-5.6-luna",
             "gpt-6-astra",
             "gpt-6-sol",
-            "gpt-6-terra",
             "gpt-6-luna",
         ):
             with self.subTest(name=name):
@@ -75,12 +74,10 @@ class TestOpenAIEffortVariants(unittest.TestCase):
             self.assertIn(f'"effort":"{effort}"', variant["patches"][0])
 
     def test_terra_only_exposes_the_curated_high_alias(self) -> None:
-        for name in ("gpt-5.6-terra", "gpt-6-terra"):
-            with self.subTest(name=name):
-                variants = um.openai_effort_variants(self._base(name), "openai")
-                self.assertEqual(
-                    [variant["name"] for variant in variants], [f"{name}:high"]
-                )
+        variants = um.openai_effort_variants(self._base("gpt-5.6-terra"), "openai")
+        self.assertEqual(
+            [variant["name"] for variant in variants], ["gpt-5.6-terra:high"]
+        )
 
     def test_gpt_6_sol_exposes_high_and_max(self) -> None:
         variants = um.openai_effort_variants(self._base("gpt-6-sol"), "openai")

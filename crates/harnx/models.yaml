@@ -781,23 +781,6 @@
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max"}
       endpoint: responses
-    - name: gpt-6-terra
-      max_input_tokens: 922000
-      max_output_tokens: 128000
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p)
-      endpoint: responses
-    - name: gpt-6-terra:high
-      real_name: gpt-6-terra
-      max_input_tokens: 922000
-      max_output_tokens: 128000
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high"}
-      endpoint: responses
     - name: gpt-audio
       max_input_tokens: 128000
       max_output_tokens: 16384
