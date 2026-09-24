@@ -12,6 +12,8 @@ use harnx_runtime::NatsSession;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
+use crate::handoff::HandoffTarget;
+
 /// Default idle timeout before reaping an inactive session (15 minutes).
 pub const SESSION_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 
@@ -58,6 +60,8 @@ pub struct SessionContext {
     /// Remains occupied while a turn is running or cancelling. Cancellation
     /// signals the sender but only `TurnGuard` releases this gate.
     active_turn: Mutex<Option<InFlightTurn>>,
+    /// Authoritative target once this source commits a handoff.
+    handoff_target: Mutex<Option<HandoffTarget>>,
 }
 
 impl SessionContext {
@@ -72,11 +76,12 @@ impl SessionContext {
             last_active_ms: AtomicU64::new(0),
             created_at: Instant::now(),
             active_turn: Mutex::new(None),
+            handoff_target: Mutex::new(None),
         }
     }
 
     #[cfg(test)]
-    fn new_for_test() -> Self {
+    pub(crate) fn new_for_test() -> Self {
         Self::from_backend(SessionBackend::Test)
     }
 
@@ -107,6 +112,21 @@ impl SessionContext {
             #[cfg(test)]
             SessionBackend::Test => panic!("test session has no NATS backend"),
         }
+    }
+
+    /// Record first authoritative target. Later duplicate commits have no effect.
+    pub(crate) fn commit_handoff(&self, target: HandoffTarget) -> bool {
+        let mut committed = self.handoff_target.lock();
+        if committed.is_some() {
+            return false;
+        }
+        *committed = Some(target);
+        true
+    }
+
+    /// Return committed target when source no longer accepts prompts.
+    pub fn handoff_target(&self) -> Option<HandoffTarget> {
+        self.handoff_target.lock().clone()
     }
 
     /// Register a new in-flight turn and return its cleanup guard and cancel receiver.
@@ -197,6 +217,19 @@ mod tests {
 
         drop(guard);
         assert!(context.begin_turn().is_some(), "guard drop releases gate");
+    }
+
+    #[test]
+    fn first_committed_handoff_deactivates_source_and_wins_duplicates() {
+        let context = SessionContext::new_for_test();
+        let first = HandoffTarget::from_committed("atlas@prod", "target-1", "source")
+            .expect("valid target");
+        let duplicate = HandoffTarget::from_committed("other@prod", "target-2", "source")
+            .expect("valid target");
+
+        assert!(context.commit_handoff(first.clone()));
+        assert!(!context.commit_handoff(duplicate));
+        assert_eq!(context.handoff_target(), Some(first));
     }
 
     #[test]

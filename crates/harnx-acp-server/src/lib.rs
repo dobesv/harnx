@@ -4,6 +4,8 @@
 //! - `initialize` negotiating protocol version 1
 //! - `session/new` creating NATS-backed sessions via local worker
 //! - `session/prompt` running turn with in-order streaming
+//! - `session/request_permission` bridging gated tools to ACP clients
+//! - committed handoffs producing an actionable fallback and deactivating source
 //! - `session/cancel` notification to interrupt running turns
 //!
 //! Architecture follows harnx-serve pattern:
@@ -11,7 +13,7 @@
 //! - Off-loop prompt execution so cancel can be received mid-turn
 //! - Single sequential drain loop for in-order streaming (PR #1038 fix)
 //!
-//! Permission-gated Phase 4 ACP bridge for #1346.
+//! Committed-handoff fallback Phase 6 ACP bridge for #1346.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,11 +36,13 @@ use tracing::{debug, error, info, warn};
 
 pub mod event_map;
 pub mod event_sink;
+pub mod handoff;
 pub mod permission;
 pub mod server_main;
 pub mod session_context;
 
 pub use event_sink::{AcpEventSink, AcpMessage, SignalHandle};
+pub use handoff::HandoffTarget;
 pub use server_main::run;
 pub use session_context::{SessionContext, SESSION_IDLE_TTL};
 
@@ -232,6 +236,9 @@ impl HarnxAgent {
     pub async fn prompt(&self, request: PromptRequest) -> acp::Result<PromptResponse> {
         let session_id = request.session_id.0.to_string();
         let session_ctx = self.get_session(&session_id).await?;
+        if let Some(target) = session_ctx.handoff_target() {
+            return Err(acp_error(anyhow::anyhow!(target.prompt_rejection())));
+        }
         session_ctx.touch();
 
         let (turn_guard, cancel_rx) = session_ctx.begin_turn().ok_or_else(|| {
@@ -244,7 +251,11 @@ impl HarnxAgent {
             (String::new(), vec![]),
             AgentConfig::default(),
         );
-        let (sink, drain_rx) = AcpEventSink::new(session_id.clone());
+        let (sink, drain_rx) = AcpEventSink::for_session(
+            session_id.clone(),
+            self.cluster.clone(),
+            Arc::clone(&session_ctx),
+        );
         let sink = Arc::new(sink);
         let connection = self.get_connection().await;
         let drain_handle = tokio::spawn(drain_updates(connection.clone(), drain_rx));
@@ -282,6 +293,15 @@ impl HarnxAgent {
             .await
             .get(session_id)
             .map(|session| session.last_touched())
+    }
+
+    /// Return authoritative target after source commits a handoff.
+    pub async fn session_handoff_target(&self, session_id: &str) -> Option<HandoffTarget> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|session| session.handoff_target())
     }
 
     /// Handle `session/cancel` notification — interrupt running turn.

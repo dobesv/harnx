@@ -2,10 +2,13 @@ use agent_client_protocol::schema::v1::{
     ContentBlock as AcpContentBlock, SessionUpdate, ToolCallContent, ToolCallStatus,
     ToolCallUpdate, ToolKind as AcpToolKind,
 };
-use harnx_acp_server::event_map::{agent_event_to_session_update, map_tool_status};
+use harnx_acp_server::event_map::{
+    agent_event_to_session_update, agent_event_to_session_update_for_cluster, map_tool_status,
+};
 use harnx_acp_server::{HARNX_ERROR_META, HARNX_MARKDOWN_META};
 use harnx_core::event::{
-    AgentEvent, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, ToolKind, ToolStatus,
+    AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent,
+    ToolKind, ToolStatus, TurnEvent,
 };
 
 fn text_content(update: &ToolCallUpdate) -> Option<&str> {
@@ -213,6 +216,65 @@ fn warning_and_error_notices_map_but_info_and_empty_notices_do_not() {
         agent_event_to_session_update(AgentEvent::Notice(NoticeEvent::Warning(String::new())))
             .is_none()
     );
+}
+
+#[test]
+fn requested_handoff_is_informational_only() {
+    let update = agent_event_to_session_update_for_cluster(
+        AgentEvent::Turn(TurnEvent::HandoffRequested {
+            agent: "atlas@prod".to_string(),
+            session_id: Some("tentative-target".to_string()),
+        }),
+        "source",
+    );
+
+    assert!(update.is_none());
+}
+
+#[test]
+fn committed_handoff_maps_to_actionable_fallback() {
+    let update = agent_event_to_session_update_for_cluster(
+        AgentEvent::Session(SessionEvent::HandoffCommitted {
+            agent: "atlas@prod".to_string(),
+            session_id: "target-1".to_string(),
+            handoff_tool_call_id: Some("handoff-call".to_string()),
+            after_seq: Some(42),
+        }),
+        "source",
+    )
+    .expect("committed handoff should map");
+    let message = agent_message_text(&update).expect("fallback should be agent text");
+
+    for expected in [
+        "agent `atlas`",
+        "local session `target-1`",
+        "cluster `prod`",
+        "running independently",
+        ".session atlas@prod target-1",
+    ] {
+        assert!(
+            message.contains(expected),
+            "missing `{expected}`: {message}"
+        );
+    }
+}
+
+#[test]
+fn nested_sub_agent_commit_does_not_redirect_parent() {
+    let update = agent_event_to_session_update_for_cluster(
+        AgentEvent::SubAgent {
+            source: AgentSource::default(),
+            event: Box::new(AgentEvent::Session(SessionEvent::HandoffCommitted {
+                agent: "atlas@prod".to_string(),
+                session_id: "target-1".to_string(),
+                handoff_tool_call_id: None,
+                after_seq: Some(42),
+            })),
+        },
+        "source",
+    );
+
+    assert!(update.is_none());
 }
 
 #[test]
