@@ -8,12 +8,14 @@ ACP (Agent Client Protocol) server front-end for harnx agents.
 
 ## Status
 
-**Phase 1 (current)**: Protocol handshake scaffold.
-- `initialize` — negotiates protocol version 1, advertises minimal capabilities.
-- `session/new` — returns a session ID (in-memory, no NATS binding).
-- All logging → stderr; stdout carries only protocol frames.
+**Phase 2**: NATS-backed prompt turns.
+- `initialize` — negotiates protocol version 1 and advertises minimal capabilities.
+- `session/new` — creates a NATS-backed harnx session.
+- `session/prompt` — runs a worker turn and streams ordered `session/update` chunks.
+- `session/cancel` — stops the local prompt follower and durably cancels the NATS turn.
+- All logging goes to stderr; stdout carries only protocol frames.
 
-Phase 2+ will add NATS binding, prompt execution, event streaming, and permission handling.
+Later phases add full event fidelity, permission handling, persistence, and handoffs.
 
 ## Installation
 
@@ -39,8 +41,10 @@ Implements ACP v1 as defined by the [Agent Client Protocol specification](https:
 
 Supported methods:
 - `initialize` — Negotiates protocol version and exchanges capabilities.
-- `authenticate` — No-op in this phase (placeholder for future auth).
-- `session/new` — Creates a new session and returns its ID.
+- `authenticate` — No-op placeholder for future authentication.
+- `session/new` — Creates a NATS-backed session and returns its ID.
+- `session/prompt` — Runs a turn and streams assistant text updates.
+- `session/cancel` — Cancels an in-flight turn.
 
 ## Client Configuration
 

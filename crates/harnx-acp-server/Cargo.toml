@@ -18,7 +18,7 @@ path = "src/bin/harnx-acp-server.rs"
 agent-client-protocol = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "io-util", "io-std"] }
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "io-util", "io-std", "time"] }
 tokio-util = { workspace = true, features = ["rt", "compat"] }
 uuid = { workspace = true }
 serde_json = { workspace = true }
@@ -26,5 +26,19 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 futures = { workspace = true }
 
+# harnx crates for NATS session binding (Phase 2)
+harnx-runtime = { path = "../harnx-runtime" }
+harnx-core = { path = "../harnx-core" }
+parking_lot = { workspace = true }
+
 [dev-dependencies]
 assert_cmd = "2"
+# For integration tests with NATS
+tempfile = { workspace = true }
+which = { workspace = true }
+async-nats = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "io-util", "io-std", "time", "process", "test-util"] }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
