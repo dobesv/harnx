@@ -11,7 +11,7 @@
 //! - Off-loop prompt execution so cancel can be received mid-turn
 //! - Single sequential drain loop for in-order streaming (PR #1038 fix)
 //!
-//! Phase 3 of #1346.
+//! Permission-gated Phase 4 ACP bridge for #1346.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +34,7 @@ use tracing::{debug, error, info, warn};
 
 pub mod event_map;
 pub mod event_sink;
+pub mod permission;
 pub mod server_main;
 pub mod session_context;
 
@@ -41,7 +42,7 @@ pub use event_sink::{AcpEventSink, AcpMessage, SignalHandle};
 pub use server_main::run;
 pub use session_context::{SessionContext, SESSION_IDLE_TTL};
 
-/// Connection to ACP client for sending notifications.
+/// Connection to ACP client for sending notifications and permission requests.
 pub type AcpConnection = acp::ConnectionTo<acp::Client>;
 
 /// Metadata key marking an ACP content chunk as a harnx model error.
@@ -245,9 +246,19 @@ impl HarnxAgent {
         );
         let (sink, drain_rx) = AcpEventSink::new(session_id.clone());
         let sink = Arc::new(sink);
-        let drain_handle = tokio::spawn(drain_updates(self.get_connection().await, drain_rx));
+        let connection = self.get_connection().await;
+        let drain_handle = tokio::spawn(drain_updates(connection.clone(), drain_rx));
+        let turn = PromptTurn {
+            input,
+            sink: Arc::clone(&sink),
+            cancel_rx,
+            confirmation_handler: permission::tool_confirmation_handler(
+                connection,
+                session_id.clone(),
+            ),
+        };
 
-        let result = run_prompt_turn(&session_ctx, input, Arc::clone(&sink), cancel_rx).await;
+        let result = run_prompt_turn(&session_ctx, turn).await;
         sink.signal_complete();
         finish_update_drain(drain_handle).await;
         turn_guard.finish();
@@ -307,29 +318,44 @@ impl HarnxAgent {
     }
 }
 
-async fn run_prompt_turn(
-    session: &SessionContext,
+struct PromptTurn {
     input: Input,
     sink: Arc<AcpEventSink>,
     cancel_rx: tokio::sync::mpsc::Receiver<()>,
+    confirmation_handler: Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationHandler>,
+}
+
+async fn run_prompt_turn(
+    session: &SessionContext,
+    turn: PromptTurn,
 ) -> acp::Result<harnx_runtime::NatsTurnResult> {
     let nats_session = session.nats_session();
-    let appended = nats_session
-        .admit_input(&input, None)
+    let route = nats_session
+        .tool_confirmation_route(turn.confirmation_handler)
         .await
-        .context("failed to admit prompt input")
+        .context("failed to create tool confirmation route")
         .map_err(acp_error)?;
-    nats_session
-        .follow_admitted_prompt(
-            appended,
-            sink,
-            Some(cancel_rx),
-            None,
-            harnx_runtime::RunTurnOptions::default(),
-        )
-        .await
-        .context("prompt turn failed")
-        .map_err(acp_error)
+    let result = async {
+        let appended = nats_session
+            .admit_input_with_tool_confirmation_route(&turn.input, &route)
+            .await
+            .context("failed to admit prompt input")
+            .map_err(acp_error)?;
+        nats_session
+            .follow_admitted_prompt(
+                appended,
+                turn.sink,
+                Some(turn.cancel_rx),
+                Some(route.subject()),
+                harnx_runtime::RunTurnOptions::default(),
+            )
+            .await
+            .context("prompt turn failed")
+            .map_err(acp_error)
+    }
+    .await;
+    route.close().await;
+    result
 }
 
 async fn drain_updates(
