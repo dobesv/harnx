@@ -2,8 +2,8 @@
 role: compaction
 model: gemini:gemini-3.5-flash-lite
 model_fallbacks:
-- codex:gpt-5.6-luna
-- openai:gpt-5.6-luna
+- codex:gpt-6-luna
+- openai:gpt-6-luna
 - claude:claude-sonnet-5
 - bedrock:zai.glm-4.7-flash
 version: '0.4.4'
