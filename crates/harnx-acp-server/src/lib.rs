@@ -326,6 +326,18 @@ async fn run_prompt_turn(
         .map_err(acp_error)
 }
 
+fn forward_update(connection: Option<&AcpConnection>, session_id: &str, event: AcpEvent) {
+    let Some(connection) = connection else {
+        return;
+    };
+    let Some(notification) = event_to_session_notification(session_id, event) else {
+        return;
+    };
+    if let Err(error) = connection.send_notification(notification) {
+        warn!(%error, "failed to send ACP session update");
+    }
+}
+
 async fn drain_updates(
     connection: Option<AcpConnection>,
     mut updates: tokio::sync::mpsc::UnboundedReceiver<AcpMessage>,
@@ -333,14 +345,7 @@ async fn drain_updates(
     while let Some(message) = updates.recv().await {
         match message {
             AcpMessage::Update { session_id, event } => {
-                if let (Some(connection), Some(notification)) = (
-                    connection.as_ref(),
-                    event_to_session_notification(&session_id, event),
-                ) {
-                    if let Err(error) = connection.send_notification(notification) {
-                        warn!(%error, "failed to send ACP session update");
-                    }
-                }
+                forward_update(connection.as_ref(), &session_id, event);
             }
             AcpMessage::TurnComplete => break,
         }
