@@ -47,7 +47,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.34.2"
+version = "0.34.3"
 edition = "2021"
 authors = ["sigoden <sigoden@gmail.com>"]
 description = "All-in-one LLM CLI Tool"

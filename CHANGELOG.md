@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.34.3 (2026-09-24)
+
+### Fixes
+
+- limit Linux ARM build resource use (#2077)
+- Reduce resource pressure when building Linux ARM release archives.
+
 ## 0.34.2 (2026-09-23)
 
 ### Fixes

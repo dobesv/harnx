@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.3 (2026-09-24)
+
+### Fixes
+
+- limit Linux ARM build resource use (#2077)
+
 ## 0.4.2 (2026-09-23)
 
 ### Fixes
