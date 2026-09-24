@@ -1,6 +1,6 @@
 # Package model policy
 
-Reviewed 2026-09-20 for issues #1765, #1514 and #2025. This policy covers Pantheon and
+Reviewed 2026-09-24 for issues #1765, #1514 and #2025. This policy covers Pantheon and
 the standalone coding package. It is a selection based on provider documentation
 and the agents' responsibilities, not a measured Harnx performance benchmark.
 
@@ -8,15 +8,11 @@ and the agents' responsibilities, not a measured Harnx performance benchmark.
 
 - Oracle and Plato prioritize reasoning quality: GPT-6 Astra at maximum effort,
   with Fable 5.1 at maximum effort as the Claude alternative.
-- Sisyphus and Daedalus retain Opus 4.8. No agent selects an Opus version above
-  4.8, including as a fallback; this is an explicit package preference.
-- Atlas uses Gemini 3.8 Flash at its default medium thinking level. Its long
-  orchestration loops and specialist delegation make it a good candidate for
-  Flash's cost profile. Sonnet 5 is the next fallback. Validate task completion
-  quality and total cost on representative plans when evaluating this choice.
+- Sisyphus, Daedalus, and Atlas prioritize orchestration quality with Opus 5.5.
+  Atlas keeps Gemini 3.8 Flash as its first fallback.
 - General Gemini workers move to 3.8 Flash, including former Pro-preview users.
   Heavy implementation, security/privacy review, plan review, and investigation
-  keep GPT-5.6 Sol; Hephaestus retains high reasoning. Everyday coding and
+  use GPT-6 Sol; Hephaestus retains high reasoning. Everyday coding and
   bounded judging use Terra. Existing GLM 5 specialists keep model diversity.
 - The reasoning-heavy agents take Kimi K3 as their Bedrock fallback: Oracle,
   Plato, Hephaestus, Daedalus, Sisyphus, Melpomene, Momus, Polyhymnia and
@@ -44,13 +40,13 @@ Codex immediately precedes the same OpenAI model and reasoning setting.
 | `apollo`, `argus`, `calliope`, `clio`, `erato`, `euterpe`, `iris`, `librarian`, `minos`, `peitho`, `pytheas`, `terpsichore`, `thalia` | `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `claude:claude-sonnet-5` → `bedrock:zai.glm-5` |
 | `aristarchus`, `coder` | `claude:claude-sonnet-5` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `gemini:gemini-3.8-flash` → `bedrock:zai.glm-5` |
 | `athena`, `metis`, `mnemosyne`, `nemesis`, `opis`, `rhadamanthus`, `tyche`, `urania` | `bedrock:zai.glm-5` → `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `claude:claude-sonnet-5` |
-| `atlas` | `gemini:gemini-3.8-flash` → `claude:claude-sonnet-5` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `bedrock:zai.glm-5` |
-| All nine `compact-*` agents (including coding) | `gemini:gemini-3.5-flash-lite` → `codex:gpt-5.6-luna` → `openai:gpt-5.6-luna` → `claude:claude-sonnet-5` → `bedrock:zai.glm-4.7-flash` |
-| `daedalus`, `sisyphus` | `claude:claude-opus-4-8` → `codex:gpt-5.6-sol` → `openai:gpt-5.6-sol` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
-| `hephaestus` | `codex:gpt-5.6-sol:high` → `openai:gpt-5.6-sol:high` → `claude:claude-opus-4-8` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
-| `hermes` | `codex:gpt-5.6-luna` → `openai:gpt-5.6-luna` → `gemini:gemini-3.8-flash` → `claude:claude-haiku-4-5` → `bedrock:minimax.minimax-m2.5` |
-| `hestia` | `bedrock:minimax.minimax-m2.5` → `gemini:gemini-3.8-flash` → `codex:gpt-5.6-luna` → `openai:gpt-5.6-luna` → `claude:claude-haiku-4-5` |
-| `melpomene`, `momus`, `polyhymnia`, `zosimus` | `codex:gpt-5.6-sol` → `openai:gpt-5.6-sol` → `claude:claude-sonnet-5` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
+| `atlas` | `claude:claude-opus-5-5` → `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `bedrock:zai.glm-5` |
+| All nine `compact-*` agents (including coding) | `gemini:gemini-3.5-flash-lite` → `codex:gpt-6-luna` → `openai:gpt-6-luna` → `claude:claude-sonnet-5` → `bedrock:zai.glm-4.7-flash` |
+| `daedalus`, `sisyphus` | `claude:claude-opus-5-5` → `codex:gpt-6-sol` → `openai:gpt-6-sol` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
+| `hephaestus` | `codex:gpt-6-sol:high` → `openai:gpt-6-sol:high` → `claude:claude-opus-5-5` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
+| `hermes` | `codex:gpt-6-luna` → `openai:gpt-6-luna` → `gemini:gemini-3.8-flash` → `claude:claude-haiku-4-5` → `bedrock:minimax.minimax-m2.5` |
+| `hestia` | `bedrock:minimax.minimax-m2.5` → `gemini:gemini-3.8-flash` → `codex:gpt-6-luna` → `openai:gpt-6-luna` → `claude:claude-haiku-4-5` |
+| `melpomene`, `momus`, `polyhymnia`, `zosimus` | `codex:gpt-6-sol` → `openai:gpt-6-sol` → `claude:claude-sonnet-5` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
 | `oracle`, `plato` | `codex:gpt-6-astra:max` → `openai:gpt-6-astra:max` → `claude:claude-fable-5-1:max` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
 
 ## Cost and provider evidence
@@ -62,7 +58,9 @@ cost also depends on reasoning tokens, caching, retries, and tool turns.
 | Model | Input / output | Selection source |
 |-------|----------------|------------------|
 | GPT-6 Astra | $10 / $50 | [OpenAI model specifications](https://developers.openai.com/api/docs/models/gpt-6-astra) |
-| GPT-5.6 Sol / Terra / Luna | $4 / $20; $2 / $12; $0.20 / $1.20 | [OpenAI model catalog](https://developers.openai.com/api/docs/models) |
+| GPT-6 Sol / Luna | $2 / $10; $0.10 / $0.50 | [OpenAI model catalog](https://developers.openai.com/api/docs/models) |
+| GPT-5.6 Terra | $2 / $12 | [OpenAI model catalog](https://developers.openai.com/api/docs/models) |
+| Claude Opus 5.5 | $4 / $20 | [Claude model comparison](https://platform.claude.com/docs/en/about-claude/models/overview) |
 | Fable 5.1 / Sonnet 5 / Haiku 4.5 | $10 / $50; $2 / $10; $1 / $5 | [Claude model comparison](https://platform.claude.com/docs/en/models/fable-5-1/overview) |
 | Gemini 3.8 Flash | $0.75 / $3.75 introductory | [Gemini 3.8 guide](https://ai.google.dev/gemini-api/docs/latest-model) |
 | Bedrock Kimi K3 | $3.30 / $16.50 (US CRIS; $0.33 cache read) | [AWS pricing](https://aws.amazon.com/bedrock/pricing/) |

@@ -11,19 +11,19 @@ results, and a multi-agent code review pipeline.
 
 | Agent | Model | Role |
 |-------|-------|------|
-| `sisyphus` | claude-opus-4-8 | Main assistant — persistent task executor. Breaks tasks into plans, delegates to specialists, runs quality gates. |
-| `daedalus` | claude-opus-4-8 | Strategic planner — interviews users, researches codebases, produces implementation plans, then hands off to Atlas. |
-| `atlas` | gemini-3.8-flash | Plan execution orchestrator — takes Daedalus plans and drives them to completion via specialist delegation. |
+| `sisyphus` | claude-opus-5-5 | Main assistant — persistent task executor. Breaks tasks into plans, delegates to specialists, runs quality gates. |
+| `daedalus` | claude-opus-5-5 | Strategic planner — interviews users, researches codebases, produces implementation plans, then hands off to Atlas. |
+| `atlas` | claude-opus-5-5 | Plan execution orchestrator — takes Daedalus plans and drives them to completion via specialist delegation. |
 
 ### Specialist Workers
 
 | Agent | Model | Best For |
 |-------|-------|----------|
-| `hephaestus` | gpt-5.6-sol:high | Large refactors, migrations, deep implementation |
+| `hephaestus` | gpt-6-sol:high | Large refactors, migrations, deep implementation |
 | `iris` | gemini-3.8-flash | UI, frontend, visual engineering |
 | `apollo` | gemini-3.8-flash | Creative solutions, novel UX |
 | `athena` | zai.glm-5 | Complex multi-file features, agent of last resort |
-| `hermes` | gpt-5.6-luna | Quick fixes, one-liners, config tweaks |
+| `hermes` | gpt-6-luna | Quick fixes, one-liners, config tweaks |
 | `hestia` | minimax.minimax-m2.5 | Maintenance, dependency updates, linting |
 | `plato` | gpt-6-astra:max | Architecture, data modeling, complex algorithms |
 | `peitho` | gemini-3.8-flash | Documentation, READMEs, release notes |
@@ -33,7 +33,7 @@ results, and a multi-agent code review pipeline.
 | Agent | Model | Role |
 |-------|-------|------|
 | `pytheas` | gemini-3.8-flash | Reconnaissance — fast codebase + GitHub/issue context lookup |
-| `zosimus` | gpt-5.6-sol | Deep investigation — bug reproduction, hypothesis validation |
+| `zosimus` | gpt-6-sol | Deep investigation — bug reproduction, hypothesis validation |
 | `librarian` | gemini-3.8-flash | External knowledge — web search, docs, GitHub |
 | `oracle` | gpt-6-astra:max | Architectural decisions and consultation |
 | `argus` | gemini-3.8-flash | Independent verification — PASS/FAIL with evidence |
@@ -129,7 +129,7 @@ entries (the `else .` is implicit when omitted).
 
 ```yaml
 agents:
-  - '.model = "claude:claude-opus-4-8"'   # override model for every agent
+  - '.model = "claude:claude-opus-5-5"'   # override model for every agent
   - 'if .name == "hephaestus" then .model = "openai:o3" end'
   - 'if .name == "zosimus" then .model = "openai:o3" end'
 ```

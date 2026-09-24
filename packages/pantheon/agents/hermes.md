@@ -1,8 +1,8 @@
 ---
 role: subagent
-model: codex:gpt-5.6-luna
+model: codex:gpt-6-luna
 model_fallbacks:
-- openai:gpt-5.6-luna
+- openai:gpt-6-luna
 - gemini:gemini-3.8-flash
 - claude:claude-haiku-4-5
 - bedrock:minimax.minimax-m2.5
