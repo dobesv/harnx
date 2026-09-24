@@ -1,6 +1,6 @@
 //! Public entry point for running the ACP server over stdin/stdout.
 //!
-//! Phase 2: Full NATS binding with:
+//! NATS-backed ACP server with:
 //! - Off-loop prompt execution (allows cancel mid-turn)
 //! - In-order streaming via single drain task
 //! - Connection context for sending notifications

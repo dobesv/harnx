@@ -7,16 +7,20 @@
 //! Key invariant: Drop the sink sender and await the drain task before
 //! finishing the prompt turn to ensure all chunks flush in order.
 
+use agent_client_protocol::schema::v1::SessionUpdate;
 use harnx_core::event::{AgentEvent, AgentEventSink};
 use tokio::sync::mpsc;
 
-use crate::AcpEvent;
+use crate::event_map::agent_event_to_session_update;
 
 /// Internal message sent from the sink to the drain task.
 #[derive(Debug)]
 pub enum AcpMessage {
     /// Send a session/update notification with content.
-    Update { session_id: String, event: AcpEvent },
+    Update {
+        session_id: String,
+        update: Box<SessionUpdate>,
+    },
     /// Turn completed signal (drain should flush and stop).
     TurnComplete,
 }
@@ -84,11 +88,10 @@ impl AcpEventSink {
 
 impl AgentEventSink for AcpEventSink {
     fn emit(&self, event: AgentEvent) {
-        // Convert AgentEvent to AcpEvent for ACP session/update
-        if let Some(acp_event) = crate::agent_event_to_acp_event(event) {
+        if let Some(update) = agent_event_to_session_update(event) {
             let msg = AcpMessage::Update {
                 session_id: self.session_id.clone(),
-                event: acp_event,
+                update: Box::new(update),
             };
             // If send fails, the drain task has stopped (turn cancelled or similar)
             let _ = self.tx.send(msg);
@@ -117,12 +120,16 @@ mod tests {
 
         let msg = rx.try_recv().expect("should have message");
         match msg {
-            AcpMessage::Update { session_id, event } => {
+            AcpMessage::Update { session_id, update } => {
                 assert_eq!(session_id, "test-session");
-                match event {
-                    AcpEvent::Text(text) => assert_eq!(text, "hello"),
-                    _ => panic!("expected Text event"),
-                }
+                let SessionUpdate::AgentMessageChunk(chunk) = *update else {
+                    panic!("expected agent message chunk");
+                };
+                let agent_client_protocol::schema::v1::ContentBlock::Text(text) = chunk.content
+                else {
+                    panic!("expected text content");
+                };
+                assert_eq!(text.text, "hello");
             }
             _ => panic!("expected Update message"),
         }
@@ -138,12 +145,17 @@ mod tests {
 
         let msg = rx.try_recv().expect("should have message");
         match msg {
-            AcpMessage::Update { session_id, event } => {
+            AcpMessage::Update { session_id, update } => {
                 assert_eq!(session_id, "test-session");
-                match event {
-                    AcpEvent::Error(err) => assert_eq!(err, "something went wrong"),
-                    _ => panic!("expected Error event"),
-                }
+                let SessionUpdate::AgentMessageChunk(chunk) = *update else {
+                    panic!("expected agent message chunk");
+                };
+                assert_eq!(
+                    chunk
+                        .meta
+                        .and_then(|meta| meta.get(crate::HARNX_ERROR_META).cloned()),
+                    Some(serde_json::Value::Bool(true))
+                );
             }
             _ => panic!("expected Update message"),
         }

@@ -8,14 +8,14 @@ ACP (Agent Client Protocol) server front-end for harnx agents.
 
 ## Status
 
-**Phase 2**: NATS-backed prompt turns.
+**Phase 3**: NATS-backed prompt turns with ACP event fidelity.
 - `initialize` — negotiates protocol version 1 and advertises minimal capabilities.
-- `session/new` — creates a NATS-backed harnx session.
-- `session/prompt` — runs a worker turn and streams ordered `session/update` chunks.
+- `session/new` — creates a NATS-backed harnx session and accepts IDE-injected MCP server entries.
+- `session/prompt` — streams ordered assistant, thought, tool-call, tool-result, notice, and flagged model-error updates.
 - `session/cancel` — stops the local prompt follower and durably cancels the NATS turn.
 - All logging goes to stderr; stdout carries only protocol frames.
 
-Later phases add full event fidelity, permission handling, persistence, and handoffs.
+Later phases add permission handling, persistence, and handoffs.
 
 ## Installation
 
@@ -48,35 +48,60 @@ Supported methods:
 
 ## Client Configuration
 
+Find the executable before editing either client configuration:
+
+```bash
+command -v harnx-acp-server
+```
+
+Copy that absolute path into the `command` field below. Don't use only
+`harnx-acp-server`: GUI applications often start with a restricted `PATH`.
+
 ### Zed
 
-In `~/.config/zed/settings.json`:
+Add a custom agent under `agent_servers` in Zed's `settings.json` (normally
+`~/.config/zed/settings.json` on Linux and macOS):
 
 ```json
 {
-  "agent_client_protocol_servers": {
+  "agent_servers": {
     "harnx": {
-      "command": "/path/to/harnx-acp-server",
-      "args": ["--agent", "default"]
+      "type": "custom",
+      "command": "/home/you/.cargo/bin/harnx-acp-server",
+      "args": ["--agent", "default"],
+      "env": {}
     }
   }
 }
 ```
 
+Replace `/home/you/.cargo/bin/harnx-acp-server` with the absolute path printed
+by the command above. Start a new external-agent thread and select `harnx`.
+
 ### JetBrains (WebStorm / Air)
 
-In `~/.jetbrains/acp.json`:
+Add the agent to `~/.jetbrains/acp.json`:
 
 ```json
 {
-  "harnx": {
-    "command": "/full/path/to/harnx-acp-server",
-    "args": ["--agent", "default"]
+  "default_mcp_settings": {
+    "use_custom_mcp": true,
+    "use_idea_mcp": true
+  },
+  "agent_servers": {
+    "harnx": {
+      "command": "/home/you/.cargo/bin/harnx-acp-server",
+      "args": ["--agent", "default"],
+      "env": {}
+    }
   }
 }
 ```
 
-Note: Use the absolute path to the binary. JetBrains GUI PATH is restricted.
+Replace `/home/you/.cargo/bin/harnx-acp-server` with an absolute path. WebStorm
+and Air can pass configured or integrated IDE MCP servers in `session/new`;
+the ACP bridge accepts those entries while harnx continues to use tool servers
+from its own agent configuration.
 
 ## Development
 

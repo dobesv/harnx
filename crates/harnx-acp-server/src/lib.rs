@@ -11,7 +11,7 @@
 //! - Off-loop prompt execution so cancel can be received mid-turn
 //! - Single sequential drain loop for in-order streaming (PR #1038 fix)
 //!
-//! Phase 2 of #1346.
+//! Phase 3 of #1346.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,20 +20,19 @@ use std::time::Duration;
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ContentBlock as AcpContentBlock, ContentChunk, Implementation, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
+    Implementation, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
+    PromptRequest, PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason,
 };
 use anyhow::Context;
 use harnx_core::abort::AbortSignal;
 use harnx_core::agent_config::AgentConfig;
-use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
 use harnx_core::input::Input;
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::local_orchestrator::{activation_route_for_cluster, LocalWorkerSupervisor};
 
 use tracing::{debug, error, info, warn};
 
+pub mod event_map;
 pub mod event_sink;
 pub mod server_main;
 pub mod session_context;
@@ -45,6 +44,10 @@ pub use session_context::{SessionContext, SESSION_IDLE_TTL};
 /// Connection to ACP client for sending notifications.
 pub type AcpConnection = acp::ConnectionTo<acp::Client>;
 
+/// Metadata key marking an ACP content chunk as a harnx model error.
+pub const HARNX_ERROR_META: &str = "harnx:error";
+/// Metadata key carrying harnx's pre-rendered tool-call markdown.
+pub const HARNX_MARKDOWN_META: &str = "harnx:markdown";
 /// The ACP agent implementation for harnx.
 ///
 /// Holds:
@@ -150,10 +153,13 @@ impl HarnxAgent {
     ///
     /// This boots the local worker supervisor if not already running,
     /// then creates a NatsSession bound to the local cluster.
-    pub async fn new_session(
-        &self,
-        _request: NewSessionRequest,
-    ) -> acp::Result<NewSessionResponse> {
+    pub async fn new_session(&self, request: NewSessionRequest) -> acp::Result<NewSessionResponse> {
+        // IDEs inject their own MCP servers here. Harnx uses its configured tool
+        // servers, so accepting and ignoring these entries is intentional.
+        debug!(
+            mcp_server_count = request.mcp_servers.len(),
+            "creating ACP session"
+        );
         let (activation_route, global_config) =
             if let (Some(route), Some(config)) = (&self.activation_route, &self.runtime_config) {
                 (route.clone(), Arc::clone(config))
@@ -332,18 +338,21 @@ async fn drain_updates(
 ) {
     while let Some(message) = updates.recv().await {
         match message {
-            AcpMessage::Update { session_id, event } => {
-                if let (Some(connection), Some(notification)) = (
-                    connection.as_ref(),
-                    event_to_session_notification(&session_id, event),
-                ) {
-                    if let Err(error) = connection.send_notification(notification) {
-                        warn!(%error, "failed to send ACP session update");
-                    }
-                }
+            AcpMessage::Update { session_id, update } => {
+                forward_update(connection.as_ref(), &session_id, *update);
             }
             AcpMessage::TurnComplete => break,
         }
+    }
+}
+
+fn forward_update(connection: Option<&AcpConnection>, session_id: &str, update: SessionUpdate) {
+    let Some(connection) = connection else {
+        return;
+    };
+    let notification = SessionNotification::new(SessionId::new(session_id.to_string()), update);
+    if let Err(error) = connection.send_notification(notification) {
+        warn!(%error, "failed to send ACP session update");
     }
 }
 
@@ -367,65 +376,6 @@ fn handle_turn_result(
     }
     debug!(%session_id, "prompt turn completed");
     Ok(PromptResponse::new(StopReason::EndTurn))
-}
-
-/// Event types that can be forwarded to ACP client.
-#[derive(Debug)]
-pub enum AcpEvent {
-    /// Text chunk for AgentMessageChunk.
-    Text(String),
-    /// Error chunk with harnx:error flag (PR #1128 fix).
-    Error(String),
-}
-
-/// Convert AgentEvent to AcpEvent for streaming.
-pub(crate) fn agent_event_to_acp_event(event: AgentEvent) -> Option<AcpEvent> {
-    match event {
-        AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
-            let text: String = blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text(text) => Some(text.clone()),
-                    _ => None,
-                })
-                .collect();
-            if text.is_empty() {
-                None
-            } else {
-                Some(AcpEvent::Text(text))
-            }
-        }
-        AgentEvent::Model(ModelEvent::Error(msg)) => {
-            // PR #1128 fix: Model errors flagged with harnx:error meta
-            Some(AcpEvent::Error(msg))
-        }
-        _ => None,
-    }
-}
-
-/// Convert an AcpEvent to a SessionNotification.
-fn event_to_session_notification(session_id: &str, event: AcpEvent) -> Option<SessionNotification> {
-    match event {
-        AcpEvent::Text(text) => {
-            let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(text)));
-            let notification = SessionNotification::new(
-                SessionId::new(session_id.to_string()),
-                SessionUpdate::AgentMessageChunk(chunk),
-            );
-            Some(notification)
-        }
-        AcpEvent::Error(msg) => {
-            // PR #1128 fix: flag with harnx:error meta
-            let mut meta = serde_json::Map::new();
-            meta.insert("harnx:error".to_string(), serde_json::Value::Bool(true));
-            let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(msg))).meta(meta);
-            let notification = SessionNotification::new(
-                SessionId::new(session_id.to_string()),
-                SessionUpdate::AgentMessageChunk(chunk),
-            );
-            Some(notification)
-        }
-    }
 }
 
 /// Parse user message content from PromptRequest.
@@ -488,6 +438,7 @@ mod tests {
 
         let response = agent.initialize(request).await.unwrap();
 
+        assert_eq!(response.agent_capabilities, AgentCapabilities::new());
         assert!(response.agent_info.is_some());
         let agent_info = response.agent_info.unwrap();
         assert_eq!(agent_info.name, "harnx");

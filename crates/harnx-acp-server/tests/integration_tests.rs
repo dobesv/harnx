@@ -52,13 +52,9 @@ mod tests {
         writer.flush().expect("Failed to flush");
     }
 
-    #[test]
-    fn mock_client_completes_initialize_and_session_new() {
-        let (_child, mut stdout, mut stdin) = spawn_server();
-
-        // Test initialize
+    fn initialize_server<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) {
         send_request(
-            &mut stdin,
+            writer,
             1,
             "initialize",
             serde_json::json!({
@@ -66,50 +62,66 @@ mod tests {
                 "clientCapabilities": {},
             }),
         );
-
-        let response = read_response(&mut stdout);
+        let response = read_response(reader);
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 1);
-        assert!(
-            response.get("result").is_some(),
-            "Expected result in response"
-        );
+        assert_eq!(response["result"]["protocolVersion"], 1);
+        assert_eq!(response["result"]["agentInfo"]["name"], "harnx");
+    }
 
-        let result = &response["result"];
-        assert_eq!(result["protocolVersion"], 1);
-
-        let agent_info = &result["agentInfo"];
-        assert_eq!(agent_info["name"], "harnx");
-
-        // Test session/new - mcpServers is required by the schema
-        send_request(
-            &mut stdin,
-            2,
-            "session/new",
-            serde_json::json!({
-                "cwd": std::env::current_dir().unwrap().to_str().unwrap(),
-                "mcpServers": [],
-            }),
-        );
-
-        let response = read_response(&mut stdout);
+    fn assert_new_session_response(response: &serde_json::Value) {
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 2);
-        assert!(
-            response.get("result").is_some(),
-            "Expected result in response"
-        );
-
         let result = &response["result"];
         let session_id = result["sessionId"].as_str().expect("Expected sessionId");
         assert!(!session_id.is_empty(), "Session ID should not be empty");
-        // NATS short IDs use the URL-safe base64 alphabet.
         assert!(
             session_id
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "Session ID should be base64url: {session_id}"
         );
+        assert!(result.get("modes").is_none());
+        assert!(result.get("configOptions").is_none());
+    }
+
+    #[test]
+    fn session_new_accepts_empty_mcp_servers() {
+        let (_child, mut stdout, mut stdin) = spawn_server();
+        initialize_server(&mut stdout, &mut stdin);
+        send_request(
+            &mut stdin,
+            2,
+            "session/new",
+            serde_json::json!({
+                "cwd": std::env::current_dir().unwrap(),
+                "mcpServers": [],
+            }),
+        );
+
+        assert_new_session_response(&read_response(&mut stdout));
+    }
+
+    #[test]
+    fn session_new_accepts_injected_mcp_servers() {
+        let (_child, mut stdout, mut stdin) = spawn_server();
+        initialize_server(&mut stdout, &mut stdin);
+        send_request(
+            &mut stdin,
+            2,
+            "session/new",
+            serde_json::json!({
+                "cwd": std::env::current_dir().unwrap(),
+                "mcpServers": [{
+                    "name": "jetbrains-ide",
+                    "command": "/usr/bin/false",
+                    "args": ["--ide-injected"],
+                    "env": [],
+                }],
+            }),
+        );
+
+        assert_new_session_response(&read_response(&mut stdout));
     }
 
     #[test]
