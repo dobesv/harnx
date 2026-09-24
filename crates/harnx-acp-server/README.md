@@ -8,14 +8,30 @@ ACP (Agent Client Protocol) server front-end for harnx agents.
 
 ## Status
 
-**Phase 4**: NATS-backed prompt turns with ACP event fidelity, cancellation, and tool permission requests.
+**Phase 6**: NATS-backed prompt turns with ACP event fidelity, cancellation, tool permission requests, and safe committed-handoff fallback.
 - `initialize` — negotiates protocol version 1 and advertises minimal capabilities.
 - `session/new` — creates a NATS-backed harnx session and accepts IDE-injected MCP server entries.
 - `session/prompt` — streams ordered assistant, thought, tool-call, tool-result, notice, and flagged model-error updates.
 - `session/cancel` — stops the local prompt follower and durably cancels the NATS turn.
+- A committed handoff reports the target agent, local session ID, cluster, and opening instructions.
 - All logging goes to stderr; stdout carries only protocol frames.
 
-Later phases add persistence and handoffs.
+Session persistence remains deferred.
+
+### Handoff limitation
+
+ACP v1 has no agent-initiated session-switch method. ACP clients therefore do
+not auto-follow handoffs yet. When harnx commits a handoff, its worker has
+already created and enqueued the target session. The bridge reports that
+independently running target as an ordinary agent message and marks the source
+ACP session inactive; another prompt to the source returns an actionable error
+instead of continuing the old conversation.
+
+Open the target in the TUI with the exact `.session <agent> <session-id>`
+command shown in the fallback. For Web, start
+`harnx-serve --addr 127.0.0.1:8000`, open `http://127.0.0.1:8000/`, and
+select the reported agent and session. Phase 7 will add full handoff following
+while keeping the same ACP session.
 
 ## Installation
 

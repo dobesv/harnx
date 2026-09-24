@@ -9,6 +9,7 @@ use harnx_core::event::{
     AgentEvent, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, ToolKind, ToolStatus,
 };
 
+use crate::handoff::{committed_target, fallback_update};
 use crate::{HARNX_ERROR_META, HARNX_MARKDOWN_META};
 
 struct ToolStart {
@@ -21,11 +22,34 @@ struct ToolStart {
 }
 /// Convert one harnx event into the ACP update visible to IDE clients.
 pub fn agent_event_to_session_update(event: AgentEvent) -> Option<SessionUpdate> {
+    agent_event_to_session_update_for_cluster(event, harnx_runtime::config::LOCAL_CLUSTER_KEY)
+}
+
+/// Convert an event while resolving bare committed targets against source cluster.
+pub fn agent_event_to_session_update_for_cluster(
+    event: AgentEvent,
+    source_cluster: &str,
+) -> Option<SessionUpdate> {
+    agent_event_to_update_inner(event, source_cluster, true)
+}
+
+fn agent_event_to_update_inner(
+    event: AgentEvent,
+    source_cluster: &str,
+    allow_handoff: bool,
+) -> Option<SessionUpdate> {
+    if allow_handoff {
+        if let Some(target) = committed_target(&event, source_cluster) {
+            return Some(fallback_update(&target));
+        }
+    }
     match event {
         AgentEvent::Model(event) => model_event_to_update(event),
         AgentEvent::Tool(event) => Some(tool_event_to_update(event)),
         AgentEvent::Notice(event) => notice_event_to_update(event),
-        AgentEvent::SubAgent { event, .. } => agent_event_to_session_update(*event),
+        AgentEvent::SubAgent { event, .. } => {
+            agent_event_to_update_inner(*event, source_cluster, false)
+        }
         _ => None,
     }
 }

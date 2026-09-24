@@ -7,11 +7,15 @@
 //! Key invariant: Drop the sink sender and await the drain task before
 //! finishing the prompt turn to ensure all chunks flush in order.
 
+use std::sync::Arc;
+
 use agent_client_protocol::schema::v1::SessionUpdate;
 use harnx_core::event::{AgentEvent, AgentEventSink};
 use tokio::sync::mpsc;
 
-use crate::event_map::agent_event_to_session_update;
+use crate::event_map::agent_event_to_session_update_for_cluster;
+use crate::handoff::{committed_target, fallback_update};
+use crate::SessionContext;
 
 /// Internal message sent from the sink to the drain task.
 #[derive(Debug)]
@@ -52,6 +56,8 @@ impl SignalHandle {
 pub struct AcpEventSink {
     tx: mpsc::UnboundedSender<AcpMessage>,
     session_id: String,
+    source_cluster: String,
+    session: Option<Arc<SessionContext>>,
 }
 
 impl AcpEventSink {
@@ -60,8 +66,37 @@ impl AcpEventSink {
     /// The sender should drop the sink and await the drain task to flush
     /// all pending updates before completing the prompt turn.
     pub fn new(session_id: String) -> (Self, mpsc::UnboundedReceiver<AcpMessage>) {
+        Self::build(
+            session_id,
+            harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+            None,
+        )
+    }
+
+    /// Create a sink that deactivates source state on an authoritative commit.
+    pub fn for_session(
+        session_id: String,
+        source_cluster: String,
+        session: Arc<SessionContext>,
+    ) -> (Self, mpsc::UnboundedReceiver<AcpMessage>) {
+        Self::build(session_id, source_cluster, Some(session))
+    }
+
+    fn build(
+        session_id: String,
+        source_cluster: String,
+        session: Option<Arc<SessionContext>>,
+    ) -> (Self, mpsc::UnboundedReceiver<AcpMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx, session_id }, rx)
+        (
+            Self {
+                tx,
+                session_id,
+                source_cluster,
+                session,
+            },
+            rx,
+        )
     }
 
     /// Get the session ID this sink is associated with.
@@ -84,11 +119,25 @@ impl AcpEventSink {
     pub fn signal_complete(&self) {
         let _ = self.tx.send(AcpMessage::TurnComplete);
     }
+
+    fn map_event(&self, event: AgentEvent) -> Option<SessionUpdate> {
+        if let Some(target) = committed_target(&event, &self.source_cluster) {
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.commit_handoff(target.clone()))
+            {
+                return None;
+            }
+            return Some(fallback_update(&target));
+        }
+        agent_event_to_session_update_for_cluster(event, &self.source_cluster)
+    }
 }
 
 impl AgentEventSink for AcpEventSink {
     fn emit(&self, event: AgentEvent) {
-        if let Some(update) = agent_event_to_session_update(event) {
+        if let Some(update) = self.map_event(event) {
             let msg = AcpMessage::Update {
                 session_id: self.session_id.clone(),
                 update: Box::new(update),
@@ -102,7 +151,7 @@ impl AgentEventSink for AcpEventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harnx_core::event::{ContentBlock, ModelEvent};
+    use harnx_core::event::{ContentBlock, ModelEvent, SessionEvent, TurnEvent};
 
     #[test]
     fn sink_creates_channel() {
@@ -159,6 +208,39 @@ mod tests {
             }
             _ => panic!("expected Update message"),
         }
+    }
+
+    #[test]
+    fn only_committed_handoff_deactivates_source_and_emits_fallback() {
+        let session = Arc::new(SessionContext::new_for_test());
+        let (sink, mut rx) = AcpEventSink::for_session(
+            "source-session".to_string(),
+            "source-cluster".to_string(),
+            Arc::clone(&session),
+        );
+
+        sink.emit(AgentEvent::Turn(TurnEvent::HandoffRequested {
+            agent: "atlas@prod".to_string(),
+            session_id: Some("tentative".to_string()),
+        }));
+        assert!(session.handoff_target().is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        sink.emit(AgentEvent::Session(SessionEvent::HandoffCommitted {
+            agent: "atlas@prod".to_string(),
+            session_id: "target-session".to_string(),
+            handoff_tool_call_id: Some("handoff-call".to_string()),
+            after_seq: Some(42),
+        }));
+        let target = session.handoff_target().expect("source is inactive");
+        assert_eq!(
+            (target.cluster(), target.agent(), target.local_session_id()),
+            ("prod", "atlas", "target-session")
+        );
+        assert!(matches!(rx.try_recv(), Ok(AcpMessage::Update { .. })));
     }
 
     #[test]
