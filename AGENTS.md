@@ -239,7 +239,7 @@ trusting a refresh, and see issue #2025 for reconciling the catalog against
 
 ## Tool Servers
 
-Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `harnx-bash-tools`, `harnx-time-tools`, `harnx-plans-tools`, `harnx-exa-tools`). They run `harnx_toolset_server::run_toolset_main(toolset)` and default to NATS mode. For Streamable HTTP MCP mode, pass `--mcp-http`; `--host` defaults to `0.0.0.0` and `--port` selects the listening port. Default HTTP ports are:
+Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `harnx-bash-tools`, `harnx-time-tools`, `harnx-plans-tools`, `harnx-exa-tools`, `harnx-fetch-tools`). They run `harnx_toolset_server::run_toolset_main(toolset)` and default to NATS mode. For Streamable HTTP MCP mode, pass `--mcp-http`; `--host` defaults to `0.0.0.0` and `--port` selects the listening port. Default HTTP ports are:
 
 | Server | Port |
 | --- | ---: |
@@ -249,6 +249,7 @@ Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `h
 | fs | 3003 |
 | grep | 3004 |
 | exa | 3005 |
+| fetch | 3006 |
 
 When launching behind `harnx-mcp-bridge` for stdio MCP compatibility, pass `--mcp-stdio` — without it, the server waits for NATS and the bridge handshake times out.
 
@@ -275,6 +276,24 @@ The checklist below covers every integration point. Miss any and the release fai
 8. **MCP HTTP port** — use the next free port in the sequence (e.g., 3006 after exa's 3005).
 
 9. **CI.yaml** — no per-crate edit needed; CI uses `cargo build --workspace` and `cargo nextest run --all`.
+
+### SSRF / private-IP protection for URL-fetching tool servers
+
+When a tool fetches attacker-influenced URLs, block connections to private, loopback, link-local, and other special-purpose IP addresses. The pattern in `harnx-fetch-tools/src/net.rs` covers the pitfalls:
+
+1. **Resolver + literal check required** — `reqwest::dns::Resolve` is NOT called for IP-literal URLs (`http://127.0.0.1`, `http://2130706433`, `http://[::ffff:127.0.0.1]`). You need BOTH a guarded resolver (for DNS answers) AND a `check_url` that classifies literal hosts, applied to the initial URL and every redirect hop.
+
+2. **Reject whole mixed answer** — the resolver must collect ALL addresses, then reject if ANY is disallowed (prevents DNS-rebinding split A/AAAA bypass). Return only vetted addresses. Empty answer = explicit error.
+
+3. **Redirects** — `reqwest::redirect::Policy::custom` does NOT inherit the default limit. Wrap `Policy::limited(10)` and re-run `check_url` on each hop; block with `attempt.error(..)` (not `stop()` — stop returns the redirect as success).
+
+4. **Proxy** — protected client must call `.no_proxy()`; reject `proxy` tool arg while protection is on (a proxy resolves the target itself, bypassing the guarded resolver).
+
+5. **IP classification** — normalize IPv4-mapped IPv6 (`to_ipv4_mapped`) before classifying. `std::net::IpAddr::is_global` is unstable; use `ipnet` CIDR ranges instead. Block the full IANA special-purpose set (0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16, 100.64/10, 192.0.0/24, 192.0.2/24, 198.18/15, 224/4, 240/4, broadcast; IPv6: ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8, plus documentation/benchmark ranges). `harnx-fetch-tools/src/net.rs` encodes the tables in `ipv4_blocked_ranges()` and `ipv6_blocked_ranges()`.
+
+6. **Testing** — assert no connection is attempted to blocked addresses (bind a listener, assert it never accepts). Redirect tests must drive live HTTP through the production policy, not just call `check_url` on strings.
+
+Reference implementation: `crates/harnx-fetch-tools/src/net.rs` (`GuardedResolver`, `check_url`, `redirect_policy`, IP tables) and `src/client.rs` (`FetchClient`).
 
 ### Reasoning-signature compatibility across providers (issue #1804)
 
