@@ -1,0 +1,39 @@
+[package]
+name = "harnx-fetch-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native URL fetching and content extraction toolset server"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+dom_smoothie = { workspace = true }
+futures-util = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+harnx-metrics = { workspace = true }
+harnx-toolset = { path = "../harnx-toolset" }
+harnx-toolset-server = { path = "../harnx-toolset-server" }
+html_to_markdown = { workspace = true }
+ipnet = { workspace = true }
+log = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+rmcp = { workspace = true }
+scraper = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+wiremock = { workspace = true }
+
+[[bin]]
+name = "harnx-fetch-tools"
+path = "src/main.rs"
