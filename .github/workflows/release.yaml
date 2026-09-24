@@ -37,14 +37,13 @@ jobs:
           cargo-flags: "--jobs 2"
         - target: aarch64-apple-darwin
           os: macos-latest
-          use-cross: true
           cargo-flags: ""
         - target: aarch64-pc-windows-msvc
           os: windows-latest
           use-cross: true
           cargo-flags: ""
         - target: x86_64-apple-darwin
-          os: macos-latest
+          os: macos-15-intel
           cargo-flags: ""
         - target: x86_64-pc-windows-msvc
           os: windows-latest
@@ -127,7 +126,9 @@ jobs:
     - name: Build
       shell: bash
       run: |
-        if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+        # Fat LTO takes over two hours for the macOS release binaries on
+        # GitHub's standard runners. Keep the faster ThinLTO on Linux ARM too.
+        if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" || "${{ matrix.target }}" == *-apple-darwin ]]; then
           export CARGO_PROFILE_RELEASE_LTO=thin
         fi
         $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
