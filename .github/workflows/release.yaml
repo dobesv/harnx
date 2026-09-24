@@ -31,7 +31,10 @@ jobs:
         - target: aarch64-unknown-linux-musl
           os: ubuntu-latest
           use-cross: true
-          cargo-flags: ""
+          # This target has repeatedly lost its hosted runner during the
+          # release build. Bound concurrent compilers and avoid fat LTO's
+          # high link-time resource use on the 16 GB runner.
+          cargo-flags: "--jobs 2"
         - target: aarch64-apple-darwin
           os: macos-latest
           use-cross: true
@@ -124,6 +127,9 @@ jobs:
     - name: Build
       shell: bash
       run: |
+        if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+          export CARGO_PROFILE_RELEASE_LTO=thin
+        fi
         $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
           -p harnx -p harnx-serve -p harnx-worker \
           -p harnx-bash-tools -p harnx-fs-tools -p harnx-grep-tools -p harnx-plans-tools -p harnx-mcp-bridge -p harnx-time-tools \
