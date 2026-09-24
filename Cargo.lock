@@ -3763,14 +3763,20 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "assert_cmd",
+ "async-nats",
  "clap",
  "futures",
+ "harnx-core",
+ "harnx-runtime",
+ "parking_lot",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "which",
 ]
 
 [[package]]

@@ -103,9 +103,12 @@ mod tests {
         let result = &response["result"];
         let session_id = result["sessionId"].as_str().expect("Expected sessionId");
         assert!(!session_id.is_empty(), "Session ID should not be empty");
+        // NATS short IDs use the URL-safe base64 alphabet.
         assert!(
-            uuid::Uuid::parse_str(session_id).is_ok(),
-            "Session ID should be valid UUID"
+            session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "Session ID should be base64url: {session_id}"
         );
     }
 
