@@ -133,7 +133,7 @@ jobs:
         fi
         $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
           -p harnx -p harnx-serve -p harnx-worker \
-          -p harnx-bash-tools -p harnx-fs-tools -p harnx-grep-tools -p harnx-plans-tools -p harnx-mcp-bridge -p harnx-time-tools \
+          -p harnx-bash-tools -p harnx-fs-tools -p harnx-exa-tools -p harnx-grep-tools -p harnx-plans-tools -p harnx-mcp-bridge -p harnx-time-tools \
           -p harnx-aws-creds -p harnx-k8s-creds -p harnx-k8s-sandbox-tools -p harnx-pkg -p harnx-proxy-auth \
           -p harnx-sandbox-run \
           -p harnx-sandbox-common
@@ -159,6 +159,7 @@ jobs:
           "harnx-worker:harnx-worker"
           "harnx-bash-tools:harnx-bash-tools"
           "harnx-fs-tools:harnx-fs-tools"
+          "harnx-exa-tools:harnx-exa-tools"
           "harnx-grep-tools:harnx-grep-tools"
           "harnx-plans-tools:harnx-plans-tools"
           "harnx-mcp-bridge:harnx-mcp-bridge"
@@ -352,6 +353,8 @@ jobs:
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-fs-tools-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-exa-tools-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-grep-tools-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-plans-tools-$V-x86_64-unknown-linux-musl.tar.gz" || true
@@ -384,6 +387,8 @@ jobs:
             --pattern "harnx-bash-tools-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-fs-tools-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-exa-tools-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-grep-tools-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
@@ -421,7 +426,7 @@ jobs:
         run: |
           missing=0
           for dir in linux-amd64 linux-arm64; do
-            for bin in harnx harnx-serve harnx-worker harnx-bash-tools harnx-fs-tools harnx-grep-tools harnx-plans-tools harnx-mcp-bridge harnx-time-tools harnx-aws-creds harnx-k8s-creds harnx-k8s-sandbox-tools harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
+            for bin in harnx harnx-serve harnx-worker harnx-bash-tools harnx-fs-tools harnx-exa-tools harnx-grep-tools harnx-plans-tools harnx-mcp-bridge harnx-time-tools harnx-aws-creds harnx-k8s-creds harnx-k8s-sandbox-tools harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
               if [ ! -f "$dir/$bin" ]; then
                 echo "ERROR: missing $dir/$bin"
                 missing=1

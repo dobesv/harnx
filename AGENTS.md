@@ -239,7 +239,7 @@ trusting a refresh, and see issue #2025 for reconciling the catalog against
 
 ## Tool Servers
 
-Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `harnx-bash-tools`, `harnx-time-tools`, `harnx-plans-tools`). They run `harnx_toolset_server::run_toolset_main(toolset)` and default to NATS mode. For Streamable HTTP MCP mode, pass `--mcp-http`; `--host` defaults to `0.0.0.0` and `--port` selects the listening port. Default HTTP ports are:
+Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `harnx-bash-tools`, `harnx-time-tools`, `harnx-plans-tools`, `harnx-exa-tools`). They run `harnx_toolset_server::run_toolset_main(toolset)` and default to NATS mode. For Streamable HTTP MCP mode, pass `--mcp-http`; `--host` defaults to `0.0.0.0` and `--port` selects the listening port. Default HTTP ports are:
 
 | Server | Port |
 | --- | ---: |
@@ -248,10 +248,33 @@ Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `h
 | bash | 3002 |
 | fs | 3003 |
 | grep | 3004 |
+| exa | 3005 |
 
 When launching behind `harnx-mcp-bridge` for stdio MCP compatibility, pass `--mcp-stdio` — without it, the server waits for NATS and the bridge handshake times out.
 
 Binaries with `-mcp-` in the name are genuine MCP infrastructure (`harnx-mcp-bridge`, `harnx-mcp-remote`) or test fixtures (`harnx-mock-mcp`), not native toolsets.
+
+### Adding a new native toolset server
+
+The checklist below covers every integration point. Miss any and the release fails or the binary ships incomplete.
+
+1. **New crate** — mirror `harnx-grep-tools` structure: `src/{lib,main,toolset,client,format}.rs`, `src/server/{mod,handler,model,params}.rs`. Implement `Toolset` (`name`, `default_mcp_http_port`, `tools`, `invoke`) and `ServerHandler` (rmcp) sharing the same handlers. `main.rs` calls `harnx_toolset_server::run_toolset_main`.
+
+2. **Workspace Cargo.toml** — add to `[workspace] members`.
+
+3. **release.yaml** — five spots: build `-p` list, `archive_specs`, x86_64 verify pattern, aarch64 verify pattern, dist bin `for` loop.
+
+4. **docker/harnx.Dockerfile** — `COPY linux-${TARGETARCH}/<binary> /usr/local/bin/<binary>` line. The Dockerfile header lists the four release.yaml locations that must be kept in sync.
+
+5. **Docs enumerating binaries** — `docs/healthz.md`, `docs/metrics.md`, `docs/environment-variables.md` enumerate tool servers in multiple places; all lists must be updated. `docs/configuration-guide.md` has a "native-servers" sentence listing examples. Illustrative mentions (time-tools examples in `docs/kubernetes-deployment.md`, etc.) do not need updates.
+
+6. **`.gitattributes`** — if the crate ships golden `.txt` fixtures, add `text eol=lf`.
+
+7. **Changeset** — if the change touches `packages/coding/**` or `packages/pantheon/**`, the changeset front-matter must include `"coding"`/`"pantheon"` scopes (separate knope packages with their own CHANGELOGs).
+
+8. **MCP HTTP port** — use the next free port in the sequence (e.g., 3006 after exa's 3005).
+
+9. **CI.yaml** — no per-crate edit needed; CI uses `cargo build --workspace` and `cargo nextest run --all`.
 
 ### Reasoning-signature compatibility across providers (issue #1804)
 

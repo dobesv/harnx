@@ -1,0 +1,34 @@
+[package]
+name = "harnx-exa-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Toolset server for Exa web search and content fetching (also supports MCP stdio via --mcp-stdio)"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+fancy-regex = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+harnx-metrics = { workspace = true }
+harnx-toolset = { path = "../harnx-toolset" }
+harnx-toolset-server = { path = "../harnx-toolset-server" }
+log = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+wiremock = { workspace = true }
+
+[[bin]]
+name = "harnx-exa-tools"
+path = "src/main.rs"

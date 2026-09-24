@@ -1,0 +1,22 @@
+Title: Rust Async Book
+URL: https://rust-lang.github.io/async-book/
+Published: 2024-01-15T10:30:00.000Z
+Author: Rust Project
+Highlights:
+Asynchronous programming in Rust.
+Learn how futures and async/await work.
+
+---
+
+Title: N/A
+URL: https://example.com/fallback
+Published: N/A
+Author: N/A
+Text: Fallback body text.
+
+---
+
+Title: Result Without Extracted Content
+URL: https://example.com/metadata-only
+Published: 2023-08-09
+Author: Ada

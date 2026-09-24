@@ -1,13 +1,6 @@
 # Note: set EXA_API_KEY in ~/.local/share/harnx/.env
-command: harnx-mcp-bridge
+command: harnx-exa-tools
 enabled: true
-description: "Web search via Exa API"
-args:
-  - --name
-  - exa
-  - --
-  - npx
-  - "-y"
-  - exa-mcp-server
-env:
-  HARNX_BASH_ENV_PASSTHROUGH: EXA_API_KEY
+description: >-
+  Web search via Exa API. Used by Librarian, Sisyphus, and Zosimus for
+  research and fact-finding.

@@ -1,16 +1,6 @@
-# Requires: Node.js / npx and an Exa API key.
-# Set EXA_API_KEY in ~/.local/share/harnx/.env
+# Requires an Exa API key. Set EXA_API_KEY in ~/.local/share/harnx/.env
 # Sign up at https://exa.ai to get a key.
-command: harnx-mcp-bridge
+command: harnx-exa-tools
 description: >-
   Web search via Exa API. Used by Librarian, Sisyphus, and Zosimus for
   research and fact-finding.
-args:
-  - --name
-  - exa
-  - --
-  - npx
-  - "-y"
-  - exa-mcp-server@3.2.1
-env:
-  HARNX_BASH_ENV_PASSTHROUGH: EXA_API_KEY

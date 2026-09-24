@@ -1,2 +1,3 @@
-# Keep grep-server golden test fixtures as LF so byte-exact output asserts pass on Windows
+# Keep tool-server golden test fixtures as LF so byte-exact output asserts pass on Windows
+crates/harnx-exa-tools/tests/fixtures/** text eol=lf
 crates/harnx-grep-tools/tests/fixtures/** text eol=lf
