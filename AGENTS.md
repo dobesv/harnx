@@ -768,6 +768,9 @@ metrics use a **separate mechanism**: `record_completion_usage` in `config/mod.r
 `Session.completion_usage` per model call. These mechanisms are independent. Anyone modifying usage
 display must keep them separate or they'll double-count.
 
+Per-tool-call display usage in `ToolEvent::Update.usage` is also display-only and non-cumulative; it
+replaces on each update and is stored in ACP `_meta.harnx:usage` (`harnx-acp-server/src/event_map.rs:254`).
+
 ## Tool Progress Patch Semantics
 
 `ToolUpdatePatch` and `ToolDisplayState` (`harnx-core/src/tool.rs:258-356`) implement pure merge:
@@ -791,6 +794,21 @@ guard (`display_state_terminal_status_ignored` in `tool.rs:1443`).
 `ToolProvider::call_tool_with_progress` (`harnx-core/src/tool.rs:232-242`) delegates to `call_tool_with_id`
 by default. Provider decorators/wrappers that forward only legacy methods silently swallow updates.
 Engine dispatch must call the `_with_progress` variant to enable progress.
+
+### Tool-call ID assignment
+
+Tool calls receive stable UUID IDs via `ensure_tool_call_ids` (`harnx-engine/src/tool.rs:182-188`) before
+session transcript persistence and provider dispatch. The runtime calls the same helper. Empty or missing
+IDs are replaced with fresh UUIDs; existing non-empty IDs are preserved. Legacy orphan repair assigns
+IDs before cloning calls so recovery position matching remains valid.
+
+### Progress emission and sink capture
+
+`RuntimeToolProgress` (`harnx-engine/src/progress.rs`) coalesces rapid updates with a 250ms budget. First
+meaningful update emits immediately; subsequent updates merge into pending state and flush after the
+interval or synchronously in `finalize()`. Abort and terminal states reject later updates. The runtime
+captures `current_agent_event_sink()` when building `emit_tool_update_fn` (`harnx-runtime/src/tool.rs:279-282`);
+tools emitting from `tokio::spawn` see the originating turn sink, not a stale task-local or global fallback.
 
 ### Tool confirmation modal ordering and delivery
 

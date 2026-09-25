@@ -6,10 +6,11 @@ use harnx_acp_server::event_map::{
     agent_event_to_replay_update, agent_event_to_session_update,
     agent_event_to_session_update_for_cluster, map_tool_status,
 };
-use harnx_acp_server::{HARNX_ERROR_META, HARNX_MARKDOWN_META};
+use harnx_acp_server::{HARNX_ERROR_META, HARNX_MARKDOWN_META, HARNX_USAGE_META};
+use harnx_core::api_types::CompletionTokenUsage;
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent,
-    ToolKind, ToolStatus, TurnEvent, UserEvent,
+    ToolKind, ToolLocation, ToolStatus, TurnEvent, UserEvent,
 };
 
 fn text_content(update: &ToolCallUpdate) -> Option<&str> {
@@ -47,15 +48,15 @@ fn replay_message(update: &SessionUpdate) -> (&str, bool) {
 
 struct ExpectedToolUpdate<'a> {
     id: &'a str,
-    status: ToolCallStatus,
+    status: Option<ToolCallStatus>,
     output: Option<serde_json::Value>,
     text: Option<&'a str>,
 }
 
 fn assert_tool_update(update: &ToolCallUpdate, expected: ExpectedToolUpdate<'_>) {
     assert_eq!(
-        (update.tool_call_id.0.as_ref(), update.fields.status),
-        (expected.id, Some(expected.status)),
+        (&*update.tool_call_id.0, update.fields.status),
+        (expected.id, expected.status),
     );
     assert_eq!(
         (update.fields.raw_output.as_ref(), text_content(update)),
@@ -115,7 +116,7 @@ macro_rules! lifecycle_case {
             }),
             ExpectedToolUpdate {
                 id: $id,
-                status: ToolCallStatus::InProgress,
+                status: None,
                 output: None,
                 text: Some($markdown),
             },
@@ -130,7 +131,7 @@ macro_rules! lifecycle_case {
             }),
             ExpectedToolUpdate {
                 id: $id,
-                status: ToolCallStatus::Completed,
+                status: Some(ToolCallStatus::Completed),
                 output: Some($expected_output),
                 text: Some($text),
             },
@@ -144,7 +145,7 @@ macro_rules! lifecycle_case {
             }),
             ExpectedToolUpdate {
                 id: $id,
-                status: ToolCallStatus::InProgress,
+                status: Some(ToolCallStatus::InProgress),
                 output: None,
                 text: Some($text),
             },
@@ -158,7 +159,7 @@ macro_rules! lifecycle_case {
             }),
             ExpectedToolUpdate {
                 id: $id,
-                status: ToolCallStatus::Failed,
+                status: Some(ToolCallStatus::Failed),
                 output: None,
                 text: Some($text),
             },
@@ -186,6 +187,76 @@ fn tool_lifecycle_updates_map_correctly() {
         };
         assert_tool_update(&update, expected);
     }
+}
+
+#[test]
+fn rich_tool_update_maps_title_kind_locations_status_and_usage() {
+    let usage = CompletionTokenUsage {
+        input_tokens: 12,
+        output_tokens: 7,
+        cached_tokens: 3,
+        cache_write_tokens: 1,
+    };
+    let update = agent_event_to_session_update(AgentEvent::Tool(ToolEvent::Update {
+        id: "call-rich".to_string(),
+        markdown: None,
+        status: Some(ToolStatus::InProgress),
+        content: Some(vec![ContentBlock::Text("working".to_string())]),
+        title: Some("Reading workspace".to_string()),
+        kind: Some(ToolKind::Read),
+        locations: Some(vec![ToolLocation {
+            path: "/tmp/config".into(),
+            line: Some(9),
+        }]),
+        usage: Some(usage.clone()),
+    }))
+    .expect("tool update should map");
+
+    let SessionUpdate::ToolCallUpdate(update) = update else {
+        panic!("expected tool call update");
+    };
+    assert_eq!(update.fields.status, Some(ToolCallStatus::InProgress));
+    assert_eq!(update.fields.title.as_deref(), Some("Reading workspace"));
+    assert_eq!(update.fields.name, None);
+    assert_eq!(update.fields.kind, Some(AcpToolKind::Read));
+    assert_eq!(text_content(&update), Some("working"));
+    let locations = update
+        .fields
+        .locations
+        .as_ref()
+        .expect("locations should be present");
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].path, std::path::PathBuf::from("/tmp/config"));
+    assert_eq!(locations[0].line, Some(9));
+    assert_eq!(
+        update
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(HARNX_USAGE_META)),
+        Some(&serde_json::to_value(usage).unwrap())
+    );
+}
+
+#[test]
+fn tool_update_preserves_explicit_collection_clears() {
+    let update = agent_event_to_session_update(AgentEvent::Tool(ToolEvent::Update {
+        id: "call-clear".to_string(),
+        markdown: None,
+        status: None,
+        content: Some(vec![]),
+        title: None,
+        kind: None,
+        locations: Some(vec![]),
+        usage: None,
+    }))
+    .expect("tool update should map");
+
+    let SessionUpdate::ToolCallUpdate(update) = update else {
+        panic!("expected tool call update");
+    };
+    assert_eq!(update.fields.status, None);
+    assert_eq!(update.fields.content.as_deref(), Some([].as_slice()));
+    assert_eq!(update.fields.locations.as_deref(), Some([].as_slice()));
 }
 
 #[test]

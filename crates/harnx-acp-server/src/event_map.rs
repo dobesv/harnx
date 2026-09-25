@@ -5,12 +5,14 @@ use agent_client_protocol::schema::v1::{
     ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     ToolKind as AcpToolKind,
 };
+use harnx_core::api_types::CompletionTokenUsage;
 use harnx_core::event::{
-    AgentEvent, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, ToolKind, ToolStatus, UserEvent,
+    AgentEvent, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, ToolKind, ToolLocation,
+    ToolStatus, UserEvent,
 };
 
 use crate::handoff::{committed_target, fallback_update};
-use crate::{HARNX_ERROR_META, HARNX_MARKDOWN_META};
+use crate::{HARNX_ERROR_META, HARNX_MARKDOWN_META, HARNX_USAGE_META};
 
 struct ToolStart {
     id: String,
@@ -19,6 +21,17 @@ struct ToolStart {
     markdown: Option<String>,
     input: serde_json::Value,
     locations: Vec<harnx_core::event::ToolLocation>,
+}
+
+struct ToolPatch {
+    id: String,
+    status: Option<ToolCallStatus>,
+    markdown: Option<String>,
+    content: Option<Vec<ContentBlock>>,
+    title: Option<String>,
+    kind: Option<ToolKind>,
+    locations: Option<Vec<ToolLocation>>,
+    usage: Option<CompletionTokenUsage>,
 }
 /// Convert one harnx event into the ACP update visible to IDE clients.
 pub fn agent_event_to_session_update(event: AgentEvent) -> Option<SessionUpdate> {
@@ -111,20 +124,20 @@ fn tool_event_to_update(event: ToolEvent) -> SessionUpdate {
             markdown,
             status,
             content,
-            // New fields (Phase 1): not yet mapped to ACP. The ACP mapper
-            // will be updated in Phase 2+ to include title/kind/locations/usage.
-            title: _,
-            kind: _,
-            locations: _,
-            usage: _,
-        } => {
-            let text = non_empty_option(markdown.clone())
-                .or_else(|| content.as_deref().and_then(text_from_blocks));
-            let status = status
-                .map(map_tool_status)
-                .unwrap_or(ToolCallStatus::InProgress);
-            SessionUpdate::ToolCallUpdate(tool_call_update(id, status, text, markdown))
-        }
+            title,
+            kind,
+            locations,
+            usage,
+        } => SessionUpdate::ToolCallUpdate(tool_call_update_with_fields(ToolPatch {
+            id,
+            status: status.map(map_tool_status),
+            markdown,
+            content,
+            title,
+            kind,
+            locations,
+            usage,
+        })),
         ToolEvent::Completed {
             id,
             output,
@@ -198,6 +211,68 @@ fn tool_call_update(
         update = update.meta(meta);
     }
     update
+}
+
+fn tool_call_update_with_fields(patch: ToolPatch) -> ToolCallUpdate {
+    let ToolPatch {
+        id,
+        status,
+        markdown,
+        content,
+        title,
+        kind,
+        locations,
+        usage,
+    } = patch;
+    let mut fields = ToolCallUpdateFields::new();
+    if let Some(status) = status {
+        fields = fields.status(status);
+    }
+    let mapped_content = non_empty_option(markdown.clone())
+        .map(|text| vec![tool_content(text)])
+        .or_else(|| map_update_content(content));
+    if let Some(content) = mapped_content {
+        fields = fields.content(content);
+    }
+    if let Some(title) = title {
+        fields = fields.title(title);
+    }
+    if let Some(kind) = kind {
+        fields = fields.kind(map_tool_kind(kind));
+    }
+    if let Some(locations) = locations {
+        fields = fields.locations(
+            locations
+                .into_iter()
+                .map(map_tool_location)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    let mut meta = markdown_meta(markdown).unwrap_or_default();
+    if let Some(usage) = usage {
+        meta.insert(
+            HARNX_USAGE_META.to_string(),
+            serde_json::to_value(usage).expect("completion token usage serializes"),
+        );
+    }
+    let mut update = ToolCallUpdate::new(id, fields);
+    if !meta.is_empty() {
+        update = update.meta(meta);
+    }
+    update
+}
+
+fn map_update_content(content: Option<Vec<ContentBlock>>) -> Option<Vec<ToolCallContent>> {
+    let blocks = content?;
+    if blocks.is_empty() {
+        return Some(Vec::new());
+    }
+    text_from_blocks(&blocks).map(|text| vec![tool_content(text)])
+}
+
+fn map_tool_location(location: ToolLocation) -> ToolCallLocation {
+    ToolCallLocation::new(location.path).line(location.line)
 }
 
 fn tool_call_completed(

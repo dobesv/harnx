@@ -1492,11 +1492,14 @@ fn partition_orphan_calls(
 }
 
 async fn rerun_or_synthesize_tool_results(
-    rerun_calls: Vec<(usize, harnx_core::tool::ToolCall)>,
+    mut rerun_calls: Vec<(usize, harnx_core::tool::ToolCall)>,
     eval_ctx: &crate::tool::ToolEvalContext,
     abort_signal: &AbortSignal,
     authorization: Option<&dyn harnx_core::tool::ReplayAuthorization>,
 ) -> Result<Vec<(usize, harnx_core::session::ToolOutput)>> {
+    for (_, call) in &mut rerun_calls {
+        harnx_engine::tool::ensure_tool_call_ids(std::slice::from_mut(call));
+    }
     let calls = rerun_calls.iter().map(|(_, call)| call.clone()).collect();
     match harnx_engine::tool::eval_tool_calls_with_authorization(
         eval_ctx,

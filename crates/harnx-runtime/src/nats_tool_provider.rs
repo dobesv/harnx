@@ -482,6 +482,9 @@ impl ToolProvider for NatsToolProvider {
         ))
         .await
     }
+
+    // The default `call_tool_with_progress` keeps forwarding call identity through
+    // `call_tool_with_id`; NATS progress transport is added in a later phase.
 }
 
 /// Open the tool registry bucket, treating "the stream genuinely doesn't
