@@ -414,7 +414,9 @@ default_provider()))` instead.
 This bites indirectly too. A dependency that builds its own config on your
 behalf hits the same panic, which is why `NatsEndpoint::apply_tls_options`
 (`crates/harnx-nats-common/src/connect.rs`) supplies a `tls_client_config` for
-every TLS connection rather than letting async-nats construct one.
+every TLS connection rather than letting async-nats construct one — including
+a best-effort config for plaintext `nats://` endpoints, in case the server
+demands a TLS upgrade in its INFO.
 
 Feature unification makes this invisible to a narrow test. `harnx-nats-common`
 alone resolves rustls with `ring` and cannot reproduce the ambiguity, so tests

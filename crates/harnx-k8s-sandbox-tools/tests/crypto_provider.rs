@@ -2,11 +2,12 @@
 //!
 //! `harnx-k8s-sandbox-tools` links two rustls crypto providers — `ring` (via async-nats) and
 //! `aws-lc-rs` (via the AWS SDK's hyper-rustls stack that `kube` uses) — and nothing installs a
-//! process default. `kube::Client::try_default` and `reqwest::Client` both build their TLS config
-//! through `rustls::ClientConfig::builder()`, which resolves the process-default provider and
-//! panics with "Could not automatically determine the process-level CryptoProvider" when the
-//! choice is ambiguous. `install_default_crypto_provider` pins `ring` up front so startup no
-//! longer panics.
+//! process default. `kube::Client::try_default` builds its TLS config through
+//! `rustls::ClientConfig::builder()`, which resolves the process-default provider and panics with
+//! "Could not automatically determine the process-level CryptoProvider" when the choice is
+//! ambiguous. `install_default_crypto_provider` pins `ring` up front so startup no longer panics.
+//! (`reqwest` is not affected — it uses `get_default()` with an explicit `aws-lc-rs` fallback — so
+//! kube is the trigger here.)
 //!
 //! This must live in a crate whose graph also pulls in the AWS SDK. A crate that resolves rustls
 //! with `ring` alone cannot reproduce the ambiguity, so the assertion would pass no matter what
@@ -39,7 +40,7 @@ fn install_default_crypto_provider_makes_client_config_builder_safe() {
         "install_default_crypto_provider must install a process-default crypto provider",
     );
 
-    // The exact call kube and reqwest make internally. Without an installed provider this resolves
+    // The exact call kube makes internally. Without an installed provider this resolves
     // the ambiguous process default and panics; with one pinned it returns a builder.
     let _config = ClientConfig::builder()
         .with_root_certificates(RootCertStore::empty())

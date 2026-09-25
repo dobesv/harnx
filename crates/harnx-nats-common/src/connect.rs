@@ -300,13 +300,16 @@ impl NatsEndpoint {
 
     /// Apply everything TLS-related in one place.
     ///
-    /// Whenever TLS is in play, harnx builds the rustls config itself rather
-    /// than letting async-nats build one. async-nats calls
-    /// `ClientConfig::builder()`, which resolves rustls' *process-default*
-    /// `CryptoProvider` and panics when several provider features are compiled
-    /// in and nothing installed a default — which is this workspace exactly.
-    /// See `crates/harnx-runtime/tests/tls_client_config.rs`, which reproduces
-    /// the panic from a crate whose dependency graph has that ambiguity.
+    /// When the endpoint requests TLS, harnx builds the rustls config itself
+    /// rather than letting async-nats build one. A plaintext TCP endpoint also
+    /// gets a best-effort config in case the server demands an upgrade in its
+    /// INFO; failure to load platform roots stays non-fatal for a connection
+    /// that may remain plaintext. async-nats calls `ClientConfig::builder()`,
+    /// which resolves rustls' *process-default* `CryptoProvider` and panics when
+    /// several provider features are compiled in and nothing installed a
+    /// default — which is this workspace exactly. See
+    /// `crates/harnx-runtime/tests/tls_client_config.rs`, which reproduces the
+    /// panic from a crate whose dependency graph has that ambiguity.
     ///
     /// Building the config here is also what lets `tls_ca` and a client
     /// certificate be used together: `tls_client_config` replaces whatever
@@ -319,14 +322,27 @@ impl NatsEndpoint {
     ) -> Result<ConnectOptions> {
         self.reject_tls_settings_on_a_plaintext_websocket(transport)?;
         let client_certificate = self.client_certificate_paths()?;
-        // A `nats://` URL with no TLS settings is left alone, so a server that
-        // demands an upgrade in its INFO anyway still reaches async-nats'
-        // builder and still panics. That is a misconfiguration — the fix is to
-        // say `tls: true` — and covering it would mean loading the platform's
-        // trust roots on every plaintext connection to the local broker.
         if self.has_tls_settings() || transport.implies_tls() {
             options = options
                 .tls_client_config(self.build_tls_client_config(client_certificate.as_ref())?);
+        } else if !transport.is_websocket() {
+            // A `nats://` server can demand a TLS upgrade in its INFO even when
+            // the endpoint has no TLS settings. Give async-nats an explicit
+            // provider for that path too, but don't make platform-root loading
+            // a prerequisite for a broker that remains plaintext.
+            match self.build_tls_client_config(client_certificate.as_ref()) {
+                Ok(config) => options = options.tls_client_config(config),
+                // Non-fatal on purpose: a plaintext connection never uses this
+                // config, so a broken trust store must not fail startup. Log it
+                // so a server that then demands a TLS upgrade — which would fail
+                // to connect — is diagnosable rather than silent.
+                Err(error) => log::debug!(
+                    "NATS cluster '{}': no fallback TLS config for a plaintext \
+                     nats:// endpoint ({error:#}); a server-required TLS upgrade \
+                     would fail",
+                    self.name
+                ),
+            }
         }
         Ok(options)
     }
