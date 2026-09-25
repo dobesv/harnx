@@ -3,6 +3,7 @@
 //! Implements ACP v1 protocol with:
 //! - `initialize` negotiating protocol version 1
 //! - `session/new` creating NATS-backed sessions via local worker
+//! - `session/load` replaying scoped durable transcript snapshots
 //! - `session/prompt` running turn with in-order streaming
 //! - `session/request_permission` bridging gated tools to ACP clients
 //! - committed handoffs producing an actionable fallback and deactivating source
@@ -13,7 +14,7 @@
 //! - Off-loop prompt execution so cancel can be received mid-turn
 //! - Single sequential drain loop for in-order streaming (PR #1038 fix)
 //!
-//! Committed-handoff fallback Phase 6 ACP bridge for #1346.
+//! Capability-gated ACP bridge for #1346.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,8 +23,9 @@ use std::time::Duration;
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    Implementation, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason,
+    Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
+    SessionNotification, SessionUpdate, StopReason,
 };
 use anyhow::Context;
 use harnx_core::abort::AbortSignal;
@@ -139,7 +141,7 @@ impl HarnxAgent {
         // Always advertise v1 instead of echoing an unsupported client version.
         Ok(
             InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
-                .agent_capabilities(AgentCapabilities::new())
+                .agent_capabilities(AgentCapabilities::new().load_session(true))
                 .agent_info(
                     Implementation::new("harnx".to_string(), env!("CARGO_PKG_VERSION").to_string())
                         .title(self.agent_name.clone()),
@@ -155,6 +157,28 @@ impl HarnxAgent {
         Ok(AuthenticateResponse::default())
     }
 
+    async fn backend_config(
+        &self,
+    ) -> acp::Result<(harnx_runtime::SessionActivationRoute, GlobalConfig)> {
+        if let (Some(route), Some(config)) = (&self.activation_route, &self.runtime_config) {
+            return Ok((route.clone(), Arc::clone(config)));
+        }
+        let route = activation_route_for_cluster(
+            &self.cluster,
+            &self.local_worker,
+            self.abort_signal.clone(),
+        )
+        .await
+        .context("failed to bootstrap local NATS worker")
+        .map_err(acp_error)?;
+        let config_path = harnx_runtime::config::Config::config_file();
+        let mut config = harnx_runtime::config::Config::load_from_file(&config_path)
+            .context("failed to load config")
+            .map_err(acp_error)?;
+        config.apply_frontend_nats_routing();
+        Ok((route, Arc::new(parking_lot::RwLock::new(config))))
+    }
+
     /// Handle `session/new` — create NATS-backed session via local worker bootstrap.
     ///
     /// This boots the local worker supervisor if not already running,
@@ -166,25 +190,7 @@ impl HarnxAgent {
             mcp_server_count = request.mcp_servers.len(),
             "creating ACP session"
         );
-        let (activation_route, global_config) =
-            if let (Some(route), Some(config)) = (&self.activation_route, &self.runtime_config) {
-                (route.clone(), Arc::clone(config))
-            } else {
-                let route = activation_route_for_cluster(
-                    &self.cluster,
-                    &self.local_worker,
-                    self.abort_signal.clone(),
-                )
-                .await
-                .context("failed to bootstrap local NATS worker")
-                .map_err(acp_error)?;
-                let config_path = harnx_runtime::config::Config::config_file();
-                let mut config = harnx_runtime::config::Config::load_from_file(&config_path)
-                    .context("failed to load config")
-                    .map_err(acp_error)?;
-                config.apply_frontend_nats_routing();
-                (route, Arc::new(parking_lot::RwLock::new(config)))
-            };
+        let (activation_route, global_config) = self.backend_config().await?;
 
         let initializer = self.session_initializer.clone().unwrap_or_else(|| {
             harnx_runtime::SessionInitializer::named(self.agent_name.clone(), Default::default())
@@ -221,6 +227,78 @@ impl HarnxAgent {
 
         debug!(session_id = %session_id, "created new ACP session");
         Ok(NewSessionResponse::new(SessionId::new(session_id)))
+    }
+
+    /// Handle `session/load` as an ordered, read-only durable transcript snapshot.
+    pub async fn load_session(
+        &self,
+        request: LoadSessionRequest,
+    ) -> acp::Result<LoadSessionResponse> {
+        let session_id = request.session_id.0.to_string();
+        if session_id.trim().is_empty() {
+            return Err(acp_error(anyhow::anyhow!("session ID must not be empty")));
+        }
+        debug!(
+            %session_id,
+            mcp_server_count = request.mcp_servers.len(),
+            additional_directory_count = request.additional_directories.len(),
+            "loading read-only ACP session snapshot"
+        );
+        let connection = self.get_connection().await.ok_or_else(|| {
+            acp_error(anyhow::anyhow!(
+                "ACP client connection unavailable for session replay"
+            ))
+        })?;
+        let entries = self.load_scoped_entries(&session_id).await?;
+        let (sink, drain_rx) = AcpEventSink::for_replay(session_id, self.cluster.clone());
+        let sink = Arc::new(sink);
+        let drain_handle = tokio::spawn(drain_updates(Some(connection), drain_rx));
+
+        harnx_runtime::replay_entries_to_sink(&entries, sink.clone());
+        sink.signal_complete();
+        finish_update_drain(drain_handle).await;
+        Ok(LoadSessionResponse::new())
+    }
+
+    async fn load_scoped_entries(
+        &self,
+        session_id: &str,
+    ) -> acp::Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
+        let (_route, global_config) = self.backend_config().await?;
+        let config = global_config.read().clone();
+        let agent_ref = self.scoped_agent_ref()?;
+        let (jetstream, metadata) =
+            harnx_runtime::config::session_metadata_for_agent(&config, &agent_ref, session_id)
+                .await
+                .context("failed to resolve scoped session identity")
+                .map_err(acp_error)?;
+        let entries =
+            harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, metadata.storage_key())
+                .load_events_async()
+                .await
+                .context("failed to load durable session transcript")
+                .map_err(acp_error)?;
+        harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)
+            .context("failed to reconstruct durable session transcript")
+            .map_err(acp_error)
+    }
+
+    fn scoped_agent_ref(&self) -> acp::Result<String> {
+        use harnx_core::agent_ref::AgentRef;
+
+        match AgentRef::parse(&self.agent_name) {
+            AgentRef::Local(agent) if self.cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY => {
+                Ok(agent.into_owned())
+            }
+            AgentRef::Local(agent) => Ok(format!("{agent}@{}", self.cluster)),
+            AgentRef::Remote { agent, cluster } if cluster == self.cluster => {
+                Ok(format!("{agent}@{cluster}"))
+            }
+            AgentRef::Remote { cluster, .. } => Err(acp_error(anyhow::anyhow!(
+                "configured agent cluster '{cluster}' does not match ACP backend cluster '{}'",
+                self.cluster
+            ))),
+        }
     }
 
     /// Handle `session/prompt` — run turn with in-order streaming via session/update.
@@ -488,7 +566,14 @@ mod tests {
 
         let response = agent.initialize(request).await.unwrap();
 
-        assert_eq!(response.agent_capabilities, AgentCapabilities::new());
+        assert_eq!(
+            response.agent_capabilities,
+            AgentCapabilities::new().load_session(true)
+        );
+        assert_eq!(
+            response.agent_capabilities.session_capabilities,
+            agent_client_protocol::schema::v1::SessionCapabilities::new()
+        );
         assert!(response.agent_info.is_some());
         let agent_info = response.agent_info.unwrap();
         assert_eq!(agent_info.name, "harnx");

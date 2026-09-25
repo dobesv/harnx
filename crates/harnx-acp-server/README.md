@@ -8,15 +8,27 @@ ACP (Agent Client Protocol) server front-end for harnx agents.
 
 ## Status
 
-**Phase 6**: NATS-backed prompt turns with ACP event fidelity, cancellation, tool permission requests, and safe committed-handoff fallback.
+**Current ACP v1 bridge**: NATS-backed prompt turns with durable session loading, event fidelity, cancellation, tool permission requests, and safe committed-handoff fallback.
 - `initialize` — negotiates protocol version 1 and advertises minimal capabilities.
 - `session/new` — creates a NATS-backed harnx session and accepts IDE-injected MCP server entries.
+- `session/load` — replays one scoped durable NATS transcript as ordered ACP updates.
 - `session/prompt` — streams ordered assistant, thought, tool-call, tool-result, notice, and flagged model-error updates.
 - `session/cancel` — stops the local prompt follower and durably cancels the NATS turn.
 - A committed handoff reports the target agent, local session ID, cluster, and opening instructions.
 - All logging goes to stderr; stdout carries only protocol frames.
 
-Session persistence remains deferred.
+### Session loading
+
+`session/load` is advertised through `agentCapabilities.loadSession`. A load
+resolves the requested local session ID only under this server's configured
+cluster and agent, reads one durable transcript snapshot, and replays user,
+assistant, and tool entries in order. Durable control records such as turn-end,
+handoff, and approval markers remain silent.
+
+Loaded sessions are read-only snapshots in this phase. Loading does not attach
+a live event subscription or make the loaded ID available to `session/prompt`;
+load again to include entries committed after the prior snapshot. Session
+list, resume, close, and delete remain unsupported and unadvertised.
 
 ### Handoff limitation
 
@@ -59,6 +71,7 @@ Supported methods:
 - `initialize` — Negotiates protocol version and exchanges capabilities.
 - `authenticate` — No-op placeholder for future authentication.
 - `session/new` — Creates a NATS-backed session and returns its ID.
+- `session/load` — Replays a scoped durable transcript snapshot.
 - `session/prompt` — Runs a turn and streams assistant text updates.
 - `session/request_permission` — Requests a per-turn allow or reject decision for gated tools.
 - `session/cancel` — Cancels an in-flight turn, including a pending permission request.

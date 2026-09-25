@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::SessionUpdate;
 use harnx_core::event::{AgentEvent, AgentEventSink};
 use tokio::sync::mpsc;
 
-use crate::event_map::agent_event_to_session_update_for_cluster;
+use crate::event_map::{agent_event_to_replay_update, agent_event_to_session_update_for_cluster};
 use crate::handoff::{committed_target, fallback_update};
 use crate::SessionContext;
 
@@ -58,6 +58,7 @@ pub struct AcpEventSink {
     session_id: String,
     source_cluster: String,
     session: Option<Arc<SessionContext>>,
+    replay: bool,
 }
 
 impl AcpEventSink {
@@ -70,6 +71,7 @@ impl AcpEventSink {
             session_id,
             harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
             None,
+            false,
         )
     }
 
@@ -79,13 +81,22 @@ impl AcpEventSink {
         source_cluster: String,
         session: Arc<SessionContext>,
     ) -> (Self, mpsc::UnboundedReceiver<AcpMessage>) {
-        Self::build(session_id, source_cluster, Some(session))
+        Self::build(session_id, source_cluster, Some(session), false)
+    }
+
+    /// Create a read-only transcript replay sink.
+    pub fn for_replay(
+        session_id: String,
+        source_cluster: String,
+    ) -> (Self, mpsc::UnboundedReceiver<AcpMessage>) {
+        Self::build(session_id, source_cluster, None, true)
     }
 
     fn build(
         session_id: String,
         source_cluster: String,
         session: Option<Arc<SessionContext>>,
+        replay: bool,
     ) -> (Self, mpsc::UnboundedReceiver<AcpMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
@@ -94,6 +105,7 @@ impl AcpEventSink {
                 session_id,
                 source_cluster,
                 session,
+                replay,
             },
             rx,
         )
@@ -121,6 +133,9 @@ impl AcpEventSink {
     }
 
     fn map_event(&self, event: AgentEvent) -> Option<SessionUpdate> {
+        if self.replay {
+            return agent_event_to_replay_update(event, &self.source_cluster);
+        }
         if let Some(target) = committed_target(&event, &self.source_cluster) {
             if self
                 .session
