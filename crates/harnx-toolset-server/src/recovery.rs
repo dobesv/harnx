@@ -69,14 +69,6 @@ impl InvocationRecovery {
     }
 }
 
-pub(super) fn reply_result(reply: ToolReply) -> Result<Value, ToolInvokeError> {
-    reply.result.map_err(|error| match error {
-        ToolErrorPayload::Recoverable(message) => ToolInvokeError::Recoverable(message),
-        ToolErrorPayload::Fatal(message) => ToolInvokeError::Fatal(message),
-        ToolErrorPayload::Interrupted(interrupted) => ToolInvokeError::Interrupted(interrupted),
-    })
-}
-
 /// Journal and admission failures are this server's, not the tool's: the call
 /// never produced a result, so the caller cannot treat one as returned.
 pub(super) fn invoke_error(error: anyhow::Error) -> ToolInvokeError {

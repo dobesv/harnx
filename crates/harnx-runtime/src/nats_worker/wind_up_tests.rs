@@ -175,6 +175,7 @@ impl InterruptedTurn {
         let reply = ToolReply {
             call_id: request.call_id.clone(),
             result: Ok(output),
+            final_progress: None,
         };
         self.journal.complete(request, reply).await.unwrap();
     }

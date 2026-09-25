@@ -141,6 +141,7 @@ async fn restart_recovers_saved_reply() -> Result<()> {
     let reply = ToolReply {
         call_id: fixture.request.call_id.clone(),
         result: Ok(json!({"text": "x".repeat(96 * 1024)})),
+        final_progress: None,
     };
     fixture
         .journal

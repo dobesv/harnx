@@ -16,10 +16,12 @@ async fn first_reply_wins_and_later_replies_are_dropped() {
     let first = ToolReply {
         call_id: "call-1".into(),
         result: Ok(serde_json::json!({"n": 1})),
+        final_progress: None,
     };
     let second = ToolReply {
         call_id: "call-1".into(),
         result: Ok(serde_json::json!({"n": 2})),
+        final_progress: None,
     };
     let winner = journal.complete(&request, first.clone()).await.unwrap();
     let loser = journal.complete(&request, second).await.unwrap();

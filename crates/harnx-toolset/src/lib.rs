@@ -38,6 +38,8 @@ pub enum CancellationGuarantee {
 
 mod cancellation;
 pub use cancellation::*;
+mod progress;
+pub use progress::*;
 pub mod cleanup;
 
 /// Schema and execution hints for one tool.
@@ -189,6 +191,9 @@ pub struct ToolInvocationContext {
     /// can act on it after the original invocation is gone. Absent when the
     /// transport does not support checkpointing.
     pub checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    /// Call-bound live progress sink. Defaults to a no-op for transports and
+    /// callers that do not negotiate progress support.
+    pub progress: ToolProgressHandle,
 }
 
 impl fmt::Debug for ToolInvocationContext {
@@ -206,6 +211,7 @@ impl fmt::Debug for ToolInvocationContext {
                     "<unset>"
                 },
             )
+            .field("progress", &self.progress)
             .finish()
     }
 }
@@ -370,6 +376,10 @@ pub enum ToolErrorPayload {
 pub struct ToolReply {
     pub call_id: String,
     pub result: Result<Value, ToolErrorPayload>,
+    /// Latest bounded progress state. Kept outside `result` so it never enters
+    /// model-facing tool output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_progress: Option<ToolProgressPatch>,
 }
 
 /// Progress update published on the per-instance control subject.
@@ -377,14 +387,14 @@ pub struct ToolReply {
 #[serde(from = "ProgressMessageWire", into = "ProgressMessageWire")]
 pub struct ProgressMessage {
     pub call_id: String,
-    pub chunk: Value,
+    pub chunk: ProgressChunk,
 }
 
 #[derive(Serialize, Deserialize)]
 struct ProgressMessageWire {
     call_id: String,
     kind: ProgressKind,
-    chunk: Value,
+    chunk: ProgressChunk,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -628,12 +638,17 @@ mod tests {
         assert_round_trip(ToolReply {
             call_id: "call-1".to_string(),
             result: Ok(json!({ "time": "12:00:00" })),
+            final_progress: None,
         });
         assert_round_trip(ToolReply {
             call_id: "call-2".to_string(),
             result: Err(ToolErrorPayload::Recoverable(
                 "unknown timezone".to_string(),
             )),
+            final_progress: Some(ToolProgressPatch {
+                title: Some("Checking timezone".into()),
+                ..Default::default()
+            }),
         });
         assert_round_trip(ControlMessage {
             protocol_version: TOOL_PROTOCOL_VERSION,
@@ -646,7 +661,10 @@ mod tests {
         });
         assert_round_trip(ProgressMessage {
             call_id: "call-1".to_string(),
-            chunk: json!({ "completed": 1, "total": 2 }),
+            chunk: ProgressChunk::V1(ToolProgressPatch {
+                title: Some("Working".into()),
+                ..Default::default()
+            }),
         });
         assert_round_trip(Registration {
             package: None,
@@ -656,6 +674,20 @@ mod tests {
             schema_version: 1,
             proto_version: 1,
         });
+    }
+
+    #[test]
+    fn tool_reply_final_progress_is_optional_and_outside_result() {
+        let legacy = json!({
+            "call_id": "call-legacy",
+            "result": { "Ok": { "content": "done" } }
+        });
+        let reply: ToolReply = serde_json::from_value(legacy).unwrap();
+        assert!(reply.final_progress.is_none());
+
+        let wire = serde_json::to_value(reply).unwrap();
+        assert!(wire.get("final_progress").is_none());
+        assert_eq!(wire["result"]["Ok"]["content"], "done");
     }
 
     #[test]
@@ -714,7 +746,10 @@ mod tests {
         .expect("serialize cancel");
         let progress = serde_json::to_value(ProgressMessage {
             call_id: "call-1".to_string(),
-            chunk: json!("working"),
+            chunk: ProgressChunk::V1(ToolProgressPatch {
+                title: Some("Working".into()),
+                ..Default::default()
+            }),
         })
         .expect("serialize progress");
 

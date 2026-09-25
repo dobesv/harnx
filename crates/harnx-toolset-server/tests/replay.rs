@@ -80,6 +80,7 @@ async fn durable_reply_is_returned_without_reinvoking_after_cache_loss() -> Resu
     let saved = ToolReply {
         call_id: request.call_id.clone(),
         result: Ok(json!({"saved": true})),
+        final_progress: None,
     };
     journal.complete(&request, saved.clone()).await?;
     assert_eq!(
@@ -150,6 +151,7 @@ async fn ordinary_duplicate_must_match_the_journal_even_with_cached_reply() -> R
             ToolReply {
                 call_id: request.call_id.clone(),
                 result: Ok(json!("saved")),
+                final_progress: None,
             },
         )
         .await?;
@@ -179,6 +181,7 @@ async fn journal_separates_standalone_calls_and_requires_persisted_records() -> 
     let standalone = ToolReply {
         call_id: request.call_id.clone(),
         result: Ok(json!("standalone")),
+        final_progress: None,
     };
     journal.complete(&request, standalone.clone()).await?;
     request.parent_session_id = Some("standalone".into());

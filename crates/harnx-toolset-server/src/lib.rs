@@ -22,6 +22,7 @@ mod mcp;
 use mcp::call_tool_result_from_value;
 use mcp::McpToolsetAdapter;
 mod lifecycle;
+mod progress;
 mod registration_identity;
 pub mod schema;
 mod subscriptions;
@@ -645,11 +646,15 @@ async fn process_tool_request(
         CacheReservation::Execute(completion) => completion,
     };
 
-    let result = invoke_uncached_tool(context, &request, parent_cx).await;
-    let reply = Arc::new(ToolReply {
-        call_id: request.call_id.clone(),
-        result: result.map_err(map_invoke_error),
-    });
+    let reply = Arc::new(
+        invoke_uncached_tool(context, &request, parent_cx)
+            .await
+            .unwrap_or_else(|error| ToolReply {
+                call_id: request.call_id.clone(),
+                result: Err(map_invoke_error(error)),
+                final_progress: None,
+            }),
+    );
     complete_cache_entry(&context.reply_cache, key, reply.clone(), completion).await;
     serve_cached(context, &request, reply_subject, reply).await
 }
@@ -714,6 +719,7 @@ async fn validate_tool_request(
         let reply = ToolReply {
             call_id: request.call_id,
             result: Err(map_invoke_error(recovery::invoke_error(error))),
+            final_progress: None,
         };
         return publish_reply(&context.client, reply_subject, &reply)
             .await
@@ -788,6 +794,7 @@ async fn publish_recoverable_reply(
         &ToolReply {
             call_id,
             result: Err(ToolErrorPayload::Recoverable(message)),
+            final_progress: None,
         },
     )
     .await
