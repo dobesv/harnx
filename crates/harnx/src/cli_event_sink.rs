@@ -21,7 +21,7 @@ use harnx_toolset::{
 };
 
 use harnx_render::{MarkdownRender, RenderOptions};
-use harnx_runtime::utils::{dimmed_text, warning_text, IS_STDOUT_TERMINAL};
+use harnx_runtime::utils::{dimmed_text, pretty_yaml_block, warning_text, IS_STDOUT_TERMINAL};
 
 /// Stderr-bound sink for the non-interactive CLI. Thread-safe — interior
 /// state is held behind an `Arc<Mutex<CliSinkState>>` so multiple clones
@@ -307,6 +307,12 @@ impl CliSinkState {
 
     fn handle_raw_chunk(&mut self, text: &str) -> anyhow::Result<()> {
         print!("{text}");
+        if let Some((_, tail)) = text.rsplit_once('\n') {
+            self.buffer.clear();
+            self.buffer.push_str(tail);
+        } else {
+            self.buffer.push_str(text);
+        }
         stdout().flush()?;
         Ok(())
     }
@@ -361,16 +367,20 @@ impl CliSinkState {
         Ok(())
     }
 
+    /// Close a partial stdout line before writing a separate line to stderr.
+    fn flush_pending_stdout_line(&mut self) -> anyhow::Result<()> {
+        if !self.buffer.is_empty() {
+            println!();
+            self.buffer.clear();
+            stdout().flush()?;
+        }
+        Ok(())
+    }
+
     /// End-of-turn cleanup: flush any buffered partial line and reset state so
     /// the next turn starts fresh.
     fn cleanup(&mut self) -> anyhow::Result<()> {
-        // The partial line in self.buffer has already been printed raw
-        // (handle_markdown_chunk prints each chunk immediately).  We just
-        // need a trailing newline to close the line on the terminal.
-        if !self.buffer.is_empty() {
-            println!();
-        }
-        self.buffer.clear();
+        self.flush_pending_stdout_line()?;
         self.render = None;
         self.last_ui_output_source = None;
         Ok(())
@@ -379,9 +389,14 @@ impl CliSinkState {
     /// Stderr render for `ToolEvent::Started`: when the producer rendered an
     /// MCP `call_template` into `markdown`, print only the markdown-styled
     /// line (no `[tool] name` prefix). When no markdown is present, fall back
-    /// to the dim `[tool] {name}` prefix.
-    fn print_tool_started(&mut self, name: &str, markdown: Option<&str>) {
-        let rendered = Self::format_tool_started(name, markdown, |text| {
+    /// to the dim tool name and YAML arguments.
+    fn print_tool_started(
+        &mut self,
+        name: &str,
+        input: &serde_json::Value,
+        markdown: Option<&str>,
+    ) {
+        let rendered = Self::format_tool_started(name, input, markdown, |text| {
             if text.contains('\n') {
                 self.render_markdown_block(text)
             } else {
@@ -393,11 +408,15 @@ impl CliSinkState {
 
     fn format_tool_started(
         name: &str,
+        input: &serde_json::Value,
         markdown: Option<&str>,
         mut render_markdown: impl FnMut(&str) -> String,
     ) -> String {
         match markdown.map(str::trim).filter(|t| !t.is_empty()) {
             Some(t) => render_markdown(t),
+            None if !input.is_null() => {
+                dimmed_text(&format!("[tool] {name}\n{}", pretty_yaml_block(input)))
+            }
             None => dimmed_text(&format!("[tool] {name}")),
         }
     }
@@ -514,7 +533,8 @@ impl CliSinkState {
         }
     }
 
-    fn print_notice(&self, event: NoticeEvent) {
+    fn print_notice(&mut self, event: NoticeEvent) {
+        self.flush_pending_stdout_line_or_warn();
         match event {
             NoticeEvent::Info(message) => println!("{message}"),
             NoticeEvent::Warning(message) => eprintln!("{}", warning_text(&message)),
@@ -567,12 +587,22 @@ impl CliSinkState {
     }
 
     fn print_tool_event(&mut self, event: ToolEvent) {
+        if !matches!(
+            &event,
+            ToolEvent::Progress { .. } | ToolEvent::Update { .. }
+        ) {
+            self.flush_pending_stdout_line_or_warn();
+        }
         match event {
             ToolEvent::Started {
-                id, name, markdown, ..
+                id,
+                name,
+                input,
+                markdown,
+                ..
             } => {
                 self.tool_call_started(&id, &name);
-                self.print_tool_started(&name, markdown.as_deref());
+                self.print_tool_started(&name, &input, markdown.as_deref());
             }
             ToolEvent::Failed { id, error, .. } => {
                 if let Some(elapsed) = self.tool_call_finished(&id) {
@@ -613,6 +643,9 @@ impl CliSinkState {
     }
 
     fn print_session_event(&mut self, event: SessionEvent) {
+        if !matches!(&event, SessionEvent::LogSeqAssigned { .. }) {
+            self.flush_pending_stdout_line_or_warn();
+        }
         match event {
             SessionEvent::CompactingStarted { .. } => {
                 eprintln!("{}", dimmed_text("Compacting the session..."));
@@ -652,6 +685,15 @@ impl CliSinkState {
             // `[event] LogSeqAssigned { seq: N }` debug line on every log write.
             SessionEvent::LogSeqAssigned { .. } => {}
             other => eprintln!("{}", dimmed_text(&format!("[event] {other:?}"))),
+        }
+    }
+
+    fn flush_pending_stdout_line_or_warn(&mut self) {
+        if let Err(error) = self.flush_pending_stdout_line() {
+            eprintln!(
+                "{}",
+                warning_text(&format!("cli-sink stdout flush failed: {error}"))
+            );
         }
     }
 
@@ -770,6 +812,28 @@ mod tests {
         let mut output = String::new();
         captured.read_to_string(&mut output).unwrap();
         output
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_event_closes_pending_stdout_line() {
+        let output = capture_output(|| {
+            let mut state = make_state(false);
+            state.handle_raw_chunk("Fetching the issue.").unwrap();
+            state.print_tool_event(ToolEvent::Started {
+                id: "call-1".into(),
+                name: "bash_exec".into(),
+                kind: harnx_core::event::ToolKind::Other,
+                markdown: None,
+                input: serde_json::Value::Null,
+                locations: vec![],
+            });
+        });
+
+        assert!(
+            output.contains("Fetching the issue.\n[tool] bash_exec\n"),
+            "tool line must not share the pending model-output line: {output:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1047,12 +1111,8 @@ mod tests {
     // prior to these tests.
     // ----------------------------------------------------------------
 
-    // The CLI Started handler renders the bare "[tool] name" prefix
-    // dimmed and appends the markdown-rendered text (or nothing if no
-    // markdown). The whitespace/empty fallback decision lives inline in the
-    // emit handler, exercised end-to-end by
-    // `emit_handles_each_top_level_variant_without_panic` plus the
-    // markdown-line tests below.
+    // The CLI Started handler renders template markdown without a tool prefix.
+    // Without a template it keeps the dimmed tool name and YAML arguments.
 
     // The CLI Completed handler delegates to
     // `harnx_runtime::utils::render_tool_result_text`, the same shared
@@ -1062,10 +1122,12 @@ mod tests {
     #[test]
     fn print_tool_started_with_markdown_omits_tool_prefix() {
         let mut state = make_state(false);
-        let rendered =
-            CliSinkState::format_tool_started("bash_exec", Some("` $ cargo build`"), |text| {
-                state.render_markdown_line(text)
-            });
+        let rendered = CliSinkState::format_tool_started(
+            "bash_exec",
+            &serde_json::Value::Null,
+            Some("` $ cargo build`"),
+            |text| state.render_markdown_line(text),
+        );
 
         assert!(
             !rendered.contains("[tool]"),
@@ -1080,9 +1142,12 @@ mod tests {
     #[test]
     fn print_tool_started_without_markdown_shows_tool_prefix() {
         let mut state = make_state(false);
-        let rendered = CliSinkState::format_tool_started("bash_exec", None, |text| {
-            state.render_markdown_line(text)
-        });
+        let rendered = CliSinkState::format_tool_started(
+            "bash_exec",
+            &serde_json::Value::Null,
+            None,
+            |text| state.render_markdown_line(text),
+        );
 
         assert!(
             rendered.contains("[tool]"),
@@ -1092,6 +1157,19 @@ mod tests {
             rendered.contains("bash_exec"),
             "expected tool name in output: {rendered}"
         );
+    }
+
+    #[test]
+    fn print_tool_started_without_markdown_shows_yaml_arguments() {
+        let mut state = make_state(false);
+        let input = serde_json::json!({"command": "cargo build", "timeout_secs": 30});
+        let rendered = CliSinkState::format_tool_started("bash_exec", &input, None, |text| {
+            state.render_markdown_line(text)
+        });
+
+        assert!(rendered.contains("[tool] bash_exec"));
+        assert!(rendered.contains("command: cargo build"));
+        assert!(rendered.contains("timeout_secs: 30"));
     }
 
     #[test]

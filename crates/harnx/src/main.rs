@@ -29,7 +29,7 @@ use crate::config::{
 };
 use crate::tui::{TranscriptItem, Tui};
 use harnx_core::agent_config::collect_agent_variables;
-use harnx_core::event::AgentSource;
+use harnx_core::event::{AgentEventSink, AgentSource};
 use harnx_render::{render_error, MarkdownRender};
 use harnx_runtime::config::SessionMeta;
 use harnx_runtime::utils::*;
@@ -37,6 +37,7 @@ use harnx_runtime::utils::*;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn invocation_limit_reached(error: &anyhow::Error) -> bool {
@@ -273,12 +274,33 @@ async fn run_dump_command(dump_args: &crate::cli::DumpArgs) -> Result<()> {
     }
 }
 
+fn tool_decl_map(config: &Config) -> HashMap<String, harnx_core::tool::ToolDeclaration> {
+    let active_pkg = config.active_package();
+    let (declarations, _) =
+        config.tool_declarations_for_use_tools(Some("*"), active_pkg.as_deref());
+    declarations
+        .into_iter()
+        .map(|declaration| (declaration.name.clone(), declaration))
+        .collect()
+}
+
+fn new_text_dump_sink() -> Arc<dyn AgentEventSink> {
+    let render_options = harnx_render::RenderOptions::default();
+    let abort_signal = harnx_core::abort::create_abort_signal();
+    Arc::new(crate::cli_event_sink::CliAgentEventSink::new(
+        false,
+        render_options,
+        abort_signal,
+    ))
+}
+
 async fn run_dump_session_once(
     session_id: &str,
     agent_name: &str,
     format: &harnx_runtime::config::SessionFormat,
 ) -> Result<()> {
     let config = init_frontend_config(WorkingMode::Cmd, true).await?;
+    let decl_map = tool_decl_map(&config);
 
     let (jetstream, metadata) =
         harnx_runtime::config::session_metadata_for_agent(&config, agent_name, session_id).await?;
@@ -287,7 +309,7 @@ async fn run_dump_session_once(
     let raw = log.load_events_async().await?;
     let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
 
-    replay_dump_entries(&entries, format).await?;
+    replay_dump_entries(&entries, format, &decl_map, None).await?;
     Ok(())
 }
 
@@ -299,6 +321,7 @@ async fn run_dump_session_follow(
     use std::io::Write;
 
     let config = init_frontend_config(WorkingMode::Cmd, true).await?;
+    let decl_map = tool_decl_map(&config);
     let (_, cluster) = config.resolve_session_agent(agent_name)?;
     let (jetstream, metadata) =
         harnx_runtime::config::session_metadata_for_agent(&config, agent_name, session_id).await?;
@@ -309,9 +332,11 @@ async fn run_dump_session_follow(
         &metadata.storage_key(),
     )
     .await?;
+    let text_sink =
+        matches!(format, harnx_runtime::config::SessionFormat::Text).then(new_text_dump_sink);
 
     // Replay initial history
-    replay_dump_entries(stream.history(), &format).await?;
+    replay_dump_entries(stream.history(), &format, &decl_map, text_sink.as_ref()).await?;
     std::io::stdout().flush()?;
 
     // Follow loop: durable-only, with periodic poll timeout for lossy advisories
@@ -332,7 +357,7 @@ async fn run_dump_session_follow(
         }
 
         // On wake, check for new durable entries
-        flush_new_entries(&mut stream, &format).await?;
+        flush_new_entries(&mut stream, &format, &decl_map, text_sink.as_ref()).await?;
     }
 }
 
@@ -340,6 +365,8 @@ async fn run_dump_session_follow(
 async fn flush_new_entries(
     stream: &mut harnx_runtime::nats_event_sink::SessionEventStream,
     format: &harnx_runtime::config::SessionFormat,
+    decl_map: &HashMap<String, harnx_core::tool::ToolDeclaration>,
+    sink: Option<&Arc<dyn AgentEventSink>>,
 ) -> Result<()> {
     use std::io::Write;
 
@@ -354,7 +381,7 @@ async fn flush_new_entries(
     if refreshed {
         let new_entries = &stream.history()[old_len..];
         if !new_entries.is_empty() {
-            replay_dump_entries(new_entries, format).await?;
+            replay_dump_entries(new_entries, format, decl_map, sink).await?;
             std::io::stdout().flush()?;
         }
     }
@@ -364,18 +391,15 @@ async fn flush_new_entries(
 async fn replay_dump_entries(
     entries: &[(u64, harnx_core::session::SessionLogEntry)],
     format: &harnx_runtime::config::SessionFormat,
+    decl_map: &HashMap<String, harnx_core::tool::ToolDeclaration>,
+    sink: Option<&Arc<dyn AgentEventSink>>,
 ) -> Result<()> {
     use harnx_runtime::config::SessionFormat;
 
     match format {
         SessionFormat::Text => {
-            use crate::cli_event_sink::CliAgentEventSink;
-            use harnx_core::abort::create_abort_signal;
-            use harnx_render::RenderOptions;
-            let render_options = RenderOptions::default();
-            let abort_signal = create_abort_signal();
-            let sink = Arc::new(CliAgentEventSink::new(false, render_options, abort_signal));
-            harnx_runtime::replay_entries_to_sink(entries, sink);
+            let sink = sink.cloned().unwrap_or_else(new_text_dump_sink);
+            harnx_runtime::replay_entries_to_sink_with_decls(entries, decl_map, sink);
         }
         SessionFormat::Yaml => {
             for (_, entry) in entries {
@@ -1001,6 +1025,79 @@ use harnx_runtime::bootstrap::setup_logger;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct DumpRecordingSink(std::sync::Mutex<Vec<harnx_core::event::AgentEvent>>);
+
+    impl AgentEventSink for DumpRecordingSink {
+        fn emit(&self, event: harnx_core::event::AgentEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn text_dump_reuses_supplied_sink_across_replay_batches() {
+        use harnx_core::event::{AgentEvent, ModelEvent, ToolEvent};
+        use harnx_core::session::{SessionLogEntry, ToolOutput};
+        use harnx_core::tool::ToolCall;
+
+        let call = ToolCall::new(
+            "bash_exec".into(),
+            serde_json::json!({"command": "cargo build"}),
+            Some("call-1".into()),
+            None,
+        );
+        let call_entries = vec![(
+            1,
+            SessionLogEntry::ToolCalls {
+                text: "Fetching the issue.".into(),
+                thought: None,
+                calls: vec![call],
+                timestamp: None,
+                fence_token: None,
+            },
+        )];
+        let result_entries = vec![(
+            2,
+            SessionLogEntry::ToolResults {
+                results: vec![ToolOutput {
+                    id: Some("call-1".into()),
+                    name: "bash_exec".into(),
+                    output: serde_json::json!({"exit_code": 0}),
+                    markdown: None,
+                    content: vec![],
+                    switch_agent: None,
+                }],
+                timestamp: None,
+            },
+        )];
+        let recording = Arc::new(DumpRecordingSink::default());
+        let sink: Arc<dyn AgentEventSink> = recording.clone();
+        let decl_map = HashMap::new();
+        let format = harnx_runtime::config::SessionFormat::Text;
+
+        replay_dump_entries(&call_entries, &format, &decl_map, Some(&sink))
+            .await
+            .unwrap();
+        replay_dump_entries(&result_entries, &format, &decl_map, Some(&sink))
+            .await
+            .unwrap();
+
+        let events = recording.0.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Tool(ToolEvent::Started { id, .. }) if id == "call-1"
+        ));
+        assert!(matches!(
+            &events[1],
+            AgentEvent::Model(ModelEvent::MessageChunk { .. })
+        ));
+        assert!(matches!(
+            &events[3],
+            AgentEvent::Tool(ToolEvent::Completed { id, .. }) if id == "call-1"
+        ));
+    }
 
     #[test]
     fn one_shot_accepts_cluster_mode_bare_agent_selection() {
