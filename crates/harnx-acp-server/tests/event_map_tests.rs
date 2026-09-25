@@ -3,12 +3,13 @@ use agent_client_protocol::schema::v1::{
     ToolCallUpdate, ToolKind as AcpToolKind,
 };
 use harnx_acp_server::event_map::{
-    agent_event_to_session_update, agent_event_to_session_update_for_cluster, map_tool_status,
+    agent_event_to_replay_update, agent_event_to_session_update,
+    agent_event_to_session_update_for_cluster, map_tool_status,
 };
 use harnx_acp_server::{HARNX_ERROR_META, HARNX_MARKDOWN_META};
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent,
-    ToolKind, ToolStatus, TurnEvent,
+    ToolKind, ToolStatus, TurnEvent, UserEvent,
 };
 
 fn text_content(update: &ToolCallUpdate) -> Option<&str> {
@@ -30,6 +31,18 @@ fn agent_message_text(update: &SessionUpdate) -> Option<&str> {
         return None;
     };
     Some(&text.text)
+}
+
+fn replay_message(update: &SessionUpdate) -> (&str, bool) {
+    let (chunk, user) = match update {
+        SessionUpdate::UserMessageChunk(chunk) => (chunk, true),
+        SessionUpdate::AgentMessageChunk(chunk) => (chunk, false),
+        _ => panic!("expected replay text chunk"),
+    };
+    let AcpContentBlock::Text(text) = &chunk.content else {
+        panic!("expected replay text content");
+    };
+    (&text.text, user)
 }
 
 struct ExpectedToolUpdate<'a> {
@@ -216,6 +229,38 @@ fn warning_and_error_notices_map_but_info_and_empty_notices_do_not() {
         agent_event_to_session_update(AgentEvent::Notice(NoticeEvent::Warning(String::new())))
             .is_none()
     );
+}
+
+#[test]
+fn replay_maps_user_and_final_agent_text_but_not_control_entries() {
+    let user = agent_event_to_replay_update(
+        AgentEvent::User(UserEvent::Message {
+            content: "question".to_string(),
+        }),
+        "prod",
+    )
+    .expect("user replay should map");
+    let agent = agent_event_to_replay_update(
+        AgentEvent::Model(ModelEvent::Final {
+            output: "answer".to_string(),
+            usage: Default::default(),
+        }),
+        "prod",
+    )
+    .expect("agent replay should map");
+    let control = agent_event_to_replay_update(
+        AgentEvent::Session(SessionEvent::HandoffCommitted {
+            agent: "atlas@prod".to_string(),
+            session_id: "target".to_string(),
+            handoff_tool_call_id: Some("handoff-call".to_string()),
+            after_seq: Some(42),
+        }),
+        "prod",
+    );
+
+    assert_eq!(replay_message(&user), ("question", true));
+    assert_eq!(replay_message(&agent), ("answer", false));
+    assert!(control.is_none());
 }
 
 #[test]

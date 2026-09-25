@@ -6,7 +6,7 @@ use agent_client_protocol::schema::v1::{
     ToolKind as AcpToolKind,
 };
 use harnx_core::event::{
-    AgentEvent, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, ToolKind, ToolStatus,
+    AgentEvent, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, ToolKind, ToolStatus, UserEvent,
 };
 
 use crate::handoff::{committed_target, fallback_update};
@@ -31,6 +31,22 @@ pub fn agent_event_to_session_update_for_cluster(
     source_cluster: &str,
 ) -> Option<SessionUpdate> {
     agent_event_to_update_inner(event, source_cluster, true)
+}
+
+/// Convert durable transcript replay events without rendering control records.
+pub fn agent_event_to_replay_update(
+    event: AgentEvent,
+    source_cluster: &str,
+) -> Option<SessionUpdate> {
+    match event {
+        AgentEvent::User(UserEvent::Message { content }) => {
+            text_chunk(content, false).map(SessionUpdate::UserMessageChunk)
+        }
+        AgentEvent::Model(ModelEvent::Final { output, .. }) => {
+            text_chunk(output, false).map(SessionUpdate::AgentMessageChunk)
+        }
+        event => agent_event_to_update_inner(event, source_cluster, false),
+    }
 }
 
 fn agent_event_to_update_inner(

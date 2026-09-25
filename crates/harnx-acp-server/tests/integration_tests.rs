@@ -67,6 +67,11 @@ mod tests {
         assert_eq!(response["id"], 1);
         assert_eq!(response["result"]["protocolVersion"], 1);
         assert_eq!(response["result"]["agentInfo"]["name"], "harnx");
+        assert_eq!(response["result"]["agentCapabilities"]["loadSession"], true);
+        assert_eq!(
+            response["result"]["agentCapabilities"]["sessionCapabilities"],
+            serde_json::json!({})
+        );
     }
 
     fn assert_new_session_response(response: &serde_json::Value) {
