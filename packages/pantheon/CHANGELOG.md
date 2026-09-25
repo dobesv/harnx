@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.5 (2026-09-25)
+
+### Features
+
+- add native harnx-exa-tools server for Exa web search (#2079)
+
 ## 0.4.4 (2026-09-24)
 
 ### Fixes

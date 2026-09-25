@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.34.5 (2026-09-25)
+
+### Features
+
+- add native harnx-exa-tools server for Exa web search (#2079)
+- Report committed session handoffs to ACP clients with target-opening instructions and reject later prompts to the inactive source session. ACP clients do not auto-follow handoffs yet.
+- Bridge harnx tool confirmation prompts to ACP clients with per-turn allow and reject choices.
+
+### Fixes
+
+- Stream ACP tool calls, tool results, notices, and flagged model errors to IDE clients, and accept IDE-injected MCP server entries when creating sessions.
+
 ## 0.34.4 (2026-09-24)
 
 ### Features

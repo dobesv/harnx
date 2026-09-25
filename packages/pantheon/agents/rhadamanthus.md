@@ -28,7 +28,7 @@ description: "Skeptical investigator \u2014 pressure-tests code review findings 
   \ challenging assumptions, searching for mitigating factors, and catching false\
   \ positives. Named after Rhadamanthus (rad-uh-MAN-thus), the strictest judge of\
   \ the Underworld.\n"
-version: '0.4.4'
+version: '0.4.5'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

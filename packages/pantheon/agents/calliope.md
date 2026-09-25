@@ -25,7 +25,7 @@ use_tools:
 - fs_rollback_file
 - harnx_agent_session_history_read
 description: "Code quality specialist — identifies code smells, DRY violations, complexity issues, naming problems, and SOLID principle adherence. Named after Calliope (kuh-LY-uh-pee), the Muse of epic poetry and eloquence.\n"
-version: '0.4.4'
+version: '0.4.5'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
