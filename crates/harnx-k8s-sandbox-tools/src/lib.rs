@@ -12,11 +12,13 @@ mod toolsets;
 ///
 /// This binary's dependency graph links two rustls crypto providers — `ring` (via async-nats)
 /// and `aws-lc-rs` (via the AWS SDK's hyper-rustls stack that `kube` uses) — and nothing else
-/// installs a default. `kube::Client::try_default` and `reqwest::Client` both build their TLS
-/// config through `rustls::ClientConfig::builder()`, which resolves the process-default provider
-/// and panics with "Could not automatically determine the process-level CryptoProvider" when the
+/// installs a default. `kube::Client::try_default` builds its TLS config through
+/// `rustls::ClientConfig::builder()` (kube's own `aws-lc-rs` fallback is compiled out because the
+/// workspace doesn't enable `kube/aws-lc-rs`), which resolves the process-default provider and
+/// panics with "Could not automatically determine the process-level CryptoProvider" when the
 /// choice is ambiguous. Pin `ring` explicitly, matching the NATS TLS path in `harnx-nats-common`
-/// (`crates/harnx-nats-common/src/connect.rs`).
+/// (`crates/harnx-nats-common/src/connect.rs`). (`reqwest` is not affected: it resolves a provider
+/// with `get_default()` plus an explicit `aws-lc-rs` fallback, never the bare builder.)
 ///
 /// Idempotent: a provider installed by an earlier call is left in place, so calling this more
 /// than once is safe.
