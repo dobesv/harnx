@@ -63,6 +63,9 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Pin the rustls crypto provider before kube/reqwest build any TLS config, or startup panics
+    // on the ambiguous process-default. See install_default_crypto_provider for details.
+    harnx_k8s_sandbox_tools::install_default_crypto_provider();
     let cli = Cli::parse();
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     harnx_metrics::init(&cli.metrics)?;

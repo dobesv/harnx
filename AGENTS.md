@@ -406,7 +406,7 @@ matching, which are separate lookups.
 Never call `rustls::ClientConfig::builder()`. It resolves rustls'
 *process-default* `CryptoProvider`, and this workspace compiles rustls with both
 `ring` (via async-nats/tokio-rustls) and `aws-lc-rs` (via the AWS SDK's
-hyper-rustls stack) while no binary installs a default — so that resolution
+hyper-rustls stack). Most binaries do not install a default, so that resolution
 panics at runtime with "Could not automatically determine the process-level
 CryptoProvider". Use `builder_with_provider(Arc::new(rustls::crypto::ring::
 default_provider()))` instead.

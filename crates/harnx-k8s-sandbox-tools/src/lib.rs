@@ -8,6 +8,27 @@ mod mcp;
 mod policy;
 mod toolsets;
 
+/// Install the process-default rustls [`CryptoProvider`] before any TLS client is built.
+///
+/// This binary's dependency graph links two rustls crypto providers — `ring` (via async-nats)
+/// and `aws-lc-rs` (via the AWS SDK's hyper-rustls stack that `kube` uses) — and nothing else
+/// installs a default. `kube::Client::try_default` and `reqwest::Client` both build their TLS
+/// config through `rustls::ClientConfig::builder()`, which resolves the process-default provider
+/// and panics with "Could not automatically determine the process-level CryptoProvider" when the
+/// choice is ambiguous. Pin `ring` explicitly, matching the NATS TLS path in `harnx-nats-common`
+/// (`crates/harnx-nats-common/src/connect.rs`).
+///
+/// Idempotent: a provider installed by an earlier call is left in place, so calling this more
+/// than once is safe.
+///
+/// Fixes <https://github.com/dobesv/harnx/issues/2103>.
+///
+/// [`CryptoProvider`]: async_nats::rustls::crypto::CryptoProvider
+pub fn install_default_crypto_provider() {
+    // Err means a provider was already installed; that's the idempotent case, so ignore it.
+    let _ = async_nats::rustls::crypto::ring::default_provider().install_default();
+}
+
 pub use kubernetes::KubernetesSandboxApi;
 pub use lifecycle::{
     SandboxApi, SandboxCondition, SandboxManager, SandboxManagerConfig, SandboxRecord,
