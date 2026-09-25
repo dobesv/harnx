@@ -913,8 +913,10 @@ observers on the same durable state.
 Tool confirmations are **point-to-point** over NATS: the worker sends the
 confirmation request to the `ToolConfirmationRoute` subject carried on the
 activation (stored as `tool_confirmation_subject`). Only the owning frontend
-receives the prompt; other observers see the resulting durable log updates
-after approval.
+receives the prompt. If the frontend includes a message with its decision, it
+commits that user row to the session stream before replying; the worker then
+places it after the real or blocked tool result. Other observers see the
+durable log updates after the decision.
 
 ### Trailing Tool Calls: Pending vs. Interrupted
 

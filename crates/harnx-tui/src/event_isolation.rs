@@ -114,7 +114,14 @@ impl Tui {
                 self.handle_pending_prompt_event(event).await;
             }
             TuiEvent::ToolConfirmation(event) => {
-                self.handle_tool_confirmation_event(event);
+                self.handle_tool_confirmation_event(event).await;
+            }
+            TuiEvent::ToolConfirmationEnqueueFinished {
+                confirmation_id,
+                decision,
+                result,
+            } => {
+                self.finish_tool_confirmation_enqueue(confirmation_id, decision, result);
             }
             event @ (TuiEvent::SessionReadInvalidation { .. } | TuiEvent::RefreshSessionList) => {
                 self.handle_session_refresh_event(event).await;

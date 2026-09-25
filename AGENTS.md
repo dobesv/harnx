@@ -768,6 +768,19 @@ metrics use a **separate mechanism**: `record_completion_usage` in `config/mod.r
 `Session.completion_usage` per model call. These mechanisms are independent. Anyone modifying usage
 display must keep them separate or they'll double-count.
 
+### Tool confirmation modal ordering and delivery
+
+When a `PreToolUse` hook returns `permissionDecision: "ask"`, the TUI modal queues an optional user message via durable JetStream append before sending the approval reply. Worker reloads the session log at the tool seam, ensuring the agent sees `tool call → tool result (real or blocked) → queued message`.
+
+Key invariants (verified by `denied_zero_execution_round_injects_queued_messages_once_after_blocked_result` in `crates/harnx-runtime/tests/nats_tool_confirmation.rs`):
+
+1. **Order-barrier** — frontend awaits JetStream PubAck before replying. Worker receives decision only after message is durable.
+2. **Origin capture** — modal state captures `(session_id, cluster)` at open; enqueue targets that origin, not the currently-active session.
+3. **Idempotent dedup** — stable `submission_id` (UUID generated at modal open) reused on retry; duplicate JetStream appends are safe.
+4. **Fail-closed paths** — append failure keeps modal open with draft; route closure, dismissal, and Ctrl+C all resolve false without enqueue.
+
+The 2-second keyboard-idle gate on approval (`TOOL_CONFIRM_IDLE_GATE` in `harnx-tui/src/tool_confirmation.rs`) resets on every keypress and paste into the message textarea. Ctrl+J is a newline fallback when Shift+Enter is unavailable.
+
 ### TUI printable-character keybindings with SHIFT-tolerant matching
 
 Crossterm may report shifted printable characters (`<`, `>`, `G`) with `KeyModifiers::SHIFT` set on

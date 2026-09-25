@@ -1,6 +1,7 @@
 use crate::lifecycle::session_history_transcript_items;
 use crate::render_helpers::render_status_line;
 use crate::strip_ansi;
+use crate::tool_confirmation::{ConfirmDecision, TOOL_CONFIRM_IDLE_GATE};
 use crate::types::{ExitPhase, ModalState, TranscriptItem, Tui};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -698,6 +699,12 @@ impl Tui {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(crate::types::ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
+            state.last_key_at = std::time::Instant::now();
+            state.message.insert_str(text);
+            return;
+        }
         if !self.can_accept_paste() {
             return;
         }
@@ -717,8 +724,6 @@ impl Tui {
         if !self.app.completions.is_empty() {
             self.app.completions.clear();
         }
-        // Normalize line endings: \r\n -> \n, then \r -> \n
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if paste_should_attach(&text) {
             // Large paste: write to temp file and attach
             match self.write_paste_to_attachment_dir(&text).await {
@@ -758,6 +763,16 @@ impl Tui {
             MouseEventKind::ScrollDown => false,
             _ => return,
         };
+        if let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
+            for _ in 0..3 {
+                if up {
+                    state.scroll.scroll_up();
+                } else {
+                    state.scroll.scroll_down();
+                }
+            }
+            return;
+        }
         let state = if self.app.detail_view_open {
             &mut self.app.detail_view_scroll
         } else if self.scroll_open_subagent(up) {
@@ -2253,6 +2268,93 @@ fn format_usage(usage: &harnx_core::api_types::CompletionTokenUsage) -> String {
 }
 
 impl Tui {
+    async fn handle_tool_confirmation_key(&mut self, key: KeyEvent) {
+        let now = std::time::Instant::now();
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                let should_submit = {
+                    let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() else {
+                        return;
+                    };
+                    if now.saturating_duration_since(state.last_key_at) < TOOL_CONFIRM_IDLE_GATE {
+                        // Swallow without moving the idle deadline. Repeated Enter
+                        // presses must not create a permanent mash-loop.
+                        return;
+                    }
+                    state.last_key_at = now;
+                    !state.submitting
+                };
+                if should_submit {
+                    self.submit_tool_confirm(ConfirmDecision::Approve).await;
+                }
+            }
+            (KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT)
+            | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                if let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
+                    state.last_key_at = now;
+                    state.message.insert_newline();
+                }
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                let should_submit = {
+                    let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() else {
+                        return;
+                    };
+                    state.last_key_at = now;
+                    !state.submitting
+                };
+                if should_submit {
+                    self.submit_tool_confirm(ConfirmDecision::RejectToAgent)
+                        .await;
+                }
+            }
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                if let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
+                    state.last_key_at = now;
+                }
+                self.cancel_tool_confirm();
+                self.handle_ctrl_c().await;
+            }
+            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                if let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
+                    state.last_key_at = now;
+                    if state.has_template {
+                        state.view = match state.view {
+                            crate::types::ConfirmView::Template => {
+                                crate::types::ConfirmView::RawYaml
+                            }
+                            crate::types::ConfirmView::RawYaml => {
+                                crate::types::ConfirmView::Template
+                            }
+                        };
+                    }
+                }
+            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => {
+                if let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
+                    state.last_key_at = now;
+                    for _ in 0..10 {
+                        state.scroll.scroll_up();
+                    }
+                }
+            }
+            (KeyCode::PageDown, KeyModifiers::NONE) => {
+                if let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
+                    state.last_key_at = now;
+                    for _ in 0..10 {
+                        state.scroll.scroll_down();
+                    }
+                }
+            }
+            _ => {
+                if let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
+                    state.last_key_at = now;
+                    state.message.input(key);
+                }
+            }
+        }
+    }
+
     /// Handle keystrokes while a modal is open. Each specialized modal owns
     /// its key bindings; delete and rewind confirmations use the y/n fallback.
     pub(super) async fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -2261,22 +2363,8 @@ impl Tui {
             | Some(crate::types::ModalState::SessionPicker { .. }) => {
                 self.handle_picker_key(key).await?;
             }
-            Some(crate::types::ModalState::ConfirmToolUse { .. }) => {
-                match (key.code, key.modifiers) {
-                    // Default is deny ([y/N]): only an explicit 'y' allows the call.
-                    (KeyCode::Char('y') | KeyCode::Char('Y'), KeyModifiers::NONE) => {
-                        self.resolve_tool_confirm(true);
-                    }
-                    // Deny on n/N/Esc/Enter, and on Ctrl+C so the blocked tool-eval
-                    // thread is never left waiting.
-                    (KeyCode::Char('n') | KeyCode::Char('N'), KeyModifiers::NONE)
-                    | (KeyCode::Esc, KeyModifiers::NONE)
-                    | (KeyCode::Enter, KeyModifiers::NONE)
-                    | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                        self.resolve_tool_confirm(false);
-                    }
-                    _ => {}
-                }
+            Some(crate::types::ModalState::ConfirmToolUse(_)) => {
+                self.handle_tool_confirmation_key(key).await;
             }
             Some(crate::types::ModalState::ConfirmExit { phase, .. }) => {
                 self.handle_confirm_exit_key(*phase, key)

@@ -6380,6 +6380,607 @@ async fn test_d5_modal_y_confirms_n_cancels() {
     );
 }
 
+fn test_tool_confirmation_show(
+    confirmation_id: u64,
+    reply: tokio::sync::oneshot::Sender<bool>,
+) -> TuiEvent {
+    TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
+        confirmation_id,
+        origin_session_id: "test-session".to_string(),
+        cluster: "test-cluster".to_string(),
+        tool_call_id: Some(format!("call-{confirmation_id}")),
+        tool_name: "test_tool".to_string(),
+        arguments: Box::new(serde_json::json!({"value": confirmation_id})),
+        reason: None,
+        reply: crate::tool_confirmation::ToolConfirmationReply::Routed {
+            reply,
+            closed: Default::default(),
+        },
+    })
+}
+
+#[tokio::test]
+async fn tool_confirmation_moves_main_input_draft_into_modal() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.set_input_text("first line\nsecond line");
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+
+    tui.handle_tui_event(test_tool_confirmation_show(35, reply))
+        .await
+        .unwrap();
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected tool confirmation modal");
+    };
+    assert_eq!(state.message.lines().join("\n"), "first line\nsecond line");
+    assert_eq!(state.opened_at, state.last_key_at);
+    assert_eq!(tui.app.input.lines(), &[String::new()]);
+}
+
+#[tokio::test]
+async fn tool_confirmation_moves_pending_draft_and_clears_shared_copy() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.app.llm_busy = true;
+    tui.queue_pending_message("pending follow-up".to_string())
+        .await;
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+
+    tui.handle_tui_event(test_tool_confirmation_show(36, reply))
+        .await
+        .unwrap();
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected tool confirmation modal");
+    };
+    assert_eq!(state.message.lines().join("\n"), "pending follow-up");
+    assert!(tui.app.pending_message.is_none());
+    assert!(tui.shared_pending_message.lock().await.is_none());
+    assert_eq!(tui.app.input.lines(), &[String::new()]);
+}
+
+#[tokio::test]
+async fn tool_confirmation_typing_and_multiline_keys_edit_modal_message() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(37, reply))
+        .await
+        .unwrap();
+
+    for key in [
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    ] {
+        tui.handle_key(key).await.unwrap();
+    }
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected tool confirmation modal");
+    };
+    assert_eq!(state.message.lines().join("\n"), "hi\nx\ny\nn");
+    assert_eq!(tui.app.input.lines(), &[String::new()]);
+}
+
+#[tokio::test]
+async fn tool_confirmation_gated_enter_is_noop_without_extending_idle_deadline() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, mut decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(341, reply))
+        .await
+        .unwrap();
+    let last_key_at = match tui.app.modal.as_ref() {
+        Some(crate::types::ModalState::ConfirmToolUse(state)) => state.last_key_at,
+        other => panic!("expected confirmation modal, got {other:?}"),
+    };
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("gated Enter must keep modal open");
+    };
+    assert_eq!(state.last_key_at, last_key_at);
+    assert!(matches!(
+        decision.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn tool_confirmation_enter_after_idle_gate_approves() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(342, reply))
+        .await
+        .unwrap();
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_mut() {
+        state.last_key_at = std::time::Instant::now() - std::time::Duration::from_millis(2100);
+    }
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(decision.await.unwrap());
+    assert!(tui.app.modal.is_none());
+}
+
+#[tokio::test]
+async fn tool_confirmation_typing_resets_idle_gate() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(343, reply))
+        .await
+        .unwrap();
+    let stale = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_mut() {
+        state.last_key_at = stale;
+    }
+
+    tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected confirmation modal");
+    };
+    assert!(state.last_key_at > stale);
+    assert!(state.last_key_at.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn tool_confirmation_paste_inserts_text_and_resets_idle_gate() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(348, reply))
+        .await
+        .unwrap();
+    let stale = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_mut() {
+        state.last_key_at = stale;
+    }
+
+    tui.handle_paste("pasted\r\nmessage".to_string()).await;
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected confirmation modal");
+    };
+    assert_eq!(state.message.lines().join("\n"), "pasted\nmessage");
+    assert!(state.last_key_at > stale);
+    assert!(state.last_key_at.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn tool_confirmation_ctrl_d_rejects_to_agent() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(344, reply))
+        .await
+        .unwrap();
+
+    tui.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(!decision.await.unwrap());
+    assert!(tui.app.modal.is_none());
+}
+
+#[tokio::test]
+async fn tool_confirmation_submitting_ignores_enter_and_ctrl_d() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, mut decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(347, reply))
+        .await
+        .unwrap();
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_mut() {
+        state.submitting = true;
+        state.last_key_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    }
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    tui.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        decision.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        tui.app.modal,
+        Some(crate::types::ModalState::ConfirmToolUse(_))
+    ));
+}
+
+#[tokio::test]
+async fn tool_confirmation_ctrl_f_toggles_only_when_template_exists() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+
+    tui.handle_tui_event(test_tool_confirmation_show(345, reply))
+        .await
+        .unwrap();
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_mut() {
+        state.has_template = false;
+        state.view = crate::types::ConfirmView::Template;
+    }
+
+    tui.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected confirmation modal");
+    };
+    assert_eq!(state.view, crate::types::ConfirmView::Template);
+
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_mut() {
+        state.has_template = true;
+    }
+    tui.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected confirmation modal");
+    };
+    assert_eq!(state.view, crate::types::ConfirmView::RawYaml);
+}
+
+#[tokio::test]
+async fn tool_confirmation_waits_for_commit_and_uses_captured_origin() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, mut decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(351, reply))
+        .await
+        .unwrap();
+    let submission_id = match tui.app.modal.as_mut() {
+        Some(crate::types::ModalState::ConfirmToolUse(state)) => {
+            state.message.insert_str("deliver after result");
+            state.submission_id.clone()
+        }
+        other => panic!("expected confirmation modal, got {other:?}"),
+    };
+
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let request_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(request_tx)));
+    let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+    let commit_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(commit_rx)));
+    tui.confirmation_enqueue_override = Some(std::sync::Arc::new(move |request| {
+        request_tx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("one enqueue request")
+            .send(request)
+            .expect("request observer");
+        let commit_rx = commit_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("one commit acknowledgement");
+        Box::pin(async move { commit_rx.await.expect("commit sender") })
+    }));
+
+    // Switching the selected session after opening the modal must not retarget
+    // the detached enqueue.
+    tui.active_remote_session = Some(("other-session".to_string(), "other-cluster".to_string()));
+    tui.submit_tool_confirm(crate::tool_confirmation::ConfirmDecision::Approve)
+        .await;
+    let request = request_rx.await.expect("enqueue request");
+    assert_eq!(request.session_id, "test-session");
+    assert_eq!(request.cluster, "test-cluster");
+    assert_eq!(request.message, "deliver after result");
+    assert_eq!(request.submission_id, submission_id);
+    assert!(matches!(
+        decision.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        tui.app.modal,
+        Some(crate::types::ModalState::ConfirmToolUse(ref state)) if state.submitting
+    ));
+
+    commit_tx
+        .send(
+            crate::tool_confirmation::ConfirmationEnqueueResult::Committed {
+                activation_error: None,
+            },
+        )
+        .unwrap();
+    let completion = tui.event_rx.recv().await.expect("enqueue completion event");
+    tui.handle_tui_event(completion).await.unwrap();
+
+    assert!(decision.await.unwrap());
+    assert!(tui.app.modal.is_none());
+}
+
+#[tokio::test]
+async fn whitespace_confirmation_message_resolves_without_enqueue() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(352, reply))
+        .await
+        .unwrap();
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_mut() {
+        state.message.insert_str("  \n\t");
+    }
+    tui.confirmation_enqueue_override = Some(std::sync::Arc::new(|_| {
+        Box::pin(async { panic!("whitespace-only decisions must not enqueue") })
+    }));
+
+    tui.submit_tool_confirm(crate::tool_confirmation::ConfirmDecision::RejectToAgent)
+        .await;
+
+    assert!(!decision.await.unwrap());
+    assert!(tui.app.modal.is_none());
+}
+#[tokio::test]
+async fn tool_confirmation_enqueue_failure_keeps_reply_and_draft_for_retry() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, mut decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(348, reply))
+        .await
+        .unwrap();
+    let submission_id =
+        if let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_mut() {
+            state.message.insert_str("retry this message");
+            state.submission_id.clone()
+        } else {
+            panic!("expected confirmation modal");
+        };
+    tui.confirmation_enqueue_override = Some(std::sync::Arc::new(|_| {
+        Box::pin(async {
+            crate::tool_confirmation::ConfirmationEnqueueResult::Failed(
+                "publish failed".to_string(),
+            )
+        })
+    }));
+
+    tui.submit_tool_confirm(crate::tool_confirmation::ConfirmDecision::Approve)
+        .await;
+    let completion = tui.event_rx.recv().await.expect("enqueue completion event");
+    tui.handle_tui_event(completion).await.unwrap();
+
+    assert!(matches!(
+        decision.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("failed enqueue must keep confirmation modal open");
+    };
+    assert!(!state.submitting);
+    assert_eq!(state.message.lines().join("\n"), "retry this message");
+    assert_eq!(state.submission_id, submission_id);
+    assert_eq!(
+        state.submission_error.as_deref(),
+        Some("Message enqueue failed: publish failed")
+    );
+}
+
+#[tokio::test]
+async fn tool_confirmation_committed_activation_failure_still_resolves() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(349, reply))
+        .await
+        .unwrap();
+    let target = match tui.app.modal.as_mut() {
+        Some(crate::types::ModalState::ConfirmToolUse(state)) => {
+            state.message.insert_str("committed once");
+            (state.session_id.clone(), state.cluster.clone())
+        }
+        other => panic!("expected confirmation modal, got {other:?}"),
+    };
+    let append_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count_for_enqueue = std::sync::Arc::clone(&append_count);
+    tui.confirmation_enqueue_override = Some(std::sync::Arc::new(move |_| {
+        count_for_enqueue.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            crate::tool_confirmation::ConfirmationEnqueueResult::Committed {
+                activation_error: Some("activation unavailable".to_string()),
+            }
+        })
+    }));
+
+    tui.submit_tool_confirm(crate::tool_confirmation::ConfirmDecision::Approve)
+        .await;
+    let completion = tui.event_rx.recv().await.expect("enqueue completion event");
+    tui.handle_tui_event(completion).await.unwrap();
+
+    assert!(decision.await.unwrap());
+    assert!(tui.app.modal.is_none());
+    assert!(tui.pending_remote_activations.contains(&target));
+    assert_eq!(
+        append_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "activation failure must not append the committed message again"
+    );
+}
+
+#[tokio::test]
+async fn stale_tool_confirmation_enqueue_completion_cannot_resolve_reply() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, mut decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(350, reply))
+        .await
+        .unwrap();
+
+    tui.finish_tool_confirmation_enqueue(
+        351,
+        crate::tool_confirmation::ConfirmDecision::Approve,
+        crate::tool_confirmation::ConfirmationEnqueueResult::Committed {
+            activation_error: None,
+        },
+    );
+
+    assert!(matches!(
+        decision.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(tui.app.pending_confirm_id, Some(350));
+}
+
+#[tokio::test]
+async fn tool_confirmation_page_and_mouse_scroll_update_body_offset() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(346, reply))
+        .await
+        .unwrap();
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_mut() {
+        state.scroll.last_max_position = 100;
+        state.scroll.position = 50;
+        state.scroll.follow = false;
+    }
+
+    tui.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected confirmation modal");
+    };
+    assert_eq!(state.scroll.position, 60);
+
+    tui.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected confirmation modal");
+    };
+    assert_eq!(state.scroll.position, 50);
+
+    tui.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollDown,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected confirmation modal");
+    };
+    assert_eq!(state.scroll.position, 53);
+}
+
+#[tokio::test]
+async fn tool_confirmation_ctrl_c_restores_modal_draft_to_main_input() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.set_input_text("keep this");
+    let (reply, decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(38, reply))
+        .await
+        .unwrap();
+    tui.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(!decision.await.unwrap());
+    assert!(tui.abort_signal.aborted_ctrlc());
+    assert!(tui.app.modal.is_none());
+    assert_eq!(tui.app.input.lines().join("\n"), "keep this!");
+    assert_eq!(tui.app.input.cursor(), (0, "keep this!".chars().count()));
+}
+
+#[tokio::test]
+async fn tool_confirmation_dismiss_restores_modal_draft_to_main_input() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(39, reply))
+        .await
+        .unwrap();
+    for key in ['r', 'e', 't', 'r', 'y'] {
+        tui.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+
+    tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Dismiss {
+        confirmation_id: 39,
+    }))
+    .await
+    .unwrap();
+
+    assert!(!decision.await.unwrap());
+    assert!(tui.app.modal.is_none());
+    assert_eq!(tui.app.input.lines().join("\n"), "retry");
+    assert_eq!(tui.app.input.cursor(), (0, 5));
+}
+
+#[tokio::test]
+async fn tool_confirmation_show_resolves_declared_call_template() {
+    let config = test_config();
+    config
+        .read()
+        .nats_tool_declarations
+        .write()
+        .push(harnx_core::tool::ToolDeclaration {
+            name: "templated_tool".to_string(),
+            description: String::new(),
+            parameters: Default::default(),
+            mcp_tool_name: Some("templated_tool".to_string()),
+            mcp_server_name: Some("test-server".to_string()),
+            call_template: Some("Run ${{ args.command }}".to_string()),
+            result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
+        });
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+
+    tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
+        confirmation_id: 40,
+        origin_session_id: "test-session".to_string(),
+        cluster: "test-cluster".to_string(),
+        tool_call_id: Some("call-template".to_string()),
+        tool_name: "templated_tool".to_string(),
+        arguments: Box::new(serde_json::json!({"command": "echo hello"})),
+        reason: None,
+        reply: crate::tool_confirmation::ToolConfirmationReply::Routed {
+            reply,
+            closed: Default::default(),
+        },
+    }))
+    .await
+    .unwrap();
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected tool confirmation modal");
+    };
+    assert!(state.has_template);
+    assert_eq!(state.view, crate::types::ConfirmView::Template);
+    assert_eq!(state.template_text.as_deref(), Some("Run $echo hello"));
+}
+
 #[tokio::test]
 async fn tool_confirmation_does_not_replace_an_existing_modal() {
     let config = test_config();
@@ -6389,8 +6990,11 @@ async fn tool_confirmation_does_not_replace_an_existing_modal() {
 
     tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
         confirmation_id: 41,
+        origin_session_id: "test-session".to_string(),
+        cluster: "test-cluster".to_string(),
+        tool_call_id: Some("call-1".to_string()),
         tool_name: "atlas_session_handoff".to_string(),
-        input_preview: r#"{"prompt":"execute"}"#.to_string(),
+        arguments: Box::new(serde_json::json!({"prompt": "execute"})),
         reason: Some("Hand off this plan?".to_string()),
         reply: crate::tool_confirmation::ToolConfirmationReply::Routed {
             reply,
@@ -6420,8 +7024,11 @@ async fn remote_confirmation_cleanup_dismisses_only_its_own_modal() {
 
     tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
         confirmation_id: 42,
+        origin_session_id: "test-session".to_string(),
+        cluster: "test-cluster".to_string(),
+        tool_call_id: Some("call-2".to_string()),
         tool_name: "atlas_session_handoff".to_string(),
-        input_preview: r#"{"prompt":"execute"}"#.to_string(),
+        arguments: Box::new(serde_json::json!({"prompt": "execute"})),
         reason: Some("Hand off this plan?".to_string()),
         reply: crate::tool_confirmation::ToolConfirmationReply::Routed {
             reply,
@@ -9342,6 +9949,209 @@ fn messages_to_transcript_items_renders_tool_message_with_seq() {
     );
 }
 
+fn tool_confirmation_modal(
+    arguments: serde_json::Value,
+    view: crate::types::ConfirmView,
+    has_template: bool,
+    template_text: Option<&str>,
+    reason: Option<&str>,
+) -> crate::types::ModalState {
+    let mut scroll = ratatui_widget_scrolling::ScrollState::new();
+    scroll.follow = false;
+    crate::types::ModalState::ConfirmToolUse(Box::new(crate::types::ConfirmToolUseState {
+        arguments,
+        tool_name: "test_tool".to_string(),
+        reason: reason.map(str::to_string),
+        session_id: "test-session".to_string(),
+        cluster: "test-cluster".to_string(),
+        tool_call_id: Some("test-call".to_string()),
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        confirmation_route: None,
+        submission_cancel: Default::default(),
+        submission_error: None,
+        view,
+        has_template,
+        template_text: template_text.map(str::to_string),
+        scroll,
+        message: ratatui_textarea::TextArea::default(),
+        opened_at: std::time::Instant::now(),
+        last_key_at: std::time::Instant::now(),
+        submitting: false,
+    }))
+}
+
+#[tokio::test]
+async fn confirm_tool_modal_footer_tracks_gate_view_and_submitting_state() {
+    let mut harness = TuiTestHarness::with_size(100, 18).await;
+    harness.tui().app.modal = Some(tool_confirmation_modal(
+        serde_json::json!({"command": "echo hello"}),
+        crate::types::ConfirmView::Template,
+        true,
+        Some("Run **echo hello**"),
+        None,
+    ));
+
+    harness.render();
+    let gated = normalize_screen(&harness.screen_contents());
+    assert!(gated.contains("ENTER approve ("), "{gated}");
+    assert!(gated.contains("Ctrl+D reject"), "{gated}");
+    assert!(gated.contains("Ctrl+C reject+interrupt"), "{gated}");
+    assert!(gated.contains("Ctrl+F raw"), "{gated}");
+    assert!(gated.contains("PgUp/PgDn scroll"), "{gated}");
+
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = harness.tui().app.modal.as_mut()
+    {
+        state.last_key_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        state.view = crate::types::ConfirmView::RawYaml;
+    }
+    harness.render();
+    let ready = normalize_screen(&harness.screen_contents());
+    assert!(ready.contains("ENTER approve · Ctrl+D"), "{ready}");
+    assert!(!ready.contains("ENTER approve ("), "{ready}");
+    assert!(ready.contains("Ctrl+F template"), "{ready}");
+
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = harness.tui().app.modal.as_mut()
+    {
+        state.submitting = true;
+    }
+    harness.render();
+    let submitting = normalize_screen(&harness.screen_contents());
+    assert!(submitting.contains("Submitting…"), "{submitting}");
+}
+
+#[tokio::test]
+async fn confirm_tool_modal_renders_multiline_yaml() {
+    let mut harness = TuiTestHarness::with_size(80, 24).await;
+    harness.tui().app.modal = Some(tool_confirmation_modal(
+        serde_json::json!({
+            "command": "cargo nextest run",
+            "environment": {"RUST_LOG": "debug"},
+            "paths": ["crates/harnx-tui", "crates/harnx-runtime"]
+        }),
+        crate::types::ConfirmView::RawYaml,
+        false,
+        None,
+        None,
+    ));
+
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(
+        rendered.contains("command: cargo nextest run"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("environment:"), "{rendered}");
+    assert!(rendered.contains("paths:"), "{rendered}");
+    assert!(!rendered.contains("Ctrl+F"), "{rendered}");
+}
+
+#[tokio::test]
+async fn confirm_tool_modal_renders_template_view() {
+    let mut harness = TuiTestHarness::with_size(80, 18).await;
+    harness.tui().app.modal = Some(tool_confirmation_modal(
+        serde_json::json!({"command": "echo raw-yaml"}),
+        crate::types::ConfirmView::Template,
+        true,
+        Some("Run **echo from template**"),
+        None,
+    ));
+
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(rendered.contains("Run echo from template"), "{rendered}");
+    assert!(!rendered.contains("command: echo raw-yaml"), "{rendered}");
+}
+
+#[tokio::test]
+async fn confirm_tool_modal_raw_view_ignores_template() {
+    let mut harness = TuiTestHarness::with_size(80, 18).await;
+    harness.tui().app.modal = Some(tool_confirmation_modal(
+        serde_json::json!({"command": "echo raw-yaml"}),
+        crate::types::ConfirmView::RawYaml,
+        true,
+        Some("Run **template output**"),
+        None,
+    ));
+
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(rendered.contains("command: echo raw-yaml"), "{rendered}");
+    assert!(!rendered.contains("template output"), "{rendered}");
+}
+
+#[tokio::test]
+async fn confirm_tool_modal_handles_null_and_empty_arguments() {
+    for arguments in [
+        serde_json::Value::Null,
+        serde_json::json!({}),
+        serde_json::json!([]),
+    ] {
+        let mut harness = TuiTestHarness::with_size(80, 12).await;
+        harness.tui().app.modal = Some(tool_confirmation_modal(
+            arguments,
+            crate::types::ConfirmView::RawYaml,
+            false,
+            None,
+            None,
+        ));
+
+        harness.render();
+        let rendered = normalize_screen(&harness.screen_contents());
+        assert!(rendered.contains("Allow tool 'test_tool'?"), "{rendered}");
+        assert!(rendered.contains("Ctrl+D reject"), "{rendered}");
+    }
+}
+
+#[tokio::test]
+async fn confirm_tool_modal_scrolls_only_body_and_expands_past_half_screen() {
+    let mut arguments = serde_json::Map::new();
+    for index in 0..40 {
+        arguments.insert(
+            format!("line_{index:02}"),
+            serde_json::Value::String(format!("value {index:02}")),
+        );
+    }
+
+    let mut harness = TuiTestHarness::with_size(80, 18).await;
+    let modal = tool_confirmation_modal(
+        serde_json::Value::Object(arguments),
+        crate::types::ConfirmView::RawYaml,
+        false,
+        None,
+        Some("Pinned approval reason"),
+    );
+    let desired_height = harness.tui().confirm_tool_modal_height(80, &modal);
+    assert!(desired_height > 9, "modal should grow beyond half screen");
+    harness.tui().app.modal = Some(modal);
+
+    harness.render();
+    let first_render = normalize_screen(&harness.screen_contents());
+    let max_position = match harness.tui().app.modal.as_ref() {
+        Some(crate::types::ModalState::ConfirmToolUse(state)) => state.scroll.last_max_position,
+        other => panic!("expected confirmation modal, got {other:?}"),
+    };
+    assert!(max_position > 0, "large YAML body should be scrollable");
+
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = harness.tui().app.modal.as_mut()
+    {
+        state.scroll.position = max_position;
+        state.scroll.follow = false;
+    }
+    harness.render();
+    let second_render = normalize_screen(&harness.screen_contents());
+
+    assert_ne!(
+        first_render, second_render,
+        "scrolling should change body rows"
+    );
+    for rendered in [&first_render, &second_render] {
+        assert!(rendered.contains("Allow tool 'test_tool'?"), "{rendered}");
+        assert!(rendered.contains("Pinned approval reason"), "{rendered}");
+        assert!(rendered.contains("Message (optional)"), "{rendered}");
+        assert!(rendered.contains("Ctrl+D reject"), "{rendered}");
+    }
+}
+
 #[tokio::test]
 async fn confirm_tool_modal_options_always_visible_with_long_input() {
     let mut harness = TuiTestHarness::new().await;
@@ -9350,11 +10160,33 @@ async fn confirm_tool_modal_options_always_visible_with_long_input() {
 
     let long_input = r#"{"prompt":"Execute handoff immediately. I am going to write a very long sentence here to make sure that the input preview takes up a lot of space, way more than would normally fit in the terminal, so that it forces the modal to clip its contents. But wait, there is more! Here is some extra data to push it over the edge."}"#;
 
-    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmToolUse {
-        tool_name: "atlas_session_handoff".to_string(),
-        input_preview: long_input.to_string(),
-        reason: Some("Hand off this plan to another agent?".to_string()),
-    });
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmToolUse(Box::new(
+        crate::types::ConfirmToolUseState {
+            arguments: serde_json::from_str(long_input).unwrap_or(serde_json::Value::Null),
+            tool_name: "atlas_session_handoff".to_string(),
+            reason: Some("Hand off this plan to another agent?".to_string()),
+            session_id: "test-session".to_string(),
+            cluster: "test-cluster".to_string(),
+            tool_call_id: None,
+            submission_id: uuid::Uuid::new_v4().to_string(),
+            confirmation_route: None,
+            submission_cancel: Default::default(),
+            submission_error: None,
+            view: crate::types::ConfirmView::RawYaml,
+            has_template: false,
+            template_text: None,
+            scroll: {
+                let mut s = ratatui_widget_scrolling::ScrollState::new();
+                s.follow = false;
+                s.position = 0; // Start at top (not following bottom)
+                s
+            },
+            message: ratatui_textarea::TextArea::default(),
+            opened_at: std::time::Instant::now(),
+            last_key_at: std::time::Instant::now(),
+            submitting: false,
+        },
+    )));
 
     harness.render();
     let contents = harness.screen_contents();
@@ -9368,7 +10200,7 @@ async fn confirm_tool_modal_options_always_visible_with_long_input() {
 
     // Assert that the options text is fully visible (which was getting pushed off screen previously)
     assert!(
-        rendered.contains("[y] allow   [n] deny   (Enter/Esc denies)"),
+        rendered.contains("ENTER approve ("),
         "Options text not found. The modal likely clipped it!"
     );
 }
@@ -9379,16 +10211,33 @@ async fn confirm_tool_modal_renders_on_short_terminals_without_panicking() {
 
     for height in [10, 6] {
         let mut harness = TuiTestHarness::with_size(80, height).await;
-        harness.tui().app.modal = Some(crate::types::ModalState::ConfirmToolUse {
-            tool_name: "atlas_session_handoff".to_string(),
-            input_preview: long_input.to_string(),
-            reason: Some("Confirm this handoff?".to_string()),
-        });
+        harness.tui().app.modal = Some(crate::types::ModalState::ConfirmToolUse(Box::new(
+            crate::types::ConfirmToolUseState {
+                arguments: serde_json::from_str(long_input).unwrap_or(serde_json::Value::Null),
+                tool_name: "atlas_session_handoff".to_string(),
+                reason: Some("Confirm this handoff?".to_string()),
+                session_id: "test-session".to_string(),
+                cluster: "test-cluster".to_string(),
+                tool_call_id: None,
+                submission_id: uuid::Uuid::new_v4().to_string(),
+                confirmation_route: None,
+                submission_cancel: Default::default(),
+                submission_error: None,
+                view: crate::types::ConfirmView::RawYaml,
+                has_template: false,
+                template_text: None,
+                scroll: ratatui_widget_scrolling::ScrollState::new(),
+                message: ratatui_textarea::TextArea::default(),
+                opened_at: std::time::Instant::now(),
+                last_key_at: std::time::Instant::now(),
+                submitting: false,
+            },
+        )));
 
         harness.render();
         let rendered = normalize_screen(&harness.screen_contents());
         assert!(
-            rendered.contains("[y] allow   [n] deny   (Enter/Esc denies)"),
+            rendered.contains("ENTER approve ("),
             "confirmation footer missing at terminal height {height}: {rendered}"
         );
     }
@@ -9507,13 +10356,6 @@ async fn tui_sync_and_clear_shut_down_confirmation_routes() {
     tui.clear_tool_confirmation_route();
     assert!(clear_shutdown.load(Ordering::SeqCst));
     assert!(tui.tool_confirmation_route.lock().is_none());
-}
-
-#[test]
-fn tool_confirmation_json_fence_exceeds_content_backticks() {
-    let markdown = crate::render::fenced_json_markdown(r#"{"value":"```inside````"}"#);
-    assert!(markdown.starts_with("`````json\n"));
-    assert!(markdown.ends_with("\n`````"));
 }
 
 #[tokio::test]

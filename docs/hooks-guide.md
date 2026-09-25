@@ -383,18 +383,9 @@ hooks:
         '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
 ```
 
-When the agent calls a tool, Harnx pauses and shows a confirmation prompt:
+When the agent calls a tool, the attached TUI shows the full arguments in its confirmation modal. Press `Enter` after the two-second keyboard-idle gate to approve, `Ctrl+D` to reject while the agent continues, or `Ctrl+C` to reject and interrupt. You can also type a message that will be queued after the tool result. See the [Tool Confirmation Guide](tool-confirmation-guide.md#4-use-the-tui-confirmation-modal) for rendering, scrolling, and editing controls.
 
-```text
-Hook requires confirmation for tool 'bash_exec'
-Reason: Manual approval required
-Input: {
-  "command": "ls -la"
-}
-Allow this tool call? (y/N)
-```
-
-The default is **No** (deny). Use `--matcher` to limit confirmation to specific tools:
+Use `--matcher` to limit confirmation to specific tools:
 
 ```yaml
 hooks:

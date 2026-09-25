@@ -18,20 +18,6 @@ fn dim_style(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::DIM)
 }
 
-pub(super) fn fenced_json_markdown(content: &str) -> String {
-    let mut longest_run = 0usize;
-    let mut current_run = 0usize;
-    for character in content.chars() {
-        if character == '`' {
-            current_run = current_run.saturating_add(1);
-            longest_run = longest_run.max(current_run);
-        } else {
-            current_run = 0;
-        }
-    }
-    let fence = "`".repeat(longest_run.saturating_add(1).max(3));
-    format!("{fence}json\n{content}\n{fence}")
-}
 fn plan_detail_lines(plan: &[harnx_core::event::PlanEntry], label: Style) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled("── plan ──", label))];
     lines.extend(plan.iter().enumerate().map(|(index, entry)| {
@@ -523,11 +509,11 @@ impl Tui {
     }
 
     fn bottom_region_height(&self, input_width: u16, screen_height: u16) -> u16 {
-        if let Some(modal @ ModalState::ConfirmToolUse { .. }) = &self.app.modal {
-            let max_height = (screen_height / 2).max(6);
+        if let Some(modal @ ModalState::ConfirmToolUse(_)) = &self.app.modal {
             return self
                 .confirm_tool_modal_height(input_width, modal)
-                .clamp(6, max_height);
+                .max(6)
+                .min(screen_height);
         }
         if let Some(modal @ ModalState::ConfirmExit { .. }) = &self.app.modal {
             let max_height = (screen_height / 2).max(5);
@@ -550,8 +536,10 @@ impl Tui {
     }
 
     fn render_bottom_region(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
-        if let Some(modal @ ModalState::ConfirmToolUse { .. }) = self.app.modal.clone() {
-            self.render_tool_confirm_modal(frame, area, &modal);
+        if matches!(self.app.modal, Some(ModalState::ConfirmToolUse(_))) {
+            let mut modal = self.app.modal.take().expect("modal checked above");
+            self.render_tool_confirm_overlay(frame, area, &mut modal);
+            self.app.modal = Some(modal);
             return;
         }
         if let Some(modal @ ModalState::ConfirmExit { .. }) = self.app.modal.clone() {
@@ -620,7 +608,7 @@ impl Tui {
         if let Some(modal) = &self.app.modal {
             if !matches!(
                 modal,
-                ModalState::ConfirmToolUse { .. } | ModalState::ConfirmExit { .. }
+                ModalState::ConfirmToolUse(_) | ModalState::ConfirmExit { .. }
             ) {
                 self.render_modal(frame, area, modal);
             }
@@ -969,8 +957,9 @@ impl Tui {
             return;
         }
         match modal {
-            ModalState::ConfirmToolUse { .. } => {
-                self.render_tool_confirm_overlay(frame, screen_size, modal);
+            ModalState::ConfirmToolUse(_) => {
+                let mut modal = modal.clone();
+                self.render_tool_confirm_overlay(frame, screen_size, &mut modal);
             }
             ModalState::ConfirmExit { .. } => {
                 self.render_exit_confirm_overlay(frame, screen_size, modal);

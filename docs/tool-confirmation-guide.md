@@ -1,6 +1,6 @@
 # Tool Confirmation Guide
 
-Tool confirmation allows you to inspect and approve tool calls before they execute. This provides a safety layer for destructive operations, an audit trail for sensitive actions, and a way to learn how the agent interacts with your system.
+Tool confirmation pauses a tool call so you can inspect its full arguments, approve it, or return a blocked result to the agent.
 
 ## 1. Quick Start
 
@@ -23,15 +23,15 @@ so no `jq` or `jaq` executable is required.
 
 ## 2. How It Works
 
-Harnx uses the **hooks system** to implement tool confirmation. When a `PreToolUse` hook returns a specific JSON response, the execution flow pauses:
+Harnx uses the hooks system for tool confirmation. When a `PreToolUse` hook returns `{"permissionDecision": "ask"}`, this sequence runs:
 
-1.  **LLM requests a tool**: The agent decides to run a tool (e.g., `bash_exec`).
-2.  **Hook triggers**: Harnx runs your configured `PreToolUse` hook.
-3.  **Hook requests confirmation**: The hook returns `{"permissionDecision": "ask"}`.
-4.  **User prompted**: Harnx displays the tool name, arguments, and reason in the terminal.
-5.  **Execution or Denial**:
-    *   If you approve (**y**), the tool runs normally.
-    *   If you deny (**N**), the tool is blocked, and the agent receives a "Denied by user" error.
+1. The model requests a tool such as `bash_exec`.
+2. The worker runs matching `PreToolUse` hooks.
+3. The worker sends a confirmation request over NATS to the attached TUI.
+4. The TUI shows the tool name, full arguments, hook reason, and optional message area.
+5. Approving runs the tool. Rejecting returns a synthetic blocked tool result so the agent can continue.
+
+Production confirmation always uses this worker-to-frontend NATS route. The old test-only local confirmation bridge has been removed.
 
 ## 3. Configuration Methods
 
@@ -72,23 +72,26 @@ hooks:
 You are a helpful assistant with manual tool oversight.
 ```
 
-## 4. The Confirmation Prompt
+## 4. Use the TUI Confirmation Modal
 
-When a hook returns `"permissionDecision": "ask"`, you will see a prompt in your terminal:
+The modal shows full tool arguments as multiline YAML. If the tool declares a transcript call template, the modal shows that rendered template first; press `Ctrl+F` to switch between the template and raw YAML.
 
-```text
-Hook requires confirmation for tool 'bash_exec'
-Reason: Manual approval required
-Input: {
-  "command": "rm -rf /tmp/test"
-}
-Allow this tool call? (y/N)
-```
+The modal grows to the available screen height. Use `PageUp`, `PageDown`, or the mouse wheel to scroll the tool-call body. The header, reason, optional message area, and key help remain visible.
 
-*   **Default Behavior**: The default choice is **No** (deny). You must explicitly type `y` to approve.
-*   **Waiting for Approval**: TUI approval prompts have no time limit. Leaving a prompt unanswered does not deny the tool call. Cancelling the turn or closing or detaching the TUI still ends the wait.
-*   **Agent Feedback**: If denied, the agent receives: `{"error": "Denied by user", "blocked_by_hook": true}`. The agent can then choose to try a different approach or ask you for clarification.
-*   **Non-interactive Mode**: If Harnx is running without a TUI/terminal (e.g., in CI or a pipe), tool calls requiring confirmation are **automatically denied**.
+The message area is focused while the modal is open:
+
+- Type an optional message for the agent.
+- Press `Shift+Enter` or `Alt+Enter` to insert a newline.
+- Press `Enter` to approve after the keyboard has been idle for two seconds. An early `Enter` is ignored and does not restart the idle timer.
+- Press `Ctrl+D` to reject the tool. The agent continues with a blocked tool result.
+- Press `Ctrl+C` to reject and interrupt the session. Text from the message area returns to the main input as a draft and is not queued.
+- Press `Ctrl+F` to switch between template and raw YAML when a template is available.
+
+On approval or `Ctrl+D`, a non-empty optional message is durably queued to the originating session before the TUI sends the confirmation reply. The agent receives the real or blocked tool result first, then the queued user message. An empty message sends only the approval or rejection.
+
+TUI confirmation prompts have no time limit. Cancelling the turn, closing the route, or detaching the TUI ends the wait. If message enqueue fails, the modal stays open with the draft intact so you can retry.
+
+If no TUI is attached, a tool call requiring confirmation is denied. A rejected tool call produces a result such as `{"error": "Denied by user", "blocked_by_hook": true}`.
 
 ## 5. Advanced: Conditional Confirmation
 
