@@ -4,6 +4,8 @@
 //! module is deliberately side-effect-free so it can be linked into any
 //! crate that needs to speak the schema.
 
+use std::sync::Arc;
+
 use crate::abort::AbortSignal;
 use crate::execution_context::ExecutionContextObservation;
 use crate::message::MessageContentPart;
@@ -216,6 +218,141 @@ pub trait ToolProvider: Send + Sync {
     ) -> Result<ToolProviderOutput, ToolError> {
         let _ = tool_call_id;
         self.call_tool(tool_name, arguments, abort).await
+    }
+
+    /// Dispatches a tool with a progress sink for live updates.
+    ///
+    /// Tools can call `progress.update(patch)` to emit incremental state changes
+    /// (title, status, kind, locations, usage) during execution. The default
+    /// implementation delegates to `call_tool_with_id` (no progress), keeping
+    /// existing implementors working unchanged.
+    ///
+    /// Engine dispatch must call this method to enable progress; legacy calls
+    /// to `call_tool` or `call_tool_with_id` silently swallow updates.
+    async fn call_tool_with_progress(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        tool_call_id: Option<&str>,
+        abort: &AbortSignal,
+        _progress: Arc<dyn ToolProgress>,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        self.call_tool_with_id(tool_name, arguments, tool_call_id, abort)
+            .await
+    }
+}
+
+// ================================================================
+// Tool Progress Sink (issue #2096)
+// ================================================================
+
+/// Patch payload for tool progress updates.
+///
+/// All fields are optional. Semantics:
+/// - `None` (omitted) = unchanged
+/// - `Some(vec![])` for collections = clear
+/// - Collections replace (never append)
+/// - Usage snapshots replace (never summed)
+///
+/// Patches cannot set terminal status (Completed/Failed); runtime owns that truth.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolUpdatePatch {
+    /// Rendered body content (markdown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
+    /// Concise activity label for the tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Current tool status (non-terminal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<crate::event::ToolStatus>,
+    /// Content blocks for structured output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<crate::event::ContentBlock>>,
+    /// Dynamic kind refinement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::event::ToolKind>,
+    /// Affected locations. Replace on each update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locations: Option<Vec<crate::event::ToolLocation>>,
+    /// Per-call usage snapshot. Replaces previous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::api_types::CompletionTokenUsage>,
+}
+
+/// Object-safe progress sink for tool implementations.
+///
+/// Tools receive an `Arc<dyn ToolProgress>` and call `update(patch)` to emit
+/// live state changes. The runtime supplies the tool-call ID; tools don't.
+pub trait ToolProgress: Send + Sync {
+    /// Emit a progress update. Patches merge per-field; see [`ToolUpdatePatch`].
+    fn update(&self, patch: ToolUpdatePatch);
+}
+
+/// No-op progress sink used as default when progress is not required.
+#[derive(Debug, Clone, Default)]
+pub struct NoopToolProgress;
+
+impl ToolProgress for NoopToolProgress {
+    fn update(&self, _patch: ToolUpdatePatch) {
+        // Intentionally no-op.
+    }
+}
+
+// ================================================================
+// ToolDisplayState — patch-merge reducer (issue #2096)
+// ================================================================
+
+/// Accumulator for tool-call display state, updated by applying patches.
+///
+/// Implements pure merge semantics:
+/// - `None`/omitted = unchanged
+/// - `Some(vec![])` for collections = clear
+/// - Collections replace (never append)
+/// - Usage replaces (never summed)
+///
+/// Does NOT track terminal status (Completed/Failed); runtime owns that truth.
+#[derive(Debug, Clone, Default)]
+pub struct ToolDisplayState {
+    pub markdown: Option<String>,
+    pub title: Option<String>,
+    pub status: Option<crate::event::ToolStatus>,
+    pub content: Option<Vec<crate::event::ContentBlock>>,
+    pub kind: Option<crate::event::ToolKind>,
+    pub locations: Option<Vec<crate::event::ToolLocation>>,
+    pub usage: Option<crate::api_types::CompletionTokenUsage>,
+}
+
+impl ToolDisplayState {
+    /// Apply a patch in place, merging per-field.
+    pub fn apply(&mut self, patch: ToolUpdatePatch) {
+        if let Some(v) = patch.markdown {
+            self.markdown = Some(v);
+        }
+        if let Some(v) = patch.title {
+            self.title = Some(v);
+        }
+        if let Some(v) = patch.status {
+            // Patches cannot set terminal status (Completed/Failed); runtime owns that truth.
+            if !matches!(
+                v,
+                crate::event::ToolStatus::Completed | crate::event::ToolStatus::Failed
+            ) {
+                self.status = Some(v);
+            }
+        }
+        if let Some(v) = patch.content {
+            self.content = Some(v);
+        }
+        if let Some(v) = patch.kind {
+            self.kind = Some(v);
+        }
+        if let Some(v) = patch.locations {
+            self.locations = Some(v);
+        }
+        if let Some(v) = patch.usage {
+            self.usage = Some(v);
+        }
     }
 }
 
@@ -1188,5 +1325,154 @@ mod tests {
         .unwrap();
         assert!(out.starts_with("```python\n"), "fence lang: {out:?}");
         assert!(out.contains("print('hi')"), "body: {out:?}");
+    }
+
+    // ================================================================
+    // ToolDisplayState::apply tests
+    // ================================================================
+
+    #[test]
+    fn display_state_apply_field_by_field() {
+        let mut state = ToolDisplayState::default();
+        state.apply(ToolUpdatePatch {
+            title: Some("t1".into()),
+            ..Default::default()
+        });
+        assert_eq!(state.title, Some("t1".into()));
+        assert!(state.markdown.is_none());
+
+        state.apply(ToolUpdatePatch {
+            markdown: Some("body".into()),
+            ..Default::default()
+        });
+        assert_eq!(state.title, Some("t1".into())); // unchanged
+        assert_eq!(state.markdown, Some("body".into()));
+    }
+
+    #[test]
+    fn display_state_clear_on_empty_vec() {
+        let mut state = ToolDisplayState {
+            locations: Some(vec![crate::event::ToolLocation {
+                path: std::path::PathBuf::from("a.rs"),
+                line: None,
+            }]),
+            ..Default::default()
+        };
+        state.apply(ToolUpdatePatch {
+            locations: Some(vec![]),
+            ..Default::default()
+        });
+        assert_eq!(state.locations, Some(vec![]));
+    }
+
+    #[test]
+    fn display_state_replace_not_append() {
+        let mut state = ToolDisplayState {
+            locations: Some(vec![crate::event::ToolLocation {
+                path: std::path::PathBuf::from("a.rs"),
+                line: None,
+            }]),
+            ..Default::default()
+        };
+        state.apply(ToolUpdatePatch {
+            locations: Some(vec![
+                crate::event::ToolLocation {
+                    path: std::path::PathBuf::from("b.rs"),
+                    line: Some(1),
+                },
+                crate::event::ToolLocation {
+                    path: std::path::PathBuf::from("c.rs"),
+                    line: Some(2),
+                },
+            ]),
+            ..Default::default()
+        });
+        assert_eq!(state.locations.as_ref().map(|v| v.len()), Some(2));
+        assert_eq!(
+            state.locations.as_ref().unwrap()[0].path,
+            std::path::PathBuf::from("b.rs")
+        );
+    }
+
+    #[test]
+    fn display_state_usage_replaces_not_sums() {
+        use crate::api_types::CompletionTokenUsage;
+
+        let mut state = ToolDisplayState {
+            usage: Some(CompletionTokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            ..Default::default()
+        };
+        state.apply(ToolUpdatePatch {
+            usage: Some(CompletionTokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(state.usage.as_ref().map(|u| u.input_tokens), Some(10));
+        assert_eq!(state.usage.as_ref().map(|u| u.output_tokens), Some(5));
+    }
+
+    #[test]
+    fn display_state_omitted_unchanged() {
+        let mut state = ToolDisplayState {
+            title: Some("orig".into()),
+            kind: Some(crate::event::ToolKind::Edit),
+            ..Default::default()
+        };
+        state.apply(ToolUpdatePatch {
+            status: Some(crate::event::ToolStatus::InProgress),
+            ..Default::default()
+        });
+        assert_eq!(state.title, Some("orig".into()));
+        assert!(matches!(state.kind, Some(crate::event::ToolKind::Edit)));
+        assert!(matches!(
+            state.status,
+            Some(crate::event::ToolStatus::InProgress)
+        ));
+    }
+
+    #[test]
+    fn display_state_terminal_status_ignored() {
+        // Completed status should not be set by patch.
+        let mut state = ToolDisplayState {
+            status: Some(crate::event::ToolStatus::InProgress),
+            ..Default::default()
+        };
+        state.apply(ToolUpdatePatch {
+            status: Some(crate::event::ToolStatus::Completed),
+            ..Default::default()
+        });
+        assert!(
+            matches!(state.status, Some(crate::event::ToolStatus::InProgress)),
+            "Completed should be ignored"
+        );
+
+        // Failed status should not be set by patch.
+        state.apply(ToolUpdatePatch {
+            status: Some(crate::event::ToolStatus::Failed),
+            ..Default::default()
+        });
+        assert!(
+            matches!(state.status, Some(crate::event::ToolStatus::InProgress)),
+            "Failed should be ignored"
+        );
+
+        // InProgress should be allowed.
+        state.apply(ToolUpdatePatch {
+            status: Some(crate::event::ToolStatus::InProgress),
+            ..Default::default()
+        });
+        assert!(matches!(
+            state.status,
+            Some(crate::event::ToolStatus::InProgress)
+        ));
     }
 }

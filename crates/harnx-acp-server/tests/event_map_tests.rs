@@ -108,6 +108,10 @@ macro_rules! lifecycle_case {
                 markdown: Some($markdown.into()),
                 status: None,
                 content: None,
+                title: None,
+                kind: None,
+                locations: None,
+                usage: None,
             }),
             ExpectedToolUpdate {
                 id: $id,

@@ -768,6 +768,30 @@ metrics use a **separate mechanism**: `record_completion_usage` in `config/mod.r
 `Session.completion_usage` per model call. These mechanisms are independent. Anyone modifying usage
 display must keep them separate or they'll double-count.
 
+## Tool Progress Patch Semantics
+
+`ToolUpdatePatch` and `ToolDisplayState` (`harnx-core/src/tool.rs:258-356`) implement pure merge:
+
+- `None`/omitted = unchanged
+- `Some(vec![])` for collections = clear
+- Collections **replace** (never append)
+- Usage snapshots **replace** (never sum)
+- Terminal status (`Completed`, `Failed`) cannot be set by patches; runtime owns that truth
+
+Surfaces (TUI/Web/CLI) and the ACP mapper must apply these semantics. Tests enforce terminal-status
+guard (`display_state_terminal_status_ignored` in `tool.rs:1443`).
+
+### `title` vs `markdown` in `ToolEvent::Update`
+
+`title` is a concise activity label; `markdown` is rendered body content. Historical lesson `5960f7d0a`
+(PR #418) split them after overloading caused confusion. Don't merge them.
+
+### `call_tool_with_progress` is opt-in
+
+`ToolProvider::call_tool_with_progress` (`harnx-core/src/tool.rs:232-242`) delegates to `call_tool_with_id`
+by default. Provider decorators/wrappers that forward only legacy methods silently swallow updates.
+Engine dispatch must call the `_with_progress` variant to enable progress.
+
 ### Tool confirmation modal ordering and delivery
 
 When a `PreToolUse` hook returns `permissionDecision: "ask"`, the TUI modal queues an optional user message via durable JetStream append before sending the approval reply. Worker reloads the session log at the tool seam, ensuring the agent sees `tool call → tool result (real or blocked) → queued message`.
