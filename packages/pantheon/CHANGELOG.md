@@ -1,6 +1,13 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.6 (2026-09-25)
+
+### Fixes
+
+- format tool calls in session dumps (#2100)
+- install rustls crypto provider before startup TLS (#2105)
+
 ## 0.4.5 (2026-09-25)
 
 ### Features

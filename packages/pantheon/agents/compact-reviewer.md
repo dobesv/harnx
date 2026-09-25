@@ -6,7 +6,7 @@ model_fallbacks:
 - openai:gpt-6-luna
 - claude:claude-sonnet-5
 - bedrock:zai.glm-4.7-flash
-version: '0.4.5'
+version: '0.4.6'
 ---
 You are summarizing a conversation between a user and an AI code review agent that analyzes pull requests and codebases for quality, security, and correctness issues.
 

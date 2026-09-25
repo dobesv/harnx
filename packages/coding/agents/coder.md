@@ -54,7 +54,7 @@ description: >
   the web for docs, and manages local plans to track multi-step tasks.
   Designed for solo coding sessions without the full Pantheon orchestration
   overhead.
-version: '0.4.5'
+version: '0.4.6'
 ---
 
 # Coder — Autonomous Coding Assistant

@@ -6,7 +6,7 @@ model_fallbacks:
 - openai:gpt-6-luna
 - claude:claude-sonnet-5
 - bedrock:zai.glm-4.7-flash
-version: '0.4.5'
+version: '0.4.6'
 ---
 You are summarizing a conversation between a user and an AI orchestrator agent that manages multi-step work plans and delegates tasks to sub-agents.
 

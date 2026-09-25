@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.34.6 (2026-09-25)
+
+### Features
+
+- Add capability-gated ACP `session/load` support for ordered, read-only replay of agent- and cluster-scoped durable NATS transcripts.
+
+### Fixes
+
+- format tool calls in session dumps (#2100)
+- install rustls crypto provider before startup TLS (#2105)
+- Render tool arguments and configured call/result templates in text session dumps, and keep tool events on separate lines from model prose.
+
 ## 0.34.5 (2026-09-25)
 
 ### Features
