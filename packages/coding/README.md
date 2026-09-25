@@ -16,7 +16,7 @@ multi-agent orchestration overhead.
 Install from GHCR (replace `v0.1.0` with the current release):
 
 ```sh
-harnx-pkg add ghcr.io/dobesv/harnx-packages/coding v0.4.4
+harnx-pkg add ghcr.io/dobesv/harnx-packages/coding v0.4.5
 ```
 
 Use harnx 0.34.0 or a development build containing the package model updates.
