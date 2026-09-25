@@ -1,4 +1,4 @@
-use crate::replay_entries_to_sink;
+use crate::{replay_entries_to_sink, replay_entries_to_sink_with_decls};
 use harnx_core::event::{
     AgentEvent, AgentEventSink, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent,
     ToolKind, UserEvent,
@@ -6,8 +6,9 @@ use harnx_core::event::{
 use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart, MessageRole};
 use harnx_core::session::{SessionLogEntry, ToolOutput};
 use harnx_core::session_reconstruct::apply_log_mutations_nats;
-use harnx_core::tool::ToolCall;
+use harnx_core::tool::{ToolCall, ToolDeclaration};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -117,6 +118,74 @@ fn replay_emits_messages_and_tool_events_in_order() {
             seq_event(3),
         ],
     );
+}
+
+#[test]
+fn replay_with_declarations_renders_tool_call_and_result_templates() {
+    let call = ToolCall::new(
+        "read".into(),
+        json!({"path": "README.md"}),
+        Some("read-call".into()),
+        None,
+    );
+    let entries = vec![
+        (
+            1,
+            SessionLogEntry::ToolCalls {
+                text: String::new(),
+                thought: None,
+                calls: vec![call],
+                timestamp: None,
+                fence_token: None,
+            },
+        ),
+        (
+            2,
+            SessionLogEntry::ToolResults {
+                results: vec![ToolOutput {
+                    id: Some("read-call".into()),
+                    name: "read".into(),
+                    output: json!({"text": "# Harnx"}),
+                    markdown: None,
+                    content: vec![],
+                    switch_agent: None,
+                }],
+                timestamp: None,
+            },
+        ),
+    ];
+    let declaration = ToolDeclaration {
+        name: "read".into(),
+        description: String::new(),
+        parameters: Default::default(),
+        mcp_tool_name: Some("read".into()),
+        mcp_server_name: None,
+        call_template: Some("📖 {{ args.path }}".into()),
+        result_template: Some("Result: {{ result.text }}".into()),
+        idempotent_hint: None,
+        read_only_hint: None,
+    };
+    let decl_map = HashMap::from([(declaration.name.clone(), declaration)]);
+    let sink = Arc::new(RecordingSink::default());
+
+    replay_entries_to_sink_with_decls(&entries, &decl_map, sink.clone());
+
+    let events = sink.0.lock().unwrap();
+    assert!(matches!(
+        &events[0],
+        AgentEvent::Tool(ToolEvent::Started {
+            markdown: Some(markdown),
+            input,
+            ..
+        }) if markdown == "📖 README.md" && input == &json!({"path": "README.md"})
+    ));
+    assert!(matches!(
+        &events[2],
+        AgentEvent::Tool(ToolEvent::Completed {
+            markdown: Some(markdown),
+            ..
+        }) if markdown == "Result: # Harnx"
+    ));
 }
 
 #[test]

@@ -42,7 +42,8 @@ use harnx_core::session::SessionLogEntry;
 use harnx_core::session_reconstruct::{
     active_context_window, reconstruct_state_from_nats, ActiveContextWindow,
 };
-use std::collections::{HashSet, VecDeque};
+use harnx_core::tool::{ToolCall, ToolDeclaration};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::nats_event_sink::SessionEventStream;
@@ -1699,9 +1700,18 @@ pub struct NatsTurnResult {
 /// compaction), so passing a follow delta starts a new numbering window. Entries
 /// before that window still render, but without sequence assignments.
 pub fn replay_entries_to_sink(entries: &[(u64, SessionLogEntry)], sink: Arc<dyn AgentEventSink>) {
+    replay_entries_to_sink_with_decls(entries, &HashMap::new(), sink);
+}
+
+/// Replay stored transcript entries with tool display templates from `decl_map`.
+pub fn replay_entries_to_sink_with_decls(
+    entries: &[(u64, SessionLogEntry)],
+    decl_map: &HashMap<String, ToolDeclaration>,
+    sink: Arc<dyn AgentEventSink>,
+) {
     let history_window = active_context_window(entries);
     for (seq, entry) in entries {
-        render_log_entry_to_sink(entry, *seq, &history_window, sink.clone());
+        render_log_entry_to_sink(entry, *seq, &history_window, decl_map, sink.clone());
     }
 }
 
@@ -1709,6 +1719,7 @@ fn render_log_entry_to_sink(
     entry: &SessionLogEntry,
     physical_seq: u64,
     history_window: &ActiveContextWindow<'_, (u64, SessionLogEntry)>,
+    decl_map: &HashMap<String, ToolDeclaration>,
     sink: Arc<dyn AgentEventSink>,
 ) {
     let rendered = match entry {
@@ -1717,11 +1728,11 @@ fn render_log_entry_to_sink(
             true
         }
         SessionLogEntry::ToolCalls { text, calls, .. } => {
-            render_tool_calls_entry(text, calls, &sink);
+            render_tool_calls_entry(text, calls, decl_map, &sink);
             true
         }
         SessionLogEntry::ToolResults { results, .. } => {
-            render_tool_results_entry(results, &sink);
+            render_tool_results_entry(results, decl_map, &sink);
             false
         }
         SessionLogEntry::Cancel { .. } => {
@@ -1913,17 +1924,24 @@ fn render_message_entry(
 
 fn render_tool_calls_entry(
     text: &str,
-    calls: &[harnx_core::tool::ToolCall],
+    calls: &[ToolCall],
+    decl_map: &HashMap<String, ToolDeclaration>,
     sink: &Arc<dyn AgentEventSink>,
 ) {
     use harnx_core::event::{ContentBlock, ModelEvent, ToolEvent, ToolKind};
 
     for call in calls {
+        let raw_fallback = match &call.arguments {
+            serde_json::Value::Null => String::new(),
+            _ => crate::utils::pretty_yaml_block(&call.arguments),
+        };
+        let markdown =
+            crate::tool::render_call_for_display(call, &call.arguments, &raw_fallback, decl_map);
         sink.emit(AgentEvent::Tool(ToolEvent::Started {
             id: call.id.clone().unwrap_or_default(),
             name: call.name.clone(),
             kind: ToolKind::Other,
-            markdown: None,
+            markdown,
             input: call.arguments.clone(),
             locations: vec![],
         }));
@@ -1938,15 +1956,27 @@ fn render_tool_calls_entry(
 
 fn render_tool_results_entry(
     results: &[harnx_core::session::ToolOutput],
+    decl_map: &HashMap<String, ToolDeclaration>,
     sink: &Arc<dyn AgentEventSink>,
 ) {
     use harnx_core::event::ToolEvent;
 
     for result in results {
+        let markdown = result.markdown.clone().or_else(|| {
+            let call = ToolCall::new(
+                result.name.clone(),
+                serde_json::Value::Null,
+                result.id.clone(),
+                None,
+            );
+            let raw_fallback = harnx_core::tool::extract_user_display_text(&result.output)
+                .unwrap_or_else(|| crate::utils::pretty_yaml_block(&result.output));
+            crate::tool::render_result_for_display(&call, &result.output, &raw_fallback, decl_map)
+        });
         sink.emit(AgentEvent::Tool(ToolEvent::Completed {
             id: result.id.clone().unwrap_or_default(),
             output: result.output.clone(),
-            markdown: result.markdown.clone(),
+            markdown,
         }));
     }
 }
@@ -2390,7 +2420,7 @@ mod tests {
         };
         let empty: Vec<(u64, SessionLogEntry)> = vec![];
         let window = active_context_window(&empty);
-        render_log_entry_to_sink(&entry, 0, &window, sink.clone());
+        render_log_entry_to_sink(&entry, 0, &window, &HashMap::new(), sink.clone());
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // Test user message
@@ -2403,7 +2433,7 @@ mod tests {
         };
         let empty: Vec<(u64, SessionLogEntry)> = vec![];
         let window = active_context_window(&empty);
-        render_log_entry_to_sink(&entry, 0, &window, sink.clone());
+        render_log_entry_to_sink(&entry, 0, &window, &HashMap::new(), sink.clone());
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
@@ -2615,7 +2645,7 @@ mod tests {
         };
         let empty: Vec<(u64, SessionLogEntry)> = vec![];
         let window = active_context_window(&empty);
-        render_log_entry_to_sink(&entry, 0, &window, sink.clone());
+        render_log_entry_to_sink(&entry, 0, &window, &HashMap::new(), sink.clone());
         assert_eq!(count.load(Ordering::SeqCst), 1);
         let events = sink.events.lock().unwrap();
         assert_eq!(events.len(), 1);
