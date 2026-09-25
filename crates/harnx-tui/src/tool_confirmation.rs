@@ -301,15 +301,31 @@ impl Tui {
         let mut scroll = ratatui_widget_scrolling::ScrollState::new();
         scroll.follow = false;
 
-        // Modal and main composer represent one draft. A pending message is
-        // authoritative because the main input deliberately mirrors it while busy.
-        let pending_text = self.app.pending_message.take().map(|pending| pending.text);
-        if pending_text.is_some() {
-            *self.shared_pending_message.lock().await = None;
-        }
+        // Dot commands and attachment-bearing drafts depend on main-composer state.
+        // Only plain text can move into the confirmation textarea safely.
+        let pending_is_movable = self.app.pending_message.as_ref().is_some_and(|pending| {
+            !pending.text.trim_start().starts_with('.') && pending.attachments.is_empty()
+        });
         let main_input_text = self.app.input.lines().join("\n");
-        let draft = pending_text.unwrap_or(main_input_text);
-        self.app.input = Self::new_input();
+        let draft = if pending_is_movable {
+            let pending = self
+                .app
+                .pending_message
+                .take()
+                .expect("movable pending message must still be present");
+            *self.shared_pending_message.lock().await = None;
+            self.app.input = Self::new_input();
+            pending.text
+        } else if self.app.pending_message.is_none()
+            && !main_input_text.trim_start().starts_with('.')
+            && self.app.attachments.is_empty()
+            && !main_input_text.is_empty()
+        {
+            self.app.input = Self::new_input();
+            main_input_text
+        } else {
+            String::new()
+        };
 
         let mut message = ratatui_textarea::TextArea::default();
         message.insert_str(draft);
@@ -359,12 +375,27 @@ impl Tui {
             return;
         };
         let draft = state.message.lines().join("\n");
+        if draft.is_empty() && !self.app.input.lines().join("\n").is_empty() {
+            return;
+        }
         self.set_input_text(&draft);
         self.refresh_input_chrome();
     }
 
     pub(super) fn cancel_tool_confirm(&mut self) {
-        self.restore_tool_confirmation_draft();
+        let submitting = matches!(
+            self.app.modal.as_ref(),
+            Some(ModalState::ConfirmToolUse(state)) if state.submitting
+        );
+        if submitting {
+            self.app.transcript.push(TranscriptItem::SystemText(
+                "⚠ Tool confirmation was cancelled while submitting; its in-flight message may already be queued."
+                    .to_string(),
+            ));
+            self.pin_transcript_to_bottom();
+        } else {
+            self.restore_tool_confirmation_draft();
+        }
         self.resolve_tool_confirm(false);
     }
 

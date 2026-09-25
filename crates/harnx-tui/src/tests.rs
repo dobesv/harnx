@@ -6441,6 +6441,141 @@ async fn tool_confirmation_moves_pending_draft_and_clears_shared_copy() {
 }
 
 #[tokio::test]
+async fn tool_confirmation_keeps_dot_command_in_main_input() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.set_input_text("  .help");
+    let (reply, decision) = tokio::sync::oneshot::channel();
+
+    tui.handle_tui_event(test_tool_confirmation_show(360, reply))
+        .await
+        .unwrap();
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected tool confirmation modal");
+    };
+    assert_eq!(state.message.lines().join("\n"), "");
+    assert_eq!(tui.app.input.lines().join("\n"), "  .help");
+
+    tui.cancel_tool_confirm();
+
+    assert!(!decision.await.unwrap());
+    assert_eq!(tui.app.input.lines().join("\n"), "  .help");
+}
+
+#[tokio::test]
+async fn tool_confirmation_keeps_attachment_draft_in_main_input() {
+    use crate::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.set_input_text("inspect attachment");
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/tool-confirm-main.txt"),
+        display_name: "tool-confirm-main.txt".to_string(),
+    });
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+
+    tui.handle_tui_event(test_tool_confirmation_show(361, reply))
+        .await
+        .unwrap();
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected tool confirmation modal");
+    };
+    assert_eq!(state.message.lines().join("\n"), "");
+    assert_eq!(tui.app.input.lines().join("\n"), "inspect attachment");
+    assert_eq!(tui.app.attachments.len(), 1);
+    assert_eq!(tui.app.attachments[0].display_name, "tool-confirm-main.txt");
+}
+
+#[tokio::test]
+async fn tool_confirmation_keeps_pending_dot_command_and_shared_copy() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.app.llm_busy = true;
+    tui.queue_pending_message(".help".to_string()).await;
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+
+    tui.handle_tui_event(test_tool_confirmation_show(362, reply))
+        .await
+        .unwrap();
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected tool confirmation modal");
+    };
+    assert_eq!(state.message.lines().join("\n"), "");
+    assert_eq!(tui.app.input.lines().join("\n"), ".help");
+    assert_eq!(
+        tui.app
+            .pending_message
+            .as_ref()
+            .map(|pending| pending.text.as_str()),
+        Some(".help")
+    );
+    let shared = tui.shared_pending_message.lock().await;
+    assert_eq!(
+        shared.as_ref().map(|pending| pending.text.as_str()),
+        Some(".help")
+    );
+}
+
+#[tokio::test]
+async fn tool_confirmation_keeps_pending_attachment_draft_and_shared_copy() {
+    use crate::types::{Attachment, PendingMessage};
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.app.llm_busy = true;
+    tui.set_input_text("inspect pending attachment");
+    let attachment = Attachment {
+        path: PathBuf::from("/tmp/tool-confirm-pending.txt"),
+        display_name: "tool-confirm-pending.txt".to_string(),
+    };
+    tui.app.attachments.push(attachment.clone());
+    let pending = PendingMessage {
+        text: "inspect pending attachment".to_string(),
+        attachments: vec![attachment],
+        attachment_dir: None,
+        paste_count: 0,
+    };
+    tui.app.pending_message = Some(pending.clone());
+    *tui.shared_pending_message.lock().await = Some(pending);
+    let (reply, _decision) = tokio::sync::oneshot::channel();
+
+    tui.handle_tui_event(test_tool_confirmation_show(363, reply))
+        .await
+        .unwrap();
+
+    let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_ref() else {
+        panic!("expected tool confirmation modal");
+    };
+    assert_eq!(state.message.lines().join("\n"), "");
+    assert_eq!(
+        tui.app.input.lines().join("\n"),
+        "inspect pending attachment"
+    );
+    assert_eq!(tui.app.attachments.len(), 1);
+    assert_eq!(
+        tui.app
+            .pending_message
+            .as_ref()
+            .map(|pending| pending.attachments.len()),
+        Some(1)
+    );
+    assert_eq!(
+        tui.shared_pending_message
+            .lock()
+            .await
+            .as_ref()
+            .map(|pending| pending.attachments.len()),
+        Some(1)
+    );
+}
+
+#[tokio::test]
 async fn tool_confirmation_typing_and_multiline_keys_edit_modal_message() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
@@ -6609,6 +6744,32 @@ async fn tool_confirmation_submitting_ignores_enter_and_ctrl_d() {
         tui.app.modal,
         Some(crate::types::ModalState::ConfirmToolUse(_))
     ));
+}
+
+#[tokio::test]
+async fn tool_confirmation_cancel_while_submitting_does_not_restore_draft() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.set_input_text("message already being queued");
+    let (reply, decision) = tokio::sync::oneshot::channel();
+    tui.handle_tui_event(test_tool_confirmation_show(364, reply))
+        .await
+        .unwrap();
+    if let Some(crate::types::ModalState::ConfirmToolUse(state)) = tui.app.modal.as_mut() {
+        state.submitting = true;
+    }
+
+    tui.cancel_tool_confirm();
+
+    assert!(!decision.await.unwrap());
+    assert!(tui.app.modal.is_none());
+    assert_eq!(tui.app.input.lines(), &[String::new()]);
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::SystemText(text)
+            if text.contains("cancelled while submitting")
+                && text.contains("in-flight message may already be queued")
+    )));
 }
 
 #[tokio::test]
