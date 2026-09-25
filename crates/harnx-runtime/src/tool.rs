@@ -367,7 +367,7 @@ fn build_decl_map(tool_declarations: Vec<ToolDeclaration>) -> HashMap<String, To
 }
 
 fn build_confirm_tool_use_fn(config: &Config) -> Arc<ConfirmToolUseFn> {
-    // Runtime-only TUI confirmation override (falls back to inquire prompt).
+    // Worker-side confirmation callback override (falls back to inquire prompt).
     config
         .tui_confirm_tool_use
         .clone()
@@ -664,7 +664,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn build_tool_eval_context_uses_tui_confirm_override() {
-        // When the TUI installs a confirmation callback, the eval context must
+        // When a worker-side confirmation callback is set, the eval context must
         // use it instead of the default inquire prompt (#695).
         let _guard = crate::client::TestStateGuard::new(None).await;
         let config = Arc::new(RwLock::new(Config::default()));

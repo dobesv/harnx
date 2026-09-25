@@ -12,6 +12,7 @@ use harnx_core::{
 use harnx_runtime::{
     nats_session_log::NatsSessionLog,
     nats_session_metadata::{SessionAgentSource, SessionMetadataStore},
+    nats_tool_confirmation::ToolConfirmationHandler,
     nats_worker::ControlCommand,
     send_control_command, NatsSession, NatsSessionConfig,
 };
@@ -305,7 +306,60 @@ async fn enqueue_text_preserves_durable_sequence_after_activation_failure() -> R
     Ok(())
 }
 
-/// Test retract-before-consume appends correct EditEntries and removes the message
+/// A retry with the same modal submission id must return the committed append
+/// rather than create another user row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmation_enqueue_reuses_stable_submission_id() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = new_remote_session_id();
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(&session_id), 1);
+    let session = NatsSession::new(
+        resumed_session_config(session_id),
+        client,
+        jetstream,
+        harnx_runtime::utils::create_abort_signal(),
+    )
+    .await?;
+    let handler: Arc<ToolConfirmationHandler> = Arc::new(|_| Box::pin(async { true }));
+    let route = session.tool_confirmation_route(handler).await?;
+    let submission_id = Uuid::new_v4().to_string();
+
+    let first = session
+        .enqueue_text_with_tool_confirmation_id("one logical message", &route, &submission_id)
+        .await?;
+    let retry = session
+        .enqueue_text_with_tool_confirmation_id("one logical message", &route, &submission_id)
+        .await?;
+
+    assert_eq!(retry.user_msg_seq(), first.user_msg_seq());
+    let matching = log
+        .load_events_async()
+        .await?
+        .into_iter()
+        .filter(|(_, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::Message {
+                    id: Some(id),
+                    role: MessageRole::User,
+                    content: MessageContent::Text(text),
+                    ..
+                } if id == &submission_id && text == "one logical message"
+            )
+        })
+        .count();
+    assert_eq!(matching, 1);
+    Ok(())
+}
+
+/// Test retract-before-consume appends correct EditEntries and removes the message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retract_queued_user_message() -> Result<()> {
     require_nextest();

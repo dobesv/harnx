@@ -574,15 +574,37 @@ impl NatsSession {
 
     async fn append_user_content(&self, content: MessageContent) -> Result<AppendedPrompt> {
         self.check_parent_work("child-prompt-admission").await?;
-        if let Some(invocation) = &self.invocation_id {
-            if let Some(prompt) = self.existing_invocation_prompt(invocation).await? {
-                return Ok(prompt);
+        let user_msg_id = match &self.invocation_id {
+            Some(invocation) => {
+                if let Some(prompt) = self.existing_prompt_with_message_id(invocation).await? {
+                    return Ok(prompt);
+                }
+                invocation.clone()
             }
+            None => new_client_message_id(),
+        };
+        self.append_user_content_unchecked(content, user_msg_id)
+            .await
+    }
+
+    async fn append_user_content_with_id(
+        &self,
+        content: MessageContent,
+        user_msg_id: String,
+    ) -> Result<AppendedPrompt> {
+        self.check_parent_work("child-prompt-admission").await?;
+        if let Some(prompt) = self.existing_prompt_with_message_id(&user_msg_id).await? {
+            return Ok(prompt);
         }
-        let user_msg_id = self
-            .invocation_id
-            .clone()
-            .unwrap_or_else(new_client_message_id);
+        self.append_user_content_unchecked(content, user_msg_id)
+            .await
+    }
+
+    async fn append_user_content_unchecked(
+        &self,
+        content: MessageContent,
+        user_msg_id: String,
+    ) -> Result<AppendedPrompt> {
         let log = NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             self.storage_key.clone(),
@@ -615,17 +637,19 @@ impl NatsSession {
         })
     }
 
-    /// A sub-agent invocation appends its prompt under the invocation id, so
-    /// a replayed call finds its own message already in the log instead of
-    /// queueing a second copy of it.
-    async fn existing_invocation_prompt(&self, invocation: &str) -> Result<Option<AppendedPrompt>> {
+    /// Find an already committed prompt by its stable append id. Sub-agent
+    /// invocation retries and frontend confirmation retries share this path.
+    async fn existing_prompt_with_message_id(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<AppendedPrompt>> {
         let entries = self.load_durable_entries().await?;
         Ok(entries.iter().find_map(|(seq, entry)| match entry {
             SessionLogEntry::Message {
                 id: Some(id), role, ..
-            } if role.is_user() && id == invocation => Some(AppendedPrompt {
+            } if role.is_user() && id == message_id => Some(AppendedPrompt {
                 execution_id: None,
-                user_msg_id: invocation.into(),
+                user_msg_id: message_id.into(),
                 user_msg_seq: *seq,
                 events: None,
                 live: None,
@@ -640,7 +664,7 @@ impl NatsSession {
         let Some(invocation) = &self.invocation_id else {
             return Ok(None);
         };
-        let Some(prompt) = self.existing_invocation_prompt(invocation).await? else {
+        let Some(prompt) = self.existing_prompt_with_message_id(invocation).await? else {
             return Ok(None);
         };
         let entries = self.load_durable_entries().await?;
@@ -762,7 +786,7 @@ impl NatsSession {
     /// sequence remains authoritative even if activation publication fails;
     /// callers must retry activation instead of appending the text again.
     pub async fn enqueue_text(&self, user_message: &str) -> Result<DurableTextEnqueue> {
-        self.enqueue_text_with_confirmation_subject(user_message, None)
+        self.enqueue_text_with_confirmation_subject(user_message, None, None)
             .await
     }
 
@@ -774,18 +798,40 @@ impl NatsSession {
         user_message: &str,
         route: &crate::nats_tool_confirmation::ToolConfirmationRoute,
     ) -> Result<DurableTextEnqueue> {
-        self.enqueue_text_with_confirmation_subject(user_message, Some(route.subject()))
+        self.enqueue_text_with_confirmation_subject(user_message, Some(route.subject()), None)
             .await
+    }
+
+    /// Queue confirmation-modal text with a caller-owned stable submission id.
+    /// The id is both the session-log message id and JetStream dedup id, so a
+    /// retry after an unknown publish outcome finds the committed append.
+    pub async fn enqueue_text_with_tool_confirmation_id(
+        &self,
+        user_message: &str,
+        route: &crate::nats_tool_confirmation::ToolConfirmationRoute,
+        submission_id: &str,
+    ) -> Result<DurableTextEnqueue> {
+        self.enqueue_text_with_confirmation_subject(
+            user_message,
+            Some(route.subject()),
+            Some(submission_id),
+        )
+        .await
     }
 
     async fn enqueue_text_with_confirmation_subject(
         &self,
         user_message: &str,
         confirmation_subject: Option<&str>,
+        submission_id: Option<&str>,
     ) -> Result<DurableTextEnqueue> {
-        let appended = self
-            .append_user_content(MessageContent::Text(user_message.to_string()))
-            .await?;
+        let content = MessageContent::Text(user_message.to_string());
+        let appended = if let Some(submission_id) = submission_id {
+            self.append_user_content_with_id(content, submission_id.to_string())
+                .await?
+        } else {
+            self.append_user_content(content).await?
+        };
         let activation_error = self
             .publish_activation(appended.user_msg_seq, confirmation_subject, None)
             .await

@@ -13,7 +13,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use syntect::highlighting::Theme;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -105,6 +105,10 @@ pub struct Tui {
     /// Confirmation route retained for the frontend's current session. Prompt
     /// and busy-enqueue paths share it so queued continuations keep a live modal.
     pub(super) tool_confirmation_route: SharedToolConfirmationRoute,
+    /// Deterministic enqueue seam for confirmation orchestration tests.
+    #[cfg(test)]
+    pub(super) confirmation_enqueue_override:
+        Option<crate::tool_confirmation::TestConfirmationEnqueueFn>,
     /// Sessions whose durable text append succeeded but whose worker activation
     /// must be retried without submitting the text as a second user message.
     pub(super) pending_remote_activations: HashSet<(String, String)>,
@@ -146,6 +150,14 @@ pub(super) enum ToolConfirmationRouteHandle {
 }
 
 impl ToolConfirmationRouteHandle {
+    pub(super) fn is_closed(&self) -> bool {
+        match self {
+            Self::Nats(_, closed) => closed.load(std::sync::atomic::Ordering::Acquire),
+            #[cfg(test)]
+            Self::Test(closed) => closed.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
     pub(super) fn shutdown(&self) {
         match self {
             Self::Nats(route, closed) => {
@@ -438,9 +450,59 @@ pub enum ToolCallBody {
     Markdown(String),
 }
 
+/// View mode for tool confirmation modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConfirmView {
+    /// Rendered call_template output (if available).
+    Template,
+    /// Raw YAML rendering of arguments.
+    RawYaml,
+}
+
+/// State for tool confirmation modal (`ModalState::ConfirmToolUse`).
+/// Extracted into a struct to avoid `large_enum_variant` warning.
+#[allow(dead_code)]
+pub(super) struct ConfirmToolUseState {
+    /// Full arguments as received from the worker (no truncation).
+    pub arguments: serde_json::Value,
+    /// Tool name for display.
+    pub tool_name: String,
+    /// Reason from the hook, if any.
+    pub reason: Option<String>,
+    /// Origin session that made the tool call.
+    pub session_id: String,
+    /// Origin cluster for the session.
+    pub cluster: String,
+    /// Tool call ID from the request, if provided.
+    pub tool_call_id: Option<String>,
+    /// Stable UUID generated once at modal open, used for idempotent enqueue.
+    pub submission_id: String,
+    /// Confirmation route captured for the origin session at modal open.
+    pub confirmation_route: Option<ToolConfirmationRouteHandle>,
+    /// Cancels the detached append when this confirmation is dismissed.
+    pub submission_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Last append error. Kept with the draft so the user can retry.
+    pub submission_error: Option<String>,
+    /// Current view mode: Template if available, else RawYaml.
+    pub view: ConfirmView,
+    /// Whether the tool has a call_template (enables Ctrl+F toggle).
+    pub has_template: bool,
+    /// Pre-rendered template text (if has_template is true).
+    pub template_text: Option<String>,
+    /// Scroll state for the arguments preview.
+    pub scroll: ratatui_widget_scrolling::ScrollState,
+    /// Optional message textarea for user-provided context.
+    pub message: TextArea<'static>,
+    /// When the modal was first shown (idle gate).
+    pub opened_at: Instant,
+    /// Time of last keypress in this modal (idle gate).
+    pub last_key_at: Instant,
+    /// True while an async enqueue is in flight (blocks double-submit).
+    pub submitting: bool,
+}
+
 /// Modal dialog state for destructive action confirmations.
 /// Used by D5 for delete/rewind confirmations.
-#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(super) enum ModalState {
     /// Confirmation for deleting one or more transcript entries.
@@ -452,11 +514,7 @@ pub(super) enum ModalState {
     },
     /// Confirmation for a tool call gated by a `PreToolUse` "ask" hook.
     /// The reply channel lives in `App::pending_confirm_reply`.
-    ConfirmToolUse {
-        tool_name: String,
-        input_preview: String,
-        reason: Option<String>,
-    },
+    ConfirmToolUse(Box<ConfirmToolUseState>),
     /// Agent is still working when user tries to exit.
     ConfirmExit {
         worker_state: ExitWorkerState,
@@ -487,6 +545,235 @@ pub(super) enum ModalState {
         /// than seeing an empty list and assuming no sessions exist.
         error: Option<String>,
     },
+}
+
+impl std::fmt::Debug for ModalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConfirmDelete { from, to } => f
+                .debug_struct("ConfirmDelete")
+                .field("from", from)
+                .field("to", to)
+                .finish(),
+            Self::ConfirmRewind { seq, user_text } => f
+                .debug_struct("ConfirmRewind")
+                .field("seq", seq)
+                .field("user_text", user_text)
+                .finish(),
+            Self::ConfirmToolUse(state) => f
+                .debug_struct("ConfirmToolUse")
+                .field("arguments", &state.arguments)
+                .field("tool_name", &state.tool_name)
+                .field("reason", &state.reason)
+                .field("session_id", &state.session_id)
+                .field("cluster", &state.cluster)
+                .field("tool_call_id", &state.tool_call_id)
+                .field("submission_id", &state.submission_id)
+                .field("view", &state.view)
+                .field("has_template", &state.has_template)
+                .field("template_text", &state.template_text)
+                .field("opened_at", &state.opened_at)
+                .field("last_key_at", &state.last_key_at)
+                .field("submitting", &state.submitting)
+                .finish_non_exhaustive(),
+            Self::ConfirmExit {
+                worker_state,
+                phase,
+            } => f
+                .debug_struct("ConfirmExit")
+                .field("worker_state", worker_state)
+                .field("phase", phase)
+                .finish(),
+            Self::AgentPicker {
+                agents,
+                selected,
+                query,
+            } => f
+                .debug_struct("AgentPicker")
+                .field("agents", agents)
+                .field("selected", selected)
+                .field("query", query)
+                .finish(),
+            Self::SessionPicker {
+                sessions,
+                selected,
+                origin_agent,
+                origin_session,
+                error,
+            } => f
+                .debug_struct("SessionPicker")
+                .field("sessions", sessions)
+                .field("selected", selected)
+                .field("origin_agent", origin_agent)
+                .field("origin_session", origin_session)
+                .field("error", error)
+                .finish(),
+        }
+    }
+}
+
+impl Clone for ModalState {
+    fn clone(&self) -> Self {
+        match self {
+            Self::ConfirmDelete { from, to } => Self::ConfirmDelete {
+                from: *from,
+                to: *to,
+            },
+            Self::ConfirmRewind { seq, user_text } => Self::ConfirmRewind {
+                seq: *seq,
+                user_text: user_text.clone(),
+            },
+            Self::ConfirmToolUse(state) => {
+                let state = state.as_ref();
+                Self::ConfirmToolUse(Box::new(ConfirmToolUseState {
+                    arguments: state.arguments.clone(),
+                    tool_name: state.tool_name.clone(),
+                    reason: state.reason.clone(),
+                    session_id: state.session_id.clone(),
+                    cluster: state.cluster.clone(),
+                    tool_call_id: state.tool_call_id.clone(),
+                    submission_id: state.submission_id.clone(),
+                    confirmation_route: state.confirmation_route.clone(),
+                    submission_cancel: Arc::clone(&state.submission_cancel),
+                    submission_error: state.submission_error.clone(),
+                    view: state.view,
+                    has_template: state.has_template,
+                    template_text: state.template_text.clone(),
+                    // ScrollState doesn't implement Clone, so create a new one
+                    // preserving only the position and follow state
+                    scroll: {
+                        let mut new_scroll = ratatui_widget_scrolling::ScrollState::new();
+                        new_scroll.position = state.scroll.position;
+                        new_scroll.follow = state.scroll.follow;
+                        new_scroll.last_max_position = state.scroll.last_max_position;
+                        new_scroll
+                    },
+                    message: state.message.clone(),
+                    opened_at: state.opened_at,
+                    last_key_at: state.last_key_at,
+                    submitting: state.submitting,
+                }))
+            }
+            Self::ConfirmExit {
+                worker_state,
+                phase,
+            } => Self::ConfirmExit {
+                worker_state: *worker_state,
+                phase: *phase,
+            },
+            Self::AgentPicker {
+                agents,
+                selected,
+                query,
+            } => Self::AgentPicker {
+                agents: agents.clone(),
+                selected: *selected,
+                query: query.clone(),
+            },
+            Self::SessionPicker {
+                sessions,
+                selected,
+                origin_agent,
+                origin_session,
+                error,
+            } => Self::SessionPicker {
+                sessions: sessions.clone(),
+                selected: *selected,
+                origin_agent: origin_agent.clone(),
+                origin_session: origin_session.clone(),
+                error: error.clone(),
+            },
+        }
+    }
+}
+
+impl PartialEq for ModalState {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::ConfirmDelete {
+                    from: a_from,
+                    to: a_to,
+                },
+                Self::ConfirmDelete {
+                    from: b_from,
+                    to: b_to,
+                },
+            ) => a_from == b_from && a_to == b_to,
+            (
+                Self::ConfirmRewind {
+                    seq: a_seq,
+                    user_text: a_user_text,
+                },
+                Self::ConfirmRewind {
+                    seq: b_seq,
+                    user_text: b_user_text,
+                },
+            ) => a_seq == b_seq && a_user_text == b_user_text,
+            (Self::ConfirmToolUse(a), Self::ConfirmToolUse(b)) => {
+                a.arguments == b.arguments
+                    && a.tool_name == b.tool_name
+                    && a.reason == b.reason
+                    && a.session_id == b.session_id
+                    && a.cluster == b.cluster
+                    && a.tool_call_id == b.tool_call_id
+                    && a.submission_id == b.submission_id
+                    && a.submission_error == b.submission_error
+                    && a.view == b.view
+                    && a.has_template == b.has_template
+                    && a.template_text == b.template_text
+                    && a.opened_at == b.opened_at
+                    && a.last_key_at == b.last_key_at
+                    && a.submitting == b.submitting
+                // scroll and message intentionally excluded from equality check
+            }
+            (
+                Self::ConfirmExit {
+                    worker_state: a_worker_state,
+                    phase: a_phase,
+                },
+                Self::ConfirmExit {
+                    worker_state: b_worker_state,
+                    phase: b_phase,
+                },
+            ) => a_worker_state == b_worker_state && a_phase == b_phase,
+            (
+                Self::AgentPicker {
+                    agents: a_agents,
+                    selected: a_selected,
+                    query: a_query,
+                },
+                Self::AgentPicker {
+                    agents: b_agents,
+                    selected: b_selected,
+                    query: b_query,
+                },
+            ) => a_agents == b_agents && a_selected == b_selected && a_query == b_query,
+            (
+                Self::SessionPicker {
+                    sessions: a_sessions,
+                    selected: a_selected,
+                    origin_agent: a_origin_agent,
+                    origin_session: a_origin_session,
+                    error: a_error,
+                },
+                Self::SessionPicker {
+                    sessions: b_sessions,
+                    selected: b_selected,
+                    origin_agent: b_origin_agent,
+                    origin_session: b_origin_session,
+                    error: b_error,
+                },
+            ) => {
+                a_sessions == b_sessions
+                    && a_selected == b_selected
+                    && a_origin_agent == b_origin_agent
+                    && a_origin_session == b_origin_session
+                    && a_error == b_error
+            }
+            _ => false,
+        }
+    }
 }
 
 impl ModalState {
@@ -636,12 +923,21 @@ impl App {
 }
 
 pub(crate) enum ToolConfirmationEvent {
-    /// A `PreToolUse` hook asked for confirmation. The blocked tool-eval thread
-    /// waits on `reply`; the main loop shows a modal and sends the decision back.
+    /// A worker-side `PreToolUse` hook asked for confirmation via NATS. The
+    /// async task waits on `reply`; the main loop shows a modal and sends the decision back.
     Show {
         confirmation_id: u64,
+        /// Canonical session storage key captured by the route owner.
+        origin_session_id: String,
+        /// NATS cluster captured by the route owner.
+        cluster: String,
+        /// Tool call ID from the request, if provided.
+        tool_call_id: Option<String>,
+        /// Tool name for display.
         tool_name: String,
-        input_preview: String,
+        /// Full arguments as received from the worker (no truncation).
+        arguments: Box<serde_json::Value>,
+        /// Reason from the hook, if any.
         reason: Option<String>,
         reply: ToolConfirmationReply,
     },
@@ -709,6 +1005,11 @@ pub(crate) enum TuiEvent {
     #[allow(dead_code)]
     PendingMessageConsumed(PendingMessage),
     ToolConfirmation(ToolConfirmationEvent),
+    ToolConfirmationEnqueueFinished {
+        confirmation_id: u64,
+        decision: crate::tool_confirmation::ConfirmDecision,
+        result: crate::tool_confirmation::ConfirmationEnqueueResult,
+    },
     /// Another frontend marked the session as read; TUI should update its cached unread state.
     SessionReadInvalidation {
         session_id: String,

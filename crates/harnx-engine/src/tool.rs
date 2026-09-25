@@ -138,7 +138,8 @@ pub struct ToolEvalContext {
     pub emit_tool_blocked_fn: Arc<ToolCallEmitFn>,
     /// Called when a PreToolUse hook returns `Ask { reason }` and the
     /// user needs to confirm before the tool runs. Harnx's default uses
-    /// an `inquire`-based terminal prompt and returns Approve/Deny.
+    /// an `inquire`-based terminal prompt (or a worker-side NATS callback
+    /// that renders a native TUI modal) and returns Approve/Deny.
     pub confirm_tool_use_fn: Arc<ConfirmToolUseFn>,
     /// Called to dispatch a hook event (PreToolUse, PostToolUse,
     /// PostToolUseFailure). Harnx's default captures `hooks.entries`,

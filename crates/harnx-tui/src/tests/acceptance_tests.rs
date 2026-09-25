@@ -64,8 +64,11 @@ async fn accepted_root_reopens_composer_and_starts_g2_without_draining_g1() {
 async fn queued_confirmation_from_retired_route_cannot_open_g2_modal() {
     let mut tui = Tui::init(&test_config()).await.unwrap();
     let closed = Arc::new(AtomicBool::new(false));
-    let handler =
-        crate::lifecycle::nats_tool_confirmation_handler(tui.event_tx.clone(), closed.clone());
+    let handler = crate::lifecycle::nats_tool_confirmation_handler(
+        tui.event_tx.clone(),
+        closed.clone(),
+        ("session".to_string(), "test-cluster".to_string()),
+    );
     let task = tokio::spawn(handler(
         harnx_runtime::nats_tool_confirmation::ToolConfirmationRequest {
             session_id: "session".into(),

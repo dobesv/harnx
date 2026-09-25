@@ -109,7 +109,7 @@ impl Tui {
     pub(super) fn settle_interrupted_prompt(&mut self) {
         self.retire_prompt_task();
         self.clear_tool_confirmation_route();
-        self.resolve_tool_confirm(false);
+        self.cancel_tool_confirm();
         self.app.llm_busy = false;
         self.app.pending_message = None;
         // Old readers retain their own queue, never G2's pending message slot.

@@ -371,6 +371,48 @@ fn make_queued_handoff_call_fn(
     })
 }
 
+fn make_denied_injection_order_call_fn(
+    captured_rounds: Arc<Mutex<Vec<Vec<harnx_core::message::Message>>>>,
+) -> harnx_runtime::agent_loop::AgentCallFn {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    Arc::new(move |input, config, _abort| {
+        let source_call = (config.read().extract_agent().name() == "approval-gated")
+            .then(|| source_calls.fetch_add(1, Ordering::SeqCst));
+        let captured_rounds = Arc::clone(&captured_rounds);
+        Box::pin(async move {
+            if source_call.is_some_and(|round| round >= 1) {
+                captured_rounds
+                    .lock()
+                    .push(harnx_runtime::config::input::build_messages(input, config)?);
+            }
+            let calls = match source_call {
+                Some(0) => vec![ToolCall::new(
+                    "target_session_handoff".to_string(),
+                    json!({
+                        "prompt": "this handoff will be denied",
+                        "session_id": TARGET_SESSION_ID,
+                    }),
+                    Some("denied-ordering-handoff".to_string()),
+                    None,
+                )],
+                Some(1) => vec![ToolCall::new(
+                    "missing_followup_tool".to_string(),
+                    json!({}),
+                    Some("post-injection-tool".to_string()),
+                    None,
+                )],
+                _ => Vec::new(),
+            };
+            Ok((
+                "activation completed".to_string(),
+                None,
+                calls,
+                CompletionTokenUsage::default(),
+            ))
+        })
+    })
+}
+
 async fn ensure_hook_server_binary() -> Result<()> {
     let mut path = std::env::current_exe()?;
     path.pop();
@@ -863,9 +905,165 @@ async fn cancelling_turn_interrupts_pending_confirmation_request() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn denied_zero_execution_round_injects_queued_messages_once_after_blocked_result(
+) -> Result<()> {
+    let captured_rounds = Arc::new(Mutex::new(Vec::new()));
+    let Some(harness) = ConfirmationHarness::start_with_call_fn(
+        make_denied_injection_order_call_fn(Arc::clone(&captured_rounds)),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let confirmation_requested = Arc::new(tokio::sync::Notify::new());
+    let release_denial = Arc::new(tokio::sync::Notify::new());
+    let requested_for_handler = Arc::clone(&confirmation_requested);
+    let release_for_handler = Arc::clone(&release_denial);
+    let handler: Arc<ToolConfirmationHandler> = Arc::new(move |_| {
+        requested_for_handler.notify_one();
+        let release_for_handler = Arc::clone(&release_for_handler);
+        Box::pin(async move {
+            release_for_handler.notified().await;
+            false
+        })
+    });
+    let route = harness.source.tool_confirmation_route(handler).await?;
+    let turn = harness.source.run_turn_with_tool_confirmation_route(
+        "start denied handoff",
+        Arc::new(NullSink),
+        None,
+        &route,
+    );
+    tokio::pin!(turn);
+
+    tokio::select! {
+        request = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            confirmation_requested.notified(),
+        ) => request.context("worker did not request confirmation")?,
+        result = &mut turn => anyhow::bail!("turn ended before confirmation: {result:?}"),
+    }
+
+    harness
+        .source
+        .enqueue_text_with_tool_confirmation_id("busy input", &route, "busy-input-id")
+        .await?;
+    harness
+        .source
+        .enqueue_text_with_tool_confirmation_id(
+            "confirmation message",
+            &route,
+            "confirmation-message-id",
+        )
+        .await?;
+    release_denial.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(30), &mut turn)
+        .await
+        .context("denied turn did not finish")??;
+
+    {
+        let rounds = captured_rounds.lock();
+        assert_eq!(
+            rounds.len(),
+            2,
+            "expected post-denial and next-seam model calls"
+        );
+        let injected_text = "busy input\n\nconfirmation message";
+        for (round, messages) in rounds.iter().enumerate() {
+            let injected_count = messages
+                .iter()
+                .filter(|message| {
+                    message.role.is_user() && message.content.to_text() == injected_text
+                })
+                .count();
+            assert_eq!(
+                injected_count,
+                1,
+                "queued messages must appear once in model round {}",
+                round + 1
+            );
+        }
+        let blocked_index = rounds[0]
+            .iter()
+            .position(|message| match &message.content {
+                MessageContent::ToolCalls(tool_calls) => {
+                    tool_calls.tool_results.iter().any(|result| {
+                        result.call.name == "target_session_handoff"
+                            && result.output["blocked_by_hook"] == json!(true)
+                    })
+                }
+                _ => false,
+            })
+            .expect("synthetic blocked tool result");
+        let injected_index = rounds[0]
+            .iter()
+            .position(|message| {
+                message.role.is_user() && message.content.to_text() == injected_text
+            })
+            .expect("folded queued messages");
+        assert!(
+            blocked_index < injected_index,
+            "agent must see blocked result before queued text"
+        );
+    }
+
+    let log = NatsSessionLog::new_with_replicas(harness.jetstream.clone(), source_key(), 1);
+    let indexed = log
+        .load_events_async()
+        .await?
+        .into_iter()
+        .map(|(seq, entry)| (usize::try_from(seq).expect("sequence fits usize"), entry))
+        .collect::<Vec<_>>();
+    let replayed = harnx_runtime::config::session::replay_log_entries_for_external(
+        &indexed,
+        "denied-ordering",
+    )?;
+    let replayed_labels = replayed
+        .messages
+        .iter()
+        .filter_map(|message| {
+            if message.role.is_user() {
+                let text = message.content.to_text();
+                if text == "busy input" || text == "confirmation message" {
+                    return Some(text);
+                }
+            }
+            match &message.content {
+                MessageContent::ToolCalls(tool_calls)
+                    if tool_calls
+                        .tool_results
+                        .iter()
+                        .any(|result| result.output["blocked_by_hook"] == json!(true)) =>
+                {
+                    Some("blocked result".to_string())
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replayed_labels,
+        ["blocked result", "busy input", "confirmation message"],
+        "reconstruction must preserve result-before-queue ordering"
+    );
+
+    let target_entries =
+        NatsSessionLog::new_with_replicas(harness.jetstream.clone(), target_key(), 1)
+            .load_events_async()
+            .await?;
+    assert!(
+        target_entries.is_empty(),
+        "denied round must execute zero handoff tools"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_continuation_handoff_reuses_live_frontend_confirmation_route() -> Result<()> {
     let first_call_started = Arc::new(tokio::sync::Notify::new());
     let release_first_call = Arc::new(tokio::sync::Notify::new());
+
     let Some(harness) = ConfirmationHarness::start_with_call_fn(make_queued_handoff_call_fn(
         Arc::clone(&first_call_started),
         Arc::clone(&release_first_call),

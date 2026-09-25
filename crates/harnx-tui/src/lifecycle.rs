@@ -247,6 +247,8 @@ impl Tui {
             exit_after_cancel: false,
             exit_interrupt_error: None,
             tool_confirmation_route: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            confirmation_enqueue_override: None,
             pending_remote_activations: HashSet::new(),
             session_activity_target: None,
             session_activity_handle: None,
@@ -635,7 +637,6 @@ impl Tui {
         E: EventSource,
     {
         self.install_external_editor_bridge();
-        self.install_tool_confirm_bridge();
         let mut last_tick = Instant::now();
         // Memory watchdog for the intermittent OOM (#842). Cheap in the common
         // case: once a second we read RSS and only emit a (warn-level) line
@@ -780,39 +781,6 @@ impl Tui {
                 needs_full_redraw.store(true, std::sync::atomic::Ordering::Release);
             })),
         );
-    }
-
-    /// Route `PreToolUse` "ask" confirmations through the TUI instead of the
-    /// default `inquire` terminal prompt (which fights ratatui's alternate
-    /// screen). The callback runs on the blocked tool-eval thread: it sends a
-    /// `ConfirmToolUse` event to the main loop and blocks on a reply channel
-    /// until the user answers the modal. If the channel drops (e.g. the TUI is
-    /// quitting), it denies.
-    fn install_tool_confirm_bridge(&self) {
-        let event_tx = self.event_tx.clone();
-        let confirm: Arc<harnx_runtime::tool::ConfirmToolUseFn> = Arc::new(
-            move |call: &harnx_core::tool::ToolCall,
-                  input: &serde_json::Value,
-                  reason: Option<&str>| {
-                let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
-                let event = TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
-                    confirmation_id: next_tool_confirmation_id(),
-                    tool_name: call.name.clone(),
-                    input_preview: confirm_input_preview(input),
-                    reason: reason.map(str::to_string),
-                    reply: ToolConfirmationReply::Blocking(reply_tx),
-                });
-                if event_tx.send(event).is_err() {
-                    return harnx_runtime::tool::ToolUseConfirmation::Deny { reason: None };
-                }
-                if reply_rx.recv().unwrap_or(false) {
-                    harnx_runtime::tool::ToolUseConfirmation::Approve
-                } else {
-                    harnx_runtime::tool::ToolUseConfirmation::Deny { reason: None }
-                }
-            },
-        );
-        self.config.write().set_tui_confirm_tool_use(Some(confirm));
     }
 
     /// Check if an async hook has signalled a resume and automatically start the follow-up prompt.
@@ -1310,22 +1278,6 @@ pub(crate) async fn session_history_transcript_items(config: &GlobalConfig) -> V
     }
 }
 
-/// Compact one-line preview of a tool call's arguments for the confirmation
-/// modal. Renders as inline JSON and truncates to keep the modal tidy.
-fn confirm_input_preview(input: &serde_json::Value) -> String {
-    if input.is_null() {
-        return String::new();
-    }
-    let rendered = serde_json::to_string(input).unwrap_or_default();
-    const MAX: usize = 160;
-    if rendered.chars().count() > MAX {
-        let head: String = rendered.chars().take(MAX).collect();
-        format!("{head}…")
-    } else {
-        rendered
-    }
-}
-
 fn next_tool_confirmation_id() -> u64 {
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1348,23 +1300,28 @@ impl Drop for ToolConfirmationDismissGuard {
     }
 }
 
-/// Convert a worker-side NATS confirmation request into the same modal event
-/// used by the in-process tool path, then asynchronously wait for the user's
-/// decision without blocking the TUI event loop.
+/// Convert a worker-side NATS confirmation request into a TUI modal event,
+/// then asynchronously wait for the user's decision without blocking the
+/// TUI event loop.
 pub(crate) fn nats_tool_confirmation_handler(
     event_tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    origin: (String, String),
 ) -> Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationHandler> {
     Arc::new(move |request| {
         let event_tx = event_tx.clone();
         let closed = closed.clone();
+        let (origin_session_id, cluster) = origin.clone();
         Box::pin(async move {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<bool>();
             let confirmation_id = next_tool_confirmation_id();
             let event = TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
                 confirmation_id,
+                origin_session_id,
+                cluster,
+                tool_call_id: request.tool_call_id,
                 tool_name: request.tool_name,
-                input_preview: confirm_input_preview(&request.arguments),
+                arguments: Box::new(request.arguments),
                 reason: request.reason,
                 reply: ToolConfirmationReply::Routed {
                     reply: reply_tx,

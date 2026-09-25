@@ -78,7 +78,8 @@ async fn ensure_tool_confirmation_route(
     }
 
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handler = crate::lifecycle::nats_tool_confirmation_handler(event_tx, closed.clone());
+    let handler =
+        crate::lifecycle::nats_tool_confirmation_handler(event_tx, closed.clone(), target.clone());
     let created = Arc::new(session.tool_confirmation_route(handler).await?);
     install_tool_confirmation_route(
         routes,
@@ -86,9 +87,28 @@ async fn ensure_tool_confirmation_route(
         ToolConfirmationRouteHandle::Nats(Arc::clone(&created), closed),
     )
     .nats()
-    .context("tool confirmation slot contained a non-NATS route")
+    .context("tool confirmation slot contained a non-NATS route (TUI-only path removed)")
 }
 
+/// Durably enqueue confirmation text into its captured origin. This boundary
+/// never consults `active_remote_session`, and the caller supplies the stable
+/// append id used for retry deduplication.
+pub(super) async fn enqueue_text_into_target(
+    config: &GlobalConfig,
+    local_worker: &Arc<Mutex<Option<harnx_runtime::local_orchestrator::LocalWorkerSupervisor>>>,
+    session_id: String,
+    cluster: String,
+    route: &harnx_runtime::nats_tool_confirmation::ToolConfirmationRoute,
+    text: &str,
+    submission_id: &str,
+) -> Result<harnx_runtime::nats_session::DurableTextEnqueue> {
+    let session =
+        crate::remote_session::nats_session_for_target(config, local_worker, session_id, cluster)
+            .await?;
+    session
+        .enqueue_text_with_tool_confirmation_id(text, route, submission_id)
+        .await
+}
 async fn run_nats_turn_with_tui_confirmation(
     session: &NatsSession,
     input: &harnx_runtime::config::Input,
@@ -284,8 +304,8 @@ impl Tui {
             return Ok(false);
         };
         let (session_id, cluster) = target.clone();
-        // Unit tests for the in-process loop use the shared pending-message
-        // callback instead of a broker-backed local worker.
+        // Loop-orchestration unit tests use the shared pending-message callback
+        // instead of a broker-backed local worker.
         #[cfg(test)]
         if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
             return Ok(false);
