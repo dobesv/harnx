@@ -111,6 +111,12 @@ fn tool_event_to_update(event: ToolEvent) -> SessionUpdate {
             markdown,
             status,
             content,
+            // New fields (Phase 1): not yet mapped to ACP. The ACP mapper
+            // will be updated in Phase 2+ to include title/kind/locations/usage.
+            title: _,
+            kind: _,
+            locations: _,
+            usage: _,
         } => {
             let text = non_empty_option(markdown.clone())
                 .or_else(|| content.as_deref().and_then(text_from_blocks));

@@ -98,6 +98,22 @@ pub enum ToolEvent {
         markdown: Option<String>,
         status: Option<ToolStatus>,
         content: Option<Vec<ContentBlock>>,
+        /// Concise activity label for the tool call (human-readable).
+        /// Distinct from `markdown` which is the rendered body content.
+        /// See historical lesson `5960f7d0a` for why these are separate.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Dynamic kind refinement. Allows tools to declare or update their
+        /// categorization during execution. Presentation-only, not authorization.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<ToolKind>,
+        /// Affected file/location snapshots. Replaced on each update, never appended.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locations: Option<Vec<ToolLocation>>,
+        /// Per-call display usage snapshot. Replaces previous, never summed.
+        /// This is display-only and separate from session cumulative totals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<CompletionTokenUsage>,
     },
     Completed {
         id: String,
@@ -272,7 +288,7 @@ pub enum ToolStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolLocation {
     pub path: PathBuf,
     pub line: Option<u32>,
@@ -578,6 +594,88 @@ mod tests {
                 assert_eq!(content, "hello from user");
             }
             other => panic!("wrong variant after round-trip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_event_update_new_fields_round_trip() {
+        use crate::api_types::CompletionTokenUsage;
+
+        // All new fields present.
+        let event = AgentEvent::Tool(ToolEvent::Update {
+            id: "tc-123".into(),
+            markdown: Some("body".into()),
+            status: Some(ToolStatus::InProgress),
+            content: None,
+            title: Some("concise title".into()),
+            kind: Some(ToolKind::Edit),
+            locations: Some(vec![ToolLocation {
+                path: std::path::PathBuf::from("src/lib.rs"),
+                line: Some(42),
+            }]),
+            usage: Some(CompletionTokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+        match decoded {
+            AgentEvent::Tool(ToolEvent::Update {
+                id,
+                title,
+                kind,
+                locations,
+                usage,
+                ..
+            }) => {
+                assert_eq!(id, "tc-123");
+                assert_eq!(title.as_deref(), Some("concise title"));
+                assert!(matches!(kind, Some(ToolKind::Edit)));
+                assert_eq!(locations.as_ref().map(|v| v.len()), Some(1));
+                assert_eq!(usage.as_ref().map(|u| u.input_tokens), Some(10));
+            }
+            other => panic!("wrong variant after round-trip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_event_update_omitted_fields_deserialize_as_none() {
+        // Old-format JSON (missing new fields) should deserialize with None.
+        let json =
+            r#"{"Tool":{"Update":{"id":"tc-456","markdown":"body","status":null,"content":null}}}"#;
+        let decoded: AgentEvent = serde_json::from_str(json).unwrap();
+        match decoded {
+            AgentEvent::Tool(ToolEvent::Update {
+                id,
+                title,
+                kind,
+                locations,
+                usage,
+                ..
+            }) => {
+                assert_eq!(id, "tc-456");
+                assert!(title.is_none());
+                assert!(kind.is_none());
+                assert!(locations.is_none());
+                assert!(usage.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_event_update_empty_vec_clears_locations() {
+        // Explicit empty vec should deserialize as Some(vec![]), not None.
+        let json = r#"{"Tool":{"Update":{"id":"tc-789","markdown":null,"status":null,"content":null,"title":null,"kind":null,"locations":[],"usage":null}}}"#;
+        let decoded: AgentEvent = serde_json::from_str(json).unwrap();
+        match decoded {
+            AgentEvent::Tool(ToolEvent::Update { locations, .. }) => {
+                assert_eq!(locations, Some(vec![]));
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 }

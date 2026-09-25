@@ -1500,6 +1500,10 @@ async fn structured_ui_output_variants_render_in_transcript() {
             markdown: Some("argus_session_prompt".to_string()),
             status: Some(ToolStatus::Completed),
             content: None,
+            title: None,
+            kind: None,
+            locations: None,
+            usage: None,
         }),
     )))
     .await
