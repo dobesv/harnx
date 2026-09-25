@@ -56,6 +56,8 @@ pub type AcpConnection = acp::ConnectionTo<acp::Client>;
 pub const HARNX_ERROR_META: &str = "harnx:error";
 /// Metadata key carrying harnx's pre-rendered tool-call markdown.
 pub const HARNX_MARKDOWN_META: &str = "harnx:markdown";
+/// Metadata key carrying the latest per-call token usage snapshot.
+pub const HARNX_USAGE_META: &str = "harnx:usage";
 /// The ACP agent implementation for harnx.
 ///
 /// Holds:

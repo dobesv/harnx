@@ -41,6 +41,7 @@ fn mixed_context(scope: harnx_core::instance::ServerScope) -> crate::tool::ToolE
         emit_tool_call_fn: Arc::new(|_, _| {}),
         emit_tool_result_fn: Arc::new(|_, _| {}),
         emit_tool_blocked_fn: Arc::new(|_, _| {}),
+        emit_tool_update_fn: Arc::new(|_, _| {}),
         confirm_tool_use_fn: Arc::new(|_, _, _| crate::tool::ToolUseConfirmation::Approve),
         dispatch_hook_fn: Arc::new(|_| {
             Box::pin(async {

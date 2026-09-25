@@ -13,6 +13,7 @@ pub mod chat_completions;
 pub mod engine;
 pub mod input;
 pub mod media;
+pub mod progress;
 pub mod retry;
 pub mod tool;
 

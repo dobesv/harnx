@@ -12,6 +12,7 @@ use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
 use harnx_core::tool::{
     SwitchAgentData, ToolCall, ToolError, ToolProvider, ToolProviderOutput, ToolResult,
+    ToolUpdatePatch,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -24,6 +25,11 @@ use tracing::Instrument;
 /// Used for both "tool is about to dispatch" and "tool returned a
 /// result" UI emission hooks on `ToolEvalContext`.
 pub type ToolCallEmitFn = dyn Fn(&ToolCall, &Value) + Send + Sync;
+
+/// Callback invoked when a tool emits a progress update during execution.
+/// Receives the tool-call ID and the update patch. The runtime supplies the ID;
+/// tools call `progress.update(patch)` without knowing their call identity.
+pub type ToolUpdateEmitFn = dyn Fn(&str, &ToolUpdatePatch) + Send + Sync;
 
 /// Callback invoked when a PreToolUse hook returns `Ask { reason }`.
 /// The callback gets full `ToolCall` identity plus parsed args so
@@ -136,6 +142,11 @@ pub struct ToolEvalContext {
     /// `"error"` key). Harnx's default emits
     /// `AgentEvent::Tool(ToolEvent::Blocked { .. })`.
     pub emit_tool_blocked_fn: Arc<ToolCallEmitFn>,
+    /// Called when a tool emits a progress update during execution.
+    /// Receives the tool-call ID and the update patch. Harnx's default
+    /// emits `AgentEvent::Tool(ToolEvent::Update { .. })` via the unified
+    /// AgentEvent sink. Runtime coalesces rapid updates with a 250ms budget.
+    pub emit_tool_update_fn: Arc<ToolUpdateEmitFn>,
     /// Called when a PreToolUse hook returns `Ask { reason }` and the
     /// user needs to confirm before the tool runs. Harnx's default uses
     /// an `inquire`-based terminal prompt (or a worker-side NATS callback
@@ -164,6 +175,18 @@ pub async fn eval_tool_calls(
     eval_tool_calls_with_authorization(ctx, calls, abort_signal, None).await
 }
 
+/// Assign stable, non-empty identity to calls that don't already have it.
+///
+/// Runtime invokes this before persistence. Evaluation invokes it again as a
+/// safety net for direct engine callers; existing IDs remain unchanged.
+pub fn ensure_tool_call_ids(calls: &mut [ToolCall]) {
+    for call in calls {
+        if call.id.as_deref().is_none_or(|id| id.trim().is_empty()) {
+            call.id = Some(uuid::Uuid::new_v4().to_string());
+        }
+    }
+}
+
 /// Legacy recovery still runs pre-use hooks and approval. Recheck the worker
 /// lease after those waits, immediately before each provider dispatch.
 pub async fn eval_tool_calls_with_authorization(
@@ -176,6 +199,8 @@ pub async fn eval_tool_calls_with_authorization(
     if calls.is_empty() {
         return Ok(output);
     }
+    let mut calls = calls;
+    ensure_tool_call_ids(&mut calls);
     let calls = ToolCall::dedup(calls);
     if calls.is_empty() {
         bail!("The request was aborted because an infinite loop of function calls was detected.")
@@ -515,6 +540,7 @@ async fn call_tool_with_tracing(
     json_data: Value,
     tool_call_id: Option<&str>,
     abort_signal: &AbortSignal,
+    progress: Arc<dyn harnx_core::tool::ToolProgress>,
 ) -> Result<ToolProviderOutput, ToolError> {
     let span = tracing::info_span!(
         "tool_call",
@@ -530,7 +556,7 @@ async fn call_tool_with_tracing(
         span.record("harnx.tool.arguments_bytes", arguments_bytes);
     }
     let result = provider
-        .call_tool_with_id(tool_name, json_data, tool_call_id, abort_signal)
+        .call_tool_with_progress(tool_name, json_data, tool_call_id, abort_signal, progress)
         .instrument(span.clone())
         .await;
     if result.is_err() {
@@ -540,11 +566,12 @@ async fn call_tool_with_tracing(
 }
 
 async fn dispatch_tool_call(
-    call: ToolCall,
+    mut call: ToolCall,
     json_data: Value,
     ctx: &ToolEvalContext,
     abort_signal: &AbortSignal,
 ) -> Result<ToolProviderOutput, ToolError> {
+    ensure_tool_call_ids(std::slice::from_mut(&mut call));
     let allowed_tool_names = &ctx.allowed_tool_names;
 
     if call.name.ends_with("_session_handoff") {
@@ -598,19 +625,34 @@ async fn dispatch_tool_call(
         .into());
     }
 
+    let tool_call_id = call
+        .id
+        .clone()
+        .expect("tool call ID assigned before provider dispatch");
+
     for provider in &ctx.providers {
         if !provider.has_tool(&call.name) {
             continue;
         }
         let tool_name = call.name.clone();
-        return call_tool_with_tracing(
+        // Create progress handle bound to the call ID and emit callback.
+        let progress = crate::progress::RuntimeToolProgress::new(
+            tool_call_id.clone(),
+            Arc::clone(&ctx.emit_tool_update_fn),
+            Arc::clone(abort_signal),
+        );
+        let result = call_tool_with_tracing(
             provider.as_ref(),
             &tool_name,
             json_data.clone(),
-            call.id.as_deref(),
+            Some(&tool_call_id),
             abort_signal,
+            progress.clone(),
         )
         .await;
+        // Finalize progress before returning (flushes pending state, marks terminal)
+        progress.finalize();
+        return result;
     }
 
     Err(ToolError::Recoverable(anyhow!(
@@ -841,6 +883,82 @@ mod tests {
         }
     }
 
+    struct UpdatingToolProvider {
+        retained_progress: Arc<std::sync::Mutex<Option<Arc<dyn harnx_core::tool::ToolProgress>>>>,
+    }
+
+    impl ToolProvider for UpdatingToolProvider {
+        fn name(&self) -> &str {
+            "updating"
+        }
+
+        fn has_tool(&self, tool_name: &str) -> bool {
+            tool_name == "updating_tool"
+        }
+
+        fn call_tool<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            _tool_name: &'life1 str,
+            _arguments: Value,
+            _abort: &'life2 AbortSignal,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<ToolProviderOutput, ToolError>> + Send + 'async_trait>,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { panic!("engine must dispatch through call_tool_with_progress") })
+        }
+
+        fn call_tool_with_progress<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+            &'life0 self,
+            tool_name: &'life1 str,
+            _arguments: Value,
+            tool_call_id: Option<&'life2 str>,
+            _abort: &'life3 AbortSignal,
+            progress: Arc<dyn harnx_core::tool::ToolProgress>,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<ToolProviderOutput, ToolError>> + Send + 'async_trait>,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            'life3: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                assert_eq!(tool_name, "updating_tool");
+                assert!(tool_call_id.is_some_and(|id| !id.trim().is_empty()));
+                *self.retained_progress.lock().unwrap() = Some(Arc::clone(&progress));
+                progress.update(ToolUpdatePatch {
+                    title: Some("first".to_string()),
+                    ..Default::default()
+                });
+                progress.update(ToolUpdatePatch {
+                    title: Some("second".to_string()),
+                    ..Default::default()
+                });
+                progress.update(ToolUpdatePatch {
+                    status: Some(harnx_core::event::ToolStatus::InProgress),
+                    locations: Some(vec![]),
+                    ..Default::default()
+                });
+                Ok(ToolProviderOutput::new(json!({"ok": true})))
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    enum RecordedToolEvent {
+        Started(String),
+        Updated(String, ToolUpdatePatch),
+        Completed(String),
+    }
+
     fn continue_hook_outcome() -> HookOutcome {
         HookOutcome {
             control: HookResultControl::Continue,
@@ -906,7 +1024,14 @@ mod tests {
         providers: Vec<Arc<dyn ToolProvider>>,
         dispatch_hook: impl Fn(HookEvent) -> HookOutcome + Send + Sync + 'static,
     ) -> ToolEvalContext {
-        test_context_with_emitters(providers, dispatch_hook, |_, _| {}, |_, _| {}, |_, _| {})
+        test_context_with_emitters(
+            providers,
+            dispatch_hook,
+            |_, _| {},
+            |_, _| {},
+            |_, _| {},
+            |_, _| {},
+        )
     }
 
     fn test_context_with_emitters(
@@ -915,6 +1040,7 @@ mod tests {
         emit_tool_call: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
         emit_tool_result: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
         emit_tool_blocked: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
+        emit_tool_update: impl Fn(&str, &ToolUpdatePatch) + Send + Sync + 'static,
     ) -> ToolEvalContext {
         ToolEvalContext {
             work_boundary: None,
@@ -927,12 +1053,137 @@ mod tests {
             emit_tool_call_fn: Arc::new(emit_tool_call),
             emit_tool_result_fn: Arc::new(emit_tool_result),
             emit_tool_blocked_fn: Arc::new(emit_tool_blocked),
+            emit_tool_update_fn: Arc::new(emit_tool_update),
             confirm_tool_use_fn: Arc::new(|_, _, _| ToolUseConfirmation::Approve),
             dispatch_hook_fn: Arc::new(move |event| {
                 let outcome = dispatch_hook(event);
                 Box::pin(async move { outcome })
             }),
         }
+    }
+
+    #[test]
+    fn tool_call_identity_is_filled_once_and_existing_ids_are_preserved() {
+        let mut calls = vec![
+            ToolCall::new("missing".to_string(), json!({}), None, None),
+            ToolCall::new("blank".to_string(), json!({}), Some("  ".to_string()), None),
+            ToolCall::new(
+                "existing".to_string(),
+                json!({}),
+                Some("call-existing".to_string()),
+                None,
+            ),
+        ];
+
+        ensure_tool_call_ids(&mut calls);
+        let assigned = calls[0].id.clone().expect("missing ID assigned");
+        assert!(!assigned.is_empty());
+        assert!(calls[1]
+            .id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty()));
+        assert_eq!(calls[2].id.as_deref(), Some("call-existing"));
+
+        ensure_tool_call_ids(&mut calls);
+        assert_eq!(calls[0].id.as_deref(), Some(assigned.as_str()));
+        assert_eq!(calls[2].id.as_deref(), Some("call-existing"));
+    }
+
+    #[tokio::test]
+    async fn emitting_provider_has_stable_identity_coalescing_and_terminal_order() {
+        let retained_progress = Arc::new(std::sync::Mutex::new(None));
+        let provider = Arc::new(UpdatingToolProvider {
+            retained_progress: Arc::clone(&retained_progress),
+        });
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = Arc::clone(&events);
+        let completed = Arc::clone(&events);
+        let updated = Arc::clone(&events);
+        let ctx = test_context_with_emitters(
+            vec![provider],
+            |_| continue_hook_outcome(),
+            move |call, _| {
+                started.lock().unwrap().push(RecordedToolEvent::Started(
+                    call.id.clone().expect("started call ID"),
+                ));
+            },
+            move |call, _| {
+                completed.lock().unwrap().push(RecordedToolEvent::Completed(
+                    call.id.clone().expect("completed call ID"),
+                ));
+            },
+            |_, _| {},
+            move |id, patch| {
+                updated
+                    .lock()
+                    .unwrap()
+                    .push(RecordedToolEvent::Updated(id.to_string(), patch.clone()));
+            },
+        );
+
+        let results = eval_tool_calls(
+            &ctx,
+            vec![ToolCall::new(
+                "updating_tool".to_string(),
+                json!({}),
+                None,
+                None,
+            )],
+            &create_abort_signal(),
+        )
+        .await
+        .expect("updating provider should complete");
+        assert_eq!(results.len(), 1);
+
+        let events_guard = events.lock().unwrap();
+        assert_eq!(
+            events_guard.len(),
+            4,
+            "three patches should coalesce to two updates"
+        );
+        let RecordedToolEvent::Started(started_id) = &events_guard[0] else {
+            panic!("first event must be Started: {:?}", events_guard[0]);
+        };
+        let RecordedToolEvent::Updated(first_id, first_patch) = &events_guard[1] else {
+            panic!("second event must be Update: {:?}", events_guard[1]);
+        };
+        let RecordedToolEvent::Updated(final_id, final_patch) = &events_guard[2] else {
+            panic!(
+                "third event must be coalesced Update: {:?}",
+                events_guard[2]
+            );
+        };
+        let RecordedToolEvent::Completed(completed_id) = &events_guard[3] else {
+            panic!("last event must be Completed: {:?}", events_guard[3]);
+        };
+        assert!(!started_id.is_empty());
+        assert_eq!(first_id, started_id);
+        assert_eq!(final_id, started_id);
+        assert_eq!(completed_id, started_id);
+        assert_eq!(results[0].call.id.as_deref(), Some(started_id.as_str()));
+        assert_eq!(first_patch.title.as_deref(), Some("first"));
+        assert_eq!(final_patch.title.as_deref(), Some("second"));
+        assert!(matches!(
+            final_patch.status,
+            Some(harnx_core::event::ToolStatus::InProgress)
+        ));
+        assert_eq!(final_patch.locations, Some(vec![]));
+        drop(events_guard);
+
+        retained_progress
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("provider retained progress")
+            .update(ToolUpdatePatch {
+                title: Some("late".to_string()),
+                ..Default::default()
+            });
+        assert_eq!(
+            events.lock().unwrap().len(),
+            4,
+            "post-terminal update emitted"
+        );
     }
 
     struct TestReplayLease(Arc<std::sync::atomic::AtomicBool>);
@@ -989,6 +1240,7 @@ mod tests {
             |_| panic!("recovery must not repeat hooks"),
             |_, _| {},
             |_, value| assert!(value.is_null(), "display preserves the provider reply"),
+            |_, _| {},
             |_, _| {},
         );
         let call = ToolCall::new("retired_tool".into(), json!({}), Some("call".into()), None);
@@ -1148,6 +1400,7 @@ mod tests {
                 *emitted_result_clone.lock().unwrap() = Some(result.clone());
             },
             |_, _| {},
+            |_, _| {},
         );
         let abort_signal = create_abort_signal();
 
@@ -1215,6 +1468,7 @@ mod tests {
             move |_, _| {
                 blocked_emit_count_clone.fetch_add(1, Ordering::SeqCst);
             },
+            |_, _| {},
         );
         let abort_signal = create_abort_signal();
 
@@ -1247,6 +1501,7 @@ mod tests {
                 },
                 _ => continue_hook_outcome(),
             },
+            |_, _| {},
             |_, _| {},
             |_, _| {},
             |_, _| {},
@@ -1294,6 +1549,7 @@ mod tests {
             |_, _| {},
             |_, _| {},
             |_, _| {},
+            |_, _| {},
         );
         let abort_signal = create_abort_signal();
 
@@ -1336,6 +1592,7 @@ mod tests {
                     .expect("lock emitted results")
                     .push(value.clone());
             },
+            |_, _| {},
             |_, _| {},
         );
         let abort_signal = create_abort_signal();
@@ -1393,6 +1650,7 @@ mod tests {
                 }
                 _ => continue_hook_outcome(),
             },
+            |_, _| {},
             |_, _| {},
             |_, _| {},
             |_, _| {},

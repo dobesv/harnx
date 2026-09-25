@@ -15,12 +15,12 @@ use std::sync::Arc;
 use harnx_core::tool::ToolProvider;
 pub use harnx_core::tool::{
     extract_user_display_text, render_tool_call_template, render_tool_result_template, JsonSchema,
-    SwitchAgentData, ToolCall, ToolDeclaration, ToolResult, Tools,
+    SwitchAgentData, ToolCall, ToolDeclaration, ToolResult, ToolUpdatePatch, Tools,
 };
 use harnx_engine::tool::ToolEvalRenderContext;
 pub use harnx_engine::tool::{
     eval_tool_calls, ConfirmToolUseFn, DeferredToolCall, DispatchHookFn, ToolApprovalRequiredError,
-    ToolCallEmitFn, ToolEvalContext, ToolUseConfirmation,
+    ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn, ToolUseConfirmation,
 };
 
 /// The LLM text completion that immediately preceded a tool round.
@@ -83,7 +83,7 @@ pub async fn execute_tool_round(
 
 pub async fn execute_tool_round_with_persistence(
     params: ToolRoundParams<'_>,
-    tool_calls: Vec<ToolCall>,
+    mut tool_calls: Vec<ToolCall>,
     persistence: ToolRoundPersistence,
 ) -> Result<Vec<ToolResult>> {
     let ToolRoundParams {
@@ -98,6 +98,7 @@ pub async fn execute_tool_round_with_persistence(
     } = params;
     let dry_run = config.read().dry_run;
     anyhow::ensure!(!abort_signal.aborted(), "interrupted during tool execution");
+    harnx_engine::tool::ensure_tool_call_ids(&mut tool_calls);
 
     if persistence.persist_tool_calls && !dry_run {
         config.write().append_session_tool_calls(
@@ -249,13 +250,14 @@ fn build_dispatch_hook_fn(
     })
 }
 
-/// Build the three emit closures (call / result / blocked) over a shared decl map.
+/// Build tool lifecycle emit closures over a shared declaration map.
 fn build_emit_fns(
     decl_map: &Arc<HashMap<String, ToolDeclaration>>,
 ) -> (
     Arc<ToolCallEmitFn>,
     Arc<ToolCallEmitFn>,
     Arc<ToolCallEmitFn>,
+    Arc<ToolUpdateEmitFn>,
 ) {
     let m1 = Arc::clone(decl_map);
     let emit_tool_call_fn: Arc<ToolCallEmitFn> =
@@ -272,7 +274,46 @@ fn build_emit_fns(
         Arc::new(move |call: &ToolCall, blocked_result: &Value| {
             emit_tool_blocked_with_template(call, blocked_result, &m3);
         });
-    (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn)
+    // Capture the turn-scoped sink now. Provider implementations may call the
+    // progress handle from `tokio::spawn`, which doesn't inherit task locals.
+    let update_sink = harnx_core::sink::current_agent_event_sink();
+    let emit_tool_update_fn: Arc<ToolUpdateEmitFn> =
+        Arc::new(move |call_id: &str, patch: &ToolUpdatePatch| {
+            emit_tool_update(call_id, patch, update_sink.as_deref());
+        });
+    (
+        emit_tool_call_fn,
+        emit_tool_result_fn,
+        emit_tool_blocked_fn,
+        emit_tool_update_fn,
+    )
+}
+
+/// Emit a tool update event for live progress reporting.
+/// Called by the runtime when a tool calls `progress.update(patch)`.
+fn emit_tool_update(
+    call_id: &str,
+    patch: &ToolUpdatePatch,
+    sink: Option<&dyn harnx_core::event::AgentEventSink>,
+) {
+    use harnx_core::event::{AgentEvent, ToolEvent};
+
+    let event = AgentEvent::Tool(ToolEvent::Update {
+        id: call_id.to_string(),
+        markdown: patch.markdown.clone(),
+        status: patch.status,
+        content: patch.content.clone(),
+        title: patch.title.clone(),
+        kind: patch.kind,
+        locations: patch.locations.clone(),
+        usage: patch.usage.clone(),
+    });
+
+    if let Some(sink) = sink {
+        sink.emit(event);
+    } else {
+        let _ = harnx_core::sink::emit_agent_event(event);
+    }
 }
 
 async fn resolve_nats_providers(
@@ -340,7 +381,8 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         nats_hook_provider,
         pending_async_context,
     );
-    let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn) = build_emit_fns(&decl_map);
+    let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn, emit_tool_update_fn) =
+        build_emit_fns(&decl_map);
     ToolEvalContext {
         work_boundary: None,
         instance_id: instance_id.clone(),
@@ -354,6 +396,7 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         emit_tool_call_fn,
         emit_tool_result_fn,
         emit_tool_blocked_fn,
+        emit_tool_update_fn,
         confirm_tool_use_fn,
         dispatch_hook_fn,
     }
@@ -990,6 +1033,7 @@ mod tests {
             emit_tool_call_fn: Arc::new(|_, _| {}),
             emit_tool_result_fn: Arc::new(|_, _| {}),
             emit_tool_blocked_fn: Arc::new(|_, _| {}),
+            emit_tool_update_fn: Arc::new(|_, _| {}),
             confirm_tool_use_fn: Arc::new(|_, _, _| ToolUseConfirmation::Approve),
             dispatch_hook_fn: Arc::new(|_| {
                 Box::pin(async {
@@ -1027,6 +1071,38 @@ mod tests {
 
         assert_eq!(results[0].markdown.as_deref(), Some("OK: hello"));
         assert!(results[1].markdown.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_update_emitter_captures_scoped_sink_across_spawn() {
+        let sink = Arc::new(RecordingSink::default());
+        let captured = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            let declarations = Arc::new(HashMap::new());
+            build_emit_fns(&declarations).3
+        })
+        .await;
+
+        tokio::spawn(async move {
+            captured(
+                "call-captured",
+                &ToolUpdatePatch {
+                    title: Some("spawned update".to_string()),
+                    ..Default::default()
+                },
+            );
+        })
+        .await
+        .expect("spawned update task");
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::Tool(ToolEvent::Update { id, title, .. }) => {
+                assert_eq!(id, "call-captured");
+                assert_eq!(title.as_deref(), Some("spawned update"));
+            }
+            other => panic!("expected tool update, got {other:?}"),
+        }
     }
 
     #[test]
