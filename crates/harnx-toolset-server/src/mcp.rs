@@ -102,6 +102,7 @@ impl McpToolsetAdapter {
             // control subject a later cancel could arrive on.
             checkpoint: None,
             checkpoint_store: None,
+            progress: Default::default(),
         };
         let attestation = RequestAttestation {
             call_id: invocation_context.call_id.clone(),

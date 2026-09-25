@@ -812,6 +812,44 @@ interval or synchronously in `finalize()`. Abort and terminal states reject late
 captures `current_agent_event_sink()` when building `emit_tool_update_fn` (`harnx-runtime/src/tool.rs:279-282`);
 tools emitting from `tokio::spawn` see the originating turn sink, not a stale task-local or global fallback.
 
+### Native toolset progress handle
+
+`ToolInvocationContext.progress` (`harnx-toolset/src/lib.rs:196`) is a cloneable `ToolProgressHandle`
+passed to `Toolset::invoke_with_context`. Defaults to a no-op sink when the request lacks the
+`harnx:tool_progress` capability. Tools call `progress.update(patch)` to emit live state; the handle
+is call-bound and safe to clone into spawned tasks. Implementations that forward only `Toolset::invoke`
+will not receive the handle.
+
+The server-side `ProgressPublisher` (`harnx-toolset-server/src/progress.rs`) coalesces on a 250ms
+interval, mirroring the engine's `RuntimeToolProgress`. First update publishes promptly; subsequent
+updates merge pending state; `finish()` yields the final bounded snapshot.
+
+### Wire capability and producer bounds
+
+Clients enable tool progress by including `CAPABILITY_TOOL_PROGRESS = "harnx:tool_progress"`
+(`harnx-toolset/src/progress.rs:10`) in `ToolRequest.capabilities`. Absent capability: no NATS
+progress messages publish, no `final_progress` snapshot attached.
+
+Producer-side bounds are UTF-8-safe and enforced before publication
+(`ToolProgressPatch::bounded()`):
+
+- `TOOL_PROGRESS_MAX_STRING_BYTES = 4 KiB` — title, path-like fields
+- `TOOL_PROGRESS_MAX_MARKDOWN_BYTES = 64 KiB` — rendered markdown body
+- `TOOL_PROGRESS_MAX_LOCATIONS = 64` — location blocks
+- `TOOL_PROGRESS_MAX_CONTENT_BLOCKS = 64` — structured content blocks
+- `TOOL_PROGRESS_MAX_CONTENT_BYTES = 64 KiB` — aggregate serialized content
+- `TOOL_PROGRESS_MAX_IMAGE_BYTES = 16 KiB` — single image data block
+
+Terminal status values (`Completed`, `Failed`) are removed before publication; runtime owns terminal
+truth. Tests verify: `terminal_status_is_removed_before_publication` (`progress.rs:390-396`).
+
+### Final progress snapshot on ToolReply
+
+`ToolReply.final_progress` (`harnx-toolset/src/lib.rs:381-382`) carries the last bounded snapshot
+outside `result`, so it never enters model-facing tool output. Journal, reply cache, and replay
+preserve the field. Fast completion (e.g., cache hit) still carries the snapshot because the
+publisher flushes before awaiting the reply.
+
 ### Tool confirmation modal ordering and delivery
 
 When a `PreToolUse` hook returns `permissionDecision: "ask"`, the TUI modal queues an optional user message via durable JetStream append before sending the approval reply. Worker reloads the session log at the tool seam, ensuring the agent sees `tool call → tool result (real or blocked) → queued message`.

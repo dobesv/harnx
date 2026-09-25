@@ -244,6 +244,7 @@ async fn complete_in_journal(
             ToolReply {
                 call_id: wire_id(call_id),
                 result: Ok(result),
+                final_progress: None,
             },
         )
         .await?;

@@ -556,6 +556,10 @@ impl ServedToolset {
     pub(crate) fn control_subject(&self) -> String {
         self.instance_id.control_subject()
     }
+
+    pub(crate) fn tool_subject(&self, tool: &str) -> String {
+        self.instance_id.tool_subject(&self.identity, tool)
+    }
 }
 
 impl Drop for ServedToolset {

@@ -146,6 +146,7 @@ async fn replay_responder(
         let reply = ToolReply {
             call_id: request.call_id.clone(),
             result: Ok(json!({"answer": "replayed"})),
+            final_progress: None,
         };
         *recorded.lock().await = Some(request);
         if let Some(subject) = message.reply {
@@ -181,6 +182,7 @@ async fn save_reply(js: &async_nats::jetstream::Context) -> anyhow::Result<()> {
                     EXECUTION_CONTEXT_NAMESPACE: harnx_core::execution_context::ExecutionContextObservation::observe(
                         std::path::Path::new("/original/workspace"), std::path::Path::new("/original/workspace"))
                 }})),
+                final_progress: None,
             },
         )
         .await?;

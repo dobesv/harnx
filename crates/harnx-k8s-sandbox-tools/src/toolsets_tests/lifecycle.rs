@@ -19,6 +19,7 @@ async fn release_uses_and_clears_the_ambient_binding() -> Result<()> {
                 capabilities: BTreeSet::new(),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
             cancel: CancellationToken::new(),
         })
@@ -47,6 +48,7 @@ async fn release_uses_and_clears_the_ambient_binding() -> Result<()> {
                 capabilities: BTreeSet::new(),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
             cancel: CancellationToken::new(),
         })
@@ -98,6 +100,7 @@ async fn connect_clones_after_a_retry_and_binds_the_session() -> Result<()> {
                 capabilities: BTreeSet::new(),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
             cancel: CancellationToken::new(),
         })
@@ -151,6 +154,7 @@ async fn connect_binds_before_a_cancelled_clone_returns() -> Result<()> {
                 capabilities: BTreeSet::new(),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
             cancel: CancellationToken::new(),
         })
@@ -195,6 +199,7 @@ async fn ambiguous_post_dispatch_failure_is_not_replayed() -> Result<()> {
                 capabilities: BTreeSet::new(),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
             cancel: CancellationToken::new(),
         })

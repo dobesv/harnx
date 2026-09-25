@@ -36,6 +36,7 @@ async fn proxy_requires_or_resolves_an_ambient_session_binding() -> Result<()> {
                 ]),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
             cancel: CancellationToken::new(),
         })
@@ -81,6 +82,7 @@ async fn proxy_explicit_override_is_one_call_and_not_forwarded() -> Result<()> {
                 capabilities: BTreeSet::new(),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
             cancel: CancellationToken::new(),
         })
@@ -120,6 +122,7 @@ async fn proxy_forwards_cancellation_after_the_mcp_call_starts() -> Result<()> {
                 capabilities: BTreeSet::new(),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
             cancel: invocation_cancel,
         })
@@ -217,6 +220,7 @@ async fn bash_routes_to_3002_and_fs_routes_to_3003() -> Result<()> {
                 capabilities: BTreeSet::new(),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
             cancel: CancellationToken::new(),
         })
@@ -238,6 +242,7 @@ async fn bash_routes_to_3002_and_fs_routes_to_3003() -> Result<()> {
                 capabilities: BTreeSet::new(),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
             cancel: CancellationToken::new(),
         })

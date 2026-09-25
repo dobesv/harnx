@@ -145,6 +145,7 @@ mod tests {
                 capabilities: Default::default(),
                 checkpoint: None,
                 checkpoint_store: None,
+                progress: Default::default(),
             },
         }
     }

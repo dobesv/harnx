@@ -262,6 +262,7 @@ async fn journal_reply_not_returned_for_disabled_tool() -> Result<()> {
     let saved_reply = ToolReply {
         call_id: request.call_id.clone(),
         result: Ok(json!({"privileged": "data"})),
+        final_progress: None,
     };
     journal.complete(&request, saved_reply.clone()).await?;
 

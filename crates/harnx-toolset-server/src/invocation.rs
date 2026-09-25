@@ -1,15 +1,16 @@
 //! Admission, reply delivery and server-owned handler cleanup.
 use super::*;
 use invocation_journal::JournalCheckpointStore;
+use progress::ProgressPublisher;
 
 pub(super) async fn invoke_uncached_tool(
     context: &ToolRequestContext,
     request: &ToolRequest,
     parent_cx: OtelContext,
-) -> Result<Value, ToolInvokeError> {
+) -> Result<ToolReply, ToolInvokeError> {
     let recovery = recovery::InvocationRecovery::load(context, request).await?;
     if let Some(reply) = recovery.completed_reply().await? {
-        return recovery::reply_result(reply);
+        return Ok(reply);
     }
     recovery.check_policy(context.toolset.as_ref())?;
     let execution =
@@ -22,7 +23,7 @@ async fn invoke_claimed(
     request: &ToolRequest,
     parent_cx: OtelContext,
     (recovery, execution): (recovery::InvocationRecovery, execution::InvocationExecution),
-) -> Result<Value, ToolInvokeError> {
+) -> Result<ToolReply, ToolInvokeError> {
     let cancel = CancellationToken::new();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let active = execution.active_call(cancel.clone());
@@ -34,7 +35,16 @@ async fn invoke_claimed(
     let metric_tool = metric_tool_name(context.toolset.as_ref(), &request.tool);
     let start = Instant::now();
     let guarantee = cancellation_guarantee(context, &request.tool);
-    let invocation = invocation(request, &recovery, &execution, &cancel);
+    let progress = ProgressPublisher::for_request(
+        &context.client,
+        context.server_scope.control_subject(),
+        request,
+    );
+    let progress_handle = progress
+        .as_ref()
+        .map(ProgressPublisher::handle)
+        .unwrap_or_default();
+    let invocation = invocation(request, &recovery, &execution, &cancel, progress_handle);
     let toolset = context.toolset.clone();
     let in_flight = context.in_flight.clone();
     let call_id = request.call_id.clone();
@@ -56,8 +66,13 @@ async fn invoke_claimed(
             in_flight.remove(&call_id);
         }
     });
-    let result = match reply_rx.await {
-        Ok(outcome) => record_outcome(context, request, outcome).await,
+    let outcome = reply_rx.await;
+    let final_progress = match progress {
+        Some(progress) => progress.finish().await,
+        None => None,
+    };
+    let result = match outcome {
+        Ok(outcome) => record_outcome(context, request, outcome, final_progress).await,
         // A lost owner task reported no outcome, so there is nothing to record:
         // whether the tool ran at all is exactly what this process cannot say.
         Err(error) => Err(ToolInvokeError::Fatal(format!(
@@ -65,7 +80,7 @@ async fn invoke_claimed(
         ))),
     };
     let elapsed = start.elapsed();
-    let is_ok = result.is_ok();
+    let is_ok = result.as_ref().is_ok_and(|reply| reply.result.is_ok());
     harnx_metrics::record_tool_call(metric_tool, is_ok, elapsed);
     result
 }
@@ -79,15 +94,18 @@ async fn record_outcome(
     context: &ToolRequestContext,
     request: &ToolRequest,
     outcome: Result<Value, ToolInvokeError>,
-) -> Result<Value, ToolInvokeError> {
+    final_progress: Option<harnx_toolset::ToolProgressPatch>,
+) -> Result<ToolReply, ToolInvokeError> {
     let reply = ToolReply {
         call_id: request.call_id.clone(),
         result: outcome.map_err(map_invoke_error),
+        final_progress,
     };
-    match context.journal.complete(request, reply).await {
-        Ok(durable) => recovery::reply_result(durable),
-        Err(error) => Err(recovery::invoke_error(error)),
-    }
+    context
+        .journal
+        .complete(request, reply)
+        .await
+        .map_err(recovery::invoke_error)
 }
 
 fn invocation(
@@ -95,6 +113,7 @@ fn invocation(
     recovery: &recovery::InvocationRecovery,
     execution: &execution::InvocationExecution,
     cancel: &CancellationToken,
+    progress: harnx_toolset::ToolProgressHandle,
 ) -> ToolInvocation {
     let mut args = request.args.clone();
     let invocation_context = ToolInvocationContext {
@@ -107,6 +126,7 @@ fn invocation(
             session: execution.session_id.clone(),
             call_id: request.call_id.clone(),
         })),
+        progress,
     };
     add_parent_context_args(
         &request.tool,
@@ -147,6 +167,7 @@ pub(super) fn orphan_invocation(
             session,
             call_id: request.call_id.clone(),
         })),
+        progress: Default::default(),
     };
     add_parent_context_args(
         &request.tool,
