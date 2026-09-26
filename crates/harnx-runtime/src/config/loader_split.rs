@@ -293,7 +293,10 @@ impl Config {
         if model_id.is_empty() {
             let models = list_models(&self.clients, ModelType::Chat);
             if models.is_empty() {
-                bail!("No available model");
+                log::info!(
+                    "no local chat model configured; remote agents resolve models on their workers"
+                );
+                return Ok(());
             }
             model_id = models[0].id()
         };
