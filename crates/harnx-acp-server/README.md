@@ -12,6 +12,9 @@ ACP (Agent Client Protocol) server front-end for harnx agents.
 - `initialize` — negotiates protocol version 1 and advertises minimal capabilities.
 - `session/new` — creates a NATS-backed harnx session and accepts IDE-injected MCP server entries.
 - `session/load` — replays one scoped durable NATS transcript as ordered ACP updates.
+- `session/resume` — establishes session context without replaying history.
+- `session/list` — discovers pinned-agent sessions on the configured cluster.
+- `session/close` — removes session context while preserving durable history.
 - `session/prompt` — streams ordered assistant, thought, tool-call, tool-result, notice, and flagged model-error updates.
 - `session/cancel` — stops the local prompt follower and durably cancels the NATS turn.
 - A committed handoff reports the target agent, local session ID, cluster, and opening instructions.
@@ -31,9 +34,30 @@ created session. If the transcript contains a `HandoffCommitted` record, the
 session is marked deactivated and rejects future prompts with an actionable
 handoff-target error.
 
-Session discovery is supported via `session/list`, returning real sessions owned
-by the server's configured agent and cluster. Session resume, close, and delete
-remain unsupported and unadvertised.
+### Session resume
+
+`session/resume` is advertised through `sessionCapabilities.resume`. Resume
+validates that the session ID exists and belongs to the configured agent,
+establishes in-memory session context (including handoff state rehydration),
+and returns immediately **without** replaying any `session/update` notifications.
+This is useful when a client already knows the history (e.g., from a previous
+`session/list` or stored state) and only needs to reestablish the session for
+subsequent `session/prompt` calls.
+
+### Session list
+
+`session/list` is advertised through `sessionCapabilities.list`. It returns
+sessions belonging to the configured agent (pinned-agent filtering), newest
+first. Each entry includes session ID, working directory, title, and last
+activity timestamp.
+
+### Session close
+
+`session/close` is advertised through `sessionCapabilities.close`. Close
+removes the session's in-memory context, cancels any active turn, but preserves
+all durable history. The session remains visible in `session/list` and can be
+resumed again via `session/resume`. Close is idempotent — closing an unknown
+or already-closed session succeeds without error.
 
 ### Handoff limitation
 
@@ -77,7 +101,9 @@ Supported methods:
 - `authenticate` — No-op placeholder for future authentication.
 - `session/new` — Creates a NATS-backed session and returns its ID.
 - `session/load` — Replays a scoped durable transcript snapshot.
+- `session/resume` — Establishes session context without replaying history.
 - `session/list` — Lists sessions for the pinned agent.
+- `session/close` — Removes session context while preserving durable history.
 - `session/prompt` — Runs a turn and streams assistant text updates.
 - `session/request_permission` — Requests a per-turn allow or reject decision for gated tools.
 - `session/cancel` — Cancels an in-flight turn, including a pending permission request.

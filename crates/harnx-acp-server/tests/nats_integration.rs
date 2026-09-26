@@ -14,5 +14,7 @@ mod permission;
 mod persistence;
 #[path = "nats_integration/prompt.rs"]
 mod prompt;
+#[path = "nats_integration/resume_close.rs"]
+mod resume_close;
 #[path = "nats_integration/support/mod.rs"]
 mod support;
