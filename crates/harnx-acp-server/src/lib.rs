@@ -4,7 +4,9 @@
 //! - `initialize` negotiating protocol version 1
 //! - `session/new` creating NATS-backed sessions via local worker
 //! - `session/load` replaying durable transcript and establishing session context
+//! - `session/resume` establishing context without replaying history
 //! - `session/list` discovering pinned-agent sessions on the configured cluster
+//! - `session/close` removing context while preserving durable history
 //! - `session/prompt` running turn with in-order streaming
 //! - `session/request_permission` bridging gated tools to ACP clients
 //! - committed handoffs producing an actionable fallback and deactivating source
@@ -24,10 +26,12 @@ use std::time::Duration;
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, SessionCapabilities, SessionId, SessionInfo,
-    SessionListCapabilities, SessionNotification, SessionUpdate, StopReason,
+    CloseSessionRequest, CloseSessionResponse, Implementation, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, StopReason,
 };
 use anyhow::Context;
 use harnx_core::abort::AbortSignal;
@@ -149,7 +153,10 @@ impl HarnxAgent {
                     AgentCapabilities::new()
                         .load_session(true)
                         .session_capabilities(
-                            SessionCapabilities::new().list(SessionListCapabilities::new()),
+                            SessionCapabilities::new()
+                                .list(SessionListCapabilities::new())
+                                .resume(SessionResumeCapabilities::new())
+                                .close(SessionCloseCapabilities::new()),
                         ),
                 )
                 .agent_info(
@@ -566,6 +573,60 @@ impl HarnxAgent {
 
         Ok(())
     }
+
+    /// Handle `session/resume` — establish context for existing session without replay.
+    ///
+    /// Validates ownership and existence, then establishes a `SessionContext` with
+    /// handoff rehydration. Unlike `load_session`, this does NOT replay history
+    /// updates to the client.
+    pub async fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+    ) -> acp::Result<ResumeSessionResponse> {
+        let session_id = request.session_id.0.to_string();
+        if session_id.trim().is_empty() {
+            return Err(acp_error(anyhow::anyhow!("session ID must not be empty")));
+        }
+
+        debug!(%session_id, "resuming ACP session");
+
+        // Validate ownership and existence by loading entries
+        let entries = self.load_scoped_entries(&session_id).await?;
+
+        // Establish session context for subsequent prompt/cancel (reuses load helper)
+        self.establish_session_context(&session_id, &entries)
+            .await?;
+
+        debug!(%session_id, "resumed ACP session without replay");
+
+        Ok(ResumeSessionResponse::new())
+    }
+
+    /// Handle `session/close` — remove session context, preserving durable history.
+    ///
+    /// Cancels any active turn and removes the `SessionContext` from in-memory storage.
+    /// Durable NATS transcript, metadata, and listing visibility remain intact.
+    /// Idempotent: closing unknown or already-closed session succeeds.
+    pub async fn close_session(
+        &self,
+        request: CloseSessionRequest,
+    ) -> acp::Result<CloseSessionResponse> {
+        let session_id = request.session_id.0.to_string();
+
+        debug!(%session_id, "closing ACP session");
+
+        if let Some(session_ctx) = self.sessions.write().await.remove(&session_id) {
+            // Cancel local turn guard if active
+            session_ctx.cancel_local_turn();
+            // Cancel pending NATS turn
+            let _ = session_ctx.nats_session().cancel_pending_turn().await;
+            debug!(%session_id, "ACP session closed");
+        } else {
+            debug!(%session_id, "ACP session already closed or unknown (idempotent)");
+        }
+
+        Ok(CloseSessionResponse::new())
+    }
 }
 
 struct PromptTurn {
@@ -755,7 +816,10 @@ mod tests {
             AgentCapabilities::new()
                 .load_session(true)
                 .session_capabilities(
-                    SessionCapabilities::new().list(SessionListCapabilities::new())
+                    SessionCapabilities::new()
+                        .list(SessionListCapabilities::new())
+                        .resume(SessionResumeCapabilities::new())
+                        .close(SessionCloseCapabilities::new())
                 )
         );
         assert!(response.agent_info.is_some());
