@@ -29,6 +29,39 @@ async fn test_server() -> Option<(Server, async_nats::Client)> {
 }
 
 #[tokio::test]
+async fn nats_completion_reports_never_claimed_activation_as_terminal_orphan() -> Result<()> {
+    let Some((_server, client)) = test_server().await else {
+        return Ok(());
+    };
+    let js = async_nats::jetstream::new(client);
+    let session_id = "never-claimed-activation";
+    let log = NatsSessionLog::new_with_replicas(js.clone(), session_id, 1);
+    log.append_event_async(&SessionLogEntry::Message {
+        id: Some("unclaimed-prompt".to_string()),
+        role: harnx_core::message::MessageRole::User,
+        content: harnx_core::message::MessageContent::Text("never claimed".to_string()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await?;
+    let entries = log.load_events_async().await?;
+    let mut poller = CompletionPoller {
+        log,
+        jetstream: js,
+        session_id: session_id.to_string(),
+        entries,
+        watchdog: SessionLeaseWatchdog::with_timeouts(None, Duration::from_millis(1)),
+    };
+
+    let update = poller.poll().await?;
+    let reason = update
+        .orphaned
+        .expect("an activation no worker claims must become terminal");
+    assert!(reason.contains("No worker claimed this session within 60 seconds"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn nats_completion_reads_only_entries_after_its_successful_cursor() -> Result<()> {
     let Some((_server, client)) = test_server().await else {
         return Ok(());

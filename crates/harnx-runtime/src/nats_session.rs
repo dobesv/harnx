@@ -81,6 +81,12 @@ const ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Two reads at the interval above leave ~4s of slack for a worker's lease
 /// release to race the barrier it just wrote.
 const ORPHAN_MISSING_CHECKS: u32 = 2;
+
+/// Maximum time an admitted turn may wait for its first worker lease.
+///
+/// This is deliberately longer than the 30s lease TTL so slow worker startup
+/// gets two full lease windows before the exposed run is failed.
+const LEASE_ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const CONTROL_ACK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 const CONTROL_ACK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const CONTROL_RECOVERY_TIMEOUT: std::time::Duration =
@@ -92,18 +98,28 @@ const CONTROL_RECOVERY_TIMEOUT: std::time::Duration =
 /// The worker writes its assistant message (or its `Error` entry) before
 /// releasing the session lease, so "lease gone, nothing in the log" means the
 /// worker died — a panic, a kill, or a lost connection. The first observed
-/// lease arms the detector. A session that is merely queued and has never been
-/// claimed therefore remains pending, while a lease that later expires is
-/// reported as orphaned after a short confirmation window.
+/// lease arms the post-start detector. A session that is admitted but never
+/// claimed is reported after the bounded acquisition budget; a lease that later
+/// expires is reported after a short confirmation window.
 pub struct SessionLeaseWatchdog {
     lease_config: crate::nats_lease::NatsLeaseConfig,
     /// Opened once and reused: `get_key_value` costs a `stream_info` round trip
     /// that the per-poll `get` does not.
     bucket: Option<async_nats::jetstream::kv::Store>,
     next_check: tokio::time::Instant,
+    lease_acquisition_deadline: tokio::time::Instant,
     saw_lease: bool,
     missing_checks: u32,
     missing_checks_limit: u32,
+}
+
+/// Result of one lease-store observation, separated from watchdog policy so
+/// transport handling and liveness decisions stay independently readable.
+enum LeaseObservation {
+    BucketUnavailable,
+    ReadFailed(anyhow::Error),
+    Absent,
+    Present(String),
 }
 
 impl SessionLeaseWatchdog {
@@ -112,16 +128,25 @@ impl SessionLeaseWatchdog {
     }
 
     fn with_orphan_timeout(orphan_timeout: Option<std::time::Duration>) -> Self {
+        Self::with_timeouts(orphan_timeout, LEASE_ACQUISITION_TIMEOUT)
+    }
+
+    fn with_timeouts(
+        orphan_timeout: Option<std::time::Duration>,
+        lease_acquisition_timeout: std::time::Duration,
+    ) -> Self {
         let missing_checks_limit = orphan_timeout.map_or(ORPHAN_MISSING_CHECKS, |timeout| {
             timeout
                 .as_nanos()
                 .div_ceil(ORPHAN_CHECK_INTERVAL.as_nanos())
                 .clamp(1, u32::MAX as u128) as u32
         });
+        let now = tokio::time::Instant::now();
         Self {
             lease_config: crate::nats_lease::NatsLeaseConfig::default(),
             bucket: None,
-            next_check: tokio::time::Instant::now() + ORPHAN_CHECK_INTERVAL,
+            next_check: now + ORPHAN_CHECK_INTERVAL.min(lease_acquisition_timeout),
+            lease_acquisition_deadline: now + lease_acquisition_timeout,
             saw_lease: false,
             missing_checks: 0,
             missing_checks_limit,
@@ -140,48 +165,78 @@ impl SessionLeaseWatchdog {
         }
         self.next_check = now + ORPHAN_CHECK_INTERVAL;
 
+        let observation = self.observe_lease(jetstream, session_id).await;
+        self.apply_observation(observation, now, session_id)
+    }
+
+    async fn observe_lease(
+        &mut self,
+        jetstream: &jetstream::Context,
+        session_id: &str,
+    ) -> LeaseObservation {
         if self.bucket.is_none() {
             self.bucket = crate::nats_lease::open_lease_bucket(jetstream, &self.lease_config).await;
         }
-        // No bucket means no worker has ever leased on this cluster; that is
-        // indistinguishable from "not started yet", so keep waiting.
-        let bucket = self.bucket.as_ref()?;
+        let Some(bucket) = self.bucket.as_ref() else {
+            return LeaseObservation::BucketUnavailable;
+        };
 
-        let holder = match crate::nats_lease::lease_holder_in(
-            bucket,
-            &self.lease_config,
-            session_id,
-        )
-        .await
-        {
-            Ok(holder) => holder,
-            Err(error) => {
+        match crate::nats_lease::lease_holder_in(bucket, &self.lease_config, session_id).await {
+            Ok(Some(holder)) => LeaseObservation::Present(holder.worker_id),
+            Ok(None) => LeaseObservation::Absent,
+            Err(error) => LeaseObservation::ReadFailed(error),
+        }
+    }
+
+    fn apply_observation(
+        &mut self,
+        observation: LeaseObservation,
+        now: tokio::time::Instant,
+        session_id: &str,
+    ) -> Option<String> {
+        match observation {
+            // A missing bucket is indistinguishable from "not started yet"
+            // until the acquisition budget expires.
+            LeaseObservation::BucketUnavailable => self.lease_acquisition_timeout(now),
+            LeaseObservation::ReadFailed(error) => {
                 // An unreadable lease says nothing about the worker.
                 log::debug!("nats session: lease liveness check failed: {error:#}");
                 self.missing_checks = 0;
-                return None;
+                self.lease_acquisition_timeout(now)
             }
-        };
+            LeaseObservation::Absent => self.handle_absent_lease(now),
+            LeaseObservation::Present(worker_id) => {
+                log::trace!("nats session: {session_id} held by {worker_id}");
+                self.saw_lease = true;
+                self.missing_checks = 0;
+                None
+            }
+        }
+    }
 
-        let Some(holder) = holder else {
-            if !self.saw_lease {
-                return None;
-            }
-            self.missing_checks += 1;
-            if self.missing_checks < self.missing_checks_limit {
-                return None;
-            }
-            return Some(
-                "The worker handling this session stopped without answering. \
-                 Check the worker log for the underlying failure."
-                    .to_string(),
-            );
-        };
+    fn handle_absent_lease(&mut self, now: tokio::time::Instant) -> Option<String> {
+        if !self.saw_lease {
+            return self.lease_acquisition_timeout(now);
+        }
+        self.missing_checks += 1;
+        if self.missing_checks < self.missing_checks_limit {
+            return None;
+        }
+        Some(
+            "The worker handling this session stopped without answering. \
+             Check the worker log for the underlying failure."
+                .to_string(),
+        )
+    }
 
-        log::trace!("nats session: {session_id} held by {}", holder.worker_id);
-        self.saw_lease = true;
-        self.missing_checks = 0;
-        None
+    fn lease_acquisition_timeout(&self, now: tokio::time::Instant) -> Option<String> {
+        (!self.saw_lease && now >= self.lease_acquisition_deadline).then(|| {
+            format!(
+                "No worker claimed this session within {} seconds after activation. \
+                 Check that a worker is running and subscribed to this agent's cluster.",
+                LEASE_ACQUISITION_TIMEOUT.as_secs()
+            )
+        })
     }
 }
 
@@ -194,8 +249,9 @@ impl Default for SessionLeaseWatchdog {
 /// Per-invocation settings for a NATS-backed turn.
 ///
 /// Extensible struct for per-invocation parameters. Add future parameters here
-/// rather than breaking the positional `run_turn` signature. The default is
-/// unbounded (all fields `None`), preserving compatibility with interactive callers.
+/// rather than breaking the positional `run_turn` signature. Defaults impose no
+/// token budget and use the standard post-acquisition orphan grace; the separate
+/// lease-acquisition budget still bounds a run that no worker ever claims.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RunTurnOptions {
     pub token_budget: Option<u64>,
@@ -2166,9 +2222,9 @@ mod tests {
     }
 
     #[test]
-    fn default_run_turn_options_keep_interactive_callers_unbounded() {
+    fn default_run_turn_options_keep_execution_budget_unbounded() {
         // TUI and WebUI use run_turn_input* methods, which delegate with this
-        // default and expose no caller-side timeout argument.
+        // default. The lease-acquisition budget is independent of these options.
         let options = RunTurnOptions::default();
         assert_eq!(options.token_budget, None);
         assert_eq!(options.orphan_timeout, None);
@@ -2183,6 +2239,28 @@ mod tests {
         let minimum =
             SessionLeaseWatchdog::with_orphan_timeout(Some(std::time::Duration::from_millis(1)));
         assert_eq!(minimum.missing_checks_limit, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_timeout_reports_unclaimed_run() {
+        let mut watchdog = SessionLeaseWatchdog::new();
+        assert_eq!(
+            watchdog.lease_acquisition_timeout(tokio::time::Instant::now()),
+            None
+        );
+
+        tokio::time::advance(LEASE_ACQUISITION_TIMEOUT).await;
+        let reason = watchdog
+            .lease_acquisition_timeout(tokio::time::Instant::now())
+            .expect("unclaimed activation must time out");
+        assert!(reason.contains("No worker claimed this session within 60 seconds"));
+
+        watchdog.saw_lease = true;
+        assert_eq!(
+            watchdog.lease_acquisition_timeout(tokio::time::Instant::now()),
+            None,
+            "the startup budget must not apply after a lease was observed"
+        );
     }
 
     /// A turn's last flush must not swallow notices just because the durable log

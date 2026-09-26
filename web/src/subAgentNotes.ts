@@ -1,4 +1,11 @@
-export type SubAgentNoteStatus = 'running' | 'done' | 'failed' | 'cancelling' | 'cancelled' | 'unconfirmed';
+export type SubAgentNoteStatus =
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'cancelling'
+  | 'cancelled'
+  | 'unconfirmed'
+  | 'awaiting_approval';
 
 export interface SubAgentNote {
   id: string;
@@ -123,7 +130,7 @@ function subAgentMarker(value: unknown): SubAgentIdentity | undefined {
 
 function progressStatus(value: unknown): SubAgentNoteStatus | undefined {
   if (typeof value !== 'string') return undefined;
-  if (!['running', 'done', 'failed', 'cancelling', 'cancelled', 'unconfirmed'].includes(value)) return undefined;
+  if (!['running', 'done', 'failed', 'cancelling', 'cancelled', 'unconfirmed', 'awaiting_approval'].includes(value)) return undefined;
   return value as SubAgentNoteStatus;
 }
 
@@ -440,7 +447,7 @@ function completeNote(state: SubAgentNotesState, content: unknown): SubAgentNote
   };
 }
 
-function freezeNote(note: SubAgentNote, status: Exclude<SubAgentNoteStatus, 'running'>): SubAgentNote {
+function freezeNote(note: SubAgentNote, status: Exclude<SubAgentNoteStatus, 'running' | 'awaiting_approval'>): SubAgentNote {
   const localElapsed = note.status === 'running'
     ? (note.startedAtMs
         ? Math.max(0, Date.now() - note.startedAtMs)
@@ -455,16 +462,16 @@ function freezeNote(note: SubAgentNote, status: Exclude<SubAgentNoteStatus, 'run
 }
 
 function failRunningNote(note: SubAgentNote): SubAgentNote {
-  return note.status === 'running' ? freezeNote(note, 'failed') : note;
+  return (note.status === 'running' || note.status === 'awaiting_approval') ? freezeNote(note, 'failed') : note;
 }
 
 function failUnresolvedNotes(state: SubAgentNotesState): SubAgentNotesState {
-  const hasRunningNotes = state.notes.some((note) => note.status === 'running');
-  if (!hasRunningNotes && state.latestParentMessageId === null) return state;
+  const hasUnresolvedNotes = state.notes.some((note) => note.status === 'running' || note.status === 'awaiting_approval');
+  if (!hasUnresolvedNotes && state.latestParentMessageId === null) return state;
   return {
     ...state,
     latestParentMessageId: null,
-    notes: hasRunningNotes
+    notes: hasUnresolvedNotes
       ? state.notes.map(failRunningNote)
       : state.notes,
   };
@@ -520,25 +527,76 @@ function restoreSnapshot(
   };
 }
 
-function childTerminal(state: SubAgentNotesState, event: EventRecord): SubAgentNotesState {
+function findChildNoteIndex(
+  state: SubAgentNotesState,
+  event: EventRecord,
+  statusPredicate: (status: SubAgentNoteStatus) => boolean,
+): number {
   const invocationId = event.invocationId as string | undefined;
   const toolCallId = event.toolCallId as string | undefined;
-  
-  let targetIndex = -1;
-  if (invocationId) {
-    targetIndex = state.notes.findIndex((n) => n.invocationId === invocationId && n.status === 'running');
-  }
-  if (targetIndex === -1 && toolCallId) {
-    targetIndex = state.notes.findIndex((n) => n.toolCallId === toolCallId && n.status === 'running');
-  }
 
+  if (invocationId) {
+    const idx = state.notes.findIndex((n) => n.invocationId === invocationId && statusPredicate(n.status));
+    if (idx !== -1) return idx;
+  }
+  if (toolCallId) {
+    return state.notes.findIndex((n) => n.toolCallId === toolCallId && statusPredicate(n.status));
+  }
+  return -1;
+}
+
+function toTerminalStatus(status: unknown): Exclude<SubAgentNoteStatus, 'running' | 'awaiting_approval'> {
+  if (status === 'failed') return 'failed';
+  if (status === 'cancelled') return 'cancelled';
+  return 'done';
+}
+
+function computeAwaitingElapsed(target: SubAgentNote): number {
+  return target.startedAtMs
+    ? Math.max(0, Date.now() - target.startedAtMs)
+    : target.elapsedMs + Math.max(0, Date.now() - target.updatedAtMs);
+}
+
+function childTerminal(state: SubAgentNotesState, event: EventRecord): SubAgentNotesState {
+  const targetIndex = findChildNoteIndex(
+    state,
+    event,
+    (s) => s === 'running' || s === 'awaiting_approval',
+  );
   if (targetIndex === -1) return state;
 
-  const terminalStatus: Exclude<SubAgentNoteStatus, 'running'> =
-    event.status === 'failed' ? 'failed' : 'done';
-
+  const terminalStatus = toTerminalStatus(event.status);
   const newNotes = [...state.notes];
   newNotes[targetIndex] = freezeNote(newNotes[targetIndex], terminalStatus);
+  return { ...state, notes: newNotes };
+}
+
+function childAwaitingApproval(state: SubAgentNotesState, event: EventRecord): SubAgentNotesState {
+  const targetIndex = findChildNoteIndex(state, event, (s) => s === 'running');
+  if (targetIndex === -1) return state;
+
+  const newNotes = [...state.notes];
+  const target = newNotes[targetIndex];
+  newNotes[targetIndex] = {
+    ...target,
+    status: 'awaiting_approval',
+    elapsedMs: computeAwaitingElapsed(target),
+    updatedAtMs: Date.now(),
+  };
+
+  return { ...state, notes: newNotes };
+}
+
+function childRunning(state: SubAgentNotesState, event: EventRecord): SubAgentNotesState {
+  const targetIndex = findChildNoteIndex(state, event, (s) => s === 'awaiting_approval');
+  if (targetIndex === -1) return state;
+
+  const newNotes = [...state.notes];
+  newNotes[targetIndex] = {
+    ...newNotes[targetIndex],
+    status: 'running',
+    updatedAtMs: Date.now(),
+  };
 
   return { ...state, notes: newNotes };
 }
@@ -553,6 +611,8 @@ const EVENT_REDUCERS: Record<string, EventReducer> = {
   RUN_FINISHED: failUnresolvedNotes,
   RUN_ERROR: failUnresolvedNotes,
   CHILD_TERMINAL: childTerminal,
+  CHILD_AWAITING_APPROVAL: childAwaitingApproval,
+  CHILD_RUNNING: childRunning,
 };
 
 export function reduceSubAgentNotes(

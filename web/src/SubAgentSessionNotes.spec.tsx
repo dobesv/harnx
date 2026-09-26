@@ -1,13 +1,28 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { useReducer } from 'react';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
-import { cancel, sessionControl } from './api';
-vi.mock('./api', () => ({ cancel: vi.fn(), sessionControl: vi.fn() }));
+import { cancel } from './api';
+vi.mock('./api', () => ({ cancel: vi.fn() }));
 
-import type { SubAgentNote } from './subAgentNotes';
+import {
+  INITIAL_SUB_AGENT_NOTES_STATE,
+  reduceSubAgentNotes,
+  type SubAgentNote,
+} from './subAgentNotes';
 import { HarnxHttpAgent } from './ChatProvider';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
+
+// Mirror the real agent's custom-event dispatch to the typed callbacks so a
+// simulated CUSTOM event reaches onTurnInterrupted / onHitlPendingApproval.
+function dispatchSimulatedCustomEvent(options: any, event: any) {
+  if (event?.type !== 'CUSTOM') return;
+  if (event.name === 'turn_interrupted') options.onTurnInterrupted?.();
+  if (event.name === 'hitl_pending_approval') {
+    options.onHitlPendingApproval?.(event.value?.tool_call_id, event.value?.summary);
+  }
+}
 
 vi.mock('./ChatProvider', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./ChatProvider')>();
@@ -16,9 +31,14 @@ vi.mock('./ChatProvider', async (importOriginal) => {
     HarnxHttpAgent: vi.fn().mockImplementation(function(this: any, options: any) {
       this.options = options;
       this.runAgent = vi.fn();
-      this.simulateEvent = (event: unknown) => options.onSubAgentEvent(event);
+      this.simulateEvent = (event: any) => {
+        options.onSubAgentEvent(event);
+        dispatchSimulatedCustomEvent(options, event);
+      };
       this.simulateUsage = (usage: unknown) => options.onUsage(usage);
       this.simulateToolSummary = (id = 'call-1', summary = 'tool-summary') => options.onToolSummary(id, summary);
+      this.simulateHitlPendingApproval = (toolCallId = 'call-1', summary = 'approval required') =>
+        options.onHitlPendingApproval?.(toolCallId, summary);
     }),
   };
 });
@@ -193,32 +213,82 @@ describe('SubAgentSessionNotes', () => {
   });
 
   describe('ChildMetricsSubscriber', () => {
+    function setupSubscriber(customNote?: SubAgentNote) {
+      const dispatch = vi.fn();
+      const testNote: SubAgentNote = customNote ?? {
+        ...note('running', 'live-child'),
+        startedAtMs: Date.now() - 10000,
+      };
+
+      render(
+        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+          <SubAgentSessionNotes notes={[testNote]} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+
+      const instances = vi.mocked(HarnxHttpAgent).mock.instances;
+      const agentInstance = instances[instances.length - 1] as any;
+      return { dispatch, agentInstance };
+    }
+
     it.each([
-      { eventType: 'RUN_FINISHED', expectedStatus: 'done' },
-      { eventType: 'RUN_ERROR', expectedStatus: 'failed' },
+      { event: { type: 'RUN_FINISHED' }, expectedType: 'CHILD_TERMINAL', expectedStatus: 'done' },
+      { event: { type: 'RUN_ERROR' }, expectedType: 'CHILD_TERMINAL', expectedStatus: 'failed' },
+      { event: { type: 'CUSTOM', name: 'turn_interrupted' }, expectedType: 'CHILD_TERMINAL', expectedStatus: 'cancelled' },
+      {
+        event: {
+          type: 'CUSTOM',
+          name: 'hitl_pending_approval',
+          value: { tool_call_id: 'call-1', summary: 'Need confirmation' },
+        },
+        expectedType: 'CHILD_AWAITING_APPROVAL',
+      },
     ])(
-      'dispatches CHILD_TERMINAL with status $expectedStatus when $eventType is received',
-      ({ eventType, expectedStatus }) => {
-        const dispatch = vi.fn();
-        const runningNote: SubAgentNote = {
-          ...note('running', 'live-child'),
-          startedAtMs: Date.now() - 10000,
-        };
-
-        render(
-          <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
-            <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
-          </SubAgentNotesContext.Provider>
-        );
-
-        const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
-        agentInstance.simulateEvent({ type: eventType });
+      'dispatches $expectedType ($expectedStatus) on $event.type ($event.name)',
+      ({ event, expectedType, expectedStatus }) => {
+        const { dispatch, agentInstance } = setupSubscriber();
+        agentInstance.simulateEvent(event);
 
         expect(dispatch).toHaveBeenCalledWith(
-          expect.objectContaining({ type: 'CHILD_TERMINAL', status: expectedStatus })
+          expect.objectContaining({
+            type: expectedType,
+            ...(expectedStatus ? { status: expectedStatus } : {}),
+          })
         );
       },
     );
+
+    it('dispatches CHILD_TERMINAL with status cancelled when RUN_FINISHED arrives after turn_interrupted', () => {
+      const { dispatch, agentInstance } = setupSubscriber();
+      agentInstance.simulateEvent({ type: 'CUSTOM', name: 'turn_interrupted' });
+      dispatch.mockClear();
+
+      agentInstance.simulateEvent({ type: 'RUN_FINISHED' });
+      expect(dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'CHILD_TERMINAL', status: 'cancelled' })
+      );
+    });
+
+    it('dispatches CHILD_AWAITING_APPROVAL when onHitlPendingApproval is called', () => {
+      const { dispatch, agentInstance } = setupSubscriber();
+      agentInstance.simulateHitlPendingApproval('call-1', 'Need confirmation');
+
+      expect(dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'CHILD_AWAITING_APPROVAL' })
+      );
+    });
+
+    it('dispatches CHILD_RUNNING when RUN_STARTED is received while awaiting approval', () => {
+      const { dispatch, agentInstance } = setupSubscriber({
+        ...note('awaiting_approval', 'live-child'),
+        startedAtMs: Date.now() - 10000,
+      });
+      agentInstance.simulateEvent({ type: 'RUN_STARTED' });
+
+      expect(dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'CHILD_RUNNING' })
+      );
+    });
 
     it('defers rather than loses RUN_FINISHED received during startup', () => {
       vi.useFakeTimers();
@@ -410,7 +480,6 @@ describe('SubAgentSessionNotes', () => {
 
 describe('child cancellation', () => {
   it('stops the running child session without opening it', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' } });
     vi.mocked(cancel).mockResolvedValue({ outcome: 'accepted', cancel_seq: 12 });
     const onOpen = vi.fn();
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={onOpen} />);
@@ -421,46 +490,24 @@ describe('child cancellation', () => {
     expect(screen.queryByRole('button', { name: /^Stop / })).not.toBeInTheDocument();
   });
 
-  it('offers Stop from the parent progress note even when the child session reports idle', async () => {
-    // A sub-agent session is never prompted through this server, so a row that
-    // waited for the child session to claim a run of its own hid Stop forever.
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'idle' } });
+  it('offers Stop from the parent progress note for a running subagent', async () => {
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
-    await waitFor(() => expect(sessionControl).toHaveBeenCalled());
     expect(await screen.findByRole('button', { name: /^Stop / })).toBeEnabled();
   });
 
-  it('gives Stop back when the child session reports running again', async () => {
-    // The session id outlives one invocation, so a stale `interrupted` answer
-    // must not label this row Cancelled for the rest of the next one.
-    vi.mocked(sessionControl)
-      .mockResolvedValueOnce({ state: { status: 'interrupted', cancel_seq: 9 } })
-      .mockResolvedValue({ state: { status: 'running' } });
-    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
-    expect(await screen.findByText('Cancelled')).toBeVisible();
-    expect(
-      await screen.findByRole('button', { name: /^Stop / }, { timeout: 3000 }),
-    ).toBeEnabled();
-  });
-
-  it('hides Stop once the child session reports it was interrupted', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'interrupted', cancel_seq: 9 } });
-    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
+  it('hides Stop once the child session is cancelled', async () => {
+    render(<SubAgentSessionNotes notes={[{ ...note('cancelled'), invocationId: 'invocation' }]} onOpen={() => {}} />);
     expect(await screen.findByText('Cancelled')).toBeVisible();
     expect(screen.queryByRole('button', { name: /^Stop / })).not.toBeInTheDocument();
   });
 
   it('labels a child parked at an approval gate without calling it cancelled', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({
-      state: { status: 'awaiting_approval' },
-    });
-    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
+    render(<SubAgentSessionNotes notes={[{ ...note('awaiting_approval'), invocationId: 'invocation' }]} onOpen={() => {}} />);
     expect(await screen.findByText('Awaiting approval')).toBeVisible();
     expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
   });
 
   it('does not surface "signal is aborted without reason" on screen (#1838)', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' } });
     vi.mocked(cancel).mockRejectedValue(new DOMException('signal is aborted without reason', 'AbortError'));
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
     fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));
@@ -469,7 +516,6 @@ describe('child cancellation', () => {
   });
 
   it('does not surface TimeoutError on screen (#1838, #1861)', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' } });
     vi.mocked(cancel).mockRejectedValue(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
     fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));
@@ -478,10 +524,93 @@ describe('child cancellation', () => {
   });
 
   it('surfaces legitimate non-abort errors on screen', async () => {
-    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' } });
     vi.mocked(cancel).mockRejectedValue(new Error('Server communication failed'));
     render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
     fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Error: Server communication failed');
+  });
+
+  describe('row status driven purely by events', () => {
+    function EventDrivenNotes({ initialNotes }: { initialNotes: SubAgentNote[] }) {
+      const [state, dispatch] = useReducer(reduceSubAgentNotes, {
+        ...INITIAL_SUB_AGENT_NOTES_STATE,
+        notes: initialNotes,
+      });
+      return (
+        <SubAgentNotesContext.Provider value={{ notes: state.notes, openSession: () => {}, dispatch }}>
+          <SubAgentSessionNotes notes={state.notes} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+    }
+
+    it('transitions Running -> Awaiting approval -> Running -> Cancelled purely via events', async () => {
+      const initialNote: SubAgentNote = {
+        ...note('running', 'event-child-1'),
+        invocationId: 'inv-ev-1',
+        toolCallId: 'call-ev-1',
+        startedAtMs: Date.now() - 10000,
+      };
+
+      render(<EventDrivenNotes initialNotes={[initialNote]} />);
+
+      expect(screen.getByText('Running')).toBeVisible();
+
+      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+      act(() => {
+        agentInstance.simulateHitlPendingApproval('call-ev-1', 'Approval required');
+      });
+      expect(await screen.findByText('Awaiting approval')).toBeVisible();
+      expect(screen.queryByText('Running')).not.toBeInTheDocument();
+
+      act(() => {
+        agentInstance.simulateEvent({ type: 'RUN_STARTED' });
+      });
+      expect(await screen.findByText('Running')).toBeVisible();
+      expect(screen.queryByText('Awaiting approval')).not.toBeInTheDocument();
+
+      act(() => {
+        agentInstance.simulateEvent({ type: 'CUSTOM', name: 'turn_interrupted' });
+      });
+      expect(await screen.findByText('Cancelled')).toBeVisible();
+      expect(screen.queryByText('Running')).not.toBeInTheDocument();
+    });
+
+    it('transitions Running -> Done on RUN_FINISHED event', async () => {
+      const initialNote: SubAgentNote = {
+        ...note('running', 'event-child-2'),
+        invocationId: 'inv-ev-2',
+        toolCallId: 'call-ev-2',
+        startedAtMs: Date.now() - 10000,
+      };
+
+      render(<EventDrivenNotes initialNotes={[initialNote]} />);
+      expect(screen.getByText('Running')).toBeVisible();
+
+      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+      act(() => {
+        agentInstance.simulateEvent({ type: 'RUN_FINISHED' });
+      });
+      expect(await screen.findByText('Done')).toBeVisible();
+      expect(screen.queryByText('Running')).not.toBeInTheDocument();
+    });
+
+    it('transitions Running -> Failed on RUN_ERROR event', async () => {
+      const initialNote: SubAgentNote = {
+        ...note('running', 'event-child-3'),
+        invocationId: 'inv-ev-3',
+        toolCallId: 'call-ev-3',
+        startedAtMs: Date.now() - 10000,
+      };
+
+      render(<EventDrivenNotes initialNotes={[initialNote]} />);
+      expect(screen.getByText('Running')).toBeVisible();
+
+      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+      act(() => {
+        agentInstance.simulateEvent({ type: 'RUN_ERROR' });
+      });
+      expect(await screen.findByText('Failed')).toBeVisible();
+      expect(screen.queryByText('Running')).not.toBeInTheDocument();
+    });
   });
 });

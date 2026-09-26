@@ -43,6 +43,8 @@ export interface HarnxCustomEventCallbacks {
   onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
   /** Called when session_compacting_failed is received. */
   onCompactingFailed?: (error: string, compactionId?: string) => void;
+  /** Called when turn_interrupted is received. */
+  onTurnInterrupted?: () => void;
   /**
    * Whether events belong to the session currently shown in the foreground.
    * When `false`, the `session_title_updated` handler skips `setDocumentTitle`
@@ -213,6 +215,9 @@ const handlers: Record<string, CustomEventHandler> = {
     const error = stringField(value, 'error') || 'Compaction failed';
     const compactionId = stringField(value, 'compaction_id');
     callbacks.onCompactingFailed?.(error, compactionId);
+  },
+  turn_interrupted: (callbacks) => {
+    callbacks.onTurnInterrupted?.();
   },
 };
 
