@@ -26,6 +26,7 @@ mod subagent_transcript;
 pub mod terminal;
 pub mod test_utils;
 mod tool_confirmation;
+pub(crate) mod tool_render;
 pub mod types;
 
 mod completion;

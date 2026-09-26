@@ -1,0 +1,26 @@
+---
+source: crates/harnx-tui/src/tests/tool_live_updates_tests.rs
+expression: completed_screen
+---
+✓ ⌕ find  Finding "**/*.rs" in crates/harnx-tui  crates/harnx-tui/src/lib.rs, c…
+pattern: '**/*.rs'
+crates/harnx-tui/src/lib.rs
+crates/harnx-tui/src/main.rs
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• Input

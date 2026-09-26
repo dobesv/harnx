@@ -61,9 +61,10 @@ pub(super) fn apply_child_event(
         AgentEvent::Tool(ToolEvent::Started {
             id,
             name,
+            kind,
             markdown,
             input,
-            ..
+            locations,
         }) => {
             state.streaming_open = false;
             state.transcript.push(TranscriptItem::ToolCall {
@@ -75,7 +76,37 @@ pub(super) fn apply_child_event(
                 start_anchor: std::time::Instant::now(),
                 final_elapsed_ms: None,
                 rendered_cache: None,
+                title: None,
+                status: None,
+                kind: Some(kind),
+                locations,
+                usage: None,
             });
+            None
+        }
+        AgentEvent::Tool(ToolEvent::Update {
+            id,
+            markdown,
+            status,
+            title,
+            kind,
+            locations,
+            usage,
+            ..
+        }) => {
+            crate::tool_render::apply_tool_event_update(
+                &mut state.transcript,
+                crate::tool_render::ToolUpdatePayload {
+                    id,
+                    markdown,
+                    status,
+                    title,
+                    kind,
+                    locations,
+                    usage,
+                },
+                None,
+            );
             None
         }
         AgentEvent::Tool(ToolEvent::Completed {
@@ -84,43 +115,7 @@ pub(super) fn apply_child_event(
             markdown,
             ..
         }) => {
-            // Capture elapsed for the matching running ToolCall by ID.
-            // If no matching ID is found, fall back to the most recent running tool.
-            let transcript = &mut state.transcript;
-            let matched_idx = transcript.iter_mut().rev().position(|item| {
-                matches!(
-                    item,
-                    TranscriptItem::ToolCall {
-                        final_elapsed_ms: None,
-                        id: Some(ref i),
-                        ..
-                    } if i == &id
-                )
-            });
-            let fallback_idx = if matched_idx.is_none() {
-                transcript.iter_mut().rev().position(|item| {
-                    matches!(
-                        item,
-                        TranscriptItem::ToolCall {
-                            final_elapsed_ms: None,
-                            ..
-                        }
-                    )
-                })
-            } else {
-                None
-            };
-            if let Some(idx) = matched_idx.or(fallback_idx) {
-                let actual_idx = transcript.len().saturating_sub(1).saturating_sub(idx);
-                if let TranscriptItem::ToolCall {
-                    start_anchor,
-                    final_elapsed_ms,
-                    ..
-                } = &mut transcript[actual_idx]
-                {
-                    *final_elapsed_ms = Some(start_anchor.elapsed().as_millis() as u64);
-                }
-            }
+            crate::tool_render::complete_tool_call(&mut state.transcript, &id);
             state.transcript.extend(tool_completed_to_transcript_items(
                 &output,
                 markdown.as_deref(),
@@ -128,43 +123,7 @@ pub(super) fn apply_child_event(
             None
         }
         AgentEvent::Tool(ToolEvent::Failed { id, error }) => {
-            // Capture elapsed for the matching running ToolCall by ID.
-            // If no matching ID is found, fall back to the most recent running tool.
-            let transcript = &mut state.transcript;
-            let matched_idx = transcript.iter_mut().rev().position(|item| {
-                matches!(
-                    item,
-                    TranscriptItem::ToolCall {
-                        final_elapsed_ms: None,
-                        id: Some(ref i),
-                        ..
-                    } if i == &id
-                )
-            });
-            let fallback_idx = if matched_idx.is_none() {
-                transcript.iter_mut().rev().position(|item| {
-                    matches!(
-                        item,
-                        TranscriptItem::ToolCall {
-                            final_elapsed_ms: None,
-                            ..
-                        }
-                    )
-                })
-            } else {
-                None
-            };
-            if let Some(idx) = matched_idx.or(fallback_idx) {
-                let actual_idx = transcript.len().saturating_sub(1).saturating_sub(idx);
-                if let TranscriptItem::ToolCall {
-                    start_anchor,
-                    final_elapsed_ms,
-                    ..
-                } = &mut transcript[actual_idx]
-                {
-                    *final_elapsed_ms = Some(start_anchor.elapsed().as_millis() as u64);
-                }
-            }
+            crate::tool_render::fail_tool_call(&mut state.transcript, &id);
             state.transcript.push(TranscriptItem::ErrorText(error));
             None
         }

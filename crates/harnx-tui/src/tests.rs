@@ -29,6 +29,7 @@ mod delegation_tests;
 mod exit_interrupt_tests;
 mod shared_session_event_tests;
 mod subagent_session_tests;
+mod tool_live_updates_tests;
 mod turn_activity_tests;
 
 fn yaml_to_json(yaml: &str) -> serde_json::Value {
@@ -1565,10 +1566,9 @@ async fn structured_ui_output_variants_render_in_transcript() {
         .collect();
 
     assert!(system_entries.contains(&"> argus ▸ session-1".to_string()));
-    assert!(system_entries.contains(&"→ argus_session_prompt".to_string()));
-    assert!(system_entries.contains(&"message: hello".to_string()));
+    assert!(system_entries.contains(&"argus_session_prompt".to_string()));
     assert!(system_entries.contains(&"<think>thinking hard</think>".to_string()));
-    assert!(system_entries.contains(&"-> argus_session_prompt completed".to_string()));
+    assert!(!system_entries.iter().any(|s| s.starts_with("-> ")));
     assert!(system_entries.contains(&"Plan:".to_string()));
     assert!(system_entries.contains(&"  [in_progress] Refactor sub-agent formatting".to_string()));
     assert!(system_entries.contains(&"→ bash".to_string()));
@@ -6047,6 +6047,11 @@ async fn tool_call_display_format() {
         start_anchor: std::time::Instant::now(),
         final_elapsed_ms: Some(0),
         rendered_cache: None,
+        title: None,
+        status: None,
+        kind: None,
+        locations: vec![],
+        usage: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
         tool_name: "write_file".to_string(),
@@ -6059,6 +6064,11 @@ async fn tool_call_display_format() {
         start_anchor: std::time::Instant::now(),
         final_elapsed_ms: Some(0),
         rendered_cache: None,
+        title: None,
+        status: None,
+        kind: None,
+        locations: vec![],
+        usage: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
         tool_name: "think".to_string(),
@@ -6069,6 +6079,11 @@ async fn tool_call_display_format() {
         start_anchor: std::time::Instant::now(),
         final_elapsed_ms: Some(0),
         rendered_cache: None,
+        title: None,
+        status: None,
+        kind: None,
+        locations: vec![],
+        usage: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
         tool_name: "search".to_string(),
@@ -6081,6 +6096,11 @@ async fn tool_call_display_format() {
         start_anchor: std::time::Instant::now(),
         final_elapsed_ms: Some(0),
         rendered_cache: None,
+        title: None,
+        status: None,
+        kind: None,
+        locations: vec![],
+        usage: None,
     });
     harness.render();
     let rendered = normalize_screen(&harness.screen_contents());
@@ -6101,6 +6121,11 @@ fn render_tool_call_markdown_body_suppresses_header() {
             start_anchor: std::time::Instant::now(),
             final_elapsed_ms: Some(0),
             rendered_cache: None,
+            title: None,
+            status: None,
+            kind: None,
+            locations: vec![],
+            usage: None,
         },
         false,
         false,
@@ -6124,6 +6149,11 @@ fn render_tool_call_yaml_body_keeps_header() {
             start_anchor: std::time::Instant::now(),
             final_elapsed_ms: Some(0),
             rendered_cache: None,
+            title: None,
+            status: None,
+            kind: None,
+            locations: vec![],
+            usage: None,
         },
         false,
         false,
@@ -6149,6 +6179,11 @@ fn render_tool_call_meta_line_precedes_markdown_body() {
             start_anchor: std::time::Instant::now(),
             final_elapsed_ms: Some(0),
             rendered_cache: None,
+            title: None,
+            status: None,
+            kind: None,
+            locations: vec![],
+            usage: None,
         },
         true,
         true,
@@ -6175,6 +6210,11 @@ async fn tool_call_with_seq_number() {
         start_anchor: std::time::Instant::now(),
         final_elapsed_ms: Some(0),
         rendered_cache: None,
+        title: None,
+        status: None,
+        kind: None,
+        locations: vec![],
+        usage: None,
     });
     harness.render();
     let rendered = normalize_screen(&harness.screen_contents());
@@ -7404,6 +7444,11 @@ async fn test_d4_key_i_copies_tool_call() {
         start_anchor: std::time::Instant::now(),
         final_elapsed_ms: Some(0),
         rendered_cache: None,
+        title: None,
+        status: None,
+        kind: None,
+        locations: vec![],
+        usage: None,
     });
     harness.tui().app.transcript_focus = Some(0);
 
@@ -10953,6 +10998,11 @@ fn make_running_tool_call(tool_name: &str, elapsed_ms: u64) -> TranscriptItem {
             .expect("elapsed should be valid"),
         final_elapsed_ms: None,
         rendered_cache: None,
+        title: None,
+        status: None,
+        kind: None,
+        locations: vec![],
+        usage: None,
     }
 }
 
@@ -10970,6 +11020,11 @@ fn make_running_tool_call_with_id(tool_name: &str, elapsed_ms: u64, id: &str) ->
             .expect("elapsed should be valid"),
         final_elapsed_ms: None,
         rendered_cache: None,
+        title: None,
+        status: None,
+        kind: None,
+        locations: vec![],
+        usage: None,
     }
 }
 
@@ -10984,6 +11039,11 @@ fn make_completed_tool_call(tool_name: &str, final_elapsed_ms: u64) -> Transcrip
         start_anchor: Instant::now(),
         final_elapsed_ms: Some(final_elapsed_ms),
         rendered_cache: None,
+        title: None,
+        status: None,
+        kind: None,
+        locations: vec![],
+        usage: None,
     }
 }
 
@@ -11296,7 +11356,8 @@ mod subagent_tool_timer_tests {
     use super::*;
     use crate::subagent_transcript::apply_child_event;
     use crate::types::{MonitoredSessionState, SubAgentStatus};
-    use harnx_core::event::{AgentEvent, ToolKind, TurnEvent};
+    use harnx_core::event::{AgentEvent, ToolEvent, ToolKind, ToolLocation, ToolStatus, TurnEvent};
+    use std::path::PathBuf;
     use std::time::Duration;
 
     fn make_child_session_state() -> MonitoredSessionState {
@@ -11596,6 +11657,341 @@ mod subagent_tool_timer_tests {
             _ => panic!("expected ToolCall"),
         }
     }
+
+    #[test]
+    fn child_tool_update_matches_active_call_and_updates_all_fields() {
+        let mut state = make_child_session_state();
+
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "child-tool-1".into(),
+                name: "file_read".into(),
+                kind: ToolKind::Read,
+                markdown: None,
+                input: serde_json::json!({"path": "src/lib.rs"}),
+                locations: vec![],
+            }),
+        );
+
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Update {
+                id: "child-tool-1".into(),
+                markdown: Some("reading `src/lib.rs` (lines 1..50)".into()),
+                status: Some(ToolStatus::InProgress),
+                content: None,
+                title: Some("Reading src/lib.rs".into()),
+                kind: Some(ToolKind::Read),
+                locations: Some(vec![ToolLocation {
+                    path: PathBuf::from("src/lib.rs"),
+                    line: Some(25),
+                }]),
+                usage: None,
+            }),
+        );
+
+        assert_eq!(state.transcript.len(), 1);
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                id,
+                tool_name,
+                title,
+                status,
+                kind,
+                locations,
+                body,
+                final_elapsed_ms,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("child-tool-1"));
+                assert_eq!(tool_name, "file_read");
+                assert_eq!(title.as_deref(), Some("Reading src/lib.rs"));
+                assert!(matches!(*status, Some(ToolStatus::InProgress)));
+                assert!(matches!(*kind, Some(ToolKind::Read)));
+                assert_eq!(locations.len(), 1);
+                assert_eq!(locations[0].line, Some(25));
+                match body {
+                    Some(ToolCallBody::Markdown(md)) => {
+                        assert_eq!(md, "reading `src/lib.rs` (lines 1..50)");
+                    }
+                    other => panic!("expected Markdown body, got {:?}", other),
+                }
+                assert!(final_elapsed_ms.is_none());
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn child_tool_update_unmatched_synthesizes_fallback_row() {
+        let mut state = make_child_session_state();
+
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Update {
+                id: "orphan-child-tool".into(),
+                markdown: Some("executing step".into()),
+                status: Some(ToolStatus::InProgress),
+                content: None,
+                title: Some("Child background task".into()),
+                kind: Some(ToolKind::Execute),
+                locations: Some(vec![ToolLocation {
+                    path: PathBuf::from("task.sh"),
+                    line: None,
+                }]),
+                usage: None,
+            }),
+        );
+
+        assert_eq!(state.transcript.len(), 1);
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                id,
+                tool_name,
+                title,
+                status,
+                kind,
+                locations,
+                final_elapsed_ms,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("orphan-child-tool"));
+                assert_eq!(tool_name, "tool");
+                assert_eq!(title.as_deref(), Some("Child background task"));
+                assert!(matches!(*status, Some(ToolStatus::InProgress)));
+                assert!(matches!(*kind, Some(ToolKind::Execute)));
+                assert_eq!(locations.len(), 1);
+                assert!(final_elapsed_ms.is_none());
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn child_tool_update_binds_to_active_unassigned_call() {
+        let mut state = make_child_session_state();
+
+        // Push an active tool call without an assigned ID
+        state.transcript.push(TranscriptItem::ToolCall {
+            tool_name: "bash".into(),
+            body: None,
+            seq: None,
+            timestamp: Some(chrono::Utc::now()),
+            id: None,
+            start_anchor: std::time::Instant::now(),
+            final_elapsed_ms: None,
+            rendered_cache: None,
+            title: None,
+            status: None,
+            kind: None,
+            locations: vec![],
+            usage: None,
+        });
+
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Update {
+                id: "bound-id-1".into(),
+                markdown: None,
+                status: Some(ToolStatus::InProgress),
+                content: None,
+                title: Some("Running command".into()),
+                kind: Some(ToolKind::Execute),
+                locations: None,
+                usage: None,
+            }),
+        );
+
+        assert_eq!(state.transcript.len(), 1);
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall { id, title, .. } => {
+                assert_eq!(id.as_deref(), Some("bound-id-1"));
+                assert_eq!(title.as_deref(), Some("Running command"));
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn child_tool_late_update_ignored_after_completed() {
+        let mut state = make_child_session_state();
+
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "child-done-1".into(),
+                name: "calc".into(),
+                kind: ToolKind::Other,
+                markdown: None,
+                input: serde_json::json!({}),
+                locations: vec![],
+            }),
+        );
+
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Completed {
+                id: "child-done-1".into(),
+                output: serde_json::json!(42),
+                markdown: None,
+            }),
+        );
+
+        assert!(!state.transcript.is_empty());
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                final_elapsed_ms,
+                title,
+                ..
+            } => {
+                assert!(final_elapsed_ms.is_some());
+                assert_eq!(title, &None);
+            }
+            _ => panic!("expected ToolCall"),
+        }
+
+        // Late update arrives after completion: must be ignored per D3
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Update {
+                id: "child-done-1".into(),
+                markdown: None,
+                status: Some(ToolStatus::InProgress),
+                content: None,
+                title: Some("Late update title".into()),
+                kind: None,
+                locations: None,
+                usage: None,
+            }),
+        );
+
+        // No new row created, and original completed row title is unchanged
+        assert_eq!(
+            state
+                .transcript
+                .iter()
+                .filter(|i| matches!(i, TranscriptItem::ToolCall { .. }))
+                .count(),
+            1
+        );
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall { title, .. } => {
+                assert_eq!(title, &None);
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn child_tool_completed_terminal_status_transition() {
+        let mut state = make_child_session_state();
+
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "child-term-1".into(),
+                name: "read_file".into(),
+                kind: ToolKind::Read,
+                markdown: None,
+                input: serde_json::json!({"path": "foo.txt"}),
+                locations: vec![],
+            }),
+        );
+
+        // Update with title but status: None
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Update {
+                id: "child-term-1".into(),
+                markdown: None,
+                status: None,
+                content: None,
+                title: Some("Reading foo.txt".into()),
+                kind: None,
+                locations: None,
+                usage: None,
+            }),
+        );
+
+        // Tool completes
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Completed {
+                id: "child-term-1".into(),
+                output: serde_json::json!("content"),
+                markdown: None,
+            }),
+        );
+
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                status,
+                final_elapsed_ms,
+                ..
+            } => {
+                assert!(final_elapsed_ms.is_some());
+                assert!(matches!(*status, Some(ToolStatus::Completed)));
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn child_tool_failed_terminal_status_transition() {
+        let mut state = make_child_session_state();
+
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "child-fail-1".into(),
+                name: "exec".into(),
+                kind: ToolKind::Execute,
+                markdown: None,
+                input: serde_json::json!({"command": "fail.sh"}),
+                locations: vec![],
+            }),
+        );
+
+        // Update with locations but status: None
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Update {
+                id: "child-fail-1".into(),
+                markdown: None,
+                status: None,
+                content: None,
+                title: None,
+                kind: None,
+                locations: Some(vec![ToolLocation {
+                    path: PathBuf::from("fail.sh"),
+                    line: None,
+                }]),
+                usage: None,
+            }),
+        );
+
+        // Tool fails
+        apply_child_event(
+            &mut state,
+            AgentEvent::Tool(ToolEvent::Failed {
+                id: "child-fail-1".into(),
+                error: "command exited with code 1".into(),
+            }),
+        );
+
+        match &state.transcript[0] {
+            TranscriptItem::ToolCall {
+                status,
+                final_elapsed_ms,
+                ..
+            } => {
+                assert!(final_elapsed_ms.is_some());
+                assert!(matches!(*status, Some(ToolStatus::Failed)));
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
 }
 
 // Tests for freeze_main_unfinished_tool_timers (prompt.rs)
@@ -11618,6 +12014,11 @@ async fn freeze_main_unfinished_tool_timers_freezes_running_tools_on_turn_comple
         start_anchor: Instant::now(),
         final_elapsed_ms: None,
         rendered_cache: None,
+        title: None,
+        status: None,
+        kind: None,
+        locations: vec![],
+        usage: None,
     });
 
     // Simulate turn completion by calling freeze_main_unfinished_tool_timers indirectly
