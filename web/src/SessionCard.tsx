@@ -9,6 +9,24 @@ function activateOnKey(e: React.KeyboardEvent, action: () => void) {
   }
 }
 
+export function formatSessionContext(
+  repository?: string | null,
+  branch?: string | null,
+): string | null {
+  const repo = repository?.trim() || null;
+  const br = branch?.trim() || null;
+  if (repo && br) {
+    return `${repo} @ ${br}`;
+  }
+  if (repo) {
+    return repo;
+  }
+  if (br) {
+    return `branch ${br}`;
+  }
+  return null;
+}
+
 export function compareSessionsUnreadFirst(a: SessionRef, b: SessionRef): number {
   const aUnread = a.unread ? 1 : 0;
   const bUnread = b.unread ? 1 : 0;
@@ -28,6 +46,9 @@ export interface SessionCardProps {
 
 export const SessionCard = ({ session, onSelect, onToggleUnread }: SessionCardProps) => {
   const isUnread = Boolean(session.unread);
+  const hasTitle = Boolean(session.title && session.title.trim().length > 0);
+  const contextText = formatSessionContext(session.repository, session.branch);
+
   return (
     <div
       className="grid-item session-card"
@@ -51,6 +72,16 @@ export const SessionCard = ({ session, onSelect, onToggleUnread }: SessionCardPr
             </span>
           )}
         </div>
+        {hasTitle && (
+          <div className="session-title" data-testid="session-title">
+            {session.title}
+          </div>
+        )}
+        {contextText && (
+          <div className="session-context" data-testid="session-context">
+            {contextText}
+          </div>
+        )}
         {session.updated_at && <p>Updated: {new Date(session.updated_at).toLocaleString()}</p>}
       </div>
       {onToggleUnread && (

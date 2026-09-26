@@ -1603,6 +1603,25 @@ fn session_recency_ordering(
         .then_with(|| right.id.cmp(&left.id))
 }
 
+/// Derive repository and branch from execution contexts.
+/// Mirrors TUI picker_label logic: pick the first context with repo or branch,
+/// then take each field independently.
+pub(crate) fn session_repository_and_branch(
+    contexts: &[harnx_core::execution_context::ExecutionContextObservation],
+) -> (Option<String>, Option<String>) {
+    let matched_context = contexts
+        .iter()
+        .find(|ctx| ctx.primary_repository().is_some() || ctx.branch().is_some());
+    (
+        matched_context
+            .and_then(|ctx| ctx.primary_repository())
+            .map(|s| s.to_owned()),
+        matched_context
+            .and_then(|ctx| ctx.branch())
+            .map(|s| s.to_owned()),
+    )
+}
+
 async fn agent_sessions_json(config: &Config, target: &ResolvedAgentTarget) -> Result<Vec<Value>> {
     ensure_frontend_nats_owner(target.cluster()).await?;
     let mut sessions: Vec<_> = config
@@ -1636,6 +1655,19 @@ async fn agent_sessions_json(config: &Config, target: &ResolvedAgentTarget) -> R
                 );
             }
             value.insert(String::from("unread"), Value::Bool(session.unread));
+
+            // Derive repository and branch from contexts, mirroring TUI picker_label logic:
+            // pick the first context with repo or branch, then take each field independently.
+            let (repository, branch) = session_repository_and_branch(&session.contexts);
+            value.insert(
+                String::from("repository"),
+                repository.map(Value::String).unwrap_or(Value::Null),
+            );
+            value.insert(
+                String::from("branch"),
+                branch.map(Value::String).unwrap_or(Value::Null),
+            );
+
             Value::Object(value)
         })
         .collect())
@@ -2637,6 +2669,76 @@ mod tests {
             .collect();
 
         assert_eq!(filtered, vec![json!({"session_id": "alpha"})]);
+    }
+
+    /// Helper to build an ExecutionContextObservation with specific repo/branch.
+    fn make_context(
+        repo: Option<&str>,
+        branch: Option<&str>,
+    ) -> harnx_core::execution_context::ExecutionContextObservation {
+        use harnx_core::execution_context::{
+            ExecutionContextObservation, GitRemoteObservation, GitRepositoryObservation,
+        };
+        ExecutionContextObservation {
+            version: harnx_core::execution_context::EXECUTION_CONTEXT_VERSION,
+            observed_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+            workspace_root: "/workspace".into(),
+            working_directory: "/workspace".into(),
+            repository: repo
+                .map(|r| GitRepositoryObservation {
+                    worktree_root: "/workspace".into(),
+                    branch: branch.map(|b| b.into()),
+                    remotes: vec![GitRemoteObservation {
+                        name: "origin".into(),
+                        repository: r.into(),
+                        primary: true,
+                    }],
+                })
+                .or_else(|| {
+                    branch.map(|_b| GitRepositoryObservation {
+                        worktree_root: "/workspace".into(),
+                        branch: Some(_b.into()),
+                        remotes: vec![],
+                    })
+                }),
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn session_repository_and_branch_from_first_context_with_either() {
+        // Two contexts: first has repo only, second has both. Should pick first's repo, branch null.
+        let contexts = vec![
+            make_context(Some("github.com/owner/repo-a"), None),
+            make_context(Some("github.com/owner/repo-b"), Some("feature")),
+        ];
+        let (repo, branch) = session_repository_and_branch(&contexts);
+        assert_eq!(repo, Some("github.com/owner/repo-a".to_string()));
+        assert_eq!(branch, None);
+    }
+
+    #[test]
+    fn session_repository_and_branch_branch_is_null_when_context_has_repo_only() {
+        let contexts = vec![make_context(Some("github.com/owner/example"), None)];
+        let (repo, branch) = session_repository_and_branch(&contexts);
+        assert_eq!(repo, Some("github.com/owner/example".to_string()));
+        assert_eq!(branch, None);
+    }
+
+    #[test]
+    fn session_repository_and_branch_repository_is_null_when_context_has_branch_only() {
+        let contexts = vec![make_context(None, Some("main"))];
+        let (repo, branch) = session_repository_and_branch(&contexts);
+        assert_eq!(repo, None);
+        assert_eq!(branch, Some("main".to_string()));
+    }
+
+    #[test]
+    fn session_repository_and_branch_repository_and_branch_null_when_empty_contexts() {
+        let contexts: Vec<_> = vec![];
+        let (repo, branch) = session_repository_and_branch(&contexts);
+        assert_eq!(repo, None);
+        assert_eq!(branch, None);
     }
 
     #[test]

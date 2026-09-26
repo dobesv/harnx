@@ -605,7 +605,38 @@ export const happyPathHandlers = [
       // Fixed timestamp so session-list screenshots are deterministic without
       // needing to freeze the browser's Date.now (freezing it collides message
       // ids/timestamps in the assistant-ui runtime and drops streamed messages).
-      { session_id: 'session-1', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-gallery', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-pending', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-restored', updated_at: '2024-01-01T12:00:00.000Z' }
+      {
+        session_id: 'session-1',
+        title: 'Fix login redirect issue',
+        repository: 'dobesv/harnx',
+        branch: 'fix-login',
+        updated_at: '2024-01-01T12:00:00.000Z',
+        unread: true,
+      },
+      {
+        session_id: 'session-gallery',
+        title: 'Component Gallery',
+        repository: 'dobesv/harnx',
+        branch: null,
+        updated_at: '2024-01-01T12:00:00.000Z',
+        unread: false,
+      },
+      {
+        session_id: 'session-pending',
+        title: null,
+        repository: null,
+        branch: 'feature/async-tools',
+        updated_at: '2024-01-01T12:00:00.000Z',
+        unread: false,
+      },
+      {
+        session_id: 'session-restored',
+        title: null,
+        repository: null,
+        branch: null,
+        updated_at: '2024-01-01T12:00:00.000Z',
+        unread: false,
+      },
     ]);
   }),
 
