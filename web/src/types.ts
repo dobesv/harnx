@@ -9,6 +9,8 @@ export interface Agent {
 export interface SessionRef {
   session_id: string;
   title?: string | null;
+  repository?: string | null;
+  branch?: string | null;
   updated_at?: string | number | null;
   unread?: boolean;
   [key: string]: unknown;

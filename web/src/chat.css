@@ -91,6 +91,21 @@ body {
   flex-shrink: 0;
 }
 
+.session-title {
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--text-h);
+  margin-bottom: 0.25rem;
+  overflow-wrap: anywhere;
+}
+
+.session-context {
+  font-size: 0.85rem;
+  color: var(--text);
+  margin-bottom: 0.35rem;
+  overflow-wrap: anywhere;
+}
+
 .session-item-actions {
   display: flex;
   align-items: center;

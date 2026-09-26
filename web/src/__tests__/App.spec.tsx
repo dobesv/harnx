@@ -890,6 +890,46 @@ describe('SessionPicker', () => {
     expect(onToggleUnread).toHaveBeenCalledWith('session-new-read', false);
     expect(onSelect).not.toHaveBeenCalled();
   });
+
+  it('renders title and repo/branch context on session cards when present', () => {
+    const sessionsWithMeta = [
+      {
+        session_id: 'session-full',
+        title: 'Full metadata session',
+        repository: 'dobesv/harnx',
+        branch: 'feat/meta',
+        updated_at: '2026-01-01T00:00:00Z',
+        unread: false,
+      },
+      {
+        session_id: 'session-bare',
+        title: null,
+        repository: null,
+        branch: null,
+        updated_at: '2026-01-02T00:00:00Z',
+        unread: false,
+      },
+    ];
+
+    render(
+      <SessionPicker
+        agentName="test-agent"
+        sessions={sessionsWithMeta}
+        sessionsError={null}
+        sessionsLoading={false}
+        hasLoadedSessions={true}
+        onRetry={vi.fn()}
+        onSelect={vi.fn()}
+        onNewChat={vi.fn()}
+        onBack={vi.fn()}
+      />
+    );
+
+    expect(screen.getByTestId('session-title')).toHaveTextContent('Full metadata session');
+    expect(screen.getByTestId('session-context')).toHaveTextContent('dobesv/harnx @ feat/meta');
+    expect(screen.getAllByTestId('session-title')).toHaveLength(1);
+    expect(screen.getAllByTestId('session-context')).toHaveLength(1);
+  });
 });
 
 describe('MyMessage attachment rendering', () => {
