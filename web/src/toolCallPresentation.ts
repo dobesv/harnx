@@ -62,8 +62,6 @@ export type ToolCallPresentationOptions = {
   isSubAgent?: boolean;
   /** Live update kind; supersedes default icon when present */
   kind?: ToolKind;
-  /** Live update status; used for border color */
-  liveStatus?: ToolStatus;
 };
 
 type ToolCallStatusFlags = { isPending: boolean; isActionRequired: boolean };
@@ -178,33 +176,11 @@ function resolveToolCallIcon(
   return toolCallIcon(flags, isError);
 }
 
-/**
- * Get border color considering live status updates.
- * Terminal states (complete, error, action-required) take precedence over liveStatus.
- * liveStatus is only consulted while the tool call is still running.
- */
 function resolveBorderColor(
   status: ToolCallStatusInput,
   flags: ToolCallStatusFlags,
   isError: boolean | undefined,
-  liveStatus?: ToolStatus,
 ): string {
-  // Terminal states take precedence - they must never be masked by stale liveStatus
-  if (!flags.isPending || flags.isActionRequired || isError) {
-    return toolCallBorderColor(status, flags, isError);
-  }
-  // Only consult liveStatus while running/pending
-  if (liveStatus) {
-    switch (liveStatus) {
-      case 'Pending':
-      case 'InProgress':
-        return 'var(--status-running)';
-      case 'Completed':
-      case 'Failed':
-        // Terminal liveStatus - fall through to standard logic
-        break;
-    }
-  }
   return toolCallBorderColor(status, flags, isError);
 }
 
@@ -219,7 +195,7 @@ export function getToolCallPresentation(
 
   return {
     icon: resolveToolCallIcon(flags, isError, opts.kind),
-    borderColor: resolveBorderColor(status, flags, isError, opts.liveStatus),
+    borderColor: resolveBorderColor(status, flags, isError),
     defaultExpanded: flags.isActionRequired || isSubAgent,
   };
 }

@@ -3,7 +3,7 @@ import type { ToolCallMessagePartProps } from '@assistant-ui/react';
 import { JsonView, darkStyles, defaultStyles } from 'react-json-view-lite';
 import 'react-json-view-lite/dist/index.css';
 import { UsageContext } from './UsageContext';
-import type { ToolCallState } from './toolUpdates';
+import type { ToolCallLocation, ToolCallState } from './toolUpdates';
 import {
   classifyToolCallStatus,
   extractResultContent,
@@ -207,17 +207,81 @@ interface ToolCallHeaderProps {
   expanded: boolean;
   onToggle: () => void;
   headerSummaryMarkdown: string | null;
-  fallbackPreview: string | null;
+  fallbackPreview: React.ReactNode;
   elapsedText?: string | null;
-  locations?: { path: string; line?: number }[];
+  locations?: ToolCallLocation[];
 }
 
-/**
- * Format a single location for display.
- */
-function formatLocation(loc: { path: string; line?: number }): string {
-  const fileName = loc.path.split(/[/\\]/).pop() || loc.path;
-  return loc.line !== undefined ? `${fileName}:${loc.line}` : fileName;
+function formatLocation(location: ToolCallLocation): string {
+  const fileName = location.path.split(/[/\\]/).pop() || location.path;
+  return location.line !== undefined ? `${fileName}:${location.line}` : fileName;
+}
+
+const ToolCallLocations: React.FC<{ locations?: ToolCallLocation[] }> = ({ locations }) => {
+  if (!locations?.length) return null;
+  return (
+    <span
+      className="aui-tool-call-locations"
+      style={{ marginLeft: '0.5em', fontWeight: 'normal', opacity: 0.7 }}
+    >
+      {locations.slice(0, 3).map(formatLocation).join(', ')}
+      {locations.length > 3 && ` +${locations.length - 3} more`}
+    </span>
+  );
+};
+
+interface ToolCallSummaryContentProps {
+  headerSummaryMarkdown?: string | null;
+  fallbackPreview?: React.ReactNode;
+  expanded: boolean;
+}
+
+const ToolCallSummaryContent: React.FC<ToolCallSummaryContentProps> = ({
+  headerSummaryMarkdown,
+  fallbackPreview,
+  expanded,
+}) => {
+  if (headerSummaryMarkdown) {
+    return <ToolSummaryPreview markdown={headerSummaryMarkdown} expanded={expanded} />;
+  }
+  if (!fallbackPreview) return null;
+  const stateClass = expanded ? 'aui-tool-summary-expanded' : 'aui-tool-summary-collapsed';
+  return <div className={`aui-tool-summary ${stateClass}`}>{fallbackPreview}</div>;
+};
+
+interface ToolCallHeaderTitleProps {
+  icon: string;
+  toolName: string;
+  title?: string | null;
+  elapsedText?: string | null;
+  locations?: ToolCallLocation[];
+}
+
+const ToolCallHeaderTitle: React.FC<ToolCallHeaderTitleProps> = ({
+  icon,
+  toolName,
+  title,
+  elapsedText,
+  locations,
+}) => (
+  <div className="aui-tool-call-header-title">
+    <span className="aui-tool-call-icon">{icon}</span>
+    <span className="aui-tool-call-label">
+      <strong>{title || toolName}</strong>
+      {elapsedText && <span className="aui-tool-call-elapsed"> ({elapsedText})</span>}
+      <ToolCallLocations locations={locations} />
+    </span>
+  </div>
+);
+
+function handleToolCallHeaderKeyDown(
+  event: React.KeyboardEvent<HTMLDivElement>,
+  onToggle: () => void,
+): void {
+  if (event.target !== event.currentTarget) return;
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  onToggle();
 }
 
 const ToolCallHeader: React.FC<ToolCallHeaderProps> = ({
@@ -234,38 +298,24 @@ const ToolCallHeader: React.FC<ToolCallHeaderProps> = ({
   <div
     className="aui-tool-call-header"
     onClick={onToggle}
-    onKeyDown={(e) => {
-      if (e.target !== e.currentTarget) return;
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        onToggle();
-      }
-    }}
+    onKeyDown={(event) => handleToolCallHeaderKeyDown(event, onToggle)}
     role="button"
     tabIndex={0}
     aria-expanded={expanded}
   >
     <div className="aui-tool-call-header-content">
-      <div className="aui-tool-call-header-title">
-        <span className="aui-tool-call-icon">{icon}</span>
-        <span className="aui-tool-call-label">
-          <strong>{title || toolName}</strong>
-          {elapsedText && <span className="aui-tool-call-elapsed"> ({elapsedText})</span>}
-          {locations && locations.length > 0 && (
-            <span className="aui-tool-call-locations" style={{ marginLeft: '0.5em', fontWeight: 'normal', opacity: 0.7 }}>
-              {locations.slice(0, 3).map(formatLocation).join(', ')}
-              {locations.length > 3 && ` +${locations.length - 3} more`}
-            </span>
-          )}
-        </span>
-      </div>
-      {headerSummaryMarkdown ? (
-        <ToolSummaryPreview markdown={headerSummaryMarkdown} expanded={expanded} />
-      ) : fallbackPreview ? (
-        <div className={`aui-tool-summary ${expanded ? 'aui-tool-summary-expanded' : 'aui-tool-summary-collapsed'}`}>
-          {fallbackPreview}
-        </div>
-      ) : null}
+      <ToolCallHeaderTitle
+        icon={icon}
+        toolName={toolName}
+        title={title}
+        elapsedText={elapsedText}
+        locations={locations}
+      />
+      <ToolCallSummaryContent
+        headerSummaryMarkdown={headerSummaryMarkdown}
+        fallbackPreview={fallbackPreview}
+        expanded={expanded}
+      />
     </div>
     <div className="aui-tool-call-chevron" aria-hidden="true">
       {expanded ? '▾' : '▸'}
@@ -460,18 +510,25 @@ function resolveToolContent({
   };
 }
 
-function computeToolPresentation(
-  status: any,
-  isError: boolean | undefined,
-  toolName: string | undefined,
-  isSubAgent: boolean,
-  liveUpdate: ToolCallState | undefined,
-) {
+interface ComputeToolPresentationOptions {
+  status: any;
+  isError: boolean | undefined;
+  toolName: string | undefined;
+  isSubAgent: boolean;
+  liveUpdate?: ToolCallState;
+}
+
+function computeToolPresentation({
+  status,
+  isError,
+  toolName,
+  isSubAgent,
+  liveUpdate,
+}: ComputeToolPresentationOptions) {
   return getToolCallPresentation(status, isError, {
     toolName,
     isSubAgent,
     kind: liveUpdate?.kind,
-    liveStatus: liveUpdate?.status,
   });
 }
 
@@ -606,13 +663,13 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
     storedSummary: toolSummaries.get(effectiveId),
     liveMarkdown: liveUpdate?.markdown,
   });
-  const { icon, borderColor, defaultExpanded } = computeToolPresentation(
+  const { icon, borderColor, defaultExpanded } = computeToolPresentation({
     status,
     isError,
     toolName,
-    content.isSubAgent,
+    isSubAgent: content.isSubAgent,
     liveUpdate,
-  );
+  });
   const [expanded, setExpanded] = useState(defaultExpanded);
   const [viewSource, setViewSource] = useState(false);
   const elapsedText = useToolElapsedText(status, toolName);
