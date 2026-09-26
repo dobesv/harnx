@@ -1,4 +1,5 @@
 import { createContext } from 'react';
+import type { ToolUpdatesState } from './toolUpdates';
 
 export interface UsageData {
   input: number;
@@ -13,7 +14,9 @@ export interface UsageData {
 export const UsageContext = createContext<{
   usage: UsageData | null;
   toolSummaries: Map<string, string>;
+  toolUpdates: ToolUpdatesState;
 }>({
   usage: null,
   toolSummaries: new Map(),
+  toolUpdates: new Map(),
 });

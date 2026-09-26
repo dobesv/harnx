@@ -792,6 +792,121 @@ fn ag_ui_sink_usage_event_includes_context_fields_and_legacy_fields() {
 }
 
 #[test]
+fn ag_ui_sink_emits_tool_update_custom_event() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+
+    sink.emit(AgentEvent::Tool(ToolEvent::Update {
+        id: "tc-123".to_string(),
+        markdown: Some("Updated summary".to_string()),
+        status: Some(harnx_core::event::ToolStatus::InProgress),
+        content: None,
+        title: Some("Refining...".to_string()),
+        kind: Some(harnx_core::event::ToolKind::Read),
+        locations: Some(vec![harnx_core::event::ToolLocation {
+            path: std::path::PathBuf::from("src/main.rs"),
+            line: Some(42),
+        }]),
+        usage: Some(harnx_core::api_types::CompletionTokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 10,
+            cache_write_tokens: 0,
+        }),
+    }));
+
+    match rx.try_recv().expect("tool_update event") {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "tool_update");
+            assert_eq!(value["tool_call_id"], "tc-123");
+            assert_eq!(value["markdown"], "Updated summary");
+            assert_eq!(value["status"], "InProgress");
+            assert_eq!(value["title"], "Refining...");
+            assert_eq!(value["kind"], "Read");
+            assert_eq!(
+                value["locations"],
+                json!([{"path": "src/main.rs", "line": 42}])
+            );
+            assert_eq!(
+                value["usage"],
+                json!({"input_tokens": 100, "output_tokens": 50, "cached_tokens": 10, "cache_write_tokens": 0})
+            );
+        }
+        other => panic!("expected tool_update custom event, got: {other:?}"),
+    }
+
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn ag_ui_sink_emits_tool_update_with_partial_fields() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+
+    // Only title, no markdown or locations
+    sink.emit(AgentEvent::Tool(ToolEvent::Update {
+        id: "tc-456".to_string(),
+        markdown: None,
+        status: None,
+        content: None,
+        title: Some("Computing...".to_string()),
+        kind: None,
+        locations: None,
+        usage: None,
+    }));
+
+    match rx.try_recv().expect("tool_update event") {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "tool_update");
+            assert_eq!(value["tool_call_id"], "tc-456");
+            assert_eq!(value["title"], "Computing...");
+            // Omitted fields are not present in the JSON payload
+            assert!(value.get("markdown").is_none());
+            assert!(value.get("status").is_none());
+            assert!(value.get("kind").is_none());
+            assert!(value.get("locations").is_none());
+            assert!(value.get("usage").is_none());
+        }
+        other => panic!("expected tool_update custom event, got: {other:?}"),
+    }
+
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn ag_ui_sink_emits_tool_update_with_empty_locations() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+
+    // Empty locations array clears previous locations
+    sink.emit(AgentEvent::Tool(ToolEvent::Update {
+        id: "tc-789".to_string(),
+        markdown: None,
+        status: None,
+        content: None,
+        title: None,
+        kind: None,
+        locations: Some(vec![]),
+        usage: None,
+    }));
+
+    match rx.try_recv().expect("tool_update event") {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "tool_update");
+            assert_eq!(value["tool_call_id"], "tc-789");
+            // Empty array is sent explicitly
+            assert_eq!(value["locations"], json!([]));
+        }
+        other => panic!("expected tool_update custom event, got: {other:?}"),
+    }
+
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn ag_ui_sink_maps_tool_failures_and_blocked_to_results() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let message_id = MessageId::from(uuid::Uuid::new_v4());

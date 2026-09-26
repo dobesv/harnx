@@ -2,6 +2,7 @@ import { render, screen, fireEvent, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ToolCallCard } from './ToolCallCard';
 import { UsageContext } from './UsageContext';
+import type { ToolCallState } from './toolUpdates';
 
 vi.mock('@assistant-ui/react-markdown', () => ({
   MarkdownTextPrimitive: ({ text, children }: any) => <div>{text}{children}</div>
@@ -35,11 +36,39 @@ vi.mock('react-json-view-lite', () => ({
 }));
 
 describe('ToolCallCard', () => {
-  function renderWithContext(props: any, summaries = new Map()) {
+  function renderWithContext(props: any, summaries = new Map(), toolUpdates = new Map()) {
     return render(
-      <UsageContext.Provider value={{ usage: null, toolSummaries: summaries }}>
+      <UsageContext.Provider value={{ usage: null, toolSummaries: summaries, toolUpdates }}>
         <ToolCallCard {...props} />
       </UsageContext.Provider>
+    );
+  }
+
+  interface LiveUpdateTestOptions {
+    props?: Record<string, unknown>;
+    summaries?: Map<string, string>;
+  }
+
+  function renderLiveUpdateTestCard(
+    toolCallId: string,
+    liveUpdate: Partial<ToolCallState>,
+    options: LiveUpdateTestOptions = {},
+  ) {
+    const props = {
+      toolName: 'my_tool',
+      toolCallId,
+      status: { type: 'running' },
+      ...options.props,
+    };
+    const update: ToolCallState = {
+      tool_call_id: toolCallId,
+      locations: [],
+      ...liveUpdate,
+    };
+    return renderWithContext(
+      props,
+      options.summaries,
+      new Map([[toolCallId, update]]),
     );
   }
 
@@ -618,7 +647,7 @@ describe('ToolCallCard', () => {
 
       // Complete the tool call
       rerender(
-        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map() }}>
+        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map(), toolUpdates: new Map() }}>
           <ToolCallCard {...props} status={{ type: 'complete' }} />
         </UsageContext.Provider>
       );
@@ -682,7 +711,7 @@ describe('ToolCallCard', () => {
 
       // Complete the tool call
       rerender(
-        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map() }}>
+        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map(), toolUpdates: new Map() }}>
           <ToolCallCard {...props} status={{ type: 'complete' }} />
         </UsageContext.Provider>
       );
@@ -729,7 +758,7 @@ describe('ToolCallCard', () => {
 
       // Complete the tool call
       rerender(
-        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map() }}>
+        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map(), toolUpdates: new Map() }}>
           <ToolCallCard {...props} status={{ type: 'complete' }} />
         </UsageContext.Provider>
       );
@@ -742,6 +771,110 @@ describe('ToolCallCard', () => {
       // Timer should still show the frozen value (around 8s), not (13s)
       expect(screen.getByText(/\(8s\)/)).toBeInTheDocument();
       expect(screen.queryByText(/\(13s\)/)).not.toBeInTheDocument();
+    });
+  });
+
+  describe('live updates', () => {
+    function expectCardBorder(expectedColor: string, excludedColor?: string) {
+      const toolCallDiv = screen.getByText('my_tool').closest('.aui-tool-call');
+      expect(toolCallDiv).toHaveAttribute('style');
+      expect(toolCallDiv?.getAttribute('style')).toContain(expectedColor);
+      if (excludedColor) {
+        expect(toolCallDiv?.getAttribute('style')).not.toContain(excludedColor);
+      }
+    }
+
+    it('displays live title instead of tool name', () => {
+      renderLiveUpdateTestCard('tc-live-title', {
+        title: 'Refining results...',
+      });
+      expect(screen.getByText('Refining results...')).toBeInTheDocument();
+      expect(screen.queryByText('my_tool')).not.toBeInTheDocument();
+    });
+
+    it('displays live markdown summary', () => {
+      const toolCallId = 'tc-live-md';
+      renderLiveUpdateTestCard(
+        toolCallId,
+        { markdown: 'Fresh live summary' },
+        { summaries: new Map([[toolCallId, 'Stale summary']]) },
+      );
+      expect(screen.getByText('Fresh live summary')).toBeInTheDocument();
+    });
+
+    it('displays live locations in header', () => {
+      renderLiveUpdateTestCard('tc-live-loc', {
+        locations: [
+          { path: 'src/main.rs', line: 42 },
+          { path: 'lib/utils.ts' },
+        ],
+      });
+      expect(screen.getByText(/main\.rs:42/)).toBeInTheDocument();
+      expect(screen.getByText(/utils\.ts/)).toBeInTheDocument();
+    });
+
+    it('uses kind icon when provided', () => {
+      renderLiveUpdateTestCard('tc-live-kind', { kind: 'Read' });
+      expect(screen.getByText('📄')).toBeInTheDocument();
+    });
+
+    it('uses live status for border color while running', () => {
+      renderLiveUpdateTestCard('tc-live-status', { status: 'InProgress' });
+      expectCardBorder('var(--status-running)');
+    });
+
+    it('terminal status overrides stale liveStatus on completion', () => {
+      renderLiveUpdateTestCard(
+        'tc-terminal-status',
+        { status: 'InProgress' },
+        { props: { status: { type: 'complete' } } },
+      );
+      expectCardBorder('var(--status-complete)', 'var(--status-running)');
+    });
+
+    it('error status overrides stale liveStatus', () => {
+      renderLiveUpdateTestCard(
+        'tc-error-status',
+        { status: 'InProgress' },
+        { props: { status: { type: 'incomplete' }, isError: true } },
+      );
+      expectCardBorder('var(--status-error)', 'var(--status-running)');
+    });
+
+    it('kind icon does not mask error icon', () => {
+      renderLiveUpdateTestCard(
+        'tc-kind-error',
+        { kind: 'Read' },
+        { props: { status: { type: 'complete' }, isError: true } },
+      );
+      expect(screen.getByText('❌')).toBeInTheDocument();
+      expect(screen.queryByText('📄')).not.toBeInTheDocument();
+    });
+
+    it('kind icon does not mask action-required icon', () => {
+      renderLiveUpdateTestCard(
+        'tc-kind-action',
+        { kind: 'Edit' },
+        { props: { status: { type: 'requires-action', reason: 'interrupt' } } },
+      );
+      expect(screen.getByText('⚠️')).toBeInTheDocument();
+      expect(screen.queryByText('✏️')).not.toBeInTheDocument();
+    });
+
+    it('shows only first 3 locations with count', () => {
+      renderLiveUpdateTestCard('tc-live-many', {
+        locations: [
+          { path: 'a.rs' },
+          { path: 'b.rs', line: 1 },
+          { path: 'c.rs' },
+          { path: 'd.rs' },
+          { path: 'e.rs' },
+        ],
+      });
+      expect(screen.getByText(/a\.rs/)).toBeInTheDocument();
+      expect(screen.getByText(/b\.rs:1/)).toBeInTheDocument();
+      expect(screen.getByText(/c\.rs/)).toBeInTheDocument();
+      expect(screen.getByText(/\+2 more/)).toBeInTheDocument();
     });
   });
 });
