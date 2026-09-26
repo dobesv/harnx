@@ -9,12 +9,13 @@ use std::sync::Arc;
 
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::v1::{
-    AuthenticateRequest, CancelNotification, InitializeRequest, LoadSessionRequest,
-    NewSessionRequest, PromptRequest, PromptResponse,
+    AuthenticateRequest, CancelNotification, InitializeRequest, ListSessionsRequest,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse,
 };
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::HarnxAgent;
+use crate::{AcpConnection, HarnxAgent};
 
 type StdioStreams = acp::ByteStreams<Compat<tokio::io::Stdout>, Compat<tokio::io::Stdin>>;
 
@@ -40,6 +41,7 @@ async fn register_handlers(agent: Arc<HarnxAgent>, streams: StdioStreams) -> any
     let authenticate_agent = Arc::clone(&agent);
     let new_agent = Arc::clone(&agent);
     let load_agent = Arc::clone(&agent);
+    let list_agent = Arc::clone(&agent);
     let prompt_agent = Arc::clone(&agent);
     let cancel_agent = Arc::clone(&agent);
     acp::Agent
@@ -62,41 +64,83 @@ async fn register_handlers(agent: Arc<HarnxAgent>, streams: StdioStreams) -> any
         .on_receive_request_from(
             acp::Client,
             async move |request: NewSessionRequest, responder, cx| {
-                new_agent.set_connection(cx.clone()).await;
-                responder.respond(new_agent.new_session(request).await?)
+                handle_new_session(&new_agent, request, responder, cx).await
             },
             acp::on_receive_request!(),
         )
         .on_receive_request_from(
             acp::Client,
             async move |request: LoadSessionRequest, responder, cx| {
-                load_agent.set_connection(cx.clone()).await;
-                responder.respond(load_agent.load_session(request).await?)
+                handle_load_session(&load_agent, request, responder, cx).await
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request_from(
+            acp::Client,
+            async move |request: ListSessionsRequest, responder, _cx| {
+                responder.respond(list_agent.list_sessions(request).await?)
             },
             acp::on_receive_request!(),
         )
         .on_receive_request_from(
             acp::Client,
             async move |request: PromptRequest, responder, cx| {
-                prompt_agent.set_connection(cx.clone()).await;
-                spawn_prompt_request(Arc::clone(&prompt_agent), request, responder);
-                Ok(())
+                handle_prompt_request(&prompt_agent, request, responder, cx).await
             },
             acp::on_receive_request!(),
         )
         .on_receive_notification_from(
             acp::Client,
             async move |notification: CancelNotification, cx| {
-                cancel_agent.set_connection(cx.clone()).await;
-                if let Err(error) = cancel_agent.cancel(notification).await {
-                    tracing::warn!("cancel failed: {error:#}");
-                }
+                handle_cancel_notification(&cancel_agent, notification, cx).await;
                 Ok(())
             },
             acp::on_receive_notification!(),
         )
         .connect_to(streams)
         .await?;
+    Ok(())
+}
+
+async fn handle_new_session(
+    agent: &HarnxAgent,
+    request: NewSessionRequest,
+    responder: acp::Responder<NewSessionResponse>,
+    cx: AcpConnection,
+) -> acp::Result<()> {
+    agent.set_connection(cx).await;
+    responder.respond(agent.new_session(request).await?)
+}
+
+async fn handle_load_session(
+    agent: &HarnxAgent,
+    request: LoadSessionRequest,
+    responder: acp::Responder<LoadSessionResponse>,
+    cx: AcpConnection,
+) -> acp::Result<()> {
+    agent.set_connection(cx).await;
+    responder.respond(agent.load_session(request).await?)
+}
+
+async fn handle_cancel_notification(
+    agent: &HarnxAgent,
+    notification: CancelNotification,
+    cx: AcpConnection,
+) {
+    agent.set_connection(cx).await;
+    if let Err(error) = agent.cancel(notification).await {
+        tracing::warn!("cancel failed: {error:#}");
+    }
+}
+
+async fn handle_prompt_request(
+    agent: &Arc<HarnxAgent>,
+    request: PromptRequest,
+    responder: acp::Responder<PromptResponse>,
+    cx: AcpConnection,
+) -> acp::Result<()> {
+    agent.set_connection(cx).await;
+    spawn_prompt_request(Arc::clone(agent), request, responder);
     Ok(())
 }
 

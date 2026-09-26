@@ -17,7 +17,7 @@ pub use keys::{
     activity_key, invalidation_subject, metadata_key, read_cursor_key, read_invalidation_subject,
     session_prefix,
 };
-pub(super) use lookup::metadata_belongs_to_agent;
+pub use lookup::metadata_belongs_to_agent;
 pub(in crate::nats_session_metadata) use mutation::is_cas_conflict;
 pub(in crate::nats_session_metadata) use mutation::PatchGuard;
 
