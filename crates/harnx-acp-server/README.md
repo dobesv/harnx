@@ -25,10 +25,13 @@ cluster and agent, reads one durable transcript snapshot, and replays user,
 assistant, and tool entries in order. Durable control records such as turn-end,
 handoff, and approval markers remain silent.
 
-Loaded sessions are read-only snapshots in this phase. Loading does not attach
-a live event subscription or make the loaded ID available to `session/prompt`;
-load again to include entries committed after the prior snapshot. Session
-list, resume, close, and delete remain unsupported and unadvertised.
+After replay, a loaded session has a live `SessionContext`, so subsequent
+`session/prompt` and `session/cancel` operations work the same as on a newly
+created session. If the transcript contains a `HandoffCommitted` record, the
+session is marked deactivated and rejects future prompts with an actionable
+handoff-target error.
+
+Session list, resume, close, and delete remain unsupported and unadvertised.
 
 ### Handoff limitation
 

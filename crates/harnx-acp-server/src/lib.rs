@@ -3,7 +3,7 @@
 //! Implements ACP v1 protocol with:
 //! - `initialize` negotiating protocol version 1
 //! - `session/new` creating NATS-backed sessions via local worker
-//! - `session/load` replaying scoped durable transcript snapshots
+//! - `session/load` replaying durable transcript and establishing session context
 //! - `session/prompt` running turn with in-order streaming
 //! - `session/request_permission` bridging gated tools to ACP clients
 //! - committed handoffs producing an actionable fallback and deactivating source
@@ -231,7 +231,11 @@ impl HarnxAgent {
         Ok(NewSessionResponse::new(SessionId::new(session_id)))
     }
 
-    /// Handle `session/load` as an ordered, read-only durable transcript snapshot.
+    /// Handle `session/load` by replaying durable transcript and establishing session context.
+    ///
+    /// After replaying the historical transcript as an ordered snapshot, establishes a
+    /// `SessionContext` so subsequent `session/prompt` and `session/cancel` calls succeed.
+    /// If replay or validation fails, no session context is inserted.
     pub async fn load_session(
         &self,
         request: LoadSessionRequest,
@@ -244,7 +248,7 @@ impl HarnxAgent {
             %session_id,
             mcp_server_count = request.mcp_servers.len(),
             additional_directory_count = request.additional_directories.len(),
-            "loading read-only ACP session snapshot"
+            "loading ACP session from durable transcript"
         );
         let connection = self.get_connection().await.ok_or_else(|| {
             acp_error(anyhow::anyhow!(
@@ -252,14 +256,70 @@ impl HarnxAgent {
             ))
         })?;
         let entries = self.load_scoped_entries(&session_id).await?;
-        let (sink, drain_rx) = AcpEventSink::for_replay(session_id, self.cluster.clone());
+        let (sink, drain_rx) = AcpEventSink::for_replay(session_id.clone(), self.cluster.clone());
         let sink = Arc::new(sink);
         let drain_handle = tokio::spawn(drain_updates(Some(connection), drain_rx));
 
         harnx_runtime::replay_entries_to_sink(&entries, sink.clone());
         sink.signal_complete();
         finish_update_drain(drain_handle).await;
+
+        // Establish session context for subsequent prompt/cancel operations
+        self.establish_session_context(&session_id, &entries)
+            .await?;
+        debug!(session_id = %session_id, "established session context after load");
+
         Ok(LoadSessionResponse::new())
+    }
+
+    /// Establish a `SessionContext` for an existing loaded session.
+    ///
+    /// This mirrors `new_session` but reuses an existing session ID from durable storage.
+    /// Called after successful replay validation in `load_session`.
+    ///
+    /// If the replayed entries contain a `HandoffCommitted` record, the session is
+    /// deactivated (rejects future prompts) by applying the handoff target to the context.
+    async fn establish_session_context(
+        &self,
+        session_id: &str,
+        entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    ) -> acp::Result<()> {
+        let (activation_route, global_config) = self.backend_config().await?;
+
+        let initializer = self.session_initializer.clone().unwrap_or_else(|| {
+            harnx_runtime::SessionInitializer::named(self.agent_name.clone(), Default::default())
+        });
+        let session_config = harnx_runtime::NatsSessionConfig {
+            cluster: self.cluster.clone(),
+            initializer,
+            session_id: Some(session_id.to_string()),
+            activation_route,
+        };
+
+        let nats_session = harnx_runtime::NatsSession::from_global_config(
+            session_config,
+            &global_config,
+            self.abort_signal.clone(),
+        )
+        .await
+        .context("failed to create NATS session for loaded session")
+        .map_err(acp_error)?;
+
+        let session_ctx = Arc::new(SessionContext::new(nats_session));
+        session_ctx.touch();
+
+        // Rehydrate handoff state from durable transcript.
+        // If the session was committed as handed off, mark it deactivated.
+        if let Some(target) = find_handoff_target(entries, &self.cluster) {
+            session_ctx.commit_handoff(target);
+        }
+
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session_ctx);
+
+        Ok(())
     }
 
     async fn load_scoped_entries(
@@ -534,6 +594,29 @@ fn parse_prompt_content(request: &PromptRequest) -> String {
 fn acp_error(e: anyhow::Error) -> acp::Error {
     // Use JSON-RPC internal error code
     acp::Error::new(-32603, format!("{:#}", e))
+}
+
+/// Find the most recent `HandoffCommitted` entry in the transcript and construct a `HandoffTarget`.
+fn find_handoff_target(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    source_cluster: &str,
+) -> Option<HandoffTarget> {
+    // Iterate in reverse to find the most recent handoff (highest seq)
+    for (_seq, entry) in entries.iter().rev() {
+        if let harnx_core::session::SessionLogEntry::HandoffCommitted {
+            target_agent,
+            target_session_id,
+            handoff_tool_call_id: _,
+        } = entry
+        {
+            if let Some(target) =
+                HandoffTarget::from_committed(target_agent, target_session_id, source_cluster)
+            {
+                return Some(target);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
