@@ -221,6 +221,21 @@ async fn wait_for_prompt_abort(abort: Option<harnx_runtime::utils::AbortSignal>)
     }
 }
 
+/// Determine what terminal status to emit (if any) when resolving a tool confirmation modal.
+/// Emits `Some(Working)` only if a confirmation modal was actually active and the LLM is still busy;
+/// otherwise returns `None` so no-op calls (e.g. during cancellation) or calls after turn-end
+/// do not emit Working and overwrite other terminal states (such as Interrupted).
+pub(crate) fn modal_resolve_terminal_status(
+    was_confirm_modal: bool,
+    llm_busy: bool,
+) -> Option<crate::terminal_status::TerminalStatus> {
+    if was_confirm_modal && llm_busy {
+        Some(crate::terminal_status::TerminalStatus::Working)
+    } else {
+        None
+    }
+}
+
 impl Tui {
     pub(super) async fn handle_tool_confirmation_event(&mut self, event: ToolConfirmationEvent) {
         match event {
@@ -333,6 +348,8 @@ impl Tui {
         let now = Instant::now();
         self.app.pending_confirm_reply = Some(reply);
         self.app.pending_confirm_id = Some(confirmation_id);
+        // Emit terminal status: tool confirmation modal opened.
+        crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Blocked);
         self.app.modal = Some(ModalState::ConfirmToolUse(Box::new(
             crate::types::ConfirmToolUseState {
                 arguments,
@@ -542,6 +559,8 @@ impl Tui {
     /// Resolve an in-flight tool-use confirmation: send the decision to the
     /// worker-side async task and dismiss the modal.
     pub(super) fn resolve_tool_confirm(&mut self, allow: bool) {
+        // Check if a confirmation modal was actually open before clearing.
+        let was_confirm_modal = matches!(self.app.modal, Some(ModalState::ConfirmToolUse(_)));
         if let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_ref() {
             state
                 .submission_cancel
@@ -552,6 +571,14 @@ impl Tui {
         }
         self.app.pending_confirm_id = None;
         self.app.modal = None;
+        // Emit terminal status: tool confirmation modal closed.
+        // Re-emit Working if llm_busy is still true, otherwise the subsequent
+        // turn-end will emit Done.
+        // Only emit if there was actually a modal open; otherwise this is a
+        // no-op call during cancellation and we should not overwrite Interrupted.
+        if let Some(status) = modal_resolve_terminal_status(was_confirm_modal, self.app.llm_busy) {
+            crate::terminal_status::set_status(status);
+        }
     }
 
     pub(super) fn render_tool_confirm_overlay(
@@ -880,5 +907,38 @@ mod tests {
 
         assert!(yaml.contains(tail));
         assert!(yaml.len() > 160);
+    }
+}
+
+// =========================================================================
+// Unit tests for resolve_tool_confirm modal-close emission
+// =========================================================================
+
+#[cfg(test)]
+mod resolve_confirm_tests {
+    use super::modal_resolve_terminal_status;
+    use crate::terminal_status::TerminalStatus;
+
+    #[test]
+    fn emits_working_when_modal_was_active_and_llm_is_busy() {
+        assert_eq!(
+            modal_resolve_terminal_status(true, true),
+            Some(TerminalStatus::Working)
+        );
+    }
+
+    #[test]
+    fn does_not_emit_when_modal_was_active_but_llm_is_not_busy() {
+        assert_eq!(modal_resolve_terminal_status(true, false), None);
+    }
+
+    #[test]
+    fn does_not_emit_when_no_modal_was_active_but_llm_is_busy() {
+        assert_eq!(modal_resolve_terminal_status(false, true), None);
+    }
+
+    #[test]
+    fn does_not_emit_when_no_modal_was_active_and_llm_is_not_busy() {
+        assert_eq!(modal_resolve_terminal_status(false, false), None);
     }
 }

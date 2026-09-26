@@ -18,7 +18,16 @@ const FIXED_SUBCOMMANDS: &[(&str, &[&str])] = &[
     ),
     (
         ".info",
-        &["session", "model", "agent", "rag", "tools", "theme", "env"],
+        &[
+            "session",
+            "model",
+            "agent",
+            "rag",
+            "tools",
+            "theme",
+            "env",
+            "terminal_status",
+        ],
     ),
     (".title", &["generate", "now"]),
     (".use", &["tool"]),

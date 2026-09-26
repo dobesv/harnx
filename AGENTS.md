@@ -878,6 +878,42 @@ Accept `NONE | SHIFT` on char arms (not CONTROL/ALT combinations). Home/End keyc
 SHIFT tolerance — they're not char keys. See AgentPicker in `input.rs` for the `||` guard variant,
 and jump-key handlers in `detail_view.rs`/`input.rs`/`subagent_sessions.rs` for the or-pattern form.
 
+
+### Terminal Agent Status Semantics
+
+The TUI emits OSC 9999 (Orca) and OSC 9;4 (kitty/JetBrains) sequences to signal agent state to
+compatible terminals. Implementation in `crates/harnx-tui/src/terminal_status.rs` with process-global
+`TERMINAL_STATUS` state (`LazyLock<TerminalStatusState>`).
+
+Key invariants (verified by tests in `terminal_status.rs`):
+
+1. **Sticky-failure rule** — `Error` and `Interrupted` states are sticky: they cannot be downgraded to
+   `Done` by the shared turn-end path. Only a new `Working` status resets and allows progression to
+   `Done`. This prevents a successful completion from overwriting a failure the user should see.
+
+2. **Wire protocol constraint** — orcatui rejects JSON `"failed"` in OSC 9999 payloads. Error state
+   uses `"interrupted"` for compatibility: `{"state":"interrupted"}`. ConEmu progress (OSC 9;4) uses
+   state=2 (red bar).
+
+3. **Cancellation ordering** — when settling an interrupted prompt (`cancellation.rs`), `llm_busy` must
+   be set to `false` **before** calling `cancel_tool_confirm()`. If reversed, `cancel_tool_confirm()`
+   sees `llm_busy == true` with an active modal and emits a transient `Working`, producing a flicker.
+   The emission at prompt-interrupted must be `Interrupted`, not `Working`.
+
+4. **Modal resolve emission** — resolving a tool confirmation modal emits `Working` only when both:
+   - `was_confirm_modal`: a `ConfirmToolUse` modal was actually open
+   - `llm_busy`: the LLM is still processing in the tool loop
+
+   If the modal was dismissed or `llm_busy` is false (e.g., cancellation already cleared it), no
+   `Working` emission occurs from the modal-close path.
+
+5. **Teardown and editor suspend** — `force_clear()` emits `Clear` but preserves `last` in the state
+   so `restore()` can re-emit the active status when resuming from `$EDITOR`. This allows a transient
+   clear during external-editor suspend without losing the semantic state.
+
+Configuration: `terminal_status: bool` in `config.yaml` (default `true`) or `HARNX_TERMINAL_STATUS=0`.
+Auto-disabled when stdout is not a TTY, `TERM=dumb`, or `CI` is set. User-facing docs in
+`docs/configuration-guide.md` under "Terminal Status".
 ## Issue/task tracker
 
 ### Session Unread State

@@ -28,6 +28,9 @@ pub(super) fn cleanup_terminal_state() {
     if !stdout.is_terminal() {
         return;
     }
+    // Clear terminal status indicator before leaving alternate screen.
+    // Safe during panic: force_clear uses lock().ok() and ignores write errors.
+    crate::terminal_status::force_clear();
     if supports_keyboard_enhancement().unwrap_or(false) {
         let _ = stdout.execute(PopKeyboardEnhancementFlags);
     }

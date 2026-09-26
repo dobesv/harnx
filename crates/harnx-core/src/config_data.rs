@@ -26,6 +26,10 @@ where
         .collect())
 }
 
+fn default_terminal_status() -> bool {
+    true
+}
+
 /// Scalar YAML-deserialized fields from `config.yaml`.
 ///
 /// This is the pure-data half of `harnx::Config`. It has no runtime state.
@@ -81,6 +85,11 @@ pub struct ConfigData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksConfig>,
 
+    /// Enable terminal/OS agent protocol emission. When false, the emitter
+    /// suppresses all terminal-agent protocol output. Defaults to true.
+    #[serde(default = "default_terminal_status")]
+    pub terminal_status: bool,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_agent: Option<String>,
     /// Token-growth threshold for title regeneration at turn end and mid-loop;
@@ -135,6 +144,8 @@ impl Default for ConfigData {
             sync_models_url: None,
 
             hooks: None,
+
+            terminal_status: default_terminal_status(),
 
             title_agent: None,
             title_update_threshold: 50_000,

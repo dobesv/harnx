@@ -127,6 +127,9 @@ impl Config {
         if let Some(Some(v)) = read_env_bool(&get_env_name("save_shell_history")) {
             self.save_shell_history = v;
         }
+        if let Some(Some(v)) = read_env_bool(&get_env_name("terminal_status")) {
+            self.terminal_status = v;
+        }
         if let Some(v) = read_env_value::<String>(&get_env_name("sync_models_url")) {
             self.sync_models_url = v;
         }
@@ -247,5 +250,49 @@ mod tests {
             Some("from-dotenv".to_string()),
             "unset var should be filled in from .env"
         );
+    }
+
+    #[test]
+    fn load_envs_terminal_status_disabled_by_zero() {
+        let _lock = env_lock();
+        let _terminal_status = EnvGuard::new("HARNX_TERMINAL_STATUS", "0");
+
+        let mut config = Config::default();
+        config.load_envs(true);
+
+        assert!(!config.terminal_status);
+    }
+
+    #[test]
+    fn load_envs_terminal_status_disabled_by_false() {
+        let _lock = env_lock();
+        let _terminal_status = EnvGuard::new("HARNX_TERMINAL_STATUS", "false");
+
+        let mut config = Config::default();
+        config.load_envs(true);
+
+        assert!(!config.terminal_status);
+    }
+
+    #[test]
+    fn load_envs_terminal_status_unset_defaults_to_true() {
+        let _lock = env_lock();
+        let _terminal_status = EnvGuard::remove("HARNX_TERMINAL_STATUS");
+
+        let mut config = Config::default();
+        config.load_envs(true);
+
+        assert!(config.terminal_status);
+    }
+
+    #[test]
+    fn load_envs_terminal_status_enabled_by_one() {
+        let _lock = env_lock();
+        let _terminal_status = EnvGuard::new("HARNX_TERMINAL_STATUS", "1");
+
+        let mut config = Config::default();
+        config.load_envs(true);
+
+        assert!(config.terminal_status);
     }
 }
