@@ -370,7 +370,11 @@ fn committed_handoff_maps_to_actionable_fallback() {
         "local session `target-1`",
         "cluster `prod`",
         "running independently",
+        "Switch to the `atlas@prod` agent's ACP server",
+        "load session `target-1`",
+        "on cluster `prod`",
         ".session atlas@prod target-1",
+        "harnx-serve --addr 127.0.0.1:8000",
     ] {
         assert!(
             message.contains(expected),
