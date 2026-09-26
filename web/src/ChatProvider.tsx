@@ -16,6 +16,7 @@ import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
 import { MessageAttachmentsContext } from './MessageAttachmentsContext';
 import { reduceMessageAttachments } from './messageAttachments';
+import { reduceToolUpdates, type ToolUpdatesState, type ToolCallUpdatePatch } from './toolUpdates';
 import { isAbortError, observedFetch } from './httpClient';
 import { connection } from './connection';
 import { formatUnchangedReason } from './compactionApi';
@@ -105,6 +106,7 @@ export interface HarnxHttpAgentOptions {
   onCompactingStarted?: (compactionId?: string) => void;
   onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
   onCompactingFailed?: (error: string, compactionId?: string) => void;
+  onToolUpdate?: (patch: import('./toolUpdates').ToolCallUpdatePatch) => void;
   isForeground?: boolean;
 }
 
@@ -138,6 +140,7 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onCompactingStarted?: (compactionId?: string) => void;
   private readonly onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
   private readonly onCompactingFailed?: (error: string, compactionId?: string) => void;
+  private readonly onToolUpdate?: (patch: import('./toolUpdates').ToolCallUpdatePatch) => void;
   private readonly isForeground: boolean;
   private handoffBoundarySeq?: number;
 
@@ -154,6 +157,7 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onCompactingStarted = options.onCompactingStarted;
     this.onCompactingCompleted = options.onCompactingCompleted;
     this.onCompactingFailed = options.onCompactingFailed;
+    this.onToolUpdate = options.onToolUpdate;
     this.isForeground = options.isForeground !== false;
   }
 
@@ -177,6 +181,7 @@ export class HarnxHttpAgent extends HttpAgent {
       onCompactingStarted: this.onCompactingStarted,
       onCompactingCompleted: this.onCompactingCompleted,
       onCompactingFailed: this.onCompactingFailed,
+      onToolUpdate: this.onToolUpdate,
       isForeground: this.isForeground,
     });
   }
@@ -277,6 +282,10 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       session: sessionId,
       attachmentsByMessageId: {},
     },
+  );
+  const [toolUpdatesState, dispatchToolUpdate] = useReducer(
+    reduceToolUpdates,
+    new Map() as ToolUpdatesState,
   );
   // Hydrated HITL pending approvals from durable log (hitl_pending_approval CUSTOM events)
   const [hydratedApprovals, setHydratedApprovals] = useState<HydratedPendingApproval[]>([]);
@@ -385,6 +394,9 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       setCompactionPhase({ phase: 'failed' });
       setErrorText(error);
     },
+    onToolUpdate: (patch: ToolCallUpdatePatch) => {
+      dispatchToolUpdate({ type: 'TOOL_UPDATE', patch });
+    },
   }), [agentName, sessionId, onHandoff, addHydratedApproval]);
 
   const runtime = useAgUiRuntime({
@@ -401,6 +413,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     setCompactionPhase({ phase: 'idle' });
     dispatchSubAgentEvent({ type: 'RESET' });
     dispatchAttachments({ type: 'RESET', agent: agentName, session: sessionId });
+    dispatchToolUpdate({ type: 'RESET' });
     clearHydratedApprovals();
   }, [agentName, sessionId, clearHydratedApprovals]);
 
@@ -426,7 +439,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
         statusMessage, setStatusMessage,
         hydratedApprovals, addHydratedApproval, clearHydratedApprovals, removeHydratedApproval
       }}>
-        <UsageContext.Provider value={{ usage, toolSummaries }}>
+        <UsageContext.Provider value={{ usage, toolSummaries, toolUpdates: toolUpdatesState }}>
           <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
             {/* Passive listener for existing sessions: when !isFreshSession, we follow the
                 session-updated stream and hydrate without re-executing. The first message

@@ -1,5 +1,7 @@
 import type { UsageData } from './UsageContext';
 import { setDocumentTitle } from './sessionTitle';
+import type { ToolCallUpdatePatch } from './toolUpdates';
+import { parseToolUpdateEvent } from './toolUpdates';
 
 /**
  * Internal Harnx control and metadata events that drive navigation, sequencing,
@@ -43,6 +45,8 @@ export interface HarnxCustomEventCallbacks {
   onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
   /** Called when session_compacting_failed is received. */
   onCompactingFailed?: (error: string, compactionId?: string) => void;
+  /** Called when a tool_update CUSTOM event is received. */
+  onToolUpdate?: (patch: ToolCallUpdatePatch) => void;
   /**
    * Whether events belong to the session currently shown in the foreground.
    * When `false`, the `session_title_updated` handler skips `setDocumentTitle`
@@ -213,6 +217,10 @@ const handlers: Record<string, CustomEventHandler> = {
     const error = stringField(value, 'error') || 'Compaction failed';
     const compactionId = stringField(value, 'compaction_id');
     callbacks.onCompactingFailed?.(error, compactionId);
+  },
+  tool_update: (callbacks, value) => {
+    const patch = parseToolUpdateEvent(value);
+    if (patch) callbacks.onToolUpdate?.(patch);
   },
 };
 
