@@ -1,7 +1,7 @@
 import { CancellationContext } from './CancellationContext';
 import { useCancellation } from './useCancellation';
 import { CompactionContext, type CompactionPhase } from './CompactionContext';
-import React, { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
 import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
@@ -105,6 +105,8 @@ export interface HarnxHttpAgentOptions {
   onCompactingStarted?: (compactionId?: string) => void;
   onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
   onCompactingFailed?: (error: string, compactionId?: string) => void;
+  onRunTerminal?: () => void;
+  onTurnInterrupted?: () => void;
   isForeground?: boolean;
 }
 
@@ -138,6 +140,8 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onCompactingStarted?: (compactionId?: string) => void;
   private readonly onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
   private readonly onCompactingFailed?: (error: string, compactionId?: string) => void;
+  private readonly onRunTerminalCb?: () => void;
+  private readonly onTurnInterruptedCb?: () => void;
   private readonly isForeground: boolean;
   private handoffBoundarySeq?: number;
 
@@ -154,6 +158,8 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onCompactingStarted = options.onCompactingStarted;
     this.onCompactingCompleted = options.onCompactingCompleted;
     this.onCompactingFailed = options.onCompactingFailed;
+    this.onRunTerminalCb = options.onRunTerminal;
+    this.onTurnInterruptedCb = options.onTurnInterrupted;
     this.isForeground = options.isForeground !== false;
   }
 
@@ -177,18 +183,29 @@ export class HarnxHttpAgent extends HttpAgent {
       onCompactingStarted: this.onCompactingStarted,
       onCompactingCompleted: this.onCompactingCompleted,
       onCompactingFailed: this.onCompactingFailed,
+      onTurnInterrupted: () => {
+        this.onTurnInterruptedCb?.();
+        this.onRunTerminalCb?.();
+      },
       isForeground: this.isForeground,
     });
+  }
+
+  private handleTerminalEvent(event: any) {
+    this.onRunTerminalCb?.();
+    if (event?.type === 'RUN_ERROR') {
+      // AG-UI delivers server failures as events; onRunFailed only handles
+      // failures of the client stream. Preserve the server's diagnostic text.
+      this.onRunFailedCb(event.message || 'Failed to send message');
+    }
   }
 
   private handleAgentEvent(event: any) {
     this.onSubAgentEvent(event);
     if (event?.type === 'CUSTOM') {
       this.handleCustomEvent(event.name, event.value);
-    } else if (event?.type === 'RUN_ERROR') {
-      // AG-UI delivers server failures as events; onRunFailed only handles
-      // failures of the client stream. Preserve the server's diagnostic text.
-      this.onRunFailedCb(event.message || 'Failed to send message');
+    } else if (event?.type === 'RUN_FINISHED' || event?.type === 'RUN_ERROR') {
+      this.handleTerminalEvent(event);
     }
   }
 
@@ -197,6 +214,7 @@ export class HarnxHttpAgent extends HttpAgent {
       return;
     }
     this.onSubAgentEvent({ type: 'RUN_ERROR' });
+    this.onRunTerminalCb?.();
     this.onRunFailedCb(message || 'Failed to send message');
 
     if (isTransportFailure(error, message)) {
@@ -260,6 +278,10 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   children,
 }) => {
   const cancellation = useCancellation(agentName, sessionId);
+  const cancellationRef = useRef(cancellation);
+  useEffect(() => {
+    cancellationRef.current = cancellation;
+  });
   const [statusText, setStatusText] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -360,8 +382,13 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     },
     onHandoff,
     isForeground: true,
-    onHitlPendingApproval: (toolCallId, summary) =>
-      addHydratedApproval({ toolCallId, summary }),
+    onHitlPendingApproval: (toolCallId, summary) => {
+      cancellationRef.current.reset?.();
+      addHydratedApproval({ toolCallId, summary });
+    },
+    onRunTerminal: () => {
+      cancellationRef.current.reset?.();
+    },
     onMessageAttachments: (messageId, attachments) => {
       dispatchAttachments({
         type: 'SET_ATTACHMENTS',

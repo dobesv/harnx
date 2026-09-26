@@ -738,6 +738,31 @@ body {
   color: var(--status-error);
 }
 
+.aui-sub-agent-status-cancelled {
+  color: var(--text-muted);
+}
+
+.aui-sub-agent-status-cancelling {
+  color: var(--text-muted);
+}
+
+.aui-sub-agent-status-cancelling .aui-sub-agent-status-icon {
+  width: 0.7rem;
+  height: 0.7rem;
+  background: transparent;
+  border: 2px solid currentcolor;
+  border-right-color: transparent;
+  animation: aui-sub-agent-spin 0.8s linear infinite;
+}
+
+.aui-sub-agent-status-awaiting_approval {
+  color: var(--status-action);
+}
+
+.aui-sub-agent-status-unconfirmed {
+  color: var(--text-muted);
+}
+
 @keyframes aui-sub-agent-spin {
   to { transform: rotate(360deg); }
 }

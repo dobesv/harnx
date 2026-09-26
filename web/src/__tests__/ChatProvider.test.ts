@@ -549,4 +549,37 @@ describe('toAgUiMessages', () => {
         { partIndex: 0, cid: 'cid:sha123', kind: 'image' },
       ]);
     });
+
+    it('invokes onRunTerminal on RUN_FINISHED, RUN_ERROR, turn_interrupted, and handleRunFailure', async () => {
+      const onRunTerminal = vi.fn();
+      const onTurnInterrupted = vi.fn();
+      const { HarnxHttpAgent } = await import('../ChatProvider');
+      const agent = new HarnxHttpAgent({
+        url: '/url',
+        onStatus: vi.fn(),
+        onRunFailed: vi.fn(),
+        onUsage: vi.fn(),
+        onToolSummary: vi.fn(),
+        onSubAgentEvent: vi.fn(),
+        onRunTerminal,
+        onTurnInterrupted,
+      });
+
+      // RUN_FINISHED
+      (agent as any).handleAgentEvent({ type: 'RUN_FINISHED' });
+      expect(onRunTerminal).toHaveBeenCalledTimes(1);
+
+      // RUN_ERROR
+      (agent as any).handleAgentEvent({ type: 'RUN_ERROR', message: 'Failed' });
+      expect(onRunTerminal).toHaveBeenCalledTimes(2);
+
+      // turn_interrupted
+      (agent as any).handleAgentEvent({ type: 'CUSTOM', name: 'turn_interrupted' });
+      expect(onRunTerminal).toHaveBeenCalledTimes(3);
+      expect(onTurnInterrupted).toHaveBeenCalledTimes(1);
+
+      // handleRunFailure
+      (agent as any).handleRunFailure('fatal error', new Error('fatal'));
+      expect(onRunTerminal).toHaveBeenCalledTimes(4);
+    });
   });

@@ -1,5 +1,8 @@
 use super::*;
-use crate::ag_ui_remote_follow::{event_frames, AdvisoryForwarder, QueuedEvent};
+use crate::ag_ui_remote_follow::{
+    event_frames, remote_terminal_frame, terminal_after_lease_poll, AdvisoryForwarder, QueuedEvent,
+    RemoteFollowTerminal, LEASE_ABSENT_THRESHOLD, WORKER_LOST_MESSAGE,
+};
 use harnx_runtime::nats_event_sink::LiveEventState;
 
 /// Queue the frames of one text chunk the way a live advisory carrying
@@ -37,6 +40,117 @@ async fn collect_remote_frames(rx: tokio::sync::mpsc::Receiver<QueuedEvent>) -> 
     drained_frames(rx, LiveEventState::default(), 0).await
 }
 
+fn assert_terminal_frame(
+    terminal: RemoteFollowTerminal,
+    expected_type: &str,
+    expected_message: Option<&str>,
+) {
+    // Thread/run ids are cosmetic here: the helper asserts the frame echoes
+    // whatever ids build it, so fixed labels keep the check without extra args.
+    let thread_id = "thread-terminal";
+    let run_id = "run-terminal";
+    let events = decode_sse_bytes_chunks(vec![remote_terminal_frame(terminal, thread_id, run_id)]);
+    let [event] = events.as_slice() else {
+        panic!("expected one terminal event, got {events:?}");
+    };
+    assert_eq!(
+        (
+            event["type"].as_str(),
+            event["threadId"].as_str(),
+            event["runId"].as_str(),
+        ),
+        (Some(expected_type), Some(thread_id), Some(run_id))
+    );
+    if let Some(message) = expected_message {
+        assert_eq!(event["message"], message);
+    }
+}
+
+fn assert_handoff_event(event: &serde_json::Value) {
+    assert_eq!(
+        (
+            event["name"].as_str(),
+            event["value"]["agent"].as_str(),
+            event["value"]["session_id"].as_str(),
+            event["value"]["handoff_tool_call_id"].as_str(),
+            event["value"]["after_seq"].as_u64(),
+        ),
+        (
+            Some("session_handoff"),
+            Some("remote-agent"),
+            Some("remote-session-456"),
+            Some("call-remote"),
+            Some(1),
+        )
+    );
+}
+
+/// The set of lifecycle segments that must all be closed when a run terminates.
+struct OpenLifecycleSegments {
+    text: usize,
+    tools: usize,
+    steps: usize,
+    thinking_text_open: bool,
+    thinking_open: bool,
+}
+
+fn assert_lifecycle_closed(segments: OpenLifecycleSegments) {
+    assert_eq!(
+        (
+            segments.text,
+            segments.tools,
+            segments.steps,
+            segments.thinking_text_open,
+            segments.thinking_open,
+        ),
+        (0, 0, 0, false, false),
+        "run terminated with an open lifecycle segment"
+    );
+}
+
+#[test]
+fn worker_loss_uses_run_error_terminal() {
+    let mut absent_count = 0;
+    for _ in 1..LEASE_ABSENT_THRESHOLD {
+        assert_eq!(
+            terminal_after_lease_poll(&mut absent_count, false, false),
+            None
+        );
+    }
+    let terminal = terminal_after_lease_poll(&mut absent_count, false, false)
+        .expect("confirmed lease absence must terminate the run");
+    assert_eq!(
+        terminal,
+        RemoteFollowTerminal::Error(WORKER_LOST_MESSAGE.to_string())
+    );
+
+    assert_terminal_frame(terminal, "RUN_ERROR", Some(WORKER_LOST_MESSAGE));
+}
+
+#[test]
+fn durable_completion_uses_run_finished_terminal() {
+    // The normal-completion path for every remote/TUI-initiated turn: a durable
+    // TurnEnd landed, so the poll finishes the run regardless of the lease.
+    let mut absent_count = 0;
+    let terminal = terminal_after_lease_poll(&mut absent_count, true, true)
+        .expect("a durable turn end must terminate the run");
+    assert_eq!(terminal, RemoteFollowTerminal::Finished);
+
+    assert_terminal_frame(terminal, "RUN_FINISHED", None);
+}
+
+#[test]
+fn durable_completion_wins_over_absent_lease() {
+    // Worker loss and durable completion can be observed on the same poll (the
+    // worker released its lease as it finished). Durable completion is
+    // authoritative: the run finished, it did not fail. A prior run of absences
+    // must not tip an already-completed turn into RUN_ERROR.
+    let mut absent_count = LEASE_ABSENT_THRESHOLD - 1;
+    assert_eq!(
+        terminal_after_lease_poll(&mut absent_count, false, true),
+        Some(RemoteFollowTerminal::Finished)
+    );
+}
 #[tokio::test]
 async fn completed_remote_path_orders_boundary_before_hydrated_handoff() {
     use harnx_core::session::SessionLogEntry;
@@ -83,12 +197,7 @@ async fn completed_remote_path_orders_boundary_before_hydrated_handoff() {
         ],
     );
     assert_attach_boundary(&events[1], 1);
-    let handoff = &events[3];
-    assert_eq!(handoff["name"], "session_handoff");
-    assert_eq!(handoff["value"]["agent"], "remote-agent");
-    assert_eq!(handoff["value"]["session_id"], "remote-session-456");
-    assert_eq!(handoff["value"]["handoff_tool_call_id"], "call-remote");
-    assert_eq!(handoff["value"]["after_seq"], 1);
+    assert_handoff_event(&events[3]);
 }
 
 fn assert_strict_lifecycle_valid(events: &[serde_json::Value]) {
@@ -142,13 +251,13 @@ fn assert_strict_lifecycle_valid(events: &[serde_json::Value]) {
                 assert!(!thinking_text, "thinking ended before thinking text");
                 thinking = false;
             }
-            "RUN_FINISHED" | "RUN_ERROR" => {
-                assert!(text.is_empty(), "active text at terminal: {text:?}");
-                assert!(tools.is_empty(), "active tools at terminal: {tools:?}");
-                assert!(steps.is_empty(), "active steps at terminal: {steps:?}");
-                assert!(!thinking_text, "active thinking text at terminal");
-                assert!(!thinking, "active thinking at terminal");
-            }
+            "RUN_FINISHED" | "RUN_ERROR" => assert_lifecycle_closed(OpenLifecycleSegments {
+                text: text.len(),
+                tools: tools.len(),
+                steps: steps.len(),
+                thinking_text_open: thinking_text,
+                thinking_open: thinking,
+            }),
             _ => {}
         }
     }

@@ -89,3 +89,41 @@ async fn session_actor_panic_aborts_in_flight_turn() {
         .expect("timed out waiting for in-flight turn to be aborted")
         .expect("drop canary sender closed without notification");
 }
+
+#[tokio::test]
+async fn child_turn_panic_broadcasts_terminal_run_error() {
+    let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "You are plain.");
+
+    let call_fn: AgentCallFn = Arc::new(|_input, _config, _abort| {
+        Box::pin(async move {
+            panic!("simulated child turn panic");
+        })
+    });
+    let registry = registry_with_call_fn(call_fn);
+    let handle = registry.get_or_spawn(key("plain", "child-panic-terminal"));
+    let mut events = subscribe(&handle).await.events;
+
+    assert!(matches!(
+        prompt(&handle, "panic in the child turn").await,
+        PromptResult::Accepted { .. }
+    ));
+
+    let message = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match events.recv().await.expect("run lifecycle event") {
+                Event::RunError(error) => break error.message,
+                Event::RunFinished(_) => {
+                    panic!("child panic must not report successful completion")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("child panic must produce a terminal event");
+    assert!(message.contains("session turn task panicked"), "{message}");
+    assert!(message.contains("simulated child turn panic"), "{message}");
+    assert_eq!(get_info(&handle).await.state, SessionState::Idle);
+}

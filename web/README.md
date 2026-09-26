@@ -97,7 +97,7 @@ HTTP calls span two modules, not one: `web/src/api.ts` and `web/src/cancellation
 ### Retry Behavior
 
 - **Reads auto-retry:** `listAgents`, `listSessions`, `getAgent` use `fetchJsonWithRetry` with capped exponential backoff (initial ~0.5–1.5s, steady-state mean 60s) and jitter. Backend outages show a connecting state during initial load or a non-blocking banner for background failures.
-- **Writes do not replay:** `createSession`, `uploadAttachment`, `sendPrompt`, `submitHitlDecision`, and observe-only calls (`sessionControl`, `cancel`) use `observedFetch` — they notify connection status but never auto-retry. The caller (or polling interval) manages retry timing.
+- **Writes do not replay:** `createSession`, `uploadAttachment`, `sendPrompt`, `submitHitlDecision`, and `cancel` use `observedFetch` — they notify connection status but never auto-retry. The caller manages retry timing.
 
 ### Status Classification Order
 
@@ -115,6 +115,14 @@ A 502 Bad Gateway with an HTML error page must retry, not fail permanently as "m
 - Parses JSON body before checking `res.ok`, so a JSON-RPC error (e.g., `-32002` idle session) can be inspected.
 - Treats `-32002` as benign success (session already idle).
 - Uses a 15-second `AbortSignal.timeout` (`CANCELLATION_TIMEOUT_MS`), aligned with `GET_TIMEOUT_MS` to avoid spurious degradation on slow-but-valid responses.
+
+### Session Status is Event-Driven (issue #2116)
+
+Sub-agent rows and foreground cancellation no longer poll `session/get` for control state.
+Status derives from AG-UI run-lifecycle events (`RUN_STARTED`, `RUN_FINISHED`, `RUN_ERROR`,
+`turn_interrupted`, `hitl_pending_approval`). The SSE `/events` endpoint is a lossy wake-up
+channel only; authoritative status flows through the AG-UI run stream. If UI state appears stale,
+reload re-hydrates from the server's durable log.
 
 ### Abort vs Timeout Classification
 

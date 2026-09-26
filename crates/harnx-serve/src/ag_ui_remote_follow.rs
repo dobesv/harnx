@@ -27,7 +27,10 @@ use harnx_runtime::{
     nats_event_sink::{AdvisoryEnvelope, JetstreamContext, SessionEventStream},
     nats_lease::session_has_active_lease,
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    oneshot,
+};
 use tokio_stream::StreamExt as _;
 
 use crate::ag_ui::{GuardedEventStream, UsageContextSnapshot};
@@ -35,7 +38,7 @@ use crate::ag_ui::{GuardedEventStream, UsageContextSnapshot};
 use crate::{
     ag_ui::{frame_event, AgUiError, AgUiSink},
     ag_ui_attach::{session_attach_boundary_event, snapshot_event},
-    ag_ui_sync::{frame_run_boundary_event, history_warning_event},
+    ag_ui_sync::{frame_run_boundary_event, frame_run_error_event, history_warning_event},
     session_actor::SubscribeResult,
 };
 
@@ -50,7 +53,31 @@ const LEASE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// At 1s poll interval, this yields ~4s effective latency (first tick
 /// is immediate). Chosen to be well under the ~30s lease TTL, allowing
 /// time for transient network issues to resolve before giving up.
-const LEASE_ABSENT_THRESHOLD: usize = 5;
+pub(crate) const LEASE_ABSENT_THRESHOLD: usize = 5;
+
+pub(crate) const WORKER_LOST_MESSAGE: &str =
+    "The worker handling this session stopped without answering. Check the worker log for the underlying failure.";
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum RemoteFollowTerminal {
+    Finished,
+    Error(String),
+}
+
+pub(crate) fn remote_terminal_frame(
+    terminal: RemoteFollowTerminal,
+    thread_id: &str,
+    run_id: &str,
+) -> Bytes {
+    match terminal {
+        RemoteFollowTerminal::Finished => {
+            Bytes::from(frame_run_boundary_event("RUN_FINISHED", thread_id, run_id))
+        }
+        RemoteFollowTerminal::Error(message) => {
+            Bytes::from(frame_run_error_event(thread_id, run_id, &message))
+        }
+    }
+}
 
 /// Buffer size for frame-forwarding channel.
 /// Sends apply backpressure because mapped advisories contain ordered AG-UI lifecycle
@@ -287,14 +314,18 @@ fn build_live_follow_stream(params: LiveFollowParams) -> GuardedEventStream {
         .filter_map(|e| super::ag_ui::frame_event(&e).ok().map(Bytes::from))
         .collect();
 
-    spawn_follow_task(FollowTaskParams {
-        interrupt_watch: params.interrupt_watch,
-        event_stream: params.event_stream,
-        jetstream: params.jetstream,
-        session_id: params.session_id,
-        tx,
-        through_seq: params.through_seq,
-    });
+    let (terminal_tx, terminal_rx) = oneshot::channel();
+    spawn_follow_task(
+        FollowTaskParams {
+            interrupt_watch: params.interrupt_watch,
+            event_stream: params.event_stream,
+            jetstream: params.jetstream,
+            session_id: params.session_id,
+            tx,
+            through_seq: params.through_seq,
+        },
+        terminal_tx,
+    );
 
     let initial_frames = vec![params.started_frame, params.boundary_frame]
         .into_iter()
@@ -302,16 +333,19 @@ fn build_live_follow_stream(params: LiveFollowParams) -> GuardedEventStream {
         .chain(params.attachment_frames)
         .chain(control_frames);
     let event_frames = event_frames_with_guard(rx, live, attached_seq, guard.clone());
-    let finished_stream = tokio_stream::once(Bytes::from(frame_run_boundary_event(
-        "RUN_FINISHED",
-        &params.thread_id,
-        &params.run_id,
-    )));
+    let thread_id = params.thread_id;
+    let run_id = params.run_id;
+    let terminal_stream = futures::stream::once(async move {
+        let terminal = terminal_rx.await.unwrap_or_else(|_| {
+            RemoteFollowTerminal::Error("Remote follow task stopped unexpectedly".to_string())
+        });
+        remote_terminal_frame(terminal, &thread_id, &run_id)
+    });
 
     let stream = Box::pin(
         tokio_stream::iter(initial_frames)
             .chain(event_frames)
-            .chain(finished_stream),
+            .chain(terminal_stream),
     );
     GuardedEventStream { stream, guard }
 }
@@ -347,15 +381,20 @@ struct FollowTaskParams {
     through_seq: u64,
 }
 
-fn spawn_follow_task(params: FollowTaskParams) {
+fn spawn_follow_task(params: FollowTaskParams, terminal_tx: oneshot::Sender<RemoteFollowTerminal>) {
     tokio::spawn(async move {
-        if let Err(err) = remote_follow_task(params).await {
-            log::warn!("Remote follow task error: {err:#}");
-        }
+        let terminal = match remote_follow_task(params).await {
+            Ok(terminal) => terminal,
+            Err(err) => {
+                log::warn!("Remote follow task error: {err:#}");
+                RemoteFollowTerminal::Error(format!("Remote follow failed: {err:#}"))
+            }
+        };
+        let _ = terminal_tx.send(terminal);
     });
 }
 
-async fn remote_follow_task(params: FollowTaskParams) -> Result<()> {
+async fn remote_follow_task(params: FollowTaskParams) -> Result<RemoteFollowTerminal> {
     let live = params.event_stream.live_state().clone();
     let interrupt_watch = params.interrupt_watch.clone();
     // Stop observation must stay pollable while history reads or a full output
@@ -370,13 +409,13 @@ async fn remote_follow_task(params: FollowTaskParams) -> Result<()> {
                 live.accept_interrupt(*cancel_seq);
             }
             live.retire();
-            result.map(|_| ())
+            result.map(|_| RemoteFollowTerminal::Finished)
         }
         result = follow_remote_turn(params) => result,
     }
 }
 
-async fn follow_remote_turn(mut params: FollowTaskParams) -> Result<()> {
+async fn follow_remote_turn(mut params: FollowTaskParams) -> Result<RemoteFollowTerminal> {
     let tx_for_close = params.tx.clone();
     let mut forwarder = AdvisoryForwarder::new(params.tx);
     let mut poller = RemoteTurnPoller::new(
@@ -394,17 +433,17 @@ async fn follow_remote_turn(mut params: FollowTaskParams) -> Result<()> {
                     .forward(&params.event_stream, envelope, &params.session_id)
                     .await
                 {
-                    break Ok(());
+                    break Ok(RemoteFollowTerminal::Finished);
                 }
             }
             _ = lease_poll_interval.tick() => {
-                match poller.turn_finished(&mut params.event_stream).await {
-                    Ok(true) => break Ok(()),
-                    Ok(false) => {}
+                match poller.poll(&mut params.event_stream).await {
+                    Ok(Some(terminal)) => break Ok(terminal),
+                    Ok(None) => {}
                     Err(err) => break Err(err),
                 }
             }
-            _ = tx_for_close.closed() => break Ok(()),
+            _ = tx_for_close.closed() => break Ok(RemoteFollowTerminal::Finished),
         }
     }
 }
@@ -487,33 +526,50 @@ impl RemoteTurnPoller {
         }
     }
 
-    async fn turn_finished(&mut self, event_stream: &mut SessionEventStream) -> Result<bool> {
+    async fn poll(
+        &mut self,
+        event_stream: &mut SessionEventStream,
+    ) -> Result<Option<RemoteFollowTerminal>> {
         let lease_active = session_has_active_lease(&self.jetstream, &self.session_id).await?;
         let _history_updated = event_stream.refresh_history().await?;
-        if turn_ended(event_stream.history(), self.through_seq) {
-            log::debug!(
+        let durable_turn_ended = turn_ended(event_stream.history(), self.through_seq);
+        let terminal = terminal_after_lease_poll(
+            &mut self.lease_absent_count,
+            lease_active,
+            durable_turn_ended,
+        );
+        match &terminal {
+            Some(RemoteFollowTerminal::Finished) => log::debug!(
                 "Turn end detected in durable history for session {}",
                 self.session_id
-            );
-            return Ok(true);
+            ),
+            Some(RemoteFollowTerminal::Error(_)) => log::warn!(
+                "Lease absent for {} consecutive polls with no TurnEnd for session {}, reporting worker loss",
+                self.lease_absent_count,
+                self.session_id
+            ),
+            None => {}
         }
-
-        if lease_active {
-            self.lease_absent_count = 0;
-            return Ok(false);
-        }
-        self.lease_absent_count += 1;
-        if self.lease_absent_count < LEASE_ABSENT_THRESHOLD {
-            return Ok(false);
-        }
-
-        log::warn!(
-            "Lease absent for {} consecutive polls with no TurnEnd for session {}, forcing finish",
-            self.lease_absent_count,
-            self.session_id
-        );
-        Ok(true)
+        Ok(terminal)
     }
+}
+
+pub(crate) fn terminal_after_lease_poll(
+    lease_absent_count: &mut usize,
+    lease_active: bool,
+    durable_turn_ended: bool,
+) -> Option<RemoteFollowTerminal> {
+    if durable_turn_ended {
+        return Some(RemoteFollowTerminal::Finished);
+    }
+    if lease_active {
+        *lease_absent_count = 0;
+        return None;
+    }
+
+    *lease_absent_count += 1;
+    (*lease_absent_count >= LEASE_ABSENT_THRESHOLD)
+        .then(|| RemoteFollowTerminal::Error(WORKER_LOST_MESSAGE.to_string()))
 }
 
 fn turn_ended(history: &[(u64, SessionLogEntry)], through_seq: u64) -> bool {

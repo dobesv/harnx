@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { listAgents, listSessions, createSession, getAgent, cancel, sessionControl, uploadAttachment, sendPrompt } from '../api';
+import { listAgents, listSessions, createSession, getAgent, cancel, uploadAttachment, sendPrompt } from '../api';
 
 const fetchMock = vi.fn();
 globalThis.fetch = fetchMock as any;
@@ -128,59 +128,6 @@ describe('api.ts', () => {
         json: async () => { throw new Error('no body'); },
       });
       await expect(cancel('agent', 'session')).rejects.toThrow('RPC call failed with HTTP 500');
-    });
-  });
-
-  describe('sessionControl', () => {
-    it('loads durable cancellation state with a 15-second request deadline', async () => {
-      const timeoutSignal = new AbortController().signal;
-      const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeoutSignal);
-      fetchMock.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          result: {
-            state: { status: 'interrupting' },
-            canPrompt: false,
-            canCancel: true,
-          },
-        }),
-      });
-
-      try {
-        await expect(sessionControl('agent/A', 'session B')).resolves.toEqual(
-          expect.objectContaining({ state: { status: 'interrupting' }, canPrompt: false }),
-        );
-        expect(timeoutSpy).toHaveBeenCalledWith(15000);
-        expect(fetchMock).toHaveBeenCalledWith(
-          '/v1/agents/agent%2FA/sessions/session%20B',
-          expect.objectContaining({
-            method: 'POST',
-            signal: timeoutSignal,
-            body: JSON.stringify({ jsonrpc: '2.0', id: 'control', method: 'session/get' }),
-          }),
-        );
-      } finally {
-        timeoutSpy.mockRestore();
-      }
-    });
-
-    it('surfaces JSON-RPC failures', async () => {
-      fetchMock.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ error: { code: -32000, message: 'Control state unavailable' } }),
-      });
-
-      await expect(sessionControl('agent', 'session')).rejects.toThrow(
-        'Control state unavailable',
-      );
-    });
-
-    it('propagates transport timeouts', async () => {
-      fetchMock.mockRejectedValueOnce(new DOMException('The operation timed out', 'TimeoutError'));
-
-      await expect(sessionControl('agent', 'session')).rejects.toMatchObject({
-        name: 'TimeoutError',
-      });
     });
   });
 
