@@ -359,7 +359,7 @@ describe('status announcements', () => {
 
     render(
       <PendingContext.Provider value={{ ...defaultPendingContext, statusText: 'This approval was already resolved elsewhere.' }}>
-        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map() }}>
+        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map(), toolUpdates: new Map() }}>
           <StatusBar />
         </UsageContext.Provider>
       </PendingContext.Provider>,
