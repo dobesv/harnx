@@ -1,4 +1,4 @@
-import type { JsonRpcResponse, SessionControlState, CancelResult } from './types';
+import type { JsonRpcResponse, CancelResult } from './types';
 import { observedFetch } from './httpClient';
 
 const API_BASE = '/v1';
@@ -7,22 +7,6 @@ export const CANCELLATION_TIMEOUT_MS = 15000;
 function createTimeoutSignal(timeoutMs: number, callerSignal?: AbortSignal): AbortSignal {
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   return callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
-}
-
-export async function sessionControl(
-  agent: string,
-  session: string,
-  options?: { signal?: AbortSignal }
-): Promise<SessionControlState> {
-  const response = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
-    method: 'POST',
-    signal: createTimeoutSignal(CANCELLATION_TIMEOUT_MS, options?.signal),
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 'control', method: 'session/get' }),
-  });
-  const body = await response.json() as JsonRpcResponse<SessionControlState>;
-  if (!response.ok || body.error || !body.result) throw new Error(body.error?.message ?? 'Cannot load session cancellation state');
-  return body.result;
 }
 
 async function safeParseJson<T>(res: Response): Promise<JsonRpcResponse<T> | undefined> {

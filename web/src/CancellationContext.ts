@@ -5,6 +5,7 @@ export interface CancellationControl {
   // composer, and `failed` means the log never took the interrupt.
   phase: 'idle' | 'requesting' | 'failed';
   stop: () => Promise<void>;
+  reset?: () => void;
 }
 
 export const CancellationContext = createContext<CancellationControl>({

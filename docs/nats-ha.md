@@ -906,9 +906,14 @@ follows a different path than the local-actor case:
 - **Local actor idle + remote lease active**: the AG-UI endpoint attaches to
   `SessionEventStream` advisories from the snapshot's last `User` row onward. It
   translates eligible events to AG-UI frames and ends the stream on the
-  terminator that covers that row — a `TurnEnd` or a `Cancel`. A sustained lease
-  absence (5 consecutive 1s polls with no `TurnEnd`) remains a worker-crash
-  fallback, never proof that a turn stopped or that its tools are gone.
+  terminator that covers that row — a `TurnEnd` or a `Cancel`.
+
+Worker death and task failure produce `RUN_ERROR` on both paths. The local-actor
+path wraps its turn task in panic supervision (`session_actor.rs:281`); the
+remote-follow path confirms lease absence before reporting loss
+(`ag_ui_remote_follow.rs:557`). Actor-owned turns additionally enforce a 60s
+acquisition deadline before reporting an unclaimed run as failed
+(`nats_session.rs:89`).
 
 The session metadata watch endpoint (`GET .../events`, `session_updates` in the
 serve implementation) is separate from the AG-UI `/run` stream and provides
