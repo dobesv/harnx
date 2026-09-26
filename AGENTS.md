@@ -172,16 +172,16 @@ Brief description of the change.
 
 The YAML front matter specifies the version bump: `patch`, `minor`, or `major`.
 
-The key on the left must be one of the three packages knope versions:
+The key on the left must be one of the packages knope versions:
 
-- `harnx` — the entire Rust workspace. All `harnx-*` crates share one version
+- **`harnx`** — the entire Rust workspace. All `harnx-*` crates share one version
   (`version.workspace = true`), so use `harnx` even for a change scoped to a
   single crate like `harnx-proxy-auth` or `harnx-core`.
-- `pantheon` — the `packages/pantheon` agent package.
-- `coding` — the `packages/coding` agent package.
+- **`pantheon`** — the `packages/pantheon` agent package.
+- **`coding`** — the `packages/coding` agent package.
 
-Individual crate names are **not** valid keys; `knope release` will error on
-them.
+Keys are **unquoted** in the YAML front matter: `harnx:`, not `"harnx":`.
+Individual crate names are not valid keys; `knope release` will error on them.
 
 ## GitHub Actions workflows that open pull requests
 
@@ -899,6 +899,18 @@ Key invariants (verified by `test_inplace_tool_call_update_sequence`, `test_tool
 3. **Fallback synthesis uses `"tool"` sentinel** — when `apply_tool_event_update` finds no matching running row, it synthesizes a minimal row with `tool_name: "tool"`. This prevents duplicate title rendering (P-DUPTITLE): the renderer suppresses the title suffix when `tool_name == title`.
 
 4. **Render cache bypass for running tools** — running rows (`final_elapsed_ms.is_none()`) bypass `rendered_cache` on every render pass to show ticking timer and spinner frame updates. Only completed rows (`!is_running`) populate the cache.
+
+### Web `tool_update` SSE event and client reducer
+
+The web client (`harnx-serve`) emits `tool_update` custom SSE events for `ToolEvent::Update`, carrying `{ tool_call_id, markdown?, status?, title?, kind?, locations?, usage? }`. Only present fields are included; omitted fields mean "no change".
+
+The client-side reducer (`web/src/toolUpdates.ts`) applies patch semantics matching the Rust side:
+
+- Omitted/undefined fields leave current state unchanged
+- `locations: []` explicitly clears locations (empty array is meaningful)
+- Terminal status (`Completed`, `Failed`) from live updates is ignored — UI status comes from the tool result, not from patches
+
+The `ToolCallCard` component uses live fields when present: `title` overrides `toolName`, `markdown` takes precedence over `toolSummary`, `kind` maps to icons, and `locations` display as `file:line` pairs. Presentation logic (`web/src/toolCallPresentation.ts`) enforces precedence: error/action-required icons and border colors never get masked by live `kind` or `status`.
 
 ### Tool confirmation modal ordering and delivery
 

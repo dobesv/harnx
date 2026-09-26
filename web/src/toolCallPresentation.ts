@@ -9,6 +9,46 @@
  * case is a real alert; everything else that lacks a result is "pending".
  */
 
+/**
+ * Tool kind categorization. Mirrors harnx_core::event::ToolKind.
+ */
+export type ToolKind =
+  | 'Read'
+  | 'Edit'
+  | 'Delete'
+  | 'Move'
+  | 'Search'
+  | 'Execute'
+  | 'Think'
+  | 'Fetch'
+  | 'SwitchMode'
+  | 'Other';
+
+/**
+ * Tool status for live updates. Mirrors harnx_core::event::ToolStatus.
+ */
+export type ToolStatus = 'Pending' | 'InProgress' | 'Completed' | 'Failed';
+
+const TOOL_KIND_ICONS: Record<ToolKind, string> = {
+  Read: '📄',
+  Edit: '✏️',
+  Delete: '🗑️',
+  Move: '📦',
+  Search: '🔍',
+  Execute: '⚡',
+  Think: '💭',
+  Fetch: '⬇️',
+  SwitchMode: '🔄',
+  Other: '🔧',
+};
+
+/**
+ * Map ToolKind to an icon for visual identification.
+ */
+export function toolKindToIcon(kind: ToolKind): string {
+  return TOOL_KIND_ICONS[kind] ?? '🔧';
+}
+
 export type ToolCallPresentation = {
   icon: string;
   borderColor: string;
@@ -20,6 +60,8 @@ export type ToolCallStatusInput = { type?: string; reason?: string } | undefined
 export type ToolCallPresentationOptions = {
   toolName?: string;
   isSubAgent?: boolean;
+  /** Live update kind; supersedes default icon when present */
+  kind?: ToolKind;
 };
 
 type ToolCallStatusFlags = { isPending: boolean; isActionRequired: boolean };
@@ -117,20 +159,43 @@ function toolCallIcon(flags: ToolCallStatusFlags, isError: boolean | undefined):
   return isError ? '❌' : '✅';
 }
 
+/**
+ * Resolve the icon to display for a tool call, considering live updates.
+ * Error and action-required states take precedence over kind icon.
+ */
+function resolveToolCallIcon(
+  flags: ToolCallStatusFlags,
+  isError: boolean | undefined,
+  kind?: ToolKind,
+): string {
+  // Error and action-required must never be masked by kind icon
+  if (flags.isActionRequired) return '⚠️';
+  if (isError) return '❌';
+  // Kind icon only applies when no terminal state
+  if (kind) return toolKindToIcon(kind);
+  return toolCallIcon(flags, isError);
+}
+
+function resolveBorderColor(
+  status: ToolCallStatusInput,
+  flags: ToolCallStatusFlags,
+  isError: boolean | undefined,
+): string {
+  return toolCallBorderColor(status, flags, isError);
+}
+
 export function getToolCallPresentation(
   status: ToolCallStatusInput,
   isError: boolean | undefined,
   options?: ToolCallPresentationOptions | boolean,
 ): ToolCallPresentation {
   const flags = classifyToolCallStatus(status);
-  const isSubAgent =
-    typeof options === 'boolean'
-      ? options
-      : Boolean(options?.isSubAgent || isSubAgentTool(options?.toolName));
+  const opts = typeof options === 'boolean' ? { isSubAgent: options } : options ?? {};
+  const isSubAgent = Boolean(opts.isSubAgent || isSubAgentTool(opts.toolName));
 
   return {
-    icon: toolCallIcon(flags, isError),
-    borderColor: toolCallBorderColor(status, flags, isError),
+    icon: resolveToolCallIcon(flags, isError, opts.kind),
+    borderColor: resolveBorderColor(status, flags, isError),
     defaultExpanded: flags.isActionRequired || isSubAgent,
   };
 }
