@@ -3,6 +3,7 @@ import type { ToolCallMessagePartProps } from '@assistant-ui/react';
 import { JsonView, darkStyles, defaultStyles } from 'react-json-view-lite';
 import 'react-json-view-lite/dist/index.css';
 import { UsageContext } from './UsageContext';
+import type { ToolCallLocation, ToolCallState } from './toolUpdates';
 import {
   classifyToolCallStatus,
   extractResultContent,
@@ -48,7 +49,8 @@ function parseArgsInput(args: any, argsText?: string) {
   }
 }
 
-function resolveSummaryMarkdown(toolSummary?: string, result?: any): string | undefined {
+function resolveSummaryMarkdown(toolSummary?: string, result?: any, liveMarkdown?: string): string | undefined {
+  if (liveMarkdown) return liveMarkdown;
   if (toolSummary) return toolSummary;
   if (typeof result === 'object' && typeof result?.markdown === 'string') {
     return result.markdown;
@@ -201,51 +203,119 @@ function formatHeaderSummary(
 interface ToolCallHeaderProps {
   icon: string;
   toolName: string;
+  title?: string | null;
   expanded: boolean;
   onToggle: () => void;
   headerSummaryMarkdown: string | null;
-  fallbackPreview: string | null;
+  fallbackPreview: React.ReactNode;
   elapsedText?: string | null;
+  locations?: ToolCallLocation[];
+}
+
+function formatLocation(location: ToolCallLocation): string {
+  const fileName = location.path.split(/[/\\]/).pop() || location.path;
+  return location.line !== undefined ? `${fileName}:${location.line}` : fileName;
+}
+
+const ToolCallLocations: React.FC<{ locations?: ToolCallLocation[] }> = ({ locations }) => {
+  if (!locations?.length) return null;
+  return (
+    <span
+      className="aui-tool-call-locations"
+      style={{ marginLeft: '0.5em', fontWeight: 'normal', opacity: 0.7 }}
+    >
+      {locations.slice(0, 3).map(formatLocation).join(', ')}
+      {locations.length > 3 && ` +${locations.length - 3} more`}
+    </span>
+  );
+};
+
+interface ToolCallSummaryContentProps {
+  headerSummaryMarkdown?: string | null;
+  fallbackPreview?: React.ReactNode;
+  expanded: boolean;
+}
+
+const ToolCallSummaryContent: React.FC<ToolCallSummaryContentProps> = ({
+  headerSummaryMarkdown,
+  fallbackPreview,
+  expanded,
+}) => {
+  if (headerSummaryMarkdown) {
+    return <ToolSummaryPreview markdown={headerSummaryMarkdown} expanded={expanded} />;
+  }
+  if (!fallbackPreview) return null;
+  const stateClass = expanded ? 'aui-tool-summary-expanded' : 'aui-tool-summary-collapsed';
+  return <div className={`aui-tool-summary ${stateClass}`}>{fallbackPreview}</div>;
+};
+
+interface ToolCallHeaderTitleProps {
+  icon: string;
+  toolName: string;
+  title?: string | null;
+  elapsedText?: string | null;
+  locations?: ToolCallLocation[];
+}
+
+const ToolCallHeaderTitle: React.FC<ToolCallHeaderTitleProps> = ({
+  icon,
+  toolName,
+  title,
+  elapsedText,
+  locations,
+}) => (
+  <div className="aui-tool-call-header-title">
+    <span className="aui-tool-call-icon">{icon}</span>
+    <span className="aui-tool-call-label">
+      <strong>{title || toolName}</strong>
+      {elapsedText && <span className="aui-tool-call-elapsed"> ({elapsedText})</span>}
+      <ToolCallLocations locations={locations} />
+    </span>
+  </div>
+);
+
+function handleToolCallHeaderKeyDown(
+  event: React.KeyboardEvent<HTMLDivElement>,
+  onToggle: () => void,
+): void {
+  if (event.target !== event.currentTarget) return;
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  onToggle();
 }
 
 const ToolCallHeader: React.FC<ToolCallHeaderProps> = ({
   icon,
   toolName,
+  title,
   expanded,
   onToggle,
   headerSummaryMarkdown,
   fallbackPreview,
   elapsedText,
+  locations,
 }) => (
   <div
     className="aui-tool-call-header"
     onClick={onToggle}
-    onKeyDown={(e) => {
-      if (e.target !== e.currentTarget) return;
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        onToggle();
-      }
-    }}
+    onKeyDown={(event) => handleToolCallHeaderKeyDown(event, onToggle)}
     role="button"
     tabIndex={0}
     aria-expanded={expanded}
   >
     <div className="aui-tool-call-header-content">
-      <div className="aui-tool-call-header-title">
-        <span className="aui-tool-call-icon">{icon}</span>
-        <span className="aui-tool-call-label">
-          <strong>{toolName}</strong>
-          {elapsedText && <span className="aui-tool-call-elapsed"> ({elapsedText})</span>}
-        </span>
-      </div>
-      {headerSummaryMarkdown ? (
-        <ToolSummaryPreview markdown={headerSummaryMarkdown} expanded={expanded} />
-      ) : fallbackPreview ? (
-        <div className={`aui-tool-summary ${expanded ? 'aui-tool-summary-expanded' : 'aui-tool-summary-collapsed'}`}>
-          {fallbackPreview}
-        </div>
-      ) : null}
+      <ToolCallHeaderTitle
+        icon={icon}
+        toolName={toolName}
+        title={title}
+        elapsedText={elapsedText}
+        locations={locations}
+      />
+      <ToolCallSummaryContent
+        headerSummaryMarkdown={headerSummaryMarkdown}
+        fallbackPreview={fallbackPreview}
+        expanded={expanded}
+      />
     </div>
     <div className="aui-tool-call-chevron" aria-hidden="true">
       {expanded ? '▾' : '▸'}
@@ -405,83 +475,220 @@ export const ToolCallDetails = ({
   );
 };
 
-export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
-  const { toolName, args, argsText, result, isError, status, toolCallId } = props as any;
-  const { toolSummaries } = useContext(UsageContext);
+interface ResolvedToolContent {
+  summaryMarkdown?: string;
+  parsedArgs: any;
+  isSubAgent: boolean;
+  promptText: string | null;
+}
 
-  const effectiveId = toolCallId || (props as any).id;
-  const summaryMarkdown = resolveSummaryMarkdown(toolSummaries.get(effectiveId), result);
+interface ResolveToolContentOptions {
+  toolName?: string;
+  args: any;
+  argsText?: string;
+  result: any;
+  storedSummary?: string;
+  liveMarkdown?: string;
+}
+
+function resolveToolContent({
+  toolName,
+  args,
+  argsText,
+  result,
+  storedSummary,
+  liveMarkdown,
+}: ResolveToolContentOptions): ResolvedToolContent {
+  const summaryMarkdown = resolveSummaryMarkdown(storedSummary, result, liveMarkdown);
   const parsedArgs = parseArgsInput(args, argsText);
   const isSubAgent = checkIsSubAgent(toolName, summaryMarkdown, parsedArgs, result);
-  const promptText = extractPromptText(isSubAgent, parsedArgs, summaryMarkdown);
+  return {
+    summaryMarkdown,
+    parsedArgs,
+    isSubAgent,
+    promptText: extractPromptText(isSubAgent, parsedArgs, summaryMarkdown),
+  };
+}
 
-  const { icon, borderColor, defaultExpanded } = getToolCallPresentation(status, isError, {
+interface ComputeToolPresentationOptions {
+  status: any;
+  isError: boolean | undefined;
+  toolName: string | undefined;
+  isSubAgent: boolean;
+  liveUpdate?: ToolCallState;
+}
+
+function computeToolPresentation({
+  status,
+  isError,
+  toolName,
+  isSubAgent,
+  liveUpdate,
+}: ComputeToolPresentationOptions) {
+  return getToolCallPresentation(status, isError, {
     toolName,
     isSubAgent,
+    kind: liveUpdate?.kind,
   });
-  const [expanded, setExpanded] = useState(defaultExpanded);
-  const [viewSource, setViewSource] = useState(false);
+}
 
-  // Timer logic for showing elapsed time on long-running non-sub-agent tool calls.
-  // This start anchor is captured on first render where status is running (pending).
-  // It uses client-side time which may under-count on late hydration/reconnect — acceptable for v1.
-  // `status.type === 'requires-action'` with `reason === 'tool-calls'` indicates pending concurrent
-  // tool calls in assistant-ui; classifyToolCallStatus().isPending handles both that and 'running'.
-  const isPending = classifyToolCallStatus(status).isPending;
-  // Suppression is strictly name-based per issue #1743 spec and plan constraints.
-  // Using isSubAgentTool(toolName) avoids over-suppressing ordinary tools that happen to have
-  // session_id/message arguments (which checkIsSubAgent() would match).
-  const suppressTimer = isSubAgentTool(toolName);
-  const startedAtMsRef = useRef<number | null>(null);
-  const finalElapsedMsRef = useRef<number | null>(null);
-  const [clockMs, setClockMs] = useState(0);
+function currentElapsedMs(
+  isPending: boolean,
+  clockMs: number,
+  startedAtMs: number | null,
+  finalElapsedMs: number | null,
+): number {
+  if (!isPending) return finalElapsedMs ?? 0;
+  return startedAtMs === null ? 0 : Math.max(0, clockMs - startedAtMs);
+}
 
-  // Capture start anchor on first running render (client-side; may under-count on late hydration)
+function elapsedTextFor(elapsedMs: number, suppressTimer: boolean): string | null {
+  return !suppressTimer && elapsedMs >= TOOL_TIMER_MIN_ELAPSED_MS
+    ? formatElapsedMs(elapsedMs)
+    : null;
+}
+
+interface MutableTimeRef {
+  current: number | null;
+}
+
+function captureStartTime(isPending: boolean, startedAtMsRef: MutableTimeRef): void {
   if (isPending && startedAtMsRef.current === null) {
     startedAtMsRef.current = Date.now();
   }
+}
 
-  // Freeze final elapsed value transitioning from running to done
+function freezeFinalElapsed(
+  isPending: boolean,
+  startedAtMsRef: MutableTimeRef,
+  finalElapsedMsRef: MutableTimeRef,
+): void {
   if (!isPending && startedAtMsRef.current !== null && finalElapsedMsRef.current === null) {
     finalElapsedMsRef.current = Math.max(0, Date.now() - startedAtMsRef.current);
   }
+}
 
-  // 1s interval clock gated on running state and not suppressed
+function useTimerClock(isPending: boolean, suppressTimer: boolean): number {
+  const [clockMs, setClockMs] = useState(0);
   useEffect(() => {
     if (!isPending || suppressTimer) return undefined;
     const timer = window.setInterval(() => setClockMs(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [isPending, suppressTimer]);
+  return clockMs;
+}
 
-  // Compute elapsed text for display
-  const elapsedMs = isPending
-    ? startedAtMsRef.current !== null
-      ? Math.max(0, clockMs - startedAtMsRef.current)
-      : 0
-    : finalElapsedMsRef.current ?? 0;
-  const showTimer = !suppressTimer && elapsedMs >= TOOL_TIMER_MIN_ELAPSED_MS;
-  const elapsedText = showTimer ? formatElapsedMs(elapsedMs) : null;
+function useToolElapsedText(status: any, toolName?: string): string | null {
+  // Name-based suppression avoids hiding timers for ordinary tools that happen
+  // to have session_id/message arguments.
+  const isPending = classifyToolCallStatus(status).isPending;
+  const suppressTimer = isSubAgentTool(toolName);
+  const startedAtMsRef = useRef<number | null>(null);
+  const finalElapsedMsRef = useRef<number | null>(null);
+  const clockMs = useTimerClock(isPending, suppressTimer);
 
-  const fallbackPreview = getFallbackPreview(summaryMarkdown, parsedArgs, isSubAgent, promptText);
-  const headerSummaryMarkdown = useMemo(
-    () => formatHeaderSummary(summaryMarkdown, isSubAgent, expanded, promptText),
-    [summaryMarkdown, isSubAgent, expanded, promptText]
+  // Client-side anchor may under-count after late hydration or reconnect.
+  captureStartTime(isPending, startedAtMsRef);
+  freezeFinalElapsed(isPending, startedAtMsRef, finalElapsedMsRef);
+
+  const elapsedMs = currentElapsedMs(
+    isPending,
+    clockMs,
+    startedAtMsRef.current,
+    finalElapsedMsRef.current,
   );
+  return elapsedTextFor(elapsedMs, suppressTimer);
+}
 
+interface ResolveToolHeaderPropsOptions {
+  icon: string;
+  toolName: string;
+  title?: string;
+  expanded: boolean;
+  onToggle: () => void;
+  summaryMarkdown?: string;
+  parsedArgs: any;
+  isSubAgent: boolean;
+  promptText: string | null;
+  elapsedText: string | null;
+  locations?: { path: string; line?: number }[];
+}
+
+function resolveToolHeaderProps({
+  icon,
+  toolName,
+  title,
+  expanded,
+  onToggle,
+  summaryMarkdown,
+  parsedArgs,
+  isSubAgent,
+  promptText,
+  elapsedText,
+  locations,
+}: ResolveToolHeaderPropsOptions): ToolCallHeaderProps {
+  return {
+    icon,
+    toolName,
+    title,
+    expanded,
+    onToggle,
+    headerSummaryMarkdown: formatHeaderSummary(
+      summaryMarkdown,
+      isSubAgent,
+      expanded,
+      promptText,
+    ),
+    fallbackPreview: getFallbackPreview(
+      summaryMarkdown,
+      parsedArgs,
+      isSubAgent,
+      promptText,
+    ),
+    elapsedText,
+    locations,
+  };
+}
+
+export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
+  const { toolName, args, argsText, result, isError, status, toolCallId } = props as any;
+  const { toolSummaries, toolUpdates } = useContext(UsageContext);
+  const effectiveId = toolCallId || (props as any).id;
+  const liveUpdate = toolUpdates.get(effectiveId);
+  const content = resolveToolContent({
+    toolName,
+    args,
+    argsText,
+    result,
+    storedSummary: toolSummaries.get(effectiveId),
+    liveMarkdown: liveUpdate?.markdown,
+  });
+  const { icon, borderColor, defaultExpanded } = computeToolPresentation({
+    status,
+    isError,
+    toolName,
+    isSubAgent: content.isSubAgent,
+    liveUpdate,
+  });
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [viewSource, setViewSource] = useState(false);
+  const elapsedText = useToolElapsedText(status, toolName);
+  const headerProps = resolveToolHeaderProps({
+    icon,
+    toolName,
+    title: liveUpdate?.title,
+    expanded,
+    onToggle: () => setExpanded(!expanded),
+    ...content,
+    elapsedText,
+    locations: liveUpdate?.locations,
+  });
   const isDarkMode = typeof document !== 'undefined' && document.body.classList.contains('dark');
   const jsonStyles = isDarkMode ? darkStyles : defaultStyles;
 
   return (
     <div className="aui-tool-call" style={{ borderLeft: `4px solid ${borderColor}` }}>
-      <ToolCallHeader
-        icon={icon}
-        toolName={toolName}
-        expanded={expanded}
-        onToggle={() => setExpanded(!expanded)}
-        headerSummaryMarkdown={headerSummaryMarkdown}
-        fallbackPreview={fallbackPreview}
-        elapsedText={elapsedText}
-      />
+      <ToolCallHeader {...headerProps} />
 
       {expanded && (
         <ToolCallDetails
@@ -490,11 +697,11 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
           setViewSource={setViewSource}
           argsText={argsText}
           args={args}
-          parsedArgs={parsedArgs}
+          parsedArgs={content.parsedArgs}
           result={result}
           jsonStyles={jsonStyles}
-          isSubAgent={isSubAgent}
-          promptText={promptText}
+          isSubAgent={content.isSubAgent}
+          promptText={content.promptText}
         />
       )}
     </div>
