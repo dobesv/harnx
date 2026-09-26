@@ -535,6 +535,41 @@ impl AgUiSink {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn emit_tool_update(
+        &self,
+        id: String,
+        markdown: Option<String>,
+        status: Option<harnx_core::event::ToolStatus>,
+        title: Option<String>,
+        kind: Option<harnx_core::event::ToolKind>,
+        locations: Option<Vec<harnx_core::event::ToolLocation>>,
+        usage: Option<harnx_core::api_types::CompletionTokenUsage>,
+    ) {
+        let mut payload = json!({
+            "tool_call_id": id,
+        });
+        if let Some(markdown) = markdown {
+            payload["markdown"] = json!(markdown);
+        }
+        if let Some(status) = status {
+            payload["status"] = serde_json::to_value(status).expect("status serializes");
+        }
+        if let Some(title) = title {
+            payload["title"] = json!(title);
+        }
+        if let Some(kind) = kind {
+            payload["kind"] = serde_json::to_value(kind).expect("kind serializes");
+        }
+        if let Some(locations) = locations {
+            payload["locations"] = serde_json::to_value(locations).expect("locations serializes");
+        }
+        if let Some(usage) = usage {
+            payload["usage"] = serde_json::to_value(usage).expect("usage serializes");
+        }
+        self.emit_custom("tool_update", payload);
+    }
+
     fn emit_tool_event(&self, event: ToolEvent) {
         self.close_thinking_segment();
         match event {
@@ -580,7 +615,19 @@ impl AgUiSink {
             ToolEvent::Blocked { id, reason, .. } => {
                 self.emit_tool_result(id, reason);
             }
-            ToolEvent::Progress { .. } | ToolEvent::Update { .. } => {}
+            ToolEvent::Progress { .. } => {}
+            ToolEvent::Update {
+                id,
+                markdown,
+                status,
+                content: _,
+                title,
+                kind,
+                locations,
+                usage,
+            } => {
+                self.emit_tool_update(id, markdown, status, title, kind, locations, usage);
+            }
         }
     }
 
