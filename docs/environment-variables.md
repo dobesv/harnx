@@ -26,6 +26,7 @@ Harnx can load environment variables from a `.env` file located in the data dire
 - **HARNX_RAG_TEMPLATE**: The template for RAG prompts.
 - **HARNX_HIGHLIGHT**: Whether to highlight the output (boolean).
 - **HARNX_LIGHT_THEME**: Whether to use a light theme (boolean).
+- **HARNX_TERMINAL_STATUS**: Enable/disable terminal status emission via OSC escape codes (boolean). Defaults to `true`. Set to `0` or `false` to disable. Emission is also suppressed when stdout is not a TTY, `TERM=dumb`, or `CI` is set. See [Configuration Guide](configuration-guide.md#terminal-status) for details on terminal support.
 - **HARNX_SERVE_ADDR**: The address to serve the API on.
 - **HARNX_USER_AGENT**: The user agent string for API requests.
 - **HARNX_SAVE_SHELL_HISTORY**: Whether to save shell history (boolean).

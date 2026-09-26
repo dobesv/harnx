@@ -24,6 +24,7 @@ mod subagent_render;
 mod subagent_sessions;
 mod subagent_transcript;
 pub mod terminal;
+pub mod terminal_status;
 pub mod test_utils;
 mod tool_confirmation;
 pub mod types;

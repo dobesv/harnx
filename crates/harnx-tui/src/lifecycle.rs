@@ -617,6 +617,11 @@ impl Tui {
             let _ = std::io::stdout().execute(crossterm::terminal::SetTitle(title));
         }
 
+        // Enable terminal status emission if configured.
+        // Must happen before entering the run loop.
+        let terminal_status_enabled = self.config.read().terminal_status;
+        crate::terminal_status::set_enabled(terminal_status_enabled);
+
         let mut event_source = CrosstermEventSource;
         let result = self.run_loop_inner(&mut terminal, &mut event_source).await;
         self.abandon_pending_exit_cancel().await;
@@ -776,6 +781,9 @@ impl Tui {
                 let _ = stdout.execute(EnableMouseCapture);
                 let _ = stdout.execute(EnableBracketedPaste);
                 let _ = stdout.flush();
+                // Restore terminal status indicator after external editor resumes.
+                // Re-emits last active state (Working/Blocked) bypassing diffing.
+                crate::terminal_status::restore();
                 // Signal the main loop to clear the terminal's diff buffer so
                 // the next draw() repaints every cell from scratch.
                 needs_full_redraw.store(true, std::sync::atomic::Ordering::Release);

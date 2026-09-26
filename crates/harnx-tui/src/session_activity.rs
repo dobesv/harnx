@@ -36,6 +36,8 @@ impl Tui {
             self.app.llm_busy = true;
             self.active_remote_session = Some(target.clone());
             self.refresh_input_chrome();
+            // Emit terminal status: session activity started.
+            crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Working);
             // Reopening a session can reveal a durable pending turn after its
             // prior worker vanished. Re-activation is idempotent under the
             // session lease and guarantees that "busy" has an owner that can
@@ -125,12 +127,24 @@ impl Tui {
         match event {
             AgentEvent::Turn(TurnEvent::Started) => {
                 self.app.llm_busy = true;
+                // Emit terminal status: turn started.
+                crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Working);
                 self.app.streaming_open = false;
                 self.app.main_streamed_text_idx = None;
                 self.refresh_input_chrome();
                 true
             }
-            AgentEvent::Turn(TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. }) => {
+            AgentEvent::Turn(TurnEvent::Ended { .. }) => {
+                self.flush_pending_thought();
+                self.app.streaming_open = false;
+                self.complete_main_prompt().await;
+                true
+            }
+            AgentEvent::Turn(TurnEvent::Interrupted { .. }) => {
+                // Emit terminal status: turn interrupted.
+                crate::terminal_status::set_status(
+                    crate::terminal_status::TerminalStatus::Interrupted,
+                );
                 self.flush_pending_thought();
                 self.app.streaming_open = false;
                 self.complete_main_prompt().await;

@@ -1331,6 +1331,8 @@ impl Tui {
 
     pub(super) async fn finish_main_prompt_error(&mut self, err: String) {
         self.flush_pending_thought();
+        // Emit terminal status: model error.
+        crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Error);
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
         self.app.last_ui_output_source = None;
@@ -2196,6 +2198,9 @@ impl Tui {
             Ok(outcome) => {
                 self.maybe_open_picker_after_command(outcome, prev_agent.clone())
                     .await;
+                // Sync terminal status emission with current config after `.set`.
+                // Commands like `.set terminal_status true/false` update config on success.
+                crate::terminal_status::set_enabled(self.config.read().terminal_status);
                 let llm_busy = self.app.llm_busy;
                 let pending_message = self.app.pending_message.is_some();
                 Self::refresh_input_chrome_from_state(

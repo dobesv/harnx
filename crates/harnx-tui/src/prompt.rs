@@ -396,6 +396,9 @@ impl Tui {
 
     pub(super) async fn complete_main_prompt(&mut self) {
         self.freeze_main_unfinished_tool_timers();
+        // Emit terminal status: turn completed.
+        // The emitter's sticky-failure rule drops this if Error/Interrupted was already emitted.
+        crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Done);
         self.current_prompt_abort = None;
         self.app.llm_busy = false;
         self.active_remote_session = None;

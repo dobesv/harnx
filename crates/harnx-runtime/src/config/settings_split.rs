@@ -72,6 +72,9 @@ impl Config {
             "highlight" => {
                 Self::update_bool_field(config, value, |cfg, value| cfg.highlight = value)
             }
+            "terminal_status" => {
+                Self::update_bool_field(config, value, |cfg, value| cfg.terminal_status = value)
+            }
             "title" => Self::set_session_title(config, value),
             _ => bail!("Unknown key '{key}'"),
         }

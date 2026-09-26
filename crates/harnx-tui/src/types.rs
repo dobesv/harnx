@@ -912,6 +912,59 @@ impl TranscriptItem {
     }
 }
 
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            transcript: Vec::new(),
+            input: TextArea::default(),
+            spinner_index: 0,
+            should_quit: false,
+            llm_busy: false,
+            scroll_state: ratatui_widget_scrolling::ScrollState::new(),
+            streaming_open: false,
+            main_streamed_text_idx: None,
+            cache_valid_width: None,
+            last_ui_output_source: None,
+            pending_thought_source: None,
+            pending_thought_text: String::new(),
+            pending_tool_seq: None,
+            pending_message: None,
+            completions: Vec::new(),
+            completion_index: 0,
+            completion_prefix: String::new(),
+            completion_suffix: String::new(),
+            history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            history_preview: false,
+            attachments: Vec::new(),
+            attachment_dir: None,
+            paste_count: 0,
+            last_known_input_width: 0,
+            show_sequence_numbers: false,
+            show_timestamps: false,
+            transcript_focus: None,
+            transcript_selection_anchor: None,
+            modal: None,
+            pending_confirm_reply: None,
+            pending_confirm_id: None,
+            current_session_unread: false,
+            detail_view_scroll: ratatui_widget_scrolling::ScrollState::new(),
+            detail_view_open: false,
+            detail_view_text: None,
+            detail_view_entry: None,
+            detail_view_title: None,
+            transcript_browsing: false,
+            browsing_view_scroll: ratatui_widget_scrolling::ScrollState::new(),
+            copy_notice_until: None,
+            scroll_to_focused_item: false,
+            use_utc_timestamps: false,
+            monitored_sessions: HashMap::new(),
+            subagent_view_stack: Vec::new(),
+        }
+    }
+}
+
 impl App {
     /// Returns the (min, max) indices of the current transcript selection.
     /// Used by render_detail_view to determine which entries to display.

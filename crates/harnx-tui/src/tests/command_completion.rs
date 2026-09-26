@@ -78,7 +78,16 @@ async fn removed_mcp_commands_are_not_completed() {
 
     assert_eq!(
         info_subcommands,
-        ["agent", "env", "model", "rag", "session", "theme", "tools"]
+        [
+            "agent",
+            "env",
+            "model",
+            "rag",
+            "session",
+            "terminal_status",
+            "theme",
+            "tools"
+        ]
     );
     assert!(
         tui.compute_completions(".mcp ", ".mcp ".len())

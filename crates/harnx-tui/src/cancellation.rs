@@ -109,8 +109,13 @@ impl Tui {
     pub(super) fn settle_interrupted_prompt(&mut self) {
         self.retire_prompt_task();
         self.clear_tool_confirmation_route();
-        self.cancel_tool_confirm();
+        // Set llm_busy = false BEFORE cancel_tool_confirm() so that
+        // cancel_tool_confirm() never sees llm_busy == true and doesn't
+        // emit a transient Working.
         self.app.llm_busy = false;
+        self.cancel_tool_confirm();
+        // Emit terminal status: prompt interrupted.
+        crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Interrupted);
         self.app.pending_message = None;
         // Old readers retain their own queue, never G2's pending message slot.
         self.shared_pending_message = std::sync::Arc::new(tokio::sync::Mutex::new(None));

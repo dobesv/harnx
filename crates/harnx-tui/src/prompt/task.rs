@@ -20,6 +20,8 @@ impl Tui {
         self.sync_session_activity_monitor();
 
         self.app.llm_busy = true;
+        // Emit terminal status: prompt task starting.
+        crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Working);
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
 

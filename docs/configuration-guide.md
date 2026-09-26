@@ -227,6 +227,36 @@ See the [RAG Guide](rag-guide.md) for detailed setup instructions.
 - **highlight**: Whether to enable syntax highlighting.
 - **light_theme**: Whether to use the light theme.
 
+### Terminal Status
+
+Harnx signals agent status (working, blocked, done, interrupted, error) to
+compatible terminals via OSC escape sequences:
+
+- **Terminal support**: Orca renders status in panes via OSC 9999. kitty (v0.40+),
+  JetBrains IDEs (2024+), and Windows Terminal render progress indicators in
+  tabs/docks via OSC 9;4 (ConEmu progress). Zed is unsupported (alacritty
+  backend drops OSC sequences).
+- **terminal_status**: Boolean to enable/disable emission. Defaults to `true`.
+  Set to `false` in `config.yaml` or via `HARNX_TERMINAL_STATUS=0` environment
+  variable to disable.
+- **Auto-disable**: Emission is suppressed when stdout is not a TTY,
+  `TERM=dumb`, or `CI` is set in the environment.
+
+Error state renders as a red progress bar (OSC 9;4 state=2) and uses
+`"interrupted"` in the OSC 9999 JSON payload for compatibility with orcatui.
+
+Example `config.yaml`:
+
+```yaml
+terminal_status: false  # Disable terminal status emission
+```
+
+Or via environment:
+
+```sh
+HARNX_TERMINAL_STATUS=0 harnx
+```
+
 ### Session Titles
 
 Harnx can automatically generate a short, human-readable title for each session
