@@ -12,6 +12,7 @@ mod ag_ui_sync;
 mod ag_ui_usage;
 mod agent_resolve;
 mod interrupt_resume;
+mod models_catalog;
 mod nats_access;
 mod serve_shutdown;
 pub mod session_actor;
@@ -75,7 +76,7 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::oneshot, task::JoinSet};
 
-const DEFAULT_MODEL_NAME: &str = "default";
+use models_catalog::advertised_models;
 
 /// Default ceiling for closing client-facing HTTP connections during shutdown.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(25);
@@ -385,29 +386,7 @@ impl Server {
         stream_drain: StreamDrainConfig,
     ) -> Self {
         let config = config.read().clone();
-        let mut models = list_all_models(&config.clients);
-        let mut default_model = config.model.clone();
-        default_model.data_mut().name = DEFAULT_MODEL_NAME.into();
-        models.insert(0, default_model);
-        let models: Vec<Value> = models
-            .into_iter()
-            .enumerate()
-            .map(|(i, model)| {
-                let id = if i == 0 {
-                    DEFAULT_MODEL_NAME.into()
-                } else {
-                    model.id()
-                };
-                let mut value = json!(model.data());
-                if let Some(value_obj) = value.as_object_mut() {
-                    value_obj.insert("id".into(), id.into());
-                    value_obj.insert("object".into(), "model".into());
-                    value_obj.insert("owned_by".into(), model.client_name().into());
-                    value_obj.remove("name");
-                }
-                value
-            })
-            .collect();
+        let models = advertised_models(&config);
         let session_registry = SessionRegistry::new(config.clone());
         let agents = config.all_agents();
         Self {
@@ -1970,6 +1949,7 @@ fn finalize_err_status(dispatch_status: StatusCode, err: &anyhow::Error) -> Stat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models_catalog::DEFAULT_MODEL_NAME;
     use crate::test_support::{seed_nats_session, NatsSessionSeed, TestConfigSandbox};
     use harnx_core::message::{ImageUrl, Message, MessageContent, MessageContentPart};
     use harnx_core::session::SessionLogEntry;
@@ -2556,6 +2536,58 @@ mod tests {
             .expect("collect body")
             .to_bytes();
         serde_json::from_slice(&body).expect("parse json")
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_omits_default_alias_without_resolved_model() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let server = Server::new(&config, PathBuf::from("web-assets"));
+
+        let body = response_json(server.list_models().expect("list models response")).await;
+
+        assert_eq!(body["data"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_keeps_default_alias_and_real_model_id() {
+        let sandbox = TestConfigSandbox::new();
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Server::new(&config, PathBuf::from("web-assets"));
+
+        let body = response_json(server.list_models().expect("list models response")).await;
+        let models = body["data"].as_array().expect("model data array");
+
+        assert_eq!(models[0]["id"], DEFAULT_MODEL_NAME);
+        assert_eq!(models[1]["id"], "openai:gpt-4o");
+    }
+
+    // The original-bug shape: local clients present but no model resolved (e.g.
+    // an explicit selection was cleared). The real client models must still be
+    // advertised with their real ids, and no synthetic "default" alias emitted.
+    #[tokio::test]
+    async fn models_endpoint_lists_client_models_without_default_when_model_unset() {
+        let sandbox = TestConfigSandbox::new();
+        let mut cfg = sandbox.config();
+        cfg.model = Default::default();
+        let config = Arc::new(RwLock::new(cfg));
+        let server = Server::new(&config, PathBuf::from("web-assets"));
+
+        let body = response_json(server.list_models().expect("list models response")).await;
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .expect("model data array")
+            .iter()
+            .map(|model| model["id"].as_str().expect("model id string"))
+            .collect();
+
+        assert!(
+            !ids.contains(&DEFAULT_MODEL_NAME),
+            "no default alias expected without a resolved model, got {ids:?}"
+        );
+        assert!(
+            ids.contains(&"openai:gpt-4o"),
+            "real client model should still be advertised, got {ids:?}"
+        );
     }
 
     #[tokio::test]

@@ -511,6 +511,13 @@ The front-end reads connection settings from `nats_servers/<name>.yaml` (in this
 example, `nats_servers/remote.yaml`) and runs as a pure client:
 
 - It does not start a local `nats-server`, worker, or tool/hook servers.
+- No local chat model or `clients/` directory is required. The model requirement
+  belongs to the worker that runs the agent loop, not to the front-end. When the
+  local catalog is empty, `setup_model` logs an informational message and
+  proceeds without selecting a model; remote agents resolve their models on the
+  target worker. Local named-agent activation fails with a clear error at the
+  worker's model guard (`ensure_named_agent_has_model` in
+  `nats_worker/daemon_session_exec.rs`).
 - Bare agent names (for example, `assistant`) automatically route to that named
   cluster as if addressed as `assistant@remote`.
 - Local (`__local__`) agents are unavailable. Addressing a local agent returns

@@ -198,6 +198,7 @@ fn e2e_worker_config(
     plans_dir: &Path,
 ) -> GlobalConfig {
     Arc::new(RwLock::new(Config {
+        model: harnx_core::model::Model::new("test", "test-model"),
         tool_servers: vec![
             ToolServerConfig {
                 name: "time".to_string(),
@@ -278,6 +279,7 @@ fn capture_selected_tools(
 
 fn single_time_server_config(time_binary: PathBuf) -> GlobalConfig {
     Arc::new(RwLock::new(Config {
+        model: harnx_core::model::Model::new("test", "test-model"),
         tool_servers: vec![ToolServerConfig {
             name: "time".to_string(),
             command: time_binary.to_string_lossy().into_owned(),

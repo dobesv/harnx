@@ -216,6 +216,71 @@ async fn missing_named_agent_fails_durably_without_calling_the_model() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn named_local_agent_without_model_fails_with_clear_durable_error() -> Result<()> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+    let config_root = tempfile::tempdir()?;
+    write_test_agent(config_root.path(), "model-less", "run without a model")?;
+    let _config_guard = EnvVarGuard::set_path("HARNX_CONFIG_DIR", config_root.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let config = local_nats_runtime_config(server.url());
+    config.write().model = Default::default();
+    let daemon = spawn_worker_daemon_with_call_fn(
+        config,
+        "worker-model-less-agent",
+        counting_stub_call_fn(Arc::clone(&calls)),
+    )
+    .await?;
+    let jetstream = local_test_nats(server.url()).await?;
+    let session_id = "model-less-local-agent";
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    seed_and_activate(
+        &jetstream,
+        &store,
+        SeedActivation {
+            session_id,
+            initializer: SessionInitializer::named("model-less", Default::default()),
+            message_id: "model-less-user",
+        },
+    )
+    .await?;
+    let log = NatsSessionLog::new_with_replicas(
+        jetstream,
+        harnx_core::session_identity::session_key(Some("model-less"), session_id),
+        1,
+    );
+
+    let error_message = tokio::time::timeout(CI_SAFE_TIMEOUT, async {
+        loop {
+            if let Some(message) =
+                log.load_events_async()
+                    .await?
+                    .into_iter()
+                    .find_map(|(_, entry)| match entry {
+                        SessionLogEntry::Error { message, .. } => Some(message),
+                        _ => None,
+                    })
+            {
+                return Ok::<_, anyhow::Error>(message);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        error_message.contains("no chat model configured for local agent 'model-less'")
+            && error_message.contains("configure a client/model or route to a remote worker"),
+        "unexpected worker error: {error_message}"
+    );
+    assert!(!error_message.contains("Invalid model ''"));
+    daemon.abort();
+    let _ = daemon.await;
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_local_id_executes_with_each_agents_configuration() -> Result<()> {
     let Some(server) = require_nats_server().await? else {
         return Ok(());

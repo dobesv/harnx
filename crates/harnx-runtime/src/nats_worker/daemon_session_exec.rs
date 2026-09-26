@@ -96,6 +96,30 @@ struct RunningSessionRuntime {
     turn: Option<JoinHandle<Result<bool>>>,
 }
 
+/// Fail a local named-agent activation early when no chat model resolved.
+///
+/// Frontends may now boot with no local model (remote-only deployments); the
+/// requirement moves here, to the worker that actually runs the agent loop. A
+/// clear setup error is recorded as a durable turn failure instead of the agent
+/// loop failing later with the opaque `Invalid model ''` from the client layer.
+///
+/// Only `Named` sources are checked. `Inline` sessions carry a resolved model
+/// enforced upstream at `SessionInitializer::from_config` ("inline NATS sessions
+/// require a resolved model"), so an unset model can't reach here for them; the
+/// early return keeps this from being a second, divergent gate on that path.
+fn ensure_named_agent_has_model(
+    per_session: &crate::config::GlobalConfig,
+    metadata: &crate::nats_session_metadata::SessionMetadata,
+) -> Result<()> {
+    let crate::nats_session_metadata::SessionAgentSource::Named { name } = &metadata.agent else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        per_session.read().current_model_id().is_some(),
+        "no chat model configured for local agent '{name}'; configure a client/model or route to a remote worker"
+    );
+    Ok(())
+}
 impl WorkerRuntime {
     pub(super) async fn execute_session(
         &self,
@@ -108,6 +132,22 @@ impl WorkerRuntime {
         let outcome =
             Self::await_turn_body(turn, &running.execution_abort, &running.shutdown).await;
         Self::complete_session_execution(running, outcome).await
+    }
+
+    /// Load the canonical session metadata for an activation, refusing to run
+    /// without it — a worker never invents identity for a session it claimed.
+    async fn load_activation_metadata(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::nats_session_metadata::SessionMetadata> {
+        Ok(self
+            .session_metadata
+            .get(session_id)
+            .await?
+            .with_context(|| {
+                format!("refusing activation without canonical session metadata: {session_id}")
+            })?
+            .metadata)
     }
 
     async fn prepare_session_runtime(
@@ -124,16 +164,8 @@ impl WorkerRuntime {
             shutdown,
         } = inputs;
         let metadata = self
-            .session_metadata
-            .get(&activation.session_id)
-            .await?
-            .with_context(|| {
-                format!(
-                    "refusing activation without canonical session metadata: {}",
-                    activation.session_id
-                )
-            })?
-            .metadata;
+            .load_activation_metadata(&activation.session_id)
+            .await?;
         let (execution_abort, abort_relay, shutdown_relay) =
             Self::spawn_execution_abort_relays(abort_signal, shutdown.clone());
         let per_session = {
@@ -147,7 +179,8 @@ impl WorkerRuntime {
             &metadata.session_id,
             &execution_abort,
         );
-        let agent_setup = super::daemon::install_session_metadata_agent(&per_session, &metadata);
+        let agent_setup = super::daemon::install_session_metadata_agent(&per_session, &metadata)
+            .and_then(|()| ensure_named_agent_has_model(&per_session, &metadata));
         let event_sink = Arc::new(
             crate::nats_event_sink::NatsEventSink::new(
                 self.client.clone(),
