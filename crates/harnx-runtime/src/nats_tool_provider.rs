@@ -6,16 +6,17 @@ use futures_util::TryStreamExt;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::execution_context::{ToolObservationProvenance, EXECUTION_CONTEXT_NAMESPACE};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
-use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider, ToolProviderOutput};
+use harnx_core::tool::{
+    JsonSchema, ToolDeclaration, ToolError, ToolProgress, ToolProvider, ToolProviderOutput,
+};
 use harnx_toolset::{
-    ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec, HDR_CALL_ID,
-    HDR_CONTENT_TYPE, HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
+    ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec,
+    CAPABILITY_TOOL_PROGRESS, HDR_CALL_ID, HDR_CONTENT_TYPE, HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
 };
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 mod cancellation;
@@ -25,11 +26,13 @@ use in_flight::InFlightFailure;
 pub(crate) use in_flight::InFlightRegistration;
 pub use in_flight::{InFlightCancelTarget, NatsInFlightCalls};
 mod execution_context;
+mod progress;
 mod replay;
 mod request;
 pub(crate) use replay::decode_journaled_reply;
 
 use execution_context::extract_execution_context;
+use progress::ProgressDispatcher;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const REGISTRATION_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -67,8 +70,8 @@ pub struct NatsToolProvider {
     /// and dispatch is usually first, so it has to carry the cluster's
     /// configured count rather than assume a single replica.
     journal_replicas: usize,
-    // Owning this subscription establishes the progress/cancel channel before requests start.
-    _control_subscription: Mutex<async_nats::Subscriber>,
+    // Owns the flushed control subscription and its call-id progress routes.
+    progress_dispatcher: ProgressDispatcher,
     in_flight: NatsInFlightCalls,
 }
 
@@ -137,7 +140,7 @@ impl NatsToolProvider {
             declarations,
             registry,
             journal_replicas,
-            _control_subscription: Mutex::new(control_subscription),
+            progress_dispatcher: ProgressDispatcher::new(control_subscription),
             in_flight,
         })
     }
@@ -479,12 +482,30 @@ impl ToolProvider for NatsToolProvider {
                 id: tool_call_id,
             },
             abort,
+            None,
         ))
         .await
     }
 
-    // The default `call_tool_with_progress` keeps forwarding call identity through
-    // `call_tool_with_id`; NATS progress transport is added in a later phase.
+    async fn call_tool_with_progress(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        tool_call_id: Option<&str>,
+        abort: &AbortSignal,
+        progress: std::sync::Arc<dyn ToolProgress>,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        Box::pin(self.call_registered_tool(
+            request::ToolCallInput {
+                name: tool_name,
+                arguments,
+                id: tool_call_id,
+            },
+            abort,
+            Some(progress),
+        ))
+        .await
+    }
 }
 
 /// Open the tool registry bucket, treating "the stream genuinely doesn't
@@ -611,7 +632,7 @@ pub async fn describe_discovery(
 mod tests {
     use super::{
         build_registered_tools, request_timeout, NatsInFlightCalls, NatsToolProvider,
-        RegisteredTool, DEFAULT_REQUEST_TIMEOUT,
+        ProgressDispatcher, RegisteredTool, DEFAULT_REQUEST_TIMEOUT,
     };
     use harnx_core::instance::ServerScope;
     use harnx_toolset::{Registration, ToolSpec};
@@ -622,7 +643,6 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::time::Duration;
-    use tokio::sync::Mutex;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -653,7 +673,7 @@ mod tests {
             declarations: Vec::new(),
             registry: None,
             journal_replicas: 1,
-            _control_subscription: Mutex::new(control_subscription),
+            progress_dispatcher: ProgressDispatcher::new(control_subscription),
             in_flight: NatsInFlightCalls::default(),
         };
         let route = RegisteredTool {
@@ -920,5 +940,293 @@ mod tests {
             }
         }
         None
+    }
+
+    #[derive(Default)]
+    struct RecordingProgress {
+        updates: std::sync::Mutex<Vec<harnx_core::tool::ToolUpdatePatch>>,
+        received: tokio::sync::Notify,
+    }
+
+    impl RecordingProgress {
+        async fn wait_for_updates(&self, count: usize) {
+            loop {
+                if self.updates.lock().unwrap().len() >= count {
+                    return;
+                }
+                self.received.notified().await;
+            }
+        }
+    }
+
+    impl harnx_core::tool::ToolProgress for RecordingProgress {
+        fn update(&self, patch: harnx_core::tool::ToolUpdatePatch) {
+            self.updates.lock().unwrap().push(patch);
+            self.received.notify_one();
+        }
+    }
+
+    fn progress_titles(progress: &RecordingProgress) -> Vec<String> {
+        progress
+            .updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|patch| patch.title.clone())
+            .collect()
+    }
+
+    fn unwrap_tool_result(
+        result: Result<harnx_core::tool::ToolProviderOutput, harnx_core::tool::ToolError>,
+    ) -> harnx_core::tool::ToolProviderOutput {
+        match result {
+            Ok(output) => output,
+            Err(harnx_core::tool::ToolError::Recoverable(error))
+            | Err(harnx_core::tool::ToolError::Fatal(error)) => {
+                panic!("tool call failed: {error:#}")
+            }
+        }
+    }
+
+    async fn progress_test_provider(
+        client: async_nats::Client,
+        instance_id: ServerScope,
+    ) -> NatsToolProvider {
+        let subscription = client
+            .subscribe(instance_id.control_subject())
+            .await
+            .expect("subscribe to progress control subject");
+        client.flush().await.expect("flush progress subscription");
+        NatsToolProvider {
+            client,
+            instance_id,
+            parent_session_id: None,
+            tools: HashMap::from([(
+                "stream".to_string(),
+                RegisteredTool {
+                    server: "progress-test".to_string(),
+                    selector_server: "progress-test".to_string(),
+                    raw_name: "stream".to_string(),
+                    request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+                },
+            )]),
+            registrations: Vec::new(),
+            active_package: None,
+            declarations: Vec::new(),
+            registry: None,
+            journal_replicas: 1,
+            progress_dispatcher: ProgressDispatcher::new(subscription),
+            in_flight: NatsInFlightCalls::default(),
+        }
+    }
+
+    async fn publish_progress(
+        client: &async_nats::Client,
+        subject: &str,
+        call_id: &str,
+        title: String,
+    ) {
+        use harnx_toolset::{ProgressChunk, ProgressMessage, ToolProgressPatch};
+        let message = ProgressMessage {
+            call_id: call_id.to_string(),
+            chunk: ProgressChunk::V1(ToolProgressPatch {
+                title: Some(title),
+                ..Default::default()
+            }),
+        };
+        client
+            .publish(
+                subject.to_string(),
+                serde_json::to_vec(&message).unwrap().into(),
+            )
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn progress_routes_parallel_calls_reconciles_fast_reply_and_cleans_up_cancel() {
+        use futures_util::StreamExt;
+        use harnx_core::abort::create_abort_signal;
+        use harnx_core::tool::ToolProvider;
+        use harnx_toolset::{ToolReply, ToolRequest, CAPABILITY_TOOL_PROGRESS};
+        use std::sync::Arc;
+
+        harnx_core::require_nextest();
+        let Some(server) = spawn_nats_server_without_jetstream() else {
+            eprintln!("skipping progress routing test: nats-server missing");
+            return;
+        };
+        let client = async_nats::connect(&server.url)
+            .await
+            .expect("connect to test NATS server");
+        let instance_id = ServerScope::new();
+        let subject = instance_id.tool_subject("progress-test", "stream");
+        let control_subject = instance_id.control_subject();
+        let mut requests = client
+            .subscribe(subject)
+            .await
+            .expect("subscribe to progress test tool");
+        client.flush().await.expect("flush tool subscription");
+        let alpha = Arc::new(RecordingProgress::default());
+        let beta = Arc::new(RecordingProgress::default());
+        let responder_alpha = alpha.clone();
+        let responder_beta = beta.clone();
+        let responder_client = client.clone();
+        let responder = tokio::spawn(async move {
+            while let Some(message) = requests.next().await {
+                let client = responder_client.clone();
+                let control_subject = control_subject.clone();
+                let alpha_progress = responder_alpha.clone();
+                let beta_progress = responder_beta.clone();
+                tokio::spawn(async move {
+                    let request: ToolRequest =
+                        serde_json::from_slice(&message.payload).expect("decode tool request");
+                    let label = request.args["label"].as_str().unwrap().to_string();
+                    let mode = request.args["mode"].as_str().unwrap_or("normal");
+                    let supports_progress = request.capabilities.contains(CAPABILITY_TOOL_PROGRESS);
+                    assert_eq!(supports_progress, label != "legacy");
+                    if mode != "final_only" {
+                        publish_progress(
+                            &client,
+                            &control_subject,
+                            &request.call_id,
+                            format!("{label}-live"),
+                        )
+                        .await;
+                    }
+                    if mode == "cancel" {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        publish_progress(
+                            &client,
+                            &control_subject,
+                            &request.call_id,
+                            format!("{label}-late"),
+                        )
+                        .await;
+                        return;
+                    }
+                    match label.as_str() {
+                        "alpha" => alpha_progress.wait_for_updates(1).await,
+                        "beta" => beta_progress.wait_for_updates(1).await,
+                        _ => {}
+                    }
+                    let final_progress =
+                        supports_progress.then(|| harnx_toolset::ToolProgressPatch {
+                            title: Some(format!("{label}-final")),
+                            ..Default::default()
+                        });
+                    let reply = ToolReply {
+                        call_id: request.call_id,
+                        result: Ok(json!({"label": label})),
+                        final_progress,
+                    };
+                    client
+                        .publish(
+                            message.reply.expect("request has reply subject"),
+                            serde_json::to_vec(&reply).unwrap().into(),
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        let provider = progress_test_provider(client, instance_id).await;
+
+        let alpha_abort = create_abort_signal();
+        let beta_abort = create_abort_signal();
+        let (alpha_result, beta_result) = tokio::join!(
+            provider.call_tool_with_progress(
+                "stream",
+                json!({"label": "alpha"}),
+                Some("logical-alpha"),
+                &alpha_abort,
+                alpha.clone(),
+            ),
+            provider.call_tool_with_progress(
+                "stream",
+                json!({"label": "beta"}),
+                Some("logical-beta"),
+                &beta_abort,
+                beta.clone(),
+            )
+        );
+        assert_eq!(unwrap_tool_result(alpha_result)["label"], "alpha");
+        assert_eq!(unwrap_tool_result(beta_result)["label"], "beta");
+        assert_eq!(progress_titles(&alpha), ["alpha-live", "alpha-final"]);
+        assert_eq!(progress_titles(&beta), ["beta-live", "beta-final"]);
+
+        let fast = Arc::new(RecordingProgress::default());
+        let fast_abort = create_abort_signal();
+        let fast_result = unwrap_tool_result(
+            provider
+                .call_tool_with_progress(
+                    "stream",
+                    json!({"label": "fast", "mode": "final_only"}),
+                    Some("logical-fast"),
+                    &fast_abort,
+                    fast.clone(),
+                )
+                .await,
+        );
+        assert_eq!(fast_result["label"], "fast");
+        assert_eq!(progress_titles(&fast), ["fast-final"]);
+
+        let cancel = Arc::new(RecordingProgress::default());
+        let abort = create_abort_signal();
+        let abort_trigger = abort.clone();
+        let cancel_progress = cancel.clone();
+        let abort_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), cancel_progress.wait_for_updates(1))
+                .await
+                .expect("cancel progress update must arrive before abort");
+            abort_trigger.set_ctrlc();
+        });
+        let cancelled = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.call_tool_with_progress(
+                "stream",
+                json!({"label": "cancel", "mode": "cancel"}),
+                Some("logical-cancel"),
+                &abort,
+                cancel.clone(),
+            ),
+        )
+        .await
+        .expect("cancelled progress call must not hang");
+        assert!(cancelled.is_err());
+        abort_task.await.expect("abort trigger task succeeds");
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(progress_titles(&cancel), ["cancel-live"]);
+
+        let after_cancel = Arc::new(RecordingProgress::default());
+        let after_abort = create_abort_signal();
+        let result = unwrap_tool_result(
+            provider
+                .call_tool_with_progress(
+                    "stream",
+                    json!({"label": "after", "mode": "final_only"}),
+                    Some("logical-after"),
+                    &after_abort,
+                    after_cancel.clone(),
+                )
+                .await,
+        );
+
+        let legacy_abort = create_abort_signal();
+        let legacy = unwrap_tool_result(
+            provider
+                .call_tool(
+                    "stream",
+                    json!({"label": "legacy", "mode": "final_only"}),
+                    &legacy_abort,
+                )
+                .await,
+        );
+        assert_eq!(legacy["label"], "legacy");
+        assert_eq!(result["label"], "after");
+        assert_eq!(progress_titles(&after_cancel), ["after-final"]);
+
+        responder.abort();
     }
 }

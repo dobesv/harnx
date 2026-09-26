@@ -3,6 +3,7 @@ use futures_util::StreamExt;
 use harnx_toolset_server::invocation_journal::InvocationJournal;
 use serde_json::json;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[test]
 fn replay_route_preserves_logical_identity_across_process_scopes() -> anyhow::Result<()> {
@@ -210,7 +211,7 @@ async fn saved_reply_provider(client: async_nats::Client) -> anyhow::Result<Nats
         declarations: Vec::new(),
         registry: None,
         journal_replicas: 1,
-        _control_subscription: Mutex::new(subscription),
+        progress_dispatcher: ProgressDispatcher::new(subscription),
         in_flight: NatsInFlightCalls::default(),
     })
 }

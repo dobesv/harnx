@@ -5,10 +5,14 @@ use crate::server::{
 use crate::tool_templates;
 use async_trait::async_trait;
 use harnx_tool_allow::ResolvedAllowlist;
-use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{
+    ToolInvocation, ToolInvokeError, ToolProgressKind, ToolProgressLocation, ToolProgressPatch,
+    ToolProgressStatus, ToolSpec, Toolset,
+};
 use rmcp::model::{CallToolResult, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
 use serde_json::{Map, Value};
+use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 /// Toolset exposing the filesystem tools (read, write, edit, insert,
@@ -66,6 +70,105 @@ fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolIn
     }
 }
 
+fn progress_patch(server: &FsServer, tool: &str, args: &Value) -> Option<ToolProgressPatch> {
+    let location = server.progress_location_for_args(tool, args)?;
+    let path = location.display();
+    let (title, kind) = match tool {
+        "read" => (format!("Reading {path}"), ToolProgressKind::Read),
+        "edit" => (format!("Editing {path}"), ToolProgressKind::Edit),
+        "grep" => (
+            format!(
+                "Searching for {:?} in {path}",
+                args.get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            ),
+            ToolProgressKind::Search,
+        ),
+        "find" => (
+            format!(
+                "Finding {:?} in {path}",
+                args.get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            ),
+            ToolProgressKind::Search,
+        ),
+        _ => return None,
+    };
+    Some(ToolProgressPatch {
+        title: Some(title),
+        status: Some(ToolProgressStatus::InProgress),
+        kind: Some(kind),
+        locations: Some(vec![ToolProgressLocation {
+            path: location,
+            line: None,
+        }]),
+        ..Default::default()
+    })
+}
+
+fn discovered_locations(
+    server: &FsServer,
+    tool: &str,
+    args: &Value,
+    result: &CallToolResult,
+) -> Option<ToolProgressPatch> {
+    let root = server.progress_location_for_args(tool, args)?;
+    let value = serde_json::to_value(result).ok()?;
+    if value.get("isError").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let text = value
+        .get("content")?
+        .as_array()?
+        .first()?
+        .get("text")?
+        .as_str()?;
+    let locations = match tool {
+        "find" => find_locations(&root, text),
+        "grep" => grep_locations(&root, text),
+        _ => return None,
+    };
+    Some(ToolProgressPatch {
+        locations: Some(locations),
+        ..Default::default()
+    })
+}
+
+fn find_locations(root: &Path, text: &str) -> Vec<ToolProgressLocation> {
+    text.lines()
+        .take_while(|line| !line.is_empty() && !line.starts_with('['))
+        .filter(|line| !line.starts_with("No files found"))
+        .map(|line| ToolProgressLocation {
+            path: root.join(line),
+            line: None,
+        })
+        .collect()
+}
+
+fn grep_locations(root: &Path, text: &str) -> Vec<ToolProgressLocation> {
+    let mut locations = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let Some((path, remainder)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((line_number, _)) = remainder.split_once(':') else {
+            continue;
+        };
+        let Ok(line_number) = line_number.parse::<u32>() else {
+            continue;
+        };
+        locations.entry(root.join(path)).or_insert(line_number);
+    }
+    locations
+        .into_iter()
+        .map(|(path, line)| ToolProgressLocation {
+            path,
+            line: Some(line),
+        })
+        .collect()
+}
 /// Canonical specifications for the filesystem tools.
 pub fn builtin_tool_specs() -> Vec<ToolSpec> {
     vec![
@@ -107,6 +210,27 @@ impl Toolset for FsToolset {
         _cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
         let result = self.server.invoke_tool_value(tool, args).await;
+        map_result(result)
+    }
+
+    async fn invoke_with_context(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Value, ToolInvokeError> {
+        if let Some(patch) = progress_patch(&self.server, &invocation.tool, &invocation.args) {
+            invocation.context.progress.update(patch);
+        }
+        let result = self
+            .server
+            .invoke_tool_value(&invocation.tool, invocation.args.clone())
+            .await;
+        if let Ok(result) = &result {
+            if let Some(patch) =
+                discovered_locations(&self.server, &invocation.tool, &invocation.args, result)
+            {
+                invocation.context.progress.update(patch);
+            }
+        }
         map_result(result)
     }
 }
@@ -252,5 +376,127 @@ mod tests {
         invoke_content_tools(&toolset, &file_arg, &root_arg).await;
         invoke_rollback(&toolset, &file, &root_arg).await;
         assert_tool_specs(&toolset);
+    }
+
+    #[derive(Default)]
+    struct RecordingProgress(std::sync::Mutex<Vec<ToolProgressPatch>>);
+
+    impl harnx_toolset::ToolProgress for RecordingProgress {
+        fn update(&self, patch: ToolProgressPatch) {
+            self.0.lock().unwrap().push(patch);
+        }
+    }
+
+    async fn invoke_with_progress(
+        toolset: &FsToolset,
+        recorder: &std::sync::Arc<RecordingProgress>,
+        tool: &str,
+        args: Value,
+    ) {
+        let result = toolset
+            .invoke_with_context(ToolInvocation {
+                tool: tool.to_string(),
+                args,
+                context: harnx_toolset::ToolInvocationContext {
+                    progress: harnx_toolset::ToolProgressHandle::new(recorder.clone()),
+                    ..Default::default()
+                },
+                cancel: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        assert_success_shape(&result);
+    }
+
+    #[tokio::test]
+    async fn native_read_search_find_and_edit_emit_resolved_progress() {
+        let root = TestDir::new();
+        let root_path = root.0.canonicalize().unwrap();
+        let file = root_path.join("sample.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let file_arg = file.to_string_lossy().into_owned();
+        let root_arg = root_path.to_string_lossy().into_owned();
+        let mut allowlist = ResolvedAllowlist::new();
+        allowlist.insert_rwx(root_path);
+        let toolset = FsToolset::new(allowlist);
+        let recorder = std::sync::Arc::new(RecordingProgress::default());
+
+        invoke_with_progress(
+            &toolset,
+            &recorder,
+            "read",
+            json!({"path": file_arg.clone()}),
+        )
+        .await;
+        invoke_with_progress(
+            &toolset,
+            &recorder,
+            "grep",
+            json!({"pattern": "one", "path": root_arg.clone()}),
+        )
+        .await;
+        invoke_with_progress(
+            &toolset,
+            &recorder,
+            "find",
+            json!({"pattern": "**/*.txt", "path": root_arg}),
+        )
+        .await;
+        invoke_with_progress(
+            &toolset,
+            &recorder,
+            "edit",
+            json!({"path": file_arg, "old_text": "one", "new_text": "two"}),
+        )
+        .await;
+
+        let patches = recorder.0.lock().unwrap();
+        assert_eq!(patches.len(), 6);
+        assert_eq!(patches[0].kind, Some(ToolProgressKind::Read));
+        assert_eq!(patches[1].kind, Some(ToolProgressKind::Search));
+        assert_eq!(patches[3].kind, Some(ToolProgressKind::Search));
+        assert_eq!(patches[5].kind, Some(ToolProgressKind::Edit));
+        assert_eq!(patches[2].locations.as_ref().unwrap()[0].line, Some(1));
+        let reported_path = &patches[4].locations.as_ref().unwrap()[0].path;
+        assert_eq!(
+            reported_path.canonicalize().unwrap(),
+            file.canonicalize().unwrap()
+        );
+        assert!([0, 1, 3, 5].into_iter().all(|index| {
+            patches[index].status == Some(ToolProgressStatus::InProgress)
+                && patches[index].locations.as_ref().is_some_and(|locations| {
+                    locations.len() == 1 && locations[0].path.is_absolute()
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn zero_match_find_clears_locations_without_emitting_result_text_as_a_path() {
+        let root = TestDir::new();
+        let root_path = root.0.canonicalize().unwrap();
+        let root_arg = root_path.to_string_lossy().into_owned();
+        let mut allowlist = ResolvedAllowlist::new();
+        allowlist.insert_read(root_path);
+        let toolset = FsToolset::new(allowlist);
+        let recorder = std::sync::Arc::new(RecordingProgress::default());
+
+        invoke_with_progress(
+            &toolset,
+            &recorder,
+            "find",
+            json!({"pattern": "**/*.missing", "path": root_arg}),
+        )
+        .await;
+
+        let patches = recorder.0.lock().unwrap();
+        assert_eq!(patches.len(), 2);
+        assert_eq!(patches[1].locations, Some(Vec::new()));
+        assert!(patches.iter().all(|patch| {
+            patch.locations.as_ref().is_none_or(|locations| {
+                locations
+                    .iter()
+                    .all(|location| !location.path.to_string_lossy().contains("No files found"))
+            })
+        }));
     }
 }
