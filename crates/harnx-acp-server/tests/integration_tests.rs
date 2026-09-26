@@ -70,7 +70,7 @@ mod tests {
         assert_eq!(response["result"]["agentCapabilities"]["loadSession"], true);
         assert_eq!(
             response["result"]["agentCapabilities"]["sessionCapabilities"],
-            serde_json::json!({"list": {}})
+            serde_json::json!({"list": {}, "resume": {}, "close": {}})
         );
     }
 
