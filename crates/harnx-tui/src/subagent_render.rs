@@ -104,7 +104,7 @@ pub(super) fn render_subagent_detail(item: &TranscriptItem) -> Vec<Line<'static>
     lines
 }
 
-fn title_suffix(title: Option<&str>, line_width: usize, prefix_width: usize) -> String {
+pub(crate) fn title_suffix(title: Option<&str>, line_width: usize, prefix_width: usize) -> String {
     let Some(title) = title.map(sanitize_title).filter(|title| !title.is_empty()) else {
         return String::new();
     };
@@ -132,7 +132,7 @@ fn title_suffix(title: Option<&str>, line_width: usize, prefix_width: usize) -> 
     format!("{TITLE_SEPARATOR}{}…", &title[..end])
 }
 
-fn sanitize_title(title: &str) -> String {
+pub(crate) fn sanitize_title(title: &str) -> String {
     let mut sanitized = String::with_capacity(title.len());
     let mut replacing_control = false;
     for character in title.chars() {

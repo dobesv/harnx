@@ -27,6 +27,7 @@ pub mod terminal;
 pub mod terminal_status;
 pub mod test_utils;
 mod tool_confirmation;
+pub(crate) mod tool_render;
 pub mod types;
 
 mod completion;

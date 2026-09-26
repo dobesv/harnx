@@ -1,8 +1,7 @@
 use crate::markdown_render::{MarkdownBlockData, RenderedEntry};
 use crate::subagent_render::{render_subagent_detail, render_subagent_row};
 use crate::types::{
-    App, ModalState, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT,
-    SPINNER_FRAMES,
+    App, ModalState, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES,
 };
 use crate::types::{RenderEntryState, RenderedCache, Tui};
 use harnx_core::event::{AgentEvent, SessionEvent, TurnEvent};
@@ -65,7 +64,7 @@ impl Tui {
         true
     }
 
-    fn render_text_entry(
+    pub(crate) fn render_text_entry(
         prefix: &str,
         text: &str,
         style: Style,
@@ -89,43 +88,6 @@ impl Tui {
             lines.push(Line::from(""));
         }
         lines
-    }
-
-    /// Render a `ToolCall` transcript item: `→ tool_name` header followed
-    /// by the body lines. Body rendering depends on its origin —
-    /// `Markdown` (from a `call_template`) is rendered inline; `Yaml`
-    /// (raw args, no template) is displayed verbatim, each line indented.
-    fn render_tool_call(
-        tool_name: &str,
-        body: Option<&ToolCallBody>,
-        width: u16,
-        theme: Option<&Theme>,
-    ) -> RenderedEntry {
-        let dim_gray = Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM);
-
-        match body {
-            Some(ToolCallBody::Markdown(md)) => {
-                // Markdown body is the tool description itself — header suppressed
-                // intentionally (the markdown content replaces the "→ tool_name" line).
-                crate::markdown_render::render_markdown(md, dim_gray, width, theme)
-            }
-            Some(ToolCallBody::Yaml(yaml)) => {
-                let mut lines = vec![];
-                let header_text = format!("→ {tool_name}");
-                lines.extend(Self::render_text_entry("", &header_text, dim_gray, false));
-                for line in yaml.lines() {
-                    lines.extend(Self::render_text_entry("", line, dim_gray, false));
-                }
-                RenderedEntry::from_lines(lines, width)
-            }
-            None => {
-                let header_text = format!("→ {tool_name}");
-                let lines = Self::render_text_entry("", &header_text, dim_gray, false);
-                RenderedEntry::from_lines(lines, width)
-            }
-        }
     }
 
     fn render_meta_suffix(
@@ -392,6 +354,11 @@ impl Tui {
                 final_elapsed_ms,
                 id: _,
                 rendered_cache,
+                title,
+                status,
+                kind,
+                locations,
+                usage: _,
             } => {
                 // Determine if we should bypass cache: running tool that may need timer update.
                 let is_running = final_elapsed_ms.is_none();
@@ -400,8 +367,8 @@ impl Tui {
                     && start_anchor.elapsed().as_millis()
                         >= harnx_toolset::TOOL_TIMER_MIN_ELAPSED_MS as u128;
 
-                // Use cache only when no timer conditions apply
-                if !is_running || !show_timer {
+                // When not running, use cache if parameters match
+                if !is_running {
                     if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
                         if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
                             return cached.clone();
@@ -409,7 +376,37 @@ impl Tui {
                     }
                 }
 
-                let mut entry = Self::render_tool_call(tool_name, body.as_ref(), width, theme);
+                let timer_text = if show_timer {
+                    let elapsed_ms = start_anchor.elapsed().as_millis() as u64;
+                    let seconds = elapsed_ms / 1_000;
+                    Some(format!(" ({seconds}s)"))
+                } else if let Some(elapsed_ms) = final_elapsed_ms {
+                    if *elapsed_ms >= harnx_toolset::TOOL_TIMER_MIN_ELAPSED_MS
+                        && !harnx_toolset::is_subagent_launcher(tool_name)
+                    {
+                        let seconds = *elapsed_ms / 1_000;
+                        Some(format!(" ({seconds}s)"))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let mut entry =
+                    crate::tool_render::render_tool_call(crate::tool_render::RenderToolCallArgs {
+                        tool_name,
+                        body: body.as_ref(),
+                        title: title.as_deref(),
+                        status: *status,
+                        kind: *kind,
+                        locations,
+                        is_running,
+                        spinner_index: state.spinner_index,
+                        timer: timer_text.as_deref(),
+                        width,
+                        theme,
+                    });
                 if let Some(suffix) =
                     Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
@@ -423,44 +420,6 @@ impl Tui {
                             height: 1,
                         },
                     );
-                }
-
-                // Append elapsed timer if running and past threshold
-                if show_timer {
-                    let elapsed_ms = start_anchor.elapsed().as_millis() as u64;
-                    let seconds = elapsed_ms / 1_000;
-                    // Append dim " (Ns)" to the last line
-                    if let Some(MarkdownBlockData::Paragraph { lines, .. }) =
-                        entry.blocks.last_mut()
-                    {
-                        if let Some(last_line) = lines.last_mut() {
-                            last_line.spans.push(Span::styled(
-                                format!(" ({seconds}s)"),
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::DIM),
-                            ));
-                        }
-                    }
-                } else if let Some(elapsed_ms) = final_elapsed_ms {
-                    // Completed tool that ran >5s: show frozen final elapsed
-                    if *elapsed_ms >= harnx_toolset::TOOL_TIMER_MIN_ELAPSED_MS
-                        && !harnx_toolset::is_subagent_launcher(tool_name)
-                    {
-                        let seconds = *elapsed_ms / 1_000;
-                        if let Some(MarkdownBlockData::Paragraph { lines, .. }) =
-                            entry.blocks.last_mut()
-                        {
-                            if let Some(last_line) = lines.last_mut() {
-                                last_line.spans.push(Span::styled(
-                                    format!(" ({seconds}s)"),
-                                    Style::default()
-                                        .fg(Color::DarkGray)
-                                        .add_modifier(Modifier::DIM),
-                                ));
-                            }
-                        }
-                    }
                 }
 
                 // Only cache when not running (timer stable)
@@ -1162,8 +1121,13 @@ impl Tui {
                 timestamp,
                 rendered_cache: _,
                 start_anchor: _,
-                final_elapsed_ms: _,
-                id: _,
+                final_elapsed_ms,
+                id,
+                title,
+                status,
+                kind,
+                locations,
+                usage,
             } => {
                 lines.push(Line::from(Span::styled("── tool call ──", label_style)));
                 if let Some(s) = seq {
@@ -1172,7 +1136,30 @@ impl Tui {
                 if let Some(ts) = timestamp {
                     push_field!("timestamp", &ts.to_rfc3339());
                 }
+                if let Some(i) = id {
+                    push_field!("id", i);
+                }
                 push_field!("tool_name", tool_name);
+                if let Some(k) = kind {
+                    push_field!("kind", &format!("{k:?}"));
+                }
+                if let Some(st) = status {
+                    push_field!("status", &format!("{st:?}"));
+                }
+                if let Some(t) = title {
+                    push_field!("title", t);
+                }
+                if !locations.is_empty() {
+                    let loc_str = crate::tool_render::format_locations(locations);
+                    push_field!("locations", &loc_str);
+                }
+                if let Some(u) = usage {
+                    push_field!("input_tokens", &u.input_tokens.to_string());
+                    push_field!("output_tokens", &u.output_tokens.to_string());
+                }
+                if let Some(elapsed) = final_elapsed_ms {
+                    push_field!("elapsed", &format!("{elapsed}ms"));
+                }
                 if let Some(b) = body {
                     match b {
                         crate::types::ToolCallBody::Yaml(y) => push_field!("body (yaml)", y),

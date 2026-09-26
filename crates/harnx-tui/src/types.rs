@@ -1,4 +1,8 @@
-use harnx_core::event::{AgentSource, PlanEntry, SubAgentProgress, SubAgentProgressStatus};
+use harnx_core::api_types::CompletionTokenUsage;
+use harnx_core::event::{
+    AgentSource, PlanEntry, SubAgentProgress, SubAgentProgressStatus, ToolKind, ToolLocation,
+    ToolStatus,
+};
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::config::SessionMeta;
 use harnx_runtime::local_orchestrator::LocalWorkerSupervisor;
@@ -857,6 +861,16 @@ pub enum TranscriptItem {
         /// frozen final value instead of ticking.
         final_elapsed_ms: Option<u64>,
         rendered_cache: RenderedCache,
+        /// Live concise activity title updated in place during tool execution.
+        title: Option<String>,
+        /// Non-terminal or terminal tool execution status.
+        status: Option<ToolStatus>,
+        /// Dynamic tool categorization kind.
+        kind: Option<ToolKind>,
+        /// Affected file or workspace locations updated during execution.
+        locations: Vec<ToolLocation>,
+        /// Live token usage snapshot reported by the tool during execution.
+        usage: Option<CompletionTokenUsage>,
     },
     AttachmentHeader(String),
     AttachmentItem(String),
@@ -872,6 +886,63 @@ pub enum TranscriptItem {
 }
 
 impl TranscriptItem {
+    /// Apply an in-place tool update patch to this item if it is an active `ToolCall`.
+    /// Returns `true` if the patch was applied, or `false` if this item is not a `ToolCall`
+    /// or has already reached a terminal state (Completed/Failed).
+    pub(crate) fn apply_tool_update(
+        &mut self,
+        markdown: Option<String>,
+        status: Option<ToolStatus>,
+        title: Option<String>,
+        kind: Option<ToolKind>,
+        locations: Option<Vec<ToolLocation>>,
+        usage: Option<CompletionTokenUsage>,
+    ) -> bool {
+        if let TranscriptItem::ToolCall {
+            body,
+            rendered_cache,
+            title: item_title,
+            status: item_status,
+            kind: item_kind,
+            locations: item_locations,
+            usage: item_usage,
+            final_elapsed_ms,
+            ..
+        } = self
+        {
+            if final_elapsed_ms.is_some() {
+                // Reject updates after completion/cancellation (D3)
+                return false;
+            }
+            if let Some(md) = markdown {
+                if !md.trim().is_empty() {
+                    *body = Some(ToolCallBody::Markdown(md));
+                }
+            }
+            if let Some(t) = title {
+                *item_title = Some(t);
+            }
+            if let Some(s) = status {
+                if !matches!(s, ToolStatus::Completed | ToolStatus::Failed) {
+                    *item_status = Some(s);
+                }
+            }
+            if let Some(k) = kind {
+                *item_kind = Some(k);
+            }
+            if let Some(locs) = locations {
+                *item_locations = locs;
+            }
+            if let Some(u) = usage {
+                *item_usage = Some(u);
+            }
+            *rendered_cache = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Text to show for a `ToolResultMarkdown` in the detail overlay: the
     /// full, untruncated `full_detail` when present, else the collapsed
     /// `text`. Returns `None` for other variants.

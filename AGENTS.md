@@ -850,6 +850,56 @@ outside `result`, so it never enters model-facing tool output. Journal, reply ca
 preserve the field. Fast completion (e.g., cache hit) still carries the snapshot because the
 publisher flushes before awaiting the reply.
 
+### Terminal Agent Status Semantics
+
+The TUI emits OSC 9999 (Orca) and OSC 9;4 (kitty/JetBrains) sequences to signal agent state to
+compatible terminals. Implementation in `crates/harnx-tui/src/terminal_status.rs` with process-global
+`TERMINAL_STATUS` state (`LazyLock<TerminalStatusState>`).
+
+Key invariants (verified by tests in `terminal_status.rs`):
+
+1. **Sticky-failure rule** — `Error` and `Interrupted` states are sticky: they cannot be downgraded to
+   `Done` by the shared turn-end path. Only a new `Working` status resets and allows progression to
+   `Done`. This prevents a successful completion from overwriting a failure the user should see.
+
+2. **Wire protocol constraint** — orcatui rejects JSON `"failed"` in OSC 9999 payloads. Error state
+   uses `"interrupted"` for compatibility: `{"state":"interrupted"}`. ConEmu progress (OSC 9;4) uses
+   state=2 (red bar).
+
+3. **Cancellation ordering** — when settling an interrupted prompt (`cancellation.rs`), `llm_busy` must
+   be set to `false` **before** calling `cancel_tool_confirm()`. If reversed, `cancel_tool_confirm()`
+   sees `llm_busy == true` with an active modal and emits a transient `Working`, producing a flicker.
+   The emission at prompt-interrupted must be `Interrupted`, not `Working`.
+
+4. **Modal resolve emission** — resolving a tool confirmation modal emits `Working` only when both:
+   - `was_confirm_modal`: a `ConfirmToolUse` modal was actually open
+   - `llm_busy`: the LLM is still processing in the tool loop
+
+   If the modal was dismissed or `llm_busy` is false (e.g., cancellation already cleared it), no
+   `Working` emission occurs from the modal-close path.
+
+5. **Teardown and editor suspend** — `force_clear()` emits `Clear` but preserves `last` in the state
+   so `restore()` can re-emit the active status when resuming from `$EDITOR`. This allows a transient
+   clear during external-editor suspend without losing the semantic state.
+
+Configuration: `terminal_status: bool` in `config.yaml` (default `true`) or `HARNX_TERMINAL_STATUS=0`.
+Auto-disabled when stdout is not a TTY, `TERM=dumb`, or `CI` is set. User-facing docs in
+`docs/configuration-guide.md` under "Terminal Status".
+
+### TUI tool-call row in-place updates
+
+Live tool progress updates (`ToolEvent::Update`) mutate the active `TranscriptItem::ToolCall` row in-place instead of appending detached `StatusLine` items. Shared reducer logic in `crates/harnx-tui/src/tool_render.rs` (`apply_tool_event_update`, `complete_tool_call`, `fail_tool_call`) handles both main transcript (`input.rs`) and subagent child transcripts (`subagent_transcript.rs`).
+
+Key invariants (verified by `test_inplace_tool_call_update_sequence`, `test_tool_update_fallback_late_update_after_completed_ignored`, and related tests in `tool_live_updates_tests.rs`):
+
+1. **Late update rejection** — `apply_tool_update` checks `final_elapsed_ms.is_some()` and returns `false` if set. Updates after completion/failed state are ignored, preventing stale late arrivals from corrupting a frozen row.
+
+2. **Terminal status guard** — `apply_tool_update` rejects `ToolStatus::Completed` and `ToolStatus::Failed` in the patch. Only `complete_tool_call` and `fail_tool_call` can set terminal status, ensuring timer freeze, cache invalidation, and result item attachment happen atomically.
+
+3. **Fallback synthesis uses `"tool"` sentinel** — when `apply_tool_event_update` finds no matching running row, it synthesizes a minimal row with `tool_name: "tool"`. This prevents duplicate title rendering (P-DUPTITLE): the renderer suppresses the title suffix when `tool_name == title`.
+
+4. **Render cache bypass for running tools** — running rows (`final_elapsed_ms.is_none()`) bypass `rendered_cache` on every render pass to show ticking timer and spinner frame updates. Only completed rows (`!is_running`) populate the cache.
+
 ### Tool confirmation modal ordering and delivery
 
 When a `PreToolUse` hook returns `permissionDecision: "ask"`, the TUI modal queues an optional user message via durable JetStream append before sending the approval reply. Worker reloads the session log at the tool seam, ensuring the agent sees `tool call → tool result (real or blocked) → queued message`.

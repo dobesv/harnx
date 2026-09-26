@@ -909,6 +909,11 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                             start_anchor: std::time::Instant::now(),
                             final_elapsed_ms: Some(0),
                             rendered_cache: None,
+                            title: None,
+                            status: Some(harnx_core::event::ToolStatus::Completed),
+                            kind: None,
+                            locations: vec![],
+                            usage: None,
                         });
                         if let Some(key) =
                             cluster.and_then(|cluster| subagent_key_from_output(&r.output, cluster))
