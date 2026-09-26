@@ -35,8 +35,8 @@ pub use model::{
 };
 pub use read_state::SessionReadState;
 pub use store::{
-    activity_key, invalidation_subject, metadata_key, read_cursor_key, read_invalidation_subject,
-    session_prefix, SessionExtensionUpdate, SessionMetadataStore,
+    activity_key, invalidation_subject, metadata_belongs_to_agent, metadata_key, read_cursor_key,
+    read_invalidation_subject, session_prefix, SessionExtensionUpdate, SessionMetadataStore,
 };
 pub use tool_context::{
     tool_context, ToolContext, ToolContextEntry, TOOL_CONTEXT_NAMESPACE, TOOL_CONTEXT_VERSION,

@@ -6,6 +6,8 @@ mod cancellation;
 mod handoff;
 #[path = "nats_integration/lifecycle.rs"]
 mod lifecycle;
+#[path = "nats_integration/listing.rs"]
+mod listing;
 #[path = "nats_integration/permission.rs"]
 mod permission;
 #[path = "nats_integration/persistence.rs"]

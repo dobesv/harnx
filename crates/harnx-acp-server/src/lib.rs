@@ -4,6 +4,7 @@
 //! - `initialize` negotiating protocol version 1
 //! - `session/new` creating NATS-backed sessions via local worker
 //! - `session/load` replaying durable transcript and establishing session context
+//! - `session/list` discovering pinned-agent sessions on the configured cluster
 //! - `session/prompt` running turn with in-order streaming
 //! - `session/request_permission` bridging gated tools to ACP clients
 //! - committed handoffs producing an actionable fallback and deactivating source
@@ -23,9 +24,10 @@ use std::time::Duration;
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
-    SessionNotification, SessionUpdate, StopReason,
+    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, SessionCapabilities, SessionId, SessionInfo,
+    SessionListCapabilities, SessionNotification, SessionUpdate, StopReason,
 };
 use anyhow::Context;
 use harnx_core::abort::AbortSignal;
@@ -143,7 +145,13 @@ impl HarnxAgent {
         // Always advertise v1 instead of echoing an unsupported client version.
         Ok(
             InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
-                .agent_capabilities(AgentCapabilities::new().load_session(true))
+                .agent_capabilities(
+                    AgentCapabilities::new()
+                        .load_session(true)
+                        .session_capabilities(
+                            SessionCapabilities::new().list(SessionListCapabilities::new()),
+                        ),
+                )
                 .agent_info(
                     Implementation::new("harnx".to_string(), env!("CARGO_PKG_VERSION").to_string())
                         .title(self.agent_name.clone()),
@@ -361,6 +369,84 @@ impl HarnxAgent {
                 self.cluster
             ))),
         }
+    }
+
+    /// Handle `session/list` — return sessions for the pinned agent only.
+    ///
+    /// Queries the NATS metadata store for the current cluster, filters by agent ownership,
+    /// and returns newest-first sessions matching the optional cwd filter.
+    pub async fn list_sessions(
+        &self,
+        request: ListSessionsRequest,
+    ) -> acp::Result<ListSessionsResponse> {
+        let (_route, global_config) = self.backend_config().await?;
+        let config = global_config.read().clone();
+
+        let jetstream = config
+            .nats_jetstream(&self.cluster)
+            .await
+            .context("failed to connect to NATS")
+            .map_err(acp_error)?;
+
+        let replicas = config
+            .nats_server(&self.cluster)
+            .context("failed to resolve NATS server config")
+            .map_err(acp_error)?
+            .resolved_replicas();
+
+        let metadata_store = harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(
+            &jetstream, replicas,
+        )
+        .await
+        .context("failed to access session metadata store")
+        .map_err(acp_error)?;
+
+        let listed_sessions = metadata_store
+            .list()
+            .await
+            .context("failed to list sessions")
+            .map_err(acp_error)?;
+
+        // Filter to pinned agent only
+        let sessions: Vec<SessionInfo> = listed_sessions
+            .into_iter()
+            .filter(|session| {
+                harnx_runtime::nats_session_metadata::metadata_belongs_to_agent(
+                    &session.metadata,
+                    &self.agent_name,
+                )
+            })
+            .filter_map(|session| {
+                let cwd = extract_session_cwd(&session.metadata).unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                });
+
+                // Apply optional cwd filter (exact match)
+                if let Some(ref filter_cwd) = request.cwd {
+                    if &cwd != filter_cwd {
+                        return None;
+                    }
+                }
+
+                let title = session.metadata.title.value;
+                let updated_at = session
+                    .activity
+                    .as_ref()
+                    .map(|a| a.last_activity_at.to_rfc3339())
+                    .or_else(|| Some(session.metadata.created_at.to_rfc3339()));
+
+                Some(
+                    SessionInfo::new(SessionId::new(session.metadata.session_id), cwd)
+                        .title(title)
+                        .updated_at(updated_at),
+                )
+            })
+            .collect();
+
+        // Sessions are already sorted newest-first by SessionMetadataStore::list()
+        // The backend ordering is preserved
+
+        Ok(ListSessionsResponse::new(sessions))
     }
 
     /// Handle `session/prompt` — run turn with in-order streaming via session/update.
@@ -619,6 +705,19 @@ fn find_handoff_target(
     None
 }
 
+/// Extract the working directory from session metadata.
+///
+/// Uses execution context observations (from tool calls) if available,
+/// falling back to the process working directory if not recorded.
+fn extract_session_cwd(
+    metadata: &harnx_runtime::nats_session_metadata::SessionMetadata,
+) -> Option<std::path::PathBuf> {
+    harnx_runtime::nats_session_metadata::execution_contexts(metadata)
+        .ok()
+        .and_then(|contexts| contexts.into_iter().next())
+        .map(|ctx| std::path::PathBuf::from(ctx.working_directory))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,7 +744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_advertises_minimal_capabilities() {
+    async fn initialize_advertises_session_list_capability() {
         let agent = test_agent();
         let request = InitializeRequest::new(agent_client_protocol::schema::ProtocolVersion::V1);
 
@@ -653,11 +752,11 @@ mod tests {
 
         assert_eq!(
             response.agent_capabilities,
-            AgentCapabilities::new().load_session(true)
-        );
-        assert_eq!(
-            response.agent_capabilities.session_capabilities,
-            agent_client_protocol::schema::v1::SessionCapabilities::new()
+            AgentCapabilities::new()
+                .load_session(true)
+                .session_capabilities(
+                    SessionCapabilities::new().list(SessionListCapabilities::new())
+                )
         );
         assert!(response.agent_info.is_some());
         let agent_info = response.agent_info.unwrap();

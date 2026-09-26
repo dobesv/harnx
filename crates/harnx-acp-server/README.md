@@ -31,7 +31,9 @@ created session. If the transcript contains a `HandoffCommitted` record, the
 session is marked deactivated and rejects future prompts with an actionable
 handoff-target error.
 
-Session list, resume, close, and delete remain unsupported and unadvertised.
+Session discovery is supported via `session/list`, returning real sessions owned
+by the server's configured agent and cluster. Session resume, close, and delete
+remain unsupported and unadvertised.
 
 ### Handoff limitation
 
@@ -75,6 +77,7 @@ Supported methods:
 - `authenticate` — No-op placeholder for future authentication.
 - `session/new` — Creates a NATS-backed session and returns its ID.
 - `session/load` — Replays a scoped durable transcript snapshot.
+- `session/list` — Lists sessions for the pinned agent.
 - `session/prompt` — Runs a turn and streams assistant text updates.
 - `session/request_permission` — Requests a per-turn allow or reject decision for gated tools.
 - `session/cancel` — Cancels an in-flight turn, including a pending permission request.
