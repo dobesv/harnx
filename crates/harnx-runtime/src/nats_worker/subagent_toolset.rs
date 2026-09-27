@@ -17,7 +17,7 @@ use harnx_core::event::{AgentEvent, AgentSource, SubAgentProgress, TurnEvent};
 use harnx_core::package_namespace::sanitize_for_tool_name;
 use harnx_core::session::SessionLogEntry;
 use harnx_toolset::{
-    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolSpec, Toolset,
+    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolProgressKind, ToolSpec, Toolset,
     SUBAGENT_SESSION_CANCEL_TOOL, SUBAGENT_SESSION_LOAD_TOOL, SUBAGENT_SESSION_NEW_TOOL,
     SUBAGENT_SESSION_PROMPT_TOOL,
 };
@@ -656,6 +656,7 @@ fn session_new_spec(agent: &str) -> ToolSpec {
     }
     .without_request_timeout()
     .with_call_template(&format!("@ {agent} new session"))
+    .with_kind(ToolProgressKind::Other)
 }
 
 fn session_prompt_spec(agent: &str) -> ToolSpec {
@@ -696,6 +697,7 @@ fn session_prompt_spec(agent: &str) -> ToolSpec {
     .with_call_template(&format!(
         "@ {agent}{{% if args.session_id %}} [{SHORT_SESSION_ID}]{{% endif %}}\n{{{{ args.message }}}}"
     ))
+    .with_kind(ToolProgressKind::Execute)
 }
 
 /// The two tools that take nothing but a session ID.
@@ -737,6 +739,10 @@ impl SessionIdTool {
 
 fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
     let verb = tool.verb();
+    let kind = match tool {
+        SessionIdTool::Load => ToolProgressKind::Read,
+        SessionIdTool::Cancel => ToolProgressKind::Delete,
+    };
     ToolSpec {
         cancellation_guarantee: Default::default(),
         name: tool.tool_name().to_string(),
@@ -757,6 +763,7 @@ fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
         meta: None,
     }
     .with_call_template(&format!("@ {agent} {verb} {SHORT_SESSION_ID}"))
+    .with_kind(kind)
 }
 
 fn standalone_context() -> ToolInvocationContext {
@@ -919,6 +926,34 @@ mod tests {
         assert_eq!(
             config.activation_route,
             SessionActivationRoute::ClusterShared
+        );
+    }
+
+    #[test]
+    fn all_subagent_tools_declare_correct_kind() {
+        let tools = tool_specs("pkg/helper");
+        let tool_map: std::collections::HashMap<_, _> =
+            tools.iter().map(|s| (s.name.as_str(), s)).collect();
+
+        assert_eq!(
+            tool_map.get(SUBAGENT_SESSION_NEW_TOOL).unwrap().kind(),
+            Some(ToolProgressKind::Other),
+            "'session_new' should have Other kind"
+        );
+        assert_eq!(
+            tool_map.get(SUBAGENT_SESSION_PROMPT_TOOL).unwrap().kind(),
+            Some(ToolProgressKind::Execute),
+            "'session_prompt' should have Execute kind"
+        );
+        assert_eq!(
+            tool_map.get(SUBAGENT_SESSION_LOAD_TOOL).unwrap().kind(),
+            Some(ToolProgressKind::Read),
+            "'session_load' should have Read kind"
+        );
+        assert_eq!(
+            tool_map.get(SUBAGENT_SESSION_CANCEL_TOOL).unwrap().kind(),
+            Some(ToolProgressKind::Delete),
+            "'session_cancel' should have Delete kind"
         );
     }
 }

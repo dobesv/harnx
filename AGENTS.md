@@ -292,15 +292,15 @@ Native toolsets declare their tool categorization (`Read`, `Edit`, `Search`, `Ex
 
 - Call `spec.with_kind(ToolProgressKind::<variant>)` on every tool spec
 - Choose kind by tool semantics:
-  - `Read` — read-only data access (fs: `read`, `ls`; plans: `get_plan`, `get_task`, `get_note`, plus `list_*` tools)
+  - `Read` — read-only data access (fs: `read`, `ls`; plans: `get_plan`, `get_task`, `get_note`, plus `list_*` tools; k8s-sandbox: `status`; subagent: `session_load`)
   - `Edit` — file/content mutation (fs: `write`, `edit`, `insert`, `re_replace`, `rollback_file`; plans: `add_plan`, `update_plan`, `add_task`, `update_task`, `add_note`, `update_note`)
-  - `Delete` — destructive removal (plans: `delete_plan`, `delete_task`, `delete_note`)
-  - `Search` — content or path search (grep, fs: `grep`, `find`)
-  - `Execute` — shell/command execution (all bash tools)
-  - `Fetch` — HTTP fetch (fetch tools)
+  - `Delete` — destructive removal (plans: `delete_plan`, `delete_task`, `delete_note`; k8s-sandbox: `release`; subagent: `session_cancel`)
+  - `Search` — content or path search (grep, fs: `grep`, `find`; exa: `web_search_exa`)
+  - `Execute` — shell/command execution (all bash tools; k8s-sandbox: `connect`; subagent: `session_prompt`)
+  - `Fetch` — HTTP fetch (fetch tools; exa: `web_fetch_exa`)
   - `Think` — model reasoning
   - `SwitchMode` — mode changes
-  - `Other` — uncategorized (time tools)
+  - `Other` — uncategorized (time tools; subagent: `session_new`)
 - Add a test asserting expected kinds (see `harnx-fs-tools/src/toolset.rs:all_fs_tools_declare_correct_kind`)
 
 **Non-goal:** Kind is presentation-only. Access control, rate limiting, or policy gating must not rely on `ToolKind` — a malicious MCP server can return any kind it wants.

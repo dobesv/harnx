@@ -1,4 +1,5 @@
 use super::*;
+use harnx_toolset::ToolProgressKind;
 
 #[test]
 fn proxy_schema_adds_an_optional_sandbox_override() {
@@ -84,4 +85,27 @@ fn lifecycle_status_is_explicitly_read_only() {
         .unwrap();
     assert!(status.read_only_hint);
     assert!(status.idempotent_hint);
+}
+
+#[test]
+fn all_lifecycle_tools_declare_correct_kind() {
+    let specs = lifecycle_specs();
+    let tool_map: std::collections::HashMap<_, _> =
+        specs.iter().map(|s| (s.name.as_str(), s)).collect();
+
+    assert_eq!(
+        tool_map.get("connect").unwrap().kind(),
+        Some(ToolProgressKind::Execute),
+        "'connect' should have Execute kind"
+    );
+    assert_eq!(
+        tool_map.get("status").unwrap().kind(),
+        Some(ToolProgressKind::Read),
+        "'status' should have Read kind"
+    );
+    assert_eq!(
+        tool_map.get("release").unwrap().kind(),
+        Some(ToolProgressKind::Delete),
+        "'release' should have Delete kind"
+    );
 }
