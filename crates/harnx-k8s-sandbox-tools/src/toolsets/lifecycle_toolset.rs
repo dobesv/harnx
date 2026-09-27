@@ -2,7 +2,9 @@ use super::repo_clone::{clone_repo, CloneRequest, RepoSpec};
 use super::{fatal, lifecycle_error, mcp_endpoint, recoverable, Gateway, SANDBOX_CONTEXT_KEY};
 use async_trait::async_trait;
 use harnx_runtime::nats_session_metadata::ToolContextEntry;
-use harnx_toolset::{ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{
+    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolProgressKind, ToolSpec, Toolset,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -264,7 +266,8 @@ pub(super) fn lifecycle_specs() -> Vec<ToolSpec> {
             read_only_hint: false,
             timeout_secs: Some(0),
             meta: None,
-        },
+        }
+        .with_kind(ToolProgressKind::Execute),
         ToolSpec {
             cancellation_guarantee: Default::default(),
             name: "status".to_string(),
@@ -277,7 +280,8 @@ pub(super) fn lifecycle_specs() -> Vec<ToolSpec> {
             read_only_hint: true,
             timeout_secs: Some(0),
             meta: None,
-        },
+        }
+        .with_kind(ToolProgressKind::Read),
         ToolSpec {
             cancellation_guarantee: Default::default(),
             name: "release".to_string(),
@@ -290,6 +294,7 @@ pub(super) fn lifecycle_specs() -> Vec<ToolSpec> {
             read_only_hint: false,
             timeout_secs: Some(0),
             meta: None,
-        },
+        }
+        .with_kind(ToolProgressKind::Delete),
     ]
 }

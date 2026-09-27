@@ -2,7 +2,7 @@ use crate::server::{
     web_fetch_schema, web_search_schema, ExaServer, WebFetchParams, WebSearchParams,
 };
 use async_trait::async_trait;
-use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{ToolInvokeError, ToolProgressKind, ToolSpec, Toolset};
 use rmcp::model::{CallToolResult, ErrorData};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -87,8 +87,10 @@ impl Toolset for ExaToolset {
                 "web_search_exa",
                 WEB_SEARCH_DESCRIPTION,
                 web_search_schema(),
-            ),
-            tool_spec("web_fetch_exa", WEB_FETCH_DESCRIPTION, web_fetch_schema()),
+            )
+            .with_kind(ToolProgressKind::Search),
+            tool_spec("web_fetch_exa", WEB_FETCH_DESCRIPTION, web_fetch_schema())
+                .with_kind(ToolProgressKind::Fetch),
         ]
     }
 
@@ -184,5 +186,23 @@ mod tests {
             .invoke("missing", json!({}), CancellationToken::new())
             .await;
         assert!(matches!(result, Err(ToolInvokeError::Recoverable(_))));
+    }
+
+    #[test]
+    fn all_exa_tools_declare_correct_kind() {
+        let tools = ExaToolset::new().tools();
+        let tool_map: std::collections::HashMap<_, _> =
+            tools.iter().map(|s| (s.name.as_str(), s)).collect();
+
+        assert_eq!(
+            tool_map.get("web_search_exa").unwrap().kind(),
+            Some(ToolProgressKind::Search),
+            "'web_search_exa' should have Search kind"
+        );
+        assert_eq!(
+            tool_map.get("web_fetch_exa").unwrap().kind(),
+            Some(ToolProgressKind::Fetch),
+            "'web_fetch_exa' should have Fetch kind"
+        );
     }
 }
