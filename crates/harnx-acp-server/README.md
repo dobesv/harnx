@@ -9,81 +9,114 @@ ACP (Agent Client Protocol) server front-end for harnx agents.
 ## Status
 
 **Current ACP v1 bridge**: NATS-backed prompt turns with durable session loading, event fidelity, cancellation, tool permission requests, and safe committed-handoff fallback.
-- `initialize` — negotiates protocol version 1 and advertises minimal capabilities.
-- `session/new` — creates a NATS-backed harnx session and accepts IDE-injected MCP server entries.
-- `session/load` — replays one scoped durable NATS transcript as ordered ACP updates.
-- `session/resume` — establishes session context without replaying history.
-- `session/list` — discovers pinned-agent sessions on the configured cluster.
-- `session/close` — removes session context while preserving durable history.
-- `session/prompt` — streams ordered assistant, thought, tool-call, tool-result, notice, and flagged model-error updates.
+- `initialize` — Negotiates protocol version 1; advertises `loadSession: true` and `sessionCapabilities: { list: {}, resume: {}, close: {} }`.
+- `authenticate` — No-op placeholder responding `Ok` for transport compatibility.
+- `session/new` — Creates a NATS-backed session with a real local session ID.
+- `session/load` — Replays durable transcript snapshot, establishes live `SessionContext`, and rehydrates handoff state.
+- `session/resume` — Establishes live `SessionContext` without replaying history notifications.
+- `session/list` — Discovers pinned-agent sessions on the configured cluster, ordered newest-first, with process CWD fallback for unrecorded contexts.
+- `session/close` — Cancels active turns, removes in-memory context, and preserves durable history, attachments, and listing visibility. Idempotent.
+- `session/prompt` — Streams in-order assistant text chunks, thought chunks, tool lifecycle updates, notices, and model errors.
   - Supported content blocks: text, embedded text resources, resource links.
-  - Unsupported content blocks: images, audio, embedded binary blobs. These return explicit errors and do not start a turn.
-- `session/cancel` — stops the local prompt follower and durably cancels the NATS turn.
-- A committed handoff reports the target agent, local session ID, cluster, and opening instructions.
+  - Unsupported content blocks: images, audio, embedded binary blobs (rejected with explicit errors; never silently dropped).
+- `session/cancel` — Stops the local prompt follower and durably cancels the NATS turn and any pending permission request.
+- `session/request_permission` — Bridges worker tool confirmation callbacks to client allow/reject single-turn choices.
+- Committed handoffs report target agent, session ID, cluster, and instructions to switch agent servers.
 - All logging goes to stderr; stdout carries only protocol frames.
 
-### Session loading
+See the [ACP v1 Support Matrix](#acp-v1-support-matrix) for capability details, content handling, and deferred feature rationales.
 
-`session/load` is advertised through `agentCapabilities.loadSession`. A load
-resolves the requested local session ID only under this server's configured
-cluster and agent, reads one durable transcript snapshot, and replays user,
-assistant, and tool entries in order. Durable control records such as turn-end,
-handoff, and approval markers remain silent.
+## ACP v1 Support Matrix
 
-After replay, a loaded session has a live `SessionContext`, so subsequent
-`session/prompt` and `session/cancel` operations work the same as on a newly
-created session. If the transcript contains a `HandoffCommitted` record, the
-session is marked deactivated and rejects future prompts with an actionable
-handoff-target error.
+The tables and descriptions below document ACP v1 method and capability support in `harnx-acp-server`.
 
-### Session resume
+### Supported Surface (Capabilities Advertised & Implemented)
 
-`session/resume` is advertised through `sessionCapabilities.resume`. Resume
-validates that the session ID exists and belongs to the configured agent,
-establishes in-memory session context (including handoff state rehydration),
-and returns immediately **without** replaying any `session/update` notifications.
-This is useful when a client already knows the history (e.g., from a previous
-`session/list` or stored state) and only needs to reestablish the session for
-subsequent `session/prompt` calls.
+| ACP Method / Capability | Capability Advertised | Status | Description |
+|---|---|---|---|
+| `initialize` | Protocol `1`, `loadSession: true`, `sessionCapabilities: { list: {}, resume: {}, close: {} }` | Shipped | Negotiates protocol version 1 and exchanges client/agent capabilities. Returns agent implementation name (`harnx`), package version, and agent title. |
+| `authenticate` | None (empty response) | Shipped | No-op placeholder responding `Ok` for transport compatibility. |
+| `session/new` | Standard core method | Shipped | Creates a new NATS-backed session with a real local session ID (UUID). |
+| `session/load` | `agentCapabilities.loadSession: true` | Shipped | Resolves the requested session ID under the pinned agent, replays durable transcripts in order, establishes a live `SessionContext`, and rehydrates handoff deactivation state. |
+| `session/resume` | `sessionCapabilities.resume: {}` | Shipped | Validates session ownership for the pinned agent and establishes a live `SessionContext` without replaying history notifications. |
+| `session/list` | `sessionCapabilities.list: {}` | Shipped | Discovers sessions for the pinned agent on the configured cluster, ordered newest-first by last activity. Falls back to server process CWD if unrecorded. Supports optional CWD filtering. |
+| `session/close` | `sessionCapabilities.close: {}` | Shipped | Cancels active turns (local prompt follower and remote NATS worker) and removes in-memory session context. Preserves durable JetStream transcripts, attachments, and listing visibility. Idempotent. |
+| `session/prompt` | Standard core method | Shipped | Streams in-order assistant text chunks, thought chunks, tool lifecycle updates (`ToolCallUpdate`), notices, and model errors. Handles turn completion and stop reasons. |
+| `session/cancel` | Standard core method | Shipped | Cancels in-flight prompt turns and any pending tool permission requests across local guards and remote NATS workers. |
+| `session/request_permission` | Client capability requested by server | Shipped | Bridges worker tool confirmation callbacks to client single-turn choices (`allow` or `reject`). Denies tool call if the client rejects, disconnects, or errors. |
 
-### Session list
+#### Detailed Handler Behaviors
 
-`session/list` is advertised through `sessionCapabilities.list`. It returns
-sessions belonging to the configured agent (pinned-agent filtering), newest
-first. Each entry includes session ID, working directory, title, and last
-activity timestamp.
+- **`initialize`**: Negotiates protocol version 1 (always advertises v1 even when a client requests higher versions). Exchanges agent capabilities: advertises `loadSession: true` and `sessionCapabilities: { list: {}, resume: {}, close: {} }`. Returns agent metadata with implementation name `harnx`, crate version, and the pinned agent title.
+- **`authenticate`**: Placeholder responding `Ok` with an empty response for clients that send authentication requests over stdio.
+- **`session/new`**: Creates a NATS-backed session using a fresh UUID as the local session ID. Accepts optional client CWD and MCP server parameters for schema compatibility.
+- **`session/load`**: Resolves the session under the configured cluster and pinned agent. Replays the durable JetStream transcript snapshot into sequential client notifications, establishes a live `SessionContext`, and rehydrates handoff deactivation state so subsequent prompts or cancels work.
+- **`session/resume`**: Validates that the requested session belongs to the pinned agent, establishes a live `SessionContext` (including handoff deactivation state), and returns immediately without replaying historical transcript notifications.
+- **`session/list`**: Queries the NATS session metadata store for the configured cluster. Returns sessions belonging to the pinned agent, sorted newest-first by last activity. Each item includes the real local session ID, title, timestamp, and CWD (falling back to server process CWD if unrecorded). Supports optional exact CWD filtering.
+- **`session/close`**: Cancels active turns across both local prompt follower and remote NATS worker, then drops in-memory session state. Durable transcripts, metadata, attachments, and session listing visibility are preserved. Closing an unknown or already-closed session succeeds idempotently.
+- **`session/prompt`**: Validates content blocks and streams assistant text chunks, thought chunks, tool call lifecycle updates (`ToolCallUpdate`), notices, and model errors. Handles turn completion, stop reasons, and error mapping.
+- **`session/cancel`**: Stops the local prompt follower and sends a durable cancel signal to the NATS worker turn. Also denies and clears any pending tool permission request.
+- **`session/request_permission`**: When a backend tool requires human-in-the-loop approval, the server calls the client's `session/request_permission` method with `allow` (`AllowOnce`) and `reject` (`RejectOnce`) choices. If the client approves, the tool proceeds; if the client rejects, disconnects, or times out, the tool call is denied.
 
-### Session close
+#### Supported Prompt Content Blocks
 
-`session/close` is advertised through `sessionCapabilities.close`. Close
-removes the session's in-memory context, cancels any active turn, but preserves
-all durable history. The session remains visible in `session/list` and can be
-resumed again via `session/resume`. Close is idempotent — closing an unknown
-or already-closed session succeeds without error.
+ACP `session/prompt` requests provide an array of `ContentBlock` items. The server processes blocks in order:
 
-### Session handoff
+- **`TextContent`**: Text is preserved verbatim in prompt input.
+- **`EmbeddedResource` (`TextResourceContents`)**: Rendered into prompt text with explicit URI and MIME provenance delimiters:
+  ```
+  --- Embedded Resource: <uri> (MIME: <mime>) ---
+  <text content>
+  --- End Embedded Resource: <uri> ---
+  ```
+- **`ResourceLink`**: Rendered into prompt text as a reference containing name, URI, and optional metadata:
+  ```
+  [Resource Link: <name> (uri=<uri>, title=..., description=..., mime=..., size=...)]
+  ```
 
-ACP v1 has no agent-initiated session-switch method. ACP server processes are
-pinned to a single agent; switching to the target agent's ACP server and loading
-the session ID is the supported flow. When harnx commits a handoff, its worker
-has already created and enqueued the target session. The bridge reports that
-independently running target as an ordinary agent message and marks the source
-ACP session inactive; another prompt to the source returns an actionable error
-instead of continuing the old conversation.
+If any content block in the request is unsupported or invalid, the entire prompt request fails immediately with an explicit error before starting a turn.
+
+#### Pinned-Agent Model and Cross-Agent Handoff
+
+Each `harnx-acp-server` process is pinned to a single agent configuration (`--agent <name>`, defaulting to `default`). Session creation, listing, loading, and resumption are strictly scoped to that pinned agent.
+
+ACP v1 has no agent-initiated session-switch method. When a harnx agent commits a handoff to another agent:
+1. The backend worker creates and enqueues the target session.
+2. The server marks the source ACP session deactivated and emits an assistant message identifying the target agent, local session ID, and cluster.
+3. The server instructs the user to switch their IDE configuration to the target agent's ACP server and load the target session ID.
+4. Any subsequent `session/prompt` to the deactivated source session fails fast with an actionable error directing the user to the target agent's server and session.
 
 To follow a handoff:
-1. Switch your IDE to the target agent's separately configured ACP server.
-2. Load the session (use the session list/picker or `session/load`).
+1. Switch your IDE to the external agent configuration pointing to the target agent's ACP server.
+2. Load or open the reported session ID (using the session picker/list or `session/load`).
 
 Alternatives:
-- TUI: `.session <agent> <session-id>` (shows target agent, session, and cluster).
-- Web: `harnx-serve --addr 127.0.0.1:8000`, then select the agent and session.
+- **TUI**: Run `.session <agent> <session-id>` (displays target agent, session, and cluster).
+- **Web UI**: Run `harnx-serve --addr 127.0.0.1:8000`, then select the agent and session.
 
-### Session deletion
+### Unadvertised and Deferred Features
 
-`session/delete` remains unadvertised and unsupported. Durable worker-owned
-session deletion across CLI, TUI, Web, and ACP surfaces is tracked in
-[#2129](https://github.com/dobesv/harnx/issues/2129).
+| Feature / Capability | Status | Technical Rationale | Client Impact / Behavior | Tracking |
+|---|---|---|---|---|
+| `session/delete` | Unadvertised | Administrative stream deletion races active worker leases. Safe deletion requires a durable worker-owned deletion command. | IDE clients like Zed hide the session delete action when `sessionCapabilities.delete` is absent. | [#2129](https://github.com/dobesv/harnx/issues/2129) |
+| Image content (`ContentBlock::Image`) | Unadvertised | Data-URL to NATS CID mapping exists, but the backend worker loop derives input text via `content.to_text()` and rejects turns with empty text when only images are provided. A vision model gating policy is also required. | Image blocks are rejected with an explicit error (`image content blocks are not supported`) before starting a turn to prevent silent content loss. | [#2135](https://github.com/dobesv/harnx/issues/2135) |
+| Audio & embedded binary blobs (`AudioContent`, `BlobResourceContents`) | Unsupported | Harnx has no native binary audio or blob model. | Rejected with an explicit error (`audio content blocks are not supported` or `embedded binary blob resources are not supported`) before starting a turn. | None |
+| Working directory propagation & `additionalDirectories` | Deferred | NATS worker and tool execution lack a persisted multi-root authorization and confinement contract. Observational CWD is mapped for listing, but execution roots are not dynamically reconfigured by the client. | Server accepts `cwd` and `additionalDirectories` parameters without error for schema compatibility, but executes within the backend worker's environment. | None |
+| Session modes & config options | Unadvertised | The server is pinned to a fixed agent configuration. No honest per-session mode switching exists. | IDE clients omit mode selection controls. | None |
+| Client-injected MCP servers (`session/new.mcpServers`) | Ignored | Remote NATS workers execute tools within server-side trust boundaries. Bridging client-supplied executable or HTTP MCP configurations across remote workers bypasses server-side tool allowlists and trust boundaries. | Accepted for schema compatibility, but Harnx uses its own configured toolsets. Client-injected MCP servers are not launched or routed. | None |
+| Client filesystem & terminal | Unadvertised | Harnx uses backend tools and container sandboxes rather than host IDE tools. | IDE clients do not expose host filesystem or terminal RPCs to the server. | None |
+| Authentication (`authenticate`) | Unadvertised | stdio transport relies on ambient local user credentials. Remote network authentication is handled at the transport or broker layer. | Clients skip authentication handshakes and proceed directly to session initialization. | None |
+
+#### Detailed Deferred Feature Rationale
+
+- **`session/delete`** (`sessionCapabilities.delete`): Unadvertised. Direct administrative deletion of streams, KV keys, and attachments can race an active worker holding the session lease. Safe deletion requires a durable worker-owned deletion command that coordinates lease cancellation before storage cleanup. IDEs like Zed hide the delete button when the capability is absent. Tracked in [#2129](https://github.com/dobesv/harnx/issues/2129).
+- **Image content** (`ContentBlock::Image`): Unadvertised. While Harnx has internal data-URL and NATS CID attachment plumbing, the worker input pipeline derives turn input through text serialization and rejects turns that contain only images. Vision capability gating and initialize advertisement policies must be implemented together. Prompts containing images are rejected upfront with an explicit error to prevent silent content loss. Tracked in [#2135](https://github.com/dobesv/harnx/issues/2135).
+- **Audio and embedded binary blobs** (`AudioContent`, `BlobResourceContents`): Unsupported. Harnx core has no native representation for arbitrary binary audio or blob data. Any prompt containing audio or blob resources is rejected immediately with an explicit error.
+- **Working directory execution propagation & `additionalDirectories`**: Deferred. Client requests may provide `cwd` or `additionalDirectories`. Observational CWD is recorded in session metadata for listing, but NATS worker processes and container sandboxes run in their configured worker roots. Propagating client-supplied directory roots requires multi-root authorization, path mapping, and sandbox confinement contracts that are not yet designed.
+- **Session modes & configuration options**: Unadvertised. Each server process is pinned to a single agent configuration. Mode switching would imply dynamic capability changes that are unsupported by the pinned-agent architecture. Clients omit mode selector controls when modes are unadvertised.
+- **Client-injected MCP servers** (`session/new.mcpServers`): Ignored for security and trust boundary reasons. IDE clients often advertise local MCP tools in `session/new`. Forwarding arbitrary client-specified executables or network endpoints across remote NATS workers bypasses server-side tool policies and authorization boundaries. The server accepts these fields without error for schema compatibility, but relies exclusively on its own configured toolsets.
+- **Client filesystem and terminal capabilities**: Unadvertised. Harnx executes tool commands inside containerized backend sandboxes or worker environments, not via reverse RPC calls into the client IDE filesystem or terminal.
+- **Authentication**: Unadvertised. Over stdio transport, authentication relies on ambient local user credentials. Network-level authentication is handled by the NATS broker.
 
 ## Installation
 
@@ -108,16 +141,18 @@ The server communicates over stdin/stdout using newline-delimited JSON-RPC 2.0. 
 Implements ACP v1 as defined by the [Agent Client Protocol specification](https://agentclientprotocol.com/).
 
 Supported methods:
-- `initialize` — Negotiates protocol version and exchanges capabilities.
-- `authenticate` — No-op placeholder for future authentication.
-- `session/new` — Creates a NATS-backed session and returns its ID.
-- `session/load` — Replays a scoped durable transcript snapshot.
-- `session/resume` — Establishes session context without replaying history.
-- `session/list` — Lists sessions for the pinned agent.
-- `session/close` — Removes session context while preserving durable history.
-- `session/prompt` — Runs a turn and streams assistant text updates.
-- `session/request_permission` — Requests a per-turn allow or reject decision for gated tools.
-- `session/cancel` — Cancels an in-flight turn, including a pending permission request.
+- `initialize` — Negotiates protocol version 1 and exchanges client/agent capabilities.
+- `authenticate` — No-op placeholder responding `Ok` for transport compatibility.
+- `session/new` — Creates a NATS-backed session with a real local ID.
+- `session/load` — Replays a durable transcript snapshot and establishes live session context.
+- `session/resume` — Establishes live session context without replaying history notifications.
+- `session/list` — Discovers sessions for the pinned agent, ordered newest-first.
+- `session/close` — Cancels active turns and releases in-memory context while preserving durable history.
+- `session/prompt` — Streams in-order assistant text, thoughts, tool lifecycle updates, notices, and errors.
+- `session/cancel` — Cancels in-flight turns and any pending permission request.
+- `session/request_permission` — Bridges worker tool confirmation to client single-turn choices.
+
+See the [ACP v1 Support Matrix](#acp-v1-support-matrix) for advertised capabilities, content block handling, and deferred feature rationales.
 
 ## Client Configuration
 
@@ -129,6 +164,8 @@ command -v harnx-acp-server
 
 Copy that absolute path into the `command` field below. Don't use only
 `harnx-acp-server`: GUI applications often start with a restricted `PATH`.
+
+Because each ACP server process is pinned to a single agent, configure a separate agent server entry for each agent you want to interact with (for example, `harnx` for the default agent, and `harnx-reviewer` for a review agent).
 
 ### Zed
 
