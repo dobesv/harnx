@@ -10,7 +10,7 @@
 //! tools:
 //!   - name: read_file
 //!     description: Read a file from the project.
-//!     call_template: "📄 read {{ args.path }}"
+//!     call_template: "read {{ args.path }}"
 //!   - name: run
 //!     description: Run a shell command.
 //!     call_template: "```sh\n$ {{ args.command }}\n```"

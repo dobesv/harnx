@@ -12,10 +12,10 @@ response_delay_ms: 1100
 tools:
   - name: read_file
     description: Read a file from the project.
-    call_template: "📄 read {{ args.path }}"
+    call_template: "read {{ args.path }}"
   - name: apply_edit
     description: Apply an edit to a file and return a unified diff.
-    call_template: "✏️  edit {{ args.path }}"
+    call_template: "edit {{ args.path }}"
   - name: run
     description: Run a shell command.
     call_template: "```sh\n$ {{ args.command }}\n```"
