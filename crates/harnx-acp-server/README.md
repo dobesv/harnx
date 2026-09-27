@@ -16,6 +16,8 @@ ACP (Agent Client Protocol) server front-end for harnx agents.
 - `session/list` — discovers pinned-agent sessions on the configured cluster.
 - `session/close` — removes session context while preserving durable history.
 - `session/prompt` — streams ordered assistant, thought, tool-call, tool-result, notice, and flagged model-error updates.
+  - Supported content blocks: text, embedded text resources, resource links.
+  - Unsupported content blocks: images, audio, embedded binary blobs. These return explicit errors and do not start a turn.
 - `session/cancel` — stops the local prompt follower and durably cancels the NATS turn.
 - A committed handoff reports the target agent, local session ID, cluster, and opening instructions.
 - All logging goes to stderr; stdout carries only protocol frames.
