@@ -966,6 +966,7 @@ mod tests {
                 result_template: None,
                 idempotent_hint: None,
                 read_only_hint: None,
+                kind: None,
             }]),
             stream: false,
             attachments_dir: None,

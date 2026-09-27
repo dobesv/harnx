@@ -277,6 +277,34 @@ The checklist below covers every integration point. Miss any and the release fai
 
 9. **CI.yaml** — no per-crate edit needed; CI uses `cargo build --workspace` and `cargo nextest run --all`.
 
+
+### Static `ToolKind` declarations
+
+Native toolsets declare their tool categorization (`Read`, `Edit`, `Search`, `Execute`, `Fetch`, etc.) statically at registration time. This kind flows through to `ToolEvent::Started` for UI presentation and is **not an authorization boundary**.
+
+**How it works:**
+
+1. `ToolSpec::with_kind(ToolProgressKind::Read)` stores kind in `meta["harnx:kind"]`
+2. `nats_tool_provider.rs:registered_tool()` extracts `spec.kind()` and sets `ToolDeclaration.kind`
+3. `ToolEvent::Started` resolves `decl.kind.unwrap_or(ToolKind::Other)` in `harnx-runtime/src/tool.rs:521` and `nats_session.rs:2044`
+
+**When adding a native toolset:**
+
+- Call `spec.with_kind(ToolProgressKind::<variant>)` on every tool spec
+- Choose kind by tool semantics:
+  - `Read` — read-only data access (fs: `read`, `ls`; plans: `get_plan`, `get_task`, `get_note`, plus `list_*` tools)
+  - `Edit` — file/content mutation (fs: `write`, `edit`, `insert`, `re_replace`, `rollback_file`; plans: `add_plan`, `update_plan`, `add_task`, `update_task`, `add_note`, `update_note`)
+  - `Delete` — destructive removal (plans: `delete_plan`, `delete_task`, `delete_note`)
+  - `Search` — content or path search (grep, fs: `grep`, `find`)
+  - `Execute` — shell/command execution (all bash tools)
+  - `Fetch` — HTTP fetch (fetch tools)
+  - `Think` — model reasoning
+  - `SwitchMode` — mode changes
+  - `Other` — uncategorized (time tools)
+- Add a test asserting expected kinds (see `harnx-fs-tools/src/toolset.rs:all_fs_tools_declare_correct_kind`)
+
+**Non-goal:** Kind is presentation-only. Access control, rate limiting, or policy gating must not rely on `ToolKind` — a malicious MCP server can return any kind it wants.
+
 ### SSRF / private-IP protection for URL-fetching tool servers
 
 When a tool fetches attacker-influenced URLs, block connections to private, loopback, link-local, and other special-purpose IP addresses. The pattern in `harnx-fetch-tools/src/net.rs` covers the pitfalls:

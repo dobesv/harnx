@@ -1421,6 +1421,7 @@ mod tests {
             result_template: None,
             idempotent_hint: None,
             read_only_hint: None,
+            kind: None,
         };
         decl_map.insert(decl.name.clone(), decl);
 
@@ -1478,6 +1479,7 @@ mod tests {
             result_template: None,
             idempotent_hint: None,
             read_only_hint: None,
+            kind: None,
         };
         let mut decl_map = HashMap::new();
         decl_map.insert(decl.name.clone(), decl);

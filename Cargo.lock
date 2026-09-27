@@ -3953,6 +3953,7 @@ dependencies = [
  "dirs 7.0.0",
  "fancy-regex 0.19.2",
  "futures-util",
+ "harnx-toolset",
  "hmac",
  "indexmap 2.14.2",
  "jaq-core",

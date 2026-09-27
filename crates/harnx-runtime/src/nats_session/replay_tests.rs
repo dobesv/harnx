@@ -164,6 +164,7 @@ fn replay_with_declarations_renders_tool_call_and_result_templates() {
         result_template: Some("Result: {{ result.text }}".into()),
         idempotent_hint: None,
         read_only_hint: None,
+        kind: None,
     };
     let decl_map = HashMap::from([(declaration.name.clone(), declaration)]);
     let sink = Arc::new(RecordingSink::default());
@@ -186,6 +187,64 @@ fn replay_with_declarations_renders_tool_call_and_result_templates() {
             ..
         }) if markdown == "Result: # Harnx"
     ));
+}
+
+#[test]
+fn replay_with_kind_propagates_declared_kind() {
+    use harnx_core::event::ToolKind;
+
+    // Entry with a tool calls entry containing one call
+    let entries = vec![(
+        10,
+        SessionLogEntry::ToolCalls {
+            text: String::new(),
+            thought: None,
+            calls: vec![ToolCall::new(
+                "edit".into(),
+                json!({"path": "file.txt"}),
+                Some("edit-call".into()),
+                None,
+            )],
+            timestamp: None,
+            fence_token: None,
+        },
+    )];
+
+    // Declaration with Edit kind
+    let declaration = ToolDeclaration {
+        name: "edit".into(),
+        description: String::new(),
+        parameters: Default::default(),
+        mcp_tool_name: None,
+        mcp_server_name: None,
+        call_template: None,
+        result_template: None,
+        idempotent_hint: None,
+        read_only_hint: None,
+        kind: Some(ToolKind::Edit),
+    };
+    let decl_map = HashMap::from([(declaration.name.clone(), declaration)]);
+    let sink = Arc::new(RecordingSink::default());
+
+    replay_entries_to_sink_with_decls(&entries, &decl_map, sink.clone());
+
+    let events = sink.0.lock().unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "expected Started and LogSeqAssigned events"
+    );
+    match &events[0] {
+        AgentEvent::Tool(ToolEvent::Started { kind, name, .. }) => {
+            assert_eq!(name, "edit");
+            assert_eq!(
+                *kind,
+                ToolKind::Edit,
+                "replay should propagate declared kind"
+            );
+        }
+        other => panic!("expected Started event, got {other:?}"),
+    }
 }
 
 #[test]

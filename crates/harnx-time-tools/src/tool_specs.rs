@@ -1,11 +1,16 @@
 //! Specs the time toolset advertises, one builder per tool.
 
 use crate::tool_templates;
-use harnx_toolset::ToolSpec;
+use harnx_toolset::{ToolProgressKind, ToolSpec};
 use serde_json::json;
 
 pub(crate) fn all() -> Vec<ToolSpec> {
-    vec![get_current_time(), convert_time(), wait(), wait_until()]
+    vec![
+        get_current_time().with_kind(ToolProgressKind::Other),
+        convert_time().with_kind(ToolProgressKind::Other),
+        wait().with_kind(ToolProgressKind::Other),
+        wait_until().with_kind(ToolProgressKind::Other),
+    ]
 }
 
 fn get_current_time() -> ToolSpec {

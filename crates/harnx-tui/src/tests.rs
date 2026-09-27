@@ -1020,6 +1020,7 @@ async fn info_agent_overlay_renders_in_tui_snapshot() {
                 result_template: None,
                 idempotent_hint: None,
                 read_only_hint: None,
+                kind: None,
             },
             harnx_runtime::tool::ToolDeclaration {
                 name: "beta_tool".to_string(),
@@ -1031,6 +1032,7 @@ async fn info_agent_overlay_renders_in_tui_snapshot() {
                 result_template: None,
                 idempotent_hint: None,
                 read_only_hint: None,
+                kind: None,
             },
         ]));
         let mut agent = harnx_runtime::config::Agent::new(
@@ -7158,6 +7160,7 @@ async fn tool_confirmation_show_resolves_declared_call_template() {
             result_template: None,
             idempotent_hint: None,
             read_only_hint: None,
+            kind: None,
         });
     let mut tui = Tui::init(&config).await.unwrap();
     let (reply, _decision) = tokio::sync::oneshot::channel();

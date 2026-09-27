@@ -265,7 +265,7 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ToolKind {
     Read,
     Edit,
@@ -278,6 +278,23 @@ pub enum ToolKind {
     SwitchMode,
     #[default]
     Other,
+}
+
+impl From<harnx_toolset::ToolProgressKind> for ToolKind {
+    fn from(kind: harnx_toolset::ToolProgressKind) -> Self {
+        match kind {
+            harnx_toolset::ToolProgressKind::Read => ToolKind::Read,
+            harnx_toolset::ToolProgressKind::Edit => ToolKind::Edit,
+            harnx_toolset::ToolProgressKind::Delete => ToolKind::Delete,
+            harnx_toolset::ToolProgressKind::Move => ToolKind::Move,
+            harnx_toolset::ToolProgressKind::Search => ToolKind::Search,
+            harnx_toolset::ToolProgressKind::Execute => ToolKind::Execute,
+            harnx_toolset::ToolProgressKind::Think => ToolKind::Think,
+            harnx_toolset::ToolProgressKind::Fetch => ToolKind::Fetch,
+            harnx_toolset::ToolProgressKind::SwitchMode => ToolKind::SwitchMode,
+            harnx_toolset::ToolProgressKind::Other => ToolKind::Other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

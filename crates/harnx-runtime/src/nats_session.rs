@@ -2039,10 +2039,14 @@ fn render_tool_calls_entry(
         };
         let markdown =
             crate::tool::render_call_for_display(call, &call.arguments, &raw_fallback, decl_map);
+        let kind = decl_map
+            .get(&call.name)
+            .and_then(|decl| decl.kind)
+            .unwrap_or(ToolKind::Other);
         sink.emit(AgentEvent::Tool(ToolEvent::Started {
             id: call.id.clone().unwrap_or_default(),
             name: call.name.clone(),
-            kind: ToolKind::Other,
+            kind,
             markdown,
             input: call.arguments.clone(),
             locations: vec![],

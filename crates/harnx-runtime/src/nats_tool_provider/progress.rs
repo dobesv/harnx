@@ -1,11 +1,10 @@
 //! Routes shared control-subject progress messages to call-bound runtime sinks.
 use futures_util::StreamExt;
 use harnx_core::api_types::CompletionTokenUsage;
-use harnx_core::event::{ContentBlock, ToolKind, ToolLocation, ToolStatus};
+use harnx_core::event::{ContentBlock, ToolLocation, ToolStatus};
 use harnx_core::tool::{ToolProgress, ToolUpdatePatch};
 use harnx_toolset::{
-    ProgressChunk, ProgressMessage, ToolProgressContent, ToolProgressKind, ToolProgressPatch,
-    ToolProgressStatus,
+    ProgressChunk, ProgressMessage, ToolProgressContent, ToolProgressPatch, ToolProgressStatus,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -153,7 +152,7 @@ fn to_runtime_patch(patch: ToolProgressPatch) -> ToolUpdatePatch {
         content: patch
             .content
             .map(|content| content.into_iter().map(to_runtime_content).collect()),
-        kind: patch.kind.map(to_runtime_kind),
+        kind: patch.kind.map(Into::into),
         locations: patch.locations.map(|locations| {
             locations
                 .into_iter()
@@ -178,21 +177,6 @@ fn to_runtime_status(status: ToolProgressStatus) -> ToolStatus {
         ToolProgressStatus::InProgress => ToolStatus::InProgress,
         ToolProgressStatus::Completed => ToolStatus::Completed,
         ToolProgressStatus::Failed => ToolStatus::Failed,
-    }
-}
-
-fn to_runtime_kind(kind: ToolProgressKind) -> ToolKind {
-    match kind {
-        ToolProgressKind::Read => ToolKind::Read,
-        ToolProgressKind::Edit => ToolKind::Edit,
-        ToolProgressKind::Delete => ToolKind::Delete,
-        ToolProgressKind::Move => ToolKind::Move,
-        ToolProgressKind::Search => ToolKind::Search,
-        ToolProgressKind::Execute => ToolKind::Execute,
-        ToolProgressKind::Think => ToolKind::Think,
-        ToolProgressKind::Fetch => ToolKind::Fetch,
-        ToolProgressKind::SwitchMode => ToolKind::SwitchMode,
-        ToolProgressKind::Other => ToolKind::Other,
     }
 }
 
@@ -245,6 +229,9 @@ mod tests {
 
     #[test]
     fn maps_every_status_and_kind_variant() {
+        use harnx_core::event::ToolKind;
+        use harnx_toolset::ToolProgressKind;
+
         let statuses = [
             (ToolProgressStatus::Pending, ToolStatus::Pending),
             (ToolProgressStatus::InProgress, ToolStatus::InProgress),
@@ -271,9 +258,8 @@ mod tests {
             (ToolProgressKind::Other, ToolKind::Other),
         ];
         for (wire, runtime) in kinds {
-            assert!(
-                std::mem::discriminant(&to_runtime_kind(wire)) == std::mem::discriminant(&runtime)
-            );
+            let converted: ToolKind = wire.into();
+            assert!(std::mem::discriminant(&converted) == std::mem::discriminant(&runtime));
         }
     }
 
@@ -318,7 +304,8 @@ mod tests {
 
     #[test]
     fn maps_full_patch_fields_without_losing_values() {
-        use harnx_toolset::{ToolProgressLocation, ToolProgressUsage};
+        use harnx_core::event::ToolKind;
+        use harnx_toolset::{ToolProgressKind, ToolProgressLocation, ToolProgressUsage};
 
         let patch = to_runtime_patch(ToolProgressPatch {
             title: Some("Indexing".into()),

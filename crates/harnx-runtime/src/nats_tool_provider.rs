@@ -362,6 +362,8 @@ fn registered_tool(
     };
     let call_template = template("call_template");
     let result_template = template("result_template");
+    // Extract kind before moving spec
+    let kind = spec.kind().map(|k| k.into());
     let parameters = match parse_json_schema(spec.input_schema) {
         Ok(parameters) => parameters,
         Err(error) => {
@@ -391,6 +393,7 @@ fn registered_tool(
         result_template,
         idempotent_hint: Some(spec.idempotent_hint),
         read_only_hint: Some(spec.read_only_hint),
+        kind,
     };
     Some((name, route, declaration))
 }
@@ -795,6 +798,98 @@ mod tests {
                 .unwrap_or_else(|| panic!("tool '{}' lost its call_template", declaration.name));
             assert!(!template.is_empty());
         }
+    }
+
+    /// `ToolSpec.kind()` -> `ToolDeclaration.kind` propagation: native
+    /// toolsets declare static kinds (e.g., fs tools have Read/Edit/Search)
+    /// and custom specs can also set kind via `with_kind`.
+    #[test]
+    fn propagates_spec_kind_into_tool_declaration() {
+        harnx_core::require_nextest();
+        use harnx_toolset::{ToolProgressKind, Toolset};
+
+        // Native toolset: time-tools have Other kind (simple check)
+        let time_specs = harnx_time_tools::TimeToolset::new().tools();
+        assert!(!time_specs.is_empty(), "time-tools should have tools");
+
+        let time_registration = Registration {
+            package: None,
+            config: String::new(),
+            server: "time".to_string(),
+            tools: time_specs.clone(),
+            schema_version: 1,
+            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
+        };
+
+        let (_, time_declarations) = build_registered_tools(None, vec![time_registration]);
+
+        // Verify time tools have expected kinds (all Other per task spec)
+        for decl in &time_declarations {
+            assert_eq!(
+                decl.kind,
+                Some(harnx_core::event::ToolKind::Other),
+                "time tool '{}' should have Other kind",
+                decl.name
+            );
+        }
+
+        // Custom spec with explicit kind via with_kind
+        let custom_spec = ToolSpec {
+            cancellation_guarantee: Default::default(),
+            name: "custom_search".to_string(),
+            description: "Custom search tool".to_string(),
+            input_schema: json!({ "type": "object" }),
+            idempotent_hint: false,
+            read_only_hint: true,
+            timeout_secs: None,
+            meta: None,
+        }
+        .with_kind(ToolProgressKind::Search);
+
+        let custom_registration = Registration {
+            package: None,
+            config: String::new(),
+            server: "custom".to_string(),
+            tools: vec![custom_spec],
+            schema_version: 1,
+            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
+        };
+
+        let (_, custom_declarations) = build_registered_tools(None, vec![custom_registration]);
+        assert_eq!(custom_declarations.len(), 1);
+        assert_eq!(
+            custom_declarations[0].kind,
+            Some(harnx_core::event::ToolKind::Search),
+            "custom tool with with_kind(Search) should have Search kind"
+        );
+
+        // Spec without kind should have None
+        let no_kind_spec = ToolSpec {
+            cancellation_guarantee: Default::default(),
+            name: "no_kind_tool".to_string(),
+            description: "Tool without kind".to_string(),
+            input_schema: json!({ "type": "object" }),
+            idempotent_hint: false,
+            read_only_hint: true,
+            timeout_secs: None,
+            meta: None,
+        };
+
+        let no_kind_registration = Registration {
+            package: None,
+            config: String::new(),
+            server: "nokind".to_string(),
+            tools: vec![no_kind_spec],
+            schema_version: 1,
+            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
+        };
+
+        let (_, no_kind_declarations) = build_registered_tools(None, vec![no_kind_registration]);
+        assert_eq!(no_kind_declarations.len(), 1);
+        assert_eq!(
+            no_kind_declarations[0].kind, None,
+            "tool without kind declaration should have None kind"
+        );
     }
 
     #[test]

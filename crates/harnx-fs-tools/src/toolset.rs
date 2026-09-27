@@ -48,7 +48,17 @@ fn spec<T: JsonSchema + 'static>(
     read_only_hint: bool,
     call_template: &str,
 ) -> ToolSpec {
-    ToolSpec {
+    // Determine kind based on tool name
+    let kind = match name {
+        "read" | "ls" => Some(ToolProgressKind::Read),
+        "write" | "edit" | "insert" | "re_replace" | "rollback_file" => {
+            Some(ToolProgressKind::Edit)
+        }
+        "grep" | "find" => Some(ToolProgressKind::Search),
+        _ => None,
+    };
+
+    let spec = ToolSpec {
         cancellation_guarantee: Default::default(),
         name: name.to_string(),
         description: description.to_string(),
@@ -58,7 +68,12 @@ fn spec<T: JsonSchema + 'static>(
         timeout_secs: None,
         meta: None,
     }
-    .with_call_template(call_template)
+    .with_call_template(call_template);
+
+    match kind {
+        Some(k) => spec.with_kind(k),
+        None => spec,
+    }
 }
 
 fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolInvokeError> {
@@ -498,5 +513,63 @@ mod tests {
                     .all(|location| !location.path.to_string_lossy().contains("No files found"))
             })
         }));
+    }
+
+    #[test]
+    fn all_fs_tools_declare_correct_kind() {
+        let specs = builtin_tool_specs();
+        let spec_map: std::collections::HashMap<_, _> =
+            specs.iter().map(|s| (s.name.as_str(), s)).collect();
+
+        // Read tools
+        assert_eq!(
+            spec_map.get("read").unwrap().kind(),
+            Some(ToolProgressKind::Read),
+            "'read' should have Read kind"
+        );
+        assert_eq!(
+            spec_map.get("ls").unwrap().kind(),
+            Some(ToolProgressKind::Read),
+            "'ls' should have Read kind"
+        );
+
+        // Edit tools
+        assert_eq!(
+            spec_map.get("write").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'write' should have Edit kind"
+        );
+        assert_eq!(
+            spec_map.get("edit").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'edit' should have Edit kind"
+        );
+        assert_eq!(
+            spec_map.get("insert").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'insert' should have Edit kind"
+        );
+        assert_eq!(
+            spec_map.get("re_replace").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'re_replace' should have Edit kind"
+        );
+        assert_eq!(
+            spec_map.get("rollback_file").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'rollback_file' should have Edit kind"
+        );
+
+        // Search tools
+        assert_eq!(
+            spec_map.get("grep").unwrap().kind(),
+            Some(ToolProgressKind::Search),
+            "'grep' should have Search kind"
+        );
+        assert_eq!(
+            spec_map.get("find").unwrap().kind(),
+            Some(ToolProgressKind::Search),
+            "'find' should have Search kind"
+        );
     }
 }

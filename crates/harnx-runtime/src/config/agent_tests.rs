@@ -91,6 +91,7 @@ fn make_tool_declaration(name: &str, description: &str) -> crate::tool::ToolDecl
         result_template: None,
         idempotent_hint: None,
         read_only_hint: None,
+        kind: None,
     }
 }
 

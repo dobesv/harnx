@@ -16,6 +16,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
 fancy-regex = { workspace = true }
+harnx-toolset = { workspace = true }
 hmac = { workspace = true }
 indexmap = { workspace = true }
 os_info = { workspace = true }

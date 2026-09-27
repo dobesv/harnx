@@ -860,6 +860,7 @@ You are a compaction agent.\n";
                 result_template: None,
                 idempotent_hint: None,
                 read_only_hint: None,
+                kind: None,
             },
             ToolDeclaration {
                 name: "bash_exec".to_string(),
@@ -871,6 +872,7 @@ You are a compaction agent.\n";
                 result_template: None,
                 idempotent_hint: None,
                 read_only_hint: None,
+                kind: None,
             },
         ];
 

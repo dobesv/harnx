@@ -6,7 +6,7 @@ use crate::tool_template::ToolTemplate;
 use crate::tool_templates;
 use async_trait::async_trait;
 use harnx_sandbox_common::SandboxConfig;
-use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{ToolInvokeError, ToolProgressKind, ToolSpec, Toolset};
 use rmcp::model::{CallToolResult, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
 use serde_json::{Map, Value};
@@ -52,6 +52,7 @@ fn spec<T: JsonSchema + 'static>(
     call_template: &str,
     timeout_secs: Option<u64>,
 ) -> ToolSpec {
+    // All bash tools are Execute kind
     ToolSpec {
         cancellation_guarantee: Default::default(),
         name: name.to_string(),
@@ -63,6 +64,7 @@ fn spec<T: JsonSchema + 'static>(
         meta: None,
     }
     .with_call_template(call_template)
+    .with_kind(ToolProgressKind::Execute)
 }
 
 fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolInvokeError> {
