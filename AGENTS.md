@@ -790,7 +790,8 @@ metrics use a **separate mechanism**: `record_completion_usage` in `config/mod.r
 display must keep them separate or they'll double-count.
 
 Per-tool-call display usage in `ToolEvent::Update.usage` is also display-only and non-cumulative; it
-replaces on each update and is stored in ACP `_meta.harnx:usage` (`harnx-acp-server/src/event_map.rs:254`).
+replaces on each update and is stored in ACP `_meta.harnx:usage` (`harnx-acp-server/src/event_map.rs:254`,
+`event_map.rs:354-357` for subagent projection).
 
 ## Tool Progress Patch Semantics
 
@@ -874,6 +875,40 @@ truth. Tests verify: `terminal_status_is_removed_before_publication` (`progress.
 outside `result`, so it never enters model-facing tool output. Journal, reply cache, and replay
 preserve the field. Fast completion (e.g., cache hit) still carries the snapshot because the
 publisher flushes before awaiting the reply.
+
+### Subagent progress projection into tool updates
+
+`TurnEvent::SubAgentProgress` projects into `ToolCallUpdate` for ACP and Web clients, bridging
+the legacy poll-based reporter with the shared tool-call rendering path. Key invariants:
+
+1. **Correlation key** — `SubAgentProgress.invocation_id` maps to the parent tool call's
+   `tool_call_id`, not the child session. A child session can be prompted more than once,
+   so `invocation_id` is the stable correlation key.
+
+2. **ACP status mapping** — `SubAgentProgressStatus` has six variants; ACP `ToolCallStatus`
+   has four. Rich internal states (`Cancelling`, `Unconfirmed`) and child `Done` all map to
+   `InProgress`. The parent tool call remains in progress until `ToolEvent::Completed` arrives.
+   Only `Cancelled` and `Failed` map to `Failed`.
+
+3. **Title format** — Projected title includes agent name, child title (if present), and compact
+   usage: `@ {agent} — {child_title} — ({in}→{out})`. Zero usage omits the arrow suffix.
+
+4. **Structured usage** — ACP has no native usage field; usage is placed in namespaced
+   `_meta.harnx:usage` (`harnx-acp-server/src/event_map.rs:354-357`). Web also includes usage
+   in the `tool_update` payload.
+
+5. **Dual emission** — Web sink emits both legacy `sub_agent_progress` and projected `tool_update`
+   custom SSE events, allowing incremental client migration. ACP emits only the projected
+   `ToolCallUpdate`.
+
+6. **Reporter unchanged** — `SubagentProgressReporter` and its 10-second heartbeat
+   (`SUBAGENT_PROGRESS_HEARTBEAT` in `subagent_toolset.rs:32`) remain unchanged. The projection
+   layer does not add throttling; the reporter's existing poll cadence governs emission.
+
+Implementation: `subagent_progress_to_update` in `event_map.rs:320-360` (ACP), and
+`emit_subagent_progress_update` in `ag_ui.rs:578-610` (Web). Tests enforce status mapping
+(`subagent_progress_preserves_internal_states`, `subagent_progress_done_keeps_parent_tool_in_progress`
+in `event_map_tests.rs`; `subagent_progress_projected_status_mapping` in `ag_ui_subagent_tests.rs`).
 
 ### Terminal Agent Status Semantics
 

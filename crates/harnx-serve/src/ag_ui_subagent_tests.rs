@@ -92,3 +92,128 @@ fn sub_agent_progress_handles_legacy_payload_without_title() {
         "title should be None for legacy payload"
     );
 }
+
+#[test]
+fn subagent_progress_emits_both_legacy_and_tool_update() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let sink = AgUiSink::new(tx, MessageId::from(uuid::Uuid::new_v4()));
+    sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(
+        SubAgentProgress {
+            invocation_id: "inv-proj".into(),
+            agent: "atlas".into(),
+            session_id: "child-proj".into(),
+            status: SubAgentProgressStatus::Running,
+            elapsed_ms: 5000,
+            usage: CompletionTokenUsage::new(Some(100), Some(50), Some(0)),
+            tool_call_count: 3,
+            title: Some("Analyzing code".into()),
+        },
+    )));
+
+    // First event: legacy sub_agent_progress custom event
+    let Event::Custom(progress) = rx.try_recv().expect("sub-agent progress custom event") else {
+        panic!("expected sub-agent progress custom event");
+    };
+    assert_eq!(progress.name, "sub_agent_progress");
+    assert_eq!(progress.value["status"], json!("running"));
+
+    // Second event: projected tool_update
+    let Event::Custom(update) = rx.try_recv().expect("tool_update event") else {
+        panic!("expected tool_update custom event");
+    };
+    assert_eq!(update.name, "tool_update");
+    assert_eq!(update.value["tool_call_id"], json!("inv-proj"));
+    let title = update.value["title"]
+        .as_str()
+        .expect("title should be string");
+    assert!(
+        title.contains("atlas"),
+        "projected title should contain agent: {title}"
+    );
+    assert!(
+        title.contains("Analyzing code"),
+        "projected title should contain child title: {title}"
+    );
+    assert!(
+        title.contains("(100→50)"),
+        "projected title should contain compact usage: {title}"
+    );
+}
+
+#[test]
+fn subagent_progress_projected_with_zero_usage() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let sink = AgUiSink::new(tx, MessageId::from(uuid::Uuid::new_v4()));
+    sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(
+        SubAgentProgress {
+            invocation_id: "inv-zero".into(),
+            agent: "pytheas".into(),
+            session_id: "child-zero".into(),
+            status: SubAgentProgressStatus::Running,
+            elapsed_ms: 1000,
+            usage: CompletionTokenUsage::new(None, None, None), // zero usage
+            tool_call_count: 0,
+            title: None,
+        },
+    )));
+
+    // Drain the legacy event first
+    let _ = rx.try_recv().expect("legacy event");
+
+    // Second event: projected tool_update
+    let Event::Custom(update) = rx.try_recv().expect("tool_update event") else {
+        panic!("expected tool_update custom event");
+    };
+    let title = update.value["title"]
+        .as_str()
+        .expect("title should be string");
+    // When usage is zero, the usage part should NOT appear in title
+    assert!(
+        !title.contains("→"),
+        "title should not contain usage arrow when usage is zero: {title}"
+    );
+    assert!(
+        title.contains("pytheas"),
+        "title should contain agent name: {title}"
+    );
+}
+
+#[test]
+fn subagent_progress_projected_status_mapping() {
+    for (progress_status, expected_status) in [
+        (SubAgentProgressStatus::Running, "InProgress"),
+        (SubAgentProgressStatus::Cancelling, "InProgress"),
+        (SubAgentProgressStatus::Unconfirmed, "InProgress"),
+        (SubAgentProgressStatus::Done, "InProgress"),
+        (SubAgentProgressStatus::Cancelled, "Failed"),
+        (SubAgentProgressStatus::Failed, "Failed"),
+    ] {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        let sink = AgUiSink::new(tx, MessageId::from(uuid::Uuid::new_v4()));
+        sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(
+            SubAgentProgress {
+                invocation_id: "inv-status".into(),
+                agent: "researcher".into(),
+                session_id: "child-status".into(),
+                status: progress_status,
+                elapsed_ms: 1000,
+                usage: CompletionTokenUsage::default(),
+                tool_call_count: 0,
+                title: None,
+            },
+        )));
+
+        // Drain legacy event
+        let _ = rx.try_recv().expect("legacy event");
+
+        // Projected tool_update
+        let Event::Custom(update) = rx.try_recv().expect("tool_update event") else {
+            panic!("expected tool_update custom event");
+        };
+        assert_eq!(
+            update.value["status"],
+            json!(expected_status),
+            "{progress_status:?} should map to {expected_status}"
+        );
+    }
+}
