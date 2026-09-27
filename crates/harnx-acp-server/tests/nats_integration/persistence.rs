@@ -192,6 +192,9 @@ async fn session_load_handed_off_session_deactivates_and_rejects_prompt() -> Res
         "agent `atlas`",
         "local session `control-target`",
         "cluster `prod`",
+        "Switch to the `atlas@prod` agent's ACP server",
+        "load session `control-target`",
+        "on cluster `prod`",
     ] {
         assert!(
             error_message.contains(expected),

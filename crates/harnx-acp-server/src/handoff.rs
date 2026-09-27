@@ -2,7 +2,7 @@
 //!
 //! ACP v1 cannot switch an IDE to an agent-created session. A committed target
 //! therefore becomes user-visible text, while the source ACP session stops
-//! accepting prompts. Phase 7 can replace this fallback with target following.
+//! accepting prompts.
 
 use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
 use harnx_core::agent_ref::AgentRef;
@@ -62,8 +62,7 @@ impl HandoffTarget {
     /// Message shown when ACP cannot follow committed target automatically.
     pub fn fallback_message(&self) -> String {
         format!(
-            "Handoff committed to {}. The target is running independently. \
-             ACP clients do not auto-follow handoffs yet. {}",
+            "Handoff committed to {}. The target is running independently. {}",
             self.identity_text(),
             self.open_instructions()
         )
@@ -96,10 +95,15 @@ impl HandoffTarget {
 
     fn open_instructions(&self) -> String {
         let selector = self.agent_selector();
+        let cluster_suffix = if self.cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
+            String::new()
+        } else {
+            format!(" on cluster `{}`", self.cluster)
+        };
         format!(
-            "Open it in the TUI with `.session {selector} {}`. For Web, start \
-             `harnx-serve --addr 127.0.0.1:8000`, open `http://127.0.0.1:8000/`, \
-             and select agent `{selector}`, session `{}`.",
+            "Switch to the `{selector}` agent's ACP server in your IDE and load session `{}` \
+             (use the session list/picker or session/load){cluster_suffix}. \
+             Alternatives: TUI (`.session {selector} {}`) or Web (`harnx-serve --addr 127.0.0.1:8000`).",
             self.local_session_id, self.local_session_id
         )
     }
@@ -150,8 +154,11 @@ mod tests {
             "local session `target-1`",
             "cluster `prod`",
             "target is running independently",
+            "Switch to the `atlas@prod` agent's ACP server",
+            "load session `target-1`",
+            "on cluster `prod`",
             ".session atlas@prod target-1",
-            "http://127.0.0.1:8000/",
+            "harnx-serve --addr 127.0.0.1:8000",
         ] {
             assert!(
                 message.contains(expected),
@@ -170,10 +177,12 @@ mod tests {
         .expect("valid target");
 
         assert_eq!(target.agent_selector(), "atlas");
-        assert!(!target.fallback_message().contains("__local__"));
-        assert!(target
-            .fallback_message()
-            .contains(".session atlas target-1"));
+        let message = target.fallback_message();
+        assert!(!message.contains("__local__"));
+        // Local targets should NOT show "on cluster" suffix
+        assert!(!message.contains("on cluster"));
+        assert!(message.contains("Switch to the `atlas` agent's ACP server"));
+        assert!(message.contains(".session atlas target-1"));
     }
 
     #[test]

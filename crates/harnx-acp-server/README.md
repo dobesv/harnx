@@ -59,20 +59,29 @@ all durable history. The session remains visible in `session/list` and can be
 resumed again via `session/resume`. Close is idempotent — closing an unknown
 or already-closed session succeeds without error.
 
-### Handoff limitation
+### Session handoff
 
-ACP v1 has no agent-initiated session-switch method. ACP clients therefore do
-not auto-follow handoffs yet. When harnx commits a handoff, its worker has
-already created and enqueued the target session. The bridge reports that
+ACP v1 has no agent-initiated session-switch method. ACP server processes are
+pinned to a single agent; switching to the target agent's ACP server and loading
+the session ID is the supported flow. When harnx commits a handoff, its worker
+has already created and enqueued the target session. The bridge reports that
 independently running target as an ordinary agent message and marks the source
 ACP session inactive; another prompt to the source returns an actionable error
 instead of continuing the old conversation.
 
-Open the target in the TUI with the exact `.session <agent> <session-id>`
-command shown in the fallback. For Web, start
-`harnx-serve --addr 127.0.0.1:8000`, open `http://127.0.0.1:8000/`, and
-select the reported agent and session. Phase 7 will add full handoff following
-while keeping the same ACP session.
+To follow a handoff:
+1. Switch your IDE to the target agent's separately configured ACP server.
+2. Load the session (use the session list/picker or `session/load`).
+
+Alternatives:
+- TUI: `.session <agent> <session-id>` (shows target agent, session, and cluster).
+- Web: `harnx-serve --addr 127.0.0.1:8000`, then select the agent and session.
+
+### Session deletion
+
+`session/delete` remains unadvertised and unsupported. Durable worker-owned
+session deletion across CLI, TUI, Web, and ACP surfaces is tracked in
+[#2129](https://github.com/dobesv/harnx/issues/2129).
 
 ## Installation
 

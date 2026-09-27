@@ -80,8 +80,11 @@ fn assert_handoff_fallback(message: &str) {
         "local session `target-session`",
         "cluster `prod`",
         "target is running independently",
+        "Switch to the `atlas@prod` agent's ACP server",
+        "load session `target-session`",
+        "on cluster `prod`",
         ".session atlas@prod target-session",
-        "http://127.0.0.1:8000/",
+        "harnx-serve --addr 127.0.0.1:8000",
     ] {
         assert!(
             message.contains(expected),
@@ -112,7 +115,9 @@ fn assert_post_handoff_error(error: &str) {
         "agent `atlas`",
         "local session `target-session`",
         "cluster `prod`",
-        ".session atlas@prod target-session",
+        "Switch to the `atlas@prod` agent's ACP server",
+        "load session `target-session`",
+        "on cluster `prod`",
     ] {
         assert!(error.contains(expected), "missing `{expected}`: {error}");
     }
