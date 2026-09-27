@@ -515,11 +515,11 @@ mod tests {
         assert_eq!(spec.meta, None);
 
         let spec = spec
-            .with_call_template("🕐 time")
+            .with_call_template("time")
             .with_result_template("{{ result.content[0].text }}");
 
         let meta = spec.meta.as_ref().expect("builders create the meta map");
-        assert_eq!(meta["call_template"], json!("🕐 time"));
+        assert_eq!(meta["call_template"], json!("time"));
         assert_eq!(
             meta["result_template"],
             json!("{{ result.content[0].text }}")

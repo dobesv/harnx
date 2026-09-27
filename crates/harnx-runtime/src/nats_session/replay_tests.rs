@@ -160,7 +160,7 @@ fn replay_with_declarations_renders_tool_call_and_result_templates() {
         parameters: Default::default(),
         mcp_tool_name: Some("read".into()),
         mcp_server_name: None,
-        call_template: Some("📖 {{ args.path }}".into()),
+        call_template: Some("{{ args.path }}".into()),
         result_template: Some("Result: {{ result.text }}".into()),
         idempotent_hint: None,
         read_only_hint: None,
@@ -178,7 +178,7 @@ fn replay_with_declarations_renders_tool_call_and_result_templates() {
             markdown: Some(markdown),
             input,
             ..
-        }) if markdown == "📖 README.md" && input == &json!({"path": "README.md"})
+        }) if markdown == "README.md" && input == &json!({"path": "README.md"})
     ));
     assert!(matches!(
         &events[2],
