@@ -15,8 +15,8 @@ BEDROCK_THINKING_PATCH = (
     '{"thinking":{"type":"enabled","budget_tokens":16000}}'
 )
 
-# Opus models from this minor version onward only accept adaptive thinking plus
-# the effort parameter. The base uses high and aliases expose higher efforts.
+# Opus 4.7+ and Opus 5.5 only accept adaptive thinking plus the effort
+# parameter. Opus 5.5 defaults to medium; other adaptive models use high.
 ADAPTIVE_ONLY_OPUS_MIN_MINOR = 7
 BASE_EFFORT = "high"
 ADAPTIVE_EFFORT_VARIANTS = ("xhigh", "max")
@@ -47,13 +47,15 @@ PROVIDER_VARIANT_RULES = {
 
 def opus_minor_version(name: str) -> int | None:
     """Return the minor version from a modern `claude-opus-4-N` name."""
-    match = re.search(r"opus-4-(\d+)", name)
+    match = re.search(r"opus-4-(\d{1,2})(?=$|@|:|-\d{8})", name)
     return int(match.group(1)) if match else None
 
 
 def is_adaptive_only_opus(name: str) -> bool:
     minor = opus_minor_version(name)
-    return minor is not None and minor >= ADAPTIVE_ONLY_OPUS_MIN_MINOR
+    return (minor is not None and minor >= ADAPTIVE_ONLY_OPUS_MIN_MINOR) or bool(
+        re.search(r"(?:^|\.)claude-opus-5-5(?:$|@|-\d)", name)
+    )
 
 
 def is_adaptive_only_claude(name: str) -> bool:
@@ -61,12 +63,17 @@ def is_adaptive_only_claude(name: str) -> bool:
 
 
 def claude_requires_max_tokens(name: str) -> bool:
-    """Whether a modern Claude Sonnet or Haiku requires `max_tokens`."""
-    match = re.search(r"claude-(sonnet|haiku)-(\d+)(?:-(\d+))?", name)
+    """Whether a modern Claude model requires `max_tokens`."""
+    match = re.search(
+        r"claude-(sonnet|haiku|opus)-(\d+)(?:-(\d{1,2}))?(?=$|@|:|-\d{8})",
+        name,
+    )
     if not match:
         return False
     major = int(match.group(2))
     minor = int(match.group(3)) if match.group(3) is not None else 0
+    if match.group(1) == "opus":
+        return major > 5 or (major == 5 and minor >= 5)
     return major >= 5 or (major == 4 and minor >= 5)
 
 
@@ -148,7 +155,8 @@ def apply_base_thinking(model: dict[str, Any], provider: str) -> None:
     if is_generated_variant_name(provider, name):
         return
     if name.startswith("claude-") and is_adaptive_only_claude(name):
-        model["patches"] = [adaptive_model_patch(name, BASE_EFFORT, provider)]
+        effort = "medium" if name.startswith("claude-opus-5-5") else BASE_EFFORT
+        model["patches"] = [adaptive_model_patch(name, effort, provider)]
         model["require_max_tokens"] = True
     if claude_requires_max_tokens(name):
         model["require_max_tokens"] = True
