@@ -46,8 +46,11 @@ pub mod event_map;
 pub mod event_sink;
 pub mod handoff;
 pub mod permission;
+pub mod prompt_content;
 pub mod server_main;
 pub mod session_context;
+
+pub use prompt_content::{parse_prompt_content, PromptContentError};
 
 pub use event_sink::{AcpEventSink, AcpMessage, SignalHandle};
 pub use handoff::HandoffTarget;
@@ -469,6 +472,10 @@ impl HarnxAgent {
     /// CRITICAL: NO per-chunk tokio::spawn. All chunks flow through single drain loop.
     pub async fn prompt(&self, request: PromptRequest) -> acp::Result<PromptResponse> {
         let session_id = request.session_id.0.to_string();
+        // Parse prompt content BEFORE beginning turn so unsupported blocks
+        // are rejected without starting a turn or touching session state.
+        let prompt_text =
+            parse_prompt_content(&request).map_err(|e| acp_error(anyhow::anyhow!("{e}")))?;
         let session_ctx = self.get_session(&session_id).await?;
         let (turn_guard, cancel_rx) = match session_ctx.begin_turn() {
             Ok(turn) => turn,
@@ -483,11 +490,7 @@ impl HarnxAgent {
             }
         };
         session_ctx.touch();
-        let input = Input::new(
-            parse_prompt_content(&request),
-            (String::new(), vec![]),
-            AgentConfig::default(),
-        );
+        let input = Input::new(prompt_text, (String::new(), vec![]), AgentConfig::default());
         let (sink, drain_rx) = AcpEventSink::for_session(
             session_id.clone(),
             self.cluster.clone(),
@@ -715,28 +718,6 @@ fn handle_turn_result(
     Ok(PromptResponse::new(StopReason::EndTurn))
 }
 
-/// Parse user message content from PromptRequest.
-///
-/// ACP PromptRequest contains a `prompt` field with a list of content blocks.
-/// For Phase 2, we extract just the text content.
-fn parse_prompt_content(request: &PromptRequest) -> String {
-    request
-        .prompt
-        .iter()
-        .filter_map(|block| {
-            // In ACP v1, ContentBlock has variants Text, Image, Audio, ResourceLink, Resource
-            // Extract text from Text variant only
-            match block {
-                agent_client_protocol::schema::v1::ContentBlock::Text(text_content) => {
-                    Some(text_content.text.clone())
-                }
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Convert an anyhow error to an ACP protocol error.
 fn acp_error(e: anyhow::Error) -> acp::Error {
     // Use JSON-RPC internal error code
@@ -848,7 +829,7 @@ mod tests {
             vec![ContentBlock::Text(text_content)],
         );
 
-        let content = parse_prompt_content(&request);
+        let content = parse_prompt_content(&request).unwrap();
         assert_eq!(content, "hello world");
     }
 }
