@@ -831,6 +831,12 @@ interval or synchronously in `finalize()`. Abort and terminal states reject late
 captures `current_agent_event_sink()` when building `emit_tool_update_fn` (`harnx-runtime/src/tool.rs:279-282`);
 tools emitting from `tokio::spawn` see the originating turn sink, not a stale task-local or global fallback.
 
+CLI sink rate-limits streamed tool-update notices (`TOOL_UPDATE_THROTTLE_MS = 2000` in `cli_event_sink.rs`)
+and deduplicates on title. A notice prints only when the title changes and at least 2 seconds have passed
+since the prior emission for that call. Entries initialize on `ToolEvent::Started`, clean up on terminal
+events (`Completed`, `Failed`, `Blocked`) or `clear_tool_timers()` at turn end. The throttle is per-call,
+not global, so concurrent tools emit independently.
+
 ### Native toolset progress handle
 
 `ToolInvocationContext.progress` (`harnx-toolset/src/lib.rs:196`) is a cloneable `ToolProgressHandle`

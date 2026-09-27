@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io::{stdout, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use harnx_core::event::{
     AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent,
@@ -59,9 +59,15 @@ struct CliSinkState {
     /// In-flight tool call timer tracking. Keyed by tool call ID.
     /// Excludes sub-agent launcher tools (session_new/session_prompt + prefixed forms).
     tool_timers: ToolCallTimerReporter,
+    /// In-flight tool update tracking for streamed progress notices.
+    tool_updates: ToolUpdateReporter,
 }
 
 const SUBAGENT_REPORT_INTERVAL_MS: u64 = 10_000;
+
+/// Minimum interval between tool update notices (rate-limiting).
+/// Prevents terminal flooding when tools emit high-frequency updates.
+const TOOL_UPDATE_THROTTLE_MS: u64 = 2_000;
 
 /// Tracks in-flight tool calls for "still running" notices.
 #[derive(Default)]
@@ -78,6 +84,19 @@ struct ToolCallTimerEntry {
     last_reported_bucket: u64,
 }
 
+/// Tracks tool update state for streamed progress notices.
+#[derive(Default)]
+struct ToolUpdateReporter {
+    /// Keyed by tool call ID. Tracks last emitted title and throttle timestamp.
+    in_flight: HashMap<String, ToolUpdateEntry>,
+}
+
+struct ToolUpdateEntry {
+    tool_name: String,
+    last_title: Option<String>,
+    last_emitted: Instant,
+}
+
 impl CliSinkState {
     /// Called on ToolEvent::Started. Tracks the call if it's not a sub-agent launcher.
     fn tool_call_started(&mut self, id: &str, name: &str) {
@@ -92,11 +111,22 @@ impl CliSinkState {
                 last_reported_bucket: 0,
             },
         );
+        self.tool_updates.in_flight.insert(
+            id.to_string(),
+            ToolUpdateEntry {
+                tool_name: name.to_string(),
+                last_title: None,
+                last_emitted: Instant::now()
+                    .checked_sub(Duration::from_millis(TOOL_UPDATE_THROTTLE_MS + 1))
+                    .unwrap_or_else(Instant::now),
+            },
+        );
     }
 
     /// Called on terminal tool events (Completed/Failed/Blocked).
     /// Returns Some(duration string) if the tool ran >= TOOL_TIMER_MIN_ELAPSED_MS.
     fn tool_call_finished(&mut self, id: &str) -> Option<String> {
+        self.tool_updates.in_flight.remove(id);
         let entry = self.tool_timers.in_flight.remove(id)?;
         let elapsed_ms = entry.started.elapsed().as_millis() as u64;
         if elapsed_ms >= TOOL_TIMER_MIN_ELAPSED_MS {
@@ -128,9 +158,53 @@ impl CliSinkState {
         }
     }
 
+    /// Handle ToolEvent::Update: emit a concise notice if title meaningfully changed,
+    /// respecting rate limits (max once per TOOL_UPDATE_THROTTLE_MS) and deduplication.
+    /// Returns true if a notice was emitted.
+    fn tool_update(&mut self, id: &str, title: Option<&str>) -> bool {
+        let entry = match self.tool_updates.in_flight.get_mut(id) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        // Extract title, defaulting to empty if None
+        let title_text = title.unwrap_or("");
+
+        // Check if title changed meaningfully
+        let title_changed = match &entry.last_title {
+            None => !title_text.is_empty(),
+            Some(prev) => prev != title_text,
+        };
+
+        if !title_changed {
+            return false;
+        }
+
+        // Check throttle
+        let now = Instant::now();
+        let elapsed_ms = now.duration_since(entry.last_emitted).as_millis() as u64;
+        if elapsed_ms < TOOL_UPDATE_THROTTLE_MS {
+            return false;
+        }
+
+        // Emit the notice
+        let line = if title_text.is_empty() {
+            format!("[tool] {}", entry.tool_name)
+        } else {
+            format!("[tool] {}: {}", entry.tool_name, title_text)
+        };
+        eprintln!("{}", dimmed_text(&line));
+
+        // Update tracking state
+        entry.last_title = Some(title_text.to_string());
+        entry.last_emitted = now;
+        true
+    }
+
     /// Clear all in-flight tool timer state (called on every run_turn exit).
     fn clear_tool_timers(&mut self) {
         self.tool_timers.in_flight.clear();
+        self.tool_updates.in_flight.clear();
     }
 }
 
@@ -248,6 +322,7 @@ impl CliAgentEventSink {
                 final_only,
                 subagents: CliSubagentReporter::default(),
                 tool_timers: ToolCallTimerReporter::default(),
+                tool_updates: ToolUpdateReporter::default(),
             })),
         }
     }
@@ -638,7 +713,10 @@ impl CliSinkState {
                 self.tool_call_finished(&id);
                 eprintln!("{}", warning_text(&format!("blocked: {name} — {reason}")));
             }
-            ToolEvent::Progress { .. } | ToolEvent::Update { .. } => {}
+            ToolEvent::Update { id, title, .. } => {
+                self.tool_update(&id, title.as_deref());
+            }
+            ToolEvent::Progress { .. } => {}
         }
     }
 
@@ -753,6 +831,7 @@ mod tests {
             final_only: false,
             subagents: CliSubagentReporter::default(),
             tool_timers: ToolCallTimerReporter::default(),
+            tool_updates: ToolUpdateReporter::default(),
         }
     }
 
@@ -2051,6 +2130,7 @@ mod tests {
             final_only: true,
             subagents: CliSubagentReporter::default(),
             tool_timers: ToolCallTimerReporter::default(),
+            tool_updates: ToolUpdateReporter::default(),
         };
 
         state.tool_call_started("call-1", "read_file");
@@ -2281,5 +2361,159 @@ mod tests {
         // Entry should now have last_reported_bucket = 2
         let entry = state.tool_timers.in_flight.get("call-1").unwrap();
         assert_eq!(entry.last_reported_bucket, 2);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tool update tests
+
+    fn make_update_entry(tool_name: &str) -> ToolUpdateEntry {
+        ToolUpdateEntry {
+            tool_name: tool_name.to_string(),
+            last_title: None,
+            last_emitted: Instant::now()
+                .checked_sub(Duration::from_millis(TOOL_UPDATE_THROTTLE_MS + 1))
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    #[test]
+    fn tool_update_dedupes_identical_titles() {
+        let mut state = make_state(false);
+        state
+            .tool_updates
+            .in_flight
+            .insert("call-1".to_string(), make_update_entry("fs_read"));
+
+        // First update emits
+        let emitted = state.tool_update("call-1", Some("Reading src/main.rs"));
+        assert!(emitted);
+
+        // Same title within throttle window should not emit
+        let emitted = state.tool_update("call-1", Some("Reading src/main.rs"));
+        assert!(!emitted);
+    }
+
+    #[test]
+    fn tool_update_rate_limits_rapid_updates() {
+        use std::time::Instant;
+
+        let mut state = make_state(false);
+        state.tool_updates.in_flight.insert(
+            "call-1".to_string(),
+            ToolUpdateEntry {
+                tool_name: "fs_read".to_string(),
+                last_title: None,
+                last_emitted: Instant::now(),
+            },
+        );
+
+        // First update should be rate-limited (last_emitted is now)
+        let emitted = state.tool_update("call-1", Some("Reading file"));
+        assert!(!emitted, "should be rate-limited immediately after start");
+    }
+
+    #[test]
+    fn tool_update_emits_after_throttle_window() {
+        use std::time::{Duration, Instant};
+
+        let mut state = make_state(false);
+        // Set last_emitted to be before throttle window
+        let past = Instant::now() - Duration::from_millis(TOOL_UPDATE_THROTTLE_MS + 100);
+        state.tool_updates.in_flight.insert(
+            "call-1".to_string(),
+            ToolUpdateEntry {
+                tool_name: "fs_read".to_string(),
+                last_title: Some("Initial title".to_string()),
+                last_emitted: past,
+            },
+        );
+
+        // New title after throttle window should emit
+        let emitted = state.tool_update("call-1", Some("Processing data"));
+        assert!(emitted);
+    }
+
+    #[test]
+    fn tool_update_completes_clears_tracking() {
+        let mut state = make_state(false);
+        state.tool_call_started("call-1", "fs_read");
+
+        // Entry should exist
+        assert!(state.tool_updates.in_flight.contains_key("call-1"));
+
+        // Complete the tool
+        let _ = state.tool_call_finished("call-1");
+
+        // Entry should be removed
+        assert!(!state.tool_updates.in_flight.contains_key("call-1"));
+    }
+
+    #[test]
+    fn tool_update_ignores_unknown_call_id() {
+        let mut state = make_state(false);
+        // No entry for "call-unknown"
+        let emitted = state.tool_update("call-unknown", Some("Some title"));
+        assert!(!emitted);
+    }
+
+    #[test]
+    fn tool_update_handles_empty_title() {
+        let mut state = make_state(false);
+        // Create entry with a previous title set
+        let mut entry = make_update_entry("fs_read");
+        entry.last_title = Some("Previous title".to_string());
+        state
+            .tool_updates
+            .in_flight
+            .insert("call-1".to_string(), entry);
+
+        // Empty title should emit (it's different from previous)
+        let emitted = state.tool_update("call-1", Some(""));
+        assert!(emitted);
+    }
+
+    #[test]
+    fn tool_update_handles_none_title() {
+        let mut state = make_state(false);
+        state
+            .tool_updates
+            .in_flight
+            .insert("call-1".to_string(), make_update_entry("fs_read"));
+
+        // None title should not emit when last_title is also empty (from make_update_entry)
+        let emitted = state.tool_update("call-1", None);
+        assert!(!emitted, "None title with empty last_title should not emit");
+    }
+
+    #[test]
+    fn tool_update_clear_removes_all_entries() {
+        let mut state = make_state(false);
+        state.tool_call_started("call-1", "fs_read");
+        state.tool_call_started("call-2", "bash_exec");
+
+        assert_eq!(state.tool_updates.in_flight.len(), 2);
+
+        state.clear_tool_timers();
+
+        assert!(state.tool_updates.in_flight.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_update_emits_dimmed_notice() {
+        let mut state = make_state(false);
+        state
+            .tool_updates
+            .in_flight
+            .insert("call-1".to_string(), make_update_entry("fs_read"));
+
+        let output = capture_output(|| {
+            state.tool_update("call-1", Some("Processing file"));
+        });
+
+        // Should contain dimmed notice format
+        assert!(output.contains("[tool]"));
+        assert!(output.contains("fs_read"));
+        assert!(output.contains("Processing file"));
     }
 }
