@@ -516,10 +516,15 @@ fn emit_tool_call_with_template(
 
     let markdown = render_call(call, json_data, &raw_fallback, decl_map);
 
+    let kind = decl_map
+        .get(&call.name)
+        .and_then(|decl| decl.kind)
+        .unwrap_or(ToolKind::Other);
+
     let event = AgentEvent::Tool(ToolEvent::Started {
         id: call.id.clone().unwrap_or_default(),
         name: call.name.clone(),
-        kind: ToolKind::Other,
+        kind,
         markdown,
         input: json_data.clone(),
         locations: Vec::new(),
@@ -833,6 +838,7 @@ mod tests {
             result_template: result_template.map(String::from),
             idempotent_hint: None,
             read_only_hint: None,
+            kind: None,
         }
     }
 
@@ -920,6 +926,111 @@ mod tests {
             match &events[0] {
                 AgentEvent::Tool(ToolEvent::Started { markdown, .. }) => {
                     assert!(markdown.is_none(), "no template => markdown must be None");
+                }
+                other => panic!("expected Started event, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn emit_tool_call_with_kind_emits_declared_kind() {
+        use harnx_core::event::ToolKind;
+
+        // Declaration with kind
+        let decl = ToolDeclaration {
+            name: "fs_read".to_string(),
+            description: String::new(),
+            parameters: Default::default(),
+            mcp_tool_name: None,
+            mcp_server_name: None,
+            call_template: None,
+            result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
+            kind: Some(ToolKind::Read),
+        };
+        let mut decl_map = HashMap::new();
+        decl_map.insert(decl.name.clone(), decl);
+        let call = ToolCall::new(
+            "fs_read".to_string(),
+            json!({"path": "/tmp/file.txt"}),
+            Some("call-2".to_string()),
+            None,
+        );
+
+        with_recording_sink(|sink| {
+            emit_tool_call_with_template(&call, &json!({"path": "/tmp/file.txt"}), &decl_map);
+            let events = sink.events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                AgentEvent::Tool(ToolEvent::Started { kind, name, .. }) => {
+                    assert_eq!(name, "fs_read");
+                    assert_eq!(*kind, ToolKind::Read, "declared kind must be emitted");
+                }
+                other => panic!("expected Started event, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn emit_tool_call_without_kind_emits_other() {
+        use harnx_core::event::ToolKind;
+
+        // Declaration without kind
+        let decl = ToolDeclaration {
+            name: "unknown_tool".to_string(),
+            description: String::new(),
+            parameters: Default::default(),
+            mcp_tool_name: None,
+            mcp_server_name: None,
+            call_template: None,
+            result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
+            kind: None,
+        };
+        let mut decl_map = HashMap::new();
+        decl_map.insert(decl.name.clone(), decl);
+        let call = ToolCall::new(
+            "unknown_tool".to_string(),
+            json!({}),
+            Some("call-3".to_string()),
+            None,
+        );
+
+        with_recording_sink(|sink| {
+            emit_tool_call_with_template(&call, &json!({}), &decl_map);
+            let events = sink.events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                AgentEvent::Tool(ToolEvent::Started { kind, .. }) => {
+                    assert_eq!(*kind, ToolKind::Other, "missing kind must default to Other");
+                }
+                other => panic!("expected Started event, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn emit_tool_call_unknown_tool_emits_other() {
+        use harnx_core::event::ToolKind;
+
+        // Empty declaration map
+        let decl_map: HashMap<String, ToolDeclaration> = HashMap::new();
+        let call = ToolCall::new(
+            "nonexistent_tool".to_string(),
+            json!({}),
+            Some("call-4".to_string()),
+            None,
+        );
+
+        with_recording_sink(|sink| {
+            emit_tool_call_with_template(&call, &json!({}), &decl_map);
+            let events = sink.events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                AgentEvent::Tool(ToolEvent::Started { kind, .. }) => {
+                    assert_eq!(*kind, ToolKind::Other, "unknown tool must emit Other");
                 }
                 other => panic!("expected Started event, got {other:?}"),
             }

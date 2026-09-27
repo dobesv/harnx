@@ -163,6 +163,23 @@ pub enum ToolProgressKind {
     Other,
 }
 
+impl std::fmt::Display for ToolProgressKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read => write!(f, "read"),
+            Self::Edit => write!(f, "edit"),
+            Self::Delete => write!(f, "delete"),
+            Self::Move => write!(f, "move"),
+            Self::Search => write!(f, "search"),
+            Self::Execute => write!(f, "execute"),
+            Self::Think => write!(f, "think"),
+            Self::Fetch => write!(f, "fetch"),
+            Self::SwitchMode => write!(f, "switch_mode"),
+            Self::Other => write!(f, "other"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolProgressLocation {
     pub path: PathBuf,

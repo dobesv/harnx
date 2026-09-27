@@ -305,6 +305,7 @@ fn handoff_tool_declarations_for_agents(
                 result_template: None,
                 idempotent_hint: None,
                 read_only_hint: None,
+                kind: None,
             }
         })
         .collect();

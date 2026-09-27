@@ -118,6 +118,35 @@ impl ToolSpec {
         );
         self
     }
+
+    /// Meta key for static tool kind declaration.
+    /// Tools declare their kind via `spec.with_kind(ToolProgressKind::Read)`.
+    /// The runtime decodes this and maps it to `ToolDeclaration.kind`.
+    const KIND_META_KEY: &'static str = "harnx:kind";
+
+    /// Attach a static kind declaration to this tool spec.
+    ///
+    /// The kind is stored in the `meta` map under `"harnx:kind"` and is
+    /// decoded by the runtime when building `ToolDeclaration`.
+    #[must_use]
+    pub fn with_kind(mut self, kind: ToolProgressKind) -> Self {
+        self.meta.get_or_insert_with(serde_json::Map::new).insert(
+            Self::KIND_META_KEY.to_string(),
+            Value::String(kind.to_string()),
+        );
+        self
+    }
+
+    /// Retrieve the static kind declaration from this tool spec.
+    ///
+    /// Returns `None` if no kind was declared or if the value is malformed.
+    pub fn kind(&self) -> Option<ToolProgressKind> {
+        self.meta
+            .as_ref()?
+            .get(Self::KIND_META_KEY)
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_value(Value::String(s.to_string())).ok())
+    }
 }
 
 /// Terminal for this call: the session was interrupted before the tool
@@ -518,6 +547,46 @@ mod tests {
         let meta = spec.meta.as_ref().expect("meta map survives");
         assert_eq!(meta["vendor"], json!("harnx"));
         assert_eq!(meta["call_template"], json!("call"));
+    }
+
+    #[test]
+    fn kind_round_trips_through_meta() {
+        use super::ToolProgressKind;
+
+        let spec = tool_spec().with_kind(ToolProgressKind::Read);
+
+        // Check kind is stored in meta
+        let kind = spec.kind();
+        assert_eq!(kind, Some(ToolProgressKind::Read));
+
+        // Check it survives serialization
+        let json = serde_json::to_value(&spec).expect("serialize spec");
+        let meta = json.get("meta").expect("meta present");
+        assert_eq!(meta["harnx:kind"], json!("read"));
+
+        // Check it deserializes back
+        let back: ToolSpec = serde_json::from_value(json).expect("deserialize spec");
+        assert_eq!(back.kind(), Some(ToolProgressKind::Read));
+    }
+
+    #[test]
+    fn kind_none_when_not_declared() {
+        let spec = tool_spec();
+        assert!(spec.kind().is_none());
+    }
+
+    #[test]
+    fn kind_preserves_other_meta_keys() {
+        use super::ToolProgressKind;
+
+        let spec = tool_spec()
+            .with_call_template("call")
+            .with_kind(ToolProgressKind::Search);
+
+        let meta = spec.meta.as_ref().expect("meta map created");
+        assert_eq!(meta["call_template"], json!("call"));
+        assert_eq!(meta["harnx:kind"], json!("search"));
+        assert_eq!(spec.kind(), Some(ToolProgressKind::Search));
     }
 
     #[test]

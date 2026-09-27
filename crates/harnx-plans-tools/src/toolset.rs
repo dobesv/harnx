@@ -1,11 +1,12 @@
 use crate::server::*;
 use crate::tool_templates;
 use async_trait::async_trait;
-use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{ToolInvokeError, ToolProgressKind, ToolSpec, Toolset};
 use rmcp::model::{CallToolResult, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
+use std::any::TypeId;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -47,6 +48,10 @@ macro_rules! dispatch_plan_tools {
 }
 
 fn input_schema<T: JsonSchema + 'static>() -> Value {
+    if TypeId::of::<T>() == TypeId::of::<()>() {
+        return serde_json::json!({"type": "object", "properties": {}});
+    }
+
     Tool::new("schema", "schema", Map::new())
         .with_input_schema::<T>()
         .schema_as_json_value()
@@ -59,6 +64,17 @@ fn spec<T: JsonSchema + 'static>(
     read_only_hint: bool,
     call_template: &str,
 ) -> ToolSpec {
+    // Determine kind based on tool name prefix
+    let kind = if name.starts_with("get_") || name.starts_with("list_") {
+        ToolProgressKind::Read
+    } else if name.starts_with("add_") || name.starts_with("update_") {
+        ToolProgressKind::Edit
+    } else if name.starts_with("delete_") {
+        ToolProgressKind::Delete
+    } else {
+        ToolProgressKind::Other
+    };
+
     ToolSpec {
         cancellation_guarantee: Default::default(),
         name: name.to_string(),
@@ -71,6 +87,7 @@ fn spec<T: JsonSchema + 'static>(
     }
     .with_call_template(call_template)
     .with_result_template(tool_templates::RESULT)
+    .with_kind(kind)
 }
 
 fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, ToolInvokeError> {
@@ -220,6 +237,115 @@ mod tests {
         assert!(tools
             .iter()
             .all(|tool| tool.input_schema["type"] == "object"));
+    }
+
+    #[test]
+    fn all_plan_tools_declare_correct_kind() {
+        use harnx_toolset::Toolset;
+
+        let dir = tempfile::tempdir().unwrap();
+        let toolset = PlansToolset::new(dir.path().to_path_buf());
+        let tools = toolset.tools();
+        let tool_map: std::collections::HashMap<_, _> =
+            tools.iter().map(|t| (t.name.as_str(), t)).collect();
+
+        // Read tools (get_*, list_*)
+        assert_eq!(
+            tool_map.get("get_plan").unwrap().kind(),
+            Some(ToolProgressKind::Read),
+            "'get_plan' should have Read kind"
+        );
+        assert_eq!(
+            tool_map.get("list_plans").unwrap().kind(),
+            Some(ToolProgressKind::Read),
+            "'list_plans' should have Read kind"
+        );
+        assert_eq!(
+            tool_map.get("get_task").unwrap().kind(),
+            Some(ToolProgressKind::Read),
+            "'get_task' should have Read kind"
+        );
+        assert_eq!(
+            tool_map.get("list_tasks").unwrap().kind(),
+            Some(ToolProgressKind::Read),
+            "'list_tasks' should have Read kind"
+        );
+        assert_eq!(
+            tool_map.get("get_note").unwrap().kind(),
+            Some(ToolProgressKind::Read),
+            "'get_note' should have Read kind"
+        );
+        assert_eq!(
+            tool_map.get("list_notes").unwrap().kind(),
+            Some(ToolProgressKind::Read),
+            "'list_notes' should have Read kind"
+        );
+
+        // Edit tools (add_*, update_*)
+        assert_eq!(
+            tool_map.get("add_plan").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'add_plan' should have Edit kind"
+        );
+        assert_eq!(
+            tool_map.get("update_plan").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'update_plan' should have Edit kind"
+        );
+        assert_eq!(
+            tool_map.get("add_task").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'add_task' should have Edit kind"
+        );
+        assert_eq!(
+            tool_map.get("update_task").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'update_task' should have Edit kind"
+        );
+        assert_eq!(
+            tool_map.get("add_note").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'add_note' should have Edit kind"
+        );
+        assert_eq!(
+            tool_map.get("update_note").unwrap().kind(),
+            Some(ToolProgressKind::Edit),
+            "'update_note' should have Edit kind"
+        );
+
+        // Delete tools (delete_*)
+        assert_eq!(
+            tool_map.get("delete_plan").unwrap().kind(),
+            Some(ToolProgressKind::Delete),
+            "'delete_plan' should have Delete kind"
+        );
+        assert_eq!(
+            tool_map.get("delete_task").unwrap().kind(),
+            Some(ToolProgressKind::Delete),
+            "'delete_task' should have Delete kind"
+        );
+        assert_eq!(
+            tool_map.get("delete_note").unwrap().kind(),
+            Some(ToolProgressKind::Delete),
+            "'delete_note' should have Delete kind"
+        );
+    }
+
+    #[test]
+    fn unknown_tool_name_falls_back_to_other_kind() {
+        let tool = spec::<()>("unknown_operation", "test", false, "");
+        assert_eq!(
+            tool.kind(),
+            Some(ToolProgressKind::Other),
+            "unrecognized tool name should have Other kind"
+        );
+
+        let tool_prefix = spec::<()>("foo_bar", "test", false, "");
+        assert_eq!(
+            tool_prefix.kind(),
+            Some(ToolProgressKind::Other),
+            "unrecognized prefix should have Other kind"
+        );
     }
 
     #[tokio::test]

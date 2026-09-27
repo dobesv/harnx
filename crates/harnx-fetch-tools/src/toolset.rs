@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{ToolInvokeError, ToolProgressKind, ToolSpec, Toolset};
 use rmcp::model::{CallToolResult, ErrorData};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -62,6 +62,7 @@ fn tool_spec(name: &str, description: &str) -> ToolSpec {
         timeout_secs: Some(35),
         meta: None,
     }
+    .with_kind(ToolProgressKind::Fetch)
 }
 
 #[async_trait]

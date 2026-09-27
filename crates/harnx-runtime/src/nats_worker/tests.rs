@@ -477,6 +477,7 @@ fn test_orphan_partition_logic() {
             result_template: None,
             idempotent_hint: Some(true),
             read_only_hint: Some(true),
+            kind: None,
         },
     );
     decl_map.insert(
@@ -491,6 +492,7 @@ fn test_orphan_partition_logic() {
             result_template: None,
             idempotent_hint: None,
             read_only_hint: None,
+            kind: None,
         },
     );
 

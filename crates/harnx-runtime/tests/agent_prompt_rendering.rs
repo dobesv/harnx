@@ -442,6 +442,7 @@ fn sandbox_connect_tool() -> ToolDeclaration {
         result_template: None,
         idempotent_hint: None,
         read_only_hint: None,
+        kind: None,
     }
 }
 

@@ -394,6 +394,10 @@ pub struct ToolDeclaration {
     /// Runtime metadata only (not persisted).
     #[serde(skip, default)]
     pub read_only_hint: Option<bool>,
+    /// Static kind declaration carried from tool registration.
+    /// Presentation-only, not authorization evidence.
+    #[serde(skip, default)]
+    pub kind: Option<crate::event::ToolKind>,
 }
 
 /// Map a shebang interpreter name to a Markdown code-fence language label.

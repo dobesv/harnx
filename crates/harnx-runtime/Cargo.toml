@@ -84,17 +84,17 @@ arboard = { workspace = true, features = ["wayland-data-control"] }
 arboard = { workspace = true }
 
 [dev-dependencies]
-insta = { version = "1", features = ["yaml"] }
-rcgen = { workspace = true }
-pretty_assertions = "1.4.0"
-scopeguard = { workspace = true }
-tempfile = "3"
-tokio-test = "0.4"
 harnx-test-bins = { path = "../harnx-test-bins" }
 harnx-telemetry = { workspace = true, features = ["testing"] }
 harnx-time-tools = { path = "../harnx-time-tools" }
+insta = { version = "1", features = ["yaml"] }
 metrics-util = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+pretty_assertions = "1.4.0"
+rcgen = { workspace = true }
+scopeguard = { workspace = true }
+tempfile = "3"
+tokio-test = "0.4"
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }

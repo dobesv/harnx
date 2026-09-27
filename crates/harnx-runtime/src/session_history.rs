@@ -243,6 +243,7 @@ Returns a JSON array of matching log entries (seq, type, text, tool names)."
         result_template: None,
         idempotent_hint: None,
         read_only_hint: None,
+        kind: None,
     }
 }
 

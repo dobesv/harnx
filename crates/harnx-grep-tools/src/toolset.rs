@@ -1,6 +1,6 @@
 use crate::server::{grep_query_schema, GrepQueryParams, GrepServer};
 use async_trait::async_trait;
-use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{ToolInvokeError, ToolProgressKind, ToolSpec, Toolset};
 use rmcp::model::{CallToolResult, ErrorData};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -72,7 +72,8 @@ impl Toolset for GrepToolset {
             read_only_hint: true,
             timeout_secs: None,
             meta: None,
-        }]
+        }
+        .with_kind(ToolProgressKind::Search)]
     }
 
     async fn invoke(
