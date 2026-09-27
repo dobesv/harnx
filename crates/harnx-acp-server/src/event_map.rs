@@ -7,8 +7,8 @@ use agent_client_protocol::schema::v1::{
 };
 use harnx_core::api_types::CompletionTokenUsage;
 use harnx_core::event::{
-    AgentEvent, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, ToolKind, ToolLocation,
-    ToolStatus, UserEvent,
+    AgentEvent, ContentBlock, ModelEvent, NoticeEvent, SubAgentProgress, SubAgentProgressStatus,
+    ToolEvent, ToolKind, ToolLocation, ToolStatus, TurnEvent, UserEvent,
 };
 
 use crate::handoff::{committed_target, fallback_update};
@@ -78,6 +78,9 @@ fn agent_event_to_update_inner(
         AgentEvent::Notice(event) => notice_event_to_update(event),
         AgentEvent::SubAgent { event, .. } => {
             agent_event_to_update_inner(*event, source_cluster, false)
+        }
+        AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)) => {
+            Some(subagent_progress_to_update(&progress))
         }
         _ => None,
     }
@@ -301,6 +304,60 @@ fn notice_event_to_update(event: NoticeEvent) -> Option<SessionUpdate> {
         NoticeEvent::Error(message) => non_empty(message).map(|message| format!("🔴 {message}")),
     }?;
     text_chunk(text, false).map(SessionUpdate::AgentMessageChunk)
+}
+
+/// Map subagent progress into an ACP ToolCallUpdate.
+///
+/// The `invocation_id` field correlates to the parent tool call that started
+/// the subagent (resolved at emission time, not session ID). ACP has no native
+/// usage field, so structured usage is placed in namespaced `_meta` under
+/// `harnx:usage`. Title incorporates the child session title plus compact usage.
+///
+/// ACP status is limited to {Pending, InProgress, Completed, Failed}. Preserve
+/// richer internal states (`Cancelling`, `Cancelled`, `Unconfirmed`) by NOT
+/// equating child `Done` with parent tool completion — the parent tool call
+/// remains InProgress until the subagent tool completes.
+fn subagent_progress_to_update(progress: &SubAgentProgress) -> SessionUpdate {
+    let id = progress.invocation_id.clone();
+
+    // Build title: agent name + child title (if present) + compact usage
+    let mut title_parts = vec![format!("@ {}", progress.agent)];
+    if let Some(ref child_title) = progress.title {
+        let trimmed = child_title.trim();
+        if !trimmed.is_empty() {
+            title_parts.push(trimmed.to_string());
+        }
+    }
+    let usage = &progress.usage;
+    if usage.input_tokens > 0 || usage.output_tokens > 0 {
+        title_parts.push(format!("({}→{})", usage.input_tokens, usage.output_tokens));
+    }
+    let title = title_parts.join(" — ");
+
+    // Preserve richer internal states (Cancelling, Cancelled, Unconfirmed).
+    // Do NOT equate child Done with parent-tool completion: while child is Done,
+    // the parent tool call is still finishing. Parent completes when ToolEvent::Completed arrives.
+    let status = match progress.status {
+        SubAgentProgressStatus::Running
+        | SubAgentProgressStatus::Cancelling
+        | SubAgentProgressStatus::Unconfirmed
+        | SubAgentProgressStatus::Done => ToolCallStatus::InProgress,
+        SubAgentProgressStatus::Cancelled => ToolCallStatus::Failed,
+        SubAgentProgressStatus::Failed => ToolCallStatus::Failed,
+    };
+
+    // Build fields with title and status
+    let fields = ToolCallUpdateFields::new().status(status).title(title);
+
+    // Structured usage under namespaced _meta
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        HARNX_USAGE_META.to_string(),
+        serde_json::to_value(&progress.usage).expect("usage serializes"),
+    );
+
+    let update = ToolCallUpdate::new(id, fields).meta(meta);
+    SessionUpdate::ToolCallUpdate(update)
 }
 
 fn text_chunk(text: String, error: bool) -> Option<ContentChunk> {

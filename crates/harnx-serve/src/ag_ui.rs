@@ -570,6 +570,51 @@ impl AgUiSink {
         self.emit_custom("tool_update", payload);
     }
 
+    /// Project subagent progress into a unified tool_update event.
+    ///
+    /// This bridges the legacy SubAgentProgress path with the shared tool-call
+    /// rendering path introduced in Phase 6 (Issue #2096). The title incorporates
+    /// the child session title and compact usage, matching ACP projection.
+    fn emit_subagent_progress_update(&self, progress: &harnx_core::event::SubAgentProgress) {
+        // Build title: agent name + child title (if present) + compact usage
+        let mut title_parts = vec![format!("@ {}", progress.agent)];
+        if let Some(ref child_title) = progress.title {
+            let trimmed = child_title.trim();
+            if !trimmed.is_empty() {
+                title_parts.push(trimmed.to_string());
+            }
+        }
+        let usage = &progress.usage;
+        if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            title_parts.push(format!("({}→{})", usage.input_tokens, usage.output_tokens));
+        }
+        let title = title_parts.join(" — ");
+
+        let status = match progress.status {
+            harnx_core::event::SubAgentProgressStatus::Running
+            | harnx_core::event::SubAgentProgressStatus::Cancelling
+            | harnx_core::event::SubAgentProgressStatus::Unconfirmed
+            | harnx_core::event::SubAgentProgressStatus::Done => {
+                harnx_core::event::ToolStatus::InProgress
+            }
+            harnx_core::event::SubAgentProgressStatus::Cancelled
+            | harnx_core::event::SubAgentProgressStatus::Failed => {
+                harnx_core::event::ToolStatus::Failed
+            }
+        };
+
+        // Emit tool_update for the invocation_id (correlates to parent tool call)
+        self.emit_tool_update(
+            progress.invocation_id.clone(),
+            None, // markdown
+            Some(status),
+            Some(title),
+            None, // kind - subagent tools don't have kind
+            None, // locations
+            Some(progress.usage.clone()),
+        );
+    }
+
     fn emit_tool_event(&self, event: ToolEvent) {
         self.close_thinking_segment();
         match event {
@@ -737,10 +782,17 @@ impl AgUiSink {
                     "invocation_id": invocation_id,
                 }),
             ),
-            TurnEvent::SubAgentProgress(progress) => self.emit_custom(
-                "sub_agent_progress",
-                serde_json::to_value(progress).expect("sub-agent progress should serialize"),
-            ),
+            TurnEvent::SubAgentProgress(progress) => {
+                // Emit both the legacy sub_agent_progress custom event AND the projected
+                // tool_call_update so clients can transition incrementally. The projected
+                // update uses the shared tool-call rendering path with title+usage.
+                self.emit_custom(
+                    "sub_agent_progress",
+                    serde_json::to_value(&progress).expect("sub-agent progress should serialize"),
+                );
+                // Project into unified tool-call update for ACP/IDE parity (Phase 6).
+                self.emit_subagent_progress_update(&progress);
+            }
             TurnEvent::Started => {}
         }
     }
