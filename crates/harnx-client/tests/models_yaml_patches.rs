@@ -169,6 +169,50 @@ fn fable_5_1_uses_adaptive_thinking_and_an_output_limit() {
 }
 
 #[test]
+fn opus_5_5_uses_adaptive_thinking_and_required_output_limit() {
+    for provider_name in ["claude", "vertexai"] {
+        let provider = ALL_PROVIDER_MODELS
+            .iter()
+            .find(|provider| provider.provider == provider_name)
+            .expect("Claude provider catalog");
+        let names: &[&str] = if provider_name == "vertexai" {
+            &[
+                "claude-opus-5-5",
+                "claude-opus-5-5:xhigh",
+                "claude-opus-5-5:max",
+                "claude-opus-5-5@default",
+                "claude-opus-5-5@default:xhigh",
+                "claude-opus-5-5@default:max",
+            ]
+        } else {
+            &[
+                "claude-opus-5-5",
+                "claude-opus-5-5:xhigh",
+                "claude-opus-5-5:max",
+            ]
+        };
+        for &name in names {
+            let model = Model::from_config(provider_name, &provider.models)
+                .into_iter()
+                .find(|model| model.name() == name)
+                .unwrap_or_else(|| panic!("missing {provider_name} model {name}"));
+            assert_eq!(model.real_name(), name.split(':').next().unwrap());
+            assert_eq!(model.max_tokens_param(), Some(128000), "{name}");
+            let patched = harnx_core::jaq::eval_filters_strict(
+                model.patches().expect("Opus 5.5 request patch"),
+                request_envelope(&model),
+            )
+            .expect("valid Opus 5.5 patch");
+            assert_eq!(patched["body"]["thinking"], json!({"type": "adaptive"}));
+            let expected_effort = name.rsplit_once(':').map_or("medium", |(_, effort)| effort);
+            assert_eq!(patched["body"]["output_config"]["effort"], expected_effort);
+            assert!(patched["body"].get("temperature").is_none());
+            assert!(patched["body"].get("top_p").is_none());
+        }
+    }
+}
+
+#[test]
 fn gemini_3_8_drops_sampling_settings_without_losing_thinking_or_output_limit() {
     let gemini = ALL_PROVIDER_MODELS
         .iter()

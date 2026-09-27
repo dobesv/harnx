@@ -1569,16 +1569,6 @@
     - name: claude-opus-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
-      input_price: 4
-      output_price: 20
-      cache_read_price: 0.2
-      cache_write_price: 5
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-opus-5-5:thinking
-      real_name: claude-opus-5-5
-      max_input_tokens: 1000000
-      max_output_tokens: 24000
       require_max_tokens: true
       input_price: 4
       output_price: 20
@@ -1587,7 +1577,33 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"medium"}
+    - name: claude-opus-5-5:max
+      real_name: claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-5-5:xhigh
+      real_name: claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-sonnet-4-5
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -3299,16 +3315,6 @@
     - name: claude-opus-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
-      input_price: 4
-      output_price: 20
-      cache_read_price: 0.2
-      cache_write_price: 5
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-opus-5-5:thinking
-      real_name: claude-opus-5-5
-      max_input_tokens: 1000000
-      max_output_tokens: 24000
       require_max_tokens: true
       input_price: 4
       output_price: 20
@@ -3317,20 +3323,36 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"medium"}
+    - name: claude-opus-5-5:max
+      real_name: claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-5-5:xhigh
+      real_name: claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-5-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
-      input_price: 4
-      output_price: 20
-      cache_read_price: 0.2
-      cache_write_price: 5
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-opus-5-5@default:thinking
-      real_name: claude-opus-5-5@default
-      max_input_tokens: 1000000
-      max_output_tokens: 24000
       require_max_tokens: true
       input_price: 4
       output_price: 20
@@ -3339,7 +3361,33 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"medium"}
+    - name: claude-opus-5-5@default:max
+      real_name: claude-opus-5-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-5-5@default:xhigh
+      real_name: claude-opus-5-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -4829,19 +4877,6 @@
       cache_write_price: 5.5
       supports_vision: true
       supports_tool_use: true
-    - name: us.anthropic.claude-opus-5-5:thinking
-      real_name: us.anthropic.claude-opus-5-5
-      max_input_tokens: 1000000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 4.4
-      output_price: 22
-      cache_read_price: 0.22
-      cache_write_price: 5.5
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
     - name: us.anthropic.claude-sonnet-4-20250514-v1:0
       max_input_tokens: 1000000
       max_output_tokens: 64000

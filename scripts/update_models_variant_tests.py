@@ -94,24 +94,40 @@ class TestOpenAIEffortVariants(unittest.TestCase):
 
 
 class TestProviderModelRegeneration(unittest.TestCase):
-    def test_fable_5_1_regenerates_adaptive_variants_with_required_limit(self) -> None:
-        name = "claude-fable-5-1"
-        base = {"name": name, "max_output_tokens": 128000, "input_price": 10}
-        old = {f"{name}:thinking": {"name": f"{name}:thinking"}}
-        for provider in ("claude", "vertexai"):
-            with self.subTest(provider=provider):
+    def test_bedrock_opus_5_5_does_not_generate_fixed_budget_variant(self) -> None:
+        name = "us.anthropic.claude-opus-5-5"
+        self.assertEqual(um.thinking_variants({"name": name}, "bedrock"), [])
+
+    def test_adaptive_models_regenerate_variants_with_required_limit(self) -> None:
+        for name, input_price, base_effort in (
+            ("claude-opus-5-5", 4, "medium"),
+            ("claude-fable-5-1", 10, "high"),
+        ):
+            base = {"name": name, "max_output_tokens": 128000, "input_price": input_price}
+            old = {f"{name}:thinking": {"name": f"{name}:thinking"}}
+            for provider in ("claude", "vertexai"):
                 models = um.regenerate_provider_models(provider, old, {name: base}, [])
-                self.assertEqual({m["name"] for m in models},
-                                 {name, f"{name}:xhigh", f"{name}:max"})
+                by_name = {model["name"]: model for model in models}
+                self.assertEqual(set(by_name), {name, f"{name}:xhigh", f"{name}:max"})
                 for model in models:
                     self.assertTrue(model["require_max_tokens"])
                     self.assertEqual(model["max_output_tokens"], 128000)
-                    self.assertEqual(model["input_price"], 10)
+                    self.assertEqual(model["input_price"], input_price)
                     self.assertIn('"type":"adaptive"', model["patches"][0])
                     self.assertNotIn("budget_tokens", model["patches"][0])
-                    if provider == "claude":
-                        self.assertIn("drop_block", model["patches"][0])
-                        self.assertIn("thinking-binding-controls-2026-08-01", model["patches"][0])
+                self.assertIn(f'"effort":"{base_effort}"', by_name[name]["patches"][0])
+                for effort in ("xhigh", "max"):
+                    self.assertIn(
+                        f'"effort":"{effort}"', by_name[f"{name}:{effort}"]["patches"][0]
+                    )
+
+    def test_fable_5_1_adds_binding_controls(self) -> None:
+        name = "claude-fable-5-1"
+        base = {"name": name, "max_output_tokens": 128000}
+        models = um.regenerate_provider_models("claude", {}, {name: base}, [])
+        for model in models:
+            self.assertIn("drop_block", model["patches"][0])
+            self.assertIn("thinking-binding-controls-2026-08-01", model["patches"][0])
 
     def test_openai_aliases_refresh_while_unowned_max_alias_survives(self) -> None:
         old_models = {

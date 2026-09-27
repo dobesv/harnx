@@ -91,6 +91,7 @@ class TestOpusVersionDetection(unittest.TestCase):
         self.assertIsNone(um.opus_minor_version("claude-sonnet-4-6"))
         # Old `claude-4-opus` ordering is not matched (it predates adaptive-only).
         self.assertIsNone(um.opus_minor_version("claude-4-opus-20250514"))
+        self.assertIsNone(um.opus_minor_version("us.anthropic.claude-opus-4-20250514-v1:0"))
 
     def test_adaptive_only_threshold(self) -> None:
         self.assertTrue(um.is_adaptive_only_opus("claude-opus-4-7"))
@@ -98,7 +99,19 @@ class TestOpusVersionDetection(unittest.TestCase):
         self.assertTrue(um.is_adaptive_only_opus("claude-opus-4-8@default"))
         self.assertFalse(um.is_adaptive_only_opus("claude-opus-4-6"))
         self.assertFalse(um.is_adaptive_only_opus("claude-opus-4-5"))
+        self.assertFalse(um.is_adaptive_only_opus("us.anthropic.claude-opus-4-20250514-v1:0"))
         self.assertFalse(um.is_adaptive_only_opus("claude-sonnet-4-6"))
+
+    def test_required_output_limit_distinguishes_minor_from_date(self) -> None:
+        self.assertTrue(um.claude_requires_max_tokens("claude-opus-5-5"))
+        self.assertTrue(um.claude_requires_max_tokens("claude-opus-5-5-20260926"))
+        self.assertFalse(um.claude_requires_max_tokens("claude-opus-5-20260926"))
+        self.assertFalse(um.claude_requires_max_tokens("claude-opus-4-1-20250805"))
+
+    def test_bedrock_dated_opus_4_retains_thinking_variant(self) -> None:
+        name = "us.anthropic.claude-opus-4-20250514-v1:0"
+        variants = um.thinking_variants({"name": name}, "bedrock")
+        self.assertEqual([variant["name"] for variant in variants], [f"{name}:thinking"])
 
     def test_is_variant_name(self) -> None:
         self.assertTrue(um.is_variant_name("claude-opus-4-6:thinking"))
