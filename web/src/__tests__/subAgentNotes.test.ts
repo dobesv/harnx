@@ -364,7 +364,43 @@ describe('reduceSubAgentNotes', () => {
       status: 'failed',
     });
   });
-  it('allows parent authoritative result to override a child-liveness failed state', () => {
+  it.each([
+    {
+      scenario: 'override a child-liveness failed state with progress',
+      content: JSON.stringify({
+        sub_agent_progress: {
+          invocation_id: 'inv-coder-1',
+          agent: 'coder',
+          session_id: 'child-coder-1',
+          status: 'done',
+          elapsed_ms: 1000,
+          usage: { input_tokens: 10, output_tokens: 20, cached_tokens: 0 },
+          tool_call_count: 1,
+        },
+      }),
+      expected: {
+        id: 'live:inv-coder-1',
+        status: 'done',
+        elapsedMs: 1000,
+        inputTokens: 10,
+        outputTokens: 20,
+      },
+    },
+    {
+      scenario: 'mark a child-liveness failed state as done with marker',
+      content: JSON.stringify({
+        sub_agent: {
+          agent: 'coder',
+          session_id: 'child-coder-1',
+          invocation_id: 'inv-coder-1',
+        },
+      }),
+      expected: {
+        id: 'live:inv-coder-1',
+        status: 'done',
+      },
+    },
+  ])('allows parent authoritative result to $scenario', ({ content, expected }) => {
     const state = apply(
       snapshotEvent(),
       {
@@ -375,76 +411,22 @@ describe('reduceSubAgentNotes', () => {
           session_id: 'child-coder-1',
           invocation_id: 'inv-coder-1',
           tool_call_id: 'call-3-missing-result',
-          started_at: '2026-09-09T05:15:30Z'
-        }
+          started_at: '2026-09-09T05:15:30Z',
+        },
       },
       {
         type: 'CHILD_TERMINAL',
         invocationId: 'inv-coder-1',
-        status: 'failed'
+        status: 'failed',
       },
       {
         type: 'TOOL_CALL_RESULT',
         toolCallId: 'call-3-missing-result',
-        content: JSON.stringify({
-          sub_agent_progress: {
-            invocation_id: 'inv-coder-1',
-            agent: 'coder',
-            session_id: 'child-coder-1',
-            status: 'done',
-            elapsed_ms: 1000,
-            usage: { input_tokens: 10, output_tokens: 20, cached_tokens: 0 },
-            tool_call_count: 1
-          }
-        })
-      }
+        content,
+      },
     );
 
-    expect(state.notes[2]).toMatchObject({
-      id: 'live:inv-coder-1',
-      status: 'done',
-      elapsedMs: 1000,
-      inputTokens: 10,
-      outputTokens: 20
-    });
-  });
-
-  it('allows parent authoritative result marker to mark a child-liveness failed state as done', () => {
-    const state = apply(
-      snapshotEvent(),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'coder',
-          session_id: 'child-coder-1',
-          invocation_id: 'inv-coder-1',
-          tool_call_id: 'call-3-missing-result',
-          started_at: '2026-09-09T05:15:30Z'
-        }
-      },
-      {
-        type: 'CHILD_TERMINAL',
-        invocationId: 'inv-coder-1',
-        status: 'failed'
-      },
-      {
-        type: 'TOOL_CALL_RESULT',
-        toolCallId: 'call-3-missing-result',
-        content: JSON.stringify({
-          sub_agent: {
-            agent: 'coder',
-            session_id: 'child-coder-1',
-            invocation_id: 'inv-coder-1'
-          }
-        })
-      }
-    );
-
-    expect(state.notes[2]).toMatchObject({
-      id: 'live:inv-coder-1',
-      status: 'done'
-    });
+    expect(state.notes[2]).toMatchObject(expected);
   });
 
   it('freezes elapsedMs on CHILD_TERMINAL by accumulating localElapsed', () => {
@@ -483,6 +465,93 @@ describe('reduceSubAgentNotes', () => {
     const frozenNote = terminalState.notes[0];
     expect(frozenNote.status).toBe('done');
     expect(frozenNote.elapsedMs).toBeGreaterThanOrEqual(3400);
+  });
+
+  it('transitions note to awaiting_approval and freezes elapsedMs on CHILD_AWAITING_APPROVAL', () => {
+    const startTime = Date.now() - 5000;
+    const initial = apply(
+      toolStart('parent-msg'),
+      {
+        type: 'CUSTOM',
+        name: 'sub_agent_started',
+        value: {
+          agent: 'coder',
+          session_id: 'child-1',
+          invocation_id: 'inv-hitl-1',
+          tool_call_id: 'call-1',
+          started_at: new Date(startTime).toISOString(),
+        },
+      }
+    );
+
+    const awaitingState = reduceSubAgentNotes(initial, {
+      type: 'CHILD_AWAITING_APPROVAL',
+      invocationId: 'inv-hitl-1',
+    });
+
+    const note = awaitingState.notes[0];
+    expect(note.status).toBe('awaiting_approval');
+    expect(note.elapsedMs).toBeGreaterThanOrEqual(4900);
+  });
+
+  function setupAwaitingNote(invocationId: string) {
+    const initial = apply(
+      toolStart('parent-msg'),
+      {
+        type: 'CUSTOM',
+        name: 'sub_agent_started',
+        value: {
+          agent: 'coder',
+          session_id: 'child-1',
+          invocation_id: invocationId,
+          tool_call_id: 'call-1',
+        },
+      },
+    );
+    return reduceSubAgentNotes(initial, {
+      type: 'CHILD_AWAITING_APPROVAL',
+      invocationId,
+    });
+  }
+
+  it.each([
+    {
+      action: { type: 'CHILD_RUNNING', invocationId: 'inv-resume-1' },
+      expectedStatus: 'running',
+    },
+    {
+      action: { type: 'CHILD_TERMINAL', invocationId: 'inv-term-hitl-1', status: 'cancelled' },
+      expectedStatus: 'cancelled',
+    },
+  ])('transitions awaiting_approval note to $expectedStatus on $action.type', ({ action, expectedStatus }) => {
+    const awaitingState = setupAwaitingNote(action.invocationId as string);
+    expect(awaitingState.notes[0].status).toBe('awaiting_approval');
+
+    const nextState = reduceSubAgentNotes(awaitingState, action);
+    expect(nextState.notes[0].status).toBe(expectedStatus);
+  });
+
+  it('transitions note to cancelled on CHILD_TERMINAL with status cancelled', () => {
+    const initial = apply(
+      toolStart('parent-msg'),
+      {
+        type: 'CUSTOM',
+        name: 'sub_agent_started',
+        value: {
+          agent: 'coder',
+          session_id: 'child-1',
+          invocation_id: 'inv-cancel-1',
+          tool_call_id: 'call-1',
+        },
+      }
+    );
+
+    const cancelledState = reduceSubAgentNotes(initial, {
+      type: 'CHILD_TERMINAL',
+      invocationId: 'inv-cancel-1',
+      status: 'cancelled',
+    });
+    expect(cancelledState.notes[0].status).toBe('cancelled');
   });
 
   it('preserves startedAtMs and toolCallId when applyProgress receives update without started_at', () => {

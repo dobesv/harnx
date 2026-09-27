@@ -51,13 +51,3 @@ export interface PromptResult {
   run_id: string;
 }
 
-// `running` covers both a turn this server is driving and one a worker holds
-// the session lease for; `awaiting_approval` is a gate waiting on a decision,
-// which is not an interrupt and must not be shown as one.
-export type SessionStatus = 'idle' | 'running' | 'interrupting' | 'interrupted' | 'awaiting_approval';
-
-export interface SessionControlState {
-  state: { status: SessionStatus; cancel_seq?: number };
-  canPrompt?: boolean;
-  canCancel?: boolean;
-}

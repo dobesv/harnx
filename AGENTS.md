@@ -720,6 +720,25 @@ for the precedent (PR #1448).
 `AgentEvent` (`harnx-core/src/event.rs`) is advisory and emitted to the lossy fan-out subject
 `sessions.{id}.events`. The durable entry is authoritative; advisories are best-effort previews.
 
+### Session status vs the `/events` wake-up channel
+
+The SSE `/events` endpoint (`session_routes.rs:173`) carries only lossy wake-ups
+(`session-updated {after_seq}`, `read-updated`), NOT the authoritative run lifecycle.
+Run status flows through the AG-UI run stream:
+
+- **RUN_STARTED/RUN_FINISHED/RUN_ERROR**: emitted by the assistant-ui POST to
+  `/v1/agents/{agent}/sessions/{session}` (`ag_ui.rs:1219`). The server derives
+  `RUN_FINISHED` from durable completion (`TurnEnd` or `Cancel`); `RUN_ERROR`
+  signals worker loss or task failure.
+- **turn_interrupted / hitl_pending_approval**: reconstructed from the durable
+  log and sent as AG-UI `CUSTOM` events during promptless attach (`ag_ui.rs:1640`).
+
+The Web UI NO LONGER polls JSON-RPC `session/get` for status. Sub-agent rows
+derive `running`/`done`/`failed`/`cancelled`/`awaiting_approval` from AG-UI events
+on the child stream (`SubAgentSessionNotes.tsx:81`); foreground interruption uses
+local optimistic state cleared by the run terminal. When status appears stale,
+reload re-hydrates from the authoritative log.
+
 ### Follow mode MUST emit durable entries only
 
 `SessionEventStream::attach()` (`nats_event_sink.rs:386`) subscribes to advisories first, then

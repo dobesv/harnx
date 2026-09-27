@@ -47,6 +47,8 @@ export interface HarnxCustomEventCallbacks {
   onCompactingFailed?: (error: string, compactionId?: string) => void;
   /** Called when a tool_update CUSTOM event is received. */
   onToolUpdate?: (patch: ToolCallUpdatePatch) => void;
+  /** Called when turn_interrupted is received. */
+  onTurnInterrupted?: () => void;
   /**
    * Whether events belong to the session currently shown in the foreground.
    * When `false`, the `session_title_updated` handler skips `setDocumentTitle`
@@ -221,6 +223,9 @@ const handlers: Record<string, CustomEventHandler> = {
   tool_update: (callbacks, value) => {
     const patch = parseToolUpdateEvent(value);
     if (patch) callbacks.onToolUpdate?.(patch);
+  },
+  turn_interrupted: (callbacks) => {
+    callbacks.onTurnInterrupted?.();
   },
 };
 

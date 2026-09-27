@@ -25,6 +25,7 @@ use ag_ui_core::{
 use anyhow::Context;
 use chrono::Utc;
 use dashmap::DashMap;
+use futures::FutureExt;
 use harnx_core::{
     abort::{create_abort_signal, AbortSignal},
     tool::ToolResult,
@@ -275,6 +276,25 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         .run_turn_input(&input, attachments_dir.as_deref(), params.sink, None)
         .await
         .map(|_| harnx_runtime::LoopResult::Completed)
+}
+
+async fn run_actor_turn_supervised(
+    params: ActorTurnParams,
+) -> anyhow::Result<harnx_runtime::LoopResult> {
+    match std::panic::AssertUnwindSafe(run_actor_turn(params))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            Err(anyhow::anyhow!("session turn task panicked: {message}"))
+        }
+    }
 }
 
 async fn open_actor_nats_session(
@@ -667,7 +687,7 @@ impl SessionActor {
             key: self.key.clone(),
         };
         let task = AbortOnDropHandle::new(tokio::spawn(async move {
-            let loop_result = run_actor_turn(turn).await;
+            let loop_result = run_actor_turn_supervised(turn).await;
             let _ = done_tx
                 .send(RunFinished {
                     run_id: run_id_for_task,

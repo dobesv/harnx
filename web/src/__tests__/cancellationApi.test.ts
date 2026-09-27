@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   cancel,
-  sessionControl,
   CANCELLATION_TIMEOUT_MS,
 } from '../cancellationApi';
 import * as connectionModule from '../connection';
@@ -24,100 +23,9 @@ describe('cancellationApi', () => {
     vi.resetAllMocks();
   });
 
-  it('exports a cancellation timeout meaningfully above normal p95 server latency (#1861)', () => {
-    expect(CANCELLATION_TIMEOUT_MS).toBe(15000);
-    expect(CANCELLATION_TIMEOUT_MS).toBeGreaterThan(2000);
-  });
-
-  describe('sessionControl', () => {
-    it('uses the 15-second timeout and succeeds', async () => {
-      fetchMock.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          result: {
-            state: { status: 'running' },
-            canPrompt: true,
-          },
-        }),
-      });
-
-      const state = await sessionControl('agent-1', 'session-1');
-      expect(state.state.status).toBe('running');
-      expect(fetchMock).toHaveBeenCalledWith(
-        '/v1/agents/agent-1/sessions/session-1',
-        expect.objectContaining({
-          method: 'POST',
-          signal: expect.any(AbortSignal),
-          body: JSON.stringify({ jsonrpc: '2.0', id: 'control', method: 'session/get' }),
-        })
-      );
-    });
-
-    it('respects caller signal when provided (#1838)', async () => {
-      const controller = new AbortController();
-      let passedSignal: AbortSignal | undefined;
-
-      fetchMock.mockImplementationOnce((_url: any, init: any) => {
-        passedSignal = init.signal;
-        return new Promise((_, reject) => {
-          if (init.signal?.aborted) {
-            reject(init.signal.reason);
-          } else {
-            init.signal?.addEventListener('abort', () => reject(init.signal.reason));
-          }
-        });
-      });
-
-      const promise = sessionControl('agent-1', 'session-1', { signal: controller.signal });
-
-      // Signal passed to fetch must not be aborted initially
-      expect(passedSignal).toBeDefined();
-      expect(passedSignal?.aborted).toBe(false);
-
-      // Aborting the caller signal must abort the composite signal passed to fetch
-      controller.abort();
-      expect(passedSignal?.aborted).toBe(true);
-
-      await expect(promise).rejects.toMatchObject({
-        name: 'AbortError',
-      });
-    });
-
-    it('does NOT flip connection status to degraded on TimeoutError (#1861)', async () => {
-      const connection = (connectionModule as any).connection;
-      const timeoutError = new DOMException('The operation was aborted due to timeout', 'TimeoutError');
-      fetchMock.mockRejectedValueOnce(timeoutError);
-
-      await expect(sessionControl('agent-1', 'session-1')).rejects.toMatchObject({
-        name: 'TimeoutError',
-      });
-
-      expect(connection.noteTransientTrouble).not.toHaveBeenCalled();
-    });
-
-    it('does NOT flip connection status to degraded on "signal is aborted without reason" (#1838)', async () => {
-      const connection = (connectionModule as any).connection;
-      const abortError = new DOMException('signal is aborted without reason', 'AbortError');
-      fetchMock.mockRejectedValueOnce(abortError);
-
-      await expect(sessionControl('agent-1', 'session-1')).rejects.toThrow(
-        'signal is aborted without reason'
-      );
-
-      expect(connection.noteTransientTrouble).not.toHaveBeenCalled();
-    });
-
-    it('flips connection status to degraded on HTTP 500 server error', async () => {
-      const connection = (connectionModule as any).connection;
-      fetchMock.mockResolvedValueOnce({
-        ok: false,
-        status: 500,
-        statusText: 'Internal Server Error',
-        json: async () => ({ error: { message: 'Internal Server Error' } }),
-      });
-
-      await expect(sessionControl('agent-1', 'session-1')).rejects.toThrow('Internal Server Error');
-      expect(connection.noteTransientTrouble).toHaveBeenCalledTimes(1);
+  describe('CANCELLATION_TIMEOUT_MS', () => {
+    it('is 15 seconds, matching the GET timeout to prevent spurious connection degradation', () => {
+      expect(CANCELLATION_TIMEOUT_MS).toBe(15_000);
     });
   });
 
@@ -133,9 +41,37 @@ describe('cancellationApi', () => {
       expect(result).toEqual({ outcome: 'idle' });
     });
 
-    it('does NOT flip connection status to degraded on timeout (#1861)', async () => {
+    it('respects caller abort signal', async () => {
+      const controller = new AbortController();
+      let passedSignal: AbortSignal | undefined;
+
+      fetchMock.mockImplementationOnce((_url: any, init: any) => {
+        passedSignal = init.signal;
+        return new Promise((_, reject) => {
+          if (init.signal?.aborted) {
+            reject(init.signal.reason);
+          } else {
+            init.signal?.addEventListener('abort', () => reject(init.signal.reason));
+          }
+        });
+      });
+
+      const promise = cancel('agent-1', 'session-1', { signal: controller.signal });
+
+      expect(passedSignal).toBeDefined();
+      expect(passedSignal?.aborted).toBe(false);
+
+      controller.abort();
+      expect(passedSignal?.aborted).toBe(true);
+
+      await expect(promise).rejects.toMatchObject({
+        name: 'AbortError',
+      });
+    });
+
+    it('does NOT flip connection status to degraded on TimeoutError (#1861)', async () => {
       const connection = (connectionModule as any).connection;
-      const timeoutError = new DOMException('Request timeout', 'TimeoutError');
+      const timeoutError = new DOMException('The operation was aborted due to timeout', 'TimeoutError');
       fetchMock.mockRejectedValueOnce(timeoutError);
 
       await expect(cancel('agent-1', 'session-1')).rejects.toMatchObject({
@@ -143,6 +79,31 @@ describe('cancellationApi', () => {
       });
 
       expect(connection.noteTransientTrouble).not.toHaveBeenCalled();
+    });
+
+    it('does NOT flip connection status to degraded on "signal is aborted without reason" (#1838)', async () => {
+      const connection = (connectionModule as any).connection;
+      const abortError = new DOMException('signal is aborted without reason', 'AbortError');
+      fetchMock.mockRejectedValueOnce(abortError);
+
+      await expect(cancel('agent-1', 'session-1')).rejects.toThrow(
+        'signal is aborted without reason'
+      );
+
+      expect(connection.noteTransientTrouble).not.toHaveBeenCalled();
+    });
+
+    it('flips connection status to degraded on HTTP 500 server error', async () => {
+      const connection = (connectionModule as any).connection;
+      fetchMock.mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        statusText: 'Internal Server Error',
+        json: async () => { throw new Error('no body'); },
+      });
+
+      await expect(cancel('agent-1', 'session-1')).rejects.toThrow('RPC call failed with HTTP 500');
+      expect(connection.noteTransientTrouble).toHaveBeenCalledTimes(1);
     });
   });
 });
