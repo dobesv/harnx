@@ -7,7 +7,7 @@ pub use super::session_persistence::{
     session_overrides, SessionAppendSink,
 };
 pub use super::session_tool_results::add_tool_results;
-pub(crate) use super::session_tool_results::prepare_tool_results;
+pub(crate) use super::session_tool_results::{prepare_tool_results, prepare_tool_results_in_place};
 use super::*;
 use crate::nats_session::new_client_message_id;
 

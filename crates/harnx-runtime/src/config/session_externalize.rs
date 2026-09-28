@@ -2,6 +2,8 @@ use super::{Session, SessionLogEntry};
 
 use crate::client::MessageContent;
 use crate::tool::ToolResult;
+use harnx_core::agent_config::TEMP_AGENT_NAME;
+use harnx_core::cid_url::SessionRef;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,18 +16,32 @@ pub(crate) fn attachments_dir(session: &Session) -> Option<std::path::PathBuf> {
     })
 }
 
+pub(super) fn session_ref(session: &Session) -> anyhow::Result<SessionRef> {
+    let agent = session
+        .agent_name()
+        .filter(|name| !name.is_empty() && *name != TEMP_AGENT_NAME)
+        .map(str::to_string);
+    SessionRef::new(agent, session.id().to_string())
+}
+
 fn externalize_message(
     dir: &Path,
+    session: &SessionRef,
     content: &mut MessageContent,
     map: &mut HashMap<String, String>,
 ) -> anyhow::Result<()> {
     match content {
         MessageContent::Array(parts) => {
-            crate::config::attachments::externalize_parts(dir, parts, map)
+            crate::config::attachments::externalize_parts(dir, session, parts, map)
         }
         MessageContent::ToolCalls(tool_calls) => {
             for result in &mut tool_calls.tool_results {
-                crate::config::attachments::externalize_parts(dir, &mut result.content, map)?;
+                crate::config::attachments::externalize_parts(
+                    dir,
+                    session,
+                    &mut result.content,
+                    map,
+                )?;
             }
             Ok(())
         }
@@ -44,7 +60,14 @@ pub(crate) fn externalize_content(
     let Some(dir) = attachments_dir(session) else {
         return map;
     };
-    if let Err(err) = externalize_message(&dir, content, &mut map) {
+    let session_ref = match session_ref(session) {
+        Ok(session_ref) => session_ref,
+        Err(err) => {
+            log::warn!("attachment externalization skipped for invalid session: {err}");
+            return map;
+        }
+    };
+    if let Err(err) = externalize_message(&dir, &session_ref, content, &mut map) {
         log::warn!("attachment externalization failed: {err}");
     }
     map
@@ -55,6 +78,7 @@ pub(crate) fn externalize_content(
 /// session has no attachments dir yet.
 pub(crate) fn externalize_tool_result_content(
     dir: Option<&Path>,
+    session: &SessionRef,
     results: &mut [ToolResult],
     map: &mut HashMap<String, String>,
 ) {
@@ -62,7 +86,8 @@ pub(crate) fn externalize_tool_result_content(
         return;
     };
     for slot in results.iter_mut() {
-        if let Err(err) = crate::config::attachments::externalize_parts(dir, &mut slot.content, map)
+        if let Err(err) =
+            crate::config::attachments::externalize_parts(dir, session, &mut slot.content, map)
         {
             log::warn!("tool-result attachment externalization failed: {err}");
         }

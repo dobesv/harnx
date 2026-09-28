@@ -140,12 +140,26 @@ pub async fn execute_tool_round_with_persistence(
         }
     };
     anyhow::ensure!(!abort_signal.aborted(), "interrupted during tool execution");
-    let results = populate_result_markdown(results, &eval_ctx);
-    if !dry_run {
-        let persistence = { config.write().prepare_session_tool_results(&results)? };
-        persistence.persist().await;
-    }
+    let mut results = populate_result_markdown(results, &eval_ctx);
+    persist_tool_results(config, &mut results, dry_run).await?;
     Ok(results)
+}
+
+async fn persist_tool_results(
+    config: &GlobalConfig,
+    results: &mut [ToolResult],
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        return Ok(());
+    }
+    let persistence = {
+        config
+            .write()
+            .prepare_session_tool_results_in_place(results)?
+    };
+    persistence.persist().await;
+    Ok(())
 }
 
 struct ToolFailure<'a> {
