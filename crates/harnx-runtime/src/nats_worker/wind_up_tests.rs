@@ -152,6 +152,8 @@ impl InterruptedTurn {
             tool: "probe".into(),
             args: serde_json::json!({}),
             parent_session_id: Some(self.storage_key.clone()),
+            parent_agent: None,
+            parent_local_session_id: None,
             tool_call_id: Some(call_id.into()),
             capabilities: Default::default(),
         }

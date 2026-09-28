@@ -117,6 +117,8 @@ async fn record_retryable_call(js: &async_nats::jetstream::Context) -> anyhow::R
                 tool: "echo".into(),
                 args: json!({}),
                 parent_session_id: Some("parent".into()),
+                parent_agent: None,
+                parent_local_session_id: None,
                 tool_call_id: Some("retryable-call".into()),
                 capabilities: Default::default(),
             },
@@ -167,6 +169,8 @@ async fn save_reply(js: &async_nats::jetstream::Context) -> anyhow::Result<()> {
         tool: "echo".into(),
         args: json!({}),
         parent_session_id: Some("parent".into()),
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: Some("model-call".into()),
         capabilities: Default::default(),
     };
@@ -197,6 +201,8 @@ async fn saved_reply_provider(client: async_nats::Client) -> anyhow::Result<Nats
         client,
         instance_id,
         parent_session_id: Some("parent".into()),
+        parent_agent: None,
+        parent_local_session_id: None,
         tools: HashMap::from([(
             "retryable_echo".to_string(),
             RegisteredTool {
@@ -263,6 +269,8 @@ async fn the_journal_bucket_takes_the_configured_replica_count() -> anyhow::Resu
         tool: "echo".into(),
         args: json!({}),
         parent_session_id: Some("replica-session".into()),
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     };

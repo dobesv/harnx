@@ -647,7 +647,6 @@ pub(super) struct ToolRoundAttachmentSync {
     pub(super) jetstream: async_nats::jetstream::Context,
     pub(super) config: crate::config::GlobalConfig,
     pub(super) replicas: usize,
-    pub(super) session_id: String,
 }
 
 pub(super) fn build_durable_tool_round_callback(
@@ -663,7 +662,6 @@ pub(super) fn build_durable_tool_round_callback(
                 &attachment_sync.jetstream,
                 &attachment_sync.config,
                 attachment_sync.replicas,
-                &attachment_sync.session_id,
             )
             .await
         })

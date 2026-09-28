@@ -151,7 +151,11 @@ async fn session_delete_removes_attachments_and_is_idempotent() -> Result<()> {
         AttachmentLocation::new(
             &jetstream,
             1,
-            &harnx_core::session_identity::session_key(Some("oracle"), session_id),
+            &harnx_core::cid_url::SessionRef::new(
+                Some("oracle".to_string()),
+                session_id.to_string(),
+            )
+            .expect("test session_id valid"),
         ),
         &mut content,
         None,

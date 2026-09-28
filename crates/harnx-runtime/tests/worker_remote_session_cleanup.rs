@@ -119,6 +119,8 @@ async fn seed_session_journal_and_attachment(
                 tool: "test_tool".into(),
                 args: serde_json::json!({}),
                 parent_session_id: Some(storage_key.to_string()),
+                parent_agent: None,
+                parent_local_session_id: None,
                 tool_call_id: Some("worker-gc-tool-call".into()),
                 capabilities: Default::default(),
             },
@@ -134,7 +136,12 @@ async fn seed_session_journal_and_attachment(
         image_url: ImageUrl { url: data_url },
     }]);
     externalize_message_attachments(
-        AttachmentLocation::new(jetstream, 1, storage_key),
+        AttachmentLocation::new(
+            jetstream,
+            1,
+            &harnx_core::cid_url::SessionRef::new(None, "worker-gc-stale".to_string())
+                .expect("test session_id valid"),
+        ),
         &mut attachment,
         None,
     )

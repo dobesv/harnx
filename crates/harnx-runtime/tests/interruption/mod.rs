@@ -219,6 +219,8 @@ fn journal_request(session_key: &str, call_id: &str) -> ToolRequest {
         tool: "slow_tool".into(),
         args: json!({}),
         parent_session_id: Some(session_key.into()),
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: Some(call_id.into()),
         capabilities: Default::default(),
     }

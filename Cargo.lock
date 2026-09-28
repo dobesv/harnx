@@ -3876,6 +3876,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-blob-store"
+version = "0.34.7"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "chrono",
+ "futures-util",
+ "harnx-core",
+ "harnx-nats-common",
+ "harnx-test-bins",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "harnx-claude-compatible-hook-server"
 version = "0.34.7"
 dependencies = [
@@ -4515,6 +4533,7 @@ dependencies = [
  "futures-util",
  "fuzzy-matcher",
  "globset",
+ "harnx-blob-store",
  "harnx-client",
  "harnx-core",
  "harnx-engine",
@@ -4707,6 +4726,7 @@ name = "harnx-test-bins"
 version = "0.34.7"
 dependencies = [
  "anyhow",
+ "async-nats",
  "async-trait",
  "jiff",
  "libc",
@@ -4715,7 +4735,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tokio",
+ "which",
 ]
 
 [[package]]

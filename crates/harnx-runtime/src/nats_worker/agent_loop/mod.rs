@@ -19,6 +19,7 @@ use crate::tool_context::{discover_nats_hook_provider_fresh, discover_nats_tool_
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
+use harnx_core::cid_url::SessionRef;
 use harnx_core::message::Message;
 use harnx_core::session::SessionLogEntry;
 use std::sync::atomic::AtomicU64;
@@ -570,16 +571,25 @@ async fn prepare_agent_session(
     .await?;
     attach_session_to_config(AttachSessionParams {
         config: params.config,
-        session,
+        session: session.clone(),
         backend: &backend,
         lease: params.lease,
         metadata: params.session_metadata,
     });
+    // Get the SessionRef from the loaded session
+    let session_ref = SessionRef::new(
+        session
+            .agent_name()
+            .filter(|name| !name.is_empty() && *name != harnx_core::agent_config::TEMP_AGENT_NAME)
+            .map(str::to_string),
+        session.id().to_string(),
+    )
+    .expect("session has valid id");
     let attachment_sync = SessionAttachmentSync::prepare(
         jetstream.clone(),
         params.config.clone(),
         params.cluster_key,
-        params.session_id,
+        session_ref,
     )
     .await?;
     Ok((jetstream, origin, attachment_sync))

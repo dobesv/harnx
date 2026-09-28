@@ -90,7 +90,10 @@ async fn upload_shared_attachment(
         "data:text/plain;base64,{}",
         harnx_core::crypto::base64_encode(b"review attachment")
     );
-    let cid = harnx_core::attachments::cid_for_data_url(&data_url);
+    let beta_cid = harnx_core::attachments::cid_for_data_url_with_session(
+        &sessions[1].session_ref(),
+        &data_url,
+    );
     for session in sessions {
         let mut content = MessageContent::Array(vec![MessageContentPart::ImageUrl {
             image_url: ImageUrl {
@@ -98,13 +101,13 @@ async fn upload_shared_attachment(
             },
         }]);
         harnx_runtime::nats_attachments::externalize_message_attachments(
-            harnx_runtime::nats_attachments::AttachmentLocation::new(js, 1, session.storage_key()),
+            harnx_runtime::nats_attachments::AttachmentLocation::new(js, 1, &session.session_ref()),
             &mut content,
             None,
         )
         .await?;
     }
-    Ok(cid)
+    Ok(beta_cid)
 }
 
 #[tokio::test]
@@ -207,13 +210,18 @@ async fn assert_beta_survived_deletion(
     let beta_log = NatsSessionLog::new_with_replicas(js.clone(), beta.storage_key(), 1);
     let hydrated = tempfile::tempdir()?;
     harnx_runtime::nats_attachments::hydrate_attachment_refs(
-        harnx_runtime::nats_attachments::AttachmentLocation::new(js, 1, beta.storage_key()),
+        harnx_runtime::nats_attachments::AttachmentLocation::new(js, 1, &beta.session_ref()),
         hydrated.path(),
         std::slice::from_ref(attachment_cid),
     )
     .await?;
+    let harnx_core::cid_url::CidUrl::Media { hash, .. } =
+        harnx_core::cid_url::CidUrl::parse(attachment_cid)?
+    else {
+        unreachable!("test attachment is media")
+    };
     assert_eq!(
-        harnx_core::attachments::read_attachment_async(hydrated.path(), attachment_cid)
+        harnx_core::attachments::read_attachment_async(hydrated.path(), &format!("cid:{hash}"),)
             .await?
             .0,
         b"review attachment"
@@ -253,14 +261,18 @@ async fn explicit_agent_controls_completion_and_info_even_with_other_active_agen
     }
     let mut cfg = admin_config(server.url());
     cfg.set_remote_agent("unrelated".into(), "unreachable-cluster".into());
-    assert_eq!(
-        cfg.list_sessions_for_completion("alpha@local").await,
-        vec!["alpha-only"]
-    );
-    assert_eq!(
-        cfg.list_sessions_for_completion("beta@local").await,
-        vec!["beta-only"]
-    );
+    async fn poll_sessions(cfg: &harnx_runtime::config::Config, agent: &str) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let sessions = cfg.list_sessions_for_completion(agent).await;
+            if !sessions.is_empty() || std::time::Instant::now() >= deadline {
+                return sessions;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    assert_eq!(poll_sessions(&cfg, "alpha@local").await, vec!["alpha-only"]);
+    assert_eq!(poll_sessions(&cfg, "beta@local").await, vec!["beta-only"]);
     let (broker, metadata) =
         harnx_runtime::config::session_metadata_for_agent(&cfg, "alpha@local", "alpha-only")
             .await?;

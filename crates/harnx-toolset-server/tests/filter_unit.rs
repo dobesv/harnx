@@ -142,6 +142,7 @@ mod tests {
             context: harnx_toolset::ToolInvocationContext {
                 call_id: "test".to_string(),
                 invoking_session_id: Some("session".to_string()),
+                invoking_session: None,
                 capabilities: Default::default(),
                 checkpoint: None,
                 checkpoint_store: None,

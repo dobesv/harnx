@@ -37,6 +37,8 @@ impl NatsToolProvider {
             tool: route.raw_name.clone(),
             args: arguments,
             parent_session_id: self.parent_session_id.clone(),
+            parent_agent: self.parent_agent.clone(),
+            parent_local_session_id: self.parent_local_session_id.clone(),
             tool_call_id: tool_call_id.map(str::to_string),
             capabilities,
         };

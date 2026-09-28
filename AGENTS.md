@@ -46,6 +46,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   │       ├── utils/          # Shared utilities
 │   │       └── bin/            # Bins that share harnx library code (mcp-bash, mcp-fs)
 │   ├── harnx-plans-tools/        # MCP server: file-based plan and todo management (standalone crate)
+│   ├── harnx-blob-store/        # NATS-backed blob storage for attachments and plans (standalone crate)
 │   └── harnx-test-bins/        # Internal dev/test binaries (publish = false)
 ├── example_config/             # Example user configuration
 ├── docs/                       # User-facing documentation
@@ -575,6 +576,24 @@ through the session log backend while holding the lease, so the append is fenced
 on the tail the turn last observed and a `Cancel` that landed meanwhile stops it.
 A sub-agent start in the parent log is written through the invoking tool's
 handle on that same lease.
+
+### Crate layering for NATS tool servers
+
+Tool servers that need NATS object/KV storage must depend on `harnx-blob-store`,
+which provides media put/get, plans KV, activity touch, and owner-scoped deletion.
+This crate is intentionally isolated from `harnx-runtime` and `harnx-toolset-server`
+to keep tool servers lightweight and avoid pulling in the full execution stack.
+
+Verify layering with: `cargo tree -p harnx-blob-store` (must show no
+`harnx-runtime` or `harnx-toolset-server`). Add new storage operations to
+`harnx-blob-store` rather than duplicating NATS access in tool servers.
+
+Caller session identity reaches native NATS toolsets via
+`ToolInvocationContext.invoking_session: Option<SessionRef>`. The `SessionRef`
+carries `agent: Option<String>` and `session_id: String` (6-char local id).
+`harnx-toolset::SessionRef` and `harnx-core::cid_url::SessionRef` are duplicate
+definitions to avoid circular dependencies; convert between them manually.
+See `crates/harnx-toolset-server/src/invocation.rs` for construction.
 
 The worker appends the durable `HandoffCommitted` entry **before** emitting the advisory
 `SessionEvent::HandoffCommitted` (see `agent_loop.rs:979-1001`). This guarantees a live

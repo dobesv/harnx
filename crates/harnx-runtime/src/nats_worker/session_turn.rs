@@ -248,7 +248,6 @@ impl SessionTurn {
             jetstream: self.worker.jetstream.clone(),
             config: self.per_session.clone(),
             replicas: self.worker.replicas,
-            session_id: self.activation.session_id.clone(),
         };
         let on_tool_round = build_durable_tool_round_callback(injection, attachment_sync);
         // Recovery and model/tool dispatch make this future large. Inline

@@ -5,7 +5,7 @@ use async_nats::jetstream::kv;
 use common::{request_headers, wait_for_registration, TestHarness, TestToolset, TOKEN};
 use harnx_core::execution_context::{ExecutionContextObservation, EXECUTION_CONTEXT_NAMESPACE};
 use harnx_nats_common::connect::NatsConnection;
-use harnx_toolset::{ControlKind, ControlMessage, ToolReply, ToolRequest};
+use harnx_toolset::{ControlKind, ControlMessage, SessionRef, ToolReply, ToolRequest};
 use harnx_toolset_server::{
     registration_key, serve_with_shutdown, RegistrationShutdown, ServeLifecycle,
     TOOL_REGISTRY_BUCKET,
@@ -16,6 +16,21 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+fn make_test_tool_request(name: &str, call_id: &str, args: serde_json::Value) -> ToolRequest {
+    ToolRequest {
+        replay: None,
+        operation_id: call_id.to_string(),
+        call_id: call_id.to_string(),
+        tool: name.to_string(),
+        args,
+        parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
+        tool_call_id: None,
+        capabilities: Default::default(),
+    }
+}
 
 async fn assert_registration(harness: &TestHarness) -> Result<()> {
     let registration = wait_for_registration(&harness.client, &harness.instance_id).await?;
@@ -36,6 +51,8 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: json!({ "value": 42 }),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     };
@@ -62,13 +79,15 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
 }
 
 async fn assert_invocation_context(harness: &TestHarness) -> Result<()> {
-    let request = ToolRequest {
+    let mut request = ToolRequest {
         replay: None,
         operation_id: "call-invocation-context".to_string(),
         call_id: "call-invocation-context".to_string(),
         tool: "echo".to_string(),
         args: json!({}),
         parent_session_id: Some("session-123".to_string()),
+        parent_agent: Some("pantheon/atlas".to_string()),
+        parent_local_session_id: Some("armDRA".to_string()),
         tool_call_id: None,
         capabilities: BTreeSet::from(["example-capability".to_string()]),
     };
@@ -83,6 +102,13 @@ async fn assert_invocation_context(harness: &TestHarness) -> Result<()> {
     let captured = harness.toolset.last_context.lock().await.clone().unwrap();
     assert_eq!(captured.call_id, request.call_id);
     assert_eq!(captured.invoking_session_id, request.parent_session_id);
+    assert_eq!(
+        captured.invoking_session,
+        Some(SessionRef {
+            agent: Some("pantheon/atlas".to_string()),
+            session_id: "armDRA".to_string(),
+        })
+    );
     assert_eq!(captured.capabilities, request.capabilities);
     assert!(
         captured.checkpoint.is_none(),
@@ -92,6 +118,28 @@ async fn assert_invocation_context(harness: &TestHarness) -> Result<()> {
         captured.checkpoint_store.is_some(),
         "a journalled call can record a checkpoint"
     );
+
+    request.call_id = "call-temp-invocation-context".to_string();
+    request.operation_id = request.call_id.clone();
+    request.parent_agent = None;
+    request.parent_local_session_id = Some("temp-123".to_string());
+    harness
+        .client
+        .request_with_headers(
+            harness.echo_subject(),
+            request_headers(&request.call_id, "logical-temp-invocation-context"),
+            serde_json::to_vec(&request)?.into(),
+        )
+        .await?;
+    let captured = harness.toolset.last_context.lock().await.clone().unwrap();
+    assert_eq!(
+        captured.invoking_session,
+        Some(SessionRef {
+            agent: None,
+            session_id: "temp-123".to_string(),
+        })
+    );
+
     Ok(())
 }
 
@@ -111,6 +159,8 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
         tool: "echo".to_string(),
         args: args.clone(),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: BTreeSet::from([EXECUTION_CONTEXT_NAMESPACE.to_string()]),
     };
@@ -135,6 +185,8 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
         tool: "echo".to_string(),
         args,
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: BTreeSet::new(),
     };
@@ -165,6 +217,8 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: args.clone(),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     };
@@ -175,6 +229,8 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: args.clone(),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     };
@@ -246,6 +302,8 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: json!({}),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     };
@@ -263,6 +321,8 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: json!({}),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     };
@@ -285,6 +345,8 @@ async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
         tool: "slow".to_string(),
         args: json!({}),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     };
@@ -530,6 +592,8 @@ async fn shutdown_drains_in_flight_requests_before_deregistering() -> Result<()>
         tool: "echo".to_string(),
         args: json!({"delay_ms": 500}),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     };
@@ -798,16 +862,11 @@ async fn drained_subscription_completes_in_flight_requests() -> Result<()> {
 
     // Enqueue a call to server A and hold its handler briefly (within the 10s budget)
     // Use "delay_ms" arg which tells TestToolset to delay responding
-    let request = ToolRequest {
-        replay: None,
-        operation_id: "call-park".to_string(),
-        call_id: "call-park".to_string(),
-        tool: "echo".to_string(),
-        args: json!({ "delay_ms": 100, "value": "from-a" }),
-        parent_session_id: None,
-        tool_call_id: None,
-        capabilities: Default::default(),
-    };
+    let request = make_test_tool_request(
+        "echo",
+        "call-park",
+        json!({ "delay_ms": 100, "value": "from-a" }),
+    );
     let subject = instance_id.tool_subject("____test", "echo");
     let inflight_call = client.request_with_headers(
         subject.clone(),
@@ -824,16 +883,11 @@ async fn drained_subscription_completes_in_flight_requests() -> Result<()> {
     // Publish new calls: all must route to B (A is draining)
     let mut new_calls = vec![];
     for i in 0..3 {
-        let req = ToolRequest {
-            replay: None,
-            operation_id: format!("new-call-{i}"),
-            call_id: format!("new-call-{i}"),
-            tool: "echo".to_string(),
-            args: json!({ "value": format!("new-{i}") }),
-            parent_session_id: None,
-            tool_call_id: None,
-            capabilities: Default::default(),
-        };
+        let req = make_test_tool_request(
+            "echo",
+            &format!("new-call-{i}"),
+            json!({ "value": format!("new-{i}") }),
+        );
         new_calls.push(client.request_with_headers(
             subject.clone(),
             request_headers(&req.call_id, &format!("new-{i}")),
@@ -967,16 +1021,8 @@ async fn load_balancing_across_replicas() -> Result<()> {
     let subject = instance_id.tool_subject(&identity, "echo");
     let mut responses = Vec::with_capacity(NUM_REQUESTS);
     for i in 0..NUM_REQUESTS {
-        let request = ToolRequest {
-            replay: None,
-            operation_id: format!("lb-test-{i}"),
-            call_id: format!("lb-test-{i}"),
-            tool: "echo".to_string(),
-            args: json!({ "value": i }),
-            parent_session_id: None,
-            tool_call_id: None,
-            capabilities: Default::default(),
-        };
+        let request =
+            make_test_tool_request("echo", &format!("lb-test-{i}"), json!({ "value": i }));
         responses.push(client.request_with_headers(
             subject.clone(),
             request_headers(&request.call_id, &format!("logical-lb-{i}")),
