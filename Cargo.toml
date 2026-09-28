@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/harnx",
     "crates/harnx-acp-server",
+    "crates/harnx-attachment-tools",
     "crates/harnx-blob-store",
     "crates/harnx-client",
     "crates/harnx-core",

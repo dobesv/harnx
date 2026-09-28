@@ -100,6 +100,10 @@ pub struct TruncationResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncateOpts {
+    /// First line to include, using 1-based indexing.
+    pub offset: Option<usize>,
+    /// Maximum number of lines to include after `offset`.
+    pub limit: Option<usize>,
     pub head_lines: usize,
     pub tail_lines: usize,
     pub line_head_bytes: usize,
@@ -111,6 +115,8 @@ pub struct TruncateOpts {
 impl Default for TruncateOpts {
     fn default() -> Self {
         Self {
+            offset: None,
+            limit: None,
             head_lines: 25,
             tail_lines: 75,
             line_head_bytes: 500,
@@ -198,6 +204,42 @@ pub fn sanitize_output_text(s: &str) -> String {
     out
 }
 
+fn truncate_line_bodies(lines: &mut [String], opts: &TruncateOpts, line_threshold: usize) {
+    for line in lines {
+        let had_newline = line.ends_with('\n');
+        let body = if had_newline {
+            &line[..line.len() - 1]
+        } else {
+            line.as_str()
+        };
+        if body.len() <= line_threshold {
+            continue;
+        }
+
+        let head_len = clamp_boundary_left(body, opts.line_head_bytes.min(body.len()));
+        let tail_start =
+            clamp_boundary_right(body, body.len().saturating_sub(opts.line_tail_bytes));
+        let removed = body
+            .len()
+            .saturating_sub(head_len)
+            .saturating_sub(body.len().saturating_sub(tail_start));
+        let marker = opts
+            .marker
+            .clone()
+            .unwrap_or_else(|| format!("... [truncated: {removed} bytes removed from line] ..."));
+
+        let mut rebuilt = String::with_capacity(
+            head_len + marker.len() + (body.len() - tail_start) + usize::from(had_newline),
+        );
+        rebuilt.push_str(&body[..head_len]);
+        rebuilt.push_str(&marker);
+        rebuilt.push_str(&body[tail_start..]);
+        if had_newline {
+            rebuilt.push('\n');
+        }
+        *line = rebuilt;
+    }
+}
 pub fn truncate_output(s: &str, opts: &TruncateOpts) -> String {
     let mut out = sanitize_output_text(s);
     if out.is_empty() {
@@ -205,44 +247,15 @@ pub fn truncate_output(s: &str, opts: &TruncateOpts) -> String {
     }
 
     let opts = normalize_opts(opts.clone());
+    out = apply_line_range(out, &opts);
+    if out.is_empty() {
+        return out;
+    }
 
     let line_threshold = opts.line_head_bytes.saturating_add(opts.line_tail_bytes);
     if line_threshold > 0 {
         let mut lines = split_lines_preserve_newlines(&out);
-        for line in &mut lines {
-            let had_newline = line.ends_with('\n');
-            let body = if had_newline {
-                &line[..line.len() - 1]
-            } else {
-                line.as_str()
-            };
-            if body.len() > line_threshold {
-                let head_len = clamp_boundary_left(body, opts.line_head_bytes.min(body.len()));
-                let tail_start =
-                    clamp_boundary_right(body, body.len().saturating_sub(opts.line_tail_bytes));
-                let removed = body
-                    .len()
-                    .saturating_sub(head_len)
-                    .saturating_sub(body.len().saturating_sub(tail_start));
-
-                let marker = if let Some(ref m) = opts.marker {
-                    m.clone()
-                } else {
-                    format!("... [truncated: {removed} bytes removed from line] ...")
-                };
-
-                let mut rebuilt = String::with_capacity(
-                    head_len + marker.len() + (body.len() - tail_start) + usize::from(had_newline),
-                );
-                rebuilt.push_str(&body[..head_len]);
-                rebuilt.push_str(&marker);
-                rebuilt.push_str(&body[tail_start..]);
-                if had_newline {
-                    rebuilt.push('\n');
-                }
-                *line = rebuilt;
-            }
-        }
+        truncate_line_bodies(&mut lines, &opts, line_threshold);
         out = lines.concat();
     }
 
@@ -323,6 +336,19 @@ fn normalize_opts(mut opts: TruncateOpts) -> TruncateOpts {
         opts.max_output_bytes = 1;
     }
     opts
+}
+
+fn apply_line_range(output: String, opts: &TruncateOpts) -> String {
+    if opts.offset.is_none() && opts.limit.is_none() {
+        return output;
+    }
+    let start = opts.offset.unwrap_or(1).saturating_sub(1);
+    let limit = opts.limit.unwrap_or(usize::MAX);
+    split_lines_preserve_newlines(&output)
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .collect()
 }
 
 fn split_lines_preserve_newlines(s: &str) -> Vec<String> {
@@ -483,6 +509,22 @@ mod tests {
         assert!(output.contains("line-2"));
         assert!(output.contains("line-8"));
         assert!(output.contains("line-10"));
+    }
+
+    #[test]
+    fn truncate_output_applies_offset_and_limit_before_truncation() {
+        let output = truncate_output(
+            "one\ntwo\nthree\nfour\n",
+            &TruncateOpts {
+                offset: Some(2),
+                limit: Some(2),
+                head_lines: 10,
+                tail_lines: 10,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(output, "two\nthree\n");
     }
 
     #[test]

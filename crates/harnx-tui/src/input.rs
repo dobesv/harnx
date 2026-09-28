@@ -136,6 +136,8 @@ pub(crate) async fn render_attachment_preview(path: &Path) -> Option<String> {
     // the first and last lines instead of cutting off only the head. See
     // issue #770.
     let opts = harnx_core::safety::TruncateOpts {
+        offset: None,
+        limit: None,
         head_lines: ATTACHMENT_PREVIEW_HEAD_LINES,
         tail_lines: ATTACHMENT_PREVIEW_TAIL_LINES,
         // Allow long single lines to be cropped in the middle too.

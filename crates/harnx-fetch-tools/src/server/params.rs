@@ -47,6 +47,8 @@ impl FetchParams {
     pub fn truncation_opts(&self, disable_line_clipping: bool) -> TruncateOpts {
         let defaults = TruncateOpts::default();
         TruncateOpts {
+            offset: None,
+            limit: None,
             head_lines: self.head_lines.unwrap_or(defaults.head_lines),
             tail_lines: self.tail_lines.unwrap_or(defaults.tail_lines),
             line_head_bytes: if disable_line_clipping {
