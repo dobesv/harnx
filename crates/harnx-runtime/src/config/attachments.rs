@@ -9,10 +9,12 @@ use std::path::Path;
 
 use anyhow::Result;
 use harnx_core::attachments::{
-    expand_passthrough_reference, read_attachment, store_attachment_data_url, ExpandedAttachment,
-    CID_PREFIX,
+    cid_for_data_url_with_session, expand_passthrough_reference, read_attachment,
+    store_attachment_data_url, ExpandedAttachment, CID_PREFIX,
 };
+use harnx_core::cid_url::SessionRef;
 use harnx_core::message::MessageContentPart;
+use harnx_core::safety::{format_size, truncate_line};
 
 /// Map a data URI's MIME type to a file extension. Defaults to `bin` for
 /// unrecognised types.
@@ -60,28 +62,77 @@ impl AttachmentEncoder for Base64Encoder {
     }
 }
 
-/// Replace inline data-URI image parts with persisted `cid:` references and
-/// record the original filename mapping for UI/export. Non-image parts and
-/// already-externalized refs are left untouched.
+struct ExternalizedPart {
+    index: usize,
+    marker: String,
+}
+
+/// Format a canonical attachment marker for agent visibility.
+///
+/// Returns `[attachment: <cid> (<mime>, <formatted size>)]`.
+/// - Normalizes MIME whitespace, truncates headers >128 chars.
+/// - Size is human-readable via `format_size` (e.g., "3B", "1.5KB").
+///
+/// Used by both local externalization and NATS externalization paths.
+pub(crate) fn attachment_marker(cid: &str, mime_type: &str, size: usize) -> String {
+    let mime_type = mime_type.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mime_type = truncate_line(&mime_type, 128);
+    format!("[attachment: {cid} ({mime_type}, {})]", format_size(size))
+}
+
+fn externalize_part(
+    dir: &Path,
+    session: &SessionRef,
+    index: usize,
+    part: &mut MessageContentPart,
+    cid_to_filename: &mut HashMap<String, String>,
+) -> Result<Option<ExternalizedPart>> {
+    let MessageContentPart::ImageUrl { image_url } = part else {
+        return Ok(None);
+    };
+    if !image_url.url.starts_with("data:") {
+        return Ok(None);
+    }
+
+    let local_cid = write_attachment(dir, &image_url.url)?;
+    let (bytes, mime_type) = read_attachment(dir, &local_cid)?;
+    let cid = cid_for_data_url_with_session(session, &image_url.url);
+    let ext = extension_for_data_url(&image_url.url);
+    let hash = local_cid.trim_start_matches(CID_PREFIX);
+    cid_to_filename.insert(cid.clone(), format!("{hash}.{ext}"));
+    image_url.url = cid.clone();
+    Ok(Some(ExternalizedPart {
+        index,
+        marker: attachment_marker(&cid, &mime_type, bytes.len()),
+    }))
+}
+
+/// Replace inline data-URI media parts with persisted `cid:media:` references.
+/// A text marker follows each rewritten part so models can pass its URL to tools.
+/// Deduplicates by skipping insertion if an identical marker already exists at `index + 1`.
 pub fn externalize_parts(
     dir: &Path,
-    parts: &mut [MessageContentPart],
+    session: &SessionRef,
+    parts: &mut Vec<MessageContentPart>,
     cid_to_filename: &mut HashMap<String, String>,
 ) -> Result<()> {
-    for part in parts.iter_mut() {
-        let MessageContentPart::ImageUrl { image_url } = part else {
-            continue;
-        };
-        if !image_url.url.starts_with("data:") {
-            continue;
+    let mut externalized = Vec::new();
+    for (index, part) in parts.iter_mut().enumerate() {
+        if let Some(item) = externalize_part(dir, session, index, part, cid_to_filename)? {
+            externalized.push(item);
         }
-        let cid = write_attachment(dir, &image_url.url)?;
-        let ext = extension_for_data_url(&image_url.url);
-        cid_to_filename.insert(
-            cid.clone(),
-            format!("{}.{}", cid.trim_start_matches(CID_PREFIX), ext),
+    }
+    for item in externalized.into_iter().rev() {
+        let marker_exists = matches!(
+            parts.get(item.index + 1),
+            Some(MessageContentPart::Text { text }) if text == &item.marker
         );
-        image_url.url = cid;
+        if !marker_exists {
+            parts.insert(
+                item.index + 1,
+                MessageContentPart::Text { text: item.marker },
+            );
+        }
     }
     Ok(())
 }
@@ -244,21 +295,33 @@ mod tests {
             },
         ];
 
+        let session = SessionRef::new(Some("pantheon/atlas".into()), "sess01".into()).unwrap();
         let mut map = HashMap::new();
-        externalize_parts(&dir, &mut parts, &mut map).unwrap();
+        externalize_parts(&dir, &session, &mut parts, &mut map).unwrap();
 
-        match &parts[1] {
+        let cid = match &parts[1] {
             MessageContentPart::ImageUrl { image_url } => {
-                assert!(image_url.url.starts_with(CID_PREFIX));
+                assert!(image_url
+                    .url
+                    .starts_with("cid:media:pantheon%2Fatlas/sess01/"));
                 assert!(!image_url.url.contains("QUJD"));
+                image_url.url.clone()
             }
             other => panic!("expected ImageUrl, got {other:#?}"),
-        }
+        };
+        assert_eq!(
+            parts[2],
+            MessageContentPart::Text {
+                text: format!("[attachment: {cid} (image/png, 3B)]")
+            }
+        );
         assert_eq!(map.len(), 1, "cid -> filename recorded");
         assert!(
             map.values().next().unwrap().ends_with(".png"),
             "recorded filename carries image extension"
         );
+        externalize_parts(&dir, &session, &mut parts, &mut map).unwrap();
+        assert_eq!(parts.len(), 3, "marker is not duplicated on another pass");
 
         let encoder = Base64Encoder;
         expand_parts(&encoder, &dir, &mut parts).unwrap();

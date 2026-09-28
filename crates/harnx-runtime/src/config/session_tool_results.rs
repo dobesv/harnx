@@ -1,7 +1,7 @@
 //! Persistence for completed tool-call rounds.
 
 use super::session_externalize::{
-    attachments_dir, externalize_tool_result_content, record_externalized,
+    attachments_dir, externalize_tool_result_content, record_externalized, session_ref,
 };
 use super::session_persistence::{
     append_event, require_authoritative_appends, PendingExecutionContextPersistence,
@@ -27,10 +27,21 @@ pub(crate) fn prepare_tool_results(
     session: &mut Session,
     results: &[ToolResult],
 ) -> Result<PendingExecutionContextPersistence> {
-    // Resolve the attachments dir up front so we don't need to borrow `session`
-    // again while the `pending` mutable borrow below is live.
-    let attachments_dir = attachments_dir(session);
-    let mut cid_urls = std::collections::HashMap::new();
+    let mut results = results.to_vec();
+    prepare_tool_results_in_place(session, &mut results)
+}
+
+/// Prepare tool results for persistence, mutating results in place.
+///
+/// Externalizes image data URIs to canonical `cid:media:` URLs and inserts
+/// adjacent `[attachment: ...]` markers. The returned `ToolResult` array and
+/// the persisted `SessionLogEntry::ToolResults` contain identical canonical
+/// references — the model sees the same URLs on subsequent turns.
+pub(crate) fn prepare_tool_results_in_place(
+    session: &mut Session,
+    results: &mut [ToolResult],
+) -> Result<PendingExecutionContextPersistence> {
+    let cid_urls = externalize_results(session, results)?;
 
     let Some(last) = session.messages.last_mut() else {
         anyhow::bail!("add_tool_results called on empty session");
@@ -45,31 +56,7 @@ pub(crate) fn prepare_tool_results(
     }
 
     let accepted_observations = accept_tool_result_replacements(&mut pending.tool_results, results);
-
-    // Externalize inline image data URIs in tool-result content to cid refs
-    // before persisting, freeing the in-memory base64 when an attachment store
-    // is configured;
-    // the cid -> filename map is logged as a DataUrls entry after the
-    // ToolResults entry (below) so the ToolCalls/ToolResults pairing on replay
-    // is not split.
-    externalize_tool_result_content(
-        attachments_dir.as_deref(),
-        &mut pending.tool_results,
-        &mut cid_urls,
-    );
-
-    let log_results: Vec<ToolOutput> = pending
-        .tool_results
-        .iter()
-        .map(|result| ToolOutput {
-            id: result.call.id.clone(),
-            name: result.call.name.clone(),
-            output: result.output.clone(),
-            markdown: result.markdown.clone(),
-            content: result.content.clone(),
-            switch_agent: result.switch_agent.clone(),
-        })
-        .collect();
+    let log_results = tool_outputs(&pending.tool_results);
 
     let appended = append_event(
         session,
@@ -88,6 +75,44 @@ pub(crate) fn prepare_tool_results(
     );
     session.update_tokens();
     Ok(persistence)
+}
+
+fn externalize_results(
+    session: &Session,
+    results: &mut [ToolResult],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut cid_urls = std::collections::HashMap::new();
+    let Some(attachments_dir) = attachments_dir(session) else {
+        return Ok(cid_urls);
+    };
+    let attachment_session = match session_ref(session) {
+        Ok(session_ref) => session_ref,
+        Err(err) => {
+            log::warn!("tool-result attachment externalization skipped: {err}");
+            return Ok(cid_urls);
+        }
+    };
+    externalize_tool_result_content(
+        Some(&attachments_dir),
+        &attachment_session,
+        results,
+        &mut cid_urls,
+    );
+    Ok(cid_urls)
+}
+
+fn tool_outputs(results: &[ToolResult]) -> Vec<ToolOutput> {
+    results
+        .iter()
+        .map(|result| ToolOutput {
+            id: result.call.id.clone(),
+            name: result.call.name.clone(),
+            output: result.output.clone(),
+            markdown: result.markdown.clone(),
+            content: result.content.clone(),
+            switch_agent: result.switch_agent.clone(),
+        })
+        .collect()
 }
 
 fn accept_tool_result_replacements(
@@ -281,5 +306,56 @@ mod tests {
                 .map(|provenance| provenance.call_id.as_str()),
             Some("accepted")
         );
+    }
+
+    #[tokio::test]
+    async fn tool_result_externalization_returns_visible_canonical_marker() -> Result<()> {
+        let _lock = super::super::test_support::env_lock_async().await;
+        let data_dir = tempfile::tempdir()?;
+        let _data_guard =
+            super::super::test_support::EnvGuard::new("HARNX_DATA_DIR", data_dir.path());
+        let sink = Arc::new(ContextMetadataSink::default());
+        let (mut session, input) = setup_session("media1", &sink);
+        let call = tool_call("call-media");
+        add_tool_calls(
+            &mut session,
+            &input,
+            "reading image",
+            None,
+            std::slice::from_ref(&call),
+        )?;
+        let mut result = ToolResult::new(call, json!({"ok": true}));
+        result
+            .content
+            .push(harnx_core::message::MessageContentPart::ImageUrl {
+                image_url: harnx_core::message::ImageUrl {
+                    url: "data:image/png;base64,QUJD".to_string(),
+                },
+            });
+
+        let persistence =
+            prepare_tool_results_in_place(&mut session, std::slice::from_mut(&mut result))?;
+        persistence.persist().await;
+
+        let cid = harnx_core::attachments::cid_for_data_url_with_session(
+            &harnx_core::cid_url::SessionRef::new(None, "media1".to_string())?,
+            "data:image/png;base64,QUJD",
+        );
+        assert_eq!(
+            result.content,
+            vec![
+                harnx_core::message::MessageContentPart::ImageUrl {
+                    image_url: harnx_core::message::ImageUrl { url: cid.clone() }
+                },
+                harnx_core::message::MessageContentPart::Text {
+                    text: format!("[attachment: {cid} (image/png, 3B)]")
+                }
+            ]
+        );
+        let MessageContent::ToolCalls(pending) = &session.messages.last().unwrap().content else {
+            unreachable!("tool result remains in pending tool message")
+        };
+        assert_eq!(pending.tool_results[0].content, result.content);
+        Ok(())
     }
 }

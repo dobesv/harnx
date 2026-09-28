@@ -148,31 +148,63 @@ fn parse_data_url(data_url: &str) -> Result<(String, Vec<u8>)> {
     Ok((mime_type.to_string(), bytes))
 }
 
+struct ExternalizedAttachment {
+    cid: String,
+    mime_type: String,
+    size: usize,
+}
+
+impl ExternalizedAttachment {
+    fn marker(&self) -> String {
+        crate::config::attachment_marker(&self.cid, &self.mime_type, self.size)
+    }
+}
+
 async fn externalize_data_url(
     store: &object_store::ObjectStore,
     session: &SessionRef,
     data_url: &str,
-) -> Result<String> {
+) -> Result<ExternalizedAttachment> {
     let (mime_type, bytes) = parse_data_url(data_url)?;
     let cid = cid_for_data_url_with_session(session, data_url);
     let cid_url = parse_media_url(&cid).context("parse generated attachment URL")?;
     put_media(store, &cid_url, &bytes, &mime_type).await?;
-    Ok(cid_url.to_string())
+    Ok(ExternalizedAttachment {
+        cid: cid_url.to_string(),
+        mime_type,
+        size: bytes.len(),
+    })
 }
 
 async fn externalize_cid_url(
     store: &object_store::ObjectStore,
     source_dir: Option<&Path>,
     cid: &str,
-) -> Result<()> {
+) -> Result<ExternalizedAttachment> {
     let cid_url = parse_media_url(cid)?;
-    if get_media(store, &cid_url).await?.is_some() {
-        return Ok(());
-    }
+    let stored = get_media(store, &cid_url).await?;
+    let (bytes, mime_type) = match stored {
+        Some(stored) => stored,
+        None => read_and_upload_local_attachment(store, source_dir, cid, &cid_url).await?,
+    };
+    Ok(ExternalizedAttachment {
+        cid: cid.to_string(),
+        mime_type,
+        size: bytes.len(),
+    })
+}
+
+async fn read_and_upload_local_attachment(
+    store: &object_store::ObjectStore,
+    source_dir: Option<&Path>,
+    cid: &str,
+    cid_url: &CidUrl,
+) -> Result<(Vec<u8>, String)> {
     let source_dir =
         source_dir.with_context(|| format!("attachment {cid} has no local source directory"))?;
-    let (bytes, mime_type) = read_attachment_async(source_dir, &local_cid(&cid_url)?).await?;
-    put_media(store, &cid_url, &bytes, &mime_type).await
+    let (bytes, mime_type) = read_attachment_async(source_dir, &local_cid(cid_url)?).await?;
+    put_media(store, cid_url, &bytes, &mime_type).await?;
+    Ok((bytes, mime_type))
 }
 
 async fn externalize_part(
@@ -180,16 +212,20 @@ async fn externalize_part(
     session: &SessionRef,
     source_dir: Option<&Path>,
     part: &mut MessageContentPart,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let MessageContentPart::ImageUrl { image_url } = part else {
-        return Ok(());
+        return Ok(None);
     };
-    if image_url.url.starts_with("data:") {
-        image_url.url = externalize_data_url(store, session, &image_url.url).await?;
+    let attachment = if image_url.url.starts_with("data:") {
+        let attachment = externalize_data_url(store, session, &image_url.url).await?;
+        image_url.url.clone_from(&attachment.cid);
+        Some(attachment)
     } else if image_url.url.starts_with(CID_PREFIX) {
-        externalize_cid_url(store, source_dir, &image_url.url).await?;
-    }
-    Ok(())
+        Some(externalize_cid_url(store, source_dir, &image_url.url).await?)
+    } else {
+        None
+    };
+    Ok(attachment.map(|attachment| attachment.marker()))
 }
 
 fn needs_externalization(part: &MessageContentPart) -> bool {
@@ -201,6 +237,9 @@ fn needs_externalization(part: &MessageContentPart) -> bool {
 
 /// Upload inline or locally-referenced attachments and rewrite inline data
 /// URIs to durable `cid:` references suitable for the session log.
+///
+/// Inserts `[attachment: ...]` markers after each externalized image, deduplicating
+/// if an identical marker already exists at the adjacent position.
 pub async fn externalize_message_attachments(
     location: AttachmentLocation<'_>,
     content: &mut MessageContent,
@@ -213,10 +252,28 @@ pub async fn externalize_message_attachments(
         return Ok(());
     }
     let store = ensure_attachments_bucket(location.jetstream, location.replicas).await?;
-    for part in parts {
-        externalize_part(&store, location.session, source_dir, part).await?;
+    let mut markers = Vec::new();
+    for (index, part) in parts.iter_mut().enumerate() {
+        if let Some(marker) = externalize_part(&store, location.session, source_dir, part).await? {
+            markers.push((index, marker));
+        }
     }
+    insert_attachment_markers(parts, markers);
     Ok(())
+}
+
+/// Insert attachment markers at `index + 1` for each externalized image.
+/// Deduplicates by checking if an identical marker already exists at the target position.
+fn insert_attachment_markers(parts: &mut Vec<MessageContentPart>, markers: Vec<(usize, String)>) {
+    for (index, marker) in markers.into_iter().rev() {
+        let marker_exists = matches!(
+            parts.get(index + 1),
+            Some(MessageContentPart::Text { text }) if text == &marker
+        );
+        if !marker_exists {
+            parts.insert(index + 1, MessageContentPart::Text { text: marker });
+        }
+    }
 }
 
 /// Download every referenced session blob that is missing from this worker's
