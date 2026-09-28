@@ -80,6 +80,7 @@ pub use self::agent::{
     apply_package_agent_transforms, complete_agent_variables, list_agents, list_assistant_agents,
     render_agent_dump, Agent, AgentConfig, AgentVariables,
 };
+pub(crate) use self::attachments::attachment_marker;
 pub use self::attachments::{write_attachment, Base64Encoder};
 pub use self::input::Input;
 pub(crate) use self::patches_split::server_display_name;

@@ -12,8 +12,8 @@ use harnx_core::require_nextest;
 use harnx_core::session::Session;
 use harnx_runtime::config::{Config, GlobalConfig, SessionAttachmentPath};
 use harnx_runtime::nats_attachments::{
-    delete_session_attachments, externalize_message_attachments, hydrate_attachment_refs,
-    sync_session_attachments, AttachmentLocation,
+    delete_session_attachments, externalize_message_attachments, get_session_attachment,
+    hydrate_attachment_refs, sync_session_attachments, AttachmentLocation,
 };
 use parking_lot::RwLock;
 use std::ffi::OsString;
@@ -55,17 +55,27 @@ fn image_content(data_url: &str) -> MessageContent {
     ])
 }
 
-fn image_ref(content: &MessageContent) -> &str {
+fn find_image_and_marker(content: &MessageContent) -> (&str, &str) {
     let MessageContent::Array(parts) = content else {
         panic!("expected multipart content");
     };
-    parts
+    let image = parts
         .iter()
         .find_map(|part| match part {
             MessageContentPart::ImageUrl { image_url } => Some(image_url.url.as_str()),
             _ => None,
         })
-        .expect("expected image part")
+        .expect("expected image part");
+    let marker = parts
+        .iter()
+        .find_map(|part| match part {
+            MessageContentPart::Text { text } if text.starts_with("[attachment: ") => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .expect("expected attachment marker");
+    (image, marker)
 }
 
 fn location<'a>(
@@ -73,6 +83,17 @@ fn location<'a>(
     session: &'a SessionRef,
 ) -> AttachmentLocation<'a> {
     AttachmentLocation::new(jetstream, 1, session)
+}
+
+fn canonical_cid(session: &SessionRef, local_cid: &str) -> String {
+    CidUrl::Media {
+        session: session.clone(),
+        hash: local_cid
+            .strip_prefix("cid:")
+            .expect("stored attachment has cid prefix")
+            .to_string(),
+    }
+    .to_string()
 }
 
 struct ExternalizeHydrateArgs<'a> {
@@ -98,6 +119,29 @@ async fn assert_session_deleted(
         delete_session_attachments(jetstream, owner).await?,
         expected
     );
+    Ok(())
+}
+
+async fn assert_visible_and_uploaded(
+    jetstream: &async_nats::jetstream::Context,
+    content: &MessageContent,
+    cid: &str,
+    expected: (&[u8], &str),
+) -> Result<()> {
+    let (bytes, mime_type) = expected;
+    let (image, marker) = find_image_and_marker(content);
+    assert_eq!(image, cid);
+    assert_eq!(
+        marker,
+        format!(
+            "[attachment: {cid} ({mime_type}, {})]",
+            harnx_core::safety::format_size(bytes.len())
+        )
+    );
+    let uploaded = get_session_attachment(jetstream, 1, cid)
+        .await?
+        .expect("externalization uploads before the turn boundary");
+    assert_eq!(uploaded, (bytes.to_vec(), mime_type.to_string()));
     Ok(())
 }
 
@@ -136,7 +180,7 @@ async fn attachments_round_trip_and_delete_with_their_session() -> Result<()> {
             cid_refs: std::slice::from_ref(cid),
         })
         .await?;
-        assert_eq!(image_ref(&content), cid);
+        assert_visible_and_uploaded(&jetstream, &content, cid, (bytes, "image/png")).await?;
         let (hydrated_bytes, mime_type) =
             read_attachment_async(hydrated.path(), &local_cid).await?;
         assert_eq!(hydrated_bytes, bytes);
@@ -181,14 +225,7 @@ async fn canonical_local_attachment_reference_round_trips_through_nats() -> Resu
         "text/plain;charset=utf-8",
     )
     .await?;
-    let canonical_cid = CidUrl::Media {
-        session: session_ref.clone(),
-        hash: local_cid
-            .strip_prefix("cid:")
-            .expect("stored attachment has cid prefix")
-            .to_string(),
-    }
-    .to_string();
+    let canonical_cid = canonical_cid(&session_ref, &local_cid);
     let mut referenced_content = MessageContent::Array(vec![MessageContentPart::ImageUrl {
         image_url: ImageUrl {
             url: canonical_cid.clone(),
@@ -200,13 +237,23 @@ async fn canonical_local_attachment_reference_round_trips_through_nats() -> Resu
         Some(source.path()),
     )
     .await?;
+    assert_visible_and_uploaded(
+        &jetstream,
+        &referenced_content,
+        &canonical_cid,
+        (b"uploaded by the web UI", "text/plain;charset=utf-8"),
+    )
+    .await?;
     externalize_message_attachments(
         location(&jetstream, &session_ref),
         &mut referenced_content,
         None,
     )
     .await?;
-    assert_eq!(image_ref(&referenced_content), canonical_cid);
+    let MessageContent::Array(parts) = &referenced_content else {
+        unreachable!("test content is multipart")
+    };
+    assert_eq!(parts.len(), 2, "attachment marker is not duplicated");
     let referenced_hydrated = tempfile::tempdir()?;
     hydrate_attachment_refs(
         location(&jetstream, &session_ref),
@@ -246,14 +293,7 @@ async fn session_attachment_sync_uploads_local_cid_refs() -> Result<()> {
     let local_cid =
         store_attachment_bytes_async(&source, b"generated by a tool", "text/plain").await?;
     let session_ref = SessionRef::new(Some(agent_name.to_string()), session_id.clone())?;
-    let cid = harnx_core::cid_url::CidUrl::Media {
-        session: session_ref.clone(),
-        hash: local_cid
-            .strip_prefix("cid:")
-            .expect("stored attachment has cid prefix")
-            .to_string(),
-    }
-    .to_string();
+    let cid = canonical_cid(&session_ref, &local_cid);
     let session = Session {
         id: session_id.clone(),
         session_id: Some(session_id.clone()),
@@ -268,6 +308,10 @@ async fn session_attachment_sync_uploads_local_cid_refs() -> Result<()> {
     let config: GlobalConfig = Arc::new(RwLock::new(config));
 
     sync_session_attachments(&jetstream, &config, 1).await?;
+    assert_eq!(
+        get_session_attachment(&jetstream, 1, &cid).await?,
+        Some((b"generated by a tool".to_vec(), "text/plain".to_string()))
+    );
 
     let hydrated = tempfile::tempdir()?;
     hydrate_attachment_refs(
@@ -296,14 +340,7 @@ async fn local_only_attachment_is_backfilled_to_new_nats_key() -> Result<()> {
     let local_only_cid =
         store_attachment_bytes_async(local_only.path(), b"local blob", "text/plain").await?;
     let session_ref = SessionRef::new(None, migrated_session.clone())?;
-    let cid = harnx_core::cid_url::CidUrl::Media {
-        session: session_ref.clone(),
-        hash: local_only_cid
-            .strip_prefix("cid:")
-            .expect("stored attachment has cid prefix")
-            .to_string(),
-    }
-    .to_string();
+    let cid = canonical_cid(&session_ref, &local_only_cid);
     hydrate_attachment_refs(
         location(&jetstream, &session_ref),
         local_only.path(),

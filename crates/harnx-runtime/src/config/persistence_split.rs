@@ -105,6 +105,16 @@ impl Config {
         crate::config::session::prepare_tool_results(session, results)
     }
 
+    pub(crate) fn prepare_session_tool_results_in_place(
+        &mut self,
+        results: &mut [ToolResult],
+    ) -> Result<session_persistence::PendingExecutionContextPersistence> {
+        let Some(session) = self.session.as_mut() else {
+            return Ok(session_persistence::PendingExecutionContextPersistence::none(""));
+        };
+        crate::config::session::prepare_tool_results_in_place(session, results)
+    }
+
     pub async fn save_message(
         &mut self,
         input: &Input,
