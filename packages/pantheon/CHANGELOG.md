@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.7 (2026-09-28)
+
+### Features
+
+- drive session status from AG-UI events and remove polling (#2125)
+
+### Fixes
+
+- support Claude Opus 5.5 requests and effort levels (#2132)
+- update assistant-ui (#2141)
+- update dependency @assistant-ui/react-markdown to v0.14.17 (#2144)
+- update dependency @assistant-ui/react-ag-ui to v0.0.62 (#2143)
+- include harnx-mcp-remote in release artifacts (#2156)
+
 ## 0.4.6 (2026-09-25)
 
 ### Fixes

@@ -11,6 +11,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.34.7 (2026-09-28)
+
+### Features
+
+- drive session status from AG-UI events and remove polling (#2125)
+- Route negotiated NATS tool progress to live tool-call updates and add filesystem read, search, find, and edit progress metadata. Addresses #2096.
+- Add capability-gated, bounded live progress updates and final progress snapshots to native toolsets for #2096.
+
+#### Add `session/resume` and `session/close` support to ACP server.
+
+`session/resume` validates session ownership and establishes in-memory context
+without replaying history updates. Useful when clients already know session state
+and just need to reestablish context for subsequent prompts.
+
+`session/close` removes session context while preserving durable history. Active
+turns are cancelled, but transcripts, metadata, and listing visibility remain
+intact. Close is idempotent — unknown or already-closed sessions succeed.
+
+Both capabilities are now advertised in `initialize` responses:
+- `sessionCapabilities.resume`
+- `sessionCapabilities.close`
+
+### Fixes
+
+- support Claude Opus 5.5 requests and effort levels (#2132)
+- update assistant-ui (#2141)
+- update dependency @assistant-ui/react-markdown to v0.14.17 (#2144)
+- update dependency @assistant-ui/react-ag-ui to v0.0.62 (#2143)
+- include harnx-mcp-remote in release artifacts (#2156)
+- Update ACP session handoff guidance to target-agent server switching and document session deletion tracking (#1346, #2129).
+- Replace silent prompt-content dropping in ACP server with ordered conversion of text resources and resource links, and explicit errors for unsupported content (#1346).
+- Publish ACP v1 support matrix and document follow-up tracking for image prompts and session deletion (#1346, #2129, #2135).
+- Include `harnx-mcp-remote` in platform release archives and the all-in-one Docker image.
+- Prevent a NATS server-required TLS upgrade from panicking when both rustls crypto providers are linked and no process default is installed.
+- Send the required output limit for Claude Opus 5.5 and provide adaptive xhigh and max effort variants.
+- Allow frontends configured only with remote agents to start without a local model, and report a clear error if a local agent runs without one. Fixes #2115.
+- End AG-UI runs with `RUN_ERROR` when a turn task panics, no worker claims an activation within 60 seconds, or a remote worker disappears before recording completion.
+- Add `tool_update` SSE custom event for live tool progress. Emits `ToolEvent::Update` fields (title, status, kind, locations, usage, markdown) so web clients can apply in-place updates to tool call cards. Part of Phase 5b (#2096).
+- Drive Web UI sub-agent row status and foreground cancellation resolution from AG-UI lifecycle and control events.
+
+#### CLI streamed tool progress notices
+
+Handle `ToolEvent::Update` in the CLI event sink to print concise, dimmed notices when a tool's title changes during execution. Updates are rate-limited (max once every 2 seconds) and deduplicated to prevent terminal flooding. Quiet for tools that don't emit updates. Existing completion and error behavior is preserved.
+
+Closes #2096
+
+#### Complete static ToolKind declarations for remaining native toolsets (#2096)
+
+Extends the static tool kind declarations to the remaining native toolsets:
+
+- exa: web_search_exa -> Search, web_fetch_exa -> Fetch
+- k8s-sandbox: connect -> Execute, status -> Read, release -> Delete
+- subagent: session_new -> Other, session_prompt -> Execute, session_load -> Read, session_cancel -> Delete
+
+Each toolset now has unit tests asserting `tool.kind()` for all declared specs.
+
+#### Remove hardcoded emoji prefixes from tool call templates (#2151)
+
+ToolKind icons now provide categorization presentation in Web and TUI, so emoji prefixes are no longer needed in templates.
+
+#### Project subagent progress into the shared tool-call update path for ACP and Web clients.
+
+- ACP: `TurnEvent::SubAgentProgress` now emits `ToolCallUpdate` with title containing child session title and compact usage (e.g., "atlas — Analyzing code (100→50)").
+- ACP: Usage structured under namespaced `_meta` (`harnx:usage`).
+- ACP: Rich internal states (`Cancelling`, `Unconfirmed`) preserved as `InProgress`; `Cancelled` maps to `Failed`.
+- Web: Subagent progress now emits both legacy `sub_agent_progress` and projected `tool_update` events for incremental client migration.
+
+The `invocation_id` field correlates to the parent tool call. The `SubagentProgressReporter` behavior and its 10-second polling cadence remain unchanged.
+
+Addresses #2096.
+
 ## 0.34.6 (2026-09-25)
 
 ### Features
