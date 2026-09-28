@@ -108,26 +108,43 @@ async fn record_outcome(
         .map_err(recovery::invoke_error)
 }
 
-fn invocation(
+fn extract_invoking_session(request: &ToolRequest) -> Option<harnx_toolset::SessionRef> {
+    request
+        .parent_local_session_id
+        .as_ref()
+        .map(|sid| harnx_toolset::SessionRef {
+            agent: request
+                .parent_agent
+                .as_ref()
+                .filter(|agent| !agent.is_empty())
+                .cloned(),
+            session_id: sid.clone(),
+        })
+}
+
+fn invocation_context(
     request: &ToolRequest,
-    recovery: &recovery::InvocationRecovery,
-    execution: &execution::InvocationExecution,
-    cancel: &CancellationToken,
+    checkpoint: Option<Value>,
+    checkpoint_store: JournalCheckpointStore,
     progress: harnx_toolset::ToolProgressHandle,
-) -> ToolInvocation {
-    let mut args = request.args.clone();
-    let invocation_context = ToolInvocationContext {
+) -> ToolInvocationContext {
+    ToolInvocationContext {
         call_id: request.call_id.clone(),
         invoking_session_id: request.parent_session_id.clone(),
+        invoking_session: extract_invoking_session(request),
         capabilities: request.capabilities.clone(),
-        checkpoint: recovery.checkpoint(),
-        checkpoint_store: Some(Arc::new(JournalCheckpointStore {
-            journal: recovery.journal(),
-            session: execution.session_id.clone(),
-            call_id: request.call_id.clone(),
-        })),
+        checkpoint,
+        checkpoint_store: Some(Arc::new(checkpoint_store)),
         progress,
-    };
+    }
+}
+
+fn build_invocation(
+    request: &ToolRequest,
+    context: ToolInvocationContext,
+    cancel: CancellationToken,
+) -> ToolInvocation {
+    let mut args = request.args.clone();
     add_parent_context_args(
         &request.tool,
         request.parent_session_id.clone(),
@@ -137,9 +154,29 @@ fn invocation(
     ToolInvocation {
         tool: request.tool.clone(),
         args,
-        context: invocation_context,
-        cancel: cancel.clone(),
+        context,
+        cancel,
     }
+}
+
+fn invocation(
+    request: &ToolRequest,
+    recovery: &recovery::InvocationRecovery,
+    execution: &execution::InvocationExecution,
+    cancel: &CancellationToken,
+    progress: harnx_toolset::ToolProgressHandle,
+) -> ToolInvocation {
+    let context = invocation_context(
+        request,
+        recovery.checkpoint(),
+        JournalCheckpointStore {
+            journal: recovery.journal(),
+            session: execution.session_id.clone(),
+            call_id: request.call_id.clone(),
+        },
+        progress,
+    );
+    build_invocation(request, context, cancel.clone())
 }
 
 /// Build the invocation `Toolset::cancel` runs against for a call this
@@ -152,37 +189,23 @@ pub(super) fn orphan_invocation(
     request: &ToolRequest,
     checkpoint: Option<Value>,
 ) -> ToolInvocation {
-    let mut args = request.args.clone();
     let session = request
         .parent_session_id
         .clone()
         .unwrap_or_else(|| request.call_id.clone());
-    let invocation_context = ToolInvocationContext {
-        call_id: request.call_id.clone(),
-        invoking_session_id: request.parent_session_id.clone(),
-        capabilities: request.capabilities.clone(),
+    let invocation_context = invocation_context(
+        request,
         checkpoint,
-        checkpoint_store: Some(Arc::new(JournalCheckpointStore {
+        JournalCheckpointStore {
             journal: context.journal.clone(),
             session,
             call_id: request.call_id.clone(),
-        })),
-        progress: Default::default(),
-    };
-    add_parent_context_args(
-        &request.tool,
-        request.parent_session_id.clone(),
-        request.tool_call_id.clone(),
-        &mut args,
+        },
+        Default::default(),
     );
     let cancel = CancellationToken::new();
     cancel.cancel();
-    ToolInvocation {
-        tool: request.tool.clone(),
-        args,
-        context: invocation_context,
-        cancel,
-    }
+    build_invocation(request, invocation_context, cancel)
 }
 
 pub(super) fn tool_exec_span(tool_name: &str, parent_cx: OtelContext) -> tracing::Span {

@@ -92,6 +92,8 @@ const CONTROL_ACK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_m
 const CONTROL_RECOVERY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(crate::nats_lease::DEFAULT_LEASE_TTL.as_secs() + 10);
 
+use harnx_core::cid_url::SessionRef;
+
 /// Lease-backed detector for a session whose worker disappeared without
 /// writing a durable terminal entry.
 ///
@@ -478,6 +480,15 @@ impl NatsSession {
         abort_signal: AbortSignal,
     ) -> Result<Self> {
         Self::new_with_resolved_replicas(config, 1, client, jetstream, abort_signal).await
+    }
+
+    /// Get the SessionRef for this session (agent + local session id).
+    pub fn session_ref(&self) -> SessionRef {
+        SessionRef::new(
+            self.config.initializer.agent_name().map(|s| s.to_string()),
+            self.session_id.clone(),
+        )
+        .expect("session_id is valid")
     }
 
     pub(crate) async fn new_with_resolved_replicas(
@@ -1103,7 +1114,7 @@ impl NatsSession {
             crate::nats_attachments::AttachmentLocation::new(
                 &self.jetstream,
                 self.attachment_replicas,
-                &self.storage_key,
+                &self.session_ref(),
             ),
             &mut content,
             source_dir,
@@ -1149,7 +1160,7 @@ impl NatsSession {
             crate::nats_attachments::AttachmentLocation::new(
                 &self.jetstream,
                 self.attachment_replicas,
-                &self.storage_key,
+                &self.session_ref(),
             ),
             &mut content,
             source_dir,
@@ -1209,7 +1220,7 @@ impl NatsSession {
             crate::nats_attachments::AttachmentLocation::new(
                 &self.jetstream,
                 self.attachment_replicas,
-                &self.storage_key,
+                &self.session_ref(),
             ),
             &mut content,
             source_dir,

@@ -60,6 +60,10 @@ pub struct NatsToolProvider {
     client: async_nats::Client,
     instance_id: ServerScope,
     parent_session_id: Option<String>,
+    /// Caller's agent name for cid: URL construction.
+    parent_agent: Option<String>,
+    /// Caller's local session id for cid: URL construction.
+    parent_local_session_id: Option<String>,
     tools: HashMap<String, RegisteredTool>,
     registrations: Vec<Registration>,
     active_package: Option<String>,
@@ -73,6 +77,21 @@ pub struct NatsToolProvider {
     // Owns the flushed control subscription and its call-id progress routes.
     progress_dispatcher: ProgressDispatcher,
     in_flight: NatsInFlightCalls,
+}
+
+fn resolve_parent_identity(config: &Config) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(session) = config.session.as_ref() else {
+        return (None, None, None);
+    };
+    let parent_agent = session
+        .agent_name()
+        .filter(|name| !name.is_empty() && *name != harnx_core::agent_config::TEMP_AGENT_NAME)
+        .map(str::to_string);
+    (
+        Some(session.storage_key()),
+        parent_agent,
+        Some(session.id.clone()),
+    )
 }
 
 impl NatsToolProvider {
@@ -128,12 +147,15 @@ impl NatsToolProvider {
             Some(_) => 2,
         });
         let (tools, declarations) = build_registered_tools(active_package, registrations.clone());
-        let parent_session_id = config.session.as_ref().map(|session| session.storage_key());
+        let (parent_session_id, parent_agent, parent_local_session_id) =
+            resolve_parent_identity(config);
 
         Ok(Self {
             client,
             instance_id,
             parent_session_id,
+            parent_agent,
+            parent_local_session_id,
             tools,
             registrations,
             active_package: active_package.map(str::to_string),
@@ -649,6 +671,29 @@ mod tests {
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     use tracing_subscriber::layer::SubscriberExt;
 
+    async fn make_test_provider(client: &async_nats::Client) -> NatsToolProvider {
+        let instance_id = ServerScope::new();
+        let control_subscription = client
+            .subscribe(instance_id.control_subject())
+            .await
+            .expect("subscribe to control subject");
+        NatsToolProvider {
+            client: client.clone(),
+            instance_id,
+            parent_session_id: None,
+            parent_agent: None,
+            parent_local_session_id: None,
+            tools: HashMap::new(),
+            registrations: Vec::new(),
+            active_package: None,
+            declarations: Vec::new(),
+            registry: None,
+            journal_replicas: 1,
+            progress_dispatcher: ProgressDispatcher::new(control_subscription),
+            in_flight: NatsInFlightCalls::default(),
+        }
+    }
+
     #[tokio::test]
     async fn prepared_request_headers_carry_active_trace_id() {
         harnx_core::require_nextest();
@@ -661,24 +706,7 @@ mod tests {
         let client = async_nats::connect(&server.url)
             .await
             .expect("connect to test NATS server");
-        let instance_id = ServerScope::new();
-        let control_subscription = client
-            .subscribe(instance_id.control_subject())
-            .await
-            .expect("subscribe to control subject");
-        let provider = NatsToolProvider {
-            client,
-            instance_id,
-            parent_session_id: None,
-            tools: HashMap::new(),
-            registrations: Vec::new(),
-            active_package: None,
-            declarations: Vec::new(),
-            registry: None,
-            journal_replicas: 1,
-            progress_dispatcher: ProgressDispatcher::new(control_subscription),
-            in_flight: NatsInFlightCalls::default(),
-        };
+        let provider = make_test_provider(&client).await;
         let route = RegisteredTool {
             server: "test-server".to_string(),
             selector_server: "test-server".to_string(),
@@ -1096,6 +1124,8 @@ mod tests {
             client,
             instance_id,
             parent_session_id: None,
+            parent_agent: None,
+            parent_local_session_id: None,
             tools: HashMap::from([(
                 "stream".to_string(),
                 RegisteredTool {

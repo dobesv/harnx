@@ -64,6 +64,8 @@ fn request(call_id: &str, supports_progress: bool) -> ToolRequest {
         tool: "work".into(),
         args: json!({}),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: if supports_progress {
             BTreeSet::from([CAPABILITY_TOOL_PROGRESS.to_string()])

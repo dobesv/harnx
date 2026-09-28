@@ -22,6 +22,8 @@ async fn parked_tool_reply(original_error: Option<&str>) -> Result<()> {
         tool: "echo".into(),
         args: json!({"park_result": true, "error": original_error}),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     };

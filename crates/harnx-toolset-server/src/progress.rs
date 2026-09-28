@@ -183,6 +183,8 @@ mod tests {
             tool: "echo".into(),
             args: serde_json::json!({}),
             parent_session_id: None,
+            parent_agent: None,
+            parent_local_session_id: None,
             tool_call_id: None,
             capabilities,
         }

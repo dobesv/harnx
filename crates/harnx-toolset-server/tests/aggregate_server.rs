@@ -133,6 +133,8 @@ async fn invoke_named(client: &async_nats::Client, scope: &ServerScope, name: &s
         tool: "echo".to_string(),
         args: json!({"server": name}),
         parent_session_id: Some("session-1".to_string()),
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     };
