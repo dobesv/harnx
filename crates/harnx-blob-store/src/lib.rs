@@ -22,6 +22,10 @@ mod plans;
 
 pub use activity::{touch_activity, ActivityGuard};
 pub use delete::delete_owner;
+pub use media::{
+    ensure_attachments_bucket as create_or_open_attachments_bucket, get_media, put_media,
+    ATTACHMENTS_BUCKET,
+};
 pub use plans::{ensure_plans_bucket, PLAN_BUCKET};
 
 use harnx_core::cid_url::{CidUrl, SessionRef};

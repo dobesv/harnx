@@ -1,0 +1,37 @@
+[package]
+name = "harnx-attachment-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Toolset server for reading and creating NATS-backed attachments via cid: URLs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+fancy-regex = { workspace = true }
+globset = { workspace = true }
+harnx-blob-store = { path = "../harnx-blob-store" }
+harnx-core = { path = "../harnx-core" }
+harnx-metrics = { workspace = true }
+harnx-nats-common = { workspace = true }
+harnx-toolset = { path = "../harnx-toolset" }
+harnx-toolset-server = { path = "../harnx-toolset-server" }
+log = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+harnx-test-bins = { path = "../harnx-test-bins" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+
+[[bin]]
+name = "harnx-attachment-tools"
+path = "src/main.rs"

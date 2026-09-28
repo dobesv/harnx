@@ -18,6 +18,7 @@ COPY linux-${TARGETARCH}/harnx /usr/local/bin/harnx
 COPY linux-${TARGETARCH}/harnx-serve /usr/local/bin/harnx-serve
 COPY linux-${TARGETARCH}/harnx-worker /usr/local/bin/harnx-worker
 COPY linux-${TARGETARCH}/harnx-bash-tools /usr/local/bin/harnx-bash-tools
+COPY linux-${TARGETARCH}/harnx-attachment-tools /usr/local/bin/harnx-attachment-tools
 COPY linux-${TARGETARCH}/harnx-fs-tools /usr/local/bin/harnx-fs-tools
 COPY linux-${TARGETARCH}/harnx-exa-tools /usr/local/bin/harnx-exa-tools
 COPY linux-${TARGETARCH}/harnx-fetch-tools /usr/local/bin/harnx-fetch-tools

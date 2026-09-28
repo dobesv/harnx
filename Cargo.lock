@@ -3826,6 +3826,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-attachment-tools"
+version = "0.34.7"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "base64 0.23.1",
+ "fancy-regex 0.19.2",
+ "globset",
+ "harnx-blob-store",
+ "harnx-core",
+ "harnx-metrics",
+ "harnx-nats-common",
+ "harnx-test-bins",
+ "harnx-toolset",
+ "harnx-toolset-server",
+ "log",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "harnx-aws-creds"
 version = "0.34.7"
 dependencies = [
