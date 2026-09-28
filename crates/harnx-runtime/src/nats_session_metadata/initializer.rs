@@ -1,6 +1,7 @@
 use super::{ParentLink, SessionAgentSource, SessionOverrides, ToolContext};
 use anyhow::Result;
 use harnx_core::agent_config::AgentVariables;
+use harnx_core::cid_url::SessionRef;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionInitializer {
@@ -16,6 +17,15 @@ pub struct SessionInitializer {
 impl SessionInitializer {
     pub fn session_key(&self, session_id: &str) -> String {
         harnx_core::session_identity::session_key(self.agent_name(), session_id)
+    }
+
+    /// Get the SessionRef for this initializer + session id.
+    pub fn session_ref(&self, session_id: &str) -> SessionRef {
+        SessionRef::new(
+            self.agent_name().map(|s| s.to_string()),
+            session_id.to_string(),
+        )
+        .expect("session_id is valid")
     }
 
     pub fn named(name: impl Into<String>, variables: AgentVariables) -> Self {

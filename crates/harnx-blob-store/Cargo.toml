@@ -1,0 +1,25 @@
+[package]
+name = "harnx-blob-store"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NATS-backed blob storage for attachments and plans"
+
+[dependencies]
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+harnx-nats-common = { path = "../harnx-nats-common" }
+log = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+harnx-test-bins = { path = "../harnx-test-bins" }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "test-util"] }

@@ -516,6 +516,8 @@ pub(crate) fn request(session: &str, call_id: &str) -> ToolRequest {
         tool: "echo".to_string(),
         args: json!({"value": 42}),
         parent_session_id: Some(session.to_string()),
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: Some("model-call".to_string()),
         capabilities: Default::default(),
     }

@@ -212,6 +212,9 @@ pub trait CheckpointStore: Send + Sync {
 pub struct ToolInvocationContext {
     pub call_id: String,
     pub invoking_session_id: Option<String>,
+    /// The caller's session identity (agent + local session id) for cid: URL construction.
+    /// Set when the transport provides parent_agent and parent_local_session_id.
+    pub invoking_session: Option<SessionRef>,
     pub capabilities: BTreeSet<String>,
     /// Handle for a checkpoint recorded on a prior attempt, if any. Set on
     /// replay so the tool can resume instead of restarting from scratch.
@@ -225,11 +228,25 @@ pub struct ToolInvocationContext {
     pub progress: ToolProgressHandle,
 }
 
+/// Re-export SessionRef to allow harnx-toolset-server to pass it through
+/// without creating a cycle via harnx-core dependency chain.
+///
+/// This is a minimal SessionRef defined here to avoid the circular dependency.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionRef {
+    /// Agent name, or None for temp/inline sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// 6-char local session id (base64url, may start with `-`).
+    pub session_id: String,
+}
+
 impl fmt::Debug for ToolInvocationContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ToolInvocationContext")
             .field("call_id", &self.call_id)
             .field("invoking_session_id", &self.invoking_session_id)
+            .field("invoking_session", &self.invoking_session)
             .field("capabilities", &self.capabilities)
             .field("checkpoint", &self.checkpoint)
             .field(
@@ -329,6 +346,14 @@ pub struct ToolRequest {
     pub args: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// Agent name of the invoking session (if available from a NATS caller).
+    /// Combined with `parent_local_session_id`, gives the caller's identity
+    /// for cid: URL construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent: Option<String>,
+    /// Local session id of the invoking session (if available from a NATS caller).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_local_session_id: Option<String>,
     /// The transcript's tool-call id (`ToolCall.id`) this invocation answers,
     /// when the caller has one. Wind-up and replay resolve a journal row by
     /// `(session, tool round, tool_call_id)`, never by `call_id`, because only
@@ -688,6 +713,8 @@ mod tests {
             tool: "time_now".to_string(),
             args: json!({ "timezone": "UTC" }),
             parent_session_id: Some("parent-session".to_string()),
+            parent_agent: None,
+            parent_local_session_id: None,
             tool_call_id: None,
             capabilities: BTreeSet::new(),
         });
@@ -701,6 +728,8 @@ mod tests {
             tool: "time_now".to_string(),
             args: json!({ "timezone": "UTC" }),
             parent_session_id: None,
+            parent_agent: None,
+            parent_local_session_id: None,
             tool_call_id: None,
             capabilities: BTreeSet::new(),
         });

@@ -202,9 +202,16 @@ fn store_attachment_blob(dir: &Path, attachment: AttachmentBlob<'_>) -> Result<(
 }
 
 pub fn read_attachment(dir: &Path, reference: &str) -> Result<(Vec<u8>, String)> {
-    let hash = AttachmentHash(reference.strip_prefix(CID_PREFIX).ok_or_else(|| {
-        anyhow::anyhow!("attachment reference must start with {CID_PREFIX}: {reference}")
-    })?);
+    let reference = if let Some(cid) = reference.strip_prefix(CID_PREFIX) {
+        cid
+    } else if reference.contains("://") {
+        return Err(anyhow::anyhow!(
+            "attachment reference must be a bare hash or start with {CID_PREFIX}: {reference}"
+        ));
+    } else {
+        reference
+    };
+    let hash = AttachmentHash(reference.rsplit('/').next().unwrap_or(reference));
     let path = find_attachment_path(dir, hash)?;
     let data = std::fs::read(&path)
         .with_context(|| format!("Failed to read attachment {}", path.display()))?;
@@ -265,6 +272,23 @@ fn read_attachment_mime(dir: &Path, hash: AttachmentHash<'_>, blob_path: &Path) 
 
 pub fn cid_for_data_url(data_url: &str) -> String {
     format!("{CID_PREFIX}{}", sha256(data_url))
+}
+
+/// Build a cid:media URL from a SessionRef and data URL content hash.
+///
+/// Returns `cid:media:<agent>/<sid>/<sha256>` where agent is percent-encoded
+/// (or `_temp` for no-agent sessions).
+pub fn cid_for_data_url_with_session(
+    session: &crate::cid_url::SessionRef,
+    data_url: &str,
+) -> String {
+    use crate::cid_url::CidUrl;
+    let hash = sha256(data_url);
+    let url = CidUrl::Media {
+        session: session.clone(),
+        hash,
+    };
+    url.to_string()
 }
 
 pub fn collect_cid_refs(messages: &[Message]) -> Vec<String> {
@@ -418,12 +442,23 @@ mod tests {
     }
 
     #[test]
-    fn read_attachment_requires_cid_prefix() {
+    fn read_attachment_accepts_bare_hash_and_media_cid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("deadbeef.png");
+        std::fs::write(&path, b"ABC").unwrap();
+
+        for reference in ["deadbeef", "cid:media:pantheon%2Fatlas/session-1/deadbeef"] {
+            let (data, mime_type) = read_attachment(tmp.path(), reference).unwrap();
+            assert_eq!(data, b"ABC");
+            assert_eq!(mime_type, "image/png");
+        }
+    }
+
+    #[test]
+    fn read_attachment_rejects_http_urls() {
         let tmp = tempfile::tempdir().unwrap();
         let err = read_attachment(tmp.path(), "https://example.com/image.png").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("attachment reference must start with cid:"));
+        assert!(err.to_string().contains("bare hash or start with cid:"));
     }
 
     #[test]

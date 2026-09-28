@@ -98,7 +98,9 @@ Harnx automatically manages the following JetStream resources:
 - **Object Store**: `harnx_attachments` stores binary attachment payloads under
   session-scoped object names. Conversation entries contain only `cid:`
   references; workers hydrate the matching blobs into their local
-  content-addressed cache before calling a model.
+  content-addressed cache before calling a model. Object names follow
+  `media/<owner>/<hash>` where `owner` is `session_key(agent, sid)` (see
+  `harnx_core::cid_url::CidUrl::kv_key`).
 - **Persistent activation streams**: `WORK_NOTIFY_<cluster>` captures
   `cluster.<cluster>.sessions.notify` with cluster-shared work-queue dispatch.
   All cluster workers bind to one shared durable pull consumer; per-worker
@@ -124,6 +126,7 @@ count (`None` means 1, no HA):
     `harnx_hook_registry`, `harnx_hook_expectations`, and
     `harnx_tool_invocations`)
   - Attachment object store (`harnx_attachments`)
+  - Plans KV bucket (`harnx_plans`)
   - Session transcript streams (`SESSION_<sha256(id)>`)
   - Cluster activation stream (`WORK_NOTIFY_<cluster>`)
 - **Do not honour `replicas` (by design)**:

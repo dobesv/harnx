@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+async-nats = { workspace = true }
 async-trait = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
@@ -18,7 +19,9 @@ rmcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
+which = { workspace = true }
 
 [[bin]]
 name = "harnx-mcp-repro249"

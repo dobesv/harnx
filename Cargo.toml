@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/harnx",
     "crates/harnx-acp-server",
+    "crates/harnx-blob-store",
     "crates/harnx-client",
     "crates/harnx-core",
     "crates/harnx-engine",
@@ -199,6 +200,7 @@ ratatui_widget_scrolling = "0.1.0"
 jiff = { version = "0.2.23", features = ["serde"] }
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
+harnx-core = { path = "crates/harnx-core" }
 harnx-nats-common = { path = "crates/harnx-nats-common" }
 harnx-telemetry = { path = "crates/harnx-telemetry" }
 harnx-toolset = { path = "crates/harnx-toolset" }

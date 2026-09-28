@@ -9,6 +9,8 @@ fn tool_request(session: &str, call_id: &str) -> ToolRequest {
         tool: "echo".into(),
         args: Value::Null,
         parent_session_id: Some(session.into()),
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     }

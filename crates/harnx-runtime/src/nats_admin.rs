@@ -66,8 +66,11 @@ pub(crate) async fn delete_remote_session_by_key(
         Err(error) => return Err(error.into()),
     }
     let metadata_keys_deleted = purge_session_metadata(&jetstream, session_id).await?;
-    let attachments_deleted =
-        crate::nats_attachments::delete_session_attachments(&jetstream, session_id).await?;
+    // Use blob-store's delete_owner for unified media + plans deletion
+    let blob_deleted = harnx_blob_store::delete_owner(&jetstream, session_id).await?;
+    // Legacy attachments are included in delete_owner (media prefix), but keep
+    // the result aligned with SessionDeleteResult's attachments_deleted field
+    let attachments_deleted = blob_deleted;
 
     Ok(SessionDeleteResult {
         stream_deleted,

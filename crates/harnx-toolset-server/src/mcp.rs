@@ -97,6 +97,7 @@ impl McpToolsetAdapter {
         let invocation_context = ToolInvocationContext {
             call_id: format!("{:?}", context.id),
             invoking_session_id: None,
+            invoking_session: None,
             capabilities,
             // MCP transports have no journal to record a checkpoint in, and no
             // control subject a later cancel could arrive on.

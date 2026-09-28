@@ -198,6 +198,8 @@ fn tool_request(call_id: &str, tool: &str) -> ToolRequest {
         tool: tool.to_owned(),
         args: json!({}),
         parent_session_id: None,
+        parent_agent: None,
+        parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
     }

@@ -11,6 +11,7 @@ pub mod ag_ui_rpc;
 mod ag_ui_sync;
 mod ag_ui_usage;
 mod agent_resolve;
+mod attachments;
 mod interrupt_resume;
 mod models_catalog;
 mod nats_access;
@@ -39,6 +40,7 @@ use crate::ag_ui::{AgUiError, AppResponse as AgUiAppResponse};
 use crate::ag_ui_rpc::{handle_ag_ui_rpc, PersistenceKind};
 use crate::session_actor::{ResolvedAgentTarget, SessionRegistry};
 use crate::session_routes::{AgentSessionRef, SessionsRouteContext};
+use attachments::*;
 
 #[cfg(test)]
 use harnx_core::agent_ref::AgentRef;
@@ -51,9 +53,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::stream::StreamExt;
-use harnx_core::attachments::{
-    collect_cid_refs, read_attachment_async, store_attachment_bytes_async, CID_PREFIX,
-};
+#[cfg(test)]
+use harnx_core::attachments::store_attachment_bytes_async;
+use harnx_core::attachments::{collect_cid_refs, CID_PREFIX};
+use harnx_core::cid_url::{CidUrl, SessionRef};
 use http::{Method, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -62,7 +65,6 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::graceful::GracefulShutdown,
 };
-use multer::Multipart;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -828,7 +830,7 @@ impl Server {
         }
         let (agent_ref, session, cid) = parse_session_attachment_blob_path(req.uri().path())
             .ok_or_else(|| anyhow!("Not Found"))?;
-        if !is_canonical_attachment_cid(&cid) {
+        if !is_canonical_attachment_cid(cid.as_bytes()) {
             return attachment_error_response(StatusCode::BAD_REQUEST, "malformed attachment cid");
         }
 
@@ -847,25 +849,17 @@ impl Server {
         let attachments_dir = Config::agent_data_dir(target.agent())
             .join("attachments")
             .join(&session);
-        let attachment = match read_attachment_async(&attachments_dir, &cid).await {
-            Ok(attachment) => Some(attachment),
-            Err(_) => {
-                let jetstream = serve_nats_jetstream(&self.config, target.cluster()).await?;
-                let storage_key =
-                    harnx_core::session_identity::session_key(Some(target.agent()), &session);
-                harnx_runtime::nats_attachments::get_session_attachment(
-                    &jetstream,
-                    1,
-                    &storage_key,
-                    &cid,
-                )
-                .await?
-            }
+        let local_cid = match CidUrl::parse(&cid) {
+            Ok(CidUrl::Media { hash, .. }) => format!("{CID_PREFIX}{hash}"),
+            _ => unreachable!("canonical attachment cid was validated above"),
         };
+        let jetstream = serve_nats_jetstream(&self.config, target.cluster()).await?;
+        let attachment =
+            read_cached_or_nats_attachment(&attachments_dir, &local_cid, &jetstream, &cid).await?;
         let Some((bytes, mime_type)) = attachment else {
             return attachment_error_response(StatusCode::NOT_FOUND, "attachment not found");
         };
-        if !is_inline_image_mime(&mime_type) {
+        if !is_inline_image_mime(mime_type.as_bytes()) {
             return attachment_error_response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "attachment content type cannot be displayed inline",
@@ -915,6 +909,8 @@ impl Server {
         let attachments_dir = Config::agent_data_dir(target.agent())
             .join("attachments")
             .join(&session);
+        let attachment_session = SessionRef::new(Some(target.agent().to_string()), session.clone())
+            .context("build attachment session identity")?;
 
         // Stream body with size limit to prevent OOM
         let body = req.into_body();
@@ -935,53 +931,17 @@ impl Server {
         }
 
         let body_bytes = chunks.into_iter().flatten().collect::<Vec<u8>>();
-        let stream = futures_util::stream::once(async move {
-            Ok::<Bytes, std::io::Error>(Bytes::from(body_bytes))
-        });
-        let mut multipart = Multipart::new(stream, boundary);
-        let mut refs = Vec::new();
-        while let Some(field) = multipart
-            .next_field()
-            .await
-            .map_err(|err| anyhow!("Bad Request: {err}"))?
+        let refs = match process_multipart_upload(
+            body_bytes,
+            boundary,
+            &attachments_dir,
+            &attachment_session,
+        )
+        .await?
         {
-            let name = field.name().unwrap_or_default().to_string();
-            if name != "attachment" && name != "attachments" && name != "file" {
-                continue;
-            }
-            let mime = field
-                .content_type()
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            let field_name = field.name().unwrap_or_default().to_string();
-            match mime.as_str() {
-                "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "application/pdf"
-                | "text/plain" => {}
-                _ => {
-                    return json_response_with_status(
-                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                        json!({"error":"unsupported attachment content type","field": field_name, "content_type":mime}),
-                    );
-                }
-            }
-            let data = field
-                .bytes()
-                .await
-                .map_err(|err| anyhow!("Bad Request: {err}"))?;
-            if data.len() > MAX_UPLOAD_BYTES {
-                return json_response_with_status(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    json!({"error":"attachment too large","max_bytes":MAX_UPLOAD_BYTES}),
-                );
-            }
-            refs.push(store_attachment_bytes_async(&attachments_dir, &data, &mime).await?);
-        }
-        if refs.is_empty() {
-            return json_response_with_status(
-                StatusCode::BAD_REQUEST,
-                json!({"error":"no attachment parts found"}),
-            );
-        }
+            Ok(refs) => refs,
+            Err((status, body)) => return json_response_with_status(status, body),
+        };
         json_response(
             json!({"attachment_refs": refs, "attachments": refs.iter().map(|cid| json!({"cid": cid})).collect::<Vec<_>>() }),
         )
@@ -1356,25 +1316,6 @@ fn is_session_attachments_path(path: &str) -> bool {
     )
 }
 
-fn parse_session_attachments_path(path: &str) -> Option<(String, String)> {
-    let suffix = path.strip_prefix("/v1/agents/")?;
-    let segments: Vec<_> = suffix
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    match segments.as_slice() {
-        [agent, "sessions", session, "attachments"] => {
-            let agent = percent_decode(agent);
-            let session = percent_decode(session);
-            if !is_safe_agent_path(&agent) || !is_safe_path_segment(&session) {
-                return None;
-            }
-            Some((agent, session))
-        }
-        _ => None,
-    }
-}
-
 fn is_session_attachment_blob_path(path: &str) -> bool {
     let Some(suffix) = path.strip_prefix("/v1/agents/") else {
         return false;
@@ -1386,40 +1327,6 @@ fn is_session_attachment_blob_path(path: &str) -> bool {
     matches!(
         segments.as_slice(),
         [_agent, "sessions", _session, "attachments", _cid]
-    )
-}
-
-fn parse_session_attachment_blob_path(path: &str) -> Option<(String, String, String)> {
-    let suffix = path.strip_prefix("/v1/agents/")?;
-    let segments: Vec<_> = suffix
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    match segments.as_slice() {
-        [agent, "sessions", session, "attachments", cid] => {
-            let agent = percent_decode(agent);
-            let session = percent_decode(session);
-            if !is_safe_agent_path(&agent) || !is_safe_path_segment(&session) {
-                return None;
-            }
-            Some((agent, session, percent_decode(cid)))
-        }
-        _ => None,
-    }
-}
-
-fn is_canonical_attachment_cid(cid: &str) -> bool {
-    cid.len() == CID_PREFIX.len() + 64
-        && cid.starts_with(CID_PREFIX)
-        && cid[CID_PREFIX.len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn is_inline_image_mime(mime_type: &str) -> bool {
-    matches!(
-        mime_type,
-        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
     )
 }
 
@@ -2207,23 +2114,30 @@ mod tests {
     #[test]
     fn session_attachment_blob_path_decodes_and_validates_cid_segment() {
         let hash = "a".repeat(64);
-        let encoded_path =
-            format!("/v1/agents/coding%2Fcoder/sessions/thread-1/attachments/cid%3A{hash}");
+        let cid = format!("cid:media:coding%2Fcoder/thread-1/{hash}");
+        let encoded_path = format!(
+            "/v1/agents/coding%2Fcoder/sessions/thread-1/attachments/cid%3Amedia%3Acoding%252Fcoder%2Fthread-1%2F{hash}"
+        );
         assert!(is_session_attachment_blob_path(&encoded_path));
         assert_eq!(
             parse_session_attachment_blob_path(&encoded_path),
             Some((
                 "coding/coder".to_string(),
                 "thread-1".to_string(),
-                format!("cid:{hash}"),
+                cid.clone(),
             ))
         );
-        assert!(is_canonical_attachment_cid(&format!("cid:{hash}")));
-        assert!(!is_canonical_attachment_cid(&format!(
-            "cid:{}",
-            "A".repeat(64)
-        )));
-        assert!(!is_canonical_attachment_cid("cid:../outside"));
+        assert!(is_canonical_attachment_cid(cid.as_bytes()));
+        assert!(!is_canonical_attachment_cid(
+            format!("cid:{hash}").as_bytes()
+        ));
+        assert!(!is_canonical_attachment_cid(
+            format!("cid:media:coding%2Fcoder/thread-1/{}", "A".repeat(64)).as_bytes()
+        ));
+        assert!(!is_canonical_attachment_cid(
+            b"cid:plan:coding%2Fcoder/thread-1/my-plan"
+        ));
+        assert!(!is_canonical_attachment_cid(b"cid:../outside"));
         assert!(!is_session_attachment_blob_path(
             "/v1/agents/hephaestus/sessions/thread-1/attachments"
         ));
@@ -3007,7 +2921,7 @@ mod tests {
             .await?;
         assert_eq!(upload.status(), reqwest::StatusCode::NOT_FOUND);
 
-        let cid = format!("cid%3A{}", "0".repeat(64));
+        let cid = format!("cid%3Amedia%3Asafe-agent%2Fsession1%2F{}", "0".repeat(64));
         let retrieval = client
             .get(format!(
                 "http://{address}/v1/agents/..%40shared/sessions/s1/attachments/{cid}"
@@ -3065,10 +2979,23 @@ mod tests {
     }
 
     fn attachment_url(session: &str, cid: &str) -> String {
-        format!(
-            "/v1/agents/plain/sessions/{session}/attachments/{}",
-            cid.replacen(':', "%3A", 1)
-        )
+        let encoded_cid = cid
+            .replace('%', "%25")
+            .replace(':', "%3A")
+            .replace('/', "%2F");
+        format!("/v1/agents/plain/sessions/{session}/attachments/{encoded_cid}")
+    }
+
+    fn media_cid(agent: &str, session: &str, stored_cid: &str) -> String {
+        CidUrl::Media {
+            session: SessionRef::new(Some(agent.to_string()), session.to_string())
+                .expect("test session identity is valid"),
+            hash: stored_cid
+                .strip_prefix(CID_PREFIX)
+                .expect("stored cid has cid prefix")
+                .to_string(),
+        }
+        .to_string()
     }
 
     fn assert_attachment_security_headers(response: &AppResponse, cache_control: &str) {
@@ -3076,6 +3003,44 @@ mod tests {
         assert_eq!(
             response.headers()[http::header::CACHE_CONTROL],
             cache_control
+        );
+    }
+
+    fn assert_snapshot_attachment_event(content: &MessageContent, cid: &str) {
+        let history = [Message::new(MessageRole::User, content.clone()).with_id("user-msg-1")];
+        let snapshot = crate::ag_ui::history_messages_for_snapshot(&history);
+        let durable_entries = vec![(
+            1,
+            SessionLogEntry::Message {
+                id: history[0].id.clone(),
+                role: MessageRole::User,
+                content: content.clone(),
+                timestamp: None,
+                fence_token: None,
+            },
+        )];
+        let events = crate::ag_ui::message_attachment_snapshot_events(&snapshot, &durable_entries);
+        let user_id = match snapshot.first().expect("snapshot user message") {
+            ag_ui_core::types::message::Message::User { id, .. } => id.clone(),
+            other => panic!("expected user snapshot message, got {other:?}"),
+        };
+        let attachment_event = events
+            .iter()
+            .find_map(|event| match event {
+                ag_ui_core::event::Event::Custom(custom)
+                    if custom.name == "message_attachments" =>
+                {
+                    Some(&custom.value)
+                }
+                _ => None,
+            })
+            .expect("message_attachments event emitted");
+        assert_eq!(
+            attachment_event,
+            &serde_json::json!({
+                "messageId": user_id,
+                "attachments": [{ "partIndex": 1, "cid": cid, "kind": "image" }],
+            })
         );
     }
 
@@ -3092,7 +3057,8 @@ mod tests {
         let attachments_dir = Config::agent_data_dir("plain")
             .join("attachments")
             .join(session);
-        let cid = store_attachment_bytes_async(&attachments_dir, bytes, mime_type).await?;
+        let stored_cid = store_attachment_bytes_async(&attachments_dir, bytes, mime_type).await?;
+        let cid = media_cid("plain", session, &stored_cid);
         let messages = [message_for_cid(&cid)];
         if !seed_nats_session(
             &config,
@@ -3219,7 +3185,6 @@ mod tests {
             return Ok(());
         }
         let session = format!("attachment-get-nats-{}", uuid::Uuid::new_v4());
-        let storage_key = harnx_core::session_identity::session_key(Some("plain"), &session);
         let bytes = b"cold cache png bytes";
         let data_url = format!(
             "data:image/png;base64,{}",
@@ -3230,7 +3195,12 @@ mod tests {
         }]);
         let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
         harnx_runtime::nats_attachments::externalize_message_attachments(
-            harnx_runtime::nats_attachments::AttachmentLocation::new(&jetstream, 1, &storage_key),
+            harnx_runtime::nats_attachments::AttachmentLocation::new(
+                &jetstream,
+                1,
+                &harnx_core::cid_url::SessionRef::new(Some("plain".to_string()), session.clone())
+                    .expect("test session valid"),
+            ),
             &mut content,
             None,
         )
@@ -3289,7 +3259,8 @@ mod tests {
         let attachments_dir = Config::agent_data_dir("plain")
             .join("attachments")
             .join(&session);
-        let cid = store_attachment_bytes_async(&attachments_dir, bytes, "image/png").await?;
+        let stored_cid = store_attachment_bytes_async(&attachments_dir, bytes, "image/png").await?;
+        let cid = media_cid("plain", &session, &stored_cid);
 
         // The durable user message: caption text plus the stored cid image.
         let content = MessageContent::Array(vec![
@@ -3308,41 +3279,8 @@ mod tests {
             format!("look at this\n\n[image attachment: {cid}]")
         );
 
-        // (b) Snapshot metadata event shares the snapshot user row's wire id and
-        //     carries the same cid.
-        let history = [Message::new(MessageRole::User, content.clone()).with_id("user-msg-1")];
-        let snapshot = crate::ag_ui::history_messages_for_snapshot(&history);
-        let durable_entries = vec![(
-            1,
-            SessionLogEntry::Message {
-                id: history[0].id.clone(),
-                role: MessageRole::User,
-                content: content.clone(),
-                timestamp: None,
-                fence_token: None,
-            },
-        )];
-        let events = crate::ag_ui::message_attachment_snapshot_events(&snapshot, &durable_entries);
-        let user_id = match snapshot.first().expect("snapshot user message") {
-            ag_ui_core::types::message::Message::User { id, .. } => id.clone(),
-            other => panic!("expected user snapshot message, got {other:?}"),
-        };
-        let attachment_event = events
-            .iter()
-            .find_map(|event| match event {
-                ag_ui_core::event::Event::Custom(custom)
-                    if custom.name == "message_attachments" =>
-                {
-                    Some(&custom.value)
-                }
-                _ => None,
-            })
-            .expect("message_attachments event emitted");
-        assert_eq!(attachment_event["messageId"], serde_json::json!(user_id));
-        assert_eq!(
-            attachment_event["attachments"],
-            serde_json::json!([{ "partIndex": 1, "cid": cid, "kind": "image" }])
-        );
+        // (b) Snapshot metadata event shares the snapshot user row's wire id and cid.
+        assert_snapshot_attachment_event(&content, &cid);
 
         // (c) The GET route serves that exact cid (requires a NATS-backed
         //     session; skip gracefully if the test broker is unavailable).
@@ -3411,7 +3349,10 @@ mod tests {
             .as_array()
             .expect("refs array");
         assert_eq!(refs.len(), 1);
-        assert!(refs[0].as_str().unwrap().starts_with("cid:"));
+        assert!(refs[0]
+            .as_str()
+            .unwrap()
+            .starts_with("cid:media:plain/test-session/"));
 
         // Verify the uploaded blob was stored in the attachment directory.
         let attachments_dir = Config::agent_data_dir("plain")

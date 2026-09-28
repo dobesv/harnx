@@ -37,6 +37,7 @@ harnx-hookset = { path = "../harnx-hookset" }
 harnx-hookset-server = { path = "../harnx-hookset-server" }
 harnx-metrics = { path = "../harnx-metrics" }
 harnx-nats-common = { workspace = true }
+harnx-blob-store = { path = "../harnx-blob-store" }
 harnx-telemetry = { workspace = true, features = ["nats"] }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
