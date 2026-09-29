@@ -54,6 +54,8 @@ mod session_start_hook_tests;
 #[cfg(test)]
 mod session_watcher_tests;
 #[cfg(test)]
+mod subagent_attachment_tests;
+#[cfg(test)]
 mod subagent_progress_tests;
 #[cfg(test)]
 mod subagent_replay_tests;

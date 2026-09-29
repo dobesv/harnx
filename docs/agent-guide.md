@@ -345,7 +345,7 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
 - **Markdown-only agent definitions**: Agents are defined solely by Markdown files with YAML front-matter in `<config-dir>/agents/*.md` (or package agents). ACP server configuration (`acp_servers/*.yaml`) and ACP stdio child processes no longer exist.
 - **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 4-tool toolset. Each registration advertises the raw names `session_new`, `session_prompt`, `session_load`, and `session_cancel`; the provider exposes them to agents with an agent-relative prefix:
   - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata.
-  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `session_id`, optional `timeout_secs`, optional `token_budget`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. The parent session ID is propagated internally.
+  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`, optional `token_budget`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. `attachments` is a list of `cid:` attachment URLs passed to the sub-agent; repeated URLs are ignored. The parent session ID is propagated internally.
   - `{agent}_session_load`: Reads prior event history for an existing sub-agent session log.
   - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
 - **Route-aware execution**: On persistent clusters, sub-agent turns use the

@@ -14,29 +14,15 @@ async fn expired_replay_returns_completed_child_without_cancelling_or_readmittin
         session.storage_key(),
         1,
     );
-    let toolset = SubagentToolset::new(
-        "helper",
-        super::super::SubagentSessionRoute::new(
-            "local",
-            crate::SessionActivationRoute::ClusterShared,
-        ),
-        super::super::SubagentNats::new(
-            js.client().clone(),
-            js.clone(),
-            session.metadata_store().clone(),
-            1,
-        ),
-    );
     let buffer = Arc::new(InvocationBufferingSink::new(Arc::new(
         harnx_core::event::NullSink,
     )));
     let before = log.load_events_async().await?;
     let turn = await_prompt_turn(
-        &toolset,
         &session,
         &buffer,
         AwaitTurnParams {
-            message: "original work",
+            content: MessageContent::Text("original work".to_string()),
             timeout: Some(Duration::ZERO),
             token_budget: None,
             cancel: CancellationToken::new(),
