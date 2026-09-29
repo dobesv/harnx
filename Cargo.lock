@@ -3717,6 +3717,7 @@ dependencies = [
  "ansi_colours",
  "anyhow",
  "arboard",
+ "async-nats",
  "async-recursion",
  "async-trait",
  "aws-smithy-eventstream",
@@ -3736,6 +3737,7 @@ dependencies = [
  "fuzzy-matcher",
  "glob",
  "globset",
+ "harnx-blob-store",
  "harnx-client",
  "harnx-core",
  "harnx-engine",
@@ -3745,6 +3747,7 @@ dependencies = [
  "harnx-runtime",
  "harnx-spinner",
  "harnx-telemetry",
+ "harnx-test-bins",
  "harnx-toolset",
  "harnx-tui",
  "hmac",
@@ -3762,7 +3765,9 @@ dependencies = [
  "jiff",
  "libc",
  "log",
+ "mime_guess",
  "nu-ansi-term",
+ "open",
  "os_info",
  "parking_lot",
  "path-absolutize",
@@ -5521,6 +5526,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
+name = "is-docker"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "928bae27f42bc99b60d9ac7334e3a21d10ad8f1835a4e12ec3ec0464765ed1b3"
+dependencies = [
+ "once_cell",
+]
+
+[[package]]
 name = "is-terminal"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5529,6 +5543,16 @@ dependencies = [
  "hermit-abi",
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "is-wsl"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
+dependencies = [
+ "is-docker",
+ "once_cell",
 ]
 
 [[package]]
@@ -6706,6 +6730,16 @@ checksum = "1e68317604e77e53b85896388e1a803c1d21b74c899ec9e5e1112db90735edd7"
 dependencies = [
  "cc",
  "pkg-config",
+]
+
+[[package]]
+name = "open"
+version = "5.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa576c76302b7b808eecc68061e67336c47833ef9d22caa74dda10fa9675eebc"
+dependencies = [
+ "is-wsl",
+ "libc",
 ]
 
 [[package]]

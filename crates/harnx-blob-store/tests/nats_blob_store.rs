@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use harnx_blob_store::{
     delete_owner, ensure_plans_bucket,
     media::{ensure_attachments_bucket, get_media, put_media},
-    media_cid_url, touch_activity,
+    media_cid_url, resolve, touch_activity, ResolvedBlob,
 };
 use harnx_core::cid_url::{CidUrl, PlanItem, SessionRef};
 
@@ -40,6 +40,65 @@ async fn media_put_get_round_trip() -> Result<()> {
         get_media(&store, &url).await?,
         Some((b"attachment bytes".to_vec(), "image/png".to_string()))
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_media_returns_bytes_and_cache_metadata() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    let store = ensure_attachments_bucket(&jetstream, 1).await?;
+    let session = SessionRef::new(Some("pantheon/atlas".to_string()), "resolv1".to_string())?;
+    let url = media_cid_url(&session, HASH_A);
+    put_media(&store, &url, b"resolved bytes", "text/plain").await?;
+
+    assert_eq!(
+        resolve(&jetstream, &url).await?,
+        ResolvedBlob {
+            mime_type: "text/plain".to_string(),
+            bytes: b"resolved bytes".to_vec(),
+            etag: Some(HASH_A.to_string()),
+            immutable: true,
+        }
+    );
+    let activity = jetstream.get_key_value("harnx_sessions").await?;
+    let activity_key = format!("sessions/{}/activity", session.owner());
+    assert!(activity.get(&activity_key).await?.is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_missing_media_returns_error() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    ensure_attachments_bucket(&jetstream, 1).await?;
+    let session = SessionRef::new(None, "miss01".to_string())?;
+    let url = media_cid_url(&session, HASH_B);
+
+    let error = resolve(&jetstream, &url).await.unwrap_err();
+    assert!(error.to_string().contains("attachment not found"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_rejects_plan_urls() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    let session = SessionRef::new(None, "plan01".to_string())?;
+    let plan = CidUrl::Plan {
+        session,
+        slug: "project-plan".to_string(),
+        item: PlanItem::Index,
+    };
+
+    let error = resolve(&jetstream, &plan).await.unwrap_err();
+    assert_eq!(error.to_string(), "plan URLs not yet supported");
     Ok(())
 }
 

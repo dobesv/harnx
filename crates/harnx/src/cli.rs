@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use harnx_runtime::config::SessionFormat;
 use is_terminal::IsTerminal;
 use std::io::{stdin, Read};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -106,8 +107,10 @@ pub enum Commands {
     Prompt(PromptArgs),
     /// Inspect harnx state
     Info(InfoArgs),
-    /// Dump session transcript (full history)
+    /// Dump resources
     Dump(DumpArgs),
+    /// Open resources in the system application
+    Open(OpenArgs),
     /// Delete resources
     Delete(DeleteArgs),
     /// List resources
@@ -237,6 +240,31 @@ pub enum DumpSubcommands {
         #[arg(long)]
         follow: bool,
     },
+    /// Dump an attachment
+    Attachment {
+        /// The cid: URL to dump
+        #[arg(allow_hyphen_values = true)]
+        url: String,
+        /// Write output to a file instead of stdout (long flag only, -f is reserved)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct OpenArgs {
+    #[command(subcommand)]
+    pub command: OpenSubcommands,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum OpenSubcommands {
+    /// Open an attachment in the system application
+    Attachment {
+        /// The cid: URL to open
+        #[arg(allow_hyphen_values = true)]
+        url: String,
+    },
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -364,9 +392,55 @@ mod tests {
                     assert_eq!(format, SessionFormat::Json);
                     assert!(follow);
                 }
+                other => panic!("unexpected dump subcommand: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_dump_attachment_with_output_and_dash_session_id() {
+        let url = concat!(
+            "cid:media:pantheon%2Fatlas/-abcDE/",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        let cli = Cli::try_parse_from([
+            "harnx",
+            "dump",
+            "attachment",
+            url,
+            "--output",
+            "attachment.txt",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.command,
+            Some(Commands::Dump(DumpArgs {
+                command: DumpSubcommands::Attachment {
+                    url: url.to_string(),
+                    output: Some(PathBuf::from("attachment.txt")),
+                },
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_open_attachment_with_dash_session_id() {
+        let url = concat!(
+            "cid:media:_temp/-abcDE/",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        let cli = Cli::try_parse_from(["harnx", "open", "attachment", url]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            Some(Commands::Open(OpenArgs {
+                command: OpenSubcommands::Attachment {
+                    url: url.to_string(),
+                },
+            }))
+        );
     }
 
     #[test]
@@ -447,12 +521,11 @@ mod tests {
         // Should either error or parse `json` as a file, not as format
         if let Ok(cli) = result {
             if let Some(Commands::Dump(args)) = cli.command {
-                let DumpSubcommands::Session { format, .. } = args.command;
-                // If it parses, -f was interpreted as --file, not --format
-                // format should still be Text (default)
-                assert_eq!(format, SessionFormat::Text);
-                // And file should contain "json"
-                assert!(cli.file.contains(&"json".to_string()));
+                if let DumpSubcommands::Session { format, .. } = args.command {
+                    // If it parses, -f was interpreted as --file, not --format
+                    assert_eq!(format, SessionFormat::Text);
+                    assert!(cli.file.contains(&"json".to_string()));
+                }
             }
         }
         // Either it errors, or -f is treated as file (not format)

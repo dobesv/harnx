@@ -20,7 +20,7 @@ pub use harnx_tui as tui;
 
 use crate::cli::{
     Cli, Commands, DeleteSessionArgs, DeleteSubcommands, DumpSubcommands, InfoSubcommands,
-    ListSubcommands,
+    ListSubcommands, OpenSubcommands,
 };
 use crate::client::{list_models, ModelType};
 use crate::config::{
@@ -164,6 +164,7 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
         Some(
             command @ (Commands::Info(_)
             | Commands::Dump(_)
+            | Commands::Open(_)
             | Commands::Delete(_)
             | Commands::List(_)
             | Commands::Compact(_)),
@@ -191,6 +192,7 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
         Commands::Prompt(_) => bail!("prompt commands use the one-shot execution path"),
         Commands::Info(info_args) => run_info_command(info_args, cli).await.map(|()| 0),
         Commands::Dump(dump_args) => run_dump_command(dump_args).await.map(|()| 0),
+        Commands::Open(open_args) => run_open_command(open_args).await.map(|()| 0),
         Commands::Delete(delete_args) => run_delete_command(delete_args).await.map(|()| 0),
         Commands::List(list_args) => run_list_command(list_args, cli).await.map(|()| 0),
         Commands::Compact(compact_args) => compact::run_compact_command(compact_args, cli).await,
@@ -271,7 +273,130 @@ async fn run_dump_command(dump_args: &crate::cli::DumpArgs) -> Result<()> {
             }
             run_dump_session_once(session_id, agent_name, format).await
         }
+        DumpSubcommands::Attachment { url, output } => {
+            run_dump_attachment(url, output.as_deref()).await
+        }
     }
+}
+
+async fn run_open_command(open_args: &crate::cli::OpenArgs) -> Result<()> {
+    match &open_args.command {
+        OpenSubcommands::Attachment { url } => run_open_attachment(url).await,
+    }
+}
+
+async fn resolve_attachment(url: &str) -> Result<harnx_blob_store::ResolvedBlob> {
+    let url = harnx_core::cid_url::CidUrl::parse(url).context("parse cid: URL")?;
+    let config = init_frontend_config(WorkingMode::Cmd, true).await?;
+    let cluster = config.default_cluster_key().to_string();
+    let jetstream = config.nats_jetstream(&cluster).await?;
+    harnx_blob_store::resolve(&jetstream, &url).await
+}
+
+async fn run_dump_attachment(url: &str, output: Option<&std::path::Path>) -> Result<()> {
+    use std::io::Write;
+
+    let resolved = resolve_attachment(url).await?;
+    if let Some(path) = output {
+        tokio::fs::write(path, &resolved.bytes)
+            .await
+            .with_context(|| format!("write attachment to '{}'", path.display()))?;
+        return Ok(());
+    }
+    if !is_text_mime(&resolved.mime_type) {
+        bail!(
+            "binary attachment ({}, {}) cannot be dumped to stdout; use 'harnx open attachment <url>' or '--output <path>'",
+            resolved.mime_type,
+            harnx_core::safety::format_size(resolved.bytes.len())
+        );
+    }
+    std::io::stdout()
+        .write_all(&resolved.bytes)
+        .context("write attachment to stdout")?;
+    std::io::stdout()
+        .flush()
+        .context("flush attachment output")?;
+    Ok(())
+}
+
+async fn run_open_attachment(url: &str) -> Result<()> {
+    let resolved = resolve_attachment(url).await?;
+    let path = write_open_temp_file(&resolved.bytes, &resolved.mime_type)?;
+    open::that_detached(&path)
+        .with_context(|| format!("open attachment temp file '{}'", path.display()))?;
+    Ok(())
+}
+
+fn write_open_temp_file(bytes: &[u8], mime_type: &str) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+
+    let extension = extension_for_mime(mime_type);
+    let suffix = format!(".{extension}");
+    let mut file = tempfile::Builder::new()
+        .prefix("harnx-attachment-")
+        .suffix(&suffix)
+        .tempfile()
+        .context("create attachment temp file")?;
+    file.write_all(bytes)
+        .context("write attachment temp file")?;
+    file.flush().context("flush attachment temp file")?;
+    let (_, path) = file
+        .keep()
+        .map_err(|error| error.error)
+        .context("persist attachment temp file")?;
+    Ok(path)
+}
+
+fn extension_for_mime(mime_type: &str) -> &'static str {
+    const PREFERRED: &[(&str, &str)] = &[
+        ("text/plain", "txt"),
+        ("text/markdown", "md"),
+        ("text/html", "html"),
+        ("text/csv", "csv"),
+        ("application/json", "json"),
+        ("application/xml", "xml"),
+        ("application/yaml", "yaml"),
+        ("application/x-yaml", "yaml"),
+        ("application/toml", "toml"),
+        ("image/jpeg", "jpg"),
+    ];
+    let mime_type = base_mime_type(mime_type).to_ascii_lowercase();
+    if let Some((_, extension)) = PREFERRED.iter().find(|(mime, _)| *mime == mime_type) {
+        return extension;
+    }
+    let extension = mime_guess::get_mime_extensions_str(&mime_type)
+        .and_then(|extensions| extensions.first())
+        .copied()
+        .unwrap_or("bin");
+    const UNSAFE_EXTENSIONS: &[&str] = &[
+        "bat", "cmd", "com", "exe", "vbs", "vbe", "js", "jse", "wsf", "wsh", "scr", "ps1", "sh",
+        "bash",
+    ];
+    if UNSAFE_EXTENSIONS.contains(&extension) {
+        "bin"
+    } else {
+        extension
+    }
+}
+
+fn is_text_mime(mime_type: &str) -> bool {
+    let mime_type = base_mime_type(mime_type).to_ascii_lowercase();
+    mime_type.starts_with("text/")
+        || matches!(
+            mime_type.as_str(),
+            "application/json"
+                | "application/javascript"
+                | "application/xml"
+                | "application/yaml"
+                | "application/x-yaml"
+                | "application/toml"
+                | "application/sql"
+                | "application/graphql"
+        )
+}
+
+fn base_mime_type(mime_type: &str) -> &str {
+    mime_type.split(';').next().unwrap_or_default().trim()
 }
 
 fn tool_decl_map(config: &Config) -> HashMap<String, harnx_core::tool::ToolDeclaration> {
@@ -1025,6 +1150,26 @@ use harnx_runtime::bootstrap::setup_logger;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_mime_helpers_handle_parameters() {
+        assert!(is_text_mime("text/plain; charset=utf-8"));
+        assert!(is_text_mime("application/json; charset=utf-8"));
+        assert!(!is_text_mime("application/octet-stream"));
+        assert_eq!(extension_for_mime("image/png"), "png");
+        assert_eq!(extension_for_mime("application/unknown"), "bin");
+    }
+
+    #[test]
+    fn open_temp_file_uses_mime_extension_and_persists_bytes() {
+        let path = write_open_temp_file(b"hello", "text/plain; charset=utf-8").unwrap();
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("txt")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[derive(Default)]
     struct DumpRecordingSink(std::sync::Mutex<Vec<harnx_core::event::AgentEvent>>);
