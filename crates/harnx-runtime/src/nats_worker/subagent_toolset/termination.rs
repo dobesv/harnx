@@ -5,6 +5,7 @@ use crate::{
     SynthesizedResult, TerminationInputs, TerminationKind,
 };
 use harnx_core::event::{SubAgentProgress, SubAgentProgressStatus};
+use harnx_core::message::MessageContent;
 use harnx_toolset::ToolInvokeError;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +20,8 @@ pub(super) fn subagent_error_message(prefix: impl std::fmt::Display, session_id:
     format!("{prefix} (session_id: {session_id})")
 }
 
-pub(super) struct PromptParams<'a> {
-    pub message: &'a str,
+pub(super) struct PromptParams {
+    pub content: MessageContent,
     pub session_id: Option<String>,
     pub parent_session_id: Option<String>,
     pub tool_call_id: Option<String>,
@@ -32,7 +33,7 @@ pub(super) struct PromptParams<'a> {
 
 pub(super) async fn run_prompt(
     toolset: &SubagentToolset,
-    params: PromptParams<'_>,
+    params: PromptParams,
 ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
     if params.cancel.is_cancelled() {
         return Err(ToolInvokeError::Fatal("sub-agent tool call aborted".into()));
@@ -59,11 +60,10 @@ pub(super) async fn run_prompt(
         .await?;
     let buffering_sink = Arc::new(InvocationBufferingSink::new(reporter.sink()));
     let turn = await_prompt_turn(
-        toolset,
         &session,
         &buffering_sink,
         AwaitTurnParams {
-            message: params.message,
+            content: params.content,
             timeout: deadline
                 .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now())),
             token_budget: params.token_budget,
@@ -102,7 +102,7 @@ pub(super) async fn run_prompt(
 
 async fn checkpointed_session(
     toolset: &SubagentToolset,
-    params: &PromptParams<'_>,
+    params: &PromptParams,
 ) -> Result<(NatsSession, Option<tokio::time::Instant>), ToolInvokeError> {
     let deadline = remaining_timeout(params.timeout_secs, None)
         .map(|remaining| tokio::time::Instant::now() + remaining);
@@ -160,18 +160,22 @@ fn remaining_timeout(seconds: Option<u64>, started_at_ms: Option<u64>) -> Option
     })
 }
 
-struct AwaitTurnParams<'a> {
-    message: &'a str,
+struct AwaitTurnParams {
+    content: MessageContent,
     timeout: Option<Duration>,
     token_budget: Option<u64>,
     cancel: CancellationToken,
 }
 
+struct AwaitCompletionParams {
+    timeout: Option<Duration>,
+    cancel: CancellationToken,
+}
+
 async fn await_prompt_turn(
-    _toolset: &SubagentToolset,
     session: &NatsSession,
     buffering_sink: &Arc<InvocationBufferingSink>,
-    params: AwaitTurnParams<'_>,
+    params: AwaitTurnParams,
 ) -> PromptTurn {
     // The child can finish before its tool-server reply reaches the journal.
     // Read that durable result before an already-expired replay can cancel it.
@@ -187,31 +191,38 @@ async fn await_prompt_turn(
             )))
         }
     }
+    let AwaitTurnParams {
+        content,
+        timeout,
+        token_budget,
+        cancel,
+    } = params;
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
     let child = session.clone();
-    let message = params.message.to_owned();
     let sink = buffering_sink.clone();
+    let options = RunTurnOptions {
+        token_budget: token_budget.filter(|budget| *budget > 0),
+        ..Default::default()
+    };
     let run_turn = tokio::spawn(async move {
         child
-            .run_turn_with_options(
-                &message,
-                sink,
-                Some(cancel_rx),
-                RunTurnOptions {
-                    token_budget: params.token_budget.filter(|budget| *budget > 0),
-                    ..Default::default()
-                },
-            )
+            .run_turn_content_with_options(content, sink, Some(cancel_rx), options)
             .await
     });
-    await_owned_turn(session, run_turn, cancel_tx, params).await
+    await_owned_turn(
+        session,
+        run_turn,
+        cancel_tx,
+        AwaitCompletionParams { timeout, cancel },
+    )
+    .await
 }
 
 async fn await_owned_turn(
     session: &NatsSession,
     mut run_turn: tokio::task::JoinHandle<anyhow::Result<NatsTurnResult>>,
     cancel_tx: mpsc::Sender<()>,
-    params: AwaitTurnParams<'_>,
+    params: AwaitCompletionParams,
 ) -> PromptTurn {
     let deadline = invocation_deadline(params.timeout);
     tokio::pin!(deadline);
