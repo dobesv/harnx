@@ -13,7 +13,10 @@ use crate::nats_worker::SessionActivationRoute;
 use crate::SynthesizedResult;
 use async_nats::jetstream;
 use async_trait::async_trait;
+use harnx_blob_store::media::{get_media, optional_attachments_bucket};
+use harnx_core::cid_url::CidUrl;
 use harnx_core::event::{AgentEvent, AgentSource, SubAgentProgress, TurnEvent};
+use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart};
 use harnx_core::package_namespace::sanitize_for_tool_name;
 use harnx_core::session::SessionLogEntry;
 use harnx_toolset::{
@@ -23,7 +26,7 @@ use harnx_toolset::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 // `_session_new` has no arguments, so a fixed bootstrap message creates the
@@ -207,9 +210,55 @@ impl SubagentToolset {
 
     async fn run_prompt(
         &self,
-        params: termination::PromptParams<'_>,
+        params: termination::PromptParams,
     ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
         Box::pin(termination::run_prompt(self, params)).await
+    }
+    async fn compose_prompt_content(
+        &self,
+        mut message: String,
+        attachments: Vec<String>,
+    ) -> Result<MessageContent, ToolInvokeError> {
+        let attachments = parse_attachment_urls(attachments)?;
+        let needs_media = attachments
+            .iter()
+            .any(|(_, url)| matches!(url, CidUrl::Media { .. }));
+        let store = if needs_media {
+            optional_attachments_bucket(&self.jetstream)
+                .await
+                .map_err(attachment_store_error)?
+        } else {
+            None
+        };
+        let mut images = Vec::new();
+        for (raw, url) in attachments {
+            if matches!(url, CidUrl::Plan { .. }) {
+                append_attachment_line(&mut message, &url);
+                continue;
+            }
+            let store = store.as_ref().ok_or_else(|| attachment_not_found(&raw))?;
+            let Some((_, mime_type)) = get_media(store, &url)
+                .await
+                .map_err(attachment_store_error)?
+            else {
+                return Err(attachment_not_found(&raw));
+            };
+            if is_image_mime(&mime_type) {
+                images.push(MessageContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: url.to_string(),
+                    },
+                });
+            } else {
+                append_attachment_line(&mut message, &url);
+            }
+        }
+        if images.is_empty() {
+            return Ok(MessageContent::Text(message));
+        }
+        let mut parts = vec![MessageContentPart::Text { text: message }];
+        parts.extend(images);
+        Ok(MessageContent::Array(parts))
     }
 
     async fn start_progress_reporter(
@@ -317,7 +366,7 @@ impl SubagentToolset {
         let args: NewSessionArgs = parse_args(SUBAGENT_SESSION_NEW_TOOL, args)?;
         let result = self
             .run_prompt(termination::PromptParams {
-                message: SESSION_NEW_INITIAL_PROMPT,
+                content: MessageContent::Text(SESSION_NEW_INITIAL_PROMPT.to_string()),
                 session_id: None,
                 parent_session_id: args.parent_session_id,
                 tool_call_id: args.tool_call_id,
@@ -342,9 +391,12 @@ impl SubagentToolset {
                 "message must not be empty".to_string(),
             ));
         }
+        let content = self
+            .compose_prompt_content(args.message, args.attachments.unwrap_or_default())
+            .await?;
         let result = self
             .run_prompt(termination::PromptParams {
-                message: &args.message,
+                content,
                 session_id: normalize_session_id(args.session_id),
                 parent_session_id: args.parent_session_id,
                 tool_call_id: args.tool_call_id,
@@ -409,6 +461,42 @@ impl SubagentToolset {
         value["session_id"] = json!(session_id);
         Ok(value)
     }
+}
+
+fn parse_attachment_urls(
+    attachments: Vec<String>,
+) -> Result<Vec<(String, CidUrl)>, ToolInvokeError> {
+    let mut seen = HashSet::new();
+    let mut parsed = Vec::with_capacity(attachments.len());
+    for raw in attachments {
+        let url = CidUrl::parse(&raw).map_err(|error| {
+            ToolInvokeError::Recoverable(format!("invalid attachment URL '{raw}': {error}"))
+        })?;
+        if seen.insert(raw.clone()) {
+            parsed.push((raw, url));
+        }
+    }
+    Ok(parsed)
+}
+
+fn append_attachment_line(message: &mut String, url: &CidUrl) {
+    message.push_str("\nAttachment: ");
+    message.push_str(&url.to_string());
+}
+
+fn is_image_mime(mime_type: &str) -> bool {
+    mime_type
+        .split(';')
+        .next()
+        .is_some_and(|base| base.trim().to_ascii_lowercase().starts_with("image/"))
+}
+
+fn attachment_store_error(error: anyhow::Error) -> ToolInvokeError {
+    ToolInvokeError::Recoverable(format!("inspect attachment: {error:#}"))
+}
+
+fn attachment_not_found(url: &str) -> ToolInvokeError {
+    ToolInvokeError::Recoverable(format!("attachment not found: {url}"))
 }
 
 /// Append a durable `SubAgentStarted` marker to the parent's transcript,
@@ -490,6 +578,8 @@ struct NewSessionArgs {
 #[derive(Deserialize)]
 struct PromptArgs {
     message: String,
+    #[serde(default)]
+    attachments: Option<Vec<String>>,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
@@ -664,7 +754,7 @@ fn session_prompt_spec(agent: &str) -> ToolSpec {
             cancellation_guarantee: Default::default(),
         name: SUBAGENT_SESSION_PROMPT_TOOL.to_string(),
         description: format!(
-            "Send a prompt to the '{agent}' agent. Omit session_id (or pass an empty/whitespace value) to start a new session with a generated ID — do this unless you are continuing an earlier session. To continue a session, pass the exact session_id returned by a prior session_prompt or session_new call. Session IDs are case-sensitive and local to this agent. Do not invent a session ID."
+            "Send a prompt to the '{agent}' agent. Omit session_id (or pass an empty/whitespace value) to start a new session with a generated ID — do this unless you are continuing an earlier session. To continue a session, pass the exact session_id returned by a prior session_prompt or session_new call. Session IDs are case-sensitive and local to this agent. Do not invent a session ID. Sub-agents return files by including cid: attachment URLs in their reply."
         ),
         input_schema: json!({
             "type": "object",
@@ -672,6 +762,11 @@ fn session_prompt_spec(agent: &str) -> ToolSpec {
                 "message": {
                     "type": "string",
                     "description": "The prompt message to send to the agent"
+                },
+                "attachments": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional list of cid: attachment URLs to pass to the sub-agent"
                 },
                 "session_id": {
                     "type": "string",
@@ -797,6 +892,15 @@ mod tests {
             json!({ "type": "object", "properties": {} })
         );
         assert_eq!(tools[1].input_schema["required"], json!(["message"]));
+        assert_eq!(
+            tools[1].input_schema["properties"]["attachments"]["type"],
+            "array"
+        );
+        assert_eq!(
+            tools[1].input_schema["properties"]["attachments"]["items"]["type"],
+            "string"
+        );
+        assert!(tools[1].description.contains("cid: attachment URLs"));
         assert_eq!(
             tools[1].input_schema["properties"]["timeout_secs"]["type"],
             "integer"

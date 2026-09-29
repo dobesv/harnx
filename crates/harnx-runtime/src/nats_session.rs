@@ -1068,6 +1068,17 @@ impl NatsSession {
         .await
     }
 
+    /// Run an already-composed turn with per-invocation settings.
+    pub async fn run_turn_content_with_options(
+        &self,
+        content: MessageContent,
+        event_sink: Arc<dyn AgentEventSink>,
+        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+        options: RunTurnOptions,
+    ) -> Result<NatsTurnResult> {
+        self.run_turn_content(content, event_sink, pending_cancel, None, options)
+            .await
+    }
     /// Run a text turn while routing `PreToolUse` approval requests from the
     /// worker to an interactive frontend.
     pub async fn run_turn_with_tool_confirmation(
