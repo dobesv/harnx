@@ -210,14 +210,11 @@ async fn bridge_registers_plans_and_round_trips_an_invoke() -> Result<()> {
     let Some(server) = spawn_nats_server().await? else {
         return Ok(());
     };
-    let plans_dir = tempfile::tempdir().context("create temporary plans directory")?;
     let bridge = BridgeToolset::new(
         "plans",
         vec![
             plans_binary()?.display().to_string(),
             "--mcp-stdio".to_owned(),
-            "--dir".to_owned(),
-            plans_dir.path().display().to_string(),
         ],
     )
     .await?;
@@ -381,7 +378,6 @@ async fn bridge_binary_exits_when_wrapped_child_dies() -> Result<()> {
     let Some(server) = spawn_nats_server().await? else {
         return Ok(());
     };
-    let plans_dir = tempfile::tempdir().context("create temporary plans directory")?;
     let instance_id = ServerScope::new();
     let mut bridge = tokio::process::Command::new(env!("CARGO_BIN_EXE_harnx-mcp-bridge"));
     bridge
@@ -390,8 +386,6 @@ async fn bridge_binary_exits_when_wrapped_child_dies() -> Result<()> {
         .arg("--")
         .arg(plans_binary()?)
         .arg("--mcp-stdio")
-        .arg("--dir")
-        .arg(plans_dir.path())
         .env("HARNX_SERVER_SCOPE", instance_id.as_str())
         .env("HARNX_NATS_URL", &server.url)
         .env("HARNX_NATS_TOKEN", TOKEN)
@@ -479,7 +473,6 @@ fn spawn_stalled_nats_listener() -> Result<StalledNatsListener> {
 #[tokio::test(flavor = "multi_thread")]
 async fn bridge_binary_exits_when_wrapped_child_dies_during_stalled_nats_connect() -> Result<()> {
     let stalled = spawn_stalled_nats_listener()?;
-    let plans_dir = tempfile::tempdir().context("create temporary plans directory")?;
     let instance_id = ServerScope::new();
     let mut bridge = tokio::process::Command::new(env!("CARGO_BIN_EXE_harnx-mcp-bridge"));
     bridge
@@ -488,8 +481,6 @@ async fn bridge_binary_exits_when_wrapped_child_dies_during_stalled_nats_connect
         .arg("--")
         .arg(plans_binary()?)
         .arg("--mcp-stdio")
-        .arg("--dir")
-        .arg(plans_dir.path())
         .env("HARNX_SERVER_SCOPE", instance_id.as_str())
         .env("HARNX_NATS_URL", &stalled.url)
         .env_remove("HARNX_NATS_TOKEN")

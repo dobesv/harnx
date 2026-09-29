@@ -2,7 +2,7 @@
 //!
 //! This crate provides data access for `cid:` URLs over NATS:
 //! - Media object store operations
-//! - Plans KV bucket helper
+//! - Plans document models and revision-CAS KV operations
 //! - Activity touch (rate-limited)
 //! - Owner deletion
 //!
@@ -18,7 +18,7 @@
 mod activity;
 mod delete;
 pub mod media;
-mod plans;
+pub mod plans;
 mod resolve;
 
 pub use activity::{touch_activity, ActivityGuard};

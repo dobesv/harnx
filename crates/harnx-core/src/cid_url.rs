@@ -212,7 +212,7 @@ impl CidUrl {
     /// Get the KV/object-store key for this URL.
     ///
     /// Media: `media/<owner>/<hash>`
-    /// Plan: `plan/<owner>/<slug>`, `plan/<owner>/<slug>/tasks/<id>`, `plan/<owner>/<slug>/notes/<id>`
+    /// Plan: `plan/<owner>/<slug>/plan`, `plan/<owner>/<slug>/tasks/<id>`, `plan/<owner>/<slug>/notes/<id>`
     pub fn kv_key(&self) -> String {
         match self {
             CidUrl::Media { session, hash } => {
@@ -225,7 +225,7 @@ impl CidUrl {
             } => {
                 let base = format!("plan/{}/{}", session.owner(), slug);
                 match item {
-                    PlanItem::Index => base,
+                    PlanItem::Index => format!("{}/plan", base),
                     PlanItem::Task(id) => format!("{}/tasks/{}", base, id),
                     PlanItem::Note(id) => format!("{}/notes/{}", base, id),
                 }
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn parse_plan_url_index() {
         let url = CidUrl::parse("cid:plan:pantheon%2Fatlas/armDRA/my-plan").unwrap();
-        match url {
+        match &url {
             CidUrl::Plan {
                 session,
                 slug,
@@ -454,7 +454,11 @@ mod tests {
                 assert_eq!(session.agent, Some("pantheon/atlas".to_string()));
                 assert_eq!(session.session_id, "armDRA");
                 assert_eq!(slug, "my-plan");
-                assert_eq!(item, PlanItem::Index);
+                assert_eq!(item, &PlanItem::Index);
+                assert_eq!(
+                    url.kv_key(),
+                    format!("plan/{}/my-plan/plan", session.owner())
+                );
             }
             _ => panic!("expected plan URL"),
         }

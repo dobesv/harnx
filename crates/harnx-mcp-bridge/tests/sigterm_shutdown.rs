@@ -181,7 +181,6 @@ async fn sigterm_removes_the_bridge_registration() -> Result<()> {
         return Ok(());
     };
 
-    let plans_dir = tempfile::tempdir().context("create temporary plans directory")?;
     let instance_id = ServerScope::new();
     let child = Command::new(env!("CARGO_BIN_EXE_harnx-mcp-bridge"))
         .env(HARNX_SERVER_SCOPE, instance_id.as_str())
@@ -192,8 +191,6 @@ async fn sigterm_removes_the_bridge_registration() -> Result<()> {
         .arg("--")
         .arg(plans_binary()?)
         .arg("--mcp-stdio")
-        .arg("--dir")
-        .arg(plans_dir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
