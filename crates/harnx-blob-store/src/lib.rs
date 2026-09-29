@@ -19,6 +19,7 @@ mod activity;
 mod delete;
 pub mod media;
 mod plans;
+mod resolve;
 
 pub use activity::{touch_activity, ActivityGuard};
 pub use delete::delete_owner;
@@ -27,6 +28,7 @@ pub use media::{
     ATTACHMENTS_BUCKET,
 };
 pub use plans::{ensure_plans_bucket, PLAN_BUCKET};
+pub use resolve::{resolve, ResolvedBlob};
 
 use harnx_core::cid_url::{CidUrl, SessionRef};
 

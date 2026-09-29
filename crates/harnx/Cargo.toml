@@ -73,6 +73,7 @@ process-wrap = { workspace = true }
 libc = { workspace = true }
 glob = { workspace = true }
 globset = { workspace = true }
+harnx-blob-store = { path = "../harnx-blob-store" }
 harnx-client = { path = "../harnx-client" }
 harnx-core = { path = "../harnx-core" }
 harnx-engine = { path = "../harnx-engine" }
@@ -92,6 +93,9 @@ jiff = { workspace = true }
 reqwest = { workspace = true }
 syntect = { workspace = true }
 scopeguard = { workspace = true }
+mime_guess = { workspace = true }
+open = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 crossterm = { workspace = true, features = ["use-dev-tty"] }
@@ -103,9 +107,10 @@ arboard = { workspace = true, features = ["wayland-data-control"] }
 arboard = { workspace = true }
 
 [dev-dependencies]
+async-nats = { workspace = true }
+harnx-test-bins = { path = "../harnx-test-bins" }
 insta = { version = "1", features = ["yaml"] }
 pretty_assertions = "1.4.0"
 rand = "0.10.0"
 tokio-test = "0.4"
-tempfile = "3"
 

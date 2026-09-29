@@ -209,6 +209,8 @@ syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"
 arboard = { version = "3.3.0", default-features = false }
 harnx-session = { path = "crates/harnx-session" }
 minijinja = { version = "2.21.0", default-features = false, features = ["builtins", "debug", "serde"] }
+mime_guess = "2"
+open = "5"
 harnx-git-history = { path = "crates/harnx-git-history" }
 harnx-sandbox-common = { path = "crates/harnx-sandbox-common" }
 harnx-tool-allow = { path = "crates/harnx-tool-allow" }
