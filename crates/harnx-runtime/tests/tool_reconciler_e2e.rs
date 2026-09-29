@@ -189,14 +189,8 @@ async fn activate(
     Ok(())
 }
 
-/// Build the worker config for the e2e test: a `time` server with no args and
-/// a `plans` server pointed at `plans_dir`. Pulled out of the test body,
-/// which was over the large-method threshold with this inlined.
-fn e2e_worker_config(
-    time_binary: PathBuf,
-    plans_binary: PathBuf,
-    plans_dir: &Path,
-) -> GlobalConfig {
+/// Build the worker config for the e2e test with `time` and `plans` servers.
+fn e2e_worker_config(time_binary: PathBuf, plans_binary: PathBuf) -> GlobalConfig {
     Arc::new(RwLock::new(Config {
         model: harnx_core::model::Model::new("test", "test-model"),
         tool_servers: vec![
@@ -213,10 +207,7 @@ fn e2e_worker_config(
             ToolServerConfig {
                 name: "plans".to_string(),
                 command: plans_binary.to_string_lossy().into_owned(),
-                args: vec![
-                    "--dir".to_string(),
-                    plans_dir.to_string_lossy().into_owned(),
-                ],
+                args: Vec::new(),
                 env: Default::default(),
                 enabled: true,
                 description: None,
@@ -405,8 +396,6 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
     write_agent(&agents_dir, &AGENT_TIME)?;
     write_agent(&agents_dir, &AGENT_PLANS)?;
 
-    let plans_dir = tempfile::tempdir()?;
-
     // The worker resolves both its main connection and its tool servers'
     // broker from this handoff (`LOCAL_CLUSTER_KEY` always does, regardless
     // of `HARNX_CONFIG_DIR`), and `retrieve_agent` finds the two agent files
@@ -417,7 +406,7 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         ("HARNX_CONFIG_DIR", &config_root.path().to_string_lossy()),
     ]);
 
-    let config = e2e_worker_config(time_binary, plans_binary, plans_dir.path());
+    let config = e2e_worker_config(time_binary, plans_binary);
 
     let daemon = WorkerDaemonConfig::managing(LOCAL_CLUSTER_KEY, "tool-reconciler-e2e");
     let worker_config = config.clone();

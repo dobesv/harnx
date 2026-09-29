@@ -184,3 +184,86 @@ async fn touch_activity_debounces_second_write() -> Result<()> {
     assert_eq!(second_revision, first_revision);
     Ok(())
 }
+
+#[test]
+fn plan_documents_preserve_yaml_frontmatter_markdown() -> Result<()> {
+    use harnx_blob_store::plans::{parse_plan, serialize_plan, PlanDocument, PlanFrontMatter};
+
+    let document = PlanDocument {
+        front: PlanFrontMatter {
+            id: "cid:plan:pantheon%2Fatlas/abcDEF/test-plan".to_string(),
+            title: Some("Test plan".to_string()),
+            created_at: "2026-09-29T00:00:00Z".to_string(),
+            ..PlanFrontMatter::default()
+        },
+        body: "# Body\n\nMarkdown stays intact.\n".to_string(),
+    };
+    let serialized = serialize_plan(&document)?;
+    assert!(serialized.starts_with("---\n"));
+    assert!(serialized.contains("\n---\n# Body"));
+    assert_eq!(parse_plan(&serialized)?, document);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plan_update_retries_revision_conflict_without_losing_writes() -> Result<()> {
+    use harnx_blob_store::plans::{
+        create_document, get_document, parse_plan, serialize_plan, PlanDocument, PlanFrontMatter,
+    };
+    use std::sync::{Arc, Barrier};
+
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    let store = ensure_plans_bucket(&jetstream, 1).await?;
+    let session = SessionRef::new(Some("pantheon/atlas".to_string()), "cas001".to_string())?;
+    let url = CidUrl::Plan {
+        session,
+        slug: "conflict-test".to_string(),
+        item: PlanItem::Index,
+    };
+    assert!(url.kv_key().ends_with("/conflict-test/plan"));
+    let initial = serialize_plan(&PlanDocument {
+        front: PlanFrontMatter {
+            id: url.to_string(),
+            created_at: "2026-09-29T00:00:00Z".to_string(),
+            ..PlanFrontMatter::default()
+        },
+        body: "start".to_string(),
+    })?;
+    create_document(&store, &url, &initial).await?;
+
+    let barrier = Arc::new(Barrier::new(2));
+    let first = spawn_append(store.clone(), url.clone(), barrier.clone(), " A");
+    let second = spawn_append(store.clone(), url.clone(), barrier, " B");
+    first.await??;
+    second.await??;
+
+    let stored = get_document(&store, &url).await?.context("updated plan")?;
+    let document = parse_plan(&stored.content)?;
+    assert!(document.body.contains(" A"), "first update was lost");
+    assert!(document.body.contains(" B"), "second update was lost");
+    Ok(())
+}
+
+fn spawn_append(
+    store: async_nats::jetstream::kv::Store,
+    url: CidUrl,
+    barrier: std::sync::Arc<std::sync::Barrier>,
+    suffix: &'static str,
+) -> tokio::task::JoinHandle<Result<harnx_blob_store::plans::StoredDocument>> {
+    tokio::spawn(async move {
+        let mut first_attempt = true;
+        harnx_blob_store::plans::update_document(&store, &url, |content| {
+            let mut document = harnx_blob_store::plans::parse_plan(content)?;
+            if first_attempt {
+                first_attempt = false;
+                barrier.wait();
+            }
+            document.body.push_str(suffix);
+            harnx_blob_store::plans::serialize_plan(&document)
+        })
+        .await
+    })
+}

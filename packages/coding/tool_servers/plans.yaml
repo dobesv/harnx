@@ -1,7 +1,3 @@
 command: harnx-plans-tools
 description: >-
-  File-based plan/task/note management — used by orchestrator
-  agents to track multi-step work across sessions.
-args:
-  - --dir
-  - .agent/plans
+  NATS-backed plan/task/note management with canonical cid:plan URLs.

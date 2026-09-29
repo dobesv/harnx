@@ -5,35 +5,29 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "MCP server that exposes a file-based plan/task/note management system"
+description = "NATS-backed plan/task/note toolset server"
 
 [dependencies]
-harnx-nats-common = { workspace = true }
 anyhow = { workspace = true }
+async-nats = { workspace = true }
 async-trait = { workspace = true }
-axum = { workspace = true }
 chrono = { workspace = true }
+harnx-blob-store = { path = "../harnx-blob-store" }
 harnx-core = { path = "../harnx-core" }
-harnx-healthz = { workspace = true }
-harnx-metrics = { workspace = true }
-log = { workspace = true }
+harnx-nats-common = { workspace = true }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
+log = { workspace = true }
 rmcp = { workspace = true }
+schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-tokio = { workspace = true, features = ["fs", "time"] }
-tokio-util = { workspace = true }
-tower = { workspace = true }
-schemars = { workspace = true }
 similar = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
-filetime = "0.2"
-reqwest = { workspace = true }
-rmcp = { workspace = true }
-tempfile = "3"
+harnx-test-bins = { path = "../harnx-test-bins" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [[bin]]

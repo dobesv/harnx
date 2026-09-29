@@ -193,7 +193,7 @@ The package includes ready-to-use tool server configs in `tool_servers/`. Bundle
 |--------|-----------|----------|-------|
 | `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution and the PR-stability waiter used after delivery. Opts into common system, development-tool, and repository allow batches plus explicit app paths. Includes a native PreToolUse hook (`harnx-proxy-auth`) for GitHub/Atlassian credential injection. |
 | `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Opts into repository and development-tool allow batches. |
-| `plans.yaml` | `plans_*` | None (bundled binary) | Plan/task/note management, stored in `.agent/plans/` relative to the working directory. |
+| `plans.yaml` | `plans_*` | None (bundled binary) | NATS-backed plan/task/note management using canonical `cid:plan:` URLs. |
 | `time.yaml` | `time_*` | None (bundled binary) | Current time and wait/sleep utilities. |
 | `fetch.yaml` | `fetch_*` | None (bundled binary) | Fetches URLs as markdown or text. No API key. |
 | `exa.yaml` | `exa_*` | None (bundled binary) | Web search via Exa. Requires `EXA_API_KEY`. |

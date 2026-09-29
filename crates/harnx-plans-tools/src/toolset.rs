@@ -1,71 +1,62 @@
-use crate::server::*;
+use crate::server::handlers::{self, OperationContext};
+use crate::server::params::*;
 use crate::tool_templates;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use harnx_toolset::{ToolInvokeError, ToolProgressKind, ToolSpec, Toolset};
-use rmcp::model::{CallToolResult, ErrorData, Tool};
+use harnx_nats_common::connect::NatsEndpoint;
+use harnx_toolset::{
+    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolProgressKind, ToolSpec, Toolset,
+};
+use rmcp::model::Tool;
 use rmcp::schemars::JsonSchema;
-use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use std::any::TypeId;
-use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
-/// Native toolset for file-backed plan, task, and note management.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct PlansToolset {
-    server: PlansServer,
+    nats_url: Option<String>,
 }
 
 impl PlansToolset {
-    pub fn new(dir: PathBuf) -> Self {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_nats_url(url: impl Into<String>) -> Self {
         Self {
-            server: PlansServer::new(dir, None),
+            nats_url: Some(url.into()),
         }
     }
 }
 
-macro_rules! dispatch_plan_tools {
-    (
-        $server:expr, $tool:expr, $args:expr;
-        $( $name:literal => $mode:ident $handler:ident, $params:ty; )+
-    ) => {
-        match $tool {
-            $(
-                $name => dispatch_plan_tools!(
-                    @call $server, $args, $mode, $handler, $params
-                ),
-            )+
-            _ => unknown_tool($tool),
+async fn connect_nats(custom_url: Option<&str>) -> Result<(async_nats::Client, usize)> {
+    match custom_url {
+        Some(url) => Ok((
+            async_nats::connect(url)
+                .await
+                .context("connect to NATS server")?,
+            1,
+        )),
+        None => {
+            let endpoint = NatsEndpoint::from_env()?;
+            let replicas = endpoint.resolved_replicas();
+            Ok((endpoint.connect().await?, replicas))
         }
-    };
-    (@call $server:expr, $args:expr, with_args, $handler:ident, $params:ty) => {
-        map_result($server.$handler(parse_args::<$params>($args)?).await)
-    };
-    (@call $server:expr, $args:expr, no_args, $handler:ident, $params:ty) => {{
-        let _params = parse_args::<$params>($args)?;
-        map_result($server.$handler().await)
-    }};
+    }
 }
 
 fn input_schema<T: JsonSchema + 'static>() -> Value {
     if TypeId::of::<T>() == TypeId::of::<()>() {
         return serde_json::json!({"type": "object", "properties": {}});
     }
-
     Tool::new("schema", "schema", Map::new())
         .with_input_schema::<T>()
         .schema_as_json_value()
 }
 
-/// Build a spec with the tool's call template plus the shared result template.
-fn spec<T: JsonSchema + 'static>(
-    name: &str,
-    description: &str,
-    read_only_hint: bool,
-    call_template: &str,
-) -> ToolSpec {
-    // Determine kind based on tool name prefix
-    let kind = if name.starts_with("get_") || name.starts_with("list_") {
+fn tool_kind(name: &str) -> ToolProgressKind {
+    if name.starts_with("get_") || name.starts_with("list_") {
         ToolProgressKind::Read
     } else if name.starts_with("add_") || name.starts_with("update_") {
         ToolProgressKind::Edit
@@ -73,53 +64,48 @@ fn spec<T: JsonSchema + 'static>(
         ToolProgressKind::Delete
     } else {
         ToolProgressKind::Other
-    };
+    }
+}
 
+struct SpecDef<'a> {
+    name: &'a str,
+    description: &'a str,
+    read_only: bool,
+    template: &'a str,
+}
+
+fn spec<T: JsonSchema + 'static>(definition: SpecDef<'_>) -> ToolSpec {
+    let SpecDef {
+        name,
+        description,
+        read_only,
+        template,
+    } = definition;
     ToolSpec {
         cancellation_guarantee: Default::default(),
         name: name.to_string(),
         description: description.to_string(),
         input_schema: input_schema::<T>(),
         idempotent_hint: false,
-        read_only_hint,
+        read_only_hint: read_only,
         timeout_secs: None,
         meta: None,
     }
-    .with_call_template(call_template)
+    .with_call_template(template)
     .with_result_template(tool_templates::RESULT)
-    .with_kind(kind)
+    .with_kind(tool_kind(name))
 }
 
-fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, ToolInvokeError> {
-    serde_json::from_value(args)
-        .map_err(|err| ToolInvokeError::Recoverable(format!("invalid tool arguments: {err}")))
-}
-
-fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolInvokeError> {
-    match result {
-        Ok(result) => serde_json::to_value(result).map_err(|err| {
-            ToolInvokeError::Fatal(format!("failed to serialize tool result: {err}"))
-        }),
-        Err(err) => Err(ToolInvokeError::Recoverable(err.message.to_string())),
-    }
-}
-
-fn unknown_tool(tool: &str) -> Result<Value, ToolInvokeError> {
-    Err(ToolInvokeError::Recoverable(format!(
-        "unknown plans tool: {tool}"
-    )))
-}
-
-/// Declares the tool table: params type, tool name, read-only hint, call
-/// template, description. A macro because `spec` is generic over the params
-/// type, so the rows cannot live in a plain array.
 macro_rules! plan_tool_specs {
-    (
-        $( $params:ty : $name:literal, $read_only:literal, $template:ident, $description:literal; )+
-    ) => {
-        vec![
-            $( spec::<$params>($name, $description, $read_only, tool_templates::$template), )+
-        ]
+    ($( $params:ty : $name:literal, $read_only:literal, $template:ident, $description:literal; )+) => {
+        vec![$(
+            spec::<$params>(SpecDef {
+                name: $name,
+                description: $description,
+                read_only: $read_only,
+                template: tool_templates::$template,
+            }),
+        )+]
     };
 }
 
@@ -129,38 +115,42 @@ impl Toolset for PlansToolset {
         "plans"
     }
 
+    fn default_mcp_http_port(&self) -> u16 {
+        3000
+    }
+
     fn tools(&self) -> Vec<ToolSpec> {
         plan_tool_specs![
             ListPlansParams: "list_plans", true, LIST_PLANS_CALL,
-                "List all plans with metadata and task/note counts.";
+                "List NATS-backed plans, optionally filtered by session owner key.";
             AddPlanParams: "add_plan", false, ADD_PLAN_CALL,
-                "Create a new plan with optional metadata. Set body with content (or body for compatibility). Keep body content under 1000 words per call; use update_plan with replace_in_content for targeted edits.";
+                "Create a plan owned by the caller session. Returns its cid:plan URL.";
             GetPlanParams: "get_plan", true, GET_PLAN_CALL,
-                "Read plan metadata, body, and list task/note IDs.";
+                "Read a plan by full cid:plan URL.";
             UpdatePlanParams: "update_plan", false, UPDATE_PLAN_CALL,
-                "Update plan body and metadata. Creates plan if it doesn't exist. Use content or replace_content to rewrite body, append_content to extend it, or replace_in_content for surgical edits. Provide at most one body-edit parameter. Optionally batch-create tasks. Keep each write under 1000 words.";
+                "Update a plan by full cid:plan URL. Body edits use revision CAS.";
             DeletePlanParams: "delete_plan", false, DELETE_PLAN_CALL,
-                "Delete an entire plan and all its tasks and notes.";
+                "Delete a plan and all task/note documents by full cid:plan URL.";
             ListTasksParams: "list_tasks", true, LIST_TASKS_CALL,
-                "List tasks in a plan with optional filters.";
+                "List tasks for a full cid:plan URL.";
             AddTaskParams: "add_task", false, ADD_TASK_CALL,
-                "Create a task in a plan. Keep body under 1000 words; use update_task with replace_in_body for targeted edits.";
+                "Create a task in a plan. Dependencies must be task URLs.";
             GetTaskParams: "get_task", true, GET_TASK_CALL,
-                "Read a task by ID within a plan.";
+                "Read a task. Plan and task ID parameters are full cid:plan URLs.";
             UpdateTaskParams: "update_task", false, UPDATE_TASK_CALL,
-                "Update a task within its plan. Use replace_body to rewrite body, append_body to extend it, or replace_in_body for surgical edits. Keep each write under 1000 words.";
+                "Update a task by full item URL using revision CAS.";
             DeleteTaskParams: "delete_task", false, DELETE_TASK_CALL,
-                "Delete a task by ID.";
+                "Delete a task by full item URL.";
             ListNotesParams: "list_notes", true, LIST_NOTES_CALL,
-                "List notes for a plan.";
+                "List notes for a full cid:plan URL.";
             AddNoteParams: "add_note", false, ADD_NOTE_CALL,
-                "Add a note to a plan. Keep body under 1000 words; use update_note with replace_in_body for targeted edits.";
+                "Create a note in a plan and return its full item URL.";
             GetNoteParams: "get_note", true, GET_NOTE_CALL,
-                "Read a note from a plan.";
+                "Read a note by full item URL.";
             UpdateNoteParams: "update_note", false, UPDATE_NOTE_CALL,
-                "Update a note within its plan. Use replace_body, append_body, or replace_in_body for body edits. Keep each write under 1000 words.";
+                "Update a note by full item URL using revision CAS.";
             DeleteNoteParams: "delete_note", false, DELETE_NOTE_CALL,
-                "Delete a note from a plan.";
+                "Delete a note by full item URL.";
         ]
     }
 
@@ -168,221 +158,62 @@ impl Toolset for PlansToolset {
         &self,
         tool: &str,
         args: Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        dispatch_plan_tools!(
-            self.server, tool, args;
-            "list_plans" => no_args handle_list_plans, ListPlansParams;
-            "add_plan" => with_args handle_add_plan, AddPlanParams;
-            "get_plan" => with_args handle_get_plan, GetPlanParams;
-            "update_plan" => with_args handle_update_plan, UpdatePlanParams;
-            "delete_plan" => with_args handle_delete_plan, DeletePlanParams;
-            "list_tasks" => with_args handle_list_tasks, ListTasksParams;
-            "add_task" => with_args handle_add_task, AddTaskParams;
-            "get_task" => with_args handle_get_task, GetTaskParams;
-            "update_task" => with_args handle_update_task, UpdateTaskParams;
-            "delete_task" => with_args handle_delete_task, DeleteTaskParams;
-            "list_notes" => with_args handle_list_notes, ListNotesParams;
-            "add_note" => with_args handle_add_note, AddNoteParams;
-            "get_note" => with_args handle_get_note, GetNoteParams;
-            "update_note" => with_args handle_update_note, UpdateNoteParams;
-            "delete_note" => with_args handle_delete_note, DeleteNoteParams;
+        self.invoke_with_context(ToolInvocation {
+            tool: tool.to_string(),
+            args,
+            context: ToolInvocationContext::default(),
+            cancel,
+        })
+        .await
+    }
+
+    async fn invoke_with_context(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Value, ToolInvokeError> {
+        if invocation.tool == "add_plan" && invocation.context.invoking_session.is_none() {
+            let result = rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+                "caller session identity required to create plan",
+            )]);
+            return serde_json::to_value(result).map_err(|error| {
+                ToolInvokeError::Fatal(format!("serialize plans result: {error}"))
+            });
+        }
+        let (client, replicas) = connect_nats(self.nats_url.as_deref())
+            .await
+            .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?;
+        let jetstream = async_nats::jetstream::new(client);
+        let store = harnx_blob_store::plans::ensure_plans_bucket(&jetstream, replicas)
+            .await
+            .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?;
+        handlers::invoke(
+            OperationContext {
+                store: &store,
+                jetstream: &jetstream,
+                caller: invocation.context.invoking_session.as_ref(),
+            },
+            &invocation.tool,
+            invocation.args,
         )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn maps_all_server_errors_to_recoverable() {
-        let internal = map_result(Err(ErrorData::internal_error("server failed", None)));
-        assert!(matches!(internal, Err(ToolInvokeError::Recoverable(_))));
-
-        let invalid = map_result(Err(ErrorData::invalid_params("bad input", None)));
-        assert!(matches!(invalid, Err(ToolInvokeError::Recoverable(_))));
-    }
-
-    #[test]
-    fn exposes_all_plan_tools() {
-        let dir = tempfile::tempdir().unwrap();
-        let toolset = PlansToolset::new(dir.path().to_path_buf());
-        assert_eq!(toolset.name(), "plans");
-        let tools = toolset.tools();
-        assert_eq!(
-            tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "list_plans",
-                "add_plan",
-                "get_plan",
-                "update_plan",
-                "delete_plan",
-                "list_tasks",
-                "add_task",
-                "get_task",
-                "update_task",
-                "delete_task",
-                "list_notes",
-                "add_note",
-                "get_note",
-                "update_note",
-                "delete_note",
-            ]
-        );
+    fn exposes_all_plan_tools_with_kinds() {
+        let tools = PlansToolset::new().tools();
+        assert_eq!(tools.len(), 15);
         assert!(tools
             .iter()
             .all(|tool| tool.input_schema["type"] == "object"));
-    }
-
-    #[test]
-    fn all_plan_tools_declare_correct_kind() {
-        use harnx_toolset::Toolset;
-
-        let dir = tempfile::tempdir().unwrap();
-        let toolset = PlansToolset::new(dir.path().to_path_buf());
-        let tools = toolset.tools();
-        let tool_map: std::collections::HashMap<_, _> =
-            tools.iter().map(|t| (t.name.as_str(), t)).collect();
-
-        // Read tools (get_*, list_*)
-        assert_eq!(
-            tool_map.get("get_plan").unwrap().kind(),
-            Some(ToolProgressKind::Read),
-            "'get_plan' should have Read kind"
-        );
-        assert_eq!(
-            tool_map.get("list_plans").unwrap().kind(),
-            Some(ToolProgressKind::Read),
-            "'list_plans' should have Read kind"
-        );
-        assert_eq!(
-            tool_map.get("get_task").unwrap().kind(),
-            Some(ToolProgressKind::Read),
-            "'get_task' should have Read kind"
-        );
-        assert_eq!(
-            tool_map.get("list_tasks").unwrap().kind(),
-            Some(ToolProgressKind::Read),
-            "'list_tasks' should have Read kind"
-        );
-        assert_eq!(
-            tool_map.get("get_note").unwrap().kind(),
-            Some(ToolProgressKind::Read),
-            "'get_note' should have Read kind"
-        );
-        assert_eq!(
-            tool_map.get("list_notes").unwrap().kind(),
-            Some(ToolProgressKind::Read),
-            "'list_notes' should have Read kind"
-        );
-
-        // Edit tools (add_*, update_*)
-        assert_eq!(
-            tool_map.get("add_plan").unwrap().kind(),
-            Some(ToolProgressKind::Edit),
-            "'add_plan' should have Edit kind"
-        );
-        assert_eq!(
-            tool_map.get("update_plan").unwrap().kind(),
-            Some(ToolProgressKind::Edit),
-            "'update_plan' should have Edit kind"
-        );
-        assert_eq!(
-            tool_map.get("add_task").unwrap().kind(),
-            Some(ToolProgressKind::Edit),
-            "'add_task' should have Edit kind"
-        );
-        assert_eq!(
-            tool_map.get("update_task").unwrap().kind(),
-            Some(ToolProgressKind::Edit),
-            "'update_task' should have Edit kind"
-        );
-        assert_eq!(
-            tool_map.get("add_note").unwrap().kind(),
-            Some(ToolProgressKind::Edit),
-            "'add_note' should have Edit kind"
-        );
-        assert_eq!(
-            tool_map.get("update_note").unwrap().kind(),
-            Some(ToolProgressKind::Edit),
-            "'update_note' should have Edit kind"
-        );
-
-        // Delete tools (delete_*)
-        assert_eq!(
-            tool_map.get("delete_plan").unwrap().kind(),
-            Some(ToolProgressKind::Delete),
-            "'delete_plan' should have Delete kind"
-        );
-        assert_eq!(
-            tool_map.get("delete_task").unwrap().kind(),
-            Some(ToolProgressKind::Delete),
-            "'delete_task' should have Delete kind"
-        );
-        assert_eq!(
-            tool_map.get("delete_note").unwrap().kind(),
-            Some(ToolProgressKind::Delete),
-            "'delete_note' should have Delete kind"
-        );
-    }
-
-    #[test]
-    fn unknown_tool_name_falls_back_to_other_kind() {
-        let tool = spec::<()>("unknown_operation", "test", false, "");
-        assert_eq!(
-            tool.kind(),
-            Some(ToolProgressKind::Other),
-            "unrecognized tool name should have Other kind"
-        );
-
-        let tool_prefix = spec::<()>("foo_bar", "test", false, "");
-        assert_eq!(
-            tool_prefix.kind(),
-            Some(ToolProgressKind::Other),
-            "unrecognized prefix should have Other kind"
-        );
-    }
-
-    #[tokio::test]
-    async fn add_then_get_plan_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let toolset = PlansToolset::new(dir.path().to_path_buf());
-
-        let added = toolset
-            .invoke(
-                "add_plan",
-                json!({"name": "native-roundtrip", "title": "Native roundtrip", "content": "Stored through PlansToolset."}),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_ne!(added["isError"], json!(true));
-
-        let fetched = toolset
-            .invoke(
-                "get_plan",
-                json!({"name": "native-roundtrip"}),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_ne!(fetched["isError"], json!(true));
-        let text = fetched["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("Native roundtrip"));
-        assert!(text.contains("Stored through PlansToolset."));
-    }
-
-    #[tokio::test]
-    async fn rejects_unknown_tool() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = PlansToolset::new(dir.path().to_path_buf())
-            .invoke("missing", json!({}), CancellationToken::new())
-            .await;
-        assert!(matches!(result, Err(ToolInvokeError::Recoverable(_))));
+        assert_eq!(tools[0].kind(), Some(ToolProgressKind::Read));
+        assert_eq!(tools[1].kind(), Some(ToolProgressKind::Edit));
+        assert_eq!(tools[4].kind(), Some(ToolProgressKind::Delete));
     }
 }

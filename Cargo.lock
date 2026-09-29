@@ -3920,6 +3920,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "tokio-util",
 ]
@@ -4435,28 +4436,23 @@ name = "harnx-plans-tools"
 version = "0.34.7"
 dependencies = [
  "anyhow",
+ "async-nats",
  "async-trait",
- "axum",
  "chrono",
- "filetime",
+ "harnx-blob-store",
  "harnx-core",
- "harnx-healthz",
- "harnx-metrics",
  "harnx-nats-common",
+ "harnx-test-bins",
  "harnx-toolset",
  "harnx-toolset-server",
  "log",
- "reqwest",
  "rmcp",
  "schemars 1.2.2",
  "serde",
  "serde_json",
- "serde_yaml",
  "similar 3.2.0",
- "tempfile",
  "tokio",
  "tokio-util",
- "tower",
 ]
 
 [[package]]

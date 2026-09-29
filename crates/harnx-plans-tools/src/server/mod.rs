@@ -1,55 +1,5 @@
-//! Plans MCP server implementation.
-//!
-//! Stores plans under per-plan directories using YAML front matter + markdown body.
-//! Layout: `<data-dir>/<plan>/plan.md`, `<data-dir>/<plan>/tasks/<id>.md`, and
-//! `<data-dir>/<plan>/notes/<id>.md`.
+//! NATS-backed plan/task/note tool handlers.
 
-use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    Implementation, ListToolsResult, MetaObject, PaginatedRequestParams, ServerCapabilities,
-    ServerConfig, Tool,
-};
-use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
-use rmcp::service::{RequestContext, RoleServer};
-use rmcp::ServerHandler;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
-use similar::{ChangeTag, TextDiff};
-use std::borrow::Cow;
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-
-mod handler;
-mod handlers;
-mod params;
-mod store;
-#[cfg(test)]
-mod tests;
-
-pub(crate) use params::*;
-pub use store::cleanup_loop;
-pub(crate) use store::*;
-
-use crate::tool_templates;
-
-/// Build a `_meta` block from a tool's call template plus the result template
-/// every plans tool shares.
-fn tool_meta(call_template: &str) -> MetaObject {
-    MetaObject(
-        json!({
-            "call_template": call_template,
-            "result_template": tool_templates::RESULT,
-        })
-        .as_object()
-        .expect("object literal")
-        .clone(),
-    )
-}
-
-#[derive(Clone)]
-pub struct PlansServer {
-    dir: PathBuf,
-    pub(crate) filter: Option<Arc<harnx_toolset_server::globset::GlobSet>>,
-}
+pub(crate) mod handlers;
+pub(crate) mod params;
+pub(crate) mod store;

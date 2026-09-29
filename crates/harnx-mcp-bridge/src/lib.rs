@@ -800,14 +800,19 @@ mod tests {
             "--",
             "harnx-plans-tools",
             "--mcp-stdio",
-            "--dir",
-            ".agent/plans",
+            "--enable-tool",
+            "list_plans",
         ]);
 
         assert_eq!(args.name.as_deref(), Some("plans"));
         assert_eq!(
             args.child,
-            ["harnx-plans-tools", "--mcp-stdio", "--dir", ".agent/plans"]
+            [
+                "harnx-plans-tools",
+                "--mcp-stdio",
+                "--enable-tool",
+                "list_plans"
+            ]
         );
     }
 
@@ -851,7 +856,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn caches_raw_plans_tool_specs() {
-        let plans_dir = tempfile::tempdir().expect("create temporary plans directory");
         let plans_binary = option_env!("CARGO_BIN_EXE_harnx-plans-tools")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -869,12 +873,7 @@ mod tests {
         );
         let bridge = BridgeToolset::new(
             "plans",
-            vec![
-                plans_binary.display().to_string(),
-                "--mcp-stdio".to_owned(),
-                "--dir".to_owned(),
-                plans_dir.path().display().to_string(),
-            ],
+            vec![plans_binary.display().to_string(), "--mcp-stdio".to_owned()],
         )
         .await
         .expect("connect to plans MCP server");
@@ -894,7 +893,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn plans_command(dir: &std::path::Path) -> Vec<String> {
+    fn plans_command() -> Vec<String> {
         let plans_binary = option_env!("CARGO_BIN_EXE_harnx-plans-tools")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -910,12 +909,7 @@ mod tests {
             "harnx-plans-tools binary missing at {}; build it before this test",
             plans_binary.display()
         );
-        vec![
-            plans_binary.display().to_string(),
-            "--mcp-stdio".to_owned(),
-            "--dir".to_owned(),
-            dir.display().to_string(),
-        ]
+        vec![plans_binary.display().to_string(), "--mcp-stdio".to_owned()]
     }
 
     #[cfg(unix)]
@@ -928,8 +922,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_bridge_terminates_child() {
-        let plans_dir = tempfile::tempdir().expect("create temporary plans directory");
-        let bridge = BridgeToolset::new("plans", plans_command(plans_dir.path()))
+        let bridge = BridgeToolset::new("plans", plans_command())
             .await
             .expect("connect to plans MCP server");
         let pid = bridge.child_id().expect("child process ID");
@@ -948,8 +941,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn child_death_cancels_token() {
-        let plans_dir = tempfile::tempdir().expect("create temporary plans directory");
-        let bridge = BridgeToolset::new("plans", plans_command(plans_dir.path()))
+        let bridge = BridgeToolset::new("plans", plans_command())
             .await
             .expect("connect to plans MCP server");
         let pid = bridge.child_id().expect("child process ID");
@@ -968,8 +960,7 @@ mod tests {
         use harnx_toolset::{ToolInvokeError, Toolset};
         use tokio_util::sync::CancellationToken;
 
-        let plans_dir = tempfile::tempdir().expect("create temporary plans directory");
-        let bridge = BridgeToolset::new("plans", plans_command(plans_dir.path()))
+        let bridge = BridgeToolset::new("plans", plans_command())
             .await
             .expect("connect to plans MCP server");
 
