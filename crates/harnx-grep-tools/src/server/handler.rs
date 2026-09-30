@@ -305,8 +305,11 @@ mod wire_tests {
     type TestClientService = RunningService<RoleClient, TestClientHandler>;
 
     async fn setup_client_server() -> (TestClientService, TestServerService) {
+        setup_client_server_for(GrepServer::new()).await
+    }
+
+    async fn setup_client_server_for(server: GrepServer) -> (TestClientService, TestServerService) {
         let (client_transport, server_transport) = duplex(65_536);
-        let server = GrepServer::new();
 
         let server_fut = serve_server(server, server_transport);
         let client_fut = serve_client(TestClientHandler, client_transport);
@@ -368,24 +371,6 @@ mod wire_tests {
             mock_server: &MockServer,
         ) -> (TestClientService, TestServerService) {
             setup_client_server_for(GrepServer::with_base_url(mock_server.uri())).await
-        }
-
-        async fn setup_client_server_for(
-            server: GrepServer,
-        ) -> (TestClientService, TestServerService) {
-            let (client_transport, server_transport) = duplex(65_536);
-
-            let server_fut = serve_server(server, server_transport);
-            let client_fut = serve_client(TestClientHandler, client_transport);
-
-            let (server_res, client_res): (
-                Result<TestServerService, _>,
-                Result<TestClientService, _>,
-            ) = tokio::join!(server_fut, client_fut);
-
-            let server = server_res.unwrap();
-            let client = client_res.unwrap();
-            (client, server)
         }
 
         #[tokio::test]

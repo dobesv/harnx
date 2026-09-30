@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -394,6 +393,7 @@ async fn llama_server_mock_name_as_hf_repo() -> Result<()> {
 mod parent_death {
     use super::*;
     use std::os::unix::net::UnixStream;
+    use std::process::Command;
 
     /// Env vars handing the helper process its paths. See
     /// [`llama_server_child_does_not_outlive_parent_process`].

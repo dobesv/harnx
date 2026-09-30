@@ -22,7 +22,7 @@ impl Fixture {
     }
 
     async fn with_args(toolset: TestToolset, args: serde_json::Value) -> Result<Self> {
-        let harness = TestHarness::with_toolset(toolset)
+        let harness = TestHarness::with_toolset(toolset, None)
             .await?
             .context("nats-server required")?;
         common::wait_for_registration(&harness.client, &harness.instance_id).await?;

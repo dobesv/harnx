@@ -364,20 +364,11 @@ pub(crate) struct TestHarness {
 
 impl TestHarness {
     pub(crate) async fn start() -> Result<Option<Self>> {
-        Self::with_toolset(TestToolset::default()).await
+        Self::with_toolset(TestToolset::default(), None).await
     }
 
-    pub(crate) async fn with_toolset(toolset: TestToolset) -> Result<Option<Self>> {
-        Self::spawn(toolset, None).await
-    }
-
-    /// A harness whose server renews its KV registration every `interval`
-    /// instead of the production 30s.
-    pub(crate) async fn with_refresh_interval(interval: Duration) -> Result<Option<Self>> {
-        Self::spawn(TestToolset::default(), Some(interval)).await
-    }
-
-    async fn spawn(
+    /// `refresh_interval` overrides the server's 30s registration renewal.
+    pub(crate) async fn with_toolset(
         toolset: TestToolset,
         refresh_interval: Option<Duration>,
     ) -> Result<Option<Self>> {

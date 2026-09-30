@@ -47,7 +47,7 @@ async fn replay(harness: &TestHarness, request: &ToolRequest) -> Result<ToolRepl
 async fn tool_server_replays_idempotent_operation_and_persists_reply() -> Result<()> {
     let mut toolset = common::TestToolset::default();
     toolset.idempotent = true;
-    let mut harness = TestHarness::with_toolset(toolset)
+    let mut harness = TestHarness::with_toolset(toolset, None)
         .await?
         .context("nats-server required")?;
     let (journal, request) = interrupted_call(&harness, "echo").await?;
@@ -128,7 +128,7 @@ async fn tool_server_rejects_non_retryable_replay_without_invoking() -> Result<(
 async fn replay_cannot_change_original_arguments() -> Result<()> {
     let mut toolset = common::TestToolset::default();
     toolset.idempotent = true;
-    let mut harness = TestHarness::with_toolset(toolset)
+    let mut harness = TestHarness::with_toolset(toolset, None)
         .await?
         .context("nats-server required")?;
     let (_, mut request) = interrupted_call(&harness, "echo").await?;
