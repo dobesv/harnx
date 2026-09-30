@@ -339,7 +339,9 @@ impl IdleWatcher for crate::lifecycle::SandboxManager {
 #[async_trait::async_trait]
 impl SessionDisconnect for Arc<dyn crate::mcp::McpCaller> {
     async fn disconnect(&self, sandbox_id: &str) {
-        self.disconnect(sandbox_id).await;
+        // Name the inner trait explicitly. `self.disconnect` resolves to this
+        // impl first and recursed until the Tokio worker stack overflowed (#2177).
+        crate::mcp::McpCaller::disconnect(&**self, sandbox_id).await;
     }
 }
 

@@ -439,3 +439,115 @@ async fn follower_readiness_independent_of_leadership() {
         .await
         .expect("leader should shut down");
 }
+
+/// Records `McpCaller::disconnect` calls so tests can drive the production
+/// `SessionDisconnect for Arc<dyn McpCaller>` adapter instead of a mock.
+struct RecordingMcpCaller {
+    disconnected: tokio::sync::Mutex<Vec<String>>,
+    notify: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl crate::mcp::McpCaller for RecordingMcpCaller {
+    async fn call(
+        &self,
+        _sandbox_id: &str,
+        _endpoint: &str,
+        _tool: &str,
+        _args: serde_json::Map<String, serde_json::Value>,
+        _capabilities: std::collections::BTreeSet<String>,
+        _cancel: CancellationToken,
+    ) -> Result<serde_json::Value, crate::mcp::McpCallError> {
+        unreachable!("idle watcher never proxies tool calls")
+    }
+
+    async fn disconnect(&self, sandbox_id: &str) {
+        self.disconnected.lock().await.push(sandbox_id.to_string());
+        self.notify.notify_one();
+    }
+}
+
+fn recording_caller() -> (Arc<RecordingMcpCaller>, Arc<dyn crate::mcp::McpCaller>) {
+    let recorder = Arc::new(RecordingMcpCaller {
+        disconnected: tokio::sync::Mutex::new(Vec::new()),
+        notify: tokio::sync::Notify::new(),
+    });
+    let caller: Arc<dyn crate::mcp::McpCaller> = recorder.clone();
+    (recorder, caller)
+}
+
+/// Regression for #2177: the adapter called itself instead of the inner
+/// `McpCaller`, so the first disconnect overflowed the worker stack and
+/// aborted the process.
+#[tokio::test]
+async fn arc_mcp_caller_session_disconnect_reaches_inner_caller() {
+    let (recorder, caller) = recording_caller();
+
+    SessionDisconnect::disconnect(&caller, "sandbox-a").await;
+
+    assert_eq!(*recorder.disconnected.lock().await, vec!["sandbox-a"]);
+}
+
+/// Idle watcher that reports one hibernated sandbox and then idles until
+/// cancelled, like a leader's scan that suspends a sandbox.
+#[derive(Clone)]
+struct HibernateOnceWatcher {
+    sandbox_id: String,
+}
+
+#[async_trait::async_trait]
+impl IdleWatcher for HibernateOnceWatcher {
+    async fn run_idle_watcher(
+        &self,
+        cancel: CancellationToken,
+        hibernated: mpsc::UnboundedSender<String>,
+        _scan_interval: Duration,
+    ) {
+        let _ = hibernated.send(self.sandbox_id.clone());
+        cancel.cancelled().await;
+    }
+}
+
+/// Drives the leader's suspend-then-disconnect path with the production
+/// `Arc<dyn McpCaller>` adapter (#2177).
+#[tokio::test]
+async fn leader_disconnects_hibernated_sandbox_through_mcp_caller() {
+    let Some((_nats, url, _temp_dir)) = start_nats_server().await else {
+        println!("Skipping: nats-server not available");
+        return;
+    };
+    let client = async_nats::connect(&url).await.expect("connect");
+    let jetstream = async_nats::jetstream::new(client);
+    let (recorder, caller) = recording_caller();
+    let shutdown = CancellationToken::new();
+    let config = LeaseGatedWatcherConfig {
+        namespace: format!("test-namespace-{}", uuid::Uuid::new_v4()),
+        scan_interval: Duration::from_millis(100),
+    };
+    let watcher = HibernateOnceWatcher {
+        sandbox_id: "sandbox-idle".to_string(),
+    };
+
+    let leader_shutdown = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        run_lease_gated_idle_watcher(jetstream, config, watcher, caller, leader_shutdown).await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !recorder.disconnected.lock().await.is_empty() {
+                return;
+            }
+            recorder.notify.notified().await;
+        }
+    })
+    .await
+    .expect("leader should disconnect the hibernated sandbox");
+    assert_eq!(*recorder.disconnected.lock().await, vec!["sandbox-idle"]);
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("leader should shut down")
+        .expect("leader task should complete");
+}
