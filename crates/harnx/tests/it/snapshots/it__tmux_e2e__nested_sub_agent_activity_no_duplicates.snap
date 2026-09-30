@@ -1,0 +1,82 @@
+---
+source: crates/harnx/tests/it/tmux_e2e.rs
+expression: normalized
+---
+Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
+nested-parent
+🤖 nested-parent ▸ mock-llm:test ▸ [SID]
+> do nested delegation
+
+Parent delegating to researcher.
+
+@ nested-researcher
+Research this deeply and delegate analysis.
+> nested-researcher ▸ [SID]
+Researcher delegating to analyst.
+
+@ nested-analyst
+Analyze data and report back.
+> nested-analyst ▸ [SID]
+Analyst complete
+
+> nested-researcher ▸ [SID]
+session_id: [SID]
+response: Analyst complete
+Researcher complete
+
+session_id: [SID]
+response: Researcher delegating to analyst.
+Nested task complete
+
+🤖 nested-parent ▸   💬 [N]
+No more scripted responses.
+
+🤖 nested-parent ▸   💬 [N]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+* 🤖 nested-parent ▸ mock-llm:test ▸ [SID]

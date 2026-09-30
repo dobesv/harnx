@@ -1081,8 +1081,8 @@ local frontends for the persistent endpoint policy: an old broker owner still
 deletes its discovery metadata at shutdown. No transcript variant is added.
 
 Regression coverage lives in `nats_local_server/failover.rs`,
-`local_worker_supervisor.rs`, `harnx-runtime/tests/interruption_fencing.rs`, and
-`harnx-nats-common/tests/registry_ttl/recovery.rs`. Failover tests must retain
+`local_worker_supervisor.rs`, `harnx-runtime/tests/it/interruption_fencing.rs`, and
+`harnx-nats-common/tests/it/registry_ttl/recovery.rs`. Failover tests must retain
 existing clients and in-flight work while removing the broker owner; reconnecting
 a newly constructed client alone does not establish recovery.
 

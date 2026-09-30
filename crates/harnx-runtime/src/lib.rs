@@ -66,5 +66,5 @@ pub use agent_loop::{
 pub use tool::{ConfirmToolUseFn, ToolApprovalInterrupt, ToolUseConfirmation};
 
 #[cfg(test)]
-#[path = "../tests/common/mod.rs"]
+#[path = "../tests/it/common/mod.rs"]
 mod nats_test_common;

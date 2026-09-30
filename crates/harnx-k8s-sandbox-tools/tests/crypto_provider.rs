@@ -11,7 +11,7 @@
 //!
 //! This must live in a crate whose graph also pulls in the AWS SDK. A crate that resolves rustls
 //! with `ring` alone cannot reproduce the ambiguity, so the assertion would pass no matter what
-//! the code did. See `crates/harnx-runtime/tests/tls_client_config.rs` for the same reasoning.
+//! the code did. See `crates/harnx-runtime/tests/it/tls_client_config.rs` for the same reasoning.
 //!
 //! The test mutates the process-global default provider, so it needs nextest's per-test process
 //! isolation and must not run under `cargo test`.

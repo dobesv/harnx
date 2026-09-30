@@ -308,7 +308,7 @@ impl NatsEndpoint {
     /// which resolves rustls' *process-default* `CryptoProvider` and panics when
     /// several provider features are compiled in and nothing installed a
     /// default — which is this workspace exactly. See
-    /// `crates/harnx-runtime/tests/tls_client_config.rs`, which reproduces the
+    /// `crates/harnx-runtime/tests/it/tls_client_config.rs`, which reproduces the
     /// panic from a crate whose dependency graph has that ambiguity.
     ///
     /// Building the config here is also what lets `tls_ca` and a client
