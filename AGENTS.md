@@ -133,9 +133,10 @@ live in `tests/it/snapshots/` with an `it__` prefix.
 ### Broker-backed tests and wall-clock margins
 
 Tests that spawn a `nats-server` run in the `broker-e2e` / `heavy-e2e` groups
-(`.config/nextest.toml`). On a contended GitHub runner that whole block has been
-measured running 6 to 40 times its idle cost, comparing runs whose diffs did not
-touch it: `cancellation::hierarchy::direct_child_cancellation_stops_only_its_worker_subtree`
+(`.config/nextest.toml`; local runs use `-local` copies with higher caps). On
+a contended GitHub runner that whole block has been measured running 6 to 40
+times its idle cost, comparing runs whose diffs did not touch it:
+`cancellation::hierarchy::direct_child_cancellation_stops_only_its_worker_subtree`
 went 0.53s to 21.2s, and the ubuntu job 184s to 483s. Tests whose duration is a
 fixed sleep stayed flat, so the cause is starvation of real work rather than
 clock skew. The trigger is not understood.

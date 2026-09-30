@@ -19,17 +19,24 @@ heavy-e2e = { max-threads = 1 }
 # Bound their aggregate process/thread load so one test's broker is not starved
 # or killed when the workspace suite fans out on high-core-count runners.
 broker-e2e = { max-threads = 8 }
+# The same groups for local runs, where these caps set the wall time: at 1 and
+# 8, the 16 heavy tests alone took the whole ~100s on a 24-core box. At 3 and
+# 16 a full run takes ~58s, and 16 such runs had no failures. A cap above
+# nextest's thread count (one per CPU) has no effect, so smaller machines get
+# what they had. CI keeps the tighter groups on its 4-CPU runners.
+heavy-e2e-local = { max-threads = 3 }
+broker-e2e-local = { max-threads = 16 }
 
 [profile.default]
 retries = 0
 
 [[profile.default.overrides]]
 filter = 'test(/^tmux_e2e::/) | test(/^interrupt_e2e::/)'
-test-group = 'heavy-e2e'
+test-group = 'heavy-e2e-local'
 
 [[profile.default.overrides]]
 filter = 'binary(/nats/) | test(/^local_worker_supervisor::/) | test(/nats/) | test(/subagent_replay/) | test(/tool_confirmation/) | test(/nats_tool_provider/)'
-test-group = 'broker-e2e'
+test-group = 'broker-e2e-local'
 
 [profile.ci]
 # Retry transient (timing/load-induced) flakes. A real failure fails all attempts.
