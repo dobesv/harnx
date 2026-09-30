@@ -2,9 +2,15 @@
 //!
 //! Validates end-to-end persistence of a full turn via NatsSessionLog.
 
+#[path = "nats_worker/activation_error_disposition.rs"]
+mod activation_error_disposition;
+#[path = "nats_worker/activation_failure_budget.rs"]
+mod activation_failure_budget;
 #[path = "nats_worker/cancellation.rs"]
 mod cancellation;
 use crate::common;
+#[path = "nats_worker/failed_assistant_recovery.rs"]
+mod failed_assistant_recovery;
 #[path = "nats_worker/manual_compaction.rs"]
 mod manual_compaction;
 use crate::generation;

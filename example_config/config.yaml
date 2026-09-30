@@ -23,6 +23,11 @@ title_update_threshold: 50000
 # here to add a time cadence as an example.
 title_update_interval_secs: 30
 
+# ---- NATS session admission ----
+# Maximum time to wait for a worker to claim an activated session (default 60).
+# Must be greater than zero.
+nats_lease_acquisition_timeout_secs: 60
+
 # ---- tool-use ----
 tool_use: true
 use_tools: '*'

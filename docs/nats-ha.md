@@ -660,7 +660,7 @@ that is the price of keeping the transcript's length off the interrupt's path.
 ### Failover vs user cancellation
 
 Worker session execution distinguishes **failover** from **user cancellation**
-because confusing them causes work loss:
+because confusing them causes work loss.
 
 - **User cancellation** (`AbortSignal` with `aborted_ctrlc()` /
   `aborted_ctrld()`): writes a durable `Cancel` to the session log and
@@ -674,6 +674,32 @@ because confusing them causes work loss:
 The `FinishCause` enum (`execution_control.rs`) encodes this distinction:
 `UserCancelled` vs `Failover(Shutdown|LeaseLost)`. Only `UserCancelled` and
 `Completed{settled:true, has_queued_input:false}` produce terminal ACK.
+
+### Activation dispositions
+
+An activation's final JetStream acknowledgement determines whether a
+replacement worker may resume:
+
+- **Progress ACK** (`AckKind::Progress`): sent immediately when a worker
+  receives the activation, then every `ack_wait/3` (10s in production) while
+  the session runs. Prevents redelivery during normal execution.
+- **Terminal ACK** (`AckKind::Ack`): the session is complete; no replacement
+  worker will resume. Used for `UserCancelled` and
+  `Completed{settled:true, has_queued_input:false}`.
+- **Terminal NAK with Term** (`AckKind::Term`): the activation cannot succeed.
+  Malformed payloads are terminated without a session-log write. Permanent
+  failures and ten genuine pre-turn infrastructure failures are terminated only
+  after persisting `SessionLogEntry::Error`.
+- **Non-terminal NAK** (`AckKind::Nak(None)`): failover path. The replacement
+  worker resumes from the journal. Used for lease loss, shutdown, and
+  transient pre-turn failures.
+- **Busy NAK** (`AckKind::Nak(10–12s)`): in-memory fast-path for
+  already-running sessions or foreign lease holders. Avoids expensive
+  session-log reads when another worker is active and does not consume the
+  failure budget.
+- **Delayed NAK** (`AckKind::Nak(0.1–2s)`): exponential backoff for
+  targeted-activation failures. Retries with increasing delay up to 2s
+  maximum.
 
 **Remote tool calls must not be cancelled on failover.** When a worker receives
 a failover abort signal, `NatsToolProvider::invoke_tool`
@@ -738,8 +764,8 @@ parent's cancellation id and winds up instead. The walk follows parent links
 upward, at most 32 levels, and fails closed: a parent log it cannot read is
 never taken for "the parent is still waiting". As implemented, that failure
 ends the child's turn with an `Error` entry rather than being retried — the
-activation is not NAKed for another attempt, so a transient read failure
-costs the child its turn.
+activation is Term'd, not retried, so a transient read failure costs the child
+its turn.
 
 **Idempotent wind-up cancels.** When the root is activated, its wind-up resends
 a cancel for every call with no journal reply, catching any child that slipped

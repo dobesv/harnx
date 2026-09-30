@@ -57,7 +57,7 @@ async fn nats_completion_reports_never_claimed_activation_as_terminal_orphan() -
     let reason = update
         .orphaned
         .expect("an activation no worker claims must become terminal");
-    assert!(reason.contains("No worker claimed this session within 60 seconds"));
+    assert!(reason.contains("No worker claimed this session"));
     Ok(())
 }
 
@@ -90,7 +90,13 @@ async fn nats_completion_reads_only_entries_after_its_successful_cursor() -> Res
         usage: None,
     })
     .await?;
-    let updates = updates(js, "incremental".into(), history, None);
+    let updates = updates(
+        js,
+        "incremental".into(),
+        history,
+        None,
+        super::super::LEASE_ACQUISITION_TIMEOUT,
+    );
     tokio::pin!(updates);
     let update = updates.next().await.unwrap()?;
     assert_eq!(update.entries.len(), 2);
@@ -124,7 +130,13 @@ async fn nats_completion_reports_persistent_read_failure_without_advisories() ->
     // responders, as happens when storage is unavailable during an outage.
     let mut js = async_nats::jetstream::with_prefix(client, "UNAVAILABLE");
     js.set_timeout(Duration::from_millis(100));
-    let updates = updates(js, "stalled-child".into(), Vec::new(), None);
+    let updates = updates(
+        js,
+        "stalled-child".into(),
+        Vec::new(),
+        None,
+        super::super::LEASE_ACQUISITION_TIMEOUT,
+    );
     tokio::pin!(updates);
     let result = tokio::time::timeout(Duration::from_secs(5), updates.next())
         .await?
@@ -150,7 +162,13 @@ async fn nats_completion_read_keeps_its_deadline_when_other_select_branches_win(
     client.flush().await?;
     let mut js = async_nats::jetstream::with_prefix(client, "BLACKHOLE");
     js.set_timeout(Duration::from_millis(100));
-    let updates = updates(js, "busy-advisories".into(), Vec::new(), None);
+    let updates = updates(
+        js,
+        "busy-advisories".into(),
+        Vec::new(),
+        None,
+        super::super::LEASE_ACQUISITION_TIMEOUT,
+    );
     tokio::pin!(updates);
     let mut advisories = tokio::time::interval(Duration::from_millis(10));
     let mut received = 0;

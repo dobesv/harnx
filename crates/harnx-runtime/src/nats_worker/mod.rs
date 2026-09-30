@@ -22,6 +22,8 @@
 //! - Supports future HA/lease wraps around the same `session_log_backend` seam
 
 mod activation;
+mod activation_delivery;
+mod activation_failure;
 mod activation_transport;
 mod agent_loop;
 mod ancestor_check;
