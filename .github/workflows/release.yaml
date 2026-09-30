@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   release:
-    name: Publish to GitHub Release
+    name: Publish to GitHub Release (${{ matrix.platform.target }}, ${{ matrix.shard.name }})
     permissions:
       contents: write
     outputs:
@@ -27,14 +27,14 @@ jobs:
       # success is still useful to ship.
       fail-fast: false
       matrix:
-        include:
+        platform:
         - target: aarch64-unknown-linux-musl
-          os: ubuntu-latest
-          use-cross: true
-          # This target has repeatedly lost its hosted runner during the
-          # release build. Bound concurrent compilers and avoid fat LTO's
-          # high link-time resource use on the 16 GB runner.
-          cargo-flags: "--jobs 2"
+          # Built natively on GitHub's ARM runner with musl-tools. Under
+          # `cross` on an x86_64 runner it needed `--jobs 2` to keep the runner
+          # alive and took 37-40 minutes; natively it takes about 21.
+          os: ubuntu-24.04-arm
+          native-musl: true
+          cargo-flags: ""
         - target: aarch64-apple-darwin
           os: macos-latest
           cargo-flags: ""
@@ -65,7 +65,34 @@ jobs:
         # 32-bit Windows (i686-pc-windows-msvc) is dropped too: it is a niche
         # platform now, and the job took 35 minutes of Windows runner time.
 
-    runs-on: ${{matrix.os}}
+        # Every platform builds its binaries in three parallel jobs. With fat
+        # LTO, each binary's link does whole-program optimisation and codegen
+        # on its own, and those links were most of a release build: on the
+        # 4-CPU runners, x86_64 Linux spent ~315s on dependencies then 3192
+        # CPU-seconds linking (19 min in all), x86_64 Windows 702s then 5698
+        # (36 min). Shards are balanced on those link times.
+        #
+        # Each shard takes one of the three big binaries (harnx, harnx-serve,
+        # harnx-worker, ~2x the others). Putting all of them and
+        # harnx-k8s-sandbox-tools in one shard ran their links at once and
+        # made the Windows shard take 51 minutes, likely from running out of
+        # the runner's 16 GB. Each package ships the binary named after it,
+        # except harnx-sandbox-common, which ships harnx-sandbox-exec.
+        shard:
+        - name: harnx
+          packages: >-
+            harnx harnx-bash-tools harnx-fetch-tools harnx-plans-tools
+            harnx-k8s-creds harnx-mcp-remote harnx-sandbox-run harnx-sandbox-common
+        - name: serve
+          packages: >-
+            harnx-serve harnx-fs-tools harnx-proxy-auth harnx-exa-tools
+            harnx-attachment-tools harnx-aws-creds
+        - name: worker
+          packages: >-
+            harnx-worker harnx-k8s-sandbox-tools harnx-grep-tools harnx-mcp-bridge
+            harnx-time-tools harnx-pkg
+
+    runs-on: ${{ matrix.platform.os }}
     env:
       BUILD_CMD: cargo
 
@@ -88,7 +115,7 @@ jobs:
     - name: Install Rust Toolchain Components
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: ${{ matrix.target }}
+        targets: ${{ matrix.platform.target }}
 
     # rust-toolchain.toml pins the active toolchain to a specific 1.x.y, so
     # `cargo build` ignores the `stable` toolchain dtolnay set up. The target
@@ -100,16 +127,23 @@ jobs:
     # no-op against the host toolchain.
     - name: Install Rust target for pinned toolchain
       shell: bash
-      run: rustup target add ${{ matrix.target }}
+      run: rustup target add ${{ matrix.platform.target }}
+
+    - name: Install musl tools
+      if: matrix.platform.native-musl
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools
+        echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
 
     - name: Install cross
-      if: matrix.use-cross
+      if: matrix.platform.use-cross
       uses: taiki-e/install-action@v2
       with:
         tool: cross
 
     - name: Overwrite build command env variable
-      if: matrix.use-cross
+      if: matrix.platform.use-cross
       shell: bash
       run: echo "BUILD_CMD=cross" >> $GITHUB_ENV
 
@@ -125,73 +159,54 @@ jobs:
 
     - name: Build
       shell: bash
+      env:
+        SHARD_PACKAGES: ${{ matrix.shard.packages }}
       run: |
         # Fat LTO takes over two hours for the macOS release binaries on
         # GitHub's standard runners. Keep the faster ThinLTO on Linux ARM too.
-        if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" || "${{ matrix.target }}" == *-apple-darwin ]]; then
+        # Elsewhere fat LTO is the faster one: with ~20 binaries linking in
+        # parallel on 4 CPUs, ThinLTO's extra work made x86_64 Windows take
+        # 51 minutes instead of 36, and x86_64 Linux 18.6 instead of 14.5.
+        if [[ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-musl" || "${{ matrix.platform.target }}" == *-apple-darwin ]]; then
           export CARGO_PROFILE_RELEASE_LTO=thin
         fi
-        $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
-          -p harnx -p harnx-serve -p harnx-worker \
-          -p harnx-attachment-tools -p harnx-bash-tools -p harnx-fs-tools -p harnx-exa-tools -p harnx-fetch-tools -p harnx-grep-tools -p harnx-plans-tools -p harnx-mcp-bridge -p harnx-mcp-remote -p harnx-time-tools \
-          -p harnx-aws-creds -p harnx-k8s-creds -p harnx-k8s-sandbox-tools -p harnx-pkg -p harnx-proxy-auth \
-          -p harnx-sandbox-run \
-          -p harnx-sandbox-common
+        packages=()
+        for package in $SHARD_PACKAGES; do
+          packages+=(-p "$package")
+        done
+        $BUILD_CMD build --locked --release --target=${{ matrix.platform.target }} ${{ matrix.platform.cargo-flags }} \
+          "${packages[@]}"
 
     - name: Build Archives
       shell: bash
       id: package
       env:
-        target: ${{ matrix.target }}
+        target: ${{ matrix.platform.target }}
         version:  ${{ steps.check-tag.outputs.version }}
+        SHARD_PACKAGES: ${{ matrix.shard.packages }}
       run: |
         set -euxo pipefail
 
         dist_dir=`pwd`/dist
         mkdir $dist_dir
 
-        # Each entry is "archive-name:bin1[,bin2...]" — the archive's
-        # filename uses archive-name; staged contents are the listed bins.
-        # Each binary ships in its own archive; harnx-sandbox-exec is packaged separately.
-        archive_specs=(
-          "harnx:harnx"
-          "harnx-serve:harnx-serve"
-          "harnx-worker:harnx-worker"
-          "harnx-attachment-tools:harnx-attachment-tools"
-          "harnx-bash-tools:harnx-bash-tools"
-          "harnx-fs-tools:harnx-fs-tools"
-          "harnx-exa-tools:harnx-exa-tools"
-          "harnx-fetch-tools:harnx-fetch-tools"
-          "harnx-grep-tools:harnx-grep-tools"
-          "harnx-plans-tools:harnx-plans-tools"
-          "harnx-mcp-bridge:harnx-mcp-bridge"
-          "harnx-mcp-remote:harnx-mcp-remote"
-          "harnx-time-tools:harnx-time-tools"
-          "harnx-aws-creds:harnx-aws-creds"
-          "harnx-k8s-creds:harnx-k8s-creds"
-          "harnx-k8s-sandbox-tools:harnx-k8s-sandbox-tools"
-          "harnx-pkg:harnx-pkg"
-          "harnx-proxy-auth:harnx-proxy-auth"
-          "harnx-sandbox-run:harnx-sandbox-run"
-          "harnx-sandbox-exec:harnx-sandbox-exec"
-        )
-
         archives=()
-        for spec in "${archive_specs[@]}"; do
-          archive_base="${spec%%:*}"
-          IFS=',' read -ra bins <<< "${spec#*:}"
+        for package in $SHARD_PACKAGES; do
+          # Each binary ships in its own archive named after it.
+          bin=$package
+          if [[ "$package" == harnx-sandbox-common ]]; then
+            bin=harnx-sandbox-exec
+          fi
 
-          name=$archive_base-$version-$target
-          staging=$dist_dir/$archive_base-stage
+          name=$bin-$version-$target
+          staging=$dist_dir/$bin-stage
           mkdir $staging
 
-          for bin in "${bins[@]}"; do
-            executable=target/$target/release/$bin
-            if [[ "$RUNNER_OS" == "Windows" ]]; then
-              executable=$executable.exe
-            fi
-            cp $executable $staging/
-          done
+          executable=target/$target/release/$bin
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            executable=$executable.exe
+          fi
+          cp $executable $staging/
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
               archive=$dist_dir/$name.zip
@@ -313,7 +328,8 @@ jobs:
   docker:
     name: Publish Docker Images
     needs: [release, web-assets]
-    if: always() && !cancelled()
+    # Pushes images, so only for a release tag, like the archive uploads.
+    if: always() && !cancelled() && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: read

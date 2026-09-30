@@ -1,10 +1,9 @@
 # harnx all-in-one image: server + tools + Web UI.
 #
-# Binary set invariant: every COPY'd binary below MUST appear in ALL FOUR release.yaml lists:
-#   1. cargo build -p (line ~129)
-#   2. archive_specs (lines ~149-167)
-#   3. docker job gh release download patterns (lines ~339-407)
-#   4. "Verify extracted binaries" loop (line ~423)
+# Binary set invariant: every COPY'd binary below MUST appear in ALL THREE release.yaml lists:
+#   1. a release shard's `packages` (the build matrix; it is both built and archived from there)
+#   2. docker job gh release download patterns
+#   3. "Verify extracted binaries" loop
 # Missing any one silently breaks the release build (COPY fails, download fails, or verify fails).
 FROM debian:bookworm-slim
 
