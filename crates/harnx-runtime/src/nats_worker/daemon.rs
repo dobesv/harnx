@@ -373,11 +373,35 @@ struct WorkerDaemonRuntimeSetup {
     shutdown: CancellationToken,
 }
 
+struct WorkerRuntimeBuild {
+    setup: WorkerDaemonRuntimeSetup,
+    startup: WorkerStartup,
+    services: WorkerServices,
+    instance_id: harnx_core::instance::ServerScope,
+    lease_bucket: async_nats::jetstream::kv::Store,
+    activation_failures: super::activation_failure::ActivationFailureTracker,
+}
+
 struct PreparedWorkerDaemon {
     runtime: Arc<WorkerRuntime>,
     consumer: jetstream::consumer::Consumer<pull::Config>,
 }
 
+fn log_worker_startup(
+    instance_id: &harnx_core::instance::ServerScope,
+    startup: &WorkerStartup,
+    daemon: &WorkerDaemonConfig,
+) {
+    log::info!(
+        "serving under server_scope='{}' session_scope={} worker_id={} pid={} build={} activation={:?}",
+        instance_id.as_str(),
+        startup.identity.session_scope,
+        startup.identity.worker_id,
+        startup.identity.pid,
+        startup.identity.build,
+        daemon.activation_mode,
+    );
+}
 async fn prepare_worker_daemon_runtime(
     mut setup: WorkerDaemonRuntimeSetup,
     readiness: &Option<harnx_healthz::Readiness>,
@@ -392,16 +416,29 @@ async fn prepare_worker_daemon_runtime(
     else {
         return Ok(None);
     };
-    log::info!(
-        "serving under server_scope='{}' session_scope={} worker_id={} pid={} build={} activation={:?}",
-        instance_id.as_str(),
-        startup.identity.session_scope,
-        startup.identity.worker_id,
-        startup.identity.pid,
-        startup.identity.build,
-        setup.daemon.activation_mode,
-    );
+    log_worker_startup(&instance_id, &startup, &setup.daemon);
     setup.daemon.lease.replicas = startup.replicas;
+    let Some(lease_bucket) = await_startup_or_shutdown(
+        &setup.shutdown,
+        readiness,
+        crate::nats_lease::ensure_lease_bucket(&startup.jetstream, &setup.daemon.lease),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let Some(activation_failures) = await_startup_or_shutdown(
+        &setup.shutdown,
+        readiness,
+        super::activation_failure::ActivationFailureTracker::ensure(
+            &startup.jetstream,
+            startup.replicas,
+        ),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
     let Some(services) = await_startup_or_shutdown(
         &setup.shutdown,
         readiness,
@@ -418,16 +455,26 @@ async fn prepare_worker_daemon_runtime(
         return Ok(None);
     }
     let consumer = startup.consumer.clone();
-    let runtime = build_worker_runtime(setup, startup, services, instance_id);
+    let runtime = build_worker_runtime(WorkerRuntimeBuild {
+        setup,
+        startup,
+        services,
+        instance_id,
+        lease_bucket,
+        activation_failures,
+    });
     Ok(Some(PreparedWorkerDaemon { runtime, consumer }))
 }
 
-fn build_worker_runtime(
-    setup: WorkerDaemonRuntimeSetup,
-    startup: WorkerStartup,
-    services: WorkerServices,
-    instance_id: harnx_core::instance::ServerScope,
-) -> Arc<WorkerRuntime> {
+fn build_worker_runtime(build: WorkerRuntimeBuild) -> Arc<WorkerRuntime> {
+    let WorkerRuntimeBuild {
+        setup,
+        startup,
+        services,
+        instance_id,
+        lease_bucket,
+        activation_failures,
+    } = build;
     let cluster = setup.daemon.connection_key().to_string();
     let cleanup_retention = setup.config.read().cleanup_remote_sessions_days;
     // This is deliberately outside the activation reconnect loop: a broker
@@ -448,10 +495,13 @@ fn build_worker_runtime(
         cluster,
         activation_route: setup.daemon.activation_route(),
         activation_mode: setup.daemon.activation_mode,
+        activation_heartbeat_interval: setup.daemon.activation_ack_wait() / 3,
         manage_servers: setup.daemon.manage_servers,
         worker_id: setup.daemon.worker_id.clone(),
         identity: startup.identity,
         lease: setup.daemon.lease,
+        lease_bucket,
+        activation_failures,
         jetstream: startup.jetstream,
         session_metadata: services.session_metadata,
         client: startup.client,
@@ -459,6 +509,7 @@ fn build_worker_runtime(
         generation: AtomicU64::new(1),
         shutdown: setup.shutdown,
         active: Mutex::new(HashMap::new()),
+        reservations: Mutex::new(HashMap::new()),
     })
 }
 
@@ -530,7 +581,7 @@ pub async fn run_worker_daemon_with_shutdown(
     reconnect_activation_stream(
         move || {
             let consumer = consumer.clone();
-            async move { consumer.messages().await }
+            async move { consumer.stream().max_messages_per_batch(8).messages().await }
         },
         move |message| {
             let runtime = Arc::clone(&activation_runtime);
@@ -542,6 +593,7 @@ pub async fn run_worker_daemon_with_shutdown(
                 .await
         },
         ACTIVATION_STREAM_RETRY_DELAY,
+        shutdown_timeout,
         &shutdown,
     )
     .await;
@@ -570,84 +622,183 @@ async fn reconnect_activation_stream<
     RejectError,
 >(
     mut open: Open,
-    mut handle: Handle,
+    handle: Handle,
     mut reject: Reject,
     retry_delay: Duration,
+    shutdown_timeout: Duration,
     shutdown: &CancellationToken,
 ) where
     Open: FnMut() -> OpenFuture,
     OpenFuture: Future<Output = std::result::Result<Messages, OpenError>>,
     Messages: Stream<Item = std::result::Result<Message, MessageError>> + Unpin,
+    Message: Send + 'static,
     OpenError: Display,
     MessageError: Display,
-    Handle: FnMut(Message) -> HandleFuture,
-    HandleFuture: Future<Output = std::result::Result<(), HandleError>>,
-    HandleError: Display,
+    Handle: Fn(Message) -> HandleFuture + Clone + Send + 'static,
+    HandleFuture: Future<Output = std::result::Result<(), HandleError>> + Send + 'static,
+    HandleError: Display + Send + 'static,
     Reject: FnMut(Message) -> RejectFuture,
     RejectFuture: Future<Output = std::result::Result<(), RejectError>>,
     RejectError: Display,
 {
-    loop {
-        let opened = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => return,
-            opened = open() => opened,
-        };
-        match opened {
-            Ok(mut messages) => loop {
-                let message = tokio::select! {
+    const MAX_CONCURRENT_ADMISSIONS: usize = 8;
+
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ADMISSIONS));
+    let mut handlers = tokio::task::JoinSet::new();
+    let mut buffered_messages = None;
+
+    'reconnect: loop {
+        let opened = {
+            let open_future = open();
+            tokio::pin!(open_future);
+            loop {
+                tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => {
-                        // A pull response can carry several activations. Return
-                        // every response already buffered in this client before
-                        // dropping the stream so another worker can claim it now.
-                        while let Some(buffered) = messages.next().now_or_never().flatten() {
-                            match buffered {
-                                Ok(buffered) => {
-                                    if let Err(error) = reject(buffered).await {
-                                        log::warn!("failed to NAK buffered activation during shutdown: {error}");
-                                    }
-                                }
-                                Err(error) => {
-                                    log::warn!("buffered activation stream failed during shutdown: {error}");
-                                    break;
-                                }
-                            }
-                        }
-                        return;
-                    },
-                    message = messages.next() => message,
-                };
-                let Some(message) = message else {
-                    break;
-                };
-                let message = match message {
-                    Ok(message) => message,
-                    Err(error) => {
-                        log::warn!("worker activation stream failed; reopening: {error}");
-                        break;
+                    _ = shutdown.cancelled() => break 'reconnect,
+                    joined = handlers.join_next(), if !handlers.is_empty() => {
+                        log_admission_result(joined);
                     }
-                };
-                if let Err(error) = handle(message).await {
-                    log::warn!("worker activation handling failed: {error}");
+                    opened = &mut open_future => break opened,
                 }
-            },
+            }
+        };
+
+        match opened {
+            Ok(messages) => {
+                buffered_messages = Some(messages);
+                loop {
+                    let permit = loop {
+                        let acquire = Arc::clone(&permits).acquire_owned();
+                        tokio::pin!(acquire);
+                        let acquired = tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => break 'reconnect,
+                            joined = handlers.join_next(), if !handlers.is_empty() => {
+                                log_admission_result(joined);
+                                continue;
+                            }
+                            acquired = &mut acquire => acquired,
+                        };
+                        break acquired.expect("activation admission semaphore cannot close");
+                    };
+
+                    let message = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => {
+                            drop(permit);
+                            break 'reconnect;
+                        }
+                        joined = handlers.join_next(), if !handlers.is_empty() => {
+                            drop(permit);
+                            log_admission_result(joined);
+                            continue;
+                        }
+                        message = buffered_messages
+                            .as_mut()
+                            .expect("open activation stream")
+                            .next() => message,
+                    };
+                    let Some(message) = message else {
+                        buffered_messages = None;
+                        break;
+                    };
+                    let message = match message {
+                        Ok(message) => message,
+                        Err(error) => {
+                            log::warn!("worker activation stream failed; reopening: {error}");
+                            buffered_messages = None;
+                            break;
+                        }
+                    };
+                    let handle = handle.clone();
+                    handlers.spawn(async move {
+                        let _permit = permit;
+                        handle(message).await
+                    });
+                }
+            }
             Err(error) => {
                 log::warn!("failed to open worker activation stream; retrying: {error}");
             }
         }
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => return,
-            _ = tokio::time::sleep(retry_delay) => {}
+
+        let retry = tokio::time::sleep(retry_delay);
+        tokio::pin!(retry);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break 'reconnect,
+                joined = handlers.join_next(), if !handlers.is_empty() => {
+                    log_admission_result(joined);
+                }
+                _ = &mut retry => break,
+            }
+        }
+    }
+
+    let deadline = Instant::now() + shutdown_timeout;
+    if let Some(messages) = buffered_messages.as_mut() {
+        while let Some(buffered) = messages.next().now_or_never().flatten() {
+            match buffered {
+                Ok(buffered) => {
+                    let rejected = reject(buffered);
+                    tokio::pin!(rejected);
+                    let result = tokio::select! {
+                        result = &mut rejected => Some(result),
+                        _ = tokio::time::sleep_until(deadline) => None,
+                    };
+                    match result {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => {
+                            log::warn!(
+                                "failed to NAK buffered activation during shutdown: {error}"
+                            );
+                        }
+                        None => break,
+                    }
+                }
+                Err(error) => {
+                    log::warn!("buffered activation stream failed during shutdown: {error}");
+                    break;
+                }
+            }
+        }
+    }
+
+    while !handlers.is_empty() {
+        match tokio::time::timeout_at(deadline, handlers.join_next()).await {
+            Ok(joined) => log_admission_result(joined),
+            Err(_) => {
+                handlers.abort_all();
+                break;
+            }
+        }
+    }
+}
+
+fn log_admission_result<HandleError: Display>(
+    joined: Option<
+        std::result::Result<std::result::Result<(), HandleError>, tokio::task::JoinError>,
+    >,
+) {
+    match joined {
+        Some(Ok(Ok(()))) | None => {}
+        Some(Ok(Err(error))) => {
+            log::warn!("worker activation handling failed: {error}");
+        }
+        Some(Err(error)) => {
+            log::warn!("worker activation handler task failed: {error}");
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{reconnect_activation_stream, spawn_remote_session_cleanup};
-    use crate::config::GlobalConfig;
+    use super::{
+        prepare_worker_daemon_runtime, reconnect_activation_stream, spawn_remote_session_cleanup,
+        WorkerDaemonRuntimeSetup,
+    };
+    use crate::config::{Config, GlobalConfig, NatsServerConfig};
     use futures_util::stream::{self, BoxStream};
     use futures_util::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -668,12 +819,189 @@ mod tests {
         let _ = handle.await;
     }
 
+    struct ActiveCleanupFixture {
+        prepared: super::PreparedWorkerDaemon,
+        calls: Arc<AtomicUsize>,
+        _child: crate::nats_worker::tests::TestNatsServer,
+        _store_dir: tempfile::TempDir,
+    }
+
+    impl ActiveCleanupFixture {
+        async fn open() -> Option<Self> {
+            let (url, child, store_dir) = crate::nats_worker::tests::spawn_test_nats().await?;
+            let config = Arc::new(parking_lot::RwLock::new(Config {
+                model: harnx_core::model::Model::new("test", "test-model"),
+                nats_servers: vec![NatsServerConfig {
+                    name: "local".to_string(),
+                    url,
+                    token: None,
+                    replicas: Some(1),
+                    tls: None,
+                    tls_cert: None,
+                    tls_key: None,
+                    tls_ca: None,
+                    ignore_discovered_servers: None,
+                    agents: vec![],
+                }],
+                ..Default::default()
+            }));
+            config.write().dry_run = false;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let call_fn: crate::agent_loop::AgentCallFn = Arc::new({
+                let calls = Arc::clone(&calls);
+                move |_input, _config, _abort| {
+                    let calls = Arc::clone(&calls);
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok((
+                            "done".to_string(),
+                            None,
+                            Vec::new(),
+                            crate::client::CompletionTokenUsage::default(),
+                        ))
+                    })
+                }
+            });
+            let prepared = prepare_worker_daemon_runtime(
+                WorkerDaemonRuntimeSetup {
+                    config,
+                    daemon: super::WorkerDaemonConfig::managing("local", "active-cleanup-worker"),
+                    call_fn: Some(call_fn),
+                    shutdown: super::CancellationToken::new(),
+                },
+                &None,
+            )
+            .await
+            .expect("prepare worker runtime")
+            .expect("worker startup was not cancelled");
+            Some(Self {
+                prepared,
+                calls,
+                _child: child,
+                _store_dir: store_dir,
+            })
+        }
+
+        async fn seed_session(&self) -> (async_nats::jetstream::Context, String) {
+            let jetstream = self.prepared.runtime.jetstream.clone();
+            let session_id = "active-cleanup-session";
+            let storage_key = harnx_core::session_identity::session_key(None, session_id);
+            self.prepared
+                .runtime
+                .session_metadata
+                .create(&crate::nats_session_metadata::SessionMetadata::new(
+                    session_id,
+                    crate::nats_session_metadata::SessionInitializer::inline(
+                        "active cleanup test",
+                        Default::default(),
+                        Default::default(),
+                    ),
+                ))
+                .await
+                .expect("seed session metadata");
+            crate::nats_session_log::NatsSessionLog::new_with_replicas(
+                jetstream.clone(),
+                &storage_key,
+                1,
+            )
+            .append_event_async(&harnx_core::session::SessionLogEntry::Message {
+                id: Some("active-cleanup-user".to_string()),
+                role: harnx_core::message::MessageRole::User,
+                content: harnx_core::message::MessageContent::Text("finish once".to_string()),
+                timestamp: None,
+                fence_token: None,
+            })
+            .await
+            .expect("seed user prompt");
+            (jetstream, storage_key)
+        }
+
+        async fn admit_session(
+            &self,
+            jetstream: &async_nats::jetstream::Context,
+            storage_key: &str,
+        ) {
+            super::publish_session_activate(
+                jetstream,
+                "local",
+                &super::SessionActivate::new(storage_key),
+                1,
+            )
+            .await
+            .expect("publish activation");
+            let mut messages = self
+                .prepared
+                .consumer
+                .fetch()
+                .max_messages(1)
+                .messages()
+                .await
+                .expect("fetch activation");
+            let message = messages
+                .next()
+                .await
+                .expect("activation delivery")
+                .expect("valid activation delivery");
+            self.prepared
+                .runtime
+                .handle_activation(message)
+                .await
+                .expect("admit activation");
+        }
+
+        async fn run_session(&self) {
+            let (jetstream, storage_key) = self.seed_session().await;
+            self.admit_session(&jetstream, &storage_key).await;
+        }
+
+        async fn wait_for_cleanup(&self) {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if self.calls.load(Ordering::SeqCst) != 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    if !self.prepared.runtime.active.lock().await.is_empty() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    if !self.prepared.runtime.reservations.lock().await.is_empty() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    break;
+                }
+            })
+            .await
+            .expect("completed session remained in worker tracking maps");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completed_sessions_are_removed_from_active_map() {
+        harnx_core::require_nextest();
+        let Some(fixture) = ActiveCleanupFixture::open().await else {
+            return;
+        };
+        fixture.run_session().await;
+        fixture.wait_for_cleanup().await;
+        assert!(fixture.prepared.runtime.active.lock().await.is_empty());
+        assert!(fixture
+            .prepared
+            .runtime
+            .reservations
+            .lock()
+            .await
+            .is_empty());
+        fixture.prepared.runtime.shutdown_active_sessions().await;
+    }
+
     #[tokio::test]
     async fn activation_stream_reopens_after_open_and_item_failures() {
         harnx_core::require_nextest();
         let attempts = Arc::new(AtomicUsize::new(0));
         let (handled_tx, handled_rx) = tokio::sync::oneshot::channel();
-        let mut handled_tx = Some(handled_tx);
+        let handled_tx = Arc::new(std::sync::Mutex::new(Some(handled_tx)));
 
         let shutdown = tokio_util::sync::CancellationToken::new();
         let task_shutdown = shutdown.clone();
@@ -703,7 +1031,7 @@ mod tests {
                     }
                 },
                 move |message| {
-                    let tx = handled_tx.take();
+                    let tx = handled_tx.lock().expect("handled sender lock").take();
                     async move {
                         if let Some(tx) = tx {
                             let _ = tx.send(message);
@@ -713,6 +1041,7 @@ mod tests {
                 },
                 |_message| async { Ok::<(), &'static str>(()) },
                 Duration::from_millis(1),
+                Duration::from_secs(1),
                 &task_shutdown,
             )
             .await;
@@ -731,47 +1060,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_activation_admission_does_not_block_later_messages() {
+        harnx_core::require_nextest();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let slow_release = tokio_util::sync::CancellationToken::new();
+        let (fast_tx, fast_rx) = tokio::sync::oneshot::channel();
+        let fast_tx = Arc::new(std::sync::Mutex::new(Some(fast_tx)));
+        let mut stream = Some(
+            stream::iter([Ok::<_, &'static str>(1_u32), Ok(2_u32)])
+                .chain(stream::pending())
+                .boxed(),
+        );
+
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn({
+            let slow_release = slow_release.clone();
+            async move {
+                reconnect_activation_stream(
+                    move || {
+                        let messages = stream.take().expect("stream opens once");
+                        async move { Ok::<_, &'static str>(messages) }
+                    },
+                    move |message| {
+                        let slow_release = slow_release.clone();
+                        let fast_tx = Arc::clone(&fast_tx);
+                        async move {
+                            if message == 1 {
+                                slow_release.cancelled().await;
+                            } else if let Some(tx) =
+                                fast_tx.lock().expect("fast sender lock").take()
+                            {
+                                let _ = tx.send(());
+                            }
+                            Ok::<(), &'static str>(())
+                        }
+                    },
+                    |_message| async { Ok::<(), &'static str>(()) },
+                    Duration::from_millis(1),
+                    Duration::from_secs(1),
+                    &task_shutdown,
+                )
+                .await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), fast_rx)
+            .await
+            .expect("second admission was blocked by slow first admission")
+            .expect("fast admission handler disappeared");
+        slow_release.cancel();
+        shutdown.cancel();
+        task.await.expect("activation loop task");
+    }
+
+    #[tokio::test]
+    async fn activation_admission_concurrency_is_bounded_at_eight() {
+        harnx_core::require_nextest();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let release = tokio_util::sync::CancellationToken::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut stream = Some(
+            stream::iter((0..16).map(Ok::<_, &'static str>))
+                .chain(stream::pending())
+                .boxed(),
+        );
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn({
+            let release = release.clone();
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let completed = Arc::clone(&completed);
+            async move {
+                reconnect_activation_stream(
+                    move || {
+                        let messages = stream.take().expect("stream opens once");
+                        async move { Ok::<_, &'static str>(messages) }
+                    },
+                    move |_message| {
+                        let release = release.clone();
+                        let active = Arc::clone(&active);
+                        let max_active = Arc::clone(&max_active);
+                        let completed = Arc::clone(&completed);
+                        async move {
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_active.fetch_max(now, Ordering::SeqCst);
+                            release.cancelled().await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            completed.fetch_add(1, Ordering::SeqCst);
+                            Ok::<(), &'static str>(())
+                        }
+                    },
+                    |_message| async { Ok::<(), &'static str>(()) },
+                    Duration::from_millis(1),
+                    Duration::from_secs(1),
+                    &task_shutdown,
+                )
+                .await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) < 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eight admissions did not start");
+        assert_eq!(active.load(Ordering::SeqCst), 8);
+        assert_eq!(max_active.load(Ordering::SeqCst), 8);
+
+        release.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while completed.load(Ordering::SeqCst) < 16 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all admissions did not finish");
+        assert_eq!(max_active.load(Ordering::SeqCst), 8);
+        shutdown.cancel();
+        task.await.expect("activation loop task");
+    }
+    #[tokio::test]
     async fn shutdown_closes_admission_and_naks_buffered_messages() {
         harnx_core::require_nextest();
         let shutdown = tokio_util::sync::CancellationToken::new();
+        let release = tokio_util::sync::CancellationToken::new();
+        let active = Arc::new(AtomicUsize::new(0));
         let handled = Arc::new(std::sync::Mutex::new(Vec::new()));
         let rejected = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut stream = Some(
-            stream::iter([
-                Ok::<_, &'static str>(1_u32),
-                Ok::<_, &'static str>(2_u32),
-                Ok::<_, &'static str>(3_u32),
-            ])
-            .boxed(),
+            stream::iter((0..10).map(Ok::<_, &'static str>))
+                .chain(stream::pending())
+                .boxed(),
         );
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn({
+            let release = release.clone();
+            let active = Arc::clone(&active);
+            let handled = Arc::clone(&handled);
+            let rejected = Arc::clone(&rejected);
+            async move {
+                reconnect_activation_stream(
+                    move || {
+                        let messages = stream.take().expect("stream opens once");
+                        async move { Ok::<_, &'static str>(messages) }
+                    },
+                    move |message| {
+                        let release = release.clone();
+                        let active = Arc::clone(&active);
+                        let handled = Arc::clone(&handled);
+                        async move {
+                            handled.lock().expect("handled lock").push(message);
+                            active.fetch_add(1, Ordering::SeqCst);
+                            release.cancelled().await;
+                            Ok::<(), &'static str>(())
+                        }
+                    },
+                    move |message| {
+                        rejected.lock().expect("rejected lock").push(message);
+                        async { Ok::<(), &'static str>(()) }
+                    },
+                    Duration::from_millis(1),
+                    Duration::from_secs(1),
+                    &task_shutdown,
+                )
+                .await;
+            }
+        });
 
-        reconnect_activation_stream(
-            move || {
-                let messages = stream.take().expect("stream opens once");
-                async move { Ok::<_, &'static str>(messages) }
-            },
-            {
-                let handled = Arc::clone(&handled);
-                let shutdown = shutdown.clone();
-                move |message| {
-                    handled.lock().expect("handled lock").push(message);
-                    shutdown.cancel();
-                    async { Ok::<(), &'static str>(()) }
-                }
-            },
-            {
-                let rejected = Arc::clone(&rejected);
-                move |message| {
-                    rejected.lock().expect("rejected lock").push(message);
-                    async { Ok::<(), &'static str>(()) }
-                }
-            },
-            Duration::from_millis(1),
-            &shutdown,
-        )
-        .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) < 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eight admissions did not start");
+        shutdown.cancel();
+        release.cancel();
+        task.await.expect("activation loop task");
 
-        assert_eq!(*handled.lock().expect("handled lock"), vec![1]);
-        assert_eq!(*rejected.lock().expect("rejected lock"), vec![2, 3]);
+        let mut handled = handled.lock().expect("handled lock").clone();
+        handled.sort_unstable();
+        let mut rejected = rejected.lock().expect("rejected lock").clone();
+        rejected.sort_unstable();
+        assert_eq!(handled, (0..8).collect::<Vec<_>>());
+        assert_eq!(rejected, vec![8, 9]);
     }
 }

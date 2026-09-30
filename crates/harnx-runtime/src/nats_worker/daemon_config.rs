@@ -1,11 +1,12 @@
 //! Worker connection, activation, and child-server configuration.
 
 use super::activation::SessionActivationRoute;
-use super::activation_transport::validate_worker_id;
+use super::activation_transport::{validate_worker_id, WORK_NOTIFY_ACK_WAIT};
 use crate::config::LOCAL_CLUSTER_KEY;
 use crate::nats_lease::NatsLeaseConfig;
 use anyhow::Result;
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
+use std::time::Duration;
 
 /// How a worker resolves its NATS connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,7 @@ pub struct WorkerDaemonConfig {
     /// Whether this worker launches its own tool and hook servers as child
     /// processes instead of discovering independently deployed ones.
     pub manage_servers: bool,
+    activation_ack_wait: Duration,
 }
 
 impl WorkerDaemonConfig {
@@ -55,6 +57,7 @@ impl WorkerDaemonConfig {
             worker_id: worker_id.into(),
             lease: NatsLeaseConfig::default(),
             manage_servers: false,
+            activation_ack_wait: WORK_NOTIFY_ACK_WAIT,
         }
     }
 
@@ -75,6 +78,7 @@ impl WorkerDaemonConfig {
             worker_id,
             lease: NatsLeaseConfig::default(),
             manage_servers: true,
+            activation_ack_wait: WORK_NOTIFY_ACK_WAIT,
         })
     }
 
@@ -90,6 +94,18 @@ impl WorkerDaemonConfig {
                 worker_id: self.worker_id.clone(),
             },
         }
+    }
+
+    pub(super) fn activation_ack_wait(&self) -> Duration {
+        self.activation_ack_wait
+    }
+
+    /// Overrides JetStream activation timing in broker-backed tests.
+    #[doc(hidden)]
+    pub fn with_activation_ack_wait_for_test(mut self, ack_wait: Duration) -> Self {
+        assert!(ack_wait >= Duration::from_millis(3));
+        self.activation_ack_wait = ack_wait;
+        self
     }
 }
 

@@ -56,6 +56,7 @@ parking_lot = { workspace = true }
 path-absolutize = { workspace = true }
 reqwest = { workspace = true }
 reqwest-eventsource = { workspace = true }
+rand = "0.10.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

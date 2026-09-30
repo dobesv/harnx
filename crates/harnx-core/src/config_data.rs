@@ -30,6 +30,24 @@ fn default_terminal_status() -> bool {
     true
 }
 
+/// Default wait for a worker to claim an activated NATS session.
+pub const DEFAULT_NATS_LEASE_ACQUISITION_TIMEOUT_SECS: u64 = 60;
+
+fn default_nats_lease_acquisition_timeout_secs() -> u64 {
+    DEFAULT_NATS_LEASE_ACQUISITION_TIMEOUT_SECS
+}
+
+fn deserialize_positive_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("value must be greater than zero"));
+    }
+    Ok(value)
+}
+
 /// Scalar YAML-deserialized fields from `config.yaml`.
 ///
 /// This is the pure-data half of `harnx::Config`. It has no runtime state.
@@ -58,6 +76,11 @@ pub struct ConfigData {
     #[serde(default, deserialize_with = "deserialize_use_tools")]
     pub use_tools: Option<Vec<String>>,
 
+    #[serde(
+        default = "default_nats_lease_acquisition_timeout_secs",
+        deserialize_with = "deserialize_positive_u64"
+    )]
+    pub nats_lease_acquisition_timeout_secs: u64,
     pub cleanup_remote_sessions_days: Option<u64>,
     pub compress_threshold: usize,
 
@@ -101,6 +124,16 @@ pub struct ConfigData {
     pub title_update_interval_secs: u64,
 }
 
+impl ConfigData {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.nats_lease_acquisition_timeout_secs == 0 {
+            return Err(
+                "nats_lease_acquisition_timeout_secs must be greater than zero".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
 impl Default for ConfigData {
     fn default() -> Self {
         Self {
@@ -120,6 +153,7 @@ impl Default for ConfigData {
             toolsets: Default::default(),
             use_tools: None,
 
+            nats_lease_acquisition_timeout_secs: default_nats_lease_acquisition_timeout_secs(),
             cleanup_remote_sessions_days: None,
             compress_threshold: 180000,
 
@@ -171,6 +205,37 @@ mod tests {
         assert!(d.save_shell_history);
         assert_eq!(d.compress_threshold, 180_000);
         assert_eq!(d.rag_top_k, 5);
+    }
+
+    #[test]
+    fn lease_acquisition_timeout_defaults_to_sixty_seconds() {
+        let default = ConfigData::default();
+        let from_empty_yaml: ConfigData = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(default.nats_lease_acquisition_timeout_secs, 60);
+        assert_eq!(from_empty_yaml.nats_lease_acquisition_timeout_secs, 60);
+    }
+
+    #[test]
+    fn lease_acquisition_timeout_accepts_positive_override() {
+        let data: ConfigData =
+            serde_yaml::from_str("nats_lease_acquisition_timeout_secs: 17\n").unwrap();
+
+        assert_eq!(data.nats_lease_acquisition_timeout_secs, 17);
+        data.validate().unwrap();
+    }
+
+    #[test]
+    fn lease_acquisition_timeout_rejects_zero() {
+        let error = serde_yaml::from_str::<ConfigData>("nats_lease_acquisition_timeout_secs: 0\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("greater than zero"));
+
+        let data = ConfigData {
+            nats_lease_acquisition_timeout_secs: 0,
+            ..Default::default()
+        };
+        assert!(data.validate().unwrap_err().contains("greater than zero"));
     }
 
     #[test]

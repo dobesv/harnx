@@ -82,6 +82,7 @@ impl SessionTurn {
     pub async fn run(mut self) -> Result<bool> {
         let event_sink = Arc::clone(&self.event_sink);
         harnx_core::sink::with_agent_event_sink(event_sink, async {
+            self.remove_unterminated_failed_assistant().await?;
             // A half-installed agent cannot render its prompt. Let the caller
             // record the setup failure rather than failing deeper in the turn.
             match self.agent_setup {
@@ -92,6 +93,47 @@ impl SessionTurn {
         .await
     }
 
+    /// Remove the empty assistant placeholder left when a prior turn failed
+    /// before its durable Error could be appended. Successful Error appends are
+    /// terminal and leave that Error at the tail, so normal turn failures never
+    /// reach this recovery path.
+    async fn remove_unterminated_failed_assistant(&self) -> Result<()> {
+        remove_unterminated_failed_assistant(&self.backend, &self.lease).await
+    }
+}
+
+async fn remove_unterminated_failed_assistant(
+    backend: &NatsSessionLogBackend,
+    lease: &NatsSessionLease,
+) -> Result<()> {
+    let entries = backend.load_events_latest_async().await?;
+    let Some((tail_seq, tail)) = entries.last() else {
+        return Ok(());
+    };
+    let failed_assistant = matches!(
+        tail,
+        harnx_core::session::SessionLogEntry::Message { role, content, .. }
+            if role.is_assistant() && content.to_text().is_empty()
+    );
+    if !failed_assistant {
+        return Ok(());
+    }
+    let edit_seq = usize::try_from(*tail_seq).context("session sequence exceeds usize")?;
+    backend
+        .append_event_fenced_with_lease(
+            &harnx_core::session::SessionLogEntry::EditEntries {
+                from: edit_seq,
+                to: edit_seq,
+                replacements: Vec::new(),
+            },
+            lease,
+            *tail_seq,
+        )
+        .await?;
+    Ok(())
+}
+
+impl SessionTurn {
     async fn run_turns(&mut self) -> Result<bool> {
         // Includes both folded input and mid-round injections. Drain checks only
         // detect new messages; only consumed messages advance this cursor.
@@ -721,161 +763,219 @@ fn advance_high_water(high_water: &mut Option<u64>, consumed: u64) {
 }
 
 #[cfg(test)]
+mod failed_assistant_recovery_tests {
+    use super::*;
+    use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig};
+    use harnx_core::message::{MessageContent, MessageRole};
+    use harnx_core::session::SessionLogEntry;
+    use std::time::Duration;
+
+    fn message(role: MessageRole, text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: None,
+            role,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    async fn acquire_lease(
+        jetstream: &async_nats::jetstream::Context,
+        session_id: &str,
+    ) -> Arc<NatsSessionLease> {
+        Arc::new(
+            NatsSessionLease::acquire(NatsLeaseAcquireParams {
+                jetstream: jetstream.clone(),
+                session_id,
+                worker_id: format!("recovery-worker-{session_id}"),
+                generation: 1,
+                config: NatsLeaseConfig {
+                    ttl: Duration::from_secs(5),
+                    renew_interval: Duration::from_millis(500),
+                    replicas: 1,
+                    ..Default::default()
+                },
+                session_metadata: None,
+            })
+            .await
+            .expect("acquire recovery lease")
+            .expect("recovery lease must be available"),
+        )
+    }
+
+    async fn append_entries(backend: &NatsSessionLogBackend, entries: &[SessionLogEntry]) {
+        for entry in entries {
+            backend.append_event(entry).await.expect("seed session log");
+        }
+    }
+
+    async fn load_raw(backend: &NatsSessionLogBackend) -> Vec<(u64, SessionLogEntry)> {
+        crate::nats_session_log::NatsSessionLog::new_with_replicas(
+            backend.jetstream(),
+            backend.session_id(),
+            1,
+        )
+        .load_events_async()
+        .await
+        .expect("load session log")
+    }
+
+    async fn test_context() -> Option<(
+        async_nats::jetstream::Context,
+        crate::nats_worker::tests::TestNatsServer,
+        tempfile::TempDir,
+    )> {
+        let (url, child, store_dir) = crate::nats_worker::tests::spawn_test_nats().await?;
+        let client = async_nats::connect(&url).await.expect("connect test NATS");
+        Some((async_nats::jetstream::new(client), child, store_dir))
+    }
+
+    async fn assert_untouched(
+        jetstream: &async_nats::jetstream::Context,
+        session_id: &str,
+        entries: Vec<SessionLogEntry>,
+    ) {
+        let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id, 1);
+        append_entries(&backend, &entries).await;
+        let lease = acquire_lease(jetstream, session_id).await;
+        remove_unterminated_failed_assistant(&backend, &lease)
+            .await
+            .expect("leave assistant intact");
+        assert_eq!(load_raw(&backend).await.len(), entries.len());
+        lease.release().await.expect("release lease");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trailing_empty_assistant_is_removed_with_fenced_edit() {
+        harnx_core::require_nextest();
+        let Some((jetstream, _child, _store_dir)) = test_context().await else {
+            return;
+        };
+        let session_id = "failed-assistant-trailing";
+        let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id, 1);
+        append_entries(
+            &backend,
+            &[
+                message(MessageRole::User, "retry this prompt"),
+                message(MessageRole::Assistant, ""),
+            ],
+        )
+        .await;
+        let lease = acquire_lease(&jetstream, session_id).await;
+        remove_unterminated_failed_assistant(&backend, &lease)
+            .await
+            .expect("remove failed assistant");
+        let raw = load_raw(&backend).await;
+        assert!(matches!(
+            raw.last(),
+            Some((
+                _,
+                SessionLogEntry::EditEntries {
+                    from: 2,
+                    to: 2,
+                    replacements,
+                },
+            )) if replacements.is_empty()
+        ));
+        let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)
+            .expect("apply recovery edit");
+        assert!(matches!(
+            effective.as_slice(),
+            [( _, SessionLogEntry::Message { role, content, .. })]
+                if role.is_user() && content.to_text() == "retry this prompt"
+        ));
+        lease.release().await.expect("release lease");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nonmatching_assistants_are_untouched() {
+        harnx_core::require_nextest();
+        let Some((jetstream, _child, _store_dir)) = test_context().await else {
+            return;
+        };
+        assert_untouched(
+            &jetstream,
+            "failed-assistant-nonempty",
+            vec![
+                message(MessageRole::User, "already answered"),
+                message(MessageRole::Assistant, "answer"),
+            ],
+        )
+        .await;
+        assert_untouched(
+            &jetstream,
+            "failed-assistant-nontrailing",
+            vec![
+                message(MessageRole::User, "first prompt"),
+                message(MessageRole::Assistant, ""),
+                message(MessageRole::User, "later prompt"),
+            ],
+        )
+        .await;
+    }
+}
+
+#[cfg(test)]
 mod compaction_deferral_tests {
     use super::*;
     use harnx_core::session::SessionLogEntry;
 
-    /// Test that compaction is deferred when there are orphan tool calls
-    /// (ToolCalls without matching ToolResults).
-    #[test]
-    fn defers_when_orphan_tool_calls_exist() {
-        // Create entries with orphan tool calls
-        let entries = vec![(
-            1u64,
-            SessionLogEntry::ToolCalls {
-                text: "calling tools".to_string(),
-                thought: None,
-                calls: vec![],
-                timestamp: None,
-                fence_token: None,
-            },
-        )];
-
-        // Apply log mutations to get effective entries
+    fn assert_compaction_deferred(entries: Vec<(u64, SessionLogEntry)>, expected: bool) {
         let effective =
             harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).unwrap();
-
-        // Should defer because there's an orphan tool call
-        let should_defer = should_defer_compaction(&effective, &entries).unwrap();
-        assert!(
-            should_defer,
-            "should defer compaction when orphan tool calls exist"
+        assert_eq!(
+            should_defer_compaction(&effective, &entries).unwrap(),
+            expected
         );
     }
 
-    /// Test that compaction is NOT deferred when tool round is settled.
-    #[test]
-    fn does_not_defer_when_tool_round_settled() {
-        // Create entries with matched ToolCalls and ToolResults
-        let entries = vec![
-            (
-                1u64,
-                SessionLogEntry::ToolCalls {
-                    text: "calling tools".to_string(),
-                    thought: None,
-                    calls: vec![],
-                    timestamp: None,
-                    fence_token: None,
-                },
-            ),
-            (
-                2u64,
-                SessionLogEntry::ToolResults {
-                    results: vec![],
-                    timestamp: None,
-                },
-            ),
-        ];
-
-        // Apply log mutations to get effective entries
-        let effective =
-            harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).unwrap();
-
-        // Should NOT defer because tool round is settled
-        let should_defer = should_defer_compaction(&effective, &entries).unwrap();
-        assert!(
-            !should_defer,
-            "should NOT defer compaction when tool round is settled"
-        );
+    fn tool_calls() -> SessionLogEntry {
+        SessionLogEntry::ToolCalls {
+            text: "calling tools".to_string(),
+            thought: None,
+            calls: vec![],
+            timestamp: None,
+            fence_token: None,
+        }
     }
 
-    /// Test that compaction is deferred when there's a pending HITL approval.
-    #[test]
-    fn defers_when_pending_hitl_approval() {
-        // Create entries with orphan tool call and pending HITL approval
-        let entries = vec![
-            (
-                1u64,
-                SessionLogEntry::ToolCalls {
-                    text: "calling tools".to_string(),
-                    thought: None,
-                    calls: vec![],
-                    timestamp: None,
-                    fence_token: None,
-                },
-            ),
-            (
-                2u64,
-                SessionLogEntry::HitlApprovalRequested {
-                    tool_call_id: "call-1".to_string(),
-                    summary: "Approve this tool".to_string(),
-                    fence_token: 0,
-                },
-            ),
-        ];
-
-        // Apply log mutations to get effective entries
-        let effective =
-            harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).unwrap();
-
-        // Should defer because there's a pending HITL approval
-        let should_defer = should_defer_compaction(&effective, &entries).unwrap();
-        assert!(
-            should_defer,
-            "should defer compaction when pending HITL approval exists"
-        );
+    fn tool_results() -> SessionLogEntry {
+        SessionLogEntry::ToolResults {
+            results: vec![],
+            timestamp: None,
+        }
     }
 
-    /// Test that compaction is NOT deferred when HITL approval was decided.
+    fn approval_request() -> SessionLogEntry {
+        SessionLogEntry::HitlApprovalRequested {
+            tool_call_id: "call-1".to_string(),
+            summary: "Approve this tool".to_string(),
+            fence_token: 0,
+        }
+    }
+
+    fn approval_decision() -> SessionLogEntry {
+        SessionLogEntry::HitlApprovalDecision {
+            tool_call_id: "call-1".to_string(),
+            approved: true,
+            note: None,
+            fence_token: 0,
+        }
+    }
+
     #[test]
-    fn does_not_defer_when_hitl_decision_made() {
-        // Create entries with tool call, HITL request, and decision
-        let entries = vec![
-            (
-                1u64,
-                SessionLogEntry::ToolCalls {
-                    text: "calling tools".to_string(),
-                    thought: None,
-                    calls: vec![],
-                    timestamp: None,
-                    fence_token: None,
-                },
-            ),
-            (
-                2u64,
-                SessionLogEntry::HitlApprovalRequested {
-                    tool_call_id: "call-1".to_string(),
-                    summary: "Approve this tool".to_string(),
-                    fence_token: 0,
-                },
-            ),
-            (
-                3u64,
-                SessionLogEntry::HitlApprovalDecision {
-                    tool_call_id: "call-1".to_string(),
-                    approved: true,
-                    note: None,
-                    fence_token: 0,
-                },
-            ),
-            (
-                4u64,
-                SessionLogEntry::ToolResults {
-                    results: vec![],
-                    timestamp: None,
-                },
-            ),
-        ];
-
-        // Apply log mutations to get effective entries
-        let effective =
-            harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).unwrap();
-
-        // Should NOT defer because HITL decision was made and tool round settled
-        let should_defer = should_defer_compaction(&effective, &entries).unwrap();
-        assert!(
-            !should_defer,
-            "should NOT defer compaction when HITL decision made and tool round settled"
+    fn compaction_deferral_tracks_unsettled_tool_and_approval_rounds() {
+        assert_compaction_deferred(vec![(1, tool_calls())], true);
+        assert_compaction_deferred(vec![(1, tool_calls()), (2, tool_results())], false);
+        assert_compaction_deferred(vec![(1, tool_calls()), (2, approval_request())], true);
+        assert_compaction_deferred(
+            vec![
+                (1, tool_calls()),
+                (2, approval_request()),
+                (3, approval_decision()),
+                (4, tool_results()),
+            ],
+            false,
         );
     }
 }

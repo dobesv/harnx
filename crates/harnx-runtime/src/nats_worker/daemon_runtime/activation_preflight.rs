@@ -5,11 +5,18 @@ use super::*;
 use harnx_core::session::SessionLogEntry;
 use harnx_core::session_reconstruct::TurnStatus;
 
+struct MetadataPreflightFailure<'a> {
+    delivery: &'a mut ActivationDelivery,
+    activation: &'a SessionActivate,
+    generation: u64,
+    error: anyhow::Error,
+}
 impl WorkerRuntime {
     async fn metadata_preflight_passes(
         &self,
-        message: &async_nats::jetstream::Message,
+        delivery: &mut ActivationDelivery,
         activation: &SessionActivate,
+        generation: u64,
     ) -> Result<bool> {
         match self.session_metadata.get(&activation.session_id).await {
             Ok(Some(_)) => Ok(true),
@@ -18,27 +25,91 @@ impl WorkerRuntime {
                     "terminating SessionActivate without canonical metadata: session_id={}",
                     activation.session_id
                 );
-                Self::terminate_activation(message, "metadata-less").await?;
+                self.terminate_activation(delivery, "metadata-less").await?;
                 Ok(false)
             }
             Err(error) => {
-                log::warn!(
-                    "session metadata preflight failed for '{}': {error:#}",
-                    activation.session_id
-                );
-                if self.uses_targeted_activation() {
-                    Self::delayed_nak(message).await?;
-                    Ok(false)
-                } else {
-                    Err(error)
-                }
+                self.handle_metadata_preflight_failure(MetadataPreflightFailure {
+                    delivery,
+                    activation,
+                    generation,
+                    error,
+                })
+                .await
             }
         }
     }
 
+    async fn retry_metadata_preflight_failure(
+        &self,
+        delivery: &mut ActivationDelivery,
+        error: anyhow::Error,
+    ) -> Result<bool> {
+        if self.uses_targeted_activation() {
+            Self::delayed_nak(delivery).await?;
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
+
+    async fn handle_metadata_preflight_failure(
+        &self,
+        failure: MetadataPreflightFailure<'_>,
+    ) -> Result<bool> {
+        let MetadataPreflightFailure {
+            delivery,
+            activation,
+            generation,
+            error,
+        } = failure;
+        log::warn!(
+            "session metadata preflight failed for '{}': {error:#}",
+            activation.session_id
+        );
+        if self.shutdown.is_cancelled() {
+            Self::shutdown_nak(delivery).await?;
+            return Ok(false);
+        }
+        let failures = match self
+            .count_activation_failure(activation, delivery.failure_key())
+            .await
+        {
+            Ok(failures) => failures,
+            Err(counter_error) => {
+                log::warn!(
+                    "activation failure counter unavailable for '{}': {counter_error:#}",
+                    activation.session_id
+                );
+                return self.retry_metadata_preflight_failure(delivery, error).await;
+            }
+        };
+        if failures < super::super::daemon_session_exec::MAX_ACTIVATION_FAILURES {
+            return self.retry_metadata_preflight_failure(delivery, error).await;
+        }
+        let Some(lease) = self
+            .acquire_or_defer_activation(delivery, activation, generation)
+            .await?
+        else {
+            return Ok(false);
+        };
+        delivery.attach_lease(&lease);
+        let error = self
+            .durabilize_pre_turn_failure(activation, &lease, error)
+            .await;
+        if super::super::daemon_session_exec::is_durable_activation_error(&error) {
+            self.terminate_activation(delivery, "durably failed")
+                .await?;
+        } else {
+            Self::delayed_nak(delivery).await?;
+        }
+        lease.release().await?;
+        Ok(false)
+    }
+
     async fn targeted_route_preflight_passes(
         &self,
-        message: &async_nats::jetstream::Message,
+        delivery: &mut ActivationDelivery,
         activation: &SessionActivate,
     ) -> Result<bool> {
         if !self.uses_targeted_activation() {
@@ -46,7 +117,8 @@ impl WorkerRuntime {
         }
         if let Err(error) = self.validate_targeted_activation(activation) {
             log::warn!("terminating misrouted targeted SessionActivate: {error:#}");
-            Self::terminate_activation(message, "misrouted targeted").await?;
+            self.terminate_activation(delivery, "misrouted targeted")
+                .await?;
             return Ok(false);
         }
         Ok(true)
@@ -62,8 +134,9 @@ impl WorkerRuntime {
     /// now sees an idle session with pending input.
     async fn wind_up_preflight(
         &self,
-        message: &async_nats::jetstream::Message,
+        delivery: &mut ActivationDelivery,
         activation: &SessionActivate,
+        generation: u64,
     ) -> Result<bool> {
         let backend = NatsSessionLogBackend::new(
             self.jetstream.clone(),
@@ -77,23 +150,30 @@ impl WorkerRuntime {
             // The interruption this activation was published for has already
             // been wound up; there is nothing left for it to do.
             TurnStatus::Idle if cancel_landed_at(&entries, activation.requested_seq) => {
-                Self::acknowledge(message, "wound-up interruption").await?;
+                self.acknowledge_activation(delivery, "wound-up interruption")
+                    .await?;
                 return Ok(false);
             }
             _ => return Ok(true),
         }
         let Some(lease) = self
-            .acquire_or_defer_activation(message, activation)
+            .acquire_or_defer_activation(delivery, activation, generation)
             .await?
         else {
             return Ok(false);
         };
+        delivery.attach_lease(&lease);
         if self.shutdown.is_cancelled() {
             lease.release().await?;
-            Self::shutdown_nak(message).await?;
+            Self::shutdown_nak(delivery).await?;
             return Ok(false);
         }
         let wound_up = self.wind_up_interrupted_session(&backend, &lease).await;
+        if lease.is_held() {
+            // This lease protected wind-up only. Keep heartbeating while this
+            // activation either settles or acquires its execution lease.
+            delivery.detach_lease();
+        }
         lease.release().await?;
         wound_up?;
         if !state.next_turn_messages.is_empty() {
@@ -101,7 +181,7 @@ impl WorkerRuntime {
             // to run, now that the interrupted one is closed out.
             return Ok(true);
         }
-        Self::acknowledge(message, "wind-up").await?;
+        self.acknowledge_activation(delivery, "wind-up").await?;
         Ok(false)
     }
 
@@ -137,49 +217,86 @@ impl WorkerRuntime {
         Ok(())
     }
 
-    async fn acknowledge(message: &async_nats::jetstream::Message, reason: &str) -> Result<()> {
-        message
-            .ack()
-            .await
-            .map_err(|error| anyhow::anyhow!("ack {reason} SessionActivate: {error}"))
+    async fn lease_holder_preflight_passes(
+        &self,
+        delivery: &mut ActivationDelivery,
+        activation: &SessionActivate,
+    ) -> Result<bool> {
+        match crate::nats_lease::lease_holder_in(
+            &self.lease_bucket,
+            &self.lease,
+            &activation.session_id,
+        )
+        .await
+        {
+            Ok(Some(holder)) => {
+                log::debug!(
+                    "deferring busy activation before session preflight: session_id={} holder_worker_id={} holder_generation={}",
+                    activation.session_id,
+                    holder.worker_id,
+                    holder.generation
+                );
+                Self::busy_nak(delivery).await?;
+                Ok(false)
+            }
+            Ok(None) => Ok(true),
+            Err(error) => {
+                log::warn!(
+                    "activation lease-holder preflight failed for '{}': {error:#}",
+                    activation.session_id
+                );
+                if self.uses_targeted_activation() {
+                    Self::delayed_nak(delivery).await?;
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     pub(super) async fn activation_is_ready(
         &self,
-        message: &async_nats::jetstream::Message,
+        delivery: &mut ActivationDelivery,
         activation: &SessionActivate,
+        generation: u64,
     ) -> Result<bool> {
-        if !self.metadata_preflight_passes(message, activation).await? {
+        if !self
+            .targeted_route_preflight_passes(delivery, activation)
+            .await?
+        {
+            return Ok(false);
+        }
+        // This cached KV read avoids metadata and full-log reads while another
+        // owner is live. Lease acquisition below remains the ownership CAS.
+        if !self
+            .lease_holder_preflight_passes(delivery, activation)
+            .await?
+        {
             return Ok(false);
         }
         if !self
-            .targeted_route_preflight_passes(message, activation)
+            .metadata_preflight_passes(delivery, activation, generation)
             .await?
         {
             return Ok(false);
         }
 
-        // A targeted re-activation stays durable until the active loop's tool
-        // boundary or final drain has covered the requested sequence. Checked
-        // before wind-up so a running turn's lease is never taken from it.
-        let already_running = self.already_running(&activation.session_id).await;
         if self.shutdown.is_cancelled() {
-            Self::shutdown_nak(message).await?;
-            return Ok(false);
-        }
-        if already_running {
-            self.settle_running_activation(message).await?;
+            Self::shutdown_nak(delivery).await?;
             return Ok(false);
         }
 
-        if !self.wind_up_preflight(message, activation).await? {
+        if !self
+            .wind_up_preflight(delivery, activation, generation)
+            .await?
+        {
             return Ok(false);
         }
 
-        if self.uses_targeted_activation()
-            && self
-                .targeted_status_preflight_finished(message, activation)
-                .await?
+        if self
+            .activation_status_preflight_finished(delivery, activation)
+            .await?
         {
             return Ok(false);
         }

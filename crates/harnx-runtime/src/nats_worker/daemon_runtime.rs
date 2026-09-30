@@ -4,6 +4,8 @@
 
 mod activation_preflight;
 
+use super::activation_delivery::ActivationDelivery;
+use super::activation_failure::ActivationFailureTracker;
 use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, SessionControlHandler};
 use super::daemon::{SessionActivate, SessionActivationRoute, WorkerActivationMode};
@@ -15,7 +17,7 @@ use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLeas
 use crate::nats_metrics;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
-use async_nats::jetstream::AckKind;
+use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -37,6 +39,8 @@ use tracing::Instrument;
 /// each redelivery re-acquiring the lease and fencing the still-running
 /// previous attempt.
 pub(super) const SESSION_TOOL_SERVER_START_TIMEOUT: Duration = Duration::from_secs(20);
+const BUSY_NAK_BASE_DELAY: Duration = Duration::from_secs(10);
+const BUSY_NAK_MAX_JITTER: Duration = Duration::from_secs(2);
 
 /// Borrowed parameters for [`WorkerRuntime::spawn_control_listener`].
 pub(super) struct ControlListenerCtx<'a> {
@@ -53,10 +57,9 @@ struct PreparedControl {
     hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<super::control::AppliedHitlDecision>,
 }
 
-/// Borrowed parameters for [`WorkerRuntime::prepare_and_ack_activation`].
-struct ActivationAckCtx<'a> {
+/// Borrowed parameters for [`WorkerRuntime::prepare_activation_control`].
+struct ActivationControlCtx<'a> {
     activation: &'a SessionActivate,
-    message: &'a async_nats::jetstream::Message,
     lease: &'a Arc<NatsSessionLease>,
     abort_signal: &'a crate::utils::AbortSignal,
 }
@@ -64,6 +67,7 @@ struct ActivationAckCtx<'a> {
 struct ClaimedActivation {
     activation: SessionActivate,
     lease: Arc<NatsSessionLease>,
+    reservation_generation: u64,
     span: tracing::Span,
 }
 
@@ -73,14 +77,39 @@ struct PreparedActivation {
     abort_signal: crate::utils::AbortSignal,
     control: PreparedControl,
     execution: WorkerExecution,
-    message: async_nats::jetstream::Message,
+    delivery: ActivationDelivery,
     shutdown: tokio_util::sync::CancellationToken,
     span: tracing::Span,
 }
 
 pub(super) struct ActiveSession {
+    reservation_generation: u64,
     shutdown: tokio_util::sync::CancellationToken,
     join: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationReservationState {
+    Starting,
+    Running,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ActivationReservation {
+    generation: u64,
+    stream_sequence: Option<u64>,
+    state: ActivationReservationState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationOutcome {
+    Reserved(u64),
+    SameDelivery,
+    DistinctDelivery,
+}
+
+fn busy_nak_delay(jitter: Duration) -> Duration {
+    BUSY_NAK_BASE_DELAY + jitter.min(BUSY_NAK_MAX_JITTER)
 }
 
 fn agent_activation_span(
@@ -111,10 +140,13 @@ pub(super) struct WorkerRuntime {
     pub(super) cluster: String,
     pub(super) activation_route: SessionActivationRoute,
     pub(super) activation_mode: WorkerActivationMode,
+    pub(super) activation_heartbeat_interval: Duration,
     pub(super) manage_servers: bool,
     pub(super) worker_id: String,
     pub(super) identity: crate::worker_identity::WorkerReadiness,
     pub(super) lease: NatsLeaseConfig,
+    pub(super) lease_bucket: jetstream::kv::Store,
+    pub(super) activation_failures: ActivationFailureTracker,
     pub(super) jetstream: jetstream::Context,
     pub(super) session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     /// Shared NATS client for control-plane subscriptions (cloned per session
@@ -124,6 +156,7 @@ pub(super) struct WorkerRuntime {
     pub(super) generation: AtomicU64,
     pub(super) shutdown: tokio_util::sync::CancellationToken,
     pub(super) active: Mutex<HashMap<String, ActiveSession>>,
+    pub(super) reservations: Mutex<HashMap<String, ActivationReservation>>,
 }
 
 impl WorkerRuntime {
@@ -131,10 +164,65 @@ impl WorkerRuntime {
         self.activation_mode == WorkerActivationMode::WorkerTargeted
     }
 
-    pub(super) async fn already_running(&self, session_id: &str) -> bool {
+    async fn reserve_activation(
+        &self,
+        session_id: &str,
+        stream_sequence: Option<u64>,
+    ) -> ReservationOutcome {
+        let mut reservations = self.reservations.lock().await;
+        if let Some(reservation) = reservations.get(session_id) {
+            return if stream_sequence.is_some() && stream_sequence == reservation.stream_sequence {
+                ReservationOutcome::SameDelivery
+            } else {
+                ReservationOutcome::DistinctDelivery
+            };
+        }
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst);
+        reservations.insert(
+            session_id.to_string(),
+            ActivationReservation {
+                generation,
+                stream_sequence,
+                state: ActivationReservationState::Starting,
+            },
+        );
+        ReservationOutcome::Reserved(generation)
+    }
+
+    async fn mark_activation_running(&self, session_id: &str, generation: u64) -> bool {
+        let mut reservations = self.reservations.lock().await;
+        let Some(reservation) = reservations.get_mut(session_id) else {
+            return false;
+        };
+        if reservation.generation != generation
+            || reservation.state != ActivationReservationState::Starting
+        {
+            return false;
+        }
+        reservation.state = ActivationReservationState::Running;
+        true
+    }
+
+    async fn release_activation_reservation(&self, session_id: &str, generation: u64) {
+        let mut reservations = self.reservations.lock().await;
+        if reservations
+            .get(session_id)
+            .is_some_and(|reservation| reservation.generation == generation)
+        {
+            reservations.remove(session_id);
+        }
+    }
+
+    async fn release_activation_tracking(&self, session_id: &str, generation: u64) {
+        self.release_activation_reservation(session_id, generation)
+            .await;
         let mut active = self.active.lock().await;
-        active.retain(|_, session| !session.join.is_finished());
-        active.contains_key(session_id)
+        if active
+            .get(session_id)
+            .is_some_and(|session| session.reservation_generation == generation)
+        {
+            active.remove(session_id);
+        }
     }
 
     /// Close admission's active-session side and await every single-owner
@@ -143,18 +231,18 @@ impl WorkerRuntime {
     pub(super) async fn shutdown_active_sessions(&self) {
         let sessions = {
             let mut active = self.active.lock().await;
-            active
-                .drain()
-                .map(|(_, session)| session)
-                .collect::<Vec<_>>()
+            active.drain().collect::<Vec<_>>()
         };
-        for session in &sessions {
+        for (_, session) in &sessions {
             session.shutdown.cancel();
         }
-        for session in sessions {
+        for (session_id, session) in sessions {
+            let generation = session.reservation_generation;
             if let Err(error) = session.join.await {
                 log::warn!("worker session supervisor failed during shutdown: {error}");
             }
+            self.release_activation_reservation(&session_id, generation)
+                .await;
         }
         match tokio::time::timeout(Duration::from_secs(2), self.client.flush()).await {
             Ok(Ok(())) => {}
@@ -247,8 +335,8 @@ impl WorkerRuntime {
     async fn acquire_activation_lease(
         &self,
         activation: &SessionActivate,
+        generation: u64,
     ) -> Result<Option<Arc<NatsSessionLease>>> {
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst);
         let lease = NatsSessionLease::acquire_for_execution(
             NatsLeaseAcquireParams {
                 jetstream: self.jetstream.clone(),
@@ -264,23 +352,37 @@ impl WorkerRuntime {
         Ok(lease.map(Arc::new))
     }
 
-    async fn shutdown_nak(message: &async_nats::jetstream::Message) -> Result<()> {
-        message
-            .ack_with(AckKind::Nak(None))
-            .await
-            .map_err(|error| anyhow::anyhow!("NAK SessionActivate during shutdown: {error}"))
+    async fn shutdown_nak(delivery: &mut ActivationDelivery) -> Result<()> {
+        delivery.nak(None, "SessionActivate during shutdown").await
     }
 
-    async fn delayed_nak(message: &async_nats::jetstream::Message) -> Result<()> {
-        let delivered = message.info().map(|info| info.delivered).unwrap_or(1);
+    async fn delayed_nak(delivery: &mut ActivationDelivery) -> Result<()> {
+        let delivered = delivery
+            .message()
+            .info()
+            .map(|info| info.delivered)
+            .unwrap_or(1);
         let exponent = u32::try_from(delivered.saturating_sub(1))
             .unwrap_or(u32::MAX)
             .min(5);
         let millis = 100_u64.saturating_mul(1_u64 << exponent).min(2_000);
-        message
-            .ack_with(AckKind::Nak(Some(Duration::from_millis(millis))))
+        delivery
+            .nak(
+                Some(Duration::from_millis(millis)),
+                "failed targeted SessionActivate",
+            )
             .await
-            .map_err(|error| anyhow::anyhow!("delayed-NAK targeted SessionActivate: {error}"))
+    }
+
+    async fn busy_nak(delivery: &mut ActivationDelivery) -> Result<()> {
+        let jitter_millis = rand::rng()
+            .random_range(0..=u64::try_from(BUSY_NAK_MAX_JITTER.as_millis()).unwrap_or(u64::MAX));
+        delivery
+            .nak(
+                Some(busy_nak_delay(Duration::from_millis(jitter_millis))),
+                "busy SessionActivate",
+            )
+            .await
     }
 
     async fn flush_shutdown_disposition(&self) {
@@ -295,16 +397,24 @@ impl WorkerRuntime {
         }
     }
 
-    async fn targeted_activation_is_covered(&self, activation: &SessionActivate) -> Result<bool> {
-        let requested_seq = activation
-            .requested_seq
-            .context("targeted activation is missing requested_seq")?;
+    async fn activation_is_covered(&self, activation: &SessionActivate) -> Result<bool> {
         let backend = NatsSessionLogBackend::new(
             self.jetstream.clone(),
             &activation.session_id,
             self.lease.replicas,
         );
         let entries = backend.load_events_latest_async().await?;
+        let requested_seq = activation.requested_seq.or_else(|| {
+            entries.iter().rev().find_map(|(seq, entry)| match entry {
+                harnx_core::session::SessionLogEntry::Message { role, .. } if role.is_user() => {
+                    Some(*seq)
+                }
+                _ => None,
+            })
+        });
+        let Some(requested_seq) = requested_seq else {
+            return Ok(false);
+        };
         Ok(
             crate::nats_session::requested_seq_status(&entries, requested_seq)?
                 == crate::nats_session::RequestedSeqStatus::Covered,
@@ -327,72 +437,85 @@ impl WorkerRuntime {
         Ok(())
     }
 
-    async fn terminate_activation(
-        message: &async_nats::jetstream::Message,
+    async fn clear_activation_failures(&self, delivery: &ActivationDelivery) {
+        if let Err(error) = delivery
+            .clear_failure_count(&self.activation_failures)
+            .await
+        {
+            log::warn!(
+                "failed to clear activation failure counter: key={} error={error:#}",
+                delivery.failure_key()
+            );
+        }
+    }
+
+    async fn acknowledge_activation(
+        &self,
+        delivery: &mut ActivationDelivery,
         reason: &str,
     ) -> Result<()> {
-        message
-            .ack_with(AckKind::Term)
-            .await
-            .map_err(|error| anyhow::anyhow!("terminate {reason} SessionActivate: {error}"))
+        delivery.ack(reason).await?;
+        self.clear_activation_failures(delivery).await;
+        Ok(())
+    }
+
+    async fn terminate_activation(
+        &self,
+        delivery: &mut ActivationDelivery,
+        reason: &str,
+    ) -> Result<()> {
+        delivery.terminate(reason).await?;
+        self.clear_activation_failures(delivery).await;
+        Ok(())
     }
 
     async fn decode_activation(
         &self,
-        message: &async_nats::jetstream::Message,
+        delivery: &mut ActivationDelivery,
     ) -> Result<Option<SessionActivate>> {
-        match serde_json::from_slice(&message.payload) {
+        match serde_json::from_slice(&delivery.message().payload) {
             Ok(activation) => Ok(Some(activation)),
-            Err(error) if self.uses_targeted_activation() => {
-                log::warn!("terminating malformed targeted SessionActivate: {error}");
-                Self::terminate_activation(message, "malformed targeted").await?;
+            Err(error) => {
+                log::warn!("terminating malformed SessionActivate: {error}");
+                self.terminate_activation(delivery, "malformed").await?;
                 Ok(None)
             }
-            Err(error) => Err(error).context("decode SessionActivate"),
         }
     }
 
-    async fn targeted_status_preflight_finished(
+    async fn activation_status_preflight_finished(
         &self,
-        message: &async_nats::jetstream::Message,
+        delivery: &mut ActivationDelivery,
         activation: &SessionActivate,
     ) -> Result<bool> {
-        match self.targeted_activation_is_covered(activation).await {
+        match self.activation_is_covered(activation).await {
             Ok(true) => {
-                message
-                    .ack()
-                    .await
-                    .map_err(|error| anyhow::anyhow!("ack covered targeted activation: {error}"))?;
+                self.acknowledge_activation(delivery, "covered activation")
+                    .await?;
                 Ok(true)
             }
             Ok(false) => Ok(false),
             Err(error) => {
                 log::warn!(
-                    "targeted activation status read failed for session '{}': {error:#}",
+                    "activation status read failed for session '{}': {error:#}",
                     activation.session_id
                 );
-                Self::delayed_nak(message).await?;
+                Self::delayed_nak(delivery).await?;
                 Ok(true)
             }
         }
     }
 
-    async fn settle_running_activation(
-        &self,
-        message: &async_nats::jetstream::Message,
-    ) -> Result<()> {
-        Self::delayed_nak(message).await
-    }
-
     async fn acquire_or_defer_activation(
         &self,
-        message: &async_nats::jetstream::Message,
+        delivery: &mut ActivationDelivery,
         activation: &SessionActivate,
+        generation: u64,
     ) -> Result<Option<Arc<NatsSessionLease>>> {
-        match self.acquire_activation_lease(activation).await {
+        match self.acquire_activation_lease(activation, generation).await {
             Ok(Some(lease)) => Ok(Some(lease)),
             Ok(None) => {
-                Self::delayed_nak(message).await?;
+                Self::busy_nak(delivery).await?;
                 Ok(None)
             }
             Err(error) if self.uses_targeted_activation() => {
@@ -400,7 +523,7 @@ impl WorkerRuntime {
                     "targeted activation lease attempt failed for session '{}': {error:#}",
                     activation.session_id
                 );
-                Self::delayed_nak(message).await?;
+                Self::delayed_nak(delivery).await?;
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -409,13 +532,12 @@ impl WorkerRuntime {
 
     async fn prepare_activation_control(
         &self,
-        ctx: &ActivationAckCtx<'_>,
+        ctx: &ActivationControlCtx<'_>,
     ) -> Result<PreparedControl> {
-        let ActivationAckCtx {
+        let ActivationControlCtx {
             activation,
             lease,
             abort_signal,
-            ..
         } = *ctx;
         let backend = NatsSessionLogBackend::new(
             self.jetstream.clone(),
@@ -433,54 +555,11 @@ impl WorkerRuntime {
         .await
         {
             Ok(control) => Ok(control),
-            Err(error) => {
-                let _ = lease.release().await;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
-    /// Subscribe control and acknowledge the activation, in that order.
-    /// `start_session_tool_servers` already registered this session as a tool-
-    /// server user before either step ran; no task exists yet to release that
-    /// on completion (that happens inside the spawned task `handle_activation`
-    /// creates once this returns `Ok`), so either failure here must release it
-    /// itself or the server stays pinned running for the rest of the worker's
-    /// lifetime.
-    async fn prepare_and_ack_activation(
-        &self,
-        ctx: ActivationAckCtx<'_>,
-    ) -> Result<PreparedControl> {
-        let control = match self.prepare_activation_control(&ctx).await {
-            Ok(control) => control,
-            Err(error) => {
-                self.end_session_tool_servers(&ctx.activation.session_id)
-                    .await;
-                return Err(error);
-            }
-        };
-        if let Err(error) = ctx.message.ack_with(AckKind::Progress).await {
-            control.task.abort();
-            let _ = ctx.lease.release().await;
-            self.end_session_tool_servers(&ctx.activation.session_id)
-                .await;
-            return Err(anyhow::anyhow!("ack SessionActivate: {error}"));
-        }
-        Ok(control)
-    }
-
-    async fn prepare_claimed_activation(
-        self: &Arc<Self>,
-        claimed: ClaimedActivation,
-        message: &async_nats::jetstream::Message,
-        shutdown: tokio_util::sync::CancellationToken,
-    ) -> Result<PreparedActivation> {
-        let ClaimedActivation {
-            activation,
-            lease,
-            span,
-        } = claimed;
-        let execution = WorkerExecution::claim(&activation, &lease);
+    fn log_activation_claim(&self, activation: &SessionActivate, lease: &NatsSessionLease) {
         log::info!(
             "session activate claimed: session_id={} worker_id={} worker_pid={} build={} activation_route={:?} revision={} epoch={}",
             activation.session_id,
@@ -491,21 +570,64 @@ impl WorkerRuntime {
             lease.fence_token(),
             activation.epoch
         );
+    }
+
+    async fn prepare_claimed_activation(
+        self: &Arc<Self>,
+        claimed: ClaimedActivation,
+        mut delivery: ActivationDelivery,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<PreparedActivation> {
+        let ClaimedActivation {
+            activation,
+            lease,
+            reservation_generation: _,
+            span,
+        } = claimed;
+        let execution = WorkerExecution::claim(&activation, &lease);
+        self.log_activation_claim(&activation, &lease);
 
         let abort_signal = crate::utils::create_abort_signal();
-        let control = self
-            .prepare_and_ack_activation(ActivationAckCtx {
+        let control = match self
+            .prepare_activation_control(&ActivationControlCtx {
                 activation: &activation,
-                message,
                 lease: &lease,
                 abort_signal: &abort_signal,
             })
-            .await?;
+            .await
+        {
+            Ok(control) => control,
+            Err(error) => {
+                let error = if self.shutdown.is_cancelled() {
+                    let _ = Self::shutdown_nak(&mut delivery).await;
+                    error
+                } else {
+                    let error = self
+                        .classify_pre_turn_failure(
+                            &activation,
+                            delivery.failure_key(),
+                            &lease,
+                            error,
+                        )
+                        .await;
+                    if super::daemon_session_exec::is_durable_activation_error(&error) {
+                        let _ = self
+                            .terminate_activation(&mut delivery, "durably failed")
+                            .await;
+                    } else {
+                        let _ = Self::delayed_nak(&mut delivery).await;
+                    }
+                    error
+                };
+                let _ = lease.release().await;
+                return Err(error);
+            }
+        };
         self.prepare_session_services(&activation, &abort_signal, &shutdown)
             .await;
         Ok(PreparedActivation {
             execution,
-            message: message.clone(),
+            delivery,
             activation,
             lease,
             abort_signal,
@@ -574,7 +696,29 @@ impl WorkerRuntime {
             lease.worker_id(),
             lease.fence_token(),
             snapshot.active_sessions_per_worker
+
         );
+    }
+    async fn settle_session_delivery(
+        &self,
+        delivery: &mut ActivationDelivery,
+        result: &Result<FinishCause>,
+    ) {
+        match result.as_ref() {
+            Ok(cause) if cause.is_terminal() => {
+                let _ = self.acknowledge_activation(delivery, "completed").await;
+            }
+            Ok(FinishCause::Failover(_)) => {
+                let _ = Self::shutdown_nak(delivery).await;
+                self.flush_shutdown_disposition().await;
+            }
+            Err(error) if super::daemon_session_exec::is_durable_activation_error(error) => {
+                let _ = self.terminate_activation(delivery, "durably failed").await;
+            }
+            _ => {
+                let _ = Self::delayed_nak(delivery).await;
+            }
+        }
     }
     async fn run_session_task(self: &Arc<Self>, prepared: PreparedActivation) {
         let PreparedActivation {
@@ -583,7 +727,7 @@ impl WorkerRuntime {
             abort_signal,
             control,
             execution,
-            message,
+            mut delivery,
             shutdown,
             span,
         } = prepared;
@@ -616,6 +760,7 @@ impl WorkerRuntime {
                 worker
                     .execute_session(super::daemon_session_exec::SessionExecutionInputs {
                         activation,
+                        activation_failure_key: delivery.failure_key().to_string(),
                         lease: Arc::clone(&lease),
                         abort_signal,
                         control_task: control.task,
@@ -625,19 +770,11 @@ impl WorkerRuntime {
                     })
                     .await
             };
-            match result.as_ref() {
-                Ok(cause) if cause.is_terminal() => {
-                    let _ = message.ack().await;
-                }
-                Ok(FinishCause::Failover(_)) => {
-                    let _ = Self::shutdown_nak(&message).await;
-                    worker.flush_shutdown_disposition().await;
-                }
-                _ => {
-                    let _ = Self::delayed_nak(&message).await;
-                }
-            }
             worker.end_session_tool_servers(&task_session_id).await;
+            worker.settle_session_delivery(&mut delivery, &result).await;
+            if result.is_err() {
+                let _ = lease.release().await;
+            }
             Self::active_session_finished(&task_session_id, &lease);
             if let Err(error) = result {
                 log::warn!("worker session execution failed: {error:#}");
@@ -649,75 +786,136 @@ impl WorkerRuntime {
 
     async fn claim_activation(
         &self,
-        message: &async_nats::jetstream::Message,
+        delivery: &mut ActivationDelivery,
     ) -> Result<Option<ClaimedActivation>> {
         if self.shutdown.is_cancelled() {
-            Self::shutdown_nak(message).await?;
+            Self::shutdown_nak(delivery).await?;
             return Ok(None);
         }
-        let Some(activation) = self.decode_activation(message).await? else {
+        let Some(activation) = self.decode_activation(delivery).await? else {
             return Ok(None);
         };
-        let span = agent_activation_span(message.headers.as_ref(), &activation.session_id);
-        if !self.activation_is_ready(message, &activation).await? {
-            return Ok(None);
-        }
-        if self.shutdown.is_cancelled() {
-            Self::shutdown_nak(message).await?;
-            return Ok(None);
-        }
-        let Some(lease) = self
-            .acquire_or_defer_activation(message, &activation)
-            .await?
-        else {
-            return Ok(None);
+        let reservation_generation = match self
+            .reserve_activation(&activation.session_id, delivery.stream_sequence())
+            .await
+        {
+            ReservationOutcome::Reserved(generation) => generation,
+            ReservationOutcome::SameDelivery => return Ok(None),
+            ReservationOutcome::DistinctDelivery => {
+                Self::busy_nak(delivery).await?;
+                return Ok(None);
+            }
         };
-        if self.shutdown.is_cancelled() {
-            lease.release().await?;
-            Self::shutdown_nak(message).await?;
-            return Ok(None);
+        self.claim_reserved_activation(delivery, activation, reservation_generation)
+            .await
+    }
+
+    async fn claim_reserved_activation(
+        &self,
+        delivery: &mut ActivationDelivery,
+        activation: SessionActivate,
+        reservation_generation: u64,
+    ) -> Result<Option<ClaimedActivation>> {
+        let session_id = activation.session_id.clone();
+        let result = async {
+            let span =
+                agent_activation_span(delivery.message().headers.as_ref(), &activation.session_id);
+            if !self
+                .activation_is_ready(delivery, &activation, reservation_generation)
+                .await?
+            {
+                return Ok(None);
+            }
+            if self.shutdown.is_cancelled() {
+                Self::shutdown_nak(delivery).await?;
+                return Ok(None);
+            }
+            let Some(lease) = self
+                .acquire_or_defer_activation(delivery, &activation, reservation_generation)
+                .await?
+            else {
+                return Ok(None);
+            };
+            delivery.attach_lease(&lease);
+            if self.shutdown.is_cancelled() {
+                lease.release().await?;
+                Self::shutdown_nak(delivery).await?;
+                return Ok(None);
+            }
+            Ok(Some(ClaimedActivation {
+                activation,
+                lease,
+                reservation_generation,
+                span,
+            }))
         }
-        Ok(Some(ClaimedActivation {
-            activation,
-            lease,
-            span,
-        }))
+        .await;
+        if !matches!(result, Ok(Some(_))) {
+            self.release_activation_reservation(&session_id, reservation_generation)
+                .await;
+        }
+        result
     }
 
     pub(super) async fn handle_activation(
         self: &Arc<Self>,
         message: async_nats::jetstream::Message,
     ) -> Result<()> {
-        let Some(claimed) = self.claim_activation(&message).await? else {
-            return Ok(());
+        let mut delivery =
+            ActivationDelivery::start(message, self.activation_heartbeat_interval).await?;
+        let claimed = match self.claim_activation(&mut delivery).await {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => {
+                delivery.stop_heartbeat().await;
+                return Ok(());
+            }
+            Err(error) => {
+                let disposition = if self.shutdown.is_cancelled() {
+                    Self::shutdown_nak(&mut delivery).await
+                } else {
+                    Self::delayed_nak(&mut delivery).await
+                };
+                disposition?;
+                return Err(error);
+            }
         };
         let worker = Arc::clone(self);
         let session_id = claimed.activation.session_id.clone();
+        let task_session_id = session_id.clone();
+        let reservation_generation = claimed.reservation_generation;
         let shutdown = self.shutdown.child_token();
         let task_shutdown = shutdown.clone();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
-            let prepared = worker
-                .prepare_claimed_activation(claimed, &message, task_shutdown)
-                .await;
-            match prepared {
-                Ok(prepared) => worker.run_session_task(prepared).await,
-                Err(error) => {
-                    log::warn!("session preparation failed: {error:#}");
-                    if worker.shutdown.is_cancelled() {
-                        let _ = Self::shutdown_nak(&message).await;
-                    } else {
-                        let _ = Self::delayed_nak(&message).await;
+            if start_rx.await.is_ok() {
+                let prepared = worker
+                    .prepare_claimed_activation(claimed, delivery, task_shutdown)
+                    .await;
+                match prepared {
+                    Ok(prepared) => worker.run_session_task(prepared).await,
+                    Err(error) => {
+                        log::warn!("session preparation failed: {error:#}");
                     }
                 }
             }
+            worker
+                .release_activation_tracking(&task_session_id, reservation_generation)
+                .await;
         });
         self.active.lock().await.insert(
-            session_id,
+            session_id.clone(),
             ActiveSession {
+                reservation_generation,
                 shutdown,
                 join: handle,
             },
         );
+        anyhow::ensure!(
+            self.mark_activation_running(&session_id, reservation_generation)
+                .await,
+            "claimed activation reservation must transition from starting to running"
+        );
+        let _ = start_tx.send(());
         Ok(())
     }
 
@@ -751,8 +949,9 @@ impl WorkerRuntime {
 mod tests {
     use async_nats::header::NATS_MESSAGE_ID;
     use opentelemetry::trace::{SpanId, SpanKind, TraceContextExt, TraceId};
+    use std::time::Duration;
 
-    use super::agent_activation_span;
+    use super::{agent_activation_span, busy_nak_delay};
 
     const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
     const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -820,5 +1019,19 @@ mod tests {
         assert_eq!(consumer.span_kind, SpanKind::Consumer);
         assert_ne!(consumer.span_context.trace_id(), TraceId::INVALID);
         assert_eq!(consumer.parent_span_id, SpanId::INVALID);
+    }
+
+    #[test]
+    fn busy_nak_uses_ten_second_base_and_caps_jitter_at_two_seconds() {
+        harnx_core::require_nextest();
+        assert_eq!(busy_nak_delay(Duration::ZERO), Duration::from_secs(10));
+        assert_eq!(
+            busy_nak_delay(Duration::from_millis(1_250)),
+            Duration::from_millis(11_250)
+        );
+        assert_eq!(
+            busy_nak_delay(Duration::from_secs(9)),
+            Duration::from_secs(12)
+        );
     }
 }

@@ -56,7 +56,7 @@ impl Config {
         config.info_flag = info_flag;
 
         let setup = |config: &mut Self| -> Result<()> {
-            config.load_envs(allow_terminal_interaction);
+            config.load_envs(allow_terminal_interaction)?;
 
             if let Some(wrap) = config.wrap.clone() {
                 config.set_wrap(&wrap)?;

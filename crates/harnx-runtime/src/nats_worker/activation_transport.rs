@@ -14,7 +14,7 @@ use std::time::Duration;
 
 const WORK_NOTIFY_STREAM_PREFIX: &str = "WORK_NOTIFY_";
 const WORK_NOTIFY_CONSUMER_NAME: &str = "workers";
-const WORK_NOTIFY_ACK_WAIT: Duration = Duration::from_secs(30);
+pub(super) const WORK_NOTIFY_ACK_WAIT: Duration = Duration::from_secs(30);
 const WORK_NOTIFY_INACTIVE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 const LOCAL_WORK_NOTIFY_STREAM: &str = "LOCAL_WORK_NOTIFY_V2";
 const LOCAL_NOTIFY_SUBJECT: &str = "session_scope.__local__.workers.*.sessions.notify";
@@ -288,7 +288,7 @@ pub(super) async fn ensure_activation_consumer(
             pull::Config {
                 durable_name: Some(consumer_name.clone()),
                 deliver_policy: DeliverPolicy::All,
-                ack_wait: WORK_NOTIFY_ACK_WAIT,
+                ack_wait: daemon.activation_ack_wait(),
                 filter_subject: subject.clone(),
                 inactive_threshold: WORK_NOTIFY_INACTIVE_THRESHOLD,
                 max_deliver: -1,
@@ -298,7 +298,12 @@ pub(super) async fn ensure_activation_consumer(
         .await
         .with_context(|| format!("create worker consumer '{consumer_name}'"))?;
     if daemon.activation_mode == WorkerActivationMode::WorkerTargeted {
-        validate_targeted_consumer(&consumer, &consumer_name, &subject)?;
+        validate_targeted_consumer(
+            &consumer,
+            &consumer_name,
+            &subject,
+            daemon.activation_ack_wait(),
+        )?;
     }
     Ok(consumer)
 }
@@ -337,6 +342,7 @@ fn validate_targeted_consumer(
     consumer: &jetstream::consumer::Consumer<pull::Config>,
     consumer_name: &str,
     subject: &str,
+    ack_wait: Duration,
 ) -> Result<()> {
     let configured = &consumer.cached_info().config;
     anyhow::ensure!(
@@ -345,10 +351,10 @@ fn validate_targeted_consumer(
         configured.filter_subject
     );
     anyhow::ensure!(
-        configured.ack_wait == WORK_NOTIFY_ACK_WAIT,
+        configured.ack_wait == ack_wait,
         "existing targeted consumer '{consumer_name}' has incompatible ack wait {:?}; expected {:?}",
         configured.ack_wait,
-        WORK_NOTIFY_ACK_WAIT
+        ack_wait
     );
     anyhow::ensure!(
         configured.max_deliver == -1,

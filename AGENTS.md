@@ -163,6 +163,11 @@ only make it slower to find. `gh run list --branch <branch> --workflow CI` also
 shows whether an earlier head on the same branch was green, which brackets the
 change that broke it.
 
+When comparing against `main` to distinguish flake from regression, use
+`origin/main`, not an intermediate branch commit. A branch that accumulated
+multiple changes may have passed earlier commits while failing on later ones,
+so a parent on the branch is not a stable baseline.
+
 ### Web/Frontend Verification
 
 **Run all web/frontend commands from `web/`, never the repo root.** The root has no

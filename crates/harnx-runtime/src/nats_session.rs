@@ -78,15 +78,17 @@ pub(crate) fn new_client_message_id() -> String {
 const ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Consecutive lease reads with no holder before a turn is declared orphaned.
-/// Two reads at the interval above leave ~4s of slack for a worker's lease
-/// release to race the barrier it just wrote.
-const ORPHAN_MISSING_CHECKS: u32 = 2;
+/// Seven reads leave 14s of slack for the 10s busy-activation NAK plus its 2s
+/// jitter before a replacement worker can receive the activation.
+const ORPHAN_MISSING_CHECKS: u32 = 7;
 
 /// Maximum time an admitted turn may wait for its first worker lease.
 ///
 /// This is deliberately longer than the 30s lease TTL so slow worker startup
 /// gets two full lease windows before the exposed run is failed.
-const LEASE_ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const LEASE_ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    harnx_core::config_data::DEFAULT_NATS_LEASE_ACQUISITION_TIMEOUT_SECS,
+);
 const CONTROL_ACK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 const CONTROL_ACK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const CONTROL_RECOVERY_TIMEOUT: std::time::Duration =
@@ -110,6 +112,7 @@ pub struct SessionLeaseWatchdog {
     bucket: Option<async_nats::jetstream::kv::Store>,
     next_check: tokio::time::Instant,
     lease_acquisition_deadline: tokio::time::Instant,
+    lease_acquisition_timeout: std::time::Duration,
     saw_lease: bool,
     missing_checks: u32,
     missing_checks_limit: u32,
@@ -149,6 +152,7 @@ impl SessionLeaseWatchdog {
             bucket: None,
             next_check: now + ORPHAN_CHECK_INTERVAL.min(lease_acquisition_timeout),
             lease_acquisition_deadline: now + lease_acquisition_timeout,
+            lease_acquisition_timeout,
             saw_lease: false,
             missing_checks: 0,
             missing_checks_limit,
@@ -236,7 +240,7 @@ impl SessionLeaseWatchdog {
             format!(
                 "No worker claimed this session within {} seconds after activation. \
                  Check that a worker is running and subscribed to this agent's cluster.",
-                LEASE_ACQUISITION_TIMEOUT.as_secs()
+                self.lease_acquisition_timeout.as_secs()
             )
         })
     }
@@ -385,6 +389,7 @@ pub struct NatsSession {
     abort_signal: AbortSignal,
     metadata_store: SessionMetadataStore,
     attachment_replicas: usize,
+    lease_acquisition_timeout: std::time::Duration,
     /// Session that invoked this one as a sub-agent child, if any.
     parent_session_id: Option<String>,
     parent_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -498,6 +503,25 @@ impl NatsSession {
         jetstream: jetstream::Context,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
+        Self::new_with_resolved_options(
+            config,
+            replicas,
+            client,
+            jetstream,
+            abort_signal,
+            LEASE_ACQUISITION_TIMEOUT,
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_resolved_options(
+        config: NatsSessionConfig,
+        replicas: usize,
+        client: async_nats::Client,
+        jetstream: jetstream::Context,
+        abort_signal: AbortSignal,
+        lease_acquisition_timeout: std::time::Duration,
+    ) -> Result<Self> {
         let metadata_store = SessionMetadataStore::ensure(&jetstream, replicas)
             .await
             .context("failed to open canonical session metadata store")?;
@@ -533,6 +557,7 @@ impl NatsSession {
             abort_signal,
             metadata_store,
             attachment_replicas: replicas,
+            lease_acquisition_timeout,
             parent_session_id: None,
             parent_cancel: None,
             invocation_id: None,
@@ -551,18 +576,21 @@ impl NatsSession {
             .resolve_nats_server(&cluster)
             .await?
             .resolved_replicas();
+        let lease_acquisition_timeout =
+            std::time::Duration::from_secs(config_snapshot.nats_lease_acquisition_timeout_secs);
         let client = config_snapshot
             .nats_client(&cluster)
             .await
             .context("failed to connect to NATS cluster")?;
         let jetstream = async_nats::jetstream::new(client.clone());
 
-        let nats_session = Self::new_with_resolved_replicas(
+        let nats_session = Self::new_with_resolved_options(
             config,
             attachment_replicas,
             client,
             jetstream,
             abort_signal,
+            lease_acquisition_timeout,
         )
         .await?;
 
@@ -1390,6 +1418,7 @@ impl NatsSession {
             self.storage_key.clone(),
             event_stream.history().to_vec(),
             options.orphan_timeout,
+            self.lease_acquisition_timeout,
         ));
         let mut completion_error = None;
         let mut emitted_subagent_completions = HashSet::new();
@@ -2268,18 +2297,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn activation_timeout_reports_unclaimed_run() {
-        let mut watchdog = SessionLeaseWatchdog::new();
+    async fn activation_timeout_reports_configured_value() {
+        let configured = std::time::Duration::from_secs(7);
+        let mut watchdog = SessionLeaseWatchdog::with_timeouts(None, configured);
         assert_eq!(
             watchdog.lease_acquisition_timeout(tokio::time::Instant::now()),
             None
         );
 
-        tokio::time::advance(LEASE_ACQUISITION_TIMEOUT).await;
+        tokio::time::advance(configured).await;
         let reason = watchdog
             .lease_acquisition_timeout(tokio::time::Instant::now())
             .expect("unclaimed activation must time out");
-        assert!(reason.contains("No worker claimed this session within 60 seconds"));
+        assert!(reason.contains("No worker claimed this session within 7 seconds"));
 
         watchdog.saw_lease = true;
         assert_eq!(

@@ -30,6 +30,26 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// for budget terminals. No other code may match this prefix directly.
 const BUDGET_TERMINAL_PREFIX: &str = "harnx:budget_exceeded ";
 
+/// Worker-side terminal condition for a bounded invocation.
+#[derive(Debug)]
+pub(crate) struct TokenBudgetExceeded {
+    budgeted: u64,
+    budget: u64,
+}
+
+impl TokenBudgetExceeded {
+    pub(crate) fn new(budgeted: u64, budget: u64) -> Self {
+        Self { budgeted, budget }
+    }
+}
+
+impl std::fmt::Display for TokenBudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&budget_terminal_message(self.budgeted, self.budget))
+    }
+}
+
+impl std::error::Error for TokenBudgetExceeded {}
 /// Maximum retained bytes in the caller-side invocation thinking buffer.
 pub const INVOCATION_TEXT_TAIL_CAP_BYTES: usize = 4 * 1024;
 

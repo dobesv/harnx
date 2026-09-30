@@ -79,6 +79,7 @@ pub(crate) struct SubagentToolset {
     session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     replicas: usize,
     progress_heartbeat: Duration,
+    lease_acquisition_timeout: Duration,
 }
 
 pub(crate) struct SubagentNats {
@@ -86,6 +87,7 @@ pub(crate) struct SubagentNats {
     jetstream: jetstream::Context,
     session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     replicas: usize,
+    lease_acquisition_timeout: Duration,
 }
 
 impl SubagentNats {
@@ -100,7 +102,13 @@ impl SubagentNats {
             jetstream,
             session_metadata,
             replicas,
+            lease_acquisition_timeout: crate::nats_session::LEASE_ACQUISITION_TIMEOUT,
         }
+    }
+
+    pub(crate) fn with_lease_acquisition_timeout(mut self, timeout: Duration) -> Self {
+        self.lease_acquisition_timeout = timeout;
+        self
     }
 }
 
@@ -136,6 +144,7 @@ impl SubagentToolset {
             session_metadata: nats.session_metadata,
             replicas: nats.replicas,
             progress_heartbeat: SUBAGENT_PROGRESS_HEARTBEAT,
+            lease_acquisition_timeout: nats.lease_acquisition_timeout,
         }
     }
 
@@ -154,12 +163,13 @@ impl SubagentToolset {
         let config = self
             .session_config(session_id, parent_session_id, tool_call_id)
             .await?;
-        NatsSession::new_with_resolved_replicas(
+        NatsSession::new_with_resolved_options(
             config,
             self.replicas,
             self.client.clone(),
             self.jetstream.clone(),
             harnx_core::abort::create_abort_signal(),
+            self.lease_acquisition_timeout,
         )
         .await
         .map_err(|error| {

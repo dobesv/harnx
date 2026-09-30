@@ -330,6 +330,18 @@ To set a title manually, use the [`.set title`](tui-guide.md) command in the
 TUI. A manually set title freezes automatic regeneration for the rest of the
 session.
 
+### NATS Worker Claim Timeout
+
+- **nats_lease_acquisition_timeout_secs**: Maximum seconds a client waits for a
+  worker to claim an activated NATS session. Defaults to `60` and must be a
+  positive integer. This setting applies to top-level and sub-agent sessions.
+  Override it with `HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS` when configuring
+  deployments through environment variables.
+
+```yaml
+nats_lease_acquisition_timeout_secs: 60
+```
+
 ### Session Retention and Garbage Collection
 
 - **cleanup_remote_sessions_days**: Retention period in days for remote NATS

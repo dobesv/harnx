@@ -896,9 +896,9 @@ fn enforce_token_budget(ctx: &AgentLoopContext) -> Result<()> {
     let budgeted = current_budgeted.saturating_sub(ctx.usage_at_start.budgeted_tokens());
 
     if budgeted >= budget {
-        return Err(anyhow::Error::msg(crate::budget_terminal_message(
-            budgeted, budget,
-        )));
+        return Err(anyhow::Error::new(
+            crate::terminated_result::TokenBudgetExceeded::new(budgeted, budget),
+        ));
     }
     Ok(())
 }
