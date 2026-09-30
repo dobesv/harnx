@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.4.10 (2026-09-30)
+
+### Fixes
+
+- download the docker job's archives in one retried call (#2212)
+
 ## 0.4.9 (2026-09-30)
 
 ### Features
