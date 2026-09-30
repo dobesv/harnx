@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.9 (2026-09-30)
+
+### Features
+
+- stop agents that keep repeating the same tool call (#2204)
+- Stop publishing 32-bit Windows (`i686-pc-windows-msvc`) release binaries. 64-bit Windows on x86_64 and ARM is still covered; 32-bit Windows users can build from source.
+- Stop publishing Intel macOS (`x86_64-apple-darwin`) release binaries. Apple silicon Macs are still covered by the `aarch64-apple-darwin` archives; Intel Mac users can build from source.
+- Stop agents that keep repeating the same tool call. The 2nd to 4th identical call with an identical result within 10 minutes gets a note, the 5th is refused, and a model that keeps asking has its turn ended with a `repetition` stop, which parent agents and CLI one-shots receive as a termination. A repetition-stopped one-shot exits with code 2 and prints the termination JSON on stderr, like a token-budget stop. Configure with `loop_detection.tool_calls` or `HARNX_LOOP_DETECTION`. `harnx dump session --check-loop-detection` replays a stored session through the same rules. `time_wait` and `time_wait_until` now report their start and end times, and `bash_wait` reports how long a still-running process has been running.
+- Open `cid:` plan and text links in the TUI, with document history and link navigation. Open image and binary attachments in their system application.
+
+### Fixes
+
+- Keep claimed NATS worker activations alive with progress acknowledgements, admit independent sessions concurrently, preserve immediate durable turn failures, back off busy activations before expensive preflight reads, terminate repeated pre-turn infrastructure failures after recording an error, and make the worker-claim timeout configurable.
+- Link x86_64 Windows builds with `rust-lld` instead of MSVC's `link.exe`, which shortens Windows build times.
+
 ## 0.34.8 (2026-09-30)
 
 ### Features

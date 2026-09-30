@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.9 (2026-09-30)
+
+### Features
+
+- stop agents that keep repeating the same tool call (#2204)
+
 ## 0.4.8 (2026-09-30)
 
 ### Fixes
