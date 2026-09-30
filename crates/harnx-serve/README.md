@@ -86,6 +86,25 @@ never used as a persistence or routing key.
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Accept: text/event-stream` | **Subscription Plane**: SSE event stream. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Content-Type: application/json` | **Control Plane**: JSON-RPC 2.0 interface. |
 | `GET` | `/v1/agents/:agent/sessions/:session/attachments/:cid` | `image/*` | Retrieve attachment blob by content-ID. |
+| `GET` | `/v1/cid/:encoded_cid` | `*/*` | Resolve any `cid:` URL as a bearer capability. |
+
+### CID Resolution
+
+`GET /v1/cid/:encoded_cid` serves content-addressed blobs addressed by canonical `cid:` URLs:
+- `{encoded_cid}` is the full `cid:media:` or `cid:plan:` URL, percent-encoded.
+- **Bearer capability**: the URL itself authorizes access; no session membership check.
+- Resolves via `harnx_blob_store::resolve`, which handles both media object store and plan KV rendering.
+- **Security headers** on all responses:
+  - `X-Content-Type-Options: nosniff`
+  - `Content-Security-Policy: default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox`
+- **Content-Disposition**:
+  - `inline`: `text/plain` and non-SVG raster images (`image/jpeg`, `image/png`, `image/gif`, `image/webp`).
+  - `attachment`: HTML, SVG, PDF, markdown, and all other types (forced download).
+- **Caching**:
+  - `cid:media`: `public, max-age=31536000, immutable` (content-addressed, never changes).
+  - `cid:plan`: `no-cache` with ETag (revision-based); `If-None-Match` returns `304 Not Modified`.
+
+Errors: 400 for malformed CIDs, 404 if blob not found.
 
 ### Attachment Retrieval
 

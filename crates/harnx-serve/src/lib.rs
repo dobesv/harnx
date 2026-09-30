@@ -12,6 +12,7 @@ mod ag_ui_sync;
 mod ag_ui_usage;
 mod agent_resolve;
 mod attachments;
+mod cid;
 mod interrupt_resume;
 mod models_catalog;
 mod nats_access;
@@ -27,6 +28,8 @@ pub use serve_shutdown::StreamDrainConfig;
 // `harnx_serve::test_support` imports. Kept public for cross-crate test reuse.
 pub mod test_support;
 
+#[cfg(test)]
+mod cid_route_tests;
 #[cfg(test)]
 mod remote_agent_nats_tests;
 
@@ -529,9 +532,9 @@ impl Server {
         } else if is_session_attachments_path(path) {
             route = "/v1/agents/*/sessions/*/attachments";
             self.upload_session_attachments(req).await
-        } else if path.starts_with("/v1/agents/") {
-            route = "/v1/agents/*";
-            self.handle_agent_tree(req).await
+        } else if let Some(resource_route) = cid::resource_route(path) {
+            route = resource_route.metric_name();
+            self.handle_resource_route(req, resource_route).await
         } else if path == "/v1/rags" {
             route = "/v1/rags";
             self.list_rags()
@@ -1328,14 +1331,6 @@ fn is_session_attachment_blob_path(path: &str) -> bool {
         segments.as_slice(),
         [_agent, "sessions", _session, "attachments", _cid]
     )
-}
-
-fn request_is_oversized(headers: &http::HeaderMap) -> bool {
-    headers
-        .get(http::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_UPLOAD_BYTES)
 }
 
 fn negotiate_agents_route(

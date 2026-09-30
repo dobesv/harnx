@@ -7,6 +7,24 @@ export function getSessionAttachmentUrl(agent: string, session: string, cid: str
   return `${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}/attachments/${encodeURIComponent(cid)}`;
 }
 
+export function getCidUrl(cid: string): string {
+  return `${API_BASE}/cid/${encodeURIComponent(cid)}`;
+}
+
+export async function fetchCidContent(
+  cid: string,
+): Promise<{ mimeType: string; text: string; etag?: string }> {
+  const res = await observedFetch(getCidUrl(cid));
+  if (!res.ok) {
+    throw new Error(`Failed to fetch CID content (${res.status}): ${res.statusText}`);
+  }
+
+  const mimeType = res.headers.get('content-type') || 'text/plain';
+  const etag = res.headers.get('etag') || undefined;
+  const text = await res.text();
+  return etag ? { mimeType, text, etag } : { mimeType, text };
+}
+
 export async function listAgents(options?: { signal?: AbortSignal }): Promise<Agent[]> {
   try {
     const json = await fetchJsonWithRetry<{ data: Agent[] }>(
