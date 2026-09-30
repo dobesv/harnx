@@ -1,4 +1,8 @@
+use std::time::Duration;
+
 use tokio_util::sync::CancellationToken;
+
+use super::REGISTRATION_REFRESH_INTERVAL;
 
 /// Policy for registration cleanup on server shutdown.
 ///
@@ -29,6 +33,7 @@ pub struct ServeLifecycle {
     shutdown: CancellationToken,
     readiness: Option<harnx_healthz::Readiness>,
     registration_shutdown: RegistrationShutdown,
+    refresh_interval: Duration,
 }
 
 impl ServeLifecycle {
@@ -40,6 +45,7 @@ impl ServeLifecycle {
             shutdown,
             readiness,
             registration_shutdown: RegistrationShutdown::default(),
+            refresh_interval: REGISTRATION_REFRESH_INTERVAL,
         }
     }
 
@@ -50,6 +56,19 @@ impl ServeLifecycle {
     pub fn with_registration_shutdown(mut self, policy: RegistrationShutdown) -> Self {
         self.registration_shutdown = policy;
         self
+    }
+
+    /// Set how often the KV registration is renewed, which defaults to a
+    /// third of its TTL. Keep it well under
+    /// `harnx_nats_common::registry::REGISTRATION_TTL`, or the registration
+    /// expires between renewals. Tests shorten it to observe a renewal.
+    pub fn with_refresh_interval(mut self, interval: Duration) -> Self {
+        self.refresh_interval = interval;
+        self
+    }
+
+    pub(super) fn refresh_interval(&self) -> Duration {
+        self.refresh_interval
     }
 
     pub(super) fn readiness(&self) -> Option<&harnx_healthz::Readiness> {

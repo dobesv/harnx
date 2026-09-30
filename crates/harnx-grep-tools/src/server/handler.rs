@@ -367,8 +367,13 @@ mod wire_tests {
         async fn setup_client_server_with_mock(
             mock_server: &MockServer,
         ) -> (TestClientService, TestServerService) {
+            setup_client_server_for(GrepServer::with_base_url(mock_server.uri())).await
+        }
+
+        async fn setup_client_server_for(
+            server: GrepServer,
+        ) -> (TestClientService, TestServerService) {
             let (client_transport, server_transport) = duplex(65_536);
-            let server = GrepServer::with_base_url(mock_server.uri());
 
             let server_fut = serve_server(server, server_transport);
             let client_fut = serve_client(TestClientHandler, client_transport);
@@ -471,14 +476,17 @@ mod wire_tests {
             let mock_server = MockServer::start().await;
             mock_server
                 .register(Mock::given(matchers::method("GET")).respond_with(
-                    ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)),
+                    ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(10)),
                 ))
                 .await;
 
-            let (client, _server) = setup_client_server_with_mock(&mock_server).await;
+            // A short timeout exercises the same path as the production 30s
+            // one without the test waiting it out.
+            let server =
+                GrepServer::with_timeout(mock_server.uri(), std::time::Duration::from_millis(200));
+            let (client, _server) = setup_client_server_for(server).await;
             let peer = client.peer();
 
-            // The timeout is set to 30s in client.rs, so 60s delay should trigger it
             let result = peer
                 .call_tool(
                     CallToolRequestParams::new("grep_query")

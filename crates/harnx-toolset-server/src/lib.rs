@@ -141,6 +141,7 @@ struct RegistrationRefresh<'a> {
     instance_id: &'a ServerScope,
     identity_token: &'a str,
     registration: &'a Registration,
+    interval: Duration,
     /// The revision of our own last-published registration, so shutdown can
     /// delete it conditionally instead of unconditionally (see the delete
     /// call in `serve_with_shutdown`). Updated after every successful
@@ -461,6 +462,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         started,
         ..
     } = settings;
+    let refresh_interval = lifecycle.refresh_interval();
     let (shutdown, readiness, registration_shutdown) = lifecycle.into_parts();
     let NatsConnection { client, .. } = connection;
     signal_started(started);
@@ -477,6 +479,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
             instance_id: &instance_id,
             identity_token: &identity_token,
             registration: &registration,
+            interval: refresh_interval,
             revision: &mut revision,
         },
     )
@@ -561,13 +564,13 @@ async fn serve_requests(
     let mut journal_reconciliation = Box::pin(invocation_journal::replica_reconciliations(
         jetstream::new(request_context.client.clone()),
         request_context.replicas,
-        REGISTRATION_REFRESH_INTERVAL,
+        refresh.interval,
     ));
     let mut renewals = Box::pin(harnx_nats_common::registry::refreshes(
         refresh.registry.clone(),
         registration_key(refresh.instance_id, refresh.identity_token),
         serde_json::to_vec(refresh.registration)?.into(),
-        REGISTRATION_REFRESH_INTERVAL,
+        refresh.interval,
     ));
     loop {
         tokio::select! {

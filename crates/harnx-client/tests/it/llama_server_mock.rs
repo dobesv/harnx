@@ -20,8 +20,6 @@ use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn llama_server_mock_e2e_lifecycle() -> Result<()> {
-    ensure_mock_binary_built()?;
-
     let temp_dir = TempDir::new()?;
     let socket_path = temp_dir.path().join("llama-server-mock.sock");
     let script_path = write_mock_script(temp_dir.path())?;
@@ -138,8 +136,6 @@ async fn llama_server_mock_e2e_lifecycle() -> Result<()> {
 /// subprocess, and both sockets are cleaned up on drop.
 #[tokio::test]
 async fn llama_server_mock_multi_model_distinct_processes() -> Result<()> {
-    ensure_mock_binary_built()?;
-
     let temp_dir = TempDir::new()?;
     let binary_path = resolve_mock_binary_path()?;
     let script_path = write_mock_script(temp_dir.path())?;
@@ -277,8 +273,6 @@ async fn llama_server_mock_multi_model_distinct_processes() -> Result<()> {
 /// The mock ignores -hf flag, so we can verify end-to-end flow.
 #[tokio::test]
 async fn llama_server_mock_hf_repo_only() -> Result<()> {
-    ensure_mock_binary_built()?;
-
     let temp_dir = TempDir::new()?;
     let socket_path = temp_dir.path().join("hf-model.sock");
     let script_path = write_mock_script(temp_dir.path())?;
@@ -337,8 +331,6 @@ async fn llama_server_mock_hf_repo_only() -> Result<()> {
 /// The mock ignores -hf flag, so we can verify end-to-end flow.
 #[tokio::test]
 async fn llama_server_mock_name_as_hf_repo() -> Result<()> {
-    ensure_mock_binary_built()?;
-
     let temp_dir = TempDir::new()?;
     // Use distinct socket to get a distinct process (prevents collision with other tests)
     let socket_path = temp_dir.path().join("name-as-hf.sock");
@@ -421,8 +413,6 @@ mod parent_death {
     /// checks the socket stops accepting connections once that parent is gone.
     #[tokio::test]
     async fn llama_server_child_does_not_outlive_parent_process() -> Result<()> {
-        ensure_mock_binary_built()?;
-
         let temp_dir = TempDir::new()?;
         let socket_path = temp_dir.path().join("orphan-check.sock");
         let script_path = write_mock_script(temp_dir.path())?;
@@ -635,17 +625,6 @@ turns:
     Ok(path)
 }
 
-fn ensure_mock_binary_built() -> Result<()> {
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "harnx-test-bins", "--bin", "harnx-mock-llm"])
-        .status()
-        .context("failed to invoke cargo to build harnx-mock-llm")?;
-    if !status.success() {
-        bail!("cargo build -p harnx-test-bins --bin harnx-mock-llm failed with status {status}");
-    }
-    Ok(())
-}
-
 fn resolve_mock_binary_path() -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
@@ -663,8 +642,11 @@ fn resolve_mock_binary_path() -> Result<PathBuf> {
         }
     }
 
+    // Building it here with `cargo build -p harnx-test-bins` resolves features
+    // differently from a workspace build, so it relinked the binary on every
+    // run and the next workspace build relinked it back.
     bail!(
-        "failed to locate harnx-mock-llm in {}",
+        "failed to locate harnx-mock-llm in {}; run `cargo build --workspace` first",
         target_dir.display()
     )
 }
