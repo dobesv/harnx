@@ -364,10 +364,14 @@ pub(crate) struct TestHarness {
 
 impl TestHarness {
     pub(crate) async fn start() -> Result<Option<Self>> {
-        Self::with_toolset(TestToolset::default()).await
+        Self::with_toolset(TestToolset::default(), None).await
     }
 
-    pub(crate) async fn with_toolset(toolset: TestToolset) -> Result<Option<Self>> {
+    /// `refresh_interval` overrides the server's 30s registration renewal.
+    pub(crate) async fn with_toolset(
+        toolset: TestToolset,
+        refresh_interval: Option<Duration>,
+    ) -> Result<Option<Self>> {
         let Some(server) = spawn_nats_server().await? else {
             return Ok(None);
         };
@@ -382,6 +386,10 @@ impl TestHarness {
         let server_instance_id = instance_id.clone();
         let server_shutdown = shutdown.clone();
         let server_readiness = readiness.clone();
+        let mut lifecycle = ServeLifecycle::new(server_shutdown, Some(server_readiness));
+        if let Some(interval) = refresh_interval {
+            lifecycle = lifecycle.with_refresh_interval(interval);
+        }
         let server_task = tokio::spawn(async move {
             serve_with_shutdown(
                 Arc::new(server_toolset),
@@ -390,7 +398,7 @@ impl TestHarness {
                     client: server_client,
                     replicas: 1,
                 },
-                ServeLifecycle::new(server_shutdown, Some(server_readiness)),
+                lifecycle,
             )
             .await
         });

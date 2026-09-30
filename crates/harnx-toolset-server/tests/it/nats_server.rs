@@ -519,7 +519,9 @@ async fn old_instances_shutdown_does_not_delete_a_replacements_registration() ->
 #[tokio::test(flavor = "multi_thread")]
 async fn graceful_shutdown_removes_the_renewed_registration() -> Result<()> {
     harnx_core::require_nextest();
-    let Some(mut harness) = TestHarness::start().await? else {
+    let Some(mut harness) =
+        TestHarness::with_toolset(TestToolset::default(), Some(Duration::from_millis(500))).await?
+    else {
         return Ok(());
     };
     assert_registration(&harness).await?;

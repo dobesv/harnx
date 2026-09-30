@@ -6,6 +6,9 @@ use crate::server::GrepQueryParams;
 
 pub const DEFAULT_SEARCH_URL: &str = "https://grep.app/api/search";
 
+/// How long one grep.app request may take before it is reported as a timeout.
+pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, PartialEq)]
 pub enum SearchOutcome {
     Ok(Value),
@@ -33,13 +36,7 @@ pub async fn search(
         query.push(("f.path", path.trim()));
     }
 
-    let response = match client
-        .get(base_url)
-        .query(&query)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-    {
+    let response = match client.get(base_url).query(&query).send().await {
         Ok(response) => response,
         Err(error) => return classify_error(error),
     };

@@ -20,8 +20,16 @@ impl GrepServer {
     ///
     /// This is primarily useful for exercising the full handler against a mock server.
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        Self::with_timeout(base_url, crate::client::SEARCH_TIMEOUT)
+    }
+
+    fn with_timeout(base_url: impl Into<String>, timeout: std::time::Duration) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("failed to build the grep.app HTTP client");
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url: base_url.into(),
         }
     }
