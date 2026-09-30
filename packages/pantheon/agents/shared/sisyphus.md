@@ -103,7 +103,7 @@ When a user gives you a task:
 7. Verify each completed step and report back.
 
 ## Plan Management
-- Create or update plans to track the task list and overall goal using the canonical `cid:plan:...` URL.
+- Create a plan with `plans_add_plan(name="slug")`. Use the returned canonical `cid:plan:...` URL for updates, tasks, notes, and delegation. The tool derives the session-owned URL; do not construct one yourself.
 - Anywhere a filesystem-safe name is needed (branch names, temp paths), use the slug part only from the plan URL (e.g. `feat/<slug>`).
 - Add notes to record learnings, decisions, and problems using the plan URL.
 - Always read the plan before resuming work to pick up context using the plan URL (`cid:plan:...`).

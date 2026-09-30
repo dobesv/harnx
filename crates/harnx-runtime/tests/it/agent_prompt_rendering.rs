@@ -451,6 +451,38 @@ fn shipped_agent_prompts_use_canonical_plan_urls_and_plan_id_trailers() {
     assert!(coder.contains("cid:plan:"));
 }
 
+#[test]
+fn plan_creating_agents_expose_add_plan() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+
+    for qualified_name in ["pantheon/sisyphus", "pantheon/daedalus"] {
+        let agent_path = Config::agent_file(qualified_name);
+        let agent = load_with_qualified_name(&agent_path, qualified_name)
+            .unwrap_or_else(|error| panic!("failed to load {qualified_name}: {error}"));
+        let tools = agent.use_tools().expect("agent must declare use_tools");
+        assert!(
+            tools.iter().any(|tool| tool == "plans_add_plan"),
+            "{qualified_name} must expose plans_add_plan to create session-owned plans"
+        );
+
+        let prompt = render_agent_prompt(qualified_name, &[])
+            .unwrap_or_else(|error| panic!("failed to render {qualified_name}: {error}"));
+        assert!(prompt.contains("plans_add_plan(name=\"slug\")"));
+        assert!(
+            prompt.contains("Use the returned canonical `cid:plan:...` URL"),
+            "{qualified_name} must tell agents to use the returned canonical plan URL"
+        );
+        assert!(
+            prompt.contains("do not construct one yourself"),
+            "{qualified_name} must not require agents to construct session-owned plan URLs"
+        );
+    }
+}
+
 /// Target agents that should declare `sandbox_connect` in their front-matter `use_tools`.
 const TARGET_AGENTS: [&str; 11] = [
     "atlas",
