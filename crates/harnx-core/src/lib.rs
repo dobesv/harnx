@@ -25,6 +25,7 @@ pub mod instance;
 pub mod last_message;
 pub mod llm_trace;
 pub mod logging;
+pub mod loop_guard;
 pub mod macros;
 pub mod message;
 pub mod model;

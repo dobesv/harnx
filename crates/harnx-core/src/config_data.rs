@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::agent_config::{deserialize_use_tools, normalize_toolset_value, ToolsetValue};
 use crate::hooks::HooksConfig;
@@ -28,6 +28,39 @@ where
 
 fn default_terminal_status() -> bool {
     true
+}
+
+/// Loop-protection switches from `config.yaml`. Each guard defaults to on.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct LoopDetectionConfig {
+    /// Warn about, refuse, and finally stop repeated identical tool calls.
+    pub tool_calls: bool,
+}
+
+impl Default for LoopDetectionConfig {
+    fn default() -> Self {
+        Self { tool_calls: true }
+    }
+}
+
+impl LoopDetectionConfig {
+    /// Apply an agent's front-matter override; unset fields keep the global value.
+    pub fn resolve(self, agent: Option<&LoopDetectionOverride>) -> Self {
+        let Some(agent) = agent else { return self };
+        Self {
+            tool_calls: agent.tool_calls.unwrap_or(self.tool_calls),
+        }
+    }
+}
+
+/// Per-agent override of [`LoopDetectionConfig`], for agents whose job is
+/// polling or whose output legitimately repeats.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct LoopDetectionOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<bool>,
 }
 
 /// Default wait for a worker to claim an activated NATS session.
@@ -113,6 +146,9 @@ pub struct ConfigData {
     #[serde(default = "default_terminal_status")]
     pub terminal_status: bool,
 
+    /// Loop protection; see [`LoopDetectionConfig`].
+    pub loop_detection: LoopDetectionConfig,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_agent: Option<String>,
     /// Token-growth threshold for title regeneration at turn end and mid-loop;
@@ -180,6 +216,8 @@ impl Default for ConfigData {
             hooks: None,
 
             terminal_status: default_terminal_status(),
+
+            loop_detection: LoopDetectionConfig::default(),
 
             title_agent: None,
             title_update_threshold: 50_000,
@@ -305,5 +343,46 @@ title_update_threshold: 25000
         let got: ConfigData = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(got.title_agent, Some("claude-sonnet-4-6".to_string()));
         assert_eq!(got.title_update_threshold, 25_000);
+    }
+}
+
+#[cfg(test)]
+mod loop_detection_tests {
+    use super::*;
+
+    #[test]
+    fn loop_detection_defaults_to_on_and_parses_from_yaml() {
+        assert!(ConfigData::default().loop_detection.tool_calls);
+        let data: ConfigData =
+            serde_yaml::from_str("loop_detection:\n  tool_calls: false\n").unwrap();
+        assert!(!data.loop_detection.tool_calls);
+    }
+
+    #[test]
+    fn an_agent_override_wins_field_by_field() {
+        let global = LoopDetectionConfig { tool_calls: false };
+        assert!(
+            global
+                .resolve(Some(&LoopDetectionOverride {
+                    tool_calls: Some(true)
+                }))
+                .tool_calls
+        );
+        assert!(
+            !global
+                .resolve(Some(&LoopDetectionOverride { tool_calls: None }))
+                .tool_calls
+        );
+        assert!(!global.resolve(None).tool_calls);
+    }
+
+    #[test]
+    fn an_empty_agent_override_keeps_protection_on() {
+        // Protection is on by default, so an agent that writes an empty
+        // `loop_detection:` block must not switch it off by accident.
+        let on = LoopDetectionConfig::default();
+        let unset = LoopDetectionOverride::default();
+        assert!(on.resolve(Some(&unset)).tool_calls);
+        assert!(on.resolve(None).tool_calls);
     }
 }

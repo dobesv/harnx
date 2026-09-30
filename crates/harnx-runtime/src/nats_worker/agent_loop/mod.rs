@@ -643,6 +643,7 @@ async fn build_agent_loop_context(
         nats_hook_provider,
         pending_async_context: Some(Arc::new(tokio::sync::Mutex::new(None))),
         working_dir: params.working_dir,
+        tool_loop_guard: Default::default(),
     }
 }
 

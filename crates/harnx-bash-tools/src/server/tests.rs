@@ -1602,6 +1602,53 @@ async fn test_spawn_wait_timeout() {
 }
 
 #[tokio::test]
+async fn test_wait_reports_total_runtime_so_polls_differ() {
+    let temp_dir = TestDir::new();
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
+    let result = server
+        .spawn_impl(spawn_params("sleep 5", temp_dir.path()))
+        .await
+        .unwrap();
+    let execution_id = extract_field(&text_content(&result), "execution_id");
+
+    let first = server
+        .wait_impl(WaitParams {
+            timeout_secs: Some(1),
+            ..wait_params(execution_id.clone())
+        })
+        .await
+        .unwrap();
+    let second = server
+        .wait_impl(WaitParams {
+            timeout_secs: Some(1),
+            ..wait_params(execution_id)
+        })
+        .await
+        .unwrap();
+
+    let (first, second) = (text_content(&first), text_content(&second));
+    assert!(first.contains("running_for: "), "{first}");
+    assert_ne!(
+        first, second,
+        "a quiet process must not produce identical polls"
+    );
+}
+
+#[test]
+fn elapsed_is_formatted_compactly() {
+    use std::time::Duration;
+    assert_eq!(super::process::format_elapsed(Duration::from_secs(7)), "7s");
+    assert_eq!(
+        super::process::format_elapsed(Duration::from_secs(252)),
+        "4m12s"
+    );
+    assert_eq!(
+        super::process::format_elapsed(Duration::from_secs(3725)),
+        "1h02m05s"
+    );
+}
+
+#[tokio::test]
 async fn test_spawn_and_terminate() {
     let temp_dir = TestDir::new();
     let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);

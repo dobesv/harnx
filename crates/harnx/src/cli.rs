@@ -239,6 +239,10 @@ pub enum DumpSubcommands {
         /// Follow live updates (stream mode)
         #[arg(long)]
         follow: bool,
+        /// Replay the session through harnx's loop protection and report
+        /// where it would have warned, refused a call, or ended the turn
+        #[arg(long, conflicts_with = "follow")]
+        check_loop_detection: bool,
     },
     /// Dump an attachment
     Attachment {
@@ -386,16 +390,52 @@ mod tests {
                     session_id,
                     format,
                     follow,
+                    check_loop_detection,
                 } => {
                     assert_eq!(agent_name, "a");
                     assert_eq!(session_id, "id");
                     assert_eq!(format, SessionFormat::Json);
                     assert!(follow);
+                    assert!(!check_loop_detection);
                 }
                 other => panic!("unexpected dump subcommand: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_dump_session_check_loop_detection() {
+        let cli = Cli::try_parse_from([
+            "harnx",
+            "dump",
+            "session",
+            "a",
+            "id",
+            "--check-loop-detection",
+        ])
+        .unwrap();
+        let Some(Commands::Dump(args)) = cli.command else {
+            panic!("expected dump")
+        };
+        let DumpSubcommands::Session {
+            check_loop_detection,
+            ..
+        } = args.command
+        else {
+            panic!("expected dump session")
+        };
+        assert!(check_loop_detection);
+        assert!(Cli::try_parse_from([
+            "harnx",
+            "dump",
+            "session",
+            "a",
+            "id",
+            "--check-loop-detection",
+            "--follow",
+        ])
+        .is_err());
     }
 
     #[test]

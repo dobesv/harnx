@@ -44,6 +44,7 @@ pub fn build_context(
         nats_hook_provider: None,
         pending_async_context: None,
         working_dir,
+        tool_loop_guard: Default::default(),
     }
 }
 
