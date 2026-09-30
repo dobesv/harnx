@@ -6,5 +6,12 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+# determinator 0.12 is built against guppy 0.17, and its API takes guppy's
+# PackageGraph, so guppy stays on 0.17 until determinator moves.
+determinator = "0.12.0"
+globset = { workspace = true }
+guppy = "0.17"
+serde = { workspace = true }
+toml = "1.1"
 dirs = { workspace = true }
 serde_json = { workspace = true }
