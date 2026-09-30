@@ -27,7 +27,7 @@ Server starts and lists tools without a key. Calls without a key return guidance
 
 ## Run
 
-Native toolset mode is default:
+Pass `--name <NAME>` to override the registered toolset name. Native toolset mode is default:
 
 ```bash
 harnx-exa-tools

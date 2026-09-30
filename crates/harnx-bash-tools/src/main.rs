@@ -148,6 +148,7 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --mcp-stdio               Use MCP stdio transport instead of NATS");
     eprintln!("  --mcp-http                Use MCP Streamable HTTP transport instead of NATS");
     eprintln!("  --host <HOST>             MCP HTTP bind host (default: 0.0.0.0)");
+    eprintln!("  --name <NAME>             Override the registered toolset name");
     eprintln!("  --port <PORT>             MCP HTTP bind port (default: 3002)");
     eprintln!(
         "  --enable-tool <glob>      Enable only tools matching the glob pattern (repeatable)."
@@ -191,11 +192,12 @@ fn initial_sandbox_config() -> SandboxConfig {
     }
 }
 
-const PASSTHROUGH_FLAGS: [(&str, &str); 5] = [
+const PASSTHROUGH_FLAGS: [(&str, &str); 6] = [
     ("--metrics-addr", "--metrics-addr="),
     ("--healthz-addr", "--healthz-addr="),
     ("--host", "--host="),
     ("--port", "--port="),
+    ("--name", "--name="),
     ("--enable-tool", "--enable-tool="),
 ];
 
@@ -497,6 +499,29 @@ mod tests {
             )
             .expect_err("legacy flag should be rejected");
             assert!(error.contains(&format!("unknown argument: {flag}")));
+        }
+    }
+
+    #[test]
+    fn accepts_name_override_forms() {
+        for name_args in [
+            ["--name", "review"].as_slice(),
+            ["--name=review"].as_slice(),
+        ] {
+            let args = std::iter::once("harnx-bash-tools")
+                .chain(name_args.iter().copied())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let mut inputs = AllowInputs::default();
+            let mut config = initial_sandbox_config();
+            parse_cli_args(
+                &args,
+                &mut inputs,
+                &mut config,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .expect("name override should pass through");
         }
     }
 }

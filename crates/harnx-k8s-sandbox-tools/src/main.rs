@@ -4,8 +4,8 @@ use harnx_k8s_sandbox_tools::leader_election::{
     run_lease_gated_idle_watcher, IdleWatcher, LeaseGatedWatcherConfig, SessionDisconnect,
 };
 use harnx_k8s_sandbox_tools::{
-    sandbox_toolsets, KubernetesSandboxApi, McpCaller, McpCallerConfig, SandboxManager,
-    SandboxManagerConfig, SandboxPorts, StreamableHttpMcpCaller,
+    sandbox_toolsets_with_names, KubernetesSandboxApi, McpCaller, McpCallerConfig, SandboxManager,
+    SandboxManagerConfig, SandboxPorts, SandboxToolsetNames, StreamableHttpMcpCaller,
 };
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
 use harnx_runtime::nats_session_metadata::SessionMetadataStore;
@@ -51,6 +51,30 @@ struct Cli {
     bash_mcp_port: u16,
     #[arg(long, env = "FS_MCP_PORT", default_value_t = 3003)]
     fs_mcp_port: u16,
+    /// Registered name for the bash proxy toolset.
+    #[arg(
+        long,
+        env = "BASH_TOOLSET_NAME",
+        default_value = "bash",
+        value_parser = parse_bash_name
+    )]
+    bash_name: String,
+    /// Registered name for the filesystem proxy toolset.
+    #[arg(
+        long,
+        env = "FS_TOOLSET_NAME",
+        default_value = "fs",
+        value_parser = parse_fs_name
+    )]
+    fs_name: String,
+    /// Registered name for the sandbox lifecycle toolset.
+    #[arg(
+        long,
+        env = "SANDBOX_TOOLSET_NAME",
+        default_value = "sandbox",
+        value_parser = parse_sandbox_name
+    )]
+    sandbox_name: String,
     #[command(flatten)]
     metrics: harnx_metrics::MetricsFlags,
     #[command(flatten)]
@@ -67,6 +91,7 @@ async fn main() -> Result<()> {
     // on the ambiguous process-default. See install_default_crypto_provider for details.
     harnx_k8s_sandbox_tools::install_default_crypto_provider();
     let cli = Cli::parse();
+    validate(&cli)?;
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     harnx_metrics::init(&cli.metrics)?;
     let readiness = harnx_healthz::init(&cli.healthz).await?;
@@ -78,8 +103,6 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli, readiness: Option<harnx_healthz::Readiness>) -> Result<()> {
-    validate(&cli)?;
-
     // Compile filter globs before connecting to NATS
     let filter_set = compile_enable_globs(&cli.enable_tool)?;
     let filter: Option<Arc<harnx_toolset_server::globset::GlobSet>> =
@@ -110,13 +133,18 @@ async fn run(cli: Cli, readiness: Option<harnx_healthz::Readiness>) -> Result<()
     );
 
     // Apply filter to toolsets if specified
-    let toolsets = sandbox_toolsets(
+    let toolsets = sandbox_toolsets_with_names(
         manager,
         caller,
         metadata,
         SandboxPorts {
             bash: cli.bash_mcp_port,
             fs: cli.fs_mcp_port,
+        },
+        SandboxToolsetNames {
+            bash: cli.bash_name,
+            fs: cli.fs_name,
+            sandbox: cli.sandbox_name,
         },
     );
     let toolsets: Vec<Arc<dyn harnx_toolset::Toolset>> = match &filter_set {
@@ -149,6 +177,24 @@ async fn run(cli: Cli, readiness: Option<harnx_healthz::Readiness>) -> Result<()
     result
 }
 
+fn parse_labeled_toolset_name(value: &str, label: &str) -> std::result::Result<String, String> {
+    harnx_toolset_server::validate_toolset_name(value, label)
+        .map(|()| value.to_string())
+        .map_err(|error| error.to_string())
+}
+
+fn parse_bash_name(value: &str) -> std::result::Result<String, String> {
+    parse_labeled_toolset_name(value, "--bash-name/BASH_TOOLSET_NAME")
+}
+
+fn parse_fs_name(value: &str) -> std::result::Result<String, String> {
+    parse_labeled_toolset_name(value, "--fs-name/FS_TOOLSET_NAME")
+}
+
+fn parse_sandbox_name(value: &str) -> std::result::Result<String, String> {
+    parse_labeled_toolset_name(value, "--sandbox-name/SANDBOX_TOOLSET_NAME")
+}
+
 struct RetrySettings {
     base: Duration,
     cap: Duration,
@@ -166,6 +212,21 @@ impl RetrySettings {
 }
 
 fn validate(cli: &Cli) -> Result<()> {
+    harnx_toolset_server::validate_toolset_name(&cli.bash_name, "--bash-name/BASH_TOOLSET_NAME")?;
+    harnx_toolset_server::validate_toolset_name(&cli.fs_name, "--fs-name/FS_TOOLSET_NAME")?;
+    harnx_toolset_server::validate_toolset_name(
+        &cli.sandbox_name,
+        "--sandbox-name/SANDBOX_TOOLSET_NAME",
+    )?;
+    anyhow::ensure!(
+        cli.bash_name != cli.fs_name
+            && cli.bash_name != cli.sandbox_name
+            && cli.fs_name != cli.sandbox_name,
+        "bash, filesystem, and sandbox toolset names must be distinct (got {:?}, {:?}, {:?})",
+        cli.bash_name,
+        cli.fs_name,
+        cli.sandbox_name
+    );
     anyhow::ensure!(
         cli.sandbox_scan_interval_minutes > 0,
         "sandbox scan interval must be greater than zero"
@@ -296,6 +357,64 @@ mod tests {
         verify_enable_tool_cli(&["--enable-tool", "echo"], &["echo"]);
         verify_enable_tool_cli(&["--enable-tool=exec*"], &["exec*"]);
         verify_enable_tool_cli(&["--enable-tool", "a", "--enable-tool=b"], &["a", "b"]);
+    }
+
+    #[test]
+    fn toolset_name_cli_parsing() {
+        let defaults = valid_cli();
+        assert_eq!(defaults.bash_name, "bash");
+        assert_eq!(defaults.fs_name, "fs");
+        assert_eq!(defaults.sandbox_name, "sandbox");
+
+        let cli = Cli::try_parse_from([
+            "harnx-k8s-sandbox-tools",
+            "--bash-name=review",
+            "--fs-name",
+            "workspace",
+            "--sandbox-name",
+            "review_sandbox",
+        ])
+        .expect("name overrides must parse");
+        assert_eq!(cli.bash_name, "review");
+        assert_eq!(cli.fs_name, "workspace");
+        assert_eq!(cli.sandbox_name, "review_sandbox");
+
+        assert!(
+            Cli::try_parse_from(["harnx-k8s-sandbox-tools", "--bash-name", "invalid.name",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn toolset_name_env_parsing() {
+        harnx_core::require_nextest();
+        // Nextest runs this test in its own process, so these mutations cannot race other tests.
+        unsafe {
+            std::env::set_var("BASH_TOOLSET_NAME", "review");
+            std::env::set_var("FS_TOOLSET_NAME", "workspace");
+            std::env::set_var("SANDBOX_TOOLSET_NAME", "review_sandbox");
+        }
+
+        let cli = Cli::try_parse_from(["harnx-k8s-sandbox-tools"])
+            .expect("name environment variables must parse");
+        assert_eq!(cli.bash_name, "review");
+        assert_eq!(cli.fs_name, "workspace");
+        assert_eq!(cli.sandbox_name, "review_sandbox");
+    }
+
+    #[test]
+    fn duplicate_toolset_names_are_rejected_before_startup() {
+        for duplicate in [("bash", "fs"), ("bash", "sandbox"), ("fs", "sandbox")] {
+            let mut cli = valid_cli();
+            match duplicate {
+                ("bash", "fs") => cli.fs_name = cli.bash_name.clone(),
+                ("bash", "sandbox") => cli.sandbox_name = cli.bash_name.clone(),
+                ("fs", "sandbox") => cli.sandbox_name = cli.fs_name.clone(),
+                _ => unreachable!(),
+            }
+            let error = validate(&cli).expect_err("duplicate names must fail validation");
+            assert!(error.to_string().contains("must be distinct"));
+        }
     }
 
     #[test]

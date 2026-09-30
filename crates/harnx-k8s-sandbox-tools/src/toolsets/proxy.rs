@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use tokio_util::sync::CancellationToken;
 
 pub(super) struct ProxyToolset {
-    name: &'static str,
+    name: String,
     specs: Vec<ToolSpec>,
     gateway: Gateway,
     port: u16,
@@ -22,12 +22,7 @@ struct ResolvedInvocation {
 }
 
 impl ProxyToolset {
-    pub(super) fn new(
-        name: &'static str,
-        specs: Vec<ToolSpec>,
-        gateway: Gateway,
-        port: u16,
-    ) -> Self {
+    pub(super) fn new(name: String, specs: Vec<ToolSpec>, gateway: Gateway, port: u16) -> Self {
         Self {
             name,
             specs: specs.into_iter().map(proxy_spec).collect(),
@@ -103,7 +98,7 @@ impl ProxyToolset {
 #[async_trait]
 impl Toolset for ProxyToolset {
     fn name(&self) -> &str {
-        self.name
+        &self.name
     }
 
     fn tools(&self) -> Vec<ToolSpec> {

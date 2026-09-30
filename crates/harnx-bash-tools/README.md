@@ -23,7 +23,7 @@ cargo install --path crates/harnx-bash-tools
 | `--allow-repo-work` | Grant detected project paths and session working directory. |
 | `--allow-all` | Request full filesystem access, subject to `$HOME` ancestor guard. |
 
-Other options include `--tool <PATH>` (load one YAML command template; repeatable), `--tools-dir <PATH>` (load every `.yaml` command template in a directory; repeatable), `--no-sandbox`, `--sandbox-run <PATH>`, `--env`/`-e`, `--mcp-stdio`, and `--help`/`-h`.
+Other options include `--tool <PATH>` (load one YAML command template; repeatable), `--tools-dir <PATH>` (load every `.yaml` command template in a directory; repeatable), `--no-sandbox`, `--sandbox-run <PATH>`, `--env`/`-e`, `--name <NAME>`, `--mcp-stdio`, and `--help`/`-h`. `--name` overrides the registered toolset name.
 
 For Streamable HTTP MCP mode, pass `--mcp-http`. `--host` defaults to `0.0.0.0`; `--port` defaults to `3002` and serves MCP at `/mcp`.
 

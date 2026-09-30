@@ -45,7 +45,7 @@ fn handle_enable_tool_arg(
 }
 
 fn is_value_option(arg: &str) -> bool {
-    ["--nats-url", "--metrics-addr", "--healthz-addr"]
+    ["--nats-url", "--metrics-addr", "--healthz-addr", "--name"]
         .iter()
         .any(|flag| arg == *flag || arg.strip_prefix(&format!("{flag}=")).is_some())
 }
@@ -87,6 +87,7 @@ fn print_help() {
     eprintln!("  --mcp-http [--mcp-http-listener <ADDR>]");
     eprintln!("                          Run as MCP server over HTTP");
     eprintln!("  --nats-url <URL>        NATS server URL (default: $HARNX_NATS_URL or nats://127.0.0.1:4222)");
+    eprintln!("  --name <NAME>           Override the registered toolset name");
     eprintln!("  --enable-tool <GLOB>    Only publish tools matching glob pattern");
     eprintln!("  --metrics-addr <ADDR>   Serve Prometheus metrics at http://ADDR/metrics");
     eprintln!("                          Blank host binds 0.0.0.0. Unset disables.");
@@ -138,5 +139,11 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--enable-tool requires a glob pattern argument"));
+    }
+
+    #[test]
+    fn accepts_name_override_forms() {
+        assert!(!parse(&["--name", "review"]).unwrap());
+        assert!(!parse(&["--name=review"]).unwrap());
     }
 }

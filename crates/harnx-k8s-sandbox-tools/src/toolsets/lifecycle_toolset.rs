@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 pub(super) struct LifecycleToolset {
+    pub(super) name: String,
     pub(super) gateway: Gateway,
 }
 
@@ -198,7 +199,7 @@ impl LifecycleToolset {
 #[async_trait]
 impl Toolset for LifecycleToolset {
     fn name(&self) -> &str {
-        "sandbox"
+        &self.name
     }
 
     fn tools(&self) -> Vec<ToolSpec> {

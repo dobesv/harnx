@@ -169,6 +169,26 @@ env:
 >
 >   Set the actual secret (`EXA_API_KEY=…`) in `~/.local/share/harnx/.env`.
 
+### Running Multiple Instances (`--name`)
+
+Native tool servers register under their built-in toolset name by default. Pass
+`--name <NAME>` to run another instance of the same server in one scope without
+sharing its NATS subject and queue group. The override also controls the
+agent-visible prefix, MCP implementation name, and telemetry service name.
+
+```yaml
+command: harnx-bash-tools
+args:
+  - --name
+  - review
+  - --allow-repo-work
+```
+
+This instance exposes tools such as `review_exec` instead of `bash_exec`. Names
+must start with an ASCII letter or digit; remaining characters may also be
+hyphens or underscores. The Kubernetes sandbox gateway uses `--bash-name`,
+`--fs-name`, and `--sandbox-name` because it registers three toolsets.
+
 ### Restricting Published Tools (`--enable-tool`)
 
 Tool servers publish all available tools by default. Pass `--enable-tool <glob>` in `args:` to restrict which tools a server publishes and makes callable. Tools that do not match are not registered and cannot be invoked. Repeat the flag to specify multiple patterns.

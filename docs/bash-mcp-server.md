@@ -66,6 +66,20 @@ Batch toggles accept `1`, `true`, `yes`, or `on`:
 
 `HARNX_BASH_ENV_PASSTHROUGH` is a comma-separated list of host environment variable names copied into child processes. `--env NAME` inherits one variable; `--env NAME=value` sets a value.
 
+## Override the toolset name
+
+Pass `--name <NAME>` when two bash servers need to run in the same scope. The
+name controls NATS registration and the agent-visible tool prefix. For example:
+
+```yaml
+command: harnx-bash-tools
+args: [--name, review, --allow-repo-work]
+```
+
+This server registers separately from the default `bash` server, and its tools
+appear as `review_exec`, `review_spawn`, and so on. Names must start with an
+ASCII letter or digit; remaining characters may also be hyphens or underscores.
+
 ## Restrict published tools
 
 By default, `harnx-bash-tools` publishes all built-in tools (`exec`, `spawn`, `wait`, `terminate`, `read_exec_log`) and any loaded command templates.
