@@ -315,7 +315,7 @@ The checklist below covers every integration point. Miss any and the release fai
 
 2. **Workspace Cargo.toml** — add to `[workspace] members`.
 
-3. **release.yaml** — four spots: one release shard's `packages` list (choose the shard whose link time it best balances; see the comment above `shard:`), the x86_64 and aarch64 `gh release download` patterns, and the "Verify extracted binaries" `for` loop.
+3. **release.yaml** — two spots: one release shard's `packages` list (choose the shard whose link time it best balances; see the comment above `shard:`), and the docker job's "Verify extracted binaries" `for` loop. The docker job downloads every Linux archive in the release, so it needs no per-binary pattern.
 
 4. **docker/harnx.Dockerfile** — `COPY linux-${TARGETARCH}/<binary> /usr/local/bin/<binary>` line. The Dockerfile header lists the four release.yaml locations that must be kept in sync.
 
