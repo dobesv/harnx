@@ -49,10 +49,6 @@ jobs:
           os: ubuntu-latest
           use-cross: true
           cargo-flags: ""
-        - target: i686-pc-windows-msvc
-          os: windows-latest
-          use-cross: true
-          cargo-flags: ""
         # 32-bit Linux targets (i686-unknown-linux-musl,
         # armv7-unknown-linux-musleabihf, arm-unknown-linux-musleabihf) are
         # intentionally excluded: `birdcage` (used by `harnx-bash-tools` for
@@ -65,6 +61,9 @@ jobs:
         # Intel macOS (x86_64-apple-darwin) is dropped: macOS 26 is the last
         # release for Intel Macs, and its build on the slow macos-15-intel
         # runner took 51 minutes, the longest in the release.
+        #
+        # 32-bit Windows (i686-pc-windows-msvc) is dropped too: it is a niche
+        # platform now, and the job took 35 minutes of Windows runner time.
 
     runs-on: ${{matrix.os}}
     env:
@@ -95,7 +94,7 @@ jobs:
     # `cargo build` ignores the `stable` toolchain dtolnay set up. The target
     # stdlib must be added to the pinned toolchain too. Run unconditionally:
     # cross silently falls back to plain cargo when no Docker image exists
-    # for the target (e.g. i686/aarch64-pc-windows-msvc), so the rustup
+    # for the target (e.g. aarch64-pc-windows-msvc), so the rustup
     # target needs to be present even on `use-cross: true` jobs. When cross
     # does run a real container build, `rustup target add` is a harmless
     # no-op against the host toolchain.
