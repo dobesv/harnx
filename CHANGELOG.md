@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.34.8 (2026-09-30)
+
+### Features
+
+- Add `harnx dump attachment` and `harnx open attachment` for NATS-backed `cid:` URLs.
+- Show canonical attachment URLs beside externalized media and upload blobs before the next tool round.
+- Store plans in NATS JetStream KV and identify plans, tasks, notes, and dependencies with canonical `cid:plan:` URLs.
+- Allow sub-agent prompts to include canonical `cid:` attachments, with image media sent as image parts and text or plan references added to the prompt.
+- Add name override options to native tool servers so multiple instances of one toolset can register in the same NATS scope without sharing subjects or queue groups.
+
 ## 0.34.7 (2026-09-28)
 
 ### Features

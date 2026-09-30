@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.8 (2026-09-30)
+
+### Fixes
+
+- Store plans in NATS JetStream KV and identify plans, tasks, notes, and dependencies with canonical `cid:plan:` URLs.
+
 ## 0.4.7 (2026-09-28)
 
 ### Features
