@@ -3,6 +3,8 @@
 //! This crate provides data access for `cid:` URLs over NATS:
 //! - Media object store operations
 //! - Plans document models and revision-CAS KV operations
+//! - Plan document markdown rendering (`render`)
+//! - Unified resolution (`resolve`) for canonical `cid:media:` and `cid:plan:` URLs
 //! - Activity touch (rate-limited)
 //! - Owner deletion
 //!

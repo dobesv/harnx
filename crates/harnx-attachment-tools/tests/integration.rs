@@ -4,7 +4,10 @@ use async_nats::jetstream::object_store::ObjectStore;
 use harnx_attachment_tools::AttachmentToolset;
 use harnx_blob_store::media::{ensure_attachments_bucket, put_media};
 use harnx_blob_store::media_cid_url;
-use harnx_core::cid_url::{CidUrl, SessionRef as CoreSessionRef};
+use harnx_blob_store::plans::{
+    create_document, ensure_plans_bucket, serialize_plan, PlanDocument, PlanFrontMatter,
+};
+use harnx_core::cid_url::{CidUrl, PlanItem, SessionRef as CoreSessionRef};
 use harnx_test_bins::{spawn_nats_server, NatsServerHandle};
 use harnx_toolset::{SessionRef as ToolSessionRef, ToolInvocation, ToolInvocationContext, Toolset};
 use serde_json::{json, Value};
@@ -17,6 +20,7 @@ struct TestContext {
     _nats: NatsServerHandle,
     toolset: AttachmentToolset,
     store: ObjectStore,
+    jetstream: async_nats::jetstream::Context,
 }
 
 impl TestContext {
@@ -34,6 +38,7 @@ impl TestContext {
             _nats: nats,
             toolset,
             store,
+            jetstream,
         })
     }
 
@@ -162,6 +167,47 @@ async fn attachment_read_returns_image_block() {
 }
 
 #[tokio::test]
+async fn attachment_read_returns_rendered_plan_markdown() {
+    let Some(ctx) = TestContext::start().await else {
+        return;
+    };
+    let session = CoreSessionRef::new(Some("test-agent".to_string()), "abcDEF".to_string())
+        .expect("valid test session");
+    let url = CidUrl::Plan {
+        session,
+        slug: "read-plan".to_string(),
+        item: PlanItem::Index,
+    };
+    let store = ensure_plans_bucket(&ctx.jetstream, 1)
+        .await
+        .expect("create plans bucket");
+    let content = serialize_plan(&PlanDocument {
+        front: PlanFrontMatter {
+            id: url.to_string(),
+            title: Some("Readable Plan".to_string()),
+            summary: Some("Plan summary".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            ..PlanFrontMatter::default()
+        },
+        body: "Plan body".to_string(),
+    })
+    .expect("serialize plan");
+    create_document(&store, &url, &content)
+        .await
+        .expect("store plan");
+
+    let result = ctx
+        .invoke("attachment_read", json!({ "url": url.to_string() }), None)
+        .await;
+
+    assert_eq!(result["isError"], false);
+    let markdown = first_text(&result);
+    assert!(markdown.starts_with("# Readable Plan\n\nPlan summary"));
+    assert!(markdown.contains("## Tasks"));
+    assert!(markdown.contains("## Notes"));
+}
+
+#[tokio::test]
 async fn tool_invocations_reject_invalid_requests() {
     let Some(ctx) = TestContext::start().await else {
         return;
@@ -177,7 +223,7 @@ async fn tool_invocations_reject_invalid_requests() {
         },
     )
     .await;
-    assert!(plan_err.contains("plan URLs not yet supported"));
+    assert!(plan_err.contains("plan document not found"));
 
     let session_err = assert_tool_error(
         &ctx.toolset,

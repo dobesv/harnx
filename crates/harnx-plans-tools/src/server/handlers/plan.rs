@@ -110,10 +110,18 @@ pub(crate) async fn add(
                     after: &serialized,
                     path: &path,
                 });
-                return result_with_diff(DiffResult {
-                    message: format!("added plan {url}"),
-                    diff,
-                });
+                let label = params
+                    .title
+                    .as_deref()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or(&params.name);
+                return result_with_diff_and_resources(
+                    DiffResult {
+                        message: format!("added plan {url}"),
+                        diff,
+                    },
+                    vec![ResponseResource::new(&url, "plan", label)],
+                );
             }
             Err(_)
                 if get_document(context.store, &url)
@@ -182,7 +190,8 @@ pub(crate) async fn get(
             .map(|note| note.front.id)
     });
     context.touch(&url).await;
-    result_json(json!({
+    let label = plan_label(&document, &url);
+    let value = json!({
         "id": document.front.id,
         "title": document.front.title,
         "summary": document.front.summary,
@@ -196,7 +205,8 @@ pub(crate) async fn get(
         "body": document.body,
         "task_ids": task_ids,
         "note_ids": note_ids,
-    }))
+    });
+    result_json_with_resources(value, vec![ResponseResource::new(&url, "plan", label)])
 }
 
 fn child_ids<F>(
@@ -212,6 +222,12 @@ where
         .filter(|(key, _)| key.starts_with(path_prefix))
         .filter_map(|(_, document)| parse_id(&document.content))
         .collect()
+}
+
+fn plan_label(document: &PlanDocument, url: &CidUrl) -> String {
+    non_empty(document.front.title.as_deref())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| plan_slug(url).to_string())
 }
 
 pub(crate) async fn update(
@@ -278,7 +294,11 @@ pub(crate) async fn update(
         after: &updated.body,
         path: &path,
     });
-    result_with_diff(DiffResult { message, diff })
+    let label = plan_label(&updated, &url);
+    result_with_diff_and_resources(
+        DiffResult { message, diff },
+        vec![ResponseResource::new(&url, "plan", label)],
+    )
 }
 
 fn validate_update(params: &UpdatePlanParams) -> Result<(), ErrorData> {

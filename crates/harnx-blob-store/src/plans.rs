@@ -417,3 +417,418 @@ pub async fn delete_plans_prefix(jetstream: &jetstream::Context, owner: &str) ->
     }
     Ok(documents.len())
 }
+
+/// Rendered markdown for a mutable plan document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedPlan {
+    pub markdown: String,
+    pub max_revision: u64,
+}
+
+struct PlanIndexDocuments {
+    plan: PlanDocument,
+    tasks: Vec<TaskDocument>,
+    notes: Vec<NoteDocument>,
+    max_revision: u64,
+}
+
+/// Render a plan index, task, or note URL as markdown.
+pub async fn render(jetstream: &jetstream::Context, url: &CidUrl) -> Result<RenderedPlan> {
+    let CidUrl::Plan { slug, item, .. } = url else {
+        bail!("expected cid:plan URL")
+    };
+    let store = optional_plans_bucket(jetstream)
+        .await?
+        .with_context(|| format!("plan document not found: {url}"))?;
+    match item {
+        PlanItem::Index => render_plan_index(&store, url, slug).await,
+        PlanItem::Task(_) => render_task(&store, url).await,
+        PlanItem::Note(id) => render_note(&store, url, id).await,
+    }
+}
+
+async fn render_plan_index(store: &kv::Store, url: &CidUrl, slug: &str) -> Result<RenderedPlan> {
+    let documents = load_plan_index(store, url).await?;
+    Ok(RenderedPlan {
+        markdown: index_markdown(slug, &documents.plan, &documents.tasks, &documents.notes)?,
+        max_revision: documents.max_revision,
+    })
+}
+
+async fn load_plan_index(store: &kv::Store, url: &CidUrl) -> Result<PlanIndexDocuments> {
+    let root = required_document(store, url).await?;
+    let prefix = plan_prefix(url)?;
+    let documents = list_documents(store, &prefix).await?;
+    let task_prefix = format!("{prefix}tasks/");
+    let note_prefix = format!("{prefix}notes/");
+    let mut tasks = Vec::new();
+    let mut notes = Vec::new();
+    let mut max_revision = root.revision;
+    for (key, stored) in documents {
+        max_revision = max_revision.max(stored.revision);
+        if key.starts_with(&task_prefix) {
+            tasks.push(parse_task(&stored.content)?);
+        } else if key.starts_with(&note_prefix) {
+            notes.push(parse_note(&stored.content)?);
+        }
+    }
+    tasks.sort_by(|left, right| task_sort_key(left).cmp(&task_sort_key(right)));
+    notes.sort_by(|left, right| note_sort_key(left).cmp(&note_sort_key(right)));
+    Ok(PlanIndexDocuments {
+        plan: parse_plan(&root.content)?,
+        tasks,
+        notes,
+        max_revision,
+    })
+}
+
+fn task_sort_key(task: &TaskDocument) -> (&str, &str) {
+    (&task.front.created_at, &task.front.id)
+}
+
+fn note_sort_key(note: &NoteDocument) -> (&str, &str) {
+    (&note.front.created_at, &note.front.id)
+}
+
+async fn render_task(store: &kv::Store, url: &CidUrl) -> Result<RenderedPlan> {
+    let stored = required_document(store, url).await?;
+    let document = parse_task(&stored.content)?;
+    Ok(RenderedPlan {
+        markdown: task_markdown(url, &document)?,
+        max_revision: stored.revision,
+    })
+}
+
+async fn render_note(store: &kv::Store, url: &CidUrl, id: &str) -> Result<RenderedPlan> {
+    let stored = required_document(store, url).await?;
+    let document = parse_note(&stored.content)?;
+    Ok(RenderedPlan {
+        markdown: note_markdown(url, id, &document)?,
+        max_revision: stored.revision,
+    })
+}
+
+async fn required_document(store: &kv::Store, url: &CidUrl) -> Result<StoredDocument> {
+    get_document(store, url)
+        .await?
+        .with_context(|| format!("plan document not found: {url}"))
+}
+
+fn index_markdown(
+    slug: &str,
+    plan: &PlanDocument,
+    tasks: &[TaskDocument],
+    notes: &[NoteDocument],
+) -> Result<String> {
+    let title = non_empty(plan.front.title.as_deref()).unwrap_or(slug);
+    let mut output = format!("# {title}\n\n");
+    append_optional_block(&mut output, plan.front.summary.as_deref());
+    append_block(&mut output, &plan.body);
+    output.push_str("## Tasks\n\n| Status | Task | Dependencies |\n|---|---|---|\n");
+    for task in tasks {
+        output.push_str(&task_row(task)?);
+    }
+    output.push_str("\n## Notes\n\n");
+    for note in notes {
+        output.push_str(&note_list_item(note));
+    }
+    Ok(output)
+}
+
+fn task_row(task: &TaskDocument) -> Result<String> {
+    let dependencies = dependency_links(&task.front.dependencies)?;
+    let dependencies = if dependencies.is_empty() {
+        "-".to_string()
+    } else {
+        dependencies
+    };
+    let title = non_empty(Some(task.front.title.trim())).unwrap_or(&task.front.id);
+    Ok(format!(
+        "| {} | {} | {} |\n",
+        table_text(&task.front.status),
+        table_text(&markdown_link(title, &task.front.id)),
+        table_text(&dependencies)
+    ))
+}
+
+fn note_list_item(note: &NoteDocument) -> String {
+    let id = plan_item_id(&note.front.id).unwrap_or_else(|| note.front.id.clone());
+    let label = non_empty(note.front.summary.as_deref()).unwrap_or(&id);
+    let author = non_empty(note.front.author.as_deref())
+        .map(|value| format!(" — {value}"))
+        .unwrap_or_default();
+    format!("- {}{author}\n", markdown_link(label, &note.front.id))
+}
+
+fn task_markdown(url: &CidUrl, task: &TaskDocument) -> Result<String> {
+    let plan = plan_index_url(url)?;
+    let mut output = format!(
+        "{}\n\n# {}\n\nStatus: `{}`\n\n",
+        markdown_link("Plan Index", &plan.to_string()),
+        task.front.title,
+        task.front.status
+    );
+    if let Some(summary) = non_empty(task.front.summary.as_deref()) {
+        output.push_str(&format!("Summary: {summary}\n\n"));
+    }
+    let dependencies = dependency_links(&task.front.dependencies)?;
+    if !dependencies.is_empty() {
+        output.push_str(&format!("Dependencies: {dependencies}\n\n"));
+    }
+    append_block(&mut output, &task.body);
+    Ok(output)
+}
+
+fn note_markdown(url: &CidUrl, id: &str, note: &NoteDocument) -> Result<String> {
+    let plan = plan_index_url(url)?;
+    let label = non_empty(note.front.summary.as_deref()).unwrap_or(id);
+    let mut output = format!(
+        "{}\n\n# Note: {label}\n\n",
+        markdown_link("Plan Index", &plan.to_string())
+    );
+    if let Some(author) = non_empty(note.front.author.as_deref()) {
+        output.push_str(&format!("Author: {author}\n\n"));
+    }
+    append_block(&mut output, &note.body);
+    Ok(output)
+}
+
+fn plan_index_url(url: &CidUrl) -> Result<CidUrl> {
+    let CidUrl::Plan { session, slug, .. } = url else {
+        bail!("expected cid:plan URL")
+    };
+    Ok(CidUrl::Plan {
+        session: session.clone(),
+        slug: slug.clone(),
+        item: PlanItem::Index,
+    })
+}
+
+fn dependency_links(dependencies: &[String]) -> Result<String> {
+    dependencies
+        .iter()
+        .map(|dependency| {
+            let url = CidUrl::parse(dependency)
+                .with_context(|| format!("invalid task dependency URL: {dependency}"))?;
+            let CidUrl::Plan {
+                item: PlanItem::Task(id),
+                ..
+            } = url
+            else {
+                bail!("task dependency is not a task URL: {dependency}")
+            };
+            Ok(markdown_link(&id, dependency))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|links| links.join(", "))
+}
+
+fn plan_item_id(url: &str) -> Option<String> {
+    match CidUrl::parse(url).ok()? {
+        CidUrl::Plan {
+            item: PlanItem::Task(id) | PlanItem::Note(id),
+            ..
+        } => Some(id),
+        _ => None,
+    }
+}
+
+fn markdown_link(label: &str, url: &str) -> String {
+    let label = label
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]");
+    format!("[{label}]({url})")
+}
+
+fn table_text(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn append_optional_block(output: &mut String, value: Option<&str>) {
+    if let Some(value) = non_empty(value) {
+        append_block(output, value);
+    }
+}
+
+fn append_block(output: &mut String, value: &str) {
+    let value = value.trim_end_matches('\n');
+    if !value.is_empty() {
+        output.push_str(value);
+        output.push_str("\n\n");
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use harnx_core::cid_url::SessionRef;
+
+    fn plan_url(item: PlanItem) -> CidUrl {
+        CidUrl::Plan {
+            session: SessionRef::new(None, "abcDEF".to_string()).unwrap(),
+            slug: "demo-plan".to_string(),
+            item,
+        }
+    }
+
+    fn task(id: &str, title: &str, created_at: &str, dependencies: Vec<String>) -> TaskDocument {
+        let url = plan_url(PlanItem::Task(id.to_string()));
+        TaskDocument {
+            front: TaskFrontMatter {
+                id: url.to_string(),
+                title: title.to_string(),
+                summary: Some(format!("{title} summary")),
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: Vec::new(),
+                plan: plan_url(PlanItem::Index).to_string(),
+                status: "open".to_string(),
+                created_at: created_at.to_string(),
+                updated_at: None,
+                dependencies,
+            },
+            body: format!("{title} body"),
+        }
+    }
+
+    #[test]
+    fn escapes_task_titles_and_falls_back_to_task_id() {
+        let escaped = task(
+            "escaped",
+            "Title | with\nnewline",
+            "2026-01-01T00:00:00Z",
+            Vec::new(),
+        );
+        let plan = PlanDocument {
+            front: PlanFrontMatter::default(),
+            body: String::new(),
+        };
+        let markdown = index_markdown("demo-plan", &plan, std::slice::from_ref(&escaped), &[])
+            .expect("render index");
+        assert!(markdown.contains("[Title \\| with newline]"));
+
+        let escaped_row = task_row(&escaped).expect("render escaped task row");
+        assert!(escaped_row.contains("[Title \\| with newline]"));
+        assert_eq!(
+            count_unescaped_pipes(&escaped_row) - 1,
+            3,
+            "escaped row has three columns: {escaped_row}"
+        );
+
+        let blank = task("blank", "  \n ", "2026-01-02T00:00:00Z", Vec::new());
+        let blank_row = task_row(&blank).expect("render blank task row");
+        assert!(blank_row.contains(&format!("[{}]({})", blank.front.id, blank.front.id)));
+        assert_eq!(
+            count_unescaped_pipes(&blank_row) - 1,
+            3,
+            "blank row has three columns: {blank_row}"
+        );
+    }
+
+    fn count_unescaped_pipes(row: &str) -> usize {
+        row.char_indices()
+            .filter(|(index, character)| {
+                *character == '|'
+                    && row[..*index]
+                        .chars()
+                        .rev()
+                        .take_while(|c| *c == '\\')
+                        .count()
+                        % 2
+                        == 0
+            })
+            .count()
+    }
+
+    #[test]
+    fn renders_plan_index_markdown() {
+        let first = task("first", "First task", "2026-01-01T00:00:00Z", Vec::new());
+        let second_url = plan_url(PlanItem::Task("second".to_string()));
+        let mut second = task(
+            "second",
+            "Second task",
+            "2026-01-02T00:00:00Z",
+            vec![first.front.id.clone()],
+        );
+        second.front.status = "closed".to_string();
+        let note_url = plan_url(PlanItem::Note("decision".to_string()));
+        let note = NoteDocument {
+            front: NoteFrontMatter {
+                id: note_url.to_string(),
+                summary: Some("Architecture decision".to_string()),
+                author: Some("Atlas".to_string()),
+                created_at: "2026-01-03T00:00:00Z".to_string(),
+                updated_at: None,
+            },
+            body: "Decision body".to_string(),
+        };
+        let plan = PlanDocument {
+            front: PlanFrontMatter {
+                id: plan_url(PlanItem::Index).to_string(),
+                title: Some("Demo Plan".to_string()),
+                summary: Some("Plan summary".to_string()),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                ..PlanFrontMatter::default()
+            },
+            body: "Plan body".to_string(),
+        };
+
+        let markdown = index_markdown("demo-plan", &plan, &[first.clone(), second], &[note])
+            .expect("render index");
+        let expected = format!(
+            "# Demo Plan\n\nPlan summary\n\nPlan body\n\n## Tasks\n\n| Status | Task | Dependencies |\n|---|---|---|\n| open | [First task]({}) | - |\n| closed | [Second task]({second_url}) | [first]({}) |\n\n## Notes\n\n- [Architecture decision]({note_url}) — Atlas\n",
+            first.front.id, first.front.id
+        );
+        assert_eq!(markdown, expected);
+    }
+
+    #[test]
+    fn renders_task_markdown() {
+        let dependency = plan_url(PlanItem::Task("first".to_string()));
+        let url = plan_url(PlanItem::Task("second".to_string()));
+        let mut document = task(
+            "second",
+            "Second task",
+            "2026-01-02T00:00:00Z",
+            vec![dependency.to_string()],
+        );
+        document.front.status = "in_progress".to_string();
+        let markdown = task_markdown(&url, &document).expect("render task");
+        assert_eq!(
+            markdown,
+            format!(
+                "[Plan Index]({})\n\n# Second task\n\nStatus: `in_progress`\n\nSummary: Second task summary\n\nDependencies: [first]({dependency})\n\nSecond task body\n\n",
+                plan_url(PlanItem::Index)
+            )
+        );
+    }
+
+    #[test]
+    fn renders_note_markdown() {
+        let url = plan_url(PlanItem::Note("decision".to_string()));
+        let document = NoteDocument {
+            front: NoteFrontMatter {
+                id: url.to_string(),
+                summary: Some("Architecture decision".to_string()),
+                author: Some("Atlas".to_string()),
+                created_at: "2026-01-03T00:00:00Z".to_string(),
+                updated_at: None,
+            },
+            body: "Use JetStream KV.".to_string(),
+        };
+        let markdown = note_markdown(&url, "decision", &document).expect("render note");
+        assert_eq!(
+            markdown,
+            format!(
+                "[Plan Index]({})\n\n# Note: Architecture decision\n\nAuthor: Atlas\n\nUse JetStream KV.\n\n",
+                plan_url(PlanItem::Index)
+            )
+        );
+    }
+}

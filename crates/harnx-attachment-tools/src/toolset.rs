@@ -11,10 +11,10 @@ use crate::handlers::{
     attachment_create, attachment_read, AttachmentCreateParams, AttachmentReadParams,
 };
 
-const ATTACHMENT_READ_DESCRIPTION: &str = "Read an attachment by its cid: URL.
+const ATTACHMENT_READ_DESCRIPTION: &str = "Read an attachment or plan by its cid: URL.
 
-Returns image content as image blocks, text content as truncated text with
-line numbers, and errors for non-displayable binary content.
+Returns image content as image blocks, text and rendered plans as truncated
+text with line numbers, and errors for non-displayable binary content.
 
 Truncation parameters follow the same semantics as fs.read:
 - head_lines: return only the first N lines
@@ -175,18 +175,7 @@ impl Toolset for AttachmentToolset {
         // Get JetStream context
         let jetstream = async_nats::jetstream::new(client);
 
-        // Get or create the attachments bucket
-        let store = create_or_open_attachments_bucket(&jetstream, 1)
-            .await
-            .map_err(|e| ToolInvokeError::Recoverable(e.to_string()))?;
-
-        invoke_with_context_tool(invocation, &store, &jetstream).await
-    }
-}
-
-async fn touch_for_url(js: &async_nats::jetstream::Context, url_str: &str) {
-    if let Ok(url) = harnx_core::cid_url::CidUrl::parse(url_str) {
-        let _ = touch_activity(js, &url.owner()).await;
+        invoke_with_context_tool(invocation, &jetstream).await
     }
 }
 
@@ -205,25 +194,25 @@ async fn touch_for_session(
 
 async fn invoke_with_context_tool(
     invocation: ToolInvocation,
-    store: &async_nats::jetstream::object_store::ObjectStore,
     jetstream: &async_nats::jetstream::Context,
 ) -> Result<serde_json::Value, ToolInvokeError> {
     match invocation.tool.as_str() {
         "attachment_read" => {
             let params: AttachmentReadParams = serde_json::from_value(invocation.args)
                 .map_err(|e| ToolInvokeError::Recoverable(format!("invalid parameters: {}", e)))?;
-            let url_str = params.url.clone();
-            let result = attachment_read(store, params)
+            let result = attachment_read(jetstream, params)
                 .await
                 .map_err(|e| ToolInvokeError::Recoverable(e.to_string()))?;
-            touch_for_url(jetstream, &url_str).await;
             serde_json::to_value(result).map_err(|e| ToolInvokeError::Recoverable(e.to_string()))
         }
         "attachment_create" => {
             let params: AttachmentCreateParams = serde_json::from_value(invocation.args)
                 .map_err(|e| ToolInvokeError::Recoverable(format!("invalid parameters: {}", e)))?;
+            let store = create_or_open_attachments_bucket(jetstream, 1)
+                .await
+                .map_err(|e| ToolInvokeError::Recoverable(e.to_string()))?;
             let caller_session = invocation.context.invoking_session.as_ref();
-            let result = attachment_create(store, caller_session, params)
+            let result = attachment_create(&store, caller_session, params)
                 .await
                 .map_err(|e| ToolInvokeError::Recoverable(e.to_string()))?;
             touch_for_session(jetstream, caller_session).await;

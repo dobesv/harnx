@@ -62,10 +62,13 @@ pub(crate) async fn add(
                     path: &path,
                 });
                 context.touch(&plan).await;
-                return result_with_diff(DiffResult {
-                    message: format!("added note {url} to plan {plan}"),
-                    diff,
-                });
+                return result_with_diff_and_resources(
+                    DiffResult {
+                        message: format!("added note {url} to plan {plan}"),
+                        diff,
+                    },
+                    item_resources(&plan, &url, "note", &note_label(&document, &url)),
+                );
             }
             Err(error) => {
                 let exists = get_document(context.store, &url)
@@ -102,7 +105,10 @@ pub(crate) async fn get(
         .ok_or_else(|| ErrorData::invalid_params(format!("note not found: {url}"), None))?;
     let note = parse_note(&stored.content).map_err(map_internal)?;
     context.touch(&plan).await;
-    result_json(note_json(&note))
+    result_json_with_resources(
+        note_json(&note),
+        item_resources(&plan, &url, "note", &note_label(&note, &url)),
+    )
 }
 
 fn note_location(plan: &str, id: &str) -> Result<(CidUrl, CidUrl), ErrorData> {
@@ -134,10 +140,13 @@ pub(crate) async fn update(
         path: &path,
     });
     context.touch(&plan).await;
-    result_with_diff(DiffResult {
-        message: format!("updated note {url}"),
-        diff,
-    })
+    result_with_diff_and_resources(
+        DiffResult {
+            message: format!("updated note {url}"),
+            diff,
+        },
+        item_resources(&plan, &url, "note", &note_label(&note, &url)),
+    )
 }
 
 fn update_note_document(
@@ -190,4 +199,11 @@ fn note_json(note: &NoteDocument) -> Value {
         "updated_at": note.front.updated_at,
         "body": note.body,
     })
+}
+
+fn note_label(note: &NoteDocument, url: &CidUrl) -> String {
+    non_empty(note.front.summary.as_deref())
+        .map(ToOwned::to_owned)
+        .or_else(|| plan_item_id(&url.to_string()))
+        .unwrap_or_else(|| url.to_string())
 }

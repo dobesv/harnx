@@ -82,6 +82,49 @@ fn assert_error(result: &Value, expected: &str) {
     );
 }
 
+fn assert_linked_resource(result: &Value, url: &str, name: &str) {
+    let content = result["content"].as_array().expect("content array");
+    assert!(
+        content.iter().any(|block| {
+            block["type"] == "resource_link"
+                && block["uri"] == url
+                && block["name"] == name
+                && block["mimeType"] == "text/markdown; charset=utf-8"
+        }),
+        "missing {name} resource link for {url}: {result}"
+    );
+    let markdown_target = format!("]({url})");
+    assert!(
+        content.iter().any(|block| {
+            block["type"] == "text"
+                && block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&markdown_target))
+        }),
+        "missing markdown link for {url}: {result}"
+    );
+}
+
+fn assert_item_resources(result: &Value, plan: &str, item: &str, name: &str) {
+    assert_linked_resource(result, plan, "plan");
+    assert_linked_resource(result, item, name);
+}
+
+fn assert_resource_label(result: &Value, url: &str) {
+    let id = url.rsplit('/').next().expect("item URL has an ID");
+    let label = format!("[{id}]({url})");
+    assert!(
+        result["content"]
+            .as_array()
+            .expect("content array")
+            .iter()
+            .any(|block| {
+                block["type"] == "text" && block["text"].as_str().unwrap_or("").contains(&label)
+            }),
+        "missing fallback label for {url}: {result}"
+    );
+}
+
 async fn create_plan(context: &TestContext, name: &str) -> String {
     let result = context
         .invoke(
@@ -91,7 +134,9 @@ async fn create_plan(context: &TestContext, name: &str) -> String {
         )
         .await;
     assert_ne!(result["isError"], true);
-    cid_from(&result)
+    let url = cid_from(&result);
+    assert_linked_resource(&result, &url, "plan");
+    url
 }
 
 #[tokio::test]
@@ -141,6 +186,45 @@ async fn add_plan_requires_context_slugifies_and_deduplicates() {
         "cid:plan:<agent>/<session-id>/<slug>/tasks/<task-id>",
     );
     assert_error(&bare, "expected cid:plan:<agent>/<session-id>/<slug>");
+}
+
+#[tokio::test]
+async fn blank_task_title_uses_task_url_as_resource_label() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let plan = create_plan(&context, "Blank Task Title").await;
+    let added = context
+        .invoke(
+            "add_task",
+            json!({
+                "plan": plan,
+                "id": "blank-title",
+                "title": "  \n ",
+                "body": "task body",
+            }),
+            None,
+        )
+        .await;
+    let task = cid_from(&added);
+    assert_item_resources(&added, &plan, &task, "task");
+    assert_resource_label(&added, &task);
+
+    let fetched = context
+        .invoke("get_task", json!({"plan": plan, "id": task}), None)
+        .await;
+    assert_item_resources(&fetched, &plan, &task, "task");
+    assert_resource_label(&fetched, &task);
+
+    let updated = context
+        .invoke(
+            "update_task",
+            json!({"plan": plan, "id": task, "title": "  \n "}),
+            None,
+        )
+        .await;
+    assert_item_resources(&updated, &plan, &task, "task");
+    assert_resource_label(&updated, &task);
 }
 
 #[tokio::test]
@@ -229,9 +313,11 @@ async fn assert_plan_update(context: &TestContext, plan: &str) {
         )
         .await;
     assert!(text(&updated).contains(plan));
+    assert_linked_resource(&updated, plan, "plan");
     let fetched = context
         .invoke("get_plan", json!({"plan": plan}), None)
         .await;
+    assert_linked_resource(&fetched, plan, "plan");
     let value = json_result(&fetched);
     assert_eq!(value["body"], "initial body\nsecond line");
     assert_eq!(value["summary"], "updated");
@@ -258,6 +344,7 @@ async fn create_task(
         .await;
     let url = cid_from(&result);
     assert!(url.contains("/tasks/"));
+    assert_item_resources(&result, plan, &url, "task");
     url
 }
 
@@ -275,6 +362,7 @@ async fn assert_task_update(context: &TestContext, items: PlanItems<'_>) {
         )
         .await;
     assert!(text(&updated).contains(items.task));
+    assert_item_resources(&updated, items.plan, items.task, "task");
     let fetched = context
         .invoke(
             "get_task",
@@ -282,6 +370,7 @@ async fn assert_task_update(context: &TestContext, items: PlanItems<'_>) {
             None,
         )
         .await;
+    assert_item_resources(&fetched, items.plan, items.task, "task");
     let value = json_result(&fetched);
     assert_eq!(value["status"], "closed");
     assert_eq!(value["dependencies"][0], items.dependency);
@@ -298,20 +387,23 @@ async fn create_note(context: &TestContext, plan: &str) -> String {
         .await;
     let url = cid_from(&result);
     assert!(url.contains("/notes/"));
+    assert_item_resources(&result, plan, &url, "note");
     url
 }
 
 async fn assert_note_update(context: &TestContext, plan: &str, note: &str) {
-    context
+    let updated = context
         .invoke(
             "update_note",
             json!({"plan": plan, "note_id": note, "append_body": "more"}),
             None,
         )
         .await;
+    assert_item_resources(&updated, plan, note, "note");
     let fetched = context
         .invoke("get_note", json!({"plan": plan, "note_id": note}), None)
         .await;
+    assert_item_resources(&fetched, plan, note, "note");
     assert_eq!(json_result(&fetched)["body"], "note body\nmore");
 }
 

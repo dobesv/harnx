@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use async_nats::jetstream::object_store::ObjectStore;
-use harnx_blob_store::{get_media, media_cid_url, put_media};
+use harnx_blob_store::{media_cid_url, put_media, resolve};
 use harnx_core::cid_url::CidUrl;
 use harnx_core::crypto::hex_encode;
 use harnx_core::safety::{format_size, truncate_output, TruncateOpts};
@@ -66,52 +66,46 @@ pub struct AttachmentCreateParams {
     pub mime_type: String,
 }
 
-/// Read an attachment from NATS object store.
+/// Read an attachment or rendered plan from NATS-backed storage.
 pub async fn attachment_read(
-    store: &ObjectStore,
+    jetstream: &async_nats::jetstream::Context,
     params: AttachmentReadParams,
 ) -> Result<CallToolResult> {
-    // Parse the URL
     let url = CidUrl::parse(&params.url).context("parse cid: URL")?;
-
-    // Reject plan URLs (not yet supported)
-    if matches!(url, CidUrl::Plan { .. }) {
-        return Ok(CallToolResult::error(vec![ContentBlock::text(
-            "plan URLs not yet supported",
+    let resolved = match resolve(jetstream, &url).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                error.to_string(),
+            )]));
+        }
+    };
+    if IMAGE_MIME_TYPES
+        .iter()
+        .any(|mime| resolved.mime_type == *mime)
+    {
+        let data =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resolved.bytes);
+        return Ok(CallToolResult::success(vec![ContentBlock::image(
+            data,
+            resolved.mime_type,
         )]));
     }
-
-    // Only media URLs are supported for read
-    let CidUrl::Media { .. } = &url else {
-        return Ok(CallToolResult::error(vec![ContentBlock::text(
-            "unknown URL type, only media and plan URLs are supported",
-        )]));
-    };
-
-    let Some((bytes, mime_type)) = get_media(store, &url).await? else {
-        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-            "attachment not found: {}",
-            params.url
-        ))]));
-    };
-
-    // Handle based on MIME type
-    if IMAGE_MIME_TYPES.iter().any(|t| mime_type == *t) {
-        // Return as image block
-        let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-        Ok(CallToolResult::success(vec![ContentBlock::image(
-            data, mime_type,
-        )]))
-    } else if is_text_mime(&mime_type) {
-        text_attachment_result(bytes, params)
-    } else {
-        // Binary, non-displayable
-        Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-            "cannot display binary content of type {} ({} bytes). image types are supported; other binary content cannot be displayed.",
-            mime_type,
-            format_size(bytes.len())
-        ))]))
+    if is_text_mime(&resolved.mime_type) {
+        return text_attachment_result(resolved.bytes, params);
     }
+    Ok(binary_attachment_error(
+        &resolved.mime_type,
+        resolved.bytes.len(),
+    ))
+}
+
+fn binary_attachment_error(mime_type: &str, byte_count: usize) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(format!(
+        "cannot display binary content of type {} ({} bytes). image types are supported; other binary content cannot be displayed.",
+        mime_type,
+        format_size(byte_count)
+    ))])
 }
 
 fn text_attachment_result(bytes: Vec<u8>, params: AttachmentReadParams) -> Result<CallToolResult> {
