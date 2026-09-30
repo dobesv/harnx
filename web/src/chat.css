@@ -1359,3 +1359,216 @@ body {
   border-radius: 8px;
   border: 1px dashed var(--border);
 }
+
+/* CID plan and text attachment viewer */
+.cid-document-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: rgb(0 0 0 / 55%);
+}
+
+.cid-document-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(960px, 100%);
+  max-height: min(88vh, 1000px);
+  overflow: hidden;
+  background: var(--surface);
+  color: var(--text-h);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+}
+
+.cid-document-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.8rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.cid-document-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+.cid-document-heading h2 {
+  margin: 0 0 0.25rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cid-document-heading code {
+  display: block;
+  max-width: 100%;
+  padding: 0;
+  color: var(--text);
+  background: transparent;
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cid-document-back,
+.cid-document-close {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text-h);
+  cursor: pointer;
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+.cid-document-back:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.cid-document-back:not(:disabled):hover,
+.cid-document-close:hover {
+  border-color: var(--accent);
+  background: var(--surface-hover);
+}
+
+.cid-document-back:focus-visible,
+.cid-document-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.cid-document-content {
+  min-height: 12rem;
+  overflow: auto;
+  padding: 1.25rem 1.5rem 2rem;
+  overscroll-behavior: contain;
+}
+
+.cid-document-loading {
+  display: flex;
+  min-height: 10rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  color: var(--text);
+}
+
+.cid-document-error {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0;
+}
+
+.cid-document-markdown {
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.cid-document-markdown h1,
+.cid-document-markdown h2,
+.cid-document-markdown h3 {
+  margin: 1.4em 0 0.55em;
+}
+
+.cid-document-markdown h1:first-child,
+.cid-document-markdown h2:first-child,
+.cid-document-markdown h3:first-child {
+  margin-top: 0;
+}
+
+.cid-document-markdown p,
+.cid-document-markdown ul,
+.cid-document-markdown ol,
+.cid-document-markdown blockquote {
+  margin: 0.8rem 0;
+}
+
+.cid-document-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.cid-document-markdown th,
+.cid-document-markdown td {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.cid-document-markdown a {
+  color: var(--accent);
+}
+
+.cid-document-markdown pre,
+.cid-document-code-block {
+  margin: 0.8rem 0;
+  padding: 0.8rem 1rem;
+  overflow-x: auto;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.cid-document-markdown pre code,
+.cid-document-code-block code {
+  display: inline;
+  padding: 0;
+  background: transparent;
+}
+
+.cid-document-code-block .token.comment,
+.cid-document-code-block .token.prolog,
+.cid-document-code-block .token.doctype {
+  color: #7c8597;
+}
+
+.cid-document-code-block .token.keyword,
+.cid-document-code-block .token.operator,
+.cid-document-code-block .token.boolean {
+  color: #c678dd;
+}
+
+.cid-document-code-block .token.string,
+.cid-document-code-block .token.attr-value {
+  color: #98c379;
+}
+
+.cid-document-code-block .token.function,
+.cid-document-code-block .token.class-name {
+  color: #61afef;
+}
+
+@media (max-width: 640px) {
+  .cid-document-backdrop {
+    padding: 0;
+  }
+
+  .cid-document-dialog {
+    width: 100%;
+    height: 100%;
+    max-height: none;
+    border: none;
+    border-radius: 0;
+  }
+
+  .cid-document-content {
+    padding: 1rem;
+  }
+}

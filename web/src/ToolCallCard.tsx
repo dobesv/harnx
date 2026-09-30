@@ -14,6 +14,7 @@ import {
   type ResultExtraction,
 } from './toolCallPresentation';
 import { MarkdownLink } from './markdownLink';
+import { markdownUrlTransform } from './markdownUrl';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -33,7 +34,11 @@ export const ToolSummaryPreview = ({
       expanded ? 'aui-tool-summary-expanded' : 'aui-tool-summary-collapsed'
     }`}
   >
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      urlTransform={markdownUrlTransform}
+      components={markdownComponents}
+    >
       {markdown}
     </ReactMarkdown>
   </div>
@@ -366,7 +371,11 @@ const ToolCallFormattedView: React.FC<{
       <div>
         <div style={{ fontSize: '0.8em', marginBottom: '0.25rem', fontWeight: 'bold' }}>Prompt:</div>
         <div className="aui-tool-prompt-markdown">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            urlTransform={markdownUrlTransform}
+            components={markdownComponents}
+          >
             {promptText}
           </ReactMarkdown>
         </div>
@@ -390,7 +399,11 @@ const ToolCallFormattedView: React.FC<{
           {isSubAgent ? 'Response:' : 'Result:'}
         </div>
         <div className="aui-tool-result-markdown">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            urlTransform={markdownUrlTransform}
+            components={markdownComponents}
+          >
             {resultContent.text}
           </ReactMarkdown>
         </div>

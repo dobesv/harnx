@@ -168,3 +168,11 @@ pub(super) fn is_inline_image_mime(mime_type: &[u8]) -> bool {
         b"image/png" | b"image/jpeg" | b"image/webp" | b"image/gif"
     )
 }
+
+pub(super) fn request_is_oversized(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_UPLOAD_BYTES)
+}

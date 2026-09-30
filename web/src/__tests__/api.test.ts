@@ -1,5 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { listAgents, listSessions, createSession, getAgent, cancel, uploadAttachment, sendPrompt } from '../api';
+import {
+  cancel,
+  createSession,
+  fetchCidContent,
+  getAgent,
+  getCidUrl,
+  listAgents,
+  listSessions,
+  sendPrompt,
+  uploadAttachment,
+} from '../api';
 
 const fetchMock = vi.fn();
 globalThis.fetch = fetchMock as any;
@@ -7,6 +17,49 @@ globalThis.fetch = fetchMock as any;
 describe('api.ts', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+  });
+
+  describe('CID content', () => {
+    it('builds a URL with the complete CID encoded as one path segment', () => {
+      expect(getCidUrl('cid:plan:pantheon%2Fatlas/abc123/project/tasks/t-1')).toBe(
+        '/v1/cid/cid%3Aplan%3Apantheon%252Fatlas%2Fabc123%2Fproject%2Ftasks%2Ft-1',
+      );
+    });
+
+    it('fetches text content with MIME type and ETag', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: new Headers({
+          'content-type': 'text/markdown; charset=utf-8',
+          etag: '"revision-7"',
+        }),
+        text: async () => '# Plan',
+      });
+
+      await expect(fetchCidContent('cid:plan:_temp/abc123/project')).resolves.toEqual({
+        mimeType: 'text/markdown; charset=utf-8',
+        text: '# Plan',
+        etag: '"revision-7"',
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/v1/cid/cid%3Aplan%3A_temp%2Fabc123%2Fproject',
+        undefined,
+      );
+    });
+
+    it('reports an HTTP fetch failure', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        headers: new Headers(),
+      });
+
+      await expect(fetchCidContent('cid:plan:_temp/abc123/missing')).rejects.toThrow(
+        'Failed to fetch CID content (404): Not Found',
+      );
+    });
   });
 
   describe('listAgents', () => {

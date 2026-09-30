@@ -24,6 +24,7 @@ clap = { workspace = true, features = ["env"] }
 dashmap = "6"
 futures = "0.3"
 futures-util = { workspace = true }
+harnx-blob-store = { path = "../harnx-blob-store" }
 harnx-core = { path = "../harnx-core" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-metrics = { workspace = true }
@@ -42,6 +43,7 @@ hyper-util = { workspace = true, features = ["server-graceful"] }
 log = { workspace = true }
 multer = { workspace = true }
 parking_lot = { workspace = true }
+percent-encoding = { workspace = true }
 rand = "0.10.2"
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -53,6 +55,7 @@ uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
 harnx-hookset = { path = "../harnx-hookset" }
+harnx-test-bins = { path = "../harnx-test-bins" }
 futures = "0.3"
 libc = "0.2"
 tempfile = { workspace = true }

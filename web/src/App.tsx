@@ -28,6 +28,8 @@ import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import { AttachIcon, SendIcon, StopIcon } from './icons';
 import { MarkdownLink } from './markdownLink';
+import { markdownUrlTransform } from './markdownUrl';
+import { CidDocumentProvider } from './CidDocumentProvider';
 import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './composer/AgentSessionMenu';
 import { ConnectionBanner } from './ConnectionBanner';
 import { useConnectionStatus, useRetryCountdownSeconds } from './useConnectionStatus';
@@ -54,6 +56,7 @@ export const MessageContent = () => (
     Text: () => (
       <MarkdownTextPrimitive
         remarkPlugins={[remarkGfm]}
+        urlTransform={markdownUrlTransform}
         components={{
           SyntaxHighlighter,
           a: MarkdownLink,
@@ -925,7 +928,6 @@ export default function App() {
     markSessionNotFresh,
     navigateSession,
   } = useAgentSessions();
-
   const handleHandoff = useCallback((agent: string, sessionId: string) => {
     navigateSession(agent, sessionId);
   }, [navigateSession]);
@@ -962,57 +964,59 @@ export default function App() {
   const suppressBanner = !selectedAgent && !hasLoadedAgents;
 
   return (
-    <div className="app-container">
-      <ConnectionBanner suppress={suppressBanner} />
-      {!selectedAgent ? (
-        <AgentPicker
-          agents={agents}
-          agentsError={agentsError}
-          hasLoadedAgents={hasLoadedAgents}
-          onSelect={selectAgent}
-        />
-      ) : !selectedSessionId ? (
-        <SessionPicker
-          agentName={selectedAgent}
-          sessions={sessions}
-          sessionsError={sessionsError}
-          sessionsLoading={sessionsLoading}
-          hasLoadedSessions={hasLoadedSessions}
-          onRetry={refreshSessions}
-          onSelect={selectSession}
-          onNewChat={newChat}
-          onBack={clearAgent}
-          onToggleUnread={handleToggleUnread}
-        />
-      ) : (
-        <div className="chat-layout">
-          <div className="chat-main">
-            <ChatProvider
-              key={`${selectedAgent}:${selectedSessionId}`}
-              agentName={selectedAgent} 
-              sessionId={selectedSessionId} 
-              isFreshSession={isFreshSession}
-              onHandoff={handleHandoff}
-              onOpenSubAgent={navigateSession}
-              onReadUpdated={refreshSessions}
-            >
-              <MyThread
+    <CidDocumentProvider>
+      <div className="app-container">
+        <ConnectionBanner suppress={suppressBanner} />
+        {!selectedAgent ? (
+          <AgentPicker
+            agents={agents}
+            agentsError={agentsError}
+            hasLoadedAgents={hasLoadedAgents}
+            onSelect={selectAgent}
+          />
+        ) : !selectedSessionId ? (
+          <SessionPicker
+            agentName={selectedAgent}
+            sessions={sessions}
+            sessionsError={sessionsError}
+            sessionsLoading={sessionsLoading}
+            hasLoadedSessions={hasLoadedSessions}
+            onRetry={refreshSessions}
+            onSelect={selectSession}
+            onNewChat={newChat}
+            onBack={clearAgent}
+            onToggleUnread={handleToggleUnread}
+          />
+        ) : (
+          <div className="chat-layout">
+            <div className="chat-main">
+              <ChatProvider
+                key={`${selectedAgent}:${selectedSessionId}`}
                 agentName={selectedAgent}
                 sessionId={selectedSessionId}
-                isUnread={isCurrentSessionUnread}
-                onMarkRead={handleCurrentMarkRead}
                 isFreshSession={isFreshSession}
-                markSessionNotFresh={markSessionNotFresh}
-                onRunFinish={refreshSessions}
-                onSwitchAgent={clearAgent}
-                onSwitchSession={clearSession}
-                switchAgentHref="/"
-                switchSessionHref={`/agents/${encodeURIComponent(selectedAgent)}`}
-              />
-            </ChatProvider>
+                onHandoff={handleHandoff}
+                onOpenSubAgent={navigateSession}
+                onReadUpdated={refreshSessions}
+              >
+                <MyThread
+                  agentName={selectedAgent}
+                  sessionId={selectedSessionId}
+                  isUnread={isCurrentSessionUnread}
+                  onMarkRead={handleCurrentMarkRead}
+                  isFreshSession={isFreshSession}
+                  markSessionNotFresh={markSessionNotFresh}
+                  onRunFinish={refreshSessions}
+                  onSwitchAgent={clearAgent}
+                  onSwitchSession={clearSession}
+                  switchAgentHref="/"
+                  switchSessionHref={`/agents/${encodeURIComponent(selectedAgent)}`}
+                />
+              </ChatProvider>
+            </div>
           </div>
-        </div>
-      )}
-    </div>
+        )}
+      </div>
+    </CidDocumentProvider>
   );
 }
