@@ -33,7 +33,7 @@ Harnx can load environment variables from a `.env` file located in the data dire
 - **HARNX_SAVE_SHELL_HISTORY**: Whether to save shell history (boolean).
 - **HARNX_SYNC_MODELS_URL**: The URL to sync models from.
 - **HARNX_CLEANUP_REMOTE_SESSIONS_DAYS**: Retention period in days for remote NATS sessions (integer). Unset disables automatic expiry (state grows unbounded; workers log a warning at startup). `0` explicitly disables expiry. Values `>0` enable worker-owned periodic session garbage collection.
-- **HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS**: Maximum seconds to wait for a worker to claim an activated NATS session. Defaults to `60` and must be greater than zero. Applies to top-level and sub-agent sessions.
+- **HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS**: Maximum seconds to wait for a worker to claim an activated NATS session. Defaults to `60`. Must be a whole number of seconds greater than zero; a malformed, fractional, negative or zero value fails startup. Applies to top-level and sub-agent sessions.
 
 ## Client-Related Envs
 
