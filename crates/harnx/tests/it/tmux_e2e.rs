@@ -15,60 +15,164 @@ use tempfile::TempDir;
 #[test]
 #[cfg(unix)]
 fn proxy_auth_hook_injects_env_vars_into_bash_exec() -> Result<()> {
+    harnx_core::require_nextest();
     if !TmuxHarness::is_available() {
         eprintln!("skipping proxy_auth_hook_injects_env_vars_into_bash_exec: tmux is unavailable");
         return Ok(());
     }
+
     let repo_root = repo_root()?;
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-    let harnx_proxy_auth_bin = harnx_proxy_auth_bin(&harnx_bin);
-    if !harnx_proxy_auth_bin.exists() {
-        eprintln!(
-            "skipping proxy_auth_hook_injects_env_vars_into_bash_exec: harnx-proxy-auth binary not found at {}",
-            harnx_proxy_auth_bin.display()
-        );
+    let Some(binaries) = proxy_auth_binaries(&harnx_bin) else {
         return Ok(());
-    }
-
+    };
     let temp = TempDir::new().context("failed to create temp dir")?;
     let mock = MockOpenAiServer::start(proxy_auth_hook_script())?;
     let paths = TestPaths::new(temp.path(), mock.port())?;
-    write_proxy_auth_fixture_files(&paths, &harnx_proxy_auth_bin)?;
+    write_proxy_auth_fixture_files(&paths, &binaries, &repo_root)?;
 
-    let tmux = match TmuxHarness::new(&repo_root, 120, 35) {
-        Ok(tmux) => tmux,
-        Err(err) => {
-            eprintln!(
-                "skipping proxy_auth_hook_injects_env_vars_into_bash_exec: tmux is unavailable or unusable ({err:#})"
-            );
-            return Ok(());
-        }
+    let tmux = TmuxHarness::new(&repo_root, 120, 35)
+        .context("failed to create tmux harness for proxy-auth e2e test")?;
+    run_proxy_auth_prompt(&tmux, &paths, &repo_root, &harnx_bin)?;
+    let result = dump_proxy_auth_bash_result(&paths, &repo_root, &harnx_bin)?;
+    assert_proxy_auth_bash_output(&result)?;
+
+    drop(tmux);
+    drop(mock);
+    Ok(())
+}
+
+#[cfg(unix)]
+struct ProxyAuthBinaries {
+    proxy_auth: PathBuf,
+    mcp_bridge: PathBuf,
+    bash_tools: PathBuf,
+}
+
+#[cfg(unix)]
+fn proxy_auth_binaries(harnx_bin: &Path) -> Option<ProxyAuthBinaries> {
+    let binaries = ProxyAuthBinaries {
+        proxy_auth: sibling_bin(harnx_bin, "harnx-proxy-auth"),
+        mcp_bridge: sibling_bin(harnx_bin, "harnx-mcp-bridge"),
+        bash_tools: sibling_bin(harnx_bin, "harnx-bash-tools"),
     };
-    prime_proxy_test_shell(&tmux, &paths, &repo_root, &harnx_bin)?;
+    for binary in [
+        &binaries.proxy_auth,
+        &binaries.mcp_bridge,
+        &binaries.bash_tools,
+    ] {
+        if !binary.exists() {
+            eprintln!(
+                "skipping proxy_auth_hook_injects_env_vars_into_bash_exec: sibling binary not found at {}",
+                binary.display()
+            );
+            return None;
+        }
+    }
+    Some(binaries)
+}
 
+#[cfg(unix)]
+fn run_proxy_auth_prompt(
+    tmux: &TmuxHarness,
+    paths: &TestPaths,
+    repo_root: &Path,
+    harnx_bin: &Path,
+) -> Result<()> {
+    prime_proxy_test_shell(tmux, paths, repo_root, harnx_bin)?;
     tmux.send_text(&format!(
         "{} prompt -a proxy-test -s proxy-auth-e2e -- {}",
         shell_escape(harnx_bin.to_string_lossy().as_ref()),
         shell_escape("Run a bash command")
     ))?;
     tmux.send_keys(&["Enter"])?;
-    let Some(screen) = wait_for_proxy_injection_or_skip(&tmux) else {
-        drop(tmux);
-        drop(mock);
-        return Ok(());
-    };
+    // The local broker, hook, bridge and bash server can take 40x longer on
+    // contended CI runners; keep this below nextest's 240s hang deadline.
+    tmux.wait_for_contains("Done.", Duration::from_secs(180))?;
+    Ok(())
+}
 
+#[cfg(unix)]
+fn dump_proxy_auth_bash_result(
+    paths: &TestPaths,
+    repo_root: &Path,
+    harnx_bin: &Path,
+) -> Result<Value> {
+    // Session transcripts live in the local NATS store; `dump session` decodes them.
+    let dump = std::process::Command::new(harnx_bin)
+        .args([
+            "dump",
+            "session",
+            "proxy-test",
+            "proxy-auth-e2e",
+            "--format",
+            "json",
+        ])
+        .env("HARNX_CONFIG_DIR", &paths.harnx_config_dir)
+        .env("HARNX_DATA_DIR", &paths.harnx_data_dir)
+        .env("HARNX_STATE_DIR", &paths.harnx_state_dir)
+        .current_dir(repo_root)
+        .output()
+        .context("failed to dump persisted proxy-auth session")?;
+    anyhow::ensure!(
+        dump.status.success(),
+        "failed to dump persisted proxy-auth session: {}",
+        String::from_utf8_lossy(&dump.stderr)
+    );
+    let dump_stdout = String::from_utf8(dump.stdout)?;
+    let entries = dump_stdout
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<Vec<SessionLogEntry>, _>>()?;
+
+    let bash_call = entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionLogEntry::ToolCalls { calls, .. } => {
+                calls.iter().find(|call| call.name == "bash_exec")
+            }
+            _ => None,
+        })
+        .context("session log has no bash_exec ToolCalls entry")?;
+    let bash_result = entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionLogEntry::ToolResults { results, .. } => results
+                .iter()
+                .find(|result| result.name == "bash_exec" && result.id == bash_call.id),
+            _ => None,
+        })
+        .context("session log has no matching bash_exec ToolResults entry")?;
+    Ok(bash_result.output.clone())
+}
+
+#[cfg(unix)]
+fn assert_proxy_auth_bash_output(result: &Value) -> Result<()> {
+    assert_eq!(
+        result.get("isError").and_then(Value::as_bool),
+        Some(false),
+        "bash_exec returned an error: {result}"
+    );
+    let output = result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        screen.contains("HTTPS_PROXY=http://127.0.0.1:"),
-        "expected HTTPS_PROXY injection in output, got screen:\n{screen}"
+        output.contains("HTTPS_PROXY=http://127.0.0.1:"),
+        "bash_exec output did not contain injected HTTPS_PROXY: {output}"
     );
     assert!(
-        screen.contains("SSL_CERT_FILE=") && screen.contains("ca.pem"),
-        "expected SSL_CERT_FILE ending with ca.pem in output, got screen:\n{screen}"
+        output.contains("SSL_CERT_FILE=") && output.contains("ca.pem"),
+        "bash_exec output did not contain injected SSL_CERT_FILE: {output}"
     );
-
-    drop(tmux);
-    drop(mock);
+    output
+        .lines()
+        .find(|line| line.starts_with("HTTPS_PROXY="))
+        .context("bash_exec output has no proxy environment line")?;
     Ok(())
 }
 
@@ -107,25 +211,6 @@ fn prime_proxy_test_shell(
     Ok(())
 }
 
-#[cfg(unix)]
-fn wait_for_proxy_injection_or_skip(tmux: &TmuxHarness) -> Option<String> {
-    match tmux.wait_for(Duration::from_secs(30), |screen| {
-        screen.contains("HTTPS_PROXY=http://127.0.0.1:")
-    }) {
-        Ok(screen) => Some(screen),
-        Err(_) => {
-            // The hook output didn't appear — likely the proxy subprocess couldn't
-            // start in this environment (e.g. sandbox execution restrictions).
-            // Skip rather than fail so the test is not a false negative in CI.
-            let last = tmux.capture_pane().unwrap_or_default();
-            eprintln!(
-                "skipping proxy_auth_hook_injects_env_vars_into_bash_exec: \
-                 HTTPS_PROXY not seen in output (sandbox restriction?). Last screen:\n{last}"
-            );
-            None
-        }
-    }
-}
 // Normalizes screen output for snapshot tests.
 fn normalize_screen(screen: &str) -> String {
     let trimmed = screen
@@ -298,10 +383,11 @@ fn normalize_short_session_ids(text: &str) -> String {
     out
 }
 
+/// Path of another workspace binary built next to `harnx`. Cargo only exposes
+/// this package's own binaries through `CARGO_BIN_EXE_*`.
 #[cfg(unix)]
-fn harnx_proxy_auth_bin(harnx_bin: &Path) -> PathBuf {
-    let ext = std::env::consts::EXE_SUFFIX;
-    harnx_bin.with_file_name(format!("harnx-proxy-auth{ext}"))
+fn sibling_bin(harnx_bin: &Path, name: &str) -> PathBuf {
+    harnx_bin.with_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn shell_escape(s: &str) -> String {
@@ -380,10 +466,14 @@ fn proxy_auth_hook_script() -> MockOpenAiScript {
 }
 
 #[cfg(unix)]
-fn write_proxy_auth_fixture_files(paths: &TestPaths, proxy_auth_bin: &Path) -> Result<()> {
+fn write_proxy_auth_fixture_files(
+    paths: &TestPaths,
+    binaries: &ProxyAuthBinaries,
+    repo_root: &Path,
+) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
     // Single-quote the binary path so spaces in the path don't split the token.
-    let bin_path = proxy_auth_bin.to_string_lossy().replace('\'', "'\\''");
+    let bin_path = binaries.proxy_auth.to_string_lossy().replace('\'', "'\\''");
     write_yaml(
         &paths.config_path,
         &json!({
@@ -394,6 +484,28 @@ fn write_proxy_auth_fixture_files(paths: &TestPaths, proxy_auth_bin: &Path) -> R
         }),
     )?;
     write_mock_llm_client(&paths.harnx_config_dir, paths.port)?;
+
+    let tool_servers_dir = paths.harnx_config_dir.join("tool_servers");
+    std::fs::create_dir_all(&tool_servers_dir)?;
+    // This test checks hook-provided process environment, not birdcage. Some CI
+    // hosts block user namespaces, which makes sandbox-exec exit 127 before bash runs.
+    write_yaml(
+        &tool_servers_dir.join("bash.yaml"),
+        &json!({
+            "command": binaries.mcp_bridge,
+            "args": [
+                "--name",
+                "bash",
+                "--",
+                binaries.bash_tools,
+                "--mcp-stdio",
+                "--no-sandbox",
+                "--allow-read",
+                repo_root,
+            ],
+        }),
+    )?;
+
     // Minimal agent that uses the mock model and exposes all MCP tools.
     std::fs::write(
         paths.agents_dir.join("proxy-test.md"),

@@ -130,6 +130,33 @@ so select tests with `test(/^tmux_e2e::/)` rather than `binary(tmux_e2e)`;
 every integration binary is now named `it`. insta snapshots for these tests
 live in `tests/it/snapshots/` with an `it__` prefix.
 
+### Bridged tool servers in tests
+
+Integration tests that need `bash_exec` register a bash tool server via `harnx-mcp-bridge`:
+
+```yaml
+command: harnx-mcp-bridge
+args:
+  - --name
+  - bash
+  - --
+  - harnx-bash-tools
+  - --mcp-stdio
+  - --no-sandbox
+  - --allow-read
+  - <working_dir>
+```
+
+Use `--no-sandbox` when the test scope is bash behavior, not sandbox isolation. Hosts that block unprivileged user namespaces (some containers) fail `harnx-sandbox-exec` with exit 127 before the command runs. Precedent: `proxy_auth_hook_injects_env_vars_into_bash_exec` in `crates/harnx/tests/it/tmux_e2e.rs`; `write_with_wait_tool` in `crates/harnx/src/test_utils/interrupt.rs` bridges the time server the same way.
+
+### Session transcript and PreToolUse hook mutation
+
+Persisted `ToolCalls` entries hold the arguments as received from the LLM, before `PreToolUse` hooks run. `execute_tool_round_with_persistence` (`crates/harnx-runtime/src/tool.rs`) appends calls before hooks apply `mutated_tool_input`. To assert hook-injected env or args, read `ToolResults` or process output instead.
+
+### Test skips must probe capability, not timeout
+
+A test that skips on timeout hides real failures. Guard skips with an explicit capability probe (checking `tmux -V`, verifying a sibling binary exists, or testing user namespace availability). A wait-for-X timeout is a test failure, not a skip condition.
+
 ### Broker-backed tests and wall-clock margins
 
 Tests that spawn a `nats-server` run in the `broker-e2e` / `heavy-e2e` groups
