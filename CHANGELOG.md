@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
-- Keep claimed NATS worker activations alive with progress acknowledgements, admit independent sessions concurrently, preserve immediate durable turn failures, back off busy activations before expensive preflight reads, terminate repeated pre-turn infrastructure failures after recording an error, and make the worker-claim timeout configurable.
+- Keep claimed NATS worker activations alive with progress acknowledgements, admit independent sessions concurrently, preserve immediate durable turn failures, back off busy activations before expensive preflight reads, terminate repeated pre-turn infrastructure failures after recording an error, and make the worker-claim timeout configurable. The claim timeout is set with `nats_lease_acquisition_timeout_secs` or `HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS` (default `60`). The env var takes a whole number of seconds greater than zero; a malformed, fractional, negative or zero value fails startup with `HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS must be a positive integer`.
 - Link x86_64 Windows builds with `rust-lld` instead of MSVC's `link.exe`, which shortens Windows build times.
 
 ## 0.34.8 (2026-09-30)

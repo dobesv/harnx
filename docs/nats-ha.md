@@ -701,6 +701,23 @@ replacement worker may resume:
   targeted-activation failures. Retries with increasing delay up to 2s
   maximum.
 
+The ten-failure limit is counted in the `harnx_activation_failures` KV bucket
+(`activation_failure.rs`, one-hour TTL per key). If a worker can't read or
+update that bucket, it logs a warning and retries the activation with a
+delayed NAK. A counter outage never terminates work, but it also means the
+limit isn't enforced while the bucket is down: an activation that keeps failing
+before its turn starts is redelivered indefinitely instead of being terminated
+after ten attempts. Watch worker logs for either of these warnings:
+
+- `activation failure counter unavailable for '<session_id>': ...` (metadata
+  preflight)
+- `failed to count activation failure: session_id=<session_id> error=...`
+  (session setup)
+
+Repeated warnings for the same session mean that activation is cycling. Restore
+the bucket (check JetStream health and KV permissions) and the limit applies
+again from the next failure.
+
 **Remote tool calls must not be cancelled on failover.** When a worker receives
 a failover abort signal, `NatsToolProvider::invoke_tool`
 (`nats_tool_provider.rs:276-280`) checks `!abort.aborted_failover()` before
