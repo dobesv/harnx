@@ -21,6 +21,7 @@ jobs:
   # this job, and a change with no Rust impact reports success in seconds. The
   # exclusions are paths no build step or test reads: `packages/` and
   # `example_config/` are embedded or read by Rust tests, so they stay in.
+  # The first path rule in .config/affected.toml mirrors this list.
   changes:
     name: Detect Rust changes
     runs-on: ubuntu-latest
@@ -84,6 +85,10 @@ jobs:
 
     - uses: actions/checkout@v7
       if: needs.changes.outputs.rust == 'true'
+      with:
+        # A pull_request run checks out the PR merged into its base; the
+        # second commit is that base, which `cargo xtask affected` diffs against.
+        fetch-depth: 2
 
     - name: Install Rust Toolchain Components
       if: needs.changes.outputs.rust == 'true'
@@ -98,16 +103,30 @@ jobs:
       with:
         tool: cargo-nextest
 
-    # harnx's integration tests (tests/interrupt_e2e.rs, tests/tmux_e2e.rs)
-    # spawn sibling bins (harnx-time-tools, harnx-mcp-repro249) via a
-    # sibling-path lookup in src/test_utils/interrupt.rs. Those bins live in
-    # separate workspace crates that harnx doesn't depend on, so
-    # `cargo nextest run --all` alone won't build them. Build the whole
-    # workspace (bins + tests) first so every bin is present before tests
-    # start.
-    - name: Build workspace
+    # Pull requests test only the packages their change can affect (see
+    # .config/affected.toml). The merge queue and main always run everything,
+    # so a missing edge in that file cannot let a break reach main. Each OS
+    # computes its own list because target-specific dependencies differ.
+    - name: Select affected packages
+      id: affected
       if: needs.changes.outputs.rust == 'true'
-      run: cargo build --workspace --all-targets
+      run: |
+        if [ "${{ github.event_name }}" = pull_request ]; then
+          args="$(cargo xtask affected --base HEAD^1)"
+        else
+          args="--workspace"
+        fi
+        echo "Testing: ${args:-nothing}"
+        echo "args=${args}" >> "${GITHUB_OUTPUT}"
+
+    # Tests spawn sibling bins by path (the worker, tool servers,
+    # harnx-mcp-repro249, ...) from crates they don't depend on, so testing a
+    # subset of packages still needs every bin. Tests themselves are built by
+    # nextest for just the selected packages; building bins first causes no
+    # rebuild because the feature sets match.
+    - name: Build workspace binaries
+      if: needs.changes.outputs.rust == 'true'
+      run: cargo build --workspace --bins
 
     - name: Install nats-server (Linux)
       if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
@@ -204,8 +223,8 @@ jobs:
       # Use the `ci` nextest profile (.config/nextest.toml): retries transient
       # timing flakes from the broker/worker/e2e tests and reports all failures
       # per run (fail-fast = false) instead of aborting on the first.
-      if: needs.changes.outputs.rust == 'true'
-      run: cargo nextest run --all --profile ci
+      if: needs.changes.outputs.rust == 'true' && steps.affected.outputs.args != ''
+      run: cargo nextest run ${{ steps.affected.outputs.args }} --profile ci
 
     - name: Check for pending snapshot updates
       if: needs.changes.outputs.rust == 'true' && failure()

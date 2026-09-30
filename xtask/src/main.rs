@@ -8,6 +8,8 @@ use std::process::{Command, ExitStatus};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
+mod affected;
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("Error: {err:#}");
@@ -18,6 +20,7 @@ fn main() {
 fn run() -> Result<()> {
     match parse_cli(env::args_os().skip(1).collect())? {
         CommandLine::Install(args) => install(args),
+        CommandLine::Affected(args) => affected::affected(args),
         CommandLine::Help => {
             print_help();
             Ok(())
@@ -27,6 +30,7 @@ fn run() -> Result<()> {
 
 enum CommandLine {
     Install(InstallArgs),
+    Affected(affected::AffectedArgs),
     Help,
 }
 
@@ -43,6 +47,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<CommandLine> {
 
     match command.to_str() {
         Some("install") => parse_install_args(&args[1..]).map(CommandLine::Install),
+        Some("affected") => affected::parse_affected_args(&args[1..]).map(CommandLine::Affected),
         Some("help") | Some("-h") | Some("--help") => Ok(CommandLine::Help),
         Some(other) => bail!("unknown subcommand `{other}`\n\n{}", help_text()),
         None => bail!("subcommand must be valid UTF-8"),
@@ -643,7 +648,7 @@ fn print_install_help() {
 }
 
 fn help_text() -> &'static str {
-    "Workspace automation tasks\n\nUsage: cargo xtask <COMMAND>\n\nCommands:\n  install    Build and copy workspace binaries into cargo bin dir\n  help       Print this message or help for given subcommand\n\nOptions:\n  -h, --help  Print help"
+    "Workspace automation tasks\n\nUsage: cargo xtask <COMMAND>\n\nCommands:\n  install    Build and copy workspace binaries into cargo bin dir\n  affected   Print `-p` arguments for the packages a change can affect\n  help       Print this message or help for given subcommand\n\nOptions:\n  -h, --help  Print help"
 }
 
 fn install_help_text() -> &'static str {

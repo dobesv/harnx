@@ -1,0 +1,92 @@
+# Rules for `cargo xtask affected`, which lists the workspace packages whose
+# tests a change can break.
+#
+# The `[determinator]` table goes to guppy's determinator unchanged
+# (https://docs.rs/determinator/0.12.0/determinator/rules/index.html). It maps
+# changed files to packages and diffs the dependency graph at both commits, so
+# a Cargo.lock bump selects only the packages that build the bumped crate. A
+# changed package also affects everything that depends on it. Anything the
+# rules do not cover and no package owns selects the whole workspace, and that
+# includes this file.
+#
+# `test-edge` and `test-path` cover what Cargo's graph cannot see: tests that
+# launch another workspace binary by path, or read files outside their own
+# crate. These add only the named packages' tests and do not propagate to
+# their dependents. Modelling them as determinator `mark-changed` rules would
+# mark, say, harnx-runtime changed on every fs-tools edit and select nearly
+# the whole workspace.
+
+# Paths no build step or test reads. Keep in step with the `rust` filter in
+# .github/workflows/ci.yaml, which skips Rust CI entirely for these.
+[[determinator.path-rule]]
+globs = [
+    "web/**",
+    "docs/**",
+    ".changeset/**",
+    "demos/**",
+    "docker/**",
+    "*.md",
+    "**/CHANGELOG.md",
+    "renovate.json",
+    "knope.toml",
+    ".mergify.yml",
+    ".github/workflows/web-ci.yml",
+    ".github/workflows/web-e2e.yml",
+    ".github/workflows/update-models.yml",
+    ".github/workflows/release.yaml",
+    ".github/workflows/release-prepare.yaml",
+    ".github/workflows/publish-packages.yaml",
+]
+mark-changed = []
+
+# The default rules ignore .gitattributes, but here it sets the line endings
+# golden test fixtures are checked out with.
+[[determinator.path-rule]]
+globs = [".gitattributes", "rust-toolchain.toml", ".github/workflows/ci.yaml"]
+mark-changed = "all"
+
+# harnx-client compiles harnx's model catalog in with include_str!.
+[[determinator.path-rule]]
+globs = ["crates/harnx/models.yaml"]
+mark-changed = ["harnx-client"]
+post-rule = "fallthrough"
+
+# harnx-tui compiles harnx-render's syntax and theme dumps in with include_bytes!.
+[[determinator.path-rule]]
+globs = ["crates/harnx-render/assets/**"]
+mark-changed = ["harnx-tui"]
+post-rule = "fallthrough"
+
+# Read only by tests; see the test-path entries below.
+[[determinator.path-rule]]
+globs = ["packages/**", "example_config/**"]
+mark-changed = []
+
+# local_orchestrator.rs spawns the worker for every frontend.
+[[test-edge]]
+on-affected = ["harnx-worker"]
+test = ["harnx-runtime", "harnx", "harnx-tui", "harnx-serve", "harnx-acp-server"]
+
+[[test-edge]]
+on-affected = ["harnx-time-tools"]
+test = ["harnx-runtime", "harnx"]
+
+[[test-edge]]
+on-affected = ["harnx-fs-tools", "harnx-claude-compatible-hook-server"]
+test = ["harnx-runtime"]
+
+[[test-edge]]
+on-affected = ["harnx-plans-tools"]
+test = ["harnx-runtime", "harnx-mcp-bridge"]
+
+# The shipped agent packages: harnx-runtime embeds their bash tool-server
+# config and activates their agents; harnx-bash-tools runs their tool templates
+# and scripts.
+[[test-path]]
+globs = ["packages/**"]
+test = ["harnx-runtime", "harnx-bash-tools"]
+
+# The example auth hooks are executed by harnx-proxy-auth's tests.
+[[test-path]]
+globs = ["example_config/**"]
+test = ["harnx-proxy-auth"]

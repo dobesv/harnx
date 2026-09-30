@@ -67,28 +67,25 @@ You MUST run the full verification pipeline before committing:
 cargo build --workspace                                       # Compile the project, including sibling bins the e2e tests spawn
 cargo fmt --all                                               # Auto-format code (rustup uses rust-toolchain.toml version — matches CI)
 cargo clippy --workspace --all-targets -- -D warnings         # Lint — treat warnings as errors
-cargo nextest run --workspace -E 'rdeps(<crate>) | ...'       # Run the tests of every crate the change can affect, once
+cargo nextest run $(cargo xtask affected)                    # Run the tests of every package the change can affect, once
 cargo nextest run --workspace -E 'test(=<name>) | ...' --stress-count=20  # Stress only the tests you added or changed
 cs delta origin/HEAD                                          # Run CodeScene code quality analysis on current branch changes
 ```
 
-**Scope the test run to the changed crates.** `rdeps(<crate>)` selects the
-tests of `<crate>` and of every workspace crate that depends on it, dev-dependencies
-included; list one `rdeps()` per changed crate. Run the whole workspace instead
-(`cargo nextest run --workspace`) when the change touches `Cargo.toml`,
-`Cargo.lock`, `rust-toolchain.toml`, `.cargo/` or `.config/nextest.toml`, or a
-crate most of the workspace depends on (`harnx-core`, `harnx-toolset`,
-`harnx-nats-common`, `harnx-runtime`), where `rdeps()` selects nearly everything
-anyway.
+**Scope the test run to the affected packages.** `cargo xtask affected` diffs
+the working tree, uncommitted and untracked files included, against its merge
+base with `origin/HEAD` (or `--base <rev>`) and prints `-p` arguments for every
+package whose tests the change can break, or `--workspace` when that is all of
+them. It uses guppy's determinator, so a `Cargo.lock` bump selects only the
+packages that build the bumped crate. If it prints nothing, no Rust test is
+affected; don't run the bare `cargo nextest run` it would expand to, which
+tests everything.
 
-`rdeps()` only knows Cargo's dependency graph. Some tests launch other workspace
-binaries by path, and those edges are invisible to it. A change to
-`harnx-worker`, `harnx-fs-tools`, `harnx-plans-tools` or
-`harnx-claude-compatible-hook-server` also needs `rdeps(harnx-runtime)`:
-`local_orchestrator.rs` spawns the worker for every frontend, and the runtime
-and MCP-bridge integration tests launch the others. `harnx-time-tools` and
-`harnx-test-bins` need nothing extra, because the tests that launch them depend
-on them as dev-dependencies.
+Cargo's graph cannot see tests that launch another workspace binary by path,
+or read files outside their crate (`packages/`, `example_config/`, an
+`include_str!` of a sibling crate's file). Those edges are listed in
+`.config/affected.toml`. Adding a test that spawns a sibling binary or reads
+such a file means adding its edge there.
 
 **Stress only what you touched.** A full-workspace stress run costs five full
 suites and surfaces flakes that predate your change, which then get ignored.
@@ -98,11 +95,12 @@ tmux/interrupt e2e and other timing-sensitive tests; a pure unit test needs no
 stress run. Some flakes only appear under full-suite load, so when a new test
 is timing-sensitive, also run it once alongside the rest of its crate.
 
-CI still runs the whole suite on every Rust change, so a missed edge is caught
-before merge rather than after. It skips the build and tests only when every
-changed file is on the exclusion list in `.github/workflows/ci.yaml` (web,
-docs, changesets, READMEs, release workflows). A test that starts reading one
-of those paths must take it off that list.
+CI uses the same selection on pull requests and runs the whole suite in the
+merge queue and on `main`, so a missing edge is caught before merge rather than
+after. CI skips the build and tests entirely when every changed file is on the
+exclusion list in `.github/workflows/ci.yaml` (web, docs, changesets, READMEs,
+release workflows), which the first path rule in `.config/affected.toml`
+mirrors. A test that starts reading one of those paths must take it off both.
 
 **Use `cargo nextest`, never `cargo test`.** Tests rely on nextest's per-test
 process isolation; `cargo test` shares one process and produces spurious
@@ -309,7 +307,7 @@ The checklist below covers every integration point. Miss any and the release fai
 
 8. **MCP HTTP port** — use the next free port in the sequence (e.g., 3006 after exa's 3005).
 
-9. **CI.yaml** — no per-crate edit needed; CI uses `cargo build --workspace` and `cargo nextest run --all`.
+9. **CI.yaml** — no per-crate edit needed; CI builds every workspace bin and selects tests with `cargo xtask affected`. If another crate's tests launch the new binary, add a `[[test-edge]]` for it to `.config/affected.toml`.
 
 
 ### Static `ToolKind` declarations
