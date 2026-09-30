@@ -1,10 +1,10 @@
 # harnx all-in-one image: server + tools + Web UI.
 #
-# Binary set invariant: every COPY'd binary below MUST appear in ALL THREE release.yaml lists:
+# Binary set invariant: every COPY'd binary below MUST appear in BOTH release.yaml lists:
 #   1. a release shard's `packages` (the build matrix; it is both built and archived from there)
-#   2. docker job gh release download patterns
-#   3. "Verify extracted binaries" loop
-# Missing any one silently breaks the release build (COPY fails, download fails, or verify fails).
+#   2. the docker job's "Verify extracted binaries" loop
+# The docker job downloads every Linux archive of the release, so a binary in
+# (1) is fetched automatically; (2) is what fails the job if one is missing.
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
