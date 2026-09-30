@@ -59,6 +59,19 @@ pub(crate) type ExitCancelFactory = Arc<
 pub(crate) type PendingExitCancel =
     JoinHandle<anyhow::Result<harnx_runtime::nats_session::InterruptOutcome>>;
 
+#[cfg(test)]
+pub(super) type TestCidResolveFn = Arc<
+    dyn Fn(
+            String,
+        )
+            -> Pin<Box<dyn Future<Output = anyhow::Result<harnx_blob_store::ResolvedBlob>> + Send>>
+        + Send
+        + Sync,
+>;
+#[cfg(test)]
+pub(super) type TestDetachedOpenFn =
+    Arc<dyn Fn(&std::path::Path) -> anyhow::Result<()> + Send + Sync>;
+
 pub struct Tui {
     pub(super) config: GlobalConfig,
     pub(super) code_theme: Option<Theme>,
@@ -113,6 +126,10 @@ pub struct Tui {
     #[cfg(test)]
     pub(super) confirmation_enqueue_override:
         Option<crate::tool_confirmation::TestConfirmationEnqueueFn>,
+    #[cfg(test)]
+    pub(super) cid_resolve_override: Option<TestCidResolveFn>,
+    #[cfg(test)]
+    pub(super) detached_open_override: Option<TestDetachedOpenFn>,
     /// Sessions whose durable text append succeeded but whose worker activation
     /// must be retried without submitting the text as a second user message.
     pub(super) pending_remote_activations: HashSet<(String, String)>,
@@ -198,6 +215,15 @@ pub(crate) struct PendingMessage {
     pub(super) paste_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CidDocView {
+    pub(super) url: String,
+    pub(super) title: String,
+    pub(super) text: String,
+    pub(super) links: Vec<crate::markdown_render::ExtractedLink>,
+    pub(super) focused_link: Option<usize>,
+}
+
 pub(super) struct App {
     pub(super) transcript: Vec<TranscriptItem>,
     pub(super) input: TextArea<'static>,
@@ -267,6 +293,8 @@ pub(super) struct App {
     pub(super) current_session_unread: bool,
     pub(super) detail_view_scroll: ratatui_widget_scrolling::ScrollState,
     pub(super) detail_view_open: bool,
+    pub(super) doc_view: Option<CidDocView>,
+    pub(super) doc_history: Vec<(String, Option<usize>)>,
     pub(super) detail_view_text: Option<String>,
     /// Passive child-session entry shown in the shared detail surface.
     /// Child transcripts are not editable, so this is kept separate from the
@@ -1028,6 +1056,8 @@ impl Default for App {
             current_session_unread: false,
             detail_view_scroll: ratatui_widget_scrolling::ScrollState::new(),
             detail_view_open: false,
+            doc_view: None,
+            doc_history: Vec::new(),
             detail_view_text: None,
             detail_view_entry: None,
             detail_view_title: None,

@@ -19,12 +19,14 @@ chrono = { workspace = true }
 crossterm = { workspace = true }
 fancy-regex = { workspace = true }
 futures-util = { workspace = true }
+harnx-blob-store = { path = "../harnx-blob-store" }
 harnx-core = { path = "../harnx-core" }
 harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
 harnx-toolset = { path = "../harnx-toolset" }
 indexmap = { workspace = true }
 log = { workspace = true }
+mime_guess = { workspace = true }
 nu-ansi-term = { workspace = true }
 open = { workspace = true }
 parking_lot = { workspace = true }
@@ -37,6 +39,7 @@ serde_yaml = { workspace = true }
 shell-words = { workspace = true }
 sha2 = { workspace = true }
 syntect = { workspace = true }
+tempfile = { workspace = true }
 textwrap = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 tokio-stream = { workspace = true }
@@ -51,6 +54,5 @@ crossterm = { workspace = true, features = ["use-dev-tty"] }
 insta = { version = "1", features = ["yaml"] }
 pretty_assertions = "1.4.0"
 rand = "0.10.0"
-tempfile = "3"
 tokio-test = "0.4"
 which = { workspace = true }

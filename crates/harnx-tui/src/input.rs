@@ -310,7 +310,7 @@ impl Tui {
                 self.handle_down_key(key);
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                self.open_focused_root_item();
+                self.open_focused_root_item().await;
             }
             (KeyCode::Char('e'), KeyModifiers::NONE) => {
                 self.handle_transcript_edit().await?;
@@ -432,7 +432,7 @@ impl Tui {
                 self.handle_transcript_rewind();
             }
             (KeyCode::Enter, KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
-                self.open_focused_root_item();
+                self.open_focused_root_item().await;
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 self.handle_enter_key().await?;
@@ -585,7 +585,7 @@ impl Tui {
         if self.app.detail_view_open {
             Some(self.handle_detail_view_key(key).await)
         } else if !self.app.subagent_view_stack.is_empty() {
-            self.handle_subagent_view_key(key);
+            self.handle_subagent_view_key(key).await;
             Some(Ok(()))
         } else {
             None
@@ -2098,6 +2098,8 @@ impl Tui {
             s.follow = false;
             s
         };
+        self.app.doc_view = None;
+        self.app.doc_history.clear();
         self.app.detail_view_text = Some(text);
         self.app.detail_view_entry = None;
         self.app.detail_view_title = Some(title.to_string());

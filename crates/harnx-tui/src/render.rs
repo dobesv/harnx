@@ -1339,6 +1339,63 @@ impl Tui {
         lines
     }
 
+    fn cid_document_entries(&self, width: u16) -> Vec<RenderedEntry> {
+        let Some(view) = &self.app.doc_view else {
+            return Vec::new();
+        };
+        let mut entries = vec![crate::markdown_render::render_markdown(
+            &view.text,
+            Style::default(),
+            width,
+            self.code_theme.as_ref(),
+        )];
+        if view.links.is_empty() {
+            return entries;
+        }
+        entries.push(RenderedEntry::from_lines(
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Links",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+            ],
+            width,
+        ));
+        entries.extend(view.links.iter().enumerate().map(|(index, link)| {
+            let mut rendered = Self::render_markdown_link(&link.text, &link.url, width);
+            if view.focused_link == Some(index) {
+                rendered.reverse_style();
+            }
+            rendered
+        }));
+        entries
+    }
+
+    fn render_detail_content(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        standard: Option<(Vec<Vec<Line<'static>>>, String)>,
+    ) {
+        if let Some((entries, _)) = standard {
+            self.app
+                .detail_view_scroll
+                .render(frame, area, &entries, |lines| {
+                    let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+                    let height = paragraph.line_count(area.width);
+                    (height, paragraph)
+                });
+            return;
+        }
+        let entries = self.cid_document_entries(area.width.max(1));
+        self.app
+            .detail_view_scroll
+            .render(frame, area, &entries, |entry| {
+                (usize::from(entry.total_height.max(1)), entry.clone())
+            });
+    }
+
     pub(super) fn render_detail_view(
         &mut self,
         frame: &mut Frame<'_>,
@@ -1353,9 +1410,18 @@ impl Tui {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(size);
 
-        // Build display content for the selected root or child transcript item,
-        // or for a textual information overlay.
-        let (entries_as_vec, title) = crate::detail_view::detail_view_content(&self.app);
+        let standard_content = self
+            .app
+            .doc_view
+            .is_none()
+            .then(|| crate::detail_view::detail_view_content(&self.app));
+        let title = self
+            .app
+            .doc_view
+            .as_ref()
+            .map(|view| view.title.clone())
+            .or_else(|| standard_content.as_ref().map(|(_, title)| title.clone()))
+            .unwrap_or_else(|| "Detail".to_string());
 
         // Create block with horizontal (top + bottom) borders and a title.
         //
@@ -1375,14 +1441,7 @@ impl Tui {
         // Render the block into the content chunk
         frame.render_widget(block, chunks[0]);
 
-        // Render the scrollable content
-        self.app
-            .detail_view_scroll
-            .render(frame, inner_area, &entries_as_vec, |lines| {
-                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-                let height = paragraph.line_count(inner_area.width);
-                (height, paragraph)
-            });
+        self.render_detail_content(frame, inner_area, standard_content);
 
         // Clamp position to the freshly-updated last_max_position
         self.app.detail_view_scroll.position = self
