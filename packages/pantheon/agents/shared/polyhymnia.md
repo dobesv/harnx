@@ -113,4 +113,4 @@ The following are NOT your responsibility — other Muses handle these:
 - **Refactoring** (Terpsichore): Code restructuring, optimization, simplification.
 
 ## Input
-You receive a plan ID from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.
+You receive workspace access and plan URL `cid:plan:...` from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.

@@ -16,7 +16,7 @@ After all implementation work is complete and individually verified by Argus:
    sub-agents need to know the changes are NOT yet committed so they review the
    working tree state, not just committed history.
 3. Delegate a comprehensive review to `aristarchus`. Include:
-   - The **plan name** for reference
+   - The full **plan URL** (`cid:plan:...`) for reference
    - A summary of all changes made across all tasks
    - **Whether changes are committed or uncommitted** — if there are unstaged/staged
      changes, explicitly state: "Changes are uncommitted in the working tree. Use

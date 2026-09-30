@@ -17,7 +17,7 @@ PRESERVE VERBATIM (do not paraphrase or omit):
 - Decisions made and their rationale
 - Current task status (completed, in-progress, pending, blocked)
 - User requirements and constraints stated
-- Plan IDs and task IDs
+- Plan URLs and task IDs
 
 SUMMARIZE (condense but retain meaning):
 - Discussion leading to decisions (keep the decision, condense the discussion)

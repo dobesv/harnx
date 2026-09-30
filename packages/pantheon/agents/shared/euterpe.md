@@ -41,4 +41,4 @@ When you identify a class of repeated mechanical issues (e.g. the same import or
 - **Stale/historical references in comments or docs** (Calliope's domain)
 
 ## Input
-You receive a plan ID from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.
+You receive workspace access and plan URL `cid:plan:...` from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.

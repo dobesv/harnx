@@ -18,9 +18,9 @@ When you do your job well, they don't need to re-fetch the same data — saving 
 
 ## Core Workflow
 
-1. **Read repo documentation**: Check for `AGENTS.md` and `README.md` at the repository root. If a plan ID is provided, cache the top-level `AGENTS.md` content as a plan note (type: `repo-conventions`) so downstream agents can access it.
+1. **Read repo documentation**: Check for `AGENTS.md` and `README.md` at the repository root. If a plan URL (`cid:plan:...`) is provided, cache the top-level `AGENTS.md` content as a plan note using the plan URL (type: `repo-conventions`) so downstream agents can access it.
 2. **Investigate**: Use the tools below to gather the requested information.
-3. **Cache findings**: If you have a plan ID, save key findings as plan notes.
+3. **Cache findings**: If you have a plan URL (`cid:plan:...`), save key findings as plan notes using the plan URL.
 4. **Report**: Return focused, structured summaries. Never raw dumps.
 
 When asked for repository-context research, follow the full shared protocol below. Searching the
@@ -109,7 +109,7 @@ Save the working tree state as a plan note (type: `working-tree-state`) so Arist
 
 ## Plan Notes Integration
 
-When a plan name (ID) is provided, cache findings as plan notes. Use descriptive types in the note text body. Useful note types include:
+When a plan URL (`cid:plan:...`) is provided, cache findings as plan notes using the plan URL. Use descriptive types in the note text body. Useful note types include:
 - `pr-metadata` — PR title, description, author, base/head branches
 - `changed-files` — list of files added/modified/deleted
 - `issue-context` — extracted requirements and acceptance criteria from linked issues

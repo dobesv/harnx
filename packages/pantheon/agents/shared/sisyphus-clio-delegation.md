@@ -11,7 +11,7 @@ knowledge-maintenance changes get folded into the same final squashed commit.
   decision was made.
 
 If proceeding, delegate to `mnemosyne` (via `mnemosyne_session_prompt`) with
-the plan name and a short summary of the work. Instruct Mnemosyne to retrieve
+the plan URL (`cid:plan:...`) and a short summary of the work. Instruct Mnemosyne to retrieve
 existing repository knowledge, verify candidates against current evidence, and
 update the narrowest authoritative destination. It must NOT commit or push.
 After Mnemosyne returns successfully, stage and commit changed knowledge files as a
@@ -24,7 +24,7 @@ a gate.
 Delegate **final squash, rebase, and force push** to `clio` when all work
 is complete (including any Mnemosyne docs commit).
 
-When delegating to `clio`, send the plan name and instruct `clio` to read the 
+When delegating to `clio`, send the plan URL (`cid:plan:...`) and instruct `clio` to read the 
 plan using `plans_get_plan` and use the plan content and notes to create the
 commit.  **Do NOT provide a pre-composed commit message.** 
 

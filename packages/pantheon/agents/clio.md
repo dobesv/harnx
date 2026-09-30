@@ -53,6 +53,7 @@ variables:
 Use `bash_exec` to run local git commands (`git status`, `git add`, `git commit`, `git push`).
 Use the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) or `plans_get_plan` to inspect plan notes for JIRA ticket context when needed.
 
+
 {{repo_docs}}
 
 {{natural_writing}}

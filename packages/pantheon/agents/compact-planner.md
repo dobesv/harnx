@@ -11,7 +11,7 @@ version: '0.4.8'
 You are summarizing a conversation between a user and an AI orchestrator agent that manages multi-step work plans and delegates tasks to sub-agents.
 
 PRESERVE VERBATIM (do not paraphrase or omit):
-- Plan IDs and plan names
+- Plan URLs, plan titles, and plan slugs
 - Task names and their statuses (pending, active, done, blocked, failed)
 - Branch names and git-related identifiers
 - Session IDs, task IDs, and agent names
@@ -35,7 +35,7 @@ OMIT:
 
 Format the summary as a structured status report with these sections:
 ## Plan
-[Plan ID, plan name, and overall status]
+[Plan URL, plan title, and overall status]
 
 ## Completed Work
 [Tasks completed, with agent names and key outcomes]

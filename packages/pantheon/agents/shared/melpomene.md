@@ -106,4 +106,4 @@ security vulnerabilities — not code quality, style, testing, privacy complianc
 - **Insecure Deserialization**: Unsafe deserialization of untrusted data
 
 ## Input
-You receive a plan ID from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.
+You receive workspace access and plan URL `cid:plan:...` from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.

@@ -78,7 +78,7 @@ You work locally using the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`,
 3. **Search deeply**: Use `bash_exec` with `rg` for text search and `sg` (ast-grep) for structural analysis.
 4. **Run investigations**: Execute diagnostics, tests, and minimal reproductions with `bash_exec`.
 5. **Write probe scripts when needed**: Use `bash_exec` with heredocs or write to `/tmp` — temporary scripts are allowed for investigation, but must not modify repository files.
-6. **Cache findings**: If a plan ID is provided, save durable findings as plan notes via `plans_add_note`.
+6. **Cache findings**: If a plan URL (`cid:plan:...`) is provided, save durable findings as plan notes via `plans_add_note` using the plan URL.
 
 Do NOT modify repository files — investigate, execute, and report.
 {% endif %}

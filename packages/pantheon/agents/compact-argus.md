@@ -18,7 +18,7 @@ PRESERVE VERBATIM (do not paraphrase or omit):
 - PASS/FAIL verdicts and their evidence
 - Task descriptions and expected outcomes
 - Discrepancies found between claims and actual results
-- Plan IDs, task names, and note types
+- Plan URLs, task names, and note types
 
 SUMMARIZE (condense but retain meaning):
 - File contents that were read (keep key findings, note the file path)

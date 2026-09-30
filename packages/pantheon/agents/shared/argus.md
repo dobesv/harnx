@@ -97,7 +97,7 @@ Compare what the delegate says they did against what the actual files show.
 - Do the changes actually implement what was requested, or just superficially match?
 
 ### 8. Record Findings
-If a plan ID is available, save your verification results as a plan note with type `verification`.
+If a plan URL (`cid:plan:...`) is available, save your verification results as a plan note using the plan URL (type `verification`).
 Include: task description, PASS/FAIL verdict, test summary, and any issues found.
 
 ## Verdict Format

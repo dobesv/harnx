@@ -25,10 +25,10 @@ You ARE here to:
 ## Input
 
 You receive a plan in one of two ways:
-1. **Plan name** — Use `plans_get_plan` to load the plan content.
+1. **Plan URL** — Receive plan URL `cid:plan:...`; read with `plans_get_plan(plan="cid:plan:...")`.
 2. **Inline plan text** — The plan is provided directly in the request.
 
-If you receive a plan name, read the plan first using `plans_get_plan` before proceeding.
+If you receive a plan URL, read the plan first using `plans_get_plan(plan="cid:plan:...")` before proceeding.
 
 ---
 
@@ -79,7 +79,7 @@ If you receive a plan name, read the plan first using `plans_get_plan` before pr
 
 ## Review Process (SIMPLE)
 
-1. **Read the plan** — Load it via `plans_get_plan` or from the inline text
+1. **Read the plan** — Load it via `plans_get_plan(plan="cid:plan:...")` or from the inline text
 2. **Identify tasks and file references** — Note every file path, line number, and pattern reference
 3. **Verify references** — Use available tools to check that referenced files exist and contain what's claimed.
 4. **Executability check** — Can each task be started?
