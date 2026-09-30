@@ -42,9 +42,6 @@ jobs:
           os: windows-latest
           use-cross: true
           cargo-flags: ""
-        - target: x86_64-apple-darwin
-          os: macos-15-intel
-          cargo-flags: ""
         - target: x86_64-pc-windows-msvc
           os: windows-latest
           cargo-flags: ""
@@ -64,6 +61,10 @@ jobs:
         # `SYS_mmap`, ...), so the build can't currently produce a working
         # set of artifacts. Re-add once birdcage gains support or it's
         # made optional in harnx-bash-tools.
+        #
+        # Intel macOS (x86_64-apple-darwin) is dropped: macOS 26 is the last
+        # release for Intel Macs, and its build on the slow macos-15-intel
+        # runner took 51 minutes, the longest in the release.
 
     runs-on: ${{matrix.os}}
     env:
