@@ -71,6 +71,11 @@ test = ["harnx-runtime", "harnx", "harnx-tui", "harnx-serve", "harnx-acp-server"
 on-affected = ["harnx-time-tools"]
 test = ["harnx-runtime", "harnx"]
 
+# tmux_e2e::proxy_auth_hook_injects_env_vars_into_bash_exec runs these by path.
+[[test-edge]]
+on-affected = ["harnx-proxy-auth", "harnx-mcp-bridge", "harnx-bash-tools"]
+test = ["harnx"]
+
 [[test-edge]]
 on-affected = ["harnx-fs-tools", "harnx-claude-compatible-hook-server"]
 test = ["harnx-runtime"]
