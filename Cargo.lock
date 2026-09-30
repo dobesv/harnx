@@ -4990,6 +4990,7 @@ dependencies = [
  "insta",
  "log",
  "nu-ansi-term",
+ "open",
  "parking_lot",
  "pretty_assertions",
  "pulldown-cmark",

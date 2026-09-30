@@ -97,6 +97,7 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
             } => text.len() + summary_text.len() + detail_text.len(),
             TranscriptItem::ToolCall { tool_name, .. } => tool_name.len(),
             TranscriptItem::SubAgentSession { key, .. } => key.agent.len() + key.session_id.len(),
+            TranscriptItem::MarkdownLink { text, url } => text.len() + url.len(),
             TranscriptItem::Plan(_) | TranscriptItem::SourceHeading(_) => 0,
         })
         .sum();
@@ -163,6 +164,15 @@ fn build_initial_app(
         monitored_sessions: HashMap::new(),
         subagent_view_stack: Vec::new(),
     })
+}
+
+pub(crate) fn append_markdown_links(items: &mut Vec<TranscriptItem>, markdown: &str) {
+    for link in crate::markdown_render::extract_markdown_links(markdown) {
+        items.push(TranscriptItem::MarkdownLink {
+            text: link.text,
+            url: link.url,
+        });
+    }
 }
 
 impl Tui {
@@ -567,11 +577,12 @@ impl Tui {
                 if let Ok(banner) = cfg.agent_banner() {
                     if !banner.trim().is_empty() {
                         entries.push(TranscriptItem::AssistantText {
-                            text: banner,
+                            text: banner.clone(),
                             seq: None,
                             timestamp: None, // Banner has no timestamp
                             rendered_cache: None,
                         });
+                        append_markdown_links(&mut entries, &banner);
                     }
                 }
                 if let Some(agent) = &cfg.agent {
@@ -846,21 +857,23 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                 let text = msg.content.to_transcript_text();
                 if !text.is_empty() {
                     items.push(TranscriptItem::UserText {
-                        text,
+                        text: text.clone(),
                         seq: msg.log_seq,
                         timestamp: msg.log_timestamp,
                     });
+                    append_markdown_links(&mut items, &text);
                 }
             }
             MessageRole::Assistant => {
                 let text = msg.content.to_transcript_text();
                 if !text.is_empty() {
                     items.push(TranscriptItem::AssistantText {
-                        text,
+                        text: text.clone(),
                         seq: msg.log_seq,
                         timestamp: msg.log_timestamp,
                         rendered_cache: None,
                     });
+                    append_markdown_links(&mut items, &text);
                 }
             }
             MessageRole::Tool => {
@@ -877,6 +890,7 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                             timestamp: msg.log_timestamp,
                             rendered_cache: None,
                         });
+                        append_markdown_links(&mut items, &tc.text);
                     }
                     for r in &tc.tool_results {
                         let raw_call_fallback = if r.call.arguments == Value::Null {
@@ -932,7 +946,13 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                                 },
                             );
                             if let Some(item) = subagent_reply_item_from_output(&r.output) {
-                                items.push(item);
+                                if let TranscriptItem::ToolResultMarkdown { ref text, .. } = item {
+                                    let item_text = text.clone();
+                                    items.push(item);
+                                    append_markdown_links(&mut items, &item_text);
+                                } else {
+                                    items.push(item);
+                                }
                             }
                             items.push(TranscriptItem::SubAgentSession {
                                 key,
@@ -964,6 +984,7 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                                 text: trimmed.to_string(),
                                 rendered_cache: None,
                             });
+                            append_markdown_links(&mut items, trimmed);
                         }
                     }
                 }
@@ -1057,6 +1078,9 @@ fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mu
             key.session_id,
             status.label()
         )),
+        TranscriptItem::MarkdownLink { text, url } => {
+            lines.push(format!("{text}: {url}"));
+        }
     }
 }
 
@@ -1614,3 +1638,56 @@ mod tests {
 #[cfg(test)]
 #[path = "lifecycle/confirmation_tests.rs"]
 mod confirmation_tests;
+
+#[cfg(test)]
+mod markdown_link_tests {
+    use super::*;
+
+    #[test]
+    fn markdown_link_contributes_text_and_url_to_footprint() {
+        let items = vec![TranscriptItem::MarkdownLink {
+            text: "Docs".into(),
+            url: "https://example.com".into(),
+        }];
+        assert_eq!(
+            transcript_footprint(&items),
+            (1, 4 + "https://example.com".len())
+        );
+    }
+
+    #[test]
+    fn compaction_detail_serializes_markdown_link() {
+        let mut lines = Vec::new();
+        flatten_transcript_item_to_compaction_lines(
+            &TranscriptItem::MarkdownLink {
+                text: "Docs".into(),
+                url: "https://example.com".into(),
+            },
+            &mut lines,
+        );
+        assert_eq!(lines, vec!["Docs: https://example.com"]);
+    }
+
+    #[tokio::test]
+    async fn initial_agent_banner_restores_markdown_link() {
+        let config = crate::tests::test_config();
+        {
+            let mut guard = config.write();
+            let agent = harnx_runtime::config::Agent::new(
+                harnx_core::agent_config::AgentConfig::from_markdown(
+                    "banner-agent",
+                    "---\ndescription: '[Banner Link](https://banner.com)'\n---\nPrompt",
+                )
+                .unwrap(),
+            );
+            guard.agent = Some(agent);
+        }
+
+        let entries = Tui::build_initial_transcript(&config).await;
+        assert!(entries.iter().any(|item| matches!(
+            item,
+            TranscriptItem::MarkdownLink { text, url }
+                if text == "Banner Link" && url == "https://banner.com"
+        )));
+    }
+}

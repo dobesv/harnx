@@ -39,9 +39,11 @@ the terminal handle selection. To copy the entire last response, use `.copy`.
 ### Transcript and sub-agent navigation
 
 When the input is blank, `↑` enters transcript navigation. Navigable rows
-include user and assistant messages, tool calls, compaction markers, and
-sub-agent sessions. Press `Enter` on a focused sub-agent row to open it in the
-fullscreen transcript surface.
+include user and assistant messages, tool calls, compaction markers,
+sub-agent sessions, and markdown links. Press `Enter` on a focused sub-agent
+row to open it in the fullscreen transcript surface. On a markdown link,
+`Enter` opens the URL in your default browser (`http`/`https`) or shows a
+placeholder status (`cid:` URLs pending future support).
 
 Inside a child transcript:
 

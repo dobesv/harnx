@@ -214,11 +214,13 @@ pub(super) fn tool_completed_to_transcript_items(
         return vec![];
     }
     let full = full_tool_result_detail(output);
-    vec![TranscriptItem::ToolResultMarkdown {
+    let mut items = vec![TranscriptItem::ToolResultMarkdown {
         full_detail: full_detail_if_extra(full, &clean),
-        text: clean,
+        text: clean.clone(),
         rendered_cache: None,
-    }]
+    }];
+    crate::lifecycle::append_markdown_links(&mut items, &clean);
+    items
 }
 
 impl Tui {
@@ -530,12 +532,13 @@ impl Tui {
             seq: None,
             timestamp: Some(chrono::Utc::now()),
         });
+        crate::lifecycle::append_markdown_links(&mut self.app.transcript, &text);
         self.render_submitted_attachments(&attachments_snapshot)
             .await;
         self.pin_transcript_to_bottom();
         self.app.input = Self::new_input();
         let msg = crate::types::PendingMessage {
-            text,
+            text: text.clone(),
             attachments: std::mem::take(&mut self.app.attachments),
             attachment_dir: self.app.attachment_dir.take(),
             paste_count: self.app.paste_count,
@@ -543,13 +546,14 @@ impl Tui {
         self.start_prompt(msg).await
     }
 
-    async fn submit_dot_command(&mut self, text: String) -> Result<()> {
+    pub(crate) async fn submit_dot_command(&mut self, text: String) -> Result<()> {
         let attachments_snapshot = self.app.attachments.clone();
         self.app.transcript.push(TranscriptItem::UserText {
             text: text.clone(),
             seq: None,
             timestamp: Some(chrono::Utc::now()),
         });
+        crate::lifecycle::append_markdown_links(&mut self.app.transcript, &text);
         self.render_submitted_attachments(&attachments_snapshot)
             .await;
         self.pin_transcript_to_bottom();
@@ -1057,11 +1061,13 @@ impl Tui {
                 // which only patches "live" items (`timestamp: Some`). A fresh
                 // timestamp would let the next live seq bind to this replayed
                 // row, breaking edit/delete/rewind targeting.
-                vec![TranscriptItem::UserText {
-                    text: content,
+                let mut items = vec![TranscriptItem::UserText {
+                    text: content.clone(),
                     seq: None,
                     timestamp: None,
-                }]
+                }];
+                crate::lifecycle::append_markdown_links(&mut items, &content);
+                items
             }
             AgentEvent::Tool(ToolEvent::Completed {
                 id,
@@ -1240,6 +1246,7 @@ impl Tui {
         self.flush_pending_thought();
         let usage_str = format_usage(usage);
         if !output.is_empty() {
+            let links = crate::markdown_render::extract_markdown_links(&output);
             if let Some(streamed_idx) = self.app.main_streamed_text_idx {
                 // Replace the latest parent-agent streamed run with canonical
                 // final output. A sub-agent may have emitted a newer assistant
@@ -1269,6 +1276,12 @@ impl Tui {
                     seq: None,
                     timestamp: Some(chrono::Utc::now()),
                     rendered_cache: None,
+                });
+            }
+            for link in links {
+                self.app.transcript.push(TranscriptItem::MarkdownLink {
+                    text: link.text,
+                    url: link.url,
                 });
             }
             self.pin_transcript_to_bottom();
@@ -2824,7 +2837,7 @@ impl Tui {
     }
 
     /// Get text content from transcript item for copy/insert operations.
-    fn get_transcript_item_text(item: &TranscriptItem) -> Option<String> {
+    pub(crate) fn get_transcript_item_text(item: &TranscriptItem) -> Option<String> {
         match item {
             TranscriptItem::UserText { text, .. } => Some(text.clone()),
             TranscriptItem::AssistantText { text, .. } => Some(text.clone()),
@@ -2841,6 +2854,13 @@ impl Tui {
             } => Some(format!("{}({})", tool_name, body)),
             TranscriptItem::ToolCall { tool_name, .. } => Some(format!("{}()", tool_name)),
             TranscriptItem::ToolResultMarkdown { text, .. } => Some(text.clone()),
+            TranscriptItem::MarkdownLink { text, url } => {
+                if text.is_empty() || text == url {
+                    Some(url.clone())
+                } else {
+                    Some(format!("{text}: {url}"))
+                }
+            }
             _ => None,
         }
     }
@@ -3009,5 +3029,34 @@ mod tests {
             }
             other => panic!("unexpected transcript item: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn completing_assistant_stream_appends_markdown_links() {
+        let config = crate::tests::test_config();
+        let mut tui = crate::types::Tui::init(&config).await.unwrap();
+        tui.finish_main_prompt_final(
+            "Read [Harnx](https://harnx.dev)".into(),
+            &Default::default(),
+        )
+        .await;
+        assert!(matches!(
+            tui.app.transcript.last(),
+            Some(crate::types::TranscriptItem::MarkdownLink { text, url })
+                if text == "Harnx" && url == "https://harnx.dev"
+        ));
+    }
+
+    #[test]
+    fn tool_completed_extracts_markdown_link() {
+        let items = tool_completed_to_transcript_items(
+            &serde_json::json!("Output [Tool Link](https://tool.com)"),
+            None,
+        );
+        assert!(items.iter().any(|item| matches!(
+            item,
+            TranscriptItem::MarkdownLink { text, url }
+                if text == "Tool Link" && url == "https://tool.com"
+        )));
     }
 }

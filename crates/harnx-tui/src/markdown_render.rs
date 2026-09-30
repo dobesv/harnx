@@ -46,10 +46,17 @@ pub enum MarkdownBlockData {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtractedLink {
+    pub text: String,
+    pub url: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RenderedEntry {
     pub blocks: Vec<MarkdownBlockData>,
     pub total_height: u16,
+    pub links: Vec<ExtractedLink>,
 }
 
 impl RenderedEntry {
@@ -64,6 +71,7 @@ impl RenderedEntry {
         RenderedEntry {
             blocks: vec![MarkdownBlockData::Paragraph { lines, height }],
             total_height,
+            links: Vec::new(),
         }
     }
 
@@ -214,6 +222,8 @@ pub fn render_markdown(
     let mut in_code_block = false;
     let mut code_block_lang: Option<String> = None;
     let mut table_state: Option<TableState> = None;
+    let mut links = Vec::new();
+    let mut current_link: Option<(String, String)> = None;
 
     let options =
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES;
@@ -254,13 +264,16 @@ pub fn render_markdown(
                     Style::default().add_modifier(Modifier::CROSSED_OUT),
                     false,
                 ),
-                Tag::Link { .. } => push_inline(
-                    &mut inline_stack,
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::UNDERLINED),
-                    true,
-                ),
+                Tag::Link { dest_url, .. } => {
+                    current_link = Some((String::new(), dest_url.into_string()));
+                    push_inline(
+                        &mut inline_stack,
+                        Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::UNDERLINED),
+                        true,
+                    );
+                }
                 Tag::CodeBlock(kind) => {
                     flush_line(&mut current_lines, &mut current_spans);
                     in_code_block = true;
@@ -336,7 +349,16 @@ pub fn render_markdown(
                 TagEnd::Item => {
                     flush_line(&mut current_lines, &mut current_spans);
                 }
-                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                    pop_inline(&mut inline_stack);
+                }
+                TagEnd::Link => {
+                    if let Some((link_text, url)) = current_link.take() {
+                        links.push(ExtractedLink {
+                            text: link_text,
+                            url,
+                        });
+                    }
                     pop_inline(&mut inline_stack);
                 }
                 TagEnd::CodeBlock => {
@@ -381,6 +403,9 @@ pub fn render_markdown(
                 _ => {}
             },
             Event::Text(content) => {
+                if let Some((link_text, _)) = current_link.as_mut() {
+                    link_text.push_str(&content);
+                }
                 if in_code_block {
                     // Apply syntect syntax highlighting to code block text
                     append_code_block_text(
@@ -415,6 +440,9 @@ pub fn render_markdown(
                 }
             }
             Event::Code(content) => {
+                if let Some((link_text, _)) = current_link.as_mut() {
+                    link_text.push_str(&content);
+                }
                 let style = resolve_span_style(base_style, &inline_stack, heading_style)
                     .patch(Style::default().fg(Color::Cyan));
                 if let Some(state) = table_state.as_mut() {
@@ -435,6 +463,9 @@ pub fn render_markdown(
                 }
             }
             Event::Html(content) | Event::InlineHtml(content) => {
+                if let Some((link_text, _)) = current_link.as_mut() {
+                    link_text.push_str(&content);
+                }
                 let style = resolve_span_style(base_style, &inline_stack, heading_style);
                 if let Some(state) = table_state.as_mut() {
                     append_text_to_cell(
@@ -546,7 +577,24 @@ pub fn render_markdown(
     RenderedEntry {
         blocks,
         total_height,
+        links,
     }
+}
+
+/// Extracts unique links from markdown text, deduplicated by URL (preserving first appearance).
+pub fn extract_markdown_links(markdown: &str) -> Vec<ExtractedLink> {
+    let rendered = render_markdown(markdown, Style::default(), 80, None);
+    let mut seen = std::collections::HashSet::new();
+    let mut unique = Vec::new();
+    for link in rendered.links {
+        if link.url.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(link.url.clone()) {
+            unique.push(link);
+        }
+    }
+    unique
 }
 
 fn push_inline(stack: &mut Vec<InlineState>, style: Style, link: bool) {
@@ -1052,7 +1100,8 @@ fn shrink_table_widths(col_widths: &mut [u16], available_width: u16, natural_wid
 #[cfg(test)]
 mod tests {
     use super::{
-        render_markdown, shrink_table_widths, wrap_spans, MarkdownBlockData, RenderedEntry,
+        extract_markdown_links, render_markdown, shrink_table_widths, wrap_spans, ExtractedLink,
+        MarkdownBlockData, RenderedEntry,
     };
     use ratatui::{
         style::{Color, Modifier, Style},
@@ -1510,6 +1559,94 @@ mod tests {
             }
             other => panic!("expected table block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_links_basic_and_autolinks() {
+        let md =
+            "Check out [Rust](https://www.rust-lang.org) and <https://crates.io> for packages.";
+        let links = extract_markdown_links(md);
+        assert_eq!(
+            links,
+            vec![
+                ExtractedLink {
+                    text: "Rust".to_string(),
+                    url: "https://www.rust-lang.org".to_string(),
+                },
+                ExtractedLink {
+                    text: "https://crates.io".to_string(),
+                    url: "https://crates.io".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_links_with_inline_formatting_and_code() {
+        let md = "See [**bold** and `code`](https://example.com/formatted).";
+        let links = extract_markdown_links(md);
+        assert_eq!(
+            links,
+            vec![ExtractedLink {
+                text: "bold and code".to_string(),
+                url: "https://example.com/formatted".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extract_links_deduplicates_by_url() {
+        let md = "Link [first](https://example.com) and [second](https://example.com) and [other](https://other.com).";
+        let links = extract_markdown_links(md);
+        assert_eq!(
+            links,
+            vec![
+                ExtractedLink {
+                    text: "first".to_string(),
+                    url: "https://example.com".to_string(),
+                },
+                ExtractedLink {
+                    text: "other".to_string(),
+                    url: "https://other.com".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_links_empty_and_no_links() {
+        assert!(extract_markdown_links("").is_empty());
+        assert!(extract_markdown_links("Plain text without any link.").is_empty());
+    }
+
+    #[test]
+    fn extract_links_in_table() {
+        let md = "| Name | Site |\n| --- | --- |\n| Google | [Search](https://google.com) |";
+        let links = extract_markdown_links(md);
+        assert_eq!(
+            links,
+            vec![ExtractedLink {
+                text: "Search".to_string(),
+                url: "https://google.com".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn rendered_entry_contains_links() {
+        let rendered = render_markdown(
+            "Read [Harnx](https://harnx.ai) for details.",
+            Style::default(),
+            80,
+            None,
+        );
+        assert_eq!(
+            rendered.links,
+            vec![ExtractedLink {
+                text: "Harnx".to_string(),
+                url: "https://harnx.ai".to_string(),
+            }]
+        );
     }
 }
 #[test]

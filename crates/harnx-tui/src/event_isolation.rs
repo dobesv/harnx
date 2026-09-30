@@ -167,6 +167,12 @@ impl Tui {
                     seq: None,
                     timestamp: Some(chrono::Utc::now()),
                 });
+                for link in crate::markdown_render::extract_markdown_links(&pending.text) {
+                    self.app.transcript.push(TranscriptItem::MarkdownLink {
+                        text: link.text,
+                        url: link.url,
+                    });
+                }
                 self.render_submitted_attachments(&pending.attachments)
                     .await;
                 self.pin_transcript_to_bottom();

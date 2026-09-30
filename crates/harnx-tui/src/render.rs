@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use syntect::highlighting::Theme;
+use unicode_width::UnicodeWidthStr;
 
 fn dim_style(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::DIM)
@@ -464,7 +465,66 @@ impl Tui {
                 );
                 RenderedEntry::from_lines(lines, width)
             }
+            TranscriptItem::MarkdownLink { text, url } => {
+                Self::render_markdown_link(text, url, width)
+            }
         }
+    }
+
+    fn render_markdown_link(text: &str, url: &str, width: u16) -> RenderedEntry {
+        let max_w = usize::from(width);
+        let prefix = "  → ";
+        let prefix_w = UnicodeWidthStr::width(prefix);
+        if max_w <= prefix_w {
+            let truncated: String = prefix.chars().take(max_w).collect();
+            return RenderedEntry::from_lines(
+                vec![Line::from(vec![Span::styled(
+                    truncated,
+                    Style::default().fg(Color::DarkGray),
+                )])],
+                width,
+            );
+        }
+        let remaining = max_w - prefix_w;
+
+        let spans = if text.is_empty() || text == url {
+            let display_url = truncate_display_str(url, remaining);
+            vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                Span::styled(display_url, Style::default().fg(Color::Cyan)),
+            ]
+        } else {
+            let text_w = UnicodeWidthStr::width(text);
+            let url_formatted = format!(" ({url})");
+            let url_w = UnicodeWidthStr::width(url_formatted.as_str());
+            if text_w + url_w <= remaining {
+                vec![
+                    Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                    Span::styled(text.to_string(), Style::default().fg(Color::Cyan)),
+                    Span::styled(url_formatted, Style::default().fg(Color::DarkGray)),
+                ]
+            } else if text_w + 5 <= remaining {
+                let url_budget = remaining - text_w;
+                let inner_budget = url_budget.saturating_sub(3);
+                let truncated_url = truncate_display_str(url, inner_budget);
+                vec![
+                    Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                    Span::styled(text.to_string(), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!(" ({truncated_url})"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]
+            } else {
+                let display_text = truncate_display_str(text, remaining);
+                vec![
+                    Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                    Span::styled(display_text, Style::default().fg(Color::Cyan)),
+                ]
+            }
+        };
+
+        RenderedEntry::from_lines(vec![Line::from(spans)], width)
     }
 
     fn bottom_region_height(&self, input_width: u16, screen_height: u16) -> u16 {
@@ -1270,6 +1330,11 @@ impl Tui {
             item @ TranscriptItem::SubAgentSession { .. } => {
                 lines.extend(render_subagent_detail(item));
             }
+            TranscriptItem::MarkdownLink { text, url } => {
+                lines.push(Line::from(Span::styled("── link ──", label_style)));
+                push_field!("text", text);
+                push_field!("url", url);
+            }
         }
         lines
     }
@@ -1499,6 +1564,28 @@ pub(crate) fn session_picker_highlight_index(selected: usize, has_error: bool) -
     } else {
         selected
     }
+}
+
+fn truncate_display_str(s: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let budget = max_width - 1;
+    let mut current_width = 0;
+    let mut result = String::new();
+    for ch in s.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + ch_width > budget {
+            break;
+        }
+        result.push(ch);
+        current_width += ch_width;
+    }
+    result.push('…');
+    result
 }
 
 #[cfg(test)]

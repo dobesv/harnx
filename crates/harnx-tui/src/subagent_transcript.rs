@@ -196,6 +196,7 @@ fn append_child_thought(state: &mut MonitoredSessionState, text: String) {
 
 fn finish_child_message(state: &mut MonitoredSessionState, output: String) {
     if !output.is_empty() {
+        let links = crate::markdown_render::extract_markdown_links(&output);
         let replace_streamed = state.streaming_open
             && matches!(
                 state.transcript.last(),
@@ -217,6 +218,12 @@ fn finish_child_message(state: &mut MonitoredSessionState, output: String) {
                 seq: None,
                 timestamp: Some(chrono::Utc::now()),
                 rendered_cache: None,
+            });
+        }
+        for link in links {
+            state.transcript.push(TranscriptItem::MarkdownLink {
+                text: link.text,
+                url: link.url,
             });
         }
     }
@@ -244,5 +251,29 @@ pub(super) fn freeze_unfinished_tool_timers(state: &mut MonitoredSessionState) {
                 *final_elapsed_ms = Some(start_anchor.elapsed().as_millis() as u64);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_final_message_appends_markdown_links() {
+        let mut state = MonitoredSessionState::new(SubAgentStatus::Running);
+        apply_child_event(
+            &mut state,
+            AgentEvent::Model(ModelEvent::Final {
+                output: "Read [Harnx](https://harnx.dev)".into(),
+                usage: Default::default(),
+            }),
+        );
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [
+                TranscriptItem::AssistantText { text, .. },
+                TranscriptItem::MarkdownLink { text: link_text, url }
+            ] if text.contains("Harnx") && link_text == "Harnx" && url == "https://harnx.dev"
+        ));
     }
 }

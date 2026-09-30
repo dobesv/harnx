@@ -26,6 +26,7 @@ harnx-toolset = { path = "../harnx-toolset" }
 indexmap = { workspace = true }
 log = { workspace = true }
 nu-ansi-term = { workspace = true }
+open = { workspace = true }
 parking_lot = { workspace = true }
 ratatui = { workspace = true }
 ratatui-textarea = { workspace = true }
