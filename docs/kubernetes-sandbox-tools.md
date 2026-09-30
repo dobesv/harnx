@@ -195,6 +195,18 @@ All flags have environment-variable equivalents:
 | `--retry-backoff-base-ms` | `RETRY_BACKOFF_BASE_MS` | `250` |
 | `--retry-backoff-cap-ms` | `RETRY_BACKOFF_CAP_MS` | `10000` |
 | `--retry-max-attempts` | `RETRY_MAX_ATTEMPTS` | `5` (includes initial attempt) |
+| `--bash-mcp-port` | `BASH_MCP_PORT` | `3002` |
+| `--fs-mcp-port` | `FS_MCP_PORT` | `3003` |
+| `--bash-name` | `BASH_TOOLSET_NAME` | `bash` |
+| `--fs-name` | `FS_TOOLSET_NAME` | `fs` |
+| `--sandbox-name` | `SANDBOX_TOOLSET_NAME` | `sandbox` |
+
+The three name options let multiple gateways or local tool servers register in
+the same scope without sharing NATS queue groups. For example,
+`--bash-name review` exposes `review_exec` instead of `bash_exec`. Changing a
+registered proxy name does not change its upstream: bash calls still go to the
+in-sandbox bash MCP port, and filesystem calls still go to the filesystem MCP
+port.
 
 The binary also accepts the shared `--metrics-addr` / `HARNX_METRICS_ADDR` and
 `--healthz-addr` / `HARNX_HEALTHZ_ADDR` options. In addition to the standard

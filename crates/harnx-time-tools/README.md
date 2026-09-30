@@ -23,6 +23,8 @@ cargo install --path crates/harnx-time-tools
 
 | Option | Description |
 | :--- | :--- |
+| `--name <NAME>` | Override the registered toolset name. |
+| `--enable-tool <GLOB>` | Publish only tools matching the glob. Repeatable. |
 | `--mcp-http` | Serve MCP over Streamable HTTP at `/mcp`. |
 | `--host <ADDR>` | Bind address for HTTP mode (default: `0.0.0.0`). |
 | `--port <N>` | Bind port for HTTP mode (default: `3001`). |

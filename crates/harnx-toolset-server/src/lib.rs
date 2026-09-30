@@ -22,6 +22,7 @@ mod mcp;
 use mcp::call_tool_result_from_value;
 use mcp::McpToolsetAdapter;
 mod lifecycle;
+mod name;
 mod progress;
 mod registration_identity;
 pub mod schema;
@@ -35,6 +36,7 @@ pub use filter::{
     ENABLE_TOOL_FLAG,
 };
 pub use lifecycle::{RegistrationShutdown, ServeLifecycle};
+pub use name::{toolset_name_from_args, validate_toolset_name, NamedToolset, NAME_FLAG};
 pub use registration_identity::RegistrationIdentity;
 // Re-export globset for callers who need to construct filters
 pub use globset;
@@ -971,6 +973,7 @@ fn print_toolset_help() {
     eprintln!("  --mcp-http                Use MCP Streamable HTTP transport instead of NATS");
     eprintln!("  --host <HOST>             MCP HTTP bind host (default: 0.0.0.0)");
     eprintln!("  --port <PORT>             MCP HTTP bind port (toolset-specific default)");
+    eprintln!("  --name <NAME>             Override the registered toolset name");
     eprintln!("  --enable-tool <glob>      Enable only tools matching the glob pattern.");
     eprintln!("                            Repeatable. If set, only enabled tools are");
     eprintln!("                            registered and invocable on this server.");
@@ -1005,12 +1008,14 @@ fn wrap_toolset_if_filtered(
 /// Kubernetes gets a chance to remove its own registration instead of
 /// leaving it for the TTL.
 ///
-/// **Strict front-parser binaries:** `harnx-{bash,fs,grep}-tools` have their own argument
-/// parsers that reject unknown flags BEFORE delegating here. When adding any new
-/// cross-cutting CLI flag to this shared entry point, update EACH front parser to
-/// recognize and skip both `--flag VALUE` (separate) and `--flag=VALUE` (equals) forms.
-/// Use EXACT match (`arg == "--flag"` or `arg.strip_prefix("--flag=")`), not
-/// `starts_with("--flag")`, to reject near-prefix typos like `--flag-typo`.
+/// **Strict front-parser binaries:** `harnx-{bash,fs,grep,exa,fetch,time,attachment}-tools`
+/// have their own argument parsers that reject unknown flags BEFORE delegating here.
+/// (`harnx-plans-tools` has no front parser; `harnx-mcp-bridge` and `harnx-k8s-sandbox-tools`
+/// use clap.) When adding any new cross-cutting CLI flag to this shared entry point,
+/// update EACH strict front parser to recognize and skip both `--flag VALUE` (separate)
+/// and `--flag=VALUE` (equals) forms. Use EXACT match (`arg == "--flag"` or
+/// `arg.strip_prefix("--flag=")`), not `starts_with("--flag")`, to reject near-prefix
+/// typos like `--flag-typo`.
 async fn run_mcp_service(
     toolset: Arc<dyn Toolset>,
     readiness: Option<Readiness>,
@@ -1080,14 +1085,19 @@ where
 {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
 
-    if std::env::args_os().any(|arg| arg == "--help" || arg == "-h") {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let name = toolset_name_from_args(&args)?;
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_toolset_help();
         return Ok(());
     }
 
-    // Parse --enable-tool flags before other initialization
-    let enable_tools = enable_tools_from_args(&std::env::args_os().collect::<Vec<_>>())?;
+    let enable_tools = enable_tools_from_args(&args)?;
     let filter_set = compile_enable_globs(&enable_tools)?;
+    let toolset: Arc<dyn Toolset> = match name {
+        Some(name) => Arc::new(NamedToolset::new(toolset, name)?),
+        None => Arc::new(toolset),
+    };
 
     let metrics_addr = harnx_metrics::metrics_addr_from_args(
         std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()),
@@ -1102,7 +1112,7 @@ where
     let service_name = format!("harnx-{}-server", toolset.name());
     let telemetry = harnx_telemetry::init_telemetry(&service_name)?;
 
-    let result = run_mcp_service(Arc::new(toolset), readiness, filter_set).await;
+    let result = run_mcp_service(toolset, readiness, filter_set).await;
 
     telemetry.shutdown().await;
     result

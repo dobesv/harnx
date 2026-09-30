@@ -15,7 +15,7 @@ command: harnx-plans-tools
 description: NATS-backed plan/task/note management
 ```
 
-The native server reads standard `HARNX_NATS_*` connection variables. `--mcp-stdio` and `--mcp-http` use the shared toolset-server transport options.
+The native server reads standard `HARNX_NATS_*` connection variables. `--name <NAME>` overrides the registered toolset name. `--mcp-stdio` and `--mcp-http` use the shared toolset-server transport options.
 
 ## URL parameters
 

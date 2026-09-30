@@ -40,6 +40,27 @@ impl Default for SandboxPorts {
 
 pub const SANDBOX_CONTEXT_KEY: &str = "sandbox";
 
+/// Registered names for the gateway's three native toolsets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxToolsetNames {
+    /// Registered name for the bash proxy toolset.
+    pub bash: String,
+    /// Registered name for the filesystem proxy toolset.
+    pub fs: String,
+    /// Registered name for the sandbox lifecycle toolset.
+    pub sandbox: String,
+}
+
+impl Default for SandboxToolsetNames {
+    fn default() -> Self {
+        Self {
+            bash: "bash".to_string(),
+            fs: "fs".to_string(),
+            sandbox: "sandbox".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxBinding {
@@ -53,6 +74,7 @@ struct Gateway {
     caller: Arc<dyn McpCaller>,
     metadata: SessionMetadataStore,
     bash_mcp_port: u16,
+    sandbox_toolset_name: String,
 }
 
 pub fn sandbox_toolsets(
@@ -61,26 +83,48 @@ pub fn sandbox_toolsets(
     metadata: SessionMetadataStore,
     ports: SandboxPorts,
 ) -> Vec<Arc<dyn Toolset>> {
+    sandbox_toolsets_with_names(
+        manager,
+        caller,
+        metadata,
+        ports,
+        SandboxToolsetNames::default(),
+    )
+}
+
+/// Build the bash, filesystem, and lifecycle toolsets with custom registration names.
+pub fn sandbox_toolsets_with_names(
+    manager: SandboxManager,
+    caller: Arc<dyn McpCaller>,
+    metadata: SessionMetadataStore,
+    ports: SandboxPorts,
+    names: SandboxToolsetNames,
+) -> Vec<Arc<dyn Toolset>> {
+    let SandboxToolsetNames { bash, fs, sandbox } = names;
     let gateway = Gateway {
         manager,
         caller,
         metadata,
         bash_mcp_port: ports.bash,
+        sandbox_toolset_name: sandbox.clone(),
     };
     vec![
         Arc::new(ProxyToolset::new(
-            "bash",
+            bash,
             harnx_bash_tools::builtin_tool_specs(),
             gateway.clone(),
             ports.bash,
         )),
         Arc::new(ProxyToolset::new(
-            "fs",
+            fs,
             harnx_fs_tools::builtin_tool_specs(),
             gateway.clone(),
             ports.fs,
         )),
-        Arc::new(LifecycleToolset { gateway }),
+        Arc::new(LifecycleToolset {
+            name: sandbox,
+            gateway,
+        }),
     ]
 }
 
@@ -96,25 +140,26 @@ impl Gateway {
         let session_id = context
             .invoking_session_id
             .as_deref()
-            .ok_or_else(missing_binding)?;
+            .ok_or_else(|| missing_binding(&self.sandbox_toolset_name))?;
         let tool_context = self
             .metadata
             .get_tool_context(session_id)
             .await
             .map_err(recoverable)?
-            .ok_or_else(missing_binding)?;
+            .ok_or_else(|| missing_binding(&self.sandbox_toolset_name))?;
         let value = tool_context
             .values
             .get(SANDBOX_CONTEXT_KEY)
             .cloned()
-            .ok_or_else(missing_binding)?;
+            .ok_or_else(|| missing_binding(&self.sandbox_toolset_name))?;
         let binding: SandboxBinding = serde_json::from_value(value).map_err(|error| {
             ToolInvokeError::Recoverable(format!("invalid ambient sandbox binding: {error}"))
         })?;
         if binding.version != 1 || binding.sandbox_id.trim().is_empty() {
-            return Err(ToolInvokeError::Recoverable(
-                "invalid ambient sandbox binding; call sandbox_connect again".to_string(),
-            ));
+            return Err(ToolInvokeError::Recoverable(format!(
+                "invalid ambient sandbox binding; call {}_connect again",
+                self.sandbox_toolset_name
+            )));
         }
         Ok(binding.sandbox_id)
     }
@@ -231,11 +276,10 @@ fn mcp_endpoint(ip: &str, port: u16) -> String {
     }
 }
 
-fn missing_binding() -> ToolInvokeError {
-    ToolInvokeError::Recoverable(
-        "no sandbox is bound to this session; call sandbox_connect or provide sandbox_id"
-            .to_string(),
-    )
+fn missing_binding(sandbox_toolset_name: &str) -> ToolInvokeError {
+    ToolInvokeError::Recoverable(format!(
+        "no sandbox is bound to this session; call {sandbox_toolset_name}_connect or provide sandbox_id"
+    ))
 }
 
 fn recoverable(error: impl std::fmt::Display) -> ToolInvokeError {

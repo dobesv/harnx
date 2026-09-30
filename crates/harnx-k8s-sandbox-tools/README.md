@@ -9,5 +9,9 @@ The gateway runs centrally. It creates or wakes a `SandboxClaim`, resolves the
 sandbox pod IP, and forwards the call to an MCP endpoint inside that pod. The
 sandbox does not connect to NATS and does not receive NATS credentials.
 
+Use `--bash-name`, `--fs-name`, and `--sandbox-name` to override the three
+registered toolset names. These options do not change the in-sandbox MCP
+endpoints used for forwarding.
+
 See the [Kubernetes sandbox gateway guide](../../docs/kubernetes-sandbox-tools.md)
 for architecture, deployment, RBAC, networking, and lifecycle details.

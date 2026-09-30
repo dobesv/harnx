@@ -18,7 +18,7 @@ async fn proxy_requires_or_resolves_an_ambient_session_binding() -> Result<()> {
         .await
         .unwrap_err();
     assert!(matches!(missing, ToolInvokeError::Recoverable(_)));
-    assert!(missing.to_string().contains("no sandbox is bound"));
+    assert!(missing.to_string().contains("call sandbox_connect"));
 
     let result = fixture
         .bash
@@ -167,6 +167,7 @@ async fn heartbeat_cancellation_does_not_drop_mcp_stop_waiter() -> Result<()> {
         caller: fixture.caller.clone(),
         metadata: fixture.metadata.clone(),
         bash_mcp_port: 3002,
+        sandbox_toolset_name: "sandbox".to_string(),
     };
     let cancel = CancellationToken::new();
     let call_cancel = cancel.clone();
@@ -268,5 +269,81 @@ async fn bash_routes_to_3002_and_fs_routes_to_3003() -> Result<()> {
     assert_eq!(calls[1].endpoint, "http://10.0.0.8:3003/mcp");
     assert_eq!(calls[1].tool, "ls");
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_name_override_does_not_change_upstream_endpoint() -> Result<()> {
+    harnx_core::require_nextest();
+    let names = SandboxToolsetNames {
+        bash: "review".to_string(),
+        fs: "workspace".to_string(),
+        sandbox: "review_sandbox".to_string(),
+    };
+    let Some(fixture) =
+        ToolsetFixture::start_with_names("session-named", Some("claim-named"), names).await?
+    else {
+        return Ok(());
+    };
+
+    assert_eq!(fixture.bash.name(), "review");
+    assert_eq!(fixture.fs.name(), "workspace");
+    assert_eq!(fixture.sandbox.name(), "review_sandbox");
+
+    fixture
+        .bash
+        .invoke_with_context(ToolInvocation {
+            tool: "exec".to_string(),
+            args: json!({"command": "pwd"}),
+            context: ToolInvocationContext {
+                call_id: "call-named".to_string(),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-named",
+                )),
+                invoking_session: None,
+                capabilities: BTreeSet::new(),
+                checkpoint: None,
+                checkpoint_store: None,
+                progress: Default::default(),
+            },
+            cancel: CancellationToken::new(),
+        })
+        .await?;
+
+    let calls = fixture.caller.calls.lock();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].endpoint, "http://10.0.0.8:3002/mcp");
+    assert_eq!(calls[0].tool, "exec");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_binding_uses_effective_sandbox_toolset_name() -> Result<()> {
+    harnx_core::require_nextest();
+    let names = SandboxToolsetNames {
+        bash: "review".to_string(),
+        fs: "workspace".to_string(),
+        sandbox: "review_sandbox".to_string(),
+    };
+    let Some(fixture) = ToolsetFixture::start_with_names("session-unbound", None, names).await?
+    else {
+        return Ok(());
+    };
+
+    let error = fixture
+        .bash
+        .invoke_with_context(ToolInvocation {
+            tool: "exec".to_string(),
+            args: json!({"command": "pwd"}),
+            context: ToolInvocationContext::default(),
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("call review_sandbox_connect or provide sandbox_id"));
     Ok(())
 }

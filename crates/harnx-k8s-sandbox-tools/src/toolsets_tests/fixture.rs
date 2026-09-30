@@ -12,6 +12,14 @@ pub(super) struct ToolsetFixture {
 
 impl ToolsetFixture {
     pub(super) async fn start(session_id: &str, binding: Option<&str>) -> Result<Option<Self>> {
+        Self::start_with_names(session_id, binding, SandboxToolsetNames::default()).await
+    }
+
+    pub(super) async fn start_with_names(
+        session_id: &str,
+        binding: Option<&str>,
+        names: SandboxToolsetNames,
+    ) -> Result<Option<Self>> {
         let Some(nats) = spawn_nats().await else {
             return Ok(None);
         };
@@ -40,27 +48,24 @@ impl ToolsetFixture {
         }
         let api = Arc::new(ReadyApi::default());
         let caller = Arc::new(RecordingCaller::default());
-        let toolsets = sandbox_toolsets(
+        let mut toolsets = sandbox_toolsets_with_names(
             SandboxManager::new(api.clone(), Default::default()),
             caller.clone(),
             metadata.clone(),
             SandboxPorts::default(),
+            names,
         );
-        let find = |name| {
-            toolsets
-                .iter()
-                .find(|toolset| toolset.name() == name)
-                .cloned()
-                .unwrap()
-        };
+        let sandbox = toolsets.pop().unwrap();
+        let fs = toolsets.pop().unwrap();
+        let bash = toolsets.pop().unwrap();
         Ok(Some(Self {
             _nats: nats,
             api,
             caller,
             metadata,
-            bash: find("bash"),
-            fs: find("fs"),
-            sandbox: find("sandbox"),
+            bash,
+            fs,
+            sandbox,
         }))
     }
 }

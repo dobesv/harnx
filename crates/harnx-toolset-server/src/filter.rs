@@ -114,6 +114,10 @@ impl Toolset for ArcToolsetWrapper {
         self.0.name()
     }
 
+    fn default_mcp_http_port(&self) -> u16 {
+        self.0.default_mcp_http_port()
+    }
+
     fn tools(&self) -> Vec<ToolSpec> {
         self.0.tools()
     }
@@ -173,6 +177,10 @@ impl<T: Toolset> FilteredToolset<T> {
 impl<T: Toolset> Toolset for FilteredToolset<T> {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn default_mcp_http_port(&self) -> u16 {
+        self.inner.default_mcp_http_port()
     }
 
     fn tools(&self) -> Vec<ToolSpec> {

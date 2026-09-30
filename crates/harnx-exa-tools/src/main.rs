@@ -31,9 +31,15 @@ fn handle_enable_tool_arg(
 }
 
 fn is_value_option(arg: &str) -> bool {
-    ["--metrics-addr", "--healthz-addr", "--host", "--port"]
-        .iter()
-        .any(|flag| arg == *flag || arg.strip_prefix(&format!("{flag}=")).is_some())
+    [
+        "--metrics-addr",
+        "--healthz-addr",
+        "--host",
+        "--port",
+        "--name",
+    ]
+    .iter()
+    .any(|flag| arg == *flag || arg.strip_prefix(&format!("{flag}=")).is_some())
 }
 
 fn consume_value(arg: &str, args: &mut impl Iterator<Item = String>) {
@@ -69,6 +75,7 @@ fn print_help() {
     eprintln!("  --mcp-http              Serve MCP over Streamable HTTP instead of toolset mode");
     eprintln!("  --host <HOST>           MCP HTTP bind host (default: 0.0.0.0)");
     eprintln!("  --port <PORT>           MCP HTTP bind port (default: 3005)");
+    eprintln!("  --name <NAME>           Override the registered toolset name");
     eprintln!(
         "  --enable-tool <glob>    Enable only tools matching the glob pattern (repeatable)."
     );
@@ -135,5 +142,11 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--enable-tool requires a glob pattern argument"));
+    }
+
+    #[test]
+    fn accepts_name_override_forms() {
+        assert!(!parse(&["--name", "review"]).unwrap());
+        assert!(!parse(&["--name=review"]).unwrap());
     }
 }
