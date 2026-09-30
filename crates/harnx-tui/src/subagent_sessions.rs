@@ -75,6 +75,18 @@ impl Tui {
     }
 
     pub(super) fn open_focused_root_item(&mut self) {
+        if let Some(focus) = self.app.transcript_focus {
+            if let Some(TranscriptItem::MarkdownLink { text: _, url }) =
+                self.app.transcript.get(focus)
+            {
+                let url = url.clone();
+                dispatch_link_action(&url, &mut self.app.transcript);
+                if url.starts_with("cid:") {
+                    self.pin_transcript_to_bottom();
+                }
+                return;
+            }
+        }
         if !self.open_focused_root_subagent() {
             self.open_detail_view_for_focused_item();
         }
@@ -123,6 +135,11 @@ impl Tui {
                     status,
                     progress,
                 });
+            }
+            TranscriptItem::MarkdownLink { text: _, url } => {
+                if let Some(state) = self.app.monitored_sessions.get_mut(current) {
+                    dispatch_link_action(&url, &mut state.transcript);
+                }
             }
             entry => self.open_child_detail(entry),
         }
@@ -390,6 +407,16 @@ impl Tui {
             }
         }
         &mut self.app.transcript
+    }
+}
+
+pub(super) fn dispatch_link_action(url: &str, transcript: &mut Vec<TranscriptItem>) {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let _ = open::that_detached(url);
+    } else if url.starts_with("cid:") {
+        transcript.push(TranscriptItem::StatusLine(
+            "Plan/attachment preview not yet supported in this build".to_string(),
+        ));
     }
 }
 

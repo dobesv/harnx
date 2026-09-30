@@ -1,3 +1,66 @@
+#[tokio::test]
+async fn handle_submit_action_appends_markdown_link() {
+    let config = test_config_with_mock_client_and_agent("test-agent", Some("test-session"));
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.set_input_text("See [User Link](https://user.com)");
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::MarkdownLink { text, url }
+            if text == "User Link" && url == "https://user.com"
+    )));
+}
+
+#[tokio::test]
+async fn submit_dot_command_appends_markdown_link() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.submit_dot_command(".echo [Dot Link](https://dot.com)".into())
+        .await
+        .unwrap();
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::MarkdownLink { text, url }
+            if text == "Dot Link" && url == "https://dot.com"
+    )));
+}
+
+#[tokio::test]
+async fn render_replayed_user_message_appends_markdown_link() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::User(UserEvent::Message {
+        content: "[Replayed Link](https://replayed.com)".into(),
+    })))
+    .await
+    .unwrap();
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::MarkdownLink { text, url }
+            if text == "Replayed Link" && url == "https://replayed.com"
+    )));
+}
+
+#[tokio::test]
+async fn durable_pending_enqueue_appends_markdown_link() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.finish_durable_pending_enqueue(crate::types::PendingMessage {
+        text: "[Queued Link](https://queued.com)".into(),
+        attachments: vec![],
+        attachment_dir: None,
+        paste_count: 0,
+    })
+    .await;
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::MarkdownLink { text, url }
+            if text == "Queued Link" && url == "https://queued.com"
+    )));
+}
+
 #[path = "tests/acceptance_tests.rs"]
 mod acceptance_tests;
 
@@ -49,7 +112,7 @@ macro_rules! usage_event {
     };
 }
 
-fn test_config() -> GlobalConfig {
+pub(crate) fn test_config() -> GlobalConfig {
     let config = Arc::new(RwLock::new(Config::default()));
     {
         let mut guard = config.write();
@@ -12044,4 +12107,342 @@ async fn freeze_main_unfinished_tool_timers_freezes_running_tools_on_turn_comple
         }
         _ => panic!("expected ToolCall with id 'tool-running', got: {:?}", tool),
     }
+}
+
+#[tokio::test]
+async fn transcript_focus_navigates_over_markdown_links() {
+    let mut harness = TuiTestHarness::with_size(60, 14).await;
+    harness.tui().clear_transcript();
+
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Please check these links".into(),
+        seq: Some(1),
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Here are links: [One](https://one.com) and [Two](https://two.com)".into(),
+            seq: Some(2),
+            timestamp: None,
+            rendered_cache: None,
+        });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::MarkdownLink {
+            text: "One".into(),
+            url: "https://one.com".into(),
+        });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::MarkdownLink {
+            text: "Two".into(),
+            url: "https://two.com".into(),
+        });
+
+    // Start with focus on UserText (index 0)
+    harness.tui().app.transcript_focus = Some(0);
+
+    // Down to AssistantText (index 1)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(1));
+
+    // Down to first MarkdownLink (index 2)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(2));
+
+    // Down to second MarkdownLink (index 3)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(3));
+
+    // Up to first MarkdownLink (index 2)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(2));
+
+    // Up to AssistantText (index 1)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(1));
+}
+
+#[tokio::test]
+async fn markdown_link_enter_http_and_cid() {
+    let mut harness = TuiTestHarness::with_size(60, 14).await;
+    harness.tui().clear_transcript();
+
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::MarkdownLink {
+            text: "Docs".into(),
+            url: "https://example.com/docs".into(),
+        });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::MarkdownLink {
+            text: "Plan".into(),
+            url: "cid:plan-123".into(),
+        });
+
+    // Focus on http link (index 0) and press Enter
+    harness.tui().app.transcript_focus = Some(0);
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // Detail view must NOT open
+    assert!(!harness.tui().app.detail_view_open);
+    // Transcript length is unchanged (no status message added for http link)
+    assert_eq!(harness.tui().app.transcript.len(), 2);
+
+    // Focus on cid link (index 1) and press Enter
+    harness.tui().app.transcript_focus = Some(1);
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // Detail view must NOT open
+    assert!(!harness.tui().app.detail_view_open);
+    // Status line must be appended to transcript
+    assert!(matches!(
+        harness.tui().app.transcript.last(),
+        Some(TranscriptItem::StatusLine(msg)) if msg == "Plan/attachment preview not yet supported in this build"
+    ));
+}
+
+#[tokio::test]
+async fn child_markdown_cid_link_appends_status_to_child_transcript_only() {
+    let mut harness = TuiTestHarness::with_size(60, 14).await;
+    harness.tui().clear_transcript();
+
+    let child = crate::types::MonitoredSessionKey {
+        cluster: harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+        agent: "researcher".into(),
+        session_id: "child-link-session".into(),
+    };
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::SubAgentSession {
+            key: child.clone(),
+            status: crate::types::SubAgentStatus::Running,
+            invocation_id: None,
+            progress: None,
+        });
+    harness.tui().app.transcript_focus = Some(0);
+
+    let mut child_state =
+        crate::types::MonitoredSessionState::new(crate::types::SubAgentStatus::Running);
+    child_state.transcript.push(TranscriptItem::MarkdownLink {
+        text: "Plan".into(),
+        url: "cid:plan-123".into(),
+    });
+    child_state.transcript_focus = Some(0);
+    harness
+        .tui()
+        .app
+        .monitored_sessions
+        .insert(child.clone(), child_state);
+
+    assert!(harness.tui().open_focused_root_subagent());
+    harness
+        .tui()
+        .handle_subagent_view_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(matches!(
+        harness.tui().app.transcript.as_slice(),
+        [TranscriptItem::SubAgentSession { key, .. }] if key == &child
+    ));
+    assert!(matches!(
+        harness.tui().app.monitored_sessions[&child]
+            .transcript
+            .as_slice(),
+        [
+            TranscriptItem::MarkdownLink { .. },
+            TranscriptItem::StatusLine(message)
+        ] if message == "Plan/attachment preview not yet supported in this build"
+    ));
+}
+
+#[test]
+fn dispatch_link_action_routes_http_and_cid_urls() {
+    let mut transcript = Vec::new();
+
+    crate::subagent_sessions::dispatch_link_action("https://example.invalid/docs", &mut transcript);
+    assert!(transcript.is_empty());
+
+    crate::subagent_sessions::dispatch_link_action("cid:plan-123", &mut transcript);
+    assert!(matches!(
+        transcript.as_slice(),
+        [TranscriptItem::StatusLine(message)]
+            if message == "Plan/attachment preview not yet supported in this build"
+    ));
+}
+
+#[test]
+fn extract_markdown_links_ignores_empty_urls() {
+    let links = crate::markdown_render::extract_markdown_links(
+        "[empty]() [blank](<   >) [docs](https://example.com/docs)",
+    );
+
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].text, "docs");
+    assert_eq!(links[0].url, "https://example.com/docs");
+}
+
+#[test]
+fn test_messages_to_transcript_items_inserts_markdown_links() {
+    use harnx_core::message::{Message, MessageContent, MessageRole};
+    use std::collections::HashMap;
+
+    let messages = vec![
+        Message {
+            role: MessageRole::User,
+            content: MessageContent::Text("User link: [search](https://google.com)".into()),
+            id: None,
+            log_seq: Some(1),
+            log_timestamp: None,
+        },
+        Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("Assistant link: <https://github.com>".into()),
+            id: None,
+            log_seq: Some(2),
+            log_timestamp: None,
+        },
+    ];
+
+    let items = crate::lifecycle::messages_to_transcript_items_for_cluster(
+        &messages,
+        &HashMap::new(),
+        None,
+    );
+    assert_eq!(items.len(), 4);
+    assert!(
+        matches!(&items[0], TranscriptItem::UserText { text, .. } if text.contains("User link"))
+    );
+    assert!(matches!(
+        &items[1],
+        TranscriptItem::MarkdownLink { text, url } if text == "search" && url == "https://google.com"
+    ));
+    assert!(
+        matches!(&items[2], TranscriptItem::AssistantText { text, .. } if text.contains("Assistant link"))
+    );
+    assert!(matches!(
+        &items[3],
+        TranscriptItem::MarkdownLink { text, url } if text == "https://github.com" && url == "https://github.com"
+    ));
+}
+
+#[test]
+fn test_get_transcript_item_text_for_markdown_link() {
+    let item1 = TranscriptItem::MarkdownLink {
+        text: "Rust".into(),
+        url: "https://rust-lang.org".into(),
+    };
+    assert_eq!(
+        Tui::get_transcript_item_text(&item1),
+        Some("Rust: https://rust-lang.org".to_string())
+    );
+
+    let item2 = TranscriptItem::MarkdownLink {
+        text: "".into(),
+        url: "https://rust-lang.org".into(),
+    };
+    assert_eq!(
+        Tui::get_transcript_item_text(&item2),
+        Some("https://rust-lang.org".to_string())
+    );
+}
+
+#[test]
+fn test_render_markdown_link_compact() {
+    let mut link = TranscriptItem::MarkdownLink {
+        text: "Documentation".into(),
+        url: "https://docs.harnx.ai".into(),
+    };
+    let rendered = Tui::render_entry(
+        &mut link,
+        false,
+        false,
+        false,
+        80,
+        crate::types::RenderEntryState::new(false, 0),
+        None,
+    );
+    assert_eq!(rendered.total_height, 1);
+    assert_eq!(rendered.blocks.len(), 1);
+}
+
+#[test]
+fn render_markdown_link_detail_contains_fields() {
+    let item = TranscriptItem::MarkdownLink {
+        text: "Docs".into(),
+        url: "https://example.com".into(),
+    };
+    let lines = Tui::render_entry_detail(&item);
+    let rendered = lines
+        .iter()
+        .map(|line| line_to_plain(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("── link ──"));
+    assert!(rendered.contains("text: Docs"));
+    assert!(rendered.contains("url: https://example.com"));
+}
+
+#[tokio::test]
+async fn pending_markdown_link_is_appended_after_user_text() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.handle_tui_event(crate::types::TuiEvent::PendingMessageConsumed(
+        crate::types::PendingMessage {
+            text: "See [Harnx](https://harnx.dev)".into(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        },
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(
+        tui.app.transcript.as_slice().last_chunk::<2>(),
+        Some([
+            TranscriptItem::UserText { text, .. },
+            TranscriptItem::MarkdownLink { text: link_text, url }
+        ]) if text.contains("Harnx") && link_text == "Harnx" && url == "https://harnx.dev"
+    ));
 }

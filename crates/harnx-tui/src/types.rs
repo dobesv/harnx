@@ -883,6 +883,11 @@ pub enum TranscriptItem {
         invocation_id: Option<String>,
         progress: Option<SubAgentInvocationProgress>,
     },
+    /// A selectable link extracted from a markdown block.
+    MarkdownLink {
+        text: String,
+        url: String,
+    },
 }
 
 impl TranscriptItem {
@@ -979,6 +984,7 @@ impl TranscriptItem {
                 | TranscriptItem::ToolCall { .. }
                 | TranscriptItem::CompactionMarker { .. }
                 | TranscriptItem::SubAgentSession { .. }
+                | TranscriptItem::MarkdownLink { .. }
         )
     }
 }
