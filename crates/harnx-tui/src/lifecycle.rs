@@ -149,6 +149,8 @@ fn build_initial_app(
             s
         },
         detail_view_open: false,
+        doc_view: None,
+        doc_history: Vec::new(),
         detail_view_text: None,
         detail_view_entry: None,
         detail_view_title: None,
@@ -259,6 +261,10 @@ impl Tui {
             tool_confirmation_route: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(test)]
             confirmation_enqueue_override: None,
+            #[cfg(test)]
+            cid_resolve_override: None,
+            #[cfg(test)]
+            detached_open_override: None,
             pending_remote_activations: HashSet::new(),
             session_activity_target: None,
             session_activity_handle: None,
