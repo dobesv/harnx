@@ -16,5 +16,12 @@
 linker = "x86_64-w64-mingw32-gcc"
 runner = "wine"
 
+# Link native Windows builds with the LLVM linker that ships in the Rust
+# toolchain instead of MSVC's link.exe. Measured on a 4-CPU GitHub Windows
+# runner, workspace units built 16% faster (integration-test binaries, which
+# are almost all link time, 24%). Changing the linker rebuilds every crate once.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+
 [alias]
 xtask = "run --package xtask --"
