@@ -15,8 +15,52 @@ defaults:
     shell: bash
 
 jobs:
+  # CI is a required merge gate (see .mergify.yml), so the `All (<os>)` checks
+  # must always post a conclusion. A workflow-level `paths:` filter would skip
+  # the workflow and hang the merge queue; instead the steps below are gated on
+  # this job, and a change with no Rust impact reports success in seconds. The
+  # exclusions are paths no build step or test reads: `packages/` and
+  # `example_config/` are embedded or read by Rust tests, so they stay in.
+  changes:
+    name: Detect Rust changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Filter Rust-affecting paths
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: |
+            rust:
+              - '**'
+              - '!web/**'
+              - '!docs/**'
+              - '!.changeset/**'
+              - '!demos/**'
+              - '!docker/**'
+              - '!*.md'
+              - '!**/README.md'
+              - '!**/CHANGELOG.md'
+              - '!LICENSE-*'
+              - '!renovate.json'
+              - '!knope.toml'
+              - '!.mergify.yml'
+              - '!.github/workflows/web-ci.yml'
+              - '!.github/workflows/web-e2e.yml'
+              - '!.github/workflows/update-models.yml'
+              - '!.github/workflows/release.yaml'
+              - '!.github/workflows/release-prepare.yaml'
+              - '!.github/workflows/publish-packages.yaml'
+
   all:
     name: All
+    needs: changes
 
     strategy:
       matrix:
@@ -34,14 +78,22 @@ jobs:
       INSTA_UPDATE: "no"
 
     steps:
+    - name: Skip notice
+      if: needs.changes.outputs.rust != 'true'
+      run: echo "No Rust-affecting changes detected — skipping build and tests and reporting success."
+
     - uses: actions/checkout@v7
+      if: needs.changes.outputs.rust == 'true'
 
     - name: Install Rust Toolchain Components
+      if: needs.changes.outputs.rust == 'true'
       uses: dtolnay/rust-toolchain@stable
 
     - uses: Swatinem/rust-cache@v2
+      if: needs.changes.outputs.rust == 'true'
 
     - name: Install cargo-nextest
+      if: needs.changes.outputs.rust == 'true'
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-nextest
@@ -54,10 +106,11 @@ jobs:
     # workspace (bins + tests) first so every bin is present before tests
     # start.
     - name: Build workspace
+      if: needs.changes.outputs.rust == 'true'
       run: cargo build --workspace --all-targets
 
     - name: Install nats-server (Linux)
-      if: runner.os == 'Linux'
+      if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
       run: |
         set -euo pipefail
         VERSION="v2.11.6"
@@ -88,7 +141,7 @@ jobs:
     # e2e tests need the binary on every OS (they skip cleanly if it is absent,
     # but we want real coverage here).
     - name: Install nats-server (macOS)
-      if: runner.os == 'macOS'
+      if: needs.changes.outputs.rust == 'true' && runner.os == 'macOS'
       run: |
         set -euo pipefail
         VERSION="v2.11.6"
@@ -121,7 +174,7 @@ jobs:
       shell: bash
 
     - name: Install nats-server (Windows)
-      if: runner.os == 'Windows'
+      if: needs.changes.outputs.rust == 'true' && runner.os == 'Windows'
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
@@ -151,10 +204,11 @@ jobs:
       # Use the `ci` nextest profile (.config/nextest.toml): retries transient
       # timing flakes from the broker/worker/e2e tests and reports all failures
       # per run (fail-fast = false) instead of aborting on the first.
+      if: needs.changes.outputs.rust == 'true'
       run: cargo nextest run --all --profile ci
 
     - name: Check for pending snapshot updates
-      if: failure()
+      if: needs.changes.outputs.rust == 'true' && failure()
       run: |
         if ls crates/harnx-tui/src/snapshots/*.snap.new 2>/dev/null; then
           echo "::error::Snapshot updates pending. Run 'cargo insta review' locally to review and accept changes."
@@ -165,11 +219,11 @@ jobs:
     # workspace` step still compiles with `--deny warnings`, which catches rustc
     # warnings in platform-gated code that Linux clippy never sees.
     - name: Clippy
-      if: runner.os == 'Linux'
+      if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
       run: cargo clippy --all --all-targets -- -D warnings
 
     - name: Format
-      if: runner.os == 'Linux'
+      if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
       run: cargo fmt --all --check
 
   docker-lint:
