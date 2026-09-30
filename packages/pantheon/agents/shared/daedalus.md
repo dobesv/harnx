@@ -104,7 +104,7 @@ go back to the user for clarification before proceeding. Do not guess.
 
 ## Phase 4 — Plan Generation
 
-Create a plan using `plans_add_plan(name="slug")` which returns a canonical `cid:plan:<agent>/<sid>/<slug>` URL.
+Create a plan using `plans_add_plan(name="slug")` which returns a canonical `cid:plan:<agent>/<sid>/<slug>` URL. The tool derives the caller's session ID. Use the returned canonical `cid:plan:...` URL; do not construct one yourself.
 Use this full `cid:plan:...` URL for all subsequent plan operations (`plans_update_plan`, `plans_add_task`, `plans_add_note`) and pass it to Atlas or executing agents.
 Write the plan content using `plans_update_plan`.
 Record material results from the repository-context research in the plan's Context section. This

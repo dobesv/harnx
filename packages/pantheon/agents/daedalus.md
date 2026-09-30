@@ -21,6 +21,7 @@ use_tools:
 - momus_session_prompt
 - oracle_session_prompt
 - plans_add_note
+- plans_add_plan
 - plans_add_task
 - plans_delete_note
 - plans_delete_task
