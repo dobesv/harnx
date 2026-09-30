@@ -709,8 +709,10 @@ impl Toolset for CountingTool {
         _args: serde_json::Value,
         _cancel: tokio_util::sync::CancellationToken,
     ) -> std::result::Result<serde_json::Value, ToolInvokeError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({"content": [{"type": "text", "text": "pong"}]}))
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        // A different reply each time: identical calls with identical results
+        // are what the repetition guard refuses, and these rounds must all run.
+        Ok(json!({"content": [{"type": "text", "text": format!("pong {call}")}]}))
     }
 }
 

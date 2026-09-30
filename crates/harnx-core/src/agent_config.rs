@@ -2,6 +2,7 @@
 //! tools, hooks, retry config, variables. Data + pure methods only; no
 //! file I/O, no inquire, no runtime state. Runtime fields (rag) live on the harnx-side `Agent` wrapper.
 
+use crate::config_data::LoopDetectionOverride;
 use crate::hooks::HooksConfig;
 use crate::model::Model;
 use crate::retry_config::RetryConfig;
@@ -149,6 +150,8 @@ pub struct AgentConfig {
     compaction_tool_output_max_chars: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loop_detection: Option<LoopDetectionOverride>,
     #[serde(default)]
     pub role: AgentRole,
     #[serde(default)]
@@ -201,6 +204,7 @@ impl AgentConfig {
             compaction_keep_recent_tokens: frontmatter.compaction_keep_recent_tokens,
             compaction_tool_output_max_chars: frontmatter.compaction_tool_output_max_chars,
             title_agent: frontmatter.title_agent,
+            loop_detection: frontmatter.loop_detection,
             role: frontmatter.role,
             prompt,
             ..Default::default()
@@ -356,6 +360,10 @@ impl AgentConfig {
 
     pub fn hooks(&self) -> Option<&HooksConfig> {
         self.hooks.as_ref()
+    }
+
+    pub fn loop_detection(&self) -> Option<&LoopDetectionOverride> {
+        self.loop_detection.as_ref()
     }
 
     pub fn compaction_agent(&self) -> Option<&str> {
@@ -579,6 +587,8 @@ struct AgentFrontMatter {
     compaction_tool_output_max_chars: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loop_detection: Option<LoopDetectionOverride>,
     #[serde(default)]
     role: AgentRole,
 }
@@ -604,6 +614,7 @@ impl AgentFrontMatter {
             compaction_keep_recent_tokens: config.compaction_keep_recent_tokens,
             compaction_tool_output_max_chars: config.compaction_tool_output_max_chars,
             title_agent: config.title_agent.clone(),
+            loop_detection: config.loop_detection,
             role: config.role,
         }
     }
@@ -638,11 +649,16 @@ impl AgentFrontMatter {
         self.title_agent.is_none()
     }
 
+    fn loop_detection_is_empty(&self) -> bool {
+        self.loop_detection.is_none()
+    }
+
     fn is_empty(&self) -> bool {
         self.model_is_empty()
             && self.content_is_empty()
             && self.compaction_is_empty()
             && self.title_is_empty()
+            && self.loop_detection_is_empty()
             && self.role == AgentRole::Assistant
     }
 }
@@ -957,6 +973,46 @@ You are a compaction agent.\n";
         let exported = agent.export().unwrap();
         let reparsed = AgentConfig::from_markdown("title-test", &exported).unwrap();
         assert_eq!(reparsed.title_agent(), Some("title-generator-v2"));
+    }
+
+    #[test]
+    fn loop_detection_override_parses_from_frontmatter() {
+        let md = "---\nloop_detection:\n  tool_calls: false\n---\nYou poll CI.\n";
+        let agent = AgentConfig::from_markdown("poller", md).unwrap();
+        assert_eq!(
+            agent.loop_detection(),
+            Some(&crate::config_data::LoopDetectionOverride {
+                tool_calls: Some(false)
+            })
+        );
+        assert_eq!(
+            AgentConfig::from_markdown("plain", "Hi")
+                .unwrap()
+                .loop_detection(),
+            None
+        );
+    }
+
+    #[test]
+    fn loop_detection_override_survives_export_and_reparse() {
+        // The override is this agent's only front-matter. If `export` judged
+        // the front-matter empty, re-saving the agent would silently drop it.
+        let md = "---\nloop_detection:\n  tool_calls: false\n---\nYou poll CI.\n";
+        let agent = AgentConfig::from_markdown("poller", md).unwrap();
+
+        let exported = agent.export().unwrap();
+        let reparsed = AgentConfig::from_markdown("poller", &exported).unwrap();
+
+        assert!(
+            exported.starts_with("---\n"),
+            "expected a front-matter block, got: {exported:?}"
+        );
+        assert_eq!(
+            reparsed.loop_detection(),
+            Some(&crate::config_data::LoopDetectionOverride {
+                tool_calls: Some(false)
+            })
+        );
     }
 }
 

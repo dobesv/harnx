@@ -15,9 +15,11 @@ cargo install --path crates/harnx-time-tools
 | Tool | Description |
 | :--- | :--- |
 | `get_current_time` | Get the current time in a specified timezone (default: local). |
-| `wait` | Wait for a specified duration (max 3600 seconds). |
-| `wait_until` | Wait until a specified timestamp. |
+| `wait` | Wait for a specified duration (max 3600 seconds). Returns `message`, `started_at` and `ended_at`, in the server's local timezone. |
+| `wait_until` | Wait until a specified timestamp. Returns `target`, `waited_seconds`, `started_at` and `ended_at`, in the requested timezone (the server's local timezone by default). |
 | `convert_time` | Convert a timestamp between timezones. |
+
+The start and end times make every wait's result different, so loop protection does not mistake a patient poll for a repeated call.
 
 ## CLI Options
 

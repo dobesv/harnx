@@ -95,6 +95,7 @@ pub async fn execute_tool_round_with_persistence(
         working_dir,
         nats_hook_provider,
         pending_async_context,
+        tool_loop_guard,
     } = params;
     let dry_run = config.read().dry_run;
     anyhow::ensure!(!abort_signal.aborted(), "interrupted during tool execution");
@@ -124,9 +125,13 @@ pub async fn execute_tool_round_with_persistence(
         pending_async_context,
     })
     .await;
-    let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal).await {
+    let guard = crate::tool_loop_guard::begin_round(tool_loop_guard.as_deref(), config, input);
+    let (to_eval, refused) = screen_tool_round(guard, config, &tool_calls, &eval_ctx).await?;
+    let results = match eval_tool_calls(&eval_ctx, to_eval, abort_signal).await {
         Ok(results) => results,
         Err(error) => {
+            // Fallback results cover every call, refused ones included, so the
+            // log keeps one result per call.
             return fail_tool_round(
                 ToolFailure {
                     config,
@@ -136,10 +141,11 @@ pub async fn execute_tool_round_with_persistence(
                 },
                 error,
             )
-            .await
+            .await;
         }
     };
     anyhow::ensure!(!abort_signal.aborted(), "interrupted during tool execution");
+    let results = crate::tool_loop_guard::finish_round(guard, results, refused, &tool_calls);
     let mut results = populate_result_markdown(results, &eval_ctx);
     persist_tool_results(config, &mut results, dry_run).await?;
     Ok(results)
@@ -221,6 +227,61 @@ async fn persist_failed_tool_results(
                 )
             })?
     };
+    persistence.persist().await;
+    Ok(())
+}
+
+/// Decide which of the round's calls run, or end the turn for repetition.
+async fn screen_tool_round(
+    guard: Option<&parking_lot::Mutex<harnx_core::loop_guard::ToolRepeatGuard>>,
+    config: &GlobalConfig,
+    calls: &[ToolCall],
+    eval_ctx: &ToolEvalContext,
+) -> Result<(Vec<ToolCall>, Vec<ToolResult>)> {
+    use crate::tool_loop_guard::Screened;
+    match crate::tool_loop_guard::screen_round(guard, calls, eval_ctx) {
+        Screened::Proceed { to_eval, refused } => Ok((to_eval, refused)),
+        Screened::Stop(terminal) => {
+            let persisted = if config.read().dry_run {
+                Ok(())
+            } else {
+                persist_stopped_tool_results(config, calls, eval_ctx, &terminal).await
+            };
+            Err(repetition_stop_error(terminal, persisted))
+        }
+    }
+}
+
+/// The error that ends a turn stopped for repetition. Parents read the stop
+/// from the end of the persisted error text, so a failure to persist the
+/// stopped results is added as context around the stop instead of replacing
+/// it.
+fn repetition_stop_error(
+    terminal: harnx_core::loop_guard::RepetitionTerminal,
+    persisted: Result<()>,
+) -> anyhow::Error {
+    let stop = anyhow::Error::new(harnx_core::loop_guard::RepetitionStop(terminal));
+    match persisted {
+        Ok(()) => stop,
+        Err(error) => stop.context(format!("failed to persist stopped tool results: {error:#}")),
+    }
+}
+
+/// None of a stopped round's calls run, but each gets a result saying why, so
+/// the transcript keeps one result per call.
+async fn persist_stopped_tool_results(
+    config: &GlobalConfig,
+    tool_calls: &[ToolCall],
+    eval_ctx: &ToolEvalContext,
+    terminal: &harnx_core::loop_guard::RepetitionTerminal,
+) -> Result<()> {
+    let output = crate::tool_loop_guard::stopped_output(terminal);
+    let results = tool_calls
+        .iter()
+        .map(|call| ToolResult::new(call.clone(), output.clone()))
+        .collect();
+    let results = populate_result_markdown(results, eval_ctx);
+    let persistence = config.write().prepare_session_tool_results(&results)?;
     persistence.persist().await;
     Ok(())
 }
@@ -681,6 +742,54 @@ mod tests {
     use parking_lot::RwLock;
     use serde_json::json;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_stop_whose_results_cannot_be_persisted_still_reports_the_stop() {
+        use harnx_core::loop_guard::{repetition_stop_sentence, RepetitionTerminal};
+        let mut config = Config::default();
+        // No pending tool-call message, so persisting the stopped round's
+        // results fails.
+        let session = crate::config::session::new(&config, "unpersisted_stop", None).unwrap();
+        config.session = Some(session);
+        let config = Arc::new(RwLock::new(config));
+        let eval = build_tool_eval_context(BuildToolEvalContextParams::new(
+            &config,
+            &harnx_core::instance::ServerScope::new(),
+        ))
+        .await;
+        let call = ToolCall::new(
+            "fs_read".to_string(),
+            json!({"path": "a.rs"}),
+            Some("call_1".to_string()),
+            None,
+        );
+        let guard = parking_lot::Mutex::new(harnx_core::loop_guard::ToolRepeatGuard::default());
+        let now = chrono::Utc::now();
+        for _ in 0..4 {
+            guard.lock().record(&call, &json!("same"), now);
+        }
+        let calls = std::slice::from_ref(&call);
+        let (_, refused) = screen_tool_round(Some(&guard), &config, calls, &eval)
+            .await
+            .expect("the first over-limit request is refused");
+        assert_eq!(refused.len(), 1);
+
+        let error = screen_tool_round(Some(&guard), &config, calls, &eval)
+            .await
+            .expect_err("asking again in the next round ends the turn");
+
+        let terminal = RepetitionTerminal::tool_calls("fs_read", 4);
+        assert_eq!(repetition_stop_sentence(&error), Some(terminal.sentence()));
+        let persisted = format!("{error:#}");
+        assert!(
+            persisted.starts_with("failed to persist stopped tool results: "),
+            "{persisted}"
+        );
+        assert_eq!(
+            crate::parse_worker_terminal(&persisted),
+            Some(crate::WorkerTerminal::Repetition(terminal))
+        );
+    }
 
     #[tokio::test]
     async fn instance_id_is_preserved_in_tool_eval_context() {

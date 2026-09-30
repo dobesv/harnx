@@ -190,6 +190,7 @@ fn test_agent_loop_context(
         nats_hook_provider: None,
         pending_async_context: None,
         working_dir: None,
+        tool_loop_guard: Default::default(),
     }
 }
 

@@ -147,10 +147,20 @@ impl Config {
         if let Some(Some(v)) = read_env_bool(&get_env_name("terminal_status")) {
             self.terminal_status = v;
         }
+        self.load_loop_detection_env();
         if let Some(v) = read_env_value::<String>(&get_env_name("sync_models_url")) {
             self.sync_models_url = v;
         }
         self.data.validate().map_err(anyhow::Error::msg)
+    }
+
+    /// `HARNX_LOOP_DETECTION` turns the loop guards on or off together. It
+    /// lives outside `load_envs` so that function, which already branches once
+    /// per setting, doesn't grow another branch.
+    fn load_loop_detection_env(&mut self) {
+        if let Some(Some(v)) = read_env_bool(&get_env_name("loop_detection")) {
+            self.loop_detection.tool_calls = v;
+        }
     }
 }
 
@@ -349,5 +359,27 @@ mod tests {
         config.load_envs(true).unwrap();
 
         assert!(config.terminal_status);
+    }
+
+    #[test]
+    fn load_envs_loop_detection_disabled_by_zero() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::new("HARNX_LOOP_DETECTION", "0");
+
+        let mut config = Config::default();
+        config.load_envs(true).unwrap();
+
+        assert!(!config.loop_detection.tool_calls);
+    }
+
+    #[test]
+    fn load_envs_loop_detection_unset_defaults_to_on() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::remove("HARNX_LOOP_DETECTION");
+
+        let mut config = Config::default();
+        config.load_envs(true).unwrap();
+
+        assert!(config.loop_detection.tool_calls);
     }
 }

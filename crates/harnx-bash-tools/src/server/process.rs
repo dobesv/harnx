@@ -30,18 +30,8 @@ impl BashServer {
         let stderr_log_path = exec_dir.join("stderr.log");
         let execution_id = exec_dir.file_name().unwrap().to_string_lossy().into_owned();
 
-        let stdout_file = std::fs::File::create(&stdout_log_path).map_err(|err| {
-            internal_error(format!(
-                "failed to create stdout log file '{}': {err}",
-                stdout_log_path.display()
-            ))
-        })?;
-        let stderr_file = std::fs::File::create(&stderr_log_path).map_err(|err| {
-            internal_error(format!(
-                "failed to create stderr log file '{}': {err}",
-                stderr_log_path.display()
-            ))
-        })?;
+        let stdout_file = create_log_file(&stdout_log_path, "stdout")?;
+        let stderr_file = create_log_file(&stderr_log_path, "stderr")?;
 
         let mut command = self
             .build_command(
@@ -72,6 +62,7 @@ impl BashServer {
             stderr_log_path: stderr_log_path.clone(),
             before_snap_ids,
             snapshot_decision: snapshot_decision.clone(),
+            started_at: std::time::Instant::now(),
         };
 
         self.store_spawned_process(execution_id.clone(), entry)
@@ -98,7 +89,7 @@ impl BashServer {
             params.max_output_bytes,
         );
 
-        let (
+        let SpawnedProcess {
             mut child,
             command,
             working_dir,
@@ -106,9 +97,10 @@ impl BashServer {
             stderr_log_path,
             before_snap_ids,
             snapshot_decision,
-        ) = {
+            started_at,
+        } = {
             let mut map = self.inner.spawned.lock().await;
-            let entry = map.remove(&params.execution_id).ok_or_else(|| {
+            map.remove(&params.execution_id).ok_or_else(|| {
                 ErrorData::invalid_params(
                     format!(
                         "execution_id '{}' is not a tracked background process (or already waited on)",
@@ -116,16 +108,7 @@ impl BashServer {
                     ),
                     None,
                 )
-            })?;
-            (
-                entry.child,
-                entry.command,
-                entry.working_dir,
-                entry.stdout_log_path,
-                entry.stderr_log_path,
-                entry.before_snap_ids,
-                entry.snapshot_decision,
-            )
+            })?
         };
 
         let timeout = Duration::from_secs(timeout_secs);
@@ -191,9 +174,11 @@ impl BashServer {
                         stderr_log_path: stderr_log_path.clone(),
                         before_snap_ids,
                         snapshot_decision,
+                        started_at,
                     },
                 );
 
+                let running_for = format_elapsed(started_at.elapsed());
                 let mut output = String::new();
                 render_metadata_header(
                     &mut output,
@@ -207,11 +192,12 @@ impl BashServer {
                         stderr_log_path: Some(&stderr_log_path),
                         total_lines: Some(total_lines),
                         total_bytes: Some(total_bytes),
+                        running_for: Some(running_for.clone()),
                     },
                 );
                 let _ = write!(output, "\n{streams_block}");
                 let summary = format!(
-                    "execution_id '{}' still running after {}s",
+                    "execution_id '{}' still running after {}s ({running_for} total)",
                     params.execution_id, timeout_secs
                 );
                 Ok(Self::build_success_result(output, summary, vec![]))
@@ -348,6 +334,7 @@ impl BashServer {
                 stderr_log_path: Some(&entry.stderr_log_path),
                 total_lines: None,
                 total_bytes: None,
+                running_for: None,
             },
         );
         let _ = write!(output, "\n\nsignal: {}", signal);
@@ -380,9 +367,33 @@ impl BashServer {
                 stderr_log_path: Some(ctx.stderr_log_path),
                 total_lines: None,
                 total_bytes: None,
+                running_for: None,
             },
         );
         let summary = format!("spawned {}", ctx.execution_id);
         Self::build_success_result(output, summary, vec![])
+    }
+}
+
+/// Create the file a spawned command's stdout or stderr is redirected into.
+fn create_log_file(path: &Path, stream: &str) -> Result<std::fs::File, ErrorData> {
+    std::fs::File::create(path).map_err(|err| {
+        internal_error(format!(
+            "failed to create {stream} log file '{}': {err}",
+            path.display()
+        ))
+    })
+}
+
+/// Compact elapsed time for the still-running header: `7s`, `4m12s`, `1h02m05s`.
+pub(crate) fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    let (hours, minutes, seconds) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
     }
 }

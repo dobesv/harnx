@@ -522,6 +522,61 @@ propagates as an error with context naming the tool and echoing the raw argument
 This convention is consolidated across all provider parsers (`openai.rs`, `openai_responses.rs`,
 `bedrock.rs`, `claude.rs`, `cohere.rs`).
 
+### Loop protection
+
+Models, Gemini in particular, fall into loops that repeat the same tool call
+with the same result hundreds of times. `harnx_core::loop_guard::ToolRepeatGuard`
+counts identical calls within the current tool loop and escalates:
+
+- A call is identified by its name plus its arguments compared as JSON values,
+  and it counts only when its result is also identical. Gemini sends the same
+  arguments with the keys in different orders, so hashing the raw argument
+  text misses its loops; comparing results leaves polls whose output changes
+  alone.
+- The 2nd to 4th identical call within 10 minutes runs and gets a `[harnx]`
+  note in its result. The 5th is refused with an error saying when it may run
+  again. A refusal ends the turn with a `RepetitionStop` instead when the
+  model's previous response contained a refusal, or when it would be the same
+  call's third refusal. A model sends a response's calls before it sees any
+  of their results, so two refusals within one response do not end the turn
+  (`ToolRepeatGuard::begin_batch`).
+- The guard lives on `AgentLoopContext`, one per turn, and resets when a user
+  or parent message arrives mid-loop (`input.injected_user_text()`) or the
+  session is compacted (the length of `compressed_messages` changes). It never
+  reads the log.
+- A call refused in a round that also defers for human (HITL) approval is not
+  persisted as refused, and the continuation starts with a fresh guard, so
+  that call can run. That is acceptable because a person is in the loop.
+- A stop persists as the turn's `Error` entry: a sentence plus a
+  `harnx:repetition {...}` marker. Match the marker only with
+  `harnx_core::loop_guard::parse_repetition_terminal`. To classify a failed
+  turn, call `harnx_runtime::parse_worker_terminal`, which tries the budget
+  marker and then that one. The sub-agent tool and the CLI one-shot turn the
+  result into `TerminationKind::Repetition`.
+- `loop_detection.tool_calls` (global or agent front matter) and
+  `HARNX_LOOP_DETECTION=0` turn it off. The variable sets the global value, so
+  an agent whose front matter sets `tool_calls: true` still has the guard on.
+  `harnx dump session <agent> <id> --check-loop-detection` replays a stored
+  session through the same guard.
+- Tools that poll should return something that changes between calls
+  (`time_wait` and `time_wait_until` return their start and end times;
+  `bash_wait` reports total runtime), or the guard treats an unchanged poll as
+  a repeat. Conversely, a result that always changes hides a loop from the
+  guard: every `bash_exec` result for a command that ran embeds a fresh
+  `execution_id` and log paths, so no two of them match and the guard never
+  counts them, however often a model repeats the command. A `bash_exec` that
+  fails before its command starts (an empty command, an invalid `env` key or an
+  unusable `working_dir`) returns the same error each time with no id, and
+  those repeats do count. An agent whose job is polling can turn the guard
+  off in its front matter.
+- Tests that drive a mock model through repeated tool calls meet the guard
+  too: a fifth identical call with an identical result in one turn is
+  refused. Give the mock tool a result that changes per call (the
+  bounded-growth interruption test's `counter_ping` answers `pong 1`,
+  `pong 2`, …), or
+  turn the guard off in the test's config
+  (`loop_detection.tool_calls = false`).
+
 ### Tool result templates and undefined behavior
 
 Tool display templates are rendered by `make_template_env()` in

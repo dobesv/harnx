@@ -40,6 +40,7 @@ mod test_environment;
 pub mod test_utils;
 pub mod tool;
 pub mod tool_context;
+pub mod tool_loop_guard;
 pub mod utils;
 mod worker_identity;
 
@@ -52,9 +53,10 @@ pub use nats_session::{
 pub use nats_session_metadata::{SessionInitializer, SessionOverrides};
 pub use nats_worker::{ControlCommand, SessionActivationRoute};
 pub use terminated_result::{
-    budget_terminal_message, parse_budget_terminal, synthesize_terminated_result, BudgetTerminal,
-    InvocationBufferingSink, SynthesizedResult, TerminationDetails, TerminationInputs,
-    TerminationKind, TerminationUsage, INVOCATION_TEXT_TAIL_CAP_BYTES,
+    budget_terminal_message, parse_budget_terminal, parse_worker_terminal,
+    synthesize_terminated_result, BudgetTerminal, InvocationBufferingSink, SynthesizedResult,
+    TerminationDetails, TerminationInputs, TerminationKind, TerminationUsage, WorkerTerminal,
+    INVOCATION_TEXT_TAIL_CAP_BYTES,
 };
 
 pub use agent_loop::{

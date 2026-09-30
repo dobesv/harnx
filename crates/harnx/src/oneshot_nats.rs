@@ -4,7 +4,7 @@ use harnx_core::api_types::CompletionTokenUsage;
 use harnx_core::event::{AgentEvent, AgentEventSink, ContentBlock, ModelEvent};
 use harnx_runtime::nats_session::InterruptOutcome;
 use harnx_runtime::{
-    parse_budget_terminal, synthesize_terminated_result, InvocationBufferingSink, NatsSession,
+    parse_worker_terminal, synthesize_terminated_result, InvocationBufferingSink, NatsSession,
     NatsTurnResult, RunTurnOptions, SynthesizedResult, TerminationInputs, TerminationKind,
 };
 use parking_lot::Mutex;
@@ -334,24 +334,28 @@ pub(crate) struct TurnOutput<'a> {
 struct TerminationSpec {
     kind: TerminationKind,
     budget: Option<u64>,
+    repetition: Option<harnx_core::loop_guard::RepetitionTerminal>,
 }
 
 fn termination_spec(result: Option<&NatsTurnResult>) -> Option<TerminationSpec> {
-    match result {
-        None => Some(TerminationSpec {
+    let Some(result) = result else {
+        return Some(TerminationSpec {
             kind: TerminationKind::Timeout,
             budget: None,
-        }),
-        Some(result) => result
-            .error
-            .as_deref()
-            .and_then(parse_budget_terminal)
-            .map(|terminal| TerminationSpec {
-                kind: TerminationKind::BudgetExceeded,
-                budget: Some(terminal.budget),
-            }),
-    }
+            repetition: None,
+        });
+    };
+    result
+        .error
+        .as_deref()
+        .and_then(parse_worker_terminal)
+        .map(|terminal| TerminationSpec {
+            kind: terminal.kind(),
+            budget: terminal.budget(),
+            repetition: terminal.repetition(),
+        })
 }
+
 pub(crate) fn finish_turn(
     result: Option<NatsTurnResult>,
     output: TurnOutput<'_>,
@@ -365,6 +369,7 @@ pub(crate) fn finish_turn(
             usage: &usage,
             thinking_excerpt: Some(&thinking_tail),
             budget: termination.budget,
+            repetition: termination.repetition,
         });
         emit_termination(&synthesized)?;
         return Err(InvocationLimitReached.into());
@@ -445,6 +450,7 @@ mod tests {
                 Some(TerminationSpec {
                     kind: TerminationKind::Timeout,
                     budget: None,
+                    repetition: None,
                 })
             );
         }
@@ -483,6 +489,7 @@ mod tests {
             usage: &usage,
             thinking_excerpt: Some("partial thought"),
             budget: None,
+            repetition: None,
         });
 
         let output = termination_output(&synthesized).unwrap();
@@ -513,6 +520,7 @@ mod tests {
             TerminationSpec {
                 kind: TerminationKind::BudgetExceeded,
                 budget: Some(20),
+                repetition: None,
             }
         );
         let usage = sample_termination_usage();
@@ -522,6 +530,7 @@ mod tests {
             usage: &usage,
             thinking_excerpt: None,
             budget: termination.budget,
+            repetition: None,
         });
 
         let output = termination_output(&synthesized).unwrap();
@@ -533,6 +542,39 @@ mod tests {
         let stderr_json: serde_json::Value = serde_json::from_str(output.stderr.trim()).unwrap();
         assert_eq!(stderr_json["kind"], "budget_exceeded");
         assert_eq!(stderr_json["session_id"], "cli-budget-session");
+    }
+
+    #[test]
+    fn parsed_repetition_terminal_has_synthesized_stdout_and_json_stderr() {
+        let stop = harnx_core::loop_guard::RepetitionStop(
+            harnx_core::loop_guard::RepetitionTerminal::tool_calls("fs_read", 4),
+        );
+        let turn = NatsTurnResult {
+            response: None,
+            session_id: "cli-loop-session".to_string(),
+            was_cancelled: false,
+            error: Some(stop.to_string()),
+            user_msg_seq: 1,
+            user_msg_id: "user-message".to_string(),
+        };
+        let termination = termination_spec(Some(&turn)).expect("repetition termination");
+        assert_eq!(termination.kind, TerminationKind::Repetition);
+        let usage = sample_termination_usage();
+        let synthesized = synthesize_terminated_result(TerminationInputs {
+            kind: termination.kind,
+            session_id: "cli-loop-session",
+            usage: &usage,
+            thinking_excerpt: None,
+            budget: termination.budget,
+            repetition: termination.repetition,
+        });
+        let output = termination_output(&synthesized).unwrap();
+        assert!(output
+            .stdout
+            .contains("kept repeating the same `fs_read` call"));
+        let stderr_json: serde_json::Value = serde_json::from_str(output.stderr.trim()).unwrap();
+        assert_eq!(stderr_json["kind"], "repetition");
+        assert_eq!(stderr_json["tool"], "fs_read");
     }
 
     fn usage_event(input: u64, output: u64, cached: u64, cache_write: u64) -> AgentEvent {
