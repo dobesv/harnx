@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::agent_config::{deserialize_use_tools, normalize_toolset_value, ToolsetValue};
 use crate::hooks::HooksConfig;
@@ -28,6 +28,57 @@ where
 
 fn default_terminal_status() -> bool {
     true
+}
+
+/// Loop-protection switches from `config.yaml`. Each guard defaults to on.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct LoopDetectionConfig {
+    /// Warn about, refuse, and finally stop repeated identical tool calls.
+    pub tool_calls: bool,
+}
+
+impl Default for LoopDetectionConfig {
+    fn default() -> Self {
+        Self { tool_calls: true }
+    }
+}
+
+impl LoopDetectionConfig {
+    /// Apply an agent's front-matter override; unset fields keep the global value.
+    pub fn resolve(self, agent: Option<&LoopDetectionOverride>) -> Self {
+        let Some(agent) = agent else { return self };
+        Self {
+            tool_calls: agent.tool_calls.unwrap_or(self.tool_calls),
+        }
+    }
+}
+
+/// Per-agent override of [`LoopDetectionConfig`], for agents whose job is
+/// polling or whose output legitimately repeats.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct LoopDetectionOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<bool>,
+}
+
+/// Default wait for a worker to claim an activated NATS session.
+pub const DEFAULT_NATS_LEASE_ACQUISITION_TIMEOUT_SECS: u64 = 60;
+
+fn default_nats_lease_acquisition_timeout_secs() -> u64 {
+    DEFAULT_NATS_LEASE_ACQUISITION_TIMEOUT_SECS
+}
+
+fn deserialize_positive_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("value must be greater than zero"));
+    }
+    Ok(value)
 }
 
 /// Scalar YAML-deserialized fields from `config.yaml`.
@@ -58,6 +109,11 @@ pub struct ConfigData {
     #[serde(default, deserialize_with = "deserialize_use_tools")]
     pub use_tools: Option<Vec<String>>,
 
+    #[serde(
+        default = "default_nats_lease_acquisition_timeout_secs",
+        deserialize_with = "deserialize_positive_u64"
+    )]
+    pub nats_lease_acquisition_timeout_secs: u64,
     pub cleanup_remote_sessions_days: Option<u64>,
     pub compress_threshold: usize,
 
@@ -90,6 +146,9 @@ pub struct ConfigData {
     #[serde(default = "default_terminal_status")]
     pub terminal_status: bool,
 
+    /// Loop protection; see [`LoopDetectionConfig`].
+    pub loop_detection: LoopDetectionConfig,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_agent: Option<String>,
     /// Token-growth threshold for title regeneration at turn end and mid-loop;
@@ -101,6 +160,16 @@ pub struct ConfigData {
     pub title_update_interval_secs: u64,
 }
 
+impl ConfigData {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.nats_lease_acquisition_timeout_secs == 0 {
+            return Err(
+                "nats_lease_acquisition_timeout_secs must be greater than zero".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
 impl Default for ConfigData {
     fn default() -> Self {
         Self {
@@ -120,6 +189,7 @@ impl Default for ConfigData {
             toolsets: Default::default(),
             use_tools: None,
 
+            nats_lease_acquisition_timeout_secs: default_nats_lease_acquisition_timeout_secs(),
             cleanup_remote_sessions_days: None,
             compress_threshold: 180000,
 
@@ -147,6 +217,8 @@ impl Default for ConfigData {
 
             terminal_status: default_terminal_status(),
 
+            loop_detection: LoopDetectionConfig::default(),
+
             title_agent: None,
             title_update_threshold: 50_000,
             title_update_interval_secs: 0,
@@ -171,6 +243,37 @@ mod tests {
         assert!(d.save_shell_history);
         assert_eq!(d.compress_threshold, 180_000);
         assert_eq!(d.rag_top_k, 5);
+    }
+
+    #[test]
+    fn lease_acquisition_timeout_defaults_to_sixty_seconds() {
+        let default = ConfigData::default();
+        let from_empty_yaml: ConfigData = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(default.nats_lease_acquisition_timeout_secs, 60);
+        assert_eq!(from_empty_yaml.nats_lease_acquisition_timeout_secs, 60);
+    }
+
+    #[test]
+    fn lease_acquisition_timeout_accepts_positive_override() {
+        let data: ConfigData =
+            serde_yaml::from_str("nats_lease_acquisition_timeout_secs: 17\n").unwrap();
+
+        assert_eq!(data.nats_lease_acquisition_timeout_secs, 17);
+        data.validate().unwrap();
+    }
+
+    #[test]
+    fn lease_acquisition_timeout_rejects_zero() {
+        let error = serde_yaml::from_str::<ConfigData>("nats_lease_acquisition_timeout_secs: 0\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("greater than zero"));
+
+        let data = ConfigData {
+            nats_lease_acquisition_timeout_secs: 0,
+            ..Default::default()
+        };
+        assert!(data.validate().unwrap_err().contains("greater than zero"));
     }
 
     #[test]
@@ -240,5 +343,46 @@ title_update_threshold: 25000
         let got: ConfigData = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(got.title_agent, Some("claude-sonnet-4-6".to_string()));
         assert_eq!(got.title_update_threshold, 25_000);
+    }
+}
+
+#[cfg(test)]
+mod loop_detection_tests {
+    use super::*;
+
+    #[test]
+    fn loop_detection_defaults_to_on_and_parses_from_yaml() {
+        assert!(ConfigData::default().loop_detection.tool_calls);
+        let data: ConfigData =
+            serde_yaml::from_str("loop_detection:\n  tool_calls: false\n").unwrap();
+        assert!(!data.loop_detection.tool_calls);
+    }
+
+    #[test]
+    fn an_agent_override_wins_field_by_field() {
+        let global = LoopDetectionConfig { tool_calls: false };
+        assert!(
+            global
+                .resolve(Some(&LoopDetectionOverride {
+                    tool_calls: Some(true)
+                }))
+                .tool_calls
+        );
+        assert!(
+            !global
+                .resolve(Some(&LoopDetectionOverride { tool_calls: None }))
+                .tool_calls
+        );
+        assert!(!global.resolve(None).tool_calls);
+    }
+
+    #[test]
+    fn an_empty_agent_override_keeps_protection_on() {
+        // Protection is on by default, so an agent that writes an empty
+        // `loop_detection:` block must not switch it off by accident.
+        let on = LoopDetectionConfig::default();
+        let unset = LoopDetectionOverride::default();
+        assert!(on.resolve(Some(&unset)).tool_calls);
+        assert!(on.resolve(None).tool_calls);
     }
 }

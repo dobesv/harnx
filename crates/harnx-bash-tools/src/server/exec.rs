@@ -342,6 +342,7 @@ impl BashServer {
                 stderr_log_path: Some(ctx.stderr_log_path),
                 total_lines: Some(ctx.total_lines),
                 total_bytes: Some(ctx.total_bytes),
+                running_for: None,
             },
         );
         let _ = write!(output, "\n{}", ctx.streams_block);

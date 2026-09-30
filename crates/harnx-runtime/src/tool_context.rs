@@ -24,6 +24,7 @@ pub struct ToolRoundParams<'a> {
     pub working_dir: Option<&'a Path>,
     pub nats_hook_provider: Option<Arc<NatsHookProvider>>,
     pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
+    pub tool_loop_guard: Option<crate::tool_loop_guard::ToolLoopGuardHandle>,
 }
 
 /// Inputs used to assemble the provider and rendering context for a tool round.
@@ -77,6 +78,7 @@ impl AgentLoopContext {
             working_dir: self.working_dir.as_deref(),
             nats_hook_provider: self.nats_hook_provider.clone(),
             pending_async_context: self.pending_async_context.clone(),
+            tool_loop_guard: Some(self.tool_loop_guard.clone()),
         }
     }
 }

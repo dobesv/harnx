@@ -1,7 +1,7 @@
 use super::{CompletedSubagentTurn, ProgressReporterStart, SubagentToolset};
 use crate::nats_session::{NatsSession, NatsTurnResult};
 use crate::{
-    parse_budget_terminal, synthesize_terminated_result, InvocationBufferingSink, RunTurnOptions,
+    parse_worker_terminal, synthesize_terminated_result, InvocationBufferingSink, RunTurnOptions,
     SynthesizedResult, TerminationInputs, TerminationKind,
 };
 use harnx_core::event::{SubAgentProgress, SubAgentProgressStatus};
@@ -314,6 +314,7 @@ async fn finish_timed_out_turn(
         TerminationSpec {
             kind: TerminationKind::Timeout,
             budget: None,
+            repetition: None,
         },
         &session_id,
         &progress,
@@ -340,12 +341,11 @@ async fn finish_completed_turn(
 ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
     let cancelled =
         params.result.was_cancelled || params.toolset.turn_has_cancel(&params.result).await;
-    let budget_terminal = params
-        .result
-        .error
-        .as_deref()
-        .and_then(parse_budget_terminal);
-    let status = completed_progress_status(&params.result, cancelled, budget_terminal.is_some());
+    let spec = completed_termination_spec(&params.result);
+    let budget_exceeded = spec
+        .as_ref()
+        .is_some_and(|spec| spec.kind == TerminationKind::BudgetExceeded);
+    let status = completed_progress_status(&params.result, cancelled, budget_exceeded);
     let progress = finish_progress(&params.reporter, status).await?;
     if cancelled {
         return Err(ToolInvokeError::Recoverable(subagent_error_message(
@@ -353,12 +353,9 @@ async fn finish_completed_turn(
             &params.child_session_id,
         )));
     }
-    let termination = budget_terminal.map(|terminal| {
+    let termination = spec.map(|spec| {
         synthesize_termination(
-            TerminationSpec {
-                kind: TerminationKind::BudgetExceeded,
-                budget: Some(terminal.budget),
-            },
+            spec,
             &params.child_session_id,
             &progress,
             &params.buffering_sink,
@@ -370,6 +367,20 @@ async fn finish_completed_turn(
         progress,
         termination,
     })
+}
+
+/// The termination a completed child turn reports, if its error is a
+/// worker-side stop rather than an ordinary failure.
+fn completed_termination_spec(result: &NatsTurnResult) -> Option<TerminationSpec> {
+    result
+        .error
+        .as_deref()
+        .and_then(parse_worker_terminal)
+        .map(|terminal| TerminationSpec {
+            kind: terminal.kind(),
+            budget: terminal.budget(),
+            repetition: terminal.repetition(),
+        })
 }
 
 fn completed_progress_status(
@@ -400,7 +411,9 @@ async fn finish_progress(
 struct TerminationSpec {
     kind: TerminationKind,
     budget: Option<u64>,
+    repetition: Option<harnx_core::loop_guard::RepetitionTerminal>,
 }
+
 fn synthesize_termination(
     spec: TerminationSpec,
     session_id: &str,
@@ -414,6 +427,7 @@ fn synthesize_termination(
         usage: &progress.usage,
         thinking_excerpt: Some(&thinking_tail),
         budget: spec.budget,
+        repetition: spec.repetition,
     })
 }
 
@@ -490,6 +504,47 @@ mod tests {
             assert!(!message.contains("session_prompt"));
             assert!(!message.contains("session_load"));
         }
+    }
+
+    fn turn_with_error(error: &str) -> NatsTurnResult {
+        NatsTurnResult {
+            response: None,
+            session_id: "child".to_string(),
+            was_cancelled: false,
+            error: Some(error.to_string()),
+            user_msg_seq: 1,
+            user_msg_id: "user-message".to_string(),
+        }
+    }
+
+    #[test]
+    fn repetition_stop_becomes_a_failed_repetition_termination() {
+        let stop = harnx_core::loop_guard::RepetitionStop(
+            harnx_core::loop_guard::RepetitionTerminal::tool_calls("fs_read", 4),
+        );
+        let result = turn_with_error(&format!("worker turn: {stop}"));
+        let spec = completed_termination_spec(&result).expect("repetition spec");
+        assert_eq!(spec.kind, TerminationKind::Repetition);
+        assert_eq!(spec.budget, None);
+        assert_eq!(
+            spec.repetition.as_ref().and_then(|t| t.tool.as_deref()),
+            Some("fs_read")
+        );
+        assert_eq!(
+            completed_progress_status(&result, false, false),
+            SubAgentProgressStatus::Failed
+        );
+    }
+
+    #[test]
+    fn budget_and_plain_errors_keep_their_behaviour() {
+        let budget =
+            completed_termination_spec(&turn_with_error(&crate::budget_terminal_message(21, 20)))
+                .expect("budget spec");
+        assert_eq!(budget.kind, TerminationKind::BudgetExceeded);
+        assert_eq!(budget.budget, Some(20));
+        assert!(budget.repetition.is_none());
+        assert!(completed_termination_spec(&turn_with_error("boom")).is_none());
     }
 
     #[tokio::test]

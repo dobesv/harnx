@@ -277,6 +277,72 @@ Or via environment:
 HARNX_TERMINAL_STATUS=0 harnx
 ```
 
+### Loop Detection
+
+Harnx stops an agent that keeps making the same tool call and getting the same
+result. Two calls are the same when they use the same tool with the same
+arguments (the order of keys does not matter) and return the same result, and
+only calls from the last 10 minutes are compared. A call that returns something
+new, such as a poll of a job that is making progress, is not a repeat. A poll
+that keeps getting the same answer is a repeat, such as a status check that
+always says "still running". `time_wait` and `time_wait_until` report when they
+started and ended, and a still-running `bash_wait` reports how long the process
+has been running, so their results differ from one call to the next.
+Every `bash_exec` result for a command that ran carries a fresh execution id,
+so a repeated `bash_exec` command is never counted. A `bash_exec` call that
+fails before its command starts, such as one with an empty command, returns
+the same error each time and does count.
+
+- The 2nd to 4th identical call runs, and harnx appends a `[harnx]` note to its
+  result saying how many times the call has repeated.
+- The 5th is refused. It does not run, and the model gets an error that says
+  when the call may run again.
+- If the model's next response asks for a call that would be refused too, or
+  the same call would be refused a third time, harnx ends the turn with an
+  error naming the tool. A parent agent that delegated to the agent receives
+  this as a `termination` of kind `"repetition"` (see the
+  [Agent Guide](agent-guide.md)), and a one-shot `harnx prompt` exits with
+  code 2 (see
+  [Limit Exhaustion Behavior](command-line-guide.md#limit-exhaustion-behavior)).
+
+The count covers one turn. It starts over when a message arrives mid-turn or the
+session is compacted.
+
+The guard is on by default. To turn it off everywhere, set this in
+`config.yaml`:
+
+```yaml
+loop_detection:
+  tool_calls: false
+```
+
+or start harnx with `HARNX_LOOP_DETECTION=0`, which takes precedence over
+`config.yaml`. The guard runs in the worker that executes the turn, so a
+separately deployed worker needs the setting in its own `config.yaml` or
+environment. An agent can override the global setting in its front matter, for
+example an agent whose job is polling:
+
+```yaml
+---
+loop_detection:
+  tool_calls: false
+---
+```
+
+The agent's own value wins over the global one in both directions. An agent
+that sets `tool_calls: true` keeps the guard on even when
+`HARNX_LOOP_DETECTION=0`, and an agent that does not set it follows the global
+value.
+
+To see where the guard would have stepped in on a stored session:
+
+```sh
+harnx dump session <agent> <session-id> --check-loop-detection
+```
+
+The [Command Line Guide](command-line-guide.md) describes the output and its
+limits.
+
 ### Session Titles
 
 Harnx can automatically generate a short, human-readable title for each session
@@ -329,6 +395,18 @@ and often return an empty or truncated title. Use a standard chat model.
 To set a title manually, use the [`.set title`](tui-guide.md) command in the
 TUI. A manually set title freezes automatic regeneration for the rest of the
 session.
+
+### NATS Worker Claim Timeout
+
+- **nats_lease_acquisition_timeout_secs**: Maximum seconds a client waits for a
+  worker to claim an activated NATS session. Defaults to `60` and must be a
+  positive integer. This setting applies to top-level and sub-agent sessions.
+  Override it with `HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS` when configuring
+  deployments through environment variables.
+
+```yaml
+nats_lease_acquisition_timeout_secs: 60
+```
 
 ### Session Retention and Garbage Collection
 

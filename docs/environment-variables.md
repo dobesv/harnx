@@ -27,11 +27,13 @@ Harnx can load environment variables from a `.env` file located in the data dire
 - **HARNX_HIGHLIGHT**: Whether to highlight the output (boolean).
 - **HARNX_LIGHT_THEME**: Whether to use a light theme (boolean).
 - **HARNX_TERMINAL_STATUS**: Enable/disable terminal status emission via OSC escape codes (boolean). Defaults to `true`. Set to `0` or `false` to disable. Emission is also suppressed when stdout is not a TTY, `TERM=dumb`, or `CI` is set. See [Configuration Guide](configuration-guide.md#terminal-status) for details on terminal support.
+- **HARNX_LOOP_DETECTION**: Enable/disable loop detection for repeated identical tool calls (boolean). Defaults to `true`. Set to `0` or `false` to disable. It sets the global value, so an agent whose front matter sets `loop_detection.tool_calls: true` still has loop detection on. See [Configuration Guide](configuration-guide.md#loop-detection).
 - **HARNX_SERVE_ADDR**: The address to serve the API on.
 - **HARNX_USER_AGENT**: The user agent string for API requests.
 - **HARNX_SAVE_SHELL_HISTORY**: Whether to save shell history (boolean).
 - **HARNX_SYNC_MODELS_URL**: The URL to sync models from.
 - **HARNX_CLEANUP_REMOTE_SESSIONS_DAYS**: Retention period in days for remote NATS sessions (integer). Unset disables automatic expiry (state grows unbounded; workers log a warning at startup). `0` explicitly disables expiry. Values `>0` enable worker-owned periodic session garbage collection.
+- **HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS**: Maximum seconds to wait for a worker to claim an activated NATS session. Defaults to `60` and must be greater than zero. Applies to top-level and sub-agent sessions.
 
 ## Client-Related Envs
 

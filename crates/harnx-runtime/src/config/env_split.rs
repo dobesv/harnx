@@ -14,8 +14,22 @@ fn theme_from_terminal(enabled: bool) -> Option<String> {
         })
 }
 
+fn read_positive_u64_env(key: &str) -> Result<Option<u64>> {
+    let raw = match env::var(key) {
+        Ok(raw) => raw,
+        Err(env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("{key} must be a positive integer, got '{raw}'"))?;
+    anyhow::ensure!(value > 0, "{key} must be a positive integer, got '{raw}'");
+    Ok(Some(value))
+}
+
 impl Config {
-    pub(super) fn load_envs(&mut self, detect_terminal_theme: bool) {
+    pub(super) fn load_envs(&mut self, detect_terminal_theme: bool) -> Result<()> {
         if let Ok(v) = env::var(get_env_name("model")) {
             self.model_id = v;
         }
@@ -73,6 +87,9 @@ impl Config {
             }
         }
 
+        self.nats_lease_acquisition_timeout_secs =
+            read_positive_u64_env(&get_env_name("nats_lease_acquisition_timeout_secs"))?
+                .unwrap_or(self.nats_lease_acquisition_timeout_secs);
         if let Some(v) = read_env_value::<u64>(&get_env_name("cleanup_remote_sessions_days")) {
             self.cleanup_remote_sessions_days = v;
         }
@@ -130,8 +147,19 @@ impl Config {
         if let Some(Some(v)) = read_env_bool(&get_env_name("terminal_status")) {
             self.terminal_status = v;
         }
+        self.load_loop_detection_env();
         if let Some(v) = read_env_value::<String>(&get_env_name("sync_models_url")) {
             self.sync_models_url = v;
+        }
+        self.data.validate().map_err(anyhow::Error::msg)
+    }
+
+    /// `HARNX_LOOP_DETECTION` turns the loop guards on or off together. It
+    /// lives outside `load_envs` so that function, which already branches once
+    /// per setting, doesn't grow another branch.
+    fn load_loop_detection_env(&mut self) {
+        if let Some(Some(v)) = read_env_bool(&get_env_name("loop_detection")) {
+            self.loop_detection.tool_calls = v;
         }
     }
 }
@@ -188,7 +216,7 @@ mod tests {
         let _cleanup_days = EnvGuard::new("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", "7");
 
         let mut config = Config::default();
-        config.load_envs(true);
+        config.load_envs(true).unwrap();
 
         assert_eq!(config.cleanup_remote_sessions_days, Some(7));
     }
@@ -199,9 +227,46 @@ mod tests {
         let _cleanup_days = EnvGuard::remove("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS");
 
         let mut config = Config::default();
-        config.load_envs(true);
+        config.load_envs(true).unwrap();
 
         assert_eq!(config.cleanup_remote_sessions_days, None);
+    }
+
+    #[test]
+    fn load_envs_reads_lease_acquisition_timeout() {
+        let _lock = env_lock();
+        let _timeout = EnvGuard::new("HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS", "23");
+
+        let mut config = Config::default();
+        config.load_envs(true).unwrap();
+
+        assert_eq!(config.nats_lease_acquisition_timeout_secs, 23);
+    }
+
+    #[test]
+    fn load_envs_rejects_zero_lease_acquisition_timeout() {
+        let _lock = env_lock();
+        let _timeout = EnvGuard::new("HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS", "0");
+
+        let mut config = Config::default();
+        let error = config.load_envs(true).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS must be a positive integer"));
+    }
+
+    #[test]
+    fn load_envs_rejects_invalid_lease_acquisition_timeout() {
+        let _lock = env_lock();
+        let _timeout = EnvGuard::new("HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS", "abc");
+
+        let mut config = Config::default();
+        let error = config.load_envs(true).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("HARNX_NATS_LEASE_ACQUISITION_TIMEOUT_SECS must be a positive integer"));
     }
 
     #[test]
@@ -258,7 +323,7 @@ mod tests {
         let _terminal_status = EnvGuard::new("HARNX_TERMINAL_STATUS", "0");
 
         let mut config = Config::default();
-        config.load_envs(true);
+        config.load_envs(true).unwrap();
 
         assert!(!config.terminal_status);
     }
@@ -269,7 +334,7 @@ mod tests {
         let _terminal_status = EnvGuard::new("HARNX_TERMINAL_STATUS", "false");
 
         let mut config = Config::default();
-        config.load_envs(true);
+        config.load_envs(true).unwrap();
 
         assert!(!config.terminal_status);
     }
@@ -280,7 +345,7 @@ mod tests {
         let _terminal_status = EnvGuard::remove("HARNX_TERMINAL_STATUS");
 
         let mut config = Config::default();
-        config.load_envs(true);
+        config.load_envs(true).unwrap();
 
         assert!(config.terminal_status);
     }
@@ -291,8 +356,30 @@ mod tests {
         let _terminal_status = EnvGuard::new("HARNX_TERMINAL_STATUS", "1");
 
         let mut config = Config::default();
-        config.load_envs(true);
+        config.load_envs(true).unwrap();
 
         assert!(config.terminal_status);
+    }
+
+    #[test]
+    fn load_envs_loop_detection_disabled_by_zero() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::new("HARNX_LOOP_DETECTION", "0");
+
+        let mut config = Config::default();
+        config.load_envs(true).unwrap();
+
+        assert!(!config.loop_detection.tool_calls);
+    }
+
+    #[test]
+    fn load_envs_loop_detection_unset_defaults_to_on() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::remove("HARNX_LOOP_DETECTION");
+
+        let mut config = Config::default();
+        config.load_envs(true).unwrap();
+
+        assert!(config.loop_detection.tool_calls);
     }
 }

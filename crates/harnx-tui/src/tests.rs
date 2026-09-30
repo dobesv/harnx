@@ -1,3 +1,66 @@
+#[tokio::test]
+async fn handle_submit_action_appends_markdown_link() {
+    let config = test_config_with_mock_client_and_agent("test-agent", Some("test-session"));
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.set_input_text("See [User Link](https://user.com)");
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::MarkdownLink { text, url }
+            if text == "User Link" && url == "https://user.com"
+    )));
+}
+
+#[tokio::test]
+async fn submit_dot_command_appends_markdown_link() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.submit_dot_command(".echo [Dot Link](https://dot.com)".into())
+        .await
+        .unwrap();
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::MarkdownLink { text, url }
+            if text == "Dot Link" && url == "https://dot.com"
+    )));
+}
+
+#[tokio::test]
+async fn render_replayed_user_message_appends_markdown_link() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::User(UserEvent::Message {
+        content: "[Replayed Link](https://replayed.com)".into(),
+    })))
+    .await
+    .unwrap();
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::MarkdownLink { text, url }
+            if text == "Replayed Link" && url == "https://replayed.com"
+    )));
+}
+
+#[tokio::test]
+async fn durable_pending_enqueue_appends_markdown_link() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.finish_durable_pending_enqueue(crate::types::PendingMessage {
+        text: "[Queued Link](https://queued.com)".into(),
+        attachments: vec![],
+        attachment_dir: None,
+        paste_count: 0,
+    })
+    .await;
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::MarkdownLink { text, url }
+            if text == "Queued Link" && url == "https://queued.com"
+    )));
+}
+
 #[path = "tests/acceptance_tests.rs"]
 mod acceptance_tests;
 
@@ -49,7 +112,7 @@ macro_rules! usage_event {
     };
 }
 
-fn test_config() -> GlobalConfig {
+pub(crate) fn test_config() -> GlobalConfig {
     let config = Arc::new(RwLock::new(Config::default()));
     {
         let mut guard = config.write();
@@ -12044,4 +12107,619 @@ async fn freeze_main_unfinished_tool_timers_freezes_running_tools_on_turn_comple
         }
         _ => panic!("expected ToolCall with id 'tool-running', got: {:?}", tool),
     }
+}
+
+#[tokio::test]
+async fn transcript_focus_navigates_over_markdown_links() {
+    let mut harness = TuiTestHarness::with_size(60, 14).await;
+    harness.tui().clear_transcript();
+
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Please check these links".into(),
+        seq: Some(1),
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Here are links: [One](https://one.com) and [Two](https://two.com)".into(),
+            seq: Some(2),
+            timestamp: None,
+            rendered_cache: None,
+        });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::MarkdownLink {
+            text: "One".into(),
+            url: "https://one.com".into(),
+        });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::MarkdownLink {
+            text: "Two".into(),
+            url: "https://two.com".into(),
+        });
+
+    // Start with focus on UserText (index 0)
+    harness.tui().app.transcript_focus = Some(0);
+
+    // Down to AssistantText (index 1)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(1));
+
+    // Down to first MarkdownLink (index 2)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(2));
+
+    // Down to second MarkdownLink (index 3)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(3));
+
+    // Up to first MarkdownLink (index 2)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(2));
+
+    // Up to AssistantText (index 1)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(1));
+}
+
+fn resolved_blob(mime_type: &str, bytes: impl Into<Vec<u8>>) -> harnx_blob_store::ResolvedBlob {
+    harnx_blob_store::ResolvedBlob {
+        mime_type: mime_type.to_string(),
+        bytes: bytes.into(),
+        etag: None,
+        immutable: false,
+    }
+}
+
+#[test]
+fn attachment_extensions_allow_safe_types_and_replace_unsafe_types() {
+    use crate::subagent_sessions::{extension_for_mime, is_unsafe_extension};
+
+    for (extension, expected) in [
+        ("png", "png"),
+        ("txt", "txt"),
+        ("exe", "bin"),
+        ("vbs", "bin"),
+        ("sh", "bin"),
+        ("bat", "bin"),
+        ("lnk", "bin"),
+        ("hta", "bin"),
+        ("application", "bin"),
+        ("svg", "bin"),
+    ] {
+        let safe_extension = if is_unsafe_extension(extension) {
+            "bin"
+        } else {
+            extension
+        };
+        assert_eq!(
+            safe_extension, expected,
+            "unexpected result for .{extension}"
+        );
+    }
+
+    assert_eq!(extension_for_mime("image/png"), "png");
+    assert_eq!(extension_for_mime("text/plain"), "txt");
+    for mime_type in [
+        "application/x-msdownload",
+        "text/vbscript",
+        "application/x-sh",
+        "application/x-ms-shortcut",
+        "application/hta",
+        "application/x-ms-application",
+        "image/svg+xml",
+    ] {
+        assert_eq!(
+            extension_for_mime(mime_type),
+            "bin",
+            "{mime_type} must use the .bin fallback"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cid_document_navigation_refetches_and_restores_history() {
+    const INDEX: &str = "cid:plan:_/session1/project";
+    const TASK: &str = "cid:plan:_/session1/project/tasks/build";
+    const DEPENDENCY: &str = "cid:plan:_/session1/project/tasks/setup";
+
+    let mut tui = Tui::init(&test_config()).await.unwrap();
+    tui.app.transcript.clear();
+    tui.app.transcript.push(TranscriptItem::MarkdownLink {
+        text: "Project".into(),
+        url: INDEX.into(),
+    });
+    tui.app.transcript_focus = Some(0);
+
+    let fetched = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fetched_for_resolver = Arc::clone(&fetched);
+    tui.cid_resolve_override = Some(Arc::new(move |url| {
+        fetched_for_resolver.lock().unwrap().push(url.clone());
+        let markdown = match url.as_str() {
+            INDEX => format!("# Project\n\n[Build]({TASK}) [Docs](https://example.com)"),
+            TASK => format!("# Build\n\n[Setup]({DEPENDENCY})"),
+            DEPENDENCY => "# Setup\n\nReady".to_string(),
+            _ => panic!("unexpected URL: {url}"),
+        };
+        Box::pin(async move { Ok(resolved_blob("text/markdown", markdown.into_bytes())) })
+    }));
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(tui.app.doc_view.as_ref().unwrap().url, INDEX);
+    assert_eq!(tui.app.doc_view.as_ref().unwrap().title, "Project");
+    assert_eq!(tui.app.doc_view.as_ref().unwrap().focused_link, Some(0));
+
+    assert_eq!(
+        crate::detail_view::detail_view_footer_text(&tui.app),
+        " ↑↓/Tab: select link  Enter: open  Backspace/Esc: back  PgUp/PgDn: scroll"
+    );
+    tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(tui.app.doc_view.as_ref().unwrap().focused_link, Some(1));
+    tui.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+    assert_eq!(tui.app.doc_view.as_ref().unwrap().focused_link, Some(0));
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(tui.app.doc_view.as_ref().unwrap().url, TASK);
+    assert_eq!(tui.app.doc_history, vec![(INDEX.into(), Some(0))]);
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(tui.app.doc_view.as_ref().unwrap().url, DEPENDENCY);
+    assert_eq!(tui.app.doc_history.len(), 2);
+
+    tui.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(tui.app.doc_view.as_ref().unwrap().url, TASK);
+    assert_eq!(tui.app.doc_view.as_ref().unwrap().focused_link, Some(0));
+
+    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(tui.app.doc_view.as_ref().unwrap().url, INDEX);
+    assert!(tui.app.doc_history.is_empty());
+
+    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!tui.app.detail_view_open);
+    assert!(tui.app.doc_view.is_none());
+    assert_eq!(
+        *fetched.lock().unwrap(),
+        [INDEX, TASK, DEPENDENCY, TASK, INDEX]
+    );
+}
+
+#[tokio::test]
+async fn transcript_http_markdown_link_enter_opens_detached() {
+    const URL: &str = "http://example.com/docs";
+
+    let mut tui = Tui::init(&test_config()).await.unwrap();
+    tui.app.transcript.clear();
+    tui.app.transcript.push(TranscriptItem::MarkdownLink {
+        text: "Docs".into(),
+        url: URL.into(),
+    });
+    tui.app.transcript_focus = Some(0);
+
+    let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let opened_for_hook = Arc::clone(&opened);
+    tui.detached_open_override = Some(Arc::new(move |path| {
+        opened_for_hook.lock().unwrap().push(path.to_path_buf());
+        Ok(())
+    }));
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(*opened.lock().unwrap(), [std::path::PathBuf::from(URL)]);
+    assert!(!tui.app.detail_view_open);
+    assert_eq!(tui.app.transcript.len(), 1);
+}
+
+#[tokio::test]
+async fn cid_document_link_enter_dispatches_web_urls_and_reports_broken_cid() {
+    const HTTP_URL: &str = "http://example.com/plain";
+    const HTTPS_URL: &str = "https://example.com/secure";
+    const BROKEN_CID: &str = "cid:plan:_/session1/missing";
+    let text =
+        format!("# Links\n\n[HTTP]({HTTP_URL}) [HTTPS]({HTTPS_URL}) [Missing]({BROKEN_CID})");
+
+    let mut tui = Tui::init(&test_config()).await.unwrap();
+    tui.app.transcript.clear();
+    tui.show_cid_document(crate::types::CidDocView {
+        url: "cid:plan:_/session1/links".into(),
+        title: "Links".into(),
+        links: crate::markdown_render::extract_markdown_links(&text),
+        text,
+        focused_link: Some(0),
+    });
+
+    let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let opened_for_hook = Arc::clone(&opened);
+    tui.detached_open_override = Some(Arc::new(move |path| {
+        opened_for_hook.lock().unwrap().push(path.to_path_buf());
+        Ok(())
+    }));
+    tui.cid_resolve_override = Some(Arc::new(|url| {
+        Box::pin(async move { anyhow::bail!("no document for {url}") })
+    }));
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *opened.lock().unwrap(),
+        [
+            std::path::PathBuf::from(HTTP_URL),
+            std::path::PathBuf::from(HTTPS_URL),
+        ]
+    );
+    assert!(tui.app.detail_view_open);
+    assert_eq!(
+        tui.app.doc_view.as_ref().map(|view| view.url.as_str()),
+        Some("cid:plan:_/session1/links")
+    );
+    assert!(tui.app.doc_history.is_empty());
+    assert!(matches!(
+        tui.app.transcript.last(),
+        Some(TranscriptItem::StatusLine(message))
+            if message.contains("Failed to resolve cid:plan:_/session1/missing")
+                && message.contains("no document")
+    ));
+}
+
+#[tokio::test]
+async fn cid_document_back_resolve_failure_discards_history_and_can_close() {
+    const OLDER_BROKEN: &str = "cid:plan:_/session1/older-missing";
+    const NEWER_BROKEN: &str = "cid:plan:_/session1/newer-missing";
+
+    let mut tui = Tui::init(&test_config()).await.unwrap();
+    tui.app.transcript.clear();
+    tui.show_cid_document(crate::types::CidDocView {
+        url: "cid:plan:_/session1/current".into(),
+        title: "Current".into(),
+        text: "# Current".into(),
+        links: Vec::new(),
+        focused_link: None,
+    });
+    tui.app.doc_history = vec![(OLDER_BROKEN.into(), None), (NEWER_BROKEN.into(), None)];
+
+    let fetched = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fetched_for_resolver = Arc::clone(&fetched);
+    tui.cid_resolve_override = Some(Arc::new(move |url| {
+        fetched_for_resolver.lock().unwrap().push(url.clone());
+        Box::pin(async move { anyhow::bail!("missing history document {url}") })
+    }));
+
+    tui.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.detail_view_open);
+    assert_eq!(tui.app.doc_history, vec![(OLDER_BROKEN.into(), None)]);
+    assert!(matches!(
+        tui.app.transcript.last(),
+        Some(TranscriptItem::StatusLine(message))
+            if message.contains(NEWER_BROKEN) && message.contains("missing history document")
+    ));
+
+    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(!tui.app.detail_view_open);
+    assert!(tui.app.doc_view.is_none());
+    assert!(tui.app.doc_history.is_empty());
+    assert!(matches!(
+        tui.app.transcript.last(),
+        Some(TranscriptItem::StatusLine(message))
+            if message.contains(OLDER_BROKEN) && message.contains("missing history document")
+    ));
+    assert_eq!(*fetched.lock().unwrap(), [NEWER_BROKEN, OLDER_BROKEN]);
+}
+
+#[tokio::test]
+async fn cid_binary_writes_mime_temp_file_and_detaches_opener() {
+    let mut tui = Tui::init(&test_config()).await.unwrap();
+    tui.app.transcript.clear();
+    tui.app.transcript.push(TranscriptItem::MarkdownLink {
+        text: "Image".into(),
+        url: "cid:media:_/session1/fixture".into(),
+    });
+    tui.app.transcript_focus = Some(0);
+    tui.cid_resolve_override = Some(Arc::new(|_| {
+        Box::pin(async { Ok(resolved_blob("image/png", b"png bytes".to_vec())) })
+    }));
+
+    let opened = Arc::new(std::sync::Mutex::new(None));
+    let opened_for_hook = Arc::clone(&opened);
+    tui.detached_open_override = Some(Arc::new(move |path| {
+        *opened_for_hook.lock().unwrap() = Some(path.to_path_buf());
+        Ok(())
+    }));
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    let path = opened.lock().unwrap().clone().expect("system opener path");
+    assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("png"));
+    assert_eq!(std::fs::read(&path).unwrap(), b"png bytes");
+    assert!(!tui.app.detail_view_open);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn cid_document_renders_markdown_and_selectable_links() {
+    let mut harness = TuiTestHarness::with_size(100, 20).await;
+    let text = "# Project\n\nPlan **body** with [Build](cid:plan:_/session1/project/tasks/build).";
+    let links = crate::markdown_render::extract_markdown_links(text);
+    harness.tui().show_cid_document(crate::types::CidDocView {
+        url: "cid:plan:_/session1/project".into(),
+        title: "Project".into(),
+        text: text.into(),
+        links,
+        focused_link: Some(0),
+    });
+
+    harness.render();
+    let screen = harness.screen_contents();
+    assert!(screen.contains("Project"));
+    assert!(screen.contains("Plan body with Build."));
+    assert!(screen.contains("Links"));
+    assert!(screen.contains("Build (cid:plan:_/session1/project/tasks/build)"));
+    assert!(screen.contains("Backspace/Esc: back"));
+}
+
+#[tokio::test]
+async fn cid_resolve_error_is_reported_in_root_transcript() {
+    let mut tui = Tui::init(&test_config()).await.unwrap();
+    tui.app.transcript.clear();
+    tui.app.transcript.push(TranscriptItem::MarkdownLink {
+        text: "Missing".into(),
+        url: "cid:plan:_/session1/missing".into(),
+    });
+    tui.app.transcript_focus = Some(0);
+    tui.cid_resolve_override = Some(Arc::new(|_| {
+        Box::pin(async { anyhow::bail!("fixture missing") })
+    }));
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        tui.app.transcript.last(),
+        Some(TranscriptItem::StatusLine(message))
+            if message.contains("Failed to resolve cid:plan:_/session1/missing")
+                && message.contains("fixture missing")
+    ));
+    assert!(!tui.app.detail_view_open);
+}
+
+#[tokio::test]
+async fn child_cid_resolve_error_stays_in_child_transcript() {
+    let mut tui = Tui::init(&test_config()).await.unwrap();
+    tui.app.transcript.clear();
+    let child = crate::types::MonitoredSessionKey {
+        cluster: harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+        agent: "researcher".into(),
+        session_id: "child-link-session".into(),
+    };
+    tui.app.transcript.push(TranscriptItem::SubAgentSession {
+        key: child.clone(),
+        status: crate::types::SubAgentStatus::Running,
+        invocation_id: None,
+        progress: None,
+    });
+    tui.app.transcript_focus = Some(0);
+    let mut child_state =
+        crate::types::MonitoredSessionState::new(crate::types::SubAgentStatus::Running);
+    child_state.transcript.push(TranscriptItem::MarkdownLink {
+        text: "Missing".into(),
+        url: "cid:plan:_/session1/missing".into(),
+    });
+    child_state.transcript_focus = Some(0);
+    tui.app
+        .monitored_sessions
+        .insert(child.clone(), child_state);
+    tui.cid_resolve_override = Some(Arc::new(|_| {
+        Box::pin(async { anyhow::bail!("fixture missing") })
+    }));
+
+    assert!(tui.open_focused_root_subagent());
+    tui.handle_subagent_view_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await;
+
+    assert_eq!(tui.app.transcript.len(), 1);
+    assert!(matches!(
+        tui.app.monitored_sessions[&child].transcript.last(),
+        Some(TranscriptItem::StatusLine(message)) if message.contains("fixture missing")
+    ));
+}
+
+#[test]
+fn extract_markdown_links_ignores_empty_urls() {
+    let links = crate::markdown_render::extract_markdown_links(
+        "[empty]() [blank](<   >) [docs](https://example.com/docs)",
+    );
+
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].text, "docs");
+    assert_eq!(links[0].url, "https://example.com/docs");
+}
+
+#[test]
+fn test_messages_to_transcript_items_inserts_markdown_links() {
+    use harnx_core::message::{Message, MessageContent, MessageRole};
+    use std::collections::HashMap;
+
+    let messages = vec![
+        Message {
+            role: MessageRole::User,
+            content: MessageContent::Text("User link: [search](https://google.com)".into()),
+            id: None,
+            log_seq: Some(1),
+            log_timestamp: None,
+        },
+        Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("Assistant link: <https://github.com>".into()),
+            id: None,
+            log_seq: Some(2),
+            log_timestamp: None,
+        },
+    ];
+
+    let items = crate::lifecycle::messages_to_transcript_items_for_cluster(
+        &messages,
+        &HashMap::new(),
+        None,
+    );
+    assert_eq!(items.len(), 4);
+    assert!(
+        matches!(&items[0], TranscriptItem::UserText { text, .. } if text.contains("User link"))
+    );
+    assert!(matches!(
+        &items[1],
+        TranscriptItem::MarkdownLink { text, url } if text == "search" && url == "https://google.com"
+    ));
+    assert!(
+        matches!(&items[2], TranscriptItem::AssistantText { text, .. } if text.contains("Assistant link"))
+    );
+    assert!(matches!(
+        &items[3],
+        TranscriptItem::MarkdownLink { text, url } if text == "https://github.com" && url == "https://github.com"
+    ));
+}
+
+#[test]
+fn test_get_transcript_item_text_for_markdown_link() {
+    let item1 = TranscriptItem::MarkdownLink {
+        text: "Rust".into(),
+        url: "https://rust-lang.org".into(),
+    };
+    assert_eq!(
+        Tui::get_transcript_item_text(&item1),
+        Some("Rust: https://rust-lang.org".to_string())
+    );
+
+    let item2 = TranscriptItem::MarkdownLink {
+        text: "".into(),
+        url: "https://rust-lang.org".into(),
+    };
+    assert_eq!(
+        Tui::get_transcript_item_text(&item2),
+        Some("https://rust-lang.org".to_string())
+    );
+}
+
+#[test]
+fn test_render_markdown_link_compact() {
+    let mut link = TranscriptItem::MarkdownLink {
+        text: "Documentation".into(),
+        url: "https://docs.harnx.ai".into(),
+    };
+    let rendered = Tui::render_entry(
+        &mut link,
+        false,
+        false,
+        false,
+        80,
+        crate::types::RenderEntryState::new(false, 0),
+        None,
+    );
+    assert_eq!(rendered.total_height, 1);
+    assert_eq!(rendered.blocks.len(), 1);
+}
+
+#[test]
+fn render_markdown_link_detail_contains_fields() {
+    let item = TranscriptItem::MarkdownLink {
+        text: "Docs".into(),
+        url: "https://example.com".into(),
+    };
+    let lines = Tui::render_entry_detail(&item);
+    let rendered = lines
+        .iter()
+        .map(|line| line_to_plain(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("── link ──"));
+    assert!(rendered.contains("text: Docs"));
+    assert!(rendered.contains("url: https://example.com"));
+}
+
+#[tokio::test]
+async fn pending_markdown_link_is_appended_after_user_text() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.handle_tui_event(crate::types::TuiEvent::PendingMessageConsumed(
+        crate::types::PendingMessage {
+            text: "See [Harnx](https://harnx.dev)".into(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        },
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(
+        tui.app.transcript.as_slice().last_chunk::<2>(),
+        Some([
+            TranscriptItem::UserText { text, .. },
+            TranscriptItem::MarkdownLink { text: link_text, url }
+        ]) if text.contains("Harnx") && link_text == "Harnx" && url == "https://harnx.dev"
+    ));
 }

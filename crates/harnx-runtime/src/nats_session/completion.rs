@@ -38,13 +38,14 @@ pub(super) fn updates(
     session_id: String,
     entries: Vec<(u64, SessionLogEntry)>,
     orphan_timeout: Option<Duration>,
+    lease_acquisition_timeout: Duration,
 ) -> impl Stream<Item = Result<DurableUpdate>> {
     let poller = CompletionPoller {
         log: NatsSessionLog::new(jetstream.clone(), session_id.clone()),
         jetstream,
         session_id,
         entries,
-        watchdog: SessionLeaseWatchdog::with_orphan_timeout(orphan_timeout),
+        watchdog: SessionLeaseWatchdog::with_timeouts(orphan_timeout, lease_acquisition_timeout),
     };
     stream::unfold(poller, |mut poller| async move {
         let result = poller.poll().await;

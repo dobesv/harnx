@@ -133,9 +133,10 @@ live in `tests/it/snapshots/` with an `it__` prefix.
 ### Broker-backed tests and wall-clock margins
 
 Tests that spawn a `nats-server` run in the `broker-e2e` / `heavy-e2e` groups
-(`.config/nextest.toml`). On a contended GitHub runner that whole block has been
-measured running 6 to 40 times its idle cost, comparing runs whose diffs did not
-touch it: `cancellation::hierarchy::direct_child_cancellation_stops_only_its_worker_subtree`
+(`.config/nextest.toml`; local runs use `-local` copies with higher caps). On
+a contended GitHub runner that whole block has been measured running 6 to 40
+times its idle cost, comparing runs whose diffs did not touch it:
+`cancellation::hierarchy::direct_child_cancellation_stops_only_its_worker_subtree`
 went 0.53s to 21.2s, and the ubuntu job 184s to 483s. Tests whose duration is a
 fixed sleep stayed flat, so the cause is starvation of real work rather than
 clock skew. The trigger is not understood.
@@ -162,6 +163,11 @@ platform while the others are green is a platform regression, and the retries
 only make it slower to find. `gh run list --branch <branch> --workflow CI` also
 shows whether an earlier head on the same branch was green, which brackets the
 change that broke it.
+
+When comparing against `main` to distinguish flake from regression, use
+`origin/main`, not an intermediate branch commit. A branch that accumulated
+multiple changes may have passed earlier commits while failing on later ones,
+so a parent on the branch is not a stable baseline.
 
 ### Web/Frontend Verification
 
@@ -309,7 +315,7 @@ The checklist below covers every integration point. Miss any and the release fai
 
 2. **Workspace Cargo.toml** — add to `[workspace] members`.
 
-3. **release.yaml** — five spots: build `-p` list, `archive_specs`, x86_64 verify pattern, aarch64 verify pattern, dist bin `for` loop.
+3. **release.yaml** — four spots: one release shard's `packages` list (choose the shard whose link time it best balances; see the comment above `shard:`), the x86_64 and aarch64 `gh release download` patterns, and the "Verify extracted binaries" `for` loop.
 
 4. **docker/harnx.Dockerfile** — `COPY linux-${TARGETARCH}/<binary> /usr/local/bin/<binary>` line. The Dockerfile header lists the four release.yaml locations that must be kept in sync.
 
@@ -516,6 +522,61 @@ Empty string maps to `{}` (API omits arguments for no-arg calls). Non-empty malf
 propagates as an error with context naming the tool and echoing the raw argument string.
 This convention is consolidated across all provider parsers (`openai.rs`, `openai_responses.rs`,
 `bedrock.rs`, `claude.rs`, `cohere.rs`).
+
+### Loop protection
+
+Models, Gemini in particular, fall into loops that repeat the same tool call
+with the same result hundreds of times. `harnx_core::loop_guard::ToolRepeatGuard`
+counts identical calls within the current tool loop and escalates:
+
+- A call is identified by its name plus its arguments compared as JSON values,
+  and it counts only when its result is also identical. Gemini sends the same
+  arguments with the keys in different orders, so hashing the raw argument
+  text misses its loops; comparing results leaves polls whose output changes
+  alone.
+- The 2nd to 4th identical call within 10 minutes runs and gets a `[harnx]`
+  note in its result. The 5th is refused with an error saying when it may run
+  again. A refusal ends the turn with a `RepetitionStop` instead when the
+  model's previous response contained a refusal, or when it would be the same
+  call's third refusal. A model sends a response's calls before it sees any
+  of their results, so two refusals within one response do not end the turn
+  (`ToolRepeatGuard::begin_batch`).
+- The guard lives on `AgentLoopContext`, one per turn, and resets when a user
+  or parent message arrives mid-loop (`input.injected_user_text()`) or the
+  session is compacted (the length of `compressed_messages` changes). It never
+  reads the log.
+- A call refused in a round that also defers for human (HITL) approval is not
+  persisted as refused, and the continuation starts with a fresh guard, so
+  that call can run. That is acceptable because a person is in the loop.
+- A stop persists as the turn's `Error` entry: a sentence plus a
+  `harnx:repetition {...}` marker. Match the marker only with
+  `harnx_core::loop_guard::parse_repetition_terminal`. To classify a failed
+  turn, call `harnx_runtime::parse_worker_terminal`, which tries the budget
+  marker and then that one. The sub-agent tool and the CLI one-shot turn the
+  result into `TerminationKind::Repetition`.
+- `loop_detection.tool_calls` (global or agent front matter) and
+  `HARNX_LOOP_DETECTION=0` turn it off. The variable sets the global value, so
+  an agent whose front matter sets `tool_calls: true` still has the guard on.
+  `harnx dump session <agent> <id> --check-loop-detection` replays a stored
+  session through the same guard.
+- Tools that poll should return something that changes between calls
+  (`time_wait` and `time_wait_until` return their start and end times;
+  `bash_wait` reports total runtime), or the guard treats an unchanged poll as
+  a repeat. Conversely, a result that always changes hides a loop from the
+  guard: every `bash_exec` result for a command that ran embeds a fresh
+  `execution_id` and log paths, so no two of them match and the guard never
+  counts them, however often a model repeats the command. A `bash_exec` that
+  fails before its command starts (an empty command, an invalid `env` key or an
+  unusable `working_dir`) returns the same error each time with no id, and
+  those repeats do count. An agent whose job is polling can turn the guard
+  off in its front matter.
+- Tests that drive a mock model through repeated tool calls meet the guard
+  too: a fifth identical call with an identical result in one turn is
+  refused. Give the mock tool a result that changes per call (the
+  bounded-growth interruption test's `counter_ping` answers `pong 1`,
+  `pong 2`, …), or
+  turn the guard off in the test's config
+  (`loop_detection.tool_calls = false`).
 
 ### Tool result templates and undefined behavior
 

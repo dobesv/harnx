@@ -1,5 +1,6 @@
 //! Shared keyboard state and content helpers for transcript detail overlays.
 
+use crate::subagent_sessions::CidOpenResult;
 use crate::types::{App, TranscriptItem, Tui};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -8,6 +9,8 @@ use ratatui::text::{Line, Span};
 impl Tui {
     pub(super) fn open_detail_view_for_focused_item(&mut self) {
         self.app.detail_view_scroll = passive_scroll_state();
+        self.app.doc_view = None;
+        self.app.doc_history.clear();
         self.app.detail_view_entry = None;
         let focused_item = self
             .app
@@ -27,11 +30,102 @@ impl Tui {
     }
 
     pub(super) async fn handle_detail_view_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.app.doc_view.is_some() {
+            self.handle_cid_document_key(key).await;
+            return Ok(());
+        }
         if self.app.detail_view_entry.is_some() {
             self.handle_passive_detail_view_key(key);
             return Ok(());
         }
         self.handle_root_detail_view_key(key).await
+    }
+
+    async fn handle_cid_document_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Tab | KeyCode::Down, KeyModifiers::NONE) => self.focus_next_doc_link(),
+            (KeyCode::BackTab | KeyCode::Up, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.focus_previous_doc_link();
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => self.open_focused_doc_link().await,
+            (KeyCode::Esc | KeyCode::Backspace, KeyModifiers::NONE) => {
+                self.go_back_from_cid_document().await;
+            }
+            _ => {
+                self.handle_detail_scroll_key(key);
+            }
+        }
+    }
+
+    fn focus_next_doc_link(&mut self) {
+        let Some(view) = self.app.doc_view.as_mut() else {
+            return;
+        };
+        view.focused_link = next_link(view.focused_link, view.links.len());
+    }
+
+    fn focus_previous_doc_link(&mut self) {
+        let Some(view) = self.app.doc_view.as_mut() else {
+            return;
+        };
+        view.focused_link = previous_link(view.focused_link, view.links.len());
+    }
+
+    async fn open_focused_doc_link(&mut self) {
+        let Some((url, history_entry)) = focused_doc_link(&self.app) else {
+            return;
+        };
+        if url.starts_with("http://") || url.starts_with("https://") {
+            let _ = self.open_detached(std::path::Path::new(&url));
+            return;
+        }
+        if !url.starts_with("cid:") {
+            return;
+        }
+        self.app.doc_history.push(history_entry);
+        match self.load_cid_url(&url).await {
+            Ok(CidOpenResult::Document(view)) => self.show_cid_document(view),
+            Ok(CidOpenResult::External) => {
+                self.app.doc_history.pop();
+            }
+            Err(error) => {
+                self.app.doc_history.pop();
+                self.push_doc_resolve_error(&url, &error);
+            }
+        }
+    }
+
+    async fn go_back_from_cid_document(&mut self) {
+        let Some((url, focused_link)) = self.app.doc_history.pop() else {
+            self.app.detail_view_open = false;
+            self.app.doc_view = None;
+            return;
+        };
+        match self.load_cid_url(&url).await {
+            Ok(CidOpenResult::Document(mut view)) => {
+                view.focused_link = valid_focus(focused_link, view.links.len());
+                self.show_cid_document(view);
+            }
+            Ok(CidOpenResult::External) => {
+                if self.app.doc_history.is_empty() {
+                    self.app.detail_view_open = false;
+                    self.app.doc_view = None;
+                }
+            }
+            Err(error) => {
+                self.push_doc_resolve_error(&url, &error);
+                if self.app.doc_history.is_empty() {
+                    self.app.detail_view_open = false;
+                    self.app.doc_view = None;
+                }
+            }
+        }
+    }
+
+    fn push_doc_resolve_error(&mut self, url: &str, error: &anyhow::Error) {
+        self.app.transcript.push(TranscriptItem::StatusLine(format!(
+            "Failed to resolve {url}: {error:#}"
+        )));
     }
 
     fn handle_passive_detail_view_key(&mut self, key: KeyEvent) {
@@ -104,8 +198,47 @@ impl Tui {
     }
 }
 
+fn next_link(current: Option<usize>, link_count: usize) -> Option<usize> {
+    if link_count == 0 {
+        None
+    } else {
+        Some(current.map_or(0, |index| (index + 1) % link_count))
+    }
+}
+
+fn previous_link(current: Option<usize>, link_count: usize) -> Option<usize> {
+    if link_count == 0 {
+        None
+    } else {
+        Some(current.map_or(link_count - 1, |index| {
+            index.checked_sub(1).unwrap_or(link_count - 1)
+        }))
+    }
+}
+
+fn focused_doc_link(app: &App) -> Option<(String, (String, Option<usize>))> {
+    let view = app.doc_view.as_ref()?;
+    let link = view.links.get(view.focused_link?)?;
+    Some((link.url.clone(), (view.url.clone(), view.focused_link)))
+}
+
+fn valid_focus(focused: Option<usize>, link_count: usize) -> Option<usize> {
+    if link_count == 0 {
+        None
+    } else {
+        focused.filter(|index| *index < link_count).or(Some(0))
+    }
+}
+
 pub(super) fn detail_view_content(app: &App) -> (Vec<Vec<Line<'static>>>, String) {
-    if let Some(text) = &app.detail_view_text {
+    if let Some(view) = &app.doc_view {
+        let entries = vec![view
+            .text
+            .lines()
+            .map(|line| Line::from(Span::raw(line.to_string())))
+            .collect()];
+        (entries, view.title.clone())
+    } else if let Some(text) = &app.detail_view_text {
         let entries = vec![text
             .lines()
             .map(|line| Line::from(Span::raw(line.to_string())))
@@ -123,7 +256,9 @@ pub(super) fn detail_view_content(app: &App) -> (Vec<Vec<Line<'static>>>, String
 }
 
 pub(super) fn detail_view_footer_text(app: &App) -> String {
-    if app.detail_view_entry.is_some() {
+    if app.doc_view.is_some() {
+        " ↑↓/Tab: select link  Enter: open  Backspace/Esc: back  PgUp/PgDn: scroll".to_string()
+    } else if app.detail_view_entry.is_some() {
         " ↑↓/scroll  PgUp/PgDn/scroll  g/G top/bot  ESC/back".to_string()
     } else if app
         .copy_notice_until

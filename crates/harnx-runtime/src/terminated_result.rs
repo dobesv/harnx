@@ -14,8 +14,12 @@
 //! Budget (`token_budget`) is enforced **worker-side** at the pre-model-call boundary.
 //! It bounds cost even for orphaned/detached workers whose caller has crashed.
 //!
-//! **Timeout must never be inferred from the session log.** Budget is the only
-//! worker-side terminal signal and is the only limit that writes a marker entry.
+//! **Timeout must never be inferred from the session log.** Budget and
+//! repetition stops are the worker-side terminal signals; each leaves a marker
+//! in the turn's `Error` entry. The repetition marker is recognized only by
+//! `harnx_core::loop_guard::parse_repetition_terminal`. Callers classify an
+//! error with [`parse_worker_terminal`], which tries both recognizers, rather
+//! than repeating that sequence themselves.
 
 use harnx_core::{
     api_types::CompletionTokenUsage,
@@ -30,6 +34,26 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// for budget terminals. No other code may match this prefix directly.
 const BUDGET_TERMINAL_PREFIX: &str = "harnx:budget_exceeded ";
 
+/// Worker-side terminal condition for a bounded invocation.
+#[derive(Debug)]
+pub(crate) struct TokenBudgetExceeded {
+    budgeted: u64,
+    budget: u64,
+}
+
+impl TokenBudgetExceeded {
+    pub(crate) fn new(budgeted: u64, budget: u64) -> Self {
+        Self { budgeted, budget }
+    }
+}
+
+impl std::fmt::Display for TokenBudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&budget_terminal_message(self.budgeted, self.budget))
+    }
+}
+
+impl std::error::Error for TokenBudgetExceeded {}
 /// Maximum retained bytes in the caller-side invocation thinking buffer.
 pub const INVOCATION_TEXT_TAIL_CAP_BYTES: usize = 4 * 1024;
 
@@ -99,12 +123,13 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
-/// Limit that stopped an invocation.
+/// Reason an invocation was stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminationKind {
     Timeout,
     BudgetExceeded,
+    Repetition,
 }
 
 /// Stable token-usage shape for a synthesized termination result.
@@ -135,6 +160,9 @@ pub struct TerminationDetails {
     pub usage: TerminationUsage,
     pub thinking_excerpt: Option<String>,
     pub retry_hint: String,
+    /// What kept repeating, for a repetition stop.
+    #[serde(flatten)]
+    pub repetition: Option<harnx_core::loop_guard::RepetitionTerminal>,
 }
 
 /// Human-readable and machine-readable forms of one stopped invocation.
@@ -160,6 +188,8 @@ pub struct TerminationInputs<'a> {
     pub thinking_excerpt: Option<&'a str>,
     /// Required when `kind` is [`TerminationKind::BudgetExceeded`].
     pub budget: Option<u64>,
+    /// Required when `kind` is [`TerminationKind::Repetition`].
+    pub repetition: Option<harnx_core::loop_guard::RepetitionTerminal>,
 }
 
 /// Build the shared human-readable and structured result for a stopped invocation.
@@ -170,6 +200,7 @@ pub fn synthesize_terminated_result(inputs: TerminationInputs<'_>) -> Synthesize
         usage,
         thinking_excerpt,
         budget,
+        repetition,
     } = inputs;
     let usage = TerminationUsage::from(usage);
     let thinking_excerpt = thinking_excerpt
@@ -194,6 +225,15 @@ pub fn synthesize_terminated_result(inputs: TerminationInputs<'_>) -> Synthesize
                 ),
             )
         }
+        TerminationKind::Repetition => {
+            let terminal = repetition
+                .as_ref()
+                .expect("repetition details are required for a repetition result");
+            (
+                format!("The invocation was stopped because {}.", terminal.reason()),
+                format!("Usage: used {} budgeted tokens.", usage.budgeted),
+            )
+        }
     };
 
     let thinking_section = match thinking_excerpt.as_deref() {
@@ -214,6 +254,7 @@ pub fn synthesize_terminated_result(inputs: TerminationInputs<'_>) -> Synthesize
             usage,
             thinking_excerpt,
             retry_hint,
+            repetition,
         },
     }
 }
@@ -235,6 +276,44 @@ pub fn parse_budget_terminal(message: &str) -> Option<BudgetTerminal> {
     let prefix_start = message.rfind(BUDGET_TERMINAL_PREFIX)?;
     let payload = &message[prefix_start + BUDGET_TERMINAL_PREFIX.len()..];
     serde_json::from_str(payload).ok()
+}
+
+/// A worker-side stop recorded in a failed turn's error text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkerTerminal {
+    BudgetExceeded(BudgetTerminal),
+    Repetition(harnx_core::loop_guard::RepetitionTerminal),
+}
+
+impl WorkerTerminal {
+    pub fn kind(&self) -> TerminationKind {
+        match self {
+            Self::BudgetExceeded(_) => TerminationKind::BudgetExceeded,
+            Self::Repetition(_) => TerminationKind::Repetition,
+        }
+    }
+
+    pub fn budget(&self) -> Option<u64> {
+        match self {
+            Self::BudgetExceeded(terminal) => Some(terminal.budget),
+            Self::Repetition(_) => None,
+        }
+    }
+
+    pub fn repetition(&self) -> Option<harnx_core::loop_guard::RepetitionTerminal> {
+        match self {
+            Self::BudgetExceeded(_) => None,
+            Self::Repetition(terminal) => Some(terminal.clone()),
+        }
+    }
+}
+
+/// Classify a failed turn's error text as a worker-side stop, if it is one.
+pub fn parse_worker_terminal(message: &str) -> Option<WorkerTerminal> {
+    if let Some(budget) = parse_budget_terminal(message) {
+        return Some(WorkerTerminal::BudgetExceeded(budget));
+    }
+    harnx_core::loop_guard::parse_repetition_terminal(message).map(WorkerTerminal::Repetition)
 }
 
 #[cfg(test)]
@@ -302,6 +381,7 @@ mod tests {
             usage: &sample_usage(),
             thinking_excerpt,
             budget,
+            repetition: None,
         })
     }
 
@@ -428,6 +508,142 @@ mod tests {
             timeout.termination_json()["thinking_excerpt"],
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn repetition_result_explains_the_stop_and_carries_the_details() {
+        let terminal = harnx_core::loop_guard::RepetitionTerminal::tool_calls("fs_read", 4);
+        let result = synthesize_terminated_result(TerminationInputs {
+            kind: TerminationKind::Repetition,
+            session_id: "child",
+            usage: &sample_usage(),
+            thinking_excerpt: None,
+            budget: None,
+            repetition: Some(terminal),
+        });
+        assert!(result.response.starts_with(
+            "The invocation was stopped because the model kept repeating the same `fs_read` call \
+             with identical arguments and results."
+        ));
+        let json = result.termination_json();
+        assert_eq!(json["kind"], "repetition");
+        assert_eq!(json["source"], "tool_calls");
+        assert_eq!(json["tool"], "fs_read");
+        assert_eq!(json["count"], 4);
+    }
+
+    #[test]
+    fn repetition_details_sit_beside_the_stable_keys_not_in_a_nested_object() {
+        let result = synthesize_terminated_result(TerminationInputs {
+            kind: TerminationKind::Repetition,
+            session_id: "child",
+            usage: &sample_usage(),
+            thinking_excerpt: Some("same call again"),
+            budget: None,
+            repetition: Some(harnx_core::loop_guard::RepetitionTerminal::tool_calls(
+                "fs_read", 4,
+            )),
+        });
+
+        assert_eq!(
+            result.termination_json(),
+            serde_json::json!({
+                "kind": "repetition",
+                "session_id": "child",
+                "usage": {
+                    "input_uncached": 50,
+                    "cache_write": 10,
+                    "output": 13,
+                    "budgeted": 73
+                },
+                "thinking_excerpt": "same call again",
+                "retry_hint": "You can retry by sending a new message to the same session id `child` with revised or narrower instructions.",
+                "source": "tool_calls",
+                "tool": "fs_read",
+                "count": 4
+            })
+        );
+    }
+
+    #[test]
+    fn timeout_and_budget_json_carry_no_repetition_keys() {
+        for (kind, budget) in [
+            (TerminationKind::Timeout, None),
+            (TerminationKind::BudgetExceeded, Some(70)),
+        ] {
+            let json = synthesize_sample(kind, "session-keys", None, budget).termination_json();
+            let mut keys: Vec<&str> = json
+                .as_object()
+                .expect("termination details serialize as an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "kind",
+                    "retry_hint",
+                    "session_id",
+                    "thinking_excerpt",
+                    "usage"
+                ],
+                "{kind:?} gained keys"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_terminal_classifies_a_budget_stop() {
+        let terminal = parse_worker_terminal(&budget_terminal_message(21, 20))
+            .expect("budget message is a worker terminal");
+
+        assert_eq!(
+            terminal,
+            WorkerTerminal::BudgetExceeded(BudgetTerminal {
+                budgeted: 21,
+                budget: 20,
+            })
+        );
+        assert_eq!(
+            (terminal.kind(), terminal.budget(), terminal.repetition()),
+            (TerminationKind::BudgetExceeded, Some(20), None)
+        );
+    }
+
+    #[test]
+    fn worker_terminal_classifies_a_repetition_stop() {
+        let stop = harnx_core::loop_guard::RepetitionStop(
+            harnx_core::loop_guard::RepetitionTerminal::tool_calls("fs_read", 4),
+        );
+        let terminal =
+            parse_worker_terminal(&stop.to_string()).expect("stop text is a worker terminal");
+
+        assert_eq!(
+            (terminal.kind(), terminal.budget(), terminal.repetition()),
+            (TerminationKind::Repetition, None, Some(stop.0))
+        );
+    }
+
+    #[test]
+    fn context_wrapped_repetition_stop_is_a_worker_terminal() {
+        let stop = harnx_core::loop_guard::RepetitionTerminal::tool_calls("fs_read", 4);
+        let wrapped = anyhow::Error::new(harnx_core::loop_guard::RepetitionStop(stop.clone()))
+            .context("some worker context");
+        let rendered = format!("{wrapped:#}");
+
+        assert!(rendered.starts_with("some worker context: Stopped: "));
+        assert_eq!(
+            parse_worker_terminal(&rendered),
+            Some(WorkerTerminal::Repetition(stop))
+        );
+    }
+
+    #[test]
+    fn plain_error_is_not_a_worker_terminal() {
+        assert_eq!(parse_worker_terminal("worker failed"), None);
+        assert_eq!(parse_worker_terminal("harnx:repetition not-json"), None);
+        assert_eq!(parse_worker_terminal(""), None);
     }
 
     #[derive(Default)]

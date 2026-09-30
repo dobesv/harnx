@@ -39,9 +39,18 @@ the terminal handle selection. To copy the entire last response, use `.copy`.
 ### Transcript and sub-agent navigation
 
 When the input is blank, `↑` enters transcript navigation. Navigable rows
-include user and assistant messages, tool calls, compaction markers, and
-sub-agent sessions. Press `Enter` on a focused sub-agent row to open it in the
-fullscreen transcript surface.
+include user and assistant messages, tool calls, compaction markers,
+sub-agent sessions, and markdown links. Press `Enter` on a focused sub-agent
+row to open it in the fullscreen transcript surface. On a markdown link,
+`Enter` opens the URL in your default browser (`http`/`https`). Plan and text
+`cid:` URLs open in a fullscreen document viewer; image and binary attachments
+open in their system application.
+
+In the `cid:` document viewer, `Tab`/`↓` selects the next link and
+`Shift+Tab`/`↑` selects the previous link. Press `Enter` to follow the selected
+link. `Backspace` or `Esc` returns to the previous document, then closes the
+viewer at the start of its history. Use `PgUp`/`PgDn`, `Home`/`End`, or
+`g`/`G` to scroll.
 
 Inside a child transcript:
 

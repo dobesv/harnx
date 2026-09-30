@@ -14,8 +14,42 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
+pub(super) const MAX_ACTIVATION_FAILURES: u64 = 10;
+
+/// Marks an execution failure whose durable Error entry makes the activation
+/// safe to remove from JetStream.
+#[derive(Debug)]
+pub(super) struct DurableActivationError {
+    source: anyhow::Error,
+}
+
+impl DurableActivationError {
+    fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+}
+
+impl std::fmt::Display for DurableActivationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for DurableActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+pub(super) fn is_durable_activation_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<DurableActivationError>().is_some())
+}
+
 pub(super) struct SessionExecutionInputs {
     pub(super) activation: SessionActivate,
+    pub(super) activation_failure_key: String,
     pub(super) lease: Arc<NatsSessionLease>,
     pub(super) abort_signal: crate::utils::AbortSignal,
     pub(super) control_task: JoinHandle<()>,
@@ -43,6 +77,7 @@ struct FinishExecutionInputs {
 
 struct SessionRuntimeStartup {
     activation: SessionActivate,
+    activation_failure_key: String,
     lease: Arc<NatsSessionLease>,
     execution_abort: crate::utils::AbortSignal,
     abort_relay: JoinHandle<()>,
@@ -121,6 +156,66 @@ fn ensure_named_agent_has_model(
     Ok(())
 }
 impl WorkerRuntime {
+    pub(super) async fn count_activation_failure(
+        &self,
+        activation: &SessionActivate,
+        activation_failure_key: &str,
+    ) -> Result<u64> {
+        self.activation_failures
+            .increment(activation_failure_key)
+            .await
+            .with_context(|| {
+                format!(
+                    "count pre-turn failure for session '{}'",
+                    activation.session_id
+                )
+            })
+    }
+
+    pub(super) async fn classify_pre_turn_failure(
+        &self,
+        activation: &SessionActivate,
+        activation_failure_key: &str,
+        lease: &NatsSessionLease,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let failures = match self
+            .count_activation_failure(activation, activation_failure_key)
+            .await
+        {
+            Ok(failures) => failures,
+            Err(counter_error) => {
+                log::warn!(
+                    "failed to count activation failure: session_id={} error={counter_error:#}",
+                    activation.session_id
+                );
+                return error;
+            }
+        };
+        if failures < MAX_ACTIVATION_FAILURES {
+            return error;
+        }
+        self.durabilize_pre_turn_failure(activation, lease, error)
+            .await
+    }
+
+    pub(super) async fn durabilize_pre_turn_failure(
+        &self,
+        activation: &SessionActivate,
+        lease: &NatsSessionLease,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let backend = NatsSessionLogBackend::new(
+            self.jetstream.clone(),
+            &activation.session_id,
+            self.lease.replicas,
+        );
+        match Self::record_session_error(&backend, lease, &error).await {
+            Ok(true) => anyhow::Error::new(DurableActivationError::new(error)),
+            Ok(false) | Err(_) => error,
+        }
+    }
+
     pub(super) async fn execute_session(
         &self,
         inputs: SessionExecutionInputs,
@@ -150,12 +245,27 @@ impl WorkerRuntime {
             .metadata)
     }
 
+    fn session_backend(
+        &self,
+        activation: &SessionActivate,
+        after_seq_observer: Arc<AtomicU64>,
+    ) -> NatsSessionLogBackend {
+        NatsSessionLogBackend::new(
+            self.jetstream.clone(),
+            &activation.session_id,
+            self.lease.replicas,
+        )
+        .with_after_seq_observer(after_seq_observer)
+        .with_metadata_store(Some(self.session_metadata.clone()))
+    }
+
     async fn prepare_session_runtime(
         &self,
         inputs: SessionExecutionInputs,
     ) -> Result<SessionRuntimeStartup> {
         let SessionExecutionInputs {
             activation,
+            activation_failure_key,
             lease,
             abort_signal,
             control_task,
@@ -163,9 +273,14 @@ impl WorkerRuntime {
             execution,
             shutdown,
         } = inputs;
-        let metadata = self
-            .load_activation_metadata(&activation.session_id)
-            .await?;
+        let metadata = match self.load_activation_metadata(&activation.session_id).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Err(self
+                    .classify_pre_turn_failure(&activation, &activation_failure_key, &lease, error)
+                    .await);
+            }
+        };
         let (execution_abort, abort_relay, shutdown_relay) =
             Self::spawn_execution_abort_relays(abort_signal, shutdown.clone());
         let per_session = {
@@ -190,15 +305,10 @@ impl WorkerRuntime {
             .await,
         );
         let after_seq_observer = event_sink.after_seq_handle();
-        let backend = NatsSessionLogBackend::new(
-            self.jetstream.clone(),
-            &activation.session_id,
-            self.lease.replicas,
-        )
-        .with_after_seq_observer(Arc::clone(&after_seq_observer))
-        .with_metadata_store(Some(self.session_metadata.clone()));
+        let backend = self.session_backend(&activation, Arc::clone(&after_seq_observer));
         Ok(SessionRuntimeStartup {
             activation,
+            activation_failure_key,
             lease,
             execution_abort,
             abort_relay,
@@ -224,12 +334,19 @@ impl WorkerRuntime {
         let pending_compaction = Arc::new(parking_lot::Mutex::new(None));
         let in_flight =
             crate::nats_tool_provider::NatsInFlightCalls::for_instance(&self.instance_id);
-        let watcher_start_after = startup
-            .backend
-            .load_events_latest_async()
-            .await?
-            .last()
-            .map_or(0, |(seq, _)| *seq);
+        let watcher_start_after = match startup.backend.load_events_latest_async().await {
+            Ok(entries) => entries.last().map_or(0, |(seq, _)| *seq),
+            Err(error) => {
+                return Err(self
+                    .classify_pre_turn_failure(
+                        &startup.activation,
+                        &startup.activation_failure_key,
+                        &startup.lease,
+                        error,
+                    )
+                    .await);
+            }
+        };
         let session_watcher = super::session_watcher::spawn_session_watcher(
             super::session_watcher::SessionWatcherCtx {
                 jetstream: self.jetstream.clone(),
@@ -310,11 +427,24 @@ impl WorkerRuntime {
             per_session: prepared.per_session,
             backend: prepared.backend,
             session_watcher: prepared.session_watcher,
+
             watch_task,
             turn: Some(tokio::spawn(Box::pin(turn.run()))),
         }
     }
 
+    async fn record_execution_error(
+        running: &RunningSessionRuntime,
+        result: &Result<bool>,
+    ) -> bool {
+        let Some(error) = result.as_ref().err() else {
+            return false;
+        };
+        matches!(
+            Self::record_session_error(&running.backend, &running.lease, error).await,
+            Ok(true)
+        )
+    }
     async fn complete_session_execution(
         running: RunningSessionRuntime,
         outcome: TurnBodyOutcome,
@@ -334,13 +464,7 @@ impl WorkerRuntime {
             );
             running.execution_abort.set_ctrlc();
         }
-        let turn_error = result
-            .as_ref()
-            .err()
-            .filter(|_| !running.execution_abort.aborted());
-        if let Some(error) = turn_error {
-            Self::record_session_error(&running.backend, &running.lease, error).await;
-        }
+        let durable_error_recorded = Self::record_execution_error(&running, &result).await;
         if !running.lease.is_held() {
             log::warn!(
                 "session execution ended after failover: session_id={} worker_id={} revision={}",
@@ -360,7 +484,7 @@ impl WorkerRuntime {
             running.shutdown_relay,
         ])
         .await;
-        Self::finish_execution(
+        let finished = Self::finish_execution(
             &running.execution,
             &running.backend,
             &running.lease,
@@ -374,7 +498,12 @@ impl WorkerRuntime {
                 shutdown: running.shutdown,
             },
         )
-        .await
+        .await;
+        if durable_error_recorded {
+            finished.map_err(|error| anyhow::Error::new(DurableActivationError::new(error)))
+        } else {
+            finished
+        }
     }
 
     fn spawn_execution_abort_relays(
@@ -532,27 +661,31 @@ impl WorkerRuntime {
         backend: &NatsSessionLogBackend,
         lease: &NatsSessionLease,
         error: &anyhow::Error,
-    ) {
+    ) -> Result<bool> {
         if interrupted_by_cancel(error) {
             log::info!(
                 "turn ended in an interruption, not a failure: session_id={} error={error:#}",
                 backend.session_id()
             );
-            return;
+            return Ok(false);
         }
         if !should_append_control_log_entry(lease) {
-            return;
+            return Ok(false);
         }
         let entry = harnx_core::session::SessionLogEntry::Error {
             message: format!("{error:#}"),
             fence_token: lease.fence_token(),
             timestamp: Some(chrono::Utc::now()),
         };
-        if let Err(append_error) = backend.append_event(&entry).await {
-            log::warn!(
-                "failed to append Error entry: session_id={} err={append_error:#}",
-                backend.session_id()
-            );
+        match backend.append_event(&entry).await {
+            Ok(_) => Ok(true),
+            Err(append_error) => {
+                log::warn!(
+                    "failed to append Error entry: session_id={} err={append_error:#}",
+                    backend.session_id()
+                );
+                Err(append_error)
+            }
         }
     }
 
@@ -781,7 +914,11 @@ mod attention_tests {
         let interrupted =
             anyhow::Error::new(crate::nats_worker::backend::TurnInterrupted { cancel_seq: 7 })
                 .context("failed to durably persist tool results");
-        WorkerRuntime::record_session_error(&backend, &lease, &interrupted).await;
+        assert!(
+            !WorkerRuntime::record_session_error(&backend, &lease, &interrupted)
+                .await
+                .unwrap()
+        );
 
         // Read through the log itself: the structural guard over this file's
         // family counts the worker's leader-authoritative decision points.
@@ -800,8 +937,13 @@ mod attention_tests {
 
         // An ordinary failure still lands, so the guard is about the cause and
         // not about silencing errors.
-        WorkerRuntime::record_session_error(&backend, &lease, &anyhow::anyhow!("model exploded"))
-            .await;
+        assert!(WorkerRuntime::record_session_error(
+            &backend,
+            &lease,
+            &anyhow::anyhow!("model exploded")
+        )
+        .await
+        .unwrap());
         assert!(log.load_events_async().await.unwrap().iter().any(|(_, entry)| matches!(
             entry,
             harnx_core::session::SessionLogEntry::Error { message, .. } if message.contains("model exploded")

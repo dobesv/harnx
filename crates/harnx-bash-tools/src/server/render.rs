@@ -274,6 +274,10 @@ pub(crate) struct MetadataHeader<'a> {
     pub(crate) total_lines: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) total_bytes: Option<usize>,
+    /// How long a background process has been running; set only while it is
+    /// still running, so consecutive polls of a quiet process differ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) running_for: Option<String>,
 }
 
 fn serialize_optional_path<S>(path: &Option<&Path>, serializer: S) -> Result<S::Ok, S::Error>
@@ -336,6 +340,7 @@ pub(crate) fn render_timeout_message(ctx: TimeoutRenderContext<'_>) -> String {
             stderr_log_path: Some(stderr_log_path),
             total_lines: Some(total_lines),
             total_bytes: Some(total_bytes),
+            running_for: None,
         },
     );
     let (streams_block, _, _, _, _) = render_streams_block(

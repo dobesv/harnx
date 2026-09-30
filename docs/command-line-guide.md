@@ -42,6 +42,7 @@ harnx info agent agent1                        # View agent info
 harnx info session agent1 session1             # View session metadata
 harnx dump session agent1 session1             # Dump session transcript
 harnx dump session agent1 session1 --follow    # Follow transcript live
+harnx dump session agent1 session1 --check-loop-detection  # Show where loop protection would step in
 harnx list sessions                            # List sessions
 harnx compact session agent1 session1          # Compact session log
 harnx delete session session1 --agent myagent --cluster local  # Delete session
@@ -106,6 +107,12 @@ Either way, the caller-facing behaviour is the same:
 
 If `--final-only` is active, normal startup headers and progress lines are suppressed, but on limit exhaustion Harnx still prints the synthesized text to `stdout` and the JSON line to `stderr`.
 
+A turn can also be stopped without either flag. When loop protection (see
+[Loop Detection](configuration-guide.md#loop-detection)) ends the turn because
+the model kept making the same tool call with the same result, the one-shot run
+reports it like a budget stop: the synthesized explanation on `stdout`, one
+JSON line on `stderr` with `kind` set to `"repetition"`, and exit code **2**.
+
 ### Stderr JSON Interface
 
 The single stderr JSON line provides a stable, machine-readable contract for downstream scripts and tooling:
@@ -114,8 +121,14 @@ The single stderr JSON line provides a stable, machine-readable contract for dow
 {"kind":"timeout","session_id":"01948a3f-7b1c-7123-8901-abcdef123456","usage":{"input_uncached":120,"cache_write":0,"output":45,"budgeted":165},"thinking_excerpt":null,"retry_hint":"You can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions."}
 ```
 
+A repetition stop adds three keys after `retry_hint`:
+
+```json
+{"kind":"repetition","session_id":"01948a3f-7b1c-7123-8901-abcdef123456","usage":{"input_uncached":120,"cache_write":0,"output":45,"budgeted":165},"thinking_excerpt":null,"retry_hint":"You can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions.","source":"tool_calls","tool":"fs_read","count":4}
+```
+
 Field reference:
-- `kind`: `"timeout"` or `"budget_exceeded"`.
+- `kind`: `"timeout"`, `"budget_exceeded"` or `"repetition"`.
 - `session_id`: Session ID of the cancelled turn. Pass this ID together with the same explicit `--agent` on a subsequent prompt command to retry in the same session.
 - `usage`: Object containing token metrics for the cancelled turn:
   - `input_uncached`: Uncached input tokens.
@@ -124,6 +137,7 @@ Field reference:
   - `budgeted`: Budget metric: `(input_tokens - cached_tokens) + output_tokens`. Excludes prompt cache reads.
 - `thinking_excerpt`: String containing captured thinking text prior to cancellation, or `null` if none was captured.
 - `retry_hint`: Human-readable text explaining how to retry the session.
+- `source`, `tool`, `count`: Present only when `kind` is `"repetition"`. `source` is what kept repeating (`"tool_calls"`). `tool` is the name of the repeated tool, and `count` is how many identical calls with identical results had run within the 10-minute window when the turn was stopped.
 
 ### Execution & Limitation Details
 
@@ -223,7 +237,7 @@ Options:
 
 This command does not output transcript entries, does not include the system prompt, and does not launch MCP servers.
 
-### `harnx dump session <agent-name> <session-id> [--format text|yaml|json] [--follow]`
+### `harnx dump session <agent-name> <session-id> [--format text|yaml|json] [--follow | --check-loop-detection]`
 
 Dumps the session transcript (history).
 
@@ -235,6 +249,29 @@ Formats:
 Live tail with `--follow`:
 - `--follow`: Runs a `tail -f`-style live follow mode. Replays existing history to stdout, then listens for newly committed durable entries and streams them until interrupted with `Ctrl-C`.
 - Read-only observation: `--follow` observes the session stream and does not interrupt, cancel, or modify the running session or agent.
+
+Loop check with `--check-loop-detection`:
+- `--check-loop-detection`: Prints no transcript. Replays the session's tool calls through harnx's loop protection (see [Loop Detection](configuration-guide.md#loop-detection)) and reports each call that would have got a note, been refused, or ended the turn. Before comparing results, the replay removes the notes harnx added to them and ignores the results of calls harnx refused or stopped, so it works on a session recorded with loop protection on as well as one recorded without it. The replay starts counting again at each user message, compaction and turn end, the points where the live guard starts over.
+- `--format text` (default): One line per event: the log sequence number of the entry that requested the call, the time in UTC, what happened (`note`, `refused` or `turn stopped`), the tool, its arguments cut to 120 characters, and how many identical calls the guard counted. A summary line follows, then the first two limits below.
+
+  ```
+  ...
+  seq 158 2026-09-30 04:38:31 note: fs_read {"offset":70,"limit":70,"path":"crates/harnx-tui/src/subagent_sessions.rs"} (4 identical)
+  seq 162 2026-09-30 04:38:36 refused: fs_read {"limit":70,"offset":70,"path":"crates/harnx-tui/src/subagent_sessions.rs"} (4 identical)
+  seq 164 2026-09-30 04:38:38 note: fs_read {"offset":140,"limit":30,"path":"crates/harnx-tui/src/subagent_sessions.rs"} (3 identical)
+  seq 166 2026-09-30 04:38:40 refused: fs_read {"offset":70,"path":"crates/harnx-tui/src/subagent_sessions.rs","limit":70} (4 identical)
+  seq 168 2026-09-30 04:38:42 turn stopped: fs_read {"path":"crates/harnx-tui/src/subagent_sessions.rs","offset":70,"limit":70} (4 identical)
+  683 tool calls: 14 notes, 2 refusals, 1 stops.
+  Replay limits: after a refusal the real session may have run the call and gone on, so later events may differ from a live run; after a stop the replay skips to the next turn.
+  ```
+
+- `--format json`: Prints one JSON object, not JSONL: `{"tool_calls": <n>, "events": [...]}`. Each event has `seq`, `timestamp` (`null` when the log has no time for the call), `kind` (`"note"`, `"refusal"` or `"stop"`), `tool`, `arguments` and `count`. `tool_calls` counts every call in the log, including the calls after a stop that the replay did not decide.
+- `--format yaml` and `--follow` are rejected with this flag.
+
+Limits of the replay, in both formats (the text output prints the first two; the JSON output states none of them):
+- In a session recorded without loop protection, a refusal in the replay did not happen in the real session. The call ran, the model saw its real result and carried on, so events after a refusal can differ from what a live run would have produced.
+- After a stop, the replay does not decide the rest of that turn's calls. It picks up again at the next turn.
+- The rules apply whatever `loop_detection` was set to when the session ran.
 
 ### `harnx list sessions`
 

@@ -267,7 +267,11 @@ async fn run_dump_command(dump_args: &crate::cli::DumpArgs) -> Result<()> {
             session_id,
             format,
             follow,
+            check_loop_detection,
         } => {
+            if *check_loop_detection {
+                return run_check_loop_detection(session_id, agent_name, format).await;
+            }
             if *follow {
                 return run_dump_session_follow(session_id, agent_name, *format).await;
             }
@@ -419,6 +423,21 @@ fn new_text_dump_sink() -> Arc<dyn AgentEventSink> {
     ))
 }
 
+/// The session's stored entries with edits and rewinds applied, so every
+/// command that reads the transcript sees the same history.
+async fn load_session_entries(
+    config: &Config,
+    agent_name: &str,
+    session_id: &str,
+) -> Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
+    let (jetstream, metadata) =
+        harnx_runtime::config::session_metadata_for_agent(config, agent_name, session_id).await?;
+    let log =
+        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, metadata.storage_key());
+    let raw = log.load_events_async().await?;
+    harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)
+}
+
 async fn run_dump_session_once(
     session_id: &str,
     agent_name: &str,
@@ -426,15 +445,29 @@ async fn run_dump_session_once(
 ) -> Result<()> {
     let config = init_frontend_config(WorkingMode::Cmd, true).await?;
     let decl_map = tool_decl_map(&config);
-
-    let (jetstream, metadata) =
-        harnx_runtime::config::session_metadata_for_agent(&config, agent_name, session_id).await?;
-    let log =
-        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, metadata.storage_key());
-    let raw = log.load_events_async().await?;
-    let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
+    let entries = load_session_entries(&config, agent_name, session_id).await?;
 
     replay_dump_entries(&entries, format, &decl_map, None).await?;
+    Ok(())
+}
+
+async fn run_check_loop_detection(
+    session_id: &str,
+    agent_name: &str,
+    format: &harnx_runtime::config::SessionFormat,
+) -> Result<()> {
+    use harnx_runtime::config::SessionFormat;
+    anyhow::ensure!(
+        !matches!(format, SessionFormat::Yaml),
+        "--check-loop-detection supports --format text or --format json"
+    );
+    let config = init_frontend_config(WorkingMode::Cmd, true).await?;
+    let entries = load_session_entries(&config, agent_name, session_id).await?;
+    let report = harnx_core::loop_guard::replay::check_session(&entries);
+    match format {
+        SessionFormat::Json => println!("{}", serde_json::to_string(&report)?),
+        _ => print!("{}", report.render_text()),
+    }
     Ok(())
 }
 
@@ -1242,6 +1275,19 @@ mod tests {
             &events[3],
             AgentEvent::Tool(ToolEvent::Completed { id, .. }) if id == "call-1"
         ));
+    }
+
+    #[tokio::test]
+    async fn check_loop_detection_rejects_yaml_before_reading_the_session() {
+        let error =
+            run_check_loop_detection("sess", "agent", &harnx_runtime::config::SessionFormat::Yaml)
+                .await
+                .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--check-loop-detection supports --format text or --format json"
+        );
     }
 
     #[test]

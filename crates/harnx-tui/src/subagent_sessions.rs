@@ -5,10 +5,25 @@ use crate::lifecycle::{
 };
 use crate::subagent_transcript::{apply_child_event, flatten_subagent_event};
 use crate::types::{
-    MonitoredSessionKey, MonitoredSessionState, SubAgentStatus, SubAgentView, TranscriptItem, Tui,
+    CidDocView, MonitoredSessionKey, MonitoredSessionState, SubAgentStatus, SubAgentView,
+    TranscriptItem, Tui,
 };
+use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_core::event::{AgentEvent, SessionEvent, ToolEvent, TurnEvent};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone)]
+enum LinkTarget {
+    Root,
+    Child(MonitoredSessionKey),
+}
+
+pub(super) enum CidOpenResult {
+    Document(CidDocView),
+    External,
+}
 
 impl Tui {
     pub(super) fn cancel_selected_child(&mut self) -> bool {
@@ -69,18 +84,32 @@ impl Tui {
             return false;
         };
         self.app.detail_view_open = false;
+        self.app.doc_view = None;
+        self.app.doc_history.clear();
         self.app.detail_view_entry = None;
         self.app.subagent_view_stack.push(view);
         true
     }
 
-    pub(super) fn open_focused_root_item(&mut self) {
+    pub(super) async fn open_focused_root_item(&mut self) {
+        if let Some(url) = self.focused_root_link() {
+            self.open_link(&url, LinkTarget::Root).await;
+            return;
+        }
         if !self.open_focused_root_subagent() {
             self.open_detail_view_for_focused_item();
         }
     }
 
-    pub(super) fn handle_subagent_view_key(&mut self, key: KeyEvent) {
+    fn focused_root_link(&self) -> Option<String> {
+        let focus = self.app.transcript_focus?;
+        let TranscriptItem::MarkdownLink { url, .. } = self.app.transcript.get(focus)? else {
+            return None;
+        };
+        Some(url.clone())
+    }
+
+    pub(super) async fn handle_subagent_view_key(&mut self, key: KeyEvent) {
         let Some(current) = self
             .app
             .subagent_view_stack
@@ -94,13 +123,13 @@ impl Tui {
             return;
         }
         if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
-            self.open_focused_child_item(&current);
+            self.open_focused_child_item(&current).await;
         } else if let Some(state) = self.app.monitored_sessions.get_mut(&current) {
             navigate_child_transcript(state, key);
         }
     }
 
-    fn open_focused_child_item(&mut self, current: &MonitoredSessionKey) {
+    async fn open_focused_child_item(&mut self, current: &MonitoredSessionKey) {
         let Some(item) = self
             .app
             .monitored_sessions
@@ -124,6 +153,10 @@ impl Tui {
                     progress,
                 });
             }
+            TranscriptItem::MarkdownLink { url, .. } => {
+                self.open_link(&url, LinkTarget::Child(current.clone()))
+                    .await;
+            }
             entry => self.open_child_detail(entry),
         }
     }
@@ -132,6 +165,8 @@ impl Tui {
         let mut scroll = ratatui_widget_scrolling::ScrollState::new();
         scroll.follow = false;
         self.app.detail_view_scroll = scroll;
+        self.app.doc_view = None;
+        self.app.doc_history.clear();
         self.app.detail_view_text = None;
         self.app.detail_view_title = None;
         self.app.detail_view_entry = Some(entry);
@@ -352,6 +387,8 @@ impl Tui {
         self.app.transcript_selection_anchor = None;
         self.app.transcript_browsing = false;
         self.app.detail_view_open = false;
+        self.app.doc_view = None;
+        self.app.doc_history.clear();
         self.app.detail_view_entry = None;
         self.app.transcript = session_history_transcript_items(&self.config).await;
         self.subagent_rows_dirty = true;
@@ -391,6 +428,185 @@ impl Tui {
         }
         &mut self.app.transcript
     }
+
+    async fn open_link(&mut self, url: &str, target: LinkTarget) {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            if let Err(error) = self.open_detached(Path::new(url)) {
+                self.push_link_status(&target, format!("Failed to open {url}: {error:#}"));
+            }
+            return;
+        }
+        if !url.starts_with("cid:") {
+            return;
+        }
+        match self.load_cid_url(url).await {
+            Ok(CidOpenResult::Document(view)) => {
+                self.app.doc_history.clear();
+                self.show_cid_document(view);
+            }
+            Ok(CidOpenResult::External) => {}
+            Err(error) => {
+                self.push_link_status(&target, format!("Failed to resolve {url}: {error:#}"));
+            }
+        }
+    }
+
+    pub(super) async fn load_cid_url(&self, url: &str) -> Result<CidOpenResult> {
+        let resolved = self.resolve_cid_blob(url).await?;
+        if is_text_mime(&resolved.mime_type) {
+            let text =
+                String::from_utf8(resolved.bytes).context("resolved document is not UTF-8")?;
+            return Ok(CidOpenResult::Document(cid_document(url, text)));
+        }
+        let path = write_open_temp_file(&resolved.bytes, &resolved.mime_type)?;
+        self.open_detached(&path)
+            .with_context(|| format!("open attachment temp file '{}'", path.display()))?;
+        Ok(CidOpenResult::External)
+    }
+
+    async fn resolve_cid_blob(&self, url: &str) -> Result<harnx_blob_store::ResolvedBlob> {
+        #[cfg(test)]
+        if let Some(resolve) = &self.cid_resolve_override {
+            return resolve(url.to_string()).await;
+        }
+        let cid_url = harnx_core::cid_url::CidUrl::parse(url).context("parse cid: URL")?;
+        let config = self.config.read().clone();
+        let cluster = config.default_cluster_key().to_string();
+        let jetstream = config.nats_jetstream(&cluster).await?;
+        harnx_blob_store::resolve(&jetstream, &cid_url).await
+    }
+
+    pub(super) fn show_cid_document(&mut self, view: CidDocView) {
+        self.app.detail_view_scroll = passive_scroll_state();
+        self.app.detail_view_text = None;
+        self.app.detail_view_title = None;
+        self.app.detail_view_entry = None;
+        self.app.doc_view = Some(view);
+        self.app.detail_view_open = true;
+    }
+
+    pub(super) fn open_detached(&self, target: &Path) -> Result<()> {
+        #[cfg(test)]
+        if let Some(open) = &self.detached_open_override {
+            return open(target);
+        }
+        open::that_detached(target).context("launch system opener")
+    }
+
+    fn push_link_status(&mut self, target: &LinkTarget, message: String) {
+        let transcript = match target {
+            LinkTarget::Root => &mut self.app.transcript,
+            LinkTarget::Child(key) => match self.app.monitored_sessions.get_mut(key) {
+                Some(state) => &mut state.transcript,
+                None => &mut self.app.transcript,
+            },
+        };
+        transcript.push(TranscriptItem::StatusLine(message));
+        if matches!(target, LinkTarget::Root) {
+            self.pin_transcript_to_bottom();
+        }
+    }
+}
+
+fn passive_scroll_state() -> ratatui_widget_scrolling::ScrollState {
+    let mut scroll = ratatui_widget_scrolling::ScrollState::new();
+    scroll.follow = false;
+    scroll
+}
+
+fn cid_document(url: &str, text: String) -> CidDocView {
+    let links = crate::markdown_render::extract_markdown_links(&text);
+    let focused_link = (!links.is_empty()).then_some(0);
+    CidDocView {
+        url: url.to_string(),
+        title: document_title(url, &text),
+        text,
+        links,
+        focused_link,
+    }
+}
+
+fn document_title(url: &str, text: &str) -> String {
+    text.lines()
+        .find_map(|line| {
+            let trimmed = line.trim_start();
+            let heading = trimmed.strip_prefix('#')?.trim_start_matches('#').trim();
+            (!heading.is_empty()).then(|| heading.to_string())
+        })
+        .unwrap_or_else(|| url.rsplit('/').next().unwrap_or(url).to_string())
+}
+
+pub(super) fn write_open_temp_file(bytes: &[u8], mime_type: &str) -> Result<PathBuf> {
+    let suffix = format!(".{}", extension_for_mime(mime_type));
+    let mut file = tempfile::Builder::new()
+        .prefix("harnx-attachment-")
+        .suffix(&suffix)
+        .tempfile()
+        .context("create attachment temp file")?;
+    file.write_all(bytes)
+        .context("write attachment temp file")?;
+    file.flush().context("flush attachment temp file")?;
+    let (_, path) = file
+        .keep()
+        .map_err(|error| error.error)
+        .context("persist attachment temp file")?;
+    Ok(path)
+}
+
+pub(super) fn extension_for_mime(mime_type: &str) -> &'static str {
+    let mime_type = base_mime_type(mime_type).to_ascii_lowercase();
+    if mime_type == "text/plain" {
+        return "txt";
+    }
+    mime_guess::get_mime_extensions_str(&mime_type)
+        .and_then(|extensions| extensions.first())
+        .copied()
+        .filter(|extension| !is_unsafe_extension(extension))
+        .unwrap_or("bin")
+}
+
+pub(super) fn is_unsafe_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "application"
+            | "bat"
+            | "cmd"
+            | "com"
+            | "exe"
+            | "hta"
+            | "lnk"
+            | "vbs"
+            | "vbe"
+            | "js"
+            | "jse"
+            | "wsf"
+            | "wsh"
+            | "scr"
+            | "ps1"
+            | "sh"
+            | "bash"
+            | "svg"
+    )
+}
+
+fn is_text_mime(mime_type: &str) -> bool {
+    let mime_type = base_mime_type(mime_type).to_ascii_lowercase();
+    mime_type.starts_with("text/")
+        || matches!(
+            mime_type.as_str(),
+            "application/json"
+                | "application/javascript"
+                | "application/xml"
+                | "application/yaml"
+                | "application/x-yaml"
+                | "application/toml"
+                | "application/sql"
+                | "application/graphql"
+        )
+}
+
+fn base_mime_type(mime_type: &str) -> &str {
+    mime_type.split(';').next().unwrap_or_default().trim()
 }
 
 fn navigate_child_transcript(state: &mut MonitoredSessionState, key: KeyEvent) {

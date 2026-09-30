@@ -165,6 +165,8 @@ pub(crate) struct SpawnedProcess {
     stderr_log_path: PathBuf,
     before_snap_ids: Vec<(PathBuf, gix::ObjectId)>,
     snapshot_decision: SnapshotDecision,
+    /// Spawn time, kept across polls so each `wait` can report total runtime.
+    started_at: std::time::Instant,
 }
 
 struct BashServerInner {

@@ -6,7 +6,7 @@
 //! inquire prompts — are injected via callbacks on `ToolEvalContext`,
 //! constructed on the harnx side by `build_tool_eval_context`.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use futures_util::future::join_all;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
@@ -202,9 +202,6 @@ pub async fn eval_tool_calls_with_authorization(
     let mut calls = calls;
     ensure_tool_call_ids(&mut calls);
     let calls = ToolCall::dedup(calls);
-    if calls.is_empty() {
-        bail!("The request was aborted because an infinite loop of function calls was detected.")
-    }
 
     let mut is_all_null = true;
     let mut approved = Vec::new();

@@ -114,6 +114,9 @@ pub struct AgentLoopContext {
     /// Optional per-session working directory. When unset, runtime falls back
     /// to process cwd for CLI compatibility.
     pub working_dir: Option<PathBuf>,
+    /// Repetition guard for this turn's tool loop. Frontends build a new
+    /// context for every turn, so every turn starts with an empty guard.
+    pub tool_loop_guard: crate::tool_loop_guard::ToolLoopGuardHandle,
 }
 
 impl AgentLoopContext {
@@ -348,9 +351,11 @@ async fn emit_turn_ended<T>(ctx: &AgentLoopContext, result: &Result<T>) -> Resul
     ctx.check_generation("turn-ended")?;
     if let Err(error) = result {
         if !ctx.abort_signal.aborted() {
-            harnx_core::sink::emit_agent_event(AgentEvent::Model(ModelEvent::Error(
-                harnx_render::pretty_error_string(error),
-            )));
+            // The persisted error keeps the machine-readable marker for
+            // parents; people watching live only need the sentence.
+            let text = harnx_core::loop_guard::repetition_stop_sentence(error)
+                .unwrap_or_else(|| harnx_render::pretty_error_string(error));
+            harnx_core::sink::emit_agent_event(AgentEvent::Model(ModelEvent::Error(text)));
         }
     }
     harnx_core::sink::emit_agent_event(AgentEvent::Turn(TurnEvent::Ended {
@@ -896,9 +901,9 @@ fn enforce_token_budget(ctx: &AgentLoopContext) -> Result<()> {
     let budgeted = current_budgeted.saturating_sub(ctx.usage_at_start.budgeted_tokens());
 
     if budgeted >= budget {
-        return Err(anyhow::Error::msg(crate::budget_terminal_message(
-            budgeted, budget,
-        )));
+        return Err(anyhow::Error::new(
+            crate::terminated_result::TokenBudgetExceeded::new(budgeted, budget),
+        ));
     }
     Ok(())
 }
@@ -1053,6 +1058,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
 #[cfg(test)]
 mod tests {
     mod input_persistence_tests;
+    mod tool_loop_guard_tests;
 
     use super::*;
     use crate::client::{
@@ -1497,6 +1503,7 @@ mod tests {
             nats_hook_provider: None,
             pending_async_context: None,
             working_dir: None,
+            tool_loop_guard: Default::default(),
         }
     }
 
@@ -1668,6 +1675,7 @@ mod tests {
             max_resume: Some(0),
             nats_hook_provider: None,
             pending_async_context: None,
+            tool_loop_guard: Default::default(),
         }
     }
 

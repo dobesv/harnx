@@ -190,6 +190,7 @@ fn test_agent_loop_context(
         nats_hook_provider: None,
         pending_async_context: None,
         working_dir: None,
+        tool_loop_guard: Default::default(),
     }
 }
 
@@ -241,17 +242,18 @@ impl Tui {
         self.refresh_input_chrome();
     }
 
-    async fn finish_durable_pending_enqueue(&mut self, pending: PendingMessage) {
+    pub(crate) async fn finish_durable_pending_enqueue(&mut self, pending: PendingMessage) {
         // The worker can consume this at its next tool-round seam. Remove the
         // local fallback so turn completion cannot submit it twice.
         self.app.pending_message = None;
         *self.shared_pending_message.lock().await = None;
         self.app.input = Self::new_input();
         self.app.transcript.push(TranscriptItem::UserText {
-            text: pending.text,
+            text: pending.text.clone(),
             seq: None,
             timestamp: Some(chrono::Utc::now()),
         });
+        crate::lifecycle::append_markdown_links(&mut self.app.transcript, &pending.text);
         self.pin_transcript_to_bottom();
     }
 

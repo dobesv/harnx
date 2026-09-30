@@ -184,6 +184,7 @@ struct SubagentToolsetStart {
     jetstream: jetstream::Context,
     replicas: usize,
     session_metadata: crate::nats_session_metadata::SessionMetadataStore,
+    lease_acquisition_timeout: std::time::Duration,
 }
 
 async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandle<Result<()>>> {
@@ -195,6 +196,7 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
         jetstream,
         replicas,
         session_metadata,
+        lease_acquisition_timeout,
     } = start;
     let package = harnx_core::package_namespace::pkg_from_qualified(&agent).map(str::to_string);
     let registration_context = jetstream.clone();
@@ -206,7 +208,8 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
             jetstream,
             session_metadata,
             replicas,
-        ),
+        )
+        .with_lease_acquisition_timeout(lease_acquisition_timeout),
     ));
     let server_name = harnx_toolset::Toolset::name(toolset.as_ref()).to_string();
     let identity_token = harnx_toolset::server_identity_token(package.as_deref(), "", &server_name);
@@ -423,6 +426,8 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
         // Tool servers aren't started here anymore — each session's own
         // servers start on demand through `WorkerRuntime::server_reconciler`.
         let (_worker_tool_servers, global_hooks) = configured_worker_services(&config);
+        let lease_acquisition_timeout =
+            std::time::Duration::from_secs(config.read().nats_lease_acquisition_timeout_secs);
         let registrations = list_agents().into_iter().map(|agent| {
             let start = SubagentToolsetStart {
                 agent: agent.clone(),
@@ -435,6 +440,7 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
                 jetstream: jetstream.clone(),
                 replicas,
                 session_metadata: session_metadata.clone(),
+                lease_acquisition_timeout,
             };
             async move { (agent, start_subagent_toolset(start).await) }
         });

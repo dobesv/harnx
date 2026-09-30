@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+/// RFC 3339 at second precision with the offset, matching `wait_until`'s target.
+const RFC3339_SECONDS: &str = "%Y-%m-%dT%H:%M:%S%:z";
+
 #[derive(Clone)]
 pub struct TimeToolset {
     local_tz: String,
@@ -78,9 +81,13 @@ impl TimeToolset {
             ));
         }
         let duration = Duration::from_secs_f64(args.seconds);
+        let tz: Tz = self.local_tz.parse().unwrap_or(chrono_tz::UTC);
+        let started_at = Utc::now().with_timezone(&tz);
         tokio::select! {
             _ = tokio::time::sleep(duration) => Ok(json!({
-                "message": format!("Waited {:.1} seconds", args.seconds)
+                "message": format!("Waited {:.1} seconds", args.seconds),
+                "started_at": started_at.format(RFC3339_SECONDS).to_string(),
+                "ended_at": Utc::now().with_timezone(&tz).format(RFC3339_SECONDS).to_string(),
             })),
             _ = cancel.cancelled() => Err(ToolInvokeError::Fatal("tool call cancelled".to_string())),
         }
@@ -129,8 +136,10 @@ impl TimeToolset {
         let duration = duration.to_std().map_err(recoverable)?;
         tokio::select! {
             _ = tokio::time::sleep(duration) => Ok(json!({
-                "target": target.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+                "target": target.format(RFC3339_SECONDS).to_string(),
                 "waited_seconds": duration.as_secs_f64(),
+                "started_at": now.format(RFC3339_SECONDS).to_string(),
+                "ended_at": Utc::now().with_timezone(&tz).format(RFC3339_SECONDS).to_string(),
             })),
             _ = cancel.cancelled() => Err(ToolInvokeError::Fatal("tool call cancelled".to_string())),
         }
@@ -388,5 +397,43 @@ mod tests {
             .invoke("wait", json!({ "seconds": 30.0 }), cancel)
             .await;
         assert!(matches!(result, Err(ToolInvokeError::Fatal(_))));
+    }
+
+    #[tokio::test]
+    async fn wait_reports_start_and_end_times() {
+        let result = TimeToolset::new()
+            .invoke("wait", json!({ "seconds": 0.2 }), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result["message"], "Waited 0.2 seconds");
+        let started =
+            chrono::DateTime::parse_from_rfc3339(result["started_at"].as_str().unwrap()).unwrap();
+        let ended =
+            chrono::DateTime::parse_from_rfc3339(result["ended_at"].as_str().unwrap()).unwrap();
+        assert!(ended >= started);
+    }
+
+    #[tokio::test]
+    async fn wait_until_reports_start_and_end_times() {
+        // The target is two seconds out, truncated to whole seconds, so the
+        // wait is between one and two seconds and never already in the past.
+        let target = (Utc::now() + chrono::Duration::seconds(2))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let result = TimeToolset::new()
+            .invoke(
+                "wait_until",
+                json!({ "time": target, "timezone": "UTC" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["target"], format!("{target}+00:00"));
+        assert!(result["waited_seconds"].as_f64().unwrap() > 0.0);
+        let started =
+            chrono::DateTime::parse_from_rfc3339(result["started_at"].as_str().unwrap()).unwrap();
+        let ended =
+            chrono::DateTime::parse_from_rfc3339(result["ended_at"].as_str().unwrap()).unwrap();
+        assert!(ended >= started);
     }
 }

@@ -428,7 +428,7 @@ async fn create_lease(
 /// is the split-brain guard every session write is fenced against, so a
 /// bucket stuck at R=1 on a cluster configured for R=3 defeats the point of
 /// running a cluster at all.
-async fn ensure_lease_bucket(
+pub(crate) async fn ensure_lease_bucket(
     jetstream: &jetstream::Context,
     config: &NatsLeaseConfig,
 ) -> Result<kv::Store> {
