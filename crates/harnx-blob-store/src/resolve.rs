@@ -1,6 +1,6 @@
 //! Resolution of canonical `cid:` URLs into bytes and response metadata.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use harnx_core::cid_url::CidUrl;
 
 use crate::{get_media, media::optional_attachments_bucket, touch_activity};
@@ -34,7 +34,15 @@ pub async fn resolve(
                 immutable: true,
             }
         }
-        CidUrl::Plan { .. } => bail!("plan URLs not yet supported"),
+        CidUrl::Plan { .. } => {
+            let rendered = crate::plans::render(jetstream, url).await?;
+            ResolvedBlob {
+                mime_type: "text/markdown; charset=utf-8".to_string(),
+                bytes: rendered.markdown.into_bytes(),
+                etag: Some(rendered.max_revision.to_string()),
+                immutable: false,
+            }
+        }
     };
 
     if let Err(error) = touch_activity(jetstream, &url.owner()).await {

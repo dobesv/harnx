@@ -23,6 +23,20 @@ pub(crate) fn gen_id() -> String {
     format!("{:08x}", (nanos & 0xffff_ffff) as u32)
 }
 
+pub(crate) fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+pub(crate) fn plan_item_id(url: &str) -> Option<String> {
+    match CidUrl::parse(url).ok()? {
+        CidUrl::Plan {
+            item: PlanItem::Task(id) | PlanItem::Note(id),
+            ..
+        } => Some(id),
+        _ => None,
+    }
+}
+
 pub(crate) fn slugify(value: &str) -> Result<String, ErrorData> {
     let mut slug = String::new();
     let mut separator = false;
@@ -230,6 +244,74 @@ pub(crate) fn result_text(text: impl Into<String>) -> Result<CallToolResult, Err
     )]))
 }
 
+pub(crate) const PLAN_MARKDOWN_MIME: &str = "text/markdown; charset=utf-8";
+
+pub(crate) struct ResponseResource {
+    url: String,
+    name: &'static str,
+    label: String,
+}
+
+impl ResponseResource {
+    pub(crate) fn new(url: &CidUrl, name: &'static str, label: impl Into<String>) -> Self {
+        Self {
+            url: url.to_string(),
+            name,
+            label: label.into(),
+        }
+    }
+}
+
+pub(crate) fn item_resources(
+    plan: &CidUrl,
+    item: &CidUrl,
+    name: &'static str,
+    item_label: &str,
+) -> Vec<ResponseResource> {
+    vec![
+        ResponseResource::new(plan, "plan", "Plan Index"),
+        ResponseResource::new(item, name, item_label),
+    ]
+}
+
+pub(crate) fn result_json_with_resources(
+    value: Value,
+    resources: Vec<ResponseResource>,
+) -> Result<CallToolResult, ErrorData> {
+    let text = serde_json::to_string_pretty(&value)
+        .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+    result_text_with_resources(text, resources)
+}
+
+fn result_text_with_resources(
+    text: String,
+    resources: Vec<ResponseResource>,
+) -> Result<CallToolResult, ErrorData> {
+    let mut content = vec![ContentBlock::text(text)];
+    if !resources.is_empty() {
+        let links = resources
+            .iter()
+            .map(|resource| format!("[{}]({})", markdown_label(&resource.label), resource.url))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        content.push(ContentBlock::text(links));
+    }
+    content.extend(resources.into_iter().map(|resource| {
+        ContentBlock::resource_link(
+            rmcp::model::Resource::new(resource.url, resource.name)
+                .with_mime_type(PLAN_MARKDOWN_MIME),
+        )
+    }));
+    Ok(CallToolResult::success(content))
+}
+
+fn markdown_label(label: &str) -> String {
+    label
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
 pub(crate) struct DiffResult {
     pub message: String,
     pub diff: String,
@@ -241,6 +323,18 @@ pub(crate) fn result_with_diff(input: DiffResult) -> Result<CallToolResult, Erro
     } else {
         result_text(format!("{}\n\n{}", input.message, input.diff))
     }
+}
+
+pub(crate) fn result_with_diff_and_resources(
+    input: DiffResult,
+    resources: Vec<ResponseResource>,
+) -> Result<CallToolResult, ErrorData> {
+    let text = if input.diff.is_empty() {
+        input.message
+    } else {
+        format!("{}\n\n{}", input.message, input.diff)
+    };
+    result_text_with_resources(text, resources)
 }
 
 pub(crate) struct DiffText<'a> {

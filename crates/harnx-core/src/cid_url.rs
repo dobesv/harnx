@@ -15,7 +15,7 @@
 //! - `_temp` (`TEMP_AGENT_NAME`) represents sessions without an agent.
 //! - `<session-id>` is the 6-char local id `[A-Za-z0-9_-]+` (may start with `-`).
 //! - Media: `cid:media:<agent>/<sid>/<sha256>` — immutable, cache forever.
-//! - Plans: `cid:plan:<agent>/<sid>/<slug>` — mutable, no-cache/ETag.
+//! - Plans: `cid:plan:<agent>/<sid>/<slug>` — mutable, validate caches with revision ETags.
 //!
 //! ## Storage Key
 //!

@@ -53,7 +53,10 @@ pub(crate) async fn get(
         .ok_or_else(|| ErrorData::invalid_params(format!("task not found: {url}"), None))?;
     let task = parse_task(&stored.content).map_err(map_internal)?;
     context.touch(&plan).await;
-    result_json(task_json(&task))
+    result_json_with_resources(
+        task_json(&task),
+        item_resources(&plan, &url, "task", &task_label(&task, &url)),
+    )
 }
 
 fn task_location(plan: &str, id: &str) -> Result<(CidUrl, CidUrl), ErrorData> {
@@ -81,10 +84,12 @@ pub(crate) async fn add(
         executor: params.executor,
     };
     let url = add_spec(context, &plan, spec).await?;
-    let stored = get_document(context.store, &CidUrl::parse(&url).map_err(map_internal)?)
+    let task_url = CidUrl::parse(&url).map_err(map_internal)?;
+    let stored = get_document(context.store, &task_url)
         .await
         .map_err(map_internal)?
         .ok_or_else(|| ErrorData::internal_error("new task was not stored", None))?;
+    let task = parse_task(&stored.content).map_err(map_internal)?;
     let path = format!("{url}.md");
     let diff = diff_text(DiffText {
         before: "",
@@ -92,10 +97,13 @@ pub(crate) async fn add(
         path: &path,
     });
     context.touch(&plan).await;
-    result_with_diff(DiffResult {
-        message: format!("added task {url} to plan {plan}"),
-        diff,
-    })
+    result_with_diff_and_resources(
+        DiffResult {
+            message: format!("added task {url} to plan {plan}"),
+            diff,
+        },
+        item_resources(&plan, &task_url, "task", &task_label(&task, &task_url)),
+    )
 }
 
 pub(super) async fn add_spec(
@@ -193,10 +201,13 @@ pub(crate) async fn update(
         path: &path,
     });
     context.touch(&plan).await;
-    result_with_diff(DiffResult {
-        message: format!("updated task {url}"),
-        diff,
-    })
+    result_with_diff_and_resources(
+        DiffResult {
+            message: format!("updated task {url}"),
+            diff,
+        },
+        item_resources(&plan, &url, "task", &task_label(&task, &url)),
+    )
 }
 
 fn update_task_document(
@@ -245,6 +256,13 @@ pub(crate) async fn delete(
         message: format!("deleted task {url}"),
         diff,
     })
+}
+
+fn task_label(task: &TaskDocument, url: &CidUrl) -> String {
+    non_empty(Some(task.front.title.trim()))
+        .map(ToOwned::to_owned)
+        .or_else(|| plan_item_id(&url.to_string()))
+        .unwrap_or_else(|| url.to_string())
 }
 
 fn task_json(task: &TaskDocument) -> Value {

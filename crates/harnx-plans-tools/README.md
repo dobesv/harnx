@@ -40,4 +40,6 @@ Task dependencies are task URLs. Bare plan names and bare item IDs are rejected.
 - Tasks: `list_tasks`, `add_task`, `get_task`, `update_task`, `delete_task`
 - Notes: `list_notes`, `add_note`, `get_note`, `update_note`, `delete_note`
 
+Tool responses include markdown cross-links (`[title](url)`) and MCP `ContentBlock::resource_link` entries with MIME `text/markdown; charset=utf-8` for the plan index and affected item, while preserving diff blocks for mutations.
+
 Writes use revision compare-and-set and retry conflicts up to five times. Reads and writes touch owner session activity so active plans follow session retention instead of a separate filesystem cleanup policy.

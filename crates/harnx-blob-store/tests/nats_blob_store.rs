@@ -2,7 +2,12 @@ use anyhow::{Context, Result};
 use harnx_blob_store::{
     delete_owner, ensure_plans_bucket,
     media::{ensure_attachments_bucket, get_media, put_media},
-    media_cid_url, resolve, touch_activity, ResolvedBlob,
+    media_cid_url,
+    plans::{
+        create_document, serialize_note, serialize_plan, serialize_task, NoteDocument,
+        NoteFrontMatter, PlanDocument, PlanFrontMatter, TaskDocument, TaskFrontMatter,
+    },
+    resolve, touch_activity, ResolvedBlob,
 };
 use harnx_core::cid_url::{CidUrl, PlanItem, SessionRef};
 
@@ -85,21 +90,153 @@ async fn resolve_missing_media_returns_error() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn resolve_rejects_plan_urls() -> Result<()> {
+async fn resolve_renders_plan_index_task_and_note() -> Result<()> {
     harnx_core::require_nextest();
     let Some((_server, jetstream)) = isolated_jetstream().await? else {
         return Ok(());
     };
-    let session = SessionRef::new(None, "plan01".to_string())?;
-    let plan = CidUrl::Plan {
-        session,
-        slug: "project-plan".to_string(),
-        item: PlanItem::Index,
-    };
+    let fixture = seed_rendered_plan(&jetstream).await?;
+    let PlanResolveFixture {
+        plan,
+        task,
+        note,
+        plan_revision,
+        task_revision,
+        note_revision,
+    } = fixture;
 
-    let error = resolve(&jetstream, &plan).await.unwrap_err();
-    assert_eq!(error.to_string(), "plan URLs not yet supported");
+    let index = resolve(&jetstream, &plan).await?;
+    assert_plan_blob(&index, note_revision);
+    let index_markdown = String::from_utf8(index.bytes)?;
+    assert!(index_markdown.starts_with("# Project Plan\n\nShip plan rendering"));
+    assert!(index_markdown.contains(&format!("[Build renderer]({task})")));
+    assert!(index_markdown.contains(&format!("[Decision]({note}) — Atlas")));
+
+    let rendered_task = resolve(&jetstream, &task).await?;
+    assert_plan_blob(&rendered_task, task_revision);
+    let task_markdown = String::from_utf8(rendered_task.bytes)?;
+    assert!(task_markdown.contains(&format!("[Plan Index]({plan})")));
+    assert!(task_markdown.contains("# Build renderer"));
+
+    let rendered_note = resolve(&jetstream, &note).await?;
+    assert_plan_blob(&rendered_note, note_revision);
+    let note_markdown = String::from_utf8(rendered_note.bytes)?;
+    assert!(note_markdown.contains("# Note: Decision"));
+    assert!(note_markdown.contains("Author: Atlas"));
+    assert!(plan_revision < task_revision && task_revision < note_revision);
     Ok(())
+}
+
+struct PlanResolveFixture {
+    plan: CidUrl,
+    task: CidUrl,
+    note: CidUrl,
+    plan_revision: u64,
+    task_revision: u64,
+    note_revision: u64,
+}
+
+async fn seed_rendered_plan(
+    jetstream: &async_nats::jetstream::Context,
+) -> Result<PlanResolveFixture> {
+    let store = ensure_plans_bucket(jetstream, 1).await?;
+    let session = SessionRef::new(None, "plan01".to_string())?;
+    let plan = plan_item_url(&session, PlanItem::Index);
+    let task = plan_item_url(&session, PlanItem::Task("build".to_string()));
+    let note = plan_item_url(&session, PlanItem::Note("decision".to_string()));
+    let plan_revision =
+        create_document(&store, &plan, &serialize_plan(&plan_document(&plan))?).await?;
+    let task_revision = create_document(
+        &store,
+        &task,
+        &serialize_task(&task_document(&plan, &task))?,
+    )
+    .await?;
+    let note_revision =
+        create_document(&store, &note, &serialize_note(&note_document(&note))?).await?;
+    Ok(PlanResolveFixture {
+        plan,
+        task,
+        note,
+        plan_revision,
+        task_revision,
+        note_revision,
+    })
+}
+
+fn plan_document(plan: &CidUrl) -> PlanDocument {
+    PlanDocument {
+        front: PlanFrontMatter {
+            id: plan.to_string(),
+            title: Some("Project Plan".to_string()),
+            summary: Some("Ship plan rendering".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            ..PlanFrontMatter::default()
+        },
+        body: "Plan body".to_string(),
+    }
+}
+
+fn task_document(plan: &CidUrl, task: &CidUrl) -> TaskDocument {
+    TaskDocument {
+        front: TaskFrontMatter {
+            id: task.to_string(),
+            title: "Build renderer".to_string(),
+            summary: Some("Render every item".to_string()),
+            author: None,
+            assignee: None,
+            executor: None,
+            tags: Vec::new(),
+            plan: plan.to_string(),
+            status: "open".to_string(),
+            created_at: "2026-01-02T00:00:00Z".to_string(),
+            updated_at: None,
+            dependencies: Vec::new(),
+        },
+        body: "Task body".to_string(),
+    }
+}
+
+fn note_document(note: &CidUrl) -> NoteDocument {
+    NoteDocument {
+        front: NoteFrontMatter {
+            id: note.to_string(),
+            summary: Some("Decision".to_string()),
+            author: Some("Atlas".to_string()),
+            created_at: "2026-01-03T00:00:00Z".to_string(),
+            updated_at: None,
+        },
+        body: "Use markdown.".to_string(),
+    }
+}
+
+fn plan_item_url(session: &SessionRef, item: PlanItem) -> CidUrl {
+    CidUrl::Plan {
+        session: session.clone(),
+        slug: "project-plan".to_string(),
+        item,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_missing_plan_returns_error() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    ensure_plans_bucket(&jetstream, 1).await?;
+    let session = SessionRef::new(None, "misspl".to_string())?;
+    let url = plan_item_url(&session, PlanItem::Index);
+
+    let error = resolve(&jetstream, &url).await.unwrap_err();
+    assert_eq!(error.to_string(), format!("plan document not found: {url}"));
+    Ok(())
+}
+
+fn assert_plan_blob(blob: &ResolvedBlob, revision: u64) {
+    assert_eq!(blob.mime_type, "text/markdown; charset=utf-8");
+    assert_eq!(blob.etag, Some(revision.to_string()));
+    assert!(!blob.immutable);
 }
 
 #[tokio::test(flavor = "multi_thread")]
