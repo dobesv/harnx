@@ -1,0 +1,303 @@
+use crate::common;
+
+use anyhow::{Context, Result};
+use harnx_core::session::SessionLogEntry;
+use harnx_runtime::{
+    config::Config,
+    nats_admin::delete_remote_session,
+    nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease},
+    nats_session_log::NatsSessionLog,
+    nats_session_metadata::SessionMetadataStore,
+    NatsSession, NatsSessionConfig, SessionActivationRoute, SessionInitializer,
+};
+
+fn config(agent: &str) -> NatsSessionConfig {
+    NatsSessionConfig {
+        cluster: "local".into(),
+        initializer: SessionInitializer::named(agent, Default::default()),
+        session_id: Some("review-12345".into()),
+        activation_route: SessionActivationRoute::ClusterShared,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_local_id_has_independent_history_leases_cancellation_and_deletion() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = common::spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let js = async_nats::jetstream::new(client.clone());
+    let create = |agent| {
+        NatsSession::new(
+            config(agent),
+            client.clone(),
+            js.clone(),
+            harnx_runtime::utils::create_abort_signal(),
+        )
+    };
+    let (alpha, beta) = tokio::try_join!(create("alpha"), create("beta"))?;
+    assert_eq!(alpha.session_id(), "review-12345");
+    assert_eq!(beta.session_id(), "review-12345");
+    assert_ne!(alpha.storage_key(), beta.storage_key());
+
+    let alpha_lease = acquire_lease(&js, &alpha).await?;
+    let beta_lease = acquire_lease(&js, &beta).await?;
+    let alpha_prompt = alpha.enqueue_text("alpha review").await?;
+    let beta_prompt = beta.enqueue_text("beta review").await?;
+    assert_eq!(alpha_prompt.user_msg_seq(), 1);
+    assert_eq!(beta_prompt.user_msg_seq(), 1);
+
+    let metadata = SessionMetadataStore::ensure(&js, 1).await?;
+    assert_metadata_isolation(&metadata, &alpha).await?;
+
+    let resumed = create("alpha").await?;
+    assert_eq!(resumed.storage_key(), alpha.storage_key());
+    let alpha_log = NatsSessionLog::new_with_replicas(js.clone(), alpha.storage_key(), 1);
+    let beta_log = NatsSessionLog::new_with_replicas(js.clone(), beta.storage_key(), 1);
+    assert_independent_history(&alpha_log, &beta_log).await?;
+
+    let attachment_cid = upload_shared_attachment(&js, [&alpha, &beta]).await?;
+    alpha.interrupt("client cancel").await?;
+    // The interrupt lands in alpha's own log and nowhere else: the two
+    // sessions share an agent name prefix but not a transcript.
+    assert!(alpha_log
+        .load_events_async()
+        .await?
+        .iter()
+        .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. })));
+    assert!(!beta_log
+        .load_events_async()
+        .await?
+        .iter()
+        .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. })));
+    alpha_lease.release().await?;
+    let admin = admin_config(server.url());
+    let deleted = delete_remote_session(&admin, "local", "alpha", "review-12345").await?;
+    assert!(deleted.stream_deleted);
+    assert_eq!(deleted.attachments_deleted, 1);
+    assert_beta_survived_deletion(&js, &beta, &beta_lease, &attachment_cid).await?;
+    beta_lease.release().await?;
+    Ok(())
+}
+
+async fn upload_shared_attachment(
+    js: &async_nats::jetstream::Context,
+    sessions: [&NatsSession; 2],
+) -> Result<String> {
+    use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart};
+    let data_url = format!(
+        "data:text/plain;base64,{}",
+        harnx_core::crypto::base64_encode(b"review attachment")
+    );
+    let beta_cid = harnx_core::attachments::cid_for_data_url_with_session(
+        &sessions[1].session_ref(),
+        &data_url,
+    );
+    for session in sessions {
+        let mut content = MessageContent::Array(vec![MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: data_url.clone(),
+            },
+        }]);
+        harnx_runtime::nats_attachments::externalize_message_attachments(
+            harnx_runtime::nats_attachments::AttachmentLocation::new(js, 1, &session.session_ref()),
+            &mut content,
+            None,
+        )
+        .await?;
+    }
+    Ok(beta_cid)
+}
+
+#[tokio::test]
+async fn reserved_inline_name_cannot_create_a_named_session() -> Result<()> {
+    let Some(server) = common::spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let js = async_nats::jetstream::new(client.clone());
+    let result = NatsSession::new(
+        config(harnx_core::agent_config::TEMP_AGENT_NAME),
+        client,
+        js,
+        harnx_runtime::utils::create_abort_signal(),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "reserved inline name must not create a second storage identity"
+    );
+    Ok(())
+}
+
+async fn assert_metadata_isolation(
+    metadata: &SessionMetadataStore,
+    alpha: &NatsSession,
+) -> Result<()> {
+    metadata
+        .patch(alpha.storage_key(), |record| {
+            record.title.value = Some("alpha title".into());
+            Ok(())
+        })
+        .await?;
+    let beta_record = metadata
+        .get_for_agent("review-12345", "beta")
+        .await?
+        .unwrap();
+    assert_eq!(beta_record.metadata.title.value, None);
+    assert_eq!(metadata.list().await?.len(), 2);
+
+    Ok(())
+}
+
+fn admin_config(url: &str) -> Config {
+    let mut admin = Config::default();
+    admin
+        .nats_servers
+        .push(harnx_runtime::config::NatsServerConfig {
+            name: "local".into(),
+            url: url.into(),
+            token: None,
+            replicas: Some(1),
+            tls: Some(false),
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
+            ignore_discovered_servers: None,
+            agents: Vec::new(),
+        });
+    admin
+}
+
+async fn assert_independent_history(
+    alpha_log: &NatsSessionLog,
+    beta_log: &NatsSessionLog,
+) -> Result<()> {
+    for (log, text) in [(alpha_log, "alpha review"), (beta_log, "beta review")] {
+        let entries = log.load_events_async().await?;
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(&entries[0].1, SessionLogEntry::Message { content, .. } if content.to_text() == text)
+        );
+    }
+    Ok(())
+}
+
+async fn acquire_lease(
+    js: &async_nats::jetstream::Context,
+    session: &NatsSession,
+) -> Result<NatsSessionLease> {
+    NatsSessionLease::acquire(NatsLeaseAcquireParams {
+        jetstream: js.clone(),
+        session_id: session.storage_key(),
+        worker_id: "same-worker".into(),
+        generation: 1,
+        config: NatsLeaseConfig::default(),
+        session_metadata: None,
+    })
+    .await?
+    .context("each agent can independently own its session lease")
+}
+
+async fn assert_beta_survived_deletion(
+    js: &async_nats::jetstream::Context,
+    beta: &NatsSession,
+    beta_lease: &NatsSessionLease,
+    attachment_cid: &String,
+) -> Result<()> {
+    let metadata = SessionMetadataStore::ensure(js, 1).await?;
+    let beta_log = NatsSessionLog::new_with_replicas(js.clone(), beta.storage_key(), 1);
+    let hydrated = tempfile::tempdir()?;
+    harnx_runtime::nats_attachments::hydrate_attachment_refs(
+        harnx_runtime::nats_attachments::AttachmentLocation::new(js, 1, &beta.session_ref()),
+        hydrated.path(),
+        std::slice::from_ref(attachment_cid),
+    )
+    .await?;
+    let harnx_core::cid_url::CidUrl::Media { hash, .. } =
+        harnx_core::cid_url::CidUrl::parse(attachment_cid)?
+    else {
+        unreachable!("test attachment is media")
+    };
+    assert_eq!(
+        harnx_core::attachments::read_attachment_async(hydrated.path(), &format!("cid:{hash}"),)
+            .await?
+            .0,
+        b"review attachment"
+    );
+    assert!(metadata
+        .get_for_agent("review-12345", "alpha")
+        .await?
+        .is_none());
+    assert!(metadata
+        .get_for_agent("review-12345", "beta")
+        .await?
+        .is_some());
+    assert_eq!(beta_log.load_events_async().await?.len(), 1);
+    assert!(beta_lease.is_held());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_agent_controls_completion_and_info_even_with_other_active_agent() -> Result<()> {
+    let Some(server) = common::spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let js = async_nats::jetstream::new(client.clone());
+    for (agent, id) in [("alpha", "alpha-only"), ("beta", "beta-only")] {
+        let session = NatsSession::new(
+            NatsSessionConfig {
+                session_id: Some(id.into()),
+                ..config(agent)
+            },
+            client.clone(),
+            js.clone(),
+            harnx_runtime::utils::create_abort_signal(),
+        )
+        .await?;
+        session.enqueue_text(agent).await?;
+    }
+    let mut cfg = admin_config(server.url());
+    cfg.set_remote_agent("unrelated".into(), "unreachable-cluster".into());
+    async fn poll_sessions(cfg: &harnx_runtime::config::Config, agent: &str) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let sessions = cfg.list_sessions_for_completion(agent).await;
+            if !sessions.is_empty() || std::time::Instant::now() >= deadline {
+                return sessions;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    assert_eq!(poll_sessions(&cfg, "alpha@local").await, vec!["alpha-only"]);
+    assert_eq!(poll_sessions(&cfg, "beta@local").await, vec!["beta-only"]);
+    let (broker, metadata) =
+        harnx_runtime::config::session_metadata_for_agent(&cfg, "alpha@local", "alpha-only")
+            .await?;
+    let entries = NatsSessionLog::new_with_replicas(broker, metadata.storage_key(), 1)
+        .load_events_async()
+        .await?;
+    assert!(serde_json::to_string(&entries)?.contains("alpha"));
+    assert!(
+        harnx_runtime::config::session_metadata_for_agent(&cfg, "beta@local", "alpha-only")
+            .await
+            .is_err()
+    );
+    let global = std::sync::Arc::new(parking_lot::RwLock::new(cfg));
+    for format in ["json", "yaml"] {
+        let mut output = Vec::new();
+        harnx_runtime::commands::run_command_with_output(
+            &global,
+            harnx_runtime::utils::create_abort_signal(),
+            &format!(".info session alpha@local alpha-only --format {format}"),
+            &mut output,
+        )
+        .await?;
+        let rendered: serde_json::Value = serde_yaml::from_slice(&output)?;
+        assert_eq!(rendered["session_id"], "alpha-only");
+        assert_eq!(rendered["agent"]["name"], "alpha");
+    }
+    Ok(())
+}

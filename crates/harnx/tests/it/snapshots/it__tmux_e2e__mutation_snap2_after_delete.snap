@@ -1,0 +1,45 @@
+---
+source: crates/harnx/tests/it/tmux_e2e.rs
+expression: s
+---
+Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
+> first message
+
+FIRST_RESPONSE_SENTINEL
+
+> third message
+
+THIRD_RESPONSE_SENTINEL
+
+🤖 mutation-test-agent ▸ mock-llm:test ▸ mutation-e2e-session
+Deleted entries 3-4.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+* 🤖 mutation-test-agent ▸ mock-llm:test ▸ mutation-e2e-session   Context: 25(0%)
+
+
+# snap: 2-after-delete

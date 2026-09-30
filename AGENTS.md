@@ -116,6 +116,20 @@ test failures.
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
 **CodeScene Health scores MUST NOT decrease as part of the change, only increase**
 
+### Integration test layout
+
+Each crate's integration tests build as one binary, `tests/it/main.rs`, with
+every test file a module of it. Add a new file under `tests/it/` and declare
+it there; shared helpers such as `common` are declared once in `main.rs` and
+reached with `use crate::common;`. A new top-level `tests/foo.rs` still works,
+but Cargo builds it as a separate binary that links the whole dependency graph
+again, and linking 128 of those was most of a Windows CI build.
+
+Test names carry the module, e.g. `tmux_e2e::retry_all_fail_shows_warnings_in_tui`,
+so select tests with `test(/^tmux_e2e::/)` rather than `binary(tmux_e2e)`;
+every integration binary is now named `it`. insta snapshots for these tests
+live in `tests/it/snapshots/` with an `it__` prefix.
+
 ### Broker-backed tests and wall-clock margins
 
 Tests that spawn a `nats-server` run in the `broker-e2e` / `heavy-e2e` groups
@@ -482,7 +496,7 @@ Feature unification makes this invisible to a narrow test. `harnx-nats-common`
 alone resolves rustls with `ring` and cannot reproduce the ambiguity, so tests
 covering it must live in a crate whose graph also pulls in the AWS SDK —
 `harnx-runtime`, `harnx-worker` or `harnx`. See
-`crates/harnx-runtime/tests/tls_client_config.rs`. Check with
+`crates/harnx-runtime/tests/it/tls_client_config.rs`. Check with
 `cargo tree -p <crate> -e features -i rustls`.
 
 ### Tool-call argument parsing
@@ -734,7 +748,7 @@ a failing assertion unwinds past the helper's own `kill`/`wait`, and
 competes with every later broker test in that nextest run, and `retries = 3`
 turns one flake into several. `spawn_test_nats` returns `TestNatsServer`
 (`crates/harnx-runtime/src/nats_worker/tests.rs`) and the integration harness
-returns `NatsServerHandle` (`crates/harnx-runtime/tests/common/mod.rs`); both
+returns `NatsServerHandle` (`crates/harnx-runtime/tests/it/common/mod.rs`); both
 reap in `Drop`. Keep new broker helpers in that shape.
 
 ### NATS routing role is per-binary, not derived from env
@@ -764,8 +778,8 @@ The seam is `resolve_nats_server()` at `nats_split.rs:234`:
 
 ### NATS/GC tests: CI coverage and isolation
 
-CI runs integration tests against an isolated `nats-server` per test file via
-`spawn_nats_server` in `crates/harnx-runtime/tests/common/mod.rs`. The CI
+CI runs integration tests against an isolated `nats-server` per test via
+`spawn_nats_server` in `crates/harnx-runtime/tests/it/common/mod.rs`. The CI
 workflow installs `nats-server` on all platforms (`.github/workflows/ci.yaml`);
 tests that skip when the binary is absent still pass, but real coverage requires
 the installed binary.
@@ -774,9 +788,9 @@ In-module `#[cfg(test)]` tests that gate on `HARNX_NATS_TEST_URL` (unset in CI)
 **do not run in CI** — they skip when that env var is missing. Those tests also
 share one physical server and the global `SESSION_METADATA_BUCKET` when run
 locally, so they contaminate each other's state. New NATS/GC tests that must run
-in CI belong in `crates/harnx-runtime/tests/`, use `spawn_nats_server` for
+in CI belong in `crates/harnx-runtime/tests/it/`, use `spawn_nats_server` for
 per-test isolation, and assert on specific session IDs rather than global
-bucket stats. Precedent: `tests/worker_remote_session_cleanup.rs`.
+bucket stats. Precedent: `tests/it/worker_remote_session_cleanup.rs`.
 
 A TUI test that spawns the local broker or worker isolates them with
 `TestEnvironment` (`crates/harnx-tui/src/test_utils/environment.rs`) under
@@ -1054,7 +1068,7 @@ The `ToolCallCard` component uses live fields when present: `title` overrides `t
 
 When a `PreToolUse` hook returns `permissionDecision: "ask"`, the TUI modal queues an optional user message via durable JetStream append before sending the approval reply. Worker reloads the session log at the tool seam, ensuring the agent sees `tool call → tool result (real or blocked) → queued message`.
 
-Key invariants (verified by `denied_zero_execution_round_injects_queued_messages_once_after_blocked_result` in `crates/harnx-runtime/tests/nats_tool_confirmation.rs`):
+Key invariants (verified by `denied_zero_execution_round_injects_queued_messages_once_after_blocked_result` in `crates/harnx-runtime/tests/it/nats_tool_confirmation.rs`):
 
 1. **Order-barrier** — frontend awaits JetStream PubAck before replying. Worker receives decision only after message is durable.
 2. **Origin capture** — modal state captures `(session_id, cluster)` at open; enqueue targets that origin, not the currently-active session.
