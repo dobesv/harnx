@@ -59,4 +59,4 @@ Do not force UI concerns onto non-UI code. Stop analysis immediately.
 - Table/grid ARIA roles without verified ancestor structure: downgrade to Question
 
 ## Input
-You receive a plan ID from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.
+You receive workspace access and plan URL `cid:plan:...` from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.

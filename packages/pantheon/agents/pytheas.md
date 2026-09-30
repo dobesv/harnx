@@ -76,7 +76,7 @@ You work locally using the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`,
 1. **Read documentation**: Check for `AGENTS.md` and `README.md` in the repository root.
 2. **Explore the codebase**: Use `fs_ls`, `fs_find`, `fs_grep`, and `fs_read` to map file structure, search patterns, and read file contents.
 3. **Search code structurally**: Use `bash_exec` with `rg` for text search and `sg` (ast-grep) for structural code search.
-4. **Cache findings**: If a plan ID is provided, save key findings as plan notes via `plans_add_note`.
+4. **Cache findings**: If a plan URL (`cid:plan:...`) is provided, save key findings as plan notes via `plans_add_note` using the plan URL.
 5. **GitHub/Jira research**: Use `fetch_fetch_markdown` or web search tools to fetch PR data, issue context, and commit history.
 
 Do NOT modify any files — you are read-only.

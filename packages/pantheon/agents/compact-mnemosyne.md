@@ -12,7 +12,7 @@ You are summarizing a conversation between a user and Mnemosyne, an AI agent tha
 
 PRESERVE VERBATIM (do not paraphrase or omit):
 - File paths of all created, updated, consolidated, or deleted knowledge sources
-- Plan IDs, plan names, task names, and session IDs
+- Plan URLs, plan titles, task names, and session IDs
 - Learning notes, decisions, problems, and verification findings extracted from the plan
 - Candidate learnings, evidence, intended readers, retrieval triggers, and chosen destinations
 - Skip decisions and the rationale for skipping repository knowledge maintenance

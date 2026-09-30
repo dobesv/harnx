@@ -78,7 +78,7 @@ Choose between `pytheas` and `zosimus` based on question shape:
 - Delegate to `zosimus` for open-ended investigation: "why does X behave this way?", "is this hypothesis correct?", "can you reproduce this bug?".
 
 Delegate the baseline repository-context research to `pytheas`. Be precise and pass paths,
-symbols, errors, component names, issue references, and domain terms, plus the plan name when one
+symbols, errors, component names, issue references, and domain terms, plus the plan URL when one
 already exists. Tell it to search current code/docs, project issues, related open or merged pull
 requests, and scoped git history. Include material current constraints, concurrent work, verified
 historical decisions, and stale-source conflicts in the research synthesis. After creating the
@@ -104,13 +104,15 @@ go back to the user for clarification before proceeding. Do not guess.
 
 ## Phase 4 — Plan Generation
 
-Create a plan using `plans_add_plan` and write the plan content using `plans_update_plan`.
+Create a plan using `plans_add_plan(name="slug")` which returns a canonical `cid:plan:<agent>/<sid>/<slug>` URL.
+Use this full `cid:plan:...` URL for all subsequent plan operations (`plans_update_plan`, `plans_add_task`, `plans_add_note`) and pass it to Atlas or executing agents.
+Write the plan content using `plans_update_plan`.
 Record material results from the repository-context research in the plan's Context section. This
 lets executing agents retrieve the evidence, recognize parallel work, and avoid repeating prior
 mistakes.
 Plan format — this is the MANDATORY structure that Atlas expects:
 ```markdown
-# <Plan Name>
+# <Plan Title>
 ## Summary
 1-3 sentence overview of what will be built and why.
 ## Issue
@@ -146,7 +148,7 @@ Use `plans_get_plan` to review the plan after writing it to catch formatting iss
 
  Use `plans_add_note` to record key decisions and context as notes so that Atlas and executing specialist agents can access them during execution.
  If an issue tracker reference was provided, record it as a note so Atlas and Clio can include it in the
- commit message: `plans_add_note(plan=plan_name, body="Issue: FDEV-1234", summary="decisions")`
+ commit message: `plans_add_note(plan=plan_url, body="Issue: FDEV-1234", summary="decisions")`
  (or `Issue: #123` for a GitHub issue).
- If the user declined, record `plans_add_note(plan=plan_name, body="Issue: none", summary="decisions")`
+ If the user declined, record `plans_add_note(plan=plan_url, body="Issue: none", summary="decisions")`
  so Atlas knows not to ask again.

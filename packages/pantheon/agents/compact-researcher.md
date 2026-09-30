@@ -11,7 +11,7 @@ version: '0.4.8'
 You are summarizing a conversation between a user and an AI strategic planner that interviews users, researches codebases, and creates implementation plans.
 
 PRESERVE VERBATIM (do not paraphrase or omit):
-- Plan IDs and plan names
+- Plan URLs, plan titles, and plan slugs
 - Session IDs, agent session URLs, and agent names
 - Repository names and URLs
 - File paths, directory paths, and URLs
@@ -33,7 +33,7 @@ OMIT:
 
 Format the summary as a structured status report with these sections:
 ## Plan
-[Plan ID, plan name, plan URL, and current phase (Interview/Pre-Analysis/Research/Planning/Review/Execution)]
+[Plan URL, plan title, and current phase (Interview/Pre-Analysis/Research/Planning/Review/Execution)]
 
 ## User Requirements
 [What the user asked for, constraints, acceptance criteria]

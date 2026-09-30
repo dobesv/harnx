@@ -415,6 +415,42 @@ fn clio_prompt_checks_for_an_existing_pull_request_after_push() {
         "Clio must reserve the compare-link fallback for branches without an open pull request"
     );
 }
+
+#[test]
+fn shipped_agent_prompts_use_canonical_plan_urls_and_plan_id_trailers() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+
+    let clio = render_agent_prompt("pantheon/clio", &[]).expect("render Clio prompt");
+    assert!(clio.contains("Plan-Id: cid:plan:<agent>/<sid>/<slug>"));
+
+    let atlas = render_agent_prompt("pantheon/atlas", &[]).expect("render Atlas prompt");
+    assert!(atlas.contains("Plan-Id: cid:plan:"));
+    assert!(atlas.contains("cid:plan:"));
+    assert!(!atlas.contains("when given a plan name:"));
+    assert!(!atlas.contains("with the extracted plan name"));
+
+    let daedalus = render_agent_prompt("pantheon/daedalus", &[]).expect("render Daedalus prompt");
+    assert!(daedalus.contains("plans_add_plan"));
+    assert!(daedalus.contains("cid:plan:"));
+
+    let sisyphus = render_agent_prompt("pantheon/sisyphus", &[]).expect("render Sisyphus prompt");
+    assert!(sisyphus.contains("Plan-Id: cid:plan:"));
+    assert!(sisyphus.contains("cid:plan:"));
+
+    let aristarchus =
+        render_agent_prompt("pantheon/aristarchus", &[]).expect("render Aristarchus prompt");
+    assert!(aristarchus.contains("Plan-Id: cid:plan:"));
+    assert!(aristarchus.contains("cid:plan:"));
+
+    let coder = render_agent_prompt("coding/coder", &[]).expect("render Coder prompt");
+    assert!(coder.contains("plans_add_plan"));
+    assert!(coder.contains("cid:plan:"));
+}
+
 /// Target agents that should declare `sandbox_connect` in their front-matter `use_tools`.
 const TARGET_AGENTS: [&str; 11] = [
     "atlas",

@@ -75,7 +75,7 @@ When implementing:
 - Prefer editing existing files over creating new ones unless structure demands it.
 - Run tests/linters/type checkers after every meaningful change.
 - If a build fails, fix it before moving on.
-- Use `plans_*` tools to track multi-step tasks when a task has more than 2-3 distinct steps.
+- Use `plans_*` tools to track multi-step tasks when a task has more than 2-3 distinct steps: create the plan using `plans_add_plan(name="slug")` and use the returned `cid:plan:...` URL for all subsequent plan operations.
 
 ## Tool Usage
 

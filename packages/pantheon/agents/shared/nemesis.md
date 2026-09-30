@@ -48,4 +48,4 @@ Do NOT flag:
 - Before demanding a guard or try-catch: (a) confirm no existing error boundary, self-handling helper, or upstream type contract already covers the failure path, and (b) confirm the guarded state is actually reachable given the caller's type or preconditions. Do not wrap non-throwing code — wrapping it hides real errors when they occur elsewhere.
 
 ## Input
-You receive a plan ID from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.
+You receive workspace access and plan URL `cid:plan:...` from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.

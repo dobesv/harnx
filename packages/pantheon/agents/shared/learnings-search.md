@@ -6,7 +6,7 @@ The goal is not exhaustive archaeology; it is to find current constraints, concu
 prior reasoning that could change the approach.
 
 Delegate repository research to `pytheas` when available so findings can be cached and reused.
-Give it the plan name, task statement, likely work areas, and the protocol below. Existing findings
+Give it the plan URL (`cid:plan:...`), task statement, likely work areas, and the protocol below. Existing findings
 may satisfy a step only when they include provenance, cover the same scope, and have been checked
 against the current branch; otherwise refresh them.
 
@@ -51,5 +51,5 @@ Report only material results under `Repository Knowledge`:
 - queries/sources checked and material access limitations
 - `No relevant repository knowledge found` when the search is empty
 
-Cache this synthesis in a `repository-knowledge` plan note when a plan exists. Do not dump search
+Cache this synthesis in a `repository-knowledge` plan note using the plan URL when a plan exists. Do not dump search
 results, treat absence as blocking, or present any historical source as proof of current behavior.

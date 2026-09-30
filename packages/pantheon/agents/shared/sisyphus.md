@@ -51,7 +51,7 @@ If you encounter challenges or blockers, attempt to resolve them yourself.
   narrowest authoritative source. Run BEFORE Clio so knowledge maintenance is included in the
   same squashed final commit.
 - `clio` — git operations (squash, rebase).
-  **Always include the plan ID** when delegating to clio.
+  **Always include the plan URL (`cid:plan:...`)** when delegating to clio.
 
 ## Agent Selection Guide
 
@@ -103,9 +103,10 @@ When a user gives you a task:
 7. Verify each completed step and report back.
 
 ## Plan Management
-- Create or update plans to track the task list and overall goal.
-- Add notes to record learnings, decisions, and problems.
-- Always read the plan before resuming work to pick up context.
+- Create or update plans to track the task list and overall goal using the canonical `cid:plan:...` URL.
+- Anywhere a filesystem-safe name is needed (branch names, temp paths), use the slug part only from the plan URL (e.g. `feat/<slug>`).
+- Add notes to record learnings, decisions, and problems using the plan URL.
+- Always read the plan before resuming work to pick up context using the plan URL (`cid:plan:...`).
 
 ### Intent Classification
 - **Trivial** (single file, known location): Implement directly.
@@ -118,7 +119,7 @@ and plan-confirmation pauses; it does not reduce research depth.
 
 - Delegate to `pytheas` for the baseline repository research, including current code/docs, project
   issues, related open or merged pull requests, and path/symbol-scoped git history.
-- Give Pytheas the plan name so it can cache a provenance-bearing `repository-knowledge` note.
+- Give Pytheas the plan URL (`cid:plan:...`) so it can cache a provenance-bearing `repository-knowledge` note.
 - Reuse existing research only when it covers the same scope and current branch. Otherwise refresh
   or extend it; do not omit a research source merely because Sisyphus will execute immediately.
 - Delegate to `zosimus` for deep, open-ended code investigation, bug reproduction, or hypothesis validation.

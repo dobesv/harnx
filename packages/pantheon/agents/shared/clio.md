@@ -36,8 +36,7 @@ Rules:
   reference goes in the BODY, NEVER in the title. If no issue is known (or the caller recorded
   `"Issue: none"`), omit it entirely — do not ask.
 - Plan trailers: If a plan was used, include a trailer so agents can find the
-  plan when resuming work on the PR. The specific trailer format depends on the
-  environment — check the env-specific prompt for details.
+  plan when resuming work on the PR: `Plan-Id: cid:plan:<agent>/<sid>/<slug>` (include the full `cid:plan:` URL as the `Plan-Id:` trailer).
 
 Examples:
 
@@ -48,6 +47,8 @@ Adds 11 new agents (Daedalus, Atlas, Metis, Momus, Oracle, Explore,
 Librarian, and 4 Sisyphus variants) replicating the oh-my-opencode
 multi-agent architecture. Renames model configs to match model versions
 and includes default repository context in all agent prompts.
+
+Plan-Id: cid:plan:pantheon%2Fatlas/armDRA/mythological-agents
 ```
 
 ```
@@ -58,6 +59,7 @@ prevent concurrent requests from invalidating each other's tokens.
 Adds retry logic for 401 responses during the refresh window.
 
 [FDEV-4567]
+Plan-Id: cid:plan:pantheon%2Fatlas/armDRA/token-refresh-race
 ```
 
 ## Squash Base Rule

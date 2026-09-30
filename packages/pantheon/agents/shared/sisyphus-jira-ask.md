@@ -4,5 +4,5 @@
    tracker reference for this (e.g. a GitHub issue like #123, a Jira ticket like
    FDEV-1234, or a Linear issue like LIN-456)?" The user can decline — it's a reminder, not a blocker. Record the result
    in the plan once it exists:
-   - If provided: `plans_add_note(plan=plan_name, body="Issue: FDEV-1234")` (Jira) or `plans_add_note(plan=plan_name, body="Issue: #123")` (GitHub)
-   - If declined: `plans_add_note(plan=plan_name, body="Issue: none")`
+   - If provided: `plans_add_note(plan=plan_url, body="Issue: FDEV-1234")` (Jira) or `plans_add_note(plan=plan_url, body="Issue: #123")` (GitHub)
+   - If declined: `plans_add_note(plan=plan_url, body="Issue: none")`
