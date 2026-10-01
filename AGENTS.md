@@ -680,6 +680,40 @@ session continues and the agent can retry. The canonical pattern is
 `crates/harnx-fs-tools/src/toolset.rs:59-66`. When adding a native toolset, do not special-case
 `ErrorCode::INTERNAL_ERROR` to `Fatal`.
 
+### Partial results
+
+A tool that has produced something worth keeping before it can fail, such as a
+remote job id or the child session a sub-agent call started, records it with
+`ToolInvocationContext::record_partial_result(value)`
+(`harnx-toolset/src/partial_result.rs`). The value is at most
+`PARTIAL_RESULT_MAX_BYTES` (4 KiB) of JSON. The latest value wins until the
+call's reply is journaled, after which it is frozen. The NATS tool server keeps
+it on the call's invocation journal row (`RecordedInvocation.partial_result`),
+so it survives a worker restart. MCP transports hand the tool no store, and
+recording is then a no-op.
+
+When the call does not succeed, the runtime adds the value under
+`partial_result` (`harnx-core/src/partial_result.rs`) to the output it writes:
+
+- the engine's `{"is_error": true, ...}` for a recoverable error, including the
+  transport failures and timeouts `NatsToolProvider` attaches it to;
+- wind-up placeholders, and journaled failures that wind-up picks up;
+- failed replays.
+
+A successful call returns only its own result. A tool that wants the model to
+see the same information on success puts it in that result itself.
+
+Recording and reading are both best-effort. `NatsToolProvider` skips its read
+of the row while NATS is disconnected and gives up after 5 s, so an unreadable
+row costs the output its partial result, never the call its error.
+`record_partial_result` returns a `Result` and the tool decides what a failure
+means; the sub-agent call logs it and carries on.
+
+Sub-agent calls record `{"session_id", "sub_agent"}` as soon as the child
+session is bound. That is how the parent model learns the child's id when the
+call fails, so nothing writes `SubAgentStarted` to the parent's transcript;
+readers keep handling the entries old transcripts hold.
+
 ### MCP ServerHandler::call_tool error mapping
 
 MCP server implementations (`ServerHandler::call_tool`) must return recoverable failures as
@@ -751,8 +785,6 @@ Client/control code can append to another session's log via
 `NatsSessionLog::new(jetstream, storage_key)`. Worker/tool output must instead go
 through the session log backend while holding the lease, so the append is fenced
 on the tail the turn last observed and a `Cancel` that landed meanwhile stops it.
-A sub-agent start in the parent log is written through the invoking tool's
-handle on that same lease.
 
 The worker appends the durable `HandoffCommitted` entry **before** emitting the advisory
 `SessionEvent::HandoffCommitted` (see `agent_loop.rs:979-1001`). This guarantees a live
@@ -1003,8 +1035,10 @@ When implementing `--follow` or live-tail rendering (CLI or TUI):
 `replay_entries_to_sink()` (`nats_session.rs:1473`) renders `SessionLogEntry` tuples through a
 frontend's `AgentEventSink`. Callers must first apply log mutations (edits/rewinds) if they need
 an effective snapshot — the helper renders entries in the supplied order without resolution.
-Control entries (`TurnEnd`, `HandoffCommitted`, `HitlApproval*`, `SubAgentStarted`) are silent
+Control entries (`TurnEnd`, `HandoffCommitted`, `HitlApproval*`) are silent
 in text rendering because their state hydrates separately from human transcript output.
+Legacy `SubAgentStarted` entries are silent too and hydrate no frontend state;
+they still render a runtime note into model context.
 
 `MessageContent::to_text()` (`harnx-core/src/message.rs`) extracts text only and drops image
 parts — it's for LLM-facing contexts. Human-readable transcripts (CLI dump/`--follow`, TUI
@@ -1144,9 +1178,10 @@ the legacy poll-based reporter with the shared tool-call rendering path. Key inv
    custom SSE events, allowing incremental client migration. ACP emits only the projected
    `ToolCallUpdate`.
 
-6. **Reporter unchanged** — `SubagentProgressReporter` and its 10-second heartbeat
-   (`SUBAGENT_PROGRESS_HEARTBEAT` in `subagent_toolset.rs:32`) remain unchanged. The projection
-   layer does not add throttling; the reporter's existing poll cadence governs emission.
+6. **Reporter cadence** — `SubagentProgressReporter` publishes a running snapshot as
+   soon as it starts, then one per metric change and one per 10-second heartbeat
+   (`SUBAGENT_PROGRESS_HEARTBEAT` in `subagent_toolset.rs`). The projection layer
+   does not add throttling.
 
 Implementation: `subagent_progress_to_update` in `event_map.rs:320-360` (ACP), and
 `emit_subagent_progress_update` in `ag_ui.rs:578-610` (Web). Tests enforce status mapping

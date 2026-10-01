@@ -844,9 +844,9 @@ pass reconstructs `Idle` and writes nothing.
 
 The model is told why the round ended. A `Cancel` renders into model context at
 its log position as `[Runtime note] The user interrupted this turn. Incomplete
-tool calls above were cancelled.`, the same way a sub-agent start does. With the
-per-call placeholders beside it, that is enough for the model to make sense of a
-tool round that came back with no real answers.
+tool calls above were cancelled.` With the per-call placeholders beside it, each
+carrying its call's partial result when the tool recorded one, that is enough
+for the model to make sense of a tool round that came back with no real answers.
 
 **Activation.** `activation_preflight.rs` winds an interrupted turn up before
 anything else may run for that session. A pure wind-up acknowledges the
@@ -898,8 +898,9 @@ levels by id. The one place a parent's id is reused is the ancestor check: a
 child that finds its parent's invocation interrupted appends its own `Cancel`
 carrying the cancellation id it read off the parent's log. The child's worker —
 live, or revived by the wind-up activation — then cancels its own calls in
-turn, and that recursion is the entire cascade. `SubAgentStarted` in the parent
-log stays a UI and model-context note; control never reads it.
+turn, and that recursion is the entire cascade. A sub-agent call writes nothing
+to the parent's log; the parent model learns the child's session id from the
+call's output, or from its partial result when the call does not succeed.
 
 Tool calls made with no parent session (the direct stdio client) get no
 checkpoint, no control subject and no orphan-cancel path. Nothing owns a session
@@ -1185,9 +1186,8 @@ as its prompt admission ID, so replay follows the admitted turn without appendin
 another prompt. Prompt recovery uses transcript lookup plus tail CAS, not just the
 broker's time-limited message deduplication. Child ID reservations retain the
 invocation identity in canonical metadata, closing the crash window before the
-checkpoint is written. Durable start entries are also deduplicated by invocation.
-The original timeout includes recovery setup time. A completed child's durable
-result is recovered before applying an expired deadline.
+checkpoint is written. The original timeout includes recovery setup time. A
+completed child's durable result is recovered before applying an expired deadline.
 
 Replies must be persisted before execution ownership is marked stopped: graph
 nodes can be pruned before the parent writes `ToolResults`. Journal records retain

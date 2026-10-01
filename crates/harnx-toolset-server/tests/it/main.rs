@@ -12,6 +12,7 @@ mod filter_integration;
 mod filter_unit;
 mod name_unit;
 mod nats_server;
+mod partial_result;
 mod progress;
 mod replay;
 mod reply_projection;

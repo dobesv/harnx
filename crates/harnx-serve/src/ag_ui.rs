@@ -770,18 +770,6 @@ impl AgUiSink {
                 "turn_handoff_requested",
                 json!({ "agent": agent, "session_id": session_id }),
             ),
-            TurnEvent::SubAgentStarted {
-                agent,
-                session_id,
-                invocation_id,
-            } => self.emit_custom(
-                "sub_agent_started",
-                json!({
-                    "agent": agent,
-                    "session_id": session_id,
-                    "invocation_id": invocation_id,
-                }),
-            ),
             TurnEvent::SubAgentProgress(progress) => {
                 // Emit both the legacy sub_agent_progress custom event AND the projected
                 // tool_call_update so clients can transition incrementally. The projected
@@ -1605,10 +1593,10 @@ pub(crate) fn message_attachment_snapshot_events(
 /// Emit CUSTOM events for control entries found in the durable log.
 ///
 /// This function scans the durable session log and emits AG-UI CUSTOM events
-/// for control entries (HandoffCommitted, TurnEnd with usage, SubAgentStarted)
+/// for control entries (HandoffCommitted, TurnEnd with usage)
 /// so clients can reconstruct control state on promptless attach.
 ///
-/// Verticals (t2-handoff, t3-usage, t4-subagent) plug in by adding their
+/// Verticals (t2-handoff, t3-usage) plug in by adding their
 /// SessionLogEntry → Event::Custom mappings here.
 ///
 /// # Marker identity
@@ -1619,7 +1607,9 @@ pub(crate) fn message_attachment_snapshot_events(
 ///
 /// - `session_handoff`: optional `handoff_tool_call_id` when provider identity is available
 /// - `usage`: (emitted with same shape as live path; context computed by caller)
-/// - `sub_agent_started`: `invocation_id` (already in live shape)
+///
+/// Legacy `SubAgentStarted` entries emit nothing; a running child reappears
+/// through its next live progress snapshot.
 pub(crate) fn control_snapshot_events(
     entries: &[(u64, harnx_core::session::SessionLogEntry)],
     tokens_usage: Option<&UsageContextSnapshot>,
@@ -1683,29 +1673,6 @@ pub(crate) fn control_snapshot_events(
                     },
                     name: "usage".to_string(),
                     value,
-                }));
-            }
-            harnx_core::session::SessionLogEntry::SubAgentStarted {
-                agent,
-                session_id,
-                invocation_id,
-                tool_call_id,
-                started_at,
-            } => {
-                // Hydrate sub-agent start with marker identity
-                events.push(Event::Custom(CustomEvent {
-                    base: BaseEvent {
-                        timestamp: None,
-                        raw_event: None,
-                    },
-                    name: "sub_agent_started".to_string(),
-                    value: json!({
-                        "agent": agent,
-                        "session_id": session_id,
-                        "invocation_id": invocation_id,
-                        "tool_call_id": tool_call_id,
-                        "started_at": started_at.map(|t| t.to_rfc3339()),
-                    }),
                 }));
             }
             // Extension point for additional SessionLogEntry variants handled here.

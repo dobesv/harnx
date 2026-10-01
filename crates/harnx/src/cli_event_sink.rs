@@ -220,25 +220,8 @@ struct CliInvocationReport {
 }
 
 impl CliSubagentReporter {
-    fn started(
-        &mut self,
-        agent: &str,
-        session_id: &str,
-        invocation_id: Option<&str>,
-    ) -> Option<String> {
-        if let Some(invocation_id) = invocation_id {
-            if self.invocations.contains_key(invocation_id) {
-                return None;
-            }
-            self.invocations
-                .insert(invocation_id.to_string(), CliInvocationReport::default());
-        }
-        Some(format!(
-            "[sub-agent] started agent={agent} session={session_id}"
-        ))
-    }
-
     fn progress(&mut self, progress: &SubAgentProgress) -> Option<String> {
+        let announced = self.invocations.contains_key(&progress.invocation_id);
         let report = self
             .invocations
             .entry(progress.invocation_id.clone())
@@ -247,6 +230,14 @@ impl CliSubagentReporter {
             return None;
         }
         match progress.status {
+            // The reporter's first snapshot is a running one; it names the
+            // child the way the start line always has.
+            SubAgentProgressStatus::Running if !announced => {
+                return Some(format!(
+                    "[sub-agent] started agent={} session={}",
+                    progress.agent, progress.session_id
+                ));
+            }
             SubAgentProgressStatus::Running => {
                 let bucket = progress.elapsed_ms / SUBAGENT_REPORT_INTERVAL_MS;
                 if bucket == 0 || bucket <= report.last_running_bucket {
@@ -580,18 +571,6 @@ impl CliSinkState {
             }
             TurnEvent::HandoffRequested { agent, .. } => {
                 eprintln!("{}", dimmed_text(&format!("handoff → {agent}")));
-            }
-            TurnEvent::SubAgentStarted {
-                agent,
-                session_id,
-                invocation_id,
-            } => {
-                if let Some(line) =
-                    self.subagents
-                        .started(&agent, &session_id, invocation_id.as_deref())
-                {
-                    eprintln!("{}", dimmed_text(&line));
-                }
             }
             TurnEvent::SubAgentProgress(progress) => self.print_subagent_progress(progress),
         }
@@ -1038,27 +1017,34 @@ mod tests {
             usage: harnx_core::api_types::CompletionTokenUsage::new(Some(120), Some(45), Some(30)),
             tool_call_count: 3,
             title: None,
+            tool_call_id: None,
         }
     }
 
     #[test]
-    fn subagent_reporter_prints_identity_at_start() {
+    fn subagent_reporter_announces_the_child_on_its_first_progress() {
         let mut reporter = CliSubagentReporter::default();
-        let line = reporter
-            .started("researcher", "child-session", Some("inv-1"))
-            .expect("first start is reported");
+        let first = subagent_progress("inv-1", "child-session", SubAgentProgressStatus::Running, 0);
 
+        let line = reporter
+            .progress(&first)
+            .expect("the first progress names the child");
+
+        assert!(line.contains("[sub-agent] started"));
         assert!(line.contains("agent=researcher"));
         assert!(line.contains("session=child-session"));
-        assert!(reporter
-            .started("researcher", "child-session", Some("inv-1"))
-            .is_none());
+        assert!(reporter.progress(&first).is_none());
     }
 
     #[test]
     fn subagent_reporter_rate_limits_metric_changes_to_heartbeat_buckets() {
         let mut reporter = CliSubagentReporter::default();
-        reporter.started("researcher", "child", Some("inv-1"));
+        reporter.progress(&subagent_progress(
+            "inv-1",
+            "child",
+            SubAgentProgressStatus::Running,
+            0,
+        ));
 
         assert!(reporter
             .progress(&subagent_progress(
@@ -1104,7 +1090,12 @@ mod tests {
             SubAgentProgressStatus::Cancelled,
         ] {
             let mut reporter = CliSubagentReporter::default();
-            reporter.started("researcher", "child", Some("inv-1"));
+            reporter.progress(&subagent_progress(
+                "inv-1",
+                "child",
+                SubAgentProgressStatus::Running,
+                0,
+            ));
             let terminal = subagent_progress("inv-1", "child", status, 1_250);
             let line = reporter
                 .progress(&terminal)
@@ -1124,7 +1115,12 @@ mod tests {
     #[test]
     fn subagent_reporter_keeps_nonterminal_cancellation_progress_open() {
         let mut reporter = CliSubagentReporter::default();
-        reporter.started("researcher", "child", Some("inv-1"));
+        reporter.progress(&subagent_progress(
+            "inv-1",
+            "child",
+            SubAgentProgressStatus::Running,
+            0,
+        ));
 
         for status in [
             SubAgentProgressStatus::Cancelling,
@@ -1144,8 +1140,18 @@ mod tests {
     #[test]
     fn subagent_reporter_tracks_concurrent_invocations_independently() {
         let mut reporter = CliSubagentReporter::default();
-        reporter.started("researcher", "child-a", Some("inv-a"));
-        reporter.started("researcher", "child-b", Some("inv-b"));
+        reporter.progress(&subagent_progress(
+            "inv-a",
+            "child-a",
+            SubAgentProgressStatus::Running,
+            0,
+        ));
+        reporter.progress(&subagent_progress(
+            "inv-b",
+            "child-b",
+            SubAgentProgressStatus::Running,
+            0,
+        ));
 
         assert!(reporter
             .progress(&subagent_progress(

@@ -317,6 +317,42 @@ describe('SubAgentSessionNotes', () => {
       );
     });
 
+    it('defers an early RUN_FINISHED for a child first seen in its running progress', () => {
+      vi.useFakeTimers();
+      const dispatch = vi.fn();
+      const announced = [
+        { type: 'TOOL_CALL_START', toolCallId: 'call-1', parentMessageId: 'assistant-1' },
+        {
+          type: 'CUSTOM',
+          name: 'sub_agent_progress',
+          value: {
+            invocation_id: 'inv-1',
+            agent: 'researcher',
+            session_id: 'live-child',
+            status: 'running',
+            elapsed_ms: 0,
+            usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0 },
+            tool_call_count: 0,
+          },
+        },
+      ].reduce(reduceSubAgentNotes, INITIAL_SUB_AGENT_NOTES_STATE);
+
+      render(
+        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+          <SubAgentSessionNotes notes={announced.notes} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+
+      // The attach can land before the child's prompt is admitted, and then
+      // finds a run that is already over.
+      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+      agentInstance.simulateEvent({ type: 'RUN_FINISHED' });
+
+      expect(dispatch).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'CHILD_TERMINAL' })
+      );
+    });
+
     it('constructs HarnxHttpAgent with session URL without /prompt suffix', () => {
       const runningNote: SubAgentNote = {
         ...note('running', 'child-123'),

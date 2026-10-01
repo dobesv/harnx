@@ -15,10 +15,26 @@ const toolStart = (parentMessageId = 'assistant-parent') => ({
   parentMessageId,
 });
 
-const started = (agent: unknown, sessionId: unknown) => ({
+// The running snapshot a sub-agent's reporter publishes as soon as its child is
+// bound; frontends learn about a child from it.
+const started = (
+  agent: unknown,
+  sessionId: unknown,
+  invocationId = `inv-${String(sessionId)}`,
+  extra: Record<string, unknown> = {},
+) => ({
   type: 'CUSTOM',
-  name: 'sub_agent_started',
-  value: { agent, session_id: sessionId },
+  name: 'sub_agent_progress',
+  value: {
+    invocation_id: invocationId,
+    agent,
+    session_id: sessionId,
+    status: 'running',
+    elapsed_ms: 0,
+    usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0 },
+    tool_call_count: 0,
+    ...extra,
+  },
 });
 
 const completed = (agent: string, sessionId: string) => ({
@@ -96,7 +112,7 @@ function snapshotEvent() {
 }
 
 describe('reduceSubAgentNotes', () => {
-  it('adds valid starts and ignores malformed identities or starts without a tool parent', () => {
+  it('adds running children and ignores malformed identities or progress without a tool parent', () => {
     const state = apply(
       started('researcher', 'orphan'),
       toolStart(),
@@ -107,7 +123,7 @@ describe('reduceSubAgentNotes', () => {
     );
 
     expect(state.notes).toEqual([expect.objectContaining({
-      id: 'live:0',
+      id: 'live:inv-child-session-0001',
       agent: 'researcher',
       sessionId: 'child-session-0001',
       parentMessageId: 'assistant-parent',
@@ -153,15 +169,7 @@ describe('reduceSubAgentNotes', () => {
   it('correlates live metrics and terminal state by invocation id', () => {
     const state = apply(
       toolStart(),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'researcher',
-          session_id: 'child-session-0001',
-          invocation_id: 'inv-1',
-        },
-      },
+      started('researcher', 'child-session-0001', 'inv-1'),
       progress('inv-1', 'running', 10_000, 'Research child'),
       progress('inv-1', 'done', 12_345),
     );
@@ -182,7 +190,7 @@ describe('reduceSubAgentNotes', () => {
   it('preserves title through terminal recovery from a durable tool result', () => {
     const state = apply(
       toolStart(),
-      started('researcher', 'child-session-0001'),
+      started('researcher', 'child-session-0001', 'inv-terminal'),
       progress('inv-terminal', 'running', 10_000, 'Terminal child'),
       {
         type: 'TOOL_CALL_RESULT',
@@ -208,15 +216,7 @@ describe('reduceSubAgentNotes', () => {
   });
 
   it('does not reopen a terminal invocation after late running events', () => {
-    const start = {
-      type: 'CUSTOM',
-      name: 'sub_agent_started',
-      value: {
-        agent: 'researcher',
-        session_id: 'child-session-0001',
-        invocation_id: 'inv-1',
-      },
-    };
+    const start = started('researcher', 'child-session-0001', 'inv-1');
     const state = apply(
       toolStart(),
       start,
@@ -235,23 +235,9 @@ describe('reduceSubAgentNotes', () => {
   it('keeps concurrent invocations of a reused child session distinct', () => {
     const state = apply(
       toolStart('assistant-1'),
-      {
-        ...started('researcher', 'child-session-0001'),
-        value: {
-          agent: 'researcher',
-          session_id: 'child-session-0001',
-          invocation_id: 'inv-1',
-        },
-      },
+      started('researcher', 'child-session-0001', 'inv-1'),
       toolStart('assistant-2'),
-      {
-        ...started('researcher', 'child-session-0001'),
-        value: {
-          agent: 'researcher',
-          session_id: 'child-session-0001',
-          invocation_id: 'inv-2',
-        },
-      },
+      started('researcher', 'child-session-0001', 'inv-2'),
       progress('inv-1', 'done', 1_000),
       progress('inv-2', 'running', 2_000),
     );
@@ -266,12 +252,12 @@ describe('reduceSubAgentNotes', () => {
   it('is idempotent for duplicate delivery but records later reuse of one child session', () => {
     const state = apply(
       toolStart('assistant-1'),
-      started('researcher', 'reused-child'),
-      started('researcher', 'reused-child'),
+      started('researcher', 'reused-child', 'inv-1'),
+      started('researcher', 'reused-child', 'inv-1'),
       completed('researcher', 'reused-child'),
       completed('researcher', 'reused-child'),
       toolStart('assistant-2'),
-      started('researcher', 'reused-child'),
+      started('researcher', 'reused-child', 'inv-2'),
       completed('researcher', 'reused-child'),
     );
 
@@ -285,73 +271,80 @@ describe('reduceSubAgentNotes', () => {
     ]);
   });
 
-  it('seeds rows from hydrated sub_agent_started with matching tool-result via snapshot', () => {
+  it('keeps a restored row when its invocation reports again after a snapshot', () => {
     const state = apply(
       snapshotEvent(),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'researcher',
-          session_id: 'reused-child',
-          invocation_id: 'snapshot-inv-1',
-          tool_call_id: 'call-1',
-          started_at: '2026-09-09T05:15:30Z'
-        }
-      }
+      progress('snapshot-inv-1', 'done', 12_345),
     );
 
-    expect(state.notes.length).toBe(2);
-    // Should NOT duplicate the completed row, because toolCallId matches and it's already "done"
+    expect(state.notes).toHaveLength(2);
     expect(state.notes[0]).toMatchObject({
       id: 'snapshot:assistant-1:call-1',
       status: 'done',
-      agent: 'researcher',
       toolCallId: 'call-1',
     });
   });
 
-  it('seeds running rows from hydrated sub_agent_started without matching tool-result', () => {
+  it('places a running child under its launching message after a snapshot', () => {
     const state = apply(
       snapshotEvent(),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'coder',
-          session_id: 'child-coder-1',
-          invocation_id: 'inv-coder-1',
-          tool_call_id: 'call-3-missing-result',
-          started_at: '2026-09-09T05:15:30Z'
-        }
-      }
+      started('coder', 'child-coder-1', 'inv-coder-1', { tool_call_id: 'call-3-missing-result' }),
     );
 
-    expect(state.notes.length).toBe(3); // 2 from snapshot + 1 running
+    expect(state.notes).toHaveLength(3);
     expect(state.notes[2]).toMatchObject({
       id: 'live:inv-coder-1',
       status: 'running',
       agent: 'coder',
       sessionId: 'child-coder-1',
       toolCallId: 'call-3-missing-result',
-      startedAtMs: new Date('2026-09-09T05:15:30Z').getTime()
+      parentMessageId: 'assistant-1',
     });
+  });
+
+  it('drops progress after a snapshot that has no launching message for it', () => {
+    const state = apply(
+      snapshotEvent(),
+      started('coder', 'child-coder-1', 'inv-coder-1', { tool_call_id: 'call-not-in-snapshot' }),
+      started('coder', 'child-coder-2', 'inv-coder-2'),
+    );
+
+    expect(state.notes).toHaveLength(2);
+  });
+
+  it("restores a failed call's child from the partial result in its output", () => {
+    const state = apply({
+      type: 'MESSAGES_SNAPSHOT',
+      messages: [
+        { id: 'assistant-1', role: 'assistant', toolCalls: [{ id: 'call-1' }] },
+        {
+          role: 'tool',
+          toolCallId: 'call-1',
+          content: JSON.stringify({
+            is_error: true,
+            error: 'tool server unavailable',
+            partial_result: {
+              session_id: 'child-1',
+              sub_agent: { agent: 'researcher', session_id: 'child-1' },
+            },
+          }),
+        },
+      ],
+    });
+
+    expect(state.notes).toEqual([expect.objectContaining({
+      id: 'snapshot:assistant-1:call-1',
+      agent: 'researcher',
+      sessionId: 'child-1',
+      parentMessageId: 'assistant-1',
+      status: 'failed',
+    })]);
   });
 
   it('classifies CHILD_TERMINAL to fail a running note', () => {
     const state = apply(
       snapshotEvent(),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'coder',
-          session_id: 'child-coder-1',
-          invocation_id: 'inv-coder-1',
-          tool_call_id: 'call-3-missing-result',
-          started_at: '2026-09-09T05:15:30Z'
-        }
-      },
+      started('coder', 'child-coder-1', 'inv-coder-1', { tool_call_id: 'call-3-missing-result' }),
       {
         type: 'CHILD_TERMINAL',
         invocationId: 'inv-coder-1',
@@ -403,17 +396,7 @@ describe('reduceSubAgentNotes', () => {
   ])('allows parent authoritative result to $scenario', ({ content, expected }) => {
     const state = apply(
       snapshotEvent(),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'coder',
-          session_id: 'child-coder-1',
-          invocation_id: 'inv-coder-1',
-          tool_call_id: 'call-3-missing-result',
-          started_at: '2026-09-09T05:15:30Z',
-        },
-      },
+      started('coder', 'child-coder-1', 'inv-coder-1', { tool_call_id: 'call-3-missing-result' }),
       {
         type: 'CHILD_TERMINAL',
         invocationId: 'inv-coder-1',
@@ -429,34 +412,26 @@ describe('reduceSubAgentNotes', () => {
     expect(state.notes[2]).toMatchObject(expected);
   });
 
-  it('freezes elapsedMs on CHILD_TERMINAL by accumulating localElapsed', () => {
-    const startTime = Date.now() - 5000;
+  // A note restored from a snapshot has no start time, so its elapsed time
+  // accumulates from the last report: 1.5 s reported, 2 s ago.
+  function runningNoteWithoutStartTime(invocationId: string): SubAgentNotesState {
     const initial = apply(
       toolStart('parent-msg'),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'coder',
-          session_id: 'child-1',
-          invocation_id: 'inv-freeze-1',
-          tool_call_id: 'call-1',
-          started_at: new Date(startTime).toISOString(),
-        },
-      }
+      started('coder', 'child-1', invocationId, { tool_call_id: 'call-1' }),
     );
-
-    const runningNote = initial.notes[0];
-    const modifiedState: SubAgentNotesState = {
+    return {
       ...initial,
       notes: [{
-        ...runningNote,
+        ...initial.notes[0],
+        startedAtMs: undefined,
         elapsedMs: 1500,
         updatedAtMs: Date.now() - 2000,
       }],
     };
+  }
 
-    const terminalState = reduceSubAgentNotes(modifiedState, {
+  it('freezes elapsedMs on CHILD_TERMINAL by accumulating localElapsed', () => {
+    const terminalState = reduceSubAgentNotes(runningNoteWithoutStartTime('inv-freeze-1'), {
       type: 'CHILD_TERMINAL',
       invocationId: 'inv-freeze-1',
       status: 'done',
@@ -467,21 +442,21 @@ describe('reduceSubAgentNotes', () => {
     expect(frozenNote.elapsedMs).toBeGreaterThanOrEqual(3400);
   });
 
+  it('freezes elapsedMs on CHILD_AWAITING_APPROVAL by accumulating from the last report', () => {
+    const awaitingState = reduceSubAgentNotes(runningNoteWithoutStartTime('inv-hitl-2'), {
+      type: 'CHILD_AWAITING_APPROVAL',
+      invocationId: 'inv-hitl-2',
+    });
+
+    const note = awaitingState.notes[0];
+    expect(note.status).toBe('awaiting_approval');
+    expect(note.elapsedMs).toBeGreaterThanOrEqual(3400);
+  });
+
   it('transitions note to awaiting_approval and freezes elapsedMs on CHILD_AWAITING_APPROVAL', () => {
-    const startTime = Date.now() - 5000;
     const initial = apply(
       toolStart('parent-msg'),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'coder',
-          session_id: 'child-1',
-          invocation_id: 'inv-hitl-1',
-          tool_call_id: 'call-1',
-          started_at: new Date(startTime).toISOString(),
-        },
-      }
+      started('coder', 'child-1', 'inv-hitl-1', { tool_call_id: 'call-1', elapsed_ms: 5_000 }),
     );
 
     const awaitingState = reduceSubAgentNotes(initial, {
@@ -497,16 +472,7 @@ describe('reduceSubAgentNotes', () => {
   function setupAwaitingNote(invocationId: string) {
     const initial = apply(
       toolStart('parent-msg'),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'coder',
-          session_id: 'child-1',
-          invocation_id: invocationId,
-          tool_call_id: 'call-1',
-        },
-      },
+      started('coder', 'child-1', invocationId, { tool_call_id: 'call-1' }),
     );
     return reduceSubAgentNotes(initial, {
       type: 'CHILD_AWAITING_APPROVAL',
@@ -534,16 +500,7 @@ describe('reduceSubAgentNotes', () => {
   it('transitions note to cancelled on CHILD_TERMINAL with status cancelled', () => {
     const initial = apply(
       toolStart('parent-msg'),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'coder',
-          session_id: 'child-1',
-          invocation_id: 'inv-cancel-1',
-          tool_call_id: 'call-1',
-        },
-      }
+      started('coder', 'child-1', 'inv-cancel-1', { tool_call_id: 'call-1' }),
     );
 
     const cancelledState = reduceSubAgentNotes(initial, {
@@ -558,17 +515,10 @@ describe('reduceSubAgentNotes', () => {
     const startTime = 1725800000000;
     const initial = apply(
       toolStart('parent-msg'),
-      {
-        type: 'CUSTOM',
-        name: 'sub_agent_started',
-        value: {
-          agent: 'coder',
-          session_id: 'child-1',
-          invocation_id: 'inv-prog-1',
-          tool_call_id: 'call-1',
-          started_at: new Date(startTime).toISOString(),
-        },
-      }
+      started('coder', 'child-1', 'inv-prog-1', {
+        tool_call_id: 'call-1',
+        started_at: new Date(startTime).toISOString(),
+      }),
     );
 
     expect(initial.notes[0].startedAtMs).toBe(startTime);
@@ -591,6 +541,22 @@ describe('reduceSubAgentNotes', () => {
     expect(updated.notes[0].startedAtMs).toBe(startTime);
     expect(updated.notes[0].toolCallId).toBe('call-1');
     expect(updated.notes[0].elapsedMs).toBe(2500);
+  });
+
+  it('dates a child first seen in a progress snapshot from its elapsed time', () => {
+    const before = Date.now();
+    const announced = apply(
+      toolStart(),
+      started('researcher', 'child-session-0001', 'inv-1', { elapsed_ms: 1_500 }),
+    );
+    const after = Date.now();
+
+    const startedAtMs = announced.notes[0].startedAtMs;
+    expect(startedAtMs).toBeGreaterThanOrEqual(before - 1_500);
+    expect(startedAtMs).toBeLessThanOrEqual(after - 1_500);
+
+    const reported = reduceSubAgentNotes(announced, progress('inv-1', 'running', 10_000));
+    expect(reported.notes[0].startedAtMs).toBe(startedAtMs);
   });
 
   it('restores completed rows under their launching assistant messages from a snapshot', () => {

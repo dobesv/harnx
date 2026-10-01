@@ -189,6 +189,10 @@ function resultProgress(content: unknown): SubAgentProgressValue | undefined {
   return subAgentProgress(resultValue(content)?.sub_agent_progress);
 }
 
+function resultPartialMarker(content: unknown): SubAgentIdentity | undefined {
+  return subAgentMarker(resultValue(content)?.partial_result);
+}
+
 function toolCalls(message: EventRecord): EventRecord[] {
   return eventRecords(message.toolCalls ?? message.tool_calls);
 }
@@ -220,17 +224,21 @@ function snapshotNote(
   if (!context) return undefined;
   const progress = resultProgress(message.content);
   const marker = progress ?? resultMarker(message.content);
-  if (!marker) return undefined;
+  // A call that failed after its child was bound names the child in its
+  // partial result.
+  const failedChild = marker ? undefined : resultPartialMarker(message.content);
+  const identity = marker ?? failedChild;
+  if (!identity) return undefined;
   const metrics = restoredMetrics(progress);
   return {
     id: `snapshot:${context.parentMessageId}:${context.callId}`,
     invocationId: progress?.invocationId,
     toolCallId: context.callId,
-    agent: marker.agent,
+    agent: identity.agent,
     title: progress?.title,
-    sessionId: marker.sessionId,
+    sessionId: identity.sessionId,
     parentMessageId: context.parentMessageId,
-    status: progress?.status ?? 'done',
+    status: progress?.status ?? (failedChild ? 'failed' : 'done'),
     ...metrics,
     updatedAtMs: Date.now(),
   };
@@ -272,79 +280,9 @@ function notesFromSnapshot(messages: unknown): { notes: SubAgentNote[]; parentBy
   return { notes: uniqueNotes(notes), parentByToolCall };
 }
 
-function startedIdentity(value: unknown): SubAgentIdentity | undefined {
-  const marker = record(value);
-  return subAgentIdentity(
-    marker?.agent,
-    marker?.session_id,
-    marker?.invocation_id,
-    marker?.tool_call_id,
-    marker?.started_at
-  );
-}
-
 function sameIdentity(note: SubAgentNote, identity: SubAgentIdentity): boolean {
   if (note.agent !== identity.agent) return false;
   return note.sessionId === identity.sessionId;
-}
-
-function isDuplicateNote(
-  note: SubAgentNote,
-  identity: SubAgentIdentity,
-  parentMessageId: string,
-): boolean {
-  if (note.parentMessageId !== parentMessageId) return false;
-  if (identity.toolCallId && note.toolCallId === identity.toolCallId) return true;
-  if (identity.invocationId && note.invocationId === identity.invocationId) return true;
-  if (note.status !== 'running') return false;
-  return sameIdentity(note, identity);
-}
-
-function hasDuplicateNote(
-  state: SubAgentNotesState,
-  identity: SubAgentIdentity,
-  parentMessageId: string,
-): boolean {
-  return state.notes.some((note) => (
-    isDuplicateNote(note, identity, parentMessageId)
-  ));
-}
-
-function runningNote(
-  state: SubAgentNotesState,
-  identity: SubAgentIdentity,
-  parentMessageId: string,
-): SubAgentNote {
-  return {
-    id: identity.invocationId ? `live:${identity.invocationId}` : `live:${state.nextId}`,
-    invocationId: identity.invocationId,
-    toolCallId: identity.toolCallId,
-    agent: identity.agent,
-    sessionId: identity.sessionId,
-    parentMessageId,
-    status: 'running',
-    elapsedMs: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedTokens: 0,
-    toolCallCount: 0,
-    updatedAtMs: Date.now(),
-    startedAtMs: identity.startedAtMs,
-  };
-}
-
-function startNote(state: SubAgentNotesState, value: unknown): SubAgentNotesState {
-  const identity = startedIdentity(value);
-  if (!identity) return state;
-  const parentMessageId = state.latestParentMessageId ?? (identity.toolCallId ? state.parentByToolCall.get(identity.toolCallId) : null);
-  if (!parentMessageId) return state;
-  if (hasDuplicateNote(state, identity, parentMessageId)) return state;
-
-  return {
-    ...state,
-    notes: [...state.notes, runningNote(state, identity, parentMessageId)],
-    nextId: state.nextId + 1,
-  };
 }
 
 function isMatchingNote(
@@ -353,6 +291,20 @@ function isMatchingNote(
 ): boolean {
   if (identity.invocationId) return note.invocationId === identity.invocationId;
   return sameIdentity(note, identity);
+}
+
+// The child's attach waits out a startup grace measured from this, so that a
+// run it finds already over before the child's prompt is admitted does not
+// end the note. The reporter's running snapshots carry no start time, but the
+// first one's elapsed time dates the start closely enough. A note already
+// shown keeps the start it has.
+function noteStartedAtMs(
+  progress: SubAgentProgressValue,
+  existingNote: SubAgentNote | undefined,
+): number | undefined {
+  if (progress.startedAtMs !== undefined) return progress.startedAtMs;
+  if (existingNote) return existingNote.startedAtMs;
+  return Date.now() - progress.elapsedMs;
 }
 
 function noteFromProgress(
@@ -375,7 +327,7 @@ function noteFromProgress(
     cachedTokens: progress.cachedTokens,
     toolCallCount: progress.toolCallCount,
     updatedAtMs: Date.now(),
-    startedAtMs: progress.startedAtMs ?? existingNote?.startedAtMs,
+    startedAtMs: noteStartedAtMs(progress, existingNote),
   };
 }
 
@@ -386,6 +338,15 @@ function progressCanReplace(
   if (current === 'done' || current === 'cancelled') return false;
   if (current === 'failed') return incoming === 'done';
   return true;
+}
+
+// After a snapshot no live tool call is open to hang a child on, but the
+// snapshot's assistant messages still say which one launched it.
+function launchingMessage(
+  state: SubAgentNotesState,
+  toolCallId: string | undefined,
+): string | undefined {
+  return toolCallId ? state.parentByToolCall.get(toolCallId) : undefined;
 }
 
 function applyProgress(
@@ -406,7 +367,7 @@ function applyProgress(
       )),
     };
   }
-  const parentMessageId = state.latestParentMessageId;
+  const parentMessageId = state.latestParentMessageId ?? launchingMessage(state, progress.toolCallId);
   if (!parentMessageId) return state;
   return {
     ...state,
@@ -498,11 +459,10 @@ function startToolCall(
   return { ...state, latestParentMessageId: parentMessageId };
 }
 
-function startFromCustomEvent(
+function applyCustomEvent(
   state: SubAgentNotesState,
   event: EventRecord,
 ): SubAgentNotesState {
-  if (event.name === 'sub_agent_started') return startNote(state, event.value);
   if (event.name === 'sub_agent_progress') return applyProgress(state, event.value);
   return state;
 }
@@ -605,7 +565,7 @@ const EVENT_REDUCERS: Record<string, EventReducer> = {
   RESET: resetNotes,
   RUN_STARTED: startRun,
   TOOL_CALL_START: startToolCall,
-  CUSTOM: startFromCustomEvent,
+  CUSTOM: applyCustomEvent,
   TOOL_CALL_RESULT: completeFromToolResult,
   MESSAGES_SNAPSHOT: restoreSnapshot,
   RUN_FINISHED: failUnresolvedNotes,

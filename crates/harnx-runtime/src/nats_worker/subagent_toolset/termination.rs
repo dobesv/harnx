@@ -40,6 +40,7 @@ pub(super) async fn run_prompt(
     }
     let cancel = params.cancel.clone();
     let (session, deadline) = checkpointed_session(toolset, &params).await?;
+    record_child(toolset, &params.context, session.session_id()).await;
     // Replay of an already-answered invocation keys off
     // `NatsSession::invocation_id`, so every child needs one bound here. The
     // parent session id rides along only to label who requested an interrupt
@@ -57,7 +58,7 @@ pub(super) async fn run_prompt(
             invocation_id: params.context.call_id.clone(),
             tool_call_id: params.tool_call_id,
         })
-        .await?;
+        .await;
     let buffering_sink = Arc::new(InvocationBufferingSink::new(reporter.sink()));
     let turn = await_prompt_turn(
         &session,
@@ -147,6 +148,31 @@ async fn checkpointed_session(
             .await?,
         deadline,
     ))
+}
+
+/// Name the child as the call's partial result, so a call that fails, times
+/// out or is interrupted from here on still tells the parent which session
+/// ran. Losing the record costs the parent that name, not the call.
+async fn record_child(
+    toolset: &SubagentToolset,
+    context: &harnx_toolset::ToolInvocationContext,
+    session_id: &str,
+) {
+    let partial_result = serde_json::json!({
+        "session_id": session_id,
+        "sub_agent": child_source(toolset, session_id),
+    });
+    if let Err(error) = context.record_partial_result(partial_result).await {
+        log::warn!("record sub-agent session {session_id} as the call's partial result: {error:#}");
+    }
+}
+
+fn child_source(toolset: &SubagentToolset, session_id: &str) -> harnx_core::event::AgentSource {
+    harnx_core::event::AgentSource {
+        agent: toolset.agent.clone(),
+        session_id: Some(session_id.to_string()),
+        model: None,
+    }
 }
 
 fn remaining_timeout(seconds: Option<u64>, started_at_ms: Option<u64>) -> Option<Duration> {
@@ -444,16 +470,18 @@ pub(super) fn result_value(
                 .expect("completed sub-agent turn without result or termination"),
         )?,
     };
-    let source = harnx_core::event::AgentSource {
-        agent: toolset.agent.clone(),
-        session_id: Some(completed.session_id.clone()),
-        model: None,
+    let source = child_source(toolset, &completed.session_id);
+    // The parent knows which of its calls this answers; the summary the model
+    // reads keeps to the invocation's own facts.
+    let progress = SubAgentProgress {
+        tool_call_id: None,
+        ..completed.progress.clone()
     };
     let mut value = serde_json::json!({
         "session_id": completed.session_id,
         "response": response,
         "sub_agent": source,
-        "sub_agent_progress": completed.progress,
+        "sub_agent_progress": progress,
     });
     if let Some(termination) = &completed.termination {
         value["termination"] = termination.termination_json();
@@ -550,9 +578,12 @@ mod tests {
     #[tokio::test]
     async fn timeout_cancellation_failure_is_recoverable_and_finishes_reporter() {
         let reporter = super::super::SubagentProgressReporter::spawn(
-            "helper".to_string(),
-            "unsafe-session".to_string(),
-            "invocation".to_string(),
+            super::super::ReportedInvocation {
+                agent: "helper".to_string(),
+                session_id: "unsafe-session".to_string(),
+                invocation_id: "invocation".to_string(),
+                tool_call_id: None,
+            },
             None,
             Duration::from_secs(60),
         );

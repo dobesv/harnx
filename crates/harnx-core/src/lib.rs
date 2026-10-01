@@ -31,6 +31,7 @@ pub mod message;
 pub mod model;
 pub mod package;
 pub mod package_namespace;
+pub mod partial_result;
 pub mod path;
 pub mod provider_config;
 pub mod retry_config;

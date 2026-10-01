@@ -328,22 +328,6 @@ impl Tui {
             |parent| parent.cluster.clone(),
         );
         match event {
-            AgentEvent::Turn(TurnEvent::SubAgentStarted {
-                agent,
-                session_id,
-                invocation_id,
-            }) => {
-                self.record_subagent_started(
-                    parent,
-                    MonitoredSessionKey {
-                        agent: agent.clone(),
-                        session_id: session_id.clone(),
-                        cluster,
-                    },
-                    invocation_id.clone(),
-                );
-                true
-            }
             AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)) => {
                 self.record_subagent_progress(parent, progress.clone());
                 true

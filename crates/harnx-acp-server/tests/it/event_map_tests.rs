@@ -520,6 +520,7 @@ fn subagent_progress_maps_to_tool_call_update() {
         usage: usage.clone(),
         tool_call_count: 5,
         title: Some("Analyzing codebase".to_string()),
+        tool_call_id: None,
     };
 
     let update =
@@ -559,6 +560,22 @@ fn subagent_progress_maps_to_tool_call_update() {
     assert_eq!(deserialized_usage.output_tokens, 50);
 }
 
+/// A snapshot with no usage, title or parent call, for tests that only vary
+/// the invocation and its status.
+fn child_progress(invocation_id: &str, status: SubAgentProgressStatus) -> SubAgentProgress {
+    SubAgentProgress {
+        invocation_id: invocation_id.to_string(),
+        agent: "test".to_string(),
+        session_id: "session-1".to_string(),
+        status,
+        elapsed_ms: 1000,
+        usage: CompletionTokenUsage::default(),
+        tool_call_count: 0,
+        title: None,
+        tool_call_id: None,
+    }
+}
+
 #[test]
 fn subagent_progress_preserves_internal_states() {
     // Cancelling and Unconfirmed map to InProgress (ACP can't encode them)
@@ -566,16 +583,7 @@ fn subagent_progress_preserves_internal_states() {
         SubAgentProgressStatus::Cancelling,
         SubAgentProgressStatus::Unconfirmed,
     ] {
-        let progress = SubAgentProgress {
-            invocation_id: "inv-internal".to_string(),
-            agent: "test".to_string(),
-            session_id: "session-1".to_string(),
-            status,
-            elapsed_ms: 1000,
-            usage: CompletionTokenUsage::default(),
-            tool_call_count: 0,
-            title: None,
-        };
+        let progress = child_progress("inv-internal", status);
         let update =
             agent_event_to_session_update(AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)))
                 .expect("should map");
@@ -594,16 +602,7 @@ fn subagent_progress_preserves_internal_states() {
         SubAgentProgressStatus::Cancelled,
         SubAgentProgressStatus::Failed,
     ] {
-        let progress = SubAgentProgress {
-            invocation_id: "inv-failed".to_string(),
-            agent: "test".to_string(),
-            session_id: "session-1".to_string(),
-            status,
-            elapsed_ms: 1000,
-            usage: CompletionTokenUsage::default(),
-            tool_call_count: 0,
-            title: None,
-        };
+        let progress = child_progress("inv-failed", status);
         let update =
             agent_event_to_session_update(AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)))
                 .expect("should map");
@@ -642,6 +641,7 @@ fn subagent_progress_done_keeps_parent_tool_in_progress() {
         usage,
         tool_call_count: 10,
         title: Some("Task completed".to_string()),
+        tool_call_id: None,
     };
 
     let update =

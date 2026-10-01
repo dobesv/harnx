@@ -822,7 +822,7 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     let _ = child.wait();
 }
 
-async fn registered_agent_provider(
+pub(super) async fn registered_agent_provider(
     jetstream: &async_nats::jetstream::Context,
     config: &Config,
     agents: &[&str],
@@ -896,7 +896,10 @@ async fn call_registered_agent(
     message: String,
     tool_call_id: Option<String>,
     early_event: Option<(&mut async_nats::Subscriber, &str)>,
-) -> (serde_json::Value, Option<String>) {
+) -> (
+    serde_json::Value,
+    Option<harnx_core::event::SubAgentProgress>,
+) {
     let prompt_call = tokio::spawn(async move {
         provider
             .call_tool_with_id(
@@ -907,8 +910,8 @@ async fn call_registered_agent(
             )
             .await
     });
-    let child_session_id = if let Some((parent_events, expected_agent)) = early_event {
-        let (agent, session_id) = tokio::time::timeout(Duration::from_secs(5), async {
+    let first_progress = if let Some((parent_events, expected_agent)) = early_event {
+        let progress = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let message = parent_events
                     .next()
@@ -918,27 +921,28 @@ async fn call_registered_agent(
                     crate::nats_event_sink::AdvisoryEnvelope::from_bytes(&message.payload)
                         .expect("decode parent advisory");
                 if let AgentEvent::SubAgent { source, event } = envelope.event {
-                    if let AgentEvent::Turn(harnx_core::event::TurnEvent::SubAgentStarted {
-                        agent,
-                        session_id,
-                        ..
-                    }) = *event
+                    if let AgentEvent::Turn(harnx_core::event::TurnEvent::SubAgentProgress(
+                        progress,
+                    )) = *event
                     {
-                        assert_eq!(source.agent, agent);
-                        assert_eq!(source.session_id.as_deref(), Some(session_id.as_str()));
-                        break (agent, session_id);
+                        assert_eq!(source.agent, progress.agent);
+                        assert_eq!(
+                            source.session_id.as_deref(),
+                            Some(progress.session_id.as_str())
+                        );
+                        break progress;
                     }
                 }
             }
         })
         .await
-        .expect("parent did not receive early SubAgentStarted");
-        assert_eq!(agent, expected_agent);
+        .expect("parent did not receive the child's first progress snapshot");
+        assert_eq!(progress.agent, expected_agent);
         assert!(
             !prompt_call.is_finished(),
-            "SubAgentStarted must arrive before final tool result"
+            "the first progress snapshot must arrive before the final tool result"
         );
-        Some(session_id)
+        Some(progress)
     } else {
         None
     };
@@ -951,7 +955,25 @@ async fn call_registered_agent(
                 panic!("registered agent prompt failed: {error:#}")
             }
         });
-    (result.value, child_session_id)
+    (result.value, first_progress)
+}
+
+/// The `SubAgentStarted` variant stays so old transcripts load, so nothing in the
+/// type system notices a sub-agent call that starts writing one again. This check does.
+async fn assert_no_sub_agent_started_entry(
+    jetstream: async_nats::jetstream::Context,
+    parent_session_id: &str,
+) {
+    let parent_entries = NatsSessionLog::new_with_replicas(jetstream, parent_session_id, 1)
+        .load_events_async()
+        .await
+        .expect("load parent log after the sub-agent call");
+    assert!(
+        !parent_entries
+            .iter()
+            .any(|(_, entry)| matches!(entry, SessionLogEntry::SubAgentStarted { .. })),
+        "a sub-agent call writes nothing to the parent's transcript"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1026,7 +1048,7 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subagent_started_reaches_parent_stream_and_durable_log() {
+async fn running_progress_reaches_the_parent_without_a_transcript_entry() {
     let _env_guard = env_lock().await;
     let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
         return;
@@ -1069,49 +1091,28 @@ async fn subagent_started_reaches_parent_stream_and_durable_log() {
     let (_, provider, _) =
         registered_agent_provider(&jetstream, &seeded.parent_config, &["metis"], None).await;
     let parent_tool_call_id = "parent-tool-call-123";
-    let before_start = chrono::Utc::now();
-    let (result, child_session_id) = call_registered_agent(
+    let (result, first_progress) = call_registered_agent(
         provider,
         "metis_session_prompt".to_string(),
-        "emit start before finishing".to_string(),
+        "report progress before finishing".to_string(),
         Some(parent_tool_call_id.to_string()),
         Some((&mut parent_events, "metis")),
     )
     .await;
-    let child_session_id = child_session_id.expect("SubAgentStarted includes child session id");
+    let first_progress = first_progress.expect("the parent stream saw the child before its result");
+    assert_eq!(
+        first_progress.status,
+        harnx_core::event::SubAgentProgressStatus::Running
+    );
+    assert_eq!(
+        first_progress.tool_call_id.as_deref(),
+        Some(parent_tool_call_id)
+    );
     assert_eq!(result["response"], "early event child response");
     assert_eq!(result["sub_agent"]["agent"], "metis");
-    assert_eq!(result["sub_agent"]["session_id"], child_session_id);
+    assert_eq!(result["sub_agent"]["session_id"], first_progress.session_id);
 
-    let parent_log = NatsSessionLog::new_with_replicas(jetstream, parent_session_id, 1);
-    let parent_entries = parent_log
-        .load_events_async()
-        .await
-        .expect("load parent log after sub-agent start");
-    let (_, start_entry) = parent_entries
-        .iter()
-        .find(|(_, entry)| {
-            matches!(
-                entry,
-                SessionLogEntry::SubAgentStarted { session_id, .. }
-                    if session_id == &child_session_id
-            )
-        })
-        .expect("parent log contains durable sub-agent start");
-    let SessionLogEntry::SubAgentStarted {
-        agent,
-        invocation_id,
-        tool_call_id,
-        started_at,
-        ..
-    } = start_entry
-    else {
-        unreachable!("entry was matched as SubAgentStarted")
-    };
-    assert_eq!(agent, "metis");
-    assert!(invocation_id.as_ref().is_some_and(|id| !id.is_empty()));
-    assert_eq!(tool_call_id.as_deref(), Some(parent_tool_call_id));
-    assert!(started_at.is_some_and(|timestamp| timestamp >= before_start));
+    assert_no_sub_agent_started_entry(jetstream, &parent_session_id).await;
 
     daemon.abort();
     let _ = daemon.await;

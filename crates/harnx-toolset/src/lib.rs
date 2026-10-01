@@ -40,6 +40,8 @@ mod cancellation;
 pub use cancellation::*;
 mod progress;
 pub use progress::*;
+mod partial_result;
+pub use partial_result::*;
 pub mod cleanup;
 
 /// Schema and execution hints for one tool.
@@ -223,6 +225,10 @@ pub struct ToolInvocationContext {
     /// can act on it after the original invocation is gone. Absent when the
     /// transport does not support checkpointing.
     pub checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    /// Where to record this call's partial result, which the runtime returns
+    /// if the call does not succeed. Absent when the transport cannot keep
+    /// one; [`ToolInvocationContext::record_partial_result`] then does nothing.
+    pub partial_result_store: Option<Arc<dyn PartialResultStore>>,
     /// Call-bound live progress sink. Defaults to a no-op for transports and
     /// callers that do not negotiate progress support.
     pub progress: ToolProgressHandle,
@@ -252,6 +258,14 @@ impl fmt::Debug for ToolInvocationContext {
             .field(
                 "checkpoint_store",
                 &if self.checkpoint_store.is_some() {
+                    "<set>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .field(
+                "partial_result_store",
+                &if self.partial_result_store.is_some() {
                     "<set>"
                 } else {
                     "<unset>"

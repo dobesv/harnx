@@ -27,6 +27,7 @@ use in_flight::InFlightFailure;
 pub(crate) use in_flight::InFlightRegistration;
 pub use in_flight::{InFlightCancelTarget, NatsInFlightCalls};
 mod execution_context;
+mod partial_result;
 mod progress;
 mod replay;
 mod request;

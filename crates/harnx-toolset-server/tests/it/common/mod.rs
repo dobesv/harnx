@@ -312,6 +312,12 @@ impl Toolset for TestToolset {
                 .await
                 .map_err(|error| ToolInvokeError::Fatal(format!("{error:#}")))?;
         }
+        // `partial_result` stands in for a tool that reports what it has
+        // produced so far, in case the call then fails.
+        if let Some(value) = invocation.args.get("partial_result").cloned() {
+            let recorded = invocation.context.record_partial_result(value).await;
+            recorded.map_err(|error| ToolInvokeError::Fatal(format!("{error:#}")))?;
+        }
         self.invoke(&invocation.tool, invocation.args, invocation.cancel)
             .await
     }

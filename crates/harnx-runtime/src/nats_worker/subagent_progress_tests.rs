@@ -40,8 +40,7 @@ async fn progress_toolset(url: &str) -> Arc<super::subagent_toolset::SubagentToo
 async fn observe_progress(
     events: &mut async_nats::Subscriber,
 ) -> (Vec<SubAgentProgress>, SubAgentProgress) {
-    let mut invocation_id = None;
-    let mut running = Vec::new();
+    let mut running: Vec<SubAgentProgress> = Vec::new();
     loop {
         let message = events.next().await.expect("parent events remain open");
         let envelope = crate::nats_event_sink::AdvisoryEnvelope::from_bytes(&message.payload)
@@ -49,29 +48,55 @@ async fn observe_progress(
         let AgentEvent::SubAgent { event, .. } = envelope.event else {
             continue;
         };
-        match *event {
-            AgentEvent::Turn(TurnEvent::SubAgentStarted {
-                invocation_id: Some(id),
-                ..
-            }) => assert!(invocation_id.replace(id).is_none(), "start is emitted once"),
-            AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)) => {
-                assert_eq!(
-                    Some(progress.invocation_id.as_str()),
-                    invocation_id.as_deref()
-                );
-                if progress.status == SubAgentProgressStatus::Running {
-                    running.push(progress);
-                } else {
-                    return (running, progress);
-                }
-            }
-            _ => {}
+        let AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)) = *event else {
+            continue;
+        };
+        if let Some(first) = running.first() {
+            assert_eq!(
+                progress.invocation_id, first.invocation_id,
+                "one call reports one invocation"
+            );
+        }
+        if progress.status == SubAgentProgressStatus::Running {
+            running.push(progress);
+        } else {
+            return (running, progress);
         }
     }
 }
 
+/// What a parent's live view should see of one call: the announcement first,
+/// heartbeats that only move forward, and every snapshot naming the call.
+fn assert_progress_sequence(running: &[SubAgentProgress], terminal: &SubAgentProgress) {
+    let announced = running
+        .first()
+        .expect("the reporter announces the invocation");
+    assert_eq!(
+        announced.elapsed_ms, 0,
+        "announced before the first heartbeat"
+    );
+    assert!(
+        running
+            .iter()
+            .skip(1)
+            .any(|progress| progress.elapsed_ms > 0),
+        "heartbeat should report liveness"
+    );
+    assert!(running
+        .windows(2)
+        .all(|pair| pair[0].elapsed_ms <= pair[1].elapsed_ms));
+    assert!(
+        running
+            .iter()
+            .chain([terminal])
+            .all(|progress| progress.tool_call_id.as_deref() == Some("parent-call-1")),
+        "every snapshot names the parent's tool call"
+    );
+    assert_eq!(terminal.status, SubAgentProgressStatus::Done);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn orders_start_heartbeats_terminal_and_durable_summary() {
+async fn orders_announcement_heartbeats_terminal_and_durable_summary() {
     let _env_guard = env_lock().await;
     let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
         return;
@@ -105,6 +130,7 @@ async fn orders_start_heartbeats_terminal_and_durable_summary() {
                 json!({
                     "message": "report progress",
                     "__harnx_parent_session_id": parent_session_id,
+                    "__harnx_tool_call_id": "parent-call-1",
                 }),
                 CancellationToken::new(),
             )
@@ -115,16 +141,19 @@ async fn orders_start_heartbeats_terminal_and_durable_summary() {
         tokio::time::timeout(Duration::from_secs(10), observe_progress(&mut events))
             .await
             .expect("receive terminal sub-agent progress");
-    assert!(!running.is_empty(), "heartbeat should report liveness");
-    assert!(running
-        .windows(2)
-        .all(|pair| pair[0].elapsed_ms <= pair[1].elapsed_ms));
-    assert_eq!(terminal.status, SubAgentProgressStatus::Done);
+    assert_progress_sequence(&running, &terminal);
 
     let result = prompt.await.expect("join prompt").expect("prompt succeeds");
     let summary: SubAgentProgress = serde_json::from_value(result["sub_agent_progress"].clone())
         .expect("decode durable progress summary");
-    assert_eq!(summary, terminal);
+    assert_eq!(
+        summary,
+        SubAgentProgress {
+            tool_call_id: None,
+            ..terminal
+        },
+        "the summary the model reads leaves out the parent's own call id"
+    );
 
     daemon.abort();
     let _ = daemon.await;

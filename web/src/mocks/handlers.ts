@@ -9,7 +9,6 @@ import {
   snapshots,
   notify,
   persistGalleryExchange,
-  broadcastLiveEvent,
   persistSubAgentExchange,
   persistExchange,
   
@@ -20,8 +19,13 @@ const activeSessions = new Set<string>();
 const openRunControllers = new Map<string, Set<any>>();
 let subAgentExchangeId = 0;
 
-function subAgentProgress(invocationId: string, status: 'running' | 'done', elapsedMs: number, title?: string) {
-  const base = {
+function subAgentProgress(
+  invocationId: string,
+  status: 'running' | 'done',
+  elapsedMs: number,
+  options: { title?: string; toolCallId?: string } = {},
+) {
+  return {
     invocation_id: invocationId,
     agent: 'researcher',
     session_id: SUB_AGENT_SESSION_ID,
@@ -29,8 +33,9 @@ function subAgentProgress(invocationId: string, status: 'running' | 'done', elap
     elapsed_ms: elapsedMs,
     usage: { input_tokens: 1200, output_tokens: 345, cached_tokens: 67 },
     tool_call_count: 4,
+    ...(options.title ? { title: options.title } : {}),
+    ...(options.toolCallId ? { tool_call_id: options.toolCallId } : {}),
   };
-  return title ? { ...base, title } : base;
 }
 
 function isSseRequest(request: Request): boolean {
@@ -241,6 +246,16 @@ interface MockRun {
   runId: string;
 }
 
+function finishOpenRuns(session: string) {
+  for (const { controller, threadId, runId } of openRunControllers.get(session) ?? []) {
+    try {
+      controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
+      controller.close();
+    } catch (e) {}
+  }
+  openRunControllers.delete(session);
+}
+
 async function emitGalleryRun({ controller, threadId, runId }: MockRun) {
   await new Promise((resolve) => setTimeout(resolve, 25));
   controller.enqueue(encodeSseEvent({
@@ -334,7 +349,7 @@ function subAgentResultContent(ids: SubAgentRunIds) {
     session_id: SUB_AGENT_SESSION_ID,
     response: 'Child task complete.',
     sub_agent: { agent: 'researcher', session_id: SUB_AGENT_SESSION_ID },
-    sub_agent_progress: subAgentProgress(ids.invocationId, 'done', 1_250, 'Research child'),
+    sub_agent_progress: subAgentProgress(ids.invocationId, 'done', 1_250, { title: 'Research child' }),
   });
 }
 
@@ -354,12 +369,8 @@ function emitSubAgentStart(run: MockRun, ids: SubAgentRunIds) {
     type: 'CUSTOM',
     threadId: run.threadId,
     runId: run.runId,
-    name: 'sub_agent_started',
-    value: {
-      agent: 'researcher',
-      session_id: SUB_AGENT_SESSION_ID,
-      invocation_id: ids.invocationId,
-    },
+    name: 'sub_agent_progress',
+    value: subAgentProgress(ids.invocationId, 'running', 0, { toolCallId: ids.toolCallId }),
   }));
 }
 
@@ -692,6 +703,11 @@ export const happyPathHandlers = [
         } else if (text === 'delegate to researcher') {
           // Staged sub-agent
           activeSessions.add(session);
+          // The child is running for as long as the call that waits on it.
+          // Marking it active keeps its run stream open: an idle session's
+          // stream ends at once, and a client attached to the child reads that
+          // as the child finishing.
+          activeSessions.add(SUB_AGENT_SESSION_ID);
           const ids = nextSubAgentRunIds();
           
           // Phase 1: start
@@ -714,31 +730,34 @@ export const happyPathHandlers = [
             }
           );
           snapshots.set(session, persisted);
-          
-          addControlState(session, {
-            name: 'sub_agent_started',
-            value: {
-              agent: 'researcher',
-              session_id: 'child-session-0001',
-              invocation_id: ids.invocationId,
-              tool_call_id: ids.toolCallId,
-              started_at: new Date().toISOString()
-            }
-          });
+
           notify(session);
-          
-          // Broadcast live progress immediately after notify
+
+          // The worker's heartbeat re-sends a running snapshot on the open run
+          // stream; a client that attached after the call started picks the
+          // child up from the next one.
+          const heartbeat = setInterval(() => {
+            for (const { controller, threadId, runId } of openRunControllers.get(session) ?? []) {
+              try {
+                controller.enqueue(encodeSseEvent({
+                  type: 'CUSTOM',
+                  threadId,
+                  runId,
+                  name: 'sub_agent_progress',
+                  value: subAgentProgress(ids.invocationId, 'running', 200, { toolCallId: ids.toolCallId }),
+                }));
+              } catch (e) {}
+            }
+          }, 100);
+
+          // Phase 2: finish after delay. The delay is also how long a test can
+          // see the child running, so it has to outlast the assertion's retry
+          // steps (100, 250, 500 and 1000 ms) with room to spare; otherwise a
+          // loaded runner first looks after the row has finished.
           setTimeout(() => {
-            broadcastLiveEvent(session, {
-              type: 'CUSTOM',
-              name: 'sub_agent_progress',
-              value: subAgentProgress(ids.invocationId, 'running', 200)
-            });
-          }, 50);
-          
-          // Phase 2: finish after delay
-          setTimeout(() => {
+            clearInterval(heartbeat);
             activeSessions.delete(session);
+            activeSessions.delete(SUB_AGENT_SESSION_ID);
             const finalPersisted = [...(snapshots.get(session) || [])];
             finalPersisted.push(
               {
@@ -756,16 +775,11 @@ export const happyPathHandlers = [
             snapshots.set(session, finalPersisted);
             notify(session);
             
-            // close pending runs
-            const listeners = openRunControllers.get(session) || new Set();
-            for (const { controller, threadId, runId } of listeners) {
-              try {
-                controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
-                controller.close();
-              } catch (e) {}
-            }
-            openRunControllers.delete(session);
-          }, 1000);
+            // The child's runs end first because it finishes before the call
+            // that waits on it returns.
+            finishOpenRuns(SUB_AGENT_SESSION_ID);
+            finishOpenRuns(session);
+          }, 1500);
           
         } else {
           persistExchange(session, text, `Mock streamed reply to: ${text || 'empty prompt'}`);
