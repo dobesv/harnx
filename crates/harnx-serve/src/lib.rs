@@ -344,6 +344,20 @@ pub struct Server {
     shutdown: serve_shutdown::ServeShutdown,
 }
 
+impl Server {
+    /// Returns `Some(cluster)` when in cluster-client mode, `None` otherwise.
+    ///
+    /// Delegates to `Config::default_cluster_for_display` for consistency.
+    fn default_cluster_for_display(&self) -> Option<&str> {
+        self.config.default_cluster_for_display()
+    }
+
+    /// Agent reference as shown to clients: bare for the default cluster.
+    fn display_ref(&self, target: &ResolvedAgentTarget) -> String {
+        target.display_ref_with_default_cluster(self.default_cluster_for_display())
+    }
+}
+
 type RouteMatch = (String, Option<String>, AgentsRoute);
 
 struct ServerHandle {
@@ -590,18 +604,73 @@ impl Server {
     }
 
     async fn filter_agents_by_role(&self, query: Option<&str>) -> Result<Vec<AgentConfig>> {
-        if !query_requests_assistant_role(query) {
-            return Ok(self.agents.clone());
+        // Filter by role FIRST, using canonical names, THEN normalize for display.
+        // This keeps the role=assistant query working against list_assistant_agents()
+        // which returns canonical `name@cluster` strings.
+        let agents = if query_requests_assistant_role(query) {
+            let assistant_names = harnx_runtime::config::agent::list_assistant_agents().await;
+            self.agents
+                .iter()
+                .filter(|agent| assistant_names.iter().any(|name| name == agent.name()))
+                .cloned()
+                .collect()
+        } else {
+            self.agents.clone()
+        };
+
+        // Now apply display normalization
+        Ok(self.normalize_agents_for_display(agents))
+    }
+
+    /// Normalize agent names for display in cluster-client mode.
+    ///
+    /// Agents on the default cluster are shown without the `@<cluster>` suffix.
+    /// When a local agent and a default-cluster remote agent share the same bare name,
+    /// the remote agent's metadata wins (bare names route to the default cluster).
+    fn normalize_agents_for_display(&self, agents: Vec<AgentConfig>) -> Vec<AgentConfig> {
+        let default_cluster = self.default_cluster_for_display();
+
+        // Build map from display name -> agent config, preferring remote default-cluster
+        // entries over local when they share the same bare name.
+        let mut agent_map: std::collections::BTreeMap<String, (bool, AgentConfig)> =
+            std::collections::BTreeMap::new();
+
+        for agent in agents {
+            let canonical_name = agent.name();
+            let default_remote_bare = match (
+                default_cluster,
+                harnx_core::agent_ref::AgentRef::parse(canonical_name),
+            ) {
+                (Some(default), harnx_core::agent_ref::AgentRef::Remote { agent, cluster })
+                    if cluster == default =>
+                {
+                    Some(agent.into_owned())
+                }
+                _ => None,
+            };
+            let is_default_remote = default_remote_bare.is_some();
+            let display_name = default_remote_bare.unwrap_or_else(|| canonical_name.to_string());
+
+            // A bare name routes to the default cluster in cluster-client mode,
+            // so on a collision the default-cluster remote entry wins.
+            use std::collections::btree_map::Entry;
+            match agent_map.entry(display_name.clone()) {
+                Entry::Vacant(e) => {
+                    let mut config = agent.clone();
+                    config.set_name(&display_name);
+                    e.insert((is_default_remote, config));
+                }
+                Entry::Occupied(mut e) => {
+                    if is_default_remote && !e.get().0 {
+                        let mut config = agent.clone();
+                        config.set_name(&display_name);
+                        e.insert((is_default_remote, config));
+                    }
+                }
+            }
         }
 
-        let assistant_names = harnx_runtime::config::agent::list_assistant_agents().await;
-        let assistants = self
-            .agents
-            .iter()
-            .filter(|agent| assistant_names.iter().any(|name| name == agent.name()))
-            .cloned()
-            .collect();
-        Ok(assistants)
+        agent_map.into_values().map(|(_, config)| config).collect()
     }
 
     /// Serve a static web-ui asset for a GET/HEAD request that did not match an
@@ -728,7 +797,7 @@ impl Server {
         let (target, scoped) = resolve_agent_target(&self.config, &agent_ref)
             .await
             .map_err(ag_ui_error_to_anyhow)?;
-        let display_ref = target.display_ref();
+        let display_ref = self.display_ref(&target);
 
         match agent_route {
             AgentsRoute::Agent => {
@@ -806,11 +875,14 @@ impl Server {
 
     async fn agent_json(&self, target: &ResolvedAgentTarget) -> Result<AppResponse> {
         let sessions = agent_sessions_json(&self.config, target).await?;
-        let display_ref = target.display_ref();
+        let display_ref = self.display_ref(target);
+        // Look up description using both display name and full @cluster name
         let description = self
             .agents
             .iter()
-            .find(|candidate| candidate.name() == display_ref)
+            .find(|candidate| {
+                candidate.name() == display_ref || candidate.name() == target.display_ref()
+            })
             .map(AgentConfig::description)
             .filter(|description| !description.is_empty());
         let data = json!({
@@ -2447,6 +2519,16 @@ mod tests {
         serde_json::from_slice(&body).expect("parse json")
     }
 
+    /// Helper: extract agent names from the JSON response data.
+    fn agent_names(json: &Value) -> Vec<String> {
+        json["data"]
+            .as_array()
+            .expect("agents array")
+            .iter()
+            .filter_map(|a| a["name"].as_str().map(String::from))
+            .collect()
+    }
+
     #[tokio::test]
     async fn models_endpoint_omits_default_alias_without_resolved_model() {
         let config = Arc::new(RwLock::new(Config::default()));
@@ -3732,5 +3814,300 @@ mod tests {
             content_type_for_path(Path::new("x.unknown")),
             "application/octet-stream"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for default-cluster display normalization
+    // -------------------------------------------------------------------------
+
+    /// When running in cluster-client mode, agents on the default cluster
+    /// should be listed without the `@<cluster>` suffix.
+    #[tokio::test]
+    async fn list_agents_hides_suffix_for_default_cluster() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
+            "assistant-alpha",
+            "role: assistant\nmodel: openai:gpt-4o\ndescription: Local assistant",
+            "You are assistant alpha.",
+        );
+        sandbox.write_nats_server(
+            "mycluster",
+            "url: nats://localhost:4222\nagents:\n  - name: sisyphus\n    description: Remote assistant\n    role: assistant\n  - name: remote-helper\n    role: subagent\n",
+        );
+
+        // Configure server in cluster-client mode
+        let mut config = sandbox.config();
+        config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
+        let config = Arc::new(RwLock::new(config));
+        let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
+
+        let agents = response_json(server.list_agents(None).await.expect("agents")).await;
+        let names = agent_names(&agents);
+
+        // Default cluster agent should appear without suffix, local with bare name,
+        // remote helper without suffix since it's on the default cluster.
+        assert_eq!(
+            names.iter().filter(|&n| n == "sisyphus").count(),
+            1,
+            "expected 'sisyphus' without suffix, got {names:?}"
+        );
+        assert!(
+            names.contains(&"assistant-alpha".to_string()),
+            "expected 'assistant-alpha', got {names:?}"
+        );
+        assert!(
+            !names.contains(&"remote-helper@mycluster".to_string()),
+            "expected no 'remote-helper@mycluster' suffix, got {names:?}"
+        );
+        assert!(
+            names.contains(&"remote-helper".to_string()),
+            "expected 'remote-helper' without suffix, got {names:?}"
+        );
+    }
+
+    /// When NOT in cluster-client mode, agents should keep their @cluster suffix.
+    #[tokio::test]
+    async fn list_agents_keeps_suffix_without_default_cluster() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
+            "assistant-alpha",
+            "role: assistant\nmodel: openai:gpt-4o\ndescription: Local assistant",
+            "You are assistant alpha.",
+        );
+        sandbox.write_nats_server(
+            "shared",
+            "url: nats://localhost:4222\nagents:\n  - name: sisyphus\n    description: Remote assistant\n    role: assistant\n",
+        );
+
+        // Default config (no HARNX_NATS_SERVER) uses NatsRouting::Default
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
+
+        let agents = response_json(server.list_agents(None).await.expect("agents")).await;
+        let names = agent_names(&agents);
+
+        // Remote agent should appear WITH suffix, local with bare name
+        assert!(
+            names.contains(&"sisyphus@shared".to_string()),
+            "expected 'sisyphus@shared' with suffix, got {names:?}"
+        );
+        assert!(
+            names.contains(&"assistant-alpha".to_string()),
+            "expected 'assistant-alpha', got {names:?}"
+        );
+    }
+
+    /// Agents on non-default clusters should keep their suffix even in cluster-client mode.
+    #[tokio::test]
+    async fn list_agents_keeps_suffix_for_non_default_cluster() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_nats_server(
+            "mycluster",
+            "url: nats://localhost:4222\nagents:\n  - name: sisyphus\n    description: Default cluster agent\n    role: assistant\n",
+        );
+        sandbox.write_nats_server(
+            "other",
+            "url: nats://localhost:4222\nagents:\n  - name: atlas\n    description: Other cluster agent\n    role: assistant\n",
+        );
+
+        // Configure server in cluster-client mode with 'mycluster' as default
+        let mut config = sandbox.config();
+        config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
+        let config = Arc::new(RwLock::new(config));
+        let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
+
+        let agents = response_json(server.list_agents(None).await.expect("agents")).await;
+        let names = agent_names(&agents);
+
+        // Default cluster agent without suffix, non-default with suffix
+        assert!(
+            names.contains(&"sisyphus".to_string()),
+            "expected 'sisyphus' without suffix, got {names:?}"
+        );
+        assert!(
+            names.contains(&"atlas@other".to_string()),
+            "expected 'atlas@other' with suffix, got {names:?}"
+        );
+    }
+
+    /// Test deduplication: bare name and @cluster name should merge for default cluster.
+    #[tokio::test]
+    async fn list_agents_dedupes_bare_and_suffixed_for_default_cluster() {
+        let sandbox = TestConfigSandbox::new();
+        // Write a local agent
+        sandbox.write_agent_with_front_matter(
+            "sisyphus",
+            "role: assistant\nmodel: openai:gpt-4o\ndescription: Local sisyphus",
+            "You are sisyphus.",
+        );
+        // Write a remote agent with the same name on the default cluster
+        sandbox.write_nats_server(
+            "mycluster",
+            "url: nats://localhost:4222\nagents:\n  - name: sisyphus\n    description: Remote sisyphus\n    role: assistant\n",
+        );
+
+        // Configure server in cluster-client mode
+        let mut config = sandbox.config();
+        config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
+        let config = Arc::new(RwLock::new(config));
+        let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
+
+        let agents = response_json(server.list_agents(None).await.expect("agents")).await;
+        let agents_list = agents["data"].as_array().expect("agents array");
+
+        // Should have exactly one "sisyphus" entry (deduped), not two
+        let sisyphus_count = agents_list
+            .iter()
+            .filter(|a| a["name"].as_str() == Some("sisyphus"))
+            .count();
+        assert_eq!(
+            sisyphus_count, 1,
+            "expected exactly 1 'sisyphus' entry after dedup, got {agents_list:?}"
+        );
+
+        // The remote agent's description should win (bare names route to default cluster)
+        let sisyphus_entry = agents_list
+            .iter()
+            .find(|a| a["name"].as_str() == Some("sisyphus"))
+            .expect("sisyphus entry should exist");
+        assert_eq!(
+            sisyphus_entry["description"].as_str(),
+            Some("Remote sisyphus"),
+            "expected remote agent's description to win, got {sisyphus_entry:?}"
+        );
+    }
+
+    /// A described local agent must not displace an undescribed default-cluster
+    /// remote with the same name: the bare name routes to the remote.
+    #[tokio::test]
+    async fn list_agents_dedup_prefers_default_remote_even_without_description() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
+            "sisyphus",
+            "role: assistant\nmodel: openai:gpt-4o\ndescription: Local sisyphus",
+            "You are sisyphus.",
+        );
+        sandbox.write_nats_server(
+            "mycluster",
+            "url: nats://localhost:4222\nagents:\n  - name: sisyphus\n    role: assistant\n",
+        );
+
+        let mut config = sandbox.config();
+        config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
+        let config = Arc::new(RwLock::new(config));
+        let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
+
+        let agents = response_json(server.list_agents(None).await.expect("agents")).await;
+        let matches: Vec<_> = agents["data"]
+            .as_array()
+            .expect("agents array")
+            .iter()
+            .filter(|a| a["name"].as_str() == Some("sisyphus"))
+            .collect();
+        assert_eq!(matches.len(), 1, "expected one sisyphus entry: {agents:?}");
+        assert_ne!(
+            matches[0]["description"].as_str(),
+            Some("Local sisyphus"),
+            "local agent must not win the collision: {:?}",
+            matches[0]
+        );
+    }
+
+    /// Test role=assistant filter works in cluster-client mode (regression test).
+    /// Remote assistants on the default cluster must not be dropped.
+    #[tokio::test]
+    async fn list_agents_filters_assistants_in_cluster_mode() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
+            "assistant-alpha",
+            "role: assistant\nmodel: openai:gpt-4o\ndescription: Local assistant",
+            "You are assistant alpha.",
+        );
+        sandbox.write_agent_with_front_matter(
+            "helper-beta",
+            "role: subagent\nmodel: openai:gpt-4o\ndescription: Local helper",
+            "You are helper beta.",
+        );
+        sandbox.write_nats_server(
+            "mycluster",
+            "url: nats://localhost:4222\nagents:\n  - name: sisyphus\n    description: Remote assistant\n    role: assistant\n  - name: remote-helper\n    role: subagent\n",
+        );
+
+        // Configure server in cluster-client mode
+        let mut config = sandbox.config();
+        config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
+        let config = Arc::new(RwLock::new(config));
+        let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
+
+        // Test role=assistant filter
+        let filtered = response_json(
+            server
+                .list_agents(Some("role=assistant"))
+                .await
+                .expect("assistant agents"),
+        )
+        .await;
+        let names = agent_names(&filtered);
+
+        // Should have exactly 2 names: local assistant-alpha and remote sisyphus
+        // (remote sisyphus appears as bare "sisyphus" since it's on the default cluster)
+        assert_eq!(names.len(), 2, "expected 2 assistants, got {names:?}");
+        assert!(
+            names.contains(&"assistant-alpha".to_string()),
+            "expected 'assistant-alpha', got {names:?}"
+        );
+        assert!(
+            names.contains(&"sisyphus".to_string()),
+            "expected 'sisyphus' (bare), got {names:?}"
+        );
+
+        // Sub-agents should NOT be in the filtered list
+        let excluded = ["helper-beta", "remote-helper", "remote-helper@mycluster"];
+        assert!(
+            excluded.iter().all(|n| !names.contains(&n.to_string())),
+            "sub-agents should not appear: expected none of {excluded:?}, got {names:?}"
+        );
+    }
+
+    /// Test round-trip: bare name from list should resolve back to the same agent.
+    #[tokio::test]
+    async fn bare_name_round_trips_to_default_cluster_agent() {
+        use crate::agent_resolve::resolve_agent_target;
+
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
+            "sisyphus",
+            "role: assistant\nmodel: openai:gpt-4o\ndescription: Local sisyphus",
+            "You are sisyphus.",
+        );
+        sandbox.write_nats_server(
+            "mycluster",
+            "url: nats://localhost:4222\nagents:\n  - name: atlas\n    description: Remote atlas\n    role: assistant\n",
+        );
+
+        // Configure server in cluster-client mode
+        let mut config = sandbox.config();
+        config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
+
+        // Bare name should resolve to the default cluster
+        let (target, _) = resolve_agent_target(&config, "atlas")
+            .await
+            .expect("bare atlas should resolve");
+        assert_eq!(target.agent(), "atlas");
+        assert_eq!(target.cluster(), "mycluster");
+
+        // Bare name for local agent should still work (routes to default, but local exists)
+        let (local_target, _) = resolve_agent_target(&config, "sisyphus")
+            .await
+            .expect("bare sisyphus should resolve");
+        assert_eq!(local_target.agent(), "sisyphus");
+        assert_eq!(local_target.cluster(), "mycluster");
+
+        // Old-style suffixed name should still work
+        let (suffixed_target, _) = resolve_agent_target(&config, "atlas@mycluster")
+            .await
+            .expect("atlas@mycluster should resolve");
+        assert_eq!(suffixed_target.agent(), "atlas");
+        assert_eq!(suffixed_target.cluster(), "mycluster");
     }
 }
