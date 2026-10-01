@@ -49,6 +49,7 @@ class TestOpenAIEffortVariants(unittest.TestCase):
             "gpt-5.6-luna",
             "gpt-6-astra",
             "gpt-6-sol",
+            "gpt-6.1-sol",
             "gpt-6-luna",
         ):
             with self.subTest(name=name):
@@ -79,12 +80,20 @@ class TestOpenAIEffortVariants(unittest.TestCase):
             [variant["name"] for variant in variants], ["gpt-5.6-terra:high"]
         )
 
-    def test_gpt_6_sol_exposes_high_and_max(self) -> None:
-        variants = um.openai_effort_variants(self._base("gpt-6-sol"), "openai")
-        self.assertEqual(
-            [variant["name"] for variant in variants],
-            ["gpt-6-sol:high", "gpt-6-sol:max"],
-        )
+    def test_gpt_6_sol_family_exposes_high_and_max(self) -> None:
+        for name in ("gpt-6-sol", "gpt-6.1-sol"):
+            with self.subTest(name=name):
+                base = self._base(name)
+                base["cache_read_price"] = 0.1
+                variants = um.openai_effort_variants(base, "openai")
+                self.assertEqual(
+                    [variant["name"] for variant in variants],
+                    [f"{name}:high", f"{name}:max"],
+                )
+                for variant in variants:
+                    self.assertEqual(variant["real_name"], name)
+                    self.assertEqual(variant["cache_read_price"], 0.1)
+                    self.assertEqual(variant["endpoint"], "responses")
 
     def test_other_providers_and_models_are_unchanged(self) -> None:
         self.assertEqual(um.openai_effort_variants(self._base(), "openrouter"), [])

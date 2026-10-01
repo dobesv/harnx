@@ -19,7 +19,7 @@ results, and a multi-agent code review pipeline.
 
 | Agent | Model | Best For |
 |-------|-------|----------|
-| `hephaestus` | gpt-6-sol:high | Large refactors, migrations, deep implementation |
+| `hephaestus` | gpt-6.1-sol:high | Large refactors, migrations, deep implementation |
 | `iris` | gemini-3.8-flash | UI, frontend, visual engineering |
 | `apollo` | gemini-3.8-flash | Creative solutions, novel UX |
 | `athena` | zai.glm-5 | Complex multi-file features, agent of last resort |
@@ -33,7 +33,7 @@ results, and a multi-agent code review pipeline.
 | Agent | Model | Role |
 |-------|-------|------|
 | `pytheas` | gemini-3.8-flash | Reconnaissance — fast codebase + GitHub/issue context lookup |
-| `zosimus` | gpt-6-sol | Deep investigation — bug reproduction, hypothesis validation |
+| `zosimus` | gpt-6.1-sol | Deep investigation — bug reproduction, hypothesis validation |
 | `librarian` | gemini-3.8-flash | External knowledge — web search, docs, GitHub |
 | `oracle` | gpt-6-astra:max | Architectural decisions and consultation |
 | `argus` | gemini-3.8-flash | Independent verification — PASS/FAIL with evidence |

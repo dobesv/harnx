@@ -1,6 +1,6 @@
 ---
 role: assistant
-model: claude:claude-sonnet-5
+model: claude:claude-sonnet-5-5
 model_fallbacks:
 - codex:gpt-5.6-terra
 - openai:gpt-5.6-terra
