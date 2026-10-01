@@ -214,6 +214,27 @@ use_tools:
 
 When tools are enabled, their declarations are injected into the system prompt as a numbered list appended after the prompt body.
 
+### Attachment Tools
+
+The `harnx-attachment-tools` server provides tools for reading and storing NATS-backed media and plan documents:
+
+- **`attachment_read(url, ...)`**: Read an attachment or rendered plan by its `cid:` URL (`cid:media:` or `cid:plan:`).
+  - Returns image blocks for images, formatted text with line numbers for text media and rendered plans, and errors for unsupported binary formats.
+  - Parameters:
+    - `url` (string, required): The canonical `cid:` URL to read.
+    - `offset` (integer, optional): Line number to start reading from (1-indexed).
+    - `limit` (integer, optional): Maximum number of lines to return from offset.
+    - `head_lines` (integer, optional): Return only the first N lines.
+    - `tail_lines` (integer, optional): Return only the last N lines.
+    - `max_output_bytes` (integer, optional): Maximum output size in bytes.
+    - `grep` (string, optional): Regex pattern to filter lines before truncation.
+- **`attachment_create(content, mime_type)`**: Create a new text attachment in NATS Object Storage (`harnx_attachments`) owned by the invoking session.
+  - Returns the canonical `cid:media:` URL for the stored attachment.
+  - Parameters:
+    - `content` (string, required): The text content to store.
+    - `mime_type` (string, required): Text MIME type (e.g. `text/plain`, `text/markdown`, `application/json`, `application/xml`, `application/yaml`). Non-text MIME types are rejected.
+  - Requires caller session identity; returns an error when invoked without session context.
+
 ## Documents (RAG)
 
 The `documents` field lists files or URLs to include as retrieval-augmented generation (RAG) context. When an agent with documents starts, Harnx offers to initialize a RAG index.
@@ -500,6 +521,30 @@ count changes, every 10 seconds as a heartbeat, and once more with `done` or
 `failed` status at termination. These snapshots carry the same fields as the
 durable `sub_agent_progress` result above. Raw child transcript events are not
 forwarded to the parent stream.
+
+### Passing Attachments to Sub-Agents
+
+When delegating tasks using `{agent}_session_prompt`, callers can pass an optional `attachments` array of canonical `cid:` URLs (`cid:media:...` or `cid:plan:...`):
+
+```json
+{
+  "message": "Review the plan and investigate the attached profile",
+  "attachments": [
+    "cid:media:pantheon%2Fatlas/armDRA/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "cid:plan:pantheon%2Fatlas/armDRA/memory-leak-fix"
+  ]
+}
+```
+
+Harnx validates each URL before launching the sub-agent turn and drops duplicates. Image attachments resolve to native image content parts for the model. For text media and plan documents, Harnx appends pointer lines (`\nAttachment: <url>`) to the prompt text so the sub-agent can inspect them with `attachment_read`.
+
+### Returning Files with Canonical cid: URLs
+
+Agents and sub-agents should return canonical `cid:` URLs when producing files, reports, or plans:
+
+1. **Create media attachments**: Call `attachment_create(content, mime_type)` to store text payloads (markdown summaries, logs, JSON reports) in NATS Object Storage (`harnx_attachments`). The tool returns a canonical `cid:media:<agent>/<session-id>/<hash>` URL.
+2. **Create or update plans**: Call `plans_add_plan`, `plans_add_task`, or `plans_add_note` to record structured planning items. The tools return and accept canonical `cid:plan:<agent>/<session-id>/<slug>` URLs.
+3. **Return the URL**: Return the canonical `cid:` URL in the final response. Parent agents, sub-agents, or users can read the content with `attachment_read`, inspect it with `harnx dump attachment <url>`, or open it in the default system viewer with `harnx open attachment <url>`.
 
 ## Examples
 
