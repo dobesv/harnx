@@ -8076,7 +8076,7 @@ fn picker_test_config() -> GlobalConfig {
     test_config()
 }
 
-/// Create agent .md stub files and return a list of agent names.
+/// Create agent .md stub files.
 fn create_agent_stubs(agents_dir: &std::path::Path, names: &[&str]) {
     std::fs::create_dir_all(agents_dir).unwrap();
     for name in names {
@@ -8084,6 +8084,9 @@ fn create_agent_stubs(agents_dir: &std::path::Path, names: &[&str]) {
         std::fs::write(f, format!("# {name}")).unwrap();
     }
 }
+
+#[path = "tests/agent_display.rs"]
+mod agent_display;
 
 // --- AgentPicker filtering ---------------------------------------------------
 
@@ -8261,38 +8264,6 @@ async fn agent_picker_enter_on_empty_filter_does_nothing() {
 }
 
 // --- AgentPicker → immediate agent activation --------------------------------
-
-#[tokio::test]
-async fn agent_picker_enter_activates_agent_immediately() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _lock = ENV_LOCK.lock().await;
-    let _env = TestEnvironment::set(tmp.path());
-
-    // Create a real agent .md file so use_agent_by_name succeeds.
-    let agents_dir = tmp.path().join("agents");
-    create_agent_stubs(&agents_dir, &["hermes"]);
-
-    let config = picker_test_config();
-    let mut tui = Tui::init(&config).await.unwrap();
-
-    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
-        agents: vec!["hermes".into()],
-        selected: 0,
-        query: String::new(),
-    });
-
-    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .await
-        .unwrap();
-
-    // Agent should be activated immediately on config.
-    let agent_name = config.read().agent.as_ref().map(|a| a.name().to_string());
-    assert_eq!(
-        agent_name.as_deref(),
-        Some("hermes"),
-        "agent must be set immediately on Enter"
-    );
-}
 
 #[tokio::test]
 async fn agent_picker_enter_with_no_sessions_starts_new_session() {

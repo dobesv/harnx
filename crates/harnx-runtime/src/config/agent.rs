@@ -621,6 +621,9 @@ where
 ///
 /// Includes agents from the top-level `agents/` directory (bare names) and
 /// from `packages/<pkg>/agents/` directories (as `pkg/stem` qualified names).
+///
+/// **IMPORTANT**: Returns canonical `name@cluster` strings for remote agents.
+/// Use [`list_assistant_agents_for_display`] for user-facing TUI/CLI display.
 pub async fn list_assistant_agents() -> Vec<String> {
     let mut output =
         collect_assistant_agents_in_dir(&Config::agents_config_dir(), |stem| stem.to_string())
@@ -654,6 +657,52 @@ pub async fn list_assistant_agents() -> Vec<String> {
     output.sort();
     output.dedup();
     output
+}
+
+/// Returns display names for assistant agents, normalized for cluster-client mode.
+///
+/// Routing is snapshotted before the returned future runs; no config borrow
+/// or lock guard needs to survive the await.
+///
+/// In cluster-client mode (`config.default_cluster_for_display()` is `Some(cluster)`):
+/// - Local filesystem/package agents are omitted (bare names route to the cluster)
+/// - Default-cluster remote agents are shown bare (no `@cluster` suffix)
+/// - Non-default cluster agents retain their `@cluster` suffix
+///
+/// In default mode (`config.default_cluster_for_display()` is `None`):
+/// - Local agents shown bare, remote agents with `@cluster` suffix
+///
+/// Use this for TUI picker/completion and CLI `--list-assistant-agents`.
+/// **Do NOT use for `harnx-serve` role filtering** — use [`list_assistant_agents`]
+/// for canonical identity matching.
+pub fn list_assistant_agents_for_display(
+    config: &Config,
+) -> impl std::future::Future<Output = Vec<String>> + Send + 'static {
+    // Snapshot routing now so callers can release their config guard before I/O.
+    let default_cluster = config.default_cluster_for_display().map(str::to_owned);
+    async move {
+        let Some(default_cluster) = default_cluster else {
+            return list_assistant_agents().await;
+        };
+        let mut output: Vec<String> = list_remote_agent_names(Some(AgentRole::Assistant))
+            .into_iter()
+            .map(|name| remote_agent_display_name(name, &default_cluster))
+            .collect();
+        output.sort();
+        output.dedup();
+        output
+    }
+}
+
+fn remote_agent_display_name(name: String, default_cluster: &str) -> String {
+    match harnx_core::agent_ref::AgentRef::parse(&name) {
+        harnx_core::agent_ref::AgentRef::Remote { agent, cluster }
+            if cluster == default_cluster =>
+        {
+            agent.into_owned()
+        }
+        _ => name,
+    }
 }
 
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {

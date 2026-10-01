@@ -18,7 +18,7 @@ use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterA
 use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
 use harnx_runtime::config::{
-    list_assistant_agents, sort_sessions_for_picker_with_context, PickerMatchMode,
+    list_assistant_agents_for_display, sort_sessions_for_picker_with_context, PickerMatchMode,
     PickerQueryContext,
 };
 use harnx_runtime::config::{GlobalConfig, SessionMeta};
@@ -218,7 +218,9 @@ impl Tui {
     }
 
     pub async fn init(config: &GlobalConfig) -> Result<Self> {
-        let agents = list_assistant_agents().await;
+        // Use display names for TUI picker; in cluster-client mode, this omits
+        // local/package agents and strips default-cluster suffix.
+        let agents = Self::assistant_agents_for_display(config).await;
         // Skip agents check in tests: test configs use a bare `Config::default()`
         // with no agents directory populated, but the production check is covered
         // by direct unit tests of `check_agents_available`.
@@ -278,8 +280,15 @@ impl Tui {
         })
     }
 
+    pub(super) async fn assistant_agents_for_display(config: &GlobalConfig) -> Vec<String> {
+        let discovery = list_assistant_agents_for_display(&config.read());
+        discovery.await
+    }
+
     pub(crate) async fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState> {
-        let agents = list_assistant_agents().await;
+        // Use display names for TUI picker; in cluster-client mode, this omits
+        // local/package agents and strips default-cluster suffix.
+        let agents = Self::assistant_agents_for_display(config).await;
         if config.read().active_agent_ref().is_none() {
             if agents.is_empty() {
                 return None;

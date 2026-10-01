@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::client::MessageRole;
-use crate::config::test_support::{env_lock, EnvGuard};
+use crate::config::test_support::{env_lock, env_lock_async, EnvGuard};
 use crate::config::GlobalConfig;
 use crate::utils::create_abort_signal;
 use std::{
@@ -765,4 +765,234 @@ fn apply_agent_patch_matches_bare_name_and_preserves_qualified_name() {
     assert!(result.is_ok());
     assert_eq!(config.model_id(), Some("anthropic:claude-3-5-sonnet"));
     assert_eq!(config.name(), "pantheon/atlas");
+}
+
+// -------------------------------------------------------------------------
+// Tests for list_assistant_agents_for_display (TUI/CLI display helper)
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_list_assistant_agents_for_display_default_mode() {
+    // In default mode (no HARNX_NATS_SERVER), local agents are shown bare,
+    // remote agents with @cluster suffix.
+    let _env = env_lock_async().await;
+    let config_dir = unique_test_config_dir();
+    let agents_dir = config_dir.join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+
+    // Local assistant agent
+    fs::write(
+        agents_dir.join("local-assistant.md"),
+        "---\nrole: assistant\nmodel: openai:gpt-4o\n---\nLocal agent",
+    )
+    .unwrap();
+
+    // Remote agent on "shared" cluster
+    write_remote_cluster_fixture(
+        &config_dir,
+        "shared",
+        r#"url: nats://localhost:4222
+agents:
+  - name: remote-assistant
+    role: assistant
+    description: Remote assistant
+"#,
+    )
+    .unwrap();
+
+    let _guard = EnvGuard::new("HARNX_CONFIG_DIR", config_dir.to_str().unwrap());
+    let config = Config::load_from_file(&Config::config_file()).unwrap();
+
+    let agents = list_assistant_agents_for_display(&config).await;
+    assert_eq!(agents, ["local-assistant", "remote-assistant@shared"]);
+}
+
+#[tokio::test]
+async fn test_list_assistant_agents_for_display_cluster_mode() {
+    // In cluster-client mode (HARNX_NATS_SERVER=shared):
+    // - Local/package agents are omitted
+    // - Default-cluster remote agents shown bare
+    // - Non-default cluster agents keep suffix
+    let _env = env_lock_async().await;
+    let config_dir = unique_test_config_dir();
+    let agents_dir = config_dir.join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+
+    // Local assistant agent (should be omitted in display)
+    fs::write(
+        agents_dir.join("local-assistant.md"),
+        "---\nrole: assistant\nmodel: openai:gpt-4o\n---\nLocal agent",
+    )
+    .unwrap();
+
+    // Remote agent on default cluster "shared"
+    write_remote_cluster_fixture(
+        &config_dir,
+        "shared",
+        r#"url: nats://localhost:4222
+agents:
+  - name: remote-assistant
+    role: assistant
+    description: Remote assistant
+"#,
+    )
+    .unwrap();
+
+    // Remote agent on other cluster "other"
+    write_remote_cluster_fixture(
+        &config_dir,
+        "other",
+        r#"url: nats://localhost:4223
+agents:
+  - name: other-assistant
+    role: assistant
+    description: Other cluster assistant
+"#,
+    )
+    .unwrap();
+
+    let _guard = EnvGuard::new("HARNX_CONFIG_DIR", config_dir.to_str().unwrap());
+    let _server_guard = EnvGuard::new("HARNX_NATS_SERVER", "shared");
+    let mut config = Config::load_from_file(&Config::config_file()).unwrap();
+    config.nats_routing = NatsRouting::Cluster("shared".to_string());
+
+    let agents = list_assistant_agents_for_display(&config).await;
+
+    assert_eq!(agents, ["other-assistant@other", "remote-assistant"]);
+}
+
+#[tokio::test]
+async fn test_list_assistant_agents_for_display_dedup() {
+    // When local and default-cluster remote share the same bare name,
+    // only the remote (bare) appears (local is omitted in cluster mode).
+    let _env = env_lock_async().await;
+    let config_dir = unique_test_config_dir();
+    let agents_dir = config_dir.join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+
+    // Local agent "sisyphus"
+    fs::write(
+        agents_dir.join("sisyphus.md"),
+        "---\nrole: assistant\nmodel: openai:gpt-4o\n---\nLocal sisyphus",
+    )
+    .unwrap();
+
+    // Remote agent "sisyphus" on default cluster
+    write_remote_cluster_fixture(
+        &config_dir,
+        "mycluster",
+        r#"url: nats://localhost:4222
+agents:
+  - name: sisyphus
+    role: assistant
+    description: Remote sisyphus
+"#,
+    )
+    .unwrap();
+
+    let _guard = EnvGuard::new("HARNX_CONFIG_DIR", config_dir.to_str().unwrap());
+    let _server_guard = EnvGuard::new("HARNX_NATS_SERVER", "mycluster");
+    let mut config = Config::load_from_file(&Config::config_file()).unwrap();
+    config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
+
+    let agents = list_assistant_agents_for_display(&config).await;
+
+    assert_eq!(agents, ["sisyphus"]);
+}
+
+/// Test with duplicate remote declarations in same cluster - should dedup.
+#[tokio::test]
+async fn test_list_assistant_agents_for_display_dedup_duplicate_remotes() {
+    // Same agent declared multiple times in same cluster should result in single entry.
+    let _env = env_lock_async().await;
+    let config_dir = unique_test_config_dir();
+
+    // Remote agent "atlas" declared twice in default cluster
+    write_remote_cluster_fixture(
+        &config_dir,
+        "mycluster",
+        r#"url: nats://localhost:4222
+agents:
+  - name: atlas
+    role: assistant
+    description: Atlas assistant
+  - name: atlas
+    role: assistant
+    description: Duplicate atlas
+"#,
+    )
+    .unwrap();
+
+    // Another remote agent in non-default cluster
+    write_remote_cluster_fixture(
+        &config_dir,
+        "other",
+        r#"url: nats://localhost:4222
+agents:
+  - name: atlas
+    role: assistant
+    description: Atlas on other cluster
+"#,
+    )
+    .unwrap();
+
+    let _guard = EnvGuard::new("HARNX_CONFIG_DIR", config_dir.to_str().unwrap());
+    let _server_guard = EnvGuard::new("HARNX_NATS_SERVER", "mycluster");
+    let mut config = Config::load_from_file(&Config::config_file()).unwrap();
+    config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
+
+    let agents = list_assistant_agents_for_display(&config).await;
+
+    assert_eq!(agents, ["atlas", "atlas@other"]);
+}
+
+/// Test package discovery is included in default mode.
+#[tokio::test]
+async fn test_list_assistant_agents_for_display_includes_package_agents() {
+    let _env = env_lock_async().await;
+    let config_dir = unique_test_config_dir();
+    let agents_dir = config_dir.join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+
+    // Local agent
+    fs::write(
+        agents_dir.join("local-agent.md"),
+        "---\nrole: assistant\nmodel: openai:gpt-4o\n---\nLocal agent",
+    )
+    .unwrap();
+
+    // Package agent
+    let pkg_dir = config_dir.join("packages").join("my-pkg").join("agents");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::write(
+        pkg_dir.join("pkg-agent.md"),
+        "---\nrole: assistant\nmodel: openai:gpt-4o\n---\nPackage agent",
+    )
+    .unwrap();
+
+    let _guard = EnvGuard::new("HARNX_CONFIG_DIR", config_dir.to_str().unwrap());
+    // NO HARNX_NATS_SERVER - default mode
+    let config = Config::load_from_file(&Config::config_file()).unwrap();
+
+    let agents = list_assistant_agents_for_display(&config).await;
+
+    assert_eq!(agents, ["local-agent", "my-pkg/pkg-agent"]);
+}
+
+#[tokio::test]
+async fn test_list_assistant_agents_for_display_snapshots_routing_before_await() {
+    let _env = env_lock_async().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard::new("HARNX_CONFIG_DIR", config_dir.path());
+    write_remote_cluster_fixture(
+        config_dir.path(),
+        "shared",
+        "url: nats://localhost:4222\nagents:\n  - name: remote-assistant\n",
+    )
+    .unwrap();
+    let mut config = Config::load_from_file(&Config::config_file()).unwrap();
+    config.nats_routing = NatsRouting::Cluster("shared".into());
+    let discovery = list_assistant_agents_for_display(&config);
+    config.nats_routing = NatsRouting::Default;
+    assert_eq!(discovery.await, ["remote-assistant"]);
 }

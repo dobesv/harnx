@@ -577,7 +577,7 @@ agents:
 
 ### Discovery Behavior
 
-- **Naming**: Agents appear as `name@cluster`. For example, `name: atlas` in `prod.yaml` surfaces as `atlas@prod`.
+- **Naming**: Canonical discovery (`--list-agents`) returns `name@cluster`. For example, `name: atlas` in `prod.yaml` surfaces as `atlas@prod`. In cluster-client mode (`HARNX_NATS_SERVER=prod`), assistant listings (`--list-assistant-agents`), TUI pickers/completion, and the Web UI show default-cluster agents as bare names (`atlas`). Agents on other clusters retain their suffix. TUI/CLI assistant discovery omits local and package catalogs in this mode because bare names route to the default cluster.
 - **Filtering**:
     - **Shell Completion**: All agents appear in `--list-agents` and tab-completion regardless of role.
     - **Assistant Picker**: Only agents with `role: assistant` (the default) appear in interactive assistant selection menus, including the TUI picker and the Web UI agent list served by `GET /v1/agents?role=assistant`. `subagent` entries are excluded from the picker.
