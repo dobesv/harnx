@@ -24,6 +24,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 - harnx_agent_session_history_read
+- attachments_attachment_read
 description: "Skeptical investigator \u2014 pressure-tests code review findings by\
   \ challenging assumptions, searching for mitigating factors, and catching false\
   \ positives. Named after Rhadamanthus (rad-uh-MAN-thus), the strictest judge of\

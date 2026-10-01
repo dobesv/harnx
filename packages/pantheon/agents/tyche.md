@@ -24,6 +24,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 - harnx_agent_session_history_read
+- attachments_attachment_read
 description: "Deployment verification specialist \u2014 produces Go/No-Go deployment\
   \ checklists with pre-deployment checks, migration verification, rollback procedures,\
   \ and monitoring plans. Named after Tyche (TY-kee), goddess of fortune who determines\

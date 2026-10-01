@@ -1,0 +1,5 @@
+command: harnx-attachment-tools
+description: >-
+  Read and create NATS-backed attachments via cid: URLs. Used by agents
+  to access media and text blobs stored in the harnx_attachments object store
+  without filesystem access or network fetching.

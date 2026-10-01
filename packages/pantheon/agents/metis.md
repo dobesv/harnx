@@ -21,6 +21,7 @@ use_tools:
 - pytheas_session_prompt
 - fs_rollback_file
 - harnx_agent_session_history_read
+- attachments_attachment_read
 description: "Pre-planning consultant \u2014 analyzes user requests before Daedalus\
   \ generates plans, identifying hidden intentions, ambiguities, and AI failure points.\
   \ Produces directives that guide the planner. Named after Metis (MEE-tis), the Greek\

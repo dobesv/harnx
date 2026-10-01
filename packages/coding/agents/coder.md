@@ -49,6 +49,8 @@ use_tools:
   - time_wait
   - time_wait_until
   - harnx_agent_session_history_read
+  - attachments_attachment_read
+  - attachments_attachment_create
 description: >
   Full-stack coding assistant — reads code, writes code, runs tests, searches
   the web for docs, and manages local plans to track multi-step tasks.

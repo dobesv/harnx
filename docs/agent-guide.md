@@ -184,6 +184,10 @@ The `use_tools` field controls which MCP tools the agent can access. Tools are s
 | `prefix_{a,b}` | Enable specific tools matching a brace expansion |
 | `toolset_name` | Enable a named toolset (defined in global config) |
 
+Tool names follow the pattern `{server}_{tool}`, where `server` is the server's registered name. Bundled configs are named to match, so `tool_servers/attachments.yaml` gives `attachments_attachment_read` and `attachments_attachment_create`.
+
+When editing `use_tools` lists, match the list's indentation exactly: some agents use column 0, others use 2-space indent. Wrong indentation folds entries into the previous line's value; YAML still parses but tools silently disappear.
+
 ### Examples
 
 ```yaml
@@ -234,6 +238,8 @@ The `harnx-attachment-tools` server provides tools for reading and storing NATS-
     - `content` (string, required): The text content to store.
     - `mime_type` (string, required): Text MIME type (e.g. `text/plain`, `text/markdown`, `application/json`, `application/xml`, `application/yaml`). Non-text MIME types are rejected.
   - Requires caller session identity; returns an error when invoked without session context.
+
+> **Note**: Agents list these tools in `use_tools` as `attachments_attachment_read` and `attachments_attachment_create`. The prefix (`attachments`) is the server's registered name, which by convention matches `tool_servers/attachments.yaml`.
 
 ## Documents (RAG)
 

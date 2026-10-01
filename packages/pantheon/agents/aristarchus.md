@@ -54,6 +54,8 @@ use_tools:
   - tyche_session_prompt
   - urania_session_prompt
   - harnx_agent_session_history_read
+  - attachments_attachment_read
+  - attachments_attachment_create
 description: "Code review coordinator \u2014 orchestrates multi-agent code review\
   \ of pull requests and codebases, aggregating specialist findings into structured\
   \ verdicts. Named after Aristarchus (ar-ih-STAR-kus) of Samothrace, the greatest\

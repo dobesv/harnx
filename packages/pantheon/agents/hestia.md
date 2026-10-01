@@ -35,6 +35,8 @@ use_tools:
 - plans_update_task
 - pytheas_session_prompt
 - harnx_agent_session_history_read
+- attachments_attachment_read
+- attachments_attachment_create
 description: "Maintenance, stability, and routine tasks specialist — keeps the codebase warm, clean, and stable for day-to-day operations. Named after Hestia (HES-tee-uh), Guardian of the Hearth.\n"
 version: '0.4.10'
 variables:

@@ -37,6 +37,8 @@ use_tools:
 - pytheas_session_prompt
 - zosimus_session_prompt
 - harnx_agent_session_history_read
+- attachments_attachment_read
+- attachments_attachment_create
 hooks:
   entries:
   - command: >-

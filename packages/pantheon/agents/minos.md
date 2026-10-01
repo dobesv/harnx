@@ -24,6 +24,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 - harnx_agent_session_history_read
+- attachments_attachment_read
 description: "Methodical auditor \u2014 systematically verifies code review findings\
   \ by tracing evidence chains, checking cited code, and rendering verdicts. Named\
   \ after Minos (MY-nos), judge of the Underworld who weighed the deeds of the deceased.\n"
