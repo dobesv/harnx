@@ -6,13 +6,14 @@
 Usage: harnx [OPTIONS] [COMMAND]
 
 Commands:
-  prompt  Run a non-interactive prompt
-  info    Inspect harnx state
-  dump    Dump session transcript (full history)
-  delete  Delete resources
-  list    List resources
-  compact Compact session logs to reduce history size
-  help    Print this message or the help of the given subcommand(s)
+  prompt   Run a non-interactive prompt
+  info     Inspect harnx state
+  dump     Dump resources
+  open     Open resources in the system application
+  delete   Delete resources
+  list     List resources
+  compact  Compact session logs to reduce history size
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
       --timeout-secs <SECONDS>  Maximum one-shot invocation duration in seconds (0 or unset means no limit)
@@ -43,6 +44,9 @@ harnx info session agent1 session1             # View session metadata
 harnx dump session agent1 session1             # Dump session transcript
 harnx dump session agent1 session1 --follow    # Follow transcript live
 harnx dump session agent1 session1 --check-loop-detection  # Show where loop protection would step in
+harnx dump attachment cid:media:...            # Dump attachment text to stdout
+harnx dump attachment cid:media:... --output file.bin  # Dump attachment to file
+harnx open attachment cid:media:...            # Open attachment in default viewer
 harnx list sessions                            # List sessions
 harnx compact session agent1 session1          # Compact session log
 harnx delete session session1 --agent myagent --cluster local  # Delete session
@@ -272,6 +276,22 @@ Limits of the replay, in both formats (the text output prints the first two; the
 - In a session recorded without loop protection, a refusal in the replay did not happen in the real session. The call ran, the model saw its real result and carried on, so events after a refusal can differ from what a live run would have produced.
 - After a stop, the replay does not decide the rest of that turn's calls. It picks up again at the next turn.
 - The rules apply whatever `loop_detection` was set to when the session ran.
+
+### `harnx dump attachment <url> [--output <path>]`
+
+Dumps an attachment or plan document to stdout or a file. Supports canonical `cid:media:` (attachments) and `cid:plan:` (rendered plan markdown) URLs.
+
+- **Text MIME types**: Outputs directly to stdout. This applies to `text/*`, `application/json`, `application/xml`, `application/yaml`, `application/toml`, `application/sql`, `application/graphql`, `application/javascript`, and rendered plan markdown.
+- **Binary MIME types without `--output`**: Fails with an error message directing you to use `harnx open attachment <url>` or supply `--output <path>`.
+- **`--output <path>`**: Writes output bytes directly to the given destination path. This flag uses the long form only; `-f` is reserved for prompt input files.
+
+### `harnx open attachment <url>`
+
+Opens an attachment or plan document in the system default application. Supports `cid:media:` and `cid:plan:` URLs.
+
+- Persists the attachment payload to a uniquely-named temporary file (`harnx-attachment-*.ext`) with a file extension derived from its MIME type.
+- Filters unsafe executable extensions (`.bat`, `.cmd`, `.com`, `.exe`, `.vbs`, `.vbe`, `.js`, `.jse`, `.wsf`, `.wsh`, `.scr`, `.ps1`, `.sh`, `.bash`), defaulting them to `.bin`.
+- Launches the system default opener in a detached background process so the command returns immediately.
 
 ### `harnx list sessions`
 

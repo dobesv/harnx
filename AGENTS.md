@@ -46,6 +46,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   │       ├── utils/          # Shared utilities
 │   │       └── bin/            # Bins that share harnx library code (mcp-bash, mcp-fs)
 │   ├── harnx-plans-tools/        # Toolset server: NATS-backed plan and todo management (standalone crate)
+│   ├── harnx-attachment-tools/   # Toolset server: NATS-backed attachment and media management (standalone crate)
 │   ├── harnx-blob-store/        # NATS-backed blob storage for attachments and plans (standalone crate)
 │   └── harnx-test-bins/        # Internal dev/test binaries (publish = false)
 ├── example_config/             # Example user configuration
@@ -318,7 +319,7 @@ trusting a refresh, and see issue #2025 for reconciling the catalog against
 
 ## Tool Servers
 
-Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `harnx-bash-tools`, `harnx-time-tools`, `harnx-plans-tools`, `harnx-exa-tools`, `harnx-fetch-tools`). They run `harnx_toolset_server::run_toolset_main(toolset)` and default to NATS mode. For Streamable HTTP MCP mode, pass `--mcp-http`; `--host` defaults to `0.0.0.0` and `--port` selects the listening port. Default HTTP ports are:
+Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `harnx-bash-tools`, `harnx-time-tools`, `harnx-plans-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-attachment-tools`). They run `harnx_toolset_server::run_toolset_main(toolset)` and default to NATS mode. For Streamable HTTP MCP mode, pass `--mcp-http`; `--host` defaults to `0.0.0.0` and `--port` selects the listening port. Default HTTP ports are:
 
 | Server | Port |
 | --- | ---: |
@@ -329,6 +330,7 @@ Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `h
 | grep | 3004 |
 | exa | 3005 |
 | fetch | 3006 |
+| attachments | 3007 |
 
 When launching behind `harnx-mcp-bridge` for stdio MCP compatibility, pass `--mcp-stdio` — without it, the server waits for NATS and the bridge handshake times out.
 
@@ -710,6 +712,18 @@ on the tail the turn last observed and a `Cancel` that landed meanwhile stops it
 A sub-agent start in the parent log is written through the invoking tool's
 handle on that same lease.
 
+The worker appends the durable `HandoffCommitted` entry **before** emitting the advisory
+`SessionEvent::HandoffCommitted` (see `agent_loop.rs:979-1001`). This guarantees a live
+handoff's sequence is strictly greater than any attach boundary captured before the commit,
+enabling clients to gate navigation on `after_seq > attached_seq`.
+
+Worker appends go through `FencedSessionLogSink`, which carries the lease fence and
+the expected tail. Stream-tail CAS is the authority: JetStream's finite dedup window
+alone is not enough, so keep the same message ID and expected-last-sequence across a
+retry and treat a conflict as a decision to re-read, never as a reason to append
+again. A `Cancel` is an ordinary log entry any holder of the session can write,
+including frontends that hold no lease. See `docs/nats-ha.md` under "Interruption".
+
 ### Crate layering for NATS tool servers
 
 Tool servers that need NATS object/KV storage must depend on `harnx-blob-store`,
@@ -728,17 +742,24 @@ carries `agent: Option<String>` and `session_id: String` (6-char local id).
 definitions to avoid circular dependencies; convert between them manually.
 See `crates/harnx-toolset-server/src/invocation.rs` for construction.
 
-The worker appends the durable `HandoffCommitted` entry **before** emitting the advisory
-`SessionEvent::HandoffCommitted` (see `agent_loop.rs:979-1001`). This guarantees a live
-handoff's sequence is strictly greater than any attach boundary captured before the commit,
-enabling clients to gate navigation on `after_seq > attached_seq`.
+### Canonical `cid:` URL scheme
 
-Worker appends go through `FencedSessionLogSink`, which carries the lease fence and
-the expected tail. Stream-tail CAS is the authority: JetStream's finite dedup window
-alone is not enough, so keep the same message ID and expected-last-sequence across a
-retry and treat a conflict as a decision to re-read, never as a reason to append
-again. A `Cancel` is an ordinary log entry any holder of the session can write,
-including frontends that hold no lease. See `docs/nats-ha.md` under "Interruption".
+Attachments and plans use canonical `cid:` URLs that identify resources by owning session and path or content digest:
+
+- `cid:media:<agent>/<session-id>/<hash>`: Immutable media blob stored in the `harnx_attachments` JetStream object store. `<hash>` is the lowercase 64-character SHA-256 digest of the content. Cached permanently.
+- `cid:plan:<agent>/<session-id>/<slug>`: Plan index document stored in the `harnx_plans` JetStream KV bucket. Resolves to rendered markdown containing the plan description, tasks table, and notes list.
+- `cid:plan:<agent>/<session-id>/<slug>/tasks/<id>` and `.../notes/<id>`: Mutable plan task and note documents stored in `harnx_plans`.
+
+URL components:
+- `<agent>`: Percent-encoded agent name (`pantheon%2Fatlas`), matching Web UI route segments. Sessions without an agent use `_temp`.
+- `<session-id>`: 6-character local session ID (`[A-Za-z0-9_-]+`, which may start with a hyphen).
+- `<slug>` and `<id>`: URL-safe slug identifiers (`[a-z0-9-]+`).
+
+Operational properties:
+- **Capability URL**: The URL is the capability (bearer token). Access is granted by possession of the URL; there are no per-resource ACLs.
+- **Activity renewal**: Any attachment or plan read or write touches the owning session's activity timestamp (`SessionActivity.last_activity_at`), debounced in-process to at most one write per hour. This resets the session retention clock while resources remain in active use.
+- **Session deletion cascade**: Session deletion (`delete_owner`) purges both `media/<owner>/` objects in `harnx_attachments` and `plan/<owner>/` keys in `harnx_plans`.
+- **Plans storage location**: Plans live exclusively in NATS JetStream KV (`harnx_plans`); previous filesystem storage under `.agent` is retired.
 
 ### Interrupt acceptance
 

@@ -101,6 +101,10 @@ Harnx automatically manages the following JetStream resources:
   content-addressed cache before calling a model. Object names follow
   `media/<owner>/<hash>` where `owner` is `session_key(agent, sid)` (see
   `harnx_core::cid_url::CidUrl::kv_key`).
+- **KV Bucket**: `harnx_plans` — stores plan index, task, and note documents
+  under `plan/<owner>/<slug>/...` keys. The bucket honours the cluster's configured
+  `replicas` count (`ensure_plans_bucket`). Documents are retained indefinitely
+  until explicitly deleted or purged when the owning session is cleaned up.
 - **Persistent activation streams**: `WORK_NOTIFY_<cluster>` captures
   `cluster.<cluster>.sessions.notify` with cluster-shared work-queue dispatch.
   All cluster workers bind to one shared durable pull consumer; per-worker
@@ -1242,11 +1246,16 @@ Log layout: `CompactRequest` → `Compress` marker → re-logged suffix messages
 
 ## Cleanup
 
-Session logs, leases, canonical metadata, and attachment blobs persist in
-JetStream until explicitly deleted or collected. Manual deletion purges the
-transcript stream, lease, every KV key under `sessions/{id}` (including read
-and unread state), tool-invocation journal entries, and attachment objects owned
-by the session:
+Session logs, leases, canonical metadata, attachment blobs, and plan documents
+persist in JetStream until explicitly deleted or collected. Manual deletion
+purges:
+- Transcript stream: `SESSION_<sha256(id)>`
+- Leases: `harnx_leases`
+- Metadata keys: `sessions/{id}/*` in `harnx_sessions` (including read and unread tracking)
+- Invocation journal: `harnx_tool_invocations`
+- Media objects: `media/<owner>/` in `harnx_attachments`
+- Plans KV: `plan/<owner>/` in `harnx_plans`
+(where `<owner>` is `session_key(agent, id)`).
 
 ```bash
 harnx delete session <session_id> --agent <agent> --cluster local
@@ -1271,11 +1280,16 @@ with zero workers deployed, no automatic garbage collection runs for that
 cluster until at least one worker joins.
 
 Automatic collection uses the exact same deletion path as manual cleanup. In
-the normal case it removes the transcript stream, lease, all `sessions/{id}`
-metadata keys (including read and unread tracking), tool-invocation journal
-entries, and attachment objects. Workers also verify that candidate sessions
-are inactive before deletion, skipping any session with an active or
-reactivated lease.
+the normal case it removes:
+- Transcript stream: `SESSION_<sha256(id)>`
+- Leases: `harnx_leases`
+- Metadata keys: `sessions/{id}/*` in `harnx_sessions` (including read and unread tracking)
+- Invocation journal: `harnx_tool_invocations`
+- Media objects: `media/<owner>/` in `harnx_attachments`
+- Plans KV: `plan/<owner>/` in `harnx_plans`
+(where `<owner>` is `session_key(agent, id)`).
+Workers also verify that candidate sessions are inactive before deletion,
+skipping any session with an active or reactivated lease.
 
 Retention is controlled by `cleanup_remote_sessions_days` in `config.yaml` or
 the `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS` environment variable. Configure the
@@ -1290,7 +1304,11 @@ applies its own retention setting:
 - **`n > 0`**: Enabled with an `n`-day retention period.
 
 The expiration threshold is measured from the session's last activity timestamp,
-falling back to its creation timestamp when no activity record exists.
+falling back to its creation timestamp when no activity record exists. Read and
+write access to attachments (`cid:media:`) and plans (`cid:plan:`) refreshes
+the owning session's activity timestamp (`SessionActivity.last_activity_at`),
+debounced to ≤1 write/hour. This resets the retention clock, ensuring actively
+referenced media and plans remain available.
 
 ### Stream Retention Decision (`max_age`)
 
@@ -1298,7 +1316,7 @@ Harnx deliberately avoids configuring a JetStream `max_age` backstop on session
 transcript streams. Message age does not equal session inactivity: an automatic
 stream-level cutoff would ignore active leases, truncate resumable conversation
 history on long-lived sessions, and leave orphaned records behind in the
-metadata KV store, invocation journal, and attachment buckets. Session-aware
+metadata KV store, invocation journal, attachment, and plan buckets. Session-aware
 garbage collection in the worker daemon is the sole authoritative mechanism for
 expiring inactive sessions cleanly across all storage layers.
 

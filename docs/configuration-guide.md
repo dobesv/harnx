@@ -410,14 +410,29 @@ nats_lease_acquisition_timeout_secs: 60
 
 ### Session Retention and Garbage Collection
 
-- **cleanup_remote_sessions_days**: Retention period in days for remote NATS
-  sessions (integer). Defaults to unset (`null`), which disables automatic
-  session garbage collection. Set `0` to explicitly disable collection. Set to
-  a positive integer (such as `30`) to collect inactive sessions older than that
-  many days. Garbage collection is enforced periodically by running
-  `harnx-worker` daemons across storage streams, metadata, leases, journals,
-  and attachments. When unset, workers emit a startup warning that automatic
-  expiry is disabled and remote session state will grow unbounded.
+- **cleanup_remote_sessions_days** (env: `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS`):
+  Retention period in days for remote NATS sessions (integer). Defaults to unset
+  (`null`), which leaves automatic session garbage collection disabled. Set `0`
+  to explicitly disable collection. When set to a positive integer (such as `30`),
+  `harnx-worker` daemons collect inactive sessions older than that many days during
+  periodic hourly sweeps.
+
+  Purged resources include:
+  - Transcript stream: `SESSION_<sha256(id)>`
+  - Leases: `harnx_leases`
+  - Metadata keys: `sessions/{id}/*` in `harnx_sessions` (including read and unread tracking)
+  - Invocation journal: `harnx_tool_invocations`
+  - Media objects: `media/<owner>/` in `harnx_attachments`
+  - Plans KV: `plan/<owner>/` in `harnx_plans`
+  (where `<owner>` is `session_key(agent, id)`).
+
+  When unset, workers emit a startup warning that automatic expiry is disabled
+  and remote session state will grow unbounded.
+
+  Read and write access to attachments (`cid:media:`) and plans (`cid:plan:`)
+  refreshes the owning session's activity timestamp (`SessionActivity.last_activity_at`),
+  debounced to ≤1 write/hour. This resets the retention clock so actively referenced
+  media and plans avoid premature collection.
 
 Example `config.yaml`:
 
