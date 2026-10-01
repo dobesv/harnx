@@ -8,7 +8,7 @@ multi-agent orchestration overhead.
 
 | Agent | Model | Role |
 |-------|-------|------|
-| `coder` | claude-sonnet-5 | Main coding assistant |
+| `coder` | claude-sonnet-5-5 | Main coding assistant |
 | `compact-coder` | gemini-3.5-flash-lite | Context compaction for long sessions |
 
 ## Quick start

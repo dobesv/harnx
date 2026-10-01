@@ -28,6 +28,7 @@ OPENAI_EFFORT_VARIANTS = {
     "gpt-5.6-terra": ("high",),
     "gpt-6-astra": ("high", "max"),
     "gpt-6-sol": ("high", "max"),
+    "gpt-6.1-sol": ("high", "max"),
 }
 OPENAI_NO_SAMPLING_PATCH = "del(.body.temperature) | del(.body.top_p)"
 
@@ -170,6 +171,7 @@ def apply_openai_base_patches(model: dict[str, Any], provider: str) -> None:
         "gpt-5.6-luna",
         "gpt-6-astra",
         "gpt-6-sol",
+        "gpt-6.1-sol",
         "gpt-6-luna",
     ):
         model["patches"] = [OPENAI_NO_SAMPLING_PATCH]

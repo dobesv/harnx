@@ -2,8 +2,8 @@
 role: assistant
 model: claude:claude-opus-5-5
 model_fallbacks:
-- codex:gpt-6-sol
-- openai:gpt-6-sol
+- codex:gpt-6.1-sol
+- openai:gpt-6.1-sol
 - gemini:gemini-3.8-flash
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-dev

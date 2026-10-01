@@ -105,6 +105,9 @@ fn package_openai_models_use_responses_without_sampling_parameters() {
         "gpt-6-sol",
         "gpt-6-sol:high",
         "gpt-6-sol:max",
+        "gpt-6.1-sol",
+        "gpt-6.1-sol:high",
+        "gpt-6.1-sol:max",
     ] {
         let model = Model::from_config("openai", &openai.models)
             .into_iter()

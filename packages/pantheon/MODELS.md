@@ -36,17 +36,17 @@ Codex immediately precedes the same OpenAI model and reasoning setting.
 
 | Agents | Primary → fallbacks |
 |--------|---------------------|
-| `aeacus` | `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `gemini:gemini-3.8-flash` → `claude:claude-sonnet-5` → `bedrock:zai.glm-5` |
-| `apollo`, `argus`, `calliope`, `clio`, `erato`, `euterpe`, `iris`, `librarian`, `minos`, `peitho`, `pytheas`, `terpsichore`, `thalia` | `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `claude:claude-sonnet-5` → `bedrock:zai.glm-5` |
-| `aristarchus`, `coder` | `claude:claude-sonnet-5` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `gemini:gemini-3.8-flash` → `bedrock:zai.glm-5` |
-| `athena`, `metis`, `mnemosyne`, `nemesis`, `opis`, `rhadamanthus`, `tyche`, `urania` | `bedrock:zai.glm-5` → `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `claude:claude-sonnet-5` |
+| `aeacus` | `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `gemini:gemini-3.8-flash` → `claude:claude-sonnet-5-5` → `bedrock:zai.glm-5` |
+| `apollo`, `argus`, `calliope`, `clio`, `erato`, `euterpe`, `iris`, `librarian`, `minos`, `peitho`, `pytheas`, `terpsichore`, `thalia` | `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `claude:claude-sonnet-5-5` → `bedrock:zai.glm-5` |
+| `aristarchus`, `coder` | `claude:claude-sonnet-5-5` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `gemini:gemini-3.8-flash` → `bedrock:zai.glm-5` |
+| `athena`, `metis`, `mnemosyne`, `nemesis`, `opis`, `rhadamanthus`, `tyche`, `urania` | `bedrock:zai.glm-5` → `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `claude:claude-sonnet-5-5` |
 | `atlas` | `claude:claude-opus-5-5` → `gemini:gemini-3.8-flash` → `codex:gpt-5.6-terra` → `openai:gpt-5.6-terra` → `bedrock:zai.glm-5` |
-| All nine `compact-*` agents (including coding) | `gemini:gemini-3.5-flash-lite` → `codex:gpt-6-luna` → `openai:gpt-6-luna` → `claude:claude-sonnet-5` → `bedrock:zai.glm-4.7-flash` |
-| `daedalus`, `sisyphus` | `claude:claude-opus-5-5` → `codex:gpt-6-sol` → `openai:gpt-6-sol` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
-| `hephaestus` | `codex:gpt-6-sol:high` → `openai:gpt-6-sol:high` → `claude:claude-opus-5-5` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
+| All nine `compact-*` agents (including coding) | `gemini:gemini-3.5-flash-lite` → `codex:gpt-6-luna` → `openai:gpt-6-luna` → `claude:claude-sonnet-5-5` → `bedrock:zai.glm-4.7-flash` |
+| `daedalus`, `sisyphus` | `claude:claude-opus-5-5` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
+| `hephaestus` | `codex:gpt-6.1-sol:high` → `openai:gpt-6.1-sol:high` → `claude:claude-opus-5-5` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
 | `hermes` | `codex:gpt-6-luna` → `openai:gpt-6-luna` → `gemini:gemini-3.8-flash` → `claude:claude-haiku-4-5` → `bedrock:minimax.minimax-m2.5` |
 | `hestia` | `bedrock:minimax.minimax-m2.5` → `gemini:gemini-3.8-flash` → `codex:gpt-6-luna` → `openai:gpt-6-luna` → `claude:claude-haiku-4-5` |
-| `melpomene`, `momus`, `polyhymnia`, `zosimus` | `codex:gpt-6-sol` → `openai:gpt-6-sol` → `claude:claude-sonnet-5` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
+| `melpomene`, `momus`, `polyhymnia`, `zosimus` | `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
 | `oracle`, `plato` | `codex:gpt-6-astra:max` → `openai:gpt-6-astra:max` → `claude:claude-fable-5-1:max` → `gemini:gemini-3.8-flash` → `bedrock:us.moonshotai.kimi-k3` |
 
 ## Cost and provider evidence

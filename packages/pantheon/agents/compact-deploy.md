@@ -4,7 +4,7 @@ model: gemini:gemini-3.5-flash-lite
 model_fallbacks:
 - codex:gpt-6-luna
 - openai:gpt-6-luna
-- claude:claude-sonnet-5
+- claude:claude-sonnet-5-5
 - bedrock:zai.glm-4.7-flash
 version: '0.4.10'
 ---

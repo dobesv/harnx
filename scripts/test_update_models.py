@@ -108,6 +108,11 @@ class TestOpusVersionDetection(unittest.TestCase):
         self.assertFalse(um.claude_requires_max_tokens("claude-opus-5-20260926"))
         self.assertFalse(um.claude_requires_max_tokens("claude-opus-4-1-20250805"))
 
+    def test_sonnet_5_family_requires_max_tokens(self) -> None:
+        self.assertTrue(um.claude_requires_max_tokens("claude-sonnet-5"))
+        self.assertTrue(um.claude_requires_max_tokens("claude-sonnet-5-5"))
+        self.assertTrue(um.claude_requires_max_tokens("us.anthropic.claude-sonnet-5-5"))
+
     def test_bedrock_dated_opus_4_retains_thinking_variant(self) -> None:
         name = "us.anthropic.claude-opus-4-20250514-v1:0"
         variants = um.thinking_variants({"name": name}, "bedrock")
