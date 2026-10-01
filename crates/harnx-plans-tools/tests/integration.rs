@@ -304,6 +304,53 @@ async fn update_plan_requires_caller_when_creating() {
     assert_error(&result, "caller session identity required to create a plan");
 }
 
+#[tokio::test]
+async fn blank_optional_arguments_are_treated_as_omitted() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let added = context
+        .invoke(
+            "add_plan",
+            json!({
+                "name": "Placeholder Args",
+                "title": "Kept title",
+                "body": "",
+                "content": "real body",
+                "summary": "",
+                "parent_issue": 0,
+            }),
+            Some(context.caller.clone()),
+        )
+        .await;
+    assert_ne!(added["isError"], true, "add_plan failed: {added}");
+    let plan = cid_from(&added);
+
+    let updated = context
+        .invoke(
+            "update_plan",
+            json!({
+                "plan": plan,
+                "content": "",
+                "replace_content": " ",
+                "append_content": "more",
+                "title": "",
+                "parent_issue": 0,
+            }),
+            None,
+        )
+        .await;
+    assert_ne!(updated["isError"], true, "update_plan failed: {updated}");
+
+    let fetched = context
+        .invoke("get_plan", json!({"plan": plan}), None)
+        .await;
+    let value = json_result(&fetched);
+    assert_eq!(value["body"], "real body\nmore");
+    assert_eq!(value["title"], "Kept title");
+    assert_eq!(value["summary"], Value::Null);
+}
+
 async fn assert_plan_update(context: &TestContext, plan: &str) {
     let updated = context
         .invoke(

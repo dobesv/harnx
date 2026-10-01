@@ -216,4 +216,23 @@ mod tests {
         assert_eq!(tools[1].kind(), Some(ToolProgressKind::Edit));
         assert_eq!(tools[4].kind(), Some(ToolProgressKind::Delete));
     }
+
+    #[test]
+    fn plan_schemas_expose_one_parameter_per_body_edit() {
+        let tools = PlansToolset::new().tools();
+        let properties = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("tool exists")
+                .input_schema["properties"]
+                .clone()
+        };
+        let add = properties("add_plan");
+        assert!(add.get("content").is_some());
+        assert!(add.get("body").is_none());
+        let update = properties("update_plan");
+        assert!(update.get("replace_content").is_some());
+        assert!(update.get("content").is_none());
+    }
 }

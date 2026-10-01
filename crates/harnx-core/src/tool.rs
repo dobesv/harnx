@@ -10,7 +10,6 @@ use crate::abort::AbortSignal;
 use crate::execution_context::ExecutionContextObservation;
 use crate::message::MessageContentPart;
 use async_trait::async_trait;
-use indexmap::IndexMap;
 use minijinja::{Environment, Error, UndefinedBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -534,76 +533,7 @@ pub fn render_tool_result_template(
     env.render_str(template, ctx)
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct JsonSchema {
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub type_value: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub properties: Option<IndexMap<String, JsonSchema>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub items: Option<Box<JsonSchema>>,
-    #[serde(rename = "anyOf", skip_serializing_if = "Option::is_none")]
-    pub any_of: Option<Vec<JsonSchema>>,
-    #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
-    pub enum_value: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub required: Option<Vec<String>>,
-}
-
-impl JsonSchema {
-    pub fn is_empty_properties(&self) -> bool {
-        match &self.properties {
-            Some(v) => v.is_empty(),
-            None => true,
-        }
-    }
-
-    /// Simplify the schema for providers that don't support `anyOf` (e.g. Gemini).
-    ///
-    /// * `anyOf: [<schema>, {"type":"null"}]` → the non-null schema (makes
-    ///   `Option<T>` transparent).
-    /// * Recursively applied to `properties` and `items`.
-    pub fn flatten_any_of(mut self) -> Self {
-        // Resolve top-level anyOf with a single non-null variant
-        if let Some(variants) = self.any_of.take() {
-            let non_null: Vec<JsonSchema> = variants
-                .into_iter()
-                .filter(|v| v.type_value.as_deref() != Some("null"))
-                .collect();
-            if non_null.len() == 1 {
-                let mut inner = non_null.into_iter().next().unwrap().flatten_any_of();
-                // Preserve description from the outer schema if the inner one lacks it
-                if inner.description.is_none() {
-                    inner.description = self.description;
-                }
-                return inner;
-            }
-            // Put back if we can't simplify
-            self.any_of = Some(non_null.into_iter().map(|v| v.flatten_any_of()).collect());
-        }
-
-        // Recurse into properties
-        if let Some(properties) = self.properties.take() {
-            self.properties = Some(
-                properties
-                    .into_iter()
-                    .map(|(k, v)| (k, v.flatten_any_of()))
-                    .collect(),
-            );
-        }
-
-        // Recurse into items
-        if let Some(items) = self.items.take() {
-            self.items = Some(Box::new((*items).flatten_any_of()));
-        }
-
-        self
-    }
-}
+pub use crate::json_schema::JsonSchema;
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct ToolCall {

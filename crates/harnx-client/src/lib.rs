@@ -21,6 +21,7 @@ pub mod macros;
 pub mod gemini_upload;
 pub mod model;
 pub(crate) mod openai_responses;
+mod openai_strict;
 pub mod stream;
 mod tool_call_id;
 // Flat re-exports so that the `register_client!` macro — which expands

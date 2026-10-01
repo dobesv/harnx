@@ -182,6 +182,10 @@ impl SseHandler {
         &self.tool_calls
     }
 
+    pub fn tool_calls_mut(&mut self) -> &mut [ToolCall] {
+        &mut self.tool_calls
+    }
+
     /// Attach thought_signature to tool calls that were emitted before
     /// reasoning.encrypted_content arrived. This supports the streaming case
     /// where function_call_arguments.done arrives before reasoning.output_item.done.

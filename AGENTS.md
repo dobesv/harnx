@@ -152,7 +152,7 @@ Use `--no-sandbox` when the test scope is bash behavior, not sandbox isolation. 
 
 ### Session transcript and PreToolUse hook mutation
 
-Persisted `ToolCalls` entries hold the arguments as received from the LLM, before `PreToolUse` hooks run. `execute_tool_round_with_persistence` (`crates/harnx-runtime/src/tool.rs`) appends calls before hooks apply `mutated_tool_input`. To assert hook-injected env or args, read `ToolResults` or process output instead.
+Persisted `ToolCalls` entries hold the arguments as received from the LLM, before `PreToolUse` hooks run, except that `null`s for omitted optional parameters are already gone (see "Tool parameter schemas"). `execute_tool_round_with_persistence` (`crates/harnx-runtime/src/tool.rs`) appends calls before hooks apply `mutated_tool_input`. To assert hook-injected env or args, read `ToolResults` or process output instead.
 
 ### Test skips must probe capability, not timeout
 
@@ -552,6 +552,45 @@ Empty string maps to `{}` (API omits arguments for no-arg calls). Non-empty malf
 propagates as an error with context naming the tool and echoing the raw argument string.
 This convention is consolidated across all provider parsers (`openai.rs`, `openai_responses.rs`,
 `bedrock.rs`, `claude.rs`, `cohere.rs`).
+
+### Tool parameter schemas
+
+`ToolDeclaration.parameters` (`harnx_core::json_schema::JsonSchema`) holds the
+schema exactly as the tool declared it. When a tool registers,
+`JsonSchema::from_tool_schema` drops `$schema` and inlines local `$ref`s. A
+`$ref` that recurses stays, along with its definitions. Keep this copy lossless:
+an earlier typed struct stripped `null` from `type` lists and dropped `$ref`,
+which sent `update_plan`'s `tasks` items to every model as `{}`. Convert at the
+provider boundary instead:
+
+- **OpenAI Responses** (`openai`, `codex`): `openai_strict::strict_parameters`
+  converts each schema to strict mode. Every property becomes required, and
+  each optional one that doesn't already accept `null` is made to.
+  `additionalProperties: false` is set on every object, unsupported annotations
+  are dropped, and `oneOf` becomes `anyOf`. A schema strict mode can't express
+  is sent unchanged with `strict: false`. Free-form maps (`bash_exec`'s `env`,
+  the fetch tools' `headers`), `{}`, `allOf` and `uniqueItems` all fall back
+  this way. The reason is logged at debug level.
+- **Gemini and Vertex** (`vertexai.rs`): the schema goes through
+  `parametersJsonSchema` unchanged. The older `parameters` field only takes an
+  OpenAPI-style subset.
+- **Claude, Bedrock Converse and Chat Completions clients**: the schema is sent unchanged.
+
+Never leave `strict` unset on a Responses tool. Responses then converts the
+schema itself: it makes every property required without making it nullable,
+and GPT models fill the optional ones with `""`, `0` or `[]`. A response
+echoes `tools[].strict`, which shows whether a tool ran strict or fell back.
+This was measured on 2026-10-01 against `gpt-6.1-sol` on both the API and the
+Codex backend.
+
+Strict mode has the model send `null` for every parameter it leaves out. In
+`harnx-engine/src/chat_completions.rs`, `DeclaredSchemas::clean` removes a
+`null` the model sent for an optional property whose schema does not accept
+`null`, for every provider, before persistence and hooks. A tool that needs a
+meaningful `null` must declare the property nullable (`Option<T>` in schemars
+does). A new native toolset with a map-typed parameter loses strict mode for
+that whole tool, so prefer a list of name/value objects when strictness
+matters.
 
 ### Loop protection
 

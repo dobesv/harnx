@@ -259,25 +259,20 @@ fn handoff_tool_declarations_for_agents(
                 harnx_core::package_namespace::handoff_display_name(&agent_name, active_pkg);
             handoff_targets.insert(display_name.clone(), agent_name.clone());
 
-            let mut properties = IndexMap::new();
-            properties.insert(
-                "prompt".to_string(),
-                crate::tool::JsonSchema {
-                    type_value: Some("string".to_string()),
-                    description: Some("The new prompt to start the target agent session with.".to_string()),
-                    ..Default::default()
+            let parameters = crate::tool::JsonSchema::new(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The new prompt to start the target agent session with.",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional target session ID. Omit it (or pass an empty value) to create a generated session; pass an unused ID to create that exact session; or pass the exact ID of an existing session owned by the target agent to continue its transcript. Do not invent an ID when you want a generated session.",
+                    },
                 },
-            );
-            properties.insert(
-                "session_id".to_string(),
-                crate::tool::JsonSchema {
-                    type_value: Some("string".to_string()),
-                    description: Some(
-                        "Optional target session ID. Omit it (or pass an empty value) to create a generated session; pass an unused ID to create that exact session; or pass the exact ID of an existing session owned by the target agent to continue its transcript. Do not invent an ID when you want a generated session.".to_string(),
-                    ),
-                    ..Default::default()
-                },
-            );
+                "required": ["prompt"],
+            }));
             let catalog_description = remote_descriptions
                 .get(&agent_name)
                 .and_then(|description| description.as_deref())
@@ -290,12 +285,7 @@ fn handoff_tool_declarations_for_agents(
             ToolDeclaration {
                 name: format!("{display_name}_session_handoff"),
                 description: handoff_description(&agent_name, catalog_description),
-                parameters: crate::tool::JsonSchema {
-                    type_value: Some("object".to_string()),
-                    properties: Some(properties),
-                    required: Some(vec!["prompt".to_string()]),
-                    ..Default::default()
-                },
+                parameters,
                 mcp_tool_name: None,
                 mcp_server_name: None,
                 call_template: None,
