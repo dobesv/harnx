@@ -738,7 +738,6 @@ fn default_confirm_tool_use(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use indexmap::IndexMap;
     use parking_lot::RwLock;
     use serde_json::json;
     use std::sync::Arc;
@@ -866,61 +865,6 @@ mod tests {
             (ctx.confirm_tool_use_fn)(&call, &serde_json::json!({}), None),
             ToolUseConfirmation::Approve
         ));
-    }
-
-    #[test]
-    fn test_flatten_any_of_nullable_array() {
-        // Simulates Option<Vec<String>> schema: anyOf: [{type: "array", items: {type: "string"}}, {type: "null"}]
-        let schema = JsonSchema {
-            type_value: Some("object".to_string()),
-            properties: Some(IndexMap::from([(
-                "tags".to_string(),
-                JsonSchema {
-                    description: Some("Optional tags".to_string()),
-                    any_of: Some(vec![
-                        JsonSchema {
-                            type_value: Some("array".to_string()),
-                            items: Some(Box::new(JsonSchema {
-                                type_value: Some("string".to_string()),
-                                ..Default::default()
-                            })),
-                            ..Default::default()
-                        },
-                        JsonSchema {
-                            type_value: Some("null".to_string()),
-                            ..Default::default()
-                        },
-                    ]),
-                    ..Default::default()
-                },
-            )])),
-            ..Default::default()
-        };
-
-        let flattened = schema.flatten_any_of();
-        let props = flattened.properties.unwrap();
-        let tags = props.get("tags").unwrap();
-
-        // anyOf should be resolved: the property should now be a plain array
-        assert!(tags.any_of.is_none());
-        assert_eq!(tags.type_value.as_deref(), Some("array"));
-        assert_eq!(tags.description.as_deref(), Some("Optional tags"));
-        assert_eq!(
-            tags.items.as_ref().and_then(|i| i.type_value.as_deref()),
-            Some("string")
-        );
-    }
-
-    #[test]
-    fn test_flatten_any_of_no_change_for_plain_schema() {
-        let schema = JsonSchema {
-            type_value: Some("string".to_string()),
-            description: Some("A name".to_string()),
-            ..Default::default()
-        };
-        let flattened = schema.flatten_any_of();
-        assert_eq!(flattened.type_value.as_deref(), Some("string"));
-        assert_eq!(flattened.description.as_deref(), Some("A name"));
     }
 
     // ----------------------------------------------------------------

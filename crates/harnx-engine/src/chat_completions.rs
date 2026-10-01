@@ -14,8 +14,9 @@ use harnx_core::event::{AgentEvent, ModelEvent, NoticeEvent};
 use harnx_core::loop_guard::find_repetitive_output;
 use harnx_core::sink::emit_agent_event;
 use harnx_core::text::{extract_code_block, strip_think_tag};
-use harnx_core::tool::ToolCall;
+use harnx_core::tool::{JsonSchema, ToolCall};
 use harnx_render::pretty_error_string;
+use std::collections::HashMap;
 use tracing::Instrument;
 
 fn llm_request_span(client: &dyn Client) -> tracing::Span {
@@ -52,6 +53,33 @@ fn record_llm_error(span: &tracing::Span, error: &anyhow::Error) {
     span.record("otel.status_description", error.to_string());
 }
 
+/// The parameter schema of every tool offered in one request, kept so the
+/// calls that come back can be checked against what was declared.
+struct DeclaredSchemas(HashMap<String, JsonSchema>);
+
+impl DeclaredSchemas {
+    fn of(data: &ChatCompletionsData) -> Self {
+        let schemas = data
+            .functions
+            .iter()
+            .flatten()
+            .map(|function| (function.name.clone(), function.parameters.clone()))
+            .collect();
+        Self(schemas)
+    }
+
+    /// Treat a `null` the model sent for an optional, non-nullable
+    /// parameter as the parameter being left out. See
+    /// `JsonSchema::drop_omitted_nulls`.
+    fn clean(&self, calls: &mut [ToolCall]) {
+        for call in calls {
+            if let Some(schema) = self.0.get(&call.name) {
+                schema.drop_omitted_nulls(&mut call.arguments);
+            }
+        }
+    }
+}
+
 /// Orchestrate one streaming chat-completions call, honouring the caller's abort signal.
 ///
 /// This is the lowest-level transport wrapper used by both the engine and the TUI.
@@ -65,6 +93,7 @@ pub async fn chat_completions_streaming_with_data(
 ) -> Result<()> {
     let abort_signal = handler.abort();
     let span = llm_request_span(client);
+    let schemas = DeclaredSchemas::of(&data);
     // `SseHandler` exposes usage only through `take(self)`, which the caller
     // invokes after this borrowed handler returns and the span has closed.
     let result = async {
@@ -93,6 +122,7 @@ pub async fn chat_completions_streaming_with_data(
     .instrument(span.clone())
     .await;
 
+    schemas.clean(handler.tool_calls_mut());
     if let Err(error) = &result {
         record_llm_error(&span, error);
     }
@@ -228,7 +258,8 @@ pub async fn chat_completions_with_data(
     ctx: &ClientCallContext<'_>,
 ) -> Result<ChatCompletionsOutput> {
     let span = llm_request_span(client);
-    let result = async {
+    let schemas = DeclaredSchemas::of(&data);
+    let mut result = async {
         let reqwest_client = client.build_client(ctx)?;
         client
             .chat_completions_inner(&reqwest_client, data)
@@ -244,6 +275,9 @@ pub async fn chat_completions_with_data(
     .instrument(span.clone())
     .await;
 
+    if let Ok(output) = &mut result {
+        schemas.clean(&mut output.tool_calls);
+    }
     match &result {
         Ok(output) => {
             record_token_count(&span, "gen_ai.usage.input_tokens", output.input_tokens);
@@ -552,5 +586,91 @@ mod tests {
         assert!(output.2.is_empty());
         assert_eq!(messages.len(), 1);
         assert!(!messages[0].is_empty());
+    }
+
+    fn plan_tool_data(stream: bool) -> ChatCompletionsData {
+        ChatCompletionsData {
+            functions: Some(vec![harnx_core::tool::ToolDeclaration {
+                name: "add_plan".into(),
+                description: String::new(),
+                parameters: harnx_core::tool::JsonSchema::new(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "content": {"type": "string"},
+                        "parent_issue": {"type": ["integer", "null"]}
+                    },
+                    "required": ["name"]
+                })),
+                mcp_tool_name: None,
+                mcp_server_name: None,
+                call_template: None,
+                result_template: None,
+                idempotent_hint: None,
+                read_only_hint: None,
+                kind: None,
+            }]),
+            stream,
+            ..streaming_data()
+        }
+    }
+
+    fn strict_style_arguments() -> serde_json::Value {
+        serde_json::json!({"name": "p", "content": null, "parent_issue": null})
+    }
+
+    fn cleaned_arguments() -> serde_json::Value {
+        serde_json::json!({"name": "p", "parent_issue": null})
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_calls_drop_nulls_for_omitted_parameters() {
+        let client = MockClient::builder()
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_tool_call("add_plan", strict_style_arguments())
+                    .build(),
+            )
+            .build();
+        let mut handler = sse_handler();
+        super::chat_completions_streaming_with_data(
+            &client,
+            plan_tool_data(true),
+            &mut handler,
+            &ClientCallContext {
+                user_agent: None,
+                dry_run: false,
+            },
+        )
+        .await
+        .expect("mock completion should succeed");
+        assert_eq!(handler.tool_calls()[0].arguments, cleaned_arguments());
+    }
+
+    #[tokio::test]
+    async fn returned_tool_calls_drop_nulls_for_omitted_parameters() {
+        let output = ChatCompletionsOutput {
+            tool_calls: vec![harnx_core::tool::ToolCall::new(
+                "add_plan".into(),
+                strict_style_arguments(),
+                Some("call-1".into()),
+                None,
+            )],
+            ..span_test_output()
+        };
+        let client = MockClient::builder()
+            .add_turn(MockTurnBuilder::new().output(output).build())
+            .build();
+        let output = chat_completions_with_data(
+            &client,
+            plan_tool_data(false),
+            &ClientCallContext {
+                user_agent: None,
+                dry_run: false,
+            },
+        )
+        .await
+        .expect("mock completion should succeed");
+        assert_eq!(output.tool_calls[0].arguments, cleaned_arguments());
     }
 }

@@ -85,7 +85,7 @@ fn responses_tool_history_items(
 ///     { "type": "function_call_output", "call_id": "...", "output": "..." }
 ///   ],
 ///   "tools": [
-///     { "type": "function", "name": "...", "description": "...", "parameters": {...} }
+///     { "type": "function", "name": "...", "description": "...", "strict": true, "parameters": {...} }
 ///   ],
 ///   "max_output_tokens": 16384,
 ///   "store": false,
@@ -98,8 +98,9 @@ fn responses_tool_history_items(
 ///
 /// - `instructions`: top-level, not in `input`; extracted from leading system message.
 /// - `input`: array of typed items (`message`, `function_call`, `function_call_output`).
-/// - `tools`: flat array, each entry `{type:"function", name, description, parameters}`.
+/// - `tools`: flat array, each entry `{type:"function", name, description, strict, parameters}`.
 ///   Unlike chat/completions, the function fields are NOT nested under a `function` key.
+///   `strict` is set per tool; see `responses_function_tool`.
 /// - `store`: hard default `false` (server default is `true`).
 /// - `include`: always `["reasoning.encrypted_content"]`.
 /// - `max_output_tokens`: from `model.max_tokens_param()`, clamped to min 16.
@@ -253,26 +254,36 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
         body["stream"] = true.into();
     }
 
-    // tools: flat array, `{type:"function", name, description, parameters}`
-    // Responses flattens tool definitions — NOT nested under `function` key.
     if let Some(functions) = functions {
-        body["tools"] = functions
-            .into_iter()
-            .map(|func| {
-                // Responses wants flat structure:
-                // {type: "function", name, description, parameters}
-                // NOT {type: "function", function: {...}}
-                json!({
-                    "type": "function",
-                    "name": func.name,
-                    "description": func.description,
-                    "parameters": func.parameters,
-                })
-            })
-            .collect();
+        body["tools"] = functions.into_iter().map(responses_function_tool).collect();
     }
 
     body
+}
+
+/// Build one Responses `tools` entry. Responses flattens the function
+/// fields into the entry, `{type, name, description, strict, parameters}`,
+/// rather than nesting them under a `function` key as chat/completions does.
+///
+/// A tool is sent in strict mode whenever its schema can be converted, so
+/// the model's arguments always match it. Leaving `strict` out instead lets
+/// Responses do its own conversion, which loses which properties were
+/// optional and has GPT models fill them with `""` or `0` placeholders.
+fn responses_function_tool(func: harnx_core::tool::ToolDeclaration) -> Value {
+    let (strict, parameters) = match crate::openai_strict::strict_parameters(&func.parameters) {
+        Ok(parameters) => (true, parameters),
+        Err(reason) => {
+            debug!("sending tool '{}' without strict mode: {reason}", func.name);
+            (false, func.parameters.into_value())
+        }
+    };
+    json!({
+        "type": "function",
+        "name": func.name,
+        "description": func.description,
+        "strict": strict,
+        "parameters": parameters,
+    })
 }
 
 /// Return the content type for a given role.
@@ -948,6 +959,71 @@ mod tests {
     }
 
     #[test]
+    fn convertible_tool_schemas_are_sent_in_strict_mode() {
+        let declaration = |name: &str, parameters: Value| harnx_core::tool::ToolDeclaration {
+            name: name.into(),
+            description: String::new(),
+            parameters: harnx_core::tool::JsonSchema::new(parameters),
+            mcp_tool_name: None,
+            mcp_server_name: None,
+            call_template: None,
+            result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
+            kind: None,
+        };
+        let tools = [
+            responses_function_tool(declaration(
+                "add_plan",
+                json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["name"]
+                }),
+            )),
+            responses_function_tool(declaration(
+                "bash_exec",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "env": {"type": "object", "additionalProperties": {"type": "string"}}
+                    }
+                }),
+            )),
+        ];
+        let summary =
+            |tool: &Value| json!({"strict": tool["strict"], "parameters": tool["parameters"]});
+        assert_eq!(
+            summary(&tools[0]),
+            json!({
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "content": {"type": ["string", "null"]}
+                    },
+                    "required": ["name", "content"],
+                    "additionalProperties": false
+                }
+            })
+        );
+        // A free-form map has no strict form, so the schema goes as declared.
+        assert_eq!(
+            summary(&tools[1]),
+            json!({
+                "strict": false,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "env": {"type": "object", "additionalProperties": {"type": "string"}}
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
     fn test_tools_flat_array() {
         let data = ChatCompletionsData {
             messages: vec![Message::new(
@@ -981,6 +1057,8 @@ mod tests {
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "get_weather");
         assert_eq!(tool["description"], "Get weather");
+        // An empty schema has no strict form.
+        assert_eq!(tool["strict"], false);
         assert!(
             tool.get("function").is_none(),
             "Tool should NOT have nested 'function' key"

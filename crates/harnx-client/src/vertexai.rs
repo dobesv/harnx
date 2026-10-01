@@ -605,8 +605,9 @@ pub fn gemini_build_chat_completions_body(
     }
 
     if let Some(functions) = functions {
-        // Gemini doesn't support functions with parameters that have empty properties, so we need to patch it.
-        // It also doesn't support `anyOf`, so we flatten nullable wrappers (e.g. Option<Vec<String>>).
+        // A function without parameters is declared without a schema.
+        // `parametersJsonSchema` takes the schema as the tool declared it;
+        // the older `parameters` field accepts only an OpenAPI-style subset.
         let function_declarations: Vec<_> = functions
             .into_iter()
             .map(|function| {
@@ -616,9 +617,11 @@ pub fn gemini_build_chat_completions_body(
                         "description": function.description,
                     })
                 } else {
-                    let mut func = function;
-                    func.parameters = func.parameters.flatten_any_of();
-                    json!(func)
+                    json!({
+                        "name": function.name,
+                        "description": function.description,
+                        "parametersJsonSchema": function.parameters,
+                    })
                 }
             })
             .collect();
@@ -1303,6 +1306,50 @@ mod tests {
             .flat_map(|message| message["content"].as_array().into_iter().flatten())
             .find_map(|part| part["signature"].as_str());
         assert_eq!(replayed_signature, Some("claude-signature"));
+    }
+
+    #[test]
+    fn tools_are_declared_with_their_full_json_schema() {
+        let declaration = |name: &str, parameters: serde_json::Value| harnx_core::tool::ToolDeclaration {
+            name: name.into(),
+            description: format!("{name} tool"),
+            parameters: harnx_core::tool::JsonSchema::new(parameters),
+            mcp_tool_name: None,
+            mcp_server_name: None,
+            call_template: None,
+            result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
+            kind: None,
+        };
+        let schema = json!({
+            "type": "object",
+            "properties": {"issue": {"type": ["integer", "null"], "minimum": 0}},
+            "additionalProperties": false
+        });
+        let body = gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages: vec![Message::new(MessageRole::User, MessageContent::Text("Hi".into()))],
+                temperature: None,
+                top_p: None,
+                functions: Some(vec![
+                    declaration("link", schema.clone()),
+                    declaration("ping", json!({"type": "object", "properties": {}})),
+                ]),
+                stream: false,
+                attachments_dir: None,
+            },
+            &Model::new("gemini", "gemini-2.5-pro"),
+            HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["tools"],
+            json!([{"functionDeclarations": [
+                {"name": "link", "description": "link tool", "parametersJsonSchema": schema},
+                {"name": "ping", "description": "ping tool"}
+            ]}])
+        );
     }
 }
 

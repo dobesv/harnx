@@ -613,11 +613,7 @@ mod tests {
     fn tool_declaration_has_expected_name_and_params() {
         let decl = tool_declaration();
         assert_eq!(decl.name, TOOL_NAME);
-        let props = decl
-            .parameters
-            .properties
-            .as_ref()
-            .expect("schema has properties");
+        let props = decl.parameters.properties().expect("schema has properties");
         assert!(props.contains_key("jaq"));
         assert!(props.contains_key("type"));
         assert!(props.contains_key("tool_name"));

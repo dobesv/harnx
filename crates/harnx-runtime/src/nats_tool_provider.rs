@@ -342,40 +342,6 @@ impl NatsToolProvider {
     }
 }
 
-fn parse_json_schema(mut value: Value) -> serde_json::Result<JsonSchema> {
-    // schemars emits nullable fields as `type: [T, "null"]`, while the
-    // completion schema uses `required` to represent optional fields.
-    normalize_schema_types(&mut value);
-    serde_json::from_value(value)
-}
-
-fn normalize_schema_types(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            if let Some(Value::Array(types)) = object.get_mut("type") {
-                let schema_type = types
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .find(|schema_type| *schema_type != "null")
-                    .or_else(|| types.iter().find_map(Value::as_str));
-                if let Some(schema_type) = schema_type {
-                    *object.get_mut("type").expect("type key exists") =
-                        Value::String(schema_type.to_string());
-                }
-            }
-            for child in object.values_mut() {
-                normalize_schema_types(child);
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                normalize_schema_types(child);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn registered_tool(
     active_package: Option<&str>,
     registration: &Registration,
@@ -392,7 +358,7 @@ fn registered_tool(
     let result_template = template("result_template");
     // Extract kind before moving spec
     let kind = spec.kind().map(|k| k.into());
-    let parameters = match parse_json_schema(spec.input_schema) {
+    let parameters = match JsonSchema::from_tool_schema(spec.input_schema) {
         Ok(parameters) => parameters,
         Err(error) => {
             log::warn!(
@@ -787,10 +753,8 @@ mod tests {
 
         assert_eq!(declarations[0].name, "fs_read");
         assert_eq!(
-            declarations[0].parameters.properties.as_ref().unwrap()["offset"]
-                .type_value
-                .as_deref(),
-            Some("integer")
+            declarations[0].parameters.properties().unwrap()["offset"],
+            json!({ "type": ["integer", "null"] })
         );
         assert_eq!(tools["fs_read"].raw_name, "read");
     }
