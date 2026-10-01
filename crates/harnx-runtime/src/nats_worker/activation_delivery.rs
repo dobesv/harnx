@@ -15,6 +15,29 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone, Copy)]
+pub(super) enum ActivationNakReason {
+    Busy,
+    PreflightNotReady,
+    Shutdown,
+    SettlementRejection,
+    ClaimError,
+    PreparationError,
+}
+
+impl ActivationNakReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::PreflightNotReady => "preflight_not_ready",
+            Self::Shutdown => "shutdown",
+            Self::SettlementRejection => "settlement_rejection",
+            Self::ClaimError => "claim_error",
+            Self::PreparationError => "preparation_error",
+        }
+    }
+}
+
 pub(super) struct ActivationDelivery {
     message: Message,
     failure_key: String,
@@ -102,12 +125,19 @@ impl ActivationDelivery {
             .map_err(|error| anyhow::anyhow!("ack {reason} SessionActivate: {error}"))
     }
 
-    pub(super) async fn nak(&mut self, delay: Option<Duration>, reason: &str) -> Result<()> {
+    pub(super) async fn nak(
+        &mut self,
+        delay: Option<Duration>,
+        reason: ActivationNakReason,
+    ) -> Result<()> {
         self.stop_heartbeat().await;
         self.message
             .ack_with(AckKind::Nak(delay))
             .await
-            .map_err(|error| anyhow::anyhow!("NAK {reason} SessionActivate: {error}"))
+            .map_err(|error| anyhow::anyhow!("NAK {} SessionActivate: {error}", reason.label()))?;
+        metrics::counter!(harnx_metrics::ACTIVATION_NAKS_TOTAL, "reason" => reason.label())
+            .increment(1);
+        Ok(())
     }
 
     pub(super) async fn terminate(&mut self, reason: &str) -> Result<()> {

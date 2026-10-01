@@ -4,7 +4,7 @@
 
 mod activation_preflight;
 
-use super::activation_delivery::ActivationDelivery;
+use super::activation_delivery::{ActivationDelivery, ActivationNakReason};
 use super::activation_failure::ActivationFailureTracker;
 use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, SessionControlHandler};
@@ -69,6 +69,7 @@ struct ClaimedActivation {
     lease: Arc<NatsSessionLease>,
     reservation_generation: u64,
     span: tracing::Span,
+    lease_acquired_at: std::time::Instant,
 }
 
 struct PreparedActivation {
@@ -80,6 +81,7 @@ struct PreparedActivation {
     delivery: ActivationDelivery,
     shutdown: tokio_util::sync::CancellationToken,
     span: tracing::Span,
+    lease_acquired_at: std::time::Instant,
 }
 
 pub(super) struct ActiveSession {
@@ -106,6 +108,16 @@ enum ReservationOutcome {
     Reserved(u64),
     SameDelivery,
     DistinctDelivery,
+}
+
+fn record_publish_to_delivery(
+    delivered: time::OffsetDateTime,
+    published: time::OffsetDateTime,
+) -> Duration {
+    // Broker and worker clocks can disagree; retain the delivery sample at zero.
+    let elapsed = Duration::try_from(delivered - published).unwrap_or_default();
+    harnx_metrics::record_activation_phase("publish_to_delivery", elapsed);
+    elapsed
 }
 
 fn busy_nak_delay(jitter: Duration) -> Duration {
@@ -353,10 +365,13 @@ impl WorkerRuntime {
     }
 
     async fn shutdown_nak(delivery: &mut ActivationDelivery) -> Result<()> {
-        delivery.nak(None, "SessionActivate during shutdown").await
+        delivery.nak(None, ActivationNakReason::Shutdown).await
     }
 
-    async fn delayed_nak(delivery: &mut ActivationDelivery) -> Result<()> {
+    async fn delayed_nak(
+        delivery: &mut ActivationDelivery,
+        reason: ActivationNakReason,
+    ) -> Result<()> {
         let delivered = delivery
             .message()
             .info()
@@ -367,10 +382,7 @@ impl WorkerRuntime {
             .min(5);
         let millis = 100_u64.saturating_mul(1_u64 << exponent).min(2_000);
         delivery
-            .nak(
-                Some(Duration::from_millis(millis)),
-                "failed targeted SessionActivate",
-            )
+            .nak(Some(Duration::from_millis(millis)), reason)
             .await
     }
 
@@ -380,7 +392,7 @@ impl WorkerRuntime {
         delivery
             .nak(
                 Some(busy_nak_delay(Duration::from_millis(jitter_millis))),
-                "busy SessionActivate",
+                ActivationNakReason::Busy,
             )
             .await
     }
@@ -465,6 +477,9 @@ impl WorkerRuntime {
         reason: &str,
     ) -> Result<()> {
         delivery.terminate(reason).await?;
+        if reason == "durably failed" {
+            metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "failure_budget_term").increment(1);
+        }
         self.clear_activation_failures(delivery).await;
         Ok(())
     }
@@ -500,7 +515,7 @@ impl WorkerRuntime {
                     "activation status read failed for session '{}': {error:#}",
                     activation.session_id
                 );
-                Self::delayed_nak(delivery).await?;
+                Self::delayed_nak(delivery, ActivationNakReason::PreflightNotReady).await?;
                 Ok(true)
             }
         }
@@ -515,6 +530,7 @@ impl WorkerRuntime {
         match self.acquire_activation_lease(activation, generation).await {
             Ok(Some(lease)) => Ok(Some(lease)),
             Ok(None) => {
+                metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "lease_held").increment(1);
                 Self::busy_nak(delivery).await?;
                 Ok(None)
             }
@@ -523,7 +539,7 @@ impl WorkerRuntime {
                     "targeted activation lease attempt failed for session '{}': {error:#}",
                     activation.session_id
                 );
-                Self::delayed_nak(delivery).await?;
+                Self::delayed_nak(delivery, ActivationNakReason::ClaimError).await?;
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -583,6 +599,7 @@ impl WorkerRuntime {
             lease,
             reservation_generation: _,
             span,
+            lease_acquired_at,
         } = claimed;
         let execution = WorkerExecution::claim(&activation, &lease);
         self.log_activation_claim(&activation, &lease);
@@ -615,7 +632,9 @@ impl WorkerRuntime {
                             .terminate_activation(&mut delivery, "durably failed")
                             .await;
                     } else {
-                        let _ = Self::delayed_nak(&mut delivery).await;
+                        let _ =
+                            Self::delayed_nak(&mut delivery, ActivationNakReason::PreparationError)
+                                .await;
                     }
                     error
                 };
@@ -634,6 +653,7 @@ impl WorkerRuntime {
             control,
             shutdown,
             span,
+            lease_acquired_at,
         })
     }
 
@@ -716,7 +736,7 @@ impl WorkerRuntime {
                 let _ = self.terminate_activation(delivery, "durably failed").await;
             }
             _ => {
-                let _ = Self::delayed_nak(delivery).await;
+                let _ = Self::delayed_nak(delivery, ActivationNakReason::SettlementRejection).await;
             }
         }
     }
@@ -730,10 +750,17 @@ impl WorkerRuntime {
             mut delivery,
             shutdown,
             span,
+            lease_acquired_at,
         } = prepared;
         let worker = Arc::clone(self);
         let session_id = activation.session_id.clone();
         let task_session_id = session_id.clone();
+        harnx_metrics::record_activation_phase("lease_to_turn_start", lease_acquired_at.elapsed());
+        tracing::info!(event = "activation_turn_started", session_id = %activation.session_id,
+            activation_id = %activation.epoch, agent = activation.agent_name.as_deref().unwrap_or("unknown"), cluster = %self.cluster,
+            delivery_attempt = delivery.message().info().map_or(0, |i| i.delivered),
+            elapsed_ms = lease_acquired_at.elapsed().as_millis() as u64, reason = "started",
+            "activation turn started");
         Self::active_session_started(&activation, &lease);
         async move {
             let result = if shutdown.is_cancelled() {
@@ -800,8 +827,13 @@ impl WorkerRuntime {
             .await
         {
             ReservationOutcome::Reserved(generation) => generation,
-            ReservationOutcome::SameDelivery => return Ok(None),
+            ReservationOutcome::SameDelivery => {
+                metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "same_delivery").increment(1);
+                return Ok(None);
+            }
             ReservationOutcome::DistinctDelivery => {
+                metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "busy")
+                    .increment(1);
                 Self::busy_nak(delivery).await?;
                 return Ok(None);
             }
@@ -817,6 +849,7 @@ impl WorkerRuntime {
         reservation_generation: u64,
     ) -> Result<Option<ClaimedActivation>> {
         let session_id = activation.session_id.clone();
+        let admission_started = std::time::Instant::now();
         let result = async {
             let span =
                 agent_activation_span(delivery.message().headers.as_ref(), &activation.session_id);
@@ -824,6 +857,7 @@ impl WorkerRuntime {
                 .activation_is_ready(delivery, &activation, reservation_generation)
                 .await?
             {
+                metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "preflight_not_ready").increment(1);
                 return Ok(None);
             }
             if self.shutdown.is_cancelled() {
@@ -836,6 +870,14 @@ impl WorkerRuntime {
             else {
                 return Ok(None);
             };
+            let lease_acquired_at = std::time::Instant::now();
+            harnx_metrics::record_activation_phase("admission_to_lease", admission_started.elapsed());
+            metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "claimed").increment(1);
+            tracing::info!(event = "activation_lease_acquired", session_id = %activation.session_id,
+                activation_id = %activation.epoch, agent = activation.agent_name.as_deref().unwrap_or("unknown"), cluster = %self.cluster,
+                delivery_attempt = delivery.message().info().map_or(0, |i| i.delivered),
+                elapsed_ms = admission_started.elapsed().as_millis() as u64, reason = "claimed",
+                "activation lease acquired");
             delivery.attach_lease(&lease);
             if self.shutdown.is_cancelled() {
                 lease.release().await?;
@@ -847,6 +889,7 @@ impl WorkerRuntime {
                 lease,
                 reservation_generation,
                 span,
+                lease_acquired_at,
             }))
         }
         .await;
@@ -860,20 +903,73 @@ impl WorkerRuntime {
     pub(super) async fn handle_activation(
         self: &Arc<Self>,
         message: async_nats::jetstream::Message,
+        delivered_wall: time::OffsetDateTime,
     ) -> Result<()> {
+        let received_at = std::time::Instant::now();
+        if let Ok(info) = message.info() {
+            let attempt = if info.delivered > 1 {
+                "redelivery"
+            } else {
+                "first"
+            };
+            metrics::counter!(harnx_metrics::ACTIVATIONS_RECEIVED_TOTAL, "attempt" => attempt)
+                .increment(1);
+            if info.delivered > 1 {
+                metrics::counter!(harnx_metrics::ACTIVATION_REDELIVERIES_TOTAL).increment(1);
+            }
+            record_publish_to_delivery(delivered_wall, info.published);
+        }
         let mut delivery =
             ActivationDelivery::start(message, self.activation_heartbeat_interval).await?;
+        if let Ok(activation) =
+            serde_json::from_slice::<SessionActivate>(&delivery.message().payload)
+        {
+            tracing::info!(event = "activation_delivered", session_id = %activation.session_id,
+                activation_id = %activation.epoch, agent = activation.agent_name.as_deref().unwrap_or("unknown"), cluster = %self.cluster,
+                delivery_attempt = delivery.message().info().map_or(0, |i| i.delivered),
+                elapsed_ms = delivery.message().info().ok()
+                    .and_then(|i| std::time::Duration::try_from(delivered_wall - i.published).ok())
+                    .map_or(0, |duration| duration.as_millis() as u64), reason = "delivered",
+                "activation delivered");
+            tracing::info!(event = "activation_admitted", session_id = %activation.session_id,
+                activation_id = %activation.epoch, agent = activation.agent_name.as_deref().unwrap_or("unknown"), cluster = %self.cluster,
+                delivery_attempt = delivery.message().info().map_or(0, |i| i.delivered),
+                elapsed_ms = std::time::Duration::try_from(time::OffsetDateTime::now_utc() - delivered_wall)
+                    .map_or(0, |duration| duration.as_millis() as u64), reason = "admitted",
+                "activation admitted");
+        }
         let claimed = match self.claim_activation(&mut delivery).await {
             Ok(Some(claimed)) => claimed,
             Ok(None) => {
+                if let Ok(activation) =
+                    serde_json::from_slice::<SessionActivate>(&delivery.message().payload)
+                {
+                    tracing::info!(event = "activation_claim_deferred", session_id = %activation.session_id,
+                        activation_id = %activation.epoch, agent = activation.agent_name.as_deref().unwrap_or("unknown"),
+                        cluster = %self.cluster,
+                        delivery_attempt = delivery.message().info().map_or(0, |i| i.delivered),
+                        elapsed_ms = received_at.elapsed().as_millis() as u64,
+                        reason = "not_claimed", "activation not claimed");
+                }
                 delivery.stop_heartbeat().await;
                 return Ok(());
             }
             Err(error) => {
+                if let Ok(activation) =
+                    serde_json::from_slice::<SessionActivate>(&delivery.message().payload)
+                {
+                    tracing::info!(event = "activation_claim_failed", session_id = %activation.session_id,
+                        activation_id = %activation.epoch, agent = activation.agent_name.as_deref().unwrap_or("unknown"), cluster = %self.cluster,
+                        delivery_attempt = delivery.message().info().map_or(0, |i| i.delivered),
+                        elapsed_ms = received_at.elapsed().as_millis() as u64,
+                        reason = "error", "activation claim failed");
+                }
+                metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "error")
+                    .increment(1);
                 let disposition = if self.shutdown.is_cancelled() {
                     Self::shutdown_nak(&mut delivery).await
                 } else {
-                    Self::delayed_nak(&mut delivery).await
+                    Self::delayed_nak(&mut delivery, ActivationNakReason::ClaimError).await
                 };
                 disposition?;
                 return Err(error);
@@ -951,7 +1047,39 @@ mod tests {
     use opentelemetry::trace::{SpanId, SpanKind, TraceContextExt, TraceId};
     use std::time::Duration;
 
-    use super::{agent_activation_span, busy_nak_delay};
+    use super::{agent_activation_span, busy_nak_delay, record_publish_to_delivery};
+
+    #[test]
+    fn broker_clock_ahead_records_zero_publish_to_delivery() {
+        use metrics_util::{
+            debugging::{DebugValue, DebuggingRecorder},
+            CompositeKey, MetricKind,
+        };
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let now = time::OffsetDateTime::now_utc();
+            assert_eq!(
+                record_publish_to_delivery(now, now + time::Duration::seconds(5)),
+                std::time::Duration::ZERO
+            );
+        });
+        let expected = CompositeKey::new(
+            MetricKind::Histogram,
+            metrics::Key::from_parts(
+                harnx_metrics::ACTIVATION_PHASE_SECONDS,
+                vec![metrics::Label::new("phase", "publish_to_delivery")],
+            ),
+        );
+        assert!(snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .any(|(key, _, _, value)| {
+                key == &expected && *value == DebugValue::Histogram(vec![0.0.into()])
+            }));
+    }
 
     const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
     const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";

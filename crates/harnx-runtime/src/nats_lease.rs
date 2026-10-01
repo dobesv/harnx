@@ -237,10 +237,12 @@ impl NatsSessionLease {
         }
 
         let revision = self.fence_token();
-        match self
-            .bucket
-            .delete_expect_revision(&self.key, Some(revision))
-            .await
+        match harnx_metrics::time_nats_operation(
+            "lease_release",
+            self.bucket
+                .delete_expect_revision(&self.key, Some(revision)),
+        )
+        .await
         {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == kv::UpdateErrorKind::WrongLastRevision => Ok(()),
@@ -289,7 +291,11 @@ impl Drop for NatsSessionLease {
                 }
                 if held {
                     let revision = state.fence_token.load(Ordering::SeqCst);
-                    let _ = bucket.delete_expect_revision(&key, Some(revision)).await;
+                    let _ = harnx_metrics::time_nats_operation(
+                        "lease_release",
+                        bucket.delete_expect_revision(&key, Some(revision)),
+                    )
+                    .await;
                 }
             });
         } else {
@@ -357,7 +363,9 @@ pub async fn open_lease_bucket(
     jetstream: &jetstream::Context,
     config: &NatsLeaseConfig,
 ) -> Option<kv::Store> {
-    jetstream.get_key_value(&config.bucket).await.ok()
+    harnx_metrics::time_nats_operation("kv_bucket_open", jetstream.get_key_value(&config.bucket))
+        .await
+        .ok()
 }
 
 /// Read the worker currently holding a session's lease, without acquiring it.
@@ -371,8 +379,7 @@ pub async fn lease_holder_in(
     session_id: &str,
 ) -> Result<Option<LeaseRecord>> {
     let key = config.key_for_session(session_id);
-    let Some(entry) = bucket
-        .get(&key)
+    let Some(entry) = harnx_metrics::time_nats_operation("lease_get", bucket.get(&key))
         .await
         .map_err(anyhow::Error::from)
         .with_context(|| format!("Failed to read NATS lease for session '{session_id}'"))?
@@ -392,7 +399,12 @@ pub async fn session_has_active_lease(
     session_id: &str,
 ) -> Result<bool> {
     let config = NatsLeaseConfig::default();
-    let bucket = match jetstream.get_key_value(&config.bucket).await {
+    let bucket = match harnx_metrics::time_nats_operation(
+        "kv_bucket_open",
+        jetstream.get_key_value(&config.bucket),
+    )
+    .await
+    {
         Ok(bucket) => bucket,
         Err(error) if crate::nats_admin::kv_bucket_missing(&error) => return Ok(false),
         Err(error) => {
@@ -415,7 +427,12 @@ async fn create_lease(
     ttl: Duration,
 ) -> Result<Option<u64>> {
     let payload = serde_json::to_vec(record).context("Failed to serialize lease record")?;
-    match bucket.create_with_ttl(key, payload.into(), ttl).await {
+    match harnx_metrics::time_nats_operation(
+        "lease_create",
+        bucket.create_with_ttl(key, payload.into(), ttl),
+    )
+    .await
+    {
         Ok(revision) => Ok(Some(revision)),
         Err(error) if is_create_conflict(&error) => Ok(None),
         Err(error) => Err(error).context("Failed to acquire NATS lease"),
@@ -432,16 +449,18 @@ pub(crate) async fn ensure_lease_bucket(
     jetstream: &jetstream::Context,
     config: &NatsLeaseConfig,
 ) -> Result<kv::Store> {
-    let create = jetstream
-        .create_key_value(kv::Config {
+    let create = harnx_metrics::time_nats_operation(
+        "kv_bucket_create",
+        jetstream.create_key_value(kv::Config {
             bucket: config.bucket.clone(),
             history: 1,
             limit_markers: Some(config.tombstone_ttl),
             num_replicas: config.replicas,
             storage: stream::StorageType::File,
             ..Default::default()
-        })
-        .await;
+        }),
+    )
+    .await;
     if let Ok(bucket) = create {
         return Ok(bucket);
     }
@@ -462,8 +481,7 @@ pub(crate) async fn ensure_lease_bucket(
         );
     }
 
-    jetstream
-        .get_key_value(&config.bucket)
+    harnx_metrics::time_nats_operation("kv_bucket_open", jetstream.get_key_value(&config.bucket))
         .await
         .map_err(anyhow::Error::from)
         .with_context(|| {
@@ -510,7 +528,7 @@ fn spawn_renew_task(params: RenewTaskParams) -> JoinHandle<()> {
                             ),
                         );
                     }
-                    info!(
+                    debug!(
                         "nats lease renewed: session_id={} worker_id={} generation={} revision={new_revision}",
                         session_id,
                         state.worker_id,
@@ -600,15 +618,18 @@ async fn renew_once(
         ),
     );
     let payload = bytes::Bytes::from(payload);
-    let ack = harnx_nats_common::recovery::retry_until(
-        deadline,
-        || async {
-            jetstream
-                .publish_with_headers(subject.clone(), headers.clone(), payload.clone())
-                .await?
-                .await
-        },
-        harnx_nats_common::recovery::transient_publish,
+    let ack = harnx_metrics::time_nats_operation(
+        "lease_renew",
+        harnx_nats_common::recovery::retry_until(
+            deadline,
+            || async {
+                jetstream
+                    .publish_with_headers(subject.clone(), headers.clone(), payload.clone())
+                    .await?
+                    .await
+            },
+            harnx_nats_common::recovery::transient_publish,
+        ),
     )
     .await;
     match ack {

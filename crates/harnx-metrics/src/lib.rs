@@ -13,7 +13,7 @@ use axum::{
     response::Response,
 };
 use clap::Args;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 
 /// Total chat-completion tokens by agent, client, provider, model, and token type.
 pub const LLM_TOKENS_TOTAL: &str = "harnx_llm_tokens_total";
@@ -27,6 +27,66 @@ pub const HTTP_REQUEST_DURATION_SECONDS: &str = "harnx_http_request_duration_sec
 pub const TOOL_CALLS_TOTAL: &str = "harnx_tool_calls_total";
 /// Tool-call duration in seconds by tool.
 pub const TOOL_CALL_DURATION_SECONDS: &str = "harnx_tool_call_duration_seconds";
+
+/// Worker activation phase duration in seconds, by phase.
+pub const ACTIVATION_PHASE_SECONDS: &str = "harnx_activation_phase_seconds";
+/// Activation deliveries by attempt (first or redelivery).
+pub const ACTIVATIONS_RECEIVED_TOTAL: &str = "harnx_activations_received_total";
+/// Claim dispositions by bounded outcome.
+pub const ACTIVATION_CLAIMS_TOTAL: &str = "harnx_activation_claims_total";
+/// Successfully NAKed activation deliveries by bounded reason.
+pub const ACTIVATION_NAKS_TOTAL: &str = "harnx_activation_naks_total";
+/// Activation redeliveries.
+pub const ACTIVATION_REDELIVERIES_TOTAL: &str = "harnx_activation_redeliveries_total";
+/// Parent-side claim deadline expirations.
+pub const ACTIVATION_CLAIM_DEADLINES_TOTAL: &str = "harnx_activation_claim_deadlines_total";
+/// Admission permits currently available in this worker process.
+pub const WORKER_ADMISSION_PERMITS: &str = "harnx_worker_admission_permits";
+/// Activation handlers currently in flight in this worker process.
+pub const WORKER_ACTIVATION_HANDLERS: &str = "harnx_worker_activation_handlers";
+/// Activations waiting for admission in this worker process.
+pub const WORKER_ACTIVATIONS_WAITING: &str = "harnx_worker_activations_waiting";
+/// JetStream/KV operation duration by bounded operation.
+pub const NATS_OPERATION_SECONDS: &str = "harnx_nats_operation_seconds";
+/// JetStream/KV operation results by bounded operation and outcome.
+pub const NATS_OPERATIONS_TOTAL: &str = "harnx_nats_operations_total";
+
+const ACTIVATION_BUCKETS: [f64; 16] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0, 300.0,
+];
+
+/// Observe one of the four worker activation phases.
+pub fn record_activation_phase(phase: &'static str, elapsed: Duration) {
+    metrics::histogram!(ACTIVATION_PHASE_SECONDS, "phase" => phase).record(elapsed.as_secs_f64());
+}
+
+/// Time one JetStream or KV operation, recording success, timeout or error.
+/// `op` must be a fixed identifier, never a stream, key, or session name.
+pub async fn time_nats_operation<F, T, E>(op: &'static str, future: F) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let started = Instant::now();
+    let result = future.await;
+    let outcome = match &result {
+        Ok(_) => "ok",
+        Err(error) => {
+            let message = error.to_string().to_ascii_lowercase();
+            if ["timed out", "timeout", "deadline", "elapsed"]
+                .iter()
+                .any(|term| message.contains(term))
+            {
+                "timeout"
+            } else {
+                "error"
+            }
+        }
+    };
+    metrics::histogram!(NATS_OPERATION_SECONDS, "op" => op).record(started.elapsed().as_secs_f64());
+    metrics::counter!(NATS_OPERATIONS_TOTAL, "op" => op, "outcome" => outcome).increment(1);
+    result
+}
 
 const HISTOGRAM_BUCKETS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -96,6 +156,16 @@ pub fn init(flags: &MetricsFlags) -> anyhow::Result<()> {
         .with_http_listener(addr)
         .set_buckets(&HISTOGRAM_BUCKETS)
         .context("failed to configure Prometheus histogram buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full(ACTIVATION_PHASE_SECONDS.to_owned()),
+            &ACTIVATION_BUCKETS,
+        )
+        .context("failed to configure activation histogram buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full(NATS_OPERATION_SECONDS.to_owned()),
+            &ACTIVATION_BUCKETS,
+        )
+        .context("failed to configure NATS histogram buckets")?
         .install()
         .context("failed to install Prometheus metrics recorder")?;
     INIT.set(())
@@ -257,6 +327,49 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn activation_phase_and_nats_outcomes_are_recorded() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_activation_phase("admission_to_lease", Duration::from_secs(120));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime should build");
+            runtime.block_on(async {
+                assert_eq!(
+                    time_nats_operation("lease_get", async { Ok::<_, &str>(42) }).await,
+                    Ok(42)
+                );
+                assert_eq!(
+                    time_nats_operation("lease_get", async { Err::<(), _>("timed out") }).await,
+                    Err("timed out")
+                );
+                assert_eq!(
+                    time_nats_operation("lease_get", async { Err::<(), _>("broken") }).await,
+                    Err("broken")
+                );
+            });
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(snapshot.iter().any(|(key, _, _, value)| {
+            *key == metric_key(
+                MetricKind::Histogram,
+                ACTIVATION_PHASE_SECONDS,
+                &[("phase", "admission_to_lease")],
+            ) && *value == DebugValue::Histogram(vec![120.0.into()])
+        }));
+        for outcome in ["ok", "timeout", "error"] {
+            assert!(snapshot.iter().any(|(key, _, _, value)| {
+                *key == metric_key(
+                    MetricKind::Counter,
+                    NATS_OPERATIONS_TOTAL,
+                    &[("op", "lease_get"), ("outcome", outcome)],
+                ) && *value == DebugValue::Counter(1)
+            }));
+        }
     }
 
     #[test]

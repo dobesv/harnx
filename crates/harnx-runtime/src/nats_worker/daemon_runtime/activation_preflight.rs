@@ -46,7 +46,7 @@ impl WorkerRuntime {
         error: anyhow::Error,
     ) -> Result<bool> {
         if self.uses_targeted_activation() {
-            Self::delayed_nak(delivery).await?;
+            Self::delayed_nak(delivery, super::ActivationNakReason::PreflightNotReady).await?;
             Ok(false)
         } else {
             Err(error)
@@ -101,7 +101,7 @@ impl WorkerRuntime {
             self.terminate_activation(delivery, "durably failed")
                 .await?;
         } else {
-            Self::delayed_nak(delivery).await?;
+            Self::delayed_nak(delivery, super::ActivationNakReason::PreflightNotReady).await?;
         }
         lease.release().await?;
         Ok(false)
@@ -246,7 +246,8 @@ impl WorkerRuntime {
                     activation.session_id
                 );
                 if self.uses_targeted_activation() {
-                    Self::delayed_nak(delivery).await?;
+                    Self::delayed_nak(delivery, super::ActivationNakReason::PreflightNotReady)
+                        .await?;
                     Ok(false)
                 } else {
                     Err(error)

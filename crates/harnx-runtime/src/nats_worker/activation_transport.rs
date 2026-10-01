@@ -122,10 +122,12 @@ async fn ensure_notify_stream(
     num_replicas: usize,
 ) -> Result<jetstream::stream::Stream> {
     let name = notify_stream_name(cluster);
-    if let Ok(stream) = jetstream.get_stream(&name).await {
+    if let Ok(stream) =
+        harnx_metrics::time_nats_operation("stream_lookup", jetstream.get_stream(&name)).await
+    {
         return Ok(stream);
     }
-    match jetstream
+    match harnx_metrics::time_nats_operation("stream_create", jetstream
         .create_stream(StreamConfig {
             name: name.clone(),
             description: Some("session activation work queue".to_string()),
@@ -134,11 +136,10 @@ async fn ensure_notify_stream(
             storage: StorageType::File,
             num_replicas,
             ..Default::default()
-        })
-        .await
+        })).await
     {
         Ok(stream) => Ok(stream),
-        Err(create_error) => match jetstream.get_stream(&name).await {
+        Err(create_error) => match harnx_metrics::time_nats_operation("stream_lookup", jetstream.get_stream(&name)).await {
             Ok(stream) => Ok(stream),
             Err(get_error) => Err(anyhow::Error::from(create_error).context(format!(
                 "Failed to create notify stream '{name}' for cluster '{cluster}' with {num_replicas} replicas; fallback get also failed: {get_error}"
@@ -158,11 +159,17 @@ async fn ensure_local_notify_stream(
 async fn open_or_create_local_stream(
     jetstream: &jetstream::Context,
 ) -> Result<jetstream::stream::Stream> {
-    if let Ok(stream) = jetstream.get_stream(LOCAL_WORK_NOTIFY_STREAM).await {
+    if let Ok(stream) = harnx_metrics::time_nats_operation(
+        "stream_lookup",
+        jetstream.get_stream(LOCAL_WORK_NOTIFY_STREAM),
+    )
+    .await
+    {
         return Ok(stream);
     }
-    match jetstream
-        .create_stream(StreamConfig {
+    match harnx_metrics::time_nats_operation(
+        "stream_create",
+        jetstream.create_stream(StreamConfig {
             name: LOCAL_WORK_NOTIFY_STREAM.to_string(),
             description: Some("frontend-targeted local session activations".to_string()),
             subjects: vec![LOCAL_NOTIFY_SUBJECT.to_string()],
@@ -171,11 +178,17 @@ async fn open_or_create_local_stream(
             // Frontend-local stream never spans a NATS cluster.
             num_replicas: 1,
             ..Default::default()
-        })
-        .await
+        }),
+    )
+    .await
     {
         Ok(stream) => Ok(stream),
-        Err(create_error) => match jetstream.get_stream(LOCAL_WORK_NOTIFY_STREAM).await {
+        Err(create_error) => match harnx_metrics::time_nats_operation(
+            "stream_lookup",
+            jetstream.get_stream(LOCAL_WORK_NOTIFY_STREAM),
+        )
+        .await
+        {
             Ok(stream) => Ok(stream),
             Err(get_error) => Err(anyhow::Error::from(create_error).context(format!(
                 "Failed to create local-v2 notify stream; fallback get also failed: {get_error}"
@@ -213,7 +226,7 @@ pub async fn publish_session_activate(
 ) -> Result<u64> {
     let subject = notify_subject(cluster);
     ensure_notify_stream(jetstream, cluster, &subject, num_replicas).await?;
-    publish_activation(jetstream, subject, activation, activation.msg_id()).await
+    publish_activation(jetstream, subject, cluster, activation, activation.msg_id()).await
 }
 
 /// Publish an activation to one frontend-owned local worker.
@@ -239,7 +252,14 @@ pub async fn publish_targeted_session_activate(
     // lease, and requested-sequence coverage checks make repeated deliveries
     // safe.
     let message_id = targeted_activation_message_id(target, activation, requested_seq);
-    publish_activation(jetstream, subject, activation, message_id).await
+    publish_activation(
+        jetstream,
+        subject,
+        target.session_scope,
+        activation,
+        message_id,
+    )
+    .await
 }
 
 fn targeted_activation_message_id(
@@ -256,17 +276,25 @@ fn targeted_activation_message_id(
 async fn publish_activation(
     jetstream: &jetstream::Context,
     subject: String,
+    cluster: &str,
     activation: &SessionActivate,
     message_id: String,
 ) -> Result<u64> {
     let payload = serde_json::to_vec(activation).context("serialize SessionActivate")?;
     let headers = activation_headers(HeaderValue::from(message_id));
-    let ack = jetstream
-        .publish_with_headers(subject, headers, payload.into())
-        .await
-        .context("publish SessionActivate")?
-        .await
-        .context("ack SessionActivate")?;
+    let started = std::time::Instant::now();
+    let ack = harnx_metrics::time_nats_operation("activation_publish", async {
+        jetstream
+            .publish_with_headers(subject, headers, payload.into())
+            .await?
+            .await
+    })
+    .await
+    .context("publish/ack SessionActivate")?;
+    tracing::info!(event = "activation_published", session_id = %activation.session_id,
+        activation_id = %activation.epoch, agent = activation.agent_name.as_deref().unwrap_or("unknown"), cluster = %cluster,
+        delivery_attempt = 0, elapsed_ms = started.elapsed().as_millis() as u64,
+        reason = "published", "activation published");
     Ok(ack.sequence)
 }
 
@@ -282,8 +310,9 @@ pub(super) async fn ensure_activation_consumer(
     daemon: &WorkerDaemonConfig,
 ) -> Result<jetstream::consumer::Consumer<pull::Config>> {
     let (stream, consumer_name, subject) = consumer_route(jetstream, daemon).await?;
-    let consumer = stream
-        .get_or_create_consumer(
+    let consumer = harnx_metrics::time_nats_operation(
+        "consumer_create",
+        stream.get_or_create_consumer(
             &consumer_name,
             pull::Config {
                 durable_name: Some(consumer_name.clone()),
@@ -294,9 +323,10 @@ pub(super) async fn ensure_activation_consumer(
                 max_deliver: -1,
                 ..Default::default()
             },
-        )
-        .await
-        .with_context(|| format!("create worker consumer '{consumer_name}'"))?;
+        ),
+    )
+    .await
+    .with_context(|| format!("create worker consumer '{consumer_name}'"))?;
     if daemon.activation_mode == WorkerActivationMode::WorkerTargeted {
         validate_targeted_consumer(
             &consumer,

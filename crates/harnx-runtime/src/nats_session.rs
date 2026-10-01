@@ -237,6 +237,7 @@ impl SessionLeaseWatchdog {
 
     fn lease_acquisition_timeout(&self, now: tokio::time::Instant) -> Option<String> {
         (!self.saw_lease && now >= self.lease_acquisition_deadline).then(|| {
+            metrics::counter!(harnx_metrics::ACTIVATION_CLAIM_DEADLINES_TOTAL).increment(1);
             format!(
                 "No worker claimed this session within {} seconds after activation. \
                  Check that a worker is running and subscribed to this agent's cluster.",
@@ -824,6 +825,7 @@ impl NatsSession {
         match &self.config.activation_route {
             SessionActivationRoute::ClusterShared => {
                 let activation = SessionActivate::new(&self.storage_key)
+                    .with_agent_name(self.config.initializer.agent_name())
                     .with_tool_confirmation_subject(tool_confirmation_subject)
                     .with_token_budget(token_budget);
                 publish_session_activate(
@@ -841,6 +843,7 @@ impl NatsSession {
             } => {
                 let activation =
                     SessionActivate::targeted(&self.storage_key, user_msg_seq, worker_id)
+                        .with_agent_name(self.config.initializer.agent_name())
                         .with_tool_confirmation_subject(tool_confirmation_subject)
                         .with_token_budget(token_budget);
                 publish_targeted_session_activate(
@@ -2296,27 +2299,50 @@ mod tests {
         assert_eq!(minimum.missing_checks_limit, 1);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn activation_timeout_reports_configured_value() {
-        let configured = std::time::Duration::from_secs(7);
-        let mut watchdog = SessionLeaseWatchdog::with_timeouts(None, configured);
-        assert_eq!(
-            watchdog.lease_acquisition_timeout(tokio::time::Instant::now()),
-            None
-        );
+    #[test]
+    fn activation_timeout_reports_configured_value() {
+        use metrics_util::{
+            debugging::{DebugValue, DebuggingRecorder},
+            CompositeKey, MetricKind,
+        };
 
-        tokio::time::advance(configured).await;
-        let reason = watchdog
-            .lease_acquisition_timeout(tokio::time::Instant::now())
-            .expect("unclaimed activation must time out");
-        assert!(reason.contains("No worker claimed this session within 7 seconds"));
-
-        watchdog.saw_lease = true;
-        assert_eq!(
-            watchdog.lease_acquisition_timeout(tokio::time::Instant::now()),
-            None,
-            "the startup budget must not apply after a lease was observed"
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .expect("test runtime")
+                .block_on(async {
+                    let configured = std::time::Duration::from_secs(7);
+                    let mut watchdog = SessionLeaseWatchdog::with_timeouts(None, configured);
+                    assert_eq!(
+                        watchdog.lease_acquisition_timeout(tokio::time::Instant::now()),
+                        None
+                    );
+                    tokio::time::advance(configured).await;
+                    let reason = watchdog
+                        .lease_acquisition_timeout(tokio::time::Instant::now())
+                        .expect("unclaimed activation must time out");
+                    assert!(reason.contains("No worker claimed this session within 7 seconds"));
+                    watchdog.saw_lease = true;
+                    assert_eq!(
+                        watchdog.lease_acquisition_timeout(tokio::time::Instant::now()),
+                        None,
+                        "the startup budget must not apply after a lease was observed"
+                    );
+                });
+        });
+        let expected = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_static_name(harnx_metrics::ACTIVATION_CLAIM_DEADLINES_TOTAL),
         );
+        assert!(snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .any(|(key, _, _, value)| { key == &expected && *value == DebugValue::Counter(1) }));
     }
 
     /// A turn's last flush must not swallow notices just because the durable log
