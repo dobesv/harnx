@@ -201,11 +201,3 @@ export function persistGalleryExchange(session: string, userText: string) {
   notify(session);
   channel?.postMessage({ session, messages: persisted, controlStates: controlStates.get(session) });
 }
-
-
-export function broadcastLiveEvent(session: string, eventData: any) {
-  const frame = new TextEncoder().encode(`event: message\ndata: ${JSON.stringify(eventData)}\n\n`);
-  for (const controller of subscribers.get(session) ?? []) {
-    try { controller.enqueue(frame); } catch (e) {}
-  }
-}

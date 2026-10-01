@@ -5,7 +5,7 @@ mod termination;
 #[cfg(test)]
 mod interrupt_tests;
 
-use super::subagent_progress::SubagentProgressReporter;
+use super::subagent_progress::{ReportedInvocation, SubagentProgressReporter};
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_session::{NatsSession, NatsSessionConfig, NatsTurnResult};
 use crate::nats_session_log::NatsSessionLog;
@@ -15,7 +15,7 @@ use async_nats::jetstream;
 use async_trait::async_trait;
 use harnx_blob_store::media::{get_media, optional_attachments_bucket};
 use harnx_core::cid_url::CidUrl;
-use harnx_core::event::{AgentEvent, AgentSource, SubAgentProgress, TurnEvent};
+use harnx_core::event::SubAgentProgress;
 use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart};
 use harnx_core::package_namespace::sanitize_for_tool_name;
 use harnx_core::session::SessionLogEntry;
@@ -110,12 +110,6 @@ impl SubagentNats {
         self.lease_acquisition_timeout = timeout;
         self
     }
-}
-
-struct SubagentStart<'a> {
-    child_session_id: &'a str,
-    invocation_id: &'a str,
-    tool_call_id: Option<&'a str>,
 }
 
 struct ProgressReporterStart {
@@ -274,83 +268,30 @@ impl SubagentToolset {
     async fn start_progress_reporter(
         &self,
         start: ProgressReporterStart,
-    ) -> Result<SubagentProgressReporter, ToolInvokeError> {
+    ) -> SubagentProgressReporter {
         let parent_sink = match start.parent_session_id {
-            Some(parent_session_id) => {
-                let sink = NatsEventSink::new(
+            Some(parent_session_id) => Some(
+                NatsEventSink::new(
                     self.client.clone(),
                     self.jetstream.clone(),
-                    parent_session_id.clone(),
+                    parent_session_id,
                 )
-                .await;
-                self.emit_parent_subagent_started(
-                    &sink,
-                    &parent_session_id,
-                    SubagentStart {
-                        child_session_id: &start.child_session_id,
-                        invocation_id: &start.invocation_id,
-                        tool_call_id: start.tool_call_id.as_deref(),
-                    },
-                )
-                .await?;
-                Some(sink)
-            }
+                .await,
+            ),
             None => None,
         };
-        Ok(SubagentProgressReporter::start(
-            self.agent.clone(),
-            start.child_session_id,
-            start.invocation_id,
+        SubagentProgressReporter::start(
+            ReportedInvocation {
+                agent: self.agent.clone(),
+                session_id: start.child_session_id,
+                invocation_id: start.invocation_id,
+                tool_call_id: start.tool_call_id,
+            },
             parent_sink,
             self.session_metadata.clone(),
             self.progress_heartbeat,
         )
-        .await)
-    }
-
-    async fn emit_parent_subagent_started(
-        &self,
-        parent_sink: &NatsEventSink,
-        parent_session_id: &str,
-        start: SubagentStart<'_>,
-    ) -> Result<(), ToolInvokeError> {
-        let SubagentStart {
-            child_session_id,
-            invocation_id,
-            tool_call_id,
-        } = start;
-        let entry = SessionLogEntry::SubAgentStarted {
-            agent: self.agent.clone(),
-            session_id: child_session_id.to_string(),
-            invocation_id: Some(invocation_id.to_string()),
-            tool_call_id: tool_call_id.map(str::to_string),
-            started_at: Some(chrono::Utc::now()),
-        };
-        let inserted = append_started(self, (parent_session_id, invocation_id), &entry).await?;
-        if !inserted {
-            return Ok(());
-        }
-        let source = AgentSource {
-            agent: self.agent.clone(),
-            session_id: Some(child_session_id.to_string()),
-            model: None,
-        };
-        let event = AgentEvent::sub_agent(
-            source,
-            AgentEvent::Turn(TurnEvent::SubAgentStarted {
-                agent: self.agent.clone(),
-                session_id: child_session_id.to_string(),
-                invocation_id: Some(invocation_id.to_string()),
-            }),
-        );
-        parent_sink.emit_required(event);
-        parent_sink.flush().await.map_err(|error| {
-            ToolInvokeError::Recoverable(format!(
-                "publish sub-agent start event to parent session: {error:#}"
-            ))
-        })?;
-
-        Ok(())
+        .await
     }
 
     async fn turn_has_cancel(&self, result: &NatsTurnResult) -> bool {
@@ -507,21 +448,6 @@ fn attachment_store_error(error: anyhow::Error) -> ToolInvokeError {
 
 fn attachment_not_found(url: &str) -> ToolInvokeError {
     ToolInvokeError::Recoverable(format!("attachment not found: {url}"))
-}
-
-/// Append a durable `SubAgentStarted` marker to the parent's transcript,
-/// deduplicated by invocation ID so a retried announcement is a no-op.
-async fn append_started(
-    toolset: &SubagentToolset,
-    destination: (&str, &str),
-    entry: &SessionLogEntry,
-) -> Result<bool, ToolInvokeError> {
-    let (parent, invocation) = destination;
-    let log = NatsSessionLog::new(toolset.jetstream.clone(), parent);
-    crate::nats_session::append_invocation_entry(&log, entry, invocation)
-        .await
-        .map(|(_, inserted)| inserted)
-        .map_err(|error| ToolInvokeError::Fatal(format!("{error:#}")))
 }
 
 struct CompletedSubagentTurn {

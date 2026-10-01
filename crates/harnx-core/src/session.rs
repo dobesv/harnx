@@ -125,10 +125,11 @@ pub enum SessionLogEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<CompletionTokenUsage>,
     },
-    /// Emitted when a sub-agent delegation starts a child session. Appended to the
-    /// PARENT session's log so the child session_id is visible (and monitorable by
-    /// reconnecting clients) even when the tool result is dropped, e.g. parent-side
-    /// cancellation. Rendered into model context as an informational note.
+    /// Legacy entry that named the child session a sub-agent call started. It
+    /// is kept so transcripts written before partial results still load;
+    /// nothing writes it now, since a failed sub-agent call names its child in
+    /// the call's partial result instead. An old entry still renders into
+    /// model context as an informational note.
     #[serde(rename = "sub_agent_started")]
     SubAgentStarted {
         agent: String,

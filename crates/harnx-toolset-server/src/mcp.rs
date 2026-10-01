@@ -99,10 +99,12 @@ impl McpToolsetAdapter {
             invoking_session_id: None,
             invoking_session: None,
             capabilities,
-            // MCP transports have no journal to record a checkpoint in, and no
-            // control subject a later cancel could arrive on.
+            // MCP transports have no journal to record a checkpoint or a
+            // partial result in, and no control subject a later cancel could
+            // arrive on.
             checkpoint: None,
             checkpoint_store: None,
+            partial_result_store: None,
             progress: Default::default(),
         };
         let attestation = RequestAttestation {

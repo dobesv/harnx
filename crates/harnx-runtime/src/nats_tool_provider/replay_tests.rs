@@ -93,6 +93,112 @@ async fn resume_without_cancel_rolls_forward_saved_reply_then_replays_retryable_
     Ok(())
 }
 
+/// A failure the journal already holds rolls forward with the partial result
+/// its tool recorded, the same as a failure the caller saw live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_saved_failure_rolls_forward_with_its_partial_result() -> anyhow::Result<()> {
+    use harnx_toolset::PartialResultStore;
+
+    let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+        .await
+        .context("nats-server required")?;
+    let client = async_nats::connect(&url).await?;
+    let js = async_nats::jetstream::new(client.clone());
+    let request = ToolRequest {
+        replay: None,
+        call_id: "failed-original".into(),
+        operation_id: "failed-original".into(),
+        tool: "echo".into(),
+        args: json!({}),
+        parent_session_id: Some("parent".into()),
+        parent_agent: None,
+        parent_local_session_id: None,
+        tool_call_id: Some("failed-call".into()),
+        capabilities: Default::default(),
+    };
+    let journal = InvocationJournal::ensure(&js, 1).await?;
+    journal
+        .record(&request, ("retired_echo", "original-scope", "retired"), 5)
+        .await?;
+    journal
+        .partial_result_store(&request)
+        .record_partial_result(json!({"job": "j-1"}))
+        .await?;
+    journal
+        .complete(
+            &request,
+            ToolReply {
+                call_id: "failed-original".into(),
+                result: Err(ToolErrorPayload::Recoverable("job failed".into())),
+                final_progress: None,
+            },
+        )
+        .await?;
+    let provider = saved_reply_provider(client).await?;
+
+    let failed = harnx_core::tool::ToolCall::new(
+        "retired_echo".into(),
+        json!({}),
+        Some("failed-call".into()),
+        None,
+    );
+    let result = provider
+        .replay_recorded_call(
+            replay_of(&failed),
+            &harnx_core::abort::create_abort_signal(),
+        )
+        .await?
+        .context("recovered failure")?;
+    assert_eq!(
+        result.value,
+        json!({"is_error": true, "error": "job failed", "partial_result": {"job": "j-1"}})
+    );
+
+    let _ = nats.kill();
+    let _ = nats.wait();
+    Ok(())
+}
+
+/// Nothing can be read from the journal while NATS is disconnected, and
+/// trying would hold a failed call's answer until the read gave up. The
+/// provider skips the read and answers with the error as it stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_call_skips_the_partial_result_read_while_disconnected() -> anyhow::Result<()> {
+    let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+        .await
+        .context("nats-server required")?;
+    let client = async_nats::connect(&url).await?;
+    let provider = saved_reply_provider(client.clone()).await?;
+    nats.kill()?;
+    nats.wait()?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while client.connection_state() == async_nats::connection::State::Connected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("the client never noticed the broker was gone")?;
+    let request: ToolRequest = serde_json::from_value(json!({
+        "call_id": "lost-original", "operation_id": "lost-original", "tool": "echo", "args": {}
+    }))?;
+
+    // The read the skip saves gives up only at its own bound, so an answer
+    // well inside that bound cannot have waited on it.
+    let answer = tokio::time::timeout(
+        super::super::partial_result::PARTIAL_RESULT_READ_TIMEOUT / 2,
+        provider
+            .with_recorded_partial_result(&request, Err(ToolError::Recoverable(anyhow!("lost")))),
+    )
+    .await
+    .context("the failed call waited on a journal it cannot reach")?;
+    let Err(ToolError::Recoverable(error)) = answer else {
+        anyhow::bail!("the failed call must keep its recoverable error");
+    };
+    assert_eq!(format!("{error:#}"), "lost");
+    assert_eq!(partial_result_of(&error), None);
+    Ok(())
+}
+
 fn replay_of(call: &harnx_core::tool::ToolCall) -> harnx_core::tool::ToolReplay<'_> {
     harnx_core::tool::ToolReplay {
         session_id: "parent",

@@ -108,13 +108,23 @@ struct ProgressTracker {
     snapshot: SubAgentProgress,
 }
 
+/// The invocation a reporter speaks for: one call into one child session.
+pub(super) struct ReportedInvocation {
+    pub agent: String,
+    pub session_id: String,
+    pub invocation_id: String,
+    /// The parent transcript's id for the call, when the caller has one.
+    pub tool_call_id: Option<String>,
+}
+
 impl ProgressTracker {
-    fn new(
-        agent: String,
-        session_id: String,
-        invocation_id: String,
-        title: Option<String>,
-    ) -> Self {
+    fn new(invocation: ReportedInvocation, title: Option<String>) -> Self {
+        let ReportedInvocation {
+            agent,
+            session_id,
+            invocation_id,
+            tool_call_id,
+        } = invocation;
         Self {
             snapshot: SubAgentProgress {
                 invocation_id,
@@ -125,6 +135,7 @@ impl ProgressTracker {
                 usage: CompletionTokenUsage::default(),
                 tool_call_count: 0,
                 title,
+                tool_call_id,
             },
         }
     }
@@ -157,9 +168,7 @@ impl ProgressTracker {
 }
 
 struct ReporterTaskConfig {
-    agent: String,
-    session_id: String,
-    invocation_id: String,
+    invocation: ReportedInvocation,
     parent_sink: Option<NatsEventSink>,
     title: ReporterTitleConfig,
     heartbeat: Duration,
@@ -192,22 +201,18 @@ impl ReporterTask {
             read_timeout: title_read_timeout,
         } = config.title;
         let source = AgentSource {
-            agent: config.agent.clone(),
-            session_id: Some(config.session_id.clone()),
+            agent: config.invocation.agent.clone(),
+            session_id: Some(config.invocation.session_id.clone()),
             model: None,
         };
-        let tracker = ProgressTracker::new(
-            config.agent,
-            config.session_id.clone(),
-            config.invocation_id,
-            initial_title,
-        );
+        let session_id = config.invocation.session_id.clone();
+        let tracker = ProgressTracker::new(config.invocation, initial_title);
         let started = tokio::time::Instant::now();
         let mut heartbeats = tokio::time::interval_at(started + config.heartbeat, config.heartbeat);
         heartbeats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         Self {
             source,
-            session_id: config.session_id,
+            session_id,
             parent_sink: config.parent_sink,
             title_source,
             title_read_timeout,
@@ -220,6 +225,10 @@ impl ReporterTask {
     }
 
     async fn run(mut self) {
+        // Announce the invocation before its first metric or heartbeat, so a
+        // live view shows the child as soon as it is bound.
+        let announcement = self.tracker.heartbeat(0);
+        publish_progress(self.parent_sink.as_ref(), &self.source, announcement);
         while self.process_next_event().await {}
     }
 
@@ -312,18 +321,14 @@ pub(super) struct SubagentProgressReporter {
 
 impl SubagentProgressReporter {
     pub(super) async fn start(
-        agent: String,
-        session_id: String,
-        invocation_id: String,
+        invocation: ReportedInvocation,
         parent_sink: Option<NatsEventSink>,
         session_metadata: SessionMetadataStore,
         heartbeat: Duration,
     ) -> Self {
         let title_source: Arc<dyn SessionTitleSource> = Arc::new(session_metadata);
         Self::start_with_title_source(
-            agent,
-            session_id,
-            invocation_id,
+            invocation,
             parent_sink,
             title_source,
             heartbeat,
@@ -333,21 +338,21 @@ impl SubagentProgressReporter {
     }
 
     async fn start_with_title_source(
-        agent: String,
-        session_id: String,
-        invocation_id: String,
+        invocation: ReportedInvocation,
         parent_sink: Option<NatsEventSink>,
         title_source: Arc<dyn SessionTitleSource>,
         heartbeat: Duration,
         title_read_timeout: Duration,
     ) -> Self {
-        let initial_title = read_title(title_source.as_ref(), &session_id, title_read_timeout)
-            .await
-            .flatten();
+        let initial_title = read_title(
+            title_source.as_ref(),
+            &invocation.session_id,
+            title_read_timeout,
+        )
+        .await
+        .flatten();
         Self::spawn_reporter(
-            agent,
-            session_id,
-            invocation_id,
+            invocation,
             parent_sink,
             ReporterTitleConfig {
                 source: Some(title_source),
@@ -359,9 +364,7 @@ impl SubagentProgressReporter {
     }
 
     fn spawn_reporter(
-        agent: String,
-        session_id: String,
-        invocation_id: String,
+        invocation: ReportedInvocation,
         parent_sink: Option<NatsEventSink>,
         title: ReporterTitleConfig,
         heartbeat: Duration,
@@ -369,9 +372,7 @@ impl SubagentProgressReporter {
         let (tx, commands) = mpsc::unbounded_channel();
         let sink = Arc::new(ProgressEventSink { tx: tx.clone() });
         let config = ReporterTaskConfig {
-            agent,
-            session_id,
-            invocation_id,
+            invocation,
             parent_sink,
             title,
             heartbeat,
@@ -382,16 +383,12 @@ impl SubagentProgressReporter {
 
     #[cfg(test)]
     pub(super) fn spawn(
-        agent: String,
-        session_id: String,
-        invocation_id: String,
+        invocation: ReportedInvocation,
         parent_sink: Option<NatsEventSink>,
         heartbeat: Duration,
     ) -> Self {
         Self::spawn_reporter(
-            agent,
-            session_id,
-            invocation_id,
+            invocation,
             parent_sink,
             ReporterTitleConfig {
                 source: None,
@@ -547,11 +544,18 @@ mod tests {
         }
     }
 
+    fn invocation() -> ReportedInvocation {
+        ReportedInvocation {
+            agent: "researcher".into(),
+            session_id: "session-1".into(),
+            invocation_id: "inv-1".into(),
+            tool_call_id: None,
+        }
+    }
+
     async fn reporter(source: StubTitleSource, heartbeat: Duration) -> SubagentProgressReporter {
         SubagentProgressReporter::start_with_title_source(
-            "researcher".into(),
-            "session-1".into(),
-            "inv-1".into(),
+            invocation(),
             None,
             Arc::new(source),
             heartbeat,
@@ -571,12 +575,7 @@ mod tests {
     }
 
     fn tracker() -> ProgressTracker {
-        ProgressTracker::new(
-            "researcher".into(),
-            "session-1".into(),
-            "inv-1".into(),
-            None,
-        )
+        ProgressTracker::new(invocation(), None)
     }
 
     #[tokio::test]
@@ -659,9 +658,7 @@ mod tests {
             StubTitleResponse::Error,
         ]);
         let reporter = SubagentProgressReporter::start_with_title_source(
-            "researcher".into(),
-            "session-1".into(),
-            "inv-1".into(),
+            invocation(),
             None,
             Arc::new(source.clone()),
             Duration::from_millis(5),
@@ -685,9 +682,7 @@ mod tests {
             StubTitleResponse::Pending,
         ]);
         let reporter = SubagentProgressReporter::start_with_title_source(
-            "researcher".into(),
-            "session-1".into(),
-            "inv-1".into(),
+            invocation(),
             None,
             Arc::new(source.clone()),
             Duration::from_millis(10),

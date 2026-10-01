@@ -2166,66 +2166,6 @@ pub async fn send_control_command(
     publish_control_command(client, session_id, &command).await
 }
 
-fn invocation_prompt_sequence(entries: &[(u64, SessionLogEntry)], message_id: &str) -> Option<u64> {
-    entries.iter().find_map(|(seq, entry)| match entry {
-        SessionLogEntry::Message { id: Some(id), .. }
-        | SessionLogEntry::SubAgentStarted {
-            invocation_id: Some(id),
-            ..
-        } if id == message_id => Some(*seq),
-        _ => None,
-    })
-}
-
-pub(crate) async fn append_invocation_entry(
-    log: &NatsSessionLog,
-    entry: &SessionLogEntry,
-    message_id: &str,
-) -> Result<(u64, bool)> {
-    // The reservation and transcript append are separate writes. A replay
-    // after a lost acknowledgement must find the original message, including
-    // after the broker's time-limited publish deduplication window expires.
-    for _ in 0..32 {
-        if let Some(seq) = try_append_invocation_prompt(log, entry, message_id).await? {
-            return Ok(seq);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    anyhow::bail!(
-        "session transcript remained busy while admitting the invocation; retry admission"
-    )
-}
-
-async fn try_append_invocation_prompt(
-    log: &NatsSessionLog,
-    entry: &SessionLogEntry,
-    message_id: &str,
-) -> Result<Option<(u64, bool)>> {
-    let entries = log.load_events_latest_async().await?;
-    if let Some(seq) = invocation_prompt_sequence(&entries, message_id) {
-        return Ok(Some((seq, false)));
-    }
-    let tail = entries.last().map_or(0, |(seq, _)| *seq);
-    match log
-        .append_event_with_expected_last_sequence_and_message_id_async(entry, tail, message_id)
-        .await
-    {
-        Ok(seq) => Ok(Some((seq, true))),
-        Err(error) if is_prompt_append_conflict(&error) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn is_prompt_append_conflict(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<async_nats::jetstream::context::PublishError>()
-            .is_some_and(|error| {
-                error.kind() == async_nats::jetstream::context::PublishErrorKind::WrongLastSequence
-            })
-    })
-}
-
 /// Test-only session/log construction shared by `nats_session`'s broker-backed
 /// tests, so each one doesn't hand-roll the client/jetstream/config wiring.
 #[cfg(test)]

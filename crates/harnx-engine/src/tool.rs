@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use futures_util::future::join_all;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
+use harnx_core::partial_result::{output_with_partial_result, partial_result_of};
 use harnx_core::tool::{
     SwitchAgentData, ToolCall, ToolError, ToolProvider, ToolProviderOutput, ToolResult,
     ToolUpdatePatch,
@@ -378,7 +379,10 @@ async fn complete_failed_tool_call(
     })
     .await;
     work_boundary(ctx, &call.call, abort, WorkBoundary::Accept).await?;
-    let value = json!({"is_error": true, "error": error_display});
+    let value = output_with_partial_result(
+        json!({"is_error": true, "error": error_display}),
+        partial_result_of(&error),
+    );
     (ctx.emit_tool_result_fn)(&call.call, &value);
     Ok(ToolResult::new(call.call, value))
 }
@@ -1414,6 +1418,35 @@ mod tests {
         assert_eq!(
             result[0].output,
             json!({"is_error": true, "error": "retry"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recoverable_error_answers_with_its_partial_result() {
+        let error = harnx_core::partial_result::error_with_partial_result(
+            anyhow!("child failed"),
+            json!({"session_id": "child-1"}),
+        );
+        let ctx = test_context(
+            vec![Arc::new(MockToolProvider::err(
+                "tool_a",
+                Duration::ZERO,
+                ToolError::Recoverable(error),
+            ))],
+            |_| continue_hook_outcome(),
+        );
+
+        let result = eval_tool_calls(&ctx, vec![test_call("tool_a")], &create_abort_signal())
+            .await
+            .expect("a recoverable error becomes a tool result");
+
+        assert_eq!(
+            result[0].output,
+            json!({
+                "is_error": true,
+                "error": "child failed",
+                "partial_result": {"session_id": "child-1"},
+            })
         );
     }
 

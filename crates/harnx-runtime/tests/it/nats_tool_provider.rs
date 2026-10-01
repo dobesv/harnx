@@ -542,6 +542,8 @@ async fn assert_server_unavailable(
 
 #[path = "nats_tool_provider/outage.rs"]
 mod outage;
+#[path = "nats_tool_provider/partial_result.rs"]
+mod partial_result;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> Result<()> {

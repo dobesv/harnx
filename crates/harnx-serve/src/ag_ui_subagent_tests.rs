@@ -6,14 +6,9 @@ use harnx_core::event::{
 use serde_json::json;
 
 #[test]
-fn maps_subagent_start_and_progress_custom_events() {
+fn maps_subagent_progress_custom_event() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let sink = AgUiSink::new(tx, MessageId::from(uuid::Uuid::new_v4()));
-    sink.emit(AgentEvent::Turn(TurnEvent::SubAgentStarted {
-        agent: "researcher".into(),
-        session_id: "child-session".into(),
-        invocation_id: Some("inv-1".into()),
-    }));
     sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(
         SubAgentProgress {
             invocation_id: "inv-1".into(),
@@ -24,19 +19,16 @@ fn maps_subagent_start_and_progress_custom_events() {
             usage: CompletionTokenUsage::new(Some(120), Some(45), Some(30)),
             tool_call_count: 3,
             title: None,
+            tool_call_id: Some("call-1".into()),
         },
     )));
-
-    let Event::Custom(start) = rx.try_recv().expect("sub-agent start") else {
-        panic!("expected sub-agent start custom event");
-    };
-    assert_eq!(start.name, "sub_agent_started");
-    assert_eq!(start.value["invocation_id"], json!("inv-1"));
 
     let Event::Custom(progress) = rx.try_recv().expect("sub-agent progress") else {
         panic!("expected sub-agent progress custom event");
     };
     assert_eq!(progress.name, "sub_agent_progress");
+    assert_eq!(progress.value["invocation_id"], json!("inv-1"));
+    assert_eq!(progress.value["tool_call_id"], json!("call-1"));
     assert_eq!(progress.value["status"], json!("running"));
     assert_eq!(progress.value["elapsed_ms"], json!(10_000));
     assert_eq!(progress.value["usage"]["cached_tokens"], json!(30));
@@ -62,6 +54,7 @@ fn sub_agent_progress_title_serializes_when_present() {
             usage: CompletionTokenUsage::new(Some(50), Some(25), Some(10)),
             tool_call_count: 1,
             title: Some("Research child".into()),
+            tool_call_id: None,
         },
     )));
 
@@ -107,6 +100,7 @@ fn subagent_progress_emits_both_legacy_and_tool_update() {
             usage: CompletionTokenUsage::new(Some(100), Some(50), Some(0)),
             tool_call_count: 3,
             title: Some("Analyzing code".into()),
+            tool_call_id: None,
         },
     )));
 
@@ -154,6 +148,7 @@ fn subagent_progress_projected_with_zero_usage() {
             usage: CompletionTokenUsage::new(None, None, None), // zero usage
             tool_call_count: 0,
             title: None,
+            tool_call_id: None,
         },
     )));
 
@@ -200,6 +195,7 @@ fn subagent_progress_projected_status_mapping() {
                 usage: CompletionTokenUsage::default(),
                 tool_call_count: 0,
                 title: None,
+                tool_call_id: None,
             },
         )));
 

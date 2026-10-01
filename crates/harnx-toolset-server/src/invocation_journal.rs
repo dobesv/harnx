@@ -8,7 +8,7 @@ use harnx_toolset::{ToolReply, ToolRequest};
 use serde::{Deserialize, Serialize};
 
 mod replies;
-pub use replies::JournalCheckpointStore;
+pub use replies::{JournalCheckpointStore, JournalPartialResultStore};
 
 pub const BUCKET: &str = "harnx_tool_invocations";
 
@@ -27,6 +27,10 @@ pub struct RecordedInvocation {
     /// cancelled after the process that started it is gone.
     #[serde(default)]
     pub checkpoint: Option<serde_json::Value>,
+    /// What the tool reported it had produced so far. Every non-success output
+    /// written for the call carries it; once `reply` is recorded it is frozen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_result: Option<serde_json::Value>,
 }
 
 impl RecordedInvocation {
@@ -105,6 +109,7 @@ impl InvocationJournal {
                 .try_into()?,
             reply: None,
             checkpoint: None,
+            partial_result: None,
         };
         self.0
             .create(key(request), serde_json::to_vec(&record)?.into())

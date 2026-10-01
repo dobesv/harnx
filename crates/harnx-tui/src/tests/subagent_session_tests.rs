@@ -54,20 +54,23 @@ fn assistant_text(text: &str) -> TranscriptItem {
 }
 
 async fn emit_subagent_started(tui: &mut crate::types::Tui, key: &MonitoredSessionKey) {
-    emit_subagent_invocation_started(tui, key, Some("inv-1")).await;
+    emit_subagent_invocation_started(tui, key, "inv-1").await;
 }
 
+/// The running snapshot a sub-agent's reporter publishes when its child is
+/// bound, which is how a frontend first learns of the child.
 async fn emit_subagent_invocation_started(
     tui: &mut crate::types::Tui,
     key: &MonitoredSessionKey,
-    invocation_id: Option<&str>,
+    invocation_id: &str,
 ) {
+    let announcement = SubAgentProgress {
+        usage: CompletionTokenUsage::default(),
+        tool_call_count: 0,
+        ..subagent_progress(key, invocation_id, SubAgentProgressStatus::Running, 0)
+    };
     tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
-        TurnEvent::SubAgentStarted {
-            agent: key.agent.clone(),
-            session_id: key.session_id.clone(),
-            invocation_id: invocation_id.map(str::to_string),
-        },
+        TurnEvent::SubAgentProgress(announcement),
     )))
     .await
     .unwrap();
@@ -88,6 +91,7 @@ fn subagent_progress(
         usage: CompletionTokenUsage::new(Some(1_200), Some(345), Some(67)),
         tool_call_count: 4,
         title: None,
+        tool_call_id: None,
     }
 }
 
@@ -168,7 +172,7 @@ async fn progress_animates_counts_elapsed_and_freezes_terminal_metrics() {
     harness.tui().clear_transcript();
     harness.tui().app.llm_busy = false;
     let key = monitored_key("researcher", "progress-session");
-    emit_subagent_invocation_started(harness.tui(), &key, Some("inv-progress")).await;
+    emit_subagent_invocation_started(harness.tui(), &key, "inv-progress").await;
     harness
         .tui()
         .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
@@ -234,7 +238,7 @@ async fn terminal_progress_is_not_reopened_by_child_monitor_or_late_progress() {
     harness.tui().clear_transcript();
     harness.tui().app.llm_busy = true;
     let key = monitored_key("researcher", "terminal-session");
-    emit_subagent_invocation_started(harness.tui(), &key, Some("inv-terminal")).await;
+    emit_subagent_invocation_started(harness.tui(), &key, "inv-terminal").await;
     harness
         .tui()
         .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
@@ -307,7 +311,7 @@ async fn invocation_ids_keep_reused_child_sessions_as_distinct_rows() {
     let key = monitored_key("researcher", "reused-session");
 
     for (invocation_id, elapsed_ms) in [("inv-1", 1_000), ("inv-2", 2_000)] {
-        emit_subagent_invocation_started(harness.tui(), &key, Some(invocation_id)).await;
+        emit_subagent_invocation_started(harness.tui(), &key, invocation_id).await;
         harness
             .tui()
             .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
@@ -365,7 +369,14 @@ async fn prompting_a_completed_child_restarts_monitoring_and_tracks_failure() {
         })))
         .await
         .unwrap();
-    emit_subagent_invocation_started(harness.tui(), &key, Some("inv-2")).await;
+    emit_subagent_invocation_started(harness.tui(), &key, "inv-2").await;
+    assert_eq!(
+        harness.tui().app.monitored_sessions[&key]
+            .invocation_id
+            .as_deref(),
+        Some("inv-2"),
+        "a running snapshot for a new invocation moves the child's monitor to it"
+    );
 
     let statuses = harness
         .tui()
@@ -402,7 +413,7 @@ async fn nested_session_harness() -> (TuiTestHarness, MonitoredSessionKey, Monit
     harness.tui().clear_transcript();
     let parent = monitored_key("researcher", "parent-session-123");
     let nested = monitored_key("fact-checker", "nested-session-456");
-    emit_subagent_invocation_started(harness.tui(), &parent, Some("inv-parent")).await;
+    emit_subagent_invocation_started(harness.tui(), &parent, "inv-parent").await;
     harness
         .tui()
         .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
@@ -504,7 +515,7 @@ async fn nested_progress_is_attached_to_the_parent_child_transcript() {
     harness.tui().clear_transcript();
     let parent = monitored_key("researcher", "parent-session");
     let nested = monitored_key("reviewer", "nested-session");
-    emit_subagent_invocation_started(harness.tui(), &parent, Some("parent-inv")).await;
+    emit_subagent_invocation_started(harness.tui(), &parent, "parent-inv").await;
 
     let stamp = child_event_stamp(harness.tui(), &parent);
     harness
@@ -624,15 +635,7 @@ async fn root_session_change_aborts_child_monitors_and_discards_child_views() {
     let mut tui = crate::types::Tui::init(&config).await.unwrap();
     tui.sync_session_activity_monitor();
     let child = monitored_key("worker", "child-session");
-    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
-        TurnEvent::SubAgentStarted {
-            agent: child.agent.clone(),
-            session_id: child.session_id.clone(),
-            invocation_id: None,
-        },
-    )))
-    .await
-    .unwrap();
+    emit_subagent_invocation_started(&mut tui, &child, "inv-1").await;
     tui.app
         .subagent_view_stack
         .push(subagent_view(child.clone()));
@@ -861,8 +864,8 @@ async fn live_subagent_reply_appears_before_status_row() {
         TranscriptItem::ToolCall { .. }
     ));
 
-    // 2) SubAgentStarted (status row) - use invocation-based start
-    emit_subagent_invocation_started(tui, &key, Some("inv-1")).await;
+    // 2) The child's first running snapshot (status row)
+    emit_subagent_invocation_started(tui, &key, "inv-1").await;
     assert_eq!(tui.app.transcript.len(), 2);
     assert!(matches!(
         tui.app.transcript[1],
@@ -913,7 +916,7 @@ async fn nested_subagent_reply_appears_in_parent_child_transcript() {
     let nested = monitored_key("reviewer", "nested-session");
 
     // Parent sub-agent session started.
-    emit_subagent_invocation_started(harness.tui(), &parent, Some("parent-inv")).await;
+    emit_subagent_invocation_started(harness.tui(), &parent, "parent-inv").await;
 
     // Send a sub-agent started (Progress) event for the nested session through the parent's TuiEvent wrapper.
     let stamp = child_event_stamp(harness.tui(), &parent);
@@ -998,8 +1001,8 @@ async fn live_subagent_empty_response_omits_reply_row() {
     .await
     .unwrap();
 
-    // 2) SubAgentStarted (status row) - use invocation-based start
-    emit_subagent_invocation_started(tui, &key, Some("inv-1")).await;
+    // 2) The child's first running snapshot (status row)
+    emit_subagent_invocation_started(tui, &key, "inv-1").await;
 
     // 3) Tool completed (empty reply)
     let progress = subagent_progress(&key, "inv-1", SubAgentProgressStatus::Done, 12_345);

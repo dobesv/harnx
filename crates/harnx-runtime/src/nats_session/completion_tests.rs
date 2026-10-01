@@ -210,6 +210,7 @@ fn durable_child_completion_repairs_a_lost_event_once_without_ending_parent_turn
         usage: CompletionTokenUsage::default(),
         tool_call_count: 3,
         title: None,
+        tool_call_id: None,
     };
     let entries = vec![(
         3,
@@ -253,6 +254,7 @@ fn terminal_tool_result_recovery_preserves_title() {
         usage: CompletionTokenUsage::new(Some(100), Some(50), Some(20)),
         tool_call_count: 5,
         title: Some("Research task".into()),
+        tool_call_id: None,
     };
     let entries = vec![(
         5,

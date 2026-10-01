@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_utils::{TestEnvironment, ENV_LOCK};
-use crate::types::{MonitoredSessionKey, SubAgentStatus, TranscriptItem};
+use crate::types::{SubAgentStatus, TranscriptItem};
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_runtime::config::Config;
 use harnx_runtime::config::LOCAL_CLUSTER_KEY;
@@ -97,12 +97,17 @@ async fn assert_child_result_recovery(compacted: bool) {
     tui.session_activity_target = Some(target.clone());
     tui.app.llm_busy = true;
     let progress = completed_child_progress();
-    let key = MonitoredSessionKey {
-        cluster: target.1.clone(),
-        agent: progress.agent.clone(),
-        session_id: progress.session_id.clone(),
-    };
-    tui.record_subagent_started(None, key, Some(progress.invocation_id.clone()));
+    // The child's first running snapshot opens its row.
+    tui.record_subagent_progress(
+        None,
+        harnx_core::event::SubAgentProgress {
+            status: harnx_core::event::SubAgentProgressStatus::Running,
+            elapsed_ms: 0,
+            usage: Default::default(),
+            tool_call_count: 0,
+            ..progress.clone()
+        },
+    );
     tui.app.transcript_focus = Some(0);
     assert!(tui.open_focused_root_subagent());
     let mut history = child_result_history(&progress);
@@ -179,6 +184,7 @@ fn completed_child_progress() -> harnx_core::event::SubAgentProgress {
         usage: harnx_core::api_types::CompletionTokenUsage::new(Some(1200), Some(345), Some(67)),
         tool_call_count: 56,
         title: None,
+        tool_call_id: None,
     }
 }
 

@@ -3810,42 +3810,7 @@ fn control_snapshot_events_skips_turn_end_without_usage() {
 }
 
 #[test]
-fn control_snapshot_events_emits_structured_sub_agent_start() {
-    use chrono::{DateTime, Utc};
-    use harnx_core::session::SessionLogEntry;
-
-    let started_at = "2026-09-09T05:15:30Z"
-        .parse::<DateTime<Utc>>()
-        .expect("valid start timestamp");
-    let entries = vec![(
-        1,
-        SessionLogEntry::SubAgentStarted {
-            agent: "sub-agent".to_string(),
-            session_id: "child-session-456".to_string(),
-            invocation_id: Some("invocation-789".to_string()),
-            tool_call_id: Some("tool-call-def".to_string()),
-            started_at: Some(started_at),
-        },
-    )];
-
-    let events = control_snapshot_events(&entries, None);
-    assert_eq!(events.len(), 1);
-
-    match &events[0] {
-        Event::Custom(CustomEvent { name, value, .. }) => {
-            assert_eq!(name, "sub_agent_started");
-            assert_eq!(value["agent"], "sub-agent");
-            assert_eq!(value["session_id"], "child-session-456");
-            assert_eq!(value["invocation_id"], "invocation-789");
-            assert_eq!(value["tool_call_id"], "tool-call-def");
-            assert_eq!(value["started_at"], "2026-09-09T05:15:30+00:00");
-        }
-        other => panic!("expected Custom event, got: {other:?}"),
-    }
-}
-
-#[test]
-fn control_snapshot_events_hydrates_legacy_sub_agent_start_with_null_optionals() {
+fn control_snapshot_events_skips_legacy_sub_agent_starts() {
     use harnx_core::session::SessionLogEntry;
 
     let entries = vec![(
@@ -3853,24 +3818,16 @@ fn control_snapshot_events_hydrates_legacy_sub_agent_start_with_null_optionals()
         SessionLogEntry::SubAgentStarted {
             agent: "legacy-agent".to_string(),
             session_id: "legacy-child".to_string(),
-            invocation_id: None,
-            tool_call_id: None,
+            invocation_id: Some("legacy-invocation".to_string()),
+            tool_call_id: Some("legacy-call".to_string()),
             started_at: None,
         },
     )];
 
-    let events = control_snapshot_events(&entries, None);
-    match events.as_slice() {
-        [Event::Custom(CustomEvent { name, value, .. })] => {
-            assert_eq!(name, "sub_agent_started");
-            assert_eq!(value["agent"], "legacy-agent");
-            assert_eq!(value["session_id"], "legacy-child");
-            assert!(value["invocation_id"].is_null());
-            assert!(value["tool_call_id"].is_null());
-            assert!(value["started_at"].is_null());
-        }
-        other => panic!("expected one Custom event, got: {other:?}"),
-    }
+    assert!(
+        control_snapshot_events(&entries, None).is_empty(),
+        "a running child reappears from its live progress, not from an old transcript note"
+    );
 }
 
 #[test]
@@ -4305,13 +4262,9 @@ async fn promptless_idle_attach_emits_hydrated_usage() {
 }
 
 #[tokio::test]
-async fn promptless_idle_attach_emits_fully_structured_sub_agent_start() {
-    use chrono::{DateTime, Utc};
+async fn promptless_idle_attach_skips_legacy_sub_agent_starts() {
     use harnx_core::session::SessionLogEntry;
 
-    let started_at = "2026-09-09T05:15:30Z"
-        .parse::<DateTime<Utc>>()
-        .expect("valid start timestamp");
     let log_entries = vec![(
         3u64,
         SessionLogEntry::SubAgentStarted {
@@ -4319,7 +4272,7 @@ async fn promptless_idle_attach_emits_fully_structured_sub_agent_start() {
             session_id: "child-session-123".to_string(),
             invocation_id: Some("invocation-456".to_string()),
             tool_call_id: Some("tool-call-789".to_string()),
-            started_at: Some(started_at),
+            started_at: None,
         },
     )];
     let run_id = Uuid::new_v4().to_string();
@@ -4342,23 +4295,7 @@ async fn promptless_idle_attach_emits_fully_structured_sub_agent_start() {
 
     assert_event_type_sequence(
         &events,
-        &[
-            "RUN_STARTED",
-            "CUSTOM",
-            "MESSAGES_SNAPSHOT",
-            "CUSTOM",
-            "RUN_FINISHED",
-        ],
+        &["RUN_STARTED", "CUSTOM", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
     );
     assert_attach_boundary(&events[1], 3);
-    let start_event = &events[3];
-    assert_eq!(start_event["name"], "sub_agent_started");
-    assert_eq!(start_event["value"]["agent"], "researcher");
-    assert_eq!(start_event["value"]["session_id"], "child-session-123");
-    assert_eq!(start_event["value"]["invocation_id"], "invocation-456");
-    assert_eq!(start_event["value"]["tool_call_id"], "tool-call-789");
-    assert_eq!(
-        start_event["value"]["started_at"],
-        "2026-09-09T05:15:30+00:00"
-    );
 }

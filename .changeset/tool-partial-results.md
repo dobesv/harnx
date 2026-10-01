@@ -1,0 +1,4 @@
+---
+harnx: minor
+---
+A tool call that does not succeed now returns what its tool had recorded so far under `partial_result`, whether it failed, lost its tool server, timed out, was interrupted or was replayed after a restart. Sub-agent calls use this to report their child session instead of appending a `SubAgentStarted` entry to the parent's transcript. That append re-read the whole parent transcript on every conflict between sibling sub-agents, which made sub-agent fan-out from long transcripts expensive. Interfaces learn about a running child from its progress snapshots, which now start as soon as the child is bound and name the parent's tool call. harnx-serve no longer emits the `sub_agent_started` AG-UI custom event, so third-party AG-UI clients that consumed it should use `sub_agent_progress` instead.

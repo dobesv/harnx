@@ -426,6 +426,26 @@ that child; tool count includes tools started directly by it. Nested agents'
 model and tool events stay on their own progress rows and are not double
 counted in the parent invocation.
 
+If the call does not succeed, because the child's turn fails, the tool server
+is lost, the parent is interrupted, or a worker restart loses the response, its
+error output carries the child's identity as a `partial_result`:
+
+```json
+{
+  "is_error": true,
+  "error": "tool server unavailable: ...",
+  "partial_result": {
+    "session_id": "01948a3f-7b1c-7123-8901-abcdef123456",
+    "sub_agent": {
+      "agent": "researcher",
+      "session_id": "01948a3f-7b1c-7123-8901-abcdef123456"
+    }
+  }
+}
+```
+
+The parent can inspect that session or prompt it again.
+
 ### Per-Invocation Execution Limits & Sub-Agent Termination
 
 Parent agents can pass per-invocation execution limits when calling `{agent}_session_prompt`:
@@ -507,26 +527,16 @@ rows from session history, and retains navigation into the child session.
 Child output remains in the child transcript rather than being rendered inline
 in the parent.
 
-To allow interfaces to attach before the sub-agent prompt completes, an early advisory event is emitted on the parent session's stream (`sessions.{parent_session_id}.events`) immediately when delegation begins:
-
-```rust
-AgentEvent::SubAgent {
-    source: AgentSource { agent: "researcher", session_id: Some("01948..."), model: None },
-    event: Box::new(AgentEvent::Turn(TurnEvent::SubAgentStarted {
-        agent: "researcher",
-        session_id: "01948...",
-        invocation_id: Some("8aa9a68a-034e-4df3-a9cf-6db978644f30"),
-    })),
-}
-```
-
-`invocation_id` is optional on `SubAgentStarted` for compatibility with older
-producers. New producers follow it with `TurnEvent::SubAgentProgress` events on
-the parent stream. A running snapshot is published whenever tokens or the tool
-count changes, every 10 seconds as a heartbeat, and once more with `done` or
-`failed` status at termination. These snapshots carry the same fields as the
-durable `sub_agent_progress` result above. Raw child transcript events are not
-forwarded to the parent stream.
+Interfaces learn about a delegation from `TurnEvent::SubAgentProgress` events on
+the parent session's stream (`sessions.{parent_session_id}.events`). The first
+is a running snapshot published as soon as the child session is bound. More
+follow whenever tokens or the tool count change, every 10 seconds as a
+heartbeat, and once more with `done` or `failed` status at termination. These
+snapshots carry the same fields as the durable `sub_agent_progress` result
+above, plus `tool_call_id`, the parent transcript's id for the call, so an
+interface that reloaded the parent can place a running child under the message
+that started it. Raw child transcript events are not forwarded to the parent
+stream.
 
 ### Passing Attachments to Sub-Agents
 

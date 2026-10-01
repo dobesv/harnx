@@ -1,4 +1,6 @@
+use super::partial_result::attach_partial_result;
 use super::*;
+use harnx_core::partial_result::{output_with_partial_result, partial_result_of};
 use harnx_toolset::ReplayAttempt;
 
 impl NatsToolProvider {
@@ -60,7 +62,10 @@ impl NatsToolProvider {
         };
         anyhow::ensure!(record.tool_name == call.name, "replayed tool name changed");
         if let Some(reply) = journal.completed_reply(&record.request).await? {
-            return recovered_output(decode_journaled_reply(&record, reply));
+            return recovered_output(attach_partial_result(
+                decode_journaled_reply(&record, reply),
+                record.partial_result.as_ref(),
+            ));
         }
         self.dispatch_replay(record, replay, abort).await
     }
@@ -88,11 +93,11 @@ impl NatsToolProvider {
             requested_by: self.instance_id.to_string(),
         });
         let id = request.call_id.clone();
-        let pending =
-            self.prepare_recorded_request(request, &route)
-                .map_err(|error| match error {
-                    ToolError::Fatal(error) | ToolError::Recoverable(error) => error,
-                })?;
+        let pending = self
+            .prepare_recorded_request(request.clone(), &route)
+            .map_err(|error| match error {
+                ToolError::Fatal(error) | ToolError::Recoverable(error) => error,
+            })?;
         if let Some(authorization) = replay.authorization {
             authorization.revalidate().await?;
         }
@@ -103,7 +108,8 @@ impl NatsToolProvider {
             .map_err(|error| match error {
                 ToolError::Fatal(error) | ToolError::Recoverable(error) => error,
             })?;
-        recovered_output(self.decode_reply(message, id, route))
+        let decoded = self.decode_reply(message, id, route);
+        recovered_output(self.with_recorded_partial_result(&request, decoded).await)
     }
 }
 
@@ -175,9 +181,12 @@ fn recovered_output(
 ) -> anyhow::Result<Option<ToolProviderOutput>> {
     match result {
         Ok(result) => Ok(Some(result)),
-        Err(ToolError::Recoverable(error)) => Ok(Some(ToolProviderOutput::new(
-            serde_json::json!({"is_error": true, "error": error.to_string()}),
-        ))),
+        Err(ToolError::Recoverable(error)) => {
+            Ok(Some(ToolProviderOutput::new(output_with_partial_result(
+                serde_json::json!({"is_error": true, "error": error.to_string()}),
+                partial_result_of(&error),
+            ))))
+        }
         Err(ToolError::Fatal(error)) => Err(error),
     }
 }

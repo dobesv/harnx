@@ -704,3 +704,6 @@ async fn a_lease_lost_between_retry_rounds_stops_the_append() {
         "the entry must not have landed"
     );
 }
+
+#[path = "wind_up_partial_result_tests.rs"]
+mod partial_result;

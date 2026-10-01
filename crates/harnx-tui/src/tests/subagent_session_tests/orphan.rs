@@ -4,9 +4,9 @@ use super::*;
 async fn stale_snapshot_cannot_replace_a_resumed_invocation() {
     let mut harness = TuiTestHarness::new().await;
     let key = monitored_key("athena", "snapshot-race");
-    emit_subagent_invocation_started(harness.tui(), &key, Some("old")).await;
+    emit_subagent_invocation_started(harness.tui(), &key, "old").await;
     harness.tui().fail_monitored_invocation(&key, "old");
-    emit_subagent_invocation_started(harness.tui(), &key, Some("resumed")).await;
+    emit_subagent_invocation_started(harness.tui(), &key, "resumed").await;
     for invocation_id in [Some("old".to_string()), None] {
         harness
             .tui()
@@ -47,10 +47,10 @@ async fn orphaned_invocation_stops_spinning_without_failing_its_resumed_invocati
     let mut harness = TuiTestHarness::new().await;
     harness.tui().clear_transcript();
     let key = monitored_key("athena", "orphan-child");
-    emit_subagent_invocation_started(harness.tui(), &key, Some("old-invocation")).await;
+    emit_subagent_invocation_started(harness.tui(), &key, "old-invocation").await;
     harness.tui().app.transcript_focus = Some(0);
     assert!(harness.tui().open_focused_root_subagent());
-    emit_subagent_invocation_started(harness.tui(), &key, Some("resumed-invocation")).await;
+    emit_subagent_invocation_started(harness.tui(), &key, "resumed-invocation").await;
     harness
         .tui()
         .handle_tui_event(TuiEvent::SubAgentInvocationFailed {

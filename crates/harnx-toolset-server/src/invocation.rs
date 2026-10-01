@@ -135,6 +135,7 @@ fn invocation_context(
         capabilities: request.capabilities.clone(),
         checkpoint,
         checkpoint_store: Some(Arc::new(checkpoint_store)),
+        partial_result_store: None,
         progress,
     }
 }
@@ -166,7 +167,7 @@ fn invocation(
     cancel: &CancellationToken,
     progress: harnx_toolset::ToolProgressHandle,
 ) -> ToolInvocation {
-    let context = invocation_context(
+    let mut context = invocation_context(
         request,
         recovery.checkpoint(),
         JournalCheckpointStore {
@@ -176,6 +177,7 @@ fn invocation(
         },
         progress,
     );
+    context.partial_result_store = Some(Arc::new(recovery.journal().partial_result_store(request)));
     build_invocation(request, context, cancel.clone())
 }
 

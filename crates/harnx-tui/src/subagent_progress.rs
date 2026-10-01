@@ -5,7 +5,6 @@ use crate::types::{
     MonitoredSessionKey, MonitoredSessionState, SubAgentInvocationProgress, SubAgentStatus,
     TranscriptItem, Tui,
 };
-use harnx_core::api_types::CompletionTokenUsage;
 use harnx_core::event::{SubAgentProgress, SubAgentProgressStatus};
 
 struct RowUpdate {
@@ -15,89 +14,16 @@ struct RowUpdate {
     progress: Option<SubAgentInvocationProgress>,
 }
 
+/// What an update did to a sub-agent's transcript row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowChange {
+    /// The row already holds a terminal snapshot, which nothing reopens.
+    Rejected,
+    Updated,
+    Created,
+}
+
 impl Tui {
-    pub(super) fn record_subagent_started(
-        &mut self,
-        parent: Option<&MonitoredSessionKey>,
-        key: MonitoredSessionKey,
-        invocation_id: Option<String>,
-    ) {
-        if key.agent.trim().is_empty() || key.session_id.trim().is_empty() {
-            return;
-        }
-        if !self.start_subagent_row(parent, &key, invocation_id.clone()) {
-            return;
-        }
-        let state = self
-            .app
-            .monitored_sessions
-            .entry(key.clone())
-            .or_insert_with(|| MonitoredSessionState::new(SubAgentStatus::Running));
-        state.status = SubAgentStatus::Running;
-        state.streaming_open = false;
-        if state.invocation_id != invocation_id {
-            state.invocation_id = invocation_id;
-            if let Some(handle) = self.subagent_monitor_handles.remove(&key) {
-                handle.abort();
-            }
-        }
-        self.ensure_subagent_monitor(key);
-        self.pin_transcript_to_bottom();
-    }
-
-    fn start_subagent_row(
-        &mut self,
-        parent: Option<&MonitoredSessionKey>,
-        key: &MonitoredSessionKey,
-        invocation_id: Option<String>,
-    ) -> bool {
-        // Start is an identity announcement, not a fresh progress snapshot.
-        // Re-delivery must not erase metrics already received for this invocation.
-        if let Some(status) = self.subagent_invocation_status(parent, invocation_id.as_deref()) {
-            return status == SubAgentStatus::Running;
-        }
-        let progress = invocation_id.as_ref().map(|invocation_id| {
-            SubAgentInvocationProgress::new(SubAgentProgress {
-                invocation_id: invocation_id.clone(),
-                agent: key.agent.clone(),
-                session_id: key.session_id.clone(),
-                status: SubAgentProgressStatus::Running,
-                elapsed_ms: 0,
-                usage: CompletionTokenUsage::default(),
-                tool_call_count: 0,
-                title: None,
-            })
-        });
-        self.upsert_subagent_row(
-            parent,
-            RowUpdate {
-                key: key.clone(),
-                status: SubAgentStatus::Running,
-                invocation_id: invocation_id.clone(),
-                progress,
-            },
-        )
-    }
-
-    fn subagent_invocation_status(
-        &self,
-        parent: Option<&MonitoredSessionKey>,
-        invocation_id: Option<&str>,
-    ) -> Option<SubAgentStatus> {
-        let id = invocation_id?;
-        let transcript = parent
-            .and_then(|parent| self.app.monitored_sessions.get(parent))
-            .map_or(&self.app.transcript, |state| &state.transcript);
-        transcript.iter().find_map(|item| match item {
-            TranscriptItem::SubAgentSession {
-                invocation_id: Some(existing),
-                status,
-                ..
-            } if existing == id => Some(status.clone()),
-            _ => None,
-        })
-    }
-
     pub(super) fn record_subagent_completed(
         &mut self,
         parent: Option<&MonitoredSessionKey>,
@@ -143,9 +69,10 @@ impl Tui {
             session_id: snapshot.session_id.clone(),
         };
         let invocation_id = snapshot.invocation_id.clone();
+        let running = snapshot.status == SubAgentProgressStatus::Running;
         let status = SubAgentStatus::from_progress(snapshot.status);
         let progress = SubAgentInvocationProgress::new(snapshot);
-        if !self.upsert_subagent_row(
+        let change = self.upsert_subagent_row(
             parent,
             RowUpdate {
                 key: key.clone(),
@@ -153,7 +80,8 @@ impl Tui {
                 invocation_id: Some(invocation_id.clone()),
                 progress: Some(progress.clone()),
             },
-        ) {
+        );
+        if change == RowChange::Rejected {
             return;
         }
         self.app
@@ -161,21 +89,40 @@ impl Tui {
             .entry(key.clone())
             .or_insert_with(|| MonitoredSessionState::new(status.clone()))
             .status = status.clone();
+        // Only a running snapshot that opens a row moves the monitor, because
+        // that is the first sight of an invocation, normally its start. A
+        // terminal snapshot replayed from history must not pull a live monitor
+        // backwards, and the heartbeats of two invocations running on one
+        // child at once must not swap it back and forth, reloading the child's
+        // log every time.
+        if running && change == RowChange::Created {
+            self.follow_invocation(&key, &invocation_id);
+        }
+        self.show_in_open_views(&invocation_id, &status, &progress);
+        self.ensure_subagent_monitor(key);
+        self.pin_transcript_to_bottom();
+    }
+
+    /// Show an invocation's latest status and metrics in every open view of it.
+    fn show_in_open_views(
+        &mut self,
+        invocation_id: &str,
+        status: &SubAgentStatus,
+        progress: &SubAgentInvocationProgress,
+    ) {
         for view in &mut self.app.subagent_view_stack {
-            if view_matches_invocation(view.progress.as_ref(), &invocation_id) {
+            if view_matches_invocation(view.progress.as_ref(), invocation_id) {
                 view.status = status.clone();
                 view.progress = Some(progress.clone());
             }
         }
-        self.ensure_subagent_monitor(key);
-        self.pin_transcript_to_bottom();
     }
 
     fn upsert_subagent_row(
         &mut self,
         parent: Option<&MonitoredSessionKey>,
         update: RowUpdate,
-    ) -> bool {
+    ) -> RowChange {
         let transcript = match parent {
             Some(parent) => {
                 &mut self
@@ -190,6 +137,23 @@ impl Tui {
         match update.invocation_id.clone() {
             Some(invocation_id) => upsert_invocation(transcript, update, invocation_id),
             None => upsert_legacy(transcript, update),
+        }
+    }
+
+    /// Point the child's monitor at `invocation_id`. A child prompted again
+    /// runs a new turn, and its monitor has to follow that turn rather than the
+    /// one it was started for.
+    fn follow_invocation(&mut self, key: &MonitoredSessionKey, invocation_id: &str) {
+        let Some(state) = self.app.monitored_sessions.get_mut(key) else {
+            return;
+        };
+        if state.invocation_id.as_deref() == Some(invocation_id) {
+            return;
+        }
+        state.invocation_id = Some(invocation_id.to_string());
+        state.streaming_open = false;
+        if let Some(handle) = self.subagent_monitor_handles.remove(key) {
+            handle.abort();
         }
     }
 
@@ -231,7 +195,7 @@ fn upsert_invocation(
     transcript: &mut Vec<TranscriptItem>,
     update: RowUpdate,
     invocation_id: String,
-) -> bool {
+) -> RowChange {
     let existing = transcript.iter_mut().find(|item| {
         matches!(
             item,
@@ -253,13 +217,13 @@ fn upsert_invocation(
                     | SubAgentProgressStatus::Cancelled
             )
         }) {
-            return false;
+            return RowChange::Rejected;
         }
         *status = update.status;
         if update.progress.is_some() {
             *progress = update.progress;
         }
-        return true;
+        return RowChange::Updated;
     }
     transcript.push(TranscriptItem::SubAgentSession {
         key: update.key,
@@ -267,10 +231,10 @@ fn upsert_invocation(
         invocation_id: Some(invocation_id),
         progress: update.progress,
     });
-    true
+    RowChange::Created
 }
 
-fn upsert_legacy(transcript: &mut Vec<TranscriptItem>, update: RowUpdate) -> bool {
+fn upsert_legacy(transcript: &mut Vec<TranscriptItem>, update: RowUpdate) -> RowChange {
     let latest_tool = transcript
         .iter()
         .rposition(|item| matches!(item, TranscriptItem::ToolCall { .. }));
@@ -280,7 +244,7 @@ fn upsert_legacy(transcript: &mut Vec<TranscriptItem>, update: RowUpdate) -> boo
     let row_follows_tool = latest_row.is_some_and(|row| latest_tool.is_none_or(|tool| row > tool));
     if row_follows_tool {
         update_legacy_status(transcript, latest_row, update.status);
-        return true;
+        return RowChange::Updated;
     }
     transcript.push(TranscriptItem::SubAgentSession {
         key: update.key,
@@ -288,7 +252,7 @@ fn upsert_legacy(transcript: &mut Vec<TranscriptItem>, update: RowUpdate) -> boo
         invocation_id: None,
         progress: None,
     });
-    true
+    RowChange::Created
 }
 
 fn update_legacy_status(

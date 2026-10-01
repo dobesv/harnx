@@ -7,7 +7,8 @@
 //! call the invocation journal has a row but no reply for — a call with no row
 //! at all was never dispatched and there is nothing to cancel — then appends
 //! ONE `ToolResults` entry carrying each journal reply where one exists and a
-//! placeholder where it does not.
+//! placeholder where it does not. A placeholder, like a reply that records a
+//! failure, carries the call's partial result when its journal row has one.
 //!
 //! A tool that finished while the interrupt was travelling wrote its result
 //! to the journal, not to the log: taking replies from there is what keeps a
@@ -23,6 +24,7 @@ use crate::nats_lease::NatsSessionLease;
 use crate::nats_tool_provider::{InFlightCancelTarget, NatsInFlightCalls};
 use anyhow::Result;
 use harnx_core::event::{AgentEvent, TurnEvent};
+use harnx_core::partial_result::output_with_partial_result;
 use harnx_core::session::{SessionLogEntry, ToolOutput};
 use harnx_core::session_reconstruct::{OrphanToolCalls, TurnStatus};
 use harnx_core::tool::{ToolCall, ToolError};
@@ -158,7 +160,8 @@ impl WindUp<'_> {
 
     /// Answer one interrupted call: its journal reply where the tool got one
     /// back in time, and otherwise a placeholder plus a cancel resent to
-    /// whatever is still running it.
+    /// whatever is still running it. A placeholder, or a reply that records a
+    /// failure, carries the partial result the call's row holds, if any.
     async fn close_one(
         &self,
         call: &ToolCall,
@@ -178,12 +181,18 @@ impl WindUp<'_> {
         if let Some(id) = call.id.as_deref() {
             self.resend_cancel(id, recorded).await;
         }
-        wound
-            .results
-            .extend(crate::config::session::interrupted_tool_outputs(
+        let partial_result = recorded.and_then(|record| record.partial_result.as_ref());
+        wound.results.extend(
+            crate::config::session::interrupted_tool_outputs(
                 std::slice::from_ref(call),
                 Some(&self.cancellation_id),
-            ));
+            )
+            .into_iter()
+            .map(|mut placeholder| {
+                placeholder.output = output_with_partial_result(placeholder.output, partial_result);
+                placeholder
+            }),
+        );
     }
 
     /// Resend a cancel for a call with no reply. The tool server treats a
@@ -282,9 +291,10 @@ fn tool_output_from_reply(
 ) -> ToolOutput {
     let output = match crate::nats_tool_provider::decode_journaled_reply(record, reply) {
         Ok(decoded) => decoded.value,
-        Err(ToolError::Recoverable(error) | ToolError::Fatal(error)) => {
-            serde_json::json!({ "error": error.to_string() })
-        }
+        Err(ToolError::Recoverable(error) | ToolError::Fatal(error)) => output_with_partial_result(
+            serde_json::json!({ "error": error.to_string() }),
+            record.partial_result.as_ref(),
+        ),
     };
     ToolOutput {
         id: call.id.clone(),

@@ -192,6 +192,7 @@ mod tests {
             usage: CompletionTokenUsage::new(Some(12), Some(3), Some(2)),
             tool_call_count: 1,
             title: title.map(str::to_string),
+            tool_call_id: None,
         })
     }
 

@@ -100,13 +100,17 @@ impl NatsToolProvider {
         Box::pin(self.record_invocation(&request, call.name, &route.server))
             .await
             .map_err(ToolError::Fatal)?;
-        let pending = self.prepare_recorded_request(request, &route)?;
-        let message = self.await_response(pending, abort).await?;
-        let mut reply = Self::parse_reply(message, &call_id)?;
-        if let Some(progress_route) = progress_route {
-            progress_route.finish(reply.final_progress.take());
+        let pending = self.prepare_recorded_request(request.clone(), &route)?;
+        let result = async {
+            let message = self.await_response(pending, abort).await?;
+            let mut reply = Self::parse_reply(message, &call_id)?;
+            if let Some(progress_route) = progress_route {
+                progress_route.finish(reply.final_progress.take());
+            }
+            self.decode_reply_value(reply, call_id, route)
         }
-        self.decode_reply_value(reply, call_id, route)
+        .await;
+        self.with_recorded_partial_result(&request, result).await
     }
 
     pub(super) fn decode_reply(

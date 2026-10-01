@@ -28,6 +28,7 @@ pub(crate) fn old_events() -> Vec<AgentEvent> {
                 usage: Default::default(),
                 tool_call_count: 5,
                 title: Some("Old child title".into()),
+                tool_call_id: None,
             },
         )),
         AgentEvent::Model(ModelEvent::Error("stale error".into())),
