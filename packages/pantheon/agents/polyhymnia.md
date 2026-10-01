@@ -25,6 +25,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 - harnx_agent_session_history_read
+- attachments_attachment_read
 description: "Privacy and compliance specialist \u2014 evaluates PII handling, data\
   \ protection patterns, consent flows, data retention, logging practices, and regulatory\
   \ compliance. Named after Polyhymnia (pol-ee-HIM-nee-uh), the Muse of sacred poetry\

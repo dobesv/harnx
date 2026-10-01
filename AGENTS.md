@@ -261,6 +261,7 @@ The key on the left must be one of the packages knope versions:
 - **`coding`** — the `packages/coding` agent package.
 
 Keys are **unquoted** in the YAML front matter: `harnx:`, not `"harnx":`.
+Quoted keys (e.g. `"harnx": patch`) are silently ignored — no CHANGELOG entry is generated and no error is raised.
 Individual crate names are not valid keys; `knope release` will error on them.
 
 ## GitHub Actions workflows that open pull requests

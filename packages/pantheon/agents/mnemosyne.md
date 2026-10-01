@@ -29,6 +29,8 @@ use_tools:
 - plans_update_note
 - time_get_current_time
 - harnx_agent_session_history_read
+- attachments_attachment_read
+- attachments_attachment_create
 description: "Repository knowledge curator \u2014 reconciles verified learnings into\
   \ current docs, scoped instructions, code comments, or tests so future\
   \ work can retrieve them. Named after Mnemosyne (neh-MOZ-ih-nee), Titan of Memory\

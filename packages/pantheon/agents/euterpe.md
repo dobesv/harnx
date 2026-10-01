@@ -24,6 +24,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 - harnx_agent_session_history_read
+- attachments_attachment_read
 description: "Coding conventions specialist — validates adherence to project patterns, naming conventions, file organization, import ordering, type safety, and documentation standards. Named after Euterpe (yoo-TUR-pee), the Muse of music and harmony.\n"
 version: '0.4.10'
 variables:

@@ -30,6 +30,8 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 - harnx_agent_session_history_read
+- attachments_attachment_read
+- attachments_attachment_create
 description: "Deep investigation agent — performs multi-step code analysis, reproduces bugs, validates hypotheses, and caches findings as plan notes for other agents. Executes targeted diagnostics and probe scripts without modifying repository source files. Named after Zosimus, the careful investigator.\n"
 version: '0.4.10'
 variables:

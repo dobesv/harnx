@@ -35,6 +35,8 @@ use_tools:
 - plans_update_task
 - pytheas_session_prompt
 - harnx_agent_session_history_read
+- attachments_attachment_read
+- attachments_attachment_create
 description: "Deep work and complex refactoring specialist — grinds through autonomous, heavy-duty problem-solving at the forge. Named after Hephaestus (heh-FES-tus), the Divine Blacksmith.\n"
 version: '0.4.10'
 variables:
