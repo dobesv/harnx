@@ -581,16 +581,27 @@ pub async fn run_worker_daemon_with_shutdown(
     reconnect_activation_stream(
         move || {
             let consumer = consumer.clone();
-            async move { consumer.stream().max_messages_per_batch(8).messages().await }
+            async move {
+                harnx_metrics::time_nats_operation(
+                    "consumer_fetch",
+                    consumer.stream().max_messages_per_batch(8).messages(),
+                )
+                .await
+            }
         },
-        move |message| {
+        move |message, delivered_wall| {
             let runtime = Arc::clone(&activation_runtime);
-            async move { runtime.handle_activation(message).await }
+            async move { runtime.handle_activation(message, delivered_wall).await }
         },
         |message: async_nats::jetstream::Message| async move {
-            message
+            let result = message
                 .ack_with(async_nats::jetstream::AckKind::Nak(None))
-                .await
+                .await;
+            if result.is_ok() {
+                metrics::counter!(harnx_metrics::ACTIVATION_NAKS_TOTAL, "reason" => "shutdown")
+                    .increment(1);
+            }
+            result
         },
         ACTIVATION_STREAM_RETRY_DELAY,
         shutdown_timeout,
@@ -634,7 +645,7 @@ async fn reconnect_activation_stream<
     Message: Send + 'static,
     OpenError: Display,
     MessageError: Display,
-    Handle: Fn(Message) -> HandleFuture + Clone + Send + 'static,
+    Handle: Fn(Message, time::OffsetDateTime) -> HandleFuture + Clone + Send + 'static,
     HandleFuture: Future<Output = std::result::Result<(), HandleError>> + Send + 'static,
     HandleError: Display + Send + 'static,
     Reject: FnMut(Message) -> RejectFuture,
@@ -646,8 +657,13 @@ async fn reconnect_activation_stream<
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ADMISSIONS));
     let mut handlers = tokio::task::JoinSet::new();
     let mut buffered_messages = None;
+    let mut pending_message = None;
 
     'reconnect: loop {
+        metrics::gauge!(harnx_metrics::WORKER_ADMISSION_PERMITS)
+            .set(permits.available_permits() as f64);
+        metrics::gauge!(harnx_metrics::WORKER_ACTIVATION_HANDLERS).set(handlers.len() as f64);
+        metrics::gauge!(harnx_metrics::WORKER_ACTIVATIONS_WAITING).set(0.0);
         let opened = {
             let open_future = open();
             tokio::pin!(open_future);
@@ -667,6 +683,32 @@ async fn reconnect_activation_stream<
             Ok(messages) => {
                 buffered_messages = Some(messages);
                 loop {
+                    metrics::gauge!(harnx_metrics::WORKER_ADMISSION_PERMITS)
+                        .set(permits.available_permits() as f64);
+                    metrics::gauge!(harnx_metrics::WORKER_ACTIVATION_HANDLERS)
+                        .set(handlers.len() as f64);
+                    let message = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => {
+                            break 'reconnect;
+                        }
+                        joined = handlers.join_next(), if !handlers.is_empty() => {
+                            log_admission_result(joined);
+                            continue;
+                        }
+                        message = harnx_metrics::time_nats_operation("consumer_messages", async {
+                            buffered_messages.as_mut().expect("open activation stream")
+                                .next().await.transpose()
+                        }) => message.transpose(),
+                    };
+                    if message.is_none() {
+                        buffered_messages = None;
+                        break;
+                    }
+                    pending_message = message;
+                    let delivered_at = std::time::Instant::now();
+                    let delivered_wall = time::OffsetDateTime::now_utc();
+                    metrics::gauge!(harnx_metrics::WORKER_ACTIVATIONS_WAITING).set(1.0);
                     let permit = loop {
                         let acquire = Arc::clone(&permits).acquire_owned();
                         tokio::pin!(acquire);
@@ -682,27 +724,12 @@ async fn reconnect_activation_stream<
                         break acquired.expect("activation admission semaphore cannot close");
                     };
 
-                    let message = tokio::select! {
-                        biased;
-                        _ = shutdown.cancelled() => {
-                            drop(permit);
-                            break 'reconnect;
-                        }
-                        joined = handlers.join_next(), if !handlers.is_empty() => {
-                            drop(permit);
-                            log_admission_result(joined);
-                            continue;
-                        }
-                        message = buffered_messages
-                            .as_mut()
-                            .expect("open activation stream")
-                            .next() => message,
-                    };
-                    let Some(message) = message else {
-                        buffered_messages = None;
-                        break;
-                    };
-                    let message = match message {
+                    metrics::gauge!(harnx_metrics::WORKER_ACTIVATIONS_WAITING).set(0.0);
+                    harnx_metrics::record_activation_phase(
+                        "delivery_to_admission",
+                        delivered_at.elapsed(),
+                    );
+                    let message = match pending_message.take().expect("received activation") {
                         Ok(message) => message,
                         Err(error) => {
                             log::warn!("worker activation stream failed; reopening: {error}");
@@ -710,10 +737,14 @@ async fn reconnect_activation_stream<
                             break;
                         }
                     };
+                    metrics::gauge!(harnx_metrics::WORKER_ADMISSION_PERMITS)
+                        .set(permits.available_permits() as f64);
+                    metrics::gauge!(harnx_metrics::WORKER_ACTIVATION_HANDLERS)
+                        .set((handlers.len() + 1) as f64);
                     let handle = handle.clone();
                     handlers.spawn(async move {
                         let _permit = permit;
-                        handle(message).await
+                        handle(message, delivered_wall).await
                     });
                 }
             }
@@ -737,6 +768,13 @@ async fn reconnect_activation_stream<
     }
 
     let deadline = Instant::now() + shutdown_timeout;
+    if let Some(Ok(message)) = pending_message.take() {
+        let rejected = reject(message);
+        tokio::pin!(rejected);
+        if let Ok(Err(error)) = tokio::time::timeout_at(deadline, &mut rejected).await {
+            log::warn!("failed to NAK waiting activation during shutdown: {error}");
+        }
+    }
     if let Some(messages) = buffered_messages.as_mut() {
         while let Some(buffered) = messages.next().now_or_never().flatten() {
             match buffered {
@@ -774,6 +812,9 @@ async fn reconnect_activation_stream<
             }
         }
     }
+    metrics::gauge!(harnx_metrics::WORKER_ADMISSION_PERMITS).set(0.0);
+    metrics::gauge!(harnx_metrics::WORKER_ACTIVATION_HANDLERS).set(0.0);
+    metrics::gauge!(harnx_metrics::WORKER_ACTIVATIONS_WAITING).set(0.0);
 }
 
 fn log_admission_result<HandleError: Display>(
@@ -944,7 +985,7 @@ mod tests {
                 .expect("valid activation delivery");
             self.prepared
                 .runtime
-                .handle_activation(message)
+                .handle_activation(message, time::OffsetDateTime::now_utc())
                 .await
                 .expect("admit activation");
         }
@@ -974,6 +1015,84 @@ mod tests {
             })
             .await
             .expect("completed session remained in worker tracking maps");
+        }
+    }
+
+    #[test]
+    fn activation_claim_deferral_and_shutdown_nak_record_metrics() {
+        use metrics_util::{
+            debugging::{DebugValue, DebuggingRecorder},
+            CompositeKey, MetricKind,
+        };
+
+        harnx_core::require_nextest();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        recorder.install().expect("install debugging recorder");
+        let ran = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let Some(fixture) = ActiveCleanupFixture::open().await else {
+                    return false;
+                };
+                fixture.run_session().await;
+                fixture.wait_for_cleanup().await;
+                let jetstream = fixture.prepared.runtime.jetstream.clone();
+                // A metadata-less activation is refused by claim preflight.
+                fixture.admit_session(&jetstream, "missing-metadata").await;
+                fixture.prepared.runtime.shutdown.cancel();
+                fixture
+                    .admit_session(&jetstream, "shutdown-activation")
+                    .await;
+                true
+            });
+        if !ran {
+            return;
+        }
+        let snapshot = snapshotter.snapshot().into_vec();
+        let value = |kind, name, label: Option<(&str, &str)>| {
+            let labels = label
+                .into_iter()
+                .map(|(key, value)| metrics::Label::new(key.to_owned(), value.to_owned()))
+                .collect::<Vec<_>>();
+            let expected = CompositeKey::new(kind, metrics::Key::from_parts(name, labels));
+            snapshot
+                .iter()
+                .find(|(key, _, _, _)| *key == expected)
+                .map(|(_, _, _, value)| value)
+                .unwrap_or_else(|| panic!("missing metric: {expected:?}"))
+        };
+        for outcome in ["claimed", "preflight_not_ready"] {
+            assert_eq!(
+                value(
+                    MetricKind::Counter,
+                    harnx_metrics::ACTIVATION_CLAIMS_TOTAL,
+                    Some(("outcome", outcome))
+                ),
+                &DebugValue::Counter(1)
+            );
+        }
+        assert_eq!(
+            value(
+                MetricKind::Counter,
+                harnx_metrics::ACTIVATION_NAKS_TOTAL,
+                Some(("reason", "shutdown"))
+            ),
+            &DebugValue::Counter(1)
+        );
+        for phase in [
+            "publish_to_delivery",
+            "admission_to_lease",
+            "lease_to_turn_start",
+        ] {
+            assert!(
+                matches!(value(MetricKind::Histogram, harnx_metrics::ACTIVATION_PHASE_SECONDS,
+                Some(("phase", phase))), DebugValue::Histogram(samples) if !samples.is_empty()),
+                "missing activation phase {phase}"
+            );
         }
     }
 
@@ -1030,7 +1149,7 @@ mod tests {
                         }
                     }
                 },
-                move |message| {
+                move |message, _delivered_wall| {
                     let tx = handled_tx.lock().expect("handled sender lock").take();
                     async move {
                         if let Some(tx) = tx {
@@ -1081,7 +1200,7 @@ mod tests {
                         let messages = stream.take().expect("stream opens once");
                         async move { Ok::<_, &'static str>(messages) }
                     },
-                    move |message| {
+                    move |message, _delivered_wall| {
                         let slow_release = slow_release.clone();
                         let fast_tx = Arc::clone(&fast_tx);
                         async move {
@@ -1138,7 +1257,7 @@ mod tests {
                         let messages = stream.take().expect("stream opens once");
                         async move { Ok::<_, &'static str>(messages) }
                     },
-                    move |_message| {
+                    move |_message, _delivered_wall| {
                         let release = release.clone();
                         let active = Arc::clone(&active);
                         let max_active = Arc::clone(&max_active);
@@ -1208,7 +1327,7 @@ mod tests {
                         let messages = stream.take().expect("stream opens once");
                         async move { Ok::<_, &'static str>(messages) }
                     },
-                    move |message| {
+                    move |message, _delivered_wall| {
                         let release = release.clone();
                         let active = Arc::clone(&active);
                         let handled = Arc::clone(&handled);

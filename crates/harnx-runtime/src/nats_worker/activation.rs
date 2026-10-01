@@ -20,6 +20,9 @@ pub struct SessionActivate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
     pub epoch: String,
+    /// Display-only context for activation tracing; older publishers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -38,11 +41,17 @@ impl SessionActivate {
             session_id: session_id.into(),
             execution_id: None,
             epoch: Utc::now().to_rfc3339(),
+            agent_name: None,
             requested_seq: None,
             target_worker_id: None,
             token_budget: None,
             tool_confirmation_subject: None,
         }
+    }
+
+    pub fn with_agent_name(mut self, agent_name: Option<&str>) -> Self {
+        self.agent_name = agent_name.map(str::to_owned);
+        self
     }
 
     pub fn with_execution_id(mut self, execution_id: &str) -> Self {
@@ -106,6 +115,7 @@ mod tests {
     fn activation_payload_without_token_budget_round_trips() {
         let legacy = br#"{"session_id":"s1","epoch":"now"}"#;
         let activation: SessionActivate = serde_json::from_slice(legacy).unwrap();
+        assert!(activation.agent_name.is_none());
         assert_eq!(activation.requested_seq, None);
         assert_eq!(activation.target_worker_id, None);
         assert_eq!(activation.token_budget, None);
@@ -120,6 +130,19 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<SessionActivate>(encoded).unwrap(),
             activation
+        );
+    }
+
+    #[test]
+    fn activation_agent_context_round_trips_without_changing_message_id() {
+        let original = SessionActivate::new("s1");
+        let enriched = original.clone().with_agent_name(Some("reviewer"));
+        assert_eq!(original.msg_id(), enriched.msg_id());
+        let encoded = serde_json::to_value(&enriched).unwrap();
+        assert_eq!(encoded["agent_name"], "reviewer");
+        assert_eq!(
+            serde_json::from_value::<SessionActivate>(encoded).unwrap(),
+            enriched
         );
     }
 
