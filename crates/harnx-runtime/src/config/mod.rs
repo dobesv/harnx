@@ -111,13 +111,13 @@ use crate::client::{
 };
 use crate::commands::{run_command, split_args_text};
 use crate::tool::{ToolDeclaration, ToolResult, Tools};
+use crate::tool_selector::ToolSelector;
 use crate::utils::*;
 use harnx_hooks::HooksConfig;
 use harnx_rag::Rag;
 use harnx_render::{MarkdownRender, RenderOptions};
 
 use anyhow::{anyhow, bail, Context, Result};
-use globset::GlobBuilder;
 use indexmap::IndexMap;
 use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use parking_lot::RwLock;
@@ -189,14 +189,10 @@ impl<'a> SessionSaveRequest<'a> {
     }
 }
 
-/// Check whether a glob pattern matches a tool name.
-/// Returns `false` if the pattern is invalid (graceful degradation).
-fn matches_tool_glob(pattern: &str, name: &str) -> bool {
-    GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .build()
-        .ok()
-        .is_some_and(|g| g.compile_matcher().is_match(name))
+/// Compile a `use_tools` entry for matching against tool names, with `*`
+/// stopping at `/`. A malformed glob matches nothing (graceful degradation).
+fn tool_name_selector(selector: &str) -> ToolSelector {
+    ToolSelector::new(selector, true)
 }
 
 fn selector_literal_prefix(selector: &str) -> &str {
@@ -825,10 +821,11 @@ impl Config {
                         .cloned(),
                 );
             } else {
+                let selector = tool_name_selector(item);
                 names.extend(
                     declaration_names
                         .iter()
-                        .filter(|n| matches_tool_glob(item, n))
+                        .filter(|n| selector.is_match(n))
                         .cloned(),
                 );
             }
@@ -901,13 +898,17 @@ impl Config {
                         .cloned(),
                 );
             } else {
+                let selector = tool_name_selector(item);
+                let sanitized_selector =
+                    (sanitized_item != item).then(|| tool_name_selector(&sanitized_item));
                 tool_names.extend(
                     declaration_names
                         .iter()
                         .filter(|name| {
-                            matches_tool_glob(item, name)
-                                || (sanitized_item != item
-                                    && matches_tool_glob(&sanitized_item, name))
+                            selector.is_match(name)
+                                || sanitized_selector
+                                    .as_ref()
+                                    .is_some_and(|sanitized| sanitized.is_match(name))
                         })
                         .cloned(),
                 );
@@ -1298,6 +1299,13 @@ impl Config {
         }
 
         let (handoff_declarations, targets) = handoff_tool_declarations_for_agents(active_pkg);
+        let compiled_selectors: Vec<(&str, ToolSelector)> = selectors
+            .iter()
+            .map(|selector| {
+                let selector = selector.trim();
+                (selector, tool_name_selector(selector))
+            })
+            .collect();
         let mut filtered_handoff_declarations = Vec::new();
         let mut handoff_targets = HashMap::new();
         for declaration in handoff_declarations {
@@ -1305,10 +1313,9 @@ impl Config {
                 .name
                 .strip_suffix("_session_handoff")
                 .unwrap_or(&declaration.name);
-            if selectors.iter().any(|selector| {
-                let selector = selector.trim();
+            if compiled_selectors.iter().any(|(selector, compiled)| {
                 selector_could_match_server(selector, handoff_display_name)
-                    || matches_tool_glob(selector, &declaration.name)
+                    || compiled.is_match(&declaration.name)
             }) {
                 if let Some(target) = targets.get(handoff_display_name) {
                     handoff_targets.insert(handoff_display_name.to_string(), target.clone());
@@ -1417,3 +1424,5 @@ mod test_support;
 mod tests;
 #[cfg(test)]
 mod tests_extra;
+#[cfg(test)]
+mod tool_selection_tests;

@@ -278,6 +278,24 @@ fn assert_declarations_and_collisions(provider: &NatsToolProvider) {
         .declarations_for_use_tools(Some("alpha"))
         .iter()
         .any(|tool| tool.name == "alpha_duplicate_tool"));
+    assert_eq!(
+        selected_tool_names(provider, "alpha_*"),
+        vec!["alpha_duplicate_tool"]
+    );
+    assert_eq!(
+        selected_tool_names(provider, "duplicate_*"),
+        vec!["alpha_duplicate_tool", "beta_duplicate_tool"]
+    );
+}
+
+fn selected_tool_names(provider: &NatsToolProvider, use_tools: &str) -> Vec<String> {
+    let mut names: Vec<String> = provider
+        .declarations_for_use_tools(Some(use_tools))
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    names.sort();
+    names
 }
 
 async fn assert_invocation_and_per_call_timeout(provider: &NatsToolProvider) -> Result<()> {
