@@ -1,5 +1,6 @@
 use crate::config::{Config, LOCAL_CLUSTER_KEY};
 use crate::server_identity::ServerIdentity;
+use crate::tool_selector::ToolSelector;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -199,26 +200,30 @@ impl NatsToolProvider {
         let Some(use_tools) = use_tools else {
             return Vec::new();
         };
-        let selectors = harnx_core::agent_config::split_tool_selectors(use_tools);
+        let selectors: Vec<(&str, ToolSelector)> =
+            harnx_core::agent_config::split_tool_selectors(use_tools)
+                .into_iter()
+                .map(|selector| {
+                    let selector = selector.trim();
+                    (selector, ToolSelector::new(selector, false))
+                })
+                .collect();
         self.declarations
             .iter()
             .filter(|declaration| {
+                // A selector can name the tool, its server, or its unprefixed name.
                 let route = self.tools.get(&declaration.name);
-                selectors.iter().any(|selector| {
-                    let selector = selector.trim();
-                    selector == "*"
-                        || selector == declaration.name
-                        || route.is_some_and(|route| {
-                            selector == route.selector_server || selector == route.raw_name
-                        })
-                        || globset::Glob::new(selector).is_ok_and(|pattern| {
-                            let matcher = pattern.compile_matcher();
-                            matcher.is_match(&declaration.name)
-                                || route.is_some_and(|route| {
-                                    matcher.is_match(&route.selector_server)
-                                        || matcher.is_match(&route.raw_name)
-                                })
-                        })
+                let names = [
+                    Some(declaration.name.as_str()),
+                    route.map(|route| route.selector_server.as_str()),
+                    route.map(|route| route.raw_name.as_str()),
+                ];
+                selectors.iter().any(|(selector, compiled)| {
+                    *selector == "*"
+                        || names
+                            .iter()
+                            .flatten()
+                            .any(|name| name == selector || compiled.is_match(name))
                 })
             })
             .cloned()

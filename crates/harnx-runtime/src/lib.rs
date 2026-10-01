@@ -41,6 +41,7 @@ pub mod test_utils;
 pub mod tool;
 pub mod tool_context;
 pub mod tool_loop_guard;
+mod tool_selector;
 pub mod utils;
 mod worker_identity;
 
