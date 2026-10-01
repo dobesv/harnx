@@ -1,5 +1,6 @@
 use crate::{catch_error, parse_retry_after, CompletionTokenUsage, ToolCall};
 use harnx_core::abort::AbortSignal;
+use harnx_core::loop_guard::{OutputChannel, OutputRepeatDetector, RepetitiveOutput};
 
 use anyhow::{anyhow, bail, Context, Result};
 use eventsource_stream::Eventsource;
@@ -28,6 +29,9 @@ pub struct SseHandler {
     output_tokens: Option<u64>,
     cached_tokens: Option<u64>,
     cache_write_tokens: Option<u64>,
+    // One detector per channel; `None` when loop_detection.output is off.
+    answer_guard: Option<OutputRepeatDetector>,
+    thought_guard: Option<OutputRepeatDetector>,
 }
 
 impl SseHandler {
@@ -43,7 +47,19 @@ impl SseHandler {
             output_tokens: None,
             cached_tokens: None,
             cache_write_tokens: None,
+            answer_guard: Some(OutputRepeatDetector::default()),
+            thought_guard: Some(OutputRepeatDetector::default()),
         }
+    }
+
+    /// Apply `loop_detection.output`: without the guard, nothing stops a
+    /// stream for repeating itself.
+    pub fn with_output_guard(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.answer_guard = None;
+            self.thought_guard = None;
+        }
+        self
     }
 
     pub fn text(&mut self, text: &str) -> Result<()> {
@@ -82,7 +98,7 @@ impl SseHandler {
             }));
         }
 
-        Ok(())
+        guard_output(&mut self.answer_guard, OutputChannel::Answer, text)
     }
 
     pub fn thought(&mut self, thought: &str) -> Result<()> {
@@ -119,7 +135,7 @@ impl SseHandler {
             }));
         }
 
-        Ok(())
+        guard_output(&mut self.thought_guard, OutputChannel::Thinking, thought)
     }
 
     pub fn done(&mut self) {
@@ -203,6 +219,19 @@ impl SseHandler {
             Some(self.thought_buffer)
         };
         (self.buffer, thought, self.tool_calls, usage)
+    }
+}
+
+/// Failing a chunk ends the provider's stream, which stops generation; the
+/// retry layer decides what happens next.
+fn guard_output(
+    guard: &mut Option<OutputRepeatDetector>,
+    channel: OutputChannel,
+    chunk: &str,
+) -> Result<()> {
+    match guard.as_mut().and_then(|guard| guard.push(chunk)) {
+        Some(tail) => Err(RepetitiveOutput::new(channel, tail).into()),
+        None => Ok(()),
     }
 }
 

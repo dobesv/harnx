@@ -162,6 +162,7 @@ pub async fn call_chat_completions(
 
     match engine_ret {
         Ok((text, thought, tool_calls, usage)) => {
+            check_reply(config, input, &text, thought.as_deref())?;
             if print {
                 if let Some(v) = &thought {
                     config
@@ -206,7 +207,8 @@ pub async fn call_chat_completions_streaming(
     let data =
         crate::config::input::prepare_completion_data(input, config, client.model(), true, client)?;
     let (tx, rx) = unbounded_channel();
-    let handler = SseHandler::new(tx, abort_signal.clone());
+    let handler = SseHandler::new(tx, abort_signal.clone())
+        .with_output_guard(output_guard_enabled(config, input));
 
     // Compute rich spinner label from config; emit as Status so
     // CliAgentEventSink picks it up as the spinner message.
@@ -241,6 +243,31 @@ pub async fn call_chat_completions_streaming(
     let (text, thought, tool_calls, usage, _aborted) = engine_ret?;
     let _ = abort_signal;
     Ok((text, thought, tool_calls, usage))
+}
+
+/// Whether `loop_detection.output` is on for this request's agent.
+fn output_guard_enabled(config: &GlobalConfig, input: &Input) -> bool {
+    config
+        .read()
+        .loop_detection
+        .resolve(input.agent().loop_detection())
+        .output
+}
+
+/// The non-streaming counterpart of `SseHandler`'s output guard.
+fn check_reply(
+    config: &GlobalConfig,
+    input: &Input,
+    text: &str,
+    thought: Option<&str>,
+) -> Result<()> {
+    if !output_guard_enabled(config, input) {
+        return Ok(());
+    }
+    use harnx_core::loop_guard::{check_output, OutputChannel};
+    check_output(OutputChannel::Thinking, thought.unwrap_or_default())?;
+    check_output(OutputChannel::Answer, text)?;
+    Ok(())
 }
 
 pub async fn create_config(

@@ -160,6 +160,7 @@ impl Config {
     fn load_loop_detection_env(&mut self) {
         if let Some(Some(v)) = read_env_bool(&get_env_name("loop_detection")) {
             self.loop_detection.tool_calls = v;
+            self.loop_detection.output = v;
         }
     }
 }
@@ -370,6 +371,7 @@ mod tests {
         config.load_envs(true).unwrap();
 
         assert!(!config.loop_detection.tool_calls);
+        assert!(!config.loop_detection.output);
     }
 
     #[test]
@@ -381,5 +383,6 @@ mod tests {
         config.load_envs(true).unwrap();
 
         assert!(config.loop_detection.tool_calls);
+        assert!(config.loop_detection.output);
     }
 }

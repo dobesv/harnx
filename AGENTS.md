@@ -552,9 +552,14 @@ This convention is consolidated across all provider parsers (`openai.rs`, `opena
 
 ### Loop protection
 
-Models, Gemini in particular, fall into loops that repeat the same tool call
-with the same result hundreds of times. `harnx_core::loop_guard::ToolRepeatGuard`
-counts identical calls within the current tool loop and escalates:
+Models, Gemini in particular, fall into loops. Two guards in
+`harnx_core::loop_guard` catch them. `ToolRepeatGuard` catches a model that
+repeats the same tool call with the same result hundreds of times. The output
+guard, described below, catches a model that streams the same text over and
+over.
+
+`ToolRepeatGuard` counts identical calls within the current tool loop and
+escalates:
 
 - A call is identified by its name plus its arguments compared as JSON values,
   and it counts only when its result is also identical. Gemini sends the same
@@ -582,10 +587,12 @@ counts identical calls within the current tool loop and escalates:
   marker and then that one. The sub-agent tool and the CLI one-shot turn the
   result into `TerminationKind::Repetition`.
 - `loop_detection.tool_calls` (global or agent front matter) and
-  `HARNX_LOOP_DETECTION=0` turn it off. The variable sets the global value, so
-  an agent whose front matter sets `tool_calls: true` still has the guard on.
-  `harnx dump session <agent> <id> --check-loop-detection` replays a stored
-  session through the same guard.
+  `HARNX_LOOP_DETECTION=0` turn it off. The variable sets both global values,
+  `tool_calls` and `output`, and an agent's front matter can override either,
+  so an agent whose front matter sets `tool_calls: true` still has this guard
+  on. `harnx dump session <agent> <id> --check-loop-detection` replays a stored
+  session through the same guard, and also reports the saved replies the
+  output guard (below) would have stopped.
 - Tools that poll should return something that changes between calls
   (`time_wait` and `time_wait_until` return their start and end times;
   `bash_wait` reports total runtime), or the guard treats an unchanged poll as
@@ -603,7 +610,41 @@ counts identical calls within the current tool loop and escalates:
   bounded-growth interruption test's `counter_ping` answers `pong 1`,
   `pong 2`, …), or
   turn the guard off in the test's config
-  (`loop_detection.tool_calls = false`).
+  (`loop_detection.tool_calls = false`). A mock model that streams 2,000 or
+  more characters of one repeated unit trips the output guard, described
+  below, in the same way: vary the text, or set
+  `loop_detection.output = false` in the test's config.
+
+#### Output guard
+
+- The output guard (`harnx_core::loop_guard::output_repeat`) watches the
+  streamed answer and thinking separately. A channel whose last 2,000 or more
+  characters are at least four back-to-back copies of one unit (up to 2,000
+  characters) fails the stream with `RepetitiveOutput`. `SseHandler` runs it
+  for every provider, and `call_chat_completions` checks non-streamed replies
+  the same way. `run_chat_completion_streaming` must never return a stopped
+  stream as a partial reply, as it does after other stream errors.
+- Clients that read an OpenAI chat-completions stream, such as
+  `openai-compatible` and `llama-server`, send reasoning through the answer
+  channel inside `<think>` tags (`openai_transition_reasoning` in
+  `crates/harnx-client/src/openai.rs`), so it shares the answer's detector. A
+  reasoning loop on those providers is still caught, but it is reported as
+  `answer`, both in the retry note's wording and as the stop's `source`.
+- The retry layer (`harnx_engine::retry`) retries that model once,
+  immediately, with `Input.transient_note`, a user message added to requests
+  but never persisted, then tries the next fallback with the note and without
+  a cooldown, and finally ends the turn with `RepetitionStop` (`source`
+  `answer` or `thinking`). A model gets that one retry per call, however many
+  backoff attempts it has. A cooldown would take the model away from every
+  other turn over one request's loop. The text streamed before a stop stays in
+  the live view; only the finished reply is saved.
+- The usage of a reply the output guard stopped is missing from session token
+  totals, token budgets, and the token and cost metrics (`record_llm_metrics`:
+  `harnx_llm_tokens_total`, `harnx_llm_cost_dollars`), which take only a
+  completed call's usage. All three undercount by the discarded replies.
+- Only exact repetition counts: a loop whose copies differ slightly (an
+  incrementing counter) is not caught, and neither is repetition inside
+  tool-call arguments. `loop_detection.output` turns this guard off.
 
 ### Tool result templates and undefined behavior
 

@@ -11,6 +11,7 @@ use harnx_client::{
 };
 use harnx_core::abort::wait_abort_signal;
 use harnx_core::event::{AgentEvent, ModelEvent, NoticeEvent};
+use harnx_core::loop_guard::find_repetitive_output;
 use harnx_core::sink::emit_agent_event;
 use harnx_core::text::{extract_code_block, strip_think_tag};
 use harnx_core::tool::ToolCall;
@@ -201,7 +202,10 @@ pub async fn run_chat_completion_streaming(
             Ok((text, thought, tool_calls, usage, false))
         }
         Err(err) => {
-            if text.trim().is_empty() {
+            // A partial reply is kept after a transport failure, but not after
+            // the output guard stopped the stream: that text is the loop, and
+            // the retry layer needs the error.
+            if text.trim().is_empty() || find_repetitive_output(&err).is_some() {
                 Err(err)
             } else {
                 emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning(

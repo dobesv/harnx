@@ -626,6 +626,32 @@ mod tests {
     }
 
     #[test]
+    fn an_output_stop_reaches_parents_with_its_source_and_no_tool() {
+        let stop = harnx_core::loop_guard::RepetitionStop(
+            harnx_core::loop_guard::RepetitionTerminal::output(
+                harnx_core::loop_guard::RepetitionSource::Answer,
+            ),
+        );
+        let terminal = parse_worker_terminal(&format!("model call failed: {stop}"))
+            .expect("the stop text is a worker terminal");
+        let result = synthesize_terminated_result(TerminationInputs {
+            kind: terminal.kind(),
+            session_id: "child",
+            usage: &sample_usage(),
+            thinking_excerpt: None,
+            budget: None,
+            repetition: terminal.repetition(),
+        });
+        assert!(result.response.starts_with(
+            "The invocation was stopped because the model's reply kept repeating the same text."
+        ));
+        let json = result.termination_json();
+        assert_eq!(json["kind"], "repetition");
+        assert_eq!(json["source"], "answer");
+        assert!(json.get("tool").is_none() && json.get("count").is_none());
+    }
+
+    #[test]
     fn context_wrapped_repetition_stop_is_a_worker_terminal() {
         let stop = harnx_core::loop_guard::RepetitionTerminal::tool_calls("fs_read", 4);
         let wrapped = anyhow::Error::new(harnx_core::loop_guard::RepetitionStop(stop.clone()))

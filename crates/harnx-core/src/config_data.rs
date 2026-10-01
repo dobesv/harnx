@@ -36,11 +36,17 @@ fn default_terminal_status() -> bool {
 pub struct LoopDetectionConfig {
     /// Warn about, refuse, and finally stop repeated identical tool calls.
     pub tool_calls: bool,
+    /// Stop, retry and finally end a response, streamed or not, whose answer
+    /// or thinking keeps repeating the same text.
+    pub output: bool,
 }
 
 impl Default for LoopDetectionConfig {
     fn default() -> Self {
-        Self { tool_calls: true }
+        Self {
+            tool_calls: true,
+            output: true,
+        }
     }
 }
 
@@ -50,6 +56,7 @@ impl LoopDetectionConfig {
         let Some(agent) = agent else { return self };
         Self {
             tool_calls: agent.tool_calls.unwrap_or(self.tool_calls),
+            output: agent.output.unwrap_or(self.output),
         }
     }
 }
@@ -61,6 +68,8 @@ impl LoopDetectionConfig {
 pub struct LoopDetectionOverride {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<bool>,
 }
 
 /// Default wait for a worker to claim an activated NATS session.
@@ -360,20 +369,42 @@ mod loop_detection_tests {
 
     #[test]
     fn an_agent_override_wins_field_by_field() {
-        let global = LoopDetectionConfig { tool_calls: false };
+        let global = LoopDetectionConfig {
+            tool_calls: false,
+            output: true,
+        };
         assert!(
             global
                 .resolve(Some(&LoopDetectionOverride {
-                    tool_calls: Some(true)
+                    tool_calls: Some(true),
+                    output: None,
                 }))
                 .tool_calls
         );
         assert!(
             !global
-                .resolve(Some(&LoopDetectionOverride { tool_calls: None }))
+                .resolve(Some(&LoopDetectionOverride {
+                    tool_calls: None,
+                    output: None,
+                }))
                 .tool_calls
         );
         assert!(!global.resolve(None).tool_calls);
+    }
+
+    #[test]
+    fn output_detection_defaults_on_and_overrides_independently() {
+        let global = LoopDetectionConfig::default();
+        assert!(global.tool_calls && global.output);
+        let data: ConfigData = serde_yaml::from_str("loop_detection:\n  output: false\n").unwrap();
+        assert!(data.loop_detection.tool_calls);
+        assert!(!data.loop_detection.output);
+        let resolved = global.resolve(Some(&LoopDetectionOverride {
+            tool_calls: None,
+            output: Some(false),
+        }));
+        assert!(resolved.tool_calls);
+        assert!(!resolved.output);
     }
 
     #[test]

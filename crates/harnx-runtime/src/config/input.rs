@@ -211,6 +211,12 @@ pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Messag
             MessageContent::Text(text.clone()),
         ))
     }
+    if let Some(note) = &input.transient_note {
+        messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text(note.clone()),
+        ))
+    }
     Ok(messages)
 }
 
@@ -404,6 +410,29 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_transient_note_is_sent_last() {
+        let config: GlobalConfig = Arc::new(RwLock::new(Config::default()));
+        let mut input = from_str(&config, "hello", None);
+        let plain = build_messages(&input, &config).unwrap();
+
+        input.injected_user_text = Some("a queued message".into());
+        input.transient_note = Some("[harnx] note".into());
+        let messages = build_messages(&input, &config).unwrap();
+
+        let added: Vec<(MessageRole, String)> = messages[plain.len()..]
+            .iter()
+            .map(|message| (message.role, message.content.to_text()))
+            .collect();
+        assert_eq!(
+            added,
+            [
+                (MessageRole::User, "a queued message".to_string()),
+                (MessageRole::User, "[harnx] note".to_string()),
+            ]
+        );
+    }
 
     /// Regression test for the "continue replayed all Edits" bug.
     ///

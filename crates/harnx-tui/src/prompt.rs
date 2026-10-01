@@ -678,7 +678,12 @@ impl Tui {
         match send_ret {
             Ok(_) => Ok((text, thought, tool_calls, usage)),
             Err(err) => {
-                if text.trim().is_empty() {
+                // Like the engine's streaming path, keep the partial reply of
+                // a failed stream but not one the output guard stopped: that
+                // text is the loop, and the retry layer needs the error.
+                if text.trim().is_empty()
+                    || harnx_core::loop_guard::find_repetitive_output(&err).is_some()
+                {
                     Err(err)
                 } else {
                     emit_agent_event(AgentEvent::Model(ModelEvent::Error(pretty_error_string(
@@ -688,5 +693,36 @@ impl Tui {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::tests::test_config;
+    use harnx_runtime::client::TestStateGuard;
+    use harnx_runtime::test_utils::{MockClient, MockTurnBuilder};
+
+    #[tokio::test]
+    async fn a_stream_the_output_guard_stopped_is_an_error_not_a_partial_reply() {
+        let turn = MockTurnBuilder::new().add_text_chunk("again ".repeat(600));
+        let mock = Arc::new(MockClient::builder().add_turn(turn.build()).build());
+        let _guard = TestStateGuard::new(Some(mock)).await;
+        let config = test_config();
+        let mut input = harnx_runtime::config::input::from_str(&config, "hello", None);
+        let client = harnx_runtime::config::input::create_client(&input, &config).unwrap();
+        let err = Tui::call_chat_completions_streaming_tui(
+            &mut input,
+            client.as_ref(),
+            &config,
+            harnx_runtime::utils::create_abort_signal(),
+        )
+        .await
+        .map(|(text, ..)| text.len())
+        .expect_err("a stopped stream is not a reply");
+        assert!(
+            harnx_core::loop_guard::find_repetitive_output(&err).is_some(),
+            "{err:#}"
+        );
     }
 }

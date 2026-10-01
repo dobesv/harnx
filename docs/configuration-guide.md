@@ -343,6 +343,45 @@ harnx dump session <agent> <session-id> --check-loop-detection
 The [Command Line Guide](command-line-guide.md) describes the output and its
 limits.
 
+#### Repeated output
+
+Harnx also stops a model that streams the same text over and over, which some
+models do in their answer or in their reasoning. When the last 2,000 or more
+characters of either one are the same piece of text repeated at least four
+times back to back, harnx stops the response and sends the request again with
+a short note telling the model it was repeating itself. If the model repeats
+itself again, harnx tries the agent's next fallback model with the same note,
+and when no model is left it ends the turn. A parent agent receives this as a
+`termination` of kind `"repetition"` with `source` set to `"answer"` or
+`"thinking"`, and a one-shot `harnx prompt` exits with code 2. The text
+streamed before a stop stays on screen, but only a reply that finished is
+saved.
+
+When a provider streams its reasoning through an OpenAI chat-completions API,
+clients such as `openai-compatible` and `llama-server` put that reasoning in
+the answer text, wrapped in `<think>` tags. A reasoning loop from such a
+provider is still stopped, but harnx sees it as a repeating answer: the note
+says the reply repeated, and `source` is `"answer"`.
+
+Only exact repetition counts, so a list that repeats a pattern with different
+values, such as numbered steps, is never stopped. Legitimate output that
+repeats one block verbatim for 2,000 or more characters is stopped, though,
+such as a zero-filled matrix or array initializer, an empty table or grid
+template with identical rows, or identical log lines pasted into an answer. An
+agent that writes output like that needs this guard turned off.
+
+This guard is on by default too. `HARNX_LOOP_DETECTION=0` turns off both
+guards. To turn off only this one, set `output: false`, in `config.yaml` or in
+an agent's front matter:
+
+```yaml
+loop_detection:
+  output: false
+```
+
+The `--check-loop-detection` replay described above also reports the saved
+replies this guard would have stopped.
+
 ### Session Titles
 
 Harnx can automatically generate a short, human-readable title for each session
