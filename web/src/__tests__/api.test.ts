@@ -85,6 +85,40 @@ describe('api.ts', () => {
       expect(fetchMock).toHaveBeenCalledWith('/v1/agents/agent%2FA/sessions', expect.any(Object));
     });
 
+    it('requests paginated sessions with limit and cursor', async () => {
+      const mockResult = {
+        sessions: [{ session_id: 's1' }],
+        next_cursor: 'cursor-123',
+      };
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResult,
+      });
+      const result = await listSessions('agent/A', { limit: 50, cursor: 'token+1==' });
+      expect(result).toEqual(mockResult);
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/v1/agents/agent%2FA/sessions?limit=50&cursor=token%2B1%3D%3D',
+        expect.any(Object),
+      );
+    });
+
+    it('requests first page with limit only', async () => {
+      const mockResult = {
+        sessions: [{ session_id: 's1' }],
+        next_cursor: null,
+      };
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResult,
+      });
+      const result = await listSessions('agent/A', { limit: 50 });
+      expect(result).toEqual(mockResult);
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/v1/agents/agent%2FA/sessions?limit=50',
+        expect.any(Object),
+      );
+    });
+
     it('throws if not ok', async () => {
       fetchMock.mockResolvedValueOnce({
         ok: false,

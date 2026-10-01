@@ -611,8 +611,10 @@ export const happyPathHandlers = [
     return HttpResponse.json({ data: agents });
   }),
 
-  http.get('/v1/agents/:agent/sessions', () => {
-    return HttpResponse.json([
+  http.get('/v1/agents/:agent/sessions', ({ request }) => {
+    const url = new URL(request.url);
+    const hasPagination = url.searchParams.has('limit') || url.searchParams.has('cursor');
+    const sessions = [
       // Fixed timestamp so session-list screenshots are deterministic without
       // needing to freeze the browser's Date.now (freezing it collides message
       // ids/timestamps in the assistant-ui runtime and drops streamed messages).
@@ -648,7 +650,16 @@ export const happyPathHandlers = [
         updated_at: '2024-01-01T12:00:00.000Z',
         unread: false,
       },
-    ]);
+    ];
+
+    if (hasPagination) {
+      return HttpResponse.json({
+        sessions,
+        next_cursor: null,
+      });
+    }
+
+    return HttpResponse.json(sessions);
   }),
 
   http.post('/v1/agents/:agent/sessions', () => {

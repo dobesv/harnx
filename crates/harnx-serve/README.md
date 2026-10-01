@@ -119,6 +119,46 @@ Errors: 400 for malformed CIDs, 404 if blob not found.
 
 Note: harnx-serve routes are unauthenticated by design. This is the first route serving raw blob bytes.
 
+### Session Listing and Pagination
+
+`GET /v1/agents/:agent/sessions` lists sessions for the specified agent. It supports optional keyset pagination via query parameters while remaining backward-compatible with unpaginated callers:
+
+- **Unpaginated Mode (no query parameters)**:
+  - If no query parameters are provided (e.g. `GET /v1/agents/:agent/sessions`), the response is a plain JSON array of session summary objects (`[SessionRef, ...]`), preserving existing behavior and compatibility.
+- **Paginated Mode (`limit` and/or `cursor` query parameters)**:
+  - If `limit` and/or `cursor` are specified, the response envelope is:
+    ```json
+    {
+      "sessions": [ ... ],
+      "next_cursor": "<opaque_base64url_cursor>"
+    }
+    ```
+  - When the final page is reached, `next_cursor` is `null`.
+
+#### Query Parameters
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `limit` | positive integer | `50` (if `cursor` only) | Page size clamped between `1` and `200`. Values `<= 0` or non-integers return `400 Bad Request`. |
+| `cursor` | string | `None` | Opaque base64url JSON token encoding the sort key of the last item from the previous page. Bounded to max 1024 bytes; must pass strict version check (`v: 1`). Malformed or invalid cursors return `400 Bad Request`. |
+
+Duplicate `limit` or `cursor` parameters return `400 Bad Request`. Other query parameters are ignored; without `limit` or `cursor`, the response remains the legacy array.
+
+#### Keyset ordering
+
+Sessions sort by:
+1. `modified` timestamp descending (most recently active sessions first). Exact nanosecond timestamp precision is preserved in the cursor sort key rather than truncating to formatted milliseconds.
+2. Sessions with a `modified` timestamp sort ahead of sessions with `None`.
+3. Ties in `modified` timestamp (including both `None`) are broken deterministically by session `id` descending.
+
+The cursor selects sessions strictly after `(modified, id)`, not a numeric offset. Inserting or deleting sessions, including the cursor's session, doesn't skip or duplicate surviving sessions whose sort keys haven't changed. New sessions ahead of the cursor appear on the next first-page refresh.
+
+Pages aren't a frozen snapshot. Activity can move a session across the cursor between requests. Clients should deduplicate by `session_id` and restart at the first page when reconciling live changes.
+
+#### Note on `GET /v1/agents/:agent` (`agent_json`)
+
+The agent detail endpoint `GET /v1/agents/:agent` embeds a `sessions` array. This embedded list remains the complete, unpaginated array of all sessions for that agent so that clients retrieving the full agent resource do not receive truncated or partial data. Incremental loading is performed exclusively through `GET /v1/agents/:agent/sessions`.
+
 ### Canonical session metadata
 
 The metadata response contains immutable session/agent identity, creation and
