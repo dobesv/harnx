@@ -35,6 +35,7 @@ import { ConnectionBanner } from './ConnectionBanner';
 import { useConnectionStatus, useRetryCountdownSeconds } from './useConnectionStatus';
 import { isAbortError } from './httpClient';
 import { SessionCard, compareSessionsUnreadFirst } from './SessionCard';
+import { SessionLoadMore } from './SessionLoadMore';
 import './chat.css';
 
 // Activate a click-like handler from keyboard (Enter / Space) so div-based
@@ -845,6 +846,23 @@ export const AgentPicker = ({
   </div>
 );
 
+export interface SessionPickerProps {
+  agentName: string;
+  sessions: SessionRef[];
+  sessionsError: string | null;
+  sessionsLoading: boolean;
+  hasLoadedSessions: boolean;
+  onRetry: () => void;
+  onSelect: (id: string) => void;
+  onNewChat: () => void;
+  onBack: () => void;
+  onToggleUnread?: (sessionId: string, currentUnread: boolean) => void;
+  hasMore?: boolean;
+  isLoadingMore?: boolean;
+  loadMoreError?: string | null;
+  onLoadMore?: () => void;
+}
+
 export const SessionPicker = ({
   agentName,
   sessions,
@@ -856,24 +874,20 @@ export const SessionPicker = ({
   onNewChat,
   onBack,
   onToggleUnread,
-}: {
-  agentName: string;
-  sessions: SessionRef[];
-  sessionsError: string | null;
-  sessionsLoading: boolean;
-  hasLoadedSessions: boolean;
-  onRetry: () => void;
-  onSelect: (id: string) => void;
-  onNewChat: () => void;
-  onBack: () => void;
-  onToggleUnread?: (sessionId: string, currentUnread: boolean) => void;
-}) => {
+  hasMore,
+  isLoadingMore,
+  loadMoreError,
+  onLoadMore,
+}: SessionPickerProps) => {
   const sortedSessions = useMemo(() => {
     return [...sessions].sort(compareSessionsUnreadFirst);
   }, [sessions]);
 
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const showLoadMore = sortedSessions.length > 0 && Boolean(hasMore);
+
   return (
-    <div className="picker-container">
+    <div className="picker-container" ref={containerRef}>
       <button className="back-button" onClick={onBack}>&larr; Back to agents</button>
       <h2>Sessions for {agentName}</h2>
       <div className="actions-bar">
@@ -887,20 +901,31 @@ export const SessionPicker = ({
           <button type="button" onClick={onRetry}>Retry</button>
         </div>
       ) : (
-        <div className="grid-list sessions-grid">
-          {sortedSessions.length === 0 ? (
-            <p className="no-sessions-msg">No existing sessions found.</p>
-          ) : (
-            sortedSessions.map((s) => (
-              <SessionCard
-                key={s.session_id}
-                session={s}
-                onSelect={onSelect}
-                onToggleUnread={onToggleUnread}
-              />
-            ))
-          )}
-        </div>
+        <>
+          <div className="grid-list sessions-grid">
+            {sortedSessions.length === 0 ? (
+              <p className="no-sessions-msg">No existing sessions found.</p>
+            ) : (
+              sortedSessions.map((s) => (
+                <SessionCard
+                  key={s.session_id}
+                  session={s}
+                  onSelect={onSelect}
+                  onToggleUnread={onToggleUnread}
+                />
+              ))
+            )}
+          </div>
+          {showLoadMore ? (
+            <SessionLoadMore
+              containerRef={containerRef}
+              hasMore={hasMore}
+              isLoadingMore={isLoadingMore}
+              loadMoreError={loadMoreError}
+              onLoadMore={onLoadMore}
+            />
+          ) : null}
+        </>
       )}
     </div>
   );
@@ -915,6 +940,10 @@ export default function App() {
     sessionsError,
     sessionsLoading,
     hasLoadedSessions,
+    hasMore,
+    isLoadingMore,
+    loadMoreError,
+    loadMore,
     selectedAgent,
     selectedSessionId,
     refreshSessions,
@@ -981,6 +1010,10 @@ export default function App() {
             sessionsError={sessionsError}
             sessionsLoading={sessionsLoading}
             hasLoadedSessions={hasLoadedSessions}
+            hasMore={hasMore}
+            isLoadingMore={isLoadingMore}
+            loadMoreError={loadMoreError}
+            onLoadMore={loadMore}
             onRetry={refreshSessions}
             onSelect={selectSession}
             onNewChat={newChat}

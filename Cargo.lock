@@ -4785,6 +4785,7 @@ dependencies = [
  "ag-ui-core",
  "anyhow",
  "async-nats",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "clap",

@@ -1,4 +1,4 @@
-import type { Agent, AgentDetail, JsonRpcResponse, PromptResult, SessionRef } from './types';
+import type { Agent, AgentDetail, JsonRpcResponse, PaginatedSessions, PromptResult, SessionRef } from './types';
 import { fetchJsonWithRetry, observedFetch, PermanentError } from './httpClient';
 
 export const API_BASE = '/v1';
@@ -41,14 +41,51 @@ export async function listAgents(options?: { signal?: AbortSignal }): Promise<Ag
   }
 }
 
-export async function listSessions(agent: string, options?: { signal?: AbortSignal }): Promise<SessionRef[]> {
+export interface ListSessionsOptions {
+  signal?: AbortSignal;
+  limit?: number;
+  cursor?: string;
+}
+
+function appendQueryParam(
+  params: URLSearchParams,
+  key: string,
+  value: string | number | undefined,
+): void {
+  if (value !== undefined) {
+    params.set(key, String(value));
+  }
+}
+
+function buildSessionListQuery(options?: ListSessionsOptions): string {
+  if (!options) return '';
+  const params = new URLSearchParams();
+  appendQueryParam(params, 'limit', options.limit);
+  appendQueryParam(params, 'cursor', options.cursor);
+  const query = params.toString();
+  return query ? `?${query}` : '';
+}
+
+export async function listSessions(
+  agent: string,
+  options: ListSessionsOptions & ({ limit: number } | { cursor: string }),
+): Promise<PaginatedSessions>;
+export async function listSessions(
+  agent: string,
+  options?: ListSessionsOptions,
+): Promise<SessionRef[] | PaginatedSessions>;
+export async function listSessions(
+  agent: string,
+  options?: ListSessionsOptions,
+): Promise<SessionRef[] | PaginatedSessions> {
+  const query = buildSessionListQuery(options);
+  const url = `${API_BASE}/agents/${encodeURIComponent(agent)}/sessions${query}`;
   try {
-    const json = await fetchJsonWithRetry<SessionRef[]>(
-      `${API_BASE}/agents/${encodeURIComponent(agent)}/sessions`,
+    return await fetchJsonWithRetry<SessionRef[] | PaginatedSessions>(
+      url,
       undefined,
       options
     );
-    return json;
   } catch (err) {
     if (err instanceof PermanentError) {
       throw new Error(`Failed to list sessions for ${agent}: ${err.message}`);

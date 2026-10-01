@@ -116,9 +116,19 @@ A 502 Bad Gateway with an HTML error page must retry, not fail permanently as "m
 - Treats `-32002` as benign success (session already idle).
 - Uses a 15-second `AbortSignal.timeout` (`CANCELLATION_TIMEOUT_MS`), aligned with `GET_TIMEOUT_MS` to avoid spurious degradation on slow-but-valid responses.
 
-### Session Status is Event-Driven (issue #2116)
+### Session List Pagination and Refresh
 
-Sub-agent rows and foreground cancellation no longer poll `session/get` for control state.
+The session list (`useSessionDiscovery`) implements keyset pagination over the backend's `GET /v1/agents/:agent/sessions` endpoint. Key invariants:
+
+- **Explicit pagination state**: `hasLoadedExtraPagesRef` tracks whether pages beyond the first have been loaded. Refresh behavior differs based on this flag:
+  - When false, page-1 refresh adopts the server's `next_cursor` and drops stale items that fell off page 1 (except the `selectedSessionId` placeholder).
+  - When true, refresh merges page 1 into the multi-page list while keeping the tail cursor (a valid keyset position).
+- **Cursor version guard**: `loadMoreVersionRef` increments on each successful `loadMore`. A reconcile in flight when `loadMore` completes cannot clobber the advanced cursor.
+- **Deep-link placeholder handling**: An unhydrated `selectedSessionId` placeholder is excluded from cursor/presence checks, preserving it for hydration by subsequent pages.
+- **IntersectionObserver cascade prevention**: In `useSessionPaginationObserver` (`useSessionPagination.ts`, rendered via `SessionLoadMore` in `SessionPicker`), the observer effect depends on `[hasMore, containerRef, sentinelRef]` with stable refs. A `wasIntersectingRef` gate ensures `loadMore` triggers only on transitions into view (`isIntersecting && !wasIntersecting`), not on replayed observer callbacks after load completion.
+- **Synchronous loading guard**: `isLoadingMoreRef.current` is set synchronously at the beginning of `loadMore()` before any async tick, preventing same-tick duplicate triggers from concurrent sentinel intersections or manual button clicks.
+
+### Session Status is Event-Driven (issue #2116)
 Status derives from AG-UI run-lifecycle events (`RUN_STARTED`, `RUN_FINISHED`, `RUN_ERROR`,
 `turn_interrupted`, `hitl_pending_approval`). The SSE `/events` endpoint is a lossy wake-up
 channel only; authoritative status flows through the AG-UI run stream. If UI state appears stale,

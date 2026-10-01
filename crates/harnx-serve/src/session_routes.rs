@@ -27,10 +27,27 @@ pub(crate) enum SessionMetadataRoute {
     Extension(String),
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct SessionsRouteContext<'a> {
     pub(crate) target: &'a crate::session_actor::ResolvedAgentTarget,
     pub(crate) scoped: &'a harnx_runtime::config::GlobalConfig,
+    pub(crate) query: Option<&'a str>,
 }
+
+impl<'a> SessionsRouteContext<'a> {
+    pub(crate) fn new(
+        target: &'a crate::session_actor::ResolvedAgentTarget,
+        scoped: &'a harnx_runtime::config::GlobalConfig,
+        query: Option<&'a str>,
+    ) -> Self {
+        Self {
+            target,
+            scoped,
+            query,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct AgentSessionRef<'a> {
     pub(crate) agent: &'a str,
@@ -139,7 +156,13 @@ impl Server {
                 self.create_session_json(context.target, context.scoped)
                     .await
             }
-            AgentsRepresentation::Json => self.sessions_json(context.target).await,
+            AgentsRepresentation::Json => {
+                self.sessions_json(
+                    context.target,
+                    crate::session_pagination::parse_session_list_query(context.query)?,
+                )
+                .await
+            }
             AgentsRepresentation::Html
             | AgentsRepresentation::AgUiSse
             | AgentsRepresentation::AgUiRpc => bail!("Not Acceptable"),
@@ -823,5 +846,153 @@ mod tests {
             crate::status_from_error(&error),
             Some(StatusCode::NOT_FOUND)
         );
+    }
+
+    #[tokio::test]
+    async fn sessions_route_invalid_query_parameters_return_bad_request() {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let global = Arc::new(RwLock::new(sandbox.config()));
+        let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
+        let (target, scoped) = crate::resolve_agent_target(&server.config, "plain")
+            .await
+            .expect("resolve agent target");
+        let headers = HeaderMap::new();
+
+        let invalid_queries = [
+            "limit=0",
+            "limit=-1",
+            "limit=abc",
+            "limit=",
+            "cursor=",
+            "cursor=invalid-base64!",
+            "limit=10&limit=20",
+            "limit",
+        ];
+
+        for query in invalid_queries {
+            let err = server
+                .handle_sessions_route(
+                    &Method::GET,
+                    &headers,
+                    SessionsRouteContext {
+                        target: &target,
+                        scoped: &scoped,
+                        query: Some(query),
+                    },
+                )
+                .await
+                .expect_err(&format!("query '{query}' should fail with BAD_REQUEST"));
+
+            assert_eq!(
+                crate::finalize_err_status(StatusCode::OK, &err),
+                StatusCode::BAD_REQUEST,
+                "query '{query}' did not map to BAD_REQUEST: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_route_pagination_end_to_end_flow() {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        if !crate::test_support::ensure_test_nats().await {
+            return;
+        }
+        let agent = "paginated-agent";
+        sandbox.write_agent(agent, "You are a test agent.");
+        let config = sandbox.config();
+        seed_paginated_sessions(&config, agent).await;
+
+        let global = Arc::new(RwLock::new(config));
+        let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
+        let (target, scoped_agent) = crate::resolve_agent_target(&server.config, agent)
+            .await
+            .expect("resolve agent target");
+
+        let context = SessionsRouteContext {
+            target: &target,
+            scoped: &scoped_agent,
+            query: None,
+        };
+        let all = session_list_json(&server, context).await;
+        assert!(all.is_array(), "legacy response must be a plain array");
+        assert_eq!(all.as_array().unwrap().len(), 5);
+        let mut loaded = Vec::new();
+        let mut query = "limit=2".to_owned();
+        let mut sizes = Vec::new();
+        loop {
+            let page = session_list_json(
+                &server,
+                SessionsRouteContext {
+                    query: Some(&query),
+                    ..context
+                },
+            )
+            .await;
+            let sessions = page["sessions"].as_array().expect("page sessions");
+            sizes.push(sessions.len());
+            loaded.extend(sessions.iter().cloned());
+            let Some(cursor) = page["next_cursor"].as_str() else {
+                break;
+            };
+            query = format!("limit=2&cursor={cursor}");
+            assert!(sizes.len() <= 3, "cursor must advance");
+        }
+        assert_eq!(sizes, [2, 2, 1]);
+        assert_eq!(serde_json::Value::Array(loaded), all);
+    }
+
+    async fn seed_paginated_sessions(config: &Config, agent: &str) {
+        ensure_frontend_nats_owner(LOCAL_CLUSTER_KEY)
+            .await
+            .expect("local NATS owner");
+        let jetstream = config
+            .nats_jetstream(LOCAL_CLUSTER_KEY)
+            .await
+            .expect("jetstream");
+        let store =
+            harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+                .await
+                .expect("metadata bucket");
+
+        let mut scoped = config.clone();
+        scoped.use_agent_by_name(agent).expect("scoped agent");
+
+        // Create 5 sessions with distinct timestamps
+        let session_ids = ["sess-p1", "sess-p2", "sess-p3", "sess-p4", "sess-p5"];
+        for (index, id) in session_ids.into_iter().enumerate() {
+            let meta = harnx_runtime::nats_session_metadata::SessionMetadata::new(
+                id,
+                harnx_runtime::SessionInitializer::from_config(&scoped).expect("initializer"),
+            );
+            store.create(&meta).await.expect("create metadata");
+            let activity = harnx_runtime::nats_session_metadata::SessionActivity {
+                first_activation_at: None,
+                last_activity_at: chrono::DateTime::from_timestamp(1_700_000_000, index as u32)
+                    .unwrap(),
+            };
+            store
+                .kv_store()
+                .put(
+                    harnx_runtime::nats_session_metadata::activity_key(&meta.storage_key()),
+                    serde_json::to_vec(&activity).unwrap().into(),
+                )
+                .await
+                .expect("write activity");
+        }
+    }
+
+    async fn session_list_json(
+        server: &Server,
+        context: SessionsRouteContext<'_>,
+    ) -> serde_json::Value {
+        let response = server
+            .handle_sessions_route(&Method::GET, &HeaderMap::new(), context)
+            .await
+            .expect("session list response");
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
     }
 }

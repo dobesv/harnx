@@ -304,3 +304,139 @@ async fn get_read_state_is_reusable_for_single_session() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn bulk_list_joins_latest_values_and_skips_deleted_sessions() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    // Empty snapshots must finish without waiting for a new bucket write.
+    assert!(store.list().await?.is_empty());
+    seed_bulk_list_fixture(&store).await?;
+    // Observe the protocol so a fallback to serial lookups cannot make this
+    // pass while hiding a broken bulk consumer.
+    use futures_util::{FutureExt, StreamExt};
+    let mut requests = client.subscribe("$JS.API.>").await?;
+    client.flush().await?;
+    // Activity takes priority, then creation time and descending session ID.
+    let listed = store.list().await?;
+    client.flush().await?;
+    while let Some(Some(request)) = requests.next().now_or_never() {
+        assert!(
+            !request.subject.contains(".DIRECT.GET.")
+                && !request.subject.contains(".STREAM.MSG.GET."),
+            "unexpected point lookup: {}",
+            request.subject
+        );
+    }
+    assert_eq!(
+        listed
+            .iter()
+            .map(|s| s.metadata.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["c", "b", "a"]
+    );
+    assert!(listed[0].unread);
+    assert!(!listed[1].unread);
+    assert!(listed[2].unread);
+    assert_eq!(listed[1].metadata.agent.name(), Some("beta"));
+    assert!(listed[1].activity.is_none());
+    assert!(listed[2].activity.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn bulk_list_rejects_invalid_metadata_storage_key() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let metadata = SessionMetadata::new(
+        "valid-id",
+        SessionInitializer::named("alpha", Default::default()),
+    );
+    store
+        .kv_store()
+        .put(
+            harnx_runtime::nats_session_metadata::metadata_key("wrong-key"),
+            serde_json::to_vec(&metadata)?.into(),
+        )
+        .await?;
+    assert!(store.list().await.is_err());
+    Ok(())
+}
+
+async fn seed_bulk_list_fixture(store: &SessionMetadataStore) -> Result<()> {
+    let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 123).unwrap();
+    for (id, agent) in [
+        ("a", "alpha"),
+        ("b", "beta"),
+        ("c", "alpha"),
+        ("deleted", "alpha"),
+        ("purged", "beta"),
+    ] {
+        let mut metadata =
+            SessionMetadata::new(id, SessionInitializer::named(agent, Default::default()));
+        metadata.created_at = timestamp;
+        let revision = store.create(&metadata).await?.unwrap();
+        let key = metadata.storage_key();
+        let activity_key = harnx_runtime::nats_session_metadata::activity_key(&key);
+        store.kv_store().delete(&activity_key).await?;
+        match id {
+            "a" => {
+                store.bump_attention(&key, 42).await?;
+                store.mark_read(&key).await?;
+                store.mark_unread(&key).await?;
+            }
+            "b" => {
+                // Malformed optional records must not hide otherwise valid metadata.
+                store
+                    .kv_store()
+                    .put(&activity_key, "not json".into())
+                    .await?;
+                store
+                    .kv_store()
+                    .put(
+                        harnx_runtime::nats_session_metadata::read_cursor_key(&key, "default"),
+                        "not json".into(),
+                    )
+                    .await?;
+            }
+            "c" => {
+                let activity = harnx_runtime::nats_session_metadata::SessionActivity {
+                    first_activation_at: Some(timestamp),
+                    last_activity_at: timestamp + chrono::Duration::seconds(10),
+                };
+                store
+                    .kv_store()
+                    .put(&activity_key, serde_json::to_vec(&activity)?.into())
+                    .await?;
+                store.bump_attention(&key, 5).await?;
+            }
+            "deleted" => {
+                store
+                    .kv_store()
+                    .delete(harnx_runtime::nats_session_metadata::metadata_key(&key))
+                    .await?;
+            }
+            "purged" => {
+                store.purge_session_prefix(&key).await?;
+            }
+            _ => unreachable!(),
+        }
+        if id == "a" {
+            let listed = store.list().await?;
+            assert_eq!(listed[0].metadata_revision, revision);
+            assert!(listed[0].activity.is_none());
+            assert!(listed[0].unread);
+        }
+    }
+    Ok(())
+}
