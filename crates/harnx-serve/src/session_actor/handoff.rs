@@ -51,14 +51,20 @@ impl SessionActor {
                 return;
             }
         };
-        let target_key = SessionKey::new(target, target_session_id.clone());
+        let target_key = SessionKey::new(target.clone(), target_session_id.clone());
         if target_key == self.key {
             self.queue_self_handoff(prompt);
         } else if let Err(error) = self.send_handoff_prompt(&target_key, prompt).await {
             self.fail_handoff(done, error);
             return;
         }
-        self.commit_handoff(done, agent, target_session_id, handoff_tool_call_id);
+        // Use display_ref for the handoff event - this shows the agent name
+        // as the user would see it in the UI. When in cluster-client mode,
+        // agents on the default cluster are shown without @cluster suffix.
+        let display_agent = target.display_ref_with_default_cluster(
+            self.actor_config.base_config.default_cluster_for_display(),
+        );
+        self.commit_handoff(done, display_agent, target_session_id, handoff_tool_call_id);
     }
 
     async fn resolve_handoff_session_id(
@@ -87,7 +93,9 @@ impl SessionActor {
         match owner {
             Some(owner) if owner != target.agent() => bail!(
                 "handoff failed: session '{session_id}' belongs to agent '{owner}', not '{}'",
-                target.display_ref()
+                target.display_ref_with_default_cluster(
+                    self.actor_config.base_config.default_cluster_for_display()
+                )
             ),
             _ => Ok(session_id),
         }
@@ -194,5 +202,23 @@ mod tests {
         let error = error.to_string();
         assert!(error.contains("did not acknowledge the prompt"));
         assert!(error.contains("atlas/target-session"));
+    }
+
+    #[test]
+    fn display_ref_with_default_cluster_bare_for_default_cluster_target() {
+        // When the target is on the default cluster, display_ref_with_default_cluster
+        // returns bare agent name.
+        let target = ResolvedAgentTarget::new("atlas", "mycluster");
+        let display = target.display_ref_with_default_cluster(Some("mycluster"));
+        assert_eq!(display, "atlas");
+
+        // Non-default cluster keeps suffix
+        let other = ResolvedAgentTarget::new("atlas", "other-cluster");
+        let display = other.display_ref_with_default_cluster(Some("mycluster"));
+        assert_eq!(display, "atlas@other-cluster");
+
+        // No default cluster falls back to display_ref behavior
+        let display = target.display_ref_with_default_cluster(None);
+        assert_eq!(display, "atlas@mycluster");
     }
 }

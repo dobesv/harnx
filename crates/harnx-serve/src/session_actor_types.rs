@@ -40,6 +40,27 @@ impl ResolvedAgentTarget {
             format!("{}@{}", self.agent, self.cluster)
         }
     }
+
+    /// Return a display reference, omitting the cluster suffix when the agent
+    /// belongs to the given default cluster.
+    ///
+    /// In cluster-client mode (`HARNX_NATS_SERVER=<cluster>`), agents on that
+    /// cluster are displayed without the `@<cluster>` suffix because it's
+    /// implied. This matches the routing behavior where bare names resolve to
+    /// the default cluster via `normalize_agent_reference`.
+    ///
+    /// Local targets (`__local__`) are always shown bare, matching `display_ref()`.
+    pub fn display_ref_with_default_cluster(&self, default_cluster: Option<&str>) -> String {
+        // Local cluster always shows bare, matching display_ref()
+        if self.cluster == LOCAL_CLUSTER_KEY {
+            return self.agent.clone();
+        }
+        match default_cluster {
+            Some(default) if self.cluster == default => self.agent.clone(),
+            Some(_) => format!("{}@{}", self.agent, self.cluster),
+            None => self.display_ref(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -170,6 +191,38 @@ mod identity_tests {
             ResolvedAgentTarget::new("atlas", "shared").display_ref(),
             "atlas@shared"
         );
+    }
+
+    #[test]
+    fn display_ref_with_default_cluster_hides_suffix_for_default() {
+        // Agent on default cluster shows bare name
+        let target = ResolvedAgentTarget::new("atlas", "shared");
+        assert_eq!(
+            target.display_ref_with_default_cluster(Some("shared")),
+            "atlas"
+        );
+
+        // Agent on non-default cluster keeps suffix
+        let other = ResolvedAgentTarget::new("atlas", "other");
+        assert_eq!(
+            other.display_ref_with_default_cluster(Some("shared")),
+            "atlas@other"
+        );
+
+        // No default cluster (not in cluster-client mode) falls back to display_ref
+        assert_eq!(
+            target.display_ref_with_default_cluster(None),
+            "atlas@shared"
+        );
+        assert_eq!(other.display_ref_with_default_cluster(None), "atlas@other");
+
+        // Local cluster (__local__) always shows bare name, even with a default cluster
+        let local = ResolvedAgentTarget::local("atlas");
+        assert_eq!(
+            local.display_ref_with_default_cluster(Some("shared")),
+            "atlas"
+        );
+        assert_eq!(local.display_ref_with_default_cluster(None), "atlas");
     }
 
     #[test]

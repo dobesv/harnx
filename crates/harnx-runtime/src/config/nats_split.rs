@@ -251,6 +251,17 @@ impl Config {
         }
     }
 
+    /// Returns `Some(cluster)` when in cluster-client mode, `None` otherwise.
+    ///
+    /// Use for display normalization: agents on the default cluster are shown
+    /// without the `@<cluster>` suffix since it's implied by the routing.
+    pub fn default_cluster_for_display(&self) -> Option<&str> {
+        match &self.nats_routing {
+            NatsRouting::Cluster(cluster) => Some(cluster),
+            NatsRouting::Default | NatsRouting::FrontendLocal => None,
+        }
+    }
+
     /// Resolve one cluster's config, whether it's a reserved dynamic identity
     /// (`LOCAL_CLUSTER_KEY`) or a `nats_servers/<cluster_key>.yaml` entry.
     ///

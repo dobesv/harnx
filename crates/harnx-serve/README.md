@@ -14,6 +14,8 @@ harnx-serve supports remote `agent@cluster` agents via the same mechanism as CLI
 - `sisyphus@shared` → `/v1/agents/sisyphus%40shared`
 - Package-qualified remote: `coding/coder@shared` → `/v1/agents/coding%2Fcoder%40shared`
 
+**Cluster-client mode:** When `HARNX_NATS_SERVER=<cluster>` is set, the server connects as a client to that cluster. Agents on the default cluster are displayed without the `@cluster` suffix in the web UI (e.g., `sisyphus` instead of `sisyphus@shared`), since the cluster is implied by the routing. Agents on other clusters retain their suffix. This applies to agent listings, detail pages, and handoff events.
+
 A session targeting a remote agent runs its turns on a worker in that cluster. A server addressing only remote agents never starts a local broker or worker. Per-cluster JetStream namespaces isolate storage; session storage keys use only the bare agent name plus session ID. See [`docs/nats-ha.md`](../../docs/nats-ha.md) for the `agent@cluster` convention and catalog discovery.
 
 ## Installation
