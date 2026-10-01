@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.11 (2026-10-01)
+
+### Features
+
+- stop a model that streams the same text over and over (#2223)
+- return partial results from failed tool calls (#2245)
+- Bundled agents now list attachment_read in use_tools; orchestrators (atlas, sisyphus, daedalus), implementation specialists (apollo, athena, hephaestus, hermes, hestia, iris, peitho, plato), aristarchus, pytheas, zosimus, mnemosyne, and clio also get attachment_create. The coding package adds tool_servers/attachments.yaml and coder gets both tools.
+
+### Fixes
+
+- expose session-owned plan creation to planners (#2221)
+- send lossless tool schemas and use OpenAI strict mode (#2267)
+- Expose plan creation to Sisyphus and Daedalus, and guide them to use the returned session-owned plan URL.
+
 ## 0.4.10 (2026-09-30)
 
 ### Fixes

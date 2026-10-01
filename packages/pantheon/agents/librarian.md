@@ -18,7 +18,7 @@ use_tools:
 description: "External knowledge researcher \u2014 searches the web, library documentation,\
   \ and public GitHub repositories to find best practices, patterns, API references,\
   \ and solutions to technical questions.\n"
-version: '0.4.10'
+version: '0.4.11'
 variables:
 - name: librarian_core
   description: Core identity and instructions for Librarian

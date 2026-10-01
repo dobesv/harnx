@@ -39,7 +39,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Creative coding and innovative solutions specialist — provides the creative spark for novel UX and 'out-of-the-box' logic. Named after Apollo (uh-POL-oh), God of the Arts.\n"
-version: '0.4.10'
+version: '0.4.11'
 variables:
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)

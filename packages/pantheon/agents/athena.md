@@ -38,7 +38,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Complex multi-faceted strategy and execution specialist — commands the field when a high-effort task is too complex for a specialist. Named after Athena (uh-THEE-nuh), Goddess of Strategic Warfare.\n"
-version: '0.4.10'
+version: '0.4.11'
 variables:
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)

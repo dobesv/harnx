@@ -26,7 +26,7 @@ use_tools:
 - harnx_agent_session_history_read
 - attachments_attachment_read
 description: "Refactoring and completeness specialist — identifies missed simplification opportunities, partial fixes, incomplete implementations, and unaddressed edge cases. Named after Terpsichore (turp-SIK-uh-ree), the Muse of dance — ensuring code moves elegantly.\n"
-version: '0.4.10'
+version: '0.4.11'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.11 (2026-10-01)
+
+### Features
+
+- stop a model that streams the same text over and over (#2223)
+- return partial results from failed tool calls (#2245)
+- Stop a model that streams the same text over and over. When the answer or the reasoning ends in at least 2,000 characters of one repeated piece of text, harnx stops the response, retries once with a note telling the model what happened, then tries the next fallback model, and finally ends the turn with a `repetition` stop (`source` `answer` or `thinking`). Turn it off with `loop_detection.output`. `harnx dump session --check-loop-detection` now also reports repeated replies.
+- A tool call that does not succeed now returns what its tool had recorded so far under `partial_result`, whether it failed, lost its tool server, timed out, was interrupted or was replayed after a restart. Sub-agent calls use this to report their child session instead of appending a `SubAgentStarted` entry to the parent's transcript. That append re-read the whole parent transcript on every conflict between sibling sub-agents, which made sub-agent fan-out from long transcripts expensive. Interfaces learn about a running child from its progress snapshots, which now start as soon as the child is bound and name the parent's tool call. harnx-serve no longer emits the `sub_agent_started` AG-UI custom event, so third-party AG-UI clients that consumed it should use `sub_agent_progress` instead.
+- Serve NATS-backed `cid:` media and plan URLs from the Web UI server with safe download and cache headers, and open plan or text links in an in-app document viewer.
+
+### Fixes
+
+- expose session-owned plan creation to planners (#2221)
+- send lossless tool schemas and use OpenAI strict mode (#2267)
+- Compile each `use_tools` selector once per tool-selection pass instead of once for every selector and tool pair. Workers were rebuilding the same glob regexes on every model request and tool round, which took most of their CPU once many agents and tool servers were registered.
+- Fix TUI agent selection so bare default-cluster names and explicit remote names select remote agents instead of local or built-in agents. Reuse async assistant discovery for TUI and CLI listings.
+
+#### GPT models on the Responses API (`openai` and `codex` clients) no longer fill optional tool parameters with placeholder values such as `""` or `0`. Each tool is now sent in strict mode: every property is listed as required, and optional ones also accept `null`. harnx removes those `null`s before the tool runs. Strict mode needs a schema it can express, so a tool that takes a free-form map, such as `bash_exec`'s `env` or the fetch tools' `headers`, is sent with `strict: false` and its schema unchanged.
+
+Tool schemas now reach providers as the tool declared them. Before, harnx removed `null` from `type` lists and dropped `$ref`, `additionalProperties` and number bounds. That left `update_plan`'s `tasks` and `replace_in_content` with no visible fields. Local `$ref`s are inlined when a tool registers. Gemini now gets the full schema too, through `parametersJsonSchema` rather than the reduced subset `parameters` accepts.
+
+When any model sends `null` for an optional parameter whose schema does not allow it, the parameter is treated as omitted.
+
+The plans tools also accept placeholders when a model sends them anyway. A blank optional string, or `parent_issue: 0`, counts as omitted. `add_plan` no longer fails when a model sends both `body` and `content` with one of them empty. One consequence is that a blank string no longer clears a plan, task or note field. The `add_plan` schema now shows only `content` and the `update_plan` schema only `replace_content`. The synonyms `body` and `content` are still accepted.
+
 ## 0.34.10 (2026-09-30)
 
 ### Fixes
