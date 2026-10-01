@@ -1,6 +1,8 @@
-//! Replays a stored session's tool calls through the live guard, for
-//! `harnx dump session --check-loop-detection`.
+//! Replays a stored session through the live guards, for
+//! `harnx dump session --check-loop-detection`: its tool calls through the
+//! tool-call guard and its saved replies through the repeated-output rule.
 
+use super::output_repeat::{detect_in_text, OutputChannel, RepeatedTail};
 use super::tool_repeat::{strip_note, ToolRepeatGuard, ToolRepeatVerdict};
 use crate::message::MessageRole;
 use crate::session::{SessionLogEntry, ToolOutput};
@@ -39,12 +41,86 @@ pub struct LoopCheckEvent {
     pub count: usize,
 }
 
+/// A saved reply the live output guard would have stopped.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct OutputCheckEvent {
+    /// Log sequence of the entry holding the reply.
+    pub seq: u64,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub channel: OutputChannel,
+    /// The repeated unit, cut to 120 characters.
+    pub unit: String,
+    pub unit_len: usize,
+    /// Characters into the channel when the repeat was found.
+    pub at_char: usize,
+}
+
+impl OutputCheckEvent {
+    fn new(
+        seq: u64,
+        timestamp: Option<DateTime<Utc>>,
+        channel: OutputChannel,
+        tail: RepeatedTail,
+    ) -> Self {
+        Self {
+            seq,
+            timestamp,
+            channel,
+            unit_len: tail.unit.chars().count(),
+            unit: tail.unit.chars().take(120).collect(),
+            at_char: tail.at_char,
+        }
+    }
+}
+
+/// One reply's two channels.
+struct ReplyText<'a> {
+    answer: &'a str,
+    thinking: Option<&'a str>,
+}
+
+impl<'a> ReplyText<'a> {
+    /// The reply of a response that asked for tool calls. A thought saved
+    /// apart is the thinking as it is; without one, the text can still hold
+    /// the reasoning inline, as a saved message does.
+    fn of_tool_calls(text: &'a str, thought: Option<&'a str>) -> Self {
+        match thought {
+            Some(_) => Self {
+                answer: text,
+                thinking: thought,
+            },
+            None => Self::from_saved(text),
+        }
+    }
+
+    /// A saved reply keeps its reasoning inline as `<think>\n…\n</think>\n`
+    /// before the answer; split it back into the two channels.
+    fn from_saved(text: &'a str) -> Self {
+        let split = text
+            .strip_prefix("<think>\n")
+            .and_then(|rest| rest.split_once("\n</think>\n"));
+        match split {
+            Some((thinking, answer)) => Self {
+                answer,
+                thinking: Some(thinking),
+            },
+            None => Self {
+                answer: text,
+                thinking: None,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct LoopCheckReport {
     /// Every call in the log, including those after a stop that the replay
     /// did not decide.
     pub tool_calls: usize,
     pub events: Vec<LoopCheckEvent>,
+    /// Saved replies the output guard would have stopped. A stream the live
+    /// guard stopped was never saved, so it cannot appear here.
+    pub output_events: Vec<OutputCheckEvent>,
 }
 
 impl LoopCheckReport {
@@ -57,16 +133,17 @@ impl LoopCheckReport {
 
     pub fn render_text(&self) -> String {
         let mut out = String::new();
+        self.render_tool_events(&mut out);
+        self.render_output_events(&mut out);
+        self.render_summaries(&mut out);
+        self.render_limits(&mut out);
+        out
+    }
+
+    fn render_tool_events(&self, out: &mut String) {
         for event in &self.events {
-            let time = event
-                .timestamp
-                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let what = match event.kind {
-                LoopCheckEventKind::Note => "note",
-                LoopCheckEventKind::Refusal => "refused",
-                LoopCheckEventKind::Stop => "turn stopped",
-            };
+            let time = format_time(event.timestamp);
+            let what = kind_label(event.kind);
             let arguments: String = event.arguments.to_string().chars().take(120).collect();
             let _ = writeln!(
                 out,
@@ -74,6 +151,21 @@ impl LoopCheckReport {
                 event.seq, event.tool, event.count
             );
         }
+    }
+
+    fn render_output_events(&self, out: &mut String) {
+        for event in &self.output_events {
+            let time = format_time(event.timestamp);
+            let channel = channel_label(event.channel);
+            let _ = writeln!(
+                out,
+                "seq {} {time} repeated {channel}: {:?} (unit of {} chars, caught at char {})",
+                event.seq, event.unit, event.unit_len, event.at_char
+            );
+        }
+    }
+
+    fn render_summaries(&self, out: &mut String) {
         let _ = writeln!(
             out,
             "{} tool calls: {} notes, {} refusals, {} stops.",
@@ -82,12 +174,50 @@ impl LoopCheckReport {
             self.count(LoopCheckEventKind::Refusal),
             self.count(LoopCheckEventKind::Stop),
         );
+        let answers = self
+            .output_events
+            .iter()
+            .filter(|event| event.channel == OutputChannel::Answer)
+            .count();
+        let _ = writeln!(
+            out,
+            "{} repeated outputs ({answers} answer, {} thinking).",
+            self.output_events.len(),
+            self.output_events.len() - answers
+        );
+    }
+
+    fn render_limits(&self, out: &mut String) {
         out.push_str(
             "Replay limits: after a refusal the real session may have run the call and gone on, \
              so later events may differ from a live run; after a stop the replay skips to the \
-             next turn.\n",
+             next turn; a response stopped for repeating itself was never saved, so only saved \
+             replies are checked for repeated output.\n",
         );
-        out
+    }
+}
+
+/// Format a timestamp for text output.
+fn format_time(timestamp: Option<DateTime<Utc>>) -> String {
+    timestamp
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Label for a loop check event kind.
+fn kind_label(kind: LoopCheckEventKind) -> &'static str {
+    match kind {
+        LoopCheckEventKind::Note => "note",
+        LoopCheckEventKind::Refusal => "refused",
+        LoopCheckEventKind::Stop => "turn stopped",
+    }
+}
+
+/// Label for an output channel.
+fn channel_label(channel: OutputChannel) -> &'static str {
+    match channel {
+        OutputChannel::Answer => "answer",
+        OutputChannel::Thinking => "thinking",
     }
 }
 
@@ -144,9 +274,23 @@ impl Replay {
             | SessionLogEntry::Compress { .. }
             | SessionLogEntry::CompactRequest { .. }
             | SessionLogEntry::CompactResult { .. } => self.restart(),
+            SessionLogEntry::Message {
+                role: MessageRole::Assistant,
+                content,
+                timestamp,
+                ..
+            } => self.scan_reply(seq, *timestamp, ReplyText::from_saved(&content.to_text())),
             SessionLogEntry::ToolCalls {
-                calls, timestamp, ..
-            } => self.calls(seq, calls, *timestamp),
+                text,
+                thought,
+                calls,
+                timestamp,
+                ..
+            } => {
+                let reply = ReplyText::of_tool_calls(text, thought.as_deref());
+                self.scan_reply(seq, *timestamp, reply);
+                self.calls(seq, calls, *timestamp)
+            }
             SessionLogEntry::ToolResults { results, .. } => self.results(results),
             _ => {}
         }
@@ -239,12 +383,30 @@ impl Replay {
             count,
         });
     }
+
+    /// Check a saved reply's thinking and answer the way the live output
+    /// guard checks a stream. The rule keeps no state, so nothing resets.
+    fn scan_reply(&mut self, seq: u64, timestamp: Option<DateTime<Utc>>, reply: ReplyText<'_>) {
+        let channels = [
+            (OutputChannel::Thinking, reply.thinking.unwrap_or_default()),
+            (OutputChannel::Answer, reply.answer),
+        ];
+        for (channel, text) in channels {
+            if let Some(tail) = detect_in_text(text) {
+                self.report
+                    .output_events
+                    .push(OutputCheckEvent::new(seq, timestamp, channel, tail));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loop_guard::{append_note, RepeatNote, RepetitionStop, RepetitionTerminal};
+    use crate::loop_guard::{
+        append_note, OutputChannel, RepeatNote, RepetitionStop, RepetitionTerminal,
+    };
     use crate::message::{MessageContent, MessageRole};
     use crate::session::{CompactOutcome, SessionLogEntry, ToolOutput};
     use serde_json::json;
@@ -363,7 +525,8 @@ mod tests {
         assert!(text.ends_with(
             "Replay limits: after a refusal the real session may have run the call and gone on, \
              so later events may differ from a live run; after a stop the replay skips to the \
-             next turn.\n"
+             next turn; a response stopped for repeating itself was never saved, so only saved \
+             replies are checked for repeated output.\n"
         ));
     }
 
@@ -711,6 +874,7 @@ mod tests {
                 arguments: json!({"path": "x".repeat(500)}),
                 count: 2,
             }],
+            ..Default::default()
         };
         let shown: String = json!({"path": "x".repeat(500)})
             .to_string()
@@ -721,5 +885,119 @@ mod tests {
             report.render_text().lines().next(),
             Some(format!("seq 7 - note: fs_read {shown} (2 identical)").as_str())
         );
+    }
+
+    fn assistant(secs: i64, text: impl Into<String>) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::Text(text.into()),
+            timestamp: at(secs),
+            fence_token: None,
+        }
+    }
+
+    #[test]
+    fn a_repeating_answer_or_thinking_is_reported() {
+        let entries: Vec<(u64, SessionLogEntry)> = vec![
+            (0, user("go")),
+            (
+                1,
+                SessionLogEntry::ToolCalls {
+                    text: String::new(),
+                    thought: Some("Let me check. ".repeat(300)),
+                    calls: vec![],
+                    timestamp: at(1),
+                    fence_token: None,
+                },
+            ),
+            // A saved reply keeps its reasoning inline, before the answer.
+            (
+                2,
+                assistant(
+                    2,
+                    format!(
+                        "<think>\nPlanning.\n</think>\nStart. {}",
+                        "again ".repeat(600)
+                    ),
+                ),
+            ),
+            (3, assistant(3, "A normal final answer.")),
+            (
+                4,
+                assistant(
+                    4,
+                    format!("<think>\n{}\n</think>\nDone.", "hmm ".repeat(700)),
+                ),
+            ),
+        ];
+        let report = check_session(&entries);
+        let found: Vec<(u64, OutputChannel)> = report
+            .output_events
+            .iter()
+            .map(|event| (event.seq, event.channel))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (1, OutputChannel::Thinking),
+                (2, OutputChannel::Answer),
+                (4, OutputChannel::Thinking),
+            ]
+        );
+        assert_eq!(report.output_events[1].unit_len, 6);
+        assert_eq!(report.output_events[1].at_char, 2_048);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["output_events"][1]["channel"], "answer");
+        let text = report.render_text();
+        assert!(text.contains("seq 2 2027-01-15 08:00:02 repeated answer: "));
+        assert!(text.contains("3 repeated outputs (1 answer, 2 thinking)."));
+    }
+
+    #[test]
+    fn a_tool_call_reply_is_split_the_way_a_message_is() {
+        // Saved with no thought of its own, the reply keeps its reasoning
+        // inline, so the loop sits in the middle of the text, not at its end.
+        let inline = SessionLogEntry::ToolCalls {
+            text: format!("<think>\n{}\n</think>\nanswer", "hmm ".repeat(700)),
+            thought: None,
+            calls: vec![],
+            timestamp: at(1),
+            fence_token: None,
+        };
+        // A thought saved apart is the thinking as it is, and the text is the
+        // answer.
+        let apart = SessionLogEntry::ToolCalls {
+            text: "again ".repeat(600),
+            thought: Some("Planning.".into()),
+            calls: vec![],
+            timestamp: at(2),
+            fence_token: None,
+        };
+        let report = check_session(&[(0, user("go")), (1, inline), (2, apart)]);
+        let found: Vec<(u64, OutputChannel)> = report
+            .output_events
+            .iter()
+            .map(|event| (event.seq, event.channel))
+            .collect();
+        assert_eq!(
+            found,
+            [(1, OutputChannel::Thinking), (2, OutputChannel::Answer)]
+        );
+    }
+
+    #[test]
+    fn ordinary_replies_report_no_output_events() {
+        let varied: String = (0..300).map(|i| format!("line {i} is new\n")).collect();
+        let entries = vec![
+            (0, user("go")),
+            (1, assistant(1, "fine")),
+            (2, assistant(2, &varied)),
+        ];
+        let report = check_session(&entries);
+        assert!(report.output_events.is_empty());
+        assert!(report
+            .render_text()
+            .contains("0 repeated outputs (0 answer, 0 thinking)."));
     }
 }

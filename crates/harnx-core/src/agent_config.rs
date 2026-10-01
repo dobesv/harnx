@@ -982,7 +982,8 @@ You are a compaction agent.\n";
         assert_eq!(
             agent.loop_detection(),
             Some(&crate::config_data::LoopDetectionOverride {
-                tool_calls: Some(false)
+                tool_calls: Some(false),
+                output: None,
             })
         );
         assert_eq!(
@@ -1010,7 +1011,8 @@ You are a compaction agent.\n";
         assert_eq!(
             reparsed.loop_detection(),
             Some(&crate::config_data::LoopDetectionOverride {
-                tool_calls: Some(false)
+                tool_calls: Some(false),
+                output: None,
             })
         );
     }

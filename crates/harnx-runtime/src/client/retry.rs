@@ -108,6 +108,10 @@ fn record_llm_metrics(
 /// Iterates through the primary model and any fallbacks configured on the agent.
 /// For each model, retries up to `retry_config.attempts` times on retryable errors.
 /// On exhaustion or auth errors, sets a cooldown on the model and moves to the next.
+/// A reply whose output starts repeating is retried at once with a note rather
+/// than after a backoff, once per model per call. A model that repeats again
+/// is skipped without a cooldown, and if the last model repeated, the call
+/// fails with a `RepetitionStop`.
 pub async fn call_with_retry_and_fallback(
     input: &mut Input,
     config: &GlobalConfig,
@@ -237,9 +241,18 @@ mod tests {
     }
 
     fn provider_switch_input(config: &GlobalConfig) -> Input {
+        input_with_attempts(config, 1)
+    }
+
+    /// Claude with a Gemini fallback, each model tried `attempts` times
+    /// with no delay between tries.
+    fn input_with_attempts(config: &GlobalConfig, attempts: u32) -> Input {
+        let front_matter = format!(
+            "---\nretry:\n  attempts: {attempts}\n  initial_delay_ms: 0\n  max_delay_ms: 0\n---\ntest"
+        );
         let mut agent = harnx_core::agent_config::AgentConfig::from_markdown(
             "provider-switch-test",
-            "---\nretry:\n  attempts: 1\n  initial_delay_ms: 0\n  max_delay_ms: 0\n---\ntest",
+            &front_matter,
         )
         .unwrap();
         agent.set_model(Model::new("claude", "claude-sonnet"));
@@ -811,5 +824,322 @@ mod tests {
         assert_eq!(find_llm_error(&error).unwrap().status, 400);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(input.agent().model().client_name(), "claude");
+    }
+
+    /// One call through the production call path (`default_call_fn`) against
+    /// a mock that returns `turn`.
+    async fn call_once(turn: MockTurnBuilder, stream: bool, output_guard: bool) -> Result<String> {
+        let mock = Arc::new(MockClient::builder().add_turn(turn.build()).build());
+        let _guard = TestStateGuard::new(Some(mock)).await;
+        let config = make_config();
+        config.write().stream = stream;
+        config.write().loop_detection.output = output_guard;
+        let mut input = make_input(&config);
+        let client = crate::config::input::create_client(&input, &config).unwrap();
+        default_call_fn(&mut input, client.as_ref(), &config, create_abort_signal())
+            .await
+            .map(|(text, ..)| text)
+    }
+
+    #[tokio::test]
+    async fn a_repeating_response_fails_on_both_paths_unless_disabled() {
+        let looping = || MockTurnBuilder::new().add_text_chunk("again ".repeat(600));
+        for stream in [false, true] {
+            let err = call_once(looping(), stream, true)
+                .await
+                .expect_err("a repeating reply fails");
+            assert!(
+                harnx_core::loop_guard::find_repetitive_output(&err).is_some(),
+                "stream={stream}: {err:#}"
+            );
+            assert!(
+                call_once(looping(), stream, false).await.is_ok(),
+                "stream={stream}"
+            );
+            let normal = MockTurnBuilder::new().add_text_chunk("a normal reply");
+            assert!(
+                call_once(normal, stream, true).await.is_ok(),
+                "stream={stream}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeating_non_streamed_thought_is_caught_as_thinking() {
+        let turn = MockTurnBuilder::new().output(harnx_client::ChatCompletionsOutput {
+            text: "fine".into(),
+            thought: Some("hmm ".repeat(700)),
+            ..Default::default()
+        });
+        let err = call_once(turn, false, true)
+            .await
+            .expect_err("thinking loop");
+        let repeat = harnx_core::loop_guard::find_repetitive_output(&err).expect("a repeat");
+        assert_eq!(
+            repeat.channel,
+            harnx_core::loop_guard::OutputChannel::Thinking
+        );
+    }
+
+    type Calls = Arc<parking_lot::Mutex<Vec<(String, Option<String>)>>>;
+
+    fn single_model_input(config: &GlobalConfig) -> Input {
+        let mut input = provider_switch_input(config);
+        input.agent_mut().set_model_fallbacks(Vec::new());
+        input
+    }
+
+    /// How one call of a scripted model ends.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        Repeats,
+        Unavailable,
+        Fine,
+    }
+
+    fn scripted_result(reply: Reply) -> RetryResult {
+        match reply {
+            Reply::Repeats => Err(
+                anyhow::Error::new(harnx_core::loop_guard::RepetitiveOutput {
+                    channel: harnx_core::loop_guard::OutputChannel::Answer,
+                    unit: "again ".into(),
+                })
+                .context("Failed to call chat-completions api"),
+            ),
+            Reply::Unavailable => Err(LlmError {
+                status: 503,
+                message: "unavailable".to_string(),
+                retry_after: None,
+            }
+            .into()),
+            Reply::Fine => Ok((
+                "ok".to_string(),
+                None,
+                Vec::new(),
+                CompletionTokenUsage::default(),
+            )),
+        }
+    }
+
+    /// Run the engine's retry loop where `script(provider, call_index)`
+    /// decides how each call ends. Records the provider and the note each
+    /// call was sent with.
+    async fn run_scripted<S>(
+        input: &mut Input,
+        abort: AbortSignal,
+        script: S,
+    ) -> (RetryResult, Calls, TurnContext)
+    where
+        S: Fn(&str, usize) -> Reply + Copy + Send + Sync + 'static,
+    {
+        let ctx = provider_switch_context();
+        let calls: Calls = Arc::default();
+        let seen = calls.clone();
+        let result = harnx_engine::retry::call_with_retry_and_fallback_custom(
+            input,
+            &ctx,
+            abort,
+            move |input, client, _| {
+                let seen = seen.clone();
+                let provider = client.model().client_name().to_string();
+                let note = input.transient_note.clone();
+                Box::pin(async move {
+                    let index = seen.lock().len();
+                    seen.lock().push((provider.clone(), note));
+                    scripted_result(script(&provider, index))
+                })
+            },
+        )
+        .await;
+        (result, calls, ctx)
+    }
+
+    /// `run_scripted` for a model whose every call either repeats or
+    /// answers, as `repeats(provider, call_index)` says.
+    async fn run_repeating(
+        input: &mut Input,
+        abort: AbortSignal,
+        repeats: fn(&str, usize) -> bool,
+    ) -> (RetryResult, Calls, TurnContext) {
+        run_scripted(input, abort, move |provider, index| {
+            if repeats(provider, index) {
+                Reply::Repeats
+            } else {
+                Reply::Fine
+            }
+        })
+        .await
+    }
+
+    fn on_cooldown(ctx: &TurnContext, model_id: &str) -> bool {
+        ctx.model_cooldowns.lock().is_on_cooldown(model_id)
+    }
+
+    #[tokio::test]
+    async fn a_repeat_is_retried_once_with_a_note_on_the_same_model() {
+        let config = make_config();
+        let mut input = provider_switch_input(&config);
+        let (result, calls, ctx) =
+            run_repeating(&mut input, create_abort_signal(), |_, index| index == 0).await;
+        assert!(result.is_ok());
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], ("claude".to_string(), None));
+        assert_eq!(calls[1].0, "claude");
+        assert!(calls[1]
+            .1
+            .as_deref()
+            .unwrap()
+            .starts_with("[harnx] Your previous reply was stopped"));
+        assert_eq!(input.transient_note, None, "a success clears the note");
+        assert!(!on_cooldown(&ctx, "claude:claude-sonnet"));
+    }
+
+    #[tokio::test]
+    async fn a_second_repeat_moves_to_the_fallback_without_cooldown() {
+        let config = make_config();
+        let mut input = provider_switch_input(&config);
+        let (result, calls, ctx) =
+            run_repeating(&mut input, create_abort_signal(), |provider, _| {
+                provider == "claude"
+            })
+            .await;
+        assert!(result.is_ok());
+        let calls = calls.lock();
+        let providers: Vec<&str> = calls
+            .iter()
+            .map(|(provider, _)| provider.as_str())
+            .collect();
+        assert_eq!(providers, ["claude", "claude", "gemini"]);
+        assert!(calls[2].1.is_some(), "the fallback gets the note too");
+        assert!(!on_cooldown(&ctx, "claude:claude-sonnet"));
+    }
+
+    #[tokio::test]
+    async fn repeats_on_every_model_end_the_turn_with_a_repetition_stop() {
+        let config = make_config();
+        let mut input = provider_switch_input(&config);
+        let (result, calls, ctx) =
+            run_repeating(&mut input, create_abort_signal(), |_, _| true).await;
+        let err = result.expect_err("every model repeated");
+        let terminal =
+            harnx_core::loop_guard::parse_repetition_terminal(&format!("{err:#}")).unwrap();
+        assert_eq!(
+            terminal.source,
+            harnx_core::loop_guard::RepetitionSource::Answer
+        );
+        assert_eq!(
+            harnx_core::loop_guard::repetition_stop_sentence(&err).as_deref(),
+            Some("Stopped: the model's reply kept repeating the same text.")
+        );
+        assert_eq!(calls.lock().len(), 4, "two calls per model");
+        assert!(!on_cooldown(&ctx, "claude:claude-sonnet"));
+        assert!(!on_cooldown(&ctx, "gemini:gemini-2.5-pro"));
+    }
+
+    #[tokio::test]
+    async fn a_model_without_fallbacks_stops_after_its_one_retry() {
+        let config = make_config();
+        let mut input = single_model_input(&config);
+        let (result, calls, _) =
+            run_repeating(&mut input, create_abort_signal(), |_, _| true).await;
+        let err = result.expect_err("no model left");
+        assert!(harnx_core::loop_guard::repetition_stop_sentence(&err).is_some());
+        assert_eq!(calls.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_model_gets_the_note_retry_once_across_backoff_rounds() {
+        // The note retry fails with a retryable error, so the next round
+        // calls the model again. Its reply repeats once more, and that moves
+        // on to the fallback instead of earning a second note retry.
+        let config = make_config();
+        let mut input = input_with_attempts(&config, 2);
+        let script = |_: &str, index: usize| match index {
+            0 | 2 => Reply::Repeats,
+            1 => Reply::Unavailable,
+            _ => Reply::Fine,
+        };
+        let (result, calls, _) = run_scripted(&mut input, create_abort_signal(), script).await;
+        assert!(result.is_ok());
+        let calls = calls.lock();
+        let providers: Vec<&str> = calls
+            .iter()
+            .map(|(provider, _)| provider.as_str())
+            .collect();
+        assert_eq!(providers, ["claude", "claude", "claude", "gemini"]);
+        let noted: Vec<bool> = calls.iter().map(|(_, note)| note.is_some()).collect();
+        assert_eq!(noted, [false, true, true, true]);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_gets_no_retry() {
+        let config = make_config();
+        let mut input = single_model_input(&config);
+        let abort = create_abort_signal();
+        abort.set_ctrlc();
+        let (result, calls, _) = run_repeating(&mut input, abort, |_, _| true).await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock(), [("claude".to_string(), None)]);
+    }
+
+    #[tokio::test]
+    async fn a_note_left_by_a_failed_call_is_not_sent_by_the_next_call() {
+        let config = make_config();
+        let mut input = provider_switch_input(&config);
+        let (result, ..) = run_repeating(&mut input, create_abort_signal(), |_, _| true).await;
+        assert!(result.is_err());
+        assert!(
+            input.transient_note.is_some(),
+            "a call that failed on every model leaves its note on the input"
+        );
+
+        let (result, calls, _) =
+            run_repeating(&mut input, create_abort_signal(), |_, _| false).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            calls.lock()[0].1,
+            None,
+            "the next call starts without the note"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_retried_request_carries_the_note_on_both_paths() {
+        for stream in [false, true] {
+            let mock = Arc::new(
+                MockClient::builder()
+                    .add_turn(
+                        MockTurnBuilder::new()
+                            .add_text_chunk("again ".repeat(600))
+                            .build(),
+                    )
+                    .add_turn(MockTurnBuilder::new().add_text_chunk("fine").build())
+                    .build(),
+            );
+            let _guard = TestStateGuard::new(Some(mock.clone())).await;
+            let config = make_config();
+            config.write().stream = stream;
+            let mut input = make_input(&config);
+            let (text, ..) =
+                call_with_retry_and_fallback(&mut input, &config, create_abort_signal())
+                    .await
+                    .unwrap_or_else(|err| panic!("stream={stream}: {err:#}"));
+            assert_eq!(text, "fine", "stream={stream}");
+
+            let history = mock.conversation_history();
+            let last_messages: Vec<String> = history
+                .conversation_history
+                .iter()
+                .map(|request| request.messages.last().unwrap().content.to_text())
+                .collect();
+            assert_eq!(last_messages.len(), 2, "stream={stream}");
+            assert_eq!(last_messages[0], "hello", "stream={stream}");
+            assert!(
+                last_messages[1].starts_with("[harnx] Your previous reply was stopped"),
+                "stream={stream}: {}",
+                last_messages[1]
+            );
+        }
     }
 }

@@ -56,6 +56,14 @@ pub struct Input {
     /// not execution authority; reset for a new tool round or injected message.
     pub session_input_start: Option<usize>,
     pub preferred_assistant_message_id: Option<String>,
+    /// A harness note sent after everything else in a request. It belongs to
+    /// the retry layer, which sets it only when a reply was stopped for
+    /// repeating itself, to tell the model so. Every request of that call
+    /// (the retry, backoff retries and fallback models) carries it until one
+    /// succeeds. The retry layer clears it when a call starts, so a value set
+    /// beforehand is discarded, and again after a successful model call. It is
+    /// never persisted.
+    pub transient_note: Option<String>,
 }
 
 impl Input {
@@ -85,6 +93,7 @@ impl Input {
             skip_user_log_append: false,
             session_input_start: None,
             preferred_assistant_message_id: None,
+            transient_note: None,
         }
     }
 

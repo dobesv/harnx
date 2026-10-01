@@ -240,7 +240,8 @@ pub enum DumpSubcommands {
         #[arg(long)]
         follow: bool,
         /// Replay the session through harnx's loop protection and report
-        /// where it would have warned, refused a call, or ended the turn
+        /// where it would have warned, refused a call, or ended the turn, and
+        /// which replies the output guard would have stopped
         #[arg(long, conflicts_with = "follow")]
         check_loop_detection: bool,
     },

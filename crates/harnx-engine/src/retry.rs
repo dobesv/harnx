@@ -13,6 +13,7 @@ use harnx_core::api_types::CompletionTokenUsage;
 use harnx_core::error::LlmError;
 use harnx_core::event::{AgentEvent, TurnEvent};
 use harnx_core::input::Input;
+use harnx_core::loop_guard::{find_repetitive_output, RepetitionStop};
 use harnx_core::model::Model;
 use harnx_core::model::ModelType;
 use harnx_core::retry_config::{ModelCooldownMap, RetryConfig};
@@ -147,6 +148,10 @@ pub fn is_non_retryable_non_auth(err: &anyhow::Error) -> bool {
 /// Iterates through the primary model and any fallbacks configured on the agent.
 /// For each model, retries up to `retry_config.attempts` times on retryable errors.
 /// On exhaustion or auth errors, sets a cooldown on the model and moves to the next.
+/// A reply whose output starts repeating is retried at once with a note rather
+/// than after a backoff, once per model per call. A model that repeats again
+/// is skipped without a cooldown, and if the last model repeated, the call
+/// fails with a `RepetitionStop`.
 ///
 /// The `call_fn` closure is invoked for each attempt and receives the current
 /// `Input`, a reference to the resolved `Client`, and the `AbortSignal`. This
@@ -190,6 +195,9 @@ where
     // Tracks the last model we actually attempted (not just validated/skipped),
     // so we can emit `TurnEvent::ModelFallback` when switching to a new one.
     let mut prev_tried_model: Option<String> = None;
+
+    // A note belongs to one call; a failed call leaves it on the Input, which a regenerate reuses.
+    input.transient_note = None;
 
     for (idx, model_id) in model_ids.iter().enumerate() {
         // Skip models on cooldown
@@ -258,15 +266,7 @@ where
                     return Err(err);
                 }
 
-                let cooldown = compute_cooldown(&err, &ctx.clients, model_id);
-                ctx.model_cooldowns.lock().set_cooldown(model_id, cooldown);
-
-                ctx.warn(&format!(
-                    "Model '{}' exhausted retries (error: {:#}), cooldown {}s. Trying next fallback.",
-                    model_id,
-                    err,
-                    cooldown.as_secs()
-                ));
+                sideline_model(ctx, &err, model_id);
                 // Yield so the TUI event loop has a chance to process the
                 // warning message (emitted via the AgentEvent sink) before
                 // the final error event arrives through a separate channel.
@@ -280,7 +280,39 @@ where
         prev_tried_model = Some(model_id.clone());
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All models are on cooldown")))
+    Err(last_error
+        .map(stop_if_repetitive)
+        .unwrap_or_else(|| anyhow::anyhow!("All models are on cooldown")))
+}
+
+/// Take a model out of the rest of this call after it failed. A model that
+/// kept repeating gets no cooldown: the loop belongs to this request, and
+/// other turns should keep using the model.
+fn sideline_model(ctx: &TurnContext, err: &anyhow::Error, model_id: &str) {
+    if find_repetitive_output(err).is_some() {
+        ctx.warn(&format!(
+            "Model '{model_id}' kept repeating its output. Trying next fallback."
+        ));
+        return;
+    }
+    let cooldown = compute_cooldown(err, &ctx.clients, model_id);
+    ctx.model_cooldowns.lock().set_cooldown(model_id, cooldown);
+    ctx.warn(&format!(
+        "Model '{}' exhausted retries (error: {:#}), cooldown {}s. Trying next fallback.",
+        model_id,
+        err,
+        cooldown.as_secs()
+    ));
+}
+
+/// A call whose last model kept repeating ends the turn as a repetition
+/// stop, so parents and the CLI receive a `repetition` termination. The stop
+/// stays the innermost cause because the marker must end `{:#}`.
+fn stop_if_repetitive(err: anyhow::Error) -> anyhow::Error {
+    match find_repetitive_output(&err).map(|repeat| repeat.terminal()) {
+        Some(terminal) => anyhow::Error::new(RepetitionStop(terminal)).context(format!("{err:#}")),
+        None => err,
+    }
 }
 
 fn resolve_client(ctx: &TurnContext, model_id: &str) -> Result<Box<dyn Client>> {
@@ -308,6 +340,11 @@ fn handle_attempt_error(
     attempt: u32,
     attempts: u32,
 ) -> AttemptOutcome {
+    // Repeated even after the note: give up on this model at once and let
+    // the fallback loop decide what comes next.
+    if find_repetitive_output(err).is_some() {
+        return AttemptOutcome::BailImmediately;
+    }
     if let Some(llm_err) = find_llm_error(err) {
         if llm_err.is_auth_error() || !llm_err.is_retryable() {
             return AttemptOutcome::BailImmediately;
@@ -335,20 +372,31 @@ fn handle_attempt_error(
             }
         }
     } else {
-        // Untyped errors include both transport and response/protocol failures.
-        if attempt + 1 < attempts {
-            let delay = compute_backoff_delay(retry_config, attempt);
-            let msg = format!(
-                "Request error, attempt {}/{}. Retrying in {}ms: {:#}",
-                attempt + 1,
-                attempts,
-                delay.as_millis(),
-                err
-            );
-            AttemptOutcome::Sleep(delay, msg)
-        } else {
-            AttemptOutcome::ExitLoop
-        }
+        untyped_error_outcome(err, retry_config, attempt, attempts)
+    }
+}
+
+/// What to do after a failure that carries no `LlmError`. Untyped errors
+/// include both transport and response/protocol failures, so they get the
+/// ordinary backoff.
+fn untyped_error_outcome(
+    err: &anyhow::Error,
+    retry_config: &RetryConfig,
+    attempt: u32,
+    attempts: u32,
+) -> AttemptOutcome {
+    if attempt + 1 < attempts {
+        let delay = compute_backoff_delay(retry_config, attempt);
+        let msg = format!(
+            "Request error, attempt {}/{}. Retrying in {}ms: {:#}",
+            attempt + 1,
+            attempts,
+            delay.as_millis(),
+            err
+        );
+        AttemptOutcome::Sleep(delay, msg)
+    } else {
+        AttemptOutcome::ExitLoop
     }
 }
 
@@ -378,6 +426,62 @@ fn retry_delay_for_llm_error(
     }
 }
 
+type Completion = (String, Option<String>, Vec<ToolCall>, CompletionTokenUsage);
+
+/// What every attempt on one model needs.
+struct ModelCall<'c, F> {
+    client: &'c dyn Client,
+    ctx: &'c TurnContext,
+    abort_signal: &'c AbortSignal,
+    call_fn: &'c F,
+    /// Whether the model has had its retry with a note. It gets one per call,
+    /// not one per attempt, so a later repeat moves on to the next fallback.
+    note_retried: bool,
+}
+
+impl<F> ModelCall<'_, F>
+where
+    F: for<'a> Fn(&'a mut Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
+{
+    /// Call the model; if its output started repeating, call it once more at
+    /// once with a note saying so. A loop comes from the sampled
+    /// continuation, not the provider, so backoff would not help, and the
+    /// attempt budget is kept for real failures. That retry happens once per
+    /// model, however many attempts it gets: a repeat after it is returned
+    /// as the error. The note stays on `input` until a call succeeds, so a
+    /// fallback model gets it too.
+    async fn attempt(&mut self, input: &mut Input) -> Result<Completion> {
+        let result = match (self.call_fn)(input, self.client, self.abort_signal.clone()).await {
+            Err(err) => self.retry_repetition(input, err).await,
+            ok => ok,
+        };
+        if result.is_ok() {
+            input.transient_note = None;
+        }
+        result
+    }
+
+    async fn retry_repetition(
+        &mut self,
+        input: &mut Input,
+        err: anyhow::Error,
+    ) -> Result<Completion> {
+        let Some(repeat) = find_repetitive_output(&err) else {
+            return Err(err);
+        };
+        if self.note_retried || self.abort_signal.aborted() {
+            return Err(err);
+        }
+        self.note_retried = true;
+        input.transient_note = Some(repeat.retry_note());
+        self.ctx.warn(&format!(
+            "{err:#}. Retrying model '{}' once with a note.",
+            self.client.model().id()
+        ));
+        (self.call_fn)(input, self.client, self.abort_signal.clone()).await
+    }
+}
+
 /// Inner retry loop for a single model. Public for test-support use in
 /// harnx — harnx retains a thin test wrapper that builds a `TurnContext`
 /// from its `GlobalConfig` and calls this function.
@@ -395,9 +499,16 @@ where
     let mut last_error: Option<anyhow::Error> = None;
     // Ensure at least one attempt even if configured as 0
     let attempts = retry_config.attempts.max(1);
+    let mut call = ModelCall {
+        client,
+        ctx,
+        abort_signal: &abort_signal,
+        call_fn,
+        note_retried: false,
+    };
 
     for attempt in 0..attempts {
-        match call_fn(input, client, abort_signal.clone()).await {
+        match call.attempt(input).await {
             Ok(result) => return Ok(result),
             Err(err) => match handle_attempt_error(&err, retry_config, attempt, attempts) {
                 AttemptOutcome::BailImmediately => return Err(err),
@@ -440,6 +551,19 @@ mod tests {
         assert!(message.contains("content-type: text/html"));
         assert!(message.starts_with("Request error"));
         assert!(!message.contains("Network error"));
+    }
+
+    #[test]
+    fn a_repeating_reply_bails_at_once_instead_of_backing_off() {
+        let err = anyhow::Error::new(harnx_core::loop_guard::RepetitiveOutput {
+            channel: harnx_core::loop_guard::OutputChannel::Answer,
+            unit: "again ".into(),
+        })
+        .context("Failed to call chat-completions api");
+        assert!(matches!(
+            handle_attempt_error(&err, &RetryConfig::default(), 0, 3),
+            AttemptOutcome::BailImmediately
+        ));
     }
 
     #[test]

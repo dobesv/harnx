@@ -225,3 +225,66 @@ async fn aborted_codex_stream_does_not_require_completion() {
     .unwrap();
     assert!(handler.take().0.is_empty());
 }
+
+fn live_handler() -> (SseHandler, tokio::sync::mpsc::UnboundedReceiver<SseEvent>) {
+    // The receiver must stay alive: a failed send ends the stream too.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (SseHandler::new(tx, create_abort_signal()), rx)
+}
+
+/// Send `unit` until about `chars` characters have gone out, stopping at the
+/// first chunk the handler rejects.
+fn stream_repeatedly(
+    mut send: impl FnMut(&str) -> Result<()>,
+    unit: &str,
+    chars: usize,
+) -> Result<()> {
+    for _ in 0..chars.div_ceil(unit.chars().count()) {
+        send(unit)?;
+    }
+    Ok(())
+}
+
+/// Stream `unit` into one channel of a fresh handler until the guard stops
+/// it, and name the channel the guard blamed.
+fn stopped_channel(
+    send: impl Fn(&mut SseHandler, &str) -> Result<()>,
+    unit: &str,
+) -> harnx_core::loop_guard::OutputChannel {
+    let (mut handler, _rx) = live_handler();
+    let err = stream_repeatedly(|chunk| send(&mut handler, chunk), unit, 4_000)
+        .expect_err("the repeat stops the stream");
+    let repeat = harnx_core::loop_guard::find_repetitive_output(&err).expect("a repeat");
+    repeat.channel
+}
+
+#[test]
+fn a_repeating_answer_ends_the_stream() {
+    let channel = stopped_channel(SseHandler::text, "the ");
+    assert_eq!(channel, harnx_core::loop_guard::OutputChannel::Answer);
+}
+
+#[test]
+fn repeating_thinking_is_reported_as_thinking() {
+    let channel = stopped_channel(SseHandler::thought, "Let me check again. ");
+    assert_eq!(channel, harnx_core::loop_guard::OutputChannel::Thinking);
+}
+
+#[test]
+fn answer_and_thinking_are_counted_separately() {
+    // 1,200 characters of "the " on each channel: 2,400 together, but neither
+    // channel alone reaches the threshold.
+    let (mut handler, _rx) = live_handler();
+    for _ in 0..300 {
+        handler.thought("the ").unwrap();
+        handler.text("the ").unwrap();
+    }
+}
+
+#[test]
+fn a_disabled_guard_stops_nothing() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut handler = SseHandler::new(tx, create_abort_signal()).with_output_guard(false);
+    stream_repeatedly(|text| handler.text(text), "the ", 4_000).unwrap();
+    stream_repeatedly(|text| handler.thought(text), "the ", 4_000).unwrap();
+}

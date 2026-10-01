@@ -474,7 +474,7 @@ When a sub-agent invocation reaches a timeout or token budget limit:
 
 The parent agent can inspect `termination.kind` (`"timeout"`, `"budget_exceeded"` or `"repetition"`) and retry by sending a new message to the same `session_id`.
 
-A `"repetition"` termination does not come from a limit the parent passed. The sub-agent's loop protection (see [Loop Detection](configuration-guide.md#loop-detection)) ended its turn because the model kept making the same tool call with the same result. The result has the same envelope, and the sub-agent's progress row ends as `failed` rather than `done`. `termination` carries three more keys beside the others: `source` (`"tool_calls"`), `tool` (the name of the repeated tool) and `count` (how many identical calls with identical results had run within the 10-minute window).
+A `"repetition"` termination does not come from a limit the parent passed. The sub-agent's loop protection (see [Loop Detection](configuration-guide.md#loop-detection)) ended its turn because the model kept making the same tool call with the same result or kept repeating the same text in its answer or reasoning. The result has the same envelope, and the sub-agent's progress row ends as `failed` rather than `done`. `termination` carries up to three more keys beside the others: `source` (`"tool_calls"`, `"answer"` or `"thinking"`), and for `"tool_calls"` also `tool` (the name of the repeated tool) and `count` (how many identical calls with identical results had run within the 10-minute window).
 
 #### Design Guarantees & Limitations
 

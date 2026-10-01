@@ -1,14 +1,22 @@
 //! Loop protection shared by the runtime and the CLI.
 //!
-//! A model stuck in a repetition loop keeps requesting the same tool call
-//! while the harness pays for every round. The decision logic here is pure
-//! and takes its clock from the caller, so a live turn and a replay of a
-//! stored session reach the same verdicts.
+//! A model stuck in a repetition loop keeps requesting the same tool call, or
+//! keeps streaming the same text, while the harness pays for every round.
+//! `tool_repeat` judges tool calls and `output_repeat` judges a reply's answer
+//! and thinking. The decision logic here is pure and takes its clock from the
+//! caller, so a live turn and a replay of a stored session reach the same
+//! verdicts.
 
 mod digest;
+pub mod output_repeat;
 pub mod replay;
 pub mod tool_repeat;
 
+pub use output_repeat::{
+    check_output, detect_in_text, find_repetitive_output, OutputChannel, OutputRepeatDetector,
+    RepeatedTail, RepetitiveOutput, OUTPUT_REPEAT_MAX_UNIT, OUTPUT_REPEAT_MIN_COPIES,
+    OUTPUT_REPEAT_MIN_COVER,
+};
 pub use tool_repeat::{
     append_note, strip_note, Refusal, RepeatNote, ToolRepeatGuard, ToolRepeatVerdict,
     TOOL_REPEAT_LIMIT, TOOL_REPEAT_WINDOW,
@@ -25,6 +33,8 @@ const REPETITION_TERMINAL_PREFIX: &str = "harnx:repetition ";
 #[serde(rename_all = "snake_case")]
 pub enum RepetitionSource {
     ToolCalls,
+    Answer,
+    Thinking,
 }
 
 /// Machine-readable details of a repetition stop.
@@ -38,6 +48,14 @@ pub struct RepetitionTerminal {
 }
 
 impl RepetitionTerminal {
+    pub fn output(source: RepetitionSource) -> Self {
+        Self {
+            source,
+            tool: None,
+            count: None,
+        }
+    }
+
     pub fn tool_calls(tool: &str, count: usize) -> Self {
         Self {
             source: RepetitionSource::ToolCalls,
@@ -49,6 +67,12 @@ impl RepetitionTerminal {
     /// Why the turn stopped, as a clause.
     pub fn reason(&self) -> String {
         match self.source {
+            RepetitionSource::Answer => {
+                "the model's reply kept repeating the same text".to_string()
+            }
+            RepetitionSource::Thinking => {
+                "the model's reasoning kept repeating the same text".to_string()
+            }
             RepetitionSource::ToolCalls => format!(
                 "the model kept repeating the same `{}` call with identical arguments and results",
                 self.tool.as_deref().unwrap_or("tool")

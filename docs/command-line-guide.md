@@ -113,9 +113,10 @@ If `--final-only` is active, normal startup headers and progress lines are suppr
 
 A turn can also be stopped without either flag. When loop protection (see
 [Loop Detection](configuration-guide.md#loop-detection)) ends the turn because
-the model kept making the same tool call with the same result, the one-shot run
-reports it like a budget stop: the synthesized explanation on `stdout`, one
-JSON line on `stderr` with `kind` set to `"repetition"`, and exit code **2**.
+the model kept making the same tool call with the same result or kept
+repeating the same text, the one-shot run reports it like a budget stop: the
+synthesized explanation on `stdout`, one JSON line on `stderr` with `kind` set
+to `"repetition"`, and exit code **2**.
 
 ### Stderr JSON Interface
 
@@ -125,7 +126,7 @@ The single stderr JSON line provides a stable, machine-readable contract for dow
 {"kind":"timeout","session_id":"01948a3f-7b1c-7123-8901-abcdef123456","usage":{"input_uncached":120,"cache_write":0,"output":45,"budgeted":165},"thinking_excerpt":null,"retry_hint":"You can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions."}
 ```
 
-A repetition stop adds three keys after `retry_hint`:
+A repetition stop adds `source` after `retry_hint`, and for repeated tool calls `tool` and `count` as well:
 
 ```json
 {"kind":"repetition","session_id":"01948a3f-7b1c-7123-8901-abcdef123456","usage":{"input_uncached":120,"cache_write":0,"output":45,"budgeted":165},"thinking_excerpt":null,"retry_hint":"You can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions.","source":"tool_calls","tool":"fs_read","count":4}
@@ -141,7 +142,7 @@ Field reference:
   - `budgeted`: Budget metric: `(input_tokens - cached_tokens) + output_tokens`. Excludes prompt cache reads.
 - `thinking_excerpt`: String containing captured thinking text prior to cancellation, or `null` if none was captured.
 - `retry_hint`: Human-readable text explaining how to retry the session.
-- `source`, `tool`, `count`: Present only when `kind` is `"repetition"`. `source` is what kept repeating (`"tool_calls"`). `tool` is the name of the repeated tool, and `count` is how many identical calls with identical results had run within the 10-minute window when the turn was stopped.
+- `source`, `tool`, `count`: `source` is present only when `kind` is `"repetition"` and says what kept repeating: `"tool_calls"`, `"answer"` or `"thinking"`. `tool` and `count` appear only with `"tool_calls"`: `tool` is the name of the repeated tool, and `count` is how many identical calls with identical results had run within the 10-minute window when the turn was stopped.
 
 ### Execution & Limitation Details
 
@@ -255,8 +256,8 @@ Live tail with `--follow`:
 - Read-only observation: `--follow` observes the session stream and does not interrupt, cancel, or modify the running session or agent.
 
 Loop check with `--check-loop-detection`:
-- `--check-loop-detection`: Prints no transcript. Replays the session's tool calls through harnx's loop protection (see [Loop Detection](configuration-guide.md#loop-detection)) and reports each call that would have got a note, been refused, or ended the turn. Before comparing results, the replay removes the notes harnx added to them and ignores the results of calls harnx refused or stopped, so it works on a session recorded with loop protection on as well as one recorded without it. The replay starts counting again at each user message, compaction and turn end, the points where the live guard starts over.
-- `--format text` (default): One line per event: the log sequence number of the entry that requested the call, the time in UTC, what happened (`note`, `refused` or `turn stopped`), the tool, its arguments cut to 120 characters, and how many identical calls the guard counted. A summary line follows, then the first two limits below.
+- `--check-loop-detection`: Prints no transcript. Replays the session's tool calls through harnx's loop protection (see [Loop Detection](configuration-guide.md#loop-detection)) and reports each call that would have got a note, been refused, or ended the turn. Before comparing results, the replay removes the notes harnx added to them and ignores the results of calls harnx refused or stopped, so it works on a session recorded with loop protection on as well as one recorded without it. The replay starts counting again at each user message, compaction and turn end, the points where the live guard starts over. It also checks each saved reply's answer and reasoning against the [repeated-output rule](configuration-guide.md#repeated-output) and reports each reply the rule would have stopped.
+- `--format text` (default): One line per event: the log sequence number of the entry that requested the call, the time in UTC (`-` when the log has none), what happened (`note`, `refused` or `turn stopped`), the tool, its arguments cut to 120 characters, and how many identical calls the guard counted. Each reply the repeated-output rule would have stopped gets a line too, with the sequence number and time of the entry that holds the reply, then the channel, the repeated text cut to 120 characters, its length, and the character at which the repeat was found. Two summary lines follow, then the first three limits below.
 
   ```
   ...
@@ -265,16 +266,20 @@ Loop check with `--check-loop-detection`:
   seq 164 2026-09-30 04:38:38 note: fs_read {"offset":140,"limit":30,"path":"crates/harnx-tui/src/subagent_sessions.rs"} (3 identical)
   seq 166 2026-09-30 04:38:40 refused: fs_read {"offset":70,"path":"crates/harnx-tui/src/subagent_sessions.rs","limit":70} (4 identical)
   seq 168 2026-09-30 04:38:42 turn stopped: fs_read {"path":"crates/harnx-tui/src/subagent_sessions.rs","offset":70,"limit":70} (4 identical)
+  seq 171 2026-09-30 04:39:02 repeated answer: "the " (unit of 4 chars, caught at char 2048)
   683 tool calls: 14 notes, 2 refusals, 1 stops.
-  Replay limits: after a refusal the real session may have run the call and gone on, so later events may differ from a live run; after a stop the replay skips to the next turn.
+  1 repeated outputs (1 answer, 0 thinking).
+  Replay limits: after a refusal the real session may have run the call and gone on, so later events may differ from a live run; after a stop the replay skips to the next turn; a response stopped for repeating itself was never saved, so only saved replies are checked for repeated output.
   ```
 
-- `--format json`: Prints one JSON object, not JSONL: `{"tool_calls": <n>, "events": [...]}`. Each event has `seq`, `timestamp` (`null` when the log has no time for the call), `kind` (`"note"`, `"refusal"` or `"stop"`), `tool`, `arguments` and `count`. `tool_calls` counts every call in the log, including the calls after a stop that the replay did not decide.
+- `--format json`: Prints one JSON object, not JSONL: `{"tool_calls": <n>, "events": [...], "output_events": [...]}`. Each event has `seq`, `timestamp` (`null` when the log has no time for the call), `kind` (`"note"`, `"refusal"` or `"stop"`), `tool`, `arguments` and `count`. Each output event has `seq`, `timestamp` (`null` when the log has no time for the reply), `channel` (`"answer"` or `"thinking"`), `unit` (the repeated text, cut to 120 characters), `unit_len` and `at_char`. `tool_calls` counts every call in the log, including the calls after a stop that the replay did not decide.
 - `--format yaml` and `--follow` are rejected with this flag.
 
-Limits of the replay, in both formats (the text output prints the first two; the JSON output states none of them):
+Limits of the replay, in both formats (the text output prints the first three; the JSON output states none of them):
 - In a session recorded without loop protection, a refusal in the replay did not happen in the real session. The call ran, the model saw its real result and carried on, so events after a refusal can differ from what a live run would have produced.
 - After a stop, the replay does not decide the rest of that turn's calls. It picks up again at the next turn.
+- A response the output guard stopped was never saved, so the output check sees only saved replies. It finds repeated replies in sessions recorded before the output guard existed or with it turned off.
+- With clients that stream reasoning inline in `<think>` tags, such as `openai-compatible` and `llama-server`, the live guard sees a reasoning loop as a repeating answer and reports it as `answer`. The replay splits the saved `<think>` block out of the reply, so it reports the same loop as `thinking`.
 - The rules apply whatever `loop_detection` was set to when the session ran.
 
 ### `harnx dump attachment <url> [--output <path>]`
