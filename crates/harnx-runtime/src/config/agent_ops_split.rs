@@ -123,7 +123,22 @@ impl Config {
         Ok(agent)
     }
 
+    fn remote_agent_target(&self, name: &str) -> Option<(String, String)> {
+        match AgentRef::parse(name) {
+            AgentRef::Remote { agent, cluster } => Some((agent.into_owned(), cluster.into_owned())),
+            AgentRef::Local(agent) => self
+                .default_cluster_for_display()
+                .map(|cluster| (agent.into_owned(), cluster.to_string())),
+        }
+    }
+
     pub fn use_agent_by_name(&mut self, name: &str) -> Result<()> {
+        if let Some((agent, cluster)) = self.remote_agent_target(name) {
+            self.nats_server(&cluster)
+                .map_err(|e| anyhow::anyhow!("remote agent validation failed: {e}"))?;
+            self.set_remote_agent(agent, cluster);
+            return Ok(());
+        }
         let mut agent = self.retrieve_agent(name)?;
         // Mirror the async `use_agent` flow: `init()` resolves file-backed
         // variable defaults (the `path:` field) before the agent becomes
@@ -266,39 +281,18 @@ impl Config {
         session_name: Option<&str>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
-        match AgentRef::parse(agent_name) {
-            AgentRef::Local(agent_name) => {
-                let default_cluster = {
-                    let config = config.read();
-                    match &config.nats_routing {
-                        NatsRouting::Default | NatsRouting::FrontendLocal => None,
-                        NatsRouting::Cluster(cluster) => Some(cluster.clone()),
-                    }
-                };
-                if let Some(cluster) = default_cluster {
-                    Self::use_remote_agent(UseRemoteAgentParams {
-                        config,
-                        agent: &agent_name,
-                        cluster: &cluster,
-                        session_name,
-                        _abort_signal: abort_signal,
-                    })
-                    .await
-                } else {
-                    Self::use_local_agent(config, agent_name.as_ref(), session_name, abort_signal)
-                        .await
-                }
-            }
-            AgentRef::Remote { agent, cluster } => {
-                Self::use_remote_agent(UseRemoteAgentParams {
-                    config,
-                    agent: &agent,
-                    cluster: &cluster,
-                    session_name,
-                    _abort_signal: abort_signal,
-                })
-                .await
-            }
+        let remote_target = config.read().remote_agent_target(agent_name);
+        if let Some((agent, cluster)) = remote_target {
+            Self::use_remote_agent(UseRemoteAgentParams {
+                config,
+                agent: &agent,
+                cluster: &cluster,
+                session_name,
+                _abort_signal: abort_signal,
+            })
+            .await
+        } else {
+            Self::use_local_agent(config, agent_name, session_name, abort_signal).await
         }
     }
 

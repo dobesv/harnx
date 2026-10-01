@@ -8,8 +8,8 @@ use crossterm::ExecutableCommand;
 use harnx_core::event::{AgentEvent, AgentSource, SessionEvent};
 use harnx_render::pretty_error_string;
 use harnx_runtime::config::{
-    dump_entries_jsonl, dump_entries_yaml, list_assistant_agents, load_session_for_render,
-    render_metadata_json, render_metadata_yaml, SessionFormat, SessionInspectionCommand,
+    dump_entries_jsonl, dump_entries_yaml, load_session_for_render, render_metadata_json,
+    render_metadata_yaml, SessionFormat, SessionInspectionCommand,
 };
 use harnx_runtime::nats_session_log::NatsSessionLog;
 use harnx_runtime::nats_session_metadata::SessionMetadataStore;
@@ -1816,10 +1816,11 @@ impl Tui {
                 );
             }
 
-            // Fetch agents async outside the config lock to avoid holding a
-            // parking_lot read guard across an await point.
+            // Fetch agents for completion using display names.
+            // In cluster-client mode, this omits local/package agents and
+            // strips default-cluster suffix.
             let precomputed_agents = if matches!(cmd, ".agent" | ".session") && args.len() == 1 {
-                list_assistant_agents().await
+                Self::assistant_agents_for_display(&self.config).await
             } else {
                 Vec::new()
             };
@@ -1833,9 +1834,10 @@ impl Tui {
         vec![]
     }
 
-    async fn open_agent_picker(&mut self) {
+    pub(crate) async fn open_agent_picker(&mut self) {
+        let agents = Self::assistant_agents_for_display(&self.config).await;
         self.app.modal = Some(crate::types::ModalState::AgentPicker {
-            agents: list_assistant_agents().await,
+            agents,
             selected: 0,
             query: String::new(),
         });
@@ -2577,14 +2579,7 @@ impl Tui {
                 }
 
                 if should_show_agent_picker {
-                    // Replace the SessionPicker with a fresh AgentPicker so the user can
-                    // pick a different agent (or the same one again).
-                    let agents = harnx_runtime::config::list_assistant_agents().await;
-                    self.app.modal = Some(crate::types::ModalState::AgentPicker {
-                        agents,
-                        selected: 0,
-                        query: String::new(),
-                    });
+                    self.open_agent_picker().await;
                 } else if should_restore_origin {
                     self.restore_picker_origin().await;
                 }

@@ -78,7 +78,7 @@ pub use self::session_format::{
 pub use self::agent::TEMP_AGENT_NAME;
 pub use self::agent::{
     apply_package_agent_transforms, complete_agent_variables, list_agents, list_assistant_agents,
-    render_agent_dump, Agent, AgentConfig, AgentVariables,
+    list_assistant_agents_for_display, render_agent_dump, Agent, AgentConfig, AgentVariables,
 };
 pub(crate) use self::attachments::attachment_marker;
 pub use self::attachments::{write_attachment, Base64Encoder};

@@ -24,8 +24,8 @@ use crate::cli::{
 };
 use crate::client::{list_models, ModelType};
 use crate::config::{
-    list_agents, list_assistant_agents, load_env_file, macro_execute, render_agent_dump, Config,
-    GlobalConfig, Input, WorkingMode,
+    list_agents, load_env_file, macro_execute, render_agent_dump, Config, GlobalConfig, Input,
+    WorkingMode,
 };
 use crate::tui::{TranscriptItem, Tui};
 use harnx_core::agent_config::collect_agent_variables;
@@ -752,7 +752,11 @@ async fn handle_sync_or_list_commands(
         return Ok(true);
     }
     if cli.list_assistant_agents {
-        println!("{}", list_assistant_agents().await.join("\n"));
+        // Use display names for CLI output; in cluster-client mode, this omits
+        // local/package agents and strips default-cluster suffix.
+        let discovery = harnx_runtime::config::list_assistant_agents_for_display(&config.read());
+        let agents = discovery.await;
+        println!("{}", agents.join("\n"));
         return Ok(true);
     }
     if cli.list_rags {
