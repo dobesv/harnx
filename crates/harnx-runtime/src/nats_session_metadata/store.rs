@@ -7,6 +7,7 @@ mod activity;
 mod extension_validation;
 mod extensions;
 mod keys;
+mod listing;
 mod lookup;
 mod mutation;
 mod read_state;
@@ -130,7 +131,22 @@ impl SessionMetadataStore {
         }
     }
 
+    /// List all sessions in the bucket with their activity and read state.
+    ///
+    /// Uses a single-pass ordered consumer (LastPerSubject) over the KV stream,
+    /// replacing N×3 serial point lookups. Falls back to `list_by_keys` on
+    /// transport or consumer creation failure, preserving the legacy behavior.
     pub async fn list(&self) -> Result<Vec<ListedSession>> {
+        match self.bulk_entries().await {
+            Ok(entries) => listing::join_entries(entries),
+            Err(error) => {
+                log::warn!("could not bulk read session metadata; falling back to key lookups: bucket={} error={error:#}", SESSION_METADATA_BUCKET);
+                self.list_by_keys().await
+            }
+        }
+    }
+
+    async fn list_by_keys(&self) -> Result<Vec<ListedSession>> {
         let mut keys = self.store.keys().await.map_err(anyhow::Error::from)?;
         let mut sessions = Vec::new();
         while let Some(key) = keys.next().await {

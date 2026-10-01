@@ -19,6 +19,7 @@ mod nats_access;
 mod serve_shutdown;
 pub mod session_actor;
 mod session_actor_types;
+pub(crate) mod session_pagination;
 pub mod session_routes;
 
 pub use serve_shutdown::StreamDrainConfig;
@@ -813,10 +814,7 @@ impl Server {
                 self.handle_sessions_route(
                     &method,
                     req.headers(),
-                    SessionsRouteContext {
-                        target: &target,
-                        scoped: &scoped,
-                    },
+                    SessionsRouteContext::new(&target, &scoped, req.uri().query()),
                 )
                 .await
             }
@@ -893,10 +891,22 @@ impl Server {
         json_response(data)
     }
 
-    async fn sessions_json(&self, target: &ResolvedAgentTarget) -> Result<AppResponse> {
-        json_response(Value::Array(
-            agent_sessions_json(&self.config, target).await?,
-        ))
+    async fn sessions_json(
+        &self,
+        target: &ResolvedAgentTarget,
+        params: Option<session_pagination::SessionPaginationQuery>,
+    ) -> Result<AppResponse> {
+        let params = match params {
+            Some(params) => params,
+            None => {
+                return json_response(Value::Array(
+                    agent_sessions_json(&self.config, target).await?,
+                ));
+            }
+        };
+        let sessions = list_target_sessions(&self.config, target).await?;
+        let data = session_pagination::paginate_sessions(&sessions, &params)?;
+        json_response(data)
     }
 
     async fn get_session_attachment<B>(&self, req: hyper::Request<B>) -> Result<AppResponse> {
@@ -1290,7 +1300,7 @@ fn set_cors_header(res: &mut AppResponse) {
     );
 }
 
-const ERROR_STATUS_MARKER: &str = "::__status=";
+pub(crate) const ERROR_STATUS_MARKER: &str = "::__status=";
 
 fn ret_err<T: std::fmt::Display>(err: T) -> AppResponse {
     let error = err.to_string();
@@ -1312,7 +1322,7 @@ fn public_error_message(message: &str) -> &str {
         .split_once(ERROR_STATUS_MARKER)
         .map_or(message, |(public, _)| public)
 }
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     let mut bytes = Vec::with_capacity(input.len());
     let mut iter = input.bytes();
     while let Some(b) = iter.next() {
@@ -1546,7 +1556,7 @@ fn accept_header_allows_event_stream(value: &str) -> bool {
 /// work surfaces at the top. Sessions without a modified time sort last; ties
 /// (equal or both-missing modified) fall back to id (descending) for stable,
 /// deterministic ordering.
-fn session_recency_ordering(
+pub(crate) fn session_recency_ordering(
     left: &harnx_runtime::config::SessionMeta,
     right: &harnx_runtime::config::SessionMeta,
 ) -> std::cmp::Ordering {
@@ -1575,7 +1585,10 @@ pub(crate) fn session_repository_and_branch(
     )
 }
 
-async fn agent_sessions_json(config: &Config, target: &ResolvedAgentTarget) -> Result<Vec<Value>> {
+pub(crate) async fn list_target_sessions(
+    config: &Config,
+    target: &ResolvedAgentTarget,
+) -> Result<Vec<harnx_runtime::config::SessionMeta>> {
     ensure_frontend_nats_owner(target.cluster()).await?;
     let mut sessions: Vec<_> = config
         .list_remote_sessions_with_meta(target.cluster())
@@ -1588,42 +1601,49 @@ async fn agent_sessions_json(config: &Config, target: &ResolvedAgentTarget) -> R
         .collect();
 
     sessions.sort_by(session_recency_ordering);
+    Ok(sessions)
+}
 
-    Ok(sessions
-        .into_iter()
-        .map(|session| {
-            let session_id = session.session_id.unwrap_or(session.id);
-            let mut value = serde_json::Map::from_iter([(
-                String::from("session_id"),
-                Value::String(session_id),
-            )]);
-            value.insert(
-                String::from("title"),
-                session.title.map(Value::String).unwrap_or(Value::Null),
-            );
-            if let Some(modified) = session.modified {
-                value.insert(
-                    String::from("updated_at"),
-                    Value::String(format_system_time(modified)),
-                );
-            }
-            value.insert(String::from("unread"), Value::Bool(session.unread));
+pub(crate) fn format_session_summary(session: &harnx_runtime::config::SessionMeta) -> Value {
+    let session_id = session.session_id.as_deref().unwrap_or(&session.id);
+    let mut value = serde_json::Map::from_iter([(
+        String::from("session_id"),
+        Value::String(session_id.to_string()),
+    )]);
+    value.insert(
+        String::from("title"),
+        session
+            .title
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    if let Some(modified) = session.modified {
+        value.insert(
+            String::from("updated_at"),
+            Value::String(format_system_time(modified)),
+        );
+    }
+    value.insert(String::from("unread"), Value::Bool(session.unread));
 
-            // Derive repository and branch from contexts, mirroring TUI picker_label logic:
-            // pick the first context with repo or branch, then take each field independently.
-            let (repository, branch) = session_repository_and_branch(&session.contexts);
-            value.insert(
-                String::from("repository"),
-                repository.map(Value::String).unwrap_or(Value::Null),
-            );
-            value.insert(
-                String::from("branch"),
-                branch.map(Value::String).unwrap_or(Value::Null),
-            );
+    // Derive repository and branch from contexts, mirroring TUI picker_label logic:
+    // pick the first context with repo or branch, then take each field independently.
+    let (repository, branch) = session_repository_and_branch(&session.contexts);
+    value.insert(
+        String::from("repository"),
+        repository.map(Value::String).unwrap_or(Value::Null),
+    );
+    value.insert(
+        String::from("branch"),
+        branch.map(Value::String).unwrap_or(Value::Null),
+    );
 
-            Value::Object(value)
-        })
-        .collect())
+    Value::Object(value)
+}
+
+async fn agent_sessions_json(config: &Config, target: &ResolvedAgentTarget) -> Result<Vec<Value>> {
+    let sessions = list_target_sessions(config, target).await?;
+    Ok(sessions.iter().map(format_session_summary).collect())
 }
 
 /// Load session history from NATS durable log.

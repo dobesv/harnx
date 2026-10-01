@@ -29,6 +29,11 @@ export interface AgentDetail {
   sessions: SessionRef[];
 }
 
+export interface PaginatedSessions {
+  sessions: SessionRef[];
+  next_cursor: string | null;
+}
+
 export interface JsonRpcResponse<T = unknown> {
   jsonrpc: string;
   id: number | string;

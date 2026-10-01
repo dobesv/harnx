@@ -183,6 +183,86 @@ body {
   background: var(--accent-border);
 }
 
+.session-load-more {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 1.5rem 0;
+  margin-top: 1rem;
+}
+
+.load-more-btn {
+  padding: 0.6rem 1.25rem;
+  min-height: 40px;
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text-h);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 8px);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.load-more-btn:hover:not(:disabled):not([aria-disabled="true"]) {
+  border-color: var(--accent);
+  background: var(--surface-hover, var(--surface));
+}
+
+.load-more-btn:disabled,
+.load-more-btn[aria-disabled="true"] {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.load-more-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.load-more-error {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.load-more-retry-btn,
+.load-more-error button,
+.aui-error button {
+  padding: 0.4rem 0.85rem;
+  min-height: 36px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-h);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 6px);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.load-more-retry-btn:hover:not(:disabled),
+.load-more-error button:hover:not(:disabled),
+.aui-error button:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--surface-hover, var(--surface));
+}
+
+.load-more-retry-btn:disabled,
+.load-more-error button:disabled,
+.aui-error button:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.load-more-retry-btn:focus-visible,
+.load-more-error button:focus-visible,
+.aui-error button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .back-button {
   background: none;
   border: none;

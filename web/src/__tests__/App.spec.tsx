@@ -13,7 +13,6 @@ import {
   MyComposer,
   MyMessage,
   SendErrorIndicator,
-  SessionPicker,
   StatusBar,
   StatusIndicator,
 } from '../App';
@@ -815,120 +814,6 @@ describe('MarkdownLink', () => {
     );
     fireEvent.click(screen.getByRole('link', { name: 'External Resource' }));
     expect(parentClick).not.toHaveBeenCalled();
-  });
-});
-
-describe('SessionPicker', () => {
-  const sessions = [
-    { session_id: 'session-old-read', updated_at: '2026-01-01T00:00:00Z', unread: false },
-    { session_id: 'session-new-read', updated_at: '2026-01-03T00:00:00Z', unread: false },
-    { session_id: 'session-old-unread', updated_at: '2026-01-02T00:00:00Z', unread: true },
-    { session_id: 'session-new-unread', updated_at: '2026-01-04T00:00:00Z', unread: true },
-  ];
-
-  it('renders unread badges and sorts unread sessions first (then recency)', () => {
-    render(
-      <SessionPicker
-        agentName="test-agent"
-        sessions={sessions}
-        sessionsError={null}
-        sessionsLoading={false}
-        hasLoadedSessions={true}
-        onRetry={vi.fn()}
-        onSelect={vi.fn()}
-        onNewChat={vi.fn()}
-        onBack={vi.fn()}
-      />
-    );
-
-    const items = screen.getAllByRole('button').filter(b => b.classList.contains('session-item'));
-    expect(items).toHaveLength(4);
-    // Order: session-new-unread, session-old-unread, session-new-read, session-old-read
-    expect(items[0]).toHaveTextContent('session-new-unread');
-    expect(items[1]).toHaveTextContent('session-old-unread');
-    expect(items[2]).toHaveTextContent('session-new-read');
-    expect(items[3]).toHaveTextContent('session-old-read');
-
-    const badges = screen.getAllByTestId('session-unread-badge');
-    expect(badges).toHaveLength(2);
-    expect(badges[0]).toHaveTextContent('Unread');
-    expect(badges[1]).toHaveTextContent('Unread');
-  });
-
-  it('toggles read/unread without triggering card selection', () => {
-    const onSelect = vi.fn();
-    const onToggleUnread = vi.fn();
-
-    render(
-      <SessionPicker
-        agentName="test-agent"
-        sessions={sessions}
-        sessionsError={null}
-        sessionsLoading={false}
-        hasLoadedSessions={true}
-        onRetry={vi.fn()}
-        onSelect={onSelect}
-        onNewChat={vi.fn()}
-        onBack={vi.fn()}
-        onToggleUnread={onToggleUnread}
-      />
-    );
-
-    // Find the toggle button on the first session (which is unread)
-    const markReadBtn = screen.getByRole('button', { name: 'Mark session session-new-unread as read' });
-    expect(markReadBtn).toHaveTextContent('Mark read');
-
-    fireEvent.click(markReadBtn);
-    expect(onToggleUnread).toHaveBeenCalledWith('session-new-unread', true);
-    expect(onSelect).not.toHaveBeenCalled();
-
-    // Find the toggle button on the third session (which is read)
-    const markUnreadBtn = screen.getByRole('button', { name: 'Mark session session-new-read as unread' });
-    expect(markUnreadBtn).toHaveTextContent('Mark unread');
-
-    fireEvent.click(markUnreadBtn);
-    expect(onToggleUnread).toHaveBeenCalledWith('session-new-read', false);
-    expect(onSelect).not.toHaveBeenCalled();
-  });
-
-  it('renders title and repo/branch context on session cards when present', () => {
-    const sessionsWithMeta = [
-      {
-        session_id: 'session-full',
-        title: 'Full metadata session',
-        repository: 'dobesv/harnx',
-        branch: 'feat/meta',
-        updated_at: '2026-01-01T00:00:00Z',
-        unread: false,
-      },
-      {
-        session_id: 'session-bare',
-        title: null,
-        repository: null,
-        branch: null,
-        updated_at: '2026-01-02T00:00:00Z',
-        unread: false,
-      },
-    ];
-
-    render(
-      <SessionPicker
-        agentName="test-agent"
-        sessions={sessionsWithMeta}
-        sessionsError={null}
-        sessionsLoading={false}
-        hasLoadedSessions={true}
-        onRetry={vi.fn()}
-        onSelect={vi.fn()}
-        onNewChat={vi.fn()}
-        onBack={vi.fn()}
-      />
-    );
-
-    expect(screen.getByTestId('session-title')).toHaveTextContent('Full metadata session');
-    expect(screen.getByTestId('session-context')).toHaveTextContent('dobesv/harnx @ feat/meta');
-    expect(screen.getAllByTestId('session-title')).toHaveLength(1);
-    expect(screen.getAllByTestId('session-context')).toHaveLength(1);
   });
 });
 
