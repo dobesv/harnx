@@ -340,8 +340,9 @@ function progressCanReplace(
   return true;
 }
 
-// After a snapshot no live tool call is open to hang a child on, but the
-// snapshot's assistant messages still say which one launched it.
+// A snapshot's assistant messages say exactly which one launched a call, so
+// they beat the latest started tool call, which is only a guess and is unset
+// right after a snapshot.
 function launchingMessage(
   state: SubAgentNotesState,
   toolCallId: string | undefined,
@@ -367,7 +368,7 @@ function applyProgress(
       )),
     };
   }
-  const parentMessageId = state.latestParentMessageId ?? launchingMessage(state, progress.toolCallId);
+  const parentMessageId = launchingMessage(state, progress.toolCallId) ?? state.latestParentMessageId;
   if (!parentMessageId) return state;
   return {
     ...state,

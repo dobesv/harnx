@@ -302,6 +302,19 @@ describe('reduceSubAgentNotes', () => {
     });
   });
 
+  it('keeps a child under its launching message when a later tool call starts first', () => {
+    const state = apply(
+      snapshotEvent(),
+      toolStart('assistant-later'),
+      started('coder', 'child-coder-1', 'inv-coder-1', { tool_call_id: 'call-3-missing-result' }),
+    );
+
+    expect(state.notes[2]).toMatchObject({
+      id: 'live:inv-coder-1',
+      parentMessageId: 'assistant-1',
+    });
+  });
+
   it('drops progress after a snapshot that has no launching message for it', () => {
     const state = apply(
       snapshotEvent(),
