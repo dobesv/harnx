@@ -304,6 +304,155 @@ async fn update_plan_requires_caller_when_creating() {
     assert_error(&result, "caller session identity required to create a plan");
 }
 
+async fn assert_issue_metadata(
+    context: &TestContext,
+    plan: &str,
+    expected: Option<u64>,
+    external_url: Option<&str>,
+) -> Value {
+    let fetched = context
+        .invoke("get_plan", json!({"plan": plan}), None)
+        .await;
+    let value = json_result(&fetched);
+    assert_eq!(value.get("github_issue"), Some(&json!(expected)));
+    assert_eq!(value.get("external_task_url"), Some(&json!(external_url)));
+    assert!(value.get("parent_issue").is_none());
+
+    let listed = json_result(&context.invoke("list_plans", json!({}), None).await);
+    let listed_plan = listed
+        .as_array()
+        .expect("plans array")
+        .iter()
+        .find(|value| value["id"] == plan)
+        .expect("plan is listed");
+    assert_eq!(listed_plan.get("github_issue"), Some(&json!(expected)));
+    assert_eq!(
+        listed_plan.get("external_task_url"),
+        Some(&json!(external_url))
+    );
+    assert!(listed_plan.get("parent_issue").is_none());
+
+    let url = harnx_core::cid_url::CidUrl::parse(plan).expect("plan URL");
+    let store = context
+        .jetstream
+        .get_key_value(harnx_blob_store::plans::PLAN_BUCKET)
+        .await
+        .expect("plans bucket");
+    let stored = harnx_blob_store::plans::get_document(&store, &url)
+        .await
+        .expect("read stored plan")
+        .expect("plan exists in NATS");
+    let document = harnx_blob_store::plans::parse_plan(&stored.content).expect("plan front matter");
+    assert_eq!(document.front.github_issue, expected);
+    assert_eq!(document.front.external_task_url.as_deref(), external_url);
+    assert_eq!(stored.content.contains("github_issue:"), expected.is_some());
+    assert_eq!(
+        stored.content.contains("external_task_url:"),
+        external_url.is_some()
+    );
+    assert!(!stored.content.contains("parent_issue:"));
+    value
+}
+
+#[tokio::test]
+async fn github_issue_is_persisted_on_create_and_can_be_changed() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let added = context
+        .invoke(
+            "add_plan",
+            json!({
+                "name": "Parent Issue",
+                "github_owner_repo": "dobesv/harnx",
+                "github_issue": 2266,
+                "content": "issue investigation",
+            }),
+            Some(context.caller.clone()),
+        )
+        .await;
+    assert_ne!(added["isError"], true, "add_plan failed: {added}");
+    let plan = cid_from(&added);
+    assert_issue_metadata(&context, &plan, Some(2266), None).await;
+
+    let updated = context
+        .invoke(
+            "update_plan",
+            json!({"plan": plan, "github_issue": 2175}),
+            None,
+        )
+        .await;
+    assert_ne!(updated["isError"], true, "update_plan failed: {updated}");
+    let fetched = assert_issue_metadata(&context, &plan, Some(2175), None).await;
+    assert_eq!(fetched["github_owner_repo"], "dobesv/harnx");
+    assert_eq!(fetched["body"], "issue investigation");
+}
+
+#[tokio::test]
+async fn existing_plan_can_set_github_issue_and_placeholder_updates_preserve_it() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let plan = create_plan(&context, "Set Parent Issue").await;
+    assert_issue_metadata(&context, &plan, None, None).await;
+    let task_url = "https://tracker.invalid/browse/HARNX-2266";
+    for args in [
+        json!({"plan": plan, "github_issue": 2266, "external_task_url": task_url}),
+        json!({"plan": plan, "summary": "omitted issue"}),
+        json!({"plan": plan, "github_issue": null, "external_task_url": null}),
+        json!({"plan": plan, "github_issue": 0, "external_task_url": ""}),
+        json!({"plan": plan, "parent_issue": 0, "external_task_url": " \t\n "}),
+        json!({"plan": plan, "parent_issue": null}),
+        json!({"plan": plan, "github_owner_repo": "legacy repo value"}),
+    ] {
+        let updated = context.invoke("update_plan", args, None).await;
+        assert_ne!(updated["isError"], true, "update_plan failed: {updated}");
+        assert_issue_metadata(&context, &plan, Some(2266), Some(task_url)).await;
+    }
+    let fetched = json_result(
+        &context
+            .invoke("get_plan", json!({"plan": plan}), None)
+            .await,
+    );
+    assert_eq!(fetched["title"], "Test plan");
+    assert_eq!(fetched["body"], "initial body");
+    assert_eq!(fetched["summary"], "omitted issue");
+}
+
+#[tokio::test]
+async fn update_plan_upsert_persists_github_issue() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let plan = format!(
+        "cid:plan:pantheon%2Fatlas/{}/parent-issue-upsert",
+        context.caller.session_id
+    );
+    let updated = context
+        .invoke(
+            "update_plan",
+            json!({
+                "plan": plan,
+                "github_issue": 2266,
+                "github_owner_repo": "dobesv/harnx",
+                "external_task_url": "https://github.com/dobesv/harnx/issues/2266",
+                "replace_content": "created by update",
+            }),
+            Some(context.caller.clone()),
+        )
+        .await;
+    assert_ne!(updated["isError"], true, "update_plan failed: {updated}");
+    let fetched = assert_issue_metadata(
+        &context,
+        &plan,
+        Some(2266),
+        Some("https://github.com/dobesv/harnx/issues/2266"),
+    )
+    .await;
+    assert_eq!(fetched["github_owner_repo"], "dobesv/harnx");
+    assert_eq!(fetched["body"], "created by update");
+}
+
 #[tokio::test]
 async fn blank_optional_arguments_are_treated_as_omitted() {
     let Some(context) = TestContext::start().await else {
@@ -318,7 +467,7 @@ async fn blank_optional_arguments_are_treated_as_omitted() {
                 "body": "",
                 "content": "real body",
                 "summary": "",
-                "parent_issue": 0,
+                "github_issue": 0,
             }),
             Some(context.caller.clone()),
         )
@@ -335,7 +484,7 @@ async fn blank_optional_arguments_are_treated_as_omitted() {
                 "replace_content": " ",
                 "append_content": "more",
                 "title": "",
-                "parent_issue": 0,
+                "github_issue": 0,
             }),
             None,
         )
@@ -544,4 +693,190 @@ async fn list_plans_filters_owner_and_touches_activity() {
         .expect("activity bucket");
     let key = format!("sessions/{}/activity", parsed.owner());
     assert!(activity.get(&key).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn external_task_url_supports_create_update_and_upsert_without_github() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let task_url = "https://tracker.invalid/browse/HARNX-2266?view=detail#comments";
+    let added = context
+        .invoke(
+            "add_plan",
+            json!({"name": "External Task", "external_task_url": format!("  {task_url} \n")}),
+            Some(context.caller.clone()),
+        )
+        .await;
+    assert_ne!(added["isError"], true, "add_plan failed: {added}");
+    let plan = cid_from(&added);
+    let fetched = assert_issue_metadata(&context, &plan, None, Some(task_url)).await;
+    assert_eq!(fetched["github_owner_repo"], Value::Null);
+
+    let updated_url = "http://tracker.invalid/tasks/HARNX-2266";
+    let updated = context
+        .invoke(
+            "update_plan",
+            json!({"plan": plan, "external_task_url": updated_url}),
+            None,
+        )
+        .await;
+    assert_ne!(updated["isError"], true, "update_plan failed: {updated}");
+    assert_issue_metadata(&context, &plan, None, Some(updated_url)).await;
+
+    let upsert_plan = format!(
+        "cid:plan:pantheon%2Fatlas/{}/external-upsert",
+        context.caller.session_id
+    );
+    let upsert = context
+        .invoke(
+            "update_plan",
+            json!({"plan": upsert_plan, "external_task_url": task_url}),
+            Some(context.caller.clone()),
+        )
+        .await;
+    assert_ne!(upsert["isError"], true, "update_plan failed: {upsert}");
+    assert_issue_metadata(&context, &upsert_plan, None, Some(task_url)).await;
+}
+
+#[tokio::test]
+async fn legacy_parent_issue_callers_use_canonical_metadata() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let added = context
+        .invoke(
+            "add_plan",
+            json!({"name": "Legacy Issue", "parent_issue": 2266}),
+            Some(context.caller.clone()),
+        )
+        .await;
+    assert_ne!(added["isError"], true, "add_plan failed: {added}");
+    let plan = cid_from(&added);
+    assert_issue_metadata(&context, &plan, Some(2266), None).await;
+    let updated = context
+        .invoke(
+            "update_plan",
+            json!({"plan": plan, "parent_issue": 2175}),
+            None,
+        )
+        .await;
+    assert_ne!(updated["isError"], true, "update_plan failed: {updated}");
+    assert_issue_metadata(&context, &plan, Some(2175), None).await;
+
+    let upsert_plan = format!(
+        "cid:plan:pantheon%2Fatlas/{}/legacy-upsert",
+        context.caller.session_id
+    );
+    let upsert = context
+        .invoke(
+            "update_plan",
+            json!({"plan": upsert_plan, "parent_issue": 2266}),
+            Some(context.caller.clone()),
+        )
+        .await;
+    assert_ne!(upsert["isError"], true, "update_plan failed: {upsert}");
+    assert_issue_metadata(&context, &upsert_plan, Some(2266), None).await;
+}
+
+#[tokio::test]
+async fn legacy_stored_parent_issue_is_read_and_migrated_on_update() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let plan = create_plan(&context, "Legacy Stored Issue").await;
+    let url = harnx_core::cid_url::CidUrl::parse(&plan).unwrap();
+    let store = context
+        .jetstream
+        .get_key_value(harnx_blob_store::plans::PLAN_BUCKET)
+        .await
+        .unwrap();
+    let legacy = format!(
+        "---\nid: {plan}\nparent_issue: 2266\ncreated_at: 2026-09-29T00:00:00Z\n---\nlegacy body"
+    );
+    store.put(url.kv_key(), legacy.into()).await.unwrap();
+
+    let fetched = json_result(
+        &context
+            .invoke("get_plan", json!({"plan": plan}), None)
+            .await,
+    );
+    assert_eq!(fetched["github_issue"], 2266);
+    assert!(fetched.get("parent_issue").is_none());
+    let listed = json_result(&context.invoke("list_plans", json!({}), None).await);
+    assert_eq!(listed[0]["github_issue"], 2266);
+    assert!(listed[0].get("parent_issue").is_none());
+
+    let updated = context
+        .invoke(
+            "update_plan",
+            json!({"plan": plan, "summary": "migrated"}),
+            None,
+        )
+        .await;
+    assert_ne!(updated["isError"], true, "update_plan failed: {updated}");
+    let fetched = assert_issue_metadata(&context, &plan, Some(2266), None).await;
+    assert_eq!(fetched["body"], "legacy body");
+    assert_eq!(fetched["created_at"], "2026-09-29T00:00:00Z");
+    assert_eq!(fetched["github_owner_repo"], Value::Null);
+}
+
+#[tokio::test]
+async fn invalid_external_task_urls_do_not_write_plan_metadata() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let plan = create_plan(&context, "Invalid Task URL").await;
+    let missing_plan = format!(
+        "cid:plan:pantheon%2Fatlas/{}/invalid-upsert",
+        context.caller.session_id
+    );
+    for invalid in [
+        "HARNX-2266",
+        "/browse/HARNX-2266",
+        "//tracker.invalid/task",
+        "not a url",
+        "file:///tmp/task",
+        "javascript:alert(1)",
+        "data:text/plain,task",
+        "ftp://tracker.invalid/task",
+        "https://",
+        "https://?task=2266",
+        "https://tracker.invalid:bad/task",
+        "https:///tracker.invalid/task",
+        "https:tracker.invalid/task?next=https://tracker.invalid",
+        "https://tracker.invalid/task with spaces",
+        "https://tracker.invalid/ta\nsk",
+        "https://tracker.invalid/ta\\sk",
+    ] {
+        for (tool, args) in [
+            (
+                "add_plan",
+                json!({"name": "Invalid URL Create", "external_task_url": invalid}),
+            ),
+            (
+                "update_plan",
+                json!({"plan": missing_plan, "external_task_url": invalid}),
+            ),
+            (
+                "update_plan",
+                json!({"plan": plan, "github_issue": 2266, "external_task_url": invalid}),
+            ),
+        ] {
+            let result = context
+                .invoke(tool, args, Some(context.caller.clone()))
+                .await;
+            assert_error(
+                &result,
+                "external_task_url must be a valid absolute http or https URL",
+            );
+        }
+    }
+    assert_issue_metadata(&context, &plan, None, None).await;
+    let listed = json_result(&context.invoke("list_plans", json!({}), None).await);
+    assert_eq!(
+        listed.as_array().unwrap().len(),
+        1,
+        "invalid creates must not store documents"
+    );
 }

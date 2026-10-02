@@ -34,6 +34,21 @@ cid:plan:pantheon%2Fatlas/armDRA/nats-attachments/notes/design
 
 Task dependencies are task URLs. Bare plan names and bare item IDs are rejected.
 
+## Plan metadata
+
+`add_plan` and `update_plan` store optional issue metadata in the plan's YAML front matter:
+
+- `github_issue`: numeric GitHub issue number. Pair it with `github_owner_repo` (`owner/repo`) to identify the issue's repository. A repository isn't required by validation, so older records and callers that supply only an issue number still work.
+- `external_task_url`: absolute `http://` or `https://` task URL for any issue tracker, including Jira, Linear, and GitHub. URLs must have a host; surrounding whitespace is trimmed. Invalid URLs and other schemes are rejected without fetching the URL.
+
+Both fields can be set or changed on an existing plan, or stored when `update_plan` creates a missing plan owned by the caller. This is metadata only; tools don't sync with trackers or create GitHub issue relationships.
+
+Omitted or `null` fields leave existing values unchanged. `github_issue: 0` and blank `external_task_url` values also count as omitted. `get_plan` and `list_plans` return `github_issue` and `external_task_url`, with `null` when unset.
+
+Arguments appear in tool-call summaries and may be visible in commit bodies. Avoid storing URLs containing credentials or secrets.
+
+Legacy stored `parent_issue` values load as `github_issue` and are written under the new name on the next update. Older callers can still send `parent_issue` as an alias, but it isn't advertised in tool schemas or returned in responses. Send only one of `github_issue` and `parent_issue`; providing both is rejected as a duplicate field. Documents without issue metadata still load unchanged.
+
 ## Tools
 
 - Plans: `list_plans`, `add_plan`, `get_plan`, `update_plan`, `delete_plan`

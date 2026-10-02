@@ -330,6 +330,9 @@ fn plan_documents_preserve_yaml_frontmatter_markdown() -> Result<()> {
         front: PlanFrontMatter {
             id: "cid:plan:pantheon%2Fatlas/abcDEF/test-plan".to_string(),
             title: Some("Test plan".to_string()),
+            github_owner_repo: Some("dobesv/harnx".to_string()),
+            github_issue: Some(2266),
+            external_task_url: Some("https://tracker.invalid/browse/HARNX-2266".to_string()),
             created_at: "2026-09-29T00:00:00Z".to_string(),
             ..PlanFrontMatter::default()
         },
@@ -339,6 +342,37 @@ fn plan_documents_preserve_yaml_frontmatter_markdown() -> Result<()> {
     assert!(serialized.starts_with("---\n"));
     assert!(serialized.contains("\n---\n# Body"));
     assert_eq!(parse_plan(&serialized)?, document);
+    Ok(())
+}
+
+#[test]
+fn plan_documents_without_parent_issue_remain_compatible() -> Result<()> {
+    use harnx_blob_store::plans::{parse_plan, serialize_plan, PlanDocument, PlanFrontMatter};
+
+    let legacy = "---\nid: cid:plan:pantheon%2Fatlas/abcDEF/test-plan\ntitle: Test plan\ngithub_owner_repo: dobesv/harnx\ncreated_at: 2026-09-29T00:00:00Z\n---\n# Body\n\nMarkdown stays intact.\n";
+    let expected = PlanDocument {
+        front: PlanFrontMatter {
+            id: "cid:plan:pantheon%2Fatlas/abcDEF/test-plan".to_string(),
+            title: Some("Test plan".to_string()),
+            github_owner_repo: Some("dobesv/harnx".to_string()),
+            created_at: "2026-09-29T00:00:00Z".to_string(),
+            ..PlanFrontMatter::default()
+        },
+        body: "# Body\n\nMarkdown stays intact.\n".to_string(),
+    };
+    assert_eq!(parse_plan(legacy)?, expected);
+    for fields in [
+        "parent_issue: null\n",
+        "github_issue: null\nexternal_task_url: null\n",
+    ] {
+        let with_null = legacy.replace("created_at:", &format!("{fields}created_at:"));
+        assert_eq!(parse_plan(&with_null)?, expected);
+    }
+    let serialized = serialize_plan(&expected)?;
+    assert!(!serialized.contains("parent_issue:"));
+    assert!(!serialized.contains("github_issue:"));
+    assert!(!serialized.contains("external_task_url:"));
+    assert_eq!(parse_plan(&serialized)?, expected);
     Ok(())
 }
 
@@ -404,4 +438,29 @@ fn spawn_append(
         })
         .await
     })
+}
+
+#[test]
+fn legacy_parent_issue_frontmatter_serializes_with_canonical_names() -> Result<()> {
+    use harnx_blob_store::plans::{parse_plan, serialize_plan};
+
+    let legacy = "---\nid: cid:plan:pantheon%2Fatlas/abcDEF/test-plan\nparent_issue: 2266\ncreated_at: 2026-09-29T00:00:00Z\n---\nlegacy body";
+    let document = parse_plan(legacy)?;
+    assert_eq!(
+        document,
+        PlanDocument {
+            front: PlanFrontMatter {
+                id: "cid:plan:pantheon%2Fatlas/abcDEF/test-plan".to_string(),
+                github_issue: Some(2266),
+                created_at: "2026-09-29T00:00:00Z".to_string(),
+                ..PlanFrontMatter::default()
+            },
+            body: "legacy body".to_string(),
+        }
+    );
+    let serialized = serialize_plan(&document)?;
+    assert!(serialized.contains("github_issue: 2266"));
+    assert!(!serialized.contains("parent_issue:"));
+    assert_eq!(parse_plan(&serialized)?, document);
+    Ok(())
 }

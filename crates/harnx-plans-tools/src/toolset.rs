@@ -235,4 +235,33 @@ mod tests {
         assert!(update.get("replace_content").is_some());
         assert!(update.get("content").is_none());
     }
+
+    #[test]
+    fn plan_schemas_advertise_canonical_issue_metadata_only() {
+        for tool in PlansToolset::new()
+            .tools()
+            .iter()
+            .filter(|tool| matches!(tool.name.as_str(), "add_plan" | "update_plan"))
+        {
+            let schema = &tool.input_schema;
+            let properties = &schema["properties"];
+            assert!(properties.get("parent_issue").is_none(), "{schema}");
+            assert_eq!(schema["additionalProperties"], false);
+            for (name, kind) in [("github_issue", "integer"), ("external_task_url", "string")] {
+                let property = &properties[name];
+                let types = property["type"].as_array().expect("nullable field type");
+                assert!(types.contains(&serde_json::json!(kind)), "{property}");
+                assert!(types.contains(&serde_json::json!("null")), "{property}");
+                assert!(property["description"].as_str().is_some());
+                assert!(!schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(name)));
+            }
+            assert!(properties["github_issue"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("github_owner_repo"));
+        }
+    }
 }

@@ -598,7 +598,8 @@ mod tests {
                     "properties": {
                         "name": {"type": "string"},
                         "content": {"type": "string"},
-                        "parent_issue": {"type": ["integer", "null"]}
+                        "github_issue": {"type": ["integer", "null"]},
+                        "external_task_url": {"type": ["string", "null"]}
                     },
                     "required": ["name"]
                 })),
@@ -616,11 +617,11 @@ mod tests {
     }
 
     fn strict_style_arguments() -> serde_json::Value {
-        serde_json::json!({"name": "p", "content": null, "parent_issue": null})
+        serde_json::json!({"name": "p", "content": null, "github_issue": null, "external_task_url": null})
     }
 
     fn cleaned_arguments() -> serde_json::Value {
-        serde_json::json!({"name": "p", "parent_issue": null})
+        serde_json::json!({"name": "p", "github_issue": null, "external_task_url": null})
     }
 
     #[tokio::test]

@@ -30,7 +30,11 @@ Do not assume you understand the request — ask about:
 - **Issue tracker reference**: Ask if there is a related issue for this task
   (e.g. a Jira ticket like FDEV-1234 or a GitHub issue like #123). The user
   can decline, but an issue reference keeps the plan and commit history
-  linked to the project's task tracker. If provided, record it.
+  linked to the project's task tracker. If provided, record it as plan metadata
+  (`github_issue` paired with `github_owner_repo`, or `external_task_url`
+  for Jira, Linear, or arbitrary URLs). Retain arbitrary URLs without fabricating;
+  resolve bare ticket keys via confirmed tracker config or tools, or ask for the URL,
+  without discarding bare ticket keys. Setting metadata has no tracker API side effects.
   If the user declines, record `"Issue: none"` as a plan note so downstream
   agents (Atlas) know not to ask again.
 Keep interviews focused: 3-5 key questions maximum. More than that loses
@@ -147,8 +151,7 @@ steps: create the file, add the function, write the test, update the config.
 Use `plans_get_plan` to review the plan after writing it to catch formatting issues.
 
  Use `plans_add_note` to record key decisions and context as notes so that Atlas and executing specialist agents can access them during execution.
- If an issue tracker reference was provided, record it as a note so Atlas and Clio can include it in the
- commit message: `plans_add_note(plan=plan_url, body="Issue: FDEV-1234", summary="decisions")`
- (or `Issue: #123` for a GitHub issue).
- If the user declined, record `plans_add_note(plan=plan_url, body="Issue: none", summary="decisions")`
- so Atlas knows not to ask again.
+ If an issue tracker reference was provided, store it in plan metadata when creating or updating the plan (`plans_add_plan` or `plans_update_plan`) rather than creating an issue note:
+ - For GitHub issues: set `github_issue` (number) paired with `github_owner_repo` (`owner/repo`), e.g. `github_issue: 123, github_owner_repo: "owner/repo"`.
+ - For Jira, Linear, or external trackers: set `external_task_url` (e.g. `external_task_url: "https://..."`). Retain arbitrary task URLs; resolve bare ticket keys via confirmed tracker config or tools, or ask for the URL, without fabricating URLs or discarding bare ticket keys. Setting metadata has no tracker API side effects.
+ If the user declined, record `plans_add_note(plan=plan_url, body="Issue: none", summary="decisions")` so Atlas knows not to ask again.

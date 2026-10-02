@@ -8,13 +8,13 @@ pub(crate) const RESULT: &str = "{{ result.content[0].text | default('') }}";
 
 pub(crate) const LIST_PLANS_CALL: &str = "list plans";
 
-pub(crate) const ADD_PLAN_CALL: &str = "create plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.content %}
+pub(crate) const ADD_PLAN_CALL: &str = "create plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}{% if args.github_issue %}#{{ args.github_issue }}{% endif %}){% elif args.github_issue %} (#{{ args.github_issue }}){% endif %}{% if args.external_task_url %} <{{ args.external_task_url }}>{% endif %}{% if args.content %}
 {{ args.content | truncate(80) }}{% elif args.body %}
 {{ args.body | truncate(80) }}{% endif %}";
 
 pub(crate) const GET_PLAN_CALL: &str = "read plan {{ args.plan }}";
 
-pub(crate) const UPDATE_PLAN_CALL: &str = "update plan {{ args.plan }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.tasks %} [{{ args.tasks | length }} tasks]{% endif %}{% if args.content %}
+pub(crate) const UPDATE_PLAN_CALL: &str = "update plan {{ args.plan }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}{% if args.github_issue %}#{{ args.github_issue }}{% endif %}){% elif args.github_issue %} (#{{ args.github_issue }}){% endif %}{% if args.external_task_url %} <{{ args.external_task_url }}>{% endif %}{% if args.tasks %} [{{ args.tasks | length }} tasks]{% endif %}{% if args.content %}
 {{ args.content | truncate(80) }}{% elif args.replace_content %}
 {{ args.replace_content | truncate(80) }}{% endif %}{% if args.append_content %}
 +{{ args.append_content | truncate(80) }}{% endif %}";
@@ -46,3 +46,41 @@ pub(crate) const UPDATE_NOTE_CALL: &str = "update note {{ args.note_id }}{% if a
 +{{ args.append_body | truncate(80) }}{% endif %}";
 
 pub(crate) const DELETE_NOTE_CALL: &str = "delete note {{ args.note_id }}";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::tool::render_tool_call_template;
+    use serde_json::json;
+
+    #[test]
+    fn plan_call_templates_display_issue_metadata() {
+        for template in [ADD_PLAN_CALL, UPDATE_PLAN_CALL] {
+            let args = json!({
+                "name": "issue-metadata",
+                "plan": "cid:plan:pantheon%2Fatlas/abcDEF/issue-metadata",
+                "github_owner_repo": "dobesv/harnx",
+                "github_issue": 2266,
+                "external_task_url": "https://tracker.invalid/browse/HARNX-2266",
+            });
+            let rendered = render_tool_call_template(template, &args, "").expect("render template");
+            assert!(rendered.contains("(dobesv/harnx#2266)"), "{rendered}");
+            assert!(
+                rendered.contains("<https://tracker.invalid/browse/HARNX-2266>"),
+                "{rendered}"
+            );
+
+            let repo_only = json!({"github_owner_repo": "dobesv/harnx", "github_issue": 0});
+            let rendered = render_tool_call_template(template, &repo_only, "").unwrap();
+            assert!(rendered.contains("(dobesv/harnx)"));
+            assert!(!rendered.contains('#'));
+
+            let issue_only = json!({"github_issue": 2266});
+            let rendered = render_tool_call_template(template, &issue_only, "").unwrap();
+            assert!(rendered.contains("(#2266)"));
+            let rendered = render_tool_call_template(template, &json!({}), "").unwrap();
+            assert!(!rendered.contains('#'));
+            assert!(!rendered.contains('<'));
+        }
+    }
+}

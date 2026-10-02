@@ -28,13 +28,11 @@ Rules:
   No conventional commit prefixes (no "feat:", "fix:", etc.). No period at end.
 - Body: Describe what the branch accomplishes. Mention key files or modules
   if helpful. Keep it factual — describe the changes, not the process.
-- Issue reference: If a issue tracker (JIRA/GitHub) ticket key is known, include it
-  on its own line after the body and BEFORE any trailers, in an appropriate
-  format for the tracker - `[FDEV-1234]` for JIRA (just the
-  issue key in square brackets — no description on the same line) or #1234 for GitHub
-  issues. The `[FDEV-1234]` format is picked up by the JIRA ↔ GitHub integration. The issue
-  reference goes in the BODY, NEVER in the title. If no issue is known (or the caller recorded
-  `"Issue: none"`), omit it entirely — do not ask.
+- Issue reference: If an issue tracker reference is known, include it on its own line after the body and BEFORE any trailers, in an appropriate format for the tracker:
+  - GitHub issues: `#<number>` (e.g. `#123`). If the target repository differs from the working repository, use the repo-qualified ref `<owner>/<repo>#<number>` (e.g. `other-owner/other-repo#123`).
+  - Jira / Linear: `[<KEY>]` (e.g. `[FDEV-1234]` or `[LIN-456]`, just the issue key in square brackets — no description on the same line). The `[KEY]` format is picked up by issue tracker integrations.
+  - Arbitrary tracker URLs: if `external_task_url` contains an arbitrary link where no standard key can be parsed, retain the URL on its own line. Do not fabricate URLs or discard bare ticket keys.
+  The issue reference goes in the BODY, NEVER in the title. If no issue is known (or the caller recorded `"Issue: none"`), omit it entirely — do not ask.
 - Plan trailers: If a plan was used, include a trailer so agents can find the
   plan when resuming work on the PR: `Plan-Id: cid:plan:<agent>/<sid>/<slug>` (include the full `cid:plan:` URL as the `Plan-Id:` trailer).
 
@@ -155,10 +153,11 @@ wait for the user to open the pull request.
 
 Look for issue references in these places (in priority order):
 1. Explicitly provided by the caller (Atlas, Sisyphus, or the user) in their request —
-   e.g. `Issue: FDEV-1234` or `Issue: #123`
-2. Plan notes — read the plan and look for a note containing `"Issue:"`. If the value is
-   a reference (e.g. `"Issue: FDEV-1234"` or `"Issue: #123"`), use it. If it is
-   `"Issue: none"`, omit the issue line entirely — the user already declined upstream.
-3. Branch name (e.g., `feature/FDEV-1234-add-auth` → FDEV-1234)
-4. Existing commit messages on the branch
-5. If none found, omit the issue line — do not ask
+   e.g. `Issue: FDEV-1234`, `Issue: #123`, `Issue: owner/repo#123`, or a task URL.
+2. Plan metadata — read the plan via `plans_get_plan`:
+   - If `github_issue` is set: use `#<github_issue>` if the plan's `github_owner_repo` matches the current working repository, or the repo-qualified `<github_owner_repo>#<github_issue>` when the target repository differs.
+   - If `external_task_url` is set: extract the ticket key (e.g. `[FDEV-1234]` or `[LIN-456]`) if recognizable from the URL path, or retain the full task URL on its own line. Do not fabricate URLs or discard bare ticket keys.
+3. Plan notes (legacy fallback for older plans) — read the plan and look for a note containing `"Issue:"`. If the value is a reference (e.g. `"Issue: FDEV-1234"` or `"Issue: #123"`), use it. If it is `"Issue: none"`, omit the issue line entirely — the user already declined upstream.
+4. Branch name (e.g., `feature/FDEV-1234-add-auth` → `[FDEV-1234]`)
+5. Existing commit messages on the branch
+6. If none found, omit the issue line — do not ask

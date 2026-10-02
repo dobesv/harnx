@@ -28,6 +28,14 @@ pub struct PlanFrontMatter {
     pub git_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_owner_repo: Option<String>,
+    #[serde(
+        default,
+        alias = "parent_issue",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub github_issue: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_task_url: Option<String>,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,

@@ -24,12 +24,9 @@ a gate.
 Delegate **final squash, rebase, and force push** to `clio` when all work
 is complete (including any Mnemosyne docs commit).
 
-When delegating to `clio`, send the plan URL (`cid:plan:...`) and instruct `clio` to read the 
-plan using `plans_get_plan` and use the plan content and notes to create the
-commit.  **Do NOT provide a pre-composed commit message.** 
+When delegating to `clio`, send the plan URL (`cid:plan:...`) and instruct `clio` to read the plan using `plans_get_plan`. Clio inspects structured metadata (`github_issue` paired with `github_owner_repo`, or `external_task_url`) or legacy plan notes to include the issue reference in the commit body. **Do NOT provide a pre-composed commit message.**
 
-If an issue tracker reference is known (JIRA or GitHub), pass it explicitly (e.g. 
-`Issue: FDEV-1234` or `Issue: #123`) so Clio includes it in the commit body.
+You may pass an explicit issue reference override (e.g. `Issue: FDEV-1234`, `Issue: #123`, or repo-qualified `Issue: owner/repo#123` when target repository differs) if needed, but Clio reads plan metadata first by default.
 
 Clio will return structured delivery metadata with either an existing pull request's
 link and status or, when none is open, a compare link for opening one. Clio does NOT

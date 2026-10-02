@@ -53,7 +53,7 @@ variables:
 
 ## Local environment Workflow
 Use `bash_exec` to run local git commands (`git status`, `git add`, `git commit`, `git push`).
-Use the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) or `plans_get_plan` to inspect plan notes for JIRA ticket context when needed.
+Use `plans_get_plan` to inspect plan metadata (`github_issue`, `github_owner_repo`, `external_task_url`) or legacy plan notes for issue tracker context when needed. Use the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) to inspect files.
 
 
 {{repo_docs}}
