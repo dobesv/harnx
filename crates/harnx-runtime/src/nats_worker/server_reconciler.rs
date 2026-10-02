@@ -424,7 +424,7 @@ pub(super) fn tool_servers_for_activation(
     config: &GlobalConfig,
     metadata: &crate::nats_session_metadata::SessionMetadata,
 ) -> Vec<ToolServerConfig> {
-    let scratch: GlobalConfig = Arc::new(parking_lot::RwLock::new(config.read().clone()));
+    let scratch: GlobalConfig = Arc::new(crate::config::ConfigLock::new(config.read().clone()));
     if let Err(error) = install_session_metadata_agent(&scratch, metadata) {
         log::warn!("could not resolve session agent for tool-server selection: {error:#}");
         return Vec::new();

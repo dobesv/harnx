@@ -904,7 +904,7 @@ mod tests {
     impl ActiveCleanupFixture {
         async fn open() -> Option<Self> {
             let (url, child, store_dir) = crate::nats_worker::tests::spawn_test_nats().await?;
-            let config = Arc::new(parking_lot::RwLock::new(Config {
+            let config = Arc::new(crate::config::ConfigLock::new(Config {
                 model: harnx_core::model::Model::new("test", "test-model"),
                 nats_servers: vec![NatsServerConfig {
                     name: "local".to_string(),

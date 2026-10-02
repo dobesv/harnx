@@ -31,7 +31,7 @@ use harnx_core::{
     tool::ToolResult,
 };
 use harnx_runtime::{
-    config::{self, Config, GlobalConfig, SessionAttachmentPath},
+    config::{self, Config, ConfigLock, GlobalConfig, SessionAttachmentPath},
     local_orchestrator::{activation_route_for_cluster, LocalWorkerSupervisor},
     AgentCallFn, AgentLoopContext, NatsSession, NatsSessionConfig, OnToolRoundFn,
 };
@@ -664,7 +664,7 @@ impl SessionActor {
         let done_tx = self.run_done_tx.clone();
         let run_id_for_task = run_id.clone();
         let thread_id_for_task = thread_id.clone();
-        let event_prompt_config = Arc::new(parking_lot::RwLock::new(prompt_config.read().clone()));
+        let event_prompt_config = Arc::new(ConfigLock::new(prompt_config.read().clone()));
         let sink = Arc::new(BroadcastEventSender::new(
             self.broadcast_tx.clone(),
             MessageId::random(),

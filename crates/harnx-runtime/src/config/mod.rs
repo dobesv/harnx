@@ -6,6 +6,7 @@ mod completion_split;
 mod env_split;
 pub mod input;
 mod loader_split;
+pub mod lock;
 mod macros_split;
 mod nats_split;
 mod patches_split;
@@ -121,7 +122,6 @@ use harnx_render::{MarkdownRender, RenderOptions};
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
 use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
-use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::{
@@ -501,7 +501,11 @@ impl Default for Config {
     }
 }
 
-pub type GlobalConfig = Arc<RwLock<Config>>;
+/// The lock around a [`Config`]. Contended waits leave the Tokio worker
+/// free; see [`lock`] for why that matters.
+pub type ConfigLock = lock::YieldingRwLock<Config>;
+
+pub type GlobalConfig = Arc<ConfigLock>;
 
 impl Config {
     pub fn state(&self) -> StateFlags {

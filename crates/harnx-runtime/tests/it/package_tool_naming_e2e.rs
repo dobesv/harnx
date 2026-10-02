@@ -6,6 +6,7 @@ use harnx_core::agent_config::AgentConfig;
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::tool::ToolCall;
 use harnx_runtime::config::agent::Agent;
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::config::{
     Config, GlobalConfig, ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV,
 };
@@ -13,7 +14,6 @@ use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use harnx_runtime::nats_worker::{ToolServerStartConfig, ToolServerSupervisor};
 use harnx_toolset::{server_identity_token, Registration};
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
-use parking_lot::RwLock;
 use serde_json::json;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -116,7 +116,7 @@ fn agent(package: &str, tool_name: &str) -> AgentConfig {
 }
 
 fn config_for(agent_config: &AgentConfig) -> GlobalConfig {
-    Arc::new(RwLock::new(Config {
+    Arc::new(ConfigLock::new(Config {
         agent: Some(Agent::new(agent_config.clone())),
         ..Config::default()
     }))

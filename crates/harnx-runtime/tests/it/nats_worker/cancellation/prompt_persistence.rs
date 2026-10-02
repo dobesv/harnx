@@ -56,7 +56,7 @@ impl Toolset for PausedTool {
 struct Fixture {
     session: NatsSession,
     js: async_nats::jetstream::Context,
-    config: Arc<RwLock<Config>>,
+    config: harnx_runtime::config::GlobalConfig,
     tool: Arc<PausedTool>,
     model_calls: Arc<AtomicUsize>,
     daemon: AbortOnDropHandle<Result<()>>,

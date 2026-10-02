@@ -195,7 +195,7 @@ pub async fn start_worker(options: WorkerOptions<'_>) -> Result<AbortOnDropHandl
         let readiness = readiness.clone();
         async move {
             run_worker_daemon(
-                Arc::new(parking_lot::RwLock::new(options.config)),
+                Arc::new(harnx_runtime::config::ConfigLock::new(options.config)),
                 daemon,
                 None,
                 Some(readiness),

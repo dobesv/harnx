@@ -66,7 +66,7 @@ pub async fn macro_execute(
     config.rag = None;
     config.agent = None;
     config.discontinuous_last_message();
-    let config = Arc::new(RwLock::new(config));
+    let config = Arc::new(crate::config::ConfigLock::new(config));
     config.write().macro_flag = true;
     for step in &macro_value.steps {
         let command = Macro::interpolate_command(step, &variables);

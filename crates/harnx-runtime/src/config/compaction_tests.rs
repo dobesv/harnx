@@ -43,7 +43,7 @@ fn with_session(mut config: Config, turns: Vec<(MessageRole, String)>) -> Global
         session.push_message_for_test(role, text);
     }
     config.session = Some(session);
-    Arc::new(RwLock::new(config))
+    Arc::new(crate::config::ConfigLock::new(config))
 }
 
 /// Install a mock summarizer client (returns one canned turn) under the global

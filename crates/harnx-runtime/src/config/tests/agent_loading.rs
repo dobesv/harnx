@@ -68,7 +68,7 @@ async fn use_agent_routes_remote_refs_to_nats_cluster_validation() {
     let config = Config::init(WorkingMode::Cmd, false)
         .await
         .expect("config init");
-    let config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+    let config = std::sync::Arc::new(crate::config::ConfigLock::new(config));
 
     let err = Config::use_agent(&config, "atlas@prod", None, create_abort_signal())
         .await

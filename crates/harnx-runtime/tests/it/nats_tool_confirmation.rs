@@ -34,7 +34,7 @@ use harnx_runtime::{
     },
     utils::create_abort_signal,
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use serde_json::json;
 use std::{
     path::{Path, PathBuf},
@@ -110,13 +110,13 @@ impl TestEnvironment {
     async fn load(
         &self,
     ) -> Result<(
-        Arc<RwLock<Config>>,
+        harnx_runtime::config::GlobalConfig,
         async_nats::Client,
         async_nats::jetstream::Context,
     )> {
-        let config = Arc::new(RwLock::new(Config::load_from_file(
-            &self.config_dir.join("config.yaml"),
-        )?));
+        let config = Arc::new(harnx_runtime::config::ConfigLock::new(
+            Config::load_from_file(&self.config_dir.join("config.yaml"))?,
+        ));
         let cfg = config.read().clone();
         let client = cfg.nats_client("local").await?;
         let jetstream = cfg.nats_jetstream("local").await?;
@@ -207,7 +207,7 @@ impl Drop for ConfirmationHarness {
 }
 
 async fn start_ready_daemon(
-    config: Arc<RwLock<Config>>,
+    config: harnx_runtime::config::GlobalConfig,
     call_fn: harnx_runtime::agent_loop::AgentCallFn,
     client: &async_nats::Client,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {

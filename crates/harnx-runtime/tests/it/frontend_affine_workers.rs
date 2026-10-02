@@ -12,6 +12,7 @@ use harnx_core::{
     require_nextest,
     session::SessionLogEntry,
 };
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::{
     client::CompletionTokenUsage,
     config::Config,
@@ -24,7 +25,6 @@ use harnx_runtime::{
     utils::create_abort_signal,
     NatsSession, NatsSessionConfig,
 };
-use parking_lot::RwLock;
 use std::{
     path::{Path, PathBuf},
     sync::{

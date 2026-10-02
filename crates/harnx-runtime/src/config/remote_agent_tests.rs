@@ -212,7 +212,7 @@ async fn cluster_routing_activates_bare_agent_as_remote() {
         nats_routing: NatsRouting::Cluster("remote".to_string()),
         ..Config::default()
     };
-    let config = Arc::new(RwLock::new(config));
+    let config = Arc::new(crate::config::ConfigLock::new(config));
 
     Config::use_agent(
         &config,

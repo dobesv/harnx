@@ -297,7 +297,7 @@ async fn retracted_mid_tool_round_message_is_not_injected() -> Result<()> {
         return Ok(());
     };
 
-    let config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+    let config = Arc::new(ConfigLock::new(local_nats_config(NatsServerSpec {
         name: "local",
         url: server.url(),
         token: None,

@@ -738,7 +738,7 @@ fn default_confirm_tool_use(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use parking_lot::RwLock;
+    use crate::config::ConfigLock;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -750,7 +750,7 @@ mod tests {
         // results fails.
         let session = crate::config::session::new(&config, "unpersisted_stop", None).unwrap();
         config.session = Some(session);
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let eval = build_tool_eval_context(BuildToolEvalContextParams::new(
             &config,
             &harnx_core::instance::ServerScope::new(),
@@ -792,7 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn instance_id_is_preserved_in_tool_eval_context() {
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = Arc::new(ConfigLock::new(Config::default()));
         let instance_id = harnx_core::instance::ServerScope::new();
 
         let context =
@@ -807,7 +807,7 @@ mod tests {
         // must be threaded into `ToolEvalContext` so the engine can resolve
         // same-package handoff targets (#709).
         let _guard = crate::client::TestStateGuard::new(None).await;
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = Arc::new(ConfigLock::new(Config::default()));
 
         // Mirror the derivation done in `execute_tool_round`.
         let pkg = harnx_core::package_namespace::pkg_from_qualified("pantheon/daedalus")
@@ -837,7 +837,7 @@ mod tests {
         // When a worker-side confirmation callback is set, the eval context must
         // use it instead of the default inquire prompt (#695).
         let _guard = crate::client::TestStateGuard::new(None).await;
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = Arc::new(ConfigLock::new(Config::default()));
 
         // Default (no override): the inquire-based prompt is used. In a
         // non-terminal test process it denies, so this returns Deny.

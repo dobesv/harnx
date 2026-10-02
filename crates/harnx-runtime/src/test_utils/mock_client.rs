@@ -45,7 +45,7 @@ use crate::client::{
     ChatCompletionsData, ChatCompletionsOutput, Client, ExtraConfig, Model, RequestPatches,
     SseHandler, ToolCall,
 };
-use crate::config::{Config, GlobalConfig};
+use crate::config::{Config, ConfigLock, GlobalConfig};
 
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -453,7 +453,7 @@ pub struct MockClientBuilder {
 impl Default for MockClientBuilder {
     fn default() -> Self {
         Self {
-            global_config: Arc::new(RwLock::new(Config::default())),
+            global_config: Arc::new(ConfigLock::new(Config::default())),
             model: Model::new("mock", "mock-model"),
             name: "mock".to_string(),
             extra_config: None,

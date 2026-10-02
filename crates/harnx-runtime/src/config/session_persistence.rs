@@ -1,5 +1,6 @@
 //! Runtime persistence adapter for in-memory session state.
 
+use super::GlobalConfig;
 use crate::nats_session_metadata::{SessionOverrideUpdate, SessionOverrides};
 use anyhow::{Context, Result};
 use harnx_core::agent_config::AgentVariables;
@@ -137,29 +138,45 @@ impl PendingExecutionContextPersistence {
 
 /// Append a log entry through the session's runtime persistence sink.
 pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
-    if let Some(append_sink) = sink(session) {
-        return match append_sink.append(entry) {
-            Ok(seq) => {
-                session.log_entry_count = seq as usize;
-                true
-            }
-            Err(error) => {
-                log::warn!(
-                    "session append failed: session_id={} entry_type={} error={error}",
-                    session.id(),
-                    crate::session_history::entry_type(entry)
-                );
-                false
-            }
-        };
+    match append_through(sink(session), session.id(), entry) {
+        Some(seq) => {
+            session.log_entry_count = seq as usize;
+            true
+        }
+        None => false,
     }
+}
 
-    log::warn!(
-        "session append dropped: no persistence sink attached (session_id={} entry_type={})",
-        session.id(),
-        crate::session_history::entry_type(entry)
-    );
-    false
+/// The session's persistence sink, cloned so a caller can append through it
+/// after releasing the config guard the session was borrowed from.
+pub(super) fn detached_sink(session: &Session) -> Option<Arc<dyn SessionAppendSink>> {
+    sink(session).cloned()
+}
+
+/// Append through a sink taken from a session, returning the entry's durable
+/// sequence. Failures are logged here, as `append_event` does.
+pub(super) fn append_through(
+    sink: Option<&Arc<dyn SessionAppendSink>>,
+    session_id: &str,
+    entry: &SessionLogEntry,
+) -> Option<u64> {
+    let Some(append_sink) = sink else {
+        log::warn!(
+            "session append dropped: no persistence sink attached (session_id={session_id} entry_type={})",
+            crate::session_history::entry_type(entry)
+        );
+        return None;
+    };
+    match append_sink.append(entry) {
+        Ok(seq) => Some(seq),
+        Err(error) => {
+            log::warn!(
+                "session append failed: session_id={session_id} entry_type={} error={error}",
+                crate::session_history::entry_type(entry)
+            );
+            None
+        }
+    }
 }
 
 pub(super) fn require_authoritative_appends(
@@ -177,20 +194,60 @@ pub(super) fn require_authoritative_appends(
     Ok(())
 }
 
-/// Persist canonical title metadata before updating the in-memory title.
-pub fn record_title(
-    session: &mut Session,
-    title: String,
-    manual: bool,
-    tokens: usize,
-) -> Result<()> {
-    if let Some(sink) = sink(session) {
+/// The active session's persistence sink, if it is `session_id`.
+///
+/// Callers take this under a short guard and drop the guard before they
+/// persist anything: the sink's methods are NATS round trips, and the config
+/// lock must never be held across one.
+fn active_session_sink(
+    config: &GlobalConfig,
+    session_id: Option<&str>,
+) -> Option<Arc<dyn SessionAppendSink>> {
+    let guard = config.read();
+    let session = guard.session.as_ref()?;
+    if session_id.is_some_and(|id| session.id != id) {
+        return None;
+    }
+    detached_sink(session)
+}
+
+/// A title and how it was chosen, as [`record_title`] persists it.
+pub struct TitleRecord {
+    pub title: String,
+    /// Set by the user. A manual title stops automatic regeneration.
+    pub manual: bool,
+    /// The session's token count when the title was chosen.
+    pub tokens: usize,
+}
+
+/// Persist canonical title metadata for session `session_id`, then set the
+/// in-memory title if that session is still the active one. Returns whether
+/// the in-memory title was set.
+///
+/// Call it without holding a config guard. It takes one only to find the
+/// sink and again to set the title, and writes the metadata in between with
+/// neither held. Two title writes to one config never overlap here:
+/// background titles run only where the agent loop runs, a worker's
+/// per-session config, and are single-flight through the session's
+/// `titling` flag, while front-end commands (`.set title`, `.title
+/// generate`) run one at a time on the front end's own config.
+pub fn record_title(config: &GlobalConfig, session_id: &str, record: TitleRecord) -> Result<bool> {
+    let TitleRecord {
+        title,
+        manual,
+        tokens,
+    } = record;
+    if let Some(sink) = active_session_sink(config, Some(session_id)) {
         sink.persist_title(&title, manual, tokens)
             .context("failed to durably persist session title")?;
     }
+    let mut guard = config.write();
+    let Some(session) = guard.session.as_mut().filter(|s| s.id == session_id) else {
+        return Ok(false);
+    };
     session.set_title(title);
     session.set_title_last_updated_tokens(if manual { usize::MAX } else { tokens });
-    Ok(())
+    Ok(true)
 }
 
 pub fn session_overrides(session: &Session) -> Result<SessionOverrides> {
@@ -220,8 +277,15 @@ pub fn persist_session_overrides(session: &Session, overrides: &SessionOverrides
     Ok(())
 }
 
-pub fn persist_session_override(session: &Session, update: &SessionOverrideUpdate) -> Result<()> {
-    if let Some(sink) = sink(session) {
+/// Persist one explicit override field for the active session before the
+/// caller applies it in memory. Call it without holding a config guard: it
+/// takes one only to find the sink, and writes the override after dropping
+/// it.
+pub fn persist_active_session_override(
+    config: &GlobalConfig,
+    update: &SessionOverrideUpdate,
+) -> Result<()> {
+    if let Some(sink) = active_session_sink(config, None) {
         sink.persist_override(update)?;
     }
     Ok(())

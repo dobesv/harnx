@@ -3,8 +3,8 @@ use super::session_externalize::{externalize_content, record_externalized};
 pub(crate) use super::session_persistence::attach_memory_log;
 use super::session_persistence::require_authoritative_appends;
 pub use super::session_persistence::{
-    append_event, persist_session_override, persist_session_overrides, record_title,
-    session_overrides, SessionAppendSink,
+    append_event, persist_active_session_override, persist_session_overrides, record_title,
+    session_overrides, SessionAppendSink, TitleRecord,
 };
 pub use super::session_tool_results::add_tool_results;
 pub(crate) use super::session_tool_results::{prepare_tool_results, prepare_tool_results_in_place};
@@ -649,46 +649,127 @@ pub fn compress(session: &mut Session, prompt: String) {
 /// can reconstruct the active transcript without stored indices. `CompactResult`
 /// (manual) or `TurnEnd` (automatic) terminates the compaction span.
 pub fn compress_keeping_recent(session: &mut Session, prompt: String, keep_from: usize) {
-    let keep_from = keep_from.min(session.messages.len());
-    // Split off the recent suffix to keep verbatim; the remainder is the prefix.
-    let suffix: Vec<Message> = session.messages.split_off(keep_from);
-    session.compressed_messages.append(&mut session.messages);
-    // Hard-cut log layout: the Compress event archives the prefix and carries
-    // the summary; the preserved suffix is then re-logged as fresh entries so
-    // replay reproduces active suffix without any stored index.
-    session.compaction_summary = Some(prompt.clone());
-    if !append_event(session, &SessionLogEntry::Compress { prompt }) {
-        session.dirty = true;
-    }
-    for mut msg in suffix {
-        let seq = relog_message(session, &msg);
-        msg.log_seq = Some(seq);
-        session.messages.push(msg);
-    }
-    session.update_tokens();
+    let appended = CompactionLog::plan(session, prompt, keep_from).append();
+    appended.apply(session);
 }
 
-/// Re-append an in-memory message to the session log as the entry (or the
-/// `ToolCalls`+`ToolResults` pair) it round-trips from, returning the log_seq of
-/// its first entry. Used to re-log the preserved suffix after a `Compress`
+/// The log entries that record a compaction, planned from the session and
+/// appended without borrowing it, so a caller holding the session under the
+/// config lock can drop the guard for the NATS round trips.
+pub(crate) struct CompactionLog {
+    session_id: String,
+    sink: Option<Arc<dyn SessionAppendSink>>,
+    summary: String,
+    keep_from: usize,
+    message_count: usize,
+    log_entry_count: usize,
+    /// The entries that re-log each kept message, in order.
+    suffix: Vec<Vec<SessionLogEntry>>,
+}
+
+/// A [`CompactionLog`] after its entries were appended, ready to apply.
+pub(crate) struct AppendedCompaction {
+    summary: String,
+    keep_from: usize,
+    message_count: usize,
+    /// The log seq each kept message takes: the log length before its first entry.
+    suffix_seqs: Vec<usize>,
+    log_entry_count: usize,
+    all_appended: bool,
+}
+
+impl CompactionLog {
+    pub(crate) fn plan(session: &Session, summary: String, keep_from: usize) -> Self {
+        let keep_from = keep_from.min(session.messages.len());
+        Self {
+            session_id: session.id().to_string(),
+            sink: super::session_persistence::detached_sink(session),
+            summary,
+            keep_from,
+            message_count: session.messages.len(),
+            log_entry_count: session.log_entry_count,
+            suffix: session.messages[keep_from..]
+                .iter()
+                .map(relog_entries)
+                .collect(),
+        }
+    }
+
+    /// Append the `Compress` marker, then re-log the kept suffix. Hard cut:
+    /// the marker archives the prefix and carries the summary; the fresh
+    /// suffix entries let replay rebuild the active transcript without any
+    /// stored index.
+    pub(crate) fn append(self) -> AppendedCompaction {
+        let mut log_entry_count = self.log_entry_count;
+        let mut all_appended = self.append_one(
+            &SessionLogEntry::Compress {
+                prompt: self.summary.clone(),
+            },
+            &mut log_entry_count,
+        );
+        let mut suffix_seqs = Vec::with_capacity(self.suffix.len());
+        for entries in &self.suffix {
+            suffix_seqs.push(log_entry_count);
+            for entry in entries {
+                all_appended &= self.append_one(entry, &mut log_entry_count);
+            }
+        }
+        AppendedCompaction {
+            summary: self.summary,
+            keep_from: self.keep_from,
+            message_count: self.message_count,
+            suffix_seqs,
+            log_entry_count,
+            all_appended,
+        }
+    }
+
+    fn append_one(&self, entry: &SessionLogEntry, log_entry_count: &mut usize) -> bool {
+        let seq =
+            super::session_persistence::append_through(self.sink.as_ref(), &self.session_id, entry);
+        if let Some(seq) = seq {
+            *log_entry_count = seq as usize;
+        }
+        seq.is_some()
+    }
+}
+
+impl AppendedCompaction {
+    pub(crate) fn apply(self, session: &mut Session) {
+        if session.messages.len() != self.message_count {
+            log::warn!(
+                "session messages changed while compaction was being persisted: session_id={} planned={} now={}",
+                session.id(),
+                self.message_count,
+                session.messages.len()
+            );
+        }
+        let keep_from = self.keep_from.min(session.messages.len());
+        let suffix: Vec<Message> = session.messages.split_off(keep_from);
+        session.compressed_messages.append(&mut session.messages);
+        session.compaction_summary = Some(self.summary);
+        for (index, mut msg) in suffix.into_iter().enumerate() {
+            if let Some(seq) = self.suffix_seqs.get(index) {
+                msg.log_seq = Some(*seq);
+            }
+            session.messages.push(msg);
+        }
+        session.log_entry_count = session.log_entry_count.max(self.log_entry_count);
+        if !self.all_appended {
+            session.dirty = true;
+        }
+        session.update_tokens();
+    }
+}
+
+/// The entry (or the `ToolCalls`+`ToolResults` pair) an in-memory message
+/// round-trips from. Used to re-log the preserved suffix after a `Compress`
 /// event so the NATS log is self-describing (no stored index).
-fn relog_message(session: &mut Session, msg: &Message) -> usize {
-    let seq = session.next_seq();
-    let message_id = msg.id.clone();
+fn relog_entries(msg: &Message) -> Vec<SessionLogEntry> {
     if msg.role == MessageRole::Tool {
         if let MessageContent::ToolCalls(tc) = &msg.content {
             let calls: Vec<crate::tool::ToolCall> =
                 tc.tool_results.iter().map(|r| r.call.clone()).collect();
-            let ok_calls = append_event(
-                session,
-                &SessionLogEntry::ToolCalls {
-                    text: tc.text.clone(),
-                    thought: tc.thought.clone(),
-                    calls,
-                    timestamp: msg.log_timestamp,
-                    fence_token: None,
-                },
-            );
             let results: Vec<harnx_core::session::ToolOutput> = tc
                 .tool_results
                 .iter()
@@ -701,32 +782,28 @@ fn relog_message(session: &mut Session, msg: &Message) -> usize {
                     switch_agent: r.switch_agent.clone(),
                 })
                 .collect();
-            let ok_results = append_event(
-                session,
-                &SessionLogEntry::ToolResults {
+            return vec![
+                SessionLogEntry::ToolCalls {
+                    text: tc.text.clone(),
+                    thought: tc.thought.clone(),
+                    calls,
+                    timestamp: msg.log_timestamp,
+                    fence_token: None,
+                },
+                SessionLogEntry::ToolResults {
                     results,
                     timestamp: msg.log_timestamp,
                 },
-            );
-            if !(ok_calls && ok_results) {
-                session.dirty = true;
-            }
-            return seq;
+            ];
         }
     }
-    if !append_event(
-        session,
-        &SessionLogEntry::Message {
-            id: message_id,
-            role: msg.role,
-            content: msg.content.clone(),
-            timestamp: msg.log_timestamp,
-            fence_token: None,
-        },
-    ) {
-        session.dirty = true;
-    }
-    seq
+    vec![SessionLogEntry::Message {
+        id: msg.id.clone(),
+        role: msg.role,
+        content: msg.content.clone(),
+        timestamp: msg.log_timestamp,
+        fence_token: None,
+    }]
 }
 
 /// Record an assistant turn that produced plain text (no tool calls).
@@ -1228,7 +1305,7 @@ mod tests {
     #[test]
     fn authoritative_assistant_append_failure_fails_the_turn() {
         let config = Config::default();
-        let global_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let global_config = Arc::new(crate::config::ConfigLock::new(config.clone()));
         let input = crate::config::input::from_str(
             &global_config,
             "question",
@@ -1250,15 +1327,29 @@ mod tests {
 
     #[test]
     fn authoritative_title_append_failure_does_not_publish_an_in_memory_title() {
-        let mut session = new(&Config::default(), "title-failure", None).unwrap();
+        let mut config = Config::default();
+        let mut session = new(&config, "title-failure", None).unwrap();
         session.runtime = Some(Arc::new(
             Arc::new(FailingAuthoritativeSink) as Arc<dyn SessionAppendSink>
         ));
+        let session_id = session.id.clone();
+        config.session = Some(session);
+        let config = Arc::new(crate::config::ConfigLock::new(config));
 
-        let error = record_title(&mut session, "Unpersisted title".to_string(), false, 42)
-            .expect_err("authoritative title persistence failure must be visible");
+        let error = record_title(
+            &config,
+            &session_id,
+            TitleRecord {
+                title: "Unpersisted title".to_string(),
+                manual: false,
+                tokens: 42,
+            },
+        )
+        .expect_err("authoritative title persistence failure must be visible");
 
         assert!(error.to_string().contains("durably persist session title"));
+        let guard = config.read();
+        let session = guard.session.as_ref().unwrap();
         assert_eq!(session.title(), None);
         assert_eq!(session.title_last_updated_tokens(), 0);
     }
@@ -1598,7 +1689,7 @@ prompt: summary
 
         let config = Config::default();
         let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+        let global_config = std::sync::Arc::new(crate::config::ConfigLock::new(config.clone()));
 
         // Build a session that ends with a Tool message (simulates
         // an interrupted session or one resumed after Ctrl-C).
@@ -1658,7 +1749,7 @@ prompt: summary
 
         let config = Config::default();
         let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+        let global_config = std::sync::Arc::new(crate::config::ConfigLock::new(config.clone()));
 
         // Build a session ending in a Tool message.
         let input1 =
@@ -2641,7 +2732,7 @@ replacements:
 
         let config = Config::default();
         let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+        let global_config = std::sync::Arc::new(crate::config::ConfigLock::new(config.clone()));
 
         let mut input =
             crate::config::input::from_str(&global_config, "do work", Some(agent.clone()));
@@ -2748,7 +2839,7 @@ replacements:
 
         let config = Config::default();
         let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+        let global_config = std::sync::Arc::new(crate::config::ConfigLock::new(config));
         let user_text =
             "I noticed something in the agent prompts and want to look at it".to_string();
         let input = crate::config::input::from_str(&global_config, &user_text, Some(agent));

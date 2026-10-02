@@ -11,5 +11,4 @@ repository.workspace = true
 anyhow = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-runtime = { path = "../harnx-runtime" }
-parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }

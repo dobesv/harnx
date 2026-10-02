@@ -260,6 +260,21 @@ impl Config {
             .map(|v| v.compressing())
             .unwrap_or_default()
     }
+
+    /// Whether `pending` holds for the active session, for loops that poll
+    /// until its compaction or title generation is done.
+    ///
+    /// A held config guard reads as still pending instead of being waited
+    /// on. The holder may be one of those maintenance tasks partway through
+    /// a NATS round trip, and a poller only wants to know whether to sleep.
+    pub(crate) fn session_maintenance_pending(
+        config: &GlobalConfig,
+        pending: impl FnOnce(&Session) -> bool,
+    ) -> bool {
+        config
+            .try_read()
+            .is_none_or(|guard| guard.session.as_ref().is_some_and(pending))
+    }
 }
 
 #[cfg(test)]

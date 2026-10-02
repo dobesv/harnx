@@ -350,7 +350,7 @@ pub(super) fn spawn_metis_worker_with_hooks(
         }],
         ..Default::default()
     };
-    let worker_config = Arc::new(parking_lot::RwLock::new(worker_config));
+    let worker_config = Arc::new(crate::config::ConfigLock::new(worker_config));
     tokio::spawn({
         let worker_config = Arc::clone(&worker_config);
         async move { run_worker_daemon(worker_config, daemon, Some(call_fn), None).await }
@@ -402,7 +402,7 @@ pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
     let parent_session =
         crate::config::session::new(&parent_config, "parent-nats-roundtrip", None)?;
     parent_config.session = Some(parent_session);
-    let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
+    let parent_global_config = Arc::new(crate::config::ConfigLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
     let session_cfg = cluster_shared_session_config(cluster, session_id);
     let session =
@@ -748,7 +748,7 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         crate::config::session::new(&parent_config, "parent-nats-remote-cancel", None)
             .expect("create parent session");
     parent_config.session = Some(parent_session);
-    let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
+    let parent_global_config = Arc::new(crate::config::ConfigLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
     let session_cfg = cluster_shared_session_config("local", session_id.clone());
     let session = Arc::new(
@@ -1641,7 +1641,7 @@ async fn remote_dispatch_retract_round_trip() {
     seed_remote_dispatch_session_log(&log, &jetstream, &session_id)
         .await
         .expect("seed remote session log");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     delete_remote_message_range(&global_config, 2, 2, &abort)
@@ -1728,7 +1728,7 @@ async fn remote_dispatch_edit_round_trip() {
         })),
     );
 
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     edit_remote_message_range(&global_config, 2, 2, &abort)
@@ -1808,7 +1808,7 @@ async fn remote_delete_turn_matches_local_any_role_parity() {
         .parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     delete_remote_message_range(&global_config, 1, 1, &abort)
@@ -1910,7 +1910,7 @@ async fn remote_delete_accepts_first_transcript_row() {
     parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     delete_remote_message_range(&global_config, 0, 0, &abort)
@@ -1967,7 +1967,7 @@ async fn remote_rewind_appends_mutation_without_truncating_stream() {
         .parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     rewind_remote_session(&global_config, 0, &abort)
@@ -2055,7 +2055,7 @@ async fn remote_delete_refreshes_after_concurrent_mutation() {
         .parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     let stale_state = load_remote_session_for_render(
@@ -2147,7 +2147,7 @@ async fn remote_edit_preserves_canonical_transcript_messages() {
         .parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     edit_remote_message_range(&global_config, 0, 0, &abort)
@@ -2217,7 +2217,7 @@ async fn remote_delete_after_older_edit_deletes_exact_late_range() {
         .parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     edit_remote_message_range(&global_config, 0, 0, &abort)
@@ -2290,7 +2290,7 @@ async fn remote_rewind_after_older_edit_preserves_correct_logical_prefix() {
         .parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     edit_remote_message_range(&global_config, 0, 0, &abort)
@@ -2363,7 +2363,7 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
         .parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     edit_remote_message_range(&global_config, 0, 0, &abort)
@@ -2470,7 +2470,7 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
         .parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
     edit_remote_message_range(&global_config, 0, 0, &abort)
@@ -2612,7 +2612,7 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         .parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+    let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
     let session = NatsSession::from_global_config(
         cluster_shared_session_config("local", session_id.clone()),

@@ -7,12 +7,12 @@ use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
 use harnx_runtime::config::Config;
 #[cfg(test)]
+use harnx_runtime::config::ConfigLock;
+#[cfg(test)]
 use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 use http::{HeaderMap, Method, Response, StatusCode};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Body, Frame};
-#[cfg(test)]
-use parking_lot::RwLock;
 use serde_json::json;
 #[cfg(test)]
 use std::sync::Arc;
@@ -531,7 +531,7 @@ mod tests {
             return;
         }
         sandbox.write_agent("session-creator", "You create sessions.");
-        let global = Arc::new(RwLock::new(sandbox.config()));
+        let global = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
         let (target, scoped) = crate::resolve_agent_target(&server.config, "session-creator")
             .await
@@ -612,7 +612,7 @@ mod tests {
         let metadata_store = test_metadata_store(&config).await;
         persist_redaction_test_metadata(&metadata_store, &session_id).await;
 
-        let global = Arc::new(RwLock::new(config));
+        let global = Arc::new(ConfigLock::new(config));
         let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
         let request = hyper::Request::builder()
             .method(Method::GET)
@@ -662,7 +662,7 @@ mod tests {
         }
 
         let store = test_metadata_store(&config).await;
-        let global = Arc::new(RwLock::new(config));
+        let global = Arc::new(ConfigLock::new(config));
         let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
         let target = AgentSessionRef::local("metadata-mutations", &session_id);
 
@@ -731,7 +731,7 @@ mod tests {
             return;
         }
 
-        let global = Arc::new(RwLock::new(config));
+        let global = Arc::new(ConfigLock::new(config));
         let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
 
         let invalid = hyper::Request::builder()
@@ -854,7 +854,7 @@ mod tests {
         harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let global = Arc::new(RwLock::new(sandbox.config()));
+        let global = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
         let (target, scoped) = crate::resolve_agent_target(&server.config, "plain")
             .await
@@ -906,7 +906,7 @@ mod tests {
         let config = sandbox.config();
         seed_paginated_sessions(&config, agent).await;
 
-        let global = Arc::new(RwLock::new(config));
+        let global = Arc::new(ConfigLock::new(config));
         let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
         let (target, scoped_agent) = crate::resolve_agent_target(&server.config, agent)
             .await

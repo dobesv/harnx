@@ -133,7 +133,7 @@ async fn activate_nats_session(
         .parent_config
         .use_session(Some(&session_id))
         .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(std::mem::take(
+    let global_config = Arc::new(crate::config::ConfigLock::new(std::mem::take(
         &mut seeded.parent_config,
     )));
     NatsSession::from_global_config(

@@ -15,6 +15,7 @@ use common::{spawn_nats_server, NatsServerHandle};
 use harnx_core::{
     abort::create_abort_signal, event::NullSink, require_nextest, session::SessionLogEntry,
 };
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::{
     config::Config,
     nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease},
@@ -23,7 +24,6 @@ use harnx_runtime::{
     nats_worker::{run_worker_daemon, WorkerDaemonConfig},
     NatsSession, NatsSessionConfig, NatsTurnResult,
 };
-use parking_lot::RwLock;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -250,7 +250,7 @@ impl TestEnv {
             }
             config.agent_variables = Some(vars);
         }
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let handle = tokio::spawn(async move {
             let _ = run_worker_daemon(
                 config,

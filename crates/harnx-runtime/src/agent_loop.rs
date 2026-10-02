@@ -475,8 +475,18 @@ fn turn_hook_context(ctx: &AgentLoopContext) -> TurnHookContext {
 }
 
 async fn wait_for_session_compaction(config: &GlobalConfig) {
-    while config.read().is_compacting_session() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    loop {
+        // Polled without waiting on the lock, whose holder may be the very
+        // compaction this waits for. A held lock usually frees in
+        // microseconds, so look again sooner than a running compaction
+        // would warrant.
+        let compacting = config.try_read().map(|guard| guard.is_compacting_session());
+        let delay = match compacting {
+            Some(false) => return,
+            Some(true) => 100,
+            None => 1,
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
     }
 }
 
@@ -1064,6 +1074,7 @@ mod tests {
     use crate::client::{
         ChatCompletionsOutput, ClientConfig, MessageRole, Model, ModelData, TestStateGuard,
     };
+    use crate::config::ConfigLock;
     use crate::test_utils::{MockClient, MockTurn, MockTurnBuilder};
     use crate::utils::create_abort_signal;
     use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent, TurnEvent};
@@ -1072,7 +1083,6 @@ mod tests {
         debugging::{DebugValue, DebuggingRecorder},
         CompositeKey, MetricKind,
     };
-    use parking_lot::RwLock;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1196,7 +1206,7 @@ mod tests {
         let mut session = crate::config::session::new(&config, "replay_test", None).unwrap();
         crate::config::session::attach_memory_log(&mut session);
         config.session = Some(session);
-        Arc::new(RwLock::new(config))
+        Arc::new(ConfigLock::new(config))
     }
 
     fn usage(input: u64, output: u64, cached: u64, cache_write: u64) -> CompletionTokenUsage {
@@ -1279,7 +1289,7 @@ mod tests {
                 .add_turn(metrics_mock_turn("all done", None, (13, 8, 3, 2)))
                 .build(),
         );
-        let config = Arc::new(RwLock::new(Config {
+        let config = Arc::new(ConfigLock::new(Config {
             data: harnx_core::config_data::ConfigData {
                 stream: false,
                 ..Default::default()
@@ -1512,7 +1522,7 @@ mod tests {
         mock: Arc<MockClient>,
         clients: Vec<ClientConfig>,
     ) -> Vec<DebugMetric> {
-        let global_config = Arc::new(RwLock::new(Config {
+        let global_config = Arc::new(ConfigLock::new(Config {
             data: harnx_core::config_data::ConfigData {
                 stream: false,
                 ..Default::default()
@@ -1682,7 +1692,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_turn_emits_neither_normal_end_nor_model_error() {
         let _guard = SINK_LOCK.lock().await;
-        let config = Arc::new(RwLock::new(crate::config::Config::default()));
+        let config = Arc::new(ConfigLock::new(crate::config::Config::default()));
         let call_fn: AgentCallFn = Arc::new(|_, _, _| unreachable!("model is not called"));
         let ctx = make_test_context(config, call_fn, handoff_on_tool_round());
         ctx.abort_signal.set_ctrlc();
@@ -1703,7 +1713,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_pending_context_is_taken_and_injected_into_next_input() {
-        let config = Arc::new(RwLock::new(crate::config::Config::default()));
+        let config = Arc::new(ConfigLock::new(crate::config::Config::default()));
         let mut input = crate::config::input::from_str(&config, "user prompt", None);
         let pending = Arc::new(tokio::sync::Mutex::new(Some(
             "context queued over NATS".to_string(),
@@ -1736,7 +1746,7 @@ user prompt"
         let _guard = SINK_LOCK.lock().await;
         harnx_core::sink::clear_agent_event_sink();
 
-        let config = Arc::new(RwLock::new(crate::config::Config::default()));
+        let config = Arc::new(ConfigLock::new(crate::config::Config::default()));
         let call_fn: AgentCallFn = Arc::new(|_, _, _| unreachable!("model is not called"));
         let ctx = make_test_context(config.clone(), call_fn, handoff_on_tool_round());
         let input = crate::config::input::from_str(&config, "start handoff", None);

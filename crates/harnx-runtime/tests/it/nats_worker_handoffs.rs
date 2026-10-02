@@ -12,6 +12,7 @@ use harnx_core::{
     session::SessionLogEntry,
     tool::ToolCall,
 };
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::{
     client::CompletionTokenUsage,
     config::Config,
@@ -22,7 +23,6 @@ use harnx_runtime::{
     utils::create_abort_signal,
     NatsSession, NatsSessionConfig, SessionActivationRoute,
 };
-use parking_lot::RwLock;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
@@ -60,7 +60,7 @@ struct HandoffFixture {
     _config_guard: EnvVarGuard,
     _data_guard: EnvVarGuard,
     _state_guard: EnvVarGuard,
-    config: Arc<RwLock<Config>>,
+    config: harnx_runtime::config::GlobalConfig,
     client: async_nats::Client,
     jetstream: async_nats::jetstream::Context,
     daemon: tokio::task::JoinHandle<Result<()>>,
@@ -83,7 +83,7 @@ impl HandoffFixture {
         let config_guard = EnvVarGuard::set_path("HARNX_CONFIG_DIR", &config_dir);
         let data_guard = EnvVarGuard::set_path("HARNX_DATA_DIR", &data_dir);
         let state_guard = EnvVarGuard::set_path("HARNX_STATE_DIR", &state_dir);
-        let config = Arc::new(RwLock::new(Config::load_from_file(
+        let config = Arc::new(ConfigLock::new(Config::load_from_file(
             &config_dir.join("config.yaml"),
         )?));
         let (client, jetstream) = {

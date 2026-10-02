@@ -57,7 +57,8 @@ mod nats_test {
         let registry = SessionRegistry::new(config.clone());
 
         // Create Server instance to verify session list JSON
-        let global_config: GlobalConfig = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let global_config: GlobalConfig =
+            Arc::new(harnx_runtime::config::ConfigLock::new(config.clone()));
         let server = Server::new(&global_config, std::path::PathBuf::from("web-assets"));
 
         // Initial state: not unread (no attention)

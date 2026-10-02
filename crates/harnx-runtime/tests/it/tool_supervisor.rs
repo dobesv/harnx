@@ -11,10 +11,10 @@ use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use harnx_runtime::nats_worker::{ToolServerStartConfig, ToolServerSupervisor};
 use harnx_toolset::{ControlKind, ControlMessage};
 // Only the Linux-gated #1350 identity/cleanup test uses these.
+use harnx_runtime::config::ConfigLock;
 #[cfg(target_os = "linux")]
 use harnx_toolset::{server_identity_token, Registration};
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
-use parking_lot::RwLock;
 use serde_json::json;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -167,7 +167,7 @@ async fn assert_pilot_registration(
 }
 
 async fn assert_nats_eval_batch(instance_id: &ServerScope) -> Result<()> {
-    let config = Arc::new(RwLock::new(Config::default()));
+    let config = Arc::new(ConfigLock::new(Config::default()));
     let context = harnx_runtime::tool::build_tool_eval_context(
         harnx_runtime::tool::BuildToolEvalContextParams::new(&config, instance_id)
             .with_agent_use_tools(Some("*")),

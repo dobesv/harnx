@@ -11,8 +11,8 @@ use harnx_core::agent_config::collect_agent_variables;
 use harnx_core::logging::LogSink;
 use harnx_render::render_error;
 use harnx_runtime::bootstrap::setup_logger;
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::config::{load_env_file, Config, WorkingMode};
-use parking_lot::RwLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Parser, Debug)]
@@ -74,13 +74,13 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
         .await
         .context("Failed to init Config")?;
     config.apply_frontend_nats_routing();
-    let config = Arc::new(RwLock::new(config));
+    let config = Arc::new(ConfigLock::new(config));
 
     if cli.dry_run {
         config.write().dry_run = true;
     }
     if let Some(model_id) = &cli.model {
-        config.write().set_model(model_id)?;
+        Config::switch_model(&config, model_id)?;
     }
     config.write().agent_variables = collect_agent_variables(&cli.agent_variable)?;
 

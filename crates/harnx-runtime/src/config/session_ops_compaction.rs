@@ -306,20 +306,33 @@ impl Config {
     /// Write the compaction summary back into the session, but only if the
     /// active session is still the one we compacted (it may have been swapped).
     /// Returns whether the summary was applied.
+    ///
+    /// The `Compress` marker and the re-logged suffix are one NATS append
+    /// each, so they are written between two short guards rather than under
+    /// one. Nothing else appends to the session meanwhile: compaction is
+    /// single-flight through `compressing`, and the worker holds the next
+    /// turn until it clears. There is no `.await` in here either, so
+    /// cancelling the compaction task cannot stop it halfway.
     pub(crate) fn apply_compaction_summary(
         config: &GlobalConfig,
         session_id: &str,
         summary_with_note: String,
         split: usize,
     ) -> bool {
+        let log = {
+            let guard = config.read();
+            let Some(session) = guard.session.as_ref().filter(|s| s.id == session_id) else {
+                return false;
+            };
+            crate::config::session::CompactionLog::plan(session, summary_with_note, split)
+        };
+        let appended = log.append();
         let mut guard = config.write();
-        let Some(session) = guard.session.as_mut() else {
+        let Some(session) = guard.session.as_mut().filter(|s| s.id == session_id) else {
+            log::warn!("compaction persisted for session {session_id}, which is no longer active");
             return false;
         };
-        if session.id != session_id {
-            return false;
-        }
-        crate::config::session::compress_keeping_recent(session, summary_with_note, split);
+        appended.apply(session);
         guard.discontinuous_last_message();
         true
     }

@@ -90,16 +90,23 @@ impl Config {
             bail!("Usage: .set title <text>");
         }
 
-        {
-            let mut guard = config.write();
+        let (session_id, tokens) = {
+            let guard = config.read();
             let session = guard
                 .session
-                .as_mut()
+                .as_ref()
                 .context("No active session to set a title on")?;
             // Manual title: record the current token count for provenance;
             // `record_title` freezes regeneration (usize::MAX) for manual titles.
-            let tokens = session.tokens;
-            crate::config::session::record_title(session, title.clone(), true, tokens)?;
+            (session.id.clone(), session.tokens)
+        };
+        let record = crate::config::session::TitleRecord {
+            title: title.clone(),
+            manual: true,
+            tokens,
+        };
+        if !crate::config::session::record_title(config, &session_id, record)? {
+            bail!("The active session changed before its title was set");
         }
         harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
             harnx_core::event::SessionEvent::TitleUpdated(title),
@@ -171,11 +178,7 @@ impl Config {
     }
 
     fn persist_override(config: &GlobalConfig, update: SessionOverrideUpdate) -> Result<()> {
-        let guard = config.read();
-        let Some(session) = guard.session.as_ref() else {
-            return Ok(());
-        };
-        crate::config::session::persist_session_override(session, &update)
+        crate::config::session::persist_active_session_override(config, &update)
     }
 
     fn update_bool_field(
@@ -312,20 +315,36 @@ impl Config {
         };
     }
 
+    /// Switch the model, persisting it as the active session's override
+    /// first. The override is written with no config guard held.
+    pub fn switch_model(config: &GlobalConfig, model_id: &str) -> Result<()> {
+        let model =
+            crate::client::retrieve_model(&config.read().clients, model_id, ModelType::Chat)?;
+        crate::config::session::persist_active_session_override(
+            config,
+            &SessionOverrideUpdate::Model(Some(model.id())),
+        )?;
+        config.write().apply_model(model);
+        Ok(())
+    }
+
+    /// Set the model in memory only. Callers that change a session's model
+    /// on the user's behalf use [`Config::switch_model`], which also persists
+    /// the override.
     pub fn set_model(&mut self, model_id: &str) -> Result<()> {
         let model = crate::client::retrieve_model(&self.clients, model_id, ModelType::Chat)?;
+        self.apply_model(model);
+        Ok(())
+    }
+
+    fn apply_model(&mut self, model: crate::client::Model) {
         if let Some(session) = self.session.as_mut() {
-            crate::config::session::persist_session_override(
-                session,
-                &SessionOverrideUpdate::Model(Some(model.id())),
-            )?;
             session.set_model(model);
         } else if let Some(agent) = self.agent.as_mut() {
             agent.set_model(model);
         } else {
             self.model = model;
         }
-        Ok(())
     }
 }
 
@@ -343,7 +362,7 @@ where
 #[cfg(test)]
 mod title_command_tests {
     use super::super::*;
-    use parking_lot::RwLock;
+    use crate::config::ConfigLock;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -352,7 +371,7 @@ mod title_command_tests {
         let mut session = crate::config::session::new(&config, "title-test", None).unwrap();
         crate::config::session::attach_memory_log(&mut session);
         config.session = Some(session);
-        Arc::new(RwLock::new(config))
+        Arc::new(ConfigLock::new(config))
     }
 
     #[test]

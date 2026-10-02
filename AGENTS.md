@@ -936,6 +936,46 @@ with `SessionLogEntry` variants (previous section), which are protocol-versioned
 New `TranscriptItem::ToolCall` fields (`start_anchor`, `final_elapsed_ms`, `id`) support tool-call
 timer display and completion correlation. These are TUI-local; no protocol change.
 
+### The config lock and blocking NATS calls
+
+Never hold a `GlobalConfig` guard across a NATS round trip. Persistence
+reaches NATS from synchronous code through `block_in_place` plus
+`Handle::block_on`, and the reply is read only while some Tokio worker polls
+the I/O driver. The multi-thread runtime lets one parked worker poll it at a
+time. If that worker wakes, runs a task that then blocks on the config lock,
+and the lock holder is waiting for a NATS reply, nothing reads the reply.
+Both sides stay parked at zero CPU, `/healthz` stops answering and the
+broker eventually drops the connections. Staging workers hung this way when
+a title write held the per-session write guard while
+`wait_for_post_turn_maintenance` blocked on `config.read()`.
+
+Take what you need under a short guard, drop it, do the round trip, then
+take the guard again to apply the result. `session::record_title` and
+`CompactionLog` (`config/session.rs`) re-check that the session id still
+matches before applying. `persist_active_session_override` and
+`Config::switch_model` don't, and rely on front-end commands running one at a
+time. Keep the sequence free of `.await` when a dropped future must not
+leave it half done, as compaction does. A loop that polls session state uses
+`try_read` and treats a held lock as still busy
+(`Config::session_maintenance_pending`).
+
+Two safeguards cover what is left:
+
+- `ConfigLock` is a `YieldingRwLock` (`config/lock.rs`). A contended
+  acquisition on a multi-thread runtime waits inside `block_in_place`, so the
+  worker hands its core on and the driver keeps being polled. It is a backstop,
+  not permission to hold the lock across I/O.
+- The agent loop's transcript appends (`before_chat_completion`,
+  `append_session_tool_calls`, `prepare_session_tool_results`,
+  `prepare_after_chat_completion`) still append under `config.write()`. They
+  depend on it to keep the in-memory transcript in log order, and they rely
+  on the yielding lock to stay deadlock-free.
+
+`config::lock::tests::contended_waiter_keeps_the_io_driver_polled`
+reproduces the hang: with a plain `parking_lot::RwLock` it deadlocks on every
+run. `config/tests/lock_free_persistence.rs` checks each persistence path
+with a sink that fails if the lock is still held.
+
 ### Spawning long-lived child processes
 
 Spawn any child that must not outlive harnx through

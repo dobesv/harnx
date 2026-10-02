@@ -109,7 +109,9 @@ impl Worker {
         });
         let readiness = harnx_healthz::Readiness::default();
         let mut task = AbortOnDropHandle::new(tokio::spawn({
-            let config = Arc::new(parking_lot::RwLock::new(bootstrap.config().clone()));
+            let config = Arc::new(harnx_runtime::config::ConfigLock::new(
+                bootstrap.config().clone(),
+            ));
             let readiness = readiness.clone();
             async move {
                 run_worker_daemon(

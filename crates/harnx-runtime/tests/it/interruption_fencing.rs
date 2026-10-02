@@ -228,7 +228,7 @@ async fn cancel_model(tool_calls: bool) -> Result<()> {
         Arc::new(h.sink().await?) as Arc<dyn SessionAppendSink>
     ));
     config.session = Some(session);
-    let config = Arc::new(parking_lot::RwLock::new(config));
+    let config = Arc::new(harnx_runtime::config::ConfigLock::new(config));
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
     let call = paused_model(entered.clone(), release.clone(), tool_calls);
@@ -318,7 +318,7 @@ impl harnx_core::tool::ToolProvider for PausedTool {
 
 async fn cancel_tool_output(failure: bool) -> Result<()> {
     let h = Harness::new().await?;
-    let config = Arc::new(parking_lot::RwLock::new(Config::default()));
+    let config = Arc::new(harnx_runtime::config::ConfigLock::new(Config::default()));
     let scope = harnx_core::instance::ServerScope::new();
     let mut eval = harnx_runtime::tool::build_tool_eval_context(
         harnx_runtime::tool::BuildToolEvalContextParams::new(&config, &scope),
@@ -398,7 +398,7 @@ async fn cancel_after_handler_suppresses_recoverable_failure() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_during_pre_hook_prevents_queued_dispatch() -> Result<()> {
     let h = Harness::new().await?;
-    let config = Arc::new(parking_lot::RwLock::new(Config::default()));
+    let config = Arc::new(harnx_runtime::config::ConfigLock::new(Config::default()));
     let scope = harnx_core::instance::ServerScope::new();
     let mut eval = harnx_runtime::tool::build_tool_eval_context(
         harnx_runtime::tool::BuildToolEvalContextParams::new(&config, &scope),

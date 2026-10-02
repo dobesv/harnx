@@ -410,12 +410,9 @@ async fn settle_abandoned_turn(
         let _ = turn.await;
     }
     let maintenance = async {
-        while turn_config
-            .read()
-            .session
-            .as_ref()
-            .is_some_and(|session| session.compressing() || session.titling())
-        {
+        while crate::config::Config::session_maintenance_pending(turn_config, |session| {
+            session.compressing() || session.titling()
+        }) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     };
@@ -646,7 +643,7 @@ mod tests {
                 FinishedTurn {
                     task: None,
                     settled: true,
-                    config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
+                    config: std::sync::Arc::new(crate::config::ConfigLock::new(config)),
                     failover_cause: None,
                 },
             )
@@ -699,7 +696,7 @@ mod tests {
                 &turn.lease,
                 FinishedTurn::for_failover(
                     None,
-                    std::sync::Arc::new(parking_lot::RwLock::new(config)),
+                    std::sync::Arc::new(crate::config::ConfigLock::new(config)),
                     FailoverCause::Shutdown,
                 ),
             )
@@ -751,7 +748,9 @@ mod tests {
                 &turn.lease,
                 FinishedTurn::for_failover(
                     None,
-                    std::sync::Arc::new(parking_lot::RwLock::new(crate::config::Config::default())),
+                    std::sync::Arc::new(crate::config::ConfigLock::new(
+                        crate::config::Config::default(),
+                    )),
                     FailoverCause::LeaseLost,
                 ),
             )
@@ -790,7 +789,7 @@ mod tests {
                 FinishedTurn {
                     task: None,
                     settled: true,
-                    config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
+                    config: std::sync::Arc::new(crate::config::ConfigLock::new(config)),
                     failover_cause: None,
                 },
             )

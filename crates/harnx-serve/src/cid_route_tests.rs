@@ -7,10 +7,10 @@ use harnx_blob_store::{
     plans::{create_document, ensure_plans_bucket, serialize_plan, PlanDocument, PlanFrontMatter},
 };
 use harnx_core::cid_url::{CidUrl, PlanItem, SessionRef};
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::config::NatsRouting;
 use http::{header, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
-use parking_lot::RwLock;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
 use crate::{
@@ -85,7 +85,7 @@ async fn cid_route_fixture() -> Result<Option<CidRouteFixture>> {
     let plan_revision =
         create_document(&plan_store, &plan, &serialize_plan(&plan_document)?).await?;
 
-    let config = Arc::new(RwLock::new(config));
+    let config = Arc::new(ConfigLock::new(config));
     let server = Arc::new(Server::new(&config, PathBuf::from("web-assets")));
     Ok(Some(CidRouteFixture {
         _nats: nats,
@@ -225,7 +225,7 @@ async fn get_cid_html_forces_download() -> Result<()> {
 #[tokio::test]
 async fn get_cid_malformed_url_returns_bad_request() -> Result<()> {
     let sandbox = TestConfigSandbox::new();
-    let config = Arc::new(RwLock::new(sandbox.config()));
+    let config = Arc::new(ConfigLock::new(sandbox.config()));
     let server = Server::new(&config, PathBuf::from("web-assets"));
     let request = hyper::Request::builder()
         .method(Method::GET)

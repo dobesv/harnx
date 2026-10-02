@@ -67,7 +67,7 @@ async fn after_chat_completion_saves_intermediate_tool_rounds() {
     config.session = Some(session);
 
     let _agent = config.extract_agent();
-    let global_config: GlobalConfig = Arc::new(RwLock::new(config));
+    let global_config: GlobalConfig = Arc::new(crate::config::ConfigLock::new(config));
     let input = crate::config::input::from_str(&global_config, "do something", None);
 
     let tool_results = vec![ToolResult::new(

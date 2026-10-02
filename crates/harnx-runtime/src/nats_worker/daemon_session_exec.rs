@@ -286,7 +286,7 @@ impl WorkerRuntime {
         let per_session = {
             let mut base = self.config.read().clone();
             base.maintenance_abort = Some(execution_abort.clone());
-            Arc::new(parking_lot::RwLock::new(base))
+            Arc::new(crate::config::ConfigLock::new(base))
         };
         self.configure_tool_confirmation(
             &per_session,
@@ -630,19 +630,17 @@ impl WorkerRuntime {
         lease: &NatsSessionLease,
     ) {
         while lease.is_held() {
-            if config
-                .read()
-                .maintenance_abort
-                .as_ref()
-                .is_some_and(|abort| abort.aborted())
-            {
+            if config.try_read().is_some_and(|guard| {
+                guard
+                    .maintenance_abort
+                    .as_ref()
+                    .is_some_and(|abort| abort.aborted())
+            }) {
                 break;
             }
-            let pending = config
-                .read()
-                .session
-                .as_ref()
-                .is_some_and(|session| session.compressing() || session.titling());
+            let pending = crate::config::Config::session_maintenance_pending(config, |session| {
+                session.compressing() || session.titling()
+            });
             if !pending {
                 break;
             }

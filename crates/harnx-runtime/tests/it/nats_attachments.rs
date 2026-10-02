@@ -10,12 +10,12 @@ use harnx_core::cid_url::{CidUrl, SessionRef};
 use harnx_core::message::{ImageUrl, Message, MessageContent, MessageContentPart, MessageRole};
 use harnx_core::require_nextest;
 use harnx_core::session::Session;
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::config::{Config, GlobalConfig, SessionAttachmentPath};
 use harnx_runtime::nats_attachments::{
     delete_session_attachments, externalize_message_attachments, get_session_attachment,
     hydrate_attachment_refs, sync_session_attachments, AttachmentLocation,
 };
-use parking_lot::RwLock;
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
@@ -305,7 +305,7 @@ async fn session_attachment_sync_uploads_local_cid_refs() -> Result<()> {
         session: Some(session),
         ..Default::default()
     };
-    let config: GlobalConfig = Arc::new(RwLock::new(config));
+    let config: GlobalConfig = Arc::new(ConfigLock::new(config));
 
     sync_session_attachments(&jetstream, &config, 1).await?;
     assert_eq!(

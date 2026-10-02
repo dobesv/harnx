@@ -12,8 +12,8 @@ use clap::{ArgGroup, Parser};
 use harnx_core::agent_config::collect_agent_variables;
 use harnx_core::logging::LogSink;
 use harnx_runtime::bootstrap::setup_logger;
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::config::{load_env_file, Config, WorkingMode};
-use parking_lot::RwLock;
 use std::sync::Arc;
 
 /// Heap-usage guard installed as the process allocator: aborts with a backtrace
@@ -222,7 +222,7 @@ async fn async_main() -> Result<()> {
 async fn run(cli: Cli, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
     harnx_metrics::init(&cli.metrics)?;
     let readiness = harnx_healthz::init(&cli.healthz).await?;
-    let config = Arc::new(RwLock::new(
+    let config = Arc::new(ConfigLock::new(
         Config::init_headless(WorkingMode::Cmd, true).await?,
     ));
     config.write().agent_variables = collect_agent_variables(&cli.agent_variable)?;

@@ -19,7 +19,7 @@ use harnx_core::{
 };
 use harnx_runtime::{
     client::{CompletionTokenUsage, TestStateGuard},
-    config::Config,
+    config::{Config, ConfigLock},
     AgentCallFn,
 };
 use harnx_serve::{
@@ -975,7 +975,7 @@ async fn e2e_success_criterion_9_legacy_endpoints_and_history_unchanged() {
     }
 
     // Build a real Server and exercise the legacy P1 endpoints directly
-    let global_config: GlobalConfig = Arc::new(parking_lot::RwLock::new(config.clone()));
+    let global_config: GlobalConfig = Arc::new(ConfigLock::new(config.clone()));
     let server = Server::new(&global_config, std::path::PathBuf::from("web-assets"));
 
     // Hit GET /v1/agents/{agent}/sessions (agent enumeration) via real handler

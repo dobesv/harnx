@@ -67,7 +67,7 @@ async fn spawn_shared_worker(
     let mut ready = client.subscribe(worker_ready_subject("shared")).await?;
     client.flush().await?;
 
-    let worker_config = Arc::new(RwLock::new(config));
+    let worker_config = Arc::new(harnx_runtime::config::ConfigLock::new(config));
     let mut daemon = tokio::spawn(run_worker_daemon(
         worker_config,
         WorkerDaemonConfig::managing("shared", "serve-remote-e2e"),
@@ -192,7 +192,7 @@ async fn nats_remote_agent_turn_runs_on_shared_worker_and_persists_bare_agent() 
 
     let calls = Arc::new(AtomicUsize::new(0));
     let daemon = spawn_shared_worker(config.clone(), Arc::clone(&calls)).await?;
-    let global = Arc::new(RwLock::new(config.clone()));
+    let global = Arc::new(harnx_runtime::config::ConfigLock::new(config.clone()));
     let server = Server::new(&global, PathBuf::from("web-assets"));
     let local_worker = server.session_registry.local_worker_for_tests();
     let session_id = format!("remote-turn-{}", uuid::Uuid::new_v4());
@@ -228,7 +228,7 @@ async fn nats_unreachable_remote_session_listing_hides_configured_url() -> Resul
         "down",
         "url: nats://127.0.0.1:1\nagents:\n  - name: agent\n    role: assistant\n",
     );
-    let config = Arc::new(RwLock::new(sandbox.config()));
+    let config = Arc::new(harnx_runtime::config::ConfigLock::new(sandbox.config()));
     let server = Server::new(&config, PathBuf::from("web-assets"));
 
     let error = server
@@ -251,7 +251,7 @@ async fn nats_unreachable_declared_cluster_stays_listed_and_reports_transport_er
         "url: nats://127.0.0.1:1\nagents:\n  - name: agent\n    description: Declared but unavailable\n    role: assistant\n",
     );
     let config = sandbox.config();
-    let global = Arc::new(RwLock::new(config));
+    let global = Arc::new(harnx_runtime::config::ConfigLock::new(config));
     let server = Server::new(&global, PathBuf::from("web-assets"));
 
     let listed = server.filter_agents_by_role(None).await?;

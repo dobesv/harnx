@@ -1,7 +1,7 @@
 use super::*;
 
 async fn seed_session_and_attach_runtime(
-    global_config: &Arc<RwLock<Config>>,
+    global_config: &harnx_runtime::config::GlobalConfig,
     jetstream: async_nats::jetstream::Context,
     session_id: &str,
 ) -> Result<NatsSessionLog> {
@@ -25,7 +25,7 @@ struct WorkerTurnLabels<'a> {
 }
 
 struct WorkerTurnParams<'a> {
-    global_config: Arc<RwLock<Config>>,
+    global_config: harnx_runtime::config::GlobalConfig,
     labels: WorkerTurnLabels<'a>,
     call_fn: harnx_runtime::agent_loop::AgentCallFn,
     lease: Option<Arc<harnx_runtime::nats_lease::NatsSessionLease>>,
@@ -112,7 +112,7 @@ async fn nats_worker_persists_full_turn_end_to_end() -> Result<()> {
         return Ok(());
     };
 
-    let global_config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+    let global_config = Arc::new(ConfigLock::new(local_nats_config(NatsServerSpec {
         name: "local",
         url: server.url(),
         token: None,
@@ -179,7 +179,7 @@ async fn nats_worker_honors_configured_token_auth() -> Result<()> {
     };
 
     // Config carries the token so the config-driven connect can authenticate.
-    let global_config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+    let global_config = Arc::new(ConfigLock::new(local_nats_config(NatsServerSpec {
         name: "secure",
         url: server.url(),
         token: Some(token),
