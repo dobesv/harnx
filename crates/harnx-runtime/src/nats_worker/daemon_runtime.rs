@@ -309,6 +309,14 @@ impl WorkerRuntime {
         let to_start = reconciler
             .claim_users(&activation.session_id, servers)
             .await;
+        Self::wait_for_tool_server_start(reconciler, to_start, &activation.session_id).await;
+    }
+
+    pub(super) async fn wait_for_tool_server_start(
+        reconciler: Arc<ServerReconciler>,
+        to_start: Vec<crate::config::ToolServerConfig>,
+        user_id: &str,
+    ) {
         if to_start.is_empty() {
             return;
         }
@@ -323,14 +331,13 @@ impl WorkerRuntime {
             Ok(Err(join_error)) => {
                 log::warn!(
                     "session '{}' tool-server startup task panicked: {join_error}",
-                    activation.session_id
+                    user_id
                 );
             }
             Err(_) => {
                 log::warn!(
-                    "session '{}' tool-server startup ({}) exceeded {}s; continuing this \
-                     activation without waiting further (still starting in the background)",
-                    activation.session_id,
+                    "session '{}' tool-server startup ({}) exceeded {}s; continuing without waiting further (still starting in the background)",
+                    user_id,
                     server_names,
                     SESSION_TOOL_SERVER_START_TIMEOUT.as_secs()
                 );

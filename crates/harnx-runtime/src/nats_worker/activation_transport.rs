@@ -404,7 +404,7 @@ pub(super) fn spawn_readiness_publisher(
     client: async_nats::Client,
     daemon: &WorkerDaemonConfig,
     identity: &crate::worker_identity::WorkerReadiness,
-) -> Result<()> {
+) -> Result<tokio_util::task::AbortOnDropHandle<()>> {
     let subject = match daemon.activation_mode {
         WorkerActivationMode::ClusterShared => worker_ready_subject(&daemon.session_scope),
         WorkerActivationMode::WorkerTargeted => targeted_worker_ready_subject(
@@ -412,15 +412,16 @@ pub(super) fn spawn_readiness_publisher(
         ),
     };
     let payload = identity.payload()?;
-    tokio::spawn(async move {
-        loop {
-            if let Err(error) = publish_readiness(&client, &subject, &payload).await {
-                log::warn!("failed to publish worker readiness marker: {error:#}");
+    Ok(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+        async move {
+            loop {
+                if let Err(error) = publish_readiness(&client, &subject, &payload).await {
+                    log::warn!("failed to publish worker readiness marker: {error:#}");
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    });
-    Ok(())
+        },
+    )))
 }
 
 async fn publish_readiness(

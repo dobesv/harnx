@@ -1,4 +1,4 @@
-use crate::config::{Config, LOCAL_CLUSTER_KEY};
+use crate::config::Config;
 use crate::server_identity::ServerIdentity;
 use crate::tool_selector::ToolSelector;
 use anyhow::{anyhow, Context};
@@ -104,11 +104,12 @@ impl NatsToolProvider {
         in_flight: NatsInFlightCalls,
         active_package: Option<&str>,
     ) -> anyhow::Result<Self> {
+        let cluster = config.default_cluster_key();
         let journal_replicas = config
-            .resolve_nats_server(LOCAL_CLUSTER_KEY)
+            .resolve_nats_server(cluster)
             .await?
             .resolved_replicas();
-        let client = config.nats_client(LOCAL_CLUSTER_KEY).await?;
+        let client = config.nats_client(cluster).await?;
         let control_subject = instance_id.control_subject();
         let control_subscription = client.subscribe(control_subject).await?;
         client.flush().await?;

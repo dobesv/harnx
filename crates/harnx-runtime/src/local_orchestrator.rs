@@ -116,6 +116,7 @@ pub fn resolve_worker_binary() -> Result<PathBuf> {
 pub struct LocalWorkerSupervisor {
     server: LocalBroker,
     worker_binary: PathBuf,
+    config_dir: Option<PathBuf>,
     route: LocalWorkerRoute,
     child: Option<Child>,
     output: WorkerOutput,
@@ -147,10 +148,29 @@ pub async fn activation_route_for_cluster(
     supervisor: &tokio::sync::Mutex<Option<LocalWorkerSupervisor>>,
     abort_signal: AbortSignal,
 ) -> Result<SessionActivationRoute> {
+    activation_route_for_cluster_with_config_dir(cluster, supervisor, abort_signal, None).await
+}
+
+/// Like `activation_route_for_cluster`, but pass an explicit frontend config
+/// directory to its child worker without changing the process environment.
+pub async fn activation_route_for_cluster_with_config_dir(
+    cluster: &str,
+    supervisor: &tokio::sync::Mutex<Option<LocalWorkerSupervisor>>,
+    abort_signal: AbortSignal,
+    config_dir: Option<&Path>,
+) -> Result<SessionActivationRoute> {
     if cluster != LOCAL_CLUSTER_KEY {
         return Ok(SessionActivationRoute::ClusterShared);
     }
     let mut supervisor = supervisor.lock().await;
+    if let (None, Some(config_dir)) = (&*supervisor, config_dir) {
+        let started = LocalWorkerSupervisor::start_with_config_dir(config_dir, abort_signal)
+            .await
+            .context("failed to ensure local NATS worker")?;
+        let route = started.route().activation_route();
+        *supervisor = Some(started);
+        return Ok(route);
+    }
     ensure_local_worker(&mut supervisor, abort_signal)
         .await
         .context("failed to ensure local NATS worker")
@@ -166,16 +186,31 @@ impl LocalWorkerSupervisor {
         binary: impl AsRef<Path>,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
+        Self::start_with_options(binary.as_ref(), None, abort_signal).await
+    }
+
+    pub async fn start_with_config_dir(
+        config_dir: &Path,
+        abort_signal: AbortSignal,
+    ) -> Result<Self> {
+        Self::start_with_options(&resolve_worker_binary()?, Some(config_dir), abort_signal).await
+    }
+
+    async fn start_with_options(
+        binary: &Path,
+        config_dir: Option<&Path>,
+        abort_signal: AbortSignal,
+    ) -> Result<Self> {
         let server = LocalBroker::start().await?;
         let worker_binary = binary
-            .as_ref()
             .canonicalize()
-            .with_context(|| format!("resolve worker binary {}", binary.as_ref().display()))?;
+            .with_context(|| format!("resolve worker binary {}", binary.display()))?;
         let route = LocalWorkerRoute::new();
         validate_worker_id(route.worker_id())?;
         let mut supervisor = Self {
             server,
             worker_binary,
+            config_dir: config_dir.map(Path::to_path_buf),
             route,
             child: None,
             output: WorkerOutput::new(),
@@ -406,6 +441,11 @@ impl LocalWorkerSupervisor {
             &self.server.status().url,
             &self.server.status().token,
         );
+        if let Some(config_dir) = &self.config_dir {
+            command
+                .env("HARNX_CONFIG_DIR", config_dir)
+                .env_remove("HARNX_CONFIG_FILE");
+        }
         command
             .stdout(self.output.sink())
             .stderr(self.output.sink());

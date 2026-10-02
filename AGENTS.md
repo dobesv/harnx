@@ -48,6 +48,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   ├── harnx-plans-tools/        # Toolset server: NATS-backed plan and todo management (standalone crate)
 │   ├── harnx-attachment-tools/   # Toolset server: NATS-backed attachment and media management (standalone crate)
 │   ├── harnx-blob-store/        # NATS-backed blob storage for attachments and plans (standalone crate)
+│   ├── harnx-mcp-server/        # MCP server: exports harnx tools and agents-as-tools over stdio or Streamable HTTP (standalone crate)
 │   └── harnx-test-bins/        # Internal dev/test binaries (publish = false)
 ├── example_config/             # Example user configuration
 ├── docs/                       # User-facing documentation
@@ -335,7 +336,7 @@ Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `h
 
 When launching behind `harnx-mcp-bridge` for stdio MCP compatibility, pass `--mcp-stdio` — without it, the server waits for NATS and the bridge handshake times out.
 
-Binaries with `-mcp-` in the name are genuine MCP infrastructure (`harnx-mcp-bridge`, `harnx-mcp-remote`) or test fixtures (`harnx-mock-mcp`), not native toolsets.
+Binaries with `-mcp-` in the name are genuine MCP infrastructure (`harnx-mcp-bridge`, `harnx-mcp-remote`, `harnx-mcp-server`) or test fixtures (`harnx-mock-mcp`), not native toolsets.
 
 ### Adding a new native toolset server
 

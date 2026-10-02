@@ -183,11 +183,13 @@ impl HarnxAgent {
         if let (Some(route), Some(config)) = (&self.activation_route, &self.runtime_config) {
             return Ok((route.clone(), Arc::clone(config)));
         }
-        let route = activation_route_for_cluster(
+        // ACP dispatch runs on the Windows main thread's small stack. Don't
+        // embed managed-worker startup state in every enclosing handler future.
+        let route = Box::pin(activation_route_for_cluster(
             &self.cluster,
             &self.local_worker,
             self.abort_signal.clone(),
-        )
+        ))
         .await
         .context("failed to bootstrap local NATS worker")
         .map_err(acp_error)?;
@@ -222,11 +224,11 @@ impl HarnxAgent {
             activation_route,
         };
 
-        let nats_session = harnx_runtime::NatsSession::from_global_config(
+        let nats_session = Box::pin(harnx_runtime::NatsSession::from_global_config(
             session_config,
             &global_config,
             self.abort_signal.clone(),
-        )
+        ))
         .await
         .context("failed to create NATS session")
         .map_err(acp_error)?;
@@ -314,11 +316,11 @@ impl HarnxAgent {
             activation_route,
         };
 
-        let nats_session = harnx_runtime::NatsSession::from_global_config(
+        let nats_session = Box::pin(harnx_runtime::NatsSession::from_global_config(
             session_config,
             &global_config,
             self.abort_signal.clone(),
-        )
+        ))
         .await
         .context("failed to create NATS session for loaded session")
         .map_err(acp_error)?;
@@ -766,6 +768,23 @@ mod tests {
 
     fn test_agent() -> HarnxAgent {
         HarnxAgent::new("test-agent".to_string())
+    }
+
+    #[test]
+    fn session_new_future_keeps_startup_state_off_dispatch_stack() {
+        let agent = test_agent();
+        let request = NewSessionRequest::new(std::path::PathBuf::from("."));
+        let session = agent.new_session(request);
+        let backend = agent.backend_config();
+        let session_bytes = std::mem::size_of_val(&session);
+        let backend_bytes = std::mem::size_of_val(&backend);
+        eprintln!("session/new future={session_bytes} bytes; backend future={backend_bytes} bytes");
+        // The Windows executable's main thread has a 1 MiB stack shared with
+        // ACP dispatch and nested poll frames. Keep startup state on the heap.
+        assert!(
+            session_bytes < 16 * 1024 && backend_bytes < 16 * 1024,
+            "session/new future={session_bytes} bytes; backend future={backend_bytes} bytes"
+        );
     }
 
     #[tokio::test]

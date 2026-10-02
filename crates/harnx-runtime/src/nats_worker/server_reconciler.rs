@@ -20,13 +20,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
 
-/// How long an idle tool server lingers with no sessions using it before the
-/// reconciler actually stops it. Long enough that back-to-back sessions (a
-/// front-end restarting a session, a new one starting moments after the last
-/// one ended) reuse the running process instead of paying startup and
-/// registration cost again.
-const TOOL_SERVER_LINGER: Duration = Duration::from_secs(60);
-
 /// Starting and stopping the actual processes, behind a trait so the
 /// reference-counting rules can be tested without a broker or child
 /// processes.
@@ -216,17 +209,23 @@ impl ServerReconciler {
     /// to zero users starts its linger window rather than stopping
     /// immediately.
     pub async fn session_ended(&self, session_id: &str) {
-        {
-            let mut state = self.state.lock().await;
-            for slot in state.values_mut() {
-                if let Slot::Running { users, idle_since } = slot {
-                    if users.remove(session_id) && users.is_empty() {
-                        *idle_since = Some(Instant::now());
-                    }
+        self.release_users(session_id).await;
+        self.sweep().await;
+    }
+
+    /// Release refcounts without waiting for child teardown. Reservation
+    /// control uses this before replying, with sweeps owned by its loop.
+    /// As with `session_ended`, claim registration must finish or be canceled
+    /// before releasing the same user token.
+    pub(super) async fn release_users(&self, session_id: &str) {
+        let mut state = self.state.lock().await;
+        for slot in state.values_mut() {
+            if let Slot::Running { users, idle_since } = slot {
+                if users.remove(session_id) && users.is_empty() {
+                    *idle_since = Some(Instant::now());
                 }
             }
         }
-        self.sweep().await;
     }
 
     /// Stop servers whose linger window has passed with no users left.
@@ -238,7 +237,7 @@ impl ServerReconciler {
     /// its way out (see `claim_or_wait`). The transition happens under the
     /// same lock as the expiry check, so two concurrent sweeps can't both
     /// pick the same name and call `stop` on it twice.
-    async fn sweep(&self) {
+    pub(super) async fn sweep(&self) {
         let expired: Vec<(String, watch::Sender<()>)> = {
             let mut state = self.state.lock().await;
             let names: Vec<String> = state
@@ -344,7 +343,10 @@ impl ServerLauncher for SupervisorLauncher {
         // for each child to exit and lets its monitor's own exit path remove
         // the tool registration, then shuts down co-located hook supervisors,
         // which have no `Drop` at all.
-        if let Some(supervisor) = self.running.lock().await.remove(config_name) {
+        // Drop the map lock before shutdown so unrelated starts/stops don't
+        // wait behind this child's exit and deregistration.
+        let supervisor = self.running.lock().await.remove(config_name);
+        if let Some(supervisor) = supervisor {
             supervisor.shutdown().await;
         }
     }
@@ -401,7 +403,7 @@ pub(super) async fn build_server_reconciler(
     match result {
         Ok(launcher) => Some(Arc::new(ServerReconciler::new(
             Arc::new(launcher),
-            TOOL_SERVER_LINGER,
+            daemon.tool_server_linger,
         ))),
         Err(error) => {
             log::warn!("local NATS tool servers disabled; continuing with stdio tools: {error:#}");

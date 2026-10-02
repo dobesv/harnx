@@ -15,7 +15,7 @@ use super::subagent_toolset::{SubagentSessionRoute, SubagentToolset};
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
     list_agents, resolve_local_nats_server_config, selector_could_match_server,
-    server_display_name, GlobalConfig, ToolServerConfig,
+    server_display_name, Config, GlobalConfig, ToolServerConfig,
 };
 use anyhow::{Context, Result};
 use async_nats::jetstream;
@@ -279,7 +279,6 @@ pub(super) fn configured_worker_services(
         .agent
         .as_ref()
         .and_then(|agent| harnx_core::package_namespace::pkg_from_qualified(agent.name()));
-    let mut selectors = Vec::new();
     let use_tools = config
         .agent
         .as_ref()
@@ -287,14 +286,27 @@ pub(super) fn configured_worker_services(
         // Fall back when no agent is active or the active agent has no use_tools.
         .or_else(|| config.use_tools.clone())
         .unwrap_or_default();
-    for selector in use_tools {
-        if let Some(namespaced) = namespaced_selector(&selector, agent_package) {
-            selectors.push(namespaced);
-        }
-        selectors.push(selector);
-    }
-    let servers = tool_servers_matching_use_tools(&config.tool_servers, agent_package, &selectors);
+    let servers = tool_servers_for_view(&config, agent_package, &use_tools);
     (servers, config.hooks.clone().unwrap_or_default())
+}
+
+/// Configured servers that could supply tools for an explicit package/selector view.
+///
+/// Does not consult the active agent or global `use_tools`. Matching is conservative
+/// because tool declarations aren't available until the servers have started.
+pub(super) fn tool_servers_for_view(
+    config: &Config,
+    package: Option<&str>,
+    selectors: &[String],
+) -> Vec<ToolServerConfig> {
+    let mut namespaced_selectors = Vec::new();
+    for selector in selectors {
+        if let Some(namespaced) = namespaced_selector(selector, package) {
+            namespaced_selectors.push(namespaced);
+        }
+        namespaced_selectors.push(selector.clone());
+    }
+    tool_servers_matching_use_tools(&config.tool_servers, package, &namespaced_selectors)
 }
 
 fn namespaced_selector(selector: &str, package: Option<&str>) -> Option<String> {
@@ -318,15 +330,11 @@ pub(super) async fn launch_worker_services(
     let session_metadata =
         super::daemon::ensure_session_metadata(&startup.jetstream, startup.replicas).await?;
 
-    // Announce readiness before starting hooks and sub-agent toolsets. Those
-    // can take tens of seconds — or never finish, when a server is
-    // misconfigured — and neither is required for the worker to accept and
-    // run a session. Gating readiness on them made a single broken server
-    // stall the front-end past its startup deadline, which turned an
-    // intentionally non-fatal degradation into an unusable CLI. Tool servers
-    // no longer start here at all: each session's own servers start (and are
-    // waited on) in `handle_activation` when that session activates.
-    super::daemon::spawn_readiness_publisher(startup.client.clone(), daemon, &startup.identity)?;
+    // Don't gate readiness on hooks or sub-agent toolsets: a broken server
+    // must not stall the frontend past its startup deadline. The daemon
+    // announces readiness after its request subscriptions are flushed, while
+    // these services start in the background. Tool servers start on demand
+    // through the reconciler for activations and tool reservations.
 
     let background = Arc::new(Mutex::new(None));
     // Session-specific tool servers are awaited during activation, but the
@@ -474,9 +482,9 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
 mod tests {
     use super::{
         configured_worker_services, optional_tool_server, should_start_tool_servers,
-        tool_servers_matching_use_tools,
+        tool_servers_for_view, tool_servers_matching_use_tools,
     };
-    use crate::config::ToolServerConfig;
+    use crate::config::{Agent, AgentConfig, Config, ToolServerConfig};
 
     fn tool_server(name: &str) -> ToolServerConfig {
         ToolServerConfig {
@@ -522,6 +530,102 @@ mod tests {
 
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "time");
+    }
+
+    #[test]
+    fn tool_servers_for_view_selects_fs_without_using_agent_or_global_selectors() {
+        let mut config = Config {
+            agent: Some(Agent::new(
+                AgentConfig::from_markdown("other/worker", "---\nuse_tools: [weather_*]\n---\n")
+                    .unwrap(),
+            )),
+            tool_servers: vec![
+                tool_server("fs"),
+                tool_server("time"),
+                tool_server("weather"),
+            ],
+            ..Default::default()
+        };
+
+        config.use_tools = Some(vec!["time_*".to_string()]);
+
+        let servers = tool_servers_for_view(&config, None, &["fs_*".to_string()]);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "fs");
+        assert_eq!(servers[0].command, config.tool_servers[0].command);
+        assert!(tool_servers_for_view(&config, None, &[]).is_empty());
+        assert!(tool_servers_for_view(&config, None, &["missing_*".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn tool_servers_for_view_matches_package_scoped_selectors() {
+        let mut local_fs = tool_server("fs");
+        local_fs.package = Some("coding".to_string());
+        let mut other_fs = tool_server("fs");
+        other_fs.package = Some("other/tools".to_string());
+        let config = Config {
+            tool_servers: vec![tool_server("fs"), local_fs, other_fs],
+            ..Default::default()
+        };
+
+        let cases = [
+            (None, "fs_*", vec![None]),
+            (Some("coding"), "fs_*", vec![None, Some("coding")]),
+            (None, "coding__fs_*", vec![Some("coding")]),
+            (
+                Some("coding"),
+                "other__tools__fs_read",
+                vec![Some("other/tools")],
+            ),
+            (
+                Some("coding"),
+                "*",
+                vec![None, Some("coding"), Some("other/tools")],
+            ),
+        ];
+        for (package, selector, expected_packages) in cases {
+            let servers = tool_servers_for_view(&config, package, &[selector.to_string()]);
+            let packages: Vec<_> = servers
+                .iter()
+                .map(|server| server.package.as_deref())
+                .collect();
+            assert_eq!(
+                packages, expected_packages,
+                "package={package:?}, selector={selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_worker_services_preserves_agent_selector_precedence_and_fallback() {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            let mut fs = tool_server("fs");
+            fs.package = Some("coding".to_string());
+            config.tool_servers = vec![fs, tool_server("time")];
+            config.use_tools = Some(vec!["time_*".to_string()]);
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("coding/worker", "---\nuse_tools: [fs_*]\n---\n")
+                    .unwrap(),
+            ));
+        }
+        let (servers, _) = configured_worker_services(&config);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "fs");
+        assert_eq!(servers[0].package.as_deref(), Some("coding"));
+
+        config.write().agent = Some(Agent::new(
+            AgentConfig::from_markdown("coding/worker", "Worker prompt").unwrap(),
+        ));
+        let (servers, _) = configured_worker_services(&config);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "time");
+
+        config.write().agent = Some(Agent::new(
+            AgentConfig::from_markdown("coding/worker", "---\nuse_tools: []\n---\n").unwrap(),
+        ));
+        assert!(configured_worker_services(&config).0.is_empty());
     }
 
     #[test]

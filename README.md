@@ -28,13 +28,15 @@ what you need:
 | `harnx-k8s-creds`       | Persistent hook that injects scoped Kubernetes credentials into sandboxed tools | [README](crates/harnx-k8s-creds/README.md)       |
 | `harnx-k8s-sandbox-tools` | Native NATS gateway routing bash and filesystem tools into Kubernetes Agent Sandboxes | [Guide](docs/kubernetes-sandbox-tools.md)       |
 | `harnx-proxy-auth`      | TLS-intercepting auth proxy that injects credentials and runs hooks             | [README](crates/harnx-proxy-auth/README.md)      |
+| `harnx-mcp-server`      | MCP server exposing harnx tools and agents-as-tools over stdio or Streamable HTTP | [README](crates/harnx-mcp-server/README.md)      |
 
 Install whichever you need. Most users want `harnx` plus `harnx-worker`:
 `harnx` runs agent turns by handing them to a worker over NATS, and it spawns
 `harnx-worker` to do that. It looks for the worker at `HARNX_WORKER_BIN` first,
 then next to itself, then on `PATH`. Headless server deployments can skip the
 TUI deps by picking `harnx-serve` — it needs `harnx-worker` too. MCP server
-binaries (`harnx-mcp-*`) are needed only when configured as external servers.
+binaries (`harnx-mcp-*`) are needed only when configured as external servers
+or when exporting harnx capabilities to external MCP clients.
 
 ### Install using asdf
 

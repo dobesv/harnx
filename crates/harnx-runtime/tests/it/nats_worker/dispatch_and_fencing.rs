@@ -1,158 +1,10 @@
+use super::support::{spawn_test_worker, WorkerPair};
 use super::*;
 use harnx_runtime::nats_lease::NatsLeaseConfig;
 use harnx_runtime::nats_worker::{
     publish_session_activate, run_worker_daemon, SessionActivate, WorkerDaemonConfig,
 };
-use std::future::Future;
 use tokio_util::task::AbortOnDropHandle;
-
-type WorkerDaemonHandle = AbortOnDropHandle<Result<()>>;
-
-async fn progress_or_daemon_exit<F, T>(
-    label: &str,
-    progress: F,
-    worker_one: &mut WorkerDaemonHandle,
-    worker_two: &mut WorkerDaemonHandle,
-) -> Result<T>
-where
-    F: Future<Output = Result<T>>,
-{
-    tokio::select! {
-        result = progress => result,
-        stopped = &mut *worker_one => {
-            anyhow::bail!("worker-one daemon stopped during {label}: {stopped:?}")
-        }
-        stopped = &mut *worker_two => {
-            anyhow::bail!("worker-two daemon stopped during {label}: {stopped:?}")
-        }
-    }
-}
-
-fn spawn_test_worker(
-    server_url: &str,
-    worker_id: &str,
-    lease: &NatsLeaseConfig,
-    counter: Arc<AtomicUsize>,
-) -> (WorkerDaemonHandle, harnx_healthz::Readiness) {
-    let mut daemon = WorkerDaemonConfig::managing("local", worker_id);
-    daemon.lease = lease.clone();
-    let config = local_nats_runtime_config(server_url);
-    let readiness = harnx_healthz::Readiness::default();
-    let handle = AbortOnDropHandle::new(tokio::spawn({
-        let readiness = readiness.clone();
-        async move {
-            run_worker_daemon(
-                config,
-                daemon,
-                Some(counting_stub_call_fn(counter)),
-                Some(readiness),
-            )
-            .await
-        }
-    }));
-    (handle, readiness)
-}
-
-struct WorkerPair {
-    worker_one: WorkerDaemonHandle,
-    worker_two: WorkerDaemonHandle,
-    readiness_one: harnx_healthz::Readiness,
-    readiness_two: harnx_healthz::Readiness,
-    counter_one: Arc<AtomicUsize>,
-    counter_two: Arc<AtomicUsize>,
-}
-
-impl WorkerPair {
-    fn spawn(server_url: &str, lease: &NatsLeaseConfig) -> Self {
-        let counter_one = Arc::new(AtomicUsize::new(0));
-        let counter_two = Arc::new(AtomicUsize::new(0));
-        let (worker_one, readiness_one) =
-            spawn_test_worker(server_url, "worker-one", lease, Arc::clone(&counter_one));
-        let (worker_two, readiness_two) =
-            spawn_test_worker(server_url, "worker-two", lease, Arc::clone(&counter_two));
-        Self {
-            worker_one,
-            worker_two,
-            readiness_one,
-            readiness_two,
-            counter_one,
-            counter_two,
-        }
-    }
-
-    async fn wait_until_ready(&mut self) -> Result<()> {
-        let readiness_one = self.readiness_one.clone();
-        let readiness_two = self.readiness_two.clone();
-        progress_or_daemon_exit(
-            "startup",
-            wait_until(CI_SAFE_TIMEOUT, move || {
-                readiness_one.is_ready() && readiness_two.is_ready()
-            }),
-            &mut self.worker_one,
-            &mut self.worker_two,
-        )
-        .await
-    }
-
-    async fn wait_for_execution_count(&mut self, label: &str, expected: usize) -> Result<()> {
-        let counter_one = Arc::clone(&self.counter_one);
-        let counter_two = Arc::clone(&self.counter_two);
-        progress_or_daemon_exit(
-            label,
-            wait_until(CI_SAFE_TIMEOUT, move || {
-                counter_one.load(Ordering::SeqCst) + counter_two.load(Ordering::SeqCst) >= expected
-            }),
-            &mut self.worker_one,
-            &mut self.worker_two,
-        )
-        .await
-    }
-
-    async fn wait_for_session_cleanup(
-        &mut self,
-        label: &str,
-        jetstream: &async_nats::jetstream::Context,
-        session_id: &str,
-    ) -> Result<()> {
-        progress_or_daemon_exit(
-            label,
-            wait_for_worker_session_cleanup(jetstream, session_id),
-            &mut self.worker_one,
-            &mut self.worker_two,
-        )
-        .await
-    }
-
-    fn execution_count(&self) -> usize {
-        self.counter_one.load(Ordering::SeqCst) + self.counter_two.load(Ordering::SeqCst)
-    }
-
-    fn assert_running(&self) {
-        assert!(
-            !self.worker_one.is_finished(),
-            "worker-one daemon stopped unexpectedly"
-        );
-        assert!(
-            !self.worker_two.is_finished(),
-            "worker-two daemon stopped unexpectedly"
-        );
-    }
-
-    async fn abort_and_assert_cancelled(self) {
-        self.worker_one.abort();
-        self.worker_two.abort();
-        let stopped_one = self.worker_one.await;
-        let stopped_two = self.worker_two.await;
-        assert!(
-            matches!(&stopped_one, Err(error) if error.is_cancelled()),
-            "worker-one daemon did not stop by cancellation: {stopped_one:?}"
-        );
-        assert!(
-            matches!(&stopped_two, Err(error) if error.is_cancelled()),
-            "worker-two daemon did not stop by cancellation: {stopped_two:?}"
-        );
-    }
-}
 
 async fn seed_and_publish_activation(
     jetstream: &async_nats::jetstream::Context,
@@ -173,18 +25,119 @@ async fn seed_and_publish_activation(
     publish_session_activate(jetstream, "local", &activation, 1).await?;
     Ok(activation)
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_workers_share_the_activation_queue_and_dispatch_is_deduplicated() -> Result<()> {
-    let Some(server) = require_nats_server().await? else {
-        return Ok(());
-    };
-    let fast_lease = NatsLeaseConfig {
+fn fast_lease_config() -> NatsLeaseConfig {
+    NatsLeaseConfig {
         ttl: Duration::from_secs(3),
         renew_interval: Duration::from_millis(500),
         replicas: 1,
         tombstone_ttl: Duration::from_secs(10),
         ..Default::default()
+    }
+}
+
+struct GatedCallFn {
+    entered: Arc<tokio::sync::Notify>,
+    release: tokio_util::sync::CancellationToken,
+    calls: Arc<AtomicUsize>,
+}
+
+impl GatedCallFn {
+    fn new(reply_text: &'static str) -> (Self, harnx_runtime::agent_loop::AgentCallFn) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_fn: harnx_runtime::agent_loop::AgentCallFn = Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = release.clone();
+            let calls = Arc::clone(&calls);
+            move |_input, _config, _abort| {
+                let entered = Arc::clone(&entered);
+                let release = release.clone();
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    release.cancelled().await;
+                    Ok((
+                        reply_text.to_string(),
+                        None,
+                        vec![],
+                        harnx_runtime::client::CompletionTokenUsage::default(),
+                    ))
+                })
+            }
+        });
+        (
+            Self {
+                entered,
+                release,
+                calls,
+            },
+            call_fn,
+        )
+    }
+
+    async fn wait_entered(&self, worker: &mut AbortOnDropHandle<Result<()>>) -> Result<()> {
+        tokio::time::timeout(CI_SAFE_TIMEOUT, async {
+            tokio::select! {
+                _ = self.entered.notified() => Ok::<_, anyhow::Error>(()),
+                stopped = worker => anyhow::bail!("worker stopped during admission: {stopped:?}"),
+            }
+        })
+        .await??;
+        Ok(())
+    }
+}
+
+/// Broker routing for observing the worker's activation delivery queue.
+#[derive(Clone, Copy)]
+struct ConsumerTarget {
+    cluster: &'static str,
+    consumer: &'static str,
+}
+
+const LOCAL_WORKER_CONSUMER: ConsumerTarget = ConsumerTarget {
+    cluster: "local",
+    consumer: "workers",
+};
+
+async fn get_worker_consumer(
+    jetstream: &async_nats::jetstream::Context,
+    target: ConsumerTarget,
+) -> Result<async_nats::jetstream::consumer::PullConsumer> {
+    let stream = jetstream
+        .get_stream(format!("WORK_NOTIFY_{}", target.cluster))
+        .await?;
+    stream
+        .get_consumer(target.consumer)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+async fn wait_for_consumer_delivered_sequence(
+    jetstream: &async_nats::jetstream::Context,
+    target: ConsumerTarget,
+    min_sequence: u64,
+) -> Result<async_nats::jetstream::consumer::PullConsumer> {
+    let consumer = get_worker_consumer(jetstream, target).await?;
+    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
+        loop {
+            if consumer.get_info().await?.delivered.consumer_sequence >= min_sequence {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    Ok(consumer)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_workers_share_the_activation_queue_and_dispatch_is_deduplicated() -> Result<()> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
     };
+    let fast_lease = fast_lease_config();
     let mut workers = WorkerPair::spawn(server.url(), &fast_lease);
     workers.wait_until_ready().await?;
     let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
@@ -233,30 +186,7 @@ async fn long_running_turn_keeps_one_activation_delivery_past_ack_wait() -> Resu
         return Ok(());
     };
     let ack_wait = Duration::from_secs(1);
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = tokio_util::sync::CancellationToken::new();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let call_fn: harnx_runtime::agent_loop::AgentCallFn = Arc::new({
-        let entered = Arc::clone(&entered);
-        let release = release.clone();
-        let calls = Arc::clone(&calls);
-        move |_input, _config, _abort| {
-            let entered = Arc::clone(&entered);
-            let release = release.clone();
-            let calls = Arc::clone(&calls);
-            Box::pin(async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                entered.notify_one();
-                release.cancelled().await;
-                Ok((
-                    "heartbeat complete".to_string(),
-                    None,
-                    vec![],
-                    harnx_runtime::client::CompletionTokenUsage::default(),
-                ))
-            })
-        }
-    });
+    let (gate, call_fn) = GatedCallFn::new("heartbeat complete");
     let mut daemon = WorkerDaemonConfig::managing("local", "heartbeat-worker")
         .with_activation_ack_wait_for_test(ack_wait);
     daemon.lease.replicas = 1;
@@ -271,29 +201,19 @@ async fn long_running_turn_keeps_one_activation_delivery_past_ack_wait() -> Resu
 
     let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     seed_and_publish_activation(&jetstream, "heartbeat-session", "stay running").await?;
-    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
-        tokio::select! {
-            _ = entered.notified() => Ok::<_, anyhow::Error>(()),
-            stopped = &mut worker => anyhow::bail!("heartbeat worker stopped during admission: {stopped:?}"),
-        }
-    })
-    .await??;
+    gate.wait_entered(&mut worker).await?;
 
     tokio::time::sleep(ack_wait * 4).await;
-    let stream = jetstream.get_stream("WORK_NOTIFY_local").await?;
-    let consumer: async_nats::jetstream::consumer::PullConsumer = stream
-        .get_consumer("workers")
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let consumer = get_worker_consumer(&jetstream, LOCAL_WORKER_CONSUMER).await?;
     let info = consumer.get_info().await?;
     assert_eq!(
         info.delivered.consumer_sequence, 1,
         "heartbeat must keep activation on its first delivery"
     );
     assert_eq!(info.num_redelivered, 0);
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
 
-    release.cancel();
+    gate.release.cancel();
     wait_for_worker_session_cleanup(&jetstream, "heartbeat-session").await?;
     worker.abort();
     let stopped = worker.await;
@@ -313,30 +233,7 @@ async fn concurrent_same_session_activations_start_one_claim() -> Result<()> {
     second.epoch = "concurrent-second-activation".to_string();
     publish_session_activate(&jetstream, "local", &second, 1).await?;
 
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = tokio_util::sync::CancellationToken::new();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let call_fn: harnx_runtime::agent_loop::AgentCallFn = Arc::new({
-        let entered = Arc::clone(&entered);
-        let release = release.clone();
-        let calls = Arc::clone(&calls);
-        move |_input, _config, _abort| {
-            let entered = Arc::clone(&entered);
-            let release = release.clone();
-            let calls = Arc::clone(&calls);
-            Box::pin(async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                entered.notify_one();
-                release.cancelled().await;
-                Ok((
-                    "one claim".to_string(),
-                    None,
-                    vec![],
-                    harnx_runtime::client::CompletionTokenUsage::default(),
-                ))
-            })
-        }
-    });
+    let (gate, call_fn) = GatedCallFn::new("one claim");
     let mut daemon = WorkerDaemonConfig::managing("local", "reservation-worker");
     daemon.lease.replicas = 1;
     let readiness = harnx_healthz::Readiness::default();
@@ -347,25 +244,12 @@ async fn concurrent_same_session_activations_start_one_claim() -> Result<()> {
         Some(readiness.clone()),
     )));
     wait_until(CI_SAFE_TIMEOUT, move || readiness.is_ready()).await?;
-    tokio::time::timeout(CI_SAFE_TIMEOUT, entered.notified()).await?;
+    tokio::time::timeout(CI_SAFE_TIMEOUT, gate.entered.notified()).await?;
 
-    let stream = jetstream.get_stream("WORK_NOTIFY_local").await?;
-    let consumer: async_nats::jetstream::consumer::PullConsumer = stream
-        .get_consumer("workers")
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
-        loop {
-            if consumer.get_info().await?.delivered.consumer_sequence >= 2 {
-                return Ok::<_, anyhow::Error>(());
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await??;
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    wait_for_consumer_delivered_sequence(&jetstream, LOCAL_WORKER_CONSUMER, 2).await?;
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
 
-    release.cancel();
+    gate.release.cancel();
     wait_for_worker_session_cleanup(&jetstream, session_id).await?;
     worker.abort();
     let stopped = worker.await;
@@ -395,20 +279,8 @@ async fn foreign_lease_defers_before_metadata_or_full_log_preflight() -> Result<
         Arc::clone(&calls),
     );
     wait_until(CI_SAFE_TIMEOUT, move || readiness.is_ready()).await?;
+    wait_for_consumer_delivered_sequence(&jetstream, LOCAL_WORKER_CONSUMER, 1).await?;
     let stream = jetstream.get_stream("WORK_NOTIFY_local").await?;
-    let consumer: async_nats::jetstream::consumer::PullConsumer = stream
-        .get_consumer("workers")
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
-        loop {
-            if consumer.get_info().await?.delivered.consumer_sequence >= 1 {
-                return Ok::<_, anyhow::Error>(());
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await??;
 
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
