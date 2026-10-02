@@ -396,7 +396,8 @@ fn spawn_append(
             let mut document = harnx_blob_store::plans::parse_plan(content)?;
             if first_attempt {
                 first_attempt = false;
-                barrier.wait();
+                // Keep both initial reads aligned without parking a Tokio worker needed by its peer.
+                tokio::task::block_in_place(|| barrier.wait());
             }
             document.body.push_str(suffix);
             harnx_blob_store::plans::serialize_plan(&document)
