@@ -404,9 +404,7 @@ fn subagent_history_status(history: &[(u64, SessionLogEntry)]) -> SubAgentStatus
 }
 
 fn latest_user_failed(history: &[(u64, SessionLogEntry)]) -> bool {
-    let latest_user_seq = history.iter().rev().find_map(|(seq, entry)| {
-        matches!(entry, SessionLogEntry::Message { role, .. } if role.is_user()).then_some(*seq)
-    });
+    let latest_user_seq = harnx_core::session_reconstruct::latest_prompt_seq(history);
     latest_user_seq.is_some_and(|user_seq| {
         history.iter().any(|(seq, entry)| {
             *seq > user_seq

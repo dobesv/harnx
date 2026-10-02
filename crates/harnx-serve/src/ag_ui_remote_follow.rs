@@ -140,18 +140,7 @@ async fn check_remote_lease(
 }
 
 fn last_user_sequence(entries: &[(u64, SessionLogEntry)]) -> u64 {
-    entries
-        .iter()
-        .rev()
-        .find(|(_, entry)| {
-            matches!(
-                entry,
-                SessionLogEntry::Message { role, .. }
-                    if *role == harnx_core::message::MessageRole::User
-            )
-        })
-        .map(|(seq, _)| *seq)
-        .unwrap_or(0)
+    harnx_core::session_reconstruct::latest_prompt_seq(entries).unwrap_or(0)
 }
 
 struct RemoteFollowStreamParams<'a> {

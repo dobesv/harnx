@@ -83,6 +83,31 @@ fn is_queued_user_message(entry: &SessionLogEntry) -> bool {
     matches!(entry, SessionLogEntry::Message { role, .. } if role.is_user())
 }
 
+/// Sequence of the newest user message that asks for a turn, skipping the
+/// copies compaction writes.
+///
+/// Compaction archives a prefix of the transcript and appends the messages it
+/// keeps again after the `Compress` marker, each under its original id, so
+/// replay can rebuild the active transcript without a stored index. Those
+/// copies were answered before compaction ran, and no `TurnEnd` covers their
+/// new sequences. Read as prompts, they make a finished session look like it
+/// has a turn in flight. A user message whose id already appeared earlier in
+/// `entries` is such a copy; messages without an id always count.
+pub fn latest_prompt_seq(entries: &[(u64, SessionLogEntry)]) -> Option<u64> {
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut latest = None;
+    for (seq, entry) in entries {
+        let SessionLogEntry::Message { id, role, .. } = entry else {
+            continue;
+        };
+        let is_copy = id.as_deref().is_some_and(|id| !seen_ids.insert(id));
+        if role.is_user() && !is_copy {
+            latest = Some(*seq);
+        }
+    }
+    latest
+}
+
 /// Entries strictly after the last terminator.
 pub fn current_turn_entries(entries: &[(u64, SessionLogEntry)]) -> &[(u64, SessionLogEntry)] {
     &entries[after_last(entries, |(_, entry)| is_terminator(entry))..]
@@ -354,5 +379,56 @@ mod tests {
             }
             other => panic!("expected wind-up, got {other:?}"),
         }
+    }
+
+    fn message(id: Option<&str>, role: MessageRole) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: id.map(str::to_string),
+            role,
+            content: MessageContent::Text("text".to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn compress() -> SessionLogEntry {
+        SessionLogEntry::Compress {
+            prompt: "summary".to_string(),
+        }
+    }
+
+    /// A compacted session: the answered prompt at seq 1, then the copies
+    /// compaction appended after its `Compress` marker.
+    fn compacted() -> Vec<(u64, SessionLogEntry)> {
+        numbered(vec![
+            message(Some("prompt"), MessageRole::User),
+            message(Some("answer"), MessageRole::Assistant),
+            compress(),
+            message(Some("prompt"), MessageRole::User),
+            message(Some("answer"), MessageRole::Assistant),
+            turn_end(1),
+        ])
+    }
+
+    #[test]
+    fn latest_prompt_skips_the_copies_compaction_relogs() {
+        assert_eq!(latest_prompt_seq(&compacted()), Some(1));
+    }
+
+    #[test]
+    fn a_prompt_after_compaction_is_the_latest() {
+        let mut log = compacted();
+        log.push((7, message(Some("next"), MessageRole::User)));
+        assert_eq!(latest_prompt_seq(&log), Some(7));
+    }
+
+    #[test]
+    fn messages_without_ids_always_count_as_prompts() {
+        let log = numbered(vec![
+            message(None, MessageRole::User),
+            compress(),
+            message(None, MessageRole::User),
+        ]);
+        assert_eq!(latest_prompt_seq(&log), Some(3));
     }
 }

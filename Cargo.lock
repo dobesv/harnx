@@ -4504,7 +4504,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-server"
-version = "0.34.10"
+version = "0.34.11"
 dependencies = [
  "anyhow",
  "assert_cmd",

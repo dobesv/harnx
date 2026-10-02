@@ -361,9 +361,8 @@ fn event_activity(event: &AgentEvent) -> Option<bool> {
 pub(crate) fn history_has_pending_turn(history: &[(u64, SessionLogEntry)]) -> bool {
     let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(history)
         .unwrap_or_else(|_| history.to_vec());
-    let Some(latest_user_seq) = effective.iter().rev().find_map(|(seq, entry)| {
-        matches!(entry, SessionLogEntry::Message { role, .. } if role.is_user()).then_some(*seq)
-    }) else {
+    let Some(latest_user_seq) = harnx_core::session_reconstruct::latest_prompt_seq(&effective)
+    else {
         return false;
     };
 
@@ -498,6 +497,62 @@ mod tests {
         ];
 
         assert!(history_has_pending_turn(&history));
+    }
+
+    fn message_with_id(id: &str, role: MessageRole, text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: Some(id.to_string()),
+            role,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn turn_end(through_seq: u64) -> SessionLogEntry {
+        SessionLogEntry::TurnEnd {
+            through_seq,
+            fence_token: 7,
+            timestamp: None,
+            usage: None,
+        }
+    }
+
+    /// Compaction appends the messages it keeps again after its `Compress`
+    /// marker, under their original ids. The copies are not new prompts.
+    #[test]
+    fn compacted_history_is_idle_once_its_turn_ended() {
+        let compress = SessionLogEntry::Compress {
+            prompt: "summary".to_string(),
+        };
+        // Automatic compaction runs before the turn's `TurnEnd` is written.
+        let automatic = vec![
+            (1, message_with_id("q", MessageRole::User, "question")),
+            (2, message_with_id("a", MessageRole::Assistant, "answer")),
+            (3, compress.clone()),
+            (4, message_with_id("q", MessageRole::User, "question")),
+            (5, message_with_id("a", MessageRole::Assistant, "answer")),
+            (6, turn_end(1)),
+        ];
+        assert!(!history_has_pending_turn(&automatic));
+
+        // Manual compaction runs after it, and writes no `TurnEnd` of its own.
+        let manual = vec![
+            (1, message_with_id("q", MessageRole::User, "question")),
+            (2, message_with_id("a", MessageRole::Assistant, "answer")),
+            (3, turn_end(1)),
+            (4, compress),
+            (5, message_with_id("q", MessageRole::User, "question")),
+            (6, message_with_id("a", MessageRole::Assistant, "answer")),
+        ];
+        assert!(!history_has_pending_turn(&manual));
+
+        let mut queued = manual;
+        queued.push((7, message_with_id("next", MessageRole::User, "follow-up")));
+        assert!(
+            history_has_pending_turn(&queued),
+            "a prompt typed after compaction still starts a turn"
+        );
     }
 
     #[test]
