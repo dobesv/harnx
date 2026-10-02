@@ -67,6 +67,57 @@ async fn find_rejects_two_rows_answering_the_same_round_and_call() {
     );
 }
 
+/// A row is read only by its own key. A cancel names its call by session and
+/// call id, so a call id that matched some other call's row would have the
+/// cancel act on that call's checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wildcard_call_id_reads_no_other_calls_row() {
+    let (_server, journal) = common::journal().await;
+    journal
+        .record(
+            &common::request("sess-wildcard", "job.1"),
+            ("echo", "scope", "srv"),
+            1,
+        )
+        .await
+        .unwrap();
+
+    for call_id in ["job.*", "job.>"] {
+        let read = journal.recorded("sess-wildcard", call_id).await;
+        assert!(read.is_err(), "call id {call_id} read {read:?}");
+    }
+}
+
+/// The server marks a key it removed, for an age limit say, with a header
+/// rather than the KV operation header. Such a key is gone, not a row whose
+/// content failed to decode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_the_server_marked_removed_reads_as_missing() -> Result<()> {
+    let (server, journal) = common::journal().await;
+    let client = async_nats::ConnectOptions::new()
+        .token(common::TOKEN.to_string())
+        .connect(&server.url)
+        .await?;
+    let mut marker = async_nats::HeaderMap::new();
+    marker.insert("Nats-Marker-Reason", "MaxAge");
+    async_nats::jetstream::new(client)
+        .publish_with_headers(
+            format!(
+                "$KV.{}.sessions/sess-marker/expired-call",
+                harnx_toolset_server::invocation_journal::BUCKET
+            ),
+            marker,
+            "".into(),
+        )
+        .await?
+        .await?;
+
+    let read = journal.recorded("sess-marker", "expired-call").await;
+
+    assert!(matches!(read, Ok(None)), "the marker read as {read:?}");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_listings_skip_a_corrupt_row_and_still_return_the_rest() {
     let (server, journal) = common::journal().await;

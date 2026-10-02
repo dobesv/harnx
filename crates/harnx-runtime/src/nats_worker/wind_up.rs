@@ -137,7 +137,7 @@ impl WindUp<'_> {
     /// One result per interrupted call, in the order the turn made them.
     async fn close_out(&self, orphans: &[OrphanToolCalls]) -> Result<WoundUp> {
         // One listing answers every orphan: the journal lists a session by
-        // streaming its whole bucket, so reading row by row would pay for
+        // listing its whole bucket, so reading row by row would pay for
         // that once per call — narrowed to the interrupted rounds, since a
         // long-lived session may hold far more journal rows than this wind-up
         // owes results for. A read that FAILS is not a missing reply —

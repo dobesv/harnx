@@ -1,6 +1,6 @@
 use crate::common;
 use anyhow::{Context, Result};
-use common::{request_headers, wait_for_registration, TestHarness};
+use common::{wait_for_registration, TestHarness};
 use harnx_toolset::{ReplayAttempt, ToolReply, ToolRequest};
 use harnx_toolset_server::invocation_journal::InvocationJournal;
 use serde_json::json;
@@ -31,18 +31,6 @@ async fn interrupted_call(
     Ok((journal, request))
 }
 
-async fn replay(harness: &TestHarness, request: &ToolRequest) -> Result<ToolReply> {
-    let message = harness
-        .client
-        .request_with_headers(
-            harness.instance_id.tool_subject("____test", &request.tool),
-            request_headers(&request.call_id, &request.call_id),
-            serde_json::to_vec(request)?.into(),
-        )
-        .await?;
-    Ok(serde_json::from_slice(&message.payload)?)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_server_replays_idempotent_operation_and_persists_reply() -> Result<()> {
     let mut toolset = common::TestToolset::default();
@@ -52,7 +40,7 @@ async fn tool_server_replays_idempotent_operation_and_persists_reply() -> Result
         .context("nats-server required")?;
     let (journal, request) = interrupted_call(&harness, "echo").await?;
     assert_eq!(
-        replay(&harness, &request).await?.result.unwrap(),
+        harness.call_tool(&request).await?.result.unwrap(),
         json!({"value": 42})
     );
     assert_eq!(harness.toolset.echo_invocations.load(Ordering::SeqCst), 1);
@@ -86,7 +74,7 @@ async fn durable_reply_is_returned_without_reinvoking_after_cache_loss() -> Resu
     assert_eq!(
         tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            replay(&harness, &request)
+            harness.call_tool(&request)
         )
         .await
         .context("replay timed out")??,
@@ -115,7 +103,7 @@ async fn tool_server_rejects_non_retryable_replay_without_invoking() -> Result<(
         .await?
         .context("nats-server required")?;
     let (_, request) = interrupted_call(&harness, "echo").await?;
-    let error = replay(&harness, &request).await?.result.unwrap_err();
+    let error = harness.call_tool(&request).await?.result.unwrap_err();
     assert!(
         matches!(error, harnx_toolset::ToolErrorPayload::Recoverable(message) if message.contains("cannot replay"))
     );
@@ -133,7 +121,7 @@ async fn replay_cannot_change_original_arguments() -> Result<()> {
         .context("nats-server required")?;
     let (_, mut request) = interrupted_call(&harness, "echo").await?;
     request.args = json!({"value": "different operation"});
-    assert!(replay(&harness, &request).await?.result.is_err());
+    assert!(harness.call_tool(&request).await?.result.is_err());
     assert_eq!(harness.toolset.echo_invocations.load(Ordering::SeqCst), 0);
     harness.shutdown().await;
     Ok(())
@@ -156,15 +144,15 @@ async fn ordinary_duplicate_must_match_the_journal_even_with_cached_reply() -> R
         )
         .await?;
     assert_eq!(
-        replay(&harness, &request).await?.result.unwrap(),
+        harness.call_tool(&request).await?.result.unwrap(),
         json!("saved")
     );
     request.replay = None;
     request.args = json!({"different": true});
-    assert!(replay(&harness, &request).await?.result.is_err());
+    assert!(harness.call_tool(&request).await?.result.is_err());
     request.args = json!({"value": 42});
     journal.purge_session("replay-parent").await?;
-    assert!(replay(&harness, &request).await?.result.is_err());
+    assert!(harness.call_tool(&request).await?.result.is_err());
     assert_eq!(harness.toolset.echo_invocations.load(Ordering::SeqCst), 0);
     harness.shutdown().await;
     Ok(())

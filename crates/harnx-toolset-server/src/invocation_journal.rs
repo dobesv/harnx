@@ -3,10 +3,10 @@
 //! may not have persisted a tool's response by the time the call finishes.
 use anyhow::{ensure, Context, Result};
 use async_nats::jetstream::{self, kv};
-use futures_util::TryStreamExt;
 use harnx_toolset::{ToolReply, ToolRequest};
 use serde::{Deserialize, Serialize};
 
+mod leader_reads;
 mod replies;
 pub use replies::{JournalCheckpointStore, JournalPartialResultStore};
 
@@ -43,8 +43,10 @@ impl RecordedInvocation {
     }
 }
 
+/// The journal's KV store, and the JetStream context its key listings are
+/// requested through.
 #[derive(Clone)]
-pub struct InvocationJournal(kv::Store);
+pub struct InvocationJournal(kv::Store, jetstream::Context);
 
 /// Reconcile durability away from the request path, so a replica count raised
 /// after this server started still reaches the journal bucket. Retain the
@@ -83,11 +85,11 @@ impl InvocationJournal {
                 js.get_key_value(BUCKET).await?
             }
         };
-        Ok(Self(store))
+        Ok(Self(store, js.clone()))
     }
 
-    pub fn from_store(store: kv::Store) -> Self {
-        Self(store)
+    pub fn from_store(js: &jetstream::Context, store: kv::Store) -> Self {
+        Self(store, js.clone())
     }
 
     pub async fn record(
@@ -126,7 +128,9 @@ impl InvocationJournal {
     pub(crate) async fn check_session_retained(&self, request: &ToolRequest) -> Result<()> {
         if let Some(session) = &request.parent_session_id {
             ensure!(
-                self.0.get(format!("deleted/{session}")).await?.is_none(),
+                self.live_entry(&format!("deleted/{session}"))
+                    .await?
+                    .is_none(),
                 "tool invocation session was deleted"
             );
         }
@@ -174,10 +178,9 @@ impl InvocationJournal {
     }
 
     async fn read(&self, key: &str) -> Result<Option<RecordedInvocation>> {
-        self.0
-            .get(key)
+        self.live_entry(key)
             .await?
-            .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            .map(|entry| serde_json::from_slice(&entry.value).map_err(Into::into))
             .transpose()
     }
 
@@ -203,9 +206,9 @@ impl InvocationJournal {
 
     /// Every row this session holds, listed and read once.
     ///
-    /// Listing a session's keys streams the whole bucket, so a caller that
-    /// wants more than one of a session's rows reads them all here and matches
-    /// in memory rather than paying for that listing per row.
+    /// Listing a session's keys lists every key in the bucket, so a caller
+    /// that wants more than one of a session's rows reads them all here and
+    /// matches in memory rather than paying for that listing per row.
     ///
     /// A row that will not deserialize is skipped with a warning: it cannot
     /// hold a usable reply, and failing the listing over one unreadable row
@@ -239,10 +242,10 @@ impl InvocationJournal {
     ) -> Result<Vec<RecordedInvocation>> {
         let mut found = Vec::new();
         for key in self.session_keys(session).await? {
-            let Some(bytes) = self.0.get(&key).await? else {
+            let Some(entry) = self.live_entry(&key).await? else {
                 continue;
             };
-            match serde_json::from_slice::<RecordedInvocation>(&bytes) {
+            match serde_json::from_slice::<RecordedInvocation>(&entry.value) {
                 Ok(record) if keep(&record) => found.push(record),
                 Ok(_) => {}
                 Err(error) => {
@@ -273,7 +276,6 @@ impl InvocationJournal {
         field: &impl Fn(&mut RecordedInvocation) -> &mut Option<T>,
     ) -> Result<Option<T>> {
         let entry = self
-            .0
             .entry(key)
             .await?
             .context("durable tool invocation missing")?;
@@ -296,18 +298,6 @@ impl InvocationJournal {
             Err(error) if error.kind() == kv::UpdateErrorKind::WrongLastRevision => Ok(None),
             Err(error) => Err(error).context("persist tool invocation state"),
         }
-    }
-
-    async fn session_keys(&self, session: &str) -> Result<Vec<String>> {
-        let prefix = format!("sessions/{session}/");
-        let mut keys = self.0.keys().await?;
-        let mut selected = Vec::new();
-        while let Some(key) = keys.try_next().await? {
-            if key.starts_with(&prefix) {
-                selected.push(key);
-            }
-        }
-        Ok(selected)
     }
 
     pub async fn purge_session(&self, session: &str) -> Result<()> {
