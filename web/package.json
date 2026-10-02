@@ -15,7 +15,7 @@
     "test:e2e:update": "playwright test --update-snapshots"
   },
   "dependencies": {
-    "@ag-ui/client": "1.0.0",
+    "@ag-ui/client": "1.0.1",
     "@assistant-ui/react": "0.15.22",
     "@assistant-ui/react-ag-ui": "0.0.62",
     "@assistant-ui/react-markdown": "0.14.17",
