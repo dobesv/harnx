@@ -1,6 +1,7 @@
 //! Per-invocation timeout and token-budget integration tests.
 
 use super::*;
+use crate::nats_session::test_support::InheritedTestTool;
 use std::sync::atomic::AtomicUsize;
 
 fn budget_boundary_call_fn(call_count: Arc<AtomicUsize>) -> crate::agent_loop::AgentCallFn {
@@ -75,7 +76,10 @@ async fn run_budget_test_turn(
 ) -> crate::NatsTurnResult {
     tokio::time::timeout(
         NATS_TEST_CONDITION_TIMEOUT,
-        session.run_turn_with_options(prompt, Arc::new(NoopEventSink), None, options),
+        session
+            .clone()
+            .with_external_admission()
+            .run_turn_with_options(prompt, Arc::new(NoopEventSink), None, options),
     )
     .await
     .expect("budget test turn timed out")
@@ -106,7 +110,7 @@ async fn invoke_subagent_prompt(
 ) -> serde_json::Value {
     tokio::time::timeout(
         NATS_TEST_CONDITION_TIMEOUT,
-        toolset.invoke("session_prompt", arguments, CancellationToken::new()),
+        toolset.invoke_inherited("session_prompt", arguments, CancellationToken::new()),
     )
     .await
     .expect("bounded sub-agent tool call did not return")
@@ -130,6 +134,20 @@ fn assert_timeout_result(stopped: &serde_json::Value, session_id: &str) {
             json!("cancelled"),
         )
     );
+    assert_eq!(stopped["termination"]["scope"], "local_invocation");
+    assert!(stopped["termination"]["deadline"].as_str().is_some());
+    assert_eq!(
+        stopped["termination"]["public_progress"]["available"],
+        false
+    );
+    assert_eq!(
+        stopped["termination"]["public_progress"]["references"],
+        json!([])
+    );
+    assert!(stopped["termination"]["retry_hint"]
+        .as_str()
+        .unwrap()
+        .contains("Do not retry unchanged"));
     let response = stopped["response"]
         .as_str()
         .expect("timeout result has synthesized response text");
@@ -138,32 +156,6 @@ fn assert_timeout_result(stopped: &serde_json::Value, session_id: &str) {
             && response.contains("No thinking text was captured")
             && response.contains(&format!("same session id `{session_id}`"))
             && response.contains("Usage: used 0 budgeted tokens.")
-    );
-}
-
-fn assert_budget_result(stopped: &serde_json::Value, session_id: &str) {
-    assert_eq!(
-        (
-            stopped["session_id"].clone(),
-            stopped["termination"]["kind"].clone(),
-            stopped["termination"]["session_id"].clone(),
-            stopped["termination"]["usage"].clone(),
-            stopped["sub_agent_progress"]["status"].clone(),
-        ),
-        (
-            json!(session_id),
-            json!("budget_exceeded"),
-            json!(session_id),
-            json!({"input_uncached": 2, "cache_write": 0, "output": 1, "budgeted": 3}),
-            json!("done"),
-        )
-    );
-    let response = stopped["response"]
-        .as_str()
-        .expect("budget result has synthesized response text");
-    assert!(
-        response.contains("reached its token budget (used 3 of 1 budgeted tokens)")
-            && response.contains(&format!("same session id `{session_id}`"))
     );
 }
 
@@ -316,46 +308,84 @@ async fn subagent_timeout_returns_synthesized_result_and_same_session_retry_succ
     let _ = nats.wait();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subagent_token_budget_returns_synthesized_result() {
+#[tokio::test]
+async fn expired_child_admission_returns_scoped_advice_without_model_dispatch() {
+    use crate::nats_session_metadata::{CallTimeoutOverride, RunLimitsRecord};
+    use harnx_toolset::{AutonomousRunContext, ToolInvocation, ToolInvocationContext, Toolset};
+
     let _env_guard = env_lock().await;
-    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
+    let (url, mut nats, _store_dir) = spawn_test_nats().await.expect("nats-server required");
     let seeded = seed_remote_config(&url);
     let _env = subagent_test_env(&url, &seeded);
-    let call_count = Arc::new(AtomicUsize::new(0));
-    let daemon =
-        spawn_metis_worker_with_call_fn(&url, budget_boundary_call_fn(Arc::clone(&call_count)));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let daemon = spawn_metis_worker_with_call_fn(&url, timeout_then_reply_call_fn(calls.clone()));
     subagent_discovery_tests::wait_for_cluster_worker(&seeded.parent_config, "local")
         .await
-        .expect("sub-agent budget test worker should register");
+        .expect("worker registration");
     let toolset = test_subagent_toolset(&url).await;
-    let session_id = crate::nats_worker::new_remote_session_id();
-
-    let stopped = invoke_subagent_prompt(
-        &toolset,
-        json!({
-            "message": "run one tool round within a tiny budget",
-            "session_id": session_id,
-            "token_budget": 1
-        }),
-    )
-    .await;
-    assert_budget_result(&stopped, &session_id);
-
-    assert_subagent_retry(
-        &toolset,
-        json!({
-            "message": "retry after the budget stop",
-            "session_id": session_id,
-            "token_budget": 1
-        }),
-        "same-session retry completed",
-        &call_count,
-    )
-    .await;
-
+    let original = chrono::Utc::now() - chrono::Duration::seconds(30);
+    for (scope, parent_allowance, local_allowance) in [
+        ("inherited_deadline", 1, 60),
+        ("local_invocation", 86400, 1),
+    ] {
+        let parent = RunLimitsRecord::admit_root(
+            Default::default(),
+            Default::default(),
+            original,
+            Default::default(),
+            None,
+            CallTimeoutOverride::from_optional(Some(parent_allowance)),
+        )
+        .unwrap();
+        let session_id = crate::nats_worker::new_remote_session_id();
+        let call_id = uuid::Uuid::new_v4().to_string();
+        let result = tokio::time::timeout(NATS_TEST_CONDITION_TIMEOUT, toolset.invoke_with_context(ToolInvocation {
+            tool: "session_prompt".into(),
+            args: json!({"message": "work until the invocation deadline", "session_id": session_id, "timeout_secs": local_allowance}),
+            cancel: CancellationToken::new(),
+            context: ToolInvocationContext {
+                call_id: call_id.clone(),
+                run_context: Some(AutonomousRunContext {
+                    snapshot: serde_json::to_value(&parent).unwrap(),
+                    started_at_ms: original.timestamp_millis().try_into().unwrap(),
+                }),
+                ..Default::default()
+            },
+        })).await.expect("admission result timeout").expect("expired admission returns a tool result");
+        assert_eq!(result["session_id"], session_id);
+        assert_eq!(result["termination"]["session_id"], session_id);
+        assert_eq!(result["termination"]["kind"], "timeout");
+        assert_eq!(result["termination"]["scope"], scope);
+        assert_eq!(result["termination"]["run_id"], parent.run_id.as_str());
+        assert_eq!(result["termination"]["invocation_id"], call_id);
+        assert_eq!(result["termination"]["usage"]["budgeted"], 0);
+        assert_eq!(
+            result["termination"]["thinking_excerpt"],
+            serde_json::Value::Null
+        );
+        assert_eq!(result["termination"]["public_progress"]["available"], false);
+        assert_eq!(result["sub_agent_progress"]["status"], "cancelled");
+        let advice = result["termination"]["retry_hint"].as_str().unwrap();
+        assert!(result["response"].as_str().unwrap().contains(advice));
+        assert!(result["response"]
+            .as_str()
+            .unwrap()
+            .contains("Public progress unavailable"));
+        if scope == "inherited_deadline" {
+            assert!(advice.contains("The inherited deadline expired."));
+            assert!(advice.contains("Do not retry:"));
+            assert!(advice.contains("Return to the user to confirm continuation"));
+        } else {
+            assert!(advice.contains("revise or narrow instructions"));
+            assert!(advice.contains("only while the outer run remains live"));
+            assert!(advice.contains(&session_id));
+        }
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "expired admissions must never call the model"
+    );
     daemon.abort();
     let _ = daemon.await;
     let _ = nats.kill();

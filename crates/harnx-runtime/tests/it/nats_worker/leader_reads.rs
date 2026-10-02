@@ -84,12 +84,9 @@ async fn load_events_latest_async_reads_leader_authoritative_tail() -> Result<()
     let session_id = "latest-tail-test";
     let log = NatsSessionLog::new_with_replicas(js, storage_key(session_id), 1);
 
-    let user_seq = log
-        .append_event_async(&append_user_message_entry(
-            "msg-to-retract",
-            "please ignore this",
-        ))
-        .await?;
+    let user_seq =
+        crate::worker::append_admitted_fixture_user(&log, "msg-to-retract", "please ignore this")
+            .await?;
     let retract_seq = log
         .append_event_async(&SessionLogEntry::EditEntries {
             from: user_seq as usize,
@@ -165,23 +162,14 @@ fn injection_decision_points_use_leader_authoritative_read() {
     .collect::<Vec<_>>()
     .join("\n");
 
-    // Nine leader reads in the daemon_family files:
-    // - daemon_turn_input.rs: reconstruction (line ~39)
-    // - daemon_turn_input.rs: continuation drain (line ~67)
-    // - session_turn.rs: retry cleanup for an unterminated failed assistant
-    // - session_turn.rs: prepare_turn (line ~164)
-    // - session_turn.rs: finish_if_drained drain check (line ~321)
-    // - session_turn.rs: maybe_execute_pending_compaction safety check (sibling tool/HITL check)
-    // - session_turn.rs: execute_manual_compaction dedupe check (cached entries)
-    // - session_turn.rs: execute_manual_compaction fallback load (when no cached entries)
-    // - daemon_session_exec.rs: session watcher start sequence (line ~196)
-    // Note: daemon.rs has 0 load_events_latest_async calls.
+    // Includes immutable admission/ancestor resolution and deadline stops, in
+    // addition to the original turn/compaction decision points.
     assert_eq!(
         daemon_family
             .lines()
             .filter(|line| line.contains("load_events_latest_async()"))
             .count(),
-        9,
+        18,
         "turn decisions use leader reads in daemon_family; session_turn has retry cleanup + prepare_turn + drain + compaction safety + dedupe + fallback"
     );
     assert_eq!(

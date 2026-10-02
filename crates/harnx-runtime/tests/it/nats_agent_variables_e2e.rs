@@ -321,7 +321,10 @@ impl TestEnv {
 
         match tokio::time::timeout(
             TURN_TIMEOUT,
-            session.run_turn("hello", Arc::new(NullSink), None),
+            session
+                .clone()
+                .with_external_admission()
+                .run_turn("hello", Arc::new(NullSink), None),
         )
         .await
         {
@@ -755,7 +758,11 @@ async fn client_ends_turn_when_worker_vanishes_without_writing() -> Result<()> {
                 create_abort_signal(),
             )
             .await?;
-            session.run_turn("hello", Arc::new(NullSink), None).await
+            session
+                .clone()
+                .with_external_admission()
+                .run_turn("hello", Arc::new(NullSink), None)
+                .await
         }
     });
 
@@ -775,5 +782,58 @@ async fn client_ends_turn_when_worker_vanishes_without_writing() -> Result<()> {
         error.contains("stopped without answering"),
         "error must explain the worker vanished, got: {error}"
     );
+    Ok(())
+}
+
+#[test]
+fn shared_orchestrator_prompts_keep_workflow_without_run_limit_prose() -> Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|path| path.join("packages/pantheon").is_dir())
+        .context("workspace root")?;
+    for (name, workflow) in [
+        (
+            "atlas",
+            vec![
+                "## Task Registration",
+                "## Plan Registration",
+                "mark the task as active",
+                "## Task Verification (Argus)",
+                "## Responding to PR Feedback",
+            ],
+        ),
+        (
+            "sisyphus",
+            vec![
+                "## Task Handling",
+                "## Plan Management",
+                "github_issue",
+                "external_task_url",
+                "### Research Before Acting",
+            ],
+        ),
+    ] {
+        let prompt = std::fs::read_to_string(
+            root.join(format!("packages/pantheon/agents/shared/{name}.md")),
+        )?;
+        for absent in [
+            "token_budget",
+            "Delegation Run Limits",
+            "termination.public_progress",
+            "inherited_deadline",
+            "local_invocation",
+        ] {
+            assert!(
+                !prompt.contains(absent),
+                "{name}: tool-local advice leaked into shared prompt: {absent}"
+            );
+        }
+        for present in workflow {
+            assert!(
+                prompt.contains(present),
+                "{name}: unrelated workflow lost: {present}"
+            );
+        }
+    }
     Ok(())
 }

@@ -50,10 +50,11 @@ async fn unterminated_failed_assistant_redelivery_retries_original_prompt() -> R
         ))
         .await?;
     let log = NatsSessionLog::new_with_replicas(jetstream.clone(), &storage_key, 1);
-    log.append_event_async(&append_user_message_entry(
+    crate::worker::append_admitted_fixture_user(
+        &log,
         "failed-assistant-user",
         "retry original prompt",
-    ))
+    )
     .await?;
     log.append_event_async(&SessionLogEntry::Message {
         id: None,

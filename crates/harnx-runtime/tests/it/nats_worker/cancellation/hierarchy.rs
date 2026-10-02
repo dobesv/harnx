@@ -1,9 +1,9 @@
 //! Interruption reaches a sub-agent subtree without any handler forwarding it.
 //!
 //! Nothing walks the tree. Each level's worker, on being activated, follows its
-//! own `ParentLink` up one step and reads the parent's log: a parent turn whose
-//! tool call for this child is closed — interrupted, or already answered —
-//! means nobody is waiting for this child any more, so the worker interrupts it
+//! own immutable invocation ancestry and reads the exact parent's log: an
+//! interrupted parent cannot resume a descendant under a later independent run.
+//! The worker interrupts the original child invocation
 //! and records the parent that closed it. Repeating that one step per level is
 //! what carries a root interruption to the leaf.
 use super::*;
@@ -89,6 +89,7 @@ async fn seed_chain(js: &async_nats::jetstream::Context) -> Result<[Level; 3]> {
         },
     ];
 
+    let mut parent_limits: Option<harnx_runtime::nats_session_metadata::RunLimitsRecord> = None;
     for (index, level) in levels.iter().enumerate() {
         let id = [ROOT, MIDDLE, LEAF][index];
         let mut initializer =
@@ -100,9 +101,66 @@ async fn seed_chain(js: &async_nats::jetstream::Context) -> Result<[Level; 3]> {
         metadata
             .create(&SessionMetadata::new(id, initializer))
             .await?;
-        log(js, &level.key)
-            .append_event_async(&user("wait until cancelled"))
+        let invocation_id = if index == 0 {
+            "root-admission".to_owned()
+        } else {
+            level.wire_invocation()
+        };
+        let now = chrono::Utc::now();
+        let authority = match &parent_limits {
+            None => harnx_runtime::nats_session_metadata::AdmissionAuthority::External {
+                admitted_at: now,
+            },
+            Some(parent) => harnx_runtime::nats_session_metadata::AdmissionAuthority::Inherited {
+                parent: parent.clone(),
+                edge: harnx_runtime::nats_session_metadata::InvocationEdgeKind::Delegation,
+                admitted_at: now,
+            },
+        };
+        let mut admission = harnx_runtime::nats_session_metadata::InvocationAdmission::new(
+            &authority,
+            invocation_id.clone(),
+            None,
+            None,
+        );
+        admission.parent_storage_key = index
+            .checked_sub(1)
+            .map(|parent| levels[parent].key.clone());
+        metadata
+            .reserve_admission(&level.key, &admission, &[])
             .await?;
+        metadata
+            .bind_prompt_admission(&level.key, &invocation_id, &invocation_id)
+            .await?;
+        let limits = match parent_limits.as_ref() {
+            Some(parent) => harnx_runtime::nats_session_metadata::RunLimitsRecord::admit_child(
+                parent,
+                admission.invocation_id.clone(),
+                admission.edge.unwrap(),
+                now,
+                Default::default(),
+                None,
+                harnx_runtime::nats_session_metadata::CallTimeoutOverride::Omitted,
+            )?,
+            None => harnx_runtime::nats_session_metadata::RunLimitsRecord::admit_root(
+                admission.run_id.clone(),
+                admission.invocation_id.clone(),
+                now,
+                Default::default(),
+                None,
+                harnx_runtime::nats_session_metadata::CallTimeoutOverride::Omitted,
+            )?,
+        };
+        metadata.put_invocation_limits(&level.key, &limits).await?;
+        if index == 0 {
+            metadata.put_run_limits(&level.key, &limits).await?;
+        }
+        parent_limits = Some(limits);
+        let mut prompt = user("wait until cancelled");
+        if let Entry::Message { id, .. } = &mut prompt {
+            *id = Some(invocation_id);
+        }
+        log(js, &level.key).append_event_async(&prompt).await?;
         // Every level but the leaf is waiting on the child below it.
         if let Some(child) = levels.get(index + 1) {
             log(js, &level.key)
@@ -276,7 +334,11 @@ async fn cancelled_ownerless_child_prompt_is_not_replayed_when_reopened() -> Res
         .context("nats-server required")?;
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let child = session(server.url(), "ownerless-cancel-child").await?;
-    child.enqueue_text("wait until cancelled").await?;
+    child
+        .clone()
+        .with_external_admission()
+        .enqueue_text("wait until cancelled")
+        .await?;
     assert!(child.cancel_pending_turn().await?);
     await_cancel_entry(&js, child.storage_key()).await?;
 

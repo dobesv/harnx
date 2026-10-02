@@ -1,5 +1,6 @@
 //! Agent loop entrypoint for NATS-backed sessions.
 
+mod deadline_recovery;
 mod hitl_attention;
 mod tool_recovery;
 use super::backend::{FencedSessionLogSink, NatsSessionLogBackend};
@@ -19,6 +20,7 @@ use crate::tool_context::{discover_nats_hook_provider_fresh, discover_nats_tool_
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
+pub(super) use deadline_recovery::recover_completed_before_deadline;
 use harnx_core::cid_url::SessionRef;
 use harnx_core::message::Message;
 use harnx_core::session::SessionLogEntry;
@@ -329,16 +331,18 @@ pub(crate) fn fold_new_user_messages_since(
 pub(crate) fn build_mid_turn_injection_callback(
     backend: NatsSessionLogBackend,
     cursor: Arc<AtomicU64>,
+    invocation_id: String,
 ) -> OnToolRoundFn {
     Arc::new(move |merged_input, _results| {
         let backend = backend.clone();
         let cursor = Arc::clone(&cursor);
+        let invocation_id = invocation_id.clone();
         Box::pin(async move {
             let tail = match backend.load_events_latest_async().await {
                 Ok(entries) => entries,
                 Err(err) => {
                     log::warn!("failed to reload session log for mid-turn injection: {err}");
-                    return Ok(());
+                    return Err(err);
                 }
             };
             let current = match cursor.load(std::sync::atomic::Ordering::SeqCst) {
@@ -348,6 +352,29 @@ pub(crate) fn build_mid_turn_injection_callback(
             let (messages, latest_seq) = fold_new_user_messages_since(&tail, current);
             if messages.is_empty() {
                 return Ok(());
+            }
+            let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&tail)?;
+            let store = backend
+                .metadata_store_opt()
+                .context("injection requires admission metadata")?;
+            for (seq, entry) in &effective {
+                if *seq > current.unwrap_or(0) {
+                    if let SessionLogEntry::Message { id, role, .. } = entry {
+                        if role.is_user() {
+                            let id = id
+                                .as_deref()
+                                .context("injected user row has no admission identity")?;
+                            let admission = store
+                                .prompt_admission(backend.session_id(), id)
+                                .await?
+                                .context("injected user row has no durable admission")?;
+                            anyhow::ensure!(
+                                admission.invocation_id.as_str() == invocation_id,
+                                "cannot inject a competing execution admission"
+                            );
+                        }
+                    }
+                }
             }
             merged_input.set_injected_user_text(fold_user_messages(&messages));
             if let Some(seq) = latest_seq {
@@ -895,9 +922,95 @@ async fn dispatch_nats_handoff(
     prompt: String,
     handoff_tool_call_id: Option<String>,
 ) -> Result<()> {
-    let requested_session_id = session_id.filter(|session_id| !session_id.trim().is_empty());
+    let mut requested_session_id = session_id.filter(|session_id| !session_id.trim().is_empty());
+    let parent = args
+        .ctx
+        .config
+        .read()
+        .run_context
+        .clone()
+        .context("handoff requires inherited run context")?;
+    let handoff_id = handoff_tool_call_id
+        .as_deref()
+        .context("handoff requires durable tool-call identity")?;
+    let source_js = args.jetstream_ctx.clone();
+    let entries =
+        crate::nats_session_log::NatsSessionLog::new(source_js.clone(), args.source_session_id)
+            .load_events_latest_async()
+            .await?;
+    let round = entries
+        .iter()
+        .rev()
+        .find_map(|(seq, entry)| match entry {
+            SessionLogEntry::ToolCalls { calls, .. }
+                if calls
+                    .iter()
+                    .any(|call| call.id.as_deref() == Some(handoff_id)) =>
+            {
+                Some(*seq)
+            }
+            _ => None,
+        })
+        .context("handoff has no durable tool round")?;
+    let edge = format!("{round}:{handoff_id}");
+    let invocation_id =
+        harnx_core::session_identity::session_key(Some(parent.invocation_id.as_str()), &edge);
+    let source_store =
+        crate::nats_session_metadata::SessionMetadataStore::ensure(&source_js, args.replicas)
+            .await?;
+    let key = format!(
+        "sessions/{}/handoff_admissions/{invocation_id}",
+        args.source_session_id
+    );
+    let proposed = harnx_toolset::AutonomousRunContext {
+        snapshot: serde_json::to_value(&parent)?,
+        started_at_ms: chrono::Utc::now().timestamp_millis().try_into()?,
+    };
+    let lineage = match source_store.kv_store().get(&key).await? {
+        Some(bytes) => serde_json::from_slice::<harnx_toolset::AutonomousRunContext>(&bytes)?,
+        None => {
+            if source_store
+                .kv_store()
+                .update(&key, serde_json::to_vec(&proposed)?.into(), 0)
+                .await
+                .is_err()
+            {
+                serde_json::from_slice(
+                    &source_store
+                        .kv_store()
+                        .get(&key)
+                        .await?
+                        .context("handoff admission unconfirmed")?,
+                )?
+            } else {
+                proposed
+            }
+        }
+    };
+    let parent: crate::nats_session_metadata::RunLimitsRecord =
+        serde_json::from_value(lineage.snapshot)?;
+    let admitted_at = chrono::DateTime::from_timestamp_millis(lineage.started_at_ms.try_into()?)
+        .context("invalid handoff admission time")?;
     let destination = resolve_handoff_destination(args, &agent).await?;
     args.ctx.check_generation("handoff-create")?;
+    if requested_session_id.is_none() {
+        let store = crate::nats_session_metadata::SessionMetadataStore::ensure(
+            &destination.jetstream,
+            destination.replicas,
+        )
+        .await?;
+        let initializer =
+            crate::SessionInitializer::named(destination.agent.clone(), Default::default());
+        requested_session_id = Some(
+            crate::utils::session_name::reserve_invocation_session_id(
+                &store,
+                &initializer,
+                &invocation_id,
+                lineage.started_at_ms,
+            )
+            .await?,
+        );
+    }
     let target_session = NatsSession::new_with_resolved_replicas(
         NatsSessionConfig {
             cluster: destination.cluster,
@@ -915,7 +1028,14 @@ async fn dispatch_nats_handoff(
     )
     .await
     .with_context(|| format!("create handoff target session for '{agent}'"))?
-    .with_parent_cancel(tokio_util::sync::CancellationToken::new());
+    .with_parent_cancel(tokio_util::sync::CancellationToken::new())
+    .with_inherited_admission(
+        parent,
+        invocation_id,
+        admitted_at,
+        crate::nats_session_metadata::InvocationEdgeKind::Handoff,
+        None,
+    );
     args.ctx.check_generation("handoff-enqueue")?;
     let enqueued = target_session
         .enqueue(&prompt)

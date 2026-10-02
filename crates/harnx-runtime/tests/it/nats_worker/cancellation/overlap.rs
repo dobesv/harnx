@@ -78,7 +78,11 @@ async fn same_worker_runs_g2_while_g1_model_drop_is_blocked() -> Result<()> {
         .await?,
     );
     let first = session(server.url(), "blocked-drop-overlap").await?;
-    first.enqueue_text("G1").await?;
+    first
+        .clone()
+        .with_external_admission()
+        .enqueue_text("G1")
+        .await?;
     tokio::time::timeout(CI_SAFE_TIMEOUT, entered.notified()).await?;
     assert!(first.cancel_pending_turn().await?);
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
@@ -88,7 +92,10 @@ async fn same_worker_runs_g2_while_g1_model_drop_is_blocked() -> Result<()> {
     let second = session(server.url(), first.session_id()).await?;
     let result = tokio::time::timeout(
         CI_SAFE_TIMEOUT,
-        second.run_turn("G2", Arc::new(NullSink), None),
+        second
+            .clone()
+            .with_external_admission()
+            .run_turn("G2", Arc::new(NullSink), None),
     )
     .await??;
     assert_eq!(result.response.as_deref(), Some("G2 response"));
@@ -111,7 +118,11 @@ async fn foreign_follower_returns_on_root_receipt_without_transcript_or_cleanup(
     let session = session(server.url(), "stop-without-projection").await?;
     let config = local_nats_runtime_config(server.url());
     let input = harnx_runtime::config::input::from_str(&config, "G1", None);
-    let admitted = session.admit_input(&input, None).await?;
+    let admitted = session
+        .clone()
+        .with_external_admission()
+        .admit_input(&input, None)
+        .await?;
     let client = async_nats::connect(server.url()).await?;
     let js = async_nats::jetstream::new(client);
     let log = harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(

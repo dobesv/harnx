@@ -338,6 +338,8 @@ async fn run_agent_turn(
     )
     .await?;
     session
+        .clone()
+        .with_external_admission()
         .run_turn(prompt, Arc::new(NoopEventSink), None)
         .await?;
     Ok(())

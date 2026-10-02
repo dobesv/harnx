@@ -119,7 +119,8 @@ async fn approval_by_owning_frontend_propagates_to_second_observer() -> Result<(
         .tool_confirmation_route(counting_confirmation_handler(&observer_request_count))
         .await?;
 
-    let turn = harness.source.run_turn_with_tool_confirmation_route(
+    let admitting_source = harness.source.clone().with_external_admission();
+    let turn = admitting_source.run_turn_with_tool_confirmation_route(
         "start handoff",
         Arc::new(NullSink),
         None,

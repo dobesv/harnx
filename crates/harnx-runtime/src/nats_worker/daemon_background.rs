@@ -177,6 +177,7 @@ fn optional_tool_server<T>(result: Result<T>) -> Option<T> {
 /// Everything [`start_subagent_toolset`] needs, bundled so adding `replicas`
 /// didn't push it to a 6th bare argument.
 struct SubagentToolsetStart {
+    config: GlobalConfig,
     agent: String,
     route: SubagentSessionRoute,
     instance_id: harnx_core::instance::ServerScope,
@@ -189,6 +190,7 @@ struct SubagentToolsetStart {
 
 async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandle<Result<()>>> {
     let SubagentToolsetStart {
+        config,
         agent,
         route,
         instance_id,
@@ -200,17 +202,21 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
     } = start;
     let package = harnx_core::package_namespace::pkg_from_qualified(&agent).map(str::to_string);
     let registration_context = jetstream.clone();
-    let toolset = Arc::new(SubagentToolset::new(
-        agent,
-        route,
-        super::subagent_toolset::SubagentNats::new(
-            client.clone(),
-            jetstream,
-            session_metadata,
-            replicas,
+    let policy = super::subagent_toolset::TargetRunPolicy::resolve(&config.read(), &agent)?;
+    let toolset = Arc::new(
+        SubagentToolset::new(
+            agent,
+            route,
+            super::subagent_toolset::SubagentNats::new(
+                client.clone(),
+                jetstream,
+                session_metadata,
+                replicas,
+            )
+            .with_lease_acquisition_timeout(lease_acquisition_timeout),
         )
-        .with_lease_acquisition_timeout(lease_acquisition_timeout),
-    ));
+        .with_run_policy(policy),
+    );
     let server_name = harnx_toolset::Toolset::name(toolset.as_ref()).to_string();
     let identity_token = harnx_toolset::server_identity_token(package.as_deref(), "", &server_name);
     let registration_key = harnx_toolset_server::registration_key(&instance_id, &identity_token);
@@ -438,6 +444,7 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
             std::time::Duration::from_secs(config.read().nats_lease_acquisition_timeout_secs);
         let registrations = list_agents().into_iter().map(|agent| {
             let start = SubagentToolsetStart {
+                config: config.clone(),
                 agent: agent.clone(),
                 route: SubagentSessionRoute::new(
                     daemon.connection_key(),

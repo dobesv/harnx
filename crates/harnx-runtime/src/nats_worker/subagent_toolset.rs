@@ -5,6 +5,9 @@ mod termination;
 #[cfg(test)]
 mod interrupt_tests;
 
+#[cfg(test)]
+mod policy_tests;
+
 use super::subagent_progress::{ReportedInvocation, SubagentProgressReporter};
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_session::{NatsSession, NatsSessionConfig, NatsTurnResult};
@@ -80,6 +83,7 @@ pub(crate) struct SubagentToolset {
     replicas: usize,
     progress_heartbeat: Duration,
     lease_acquisition_timeout: Duration,
+    run_policy: Option<TargetRunPolicy>,
 }
 
 pub(crate) struct SubagentNats {
@@ -139,7 +143,13 @@ impl SubagentToolset {
             replicas: nats.replicas,
             progress_heartbeat: SUBAGENT_PROGRESS_HEARTBEAT,
             lease_acquisition_timeout: nats.lease_acquisition_timeout,
+            run_policy: None,
         }
+    }
+
+    pub(crate) fn with_run_policy(mut self, policy: TargetRunPolicy) -> Self {
+        self.run_policy = Some(policy);
+        self
     }
 
     #[cfg(test)]
@@ -302,8 +312,12 @@ impl SubagentToolset {
         .load_events_async()
         .await
         .is_ok_and(|events| {
+            let end = crate::nats_session::invocation_terminal_seq(&events, result.user_msg_seq)
+                .unwrap_or(u64::MAX);
             events.iter().any(|(seq, entry)| {
-                *seq > result.user_msg_seq && matches!(entry, SessionLogEntry::Cancel { .. })
+                *seq > result.user_msg_seq
+                    && *seq <= end
+                    && matches!(entry, SessionLogEntry::Cancel { .. })
             })
         })
     }
@@ -322,7 +336,6 @@ impl SubagentToolset {
                 parent_session_id: args.parent_session_id,
                 tool_call_id: args.tool_call_id,
                 timeout_secs: None,
-                token_budget: None,
                 cancel,
                 context,
             })
@@ -336,7 +349,7 @@ impl SubagentToolset {
         cancel: CancellationToken,
         context: ToolInvocationContext,
     ) -> Result<Value, ToolInvokeError> {
-        let args: PromptArgs = parse_args(SUBAGENT_SESSION_PROMPT_TOOL, args)?;
+        let args = parse_prompt_args(args)?;
         if args.message.trim().is_empty() {
             return Err(ToolInvokeError::Recoverable(
                 "message must not be empty".to_string(),
@@ -352,7 +365,6 @@ impl SubagentToolset {
                 parent_session_id: args.parent_session_id,
                 tool_call_id: args.tool_call_id,
                 timeout_secs: args.timeout_secs,
-                token_budget: args.token_budget,
                 cancel,
                 context,
             })
@@ -384,22 +396,62 @@ impl SubagentToolset {
         Ok(json!({ "session_id": session_id, "events": events }))
     }
 
-    async fn session_cancel(&self, args: Value) -> Result<Value, ToolInvokeError> {
+    async fn session_cancel(
+        &self,
+        args: Value,
+        context: ToolInvocationContext,
+    ) -> Result<Value, ToolInvokeError> {
         let args: SessionArgs = parse_args(SUBAGENT_SESSION_CANCEL_TOOL, args)?;
         let session_id = required_session_id(args.session_id)?;
+        let storage = harnx_core::session_identity::session_key(Some(&self.agent), &session_id);
+        let log = crate::nats_session_log::NatsSessionLog::new(self.jetstream.clone(), &storage);
+        let entries = log
+            .load_events_async()
+            .await
+            .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?;
+        let checkpoint = match context.checkpoint.clone() {
+            Some(saved) => saved,
+            None => {
+                let current = self
+                    .session_metadata
+                    .active_admission(&storage, &entries)
+                    .await
+                    .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?;
+                let proposed = json!({ "target_invocation": current.as_ref().map(|admission| admission.invocation_id.as_str()) });
+                match context.checkpoint_store.as_ref() {
+                    Some(store) => store
+                        .checkpoint(proposed)
+                        .await
+                        .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?,
+                    None => proposed,
+                }
+            }
+        };
+        let prompt_seq = match checkpoint["target_invocation"].as_str() {
+            Some(id) => self
+                .session_metadata
+                .invocation_prompt_seq(&storage, id, &entries)
+                .await
+                .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?,
+            None => None,
+        };
+        let Some(prompt_seq) = prompt_seq else {
+            return Ok(json!({"outcome": "idle", "session_id": session_id}));
+        };
         let request = crate::nats_session::interrupt::InterruptRequest {
             session_id: harnx_core::session_identity::session_key(Some(&self.agent), &session_id),
             cluster: self.route.cluster().to_string(),
             replicas: self.replicas,
-            cancellation_id: uuid::Uuid::now_v7().to_string(),
+            cancellation_id: format!("tool-stop:{}", context.call_id),
             requested_by: "session_cancel".to_string(),
             reason: "cancelled via session_cancel tool".into(),
         };
-        let outcome = crate::nats_session::interrupt::interrupt_session(
+        let outcome = crate::nats_session::interrupt::interrupt_invocation(
             &self.jetstream,
             &self.client,
             self.route.activation_route(),
             request,
+            prompt_seq,
         )
         .await
         .map_err(|error| {
@@ -503,7 +555,23 @@ fn parse_args<T: for<'de> Deserialize<'de>>(tool: &str, args: Value) -> Result<T
         .map_err(|error| ToolInvokeError::Recoverable(format!("invalid {tool} arguments: {error}")))
 }
 
+fn parse_prompt_args(args: Value) -> Result<PromptArgs, ToolInvokeError> {
+    let parsed: PromptArgs = parse_args(SUBAGENT_SESSION_PROMPT_TOOL, args)?;
+    crate::nats_session_metadata::EffectiveDeadline::resolve(
+        Default::default(),
+        None,
+        crate::nats_session_metadata::CallTimeoutOverride::from_optional(parsed.timeout_secs),
+        None,
+        chrono::Utc::now(),
+    )
+    .map_err(|error| {
+        ToolInvokeError::Recoverable(format!("invalid session_prompt arguments: {error}"))
+    })?;
+    Ok(parsed)
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NewSessionArgs {
     #[serde(default, rename = "__harnx_parent_session_id")]
     parent_session_id: Option<String>,
@@ -512,16 +580,18 @@ struct NewSessionArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PromptArgs {
     message: String,
     #[serde(default)]
     attachments: Option<Vec<String>>,
     #[serde(default)]
     session_id: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "harnx_core::config_data::deserialize_timeout_override"
+    )]
     timeout_secs: Option<u64>,
-    #[serde(default)]
-    token_budget: Option<u64>,
     #[serde(default, rename = "__harnx_parent_session_id")]
     parent_session_id: Option<String>,
     #[serde(default, rename = "__harnx_tool_call_id")]
@@ -529,6 +599,7 @@ struct PromptArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionArgs {
     session_id: String,
 }
@@ -546,9 +617,8 @@ impl Toolset for SubagentToolset {
     }
 
     async fn replay(&self, invocation: ToolInvocation) -> Result<Value, ToolInvokeError> {
-        // A replayed cancel is one more fenced `Cancel` append against a turn
-        // the first one already ended, which `interrupt_session` reports as
-        // `AlreadyInterrupted` and writes nothing for. `run_prompt` binds a
+        // Cancel replays retain the checkpointed invocation target, so they
+        // cannot interrupt a later independent run in the same conversation. `run_prompt` binds a
         // durable child handle and deduplicates its prompt by invocation
         // identity, so that reattaches instead of redelegating.
         self.invoke_with_context(invocation).await
@@ -559,7 +629,7 @@ impl Toolset for SubagentToolset {
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
-        tool_specs(&self.agent)
+        tool_specs_with_policy(&self.agent, self.run_policy.as_ref())
     }
 
     async fn invoke(
@@ -576,7 +646,7 @@ impl Toolset for SubagentToolset {
         } else if tool == SUBAGENT_SESSION_LOAD_TOOL {
             self.session_load(args).await
         } else if tool == SUBAGENT_SESSION_CANCEL_TOOL {
-            self.session_cancel(args).await
+            self.session_cancel(args, standalone_context()).await
         } else {
             Err(ToolInvokeError::Recoverable(format!(
                 "unknown sub-agent tool: {tool}"
@@ -611,6 +681,10 @@ impl Toolset for SubagentToolset {
                 self.session_prompt(invocation.args, invocation.cancel, invocation.context)
                     .await
             }
+            SUBAGENT_SESSION_CANCEL_TOOL => {
+                self.session_cancel(invocation.args, invocation.context)
+                    .await
+            }
             _ => {
                 self.invoke(&invocation.tool, invocation.args, invocation.cancel)
                     .await
@@ -643,11 +717,27 @@ impl Toolset for SubagentToolset {
             requested_by: format!("parent:{parent}"),
             reason: "parent interrupted".into(),
         };
-        crate::nats_session::interrupt::interrupt_session(
+        let entries = crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            &request.session_id,
+        )
+        .load_events_async()
+        .await
+        .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?;
+        let Some(prompt_seq) = self
+            .session_metadata
+            .invocation_prompt_seq(&request.session_id, &invocation.context.call_id, &entries)
+            .await
+            .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?
+        else {
+            return Ok(());
+        };
+        crate::nats_session::interrupt::interrupt_invocation(
             &self.jetstream,
             &self.client,
             self.route.activation_route(),
             request,
+            prompt_seq,
         )
         .await
         .map(drop)
@@ -657,24 +747,89 @@ impl Toolset for SubagentToolset {
     }
 }
 
+#[cfg(test)]
 fn tool_specs(agent: &str) -> Vec<ToolSpec> {
+    tool_specs_with_policy(agent, None)
+}
+
+fn tool_specs_with_policy(agent: &str, policy: Option<&TargetRunPolicy>) -> Vec<ToolSpec> {
     vec![
-        session_new_spec(agent),
-        session_prompt_spec(agent),
+        session_new_spec(agent, policy),
+        session_prompt_spec(agent, policy),
         session_id_tool_spec(agent, SessionIdTool::Load),
         session_id_tool_spec(agent, SessionIdTool::Cancel),
     ]
 }
 
+/// Resolved on the publishing worker, never from the caller's active agent.
+#[derive(Clone, Debug)]
+pub(crate) struct TargetRunPolicy {
+    timeout_secs: u64,
+    source: crate::nats_session_metadata::RunLimitsPolicySource,
+}
+
+impl TargetRunPolicy {
+    pub(crate) fn resolve(config: &crate::config::Config, agent: &str) -> anyhow::Result<Self> {
+        // retrieve_agent applies the same package patches used at worker admission.
+        let target = config.retrieve_agent(agent)?;
+        let admitted_at = chrono::Utc::now();
+        let resolved = config.resolve_run_deadline(
+            Some(&target),
+            crate::nats_session_metadata::CallTimeoutOverride::Omitted,
+            None,
+            admitted_at,
+        )?;
+        Ok(Self {
+            timeout_secs: u64::try_from(
+                (resolved.deadline.ok_or_else(|| {
+                    anyhow::anyhow!("resolved target policy has no finite deadline")
+                })? - admitted_at)
+                    .num_seconds(),
+            )?,
+            source: resolved.source,
+        })
+    }
+}
+
+fn allowance_description(policy: Option<&TargetRunPolicy>) -> String {
+    match policy {
+        Some(TargetRunPolicy {
+            timeout_secs: seconds,
+            source,
+        }) => {
+            use crate::nats_session_metadata::RunLimitsPolicySource;
+            let source = match source {
+                RunLimitsPolicySource::GlobalDefault => "global policy",
+                RunLimitsPolicySource::TargetAgent { .. } => "target policy",
+                RunLimitsPolicySource::ExplicitOverride => "call override",
+                RunLimitsPolicySource::InheritedFrom { .. } => "inherited policy",
+            };
+            format!("Target local allowance: {seconds} seconds ({source}).")
+        }
+        None => {
+            "Target configured local allowance unavailable; target worker resolves it at admission."
+                .into()
+        }
+    }
+}
+
+fn policy_description(policy: Option<&TargetRunPolicy>) -> String {
+    let allowance = allowance_description(policy);
+    format!("Omit or pass zero unless a specific deadline is needed. {allowance} Omitted, null, zero or negative inherits target policy (fallback: 86400 seconds / 24 hours). Positive seconds override local allowance; inherited deadlines can shorten it.")
+}
+
 /// A truncated session ID, so the call header stays one short line.
 const SHORT_SESSION_ID: &str = "{{ args.session_id | truncate(8, end='') }}";
 
-fn session_new_spec(agent: &str) -> ToolSpec {
+fn session_new_spec(agent: &str, policy: Option<&TargetRunPolicy>) -> ToolSpec {
     ToolSpec {
         cancellation_guarantee: Default::default(),
         name: SUBAGENT_SESSION_NEW_TOOL.to_string(),
-        description: format!("Create a new session on the '{agent}' agent"),
-        input_schema: json!({ "type": "object", "properties": {} }),
+        description: format!(
+            "Create a new session on the '{agent}' agent. {}",
+            allowance_description(policy) + " Uses target policy and the inherited deadline, which can shorten the allowance."
+        ),
+        input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         idempotent_hint: false,
         read_only_hint: false,
         timeout_secs: None,
@@ -685,12 +840,12 @@ fn session_new_spec(agent: &str) -> ToolSpec {
     .with_kind(ToolProgressKind::Other)
 }
 
-fn session_prompt_spec(agent: &str) -> ToolSpec {
+fn session_prompt_spec(agent: &str, policy: Option<&TargetRunPolicy>) -> ToolSpec {
     ToolSpec {
             cancellation_guarantee: Default::default(),
         name: SUBAGENT_SESSION_PROMPT_TOOL.to_string(),
         description: format!(
-            "Send a prompt to the '{agent}' agent. Omit session_id (or pass an empty/whitespace value) to start a new session with a generated ID — do this unless you are continuing an earlier session. To continue a session, pass the exact session_id returned by a prior session_prompt or session_new call. Session IDs are case-sensitive and local to this agent. Do not invent a session ID. Sub-agents return files by including cid: attachment URLs in their reply."
+            "Send a prompt to the '{agent}' agent. Omit session_id (or pass an empty/whitespace value) to start a new session with a generated ID — do this unless you are continuing an earlier session. To continue a session, pass the exact session_id returned by a prior session_prompt or session_new call. Session IDs are case-sensitive and local to this agent. Do not invent a session ID. Sub-agents return files by including cid: attachment URLs in their reply. {}", policy_description(policy)
         ),
         input_schema: json!({
             "type": "object",
@@ -710,14 +865,11 @@ fn session_prompt_spec(agent: &str) -> ToolSpec {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Maximum invocation duration in seconds; 0 or unset means no time limit"
-                },
-                "token_budget": {
-                    "type": "integer",
-                    "description": "Maximum budgeted tokens for this invocation; 0 or unset means unlimited"
+                    "description": policy_description(policy)
                 }
             },
-            "required": ["message"]
+            "required": ["message"],
+            "additionalProperties": false
         }),
         idempotent_hint: false,
         read_only_hint: false,
@@ -786,7 +938,8 @@ fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
                     "description": format!("The session ID to {verb}")
                 }
             },
-            "required": ["session_id"]
+            "required": ["session_id"],
+            "additionalProperties": false
         }),
         idempotent_hint: true,
         read_only_hint: tool.read_only(),
@@ -825,7 +978,7 @@ mod tests {
         );
         assert_eq!(
             tools[0].input_schema,
-            json!({ "type": "object", "properties": {} })
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
         );
         assert_eq!(tools[1].input_schema["required"], json!(["message"]));
         assert_eq!(
@@ -841,20 +994,12 @@ mod tests {
             tools[1].input_schema["properties"]["timeout_secs"]["type"],
             "integer"
         );
-        assert_eq!(
-            tools[1].input_schema["properties"]["token_budget"]["type"],
-            "integer"
-        );
-        assert!(
-            tools[1].input_schema["properties"]["timeout_secs"]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("seconds"))
-        );
-        assert!(
-            tools[1].input_schema["properties"]["token_budget"]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("unlimited"))
-        );
+        assert!(tools[1].input_schema["properties"]
+            .get("token_budget")
+            .is_none());
+        assert!(tools[1].input_schema["properties"]["timeout_secs"]
+            .get("minimum")
+            .is_none());
         assert_eq!(tools[2].input_schema["required"], json!(["session_id"]));
         assert_eq!(tools[3].input_schema["required"], json!(["session_id"]));
         assert_eq!(tools[0].timeout_secs, Some(0));

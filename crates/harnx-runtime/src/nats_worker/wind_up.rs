@@ -284,7 +284,7 @@ async fn live_targets(inputs: &WindUpInputs<'_>) -> HashMap<String, InFlightCanc
 /// but going through it would bypass the lease every other wind-up write is
 /// fenced under, so the observation the decode validates is dropped with the
 /// envelope instead of persisted unfenced.
-fn tool_output_from_reply(
+pub(super) fn tool_output_from_reply(
     call: &ToolCall,
     record: &RecordedInvocation,
     reply: ToolReply,

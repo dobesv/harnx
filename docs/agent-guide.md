@@ -372,7 +372,7 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
 - **Markdown-only agent definitions**: Agents are defined solely by Markdown files with YAML front-matter in `<config-dir>/agents/*.md` (or package agents). ACP server configuration (`acp_servers/*.yaml`) and ACP stdio child processes no longer exist.
 - **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 4-tool toolset. Each registration advertises the raw names `session_new`, `session_prompt`, `session_load`, and `session_cancel`; the provider exposes them to agents with an agent-relative prefix:
   - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata.
-  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`, optional `token_budget`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. `attachments` is a list of `cid:` attachment URLs passed to the sub-agent; repeated URLs are ignored. The parent session ID is propagated internally.
+  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. `attachments` is a list of `cid:` attachment URLs passed to the sub-agent; repeated URLs are ignored. The parent session ID is propagated internally.
   - `{agent}_session_load`: Reads prior event history for an existing sub-agent session log.
   - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
 - **Route-aware execution**: On persistent clusters, sub-agent turns use the
@@ -446,26 +446,50 @@ error output carries the child's identity as a `partial_result`:
 
 The parent can inspect that session or prompt it again.
 
-### Per-Invocation Execution Limits & Sub-Agent Termination
+### Run Limits & Sub-Agent Termination
 
-Parent agents can pass per-invocation execution limits when calling `{agent}_session_prompt`:
+Harnx bounds autonomous agent executions and runaway loops using runtime-owned wall-clock deadlines. Generated delegation tool metadata describes the target's allowance and when to set an override. Stopped invocations return continuation advice with available public results; shared agent prompts don't need run-limit instructions. CLI `--token-budget` remains an independent accounting limit for non-interactive one-shot prompts.
 
-- `timeout_secs` (integer, seconds): Maximum time allowed for the sub-agent invocation. Passing `0` or omitting the argument sets no time limit.
-- `token_budget` (integer, tokens): Maximum cumulative tokens allowed for the sub-agent invocation. Passing `0` or omitting the argument sets no token limit.
+#### Delegation Parameters and Policy Precedence
 
-Interactive user paths (TUI and Web UI) are unbounded by design.
+When delegating via `{agent}_session_prompt`, callers can pass:
+- `message` (required string): The prompt message for the sub-agent.
+- `attachments` (optional array of strings): Canonical `cid:` URLs.
+- `session_id` (optional string): Prior session ID to continue, or omitted to start a fresh session.
+- `timeout_secs` (optional integer, seconds): Per-call timeout override.
+
+Effective deadlines follow a four-tier precedence hierarchy:
+
+1. **Global configuration**: `run_limits.timeout_secs` set in `config.yaml`.
+2. **Target agent configuration**: `run_limits.timeout_secs` set in the target agent's Markdown front matter. The publishing target worker's effective configuration (including package patches) is authoritative; target policy is never inferred from caller heuristics.
+3. **Call-level override**: `timeout_secs` passed in `{agent}_session_prompt`.
+4. **Ancestor deadline clamp**: `min(admitted_at + local allowance, ancestor deadline)`. Target configuration and call overrides cannot extend a frozen ancestor deadline.
+
+The `timeout_secs` field accepts integers, not strings:
+- **Omitted, `null`, zero or negative integer**: Inherits the next policy level. Delegation uses the target's effective policy; the target inherits global configuration. With no positive configuration, the finite fallback is **86,400 seconds (24 hours)**.
+- **Positive integer**: Sets an explicit finite local allowance in seconds, clamped by any ancestor deadline. Large values such as `604800` (7 days) or `2592000` (30 days) are allowed; overflow is rejected.
+
+There is no deadline-disable setting. The 24-hour fallback is user-chosen policy, not a workload-calibrated threshold. New root admissions, including macros and incoming MCP requests, always receive finite deadlines; replay and config reload retain existing frozen records.
+
+#### Runtime-Owned Deadlines & Worker Enforcement
+
+Autonomous run deadlines belong to the runtime, not the delegating model:
+
+- **Root run boundary**: A trusted external admission (such as an interactive user command or a top-level CLI prompt) mints an immutable `RunIdentity` and sets the initial run deadline.
+- **Inheritance across delegations**: All child delegations, handoffs, and resumed sessions within that autonomous run inherit the root run's deadline (`parent.deadline`). Autonomous activity cannot renew or extend this deadline.
+- **Worker-owned enforcement**: The worker daemon enforces deadlines independently while awaiting models, tool executions, retries, and nested sub-agents. If a calling process disconnects or dies while waiting, the detached worker continues running under its independent deadline and terminates cleanly when that deadline expires.
 
 #### Result Envelope on Limit Reached
 
-When a sub-agent invocation reaches a timeout or token budget limit:
-1. The child session turn is hard-cancelled through the background cancellation path.
-2. The sub-agent tool completes as a normal `Ok` tool result (not a tool execution error).
-3. The returned JSON object includes a synthesized explanation in `response`, plus a structured `termination` sub-object:
+When a sub-agent invocation reaches a timeout or repetition limit:
+1. The child session turn is cancelled through the worker cancellation path.
+2. The sub-agent tool completes as a normal `Ok` tool result (not an unhandled tool error).
+3. The returned JSON object includes a synthesized explanation in `response`, terminal progress in `sub_agent_progress`, and structured metadata in `termination`:
 
 ```json
 {
   "session_id": "01948a3f-7b1c-7123-8901-abcdef123456",
-  "response": "The invocation was stopped after reaching its time limit.\n\nNo thinking text was captured (the non-streaming path produces none mid-call).\n\nYou can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions.\n\nUsage: used 165 budgeted tokens.",
+  "response": "The invocation was stopped after reaching its time limit.\n\nPublic progress (partial):\nAnalysis complete for auth middleware. Drafted fix in plan.\nReferences: cid:plan:pantheon%2Fatlas/armDRA/issue-2222\n\nNo thinking text was captured (the non-streaming path produces none mid-call).\n\nLocal invocation allowance expired. Inspect saved public results and revise or narrow instructions before continuing the same session id `01948a3f-7b1c-7123-8901-abcdef123456`, only while the outer run remains live. Do not retry unchanged.\n\nUsage: used 165 budgeted tokens.",
   "sub_agent": {
     "agent": "researcher",
     "session_id": "01948a3f-7b1c-7123-8901-abcdef123456"
@@ -474,7 +498,7 @@ When a sub-agent invocation reaches a timeout or token budget limit:
     "invocation_id": "8aa9a68a-034e-4df3-a9cf-6db978644f30",
     "agent": "researcher",
     "session_id": "01948a3f-7b1c-7123-8901-abcdef123456",
-    "status": "done",
+    "status": "failed",
     "elapsed_ms": 30012,
     "usage": {
       "input_tokens": 120,
@@ -493,20 +517,55 @@ When a sub-agent invocation reaches a timeout or token budget limit:
       "budgeted": 165
     },
     "thinking_excerpt": null,
-    "retry_hint": "You can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions."
+    "retry_hint": "Local invocation allowance expired. Inspect saved public results and revise or narrow instructions before continuing the same session id `01948a3f-7b1c-7123-8901-abcdef123456`, only while the outer run remains live. Do not retry unchanged.",
+    "scope": "local_invocation",
+    "deadline": "2026-10-02T05:30:00Z",
+    "run_id": "01948a3f-7b1c-7000-8000-000000000001",
+    "invocation_id": "8aa9a68a-034e-4df3-a9cf-6db978644f30",
+    "public_progress": {
+      "available": true,
+      "output_excerpt": "Analysis complete for auth middleware. Drafted fix in plan.",
+      "references": [
+        "cid:plan:pantheon%2Fatlas/armDRA/issue-2222"
+      ]
+    }
   }
 }
 ```
 
-The parent agent can inspect `termination.kind` (`"timeout"`, `"budget_exceeded"` or `"repetition"`) and retry by sending a new message to the same `session_id`.
+Field reference for `termination`:
+- `kind`: `"timeout"` or `"repetition"` (or `"budget_exceeded"` in CLI contexts).
+- `session_id`: Session ID of the stopped turn.
+- `usage`: Token metrics for the turn (`input_uncached`, `cache_write`, `output`, `budgeted`).
+- `scope`: Timeout scope derived from the worker's frozen record:
+  - `"local_invocation"`: Only the local invocation allowance expired while the outer run deadline remains live.
+  - `"inherited_deadline"`: An ancestor run deadline expired.
+  - `"outer_run"`: The top-level run deadline expired.
+- `deadline`: Absolute UTC ISO-8601 timestamp of the frozen deadline.
+- `run_id`: UUID of the root run.
+- `invocation_id`: UUID of this specific invocation.
+- `public_progress`: Available partial output and artifact references:
+  - `available`: Boolean indicating whether public output or artifact references were captured.
+  - `output_excerpt`: Bounded public assistant text (up to 4 KiB).
+  - `references`: Array of up to 16 canonical `cid:` URLs discovered during execution (up to 1,024 bytes per URL).
+  - If no output or artifact references were captured, `available` is `false` and public progress is reported as unavailable.
+- `thinking_excerpt`: Bounded tail of thinking text (up to 4 KiB) when streaming is active, or `null` if none was captured (non-streaming requests yield no intermediate thinking text mid-call).
+- `retry_hint`: Guidance describing continuation rules based on termination scope.
+- For `"repetition"` stops: `source` (`"tool_calls"`, `"answer"`, or `"thinking"`), and for tool calls `tool` and `count`.
 
-A `"repetition"` termination does not come from a limit the parent passed. The sub-agent's loop protection (see [Loop Detection](configuration-guide.md#loop-detection)) ended its turn because the model kept making the same tool call with the same result or kept repeating the same text in its answer or reasoning. The result has the same envelope, and the sub-agent's progress row ends as `failed` rather than `done`. `termination` carries up to three more keys beside the others: `source` (`"tool_calls"`, `"answer"` or `"thinking"`), and for `"tool_calls"` also `tool` (the name of the repeated tool) and `count` (how many identical calls with identical results had run within the 10-minute window).
+#### Tool-Local Continuation Advice
 
-#### Design Guarantees & Limitations
+The tool's `response` and `termination.retry_hint` explain each stop. An expired inherited or outer deadline says not to retry and to return to the user to confirm continuation with a new external instruction. A local timeout allows revised instructions to the same `session_id` only while the ancestor run remains live; local scope alone doesn't guarantee it is still live when the reply arrives. Repetition stops ask for a changed approach. Available durable public output and artifact references accompany the advice; missing output is reported as unavailable.
 
-- **Budget metric & scope**: Token budget metric is `(input_tokens - cached_tokens) + output_tokens` (uncached input + cache writes + output; cache reads excluded). It applies per invocation as a fresh delta; retrying a session starts a clean token budget allowance. Workers evaluate budget before each model call, so at least one model call executes when `token_budget > 0`.
-- **Enforcement asymmetry**: `timeout_secs` is enforced on the caller side and stops invocations whose calling session remains alive. If a calling process dies while waiting, caller-side timeout does not stop the detached sub-agent worker. However, `token_budget` is enforced worker-side before model calls, bounding cost even for orphaned workers.
-- **Thinking excerpts**: Non-streaming model calls do not yield intermediate thinking text during an active request, so mid-call timeouts produce an empty thinking excerpt ("none captured"). Budget limits trigger at turn boundaries and can capture thinking excerpts when streaming is enabled.
+Expired admission or pre-dispatch failures also identify the exhausted scope and explain continuation, even when returned through an error envelope rather than a completed worker result. They don't claim that new tool output was produced. These are tool-local responses, not policies to copy into every agent prompt.
+
+#### System Boundaries and Operational Invariants
+
+- **Trusted frontend boundary**: Trusted external admissions establish run boundaries. Mid-turn user inputs steer an active turn without resetting or extending the autonomous run deadline.
+- **Persisted run records & replay recovery**: Admission records (`RunLimitsRecord`) are persisted durably before execution. On replay or worker restart, the saved record is loaded rather than computing `now + timeout`. Completed child results are recovered before checking expiry, ensuring successful historical work is not converted into a false timeout.
+- **Cancellation is not rollback**: Terminating an invocation interrupts pending turns, but does not revert side effects already executed (such as files created or edited, git commits, or external tool executions).
+- **Bounded clock skew**: Distributed nodes assume bounded clock skew across machines for UTC deadline evaluation.
+- **Tool metadata snapshots**: Tool descriptions advertise target policy resolved at worker registration. Modifying agent front-matter or package patches after registration requires re-registering or restarting the worker to advertise updated descriptions, though worker admissions resolve against current files on disk.
 
 ### Live Event Streaming for User Interfaces
 

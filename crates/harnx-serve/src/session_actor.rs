@@ -66,6 +66,7 @@ struct SessionActorConfig {
 }
 
 struct RunFinished {
+    limits: Option<harnx_runtime::nats_session_metadata::RunLimitsRecord>,
     run_id: RunId,
     result: anyhow::Result<harnx_runtime::LoopResult>,
     sink: Arc<BroadcastEventSender>,
@@ -273,6 +274,7 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         )
     };
     session
+        .with_external_admission()
         .run_turn_input(&input, attachments_dir.as_deref(), params.sink, None)
         .await
         .map(|_| harnx_runtime::LoopResult::Completed)
@@ -281,10 +283,33 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
 async fn run_actor_turn_supervised(
     params: ActorTurnParams,
 ) -> anyhow::Result<harnx_runtime::LoopResult> {
-    match std::panic::AssertUnwindSafe(run_actor_turn(params))
-        .catch_unwind()
+    let deadline = if params.call_fn.is_some() {
+        let limits = params
+            .prompt_config
+            .read()
+            .run_context
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!("injected executor admission could not resolve run policy")
+            })?;
+        limits.deadline
+    } else {
+        None
+    };
+    let body = std::panic::AssertUnwindSafe(run_actor_turn(params)).catch_unwind();
+    let result = match deadline {
+        Some(deadline) => tokio::time::timeout(
+            deadline
+                .signed_duration_since(Utc::now())
+                .to_std()
+                .unwrap_or_default(),
+            body,
+        )
         .await
-    {
+        .map_err(|_| harnx_runtime::nats_session_metadata::run_limits::DeadlineExpired)?,
+        None => body.await,
+    };
+    match result {
         Ok(result) => result,
         Err(payload) => {
             let message = payload
@@ -649,6 +674,39 @@ impl SessionActor {
     ) -> RunId {
         self.cancel_reap(reap_sleep);
         let prompt_config = self.prompt_config().await;
+        // Injected executors are a test/embed seam. Production handoffs run in
+        // NATS workers, but this seam must not mint new outer scopes either.
+        if self.actor_config.call_fn.is_some() {
+            let (global, target) = {
+                let cfg = prompt_config.read();
+                (
+                    cfg.data.run_limits,
+                    cfg.agent.as_ref().map(|agent| agent.clone().into_config()),
+                )
+            };
+            let now = Utc::now();
+            let resolved = match options.runtime_parent.as_deref() {
+                Some(parent) => harnx_runtime::nats_session_metadata::RunLimitsRecord::admit_child(
+                    parent,
+                    Default::default(),
+                    harnx_runtime::nats_session_metadata::InvocationEdgeKind::Handoff,
+                    now,
+                    global,
+                    target.as_ref(),
+                    harnx_runtime::nats_session_metadata::CallTimeoutOverride::Omitted,
+                ),
+                None => harnx_runtime::nats_session_metadata::RunLimitsRecord::admit_root(
+                    Default::default(),
+                    Default::default(),
+                    now,
+                    global,
+                    target.as_ref(),
+                    harnx_runtime::nats_session_metadata::CallTimeoutOverride::Omitted,
+                ),
+            };
+            prompt_config.write().run_context = resolved.ok();
+        }
+        let limits = prompt_config.read().run_context.clone();
         let run_id = RunId::random();
         let thread_id = derive_thread_id(&self.key.session);
         let started_at = Utc::now();
@@ -690,6 +748,7 @@ impl SessionActor {
             let loop_result = run_actor_turn_supervised(turn).await;
             let _ = done_tx
                 .send(RunFinished {
+                    limits,
                     run_id: run_id_for_task,
                     result: loop_result,
                     sink: sink_for_task,

@@ -212,6 +212,7 @@ pub trait CheckpointStore: Send + Sync {
 /// [`Toolset::invoke`] only.
 #[derive(Clone, Default)]
 pub struct ToolInvocationContext {
+    pub run_context: Option<AutonomousRunContext>,
     pub call_id: String,
     pub invoking_session_id: Option<String>,
     /// The caller's session identity (agent + local session id) for cid: URL construction.
@@ -342,9 +343,21 @@ pub trait Toolset: Send + Sync {
     }
 }
 
+/// Immutable lineage carried by the runtime and saved with the journal request.
+/// Snapshot is opaque to generic tool servers; the agent runtime validates its
+/// RunLimitsRecord schema. Keeping it here avoids a toolset/core dependency cycle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutonomousRunContext {
+    pub snapshot: Value,
+    pub started_at_ms: u64,
+}
+
 /// Request body for one tool invocation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequest {
+    /// Runtime-owned snapshot; never read from model-authored tool arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_context: Option<AutonomousRunContext>,
     /// Set when this request replays a call whose original result was never
     /// observed. Preserves call_id/operation_id and never silently falls
     /// through to a normal invoke.
@@ -721,6 +734,7 @@ mod tests {
     fn wire_types_round_trip_through_serde() {
         assert_round_trip(tool_spec());
         assert_round_trip(ToolRequest {
+            run_context: None,
             replay: None,
             operation_id: "call-1".to_string(),
             call_id: "call-1".to_string(),
@@ -733,6 +747,7 @@ mod tests {
             capabilities: BTreeSet::new(),
         });
         assert_round_trip(ToolRequest {
+            run_context: None,
             replay: Some(ReplayAttempt {
                 attempt: 2,
                 requested_by: "worker-b".to_string(),

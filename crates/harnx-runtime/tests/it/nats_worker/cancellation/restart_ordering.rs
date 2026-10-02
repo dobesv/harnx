@@ -69,8 +69,53 @@ async fn seed(js: &async_nats::jetstream::Context) -> Result<(String, String)> {
         .create(&SessionMetadata::new(CHILD, child_initializer))
         .await?;
 
-    log(js, &root_key)
-        .append_event_async(&user("delegate"))
+    let root_log = log(js, &root_key);
+    crate::worker::append_admitted_fixture_user(&root_log, "root-admission", "delegate").await?;
+    let root_admission = metadata
+        .admission(&root_key, "root-admission")
+        .await?
+        .unwrap();
+    let root_limits = harnx_runtime::nats_session_metadata::RunLimitsRecord::admit_root(
+        root_admission.run_id.clone(),
+        root_admission.invocation_id.clone(),
+        root_admission.admitted_at,
+        Default::default(),
+        None,
+        harnx_runtime::nats_session_metadata::CallTimeoutOverride::Omitted,
+    )?;
+    metadata.put_run_limits(&root_key, &root_limits).await?;
+    metadata
+        .put_invocation_limits(&root_key, &root_limits)
+        .await?;
+    let child_time = chrono::Utc::now();
+    let mut admission = harnx_runtime::nats_session_metadata::InvocationAdmission::new(
+        &harnx_runtime::nats_session_metadata::AdmissionAuthority::Inherited {
+            parent: root_limits.clone(),
+            edge: harnx_runtime::nats_session_metadata::InvocationEdgeKind::Delegation,
+            admitted_at: child_time,
+        },
+        WIRE_CALL.into(),
+        None,
+        None,
+    );
+    admission.parent_storage_key = Some(root_key.clone());
+    metadata
+        .reserve_admission(&child_key, &admission, &[])
+        .await?;
+    metadata
+        .bind_prompt_admission(&child_key, WIRE_CALL, WIRE_CALL)
+        .await?;
+    let child_limits = harnx_runtime::nats_session_metadata::RunLimitsRecord::admit_child(
+        &root_limits,
+        admission.invocation_id.clone(),
+        admission.edge.unwrap(),
+        child_time,
+        Default::default(),
+        None,
+        harnx_runtime::nats_session_metadata::CallTimeoutOverride::Omitted,
+    )?;
+    metadata
+        .put_invocation_limits(&child_key, &child_limits)
         .await?;
     log(js, &root_key)
         .append_event_async(&tool_calls("subagent_session_prompt", CALL))
@@ -84,8 +129,12 @@ async fn seed(js: &async_nats::jetstream::Context) -> Result<(String, String)> {
             started_at: None,
         })
         .await?;
+    let mut child_prompt = user("child work");
+    if let Entry::Message { id, .. } = &mut child_prompt {
+        *id = Some(WIRE_CALL.into());
+    }
     log(js, &child_key)
-        .append_event_async(&user("child work"))
+        .append_event_async(&child_prompt)
         .await?;
     log(js, &child_key)
         .append_event_async(&tool_calls("slow_tool", "child-call"))
@@ -217,7 +266,11 @@ async fn a_message_queued_behind_the_interrupt_runs_after_the_wind_up() -> Resul
         fold_capture_call_fn(calls.clone(), prompts.clone()),
     )
     .await?;
-    session.enqueue_text("actually, do this instead").await?;
+    session
+        .clone()
+        .with_external_admission()
+        .enqueue_text("actually, do this instead")
+        .await?;
 
     poll_until(async || {
         Ok(prompts

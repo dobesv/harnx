@@ -6,12 +6,7 @@ use harnx_runtime::nats_session_log::NatsSessionLog;
 use anyhow::{Context, Result};
 use common::spawn_nats_server;
 use futures_util::StreamExt;
-use harnx_core::{
-    event::NullSink,
-    message::{MessageContent, MessageRole},
-    require_nextest,
-    session::SessionLogEntry,
-};
+use harnx_core::{event::NullSink, require_nextest, session::SessionLogEntry};
 use harnx_runtime::config::ConfigLock;
 use harnx_runtime::{
     client::CompletionTokenUsage,
@@ -71,16 +66,6 @@ async fn require_nats_server() -> Result<Option<common::NatsServerHandle>> {
         return Ok(None);
     };
     Ok(Some(server))
-}
-
-fn append_user_message_entry(message_id: &str, text: &str) -> SessionLogEntry {
-    SessionLogEntry::Message {
-        id: Some(message_id.to_string()),
-        role: MessageRole::User,
-        content: MessageContent::Text(text.to_string()),
-        timestamp: None,
-        fence_token: None,
-    }
 }
 
 fn user_message_texts(entries: &[(u64, SessionLogEntry)]) -> Vec<String> {

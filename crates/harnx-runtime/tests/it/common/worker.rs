@@ -315,3 +315,46 @@ pub async fn start_tool_server<T: Toolset + 'static>(
         .context("registration watch closed")??;
     Ok(server)
 }
+
+/// Raw-transcript fixture adapter. Explicitly admit each user row before append;
+/// production deadline tests use NatsSession admission instead of this helper.
+pub async fn append_admitted_fixture_user(
+    log: &harnx_runtime::nats_session_log::NatsSessionLog,
+    id: &str,
+    text: &str,
+) -> Result<u64> {
+    use harnx_runtime::nats_session_metadata::{
+        AdmissionAuthority, InvocationAdmission, SessionMetadataStore,
+    };
+    let store = SessionMetadataStore::ensure(log.jetstream(), 1).await?;
+    let entries = log.load_events_async().await?;
+    let active = store.active_admission(log.storage_key(), &entries).await?;
+    let intent = match active {
+        Some(active) => active,
+        None => {
+            let mut proposed = InvocationAdmission::new(
+                &AdmissionAuthority::External {
+                    admitted_at: chrono::Utc::now(),
+                },
+                id.into(),
+                None,
+                None,
+            );
+            proposed.prompt_content = Some(harnx_core::message::MessageContent::Text(text.into()));
+            store
+                .reserve_admission(log.storage_key(), &proposed, &entries)
+                .await?
+        }
+    };
+    store
+        .bind_prompt_admission(log.storage_key(), id, intent.invocation_id.as_str())
+        .await?;
+    log.append_event_async(&harnx_core::session::SessionLogEntry::Message {
+        id: Some(id.into()),
+        role: harnx_core::message::MessageRole::User,
+        content: harnx_core::message::MessageContent::Text(text.into()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await
+}

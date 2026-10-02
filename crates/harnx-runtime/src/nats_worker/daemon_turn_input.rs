@@ -2,13 +2,12 @@
 //! tombstones, resumable in-flight turns, and queued next-turn messages.
 
 use super::agent_loop::fold_new_user_messages_since;
-use super::ancestor_check::{check_ancestors, AncestorVerdict};
 use super::backend::NatsSessionLogBackend;
 use super::daemon::SessionActivate;
 use super::session_turn::TurnWorker;
 use crate::config::{GlobalConfig, Input};
 use crate::nats_lease::NatsSessionLease;
-use crate::nats_session::{interrupt_session, InterruptRequest};
+use crate::nats_session::InterruptRequest;
 use anyhow::{Context, Result};
 use harnx_core::session_reconstruct::TurnStatus;
 
@@ -124,7 +123,10 @@ impl TurnWorker {
                 .await
             }
             TurnStatus::InFlightResumable { .. } => {
-                match self.refuse_resume_under_interrupted_parent(backend).await? {
+                match self
+                    .refuse_resume_under_interrupted_parent(backend, per_session)
+                    .await?
+                {
                     true => (crate::config::input::from_str(per_session, "", None), None),
                     false => self.derive_resumable_turn_input(
                         ctx,
@@ -155,39 +157,111 @@ impl TurnWorker {
     /// A child session may only resume while the parent tool call that
     /// created it is still open. When it is not, interrupt this session so the
     /// log records why it stopped, and run nothing.
-    async fn refuse_resume_under_interrupted_parent(
+    pub(super) async fn refuse_resume_under_interrupted_parent(
         &self,
         backend: &NatsSessionLogBackend,
+        config: &GlobalConfig,
     ) -> Result<bool> {
-        let AncestorVerdict::Interrupted {
-            parent_session,
-            cancellation_id,
-        } = check_ancestors(
-            &self.jetstream,
-            &self.session_metadata,
-            backend.session_id(),
-        )
-        .await?
-        else {
+        let current = config
+            .read()
+            .run_context
+            .clone()
+            .context("resuming invocation without frozen policy")?;
+        if current.parent_invocation.is_none() {
+            return Ok(false);
+        }
+        let admission = self
+            .session_metadata
+            .admission(backend.session_id(), current.invocation_id.as_str())
+            .await?
+            .context("resuming invocation has no admission")?;
+        if admission.edge != Some(crate::nats_session_metadata::InvocationEdgeKind::Delegation) {
+            return Ok(false);
+        }
+        let mut ancestor = admission.clone();
+        let mut stopped_parent = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            if ancestor.edge != Some(crate::nats_session_metadata::InvocationEdgeKind::Delegation) {
+                break;
+            }
+            let Some(parent_key) = ancestor.parent_storage_key.as_deref() else {
+                break;
+            };
+            let parent = ancestor
+                .parent
+                .as_ref()
+                .context("child has no parent snapshot")?;
+            anyhow::ensure!(
+                seen.insert(parent.invocation_id.as_str().to_owned()),
+                "cycle in invocation ancestry"
+            );
+            // Source metadata is absent at a different broker. Its snapshot still
+            // bounds local dispatch; original RPC cancellation crosses brokers.
+            if self.session_metadata.get(parent_key).await?.is_none() {
+                break;
+            }
+            let parent_entries =
+                crate::nats_session_log::NatsSessionLog::new(self.jetstream.clone(), parent_key)
+                    .load_events_latest_async()
+                    .await?;
+            let Some(parent_seq) = self
+                .session_metadata
+                .invocation_prompt_seq(parent_key, parent.invocation_id.as_str(), &parent_entries)
+                .await?
+            else {
+                break;
+            };
+            let stopped = crate::nats_session::invocation_terminal_seq(&parent_entries, parent_seq)
+                .is_some_and(|seq| {
+                    parent_entries.iter().any(|(row, entry)| {
+                        *row == seq
+                            && matches!(
+                                entry,
+                                harnx_core::session::SessionLogEntry::Cancel { .. }
+                                    | harnx_core::session::SessionLogEntry::Error { .. }
+                            )
+                    })
+                });
+            if stopped {
+                stopped_parent = Some(parent_key.to_owned());
+                break;
+            }
+            let Some(parent_admission) = self
+                .session_metadata
+                .admission(parent_key, parent.invocation_id.as_str())
+                .await?
+            else {
+                break;
+            };
+            ancestor = parent_admission;
+        }
+        let Some(parent_key) = stopped_parent else {
             return Ok(false);
         };
-        log::info!(
-            "refusing to resume under interrupted parent: session_id={} parent={parent_session}",
-            backend.session_id()
-        );
-        interrupt_session(
+        let entries = backend.load_events_latest_async().await?;
+        let prompt_seq = self
+            .session_metadata
+            .invocation_prompt_seq(
+                backend.session_id(),
+                current.invocation_id.as_str(),
+                &entries,
+            )
+            .await?
+            .context("child prompt binding missing")?;
+        crate::nats_session::interrupt::interrupt_invocation(
             &self.jetstream,
             &self.client,
             &self.activation_route,
             InterruptRequest {
-                session_id: backend.session_id().to_string(),
+                session_id: backend.session_id().to_owned(),
                 cluster: self.cluster.clone(),
                 replicas: self.replicas,
-                cancellation_id: cancellation_id
-                    .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
-                requested_by: format!("parent:{parent_session}"),
+                cancellation_id: format!("parent-stop:{}", current.invocation_id.as_str()),
+                requested_by: format!("parent:{parent_key}"),
                 reason: "parent invocation interrupted".into(),
             },
+            prompt_seq,
         )
         .await?;
         Ok(true)

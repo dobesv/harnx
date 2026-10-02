@@ -98,6 +98,34 @@ impl ToolReservationHandle {
         &self.config
     }
 
+    /// Grant one independent request at a trusted external frontend, not at reservation creation.
+    /// Internal model calls must carry their existing run instead of calling this adapter.
+    pub async fn admit_external_call(
+        &self,
+    ) -> Result<crate::nats_session_metadata::RunLimitsRecord> {
+        use crate::nats_session_metadata::{CallTimeoutOverride, RunLimitsRecord};
+        ensure!(
+            self.config.run_context.is_none(),
+            "external tool admission cannot replace an inherited run"
+        );
+        let record = RunLimitsRecord::admit_root(
+            Default::default(),
+            Default::default(),
+            chrono::Utc::now(),
+            self.config.data.run_limits,
+            None,
+            CallTimeoutOverride::Omitted,
+        )?;
+        let store = self.session.metadata_store();
+        store
+            .put_run_limits(self.session.storage_key(), &record)
+            .await?;
+        store
+            .put_invocation_limits(self.session.storage_key(), &record)
+            .await?;
+        Ok(record)
+    }
+
     pub fn session_id(&self) -> &str {
         self.session.session_id()
     }

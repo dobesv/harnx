@@ -2,9 +2,9 @@ use super::tests::{
     env_lock, fixed_prompt_call_fn, seed_remote_config, slow_prompt_call_fn,
     spawn_metis_worker_with_call_fn, spawn_test_nats, subagent_test_env, test_subagent_toolset,
 };
+use crate::nats_session::test_support::InheritedTestTool;
 use futures_util::StreamExt;
 use harnx_core::event::{AgentEvent, SubAgentProgress, SubAgentProgressStatus, TurnEvent};
-use harnx_toolset::Toolset;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -125,7 +125,7 @@ async fn orders_announcement_heartbeats_terminal_and_durable_summary() {
     let toolset = progress_toolset(&url).await;
     let prompt = tokio::spawn(async move {
         toolset
-            .invoke(
+            .invoke_inherited(
                 "session_prompt",
                 json!({
                     "message": "report progress",
@@ -173,7 +173,7 @@ async fn completed_results_include_progress_and_preserve_agent_marker() {
     let toolset = test_subagent_toolset(&url).await;
 
     let created = toolset
-        .invoke("session_new", json!({}), CancellationToken::new())
+        .invoke_inherited("session_new", json!({}), CancellationToken::new())
         .await
         .expect("create marked child session");
     let session_id = created["session_id"]
@@ -183,7 +183,7 @@ async fn completed_results_include_progress_and_preserve_agent_marker() {
     assert_completed_result(&created, &session_id);
 
     let prompted = toolset
-        .invoke(
+        .invoke_inherited(
             "session_prompt",
             json!({ "message": "continue marked session", "session_id": session_id }),
             CancellationToken::new(),

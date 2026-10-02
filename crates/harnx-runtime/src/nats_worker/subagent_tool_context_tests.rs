@@ -3,6 +3,7 @@ use super::tests::{
     echoing_call_fn, env_lock, seed_remote_config, spawn_metis_worker_with_call_fn,
     spawn_test_nats, subagent_test_env, test_subagent_toolset,
 };
+use crate::nats_session::test_support::InheritedTestTool;
 use crate::nats_session_log::NatsSessionLog;
 use crate::nats_session_metadata::{SessionMetadataStore, ToolContextEntry};
 use crate::{NatsSession, NatsSessionConfig, SessionActivationRoute, SessionInitializer};
@@ -93,6 +94,7 @@ async fn create_inheriting_child(toolset: &SubagentToolset, parent_session_id: &
             tool: "session_new".to_string(),
             args: json!({}),
             context: ToolInvocationContext {
+                run_context: Some(crate::nats_session::test_support::inherited_tool_context()),
                 call_id: "parent-delegation".to_string(),
                 invoking_session_id: Some(parent_session_id.to_string()),
                 ..Default::default()
@@ -130,7 +132,7 @@ async fn child_log(config: &crate::config::Config, session_id: &str) -> NatsSess
 async fn exercise_reused_child(toolset: &SubagentToolset, session_id: &str, after_new: usize) {
     for message in ["first continuation", "second continuation"] {
         let result = toolset
-            .invoke(
+            .invoke_inherited(
                 "session_prompt",
                 json!({"message": message, "session_id": session_id}),
                 CancellationToken::new(),
@@ -144,7 +146,7 @@ async fn exercise_reused_child(toolset: &SubagentToolset, session_id: &str, afte
         );
     }
     let loaded = toolset
-        .invoke(
+        .invoke_inherited(
             "session_load",
             json!({"session_id": session_id}),
             CancellationToken::new(),

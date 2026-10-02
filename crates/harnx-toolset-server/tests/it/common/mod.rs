@@ -524,6 +524,7 @@ pub(crate) async fn journal() -> (NatsServerHandle, InvocationJournal) {
 /// A session-scoped `echo` request whose operation ID matches its call ID.
 pub(crate) fn request(session: &str, call_id: &str) -> ToolRequest {
     ToolRequest {
+        run_context: None,
         replay: None,
         operation_id: call_id.to_string(),
         call_id: call_id.to_string(),

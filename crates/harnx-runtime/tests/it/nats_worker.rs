@@ -104,16 +104,6 @@ async fn seed_session_metadata(
     Ok((store, metadata))
 }
 
-fn append_user_message_entry(message_id: &str, text: &str) -> SessionLogEntry {
-    SessionLogEntry::Message {
-        id: Some(message_id.to_string()),
-        role: MessageRole::User,
-        content: harnx_core::message::MessageContent::Text(text.to_string()),
-        timestamp: None,
-        fence_token: None,
-    }
-}
-
 fn mid_round_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
     Arc::new(move |input, _config, _abort| {
         // The mid-turn injection is delivered via `input.injected_user_text`

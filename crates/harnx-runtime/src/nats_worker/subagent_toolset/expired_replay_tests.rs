@@ -17,14 +17,25 @@ async fn expired_replay_returns_completed_child_without_cancelling_or_readmittin
     let buffer = Arc::new(InvocationBufferingSink::new(Arc::new(
         harnx_core::event::NullSink,
     )));
+    let store = crate::nats_session_metadata::SessionMetadataStore::ensure(&js, 1).await?;
+    let record = crate::nats_session_metadata::RunLimitsRecord::admit_root(
+        crate::nats_session_metadata::RunIdentity::new(),
+        crate::nats_session_metadata::InvocationIdentity::from_string("invocation".into()),
+        chrono::Utc::now() - chrono::Duration::seconds(30),
+        Default::default(),
+        None,
+        crate::nats_session_metadata::CallTimeoutOverride::from_optional(Some(1)),
+    )?;
+    store
+        .put_invocation_limits(session.storage_key(), &record)
+        .await?;
+    assert!(record.is_expired_at(chrono::Utc::now()));
     let before = log.load_events_async().await?;
     let turn = await_prompt_turn(
         &session,
         &buffer,
         AwaitTurnParams {
             content: MessageContent::Text("original work".to_string()),
-            timeout: Some(Duration::ZERO),
-            token_budget: None,
             cancel: CancellationToken::new(),
         },
     )
@@ -64,7 +75,10 @@ async fn completed_child(js: &async_nats::jetstream::Context) -> Result<NatsSess
         crate::utils::create_abort_signal(),
     )
     .await?;
-    let session = session.with_execution_parent("parent".into(), "invocation".into());
+    let session = session
+        .with_external_admission()
+        .with_execution_parent("parent".into(), "invocation".into());
+    let session = session.with_admission_timeout(Some(1));
     let prompt = session.enqueue_text("original work").await?;
     let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
         js.clone(),

@@ -42,11 +42,15 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
 
     let ready_fut = MID_ROUND_APPEND_READY.notified();
     queue_session
+        .clone()
+        .with_external_admission()
         .enqueue_text("seed message")
         .await?
         .into_activation_result()?;
     ready_fut.await;
     queue_session
+        .clone()
+        .with_external_admission()
         .enqueue_text("late message")
         .await?
         .into_activation_result()?;
@@ -149,8 +153,7 @@ async fn seed_resume_fixture(server_url: &str) -> Result<ResumeFixture> {
     let js = local_test_nats(server_url).await?;
     let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(SESSION_ID), 1);
     seed_session_metadata(&js, SESSION_ID).await?;
-    log.append_event_async(&append_user_message_entry("user-1", "original request"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "user-1", "original request").await?;
     let lease = acquire_test_lease(js.clone(), SESSION_ID, "crashed-worker").await?;
     let backend = generation::fenced_backend(&js, &storage_key(SESSION_ID)).await?;
     backend
@@ -166,12 +169,9 @@ async fn seed_resume_fixture(server_url: &str) -> Result<ResumeFixture> {
             "second round",
         ))
         .await?;
-    let queued_user_seq = log
-        .append_event_async(&append_user_message_entry(
-            "user-queued",
-            "queued correction",
-        ))
-        .await?;
+    let queued_user_seq =
+        crate::worker::append_admitted_fixture_user(&log, "user-queued", "queued correction")
+            .await?;
     lease.release().await?; // Owner exited without requesting interruption.
     let session = NatsSession::new(
         NatsSessionConfig {

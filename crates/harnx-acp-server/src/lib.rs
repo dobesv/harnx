@@ -656,6 +656,8 @@ async fn run_prompt_turn(
         .map_err(acp_error)?;
     let result = async {
         let appended = nats_session
+            .clone()
+            .with_external_admission()
             .admit_input_with_tool_confirmation_route(&turn.input, &route)
             .await
             .context("failed to admit prompt input")

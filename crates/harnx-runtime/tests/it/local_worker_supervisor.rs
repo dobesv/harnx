@@ -180,7 +180,10 @@ async fn assert_worker_completes_turn(
     .expect("create local NATS session");
     let result = tokio::time::timeout(
         Duration::from_secs(15),
-        session.run_turn("hello", Arc::new(NullSink), None),
+        session
+            .clone()
+            .with_external_admission()
+            .run_turn("hello", Arc::new(NullSink), None),
     )
     .await
     .expect("local worker turn timeout")

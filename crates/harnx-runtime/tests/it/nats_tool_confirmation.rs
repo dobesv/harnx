@@ -16,10 +16,7 @@ mod multi_client;
 
 use anyhow::{Context, Result};
 use harnx_core::{
-    event::NullSink,
-    message::{MessageContent, MessageRole},
-    require_nextest,
-    session::SessionLogEntry,
+    event::NullSink, message::MessageContent, require_nextest, session::SessionLogEntry,
     tool::ToolCall,
 };
 use harnx_runtime::{
@@ -179,6 +176,8 @@ impl ConfirmationHarness {
             Box::pin(async move { approved })
         });
         self.source
+            .clone()
+            .with_external_admission()
             .run_turn_with_tool_confirmation("start handoff", Arc::new(NullSink), None, handler)
             .await?;
         let source_entries =
@@ -531,14 +530,8 @@ async fn activate_durable_text(
     text: &str,
 ) -> Result<()> {
     let log = NatsSessionLog::new_with_replicas(jetstream.clone(), source_key(), 1);
-    log.append_event_async(&SessionLogEntry::Message {
-        id: Some(uuid::Uuid::new_v4().to_string()),
-        role: MessageRole::User,
-        content: MessageContent::Text(text.to_string()),
-        timestamp: None,
-        fence_token: None,
-    })
-    .await?;
+    crate::worker::append_admitted_fixture_user(&log, &uuid::Uuid::new_v4().to_string(), text)
+        .await?;
     publish_session_activate(jetstream, "local", &SessionActivate::new(source_key()), 1).await?;
     Ok(())
 }
@@ -872,7 +865,8 @@ async fn cancelling_turn_interrupts_pending_confirmation_request() -> Result<()>
         requested_for_handler.notify_one();
         Box::pin(std::future::pending())
     });
-    let turn = harness.source.run_turn_with_tool_confirmation(
+    let admitting_source = harness.source.clone().with_external_admission();
+    let turn = admitting_source.run_turn_with_tool_confirmation(
         "start handoff",
         Arc::new(NullSink),
         None,
@@ -927,7 +921,8 @@ async fn denied_zero_execution_round_injects_queued_messages_once_after_blocked_
         })
     });
     let route = harness.source.tool_confirmation_route(handler).await?;
-    let turn = harness.source.run_turn_with_tool_confirmation_route(
+    let admitting_source = harness.source.clone().with_external_admission();
+    let turn = admitting_source.run_turn_with_tool_confirmation_route(
         "start denied handoff",
         Arc::new(NullSink),
         None,
@@ -945,10 +940,14 @@ async fn denied_zero_execution_round_injects_queued_messages_once_after_blocked_
 
     harness
         .source
+        .clone()
+        .with_external_admission()
         .enqueue_text_with_tool_confirmation_id("busy input", &route, "busy-input-id")
         .await?;
     harness
         .source
+        .clone()
+        .with_external_admission()
         .enqueue_text_with_tool_confirmation_id(
             "confirmation message",
             &route,
@@ -1078,7 +1077,8 @@ async fn queued_continuation_handoff_reuses_live_frontend_confirmation_route() -
         Box::pin(async { true })
     });
     let route = harness.source.tool_confirmation_route(handler).await?;
-    let turn = harness.source.run_turn_with_tool_confirmation_route(
+    let admitting_source = harness.source.clone().with_external_admission();
+    let turn = admitting_source.run_turn_with_tool_confirmation_route(
         "start slow turn",
         Arc::new(NullSink),
         None,
@@ -1095,6 +1095,8 @@ async fn queued_continuation_handoff_reuses_live_frontend_confirmation_route() -
     }
     harness
         .source
+        .clone()
+        .with_external_admission()
         .enqueue_text_with_tool_confirmation("perform queued handoff", &route)
         .await?
         .into_activation_result()?;
@@ -1151,6 +1153,8 @@ async fn queued_continuation_handoff_denies_after_frontend_route_closes() -> Res
     let route = harness.source.tool_confirmation_route(handler).await?;
     harness
         .source
+        .clone()
+        .with_external_admission()
         .enqueue_text_with_tool_confirmation("start slow turn", &route)
         .await?
         .into_activation_result()?;
@@ -1162,6 +1166,8 @@ async fn queued_continuation_handoff_denies_after_frontend_route_closes() -> Res
     .context("first source call did not start")?;
     harness
         .source
+        .clone()
+        .with_external_admission()
         .enqueue_text_with_tool_confirmation("perform queued handoff", &route)
         .await?
         .into_activation_result()?;
@@ -1231,13 +1237,11 @@ fn target_key() -> String {
 
 async fn seed_pending_hitl_round(harness: &ConfirmationHarness) -> Result<()> {
     let log = NatsSessionLog::new_with_replicas(harness.jetstream.clone(), source_key(), 1);
-    log.append_event_async(&SessionLogEntry::Message {
-        id: Some(uuid::Uuid::new_v4().to_string()),
-        role: MessageRole::User,
-        content: MessageContent::Text("start handoff".to_string()),
-        timestamp: None,
-        fence_token: None,
-    })
+    crate::worker::append_admitted_fixture_user(
+        &log,
+        &uuid::Uuid::new_v4().to_string(),
+        "start handoff",
+    )
     .await?;
     let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
         jetstream: harness.jetstream.clone(),

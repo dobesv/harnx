@@ -2,9 +2,10 @@ use super::tests::{
     env_lock, seed_remote_config, spawn_metis_worker_with_call_fn, spawn_test_nats,
     subagent_test_env, test_subagent_toolset,
 };
+use crate::nats_session::test_support::InheritedTestTool;
 use harnx_core::cid_url::{CidUrl, PlanItem, SessionRef};
 use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart, MessageRole};
-use harnx_toolset::{ToolInvokeError, Toolset};
+use harnx_toolset::ToolInvokeError;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -41,7 +42,7 @@ async fn assert_image_handoff(
     image_url: &str,
 ) {
     toolset
-        .invoke(
+        .invoke_inherited(
             "session_prompt",
             json!({"message": "inspect image", "attachments": [image_url]}),
             CancellationToken::new(),
@@ -70,7 +71,7 @@ async fn assert_text_and_plan_handoff(
     plan_url: &str,
 ) {
     toolset
-        .invoke(
+        .invoke_inherited(
             "session_prompt",
             json!({
                 "message": "inspect references",
@@ -94,7 +95,7 @@ async fn assert_invalid_url_does_not_spawn(
 ) {
     let before = metadata.list().await.expect("list child sessions").len();
     let error = toolset
-        .invoke(
+        .invoke_inherited(
             "session_prompt",
             json!({"message": "bad handoff", "attachments": ["https://example.com/a.png"]}),
             CancellationToken::new(),

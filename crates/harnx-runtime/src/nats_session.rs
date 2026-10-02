@@ -343,7 +343,7 @@ pub(crate) fn requested_seq_status(
     ))
 }
 
-fn requested_seq_status_with_effective(
+pub(crate) fn requested_seq_status_with_effective(
     entries: &[(u64, SessionLogEntry)],
     effective: &[(u64, SessionLogEntry)],
     requested_seq: u64,
@@ -376,12 +376,50 @@ fn requested_seq_status_with_effective(
     }
 }
 
+/// First durable terminator of this prompt, never a later turn's terminal row.
+///
+/// Historical result extraction (extract_final_response, extract_turn_error,
+/// turn_has_cancel) uses this upper bound to prevent later turns from
+/// contaminating earlier invocation results. After invocation isolation was
+/// introduced, completed child results must be recovered before applying an
+/// expired deadline; scanning past the terminal would incorrectly surface
+/// later-run outcomes.
+pub(crate) fn invocation_terminal_seq(
+    entries: &[(u64, SessionLogEntry)],
+    prompt: u64,
+) -> Option<u64> {
+    let maintenance = entries.iter().find_map(|(seq, entry)| match entry {
+        SessionLogEntry::CompactRequest { compaction_id, .. } if *seq == prompt => {
+            Some(compaction_id)
+        }
+        _ => None,
+    });
+    entries.iter().find_map(|(seq, entry)| {
+        (*seq > prompt
+            && match entry {
+                SessionLogEntry::TurnEnd { through_seq, .. } => {
+                    maintenance.is_none() && *through_seq >= prompt
+                }
+                SessionLogEntry::Cancel { .. } | SessionLogEntry::Error { .. } => true,
+                SessionLogEntry::CompactResult { compaction_id, .. } => {
+                    maintenance == Some(compaction_id)
+                }
+                _ => false,
+            })
+        .then_some(*seq)
+    })
+}
+
 /// Session driver.
 ///
 /// Orchestrates the workflow: append user message, activate, stream events,
 /// detect completion.
 #[derive(Clone)]
 pub struct NatsSession {
+    admission_authority: Option<crate::nats_session_metadata::AdmissionAuthority>,
+    admission_timeout: Option<u64>,
+    admission_token_budget: Option<u64>,
+    steering_admission: bool,
     config: NatsSessionConfig,
     session_id: String,
     storage_key: String,
@@ -561,6 +599,10 @@ impl NatsSession {
             lease_acquisition_timeout,
             parent_session_id: None,
             parent_cancel: None,
+            admission_authority: None,
+            admission_timeout: None,
+            admission_token_budget: None,
+            steering_admission: false,
             invocation_id: None,
         })
     }
@@ -669,6 +711,105 @@ impl NatsSession {
         &self.metadata_store
     }
 
+    /// Explicit frontend grant. Internal tools must use inherited context instead.
+    pub fn with_external_admission(mut self) -> Self {
+        self.admission_authority =
+            Some(crate::nats_session_metadata::AdmissionAuthority::External {
+                admitted_at: chrono::Utc::now(),
+            });
+        self
+    }
+
+    pub fn with_inherited_admission(
+        mut self,
+        parent: crate::nats_session_metadata::RunLimitsRecord,
+        invocation_id: String,
+        admitted_at: chrono::DateTime<chrono::Utc>,
+        edge: crate::nats_session_metadata::InvocationEdgeKind,
+        timeout_secs: Option<u64>,
+    ) -> Self {
+        self.admission_authority = Some(
+            crate::nats_session_metadata::AdmissionAuthority::Inherited {
+                parent,
+                edge,
+                admitted_at,
+            },
+        );
+        self.invocation_id = Some(invocation_id);
+        self.admission_timeout = timeout_secs;
+        self
+    }
+
+    /// Interactive text submitted by a trusted frontend joins active work.
+    pub fn with_steering_admission(mut self) -> Self {
+        self.steering_admission = true;
+        self
+    }
+
+    /// Stable identity allocated once by an admission adapter, retained across
+    /// retries and automatic stop callbacks. This grants no execution authority.
+    pub fn with_admission_id(mut self, id: String) -> Self {
+        self.invocation_id = Some(id);
+        self
+    }
+
+    pub fn with_admission_timeout(mut self, timeout_secs: Option<u64>) -> Self {
+        self.admission_timeout = timeout_secs;
+        self
+    }
+
+    async fn admit_prompt(
+        &self,
+        user_msg_id: &str,
+        steering: bool,
+        content: Option<&MessageContent>,
+    ) -> Result<String> {
+        use crate::nats_session_metadata::{AdmissionAuthority, InvocationAdmission};
+        if let Some(saved) = self
+            .metadata_store
+            .prompt_admission(&self.storage_key, user_msg_id)
+            .await?
+        {
+            return Ok(saved.invocation_id.as_str().to_owned());
+        }
+        let authority = self.admission_authority.as_ref().context(
+            "execution admission requires explicit frontend authority or inherited run context",
+        )?;
+        let entries = self.load_durable_entries().await?;
+        if steering && matches!(authority, AdmissionAuthority::External { .. }) {
+            if let Some(active) = self
+                .metadata_store
+                .active_admission(&self.storage_key, &entries)
+                .await?
+            {
+                self.metadata_store
+                    .bind_prompt_admission(
+                        &self.storage_key,
+                        user_msg_id,
+                        active.invocation_id.as_str(),
+                    )
+                    .await?;
+                return Ok(active.invocation_id.as_str().to_owned());
+            }
+        }
+        let mut intent = InvocationAdmission::new(
+            authority,
+            user_msg_id.to_owned(),
+            self.admission_timeout,
+            self.admission_token_budget,
+        );
+        intent.parent_storage_key = self.parent_session_id.clone();
+        intent.prompt_content = content.cloned();
+        let saved = self
+            .metadata_store
+            .reserve_admission(&self.storage_key, &intent, &entries)
+            .await?;
+        self.metadata_store
+            .bind_prompt_admission(&self.storage_key, user_msg_id, saved.invocation_id.as_str())
+            .await?;
+        Ok(saved.invocation_id.as_str().to_owned())
+    }
+
     async fn append_user_content(&self, content: MessageContent) -> Result<AppendedPrompt> {
         self.check_parent_work("child-prompt-admission").await?;
         let user_msg_id = match &self.invocation_id {
@@ -679,6 +820,21 @@ impl NatsSession {
                 invocation.clone()
             }
             None => new_client_message_id(),
+        };
+        self.admit_prompt(&user_msg_id, self.steering_admission, Some(&content))
+            .await?;
+        let admitted = self
+            .metadata_store
+            .prompt_admission(&self.storage_key, &user_msg_id)
+            .await?
+            .context("prompt admission missing after reservation")?;
+        let content = if admitted.invocation_id.as_str() == user_msg_id {
+            admitted
+                .prompt_content
+                .clone()
+                .context("prompt admission has no original content")?
+        } else {
+            content
         };
         self.append_user_content_unchecked(content, user_msg_id)
             .await
@@ -693,6 +849,8 @@ impl NatsSession {
         if let Some(prompt) = self.existing_prompt_with_message_id(&user_msg_id).await? {
             return Ok(prompt);
         }
+        self.admit_prompt(&user_msg_id, true, Some(&content))
+            .await?;
         self.append_user_content_unchecked(content, user_msg_id)
             .await
     }
@@ -726,7 +884,11 @@ impl NatsSession {
             serde_json::to_string(&user_entry).map_or(0, |entry| entry.len())
         );
         Ok(AppendedPrompt {
-            execution_id: None,
+            execution_id: self
+                .metadata_store
+                .prompt_admission(&self.storage_key, &user_msg_id)
+                .await?
+                .map(|admission| admission.invocation_id.as_str().to_owned()),
             user_msg_id,
             user_msg_seq,
             events: None,
@@ -788,8 +950,29 @@ impl NatsSession {
         entry: &SessionLogEntry,
         message_id: &str,
     ) -> Result<u64> {
-        let mut tail = log.last_entry_async().await?.map_or(0, |(seq, _)| seq);
+        let mut entries = log.load_events_latest_async().await?;
+        let mut tail = entries.last().map_or(0, |(seq, _)| *seq);
         for _ in 0..16 {
+            let admission = self
+                .metadata_store
+                .prompt_admission(&self.storage_key, message_id)
+                .await?
+                .context("prompt has no admission")?;
+            if let Some(seq) = self
+                .metadata_store
+                .invocation_prompt_seq(
+                    &self.storage_key,
+                    admission.invocation_id.as_str(),
+                    &entries,
+                )
+                .await?
+            {
+                anyhow::ensure!(
+                    invocation_terminal_seq(&entries, seq).is_none(),
+                    "session admission already completed; cannot append late steering"
+                );
+            }
+
             match log.append_fenced(entry, tail, message_id).await? {
                 FencedAppend::Appended(seq) => return Ok(seq),
                 FencedAppend::Conflict { entries } => {
@@ -799,8 +982,11 @@ impl NatsSession {
                         return Ok(*seq);
                     }
                     tail = entries.last().map_or(tail, |(seq, _)| *seq);
+                    // Refresh full history before validating the same admission on retry.
+                    // Conflict entries start after the previous tail.
                 }
             }
+            entries = log.load_events_latest_async().await?;
         }
         anyhow::bail!("session log tail kept moving; prompt not appended")
     }
@@ -825,6 +1011,7 @@ impl NatsSession {
         match &self.config.activation_route {
             SessionActivationRoute::ClusterShared => {
                 let activation = SessionActivate::new(&self.storage_key)
+                    .with_requested_seq(user_msg_seq)
                     .with_agent_name(self.config.initializer.agent_name())
                     .with_tool_confirmation_subject(tool_confirmation_subject)
                     .with_token_budget(token_budget);
@@ -928,8 +1115,11 @@ impl NatsSession {
         let appended = if let Some(submission_id) = submission_id {
             self.append_user_content_with_id(content, submission_id.to_string())
                 .await?
-        } else {
+        } else if self.invocation_id.is_some() {
             self.append_user_content(content).await?
+        } else {
+            self.append_user_content_with_id(content, new_client_message_id())
+                .await?
         };
         let activation_error = self
             .publish_activation(appended.user_msg_seq, confirmation_subject, None)
@@ -1283,7 +1473,9 @@ impl NatsSession {
     ) -> Result<NatsTurnResult> {
         // Step 1: Append user message to durable log BEFORE activating.
         // The worker derives input from the last user message.
-        let appended = self.append_user_content(content).await?;
+        let mut admitting = self.clone();
+        admitting.admission_token_budget = options.token_budget;
+        let appended = admitting.append_user_content(content).await?;
         self.follow_admitted_prompt(
             appended,
             event_sink,
@@ -1305,7 +1497,7 @@ impl NatsSession {
         options: RunTurnOptions,
     ) -> Result<NatsTurnResult> {
         let user_msg_seq = appended.user_msg_seq;
-        let stopped_result = NatsTurnResult {
+        let mut stopped_result = NatsTurnResult {
             response: None,
             session_id: self.session_id.clone(),
             was_cancelled: true,
@@ -1319,7 +1511,8 @@ impl NatsSession {
         let result = tokio::select! {
             biased;
             cancel_seq = self.wait_for_prompt_interrupt(user_msg_seq) => {
-                let cancel_seq = cancel_seq?;
+                let (cancel_seq, timeout) = cancel_seq?;
+                stopped_result.error = timeout;
                 if let Some(live) = &live { live.accept_interrupt(cancel_seq); }
                 return Ok(stopped_result);
             }
@@ -1330,7 +1523,8 @@ impl NatsSession {
         }
         // Completion and the interrupt watch can become ready together. The
         // log settles it: a `Cancel` that terminated this turn wins.
-        if let Some(cancel_seq) = self.prompt_interrupt_seq(user_msg_seq).await? {
+        if let Some((cancel_seq, timeout)) = self.prompt_interrupt_receipt(user_msg_seq).await? {
+            stopped_result.error = timeout;
             if let Some(live) = &live {
                 live.accept_interrupt(cancel_seq);
             }
@@ -1433,7 +1627,7 @@ impl NatsSession {
                 _ = wait_abort_signal(&abort_signal_clone) => {
                     was_cancelled = true;
                     log::info!("nats session: abort signal received, publishing cancel");
-                    if let Some(cancel_seq) = self.interrupt("client cancel").await?.cancel_seq() {
+                    if let Some(cancel_seq) = self.interrupt_prompt(user_msg_seq, "client cancel").await?.cancel_seq() {
                         live.accept_interrupt(cancel_seq);
                     }
                     break;
@@ -1449,7 +1643,7 @@ impl NatsSession {
                 } => {
                     was_cancelled = true;
                     log::info!("nats session: pending cancel received, publishing cancel");
-                    if let Some(cancel_seq) = self.interrupt("client cancel").await?.cancel_seq() {
+                    if let Some(cancel_seq) = self.interrupt_prompt(user_msg_seq, "client cancel").await?.cancel_seq() {
                         live.accept_interrupt(cancel_seq);
                     }
                     break;
@@ -1736,7 +1930,7 @@ impl NatsSession {
             self.storage_key.clone(),
             self.attachment_replicas,
         );
-        log.load_events_async()
+        log.load_events_latest_async()
             .await
             .context("failed to load durable session log")
     }
@@ -1766,7 +1960,7 @@ impl NatsSession {
     }
 
     /// Final assistant text and worker-reported failure for the current turn.
-    fn extract_turn_outcome(
+    pub(crate) fn extract_turn_outcome(
         entries: &[(u64, SessionLogEntry)],
         user_msg_seq: u64,
     ) -> (Option<String>, Option<String>) {
@@ -1778,12 +1972,17 @@ impl NatsSession {
 
     /// Worker-reported failure for the current turn, if the turn ended in one.
     fn extract_turn_error(entries: &[(u64, SessionLogEntry)], user_msg_seq: u64) -> Option<String> {
+        let end = invocation_terminal_seq(entries, user_msg_seq).unwrap_or(u64::MAX);
         entries
             .iter()
             .rev()
-            .filter(|(seq, _)| *seq > user_msg_seq)
+            .filter(|(seq, _)| *seq > user_msg_seq && *seq <= end)
             .find_map(|(_, entry)| match entry {
                 SessionLogEntry::Error { message, .. } => Some(message.clone()),
+                SessionLogEntry::Cancel {
+                    requested_by: Some(reason),
+                    ..
+                } if crate::parse_timeout_terminal(reason).is_some() => Some(reason.clone()),
                 _ => None,
             })
     }
@@ -1793,9 +1992,10 @@ impl NatsSession {
         entries: &[(u64, SessionLogEntry)],
         user_msg_seq: u64,
     ) -> Option<String> {
+        let end = invocation_terminal_seq(entries, user_msg_seq).unwrap_or(u64::MAX);
         let turn_entries: Vec<_> = entries
             .iter()
-            .filter(|(seq, _)| *seq > user_msg_seq)
+            .filter(|(seq, _)| *seq > user_msg_seq && *seq <= end)
             .cloned()
             .collect();
 
@@ -2167,6 +2367,92 @@ pub async fn send_control_command(
 pub(crate) mod test_support {
     use super::*;
 
+    /// Explicit 24-hour parent fixture for tests of sub-agent presentation,
+    /// attachments and cancellation. Deadline/admission tests use real parents.
+    pub(crate) fn inherited_tool_context() -> harnx_toolset::AutonomousRunContext {
+        let now = chrono::Utc::now();
+        let parent = crate::nats_session_metadata::RunLimitsRecord::admit_root(
+            Default::default(),
+            Default::default(),
+            now,
+            Default::default(),
+            None,
+            crate::nats_session_metadata::CallTimeoutOverride::Omitted,
+        )
+        .unwrap();
+        harnx_toolset::AutonomousRunContext {
+            snapshot: serde_json::to_value(parent).unwrap(),
+            started_at_ms: now.timestamp_millis().try_into().unwrap(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    pub(crate) trait InheritedTestTool: harnx_toolset::Toolset {
+        async fn invoke_inherited(
+            &self,
+            tool: &str,
+            args: serde_json::Value,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<serde_json::Value, harnx_toolset::ToolInvokeError> {
+            let parent = args["__harnx_parent_session_id"]
+                .as_str()
+                .map(str::to_owned);
+            self.invoke_with_context(harnx_toolset::ToolInvocation {
+                tool: tool.into(),
+                args,
+                cancel,
+                context: harnx_toolset::ToolInvocationContext {
+                    call_id: uuid::Uuid::new_v4().to_string(),
+                    invoking_session_id: parent,
+                    run_context: Some(inherited_tool_context()),
+                    ..Default::default()
+                },
+            })
+            .await
+        }
+    }
+    impl<T: harnx_toolset::Toolset + ?Sized> InheritedTestTool for T {}
+
+    pub(crate) async fn append_admitted_user(
+        log: &NatsSessionLog,
+        id: &str,
+        text: &str,
+    ) -> Result<u64> {
+        use crate::nats_session_metadata::{AdmissionAuthority, InvocationAdmission};
+        let store = SessionMetadataStore::ensure(log.jetstream(), 1).await?;
+        let entries = log.load_events_latest_async().await?;
+        let intent = match store.active_admission(log.storage_key(), &entries).await? {
+            Some(active) => active,
+            None => {
+                store
+                    .reserve_admission(
+                        log.storage_key(),
+                        &InvocationAdmission::new(
+                            &AdmissionAuthority::External {
+                                admitted_at: chrono::Utc::now(),
+                            },
+                            id.to_owned(),
+                            None,
+                            None,
+                        ),
+                        &entries,
+                    )
+                    .await?
+            }
+        };
+        store
+            .bind_prompt_admission(log.storage_key(), id, intent.invocation_id.as_str())
+            .await?;
+        log.append_event_async(&SessionLogEntry::Message {
+            id: Some(id.to_owned()),
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_owned()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await
+    }
+
     pub(crate) async fn session_with_log(
         server: &crate::nats_test_common::NatsServerHandle,
         agent: &str,
@@ -2187,7 +2473,8 @@ pub(crate) mod test_support {
             harnx_core::abort::create_abort_signal(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_external_admission();
         let log = NatsSessionLog::new_with_replicas(
             js,
             session.storage_key.clone(),
@@ -2832,3 +3119,7 @@ mod event_isolation_tests;
 #[cfg(test)]
 #[path = "nats_session/interrupt_tests.rs"]
 mod interrupt_tests;
+
+#[cfg(test)]
+#[path = "nats_session/invocation_terminal_seq_tests.rs"]
+pub(crate) mod invocation_terminal_seq_tests;

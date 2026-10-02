@@ -83,8 +83,7 @@ async fn end_of_turn_reread_runs_continuation_turn_with_same_activation() -> Res
     // to avoid lost wakeup race between notify_one() and notified().await
     let ready_fut = END_TURN_APPEND_READY.notified();
 
-    log.append_event_async(&append_user_message_entry("user-1", "first"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "user-1", "first").await?;
     activate_session(&js, session_id).await?;
 
     // Now await the ready signal - the permit was stored by notify_one()
@@ -93,8 +92,7 @@ async fn end_of_turn_reread_runs_continuation_turn_with_same_activation() -> Res
     // Give a moment for the NATS message to propagate
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    log.append_event_async(&append_user_message_entry("user-2", "second"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "user-2", "second").await?;
     // Signal to turn 1 that it can complete now
     END_TURN_APPEND_DONE.notify_one();
 
@@ -172,10 +170,8 @@ async fn idle_concurrent_messages_fold_in_seq_order_into_single_turn() -> Result
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "fold-order";
     let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
-    log.append_event_async(&append_user_message_entry("user-1", "alpha"))
-        .await?;
-    log.append_event_async(&append_user_message_entry("user-2", "beta"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "user-1", "alpha").await?;
+    crate::worker::append_admitted_fixture_user(&log, "user-2", "beta").await?;
     activate_session(&js, session_id).await?;
 
     wait_until(CI_SAFE_TIMEOUT, || calls.load(Ordering::SeqCst) >= 1).await?;

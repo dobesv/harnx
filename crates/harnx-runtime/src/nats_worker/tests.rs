@@ -5,6 +5,7 @@ use crate::config::remote_session_ops::{
     load_remote_transcript_for_render, rewind_remote_session,
 };
 use crate::config::{self, Config};
+use crate::nats_session::test_support::InheritedTestTool;
 use crate::nats_session_log::NatsSessionLog;
 use crate::nats_session_metadata::{
     activity_key, SessionActivity, SessionAgentSource, SessionMetadata, SessionMetadataStore,
@@ -19,7 +20,6 @@ use harnx_core::event::{AgentEvent, AgentEventSink};
 use harnx_core::session::{SessionLogEntry, ToolOutput};
 use harnx_core::session_reconstruct::{reconstruct_state_from_nats, TurnStatus};
 use harnx_core::tool::{ToolCall, ToolDeclaration, ToolProvider};
-use harnx_toolset::Toolset;
 use serde_json::json;
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+mod deadline_enforcement_tests;
 mod invocation_limit_tests;
 mod subagent_discovery_tests;
 mod transcript_render_tests;
@@ -412,7 +413,11 @@ pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
     const REMOTE_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(60);
     let turn_result = tokio::time::timeout(
         REMOTE_ROUND_TRIP_TIMEOUT,
-        session.run_turn("delegate over nats", sink, None),
+        session
+            .clone()
+            .with_external_admission()
+            .with_steering_admission()
+            .run_turn("delegate over nats", sink, None),
     )
     .await
     .with_context(|| {
@@ -760,6 +765,9 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     let running_session = Arc::clone(&session);
     let run_turn = tokio::spawn(async move {
         running_session
+            .as_ref()
+            .clone()
+            .with_external_admission()
             .run_turn("delegate over nats", Arc::new(NoopEventSink), None)
             .await
     });
@@ -879,8 +887,19 @@ pub(super) async fn registered_agent_provider(
     })
     .await
     .expect("worker did not register configured agents");
+    // Direct-provider catalogue/progress fixtures supply an explicit parent
+    // snapshot. Full deadline tests dispatch from real admitted worker turns.
+    let mut admitted_config = config.clone();
+    if admitted_config.run_context.is_none() {
+        admitted_config.run_context = Some(
+            serde_json::from_value(
+                crate::nats_session::test_support::inherited_tool_context().snapshot,
+            )
+            .unwrap(),
+        );
+    }
     let provider = crate::nats_tool_provider::NatsToolProvider::discover(
-        config,
+        &admitted_config,
         harnx_core::instance::ServerScope::from_string(instance_id.clone()),
         crate::nats_tool_provider::NatsInFlightCalls::default(),
         active_package,
@@ -1157,7 +1176,7 @@ async fn run_subagent_cancel_case(parent_abort: bool) {
         let session_id = session_id.clone();
         async move {
             toolset
-                .invoke(
+                .invoke_inherited(
                     "session_prompt",
                     json!({ "message": "block until cancelled", "session_id": session_id }),
                     parent_cancel,
@@ -1173,7 +1192,7 @@ async fn run_subagent_cancel_case(parent_abort: bool) {
         parent_cancel.cancel();
     } else {
         toolset
-            .invoke(
+            .invoke_inherited(
                 "session_cancel",
                 json!({ "session_id": session_id }),
                 CancellationToken::new(),
@@ -1237,7 +1256,7 @@ async fn subagent_silent_turn_waits_for_lease_backed_completion() {
     let session_id = crate::nats_worker::new_remote_session_id();
     let result = tokio::time::timeout(
         NATS_TEST_CONDITION_TIMEOUT,
-        toolset.invoke(
+        toolset.invoke_inherited(
             "session_prompt",
             json!({ "message": "wait silently", "session_id": session_id }),
             CancellationToken::new(),
@@ -1349,7 +1368,7 @@ async fn nested_subagent_prompt() {
         // Cold discovery and both durable turn boundaries share the remote
         // round-trip budget; this test constrains stack size, not startup latency.
         Duration::from_secs(60),
-        session.run_turn(
+        session.clone().with_external_admission().run_turn(
             "delegate this request through the nested tool",
             Arc::new(NoopEventSink),
             None,
@@ -1887,16 +1906,10 @@ async fn remote_delete_accepts_first_transcript_row() {
         .expect("create canonical metadata");
     let message_id = uuid::Uuid::new_v4().to_string();
     let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id).with_replicas(1);
-    let first_user_seq = log
-        .append_event_async(&SessionLogEntry::Message {
-            id: Some(message_id.clone()),
-            role: harnx_core::message::MessageRole::User,
-            content: harnx_core::message::MessageContent::Text("first prompt".to_string()),
-            timestamp: None,
-            fence_token: None,
-        })
-        .await
-        .expect("append first user message");
+    let first_user_seq =
+        crate::nats_session::test_support::append_admitted_user(&log, &message_id, "first prompt")
+            .await
+            .expect("admit first user message");
     assert_eq!(first_user_seq, 1, "first physical row is the user message");
 
     let worker =
@@ -2558,7 +2571,7 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
 /// precede a worker activation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
-    use harnx_core::message::{MessageContent, MessageRole};
+    use harnx_core::message::MessageRole;
     let _env_guard = env_lock().await;
     let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
         return;
@@ -2587,16 +2600,13 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         .expect("seed canonical session metadata");
     let seed_log = NatsSessionLog::for_agent(jetstream, "metis", &session_id).with_replicas(1);
     for text in ["leading one", "leading two"] {
-        seed_log
-            .append_event_async(&SessionLogEntry::Message {
-                id: Some(text.replace(' ', "-")),
-                role: MessageRole::User,
-                content: MessageContent::Text(text.to_string()),
-                timestamp: None,
-                fence_token: None,
-            })
-            .await
-            .expect("seed leading user message");
+        crate::nats_session::test_support::append_admitted_user(
+            &seed_log,
+            &text.replace(' ', "-"),
+            text,
+        )
+        .await
+        .expect("admit leading user message");
     }
 
     let worker =

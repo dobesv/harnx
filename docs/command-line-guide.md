@@ -90,9 +90,9 @@ expiry interrupts the same way but keeps its own exit contract below.
 
 ## Bounding a One-Shot Run
 
-Non-interactive prompts (`harnx prompt` or `harnx -- <text>`) can set per-invocation execution limits using `--timeout-secs` and `--token-budget`. Interactive TUI sessions (`harnx`) and Web UI runs are unbounded by design.
+Non-interactive prompts (`harnx prompt` or `harnx -- <text>`) can set per-invocation controls using `--timeout-secs` and `--token-budget`. Worker-owned run deadlines also apply to TUI and Web UI admissions, with a finite 24-hour fallback when no positive policy is configured.
 
-- `--timeout-secs <SECONDS>`: Maximum execution time in seconds. Passing `0` or omitting the option means no time limit.
+- `--timeout-secs <SECONDS>`: A positive value sets the admission allowance and a caller-side observer timer. Passing `0` or omitting the option leaves that observer timer off; the worker still uses target/global policy and the finite 24-hour fallback.
 - `--token-budget <TOKENS>`: Maximum budgeted tokens for the invocation. Passing `0` or omitting the option means unlimited tokens.
 
 ### Limit Exhaustion Behavior
@@ -123,13 +123,13 @@ to `"repetition"`, and exit code **2**.
 The single stderr JSON line provides a stable, machine-readable contract for downstream scripts and tooling:
 
 ```json
-{"kind":"timeout","session_id":"01948a3f-7b1c-7123-8901-abcdef123456","usage":{"input_uncached":120,"cache_write":0,"output":45,"budgeted":165},"thinking_excerpt":null,"retry_hint":"You can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions."}
+{"kind":"timeout","session_id":"01948a3f-7b1c-7123-8901-abcdef123456","usage":{"input_uncached":120,"cache_write":0,"output":45,"budgeted":165},"thinking_excerpt":null,"retry_hint":"Inspect saved public results before sending revised or narrower instructions to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` within a live run. Do not retry unchanged."}
 ```
 
 A repetition stop adds `source` after `retry_hint`, and for repeated tool calls `tool` and `count` as well:
 
 ```json
-{"kind":"repetition","session_id":"01948a3f-7b1c-7123-8901-abcdef123456","usage":{"input_uncached":120,"cache_write":0,"output":45,"budgeted":165},"thinking_excerpt":null,"retry_hint":"You can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions.","source":"tool_calls","tool":"fs_read","count":4}
+{"kind":"repetition","session_id":"01948a3f-7b1c-7123-8901-abcdef123456","usage":{"input_uncached":120,"cache_write":0,"output":45,"budgeted":165},"thinking_excerpt":null,"retry_hint":"Inspect saved public results and change the repeated approach before continuing the same session id `01948a3f-7b1c-7123-8901-abcdef123456` within a live run. Do not retry unchanged.","source":"tool_calls","tool":"fs_read","count":4}
 ```
 
 Field reference:
@@ -146,8 +146,8 @@ Field reference:
 
 ### Execution & Limitation Details
 
-- **Budget metric & scope**: Token budget applies per invocation as a fresh delta. Each retry starts with a clean budget allowance. Workers evaluate token usage at turn boundaries before calling the model, so at least one model call executes when `token_budget > 0`.
-- **Caller-side timeout vs worker-side budget**: `--timeout-secs` is enforced on the caller side. If the CLI process disconnects or terminates unexpectedly, the caller-side timeout timer stops, leaving any detached worker running. In contrast, `--token-budget` is enforced worker-side before model calls, bounding costs even if a worker becomes orphaned.
+- **Budget metric & scope**: Token budget applies per invocation as a fresh delta. Each retry starts with a clean budget allowance. Workers evaluate token usage at turn boundaries before calling the model, so at least one model call executes when `--token-budget` is positive.
+- **Worker-owned deadlines & CLI budgets**: `--timeout-secs` sets an admission deadline on the worker session while also maintaining a caller-side observer timer. Detached workers enforce this deadline independently and terminate even if the CLI process disconnects. In contrast, `--token-budget` is an independent token accounting limit evaluated worker-side before model calls for non-interactive CLI prompts.
 - **Thinking excerpt limitation**: Non-streaming model calls do not yield partial thinking text during an active request. A mid-call timeout on a non-streaming request produces an empty thinking excerpt ("none captured"). Budget exhaustion triggers at turn boundaries and can include thinking text when streaming is enabled.
 
 ## Shell Integration

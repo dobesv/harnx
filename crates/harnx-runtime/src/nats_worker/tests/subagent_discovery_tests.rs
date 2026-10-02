@@ -223,7 +223,11 @@ async fn first_package_agent_turn_waits_for_delegation_registrations() {
     // a regression fails promptly instead of consuming the full 30 seconds.
     let result = tokio::time::timeout(
         Duration::from_secs(15),
-        session.run_turn("review this change", Arc::new(NoopEventSink), None),
+        session.clone().with_external_admission().run_turn(
+            "review this change",
+            Arc::new(NoopEventSink),
+            None,
+        ),
     )
     .await
     .expect("first package turn timed out")
@@ -277,7 +281,11 @@ async fn repeated_nested_delegation() {
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         PARENT_TURN_BACKSTOP,
-        session.run_turn("delegate twice", Arc::new(NoopEventSink), None),
+        session.clone().with_external_admission().run_turn(
+            "delegate twice",
+            Arc::new(NoopEventSink),
+            None,
+        ),
     )
     .await
     .unwrap_or_else(|_| {
@@ -296,6 +304,160 @@ async fn repeated_nested_delegation() {
         result.error
     );
 
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = nats.kill();
+    let _ = nats.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_metadata_uses_worker_target_policy_and_package_patches_not_caller() {
+    let _env_guard = env_lock().await;
+    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let mut seeded = seed_remote_config(&url);
+    let _env = subagent_test_env(&url, &seeded);
+    write_package_agent(
+        &seeded,
+        "finite",
+        "---\nrun_limits:\n  timeout_secs: 40\n---\nFinite target\n",
+    );
+    write_package_agent(
+        &seeded,
+        "long",
+        "---\nrun_limits:\n  timeout_secs: 2592000\n---\nLong finite target\n",
+    );
+    write_package_agent(
+        &seeded,
+        "inherit",
+        "---\nrun_limits:\n  timeout_secs: 40\n---\nPatched inherited target\n",
+    );
+    std::fs::write(
+        seeded.config_dir().join("packages/pantheon.patch.yaml"),
+        "agents:\n  - 'if .name == \"finite\" then .run_limits.timeout_secs = 9 elif .name == \"inherit\" then .run_limits.timeout_secs = -1 else . end'\n",
+    )
+    .unwrap();
+    // Caller policy intentionally conflicts with the worker's 24-hour fallback.
+    seeded.parent_config.data.run_limits = serde_yaml::from_str("timeout_secs: 999").unwrap();
+    let daemon = spawn_metis_worker_with_call_fn(
+        &url,
+        echoing_call_fn(Arc::new(AsyncMutex::new(Vec::new()))),
+    );
+    let js = async_nats::jetstream::new(async_nats::connect(&url).await.unwrap());
+    let (_, provider, registrations) = registered_agent_provider(
+        &js,
+        &seeded.parent_config,
+        &[
+            "pantheon/finite",
+            "pantheon/long",
+            "pantheon/inherit",
+            "metis",
+        ],
+        Some("pantheon"),
+    )
+    .await;
+    for (name, expected) in [
+        ("finite", "9 seconds"),
+        ("long", "2592000 seconds"),
+        ("inherit", "86400 seconds"),
+        ("metis", "86400 seconds"),
+    ] {
+        let registration = &registrations
+            .iter()
+            .find(|(_, r)| r.server == name)
+            .unwrap()
+            .1;
+        for tool in registration
+            .tools
+            .iter()
+            .filter(|t| ["session_prompt", "session_new"].contains(&t.name.as_str()))
+        {
+            assert!(tool.description.contains(expected), "{}", tool.description);
+            assert!(!tool.description.contains("999"));
+            assert!(!tool.input_schema.to_string().contains("token_budget"));
+        }
+        let prompt = registration
+            .tools
+            .iter()
+            .find(|t| t.name == "session_prompt")
+            .unwrap();
+        assert!(prompt
+            .description
+            .contains("Omitted, null, zero or negative inherits target policy"));
+        assert!(prompt
+            .description
+            .contains("fallback: 86400 seconds / 24 hours"));
+        assert!(prompt
+            .description
+            .contains("inherited deadlines can shorten"));
+        assert!(prompt.input_schema["properties"]["timeout_secs"]
+            .get("default")
+            .is_none());
+    }
+    for timeout in [
+        None,
+        Some(json!(null)),
+        Some(json!(0)),
+        Some(json!(-1)),
+        Some(json!(i64::MIN)),
+    ] {
+        let mut args = json!({"message": "verify target policy"});
+        if let Some(value) = timeout {
+            args["timeout_secs"] = value;
+        }
+        let result = provider
+            .call_tool_with_id(
+                "finite_session_prompt",
+                args,
+                None,
+                &harnx_core::abort::create_abort_signal(),
+            )
+            .await
+            .unwrap_or_else(|error| match error {
+                harnx_core::tool::ToolError::Recoverable(error)
+                | harnx_core::tool::ToolError::Fatal(error) => {
+                    panic!("numeric inherited call failed: {error:#}")
+                }
+            })
+            .value;
+        let storage = harnx_core::session_identity::session_key(
+            Some("pantheon/finite"),
+            result["session_id"].as_str().unwrap(),
+        );
+        let entries = NatsSessionLog::new(js.clone(), &storage)
+            .load_events_latest_async()
+            .await
+            .unwrap();
+        let prompt_id = entries
+            .iter()
+            .find_map(|(_, e)| match e {
+                SessionLogEntry::Message {
+                    id,
+                    role: harnx_core::message::MessageRole::User,
+                    ..
+                } => id.clone(),
+                _ => None,
+            })
+            .unwrap();
+        let record = SessionMetadataStore::ensure(&js, 1)
+            .await
+            .unwrap()
+            .get_invocation_limits(&storage, &prompt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (record.deadline.unwrap() - record.admitted_at).num_seconds(),
+            9
+        );
+        assert_eq!(
+            record.policy_source,
+            crate::nats_session_metadata::RunLimitsPolicySource::TargetAgent {
+                agent_name: "pantheon/finite".into()
+            }
+        );
+    }
     daemon.abort();
     let _ = daemon.await;
     let _ = nats.kill();

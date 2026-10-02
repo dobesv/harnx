@@ -875,6 +875,19 @@ Operational properties:
 - **Session deletion cascade**: Session deletion (`delete_owner`) purges both `media/<owner>/` objects in `harnx_attachments` and `plan/<owner>/` keys in `harnx_plans`.
 - **Plans storage location**: Plans live exclusively in NATS JetStream KV (`harnx_plans`); previous filesystem storage under `.agent` is retired.
 
+
+### Run-deadline cancellation is invocation-fenced
+
+Worker deadline timeouts use `interrupt_invocation` (in `nats_session/interrupt.rs`),
+binding the cancellation to the specific admission's prompt sequence. Unlike
+session-level `interrupt_session`, which targets the current turn, invocation-fenced
+cancellation checks the terminal boundary before appending a `Cancel`. If the
+invocation already completed or an earlier cancellation won, the fenced call
+returns without appending. Late timer callbacks cannot cancel a subsequent
+independent run in the same session.
+
+This fencing is distinct from lease loss or worker failover, which set a
+nonterminal abort flag without publishing a cancellation.
 ### Interrupt acceptance
 
 Interruption is established by one durable `Cancel` entry in the session log and

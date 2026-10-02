@@ -217,6 +217,7 @@ async fn await_wind_up(log: &NatsSessionLog, call_id: &str) -> Result<Vec<(u64, 
 /// transcript call to its row.
 fn journal_request(session_key: &str, call_id: &str) -> ToolRequest {
     ToolRequest {
+        run_context: None,
         replay: None,
         operation_id: format!("op-{}", wire_id(call_id)),
         call_id: wire_id(call_id),
@@ -508,7 +509,9 @@ async fn placeholder_and_real_result_race_yields_exactly_one_tool_results_entry(
     let next = open_session(server.url(), session.session_id()).await?;
     let result = tokio::time::timeout(
         CI_SAFE_TIMEOUT,
-        next.run_turn("carry on", Arc::new(NullSink), None),
+        next.clone()
+            .with_external_admission()
+            .run_turn("carry on", Arc::new(NullSink), None),
     )
     .await??;
     assert!(!result.was_cancelled, "the next turn runs on its own");
@@ -748,7 +751,11 @@ async fn one_tool_round_adds_bounded_stream_entries_and_no_control_plane_keys() 
 
     let result = tokio::time::timeout(
         CI_SAFE_TIMEOUT,
-        session.run_turn("count for me", Arc::new(NullSink), None),
+        session.clone().with_external_admission().run_turn(
+            "count for me",
+            Arc::new(NullSink),
+            None,
+        ),
     )
     .await??;
     assert_eq!(result.response.as_deref(), Some("counted"));
@@ -865,7 +872,9 @@ async fn no_cancel_is_resent_once_placeholders_are_durable() -> Result<()> {
     let next = open_session(server.url(), session.session_id()).await?;
     let result = tokio::time::timeout(
         CI_SAFE_TIMEOUT,
-        next.run_turn("carry on", Arc::new(NullSink), None),
+        next.clone()
+            .with_external_admission()
+            .run_turn("carry on", Arc::new(NullSink), None),
     )
     .await??;
     assert!(!result.was_cancelled, "the next turn runs on its own");

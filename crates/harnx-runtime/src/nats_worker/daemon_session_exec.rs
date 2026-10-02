@@ -222,11 +222,12 @@ impl WorkerRuntime {
     ) -> Result<FinishCause> {
         let startup = self.prepare_session_runtime(inputs).await?;
         let prepared = self.start_session_runtime_services(startup).await?;
+
         let mut running = self.start_session_execution(prepared);
         let turn = running.turn.take().expect("prepared session turn");
         let outcome =
             Self::await_turn_body(turn, &running.execution_abort, &running.shutdown).await;
-        Self::complete_session_execution(running, outcome).await
+        self.complete_session_execution(running, outcome).await
     }
 
     /// Load the canonical session metadata for an activation, refusing to run
@@ -304,8 +305,21 @@ impl WorkerRuntime {
             )
             .await,
         );
+        self.freeze_activation_limits(&activation, &per_session)
+            .await?;
+
         let after_seq_observer = event_sink.after_seq_handle();
         let backend = self.session_backend(&activation, Arc::clone(&after_seq_observer));
+        super::agent_loop::recover_completed_before_deadline(
+            &backend,
+            &lease,
+            &per_session,
+            &self.jetstream,
+            self.lease.replicas,
+        )
+        .await?;
+        self.start_invocation_deadline(&activation, &per_session, &execution_abort)
+            .await?;
         Ok(SessionRuntimeStartup {
             activation,
             activation_failure_key,
@@ -323,6 +337,218 @@ impl WorkerRuntime {
             after_seq_observer,
             agent_setup,
         })
+    }
+
+    async fn freeze_activation_limits(
+        &self,
+        activation: &SessionActivate,
+        config: &crate::config::GlobalConfig,
+    ) -> Result<()> {
+        use crate::nats_session_metadata::{CallTimeoutOverride, RunLimitsRecord};
+        use harnx_core::session::SessionLogEntry;
+        let entries = crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            &activation.session_id,
+        )
+        .load_events_latest_async()
+        .await?;
+        // Never infer external authority from role. Every executable prompt must
+        // reference a durable admission established before it was appended.
+        let requested = activation
+            .requested_seq
+            .unwrap_or_else(|| entries.last().map_or(0, |(seq, _)| *seq));
+        let prompt_id = entries.iter().rev().find_map(|(seq, entry)| match entry {
+            SessionLogEntry::Message {
+                id: Some(id), role, ..
+            } if role.is_user() && *seq <= requested => Some(id.clone()),
+            SessionLogEntry::CompactRequest { compaction_id, .. } if *seq <= requested => {
+                Some(compaction_id.clone())
+            }
+            _ => None,
+        });
+        let Some(prompt_id) = prompt_id else {
+            return Ok(());
+        };
+        let intent = self
+            .session_metadata
+            .prompt_admission(&activation.session_id, &prompt_id)
+            .await?
+            .context("refusing executable prompt without durable run admission")?;
+        let (global, target) = {
+            let config = config.read();
+            (
+                config.data.run_limits,
+                config
+                    .agent
+                    .as_ref()
+                    .map(|agent| agent.clone().into_config()),
+            )
+        };
+        let root = if intent.origin == crate::nats_session_metadata::AdmissionOrigin::External {
+            Some(
+                self.session_metadata
+                    .load_or_create_run_limits(
+                        &activation.session_id,
+                        intent.run_id.as_str(),
+                        || {
+                            Ok(RunLimitsRecord::admit_root(
+                                intent.run_id.clone(),
+                                intent.invocation_id.clone(),
+                                intent.admitted_at,
+                                global,
+                                target.as_ref(),
+                                CallTimeoutOverride::from_optional(intent.timeout_secs),
+                            )?)
+                        },
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let record = self
+            .session_metadata
+            .load_or_create_invocation_limits(
+                &activation.session_id,
+                intent.run_id.as_str(),
+                intent.invocation_id.as_str(),
+                || match &intent.parent {
+                    Some(parent) => Ok(RunLimitsRecord::admit_child(
+                        parent,
+                        intent.invocation_id.clone(),
+                        intent.edge.context("inherited admission has no edge")?,
+                        intent.admitted_at,
+                        global,
+                        target.as_ref(),
+                        CallTimeoutOverride::from_optional(intent.timeout_secs),
+                    )?),
+                    None => Ok(root.clone().context("root policy missing")?),
+                },
+            )
+            .await?;
+        if record.parent_invocation.is_none() {
+            self.session_metadata
+                .put_run_limits(&activation.session_id, &record)
+                .await?;
+        }
+        config.write().run_context = Some(record);
+        Ok(())
+    }
+
+    async fn start_invocation_deadline(
+        &self,
+        activation: &SessionActivate,
+        config: &crate::config::GlobalConfig,
+        execution_abort: &crate::utils::AbortSignal,
+    ) -> Result<()> {
+        let Some(record) = config.read().run_context.clone() else {
+            return Ok(());
+        };
+        let Some(deadline) = record.deadline else {
+            return Ok(());
+        };
+        let log = crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            &activation.session_id,
+        );
+        let js = self.jetstream.clone();
+        let client = self.client.clone();
+        let route = self.activation_route.clone();
+        let cluster = self.cluster.clone();
+        let replicas = self.lease.replicas;
+        let storage = activation.session_id.clone();
+        let abort = execution_abort.clone();
+        let remaining = deadline
+            .signed_duration_since(chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            let entries = log.load_events_latest_async().await?;
+            let prompt = self
+                .session_metadata
+                .invocation_prompt_seq(&storage, record.invocation_id.as_str(), &entries)
+                .await?
+                .context("expired admission has no prompt binding")?;
+            let request = crate::nats_session::InterruptRequest {
+                session_id: storage,
+                cluster,
+                replicas,
+                cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
+                reason: "autonomous invocation deadline expired".into(),
+                requested_by: crate::TimeoutTerminal::from_record(&record)
+                    .expect("finite worker deadline")
+                    .message(),
+            };
+            let outcome = crate::nats_session::interrupt::interrupt_invocation(
+                &js, &client, &route, request, prompt,
+            )
+            .await?;
+            if outcome.cancel_seq().is_some() {
+                execution_abort.set_ctrlc();
+            }
+            return Ok(());
+        }
+        // Detached on approval pause: deadline is owned by the worker, not by a
+        // frontend waiter. Fencing makes late completion/timer races harmless.
+        tokio::spawn(async move {
+            tokio::time::sleep(remaining).await;
+            let latest = match log.load_events_latest_async().await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    abort.set_failover();
+                    log::error!("deadline log unavailable: {error:#}");
+                    return;
+                }
+            };
+            let metadata =
+                match crate::nats_session_metadata::SessionMetadataStore::ensure(&js, replicas)
+                    .await
+                {
+                    Ok(store) => store,
+                    Err(error) => {
+                        abort.set_failover();
+                        log::error!("deadline metadata unavailable: {error:#}");
+                        return;
+                    }
+                };
+            let prompt = match metadata
+                .invocation_prompt_seq(&storage, record.invocation_id.as_str(), &latest)
+                .await
+            {
+                Ok(Some(prompt)) => prompt,
+                Ok(None) => return,
+                Err(error) => {
+                    abort.set_failover();
+                    log::error!("deadline binding unavailable: {error:#}");
+                    return;
+                }
+            };
+            let request = crate::nats_session::InterruptRequest {
+                session_id: storage.clone(),
+                cluster,
+                replicas,
+                cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
+                reason: "autonomous invocation deadline expired".into(),
+                requested_by: crate::TimeoutTerminal::from_record(&record)
+                    .expect("finite worker deadline")
+                    .message(),
+            };
+            match crate::nats_session::interrupt::interrupt_invocation(
+                &js, &client, &route, request, prompt,
+            )
+            .await
+            {
+                Ok(outcome) if outcome.cancel_seq().is_some() => abort.set_ctrlc(),
+                Ok(_) => {}
+                Err(error) => {
+                    // Stop dispatch even if the broker cannot confirm Cancel.
+                    // Failover must recover the same frozen expired admission.
+                    abort.set_failover();
+                    log::error!("deadline cancellation unconfirmed, external cleanup unknown: storage={storage} error={error:#}");
+                }
+            }
+        });
+        Ok(())
     }
 
     async fn start_session_runtime_services(
@@ -385,8 +611,15 @@ impl WorkerRuntime {
     }
 
     fn start_session_execution(&self, prepared: PreparedSessionRuntime) -> RunningSessionRuntime {
+        let invocation_id = prepared
+            .per_session
+            .read()
+            .run_context
+            .as_ref()
+            .map(|record| record.invocation_id.as_str().to_owned());
         let execution = prepared
             .execution
+            .with_invocation(invocation_id)
             .with_wind_up(super::execution_control::WindUpContext {
                 client: self.client.clone(),
                 jetstream: self.jetstream.clone(),
@@ -434,18 +667,70 @@ impl WorkerRuntime {
     }
 
     async fn record_execution_error(
+        &self,
         running: &RunningSessionRuntime,
         result: &Result<bool>,
     ) -> bool {
         let Some(error) = result.as_ref().err() else {
             return false;
         };
+        if error
+            .downcast_ref::<crate::nats_session_metadata::run_limits::DeadlineExpired>()
+            .is_some()
+        {
+            let record = running.per_session.read().run_context.clone();
+            if let Some(record) = record {
+                if let Ok(entries) = running.backend.load_events_latest_async().await {
+                    if let Ok(Some(prompt)) = self
+                        .session_metadata
+                        .invocation_prompt_seq(
+                            &running.activation.session_id,
+                            record.invocation_id.as_str(),
+                            &entries,
+                        )
+                        .await
+                    {
+                        let request = crate::nats_session::InterruptRequest {
+                            session_id: running.activation.session_id.clone(),
+                            cluster: self.cluster.clone(),
+                            replicas: self.lease.replicas,
+                            cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
+                            reason: "autonomous invocation deadline expired".into(),
+                            requested_by: crate::TimeoutTerminal::from_record(&record)
+                                .expect("finite worker deadline")
+                                .message(),
+                        };
+                        match crate::nats_session::interrupt::interrupt_invocation(
+                            &self.jetstream,
+                            &self.client,
+                            &self.activation_route,
+                            request,
+                            prompt,
+                        )
+                        .await
+                        {
+                            Ok(outcome) if outcome.cancel_seq().is_some() => {
+                                running.execution_abort.set_ctrlc()
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                running.execution_abort.set_failover();
+                                log::error!("deadline cancellation unconfirmed: {error:#}");
+                            }
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
         matches!(
             Self::record_session_error(&running.backend, &running.lease, error).await,
             Ok(true)
         )
     }
     async fn complete_session_execution(
+        &self,
         running: RunningSessionRuntime,
         outcome: TurnBodyOutcome,
     ) -> Result<FinishCause> {
@@ -464,7 +749,7 @@ impl WorkerRuntime {
             );
             running.execution_abort.set_ctrlc();
         }
-        let durable_error_recorded = Self::record_execution_error(&running, &result).await;
+        let durable_error_recorded = self.record_execution_error(&running, &result).await;
         if !running.lease.is_held() {
             log::warn!(
                 "session execution ended after failover: session_id={} worker_id={} revision={}",
@@ -922,7 +1207,7 @@ mod attention_tests {
         // family counts the worker's leader-authoritative decision points.
         let log = crate::nats_session_log::NatsSessionLog::new(jetstream.clone(), &storage_key);
         assert!(
-            !log.load_events_async()
+            !log.load_events_latest_async()
                 .await
                 .unwrap()
                 .iter()
@@ -942,7 +1227,7 @@ mod attention_tests {
         )
         .await
         .unwrap());
-        assert!(log.load_events_async().await.unwrap().iter().any(|(_, entry)| matches!(
+        assert!(log.load_events_latest_async().await.unwrap().iter().any(|(_, entry)| matches!(
             entry,
             harnx_core::session::SessionLogEntry::Error { message, .. } if message.contains("model exploded")
         )));

@@ -71,6 +71,9 @@ async fn the_child_is_the_partial_result_while_its_turn_runs() {
                     tool: "session_prompt".into(),
                     args: json!({"message": "run until cancelled"}),
                     context: ToolInvocationContext {
+                        run_context: Some(
+                            crate::nats_session::test_support::inherited_tool_context(),
+                        ),
                         call_id: "wire-partial".into(),
                         partial_result_store: Some(partial_results),
                         ..Default::default()
@@ -132,6 +135,12 @@ async fn a_failed_sub_agent_call_returns_its_child_as_the_partial_result() {
             .expect("create parent session");
     let parent_session_id = parent_session.storage_key();
     seeded.parent_config.session = Some(parent_session);
+    seeded.parent_config.run_context = Some(
+        serde_json::from_value(
+            crate::nats_session::test_support::inherited_tool_context().snapshot,
+        )
+        .unwrap(),
+    );
     let daemon = spawn_metis_worker_with_call_fn(&url, failing_call_fn());
     let client = async_nats::connect(&url)
         .await

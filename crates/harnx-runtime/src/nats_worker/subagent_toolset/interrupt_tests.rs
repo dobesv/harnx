@@ -46,7 +46,7 @@ async fn create_child(toolset: &SubagentToolset, parent: &str) -> Result<NatsSes
 async fn seed_active_turn(js: &async_nats::jetstream::Context, storage_key: &str) -> Result<()> {
     let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key.to_string(), 1);
     log.append_event_async(&SessionLogEntry::Message {
-        id: Some("user-1".into()),
+        id: Some(WIRE_CALL.into()),
         role: MessageRole::User,
         content: MessageContent::Text("do the thing".into()),
         timestamp: None,
@@ -61,6 +61,7 @@ fn cancel_invocation(child: &str) -> ToolInvocation {
         tool: SUBAGENT_SESSION_PROMPT_TOOL.to_string(),
         args: json!({}),
         context: ToolInvocationContext {
+            run_context: Some(crate::nats_session::test_support::inherited_tool_context()),
             call_id: WIRE_CALL.to_string(),
             invoking_session_id: Some(PARENT.to_string()),
             checkpoint: Some(json!({"session_id": child})),
@@ -144,6 +145,7 @@ async fn cancel_is_a_no_op_without_a_checkpoint() -> Result<()> {
         tool: SUBAGENT_SESSION_PROMPT_TOOL.to_string(),
         args: json!({}),
         context: ToolInvocationContext {
+            run_context: Some(crate::nats_session::test_support::inherited_tool_context()),
             call_id: WIRE_CALL.to_string(),
             invoking_session_id: Some(PARENT.to_string()),
             checkpoint: None,

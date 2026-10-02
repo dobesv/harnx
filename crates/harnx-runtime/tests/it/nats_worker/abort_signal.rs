@@ -88,6 +88,8 @@ async fn abort_signal_cancels_blocked_worker_and_persists_tombstone() -> Result<
 
     let run_turn = tokio::spawn(async move {
         session
+            .clone()
+            .with_external_admission()
             .run_turn("block until cancelled", Arc::new(NullSink), None)
             .await
     });
@@ -142,10 +144,11 @@ async fn cancel_immediately_after_activation_ack_is_not_lost() -> Result<()> {
     // metadata before the first transcript entry.
     seed_session_metadata(&jetstream, session_id).await?;
     let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(session_id), 1);
-    log.append_event_async(&append_user_message_entry(
+    crate::worker::append_admitted_fixture_user(
+        &log,
         "immediate-cancel-user",
         "block until cancelled",
-    ))
+    )
     .await?;
 
     activate_session(&jetstream, session_id).await?;

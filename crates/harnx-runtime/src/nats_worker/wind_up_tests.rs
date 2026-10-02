@@ -146,6 +146,7 @@ impl InterruptedTurn {
     /// the same string.
     fn request(&self, call_id: &str) -> ToolRequest {
         ToolRequest {
+            run_context: None,
             replay: None,
             operation_id: format!("op-{}", wire_id(call_id)),
             call_id: wire_id(call_id),
@@ -189,6 +190,7 @@ impl InterruptedTurn {
     /// `c3`, and the retry is the one that answers it.
     async fn seed_dispatch_and_replies(&self) {
         let c3_retry = ToolRequest {
+            run_context: None,
             operation_id: "op-retry-c3".into(),
             call_id: "retry-c3".into(),
             ..self.request("c3")
@@ -452,6 +454,7 @@ async fn the_newest_unanswered_attempt_is_the_one_cancelled() {
     };
     let turn = InterruptedTurn::seed(server.url(), &["twice"]).await;
     let newest = ToolRequest {
+        run_context: None,
         operation_id: "op-second-twice".into(),
         call_id: "second-twice".into(),
         ..turn.request("twice")

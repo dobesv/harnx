@@ -241,7 +241,12 @@ pub(crate) async fn run_turn(
     tool_timer_tick: Option<ToolTimerTickFn>,
     clear_tool_timers: ClearToolTimersFn,
 ) -> anyhow::Result<Option<NatsTurnResult>> {
-    let run_turn = session.run_turn_with_options(
+    let admitting_session = session
+        .clone()
+        .with_external_admission()
+        .with_admission_id(uuid::Uuid::new_v4().to_string())
+        .with_admission_timeout(options.timeout_secs);
+    let run_turn = admitting_session.run_turn_with_options(
         input_text,
         tracking_sink,
         None,
@@ -283,7 +288,9 @@ pub(crate) async fn run_turn(
         }
         TurnLoopOutcome::Completed(res) => Ok(Some(res?)),
         TurnLoopOutcome::TimedOut => {
-            let outcome = session.interrupt("one-shot timeout").await;
+            let outcome = admitting_session
+                .interrupt_admitted_invocation("one-shot timeout")
+                .await;
             if outcome.is_err() {
                 eprintln!("{}", describe_interrupt_outcome(&outcome));
             }
@@ -332,6 +339,7 @@ pub(crate) struct TurnOutput<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct TerminationSpec {
+    timeout: Option<harnx_runtime::TimeoutTerminal>,
     kind: TerminationKind,
     budget: Option<u64>,
     repetition: Option<harnx_core::loop_guard::RepetitionTerminal>,
@@ -340,6 +348,7 @@ struct TerminationSpec {
 fn termination_spec(result: Option<&NatsTurnResult>) -> Option<TerminationSpec> {
     let Some(result) = result else {
         return Some(TerminationSpec {
+            timeout: None,
             kind: TerminationKind::Timeout,
             budget: None,
             repetition: None,
@@ -353,6 +362,7 @@ fn termination_spec(result: Option<&NatsTurnResult>) -> Option<TerminationSpec> 
             kind: terminal.kind(),
             budget: terminal.budget(),
             repetition: terminal.repetition(),
+            timeout: terminal.timeout(),
         })
 }
 
@@ -364,6 +374,8 @@ pub(crate) fn finish_turn(
         let thinking_tail = output.buffering_sink.thinking_tail();
         let usage = output.tracking_sink.observed_usage();
         let synthesized = synthesize_terminated_result(TerminationInputs {
+            timeout: termination.timeout,
+            public_progress: Some(&output.buffering_sink.public_progress()),
             kind: termination.kind,
             session_id: output.session_id,
             usage: &usage,
@@ -448,6 +460,7 @@ mod tests {
             assert_eq!(
                 termination_spec(result.as_ref()),
                 Some(TerminationSpec {
+                    timeout: None,
                     kind: TerminationKind::Timeout,
                     budget: None,
                     repetition: None,
@@ -484,6 +497,8 @@ mod tests {
     fn timeout_output_has_synthesized_stdout_single_json_stderr_line_and_exit_code_two() {
         let usage = sample_termination_usage();
         let synthesized = synthesize_terminated_result(TerminationInputs {
+            timeout: None,
+            public_progress: None,
             kind: TerminationKind::Timeout,
             session_id: "cli-timeout-session",
             usage: &usage,
@@ -518,6 +533,7 @@ mod tests {
         assert_eq!(
             termination,
             TerminationSpec {
+                timeout: None,
                 kind: TerminationKind::BudgetExceeded,
                 budget: Some(20),
                 repetition: None,
@@ -525,6 +541,8 @@ mod tests {
         );
         let usage = sample_termination_usage();
         let synthesized = synthesize_terminated_result(TerminationInputs {
+            timeout: termination.timeout,
+            public_progress: None,
             kind: termination.kind,
             session_id: "cli-budget-session",
             usage: &usage,
@@ -561,6 +579,8 @@ mod tests {
         assert_eq!(termination.kind, TerminationKind::Repetition);
         let usage = sample_termination_usage();
         let synthesized = synthesize_terminated_result(TerminationInputs {
+            timeout: termination.timeout,
+            public_progress: None,
             kind: termination.kind,
             session_id: "cli-loop-session",
             usage: &usage,

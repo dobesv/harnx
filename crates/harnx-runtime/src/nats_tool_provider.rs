@@ -59,6 +59,7 @@ struct PendingToolRequest {
 
 /// Core-NATS tool provider built from one turn's KV registration snapshot.
 pub struct NatsToolProvider {
+    run_context: Option<crate::nats_session_metadata::RunLimitsRecord>,
     client: async_nats::Client,
     instance_id: ServerScope,
     parent_session_id: Option<String>,
@@ -97,6 +98,34 @@ fn resolve_parent_identity(config: &Config) -> (Option<String>, Option<String>, 
 }
 
 impl NatsToolProvider {
+    /// Dispatch one trusted frontend request with its already-persisted outer scope.
+    /// Keep connection catalogs reusable without sharing a deadline between requests.
+    pub async fn call_tool_with_external_admission(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        tool_call_id: &str,
+        record: &crate::nats_session_metadata::RunLimitsRecord,
+        abort: &AbortSignal,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        if self.run_context.is_some() || record.parent_invocation.is_some() {
+            return Err(ToolError::Fatal(anyhow!(
+                "external tool admission cannot replace an inherited run"
+            )));
+        }
+        Box::pin(self.call_registered_tool(
+            request::ToolCallInput {
+                name: tool_name,
+                arguments,
+                id: Some(tool_call_id),
+                run_context: Some(record),
+            },
+            abort,
+            None,
+        ))
+        .await
+    }
+
     /// Connect through runtime config and snapshot registered tools for this instance.
     pub async fn discover(
         config: &Config,
@@ -154,6 +183,7 @@ impl NatsToolProvider {
             resolve_parent_identity(config);
 
         Ok(Self {
+            run_context: config.run_context.clone(),
             client,
             instance_id,
             parent_session_id,
@@ -478,6 +508,7 @@ impl ToolProvider for NatsToolProvider {
                 name: tool_name,
                 arguments,
                 id: tool_call_id,
+                run_context: None,
             },
             abort,
             None,
@@ -498,6 +529,7 @@ impl ToolProvider for NatsToolProvider {
                 name: tool_name,
                 arguments,
                 id: tool_call_id,
+                run_context: None,
             },
             abort,
             Some(progress),
@@ -654,6 +686,7 @@ mod tests {
             client: client.clone(),
             instance_id,
             parent_session_id: None,
+            run_context: None,
             parent_agent: None,
             parent_local_session_id: None,
             tools: HashMap::new(),
@@ -665,6 +698,85 @@ mod tests {
             progress_dispatcher: ProgressDispatcher::new(control_subscription),
             in_flight: NatsInFlightCalls::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn external_tool_admission_rejects_expiry_and_cannot_replace_inherited_scope(
+    ) -> anyhow::Result<()> {
+        use crate::nats_session_metadata::{
+            CallTimeoutOverride, RunLimitsRecord, SessionMetadataStore,
+        };
+        let server = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let client = async_nats::connect(server.url()).await?;
+        let js = async_nats::jetstream::new(client.clone());
+        let store = SessionMetadataStore::ensure(&js, 1).await?;
+        let expired = RunLimitsRecord::admit_root(
+            Default::default(),
+            Default::default(),
+            chrono::Utc::now() - chrono::Duration::seconds(30),
+            Default::default(),
+            None,
+            CallTimeoutOverride::from_optional(Some(1)),
+        )?;
+        store.put_run_limits("external-provider", &expired).await?;
+        store
+            .put_invocation_limits("external-provider", &expired)
+            .await?;
+        let fresh = RunLimitsRecord::admit_root(
+            Default::default(),
+            Default::default(),
+            chrono::Utc::now(),
+            Default::default(),
+            None,
+            CallTimeoutOverride::Omitted,
+        )?;
+        let mut provider = make_test_provider(&client).await;
+        provider.tools.insert(
+            "read".into(),
+            RegisteredTool {
+                server: "fs".into(),
+                selector_server: "fs".into(),
+                raw_name: "read".into(),
+                request_timeout: None,
+            },
+        );
+        let abort = harnx_core::abort::create_abort_signal();
+        let error = provider
+            .call_tool_with_external_admission("read", json!({}), "expired", &expired, &abort)
+            .await
+            .unwrap_err();
+        let harnx_core::tool::ToolError::Fatal(error) = error else {
+            panic!("expired external scope wasn't fatal");
+        };
+        assert!(error.is::<crate::nats_session_metadata::run_limits::DeadlineExpired>());
+        let message = error.to_string();
+        for expected in [
+            "scope: outer_run",
+            "deadline:",
+            expired.run_id.as_str(),
+            expired.invocation_id.as_str(),
+            "Do not retry",
+            "Return to the user to confirm continuation",
+            "No new dispatch occurred; tool output from this attempt is unavailable",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+        provider.run_context = Some(expired.clone());
+        let error = provider
+            .call_tool_with_external_admission("read", json!({}), "renew", &fresh, &abort)
+            .await
+            .unwrap_err();
+        let harnx_core::tool::ToolError::Fatal(error) = error else {
+            panic!("inherited scope replacement wasn't fatal");
+        };
+        assert_eq!(
+            error.to_string(),
+            "external tool admission cannot replace an inherited run"
+        );
+        assert_eq!(provider.run_context, Some(expired));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1095,6 +1207,7 @@ mod tests {
             client,
             instance_id,
             parent_session_id: None,
+            run_context: None,
             parent_agent: None,
             parent_local_session_id: None,
             tools: HashMap::from([(

@@ -28,9 +28,12 @@ async fn seed_and_activate(
     store
         .create(&SessionMetadata::new(session_id, initializer))
         .await?;
-    NatsSessionLog::new_with_replicas(jetstream.clone(), &storage_key, 1)
-        .append_event_async(&append_user_message_entry(message_id, message_id))
-        .await?;
+    crate::worker::append_admitted_fixture_user(
+        &NatsSessionLog::new_with_replicas(jetstream.clone(), &storage_key, 1),
+        message_id,
+        message_id,
+    )
+    .await?;
     publish_session_activate(jetstream, "local", &SessionActivate::new(storage_key), 1).await?;
     Ok(())
 }
@@ -150,7 +153,11 @@ async fn missing_named_agent_fails_durably_without_calling_the_model() -> Result
     .await?;
     let outcome = tokio::time::timeout(
         CI_SAFE_TIMEOUT,
-        session.run_turn("missing-user", Arc::new(NullSink), None),
+        session.clone().with_external_admission().run_turn(
+            "missing-user",
+            Arc::new(NullSink),
+            None,
+        ),
     )
     .await??;
     let caller_error = outcome
@@ -209,7 +216,10 @@ async fn turn_failure_is_recorded_and_returned_without_redelivery() -> Result<()
 
     let outcome = tokio::time::timeout(
         CI_SAFE_TIMEOUT,
-        session.run_turn("fail once", Arc::new(NullSink), None),
+        session
+            .clone()
+            .with_external_admission()
+            .run_turn("fail once", Arc::new(NullSink), None),
     )
     .await??;
     assert_eq!(calls.load(Ordering::SeqCst), 1);

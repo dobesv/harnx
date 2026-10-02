@@ -482,6 +482,7 @@ fn assert_no_cancel(entries: &[(u64, SessionLogEntry)]) {
 }
 
 struct RunningScenario {
+    original_limits: harnx_runtime::nats_session_metadata::RunLimitsRecord,
     first: ChildGuard,
     replacement: ChildGuard,
     first_health_url: String,
@@ -519,6 +520,10 @@ async fn start_scenario(
     let session_key = session.storage_key().to_string();
     let turn = tokio::spawn(async move {
         session
+            .as_ref()
+            .clone()
+            .with_external_admission()
+            .with_admission_timeout(Some(60))
             .run_turn_with_options(
                 "run until SIGTERM",
                 Arc::new(NullSink),
@@ -542,7 +547,33 @@ async fn start_scenario(
     let replacement_url = format!("http://{replacement_health}/healthz");
     let replacement = fixture.spawn_worker(&format!("{name}-replacement"), &replacement_health)?;
     wait_for_health(&replacement_url, reqwest::StatusCode::OK).await?;
+    let store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&fixture.jetstream, 1)
+            .await?;
+    let before = entries(&fixture.jetstream, &session_key).await?;
+    let prompt = before
+        .iter()
+        .find_map(|(_, entry)| match entry {
+            SessionLogEntry::Message {
+                id: Some(id), role, ..
+            } if role.is_user() => Some(id),
+            _ => None,
+        })
+        .context("original admitted prompt")?;
+    let admission = store
+        .prompt_admission(&session_key, prompt)
+        .await?
+        .context("original admission")?;
+    let original_limits = store
+        .get_invocation_limits(&session_key, admission.invocation_id.as_str())
+        .await?
+        .context("frozen original limits")?;
+    assert_eq!(
+        original_limits.deadline,
+        Some(admission.admitted_at + chrono::Duration::seconds(60))
+    );
     Ok(RunningScenario {
+        original_limits,
         first,
         replacement,
         first_health_url,
@@ -608,6 +639,21 @@ async fn verify_replacement(
     assert!(status.success(), "worker exited unsuccessfully: {status}");
     let after = entries(&fixture.jetstream, &scenario.session_key).await?;
     assert_no_cancel(&after);
+    let store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&fixture.jetstream, 1)
+            .await?;
+    let replayed = store
+        .get_invocation_limits(
+            &scenario.session_key,
+            scenario.original_limits.invocation_id.as_str(),
+        )
+        .await?
+        .context("replacement's frozen limits")?;
+    assert_eq!(
+        replayed, scenario.original_limits,
+        "SIGTERM/failover must not renew deadline or identity"
+    );
+
     if use_tool {
         assert!(after.iter().any(|(_, entry)| matches!(
             entry,

@@ -8,6 +8,8 @@ External MCP clients (such as Claude Code or Claude Desktop) can use `harnx-mcp-
 
 Each MCP connection is backed by an isolated, durable harnx session. The server holds a worker-side **tool reservation** that starts and maintains the selected tool servers for the connection lifetime without running any LLM turn.
 
+The MCP frontend admits each external `tools/call` into a new durable run before dispatch. Exported agent calls inherit that request's configured global `run_limits` deadline; the worker resolves the target agent's local allowance and clamps it to the inherited deadline. Omitted, `null`, zero and negative delegation timeouts inherit the target policy. Connection reservations and cached catalogs don't grant or renew execution time. Distinct external requests, including later prompts to the same completed agent session, get independent runs. Unconfigured runs have a finite 86,400-second (24-hour) fallback; positive integer settings can choose longer finite allowances. Native tool calls keep their existing timeout and cancellation behavior; the run deadline bounds autonomous agent execution, not rollback of tool side effects.
+
 ## Quickstart
 
 Run over stdio:

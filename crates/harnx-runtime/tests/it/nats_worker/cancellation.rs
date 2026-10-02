@@ -112,7 +112,11 @@ async fn accepted_cancellation_survives_recovery_activation_failure() -> Result<
         },
     )
     .await?;
-    session.enqueue_text("interrupt me").await?;
+    session
+        .clone()
+        .with_external_admission()
+        .enqueue_text("interrupt me")
+        .await?;
 
     let cancel_seq = accepted_seq(session.interrupt("client cancel").await?)?;
 
@@ -133,7 +137,11 @@ async fn resume_with_cancel_winds_up_and_does_not_call_model() -> Result<()> {
         return Ok(());
     };
     let session = session(server.url(), "cancel-before-activation").await?;
-    session.enqueue_text("must never reach the model").await?;
+    session
+        .clone()
+        .with_external_admission()
+        .enqueue_text("must never reach the model")
+        .await?;
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     // The turn had already made a tool call, so winding it up is something the
     // log can be checked for rather than a no-op.
@@ -210,6 +218,8 @@ async fn durable_watch_cancels_streaming_without_a_core_command() -> Result<()> 
     .await?;
     let session = session(server.url(), "watch-only-cancel").await?;
     session
+        .clone()
+        .with_external_admission()
         .enqueue_text("stream until durable cancellation")
         .await?;
     tokio::time::timeout(CI_SAFE_TIMEOUT, entered.notified()).await?;

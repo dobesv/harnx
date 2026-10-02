@@ -27,6 +27,10 @@ impl SessionActor {
         done: &RunFinished,
         request: HandoffRequest,
     ) {
+        let Some(parent) = done.limits.clone() else {
+            self.fail_handoff(done, anyhow!("handoff has no inherited execution context"));
+            return;
+        };
         let HandoffRequest {
             agent,
             session_id,
@@ -53,8 +57,8 @@ impl SessionActor {
         };
         let target_key = SessionKey::new(target.clone(), target_session_id.clone());
         if target_key == self.key {
-            self.queue_self_handoff(prompt);
-        } else if let Err(error) = self.send_handoff_prompt(&target_key, prompt).await {
+            self.queue_self_handoff(prompt, parent);
+        } else if let Err(error) = self.send_handoff_prompt(&target_key, prompt, parent).await {
             self.fail_handoff(done, error);
             return;
         }
@@ -101,21 +105,36 @@ impl SessionActor {
         }
     }
 
-    fn queue_self_handoff(&mut self, prompt: String) {
+    fn queue_self_handoff(
+        &mut self,
+        prompt: String,
+        parent: harnx_runtime::nats_session_metadata::RunLimitsRecord,
+    ) {
         self.pending.push_back(PendingPrompt {
             text: prompt,
-            options: SessionPromptOptions::default(),
+            options: SessionPromptOptions {
+                runtime_parent: Some(Box::new(parent)),
+                ..Default::default()
+            },
         });
     }
 
-    async fn send_handoff_prompt(&mut self, target_key: &SessionKey, prompt: String) -> Result<()> {
+    async fn send_handoff_prompt(
+        &mut self,
+        target_key: &SessionKey,
+        prompt: String,
+        parent: harnx_runtime::nats_session_metadata::RunLimitsRecord,
+    ) -> Result<()> {
         let target_handle = self.get_or_spawn_target_session_actor(target_key.clone());
         let (reply_tx, reply_rx) = oneshot::channel();
         target_handle
             .tx
             .send(SessionCommand::Prompt {
                 text: prompt,
-                options: SessionPromptOptions::default(),
+                options: SessionPromptOptions {
+                    runtime_parent: Some(Box::new(parent)),
+                    ..Default::default()
+                },
                 reply: reply_tx,
             })
             .await

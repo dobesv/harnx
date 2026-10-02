@@ -11,16 +11,10 @@ async fn seed_and_publish_activation(
     session_id: &str,
     user_text: &str,
 ) -> Result<SessionActivate> {
-    NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(session_id), 1)
-        .append_event_async(&SessionLogEntry::Message {
-            id: None,
-            role: harnx_core::message::MessageRole::User,
-            content: harnx_core::message::MessageContent::Text(user_text.to_string()),
-            timestamp: None,
-            fence_token: None,
-        })
-        .await?;
     seed_session_metadata(jetstream, session_id).await?;
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(session_id), 1);
+    crate::worker::append_admitted_fixture_user(&log, &uuid::Uuid::new_v4().to_string(), user_text)
+        .await?;
     let activation = SessionActivate::new(storage_key(session_id));
     publish_session_activate(jetstream, "local", &activation, 1).await?;
     Ok(activation)

@@ -58,6 +58,7 @@ impl Toolset for ProgressToolset {
 
 fn request(call_id: &str, supports_progress: bool) -> ToolRequest {
     ToolRequest {
+        run_context: None,
         replay: None,
         operation_id: call_id.to_string(),
         call_id: call_id.to_string(),

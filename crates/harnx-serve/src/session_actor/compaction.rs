@@ -34,6 +34,7 @@ impl SessionActor {
             .await
             .map_err(|error| format!("{error:#}"))?;
         session
+            .with_external_admission()
             .request_compaction(Some("web".to_string()))
             .await
             .map_err(|error| format!("{error:#}"))

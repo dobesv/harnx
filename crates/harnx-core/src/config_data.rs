@@ -72,6 +72,112 @@ pub struct LoopDetectionOverride {
     pub output: Option<bool>,
 }
 
+// =============================================================================
+// Run Limits Configuration
+// =============================================================================
+
+/// User-chosen finite fallback when no positive run timeout is configured.
+pub const DEFAULT_RUN_TIMEOUT_SECS: u64 = 86_400;
+
+/// Wall-clock limits for autonomous runs. Only a fresh external admission can
+/// start a new deadline; local overrides never extend a frozen ancestor.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct RunLimitsConfig {
+    /// Positive seconds override the fallback; omitted/null/nonpositive inherit.
+    #[serde(skip_serializing_if = "RunLimitsTimeout::is_omit")]
+    pub timeout_secs: RunLimitsTimeout,
+}
+
+impl RunLimitsConfig {
+    /// Target -> global -> 24-hour fallback. Resolution always returns finite seconds.
+    pub fn resolve(self, agent_override: Option<&RunLimitsTimeout>) -> ResolvedRunLimits {
+        let seconds = agent_override
+            .and_then(RunLimitsTimeout::as_finite_secs)
+            .or_else(|| self.timeout_secs.as_finite_secs())
+            .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
+        ResolvedRunLimits {
+            timeout_secs: std::num::NonZeroU64::new(seconds).expect("finite policy is positive"),
+        }
+    }
+}
+
+/// Raw numeric policy: inherit or an explicit positive allowance, never a disable switch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RunLimitsTimeout {
+    /// Omitted, null, zero, or negative: use the next configuration level.
+    #[default]
+    Omit,
+    Finite(std::num::NonZeroU64),
+}
+
+impl<'de> Deserialize<'de> for RunLimitsTimeout {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Null => Ok(Self::Omit),
+            serde_json::Value::Number(n) if n.as_i64().is_some_and(|n| n <= 0) => Ok(Self::Omit),
+            serde_json::Value::Number(n) => {
+                let seconds = n
+                    .as_u64()
+                    .ok_or_else(|| D::Error::custom("timeout_secs must be an integer or null"))?;
+                let signed = i64::try_from(seconds)
+                    .map_err(|_| D::Error::custom("timeout_secs is too large"))?;
+                if chrono::Duration::try_seconds(signed).is_none() {
+                    return Err(D::Error::custom("timeout_secs is too large"));
+                }
+                Ok(Self::Finite(
+                    std::num::NonZeroU64::new(seconds).expect("positive integer"),
+                ))
+            }
+            _ => Err(D::Error::custom("timeout_secs must be an integer or null")),
+        }
+    }
+}
+
+impl Serialize for RunLimitsTimeout {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Omit => serializer.serialize_none(),
+            Self::Finite(seconds) => serializer.serialize_u64(seconds.get()),
+        }
+    }
+}
+
+impl RunLimitsTimeout {
+    pub fn is_omit(&self) -> bool {
+        matches!(self, Self::Omit)
+    }
+
+    pub fn as_finite_secs(&self) -> Option<u64> {
+        match self {
+            Self::Finite(seconds) => Some(seconds.get()),
+            Self::Omit => None,
+        }
+    }
+}
+
+/// Normalize delegation overrides with the same numeric rules as config/front matter.
+pub fn deserialize_timeout_override<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    RunLimitsTimeout::deserialize(deserializer).map(|timeout| timeout.as_finite_secs())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedRunLimits {
+    pub timeout_secs: std::num::NonZeroU64,
+}
+
+/// Per-target finite allowance. Nonpositive values inherit the global policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct RunLimitsOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<RunLimitsTimeout>,
+}
+
 /// Default wait for a worker to claim an activated NATS session.
 pub const DEFAULT_NATS_LEASE_ACQUISITION_TIMEOUT_SECS: u64 = 60;
 
@@ -158,6 +264,11 @@ pub struct ConfigData {
     /// Loop protection; see [`LoopDetectionConfig`].
     pub loop_detection: LoopDetectionConfig,
 
+    /// Run execution limits; see [`RunLimitsConfig`].
+    /// Opt-in: defaults to `Omit` (no limit unless configured).
+    #[serde(default)]
+    pub run_limits: RunLimitsConfig,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_agent: Option<String>,
     /// Token-growth threshold for title regeneration at turn end and mid-loop;
@@ -227,6 +338,8 @@ impl Default for ConfigData {
             terminal_status: default_terminal_status(),
 
             loop_detection: LoopDetectionConfig::default(),
+
+            run_limits: RunLimitsConfig::default(),
 
             title_agent: None,
             title_update_threshold: 50_000,
@@ -415,5 +528,132 @@ mod loop_detection_tests {
         let unset = LoopDetectionOverride::default();
         assert!(on.resolve(Some(&unset)).tool_calls);
         assert!(on.resolve(None).tool_calls);
+    }
+}
+
+#[cfg(test)]
+mod run_limits_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_inherit_values_resolve_to_24_hours_or_configured_global() {
+        for yaml in [
+            "{}",
+            "run_limits: {}",
+            "run_limits:\n  timeout_secs: null",
+            "run_limits:\n  timeout_secs: 0",
+            "run_limits:\n  timeout_secs: -1",
+            "run_limits:\n  timeout_secs: -9223372036854775808",
+        ] {
+            let config: ConfigData = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(
+                config.run_limits.resolve(None).timeout_secs.get(),
+                86_400,
+                "{yaml}"
+            );
+        }
+        let global: RunLimitsConfig = serde_yaml::from_str("timeout_secs: 80").unwrap();
+        for yaml in [
+            "{}",
+            "timeout_secs: null",
+            "timeout_secs: 0",
+            "timeout_secs: -1",
+            "timeout_secs: -9223372036854775808",
+        ] {
+            let target: RunLimitsOverride = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(
+                global
+                    .resolve(target.timeout_secs.as_ref())
+                    .timeout_secs
+                    .get(),
+                80,
+                "{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn positive_timeouts_allow_seven_and_thirty_days_and_serialize_as_numbers() {
+        for seconds in [1, 3600, 604_800, 2_592_000] {
+            let config: RunLimitsConfig =
+                serde_yaml::from_str(&format!("timeout_secs: {seconds}")).unwrap();
+            assert_eq!(config.resolve(None).timeout_secs.get(), seconds);
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["timeout_secs"],
+                seconds
+            );
+            let target = RunLimitsTimeout::Finite(std::num::NonZeroU64::new(seconds).unwrap());
+            assert_eq!(
+                RunLimitsConfig::default()
+                    .resolve(Some(&target))
+                    .timeout_secs
+                    .get(),
+                seconds
+            );
+        }
+        assert!(!serde_yaml::to_string(&RunLimitsConfig::default())
+            .unwrap()
+            .contains("timeout_secs"));
+    }
+
+    #[test]
+    fn strings_fractions_booleans_and_overflow_are_invalid() {
+        for value in [
+            "unlimited",
+            "\"3600\"",
+            "1.5",
+            "-0.5",
+            "true",
+            "18446744073709551615",
+            "9223372036854775807",
+        ] {
+            assert!(
+                serde_yaml::from_str::<RunLimitsConfig>(&format!("timeout_secs: {value}")).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn delegation_override_parser_uses_the_same_numeric_rules() {
+        #[derive(Deserialize)]
+        struct Call {
+            #[serde(default, deserialize_with = "deserialize_timeout_override")]
+            timeout_secs: Option<u64>,
+        }
+        for json in [
+            "{}",
+            "{\"timeout_secs\":null}",
+            "{\"timeout_secs\":0}",
+            "{\"timeout_secs\":-1}",
+            "{\"timeout_secs\":-9223372036854775808}",
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Call>(json).unwrap().timeout_secs,
+                None,
+                "{json}"
+            );
+        }
+        for seconds in [604_800, 2_592_000] {
+            let call: Call =
+                serde_json::from_str(&format!("{{\"timeout_secs\":{seconds}}}")).unwrap();
+            assert_eq!(call.timeout_secs, Some(seconds));
+        }
+        for json in [
+            "{\"timeout_secs\":\"unlimited\"}",
+            "{\"timeout_secs\":1.5}",
+            "{\"timeout_secs\":18446744073709551615}",
+        ] {
+            assert!(serde_json::from_str::<Call>(json).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn docs_config_yaml_examples_validate() {
+        for seconds in [86400, 7200, 604800, 2_592_000] {
+            let config: ConfigData =
+                serde_yaml::from_str(&format!("run_limits:\n  timeout_secs: {seconds}\n")).unwrap();
+            assert_eq!(config.run_limits.resolve(None).timeout_secs.get(), seconds);
+        }
     }
 }

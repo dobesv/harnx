@@ -16,6 +16,7 @@ async fn parked_tool_reply(original_error: Option<&str>) -> Result<()> {
     wait_for_registration(&harness.client, &harness.instance_id).await?;
     let call_id = "parked-call";
     let request = ToolRequest {
+        run_context: None,
         replay: None,
         call_id: call_id.into(),
         operation_id: call_id.into(),
