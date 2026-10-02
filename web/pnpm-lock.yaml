@@ -163,7 +163,7 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  '@ag-ui/client': 1.0.0
+  '@ag-ui/client': 1.0.1
   '@assistant-ui/core': 0.3.21
   '@assistant-ui/store': 0.3.15
   assistant-stream: 0.3.45
@@ -173,8 +173,8 @@ importers:
   .:
     dependencies:
       '@ag-ui/client':
-        specifier: 1.0.0
-        version: 1.0.0
+        specifier: 1.0.1
+        version: 1.0.1
       '@assistant-ui/react':
         specifier: 0.15.22
         version: 0.15.22(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -263,22 +263,22 @@ packages:
   '@adobe/css-tools@4.5.0':
     resolution: {integrity: sha512-6OzddxPio9UiWTCemp4N8cYLV2ZN1ncRnV1cVGtve7dhPOtRkleRyx32GQCYSwDYgaHU3USMm84tNsvKzRCa1Q==}
 
-  '@ag-ui/client@1.0.0':
-    resolution: {integrity: sha512-Q24E4yuK35tz7ROOC0yWYltdOZK1K+5GmM2Syh/PReFE9e8lDcE8LoMoY5HZyxpQZ+0IizwpQm9LyVqAHP8mpw==}
+  '@ag-ui/client@1.0.1':
+    resolution: {integrity: sha512-AxJ1+fnsRrhWBg+dXItoyXNqUhI/tOXk0/TxXrsuvdjtyTx216Hu+3q5DgQnTDbluP95fCW4buoCKQsKpHmmCw==}
 
-  '@ag-ui/core@1.0.0':
-    resolution: {integrity: sha512-yCRhsQvb4+lmGMrDsi4TOJxqKpm/kb3H64wwL+Z90jNVrkhy17RErfzsNgybfbjNKLM0nenEDYDVJsZHJJSigQ==}
+  '@ag-ui/core@1.0.1':
+    resolution: {integrity: sha512-Q6pxgI7gcey/0pHfM37S7GNrsYqTrrjjFLpi1dckHNGX2l9VTL0CjnyNc44lwPfHIzFmmEvQfbrAeEPINGGg/Q==}
     peerDependencies:
       zod: ^3.25.18 || ^4.0.0
     peerDependenciesMeta:
       zod:
         optional: true
 
-  '@ag-ui/encoder@1.0.0':
-    resolution: {integrity: sha512-8w+SHIjsatOcHHe5UBqdlqOiZaQWa3rMv1cUdNFXtHmfcIOLbMd1PG3SRWHD9AMUzApDl4964BV9xs3QPZogrw==}
+  '@ag-ui/encoder@1.0.1':
+    resolution: {integrity: sha512-or0xYLdzGOuJg5avAtUxS1zNiMqO7MxUso+7z90Wl4jpl94QzfmfybXWopvPipVm/dh8IqkB/Zn+LHy4MI2e+g==}
 
-  '@ag-ui/proto@1.0.0':
-    resolution: {integrity: sha512-RXEdjD3RfZ/8fUEX+ZqN5SrZAxrOZ9oQt0FlEhN4Ie/YEOKDVv0u1g83fOhGxWJTTVAmYSM/xf+ijwixsmz2RA==}
+  '@ag-ui/proto@1.0.1':
+    resolution: {integrity: sha512-w7R2gLeXv04Mss0B29thkF+nLitSx6aLeqhUpvmeJZNjBPbwZ6zkXdK3/KEqavCMtHvot7AGj6RaHG1DvbJwww==}
 
   '@asamuzakjp/css-color@7.0.0':
     resolution: {integrity: sha512-IxddtGnnoidVSO6O/aiTueptbTThHvi2qGHu9/AWuD1J7i86Ox+jl+Y5SXcDH1RixzQlP2cjH/PjnlImZiAurQ==}
@@ -2814,11 +2814,11 @@ snapshots:
 
   '@adobe/css-tools@4.5.0': {}
 
-  '@ag-ui/client@1.0.0':
+  '@ag-ui/client@1.0.1':
     dependencies:
-      '@ag-ui/core': 1.0.0(zod@3.25.76)
-      '@ag-ui/encoder': 1.0.0(zod@3.25.76)
-      '@ag-ui/proto': 1.0.0
+      '@ag-ui/core': 1.0.1(zod@3.25.76)
+      '@ag-ui/encoder': 1.0.1(zod@3.25.76)
+      '@ag-ui/proto': 1.0.1
       '@types/uuid': 10.0.0
       compare-versions: 6.1.1
       fast-json-patch: 3.1.1
@@ -2827,20 +2827,20 @@ snapshots:
       uuid: 11.1.1
       zod: 3.25.76
 
-  '@ag-ui/core@1.0.0(zod@3.25.76)':
+  '@ag-ui/core@1.0.1(zod@3.25.76)':
     optionalDependencies:
       zod: 3.25.76
 
-  '@ag-ui/encoder@1.0.0(zod@3.25.76)':
+  '@ag-ui/encoder@1.0.1(zod@3.25.76)':
     dependencies:
-      '@ag-ui/core': 1.0.0(zod@3.25.76)
-      '@ag-ui/proto': 1.0.0
+      '@ag-ui/core': 1.0.1(zod@3.25.76)
+      '@ag-ui/proto': 1.0.1
     transitivePeerDependencies:
       - zod
 
-  '@ag-ui/proto@1.0.0':
+  '@ag-ui/proto@1.0.1':
     dependencies:
-      '@ag-ui/core': 1.0.0(zod@3.25.76)
+      '@ag-ui/core': 1.0.1(zod@3.25.76)
       '@bufbuild/protobuf': 2.14.0
       '@protobuf-ts/protoc': 2.11.1
       zod: 3.25.76
@@ -2876,7 +2876,7 @@ snapshots:
 
   '@assistant-ui/react-ag-ui@0.0.62(@assistant-ui/react@0.15.22(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@assistant-ui/tap@0.9.19(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(assistant-cloud@0.2.3)(react@19.3.0)(zod@4.6.5)':
     dependencies:
-      '@ag-ui/client': 1.0.0
+      '@ag-ui/client': 1.0.1
       '@assistant-ui/core': 0.3.21(@assistant-ui/store@0.3.15(@assistant-ui/tap@0.9.19(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0))(@assistant-ui/tap@0.9.19(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(assistant-cloud@0.2.3)(react@19.3.0)
       '@assistant-ui/react-generative-ui': 0.0.21(@assistant-ui/react@0.15.22(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)(zod@4.6.5)
       '@assistant-ui/store': 0.3.15(@assistant-ui/tap@0.9.19(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
