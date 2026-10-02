@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use futures_util::TryStreamExt;
 use harnx_core::{event::NullSink, require_nextest, session::SessionLogEntry, tool::ToolCall};
 use harnx_hookset::{HOOK_EXPECTATIONS_BUCKET, HOOK_REGISTRY_BUCKET};
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::{
     client::CompletionTokenUsage,
     config::Config,
@@ -22,7 +23,6 @@ use harnx_runtime::{
     nats_worker::{run_worker_daemon, WorkerDaemonConfig},
     utils::create_abort_signal,
 };
-use parking_lot::RwLock;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -352,7 +352,7 @@ fn setup_test_env(server_url: &str) -> Result<TestEnv> {
 async fn build_test_config(
     env: &TestEnv,
 ) -> Result<(
-    Arc<RwLock<Config>>,
+    harnx_runtime::config::GlobalConfig,
     async_nats::Client,
     async_nats::jetstream::Context,
 )> {
@@ -361,7 +361,7 @@ async fn build_test_config(
         let _config_guard = EnvVarGuard::set_path("HARNX_CONFIG_DIR", &env.config_dir);
         Config::load_from_file(&config_path)?
     };
-    let config = Arc::new(RwLock::new(base));
+    let config = Arc::new(ConfigLock::new(base));
     let (client, js) = {
         let cfg = config.read().clone();
         (

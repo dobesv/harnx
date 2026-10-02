@@ -13,6 +13,10 @@ use std::sync::Arc;
 /// handed to the runtime rather than awaited in place. The join handle is
 /// owned, so dropping the waiter aborts the task instead of detaching
 /// unfinished I/O.
+///
+/// The reply is read only while some worker polls the I/O driver, so avoid
+/// calling this with a `GlobalConfig` guard held: a worker blocked waiting
+/// for that guard is one that is not polling (see `config::lock`).
 fn block_on_io<T: Send + 'static>(
     future: impl std::future::Future<Output = Result<T>> + Send + 'static,
 ) -> Result<T> {

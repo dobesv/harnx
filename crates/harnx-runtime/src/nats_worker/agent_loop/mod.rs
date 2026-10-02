@@ -1952,7 +1952,7 @@ mod tests {
             },
             ..Config::default()
         };
-        let config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+        let config = std::sync::Arc::new(crate::config::ConfigLock::new(config));
 
         assert!(agent_resolved_hooks(&config).entries.is_empty());
     }
@@ -1981,7 +1981,7 @@ mod tests {
             agent: Some(crate::config::Agent::new(agent_config)),
             ..Config::default()
         };
-        let config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+        let config = std::sync::Arc::new(crate::config::ConfigLock::new(config));
 
         let hooks = agent_resolved_hooks(&config);
         assert_eq!(hooks.entries.len(), 1);

@@ -192,7 +192,7 @@ fn tui_compact_session_remote_submit_dispatch() -> Result<()> {
                     .use_session(Some(&session_id))
                     .expect("activate remote session id");
 
-                let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
+                let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
                 let abort = harnx_core::abort::create_abort_signal();
 
                 // Collecting sink to capture events

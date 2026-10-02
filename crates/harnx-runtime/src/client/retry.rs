@@ -195,10 +195,10 @@ mod tests {
     use super::super::LlmError;
     use crate::client::TestStateGuard;
     use crate::config::Config;
+    use crate::config::ConfigLock;
     use crate::test_utils::{MockClient, MockTurnBuilder};
     use crate::utils::create_abort_signal;
     use harnx_core::retry_config::RetryConfig;
-    use parking_lot::RwLock;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -210,7 +210,7 @@ mod tests {
             },
             ..Default::default()
         };
-        Arc::new(RwLock::new(config))
+        Arc::new(ConfigLock::new(config))
     }
 
     fn make_input(config: &GlobalConfig) -> Input {

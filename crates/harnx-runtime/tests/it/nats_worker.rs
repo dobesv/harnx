@@ -83,7 +83,7 @@ static MID_ROUND_APPEND_DONE: LazyLock<Notify> = LazyLock::new(Notify::new);
 static MID_ROUND_FINAL_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MID_ROUND_RELOAD_SEEN: AtomicUsize = AtomicUsize::new(0);
 static END_TURN_CALLS: AtomicUsize = AtomicUsize::new(0);
-use parking_lot::RwLock;
+use harnx_runtime::config::ConfigLock;
 use serde_json::json;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};

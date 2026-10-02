@@ -18,6 +18,7 @@ use futures_util::StreamExt;
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::require_nextest;
 use harnx_nats_common::{connect::NatsConnection, registry};
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::config::{Config, NatsServerConfig};
 use harnx_runtime::nats_lease::{
     lease_holder_in, open_lease_bucket, NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease,
@@ -27,7 +28,6 @@ use harnx_toolset::Toolset;
 use harnx_toolset_server::{
     registration_key, serve_with_client_and_identity, TOOL_REGISTRY_BUCKET,
 };
-use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -140,8 +140,8 @@ pub fn local_nats_config(spec: NatsServerSpec<'_>) -> Config {
     config
 }
 
-pub fn local_nats_runtime_config(server_url: &str) -> Arc<RwLock<Config>> {
-    Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+pub fn local_nats_runtime_config(server_url: &str) -> harnx_runtime::config::GlobalConfig {
+    Arc::new(ConfigLock::new(local_nats_config(NatsServerSpec {
         name: "local",
         url: server_url,
         token: None,
@@ -161,7 +161,7 @@ pub async fn require_nats_server() -> Result<Option<crate::common::NatsServerHan
 /// itself, so a caller never publishes an activation into a broker no worker
 /// is consuming from yet.
 pub async fn spawn_worker_daemon_with_call_fn(
-    config: Arc<RwLock<Config>>,
+    config: harnx_runtime::config::GlobalConfig,
     worker_id: &str,
     call_fn: harnx_runtime::agent_loop::AgentCallFn,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {

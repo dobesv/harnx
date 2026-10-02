@@ -38,7 +38,7 @@ fn session_config() -> (GlobalConfig, Arc<PromptLog>) {
     let log = Arc::new(PromptLog::default());
     session.runtime = Some(Arc::new(log.clone() as Arc<dyn SessionAppendSink>));
     config.session = Some(session);
-    (Arc::new(RwLock::new(config)), log)
+    (Arc::new(crate::config::ConfigLock::new(config)), log)
 }
 
 fn user_texts(messages: &[Message]) -> Vec<String> {

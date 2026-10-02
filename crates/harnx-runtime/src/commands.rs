@@ -3,7 +3,8 @@ use std::io::Write;
 use syntect::highlighting::{Color, Theme};
 
 use crate::config::{
-    macro_execute, remote_session_ops, AgentVariables, Config, GlobalConfig, Input, LastMessage,
+    macro_execute, remote_session_ops, AgentVariables, Config, ConfigLock, GlobalConfig, Input,
+    LastMessage,
 };
 use crate::nats_hook_provider::{
     discover_process_nats_hook_provider, dispatch_hook_event, HookDispatchMeta, HookEventDispatch,
@@ -405,7 +406,7 @@ pub async fn run_command_with_output_and_local_worker(
             ".model" => match args {
                 Some(name) => {
                     let from_model = config.read().current_model().id().to_string();
-                    config.write().set_model(name)?;
+                    Config::switch_model(config, name)?;
                     let to_model = config.read().current_model().id().to_string();
                     harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
                         harnx_core::event::SessionEvent::ModelChanged {
@@ -427,7 +428,7 @@ pub async fn run_command_with_output_and_local_worker(
                     return Ok(CommandOutcome::OpenSessionPicker);
                 }
                 let (agent, session) = explicit_session_target(args.unwrap(), ".session")?;
-                let candidate = Arc::new(parking_lot::RwLock::new(config.read().clone()));
+                let candidate = Arc::new(ConfigLock::new(config.read().clone()));
                 Box::pin(Config::use_agent(&candidate, &agent, Some(&session), abort_signal.clone())).await?;
                 config.write().apply_prepared_agent_selection(candidate.read().clone());
             }
@@ -1131,7 +1132,6 @@ mod tests {
     use super::*;
     use crate::config::{self, WorkingMode};
     use harnx_core::config_data::ConfigData;
-    use parking_lot::RwLock;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -1159,7 +1159,7 @@ mod tests {
 
     #[test]
     fn nats_turn_result_updates_last_message_only_after_completed_turn() {
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = Arc::new(ConfigLock::new(Config::default()));
         let input = crate::config::input::from_str(&config, "hello", None);
         let completed = crate::NatsTurnResult {
             response: Some("world".to_string()),
@@ -1207,7 +1207,7 @@ mod tests {
             ..Default::default()
         };
         config.session = Some(config::session::new(&config, "test", None).expect("test session"));
-        Arc::new(RwLock::new(config))
+        Arc::new(ConfigLock::new(config))
     }
 
     #[test]
@@ -1251,7 +1251,7 @@ mod tests {
         session.set_title("Inspect title generation".to_string());
         session.set_title_last_updated_tokens(42);
         config.session = Some(session);
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
 
@@ -1284,7 +1284,7 @@ mod tests {
         session.set_title("Manual title".to_string());
         session.set_title_last_updated_tokens(usize::MAX);
         config.session = Some(session);
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
 
@@ -1319,7 +1319,7 @@ mod tests {
         };
         let session = config::session::new(&config, "test", None).expect("test session");
         config.session = Some(session);
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
 
@@ -1342,7 +1342,7 @@ mod tests {
             working_mode: WorkingMode::Cmd,
             ..Default::default()
         };
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
 
@@ -1377,7 +1377,7 @@ mod tests {
             ..Default::default()
         };
         config.session = Some(config::session::new(&config, "test", None).expect("test session"));
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
 
@@ -1420,7 +1420,7 @@ mod tests {
             ..Default::default()
         };
         config.session = Some(config::session::new(&config, "test", None).expect("test session"));
-        Arc::new(RwLock::new(config))
+        Arc::new(ConfigLock::new(config))
     }
 
     async fn run_info_theme(config: &GlobalConfig) -> String {
@@ -1708,7 +1708,7 @@ mod session_target_tests {
         cfg.use_agent_obj(agent).unwrap();
         cfg.use_session(Some("review-12345")).unwrap();
         let original_key = cfg.session.as_ref().unwrap().storage_key();
-        let config = Arc::new(parking_lot::RwLock::new(cfg));
+        let config = Arc::new(ConfigLock::new(cfg));
         let result = run_command_with_output(
             &config,
             crate::utils::create_abort_signal(),
@@ -1737,7 +1737,7 @@ mod session_target_tests {
         cfg.tui_after_editor = Some(Box::new(move || {
             after.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }));
-        let config = Arc::new(parking_lot::RwLock::new(cfg));
+        let config = Arc::new(ConfigLock::new(cfg));
         run_command_with_output(
             &config,
             crate::utils::create_abort_signal(),
@@ -1769,7 +1769,7 @@ mod compact_session_tests {
     use crate::config::WorkingMode;
 
     fn command_config() -> GlobalConfig {
-        Arc::new(parking_lot::RwLock::new(Config {
+        Arc::new(ConfigLock::new(Config {
             working_mode: WorkingMode::Cmd,
             ..Default::default()
         }))
@@ -1828,7 +1828,7 @@ mod compact_session_tests {
         agent.set_name("test-agent");
         cfg.use_agent_obj(agent).expect("agent created");
         // No session created - this tests the "No active session" path
-        let config = Arc::new(parking_lot::RwLock::new(cfg));
+        let config = Arc::new(ConfigLock::new(cfg));
 
         let (result, output_str) = run_compact_for_test(&config, ".compact session").await;
         assert!(result.is_ok(), "command should succeed: {:?}", result);

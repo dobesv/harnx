@@ -62,7 +62,7 @@ async fn end_of_turn_reread_runs_continuation_turn_with_same_activation() -> Res
         return Ok(());
     };
 
-    let config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+    let config = Arc::new(ConfigLock::new(local_nats_config(NatsServerSpec {
         name: "local",
         url: server.url(),
         token: None,
@@ -145,7 +145,7 @@ async fn idle_concurrent_messages_fold_in_seq_order_into_single_turn() -> Result
         return Ok(());
     };
 
-    let config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+    let config = Arc::new(ConfigLock::new(local_nats_config(NatsServerSpec {
         name: "local",
         url: server.url(),
         token: None,

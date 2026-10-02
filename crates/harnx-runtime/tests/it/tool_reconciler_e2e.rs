@@ -7,6 +7,7 @@ use crate::common;
 
 use futures_util::{StreamExt, TryStreamExt};
 use harnx_core::event::{AgentEvent, AgentEventSink};
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::config::{
     Config, GlobalConfig, ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV,
     LOCAL_CLUSTER_KEY,
@@ -20,7 +21,6 @@ use harnx_runtime::nats_worker::{
 use harnx_runtime::{NatsSession, NatsSessionConfig, SessionActivationRoute, SessionInitializer};
 use harnx_toolset::Registration;
 use harnx_toolset_server::TOOL_REGISTRY_BUCKET;
-use parking_lot::RwLock;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -190,7 +190,7 @@ async fn activate(
 
 /// Build the worker config for the e2e test with `time` and `plans` servers.
 fn e2e_worker_config(time_binary: PathBuf, plans_binary: PathBuf) -> GlobalConfig {
-    Arc::new(RwLock::new(Config {
+    Arc::new(ConfigLock::new(Config {
         model: harnx_core::model::Model::new("test", "test-model"),
         tool_servers: vec![
             ToolServerConfig {
@@ -268,7 +268,7 @@ fn capture_selected_tools(
 }
 
 fn single_time_server_config(time_binary: PathBuf) -> GlobalConfig {
-    Arc::new(RwLock::new(Config {
+    Arc::new(ConfigLock::new(Config {
         model: harnx_core::model::Model::new("test", "test-model"),
         tool_servers: vec![ToolServerConfig {
             name: "time".to_string(),

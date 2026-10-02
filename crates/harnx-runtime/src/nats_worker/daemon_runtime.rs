@@ -12,7 +12,7 @@ use super::daemon::{SessionActivate, SessionActivationRoute, WorkerActivationMod
 use super::daemon_background::BackgroundServices;
 use super::execution_control::{FinishCause, WorkerExecution};
 use super::server_reconciler::{tool_servers_for_activation, ServerReconciler};
-use crate::config::GlobalConfig;
+use crate::config::{ConfigLock, GlobalConfig};
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
 use anyhow::{Context, Result};
@@ -778,7 +778,7 @@ impl WorkerRuntime {
                     &activation.session_id,
                     worker.lease.replicas,
                 );
-                let turn_config = Arc::new(parking_lot::RwLock::new(worker.config.read().clone()));
+                let turn_config = Arc::new(ConfigLock::new(worker.config.read().clone()));
                 execution
                     .finish(
                         &backend,

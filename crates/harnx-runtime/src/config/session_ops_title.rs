@@ -598,28 +598,26 @@ impl Config {
             return Ok(None);
         }
 
-        {
-            let mut guard = config.write();
-            let Some(session) = guard.session.as_mut() else {
-                return Ok(None);
-            };
-            if session.id != session_id {
-                return Ok(None);
-            }
-            crate::config::session::record_title(session, title.clone(), false, tokens)?;
-        }
-
-        Ok(Some(title))
+        let recorded = crate::config::session::record_title(
+            config,
+            &session_id,
+            crate::config::session::TitleRecord {
+                title: title.clone(),
+                manual: false,
+                tokens,
+            },
+        )?;
+        Ok(recorded.then_some(title))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigLock;
     use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent, SessionEvent};
     use harnx_core::message::{Message, MessageContent};
     use harnx_core::session::Session;
-    use parking_lot::RwLock;
     use std::sync::{Arc, Mutex};
 
     // --- title-agent name resolution (#103) ---
@@ -816,7 +814,7 @@ mod tests {
         let mut session = crate::config::session::new(&config, "title-test", None).unwrap();
         crate::config::session::attach_memory_log(&mut session);
         config.session = Some(session);
-        Arc::new(RwLock::new(config))
+        Arc::new(ConfigLock::new(config))
     }
 
     fn assert_mid_loop_claim_guards(config: &GlobalConfig) {

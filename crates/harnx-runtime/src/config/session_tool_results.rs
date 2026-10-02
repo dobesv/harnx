@@ -205,7 +205,7 @@ mod tests {
 
     fn setup_session(id: &str, sink: &Arc<ContextMetadataSink>) -> (Session, crate::config::Input) {
         let config = Config::default();
-        let global_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let global_config = Arc::new(crate::config::ConfigLock::new(config.clone()));
         let input = crate::config::input::from_str(
             &global_config,
             "inspect repository",

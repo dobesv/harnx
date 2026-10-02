@@ -61,6 +61,7 @@ use futures_util::stream::StreamExt;
 use harnx_core::attachments::store_attachment_bytes_async;
 use harnx_core::attachments::{collect_cid_refs, CID_PREFIX};
 use harnx_core::cid_url::{CidUrl, SessionRef};
+use harnx_runtime::config::ConfigLock;
 use http::{Method, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -69,7 +70,6 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::graceful::GracefulShutdown,
 };
-use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -1087,7 +1087,7 @@ impl Server {
         let SearchRagReqBody { name, input } = serde_json::from_value(req_body)
             .map_err(|err| anyhow!("Invalid request body, {err}"))?;
 
-        let config = Arc::new(RwLock::new(self.config.clone()));
+        let config = Arc::new(ConfigLock::new(self.config.clone()));
 
         let abort_signal = create_abort_signal();
 
@@ -1135,7 +1135,7 @@ impl Server {
             model: embedding_model_id,
         } = req_body;
 
-        let config = Arc::new(RwLock::new(self.config.clone()));
+        let config = Arc::new(ConfigLock::new(self.config.clone()));
 
         let embedding_model = harnx_runtime::client::retrieve_model(
             &config.read().clients,
@@ -1209,7 +1209,7 @@ impl Server {
 
         let top_n = top_n.unwrap_or(documents.len());
 
-        let config = Arc::new(RwLock::new(self.config.clone()));
+        let config = Arc::new(ConfigLock::new(self.config.clone()));
 
         let reranker_model = harnx_runtime::client::retrieve_model(
             &config.read().clients,
@@ -2551,7 +2551,7 @@ mod tests {
 
     #[tokio::test]
     async fn models_endpoint_omits_default_alias_without_resolved_model() {
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = Arc::new(ConfigLock::new(Config::default()));
         let server = Server::new(&config, PathBuf::from("web-assets"));
 
         let body = response_json(server.list_models().expect("list models response")).await;
@@ -2562,7 +2562,7 @@ mod tests {
     #[tokio::test]
     async fn models_endpoint_keeps_default_alias_and_real_model_id() {
         let sandbox = TestConfigSandbox::new();
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Server::new(&config, PathBuf::from("web-assets"));
 
         let body = response_json(server.list_models().expect("list models response")).await;
@@ -2580,7 +2580,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         let mut cfg = sandbox.config();
         cfg.model = Default::default();
-        let config = Arc::new(RwLock::new(cfg));
+        let config = Arc::new(ConfigLock::new(cfg));
         let server = Server::new(&config, PathBuf::from("web-assets"));
 
         let body = response_json(server.list_models().expect("list models response")).await;
@@ -2619,7 +2619,7 @@ mod tests {
             "url: nats://localhost:4222\nagents:\n  - name: sisyphus\n    description: Remote assistant\n    role: assistant\n  - name: remote-helper\n    role: subagent\n",
         );
 
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
         let unfiltered = response_json(server.list_agents(None).await.expect("all agents")).await;
@@ -2992,7 +2992,7 @@ mod tests {
             .join("s1");
         assert!(!escaped_attachments.exists());
 
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, PathBuf::from("web-assets")));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -3169,7 +3169,7 @@ mod tests {
         {
             return Ok(None);
         }
-        let global_config = Arc::new(RwLock::new(config));
+        let global_config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&global_config, PathBuf::from("web-assets"));
         Ok(Some((server, cid)))
     }
@@ -3229,7 +3229,7 @@ mod tests {
     async fn get_attachment_rejects_malformed_cid_before_session_read() -> Result<()> {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let global_config = Arc::new(RwLock::new(sandbox.config()));
+        let global_config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Server::new(&global_config, PathBuf::from("web-assets"));
         let response = call_get_attachment_handler(
             &server,
@@ -3325,7 +3325,7 @@ mod tests {
             .join("attachments")
             .join(&session);
         assert!(!attachments_dir.exists());
-        let global_config = Arc::new(RwLock::new(config));
+        let global_config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&global_config, PathBuf::from("web-assets"));
 
         let response =
@@ -3394,7 +3394,7 @@ mod tests {
         {
             return Ok(());
         }
-        let global_config = Arc::new(RwLock::new(config));
+        let global_config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&global_config, PathBuf::from("web-assets"));
         let response =
             call_get_attachment_handler(&server, &attachment_url(&session, &cid)).await?;
@@ -3410,7 +3410,7 @@ mod tests {
     fn upload_attachments_success_returns_cid_refs() {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         let boundary = "boundary123";
@@ -3466,7 +3466,7 @@ mod tests {
     fn upload_attachments_malformed_multipart_returns_400() {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a malformed multipart body (missing proper headers)
@@ -3497,7 +3497,7 @@ mod tests {
     fn upload_attachments_no_parts_returns_400() {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a valid multipart with no attachment fields (field named "other")
@@ -3532,7 +3532,7 @@ mod tests {
     fn upload_attachments_oversized_returns_413() {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a multipart body that exceeds MAX_UPLOAD_BYTES
@@ -3561,7 +3561,7 @@ mod tests {
     fn upload_attachments_oversized_content_length_header_returns_413_early() {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a request with a Content-Length header that exceeds MAX_UPLOAD_BYTES
@@ -3586,7 +3586,7 @@ mod tests {
     fn upload_attachments_unsupported_content_type_returns_415() {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a multipart with an unsupported MIME type
@@ -3618,7 +3618,7 @@ mod tests {
         sandbox.write_agent("plain", "You are plain.");
         // Server::new snapshots the config at construction, so the sandbox can
         // be dropped afterwards without affecting the built Server.
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         Server::new(&config, assets_dir)
     }
 
@@ -3858,7 +3858,7 @@ mod tests {
         // Configure server in cluster-client mode
         let mut config = sandbox.config();
         config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
         let agents = response_json(server.list_agents(None).await.expect("agents")).await;
@@ -3900,7 +3900,7 @@ mod tests {
         );
 
         // Default config (no HARNX_NATS_SERVER) uses NatsRouting::Default
-        let config = Arc::new(RwLock::new(sandbox.config()));
+        let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
         let agents = response_json(server.list_agents(None).await.expect("agents")).await;
@@ -3933,7 +3933,7 @@ mod tests {
         // Configure server in cluster-client mode with 'mycluster' as default
         let mut config = sandbox.config();
         config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
         let agents = response_json(server.list_agents(None).await.expect("agents")).await;
@@ -3969,7 +3969,7 @@ mod tests {
         // Configure server in cluster-client mode
         let mut config = sandbox.config();
         config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
         let agents = response_json(server.list_agents(None).await.expect("agents")).await;
@@ -4014,7 +4014,7 @@ mod tests {
 
         let mut config = sandbox.config();
         config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
         let agents = response_json(server.list_agents(None).await.expect("agents")).await;
@@ -4056,7 +4056,7 @@ mod tests {
         // Configure server in cluster-client mode
         let mut config = sandbox.config();
         config.nats_routing = NatsRouting::Cluster("mycluster".to_string());
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
         // Test role=assistant filter

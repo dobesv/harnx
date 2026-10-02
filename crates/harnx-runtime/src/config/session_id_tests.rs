@@ -131,5 +131,9 @@ async fn isolated_session_config() -> Option<(
         agents: Vec::new(),
     });
     config.set_remote_agent("test-agent".to_string(), TEST_CLUSTER.to_string());
-    Some((Arc::new(RwLock::new(config)), child, store_dir))
+    Some((
+        Arc::new(crate::config::ConfigLock::new(config)),
+        child,
+        store_dir,
+    ))
 }

@@ -281,7 +281,7 @@ fn spawn_targeted_daemon(
     worker_id: &'static str,
     call_fn: harnx_runtime::agent_loop::AgentCallFn,
 ) -> tokio::task::JoinHandle<Result<()>> {
-    let config = Arc::new(RwLock::new(Config::default()));
+    let config = Arc::new(ConfigLock::new(Config::default()));
     tokio::spawn(async move {
         run_worker_daemon(
             config,

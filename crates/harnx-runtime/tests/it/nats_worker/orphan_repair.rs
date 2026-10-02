@@ -81,7 +81,7 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
         return Ok(());
     };
 
-    let config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+    let config = Arc::new(ConfigLock::new(local_nats_config(NatsServerSpec {
         name: "local",
         url: server.url(),
         token: None,

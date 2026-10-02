@@ -9,7 +9,7 @@ use harnx_core::event::{AgentEvent, AgentSource, SessionEvent};
 use harnx_render::pretty_error_string;
 use harnx_runtime::config::{
     dump_entries_jsonl, dump_entries_yaml, load_session_for_render, render_metadata_json,
-    render_metadata_yaml, SessionFormat, SessionInspectionCommand,
+    render_metadata_yaml, ConfigLock, SessionFormat, SessionInspectionCommand,
 };
 use harnx_runtime::nats_session_log::NatsSessionLog;
 use harnx_runtime::nats_session_metadata::SessionMetadataStore;
@@ -1939,7 +1939,7 @@ impl Tui {
         let (agent, session) = (agent.clone(), origin_session.clone());
         // Prepare on a separate config so a missing origin agent cannot destroy
         // the current selection. Picker switching runs while the prompt is idle.
-        let candidate = std::sync::Arc::new(parking_lot::RwLock::new(self.config.read().clone()));
+        let candidate = std::sync::Arc::new(ConfigLock::new(self.config.read().clone()));
         match harnx_runtime::config::Config::use_agent(
             &candidate,
             &agent,

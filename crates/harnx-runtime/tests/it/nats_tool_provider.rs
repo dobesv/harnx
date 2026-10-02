@@ -10,6 +10,7 @@ use harnx_core::execution_context::{
 };
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::tool::{ToolCall, ToolError, ToolProvider, ToolResult};
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::config::{Config, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use harnx_runtime::nats_session_metadata::{
     execution_contexts, SessionInitializer, SessionMetadata, SessionMetadataStore,
@@ -21,7 +22,6 @@ use harnx_toolset_server::{
     registration_key, serve_over_nats, TOOL_PROTOCOL_VERSION, TOOL_REGISTRY_BUCKET,
     TOOL_SCHEMA_VERSION,
 };
-use parking_lot::RwLock;
 use serde_json::json;
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -355,7 +355,7 @@ async fn assert_context_flows_from_tool_to_session_enumeration(
     let mut session = metadata.base_session();
     let sink = Arc::new(backend) as Arc<dyn harnx_runtime::config::session::SessionAppendSink>;
     session.runtime = Some(Arc::new(sink));
-    let config = Arc::new(RwLock::new(Config::default()));
+    let config = Arc::new(ConfigLock::new(Config::default()));
     let input = harnx_runtime::config::input::from_str(
         &config,
         "inspect context",
@@ -415,7 +415,7 @@ async fn assert_per_call_timeout_enforced(provider: &NatsToolProvider) -> Result
 }
 
 async fn assert_context_declarations_and_precedence(instance_id: &ServerScope) {
-    let config = Arc::new(RwLock::new(Config::default()));
+    let config = Arc::new(ConfigLock::new(Config::default()));
     let context = harnx_runtime::tool::build_tool_eval_context(
         harnx_runtime::tool::BuildToolEvalContextParams::new(&config, instance_id)
             .with_agent_use_tools(Some("*")),

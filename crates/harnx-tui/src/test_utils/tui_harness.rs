@@ -8,7 +8,7 @@ use crate::types::Tui;
 use harnx_runtime::config::{Config, GlobalConfig};
 use harnx_runtime::test_utils::SyncHarness;
 
-use parking_lot::RwLock;
+use harnx_runtime::config::ConfigLock;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use std::sync::Arc;
@@ -69,7 +69,7 @@ impl TuiTestHarness {
     }
 
     fn create_test_config() -> GlobalConfig {
-        Arc::new(RwLock::new(Config::default()))
+        Arc::new(ConfigLock::new(Config::default()))
     }
 
     /// Get the current screen contents as a string.

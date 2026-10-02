@@ -36,7 +36,7 @@ use harnx_runtime::utils::*;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use parking_lot::RwLock;
+use harnx_runtime::config::ConfigLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -181,7 +181,7 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
         _ => WorkingMode::Tui,
     };
     let info_flag = legacy_info_flag(&cli);
-    let config = Arc::new(RwLock::new(
+    let config = Arc::new(ConfigLock::new(
         init_frontend_config(working_mode, info_flag).await?,
     ));
     Ok((run(config, cli, text).await.err(), 0))
@@ -794,7 +794,7 @@ async fn configure_agent_and_session(
 
 fn apply_cli_model_and_tool_options(config: &GlobalConfig, cli: &Cli) -> Result<()> {
     if let Some(model_id) = &cli.model {
-        config.write().set_model(model_id)?;
+        Config::switch_model(config, model_id)?;
     }
     if !cli.tool.is_empty() {
         let existing = config
@@ -1473,7 +1473,7 @@ mod resume_tests {
             session,
             ..Default::default()
         };
-        Arc::new(RwLock::new(config))
+        Arc::new(ConfigLock::new(config))
     }
 
     fn session_with_message(id: &str) -> Session {
@@ -1521,7 +1521,7 @@ mod resume_tests {
             session: Some(session),
             ..Default::default()
         };
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
 
         assert_eq!(
             session_resume_command(&config).unwrap(),
@@ -1536,7 +1536,7 @@ mod resume_tests {
             session: Some(session_with_message("review-12345")),
             ..Config::default()
         };
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
 
         assert_eq!(
             session_resume_command(&config).unwrap(),
@@ -1556,7 +1556,7 @@ mod resume_tests {
             session: Some(session),
             ..Default::default()
         };
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
 
         assert_eq!(
             session_resume_command(&config).unwrap(),
@@ -1575,7 +1575,7 @@ mod resume_tests {
             session: Some(session),
             ..Default::default()
         };
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(ConfigLock::new(config));
 
         assert_eq!(
             session_resume_command(&config).unwrap(),

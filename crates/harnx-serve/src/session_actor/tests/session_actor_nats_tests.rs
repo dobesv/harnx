@@ -216,7 +216,7 @@ fn live_worker_binary() -> Option<std::path::PathBuf> {
 }
 
 async fn reserve_session(config: &Config, agent: &str) -> String {
-    let scoped = Arc::new(parking_lot::RwLock::new(config.clone()));
+    let scoped = Arc::new(harnx_runtime::config::ConfigLock::new(config.clone()));
     scoped
         .write()
         .use_agent_by_name(agent)

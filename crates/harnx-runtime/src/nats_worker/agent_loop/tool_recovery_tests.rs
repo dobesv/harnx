@@ -57,7 +57,9 @@ fn mixed_context(scope: harnx_core::instance::ServerScope) -> crate::tool::ToolE
 #[tokio::test]
 async fn mixed_recovery_preserves_original_positions_including_anonymous_calls() -> Result<()> {
     let scope = harnx_core::instance::ServerScope::new();
-    let config = Arc::new(parking_lot::RwLock::new(crate::config::Config::default()));
+    let config = Arc::new(crate::config::ConfigLock::new(
+        crate::config::Config::default(),
+    ));
     let mut repair = build_tool_repair_context(&config);
     let mut declaration: harnx_core::tool::ToolDeclaration = serde_json::from_value(json!({
         "name": "rerun", "description": "", "parameters": {"type": "object", "properties": {}}

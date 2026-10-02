@@ -198,7 +198,10 @@ impl HarnxAgent {
             .context("failed to load config")
             .map_err(acp_error)?;
         config.apply_frontend_nats_routing();
-        Ok((route, Arc::new(parking_lot::RwLock::new(config))))
+        Ok((
+            route,
+            Arc::new(harnx_runtime::config::ConfigLock::new(config)),
+        ))
     }
 
     /// Handle `session/new` — create NATS-backed session via local worker bootstrap.

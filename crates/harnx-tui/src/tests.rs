@@ -74,9 +74,9 @@ use harnx_core::event::{
     ToolEvent, ToolKind, ToolStatus, UserEvent,
 };
 use harnx_runtime::client::{Client, ClientConfig, TestStateGuard};
+use harnx_runtime::config::ConfigLock;
 use harnx_runtime::config::{Config, GlobalConfig};
 use harnx_runtime::test_utils::{MockClient, MockTurnBuilder};
-use parking_lot::RwLock;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 use std::sync::{
@@ -113,7 +113,7 @@ macro_rules! usage_event {
 }
 
 pub(crate) fn test_config() -> GlobalConfig {
-    let config = Arc::new(RwLock::new(Config::default()));
+    let config = Arc::new(ConfigLock::new(Config::default()));
     {
         let mut guard = config.write();
         guard.clients = vec![ClientConfig::Unknown];
@@ -8905,8 +8905,8 @@ async fn session_picker_no_error_on_successful_fetch() {
 #[tokio::test]
 async fn session_picker_delivery_path_carries_error() {
     use crate::test_utils::TuiTestHarness;
+    use harnx_runtime::config::ConfigLock;
     use harnx_runtime::config::{Config, NatsServerConfig};
-    use parking_lot::RwLock;
     use std::sync::Arc;
 
     let nats_server = NatsServerConfig {
@@ -8928,7 +8928,7 @@ async fn session_picker_delivery_path_carries_error() {
         ..Config::default()
     };
 
-    let global_config = Arc::new(RwLock::new(config));
+    let global_config = Arc::new(ConfigLock::new(config));
     let mut harness = TuiTestHarness::with_config(global_config).await;
 
     // Invoke the real delivery path with a timeout to ensure fast test completion.

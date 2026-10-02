@@ -404,16 +404,16 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigLock;
     use crate::config::{session, Config, ConfigData, GlobalConfig};
     use crate::tool::{ToolCall, ToolResult};
-    use parking_lot::RwLock;
     use serde_json::json;
     use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
     fn a_transient_note_is_sent_last() {
-        let config: GlobalConfig = Arc::new(RwLock::new(Config::default()));
+        let config: GlobalConfig = Arc::new(ConfigLock::new(Config::default()));
         let mut input = from_str(&config, "hello", None);
         let plain = build_messages(&input, &config).unwrap();
 
@@ -463,7 +463,7 @@ mod tests {
         let mut sess = session::new(&config, "trace-repro", None).unwrap();
         session::attach_memory_log(&mut sess);
         config.session = Some(sess);
-        let global_config: GlobalConfig = Arc::new(RwLock::new(config));
+        let global_config: GlobalConfig = Arc::new(ConfigLock::new(config));
 
         let call = ToolCall::new(
             "Edit".to_string(),

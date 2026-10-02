@@ -51,7 +51,7 @@ fn build_fixture_config(
     server_url: &str,
     targeted: bool,
     binary: &std::path::Path,
-) -> Arc<parking_lot::RwLock<Config>> {
+) -> harnx_runtime::config::GlobalConfig {
     let config = local_nats_runtime_config(server_url);
     {
         let mut config = config.write();

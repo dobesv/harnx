@@ -285,7 +285,7 @@ async fn explicit_agent_controls_completion_and_info_even_with_other_active_agen
             .await
             .is_err()
     );
-    let global = std::sync::Arc::new(parking_lot::RwLock::new(cfg));
+    let global = std::sync::Arc::new(harnx_runtime::config::ConfigLock::new(cfg));
     for format in ["json", "yaml"] {
         let mut output = Vec::new();
         harnx_runtime::commands::run_command_with_output(

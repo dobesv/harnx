@@ -16,7 +16,7 @@ pub(crate) fn test_config(url: &str) -> GlobalConfig {
     .expect("parse test agent");
     agent.set_resolved_model(harnx_core::model::Model::new("test", "test-model"));
 
-    Arc::new(parking_lot::RwLock::new(Config {
+    Arc::new(harnx_runtime::config::ConfigLock::new(Config {
         data: harnx_core::config_data::ConfigData {
             model_id: "test:test-model".to_string(),
             dry_run: false,
