@@ -80,6 +80,16 @@ test = ["harnx"]
 on-affected = ["harnx-fs-tools", "harnx-claude-compatible-hook-server"]
 test = ["harnx-runtime"]
 
+# Tool reservation client integration tests launch the attachment server.
+[[test-edge]]
+on-affected = ["harnx-attachment-tools"]
+test = ["harnx-runtime"]
+
+# MCP bootstrap/handler tests launch worker, filesystem, and attachment servers.
+[[test-edge]]
+on-affected = ["harnx-worker", "harnx-fs-tools", "harnx-attachment-tools"]
+test = ["harnx-mcp-server"]
+
 [[test-edge]]
 on-affected = ["harnx-plans-tools"]
 test = ["harnx-runtime", "harnx-mcp-bridge"]

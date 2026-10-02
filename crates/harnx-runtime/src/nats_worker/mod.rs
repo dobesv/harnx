@@ -46,6 +46,7 @@ mod session_watcher;
 mod subagent_progress;
 mod subagent_toolset;
 mod tool_registry;
+pub mod tool_reservation;
 mod tool_supervisor;
 mod wind_up;
 

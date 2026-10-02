@@ -45,6 +45,12 @@ pub struct WorkerDaemonConfig {
     /// processes instead of discovering independently deployed ones.
     pub manage_servers: bool,
     activation_ack_wait: Duration,
+    /// Frontends renew every third of this window. Lost replies and crashes
+    /// cannot keep a reservation alive indefinitely.
+    pub(super) tool_reservation_ttl: Duration,
+    /// Keep idle processes briefly so back-to-back sessions reuse them instead
+    /// of paying startup and registration costs again.
+    pub(super) tool_server_linger: Duration,
 }
 
 impl WorkerDaemonConfig {
@@ -58,6 +64,8 @@ impl WorkerDaemonConfig {
             lease: NatsLeaseConfig::default(),
             manage_servers: false,
             activation_ack_wait: WORK_NOTIFY_ACK_WAIT,
+            tool_reservation_ttl: Duration::from_secs(60),
+            tool_server_linger: Duration::from_secs(60),
         }
     }
 
@@ -79,6 +87,8 @@ impl WorkerDaemonConfig {
             lease: NatsLeaseConfig::default(),
             manage_servers: true,
             activation_ack_wait: WORK_NOTIFY_ACK_WAIT,
+            tool_reservation_ttl: Duration::from_secs(60),
+            tool_server_linger: Duration::from_secs(60),
         })
     }
 
@@ -94,6 +104,19 @@ impl WorkerDaemonConfig {
                 worker_id: self.worker_id.clone(),
             },
         }
+    }
+
+    /// Shortens reservation expiry and server teardown in broker-backed tests.
+    #[doc(hidden)]
+    pub fn with_tool_reservation_timing_for_test(
+        mut self,
+        ttl: Duration,
+        linger: Duration,
+    ) -> Self {
+        assert!(ttl >= Duration::from_millis(3));
+        self.tool_reservation_ttl = ttl;
+        self.tool_server_linger = linger;
+        self
     }
 
     pub(super) fn activation_ack_wait(&self) -> Duration {

@@ -156,6 +156,13 @@ No allow variables or CLI options means deny-all for filesystem and bash tool se
 
 `HARNX_BASH_ENV_PASSTHROUGH` remains a comma-separated list of host environment variable names forwarded into bash or sandbox-run child processes. Example: `HARNX_BASH_ENV_PASSTHROUGH=GITHUB_TOKEN,SSH_AUTH_SOCK`.
 
+## MCP Server Envs
+
+Variables used by `harnx-mcp-server`:
+
+- **HARNX_MCP_USE_TOOLS**: Tool selectors to expose over MCP (comma-separated, brace-expansion supported, e.g. `fs_{read,write},bash_exec`). Used when `--use-tools` is omitted; CLI values replace this value when the flag is provided.
+- **HARNX_MCP_PACKAGE**: Package context for tool naming. When set, tools belonging to this package appear with package-unqualified names (e.g. `fs_read`, stripping the package prefix, not the server prefix) while cross-package tools use `pkg__server_tool` qualification. Overridden by `--package`.
+
 ## NATS Transport Envs
 
 These are set for you in normal use. Tool and hook servers receive them from

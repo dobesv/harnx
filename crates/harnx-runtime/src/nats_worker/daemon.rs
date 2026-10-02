@@ -383,6 +383,8 @@ struct WorkerRuntimeBuild {
 }
 
 struct PreparedWorkerDaemon {
+    _tool_reservations: tokio_util::task::AbortOnDropHandle<()>,
+    _readiness_publisher: tokio_util::task::AbortOnDropHandle<()>,
     runtime: Arc<WorkerRuntime>,
     consumer: jetstream::consumer::Consumer<pull::Config>,
 }
@@ -455,6 +457,7 @@ async fn prepare_worker_daemon_runtime(
         return Ok(None);
     }
     let consumer = startup.consumer.clone();
+    let daemon = setup.daemon.clone();
     let runtime = build_worker_runtime(WorkerRuntimeBuild {
         setup,
         startup,
@@ -463,7 +466,34 @@ async fn prepare_worker_daemon_runtime(
         lease_bucket,
         activation_failures,
     });
-    Ok(Some(PreparedWorkerDaemon { runtime, consumer }))
+    finish_worker_daemon_runtime(runtime, consumer, &daemon, readiness).await
+}
+
+async fn finish_worker_daemon_runtime(
+    runtime: Arc<WorkerRuntime>,
+    consumer: async_nats::jetstream::consumer::Consumer<
+        async_nats::jetstream::consumer::pull::Config,
+    >,
+    daemon: &WorkerDaemonConfig,
+    readiness: &Option<harnx_healthz::Readiness>,
+) -> Result<Option<PreparedWorkerDaemon>> {
+    let Some(tool_reservations) = await_startup_or_shutdown(
+        &runtime.shutdown,
+        readiness,
+        super::tool_reservation::handler::subscribe(&runtime, daemon.tool_reservation_ttl),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let readiness_publisher =
+        spawn_readiness_publisher(runtime.client.clone(), daemon, &runtime.identity)?;
+    Ok(Some(PreparedWorkerDaemon {
+        runtime,
+        consumer,
+        _tool_reservations: tool_reservations,
+        _readiness_publisher: readiness_publisher,
+    }))
 }
 
 fn build_worker_runtime(build: WorkerRuntimeBuild) -> Arc<WorkerRuntime> {
@@ -570,8 +600,12 @@ pub async fn run_worker_daemon_with_shutdown(
         call_fn,
         shutdown: shutdown.clone(),
     };
-    let Some(PreparedWorkerDaemon { runtime, consumer }) =
-        prepare_worker_daemon_runtime(setup, &readiness).await?
+    let Some(PreparedWorkerDaemon {
+        runtime,
+        consumer,
+        _tool_reservations,
+        _readiness_publisher,
+    }) = prepare_worker_daemon_runtime(setup, &readiness).await?
     else {
         return Ok(());
     };

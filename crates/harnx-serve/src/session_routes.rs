@@ -525,10 +525,11 @@ mod tests {
     #[tokio::test]
     async fn create_session_json_returns_created() {
         harnx_core::require_nextest();
+        // Broker discovery must use this test's data directory, not the runner's store.
+        let sandbox = TestConfigSandbox::new();
         if !crate::test_support::ensure_test_nats().await {
             return;
         }
-        let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("session-creator", "You create sessions.");
         let global = Arc::new(RwLock::new(sandbox.config()));
         let server = Server::new(&global, std::path::PathBuf::from("web-assets"));

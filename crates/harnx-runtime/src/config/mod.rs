@@ -25,6 +25,7 @@ pub mod session_ops_title;
 mod session_persistence;
 mod session_tool_results;
 mod settings_split;
+mod tool_selection;
 mod tool_servers_split;
 
 pub use self::env_split::load_env_file;
@@ -832,102 +833,6 @@ impl Config {
             }
         }
         Ok(())
-    }
-
-    pub fn select_tools(&self, agent: &AgentConfig) -> Option<Vec<ToolDeclaration>> {
-        if !self.tool_use {
-            return None;
-        }
-        let use_tools = agent.use_tools()?;
-        let use_tools_str = use_tools.join(",");
-        // Handoff declarations must be spelled relative to this agent's package
-        // so the tool names sent to the LLM match what the engine can decode
-        // and what `build_tool_eval_context` allow-lists (#709).
-        let active_pkg =
-            harnx_core::package_namespace::pkg_from_qualified(agent.name()).map(str::to_string);
-        let (declarations, _) =
-            self.tool_declarations_for_use_tools(Some(&use_tools_str), active_pkg.as_deref());
-        let tool_names = self.collect_selected_tool_names(&use_tools, &declarations);
-
-        let mut functions: Vec<ToolDeclaration> = declarations
-            .iter()
-            .filter(|v| tool_names.contains(&v.name))
-            .cloned()
-            .collect();
-        self.merge_agent_owned_tools(&mut functions, &tool_names);
-
-        if functions.is_empty() {
-            None
-        } else {
-            Some(functions)
-        }
-    }
-
-    /// Resolve the concrete set of tool names selected by `use_tools`,
-    /// expanding toolset names and glob selectors against the available
-    /// `declarations`.
-    fn collect_selected_tool_names(
-        &self,
-        use_tools: &[String],
-        declarations: &[ToolDeclaration],
-    ) -> HashSet<String> {
-        let declaration_names: HashSet<String> =
-            declarations.iter().map(|v| v.name.to_string()).collect();
-        let mut tool_names: HashSet<String> = HashSet::new();
-        for item in use_tools.iter().map(|s| s.trim()) {
-            let sanitized_item = harnx_core::package_namespace::sanitize_for_tool_name(item);
-            if let Some(values) = self.toolsets.get(item).or_else(|| {
-                (sanitized_item != item)
-                    .then(|| self.toolsets.get(&sanitized_item))
-                    .flatten()
-            }) {
-                tool_names.extend(
-                    values
-                        .iter()
-                        .filter(|v| declaration_names.contains(v.as_str()))
-                        .cloned(),
-                );
-            } else {
-                let selector = tool_name_selector(item);
-                let sanitized_selector =
-                    (sanitized_item != item).then(|| tool_name_selector(&sanitized_item));
-                tool_names.extend(
-                    declaration_names
-                        .iter()
-                        .filter(|name| {
-                            selector.is_match(name)
-                                || sanitized_selector
-                                    .as_ref()
-                                    .is_some_and(|sanitized| sanitized.is_match(name))
-                        })
-                        .cloned(),
-                );
-            }
-        }
-        tool_names
-    }
-
-    /// Merge in any agent-owned tool declarations (e.g. handoff tools, builtins)
-    /// that are permitted by `tool_names` but not already present in `functions`.
-    /// The `tool_names` whitelist ensures `agent.tools()` cannot smuggle in tools
-    /// that `use_tools` did not request.
-    fn merge_agent_owned_tools(
-        &self,
-        functions: &mut Vec<ToolDeclaration>,
-        tool_names: &HashSet<String>,
-    ) {
-        let Some(active_agent) = &self.agent else {
-            return;
-        };
-        let existing_names: HashSet<String> =
-            functions.iter().map(|v| v.name.to_string()).collect();
-        functions.extend(
-            active_agent
-                .tools()
-                .declarations()
-                .into_iter()
-                .filter(|v| tool_names.contains(&v.name) && !existing_names.contains(&v.name)),
-        );
     }
 
     pub fn editor(&self) -> Result<String> {

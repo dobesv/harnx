@@ -117,13 +117,21 @@ async fn handle_list_sessions(
 }
 
 async fn handle_new_session(
-    agent: &HarnxAgent,
+    agent: &Arc<HarnxAgent>,
     request: NewSessionRequest,
     responder: acp::Responder<NewSessionResponse>,
     cx: AcpConnection,
 ) -> acp::Result<()> {
     agent.set_connection(cx).await;
-    responder.respond(agent.new_session(request).await?)
+    let agent = Arc::clone(agent);
+    // session/new overflowed the Windows main stack during local bootstrap.
+    // Poll startup on Tokio's worker stack, keeping dispatch ordered by joining.
+    let response = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        agent.new_session(request).await
+    }))
+    .await
+    .map_err(|error| crate::acp_error(error.into()))??;
+    responder.respond(response)
 }
 
 async fn handle_load_session(

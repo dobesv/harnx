@@ -41,6 +41,12 @@ mod orphan_repair;
 mod prompt_injection;
 #[path = "nats_worker/rewind_and_retraction.rs"]
 mod rewind_and_retraction;
+#[path = "nats_worker/support.rs"]
+mod support;
+#[path = "nats_worker/tool_reservation.rs"]
+mod tool_reservation;
+#[path = "nats_worker/tool_reservation_client.rs"]
+mod tool_reservation_client;
 #[path = "nats_worker/turn_continuation.rs"]
 mod turn_continuation;
 #[path = "nats_worker/turn_persistence.rs"]
