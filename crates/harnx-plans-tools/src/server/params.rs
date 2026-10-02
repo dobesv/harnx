@@ -35,10 +35,16 @@ pub(crate) struct AddPlanParams {
     pub(crate) executor: Option<String>,
     #[serde(default, deserialize_with = "blank_as_none")]
     pub(crate) git_branch: Option<String>,
+    /// GitHub `owner/repo` identifying the repository for `github_issue`.
     #[serde(default, deserialize_with = "blank_as_none")]
     pub(crate) github_owner_repo: Option<String>,
-    #[serde(default, deserialize_with = "zero_as_none")]
-    pub(crate) parent_issue: Option<u64>,
+    /// GitHub issue number in `github_owner_repo`. Metadata only; no GitHub sync.
+    /// Omit or pass null/0 for no issue.
+    #[serde(default, alias = "parent_issue", deserialize_with = "zero_as_none")]
+    pub(crate) github_issue: Option<u64>,
+    /// Absolute http/https task URL for any issue tracker. Metadata only; never fetched.
+    #[serde(default, deserialize_with = "blank_as_none")]
+    pub(crate) external_task_url: Option<String>,
     /// Accepted for older callers but left out of the schema, so a model
     /// sees one body parameter rather than two it must choose between.
     #[serde(default, deserialize_with = "blank_as_none")]
@@ -88,10 +94,17 @@ pub(crate) struct UpdatePlanParams {
     pub(crate) executor: Option<String>,
     #[serde(default, deserialize_with = "blank_as_none")]
     pub(crate) git_branch: Option<String>,
+    /// GitHub `owner/repo` identifying the repository for `github_issue`.
     #[serde(default, deserialize_with = "blank_as_none")]
     pub(crate) github_owner_repo: Option<String>,
-    #[serde(default, deserialize_with = "zero_as_none")]
-    pub(crate) parent_issue: Option<u64>,
+    /// GitHub issue number in `github_owner_repo`. Metadata only; no GitHub sync.
+    /// Omit or pass null/0 to leave it unchanged.
+    #[serde(default, alias = "parent_issue", deserialize_with = "zero_as_none")]
+    pub(crate) github_issue: Option<u64>,
+    /// Absolute http/https task URL for any issue tracker. Metadata only; never fetched.
+    /// Omit or pass null/blank to leave it unchanged.
+    #[serde(default, deserialize_with = "blank_as_none")]
+    pub(crate) external_task_url: Option<String>,
     #[serde(default)]
     pub(crate) tasks: Option<Vec<TaskSpec>>,
 }
@@ -281,8 +294,91 @@ fn blank_as_none<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<St
 }
 
 /// GitHub issue numbers start at 1, so `0` is a model's placeholder for
-/// "no parent issue".
+/// "no issue".
 fn zero_as_none<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
     let value = Option::<u64>::deserialize(deserializer)?;
     Ok(value.filter(|issue| *issue != 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn issue_metadata_placeholders_and_alias_deserialize_consistently() {
+        for field in ["github_issue", "parent_issue"] {
+            for (issue, expected) in [
+                (json!(null), None),
+                (json!(0), None),
+                (json!(2266), Some(2266)),
+            ] {
+                for (url, expected_url) in [
+                    (json!(null), None),
+                    (json!(" \t\n "), None),
+                    (
+                        json!("https://tracker.invalid/task"),
+                        Some("https://tracker.invalid/task"),
+                    ),
+                ] {
+                    let mut args = json!({"name": "test", "external_task_url": url});
+                    args[field] = issue.clone();
+                    let add: AddPlanParams = serde_json::from_value(args.clone()).unwrap();
+                    assert_eq!(add.github_issue, expected);
+                    assert_eq!(add.external_task_url.as_deref(), expected_url);
+                    let serialized = serde_json::to_value(&add).unwrap();
+                    assert_eq!(serialized["github_issue"], json!(expected));
+                    assert!(serialized.get("parent_issue").is_none());
+
+                    args.as_object_mut().unwrap().remove("name");
+                    args["plan"] = json!("cid:plan:pantheon%2Fatlas/abcDEF/test");
+                    let update: UpdatePlanParams = serde_json::from_value(args).unwrap();
+                    assert_eq!(update.github_issue, expected);
+                    assert_eq!(update.external_task_url.as_deref(), expected_url);
+                    assert!(serde_json::to_value(update)
+                        .unwrap()
+                        .get("parent_issue")
+                        .is_none());
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::from_value::<AddPlanParams>(json!({"name": "test"}))
+                .unwrap()
+                .github_issue,
+            None
+        );
+        assert_eq!(
+            serde_json::from_value::<UpdatePlanParams>(json!({"plan": "test"}))
+                .unwrap()
+                .external_task_url,
+            None
+        );
+    }
+
+    #[test]
+    fn issue_metadata_rejects_duplicate_aliases_and_invalid_types() {
+        for issue in [json!(-1), json!(1.5), json!("2266")] {
+            for field in ["github_issue", "parent_issue"] {
+                let mut args = json!({"name": "test"});
+                args[field] = issue.clone();
+                assert!(serde_json::from_value::<AddPlanParams>(args.clone()).is_err());
+                args.as_object_mut().unwrap().remove("name");
+                args["plan"] = json!("test");
+                assert!(serde_json::from_value::<UpdatePlanParams>(args).is_err());
+            }
+        }
+        for args in [
+            json!({"github_issue": 2266, "parent_issue": 2175}),
+            json!({"github_issue": null, "parent_issue": 2266}),
+            json!({"external_task_url": 2266}),
+        ] {
+            let mut add_args = args.clone();
+            add_args["name"] = json!("test");
+            assert!(serde_json::from_value::<AddPlanParams>(add_args).is_err());
+            let mut update_args = args;
+            update_args["plan"] = json!("test");
+            assert!(serde_json::from_value::<UpdatePlanParams>(update_args).is_err());
+        }
+    }
 }

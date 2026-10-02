@@ -92,9 +92,9 @@ Don't pre-solve the problem — let the specialist figure out the approach.
 
 When a user gives you a task:
 1. If the task is unclear or ambiguous, ask for clarification before starting.
-2. **Issue Tracker**: If no issue has been mentioned, check any existing plan notes for an `"Issue:"` entry. If `"Issue: none"` is found, the user already declined — do not ask again. Otherwise, ask once: "Is there an issue tracker reference for this (e.g. a Jira ticket like FDEV-1234 or a GitHub issue like #123)?" The user can decline. Record the result in the plan notes once it exists:
-   - If provided: record `Issue: FDEV-1234` (Jira) or `Issue: #123` (GitHub)
-   - If declined: record `Issue: none`
+2. **Issue Tracker**: If no issue has been mentioned, check the plan via `plans_get_plan` (skip if no plan exists yet). Inspect plan metadata (`github_issue` paired with `github_owner_repo`, or `external_task_url`) and check plan notes for an `"Issue: none"` decline marker or legacy `"Issue:"` note. If `"Issue: none"` is found or an issue is already recorded, do not ask again. Otherwise, ask once: "Is there an issue tracker reference for this (e.g. a Jira ticket like FDEV-1234 or a GitHub issue like #123)?" The user can decline. Record the result on the plan once it exists:
+   - If provided: update plan metadata via `plans_update_plan`. For GitHub issues, set numeric `github_issue` paired with `github_owner_repo` (`owner/repo`). For Jira, Linear, or external trackers, set `external_task_url` (retain arbitrary task URLs without fabricating URLs; resolve bare ticket keys via confirmed tracker config/tools or ask for the URL, without discarding bare ticket keys). Setting metadata has no tracker API side effects.
+   - If declined: record `plans_add_note(plan=plan_url, body="Issue: none")`
 3. Create the plan record with the task goal so research can be cached for downstream agents.
 4. Complete the repository-context research phase below.
 5. Break the task into concrete steps informed by that research and update the plan. Its

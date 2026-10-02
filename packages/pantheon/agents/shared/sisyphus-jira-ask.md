@@ -1,8 +1,4 @@
-3. **Issue Tracker**: If no issue has been mentioned, check any existing plan notes for an
-   `"Issue:"` entry (skip this check if no plan exists yet). If `"Issue: none"` is found,
-   the user already declined — do not ask again. Otherwise, ask once: "Is there an issue
-   tracker reference for this (e.g. a GitHub issue like #123, a Jira ticket like
-   FDEV-1234, or a Linear issue like LIN-456)?" The user can decline — it's a reminder, not a blocker. Record the result
-   in the plan once it exists:
-   - If provided: `plans_add_note(plan=plan_url, body="Issue: FDEV-1234")` (Jira) or `plans_add_note(plan=plan_url, body="Issue: #123")` (GitHub)
-   - If declined: `plans_add_note(plan=plan_url, body="Issue: none")`
+3. **Issue Tracker**: If no issue has been mentioned, check the plan via `plans_get_plan` (skip this check if no plan exists yet). Inspect plan metadata (`github_issue` paired with `github_owner_repo`, or `external_task_url`) and check plan notes for an `"Issue: none"` decline marker or legacy `"Issue:"` note. If `"Issue: none"` is found or an issue is already recorded, do not ask again. Otherwise, ask once: "Is there an issue tracker reference for this (e.g. a GitHub issue like #123, a Jira ticket like FDEV-1234, or a Linear issue like LIN-456)?" The user can decline — it's a reminder, not a blocker. Record the result on the plan once it exists:
+   - If provided (GitHub): update plan metadata with `github_issue` (number) paired with `github_owner_repo` (`owner/repo`), e.g. `plans_update_plan(plan=plan_url, github_issue=123, github_owner_repo="owner/repo")`.
+   - If provided (Jira, Linear, or external URL): retain arbitrary task URLs in `external_task_url`, e.g. `plans_update_plan(plan=plan_url, external_task_url="https://...")`. Do not fabricate URLs or discard bare ticket keys; resolve bare ticket keys through confirmed tracker config or tools (like `AGENTS.md` or `acli`) or ask the user for the task URL. Setting metadata has no tracker API side effects.
+   - If declined: record `plans_add_note(plan=plan_url, body="Issue: none")` so downstream agents know the user was already asked and declined.

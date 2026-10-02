@@ -71,6 +71,8 @@ fn plan_json(document: &PlanDocument, task_count: usize, note_count: usize) -> V
         "executor": document.front.executor,
         "git_branch": document.front.git_branch,
         "github_owner_repo": document.front.github_owner_repo,
+        "github_issue": document.front.github_issue,
+        "external_task_url": document.front.external_task_url,
         "created_at": document.front.created_at,
         "updated_at": document.front.updated_at,
         "task_count": task_count,
@@ -80,8 +82,9 @@ fn plan_json(document: &PlanDocument, task_count: usize, note_count: usize) -> V
 
 pub(crate) async fn add(
     context: &OperationContext<'_>,
-    params: AddPlanParams,
+    mut params: AddPlanParams,
 ) -> Result<CallToolResult, ErrorData> {
+    params.external_task_url = normalize_external_task_url(params.external_task_url)?;
     let caller = context.caller.ok_or_else(|| {
         ErrorData::invalid_params("caller session identity required to create plan", None)
     })?;
@@ -158,6 +161,8 @@ fn new_document(url: &CidUrl, params: &AddPlanParams, body: String) -> PlanDocum
             executor: params.executor.clone(),
             git_branch: params.git_branch.clone(),
             github_owner_repo: params.github_owner_repo.clone(),
+            github_issue: params.github_issue,
+            external_task_url: params.external_task_url.clone(),
             created_at: now_iso(),
             updated_at: None,
         },
@@ -200,6 +205,8 @@ pub(crate) async fn get(
         "executor": document.front.executor,
         "git_branch": document.front.git_branch,
         "github_owner_repo": document.front.github_owner_repo,
+        "github_issue": document.front.github_issue,
+        "external_task_url": document.front.external_task_url,
         "created_at": document.front.created_at,
         "updated_at": document.front.updated_at,
         "body": document.body,
@@ -232,9 +239,10 @@ fn plan_label(document: &PlanDocument, url: &CidUrl) -> String {
 
 pub(crate) async fn update(
     context: &OperationContext<'_>,
-    params: UpdatePlanParams,
+    mut params: UpdatePlanParams,
 ) -> Result<CallToolResult, ErrorData> {
     validate_update(&params)?;
+    params.external_task_url = normalize_external_task_url(params.external_task_url)?;
     let url = parse_plan_url(&params.plan)?;
     let exists = get_document(context.store, &url)
         .await
@@ -255,12 +263,6 @@ pub(crate) async fn update(
                 None,
             ));
         }
-    }
-    if exists && params.parent_issue.is_some() {
-        return Err(ErrorData::invalid_params(
-            "parent_issue can only be set when creating a plan, not when updating an existing plan",
-            None,
-        ));
     }
     let initial = serialize_plan(&PlanDocument {
         front: PlanFrontMatter {
@@ -346,6 +348,11 @@ fn update_document(
         .github_owner_repo
         .clone()
         .or(document.front.github_owner_repo);
+    document.front.github_issue = params.github_issue.or(document.front.github_issue);
+    document.front.external_task_url = params
+        .external_task_url
+        .clone()
+        .or(document.front.external_task_url);
     document.front.updated_at = Some(now_iso());
     serialize_plan(&document)
 }
@@ -392,4 +399,55 @@ pub(crate) async fn delete(
         message: format!("deleted plan {url}"),
         diff: diffs,
     })
+}
+
+fn normalize_external_task_url(value: Option<String>) -> Result<Option<String>, ErrorData> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    // URL parsers repair missing slashes and strip whitespace; don't silently store those inputs.
+    let valid = value.split_once("://").is_some_and(|(scheme, rest)| {
+        matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") && !rest.starts_with('/')
+    }) && !value
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\\')
+        && url::Url::parse(value).is_ok_and(|url| url.has_host());
+    if !valid {
+        return Err(ErrorData::invalid_params(
+            "external_task_url must be a valid absolute http or https URL",
+            None,
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_external_task_url;
+
+    #[test]
+    fn external_task_urls_are_validated_without_network_or_host_restrictions() {
+        assert_eq!(normalize_external_task_url(None).unwrap(), None);
+        for value in [
+            "https://tracker.invalid/task/2266?view=detail#comments",
+            "http://localhost:8080/tasks/2266",
+            "https://[::1]:8443/tasks/2266",
+            "HTTPS://tracker.invalid/tasks/2266",
+            "https://tracker.invalid/tasks/encoded%20space",
+        ] {
+            assert_eq!(
+                normalize_external_task_url(Some(value.to_string()))
+                    .unwrap()
+                    .as_deref(),
+                Some(value)
+            );
+            assert_eq!(
+                normalize_external_task_url(Some(format!(" \t{value}\n")))
+                    .unwrap()
+                    .as_deref(),
+                Some(value)
+            );
+        }
+    }
 }

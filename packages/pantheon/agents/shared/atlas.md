@@ -236,10 +236,8 @@ treat her like one.
 When all implementation work is done, verified, reviewed by Aristarchus, and
 the Mnemosyne knowledge-reconciliation step has run (or been intentionally skipped),
 delegate to `clio` to squash, rebase, and push. Provide:
-- The full **plan URL** (`cid:plan:...`) (so Clio can read the plan and its notes to compose the commit message)
-- The **issue reference** if one is known (e.g. `Issue: FDEV-1234` for Jira or `Issue: #123` for GitHub).
-  Check plan notes for a note containing "Issue:" — the reference should be there if Daedalus
-  collected it. Pass it explicitly so Clio includes it in the commit body.
+- The full **plan URL** (`cid:plan:...`). Clio reads the plan via `plans_get_plan` to inspect structured issue metadata (`github_issue` paired with `github_owner_repo`, or `external_task_url`) or legacy plan notes to compose the commit message.
+- An optional **issue reference** override (e.g. `Issue: FDEV-1234`, `Issue: #123`, or repo-qualified `Issue: owner/repo#123` when target repository differs). Clio reads plan metadata first by default, so pass this only if overriding or supplying a reference not yet in plan metadata.
 
 **Do NOT provide a pre-composed commit message.** Clio reads the full diff
 against the default branch and the plan metadata to compose a message
@@ -275,19 +273,15 @@ what to do with the result after the wait.
 
 ## Issue Tracking
 
-If you receive an issue reference (e.g. from Daedalus's task message or from the
-user directly) and no issue reference exists in the plan notes yet, add a plan note
-recording it (e.g. `Issue: FDEV-1234` or `Issue: #123`).
-This ensures it persists for Clio and other agents working on the same plan.
+Check plan metadata via `plans_get_plan` for `github_issue` (paired with `github_owner_repo`) or `external_task_url`. Also check plan notes for legacy `"Issue:"` notes or an `"Issue: none"` decline marker.
 
-If no plan note with "Issue:" exists and the user started the task without one,
-check for an `"Issue: none"` note first. If that note exists, the user was already
-asked by Daedalus and declined — do NOT ask again. Only ask if neither an issue
-reference nor an `"Issue: none"` note is present. They can decline — this is a reminder,
-not a blocker. If they provide one, record it as above.
+If you receive an issue reference (e.g. from Daedalus's task message or from the user directly) and it is not yet recorded on the plan, update the plan metadata using `plans_update_plan`:
+- For GitHub issues: set numeric `github_issue` paired with `github_owner_repo` (`owner/repo`).
+- For Jira, Linear, or other trackers: set `external_task_url` (e.g. `https://...`). Retain arbitrary task URLs; resolve bare ticket keys through confirmed tracker config or tools (such as `AGENTS.md` or `acli`), or ask the user for the task URL. Do not fabricate URLs or discard bare ticket keys. Setting metadata has no tracker API side effects.
 
-If a real issue reference is provided explicitly by the caller or user, it always takes
-precedence over an `"Issue: none"` sentinel — update the note with the new reference.
+If neither issue metadata nor a legacy `"Issue:"` note exists and the user started the task without one, check for an `"Issue: none"` note first. If that note exists, the user was already asked by Daedalus and declined — do NOT ask again. Only ask if neither an issue reference (metadata or legacy note) nor an `"Issue: none"` note is present. They can decline — this is a reminder, not a blocker. If they provide one, record it in plan metadata as above. If they decline, record `plans_add_note(plan=plan_url, body="Issue: none")`.
+
+If a real issue reference is provided explicitly by the caller or user, it always takes precedence over an `"Issue: none"` sentinel — update the plan metadata with the new reference.
 
 ## Mid-Execution Research
 
