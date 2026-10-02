@@ -1,6 +1,6 @@
 import { CancellationContext } from './CancellationContext';
 import { useCancellation } from './useCancellation';
-import { CompactionContext, type CompactionPhase } from './CompactionContext';
+import { CompactionContext, compactionAfterRunTerminal, type CompactionPhase } from './CompactionContext';
 import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
@@ -397,6 +397,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     },
     onRunTerminal: () => {
       cancellationRef.current.reset?.();
+      setCompactionPhase(compactionAfterRunTerminal);
     },
     onMessageAttachments: (messageId, attachments) => {
       dispatchAttachments({

@@ -973,13 +973,8 @@ impl NatsSession {
             .await
             .context("failed to inspect pending session before activation")?;
         let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
-        let Some(user_msg_seq) = effective.iter().rev().find_map(|(seq, entry)| {
-            matches!(
-                entry,
-                SessionLogEntry::Message { role, .. } if role.is_user()
-            )
-            .then_some(*seq)
-        }) else {
+        let Some(user_msg_seq) = harnx_core::session_reconstruct::latest_prompt_seq(&effective)
+        else {
             return Ok(None);
         };
         if requested_seq_status(&entries, user_msg_seq)? == RequestedSeqStatus::Covered {
