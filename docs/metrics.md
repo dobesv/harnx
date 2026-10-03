@@ -47,7 +47,7 @@ All exported metrics use the `harnx_` prefix.
 | `harnx_sandbox_hibernations_total` | Counter | `reason` | Kubernetes sandboxes suspended explicitly or after idle timeout. | `harnx-k8s-sandbox-tools` |
 | `harnx_activation_phase_seconds` | Histogram | `phase` | Duration of worker activation phases (`publish_to_delivery`, `delivery_to_admission`, `admission_to_lease`, `lease_to_turn_start`). Extended buckets: 0.005s to 300s. | `harnx-worker` |
 | `harnx_activations_received_total` | Counter | `attempt` | Activation deliveries received by workers (`first` or `redelivery`). | `harnx-worker` |
-| `harnx_activation_claims_total` | Counter | `outcome` | Activation claim dispositions (`claimed`, `busy`, `lease_held`, `same_delivery`, `preflight_not_ready`, `failure_budget_term`, `error`). | `harnx-worker` |
+| `harnx_activation_claims_total` | Counter | `outcome` | Activation claim dispositions (`claimed`, `busy`, `lease_held`, `same_delivery`, `preflight_not_ready`, `failure_budget_term`, `refused_term`, `delivery_limit_term`, `error`). | `harnx-worker` |
 | `harnx_activation_naks_total` | Counter | `reason` | Successfully NAKed activation deliveries by bounded reason (`busy`, `preflight_not_ready`, `shutdown`, `settlement_rejection`, `claim_error`, `preparation_error`). | `harnx-worker` |
 | `harnx_activation_redeliveries_total` | Counter | none | Activation redeliveries received by workers (delivery count > 1). | `harnx-worker` |
 | `harnx_activation_claim_deadlines_total` | Counter | none | Client/parent watchdog timeouts waiting for a worker to claim an activated session. | Client / parent (`harnx`, `harnx-serve`) |
@@ -123,7 +123,9 @@ The `harnx_activation_claims_total` counter categorizes the worker's decision fo
 - `lease_held`: Lease creation in the KV bucket found another holder for this session; the message was delayed-NAKed (NAK reason `busy`).
 - `same_delivery`: Duplicate delivery of an in-flight delivery attempt already being processed.
 - `preflight_not_ready`: `activation_is_ready` declined the activation before lease acquisition. This covers several cases: the lease-holder check found another worker holding the session (NAK reason `busy`), session metadata or routing was not ready (NAK reason `preflight_not_ready`), the worker was shutting down (NAK reason `shutdown`), or the activation was stale, cancelled, or missing metadata and was acked or terminated without a turn. Compare with `harnx_activation_naks_total` by reason to tell these apart; the `activation_claim_deferred` event only reports `reason="not_claimed"`.
-- `failure_budget_term`: Retries exceeded the activation failure budget; message was terminated with JetStream `Term` ack to stop poison loops.
+- `failure_budget_term`: The worker recorded an `Error` on the session and terminated the message with a JetStream `Term` ack, because the activation failed ten times before its turn started or its turn failed.
+- `refused_term`: The worker refused the activation on two deliveries, recorded why as an `Error` on the session, and terminated the message. A prompt with no durable run admission, such as one sent before run admissions existed, is refused this way.
+- `delivery_limit_term`: The activation had been delivered `MAX_ACTIVATION_DELIVERIES` (100) times, and the worker terminated it instead of NAKing it again. Usually a session that stayed busy for hours; the worker logs the session and the reason it would have NAKed.
 - `error`: Unexpected error occurred while attempting to claim the activation (e.g. NATS communication error).
 
 #### NAK Reasons

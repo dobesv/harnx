@@ -60,7 +60,10 @@ impl ActivationFailureTracker {
     }
 
     async fn snapshot(&self, key: &str) -> Result<(u64, u64)> {
-        let Some(entry) = self.store.entry(key.to_string()).await? else {
+        // Another worker may have counted the previous failure a moment ago. A
+        // follower that hasn't applied it would hand every retry of the CAS
+        // below the same stale revision.
+        let Some(entry) = harnx_nats_common::leader_reads::entry(&self.store, key).await? else {
             return Ok((0, 0));
         };
         if !matches!(entry.operation, kv::Operation::Put) {

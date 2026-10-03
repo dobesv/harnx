@@ -16,6 +16,19 @@ const WORK_NOTIFY_STREAM_PREFIX: &str = "WORK_NOTIFY_";
 const WORK_NOTIFY_CONSUMER_NAME: &str = "workers";
 pub(super) const WORK_NOTIFY_ACK_WAIT: Duration = Duration::from_secs(30);
 const WORK_NOTIFY_INACTIVE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
+/// Deliveries after which JetStream stops delivering an activation no worker
+/// settles, such as one that crashes every worker that takes it. Workers
+/// terminate an activation themselves at
+/// [`super::daemon_runtime::MAX_ACTIVATION_DELIVERIES`], below this, and log
+/// why; this limit only catches what they never get to. A message that
+/// reaches it is never delivered again, even if the limit is raised later, and
+/// NATS 2.12.5 and later keep it in the stream.
+const WORK_NOTIFY_MAX_DELIVER: i64 = 200;
+const _: () = assert!(super::daemon_runtime::MAX_ACTIVATION_DELIVERIES < WORK_NOTIFY_MAX_DELIVER);
+/// Deliveries that keep the plain ack wait before the backoff grows. They
+/// cover an activation deferred while its session is busy for a few minutes,
+/// or retried through the whole failure budget, without changing its timing.
+const WORK_NOTIFY_STEADY_DELIVERIES: usize = 30;
 const LOCAL_WORK_NOTIFY_STREAM: &str = "LOCAL_WORK_NOTIFY_V2";
 const LOCAL_NOTIFY_SUBJECT: &str = "session_scope.__local__.workers.*.sessions.notify";
 
@@ -305,35 +318,51 @@ pub(super) fn activation_headers(message_id: HeaderValue) -> async_nats::HeaderM
     headers
 }
 
+/// The ack waits JetStream gives an activation's successive deliveries, the
+/// last one repeating. NATS replaces the consumer's ack wait with the first
+/// entry, and it measures a delayed NAK against the entry for the delivery
+/// count too, so a worker asking for `delay` on a later delivery waits
+/// `entry - ack_wait` longer. The steady entries leave those delays and the
+/// progress heartbeat as they were for the deliveries an activation normally
+/// uses; one redelivered past them, by workers that keep crashing on it say,
+/// comes back less and less often.
+fn activation_backoff(ack_wait: Duration) -> Vec<Duration> {
+    let mut backoff = vec![ack_wait; WORK_NOTIFY_STEADY_DELIVERIES];
+    backoff.extend([2, 4, 10].map(|factor| ack_wait * factor));
+    backoff
+}
+
+fn activation_consumer_config(name: &str, subject: &str, ack_wait: Duration) -> pull::Config {
+    pull::Config {
+        durable_name: Some(name.to_string()),
+        deliver_policy: DeliverPolicy::All,
+        ack_wait,
+        filter_subject: subject.to_string(),
+        inactive_threshold: WORK_NOTIFY_INACTIVE_THRESHOLD,
+        max_deliver: WORK_NOTIFY_MAX_DELIVER,
+        backoff: activation_backoff(ack_wait),
+        ..Default::default()
+    }
+}
+
 pub(super) async fn ensure_activation_consumer(
     jetstream: &jetstream::Context,
     daemon: &WorkerDaemonConfig,
 ) -> Result<jetstream::consumer::Consumer<pull::Config>> {
     let (stream, consumer_name, subject) = consumer_route(jetstream, daemon).await?;
+    let config = activation_consumer_config(&consumer_name, &subject, daemon.activation_ack_wait());
+    // `create_consumer` also updates a consumer that already exists, which is
+    // how one created by an earlier version, without a delivery limit, gets
+    // this one. `get_or_create_consumer` would return it as it was. An update
+    // replaces the whole configuration, so `config` carries every field.
     let consumer = harnx_metrics::time_nats_operation(
         "consumer_create",
-        stream.get_or_create_consumer(
-            &consumer_name,
-            pull::Config {
-                durable_name: Some(consumer_name.clone()),
-                deliver_policy: DeliverPolicy::All,
-                ack_wait: daemon.activation_ack_wait(),
-                filter_subject: subject.clone(),
-                inactive_threshold: WORK_NOTIFY_INACTIVE_THRESHOLD,
-                max_deliver: -1,
-                ..Default::default()
-            },
-        ),
+        stream.create_consumer(config.clone()),
     )
     .await
     .with_context(|| format!("create worker consumer '{consumer_name}'"))?;
     if daemon.activation_mode == WorkerActivationMode::WorkerTargeted {
-        validate_targeted_consumer(
-            &consumer,
-            &consumer_name,
-            &subject,
-            daemon.activation_ack_wait(),
-        )?;
+        validate_targeted_consumer(&consumer, &consumer_name, &config)?;
     }
     Ok(consumer)
 }
@@ -371,31 +400,34 @@ async fn consumer_route(
 fn validate_targeted_consumer(
     consumer: &jetstream::consumer::Consumer<pull::Config>,
     consumer_name: &str,
-    subject: &str,
-    ack_wait: Duration,
+    expected: &pull::Config,
 ) -> Result<()> {
     let configured = &consumer.cached_info().config;
     anyhow::ensure!(
-        configured.filter_subject == subject,
-        "existing targeted consumer '{consumer_name}' has incompatible filter '{}'; expected '{subject}'",
-        configured.filter_subject
+        configured.filter_subject == expected.filter_subject,
+        "existing targeted consumer '{consumer_name}' has incompatible filter '{}'; expected '{}'",
+        configured.filter_subject,
+        expected.filter_subject
     );
     anyhow::ensure!(
-        configured.ack_wait == ack_wait,
+        configured.ack_wait == expected.ack_wait,
         "existing targeted consumer '{consumer_name}' has incompatible ack wait {:?}; expected {:?}",
         configured.ack_wait,
-        ack_wait
+        expected.ack_wait
     );
     anyhow::ensure!(
-        configured.max_deliver == -1,
-        "existing targeted consumer '{consumer_name}' has incompatible max deliveries {}; expected unlimited (-1)",
-        configured.max_deliver
+        configured.max_deliver == expected.max_deliver && configured.backoff == expected.backoff,
+        "existing targeted consumer '{consumer_name}' has incompatible redelivery limit {} with backoff {:?}; expected {} with {:?}",
+        configured.max_deliver,
+        configured.backoff,
+        expected.max_deliver,
+        expected.backoff
     );
     anyhow::ensure!(
-        configured.inactive_threshold == WORK_NOTIFY_INACTIVE_THRESHOLD,
+        configured.inactive_threshold == expected.inactive_threshold,
         "existing targeted consumer '{consumer_name}' has incompatible inactive threshold {:?}; expected {:?}",
         configured.inactive_threshold,
-        WORK_NOTIFY_INACTIVE_THRESHOLD
+        expected.inactive_threshold
     );
     Ok(())
 }
@@ -478,6 +510,20 @@ mod tests {
             targeted_consumer_name(first).unwrap(),
             targeted_consumer_name(second).unwrap()
         );
+    }
+
+    #[test]
+    fn activation_backoff_keeps_the_ack_wait_then_grows_within_the_delivery_limit() {
+        let ack_wait = Duration::from_secs(30);
+        let backoff = activation_backoff(ack_wait);
+        assert!(backoff[..WORK_NOTIFY_STEADY_DELIVERIES]
+            .iter()
+            .all(|wait| *wait == ack_wait));
+        assert!(backoff.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(backoff.last() > backoff.first());
+        // NATS refuses a backoff with more entries than the consumer allows
+        // deliveries.
+        assert!(i64::try_from(backoff.len()).unwrap() <= WORK_NOTIFY_MAX_DELIVER);
     }
 
     #[test]

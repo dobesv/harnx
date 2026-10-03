@@ -898,6 +898,21 @@ independent run in the same session.
 
 This fencing is distinct from lease loss or worker failover, which set a
 nonterminal abort flag without publishing a cancellation.
+### Changing a JetStream consumer's configuration
+
+`Stream::get_or_create_consumer` returns an existing consumer unchanged, so a
+configuration change made there never reaches a cluster that already has the
+consumer. Use `create_consumer`, which updates it, and pass every field: an
+update replaces the whole configuration, and async-nats leaves zero values
+out, so an omitted field falls back to the server default. `backoff` has three
+effects the activation consumers depend on (`activation_transport.rs`): NATS
+replaces `ack_wait` with `backoff[0]`, a progress ack restarts the timer
+against the current delivery's entry, and a NAK asking for `delay` on delivery
+k waits `delay - backoff[0] + backoff[k-1]`. A message that reaches
+`max_deliver` is never delivered again, even after the limit is raised, and
+lowering the limit below a message's delivery count drops it without the
+max-deliveries advisory. See "Delivery limits" in `docs/nats-ha.md`.
+
 ### Interrupt acceptance
 
 Interruption is established by one durable `Cancel` entry in the session log and

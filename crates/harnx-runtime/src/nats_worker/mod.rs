@@ -94,6 +94,7 @@ pub use daemon::{
 };
 #[doc(hidden)]
 pub use daemon_background::start_local_tool_servers_for_test;
+pub use daemon_runtime::MAX_ACTIVATION_DELIVERIES;
 pub use diagnostics::diagnose_tool_servers;
 #[doc(hidden)]
 pub use hook_crash::{publish_crash_rejector, RejectorTarget};

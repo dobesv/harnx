@@ -837,6 +837,12 @@ async fn close_after_dead_worker_is_best_effort() -> Result<()> {
     let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
+    // Without the handoff a local worker joins the machine's shared broker,
+    // where every run of this test, on any branch, meets the same consumer.
+    let _env = [
+        EnvGuard::set("HARNX_NATS_URL", server.url()),
+        EnvGuard::set("HARNX_NATS_TOKEN", ""),
+    ];
     let global = local_nats_runtime_config(server.url());
     let readiness = harnx_healthz::Readiness::default();
     let daemon = WorkerDaemonConfig::local("close-worker")?
