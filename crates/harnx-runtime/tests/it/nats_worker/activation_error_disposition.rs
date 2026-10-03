@@ -304,6 +304,91 @@ async fn named_local_agent_without_model_fails_with_clear_durable_error() -> Res
     Ok(())
 }
 
+/// Nothing answers the session's control subject: the listener a failed
+/// attempt subscribed there was stopped with it.
+async fn assert_no_control_listener(client: &async_nats::Client, session_key: &str) -> Result<()> {
+    let hint = harnx_runtime::ControlCommand::Compact {
+        compaction_id: "listener-probe".into(),
+    };
+    poll_until(async || {
+        Ok(harnx_runtime::nats_worker::request_control_command(
+            client,
+            session_key,
+            &hint,
+            Duration::from_secs(1),
+        )
+        .await
+        .is_err())
+    })
+    .await
+    .context("a listener from the failed attempt still answers the session's control subject")
+}
+
+/// A prompt with no durable run admission can never run. Every prompt from
+/// before run admissions existed is one, including the one each session that
+/// was mid-turn during the upgrade resumes. The worker used to refuse it and
+/// hand the activation back, and JetStream redelivered it forever. Now a
+/// second delivery confirms the refusal, records why on the session and
+/// terminates the activation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unadmitted_prompt_fails_its_session_on_the_second_delivery() -> Result<()> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let daemon = spawn_worker_daemon_with_call_fn(
+        local_nats_runtime_config(server.url()),
+        "worker-unadmitted-prompt",
+        counting_stub_call_fn(Arc::clone(&calls)),
+    )
+    .await?;
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = "unadmitted-prompt";
+    seed_session_metadata(&jetstream, session_id).await?;
+    let session_key = storage_key(session_id);
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), &session_key, 1);
+    let prompt_seq = log
+        .append_event_async(&SessionLogEntry::Message {
+            id: Some("before-admissions".into()),
+            role: MessageRole::User,
+            content: harnx_core::message::MessageContent::Text("resume me".into()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await?;
+    publish_session_activate(
+        &jetstream,
+        "local",
+        &SessionActivate::new(&session_key).with_requested_seq(prompt_seq),
+        1,
+    )
+    .await?;
+
+    let error = wait_for_error(&log).await?;
+    assert!(
+        error.contains("refusing executable prompt without durable run admission")
+            && error.contains("send it again"),
+        "unexpected worker error: {error}"
+    );
+    let stream = jetstream.get_stream("WORK_NOTIFY_local").await?;
+    let consumer: async_nats::jetstream::consumer::PullConsumer = stream
+        .get_consumer("workers")
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    wait_for_terminal_activation(&consumer, &stream, 2).await?;
+    assert_eq!(
+        consumer.get_info().await?.delivered.consumer_sequence,
+        2,
+        "a refusal is settled on the delivery that confirms it"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_no_control_listener(&client, &session_key).await?;
+    daemon.abort();
+    let _ = daemon.await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_shared_activation_is_terminated() -> Result<()> {
     let Some(server) = require_nats_server().await? else {

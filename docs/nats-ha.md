@@ -691,27 +691,51 @@ replacement worker may resume:
   worker will resume. Used for `UserCancelled` and
   `Completed{settled:true, has_queued_input:false}`.
 - **Terminal NAK with Term** (`AckKind::Term`): the activation cannot succeed.
-  Malformed payloads are terminated without a session-log write. Permanent
-  failures and ten genuine pre-turn infrastructure failures are terminated only
-  after persisting `SessionLogEntry::Error`.
+  Malformed payloads are terminated without a session-log write. A refusal
+  (see below) and the tenth failure before a turn starts are terminated only
+  after persisting `SessionLogEntry::Error`. An activation past the delivery
+  limit is terminated without one.
 - **Non-terminal NAK** (`AckKind::Nak(None)`): failover path. The replacement
-  worker resumes from the journal. Used for lease loss, shutdown, and
-  transient pre-turn failures.
+  worker resumes from the journal. Used for lease loss and shutdown.
 - **Busy NAK** (`AckKind::Nak(10–12s)`): in-memory fast-path for
   already-running sessions or foreign lease holders. Avoids expensive
   session-log reads when another worker is active and does not consume the
-  failure budget.
-- **Delayed NAK** (`AckKind::Nak(0.1–2s)`): exponential backoff for
-  targeted-activation failures. Retries with increasing delay up to 2s
-  maximum.
+  failure budget, though it counts toward the delivery limit.
+- **Delayed NAK** (`AckKind::Nak(0.1–2s)`): exponential backoff for failures
+  before a turn starts, claim errors and rejected settlements. Retries with
+  increasing delay up to 2s maximum.
+
+Every failure between claiming the lease and starting the turn counts toward a
+budget of ten, including loading the session's metadata, freezing its run
+limits, recovering a child result that completed before its deadline and
+arming the invocation's deadline. A refusal is a failure no redelivery can
+change, so it doesn't wait for the budget: the second delivery that refuses
+the activation records it and terminates the activation, and the metric counts
+it as `harnx_activation_claims_total{outcome="refused_term"}`. Waiting for a
+second refusal costs one redelivery and keeps a single wrong read from failing
+a prompt for good.
+
+A prompt with no durable run admission is refused. Frontends write the
+admission before they append the prompt, so a prompt in the log without one
+was sent before run admissions existed, or by a path that skipped admission.
+The `Error` the worker records says so and asks for the prompt to be sent again,
+which admits it as a new run. A session that was mid-turn when its cluster
+moved to a version with run admissions ends that way when a worker next picks
+it up, unless its activation is past the consumer's delivery limit (see
+"Delivery limits" below). Workers never run such a prompt under default limits, because
+that would have the worker grant run authority only a frontend may grant, and
+would let a sub-agent whose admission went missing outlive its parent's
+deadline. Admission reads go to the stream leader (see "Read a record that was
+just written" in the recovery table below), so a missing admission is not a
+replica that hasn't caught up yet.
 
 The ten-failure limit is counted in the `harnx_activation_failures` KV bucket
 (`activation_failure.rs`, one-hour TTL per key). If a worker can't read or
 update that bucket, it logs a warning and retries the activation with a
-delayed NAK. A counter outage never terminates work, but it also means the
-limit isn't enforced while the bucket is down: an activation that keeps failing
-before its turn starts is redelivered indefinitely instead of being terminated
-after ten attempts. Watch worker logs for either of these warnings:
+delayed NAK. The budget isn't enforced while the bucket is down, so an
+activation that keeps failing before its turn starts goes on until the delivery
+limit ends it, without an `Error` on the session. Watch worker logs for either
+of these warnings:
 
 - `activation failure counter unavailable for '<session_id>': ...` (metadata
   preflight)
@@ -721,6 +745,39 @@ after ten attempts. Watch worker logs for either of these warnings:
 Repeated warnings for the same session mean that activation is cycling. Restore
 the bucket (check JetStream health and KV permissions) and the limit applies
 again from the next failure.
+
+#### Delivery limits
+
+A worker terminates an activation instead of handing it back once JetStream
+has delivered it 100 times (`MAX_ACTIVATION_DELIVERIES`), whatever the reason:
+the session is busy, a preflight read failed, the claim failed or the
+settlement was rejected. It logs `terminating activation after <n> deliveries
+instead of redelivering it` with the session and counts
+`harnx_activation_claims_total{outcome="delivery_limit_term"}`. Shutdown NAKs
+never terminate, so a rolling deploy can't use up an activation.
+
+The activation consumers carry their own limit as a backstop: `max_deliver`
+200, and a backoff that keeps the 30s ack wait for the first 30 deliveries and
+then grows to 60s, 120s and 300s. NATS uses the backoff in place of the ack
+wait, and it measures a delayed NAK against the backoff entry too, so a busy
+NAK on a later delivery comes back after about 40s, then 100s, then 280s. A
+session that stays busy therefore holds its other activations for about five
+hours before the worker's limit ends them. By then the worker holding the
+session has covered what they asked for, or it is stuck and keeps the session
+however often they come back. JetStream's limit only stops activations no
+worker settles, such as one that crashes every worker that takes it, and it
+does so without logging anything.
+
+Workers apply this configuration when they start, with `create_consumer`,
+which updates a consumer an earlier version created without a limit.
+`get_or_create_consumer` returns an existing consumer unchanged. An activation
+already delivered more than 200 times when a worker updates its consumer is
+never delivered again, even if the limit is raised later, and NATS 2.12.5 and
+later keep it in the stream. On a cluster that had activations cycling before
+the upgrade, those are the ones past the limit: no worker refuses them or
+records an `Error`, so whoever waits on them is not told. Remove them with
+`nats stream rmm <stream> <seq>`. A new message to an affected session starts a
+new run as usual.
 
 **Remote tool calls must not be cancelled on failover.** When a worker receives
 a failover abort signal, `NatsToolProvider::invoke_tool`

@@ -15,6 +15,10 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 pub(super) const MAX_ACTIVATION_FAILURES: u64 = 10;
+/// Deliveries that must refuse an activation before the refusal is recorded.
+/// The second look costs one redelivery and keeps a single wrong read, a
+/// misconfigured broker say, from failing a prompt for good.
+const REFUSAL_CONFIRMATIONS: u64 = 2;
 
 /// Marks an execution failure whose durable Error entry makes the activation
 /// safe to remove from JetStream.
@@ -45,6 +49,57 @@ pub(super) fn is_durable_activation_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<DurableActivationError>().is_some())
+}
+
+/// A refusal no redelivery can change, such as a prompt without a durable run
+/// admission. It is recorded on the session once a second delivery confirms
+/// it, instead of after the ten failures the budget allows for failures that
+/// may clear up.
+#[derive(Debug)]
+pub(super) struct ActivationRefusal(String);
+
+impl std::fmt::Display for ActivationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ActivationRefusal {}
+
+pub(super) fn is_activation_refusal(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<ActivationRefusal>().is_some())
+}
+
+/// The id of the latest prompt, or compaction request, at or before
+/// `requested`.
+fn latest_prompt_id(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    requested: u64,
+) -> Option<String> {
+    use harnx_core::session::SessionLogEntry;
+    entries.iter().rev().find_map(|(seq, entry)| match entry {
+        SessionLogEntry::Message {
+            id: Some(id), role, ..
+        } if role.is_user() && *seq <= requested => Some(id.clone()),
+        SessionLogEntry::CompactRequest { compaction_id, .. } if *seq <= requested => {
+            Some(compaction_id.clone())
+        }
+        _ => None,
+    })
+}
+
+/// The frontend writes a prompt's admission before it appends the prompt, so
+/// a prompt in the log without one is from before admissions existed or was
+/// appended by a path that skipped admission. Running it anyway would have
+/// the worker grant run authority that only a frontend may grant.
+fn unadmitted_prompt(prompt_id: &str) -> anyhow::Error {
+    anyhow::Error::new(ActivationRefusal(format!(
+        "refusing executable prompt without durable run admission: prompt '{prompt_id}' \
+         was sent before run admissions existed or appended without one; send it again \
+         to start a new run"
+    )))
 }
 
 pub(super) struct SessionExecutionInputs {
@@ -179,24 +234,43 @@ impl WorkerRuntime {
         lease: &NatsSessionLease,
         error: anyhow::Error,
     ) -> anyhow::Error {
-        let failures = match self
+        let budget = if is_activation_refusal(&error) {
+            REFUSAL_CONFIRMATIONS
+        } else {
+            MAX_ACTIVATION_FAILURES
+        };
+        if self
+            .failure_budget_spent(activation, activation_failure_key, budget)
+            .await
+        {
+            return self
+                .durabilize_pre_turn_failure(activation, lease, error)
+                .await;
+        }
+        error
+    }
+
+    /// Count this failure against the activation. A counter that can't be
+    /// updated leaves the budget unspent, so the activation is retried.
+    async fn failure_budget_spent(
+        &self,
+        activation: &SessionActivate,
+        activation_failure_key: &str,
+        budget: u64,
+    ) -> bool {
+        match self
             .count_activation_failure(activation, activation_failure_key)
             .await
         {
-            Ok(failures) => failures,
+            Ok(failures) => failures >= budget,
             Err(counter_error) => {
                 log::warn!(
                     "failed to count activation failure: session_id={} error={counter_error:#}",
                     activation.session_id
                 );
-                return error;
+                false
             }
-        };
-        if failures < MAX_ACTIVATION_FAILURES {
-            return error;
         }
-        self.durabilize_pre_turn_failure(activation, lease, error)
-            .await
     }
 
     pub(super) async fn durabilize_pre_turn_failure(
@@ -277,6 +351,7 @@ impl WorkerRuntime {
         let metadata = match self.load_activation_metadata(&activation.session_id).await {
             Ok(metadata) => metadata,
             Err(error) => {
+                Self::stop_execution_tasks([control_task]).await;
                 return Err(self
                     .classify_pre_turn_failure(&activation, &activation_failure_key, &lease, error)
                     .await);
@@ -305,22 +380,9 @@ impl WorkerRuntime {
             )
             .await,
         );
-        self.freeze_activation_limits(&activation, &per_session)
-            .await?;
-
         let after_seq_observer = event_sink.after_seq_handle();
         let backend = self.session_backend(&activation, Arc::clone(&after_seq_observer));
-        super::agent_loop::recover_completed_before_deadline(
-            &backend,
-            &lease,
-            &per_session,
-            &self.jetstream,
-            self.lease.replicas,
-        )
-        .await?;
-        self.start_invocation_deadline(&activation, &per_session, &execution_abort)
-            .await?;
-        Ok(SessionRuntimeStartup {
+        let startup = SessionRuntimeStartup {
             activation,
             activation_failure_key,
             lease,
@@ -336,7 +398,56 @@ impl WorkerRuntime {
             event_sink,
             after_seq_observer,
             agent_setup,
-        })
+        };
+        match self.freeze_run_policy(&startup).await {
+            Ok(()) => Ok(startup),
+            Err(error) => Err(self.abandon_startup(startup, error).await),
+        }
+    }
+
+    /// Freeze the limits this activation runs under, recover a child result
+    /// that completed before its deadline, and arm the invocation's deadline.
+    async fn freeze_run_policy(&self, startup: &SessionRuntimeStartup) -> Result<()> {
+        self.freeze_activation_limits(&startup.activation, &startup.per_session)
+            .await?;
+        super::agent_loop::recover_completed_before_deadline(
+            &startup.backend,
+            &startup.lease,
+            &startup.per_session,
+            &self.jetstream,
+            self.lease.replicas,
+        )
+        .await?;
+        self.start_invocation_deadline(
+            &startup.activation,
+            &startup.per_session,
+            &startup.execution_abort,
+        )
+        .await
+    }
+
+    /// Give up on a session whose turn can't start. The control listener and
+    /// abort relays started for it would otherwise outlive the attempt, and
+    /// every redelivery would leave another listener on the session's control
+    /// subject.
+    async fn abandon_startup(
+        &self,
+        startup: SessionRuntimeStartup,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        Self::stop_execution_tasks([
+            startup.control_task,
+            startup.abort_relay,
+            startup.shutdown_relay,
+        ])
+        .await;
+        self.classify_pre_turn_failure(
+            &startup.activation,
+            &startup.activation_failure_key,
+            &startup.lease,
+            error,
+        )
+        .await
     }
 
     async fn freeze_activation_limits(
@@ -345,35 +456,9 @@ impl WorkerRuntime {
         config: &crate::config::GlobalConfig,
     ) -> Result<()> {
         use crate::nats_session_metadata::{CallTimeoutOverride, RunLimitsRecord};
-        use harnx_core::session::SessionLogEntry;
-        let entries = crate::nats_session_log::NatsSessionLog::new(
-            self.jetstream.clone(),
-            &activation.session_id,
-        )
-        .load_events_latest_async()
-        .await?;
-        // Never infer external authority from role. Every executable prompt must
-        // reference a durable admission established before it was appended.
-        let requested = activation
-            .requested_seq
-            .unwrap_or_else(|| entries.last().map_or(0, |(seq, _)| *seq));
-        let prompt_id = entries.iter().rev().find_map(|(seq, entry)| match entry {
-            SessionLogEntry::Message {
-                id: Some(id), role, ..
-            } if role.is_user() && *seq <= requested => Some(id.clone()),
-            SessionLogEntry::CompactRequest { compaction_id, .. } if *seq <= requested => {
-                Some(compaction_id.clone())
-            }
-            _ => None,
-        });
-        let Some(prompt_id) = prompt_id else {
+        let Some(intent) = self.requested_prompt_admission(activation).await? else {
             return Ok(());
         };
-        let intent = self
-            .session_metadata
-            .prompt_admission(&activation.session_id, &prompt_id)
-            .await?
-            .context("refusing executable prompt without durable run admission")?;
         let (global, target) = {
             let config = config.read();
             (
@@ -433,6 +518,33 @@ impl WorkerRuntime {
         }
         config.write().run_context = Some(record);
         Ok(())
+    }
+
+    /// The admission of the prompt this activation runs, the latest one at or
+    /// before its requested sequence, or `None` when there is no prompt to run.
+    /// Never infer external authority from role: every executable prompt must
+    /// reference a durable admission established before it was appended.
+    async fn requested_prompt_admission(
+        &self,
+        activation: &SessionActivate,
+    ) -> Result<Option<crate::nats_session_metadata::InvocationAdmission>> {
+        let entries = crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            &activation.session_id,
+        )
+        .load_events_latest_async()
+        .await?;
+        let requested = activation
+            .requested_seq
+            .unwrap_or_else(|| entries.last().map_or(0, |(seq, _)| *seq));
+        let Some(prompt_id) = latest_prompt_id(&entries, requested) else {
+            return Ok(None);
+        };
+        self.session_metadata
+            .prompt_admission(&activation.session_id, &prompt_id)
+            .await?
+            .map(Some)
+            .ok_or_else(|| unadmitted_prompt(&prompt_id))
     }
 
     async fn start_invocation_deadline(
@@ -562,16 +674,7 @@ impl WorkerRuntime {
             crate::nats_tool_provider::NatsInFlightCalls::for_instance(&self.instance_id);
         let watcher_start_after = match startup.backend.load_events_latest_async().await {
             Ok(entries) => entries.last().map_or(0, |(seq, _)| *seq),
-            Err(error) => {
-                return Err(self
-                    .classify_pre_turn_failure(
-                        &startup.activation,
-                        &startup.activation_failure_key,
-                        &startup.lease,
-                        error,
-                    )
-                    .await);
-            }
+            Err(error) => return Err(self.abandon_startup(startup, error).await),
         };
         let session_watcher = super::session_watcher::spawn_session_watcher(
             super::session_watcher::SessionWatcherCtx {
@@ -864,7 +967,7 @@ impl WorkerRuntime {
         }
     }
 
-    async fn stop_execution_tasks(tasks: [JoinHandle<()>; 5]) {
+    async fn stop_execution_tasks<const N: usize>(tasks: [JoinHandle<()>; N]) {
         for task in &tasks {
             task.abort();
         }

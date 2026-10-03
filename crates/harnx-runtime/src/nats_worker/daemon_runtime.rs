@@ -34,13 +34,24 @@ use tracing::Instrument;
 /// concurrently (see `ServerReconciler::session_started`), so this only needs
 /// to cover one server's own startup timeout plus margin, not the sum of
 /// several. Comfortably clearing this margin matters because JetStream
-/// redelivers an unacked activation at `WORK_NOTIFY_ACK_WAIT` with
-/// `max_deliver: -1` — a session that never manages to ack loops forever,
-/// each redelivery re-acquiring the lease and fencing the still-running
-/// previous attempt.
+/// redelivers an unacked activation once its ack wait runs out, and each
+/// redelivery re-acquires the lease and fences the still-running previous
+/// attempt.
 pub(super) const SESSION_TOOL_SERVER_START_TIMEOUT: Duration = Duration::from_secs(20);
 const BUSY_NAK_BASE_DELAY: Duration = Duration::from_secs(10);
 const BUSY_NAK_MAX_JITTER: Duration = Duration::from_secs(2);
+/// Deliveries after which a worker terminates an activation instead of handing
+/// it back for another one. Busy redeliveries count, which is the point: a
+/// session busy for this long is held by a worker whose own run covers the
+/// work, or by one that is stuck, and redelivering forever helps neither.
+/// With the consumer's backoff this is several hours of being busy. Failures
+/// after the lease is claimed are recorded on the session by the failure
+/// budget long before; failures before it is claimed, and any while the
+/// failure counter is unavailable, aren't counted and end here without an
+/// `Error`. Kept below the consumer's `max_deliver`, so a worker sees the
+/// activation and says why it gave up before JetStream stops delivering it
+/// silently.
+pub const MAX_ACTIVATION_DELIVERIES: i64 = 100;
 
 /// Borrowed parameters for [`WorkerRuntime::spawn_control_listener`].
 pub(super) struct ControlListenerCtx<'a> {
@@ -118,6 +129,16 @@ fn record_publish_to_delivery(
     let elapsed = Duration::try_from(delivered - published).unwrap_or_default();
     harnx_metrics::record_activation_phase("publish_to_delivery", elapsed);
     elapsed
+}
+
+/// How a durably recorded failure is reported when its activation is
+/// terminated: a refusal, or a failure that spent its budget or ended a turn.
+fn durable_termination_reason(error: &anyhow::Error) -> &'static str {
+    if super::daemon_session_exec::is_activation_refusal(error) {
+        "refused"
+    } else {
+        "durably failed"
+    }
 }
 
 fn busy_nak_delay(jitter: Duration) -> Duration {
@@ -379,29 +400,48 @@ impl WorkerRuntime {
         delivery: &mut ActivationDelivery,
         reason: ActivationNakReason,
     ) -> Result<()> {
-        let delivered = delivery
-            .message()
-            .info()
-            .map(|info| info.delivered)
-            .unwrap_or(1);
-        let exponent = u32::try_from(delivered.saturating_sub(1))
+        let exponent = u32::try_from(delivery.delivered().saturating_sub(1))
             .unwrap_or(u32::MAX)
             .min(5);
         let millis = 100_u64.saturating_mul(1_u64 << exponent).min(2_000);
-        delivery
-            .nak(Some(Duration::from_millis(millis)), reason)
-            .await
+        Self::redeliver_later(delivery, Duration::from_millis(millis), reason).await
     }
 
     async fn busy_nak(delivery: &mut ActivationDelivery) -> Result<()> {
         let jitter_millis = rand::rng()
             .random_range(0..=u64::try_from(BUSY_NAK_MAX_JITTER.as_millis()).unwrap_or(u64::MAX));
-        delivery
-            .nak(
-                Some(busy_nak_delay(Duration::from_millis(jitter_millis))),
-                ActivationNakReason::Busy,
-            )
-            .await
+        Self::redeliver_later(
+            delivery,
+            busy_nak_delay(Duration::from_millis(jitter_millis)),
+            ActivationNakReason::Busy,
+        )
+        .await
+    }
+
+    /// Hand the activation back for another delivery after `delay`, unless it
+    /// has used up [`MAX_ACTIVATION_DELIVERIES`]. Shutdown hands activations
+    /// back through [`Self::shutdown_nak`] instead, so a rolling deploy never
+    /// spends an activation's last delivery.
+    async fn redeliver_later(
+        delivery: &mut ActivationDelivery,
+        delay: Duration,
+        reason: ActivationNakReason,
+    ) -> Result<()> {
+        if delivery.delivered() < MAX_ACTIVATION_DELIVERIES {
+            return delivery.nak(Some(delay), reason).await;
+        }
+        delivery.terminate("delivery limit").await?;
+        log::warn!(
+            "terminated activation after {} deliveries instead of redelivering it ({}): \
+             activation={} session_id={}",
+            delivery.delivered(),
+            reason.label(),
+            delivery.failure_key(),
+            delivery.session_id().as_deref().unwrap_or("unknown"),
+        );
+        metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "delivery_limit_term")
+            .increment(1);
+        Ok(())
     }
 
     async fn flush_shutdown_disposition(&self) {
@@ -484,8 +524,14 @@ impl WorkerRuntime {
         reason: &str,
     ) -> Result<()> {
         delivery.terminate(reason).await?;
-        if reason == "durably failed" {
-            metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "failure_budget_term").increment(1);
+        match reason {
+            "durably failed" => {
+                metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "failure_budget_term").increment(1);
+            }
+            "refused" => {
+                metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "refused_term").increment(1);
+            }
+            _ => {}
         }
         self.clear_activation_failures(delivery).await;
         Ok(())
@@ -740,7 +786,9 @@ impl WorkerRuntime {
                 self.flush_shutdown_disposition().await;
             }
             Err(error) if super::daemon_session_exec::is_durable_activation_error(error) => {
-                let _ = self.terminate_activation(delivery, "durably failed").await;
+                let _ = self
+                    .terminate_activation(delivery, durable_termination_reason(error))
+                    .await;
             }
             _ => {
                 let _ = Self::delayed_nak(delivery, ActivationNakReason::SettlementRejection).await;
@@ -811,7 +859,7 @@ impl WorkerRuntime {
             }
             Self::active_session_finished(&task_session_id, &lease);
             if let Err(error) = result {
-                log::warn!("worker session execution failed: {error:#}");
+                log::warn!("worker session execution failed for {task_session_id}: {error:#}");
             }
         }
         .instrument(span)
