@@ -15,14 +15,15 @@ impl SessionMetadataStore {
     /// Returns read-state by agent-scoped storage key, defaulting to all-zeros if missing.
     pub async fn get_read_state(&self, storage_key: &str) -> Result<SessionReadState> {
         let key = read_cursor_key(storage_key, DEFAULT_VIEWER);
-        match self.store.entry(key.clone()).await {
+        match self.leader_entry(&key).await {
             Ok(Some(entry)) if matches!(entry.operation, kv::Operation::Put) => {
                 serde_json::from_slice(&entry.value)
                     .with_context(|| format!("Failed to deserialize session read state '{key}'"))
             }
             Ok(Some(_)) | Ok(None) => Ok(SessionReadState::default()),
-            Err(error) => Err(anyhow::Error::from(error))
-                .with_context(|| format!("Failed to read session read state key '{key}'")),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to read session read state key '{key}'"))
+            }
         }
     }
 
@@ -109,7 +110,7 @@ impl SessionMetadataStore {
     }
 
     async fn read_state_snapshot(&self, key: &str) -> Result<(SessionReadState, u64)> {
-        let Some(entry) = self.store.entry(key.to_string()).await? else {
+        let Some(entry) = self.leader_entry(key).await? else {
             return Ok((SessionReadState::default(), 0));
         };
         if !matches!(entry.operation, kv::Operation::Put) {

@@ -41,6 +41,7 @@ mod nats_session_delete;
 mod nats_session_dump;
 mod nats_session_log;
 mod nats_session_metadata;
+mod nats_session_metadata_stale_replica;
 mod nats_session_stream_identity;
 mod nats_tool_confirmation;
 mod nats_tool_provider;

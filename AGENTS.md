@@ -838,6 +838,16 @@ retry and treat a conflict as a decision to re-read, never as a reason to append
 again. A `Cancel` is an ordinary log entry any holder of the session can write,
 including frontends that hold no lease. See `docs/nats-ha.md` under "Interruption".
 
+### Reading KV state that was just written
+
+async-nats creates every KV bucket with `allow_direct`, so `kv::Store::get`
+and `entry` are direct gets, which a follower answers from whatever it has
+applied. A key written moments earlier, by this process or by the one that
+handed it the work, has to be read through `harnx_nats_common::leader_reads`,
+inside `leader_reads::retry_transient` so a leader election isn't a failure.
+`SessionMetadataStore` reads every key that way. See "Read a record that was
+just written" in `docs/nats-ha.md`.
+
 ### Crate layering for NATS tool servers
 
 Tool servers that need NATS object/KV storage must depend on `harnx-blob-store`,
@@ -1082,9 +1092,11 @@ genuine 404 the way a lagging follower does, and `$JS.API.CONSUMER.CREATE.<strea
 only the leader answers while the stream has one, still reach the real stream.
 `crates/harnx-toolset-server/tests/it/stale_replica.rs` does this for the
 invocation journal, with a probe that fails the test if the diversion stops
-applying. A leaderless stream, where every replica answers `STREAM.INFO`, is
-simulated the same way: `journal_listing.rs` maps that request to a responder
-that answers as such a replica does.
+applying. `crates/harnx-runtime/tests/it/nats_session_metadata_stale_replica.rs`
+does the same for the session metadata bucket, starting its broker with
+`common::spawn_configured_nats_server`. A leaderless stream, where every
+replica answers `STREAM.INFO`, is simulated the same way: `journal_listing.rs`
+maps that request to a responder that answers as such a replica does.
 
 ## CLI Flag Constraints
 

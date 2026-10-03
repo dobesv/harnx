@@ -2,6 +2,7 @@ use super::*;
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
+use harnx_nats_common::leader_reads;
 
 mod activity;
 mod extension_validation;
@@ -79,6 +80,25 @@ impl SessionMetadataStore {
         &self.store
     }
 
+    /// `key`'s latest revision as the stream leader has it, which may be a
+    /// delete or purge marker. `kv_store().entry` can be answered by a follower
+    /// that hasn't applied a write made a moment ago, by this process or by the
+    /// one that handed it the session, such as a frontend that admitted a
+    /// prompt just before a worker picks it up.
+    ///
+    /// The read waits out a leader election rather than failing at once.
+    /// Workers count a failed read before a turn toward the activation's
+    /// failure budget, and a few seconds of election would otherwise spend it.
+    pub(crate) async fn leader_entry(&self, key: &str) -> Result<Option<kv::Entry>> {
+        leader_reads::retry_transient(|| leader_reads::entry(&self.store, key)).await
+    }
+
+    /// `key`'s value as the stream leader has it, or `None` once it has been
+    /// deleted or purged. See [`Self::leader_entry`].
+    pub(crate) async fn leader_value(&self, key: &str) -> Result<Option<bytes::Bytes>> {
+        leader_reads::retry_transient(|| leader_reads::get(&self.store, key)).await
+    }
+
     pub async fn create(&self, metadata: &SessionMetadata) -> Result<Option<u64>> {
         metadata.validate(&metadata.session_id)?;
         let key = metadata_key(&metadata.storage_key());
@@ -116,7 +136,7 @@ impl SessionMetadataStore {
     /// Read by agent-scoped storage key. Use `get_for_agent` at a public boundary.
     pub async fn get(&self, session_id: &str) -> Result<Option<MetadataRecord>> {
         let key = metadata_key(session_id);
-        match self.store.entry(key.clone()).await {
+        match self.leader_entry(&key).await {
             Ok(Some(entry)) if matches!(entry.operation, kv::Operation::Put) => {
                 let metadata: SessionMetadata = serde_json::from_slice(&entry.value)
                     .with_context(|| format!("Failed to deserialize session metadata '{key}'"))?;
@@ -127,8 +147,9 @@ impl SessionMetadataStore {
                 }))
             }
             Ok(Some(_)) | Ok(None) => Ok(None),
-            Err(error) => Err(anyhow::Error::from(error))
-                .with_context(|| format!("Failed to read session metadata key '{key}'")),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to read session metadata key '{key}'"))
+            }
         }
     }
 

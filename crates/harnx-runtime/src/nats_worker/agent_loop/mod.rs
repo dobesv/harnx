@@ -966,7 +966,7 @@ async fn dispatch_nats_handoff(
         snapshot: serde_json::to_value(&parent)?,
         started_at_ms: chrono::Utc::now().timestamp_millis().try_into()?,
     };
-    let lineage = match source_store.kv_store().get(&key).await? {
+    let lineage = match source_store.leader_value(&key).await? {
         Some(bytes) => serde_json::from_slice::<harnx_toolset::AutonomousRunContext>(&bytes)?,
         None => {
             if source_store
@@ -977,8 +977,7 @@ async fn dispatch_nats_handoff(
             {
                 serde_json::from_slice(
                     &source_store
-                        .kv_store()
-                        .get(&key)
+                        .leader_value(&key)
                         .await?
                         .context("handoff admission unconfirmed")?,
                 )?
