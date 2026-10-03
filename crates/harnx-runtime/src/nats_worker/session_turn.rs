@@ -194,7 +194,69 @@ impl SessionTurn {
         if !self.is_running() || !self.prepare_turn().await? {
             return Ok(None);
         }
-        self.derive_input(high_water).await
+        if self
+            .worker
+            .refuse_resume_under_interrupted_parent(&self.backend, &self.per_session)
+            .await?
+        {
+            return Ok(None);
+        }
+        let next = self.derive_input(high_water).await?;
+        if let Some((_, seed)) = &next {
+            let entries = self.backend.load_events_latest_async().await?;
+            let prompt_id = entries
+                .iter()
+                .rev()
+                .find_map(|(seq, entry)| match entry {
+                    harnx_core::session::SessionLogEntry::Message {
+                        id: Some(id), role, ..
+                    } if role.is_user() && *seq <= *seed => Some(id),
+                    _ => None,
+                })
+                .context("worker input has no admitted prompt")?;
+            let admission = self
+                .worker
+                .session_metadata
+                .prompt_admission(&self.activation.session_id, prompt_id)
+                .await?
+                .context("worker input has no durable admission")?;
+            let current = self
+                .per_session
+                .read()
+                .run_context
+                .clone()
+                .context("worker run policy is not finalized")?;
+            if admission.invocation_id != current.invocation_id {
+                // A later independent run has its own durable activation. Do not
+                // drain it under this activation's abort signal or frozen policy.
+                return Ok(None);
+            }
+            let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
+            for (seq, entry) in &effective {
+                if let harnx_core::session::SessionLogEntry::Message { id, role, .. } = entry {
+                    if role.is_user()
+                        && crate::nats_session::requested_seq_status_with_effective(
+                            &entries, &effective, *seq,
+                        ) == crate::nats_session::RequestedSeqStatus::Pending
+                    {
+                        let prompt = id
+                            .as_deref()
+                            .context("unmapped executable user row has no admission identity")?;
+                        let bound = self
+                            .worker
+                            .session_metadata
+                            .prompt_admission(&self.activation.session_id, prompt)
+                            .await?
+                            .context("unmapped executable user row has no durable admission")?;
+                        anyhow::ensure!(
+                            bound.invocation_id == current.invocation_id,
+                            "cannot coalesce different execution admissions"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(next)
     }
 
     async fn prepare_turn(&mut self) -> Result<bool> {
@@ -285,7 +347,17 @@ impl SessionTurn {
         input: Input,
         turn_cursor: Arc<AtomicU64>,
     ) -> Result<NatsAgentLoopOutcome> {
-        let injection = build_mid_turn_injection_callback(self.backend.clone(), turn_cursor);
+        let invocation_id = self
+            .per_session
+            .read()
+            .run_context
+            .as_ref()
+            .context("worker turn has no frozen run context")?
+            .invocation_id
+            .as_str()
+            .to_owned();
+        let injection =
+            build_mid_turn_injection_callback(self.backend.clone(), turn_cursor, invocation_id);
         let attachment_sync = ToolRoundAttachmentSync {
             jetstream: self.worker.jetstream.clone(),
             config: self.per_session.clone(),

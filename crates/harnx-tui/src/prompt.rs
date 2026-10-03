@@ -106,6 +106,8 @@ pub(super) async fn enqueue_text_into_target(
         crate::remote_session::nats_session_for_target(config, local_worker, session_id, cluster)
             .await?;
     session
+        .clone()
+        .with_external_admission()
         .enqueue_text_with_tool_confirmation_id(text, route, submission_id)
         .await
 }
@@ -124,6 +126,8 @@ async fn run_nats_turn_with_tui_confirmation(
     )
     .await?;
     let appended = session
+        .clone()
+        .with_external_admission()
         .admit_input_with_tool_confirmation_route(input, &route)
         .await?
         .with_live_state(ctx.live_events.clone());
@@ -322,6 +326,7 @@ impl Tui {
         )
         .await?;
         let enqueued = session
+            .with_external_admission()
             .enqueue_text_with_tool_confirmation(&pending.text, &route)
             .await?;
         if let Some(error) = enqueued.activation_error() {

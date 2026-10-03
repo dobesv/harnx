@@ -892,7 +892,31 @@ async fn ask(
     .context("failed to create NATS session for command")?;
     let sink = harnx_core::sink::current_agent_event_sink()
         .unwrap_or_else(|| Arc::new(harnx_core::event::NullSink));
+    let lineage = config.read().run_context.clone();
+    let session = match lineage {
+        Some(parent) => session.with_inherited_admission(
+            parent,
+            uuid::Uuid::new_v4().to_string(),
+            chrono::Utc::now(),
+            crate::nats_session_metadata::InvocationEdgeKind::MacroContinuation,
+            None,
+        ),
+        None => session.with_external_admission(),
+    };
     let result = session.run_turn_input(&input, None, sink, None).await?;
+    if config.read().macro_flag {
+        if let Some(admission) = session
+            .metadata_store()
+            .prompt_admission(session.storage_key(), &result.user_msg_id)
+            .await?
+        {
+            let frozen = session
+                .metadata_store()
+                .get_invocation_limits(session.storage_key(), admission.invocation_id.as_str())
+                .await?;
+            config.write().run_context = frozen;
+        }
+    }
     update_last_message_after_nats_turn(config, input, &result);
     Ok(())
 }

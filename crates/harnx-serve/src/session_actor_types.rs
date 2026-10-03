@@ -142,6 +142,7 @@ pub(crate) struct PendingPrompt {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionPromptOptions {
+    pub(crate) runtime_parent: Option<Box<harnx_runtime::nats_session_metadata::RunLimitsRecord>>,
     pub(crate) admitted: Option<harnx_runtime::nats_session::AppendedPrompt>,
     pub working_dir: Option<std::path::PathBuf>,
     pub attachment_refs: Vec<String>,

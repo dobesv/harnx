@@ -134,8 +134,7 @@ async fn lone_prompt_is_not_reinjected_across_tool_rounds() -> Result<()> {
     let session_id = "solo-turn-no-reinjection";
     let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
 
-    log.append_event_async(&append_user_message_entry("user-1", "seed message"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "user-1", "seed message").await?;
     activate_session(&js, session_id).await?;
 
     // Four calls = three tool rounds plus the final text that ends the turn.
@@ -202,13 +201,11 @@ async fn queued_message_is_injected_once_across_many_tool_rounds() -> Result<()>
 
     // Register the wakeup before activating so notify_one() cannot be lost.
     let ready_fut = LATE_MSG_READY.notified();
-    log.append_event_async(&append_user_message_entry("user-1", "seed message"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "user-1", "seed message").await?;
     activate_session(&js, session_id).await?;
     ready_fut.await;
 
-    log.append_event_async(&append_user_message_entry("user-2", "late message"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "user-2", "late message").await?;
     LATE_MSG_DONE.notify_one();
 
     // Six calls = five tool rounds plus the final text that ends the turn.
@@ -263,8 +260,7 @@ async fn worker_turn_sends_the_prompt_to_the_model_once() -> Result<()> {
     let session_id = "wire-prompt-once";
     let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
 
-    log.append_event_async(&append_user_message_entry("user-1", "seed message"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "user-1", "seed message").await?;
     activate_session(&js, session_id).await?;
 
     wait_until(CI_SAFE_TIMEOUT, || WIRE_CALLS.load(Ordering::SeqCst) >= 1).await?;
@@ -311,8 +307,7 @@ async fn retracted_mid_tool_round_message_is_not_injected() -> Result<()> {
     let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
     let ready_fut = MID_ROUND_APPEND_READY.notified();
 
-    log.append_event_async(&append_user_message_entry("user-1", "seed message"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "user-1", "seed message").await?;
     activate_session(&js, session_id).await?;
     ready_fut.await;
 

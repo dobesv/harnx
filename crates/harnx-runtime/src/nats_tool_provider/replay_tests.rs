@@ -105,6 +105,7 @@ async fn a_saved_failure_rolls_forward_with_its_partial_result() -> anyhow::Resu
     let client = async_nats::connect(&url).await?;
     let js = async_nats::jetstream::new(client.clone());
     let request = ToolRequest {
+        run_context: None,
         replay: None,
         call_id: "failed-original".into(),
         operation_id: "failed-original".into(),
@@ -217,6 +218,7 @@ async fn record_retryable_call(js: &async_nats::jetstream::Context) -> anyhow::R
         .await?
         .record(
             &ToolRequest {
+                run_context: None,
                 replay: None,
                 call_id: "retryable-original".into(),
                 operation_id: "retryable-original".into(),
@@ -269,6 +271,7 @@ async fn replay_responder(
 
 async fn save_reply(js: &async_nats::jetstream::Context) -> anyhow::Result<()> {
     let request = ToolRequest {
+        run_context: None,
         replay: None,
         call_id: "original".into(),
         operation_id: "original".into(),
@@ -304,6 +307,7 @@ async fn saved_reply_provider(client: async_nats::Client) -> anyhow::Result<Nats
     let instance_id = ServerScope::new();
     let subscription = client.subscribe(instance_id.control_subject()).await?;
     Ok(NatsToolProvider {
+        run_context: None,
         client,
         instance_id,
         parent_session_id: Some("parent".into()),
@@ -369,6 +373,7 @@ async fn the_journal_bucket_takes_the_configured_replica_count() -> anyhow::Resu
     assert_eq!(provider.journal_replicas, 3);
 
     let request = ToolRequest {
+        run_context: None,
         replay: None,
         call_id: "wire-1".into(),
         operation_id: "wire-1".into(),
@@ -391,5 +396,109 @@ async fn the_journal_bucket_takes_the_configured_replica_count() -> anyhow::Resu
             .is_err(),
         "the bucket must not exist at the wrong durability"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_pending_replay_reports_scope_but_completed_reply_still_recovers(
+) -> anyhow::Result<()> {
+    use crate::nats_session_metadata::{CallTimeoutOverride, InvocationEdgeKind, RunLimitsRecord};
+    let server = crate::nats_test_common::spawn_nats_server()
+        .await?
+        .context("nats-server required")?;
+    let client = async_nats::connect(server.url()).await?;
+    let js = async_nats::jetstream::new(client.clone());
+    let journal = InvocationJournal::ensure(&js, 1).await?;
+    let provider = saved_reply_provider(client).await?;
+    let original = chrono::Utc::now() - chrono::Duration::seconds(30);
+    for (index, (scope, parent_allowance, child_allowance)) in [
+        ("outer_run", 1, None),
+        ("inherited_deadline", 1, Some(60)),
+        ("local_invocation", 86400, Some(1)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parent = RunLimitsRecord::admit_root(
+            Default::default(),
+            Default::default(),
+            original,
+            Default::default(),
+            None,
+            CallTimeoutOverride::from_optional(Some(parent_allowance)),
+        )?;
+        let frozen = match child_allowance {
+            None => parent,
+            Some(seconds) => RunLimitsRecord::admit_child(
+                &parent,
+                Default::default(),
+                InvocationEdgeKind::Delegation,
+                original,
+                Default::default(),
+                None,
+                CallTimeoutOverride::from_optional(Some(seconds)),
+            )?,
+        };
+        let call = harnx_core::tool::ToolCall::new(
+            "retryable_echo".into(),
+            json!({}),
+            Some(format!("model-{index}")),
+            None,
+        );
+        let request = ToolRequest {
+            call_id: format!("wire-{index}"),
+            operation_id: format!("wire-{index}"),
+            tool: "echo".into(),
+            args: json!({}),
+            parent_session_id: Some("parent".into()),
+            parent_agent: None,
+            parent_local_session_id: None,
+            tool_call_id: call.id.clone(),
+            capabilities: Default::default(),
+            replay: None,
+            run_context: Some(harnx_toolset::AutonomousRunContext {
+                snapshot: serde_json::to_value(&frozen)?,
+                started_at_ms: original.timestamp_millis().try_into()?,
+            }),
+        };
+        journal
+            .record(
+                &request,
+                ("retryable_echo", "original-scope", "retryable"),
+                5,
+            )
+            .await?;
+        let error = provider
+            .replay_recorded_call(replay_of(&call), &harnx_core::abort::create_abort_signal())
+            .await
+            .expect_err("pending expired call cannot redispatch");
+        assert!(error.is::<crate::nats_session_metadata::run_limits::DeadlineExpired>());
+        let message = error.to_string();
+        for expected in [
+            scope,
+            frozen.run_id.as_str(),
+            frozen.invocation_id.as_str(),
+            "Do not retry",
+            "Return to the user to confirm continuation",
+            "No new dispatch occurred; tool output from this attempt is unavailable",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+        journal
+            .complete(
+                &request,
+                ToolReply {
+                    call_id: request.call_id.clone(),
+                    result: Ok(json!({"answer": "saved"})),
+                    final_progress: None,
+                },
+            )
+            .await?;
+        let recovered = provider
+            .replay_recorded_call(replay_of(&call), &harnx_core::abort::create_abort_signal())
+            .await?
+            .context("completed reply wins over expired gate")?;
+        assert_eq!(recovered.value, json!({"answer": "saved"}));
+    }
     Ok(())
 }

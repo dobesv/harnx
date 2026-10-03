@@ -140,6 +140,7 @@ async fn invocation_rejected_for_disabled_tool() -> Result<()> {
     wait_for_registration(&harness.client, &harness.instance_id).await?;
 
     let request = ToolRequest {
+        run_context: None,
         replay: None,
         operation_id: "fail-call".to_string(),
         call_id: "fail-call".to_string(),
@@ -191,6 +192,7 @@ async fn idempotent_cache_does_not_bypass_admission_gate() -> Result<()> {
     wait_for_registration(&harness.client, &harness.instance_id).await?;
 
     let request = ToolRequest {
+        run_context: None,
         replay: None,
         operation_id: "fail-call".to_string(),
         call_id: "fail-call".to_string(),
@@ -249,6 +251,7 @@ async fn journal_reply_not_returned_for_disabled_tool() -> Result<()> {
 
     // Pre-seed the journal with a completed reply for a disabled tool
     let request = ToolRequest {
+        run_context: None,
         replay: None,
         operation_id: "fail-call".to_string(),
         call_id: "fail-call".to_string(),
@@ -320,6 +323,7 @@ async fn enabled_tool_works_normally_with_durable_replay() -> Result<()> {
     wait_for_registration(&harness.client, &harness.instance_id).await?;
 
     let request = ToolRequest {
+        run_context: None,
         replay: None,
         operation_id: "echo-call".to_string(),
         call_id: "echo-call".to_string(),
@@ -389,6 +393,7 @@ async fn admission_gate_rejects_disabled_tool_via_wildcard() -> Result<()> {
 
     // Send request directly via wildcard subject (bypassing registration lookup)
     let request = ToolRequest {
+        run_context: None,
         replay: None,
         operation_id: "sleep-call".to_string(),
         call_id: "sleep-call".to_string(),

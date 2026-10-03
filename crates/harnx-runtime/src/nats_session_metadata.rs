@@ -12,10 +12,13 @@
 //! `harnx.session.{storage_key}.read.invalidated`.
 
 mod activity;
+mod admission;
+pub use admission::{AdmissionAuthority, AdmissionOrigin, InvocationAdmission};
 mod execution_context;
 mod initializer;
 mod model;
 mod read_state;
+pub mod run_limits;
 mod store;
 mod tool_context;
 mod view;
@@ -34,6 +37,10 @@ pub use model::{
     SessionTitle,
 };
 pub use read_state::SessionReadState;
+pub use run_limits::{
+    CallTimeoutOverride, EffectiveDeadline, InvocationEdgeKind, InvocationIdentity,
+    ParentInvocationLink, RunIdentity, RunLimitsError, RunLimitsPolicySource, RunLimitsRecord,
+};
 pub use store::{
     activity_key, invalidation_subject, metadata_belongs_to_agent, metadata_key, read_cursor_key,
     read_invalidation_subject, session_prefix, SessionExtensionUpdate, SessionMetadataStore,

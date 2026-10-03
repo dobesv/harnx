@@ -95,6 +95,7 @@ impl McpToolsetAdapter {
             .into_iter()
             .collect();
         let invocation_context = ToolInvocationContext {
+            run_context: None,
             call_id: format!("{:?}", context.id),
             invoking_session_id: None,
             invoking_session: None,

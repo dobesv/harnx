@@ -11,6 +11,7 @@ async fn release_uses_and_clears_the_ambient_binding() -> Result<()> {
             tool: "release".to_string(),
             args: json!({}),
             context: ToolInvocationContext {
+                run_context: None,
                 call_id: "call-2".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),
@@ -42,6 +43,7 @@ async fn release_uses_and_clears_the_ambient_binding() -> Result<()> {
             tool: "release".to_string(),
             args: json!({"destroy": true}),
             context: ToolInvocationContext {
+                run_context: None,
                 call_id: "call-3".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),
@@ -96,6 +98,7 @@ async fn connect_clones_after_a_retry_and_binds_the_session() -> Result<()> {
                 "repos": [{"repo_url": "https://github.com/acme/widgets.git"}]
             }),
             context: ToolInvocationContext {
+                run_context: None,
                 call_id: "call-clone".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),
@@ -152,6 +155,7 @@ async fn connect_binds_before_a_cancelled_clone_returns() -> Result<()> {
                 "repos": [{"repo_url": "https://github.com/acme/widgets.git"}]
             }),
             context: ToolInvocationContext {
+                run_context: None,
                 call_id: "call-cancelled-clone".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),
@@ -199,6 +203,7 @@ async fn ambiguous_post_dispatch_failure_is_not_replayed() -> Result<()> {
             tool: "exec".to_string(),
             args: json!({"command": "touch /workspace/once"}),
             context: ToolInvocationContext {
+                run_context: None,
                 call_id: "call-no-replay".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),

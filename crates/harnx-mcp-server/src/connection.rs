@@ -2,7 +2,7 @@
 use crate::{bootstrap::Bootstrap, handler::tool_result};
 use harnx_core::{
     abort::{create_abort_signal, AbortSignal},
-    tool::{ToolDeclaration, ToolProvider},
+    tool::ToolDeclaration,
 };
 use harnx_runtime::{
     config::Config,
@@ -125,15 +125,33 @@ impl Connection {
             if self.shutdown.is_cancelled() || cancellation.is_cancelled() {
                 return Err(unavailable("connection or request cancelled"));
             }
+            // Only this external request adapter grants a root. Reservation/catalog lifetime
+            // isn't execution lifetime, and delegated work must retain this frozen scope.
+            let record = state
+                .reservation
+                .as_ref()
+                .expect("reservation opened")
+                .admit_external_call()
+                .await
+                .map_err(|error| {
+                    unavailable(format!("external run admission failed: {error:#}"))
+                })?;
+            if self.shutdown.is_cancelled()
+                || cancellation.is_cancelled()
+                || state.reservation.as_ref().map(|r| r.state()) != Some(catalog.state.clone())
+            {
+                return Err(unavailable(
+                    "connection, request, or reservation changed during run admission",
+                ));
+            }
             let abort = create_abort_signal();
             let guard = AbortOnDrop(abort.clone());
             let shutdown = self.shutdown.clone();
             let call_id = uuid::Uuid::new_v4().to_string();
             let task = self.calls.spawn(async move {
-                let call =
-                    catalog
-                        .provider
-                        .call_tool_with_id(&name, arguments, Some(&call_id), &abort);
+                let call = catalog
+                    .provider
+                    .call_tool_with_external_admission(&name, arguments, &call_id, &record, &abort);
                 tokio::pin!(call);
                 let result = tokio::select! {
                     result = &mut call => result,

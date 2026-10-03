@@ -5,6 +5,7 @@ pub(super) struct ToolCallInput<'a> {
     pub name: &'a str,
     pub arguments: Value,
     pub id: Option<&'a str>,
+    pub run_context: Option<&'a crate::nats_session_metadata::RunLimitsRecord>,
 }
 
 impl NatsToolProvider {
@@ -15,7 +16,13 @@ impl NatsToolProvider {
         route: &RegisteredTool,
         tool_call_id: Option<&str>,
     ) -> Result<PendingToolRequest, ToolError> {
-        self.prepare_request_with_progress(arguments, route, tool_call_id, false)
+        self.prepare_request_with_progress(
+            arguments,
+            route,
+            tool_call_id,
+            false,
+            self.run_context.as_ref(),
+        )
     }
 
     fn prepare_request_with_progress(
@@ -24,6 +31,7 @@ impl NatsToolProvider {
         route: &RegisteredTool,
         tool_call_id: Option<&str>,
         enable_progress: bool,
+        run_context: Option<&crate::nats_session_metadata::RunLimitsRecord>,
     ) -> Result<PendingToolRequest, ToolError> {
         let call_id = Uuid::new_v4().to_string();
         let mut capabilities = BTreeSet::from([EXECUTION_CONTEXT_NAMESPACE.to_string()]);
@@ -31,6 +39,13 @@ impl NatsToolProvider {
             capabilities.insert(CAPABILITY_TOOL_PROGRESS.to_string());
         }
         let request = ToolRequest {
+            run_context: run_context.map(|record| harnx_toolset::AutonomousRunContext {
+                snapshot: serde_json::to_value(record).expect("run limits serialize"),
+                started_at_ms: chrono::Utc::now()
+                    .timestamp_millis()
+                    .try_into()
+                    .expect("current UTC time is positive"),
+            }),
             replay: None,
             operation_id: call_id.clone(),
             call_id: call_id.clone(),
@@ -87,16 +102,24 @@ impl NatsToolProvider {
                 call.name
             )));
         };
+        let run_context = call.run_context.or(self.run_context.as_ref());
         let pending = self.prepare_request_with_progress(
             call.arguments,
             &route,
             call.id,
             progress.is_some(),
+            run_context,
         )?;
         let call_id = pending.call_id.clone();
         let progress_route =
             progress.map(|progress| self.progress_dispatcher.register(call_id.clone(), progress));
         let request = pending.durable;
+        if let Some(record) = run_context.filter(|record| record.is_expired_at(chrono::Utc::now()))
+        {
+            return Err(ToolError::Fatal(
+                crate::nats_session_metadata::run_limits::DeadlineExpired::before_dispatch(record),
+            ));
+        }
         Box::pin(self.record_invocation(&request, call.name, &route.server))
             .await
             .map_err(ToolError::Fatal)?;

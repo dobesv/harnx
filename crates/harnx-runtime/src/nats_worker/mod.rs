@@ -26,6 +26,7 @@ mod activation_delivery;
 mod activation_failure;
 mod activation_transport;
 mod agent_loop;
+#[cfg(test)]
 mod ancestor_check;
 mod backend;
 mod control;

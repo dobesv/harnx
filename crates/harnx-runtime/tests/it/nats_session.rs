@@ -277,7 +277,11 @@ async fn enqueue_text_preserves_durable_sequence_after_activation_failure() -> R
         })
         .await?;
 
-    let enqueued = session.enqueue_text("queued once").await?;
+    let enqueued = session
+        .clone()
+        .with_external_admission()
+        .enqueue_text("queued once")
+        .await?;
     assert!(enqueued.activation_error().is_some());
     let user_msg_seq = enqueued.user_msg_seq();
     let entries_after_failure = log.load_events_async().await?;
@@ -332,9 +336,13 @@ async fn confirmation_enqueue_reuses_stable_submission_id() -> Result<()> {
     let submission_id = Uuid::new_v4().to_string();
 
     let first = session
+        .clone()
+        .with_external_admission()
         .enqueue_text_with_tool_confirmation_id("one logical message", &route, &submission_id)
         .await?;
     let retry = session
+        .clone()
+        .with_external_admission()
         .enqueue_text_with_tool_confirmation_id("one logical message", &route, &submission_id)
         .await?;
 
@@ -590,7 +598,11 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
 
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        session.run_turn("new prompt", Arc::new(NoopEventSink), None),
+        session.clone().with_external_admission().run_turn(
+            "new prompt",
+            Arc::new(NoopEventSink),
+            None,
+        ),
     )
     .await??;
 
@@ -641,6 +653,7 @@ async fn lazy_arbitrary_id_creation_precedes_the_first_user_entry() -> Result<()
     assert!(log.load_events_async().await?.is_empty());
     let turn = tokio::spawn(async move {
         session
+            .with_external_admission()
             .run_turn("first prompt", Arc::new(NoopEventSink), None)
             .await
     });

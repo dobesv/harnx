@@ -24,6 +24,15 @@ pub struct NatsSessionLog {
 }
 
 impl NatsSessionLog {
+    pub fn jetstream(&self) -> &jetstream::Context {
+        &self.jetstream
+    }
+
+    /// Agent-scoped identity shared by this transcript and its admission records.
+    pub fn storage_key(&self) -> &str {
+        &self.session_id
+    }
+
     /// Open a named agent's local session ID. Internal workers already carry
     /// the derived storage key and use `new` directly.
     pub fn for_agent(jetstream: jetstream::Context, agent: &str, session_id: &str) -> Self {

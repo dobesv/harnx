@@ -253,7 +253,12 @@ fn assert_cancelled_history(entries: &[(u64, SessionLogEntry)]) -> Result<()> {
 async fn cancel_during_tool_keeps_admitted_prompt_and_returns_idle() -> Result<()> {
     let fixture = Fixture::start().await?;
     let input = harnx_runtime::config::input::from_str(&fixture.config, PROMPT, None);
-    fixture.session.admit_input(&input, None).await?;
+    fixture
+        .session
+        .clone()
+        .with_external_admission()
+        .admit_input(&input, None)
+        .await?;
     tokio::time::timeout(CI_SAFE_TIMEOUT, fixture.tool.entered.notified()).await?;
     assert_user_history(&fixture.entries().await?, &[PROMPT])?;
     let admitted_seq = fixture.opening_prompt_seq().await?;
@@ -264,6 +269,8 @@ async fn cancel_during_tool_keeps_admitted_prompt_and_returns_idle() -> Result<(
     let reopened = session(fixture.server.url(), SESSION_ID).await?;
     assert_eq!(reopened.activate_pending_turn().await?, None);
     reopened
+        .clone()
+        .with_external_admission()
         .run_turn(NEXT_PROMPT, Arc::new(NullSink), None)
         .await?;
     wait_for_worker_session_cleanup(&fixture.js, fixture.session.storage_key()).await?;
@@ -285,7 +292,12 @@ async fn cancel_during_tool_keeps_admitted_prompt_and_returns_idle() -> Result<(
 async fn interrupt_returns_after_single_append_without_awaiting_children_or_tools() -> Result<()> {
     let fixture = Fixture::start().await?;
     let input = harnx_runtime::config::input::from_str(&fixture.config, PROMPT, None);
-    let admitted = fixture.session.admit_input(&input, None).await?;
+    let admitted = fixture
+        .session
+        .clone()
+        .with_external_admission()
+        .admit_input(&input, None)
+        .await?;
     tokio::time::timeout(CI_SAFE_TIMEOUT, fixture.tool.entered.notified()).await?;
     let foreign = session(fixture.server.url(), SESSION_ID).await?;
     let follower = foreign.follow_admitted_prompt(
@@ -306,7 +318,9 @@ async fn interrupt_returns_after_single_append_without_awaiting_children_or_tool
     let next = session(fixture.server.url(), SESSION_ID).await?;
     let result = tokio::time::timeout(
         CI_SAFE_TIMEOUT,
-        next.run_turn(NEXT_PROMPT, Arc::new(NullSink), None),
+        next.clone()
+            .with_external_admission()
+            .run_turn(NEXT_PROMPT, Arc::new(NullSink), None),
     )
     .await??;
     assert!(

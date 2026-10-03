@@ -24,10 +24,18 @@ impl SessionActor {
             agent_name: self.key.agent(),
             session_id: &self.key.session,
         });
-        self.control_session()
-            .await?
-            .admit_input(&input, source_dir.as_deref())
-            .await
+        let session = self.control_session().await?;
+        let session = match options.runtime_parent.as_deref() {
+            Some(parent) => session.with_inherited_admission(
+                parent.clone(),
+                uuid::Uuid::new_v4().to_string(),
+                chrono::Utc::now(),
+                harnx_runtime::nats_session_metadata::InvocationEdgeKind::Handoff,
+                None,
+            ),
+            None => session.with_external_admission().with_steering_admission(),
+        };
+        session.admit_input(&input, source_dir.as_deref()).await
     }
 
     pub(super) async fn control_session(&self) -> anyhow::Result<NatsSession> {

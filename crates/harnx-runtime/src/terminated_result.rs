@@ -5,21 +5,13 @@
 //! are the only code that matches this prefix. All budget-terminal handling must
 //! use these helpers—never ad-hoc string matching on `"harnx:budget_exceeded"`.
 //!
-//! ## Timeout vs Budget Asymmetry
-//!
-//! Timeout (`timeout_secs`) is enforced **caller-side only**. It fires the existing
-//! cancellation path (AbortSignal → generation-scoped root acceptance) for
-//! invocations whose caller remains alive. There is NO worker-side deadline timer.
-//!
-//! Budget (`token_budget`) is enforced **worker-side** at the pre-model-call boundary.
-//! It bounds cost even for orphaned/detached workers whose caller has crashed.
-//!
-//! **Timeout must never be inferred from the session log.** Budget and
-//! repetition stops are the worker-side terminal signals; each leaves a marker
-//! in the turn's `Error` entry. The repetition marker is recognized only by
-//! `harnx_core::loop_guard::parse_repetition_terminal`. Callers classify an
-//! error with [`parse_worker_terminal`], which tries both recognizers, rather
-//! than repeating that sequence themselves.
+//! Worker deadlines persist scoped timeout details in the existing Cancel requester label.
+//! Budget and repetition stops use Error entries. All three share this recognizer.
+
+mod public_progress;
+mod timeout;
+pub use public_progress::{PublicProgress, PUBLIC_REFERENCE_CAP};
+pub use timeout::{parse_timeout_terminal, TimeoutScope, TimeoutTerminal};
 
 use harnx_core::{
     api_types::CompletionTokenUsage,
@@ -59,13 +51,14 @@ pub const INVOCATION_TEXT_TAIL_CAP_BYTES: usize = 4 * 1024;
 
 /// Delegating sink that retains a bounded tail of direct model thinking.
 ///
-/// Output isn't buffered because v1 termination results don't surface an output excerpt.
+/// Public output is retained separately from thinking; neither is required for a stop result.
 /// Nested [`AgentEvent::SubAgent`] chunks belong to another invocation and are not
 /// included. Non-streaming model calls don't emit thought chunks, so
 /// [`Self::thinking_tail`] remains empty if such a call is cancelled mid-request.
 pub struct InvocationBufferingSink {
     inner: Arc<dyn AgentEventSink>,
     thinking_buf: Arc<Mutex<String>>,
+    public_progress: Arc<Mutex<PublicProgress>>,
 }
 
 impl InvocationBufferingSink {
@@ -73,7 +66,12 @@ impl InvocationBufferingSink {
         Self {
             inner,
             thinking_buf: Arc::new(Mutex::new(String::new())),
+            public_progress: Arc::new(Mutex::new(PublicProgress::default())),
         }
+    }
+
+    pub fn public_progress(&self) -> PublicProgress {
+        lock_or_recover(&self.public_progress).clone()
     }
 
     pub fn thinking_tail(&self) -> String {
@@ -88,6 +86,13 @@ impl AgentEventSink for InvocationBufferingSink {
         match &event {
             AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
                 append_text_blocks(&self.thinking_buf, blocks);
+            }
+            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
+                for block in blocks {
+                    if let ContentBlock::Text(text) = block {
+                        lock_or_recover(&self.public_progress).observe_text(text);
+                    }
+                }
             }
             // Keep this invocation's accounting consistent with sub-agent progress:
             // nested events belong to the nested invocation.
@@ -160,6 +165,10 @@ pub struct TerminationDetails {
     pub usage: TerminationUsage,
     pub thinking_excerpt: Option<String>,
     pub retry_hint: String,
+    #[serde(flatten)]
+    pub timeout: Option<TimeoutTerminal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_progress: Option<PublicProgress>,
     /// What kept repeating, for a repetition stop.
     #[serde(flatten)]
     pub repetition: Option<harnx_core::loop_guard::RepetitionTerminal>,
@@ -183,6 +192,8 @@ impl SynthesizedResult {
 /// Inputs used to build a synthesized result for one stopped invocation.
 pub struct TerminationInputs<'a> {
     pub kind: TerminationKind,
+    pub timeout: Option<TimeoutTerminal>,
+    pub public_progress: Option<&'a PublicProgress>,
     pub session_id: &'a str,
     pub usage: &'a CompletionTokenUsage,
     pub thinking_excerpt: Option<&'a str>,
@@ -201,6 +212,8 @@ pub fn synthesize_terminated_result(inputs: TerminationInputs<'_>) -> Synthesize
         thinking_excerpt,
         budget,
         repetition,
+        timeout,
+        public_progress,
     } = inputs;
     let usage = TerminationUsage::from(usage);
     let thinking_excerpt = thinking_excerpt
@@ -241,10 +254,27 @@ pub fn synthesize_terminated_result(inputs: TerminationInputs<'_>) -> Synthesize
         None => "No thinking text was captured (the non-streaming path produces none mid-call)."
             .to_owned(),
     };
-    let retry_hint = format!(
-        "You can retry by sending a new message to the same session id `{session_id}` with revised or narrower instructions."
+    let retry_hint = match timeout.as_ref().map(|t| t.scope) {
+        Some(scope) => scope.retry_hint(session_id),
+        None if kind == TerminationKind::Repetition => format!("Inspect saved public results and change the repeated approach before continuing the same session id `{session_id}` within a live run. Do not retry unchanged."),
+        None => format!("Inspect saved public results before sending revised or narrower instructions to the same session id `{session_id}` within a live run. Do not retry unchanged."),
+    };
+    let public_progress = public_progress.map(PublicProgress::bounded);
+    let public_section = match &public_progress {
+        Some(progress) if progress.available => format!(
+            "Public progress (partial):\n{}\nReferences: {}",
+            progress
+                .output_excerpt
+                .as_deref()
+                .unwrap_or("No public output excerpt available."),
+            progress.references.join(" ")
+        ),
+        _ => "Public progress unavailable; no public output or artifact references were captured."
+            .to_owned(),
+    };
+    let response = format!(
+        "{explanation}\n\n{public_section}\n\n{thinking_section}\n\n{retry_hint}\n\n{usage_line}"
     );
-    let response = format!("{explanation}\n\n{thinking_section}\n\n{retry_hint}\n\n{usage_line}");
 
     SynthesizedResult {
         response,
@@ -254,6 +284,8 @@ pub fn synthesize_terminated_result(inputs: TerminationInputs<'_>) -> Synthesize
             usage,
             thinking_excerpt,
             retry_hint,
+            timeout,
+            public_progress,
             repetition,
         },
     }
@@ -281,6 +313,7 @@ pub fn parse_budget_terminal(message: &str) -> Option<BudgetTerminal> {
 /// A worker-side stop recorded in a failed turn's error text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerTerminal {
+    Timeout(TimeoutTerminal),
     BudgetExceeded(BudgetTerminal),
     Repetition(harnx_core::loop_guard::RepetitionTerminal),
 }
@@ -288,21 +321,29 @@ pub enum WorkerTerminal {
 impl WorkerTerminal {
     pub fn kind(&self) -> TerminationKind {
         match self {
+            Self::Timeout(_) => TerminationKind::Timeout,
             Self::BudgetExceeded(_) => TerminationKind::BudgetExceeded,
             Self::Repetition(_) => TerminationKind::Repetition,
+        }
+    }
+
+    pub fn timeout(&self) -> Option<TimeoutTerminal> {
+        match self {
+            Self::Timeout(t) => Some(t.clone()),
+            _ => None,
         }
     }
 
     pub fn budget(&self) -> Option<u64> {
         match self {
             Self::BudgetExceeded(terminal) => Some(terminal.budget),
-            Self::Repetition(_) => None,
+            Self::Timeout(_) | Self::Repetition(_) => None,
         }
     }
 
     pub fn repetition(&self) -> Option<harnx_core::loop_guard::RepetitionTerminal> {
         match self {
-            Self::BudgetExceeded(_) => None,
+            Self::Timeout(_) | Self::BudgetExceeded(_) => None,
             Self::Repetition(terminal) => Some(terminal.clone()),
         }
     }
@@ -310,6 +351,9 @@ impl WorkerTerminal {
 
 /// Classify a failed turn's error text as a worker-side stop, if it is one.
 pub fn parse_worker_terminal(message: &str) -> Option<WorkerTerminal> {
+    if let Some(timeout) = parse_timeout_terminal(message) {
+        return Some(WorkerTerminal::Timeout(timeout));
+    }
     if let Some(budget) = parse_budget_terminal(message) {
         return Some(WorkerTerminal::BudgetExceeded(budget));
     }
@@ -376,6 +420,8 @@ mod tests {
         budget: Option<u64>,
     ) -> SynthesizedResult {
         synthesize_terminated_result(TerminationInputs {
+            timeout: None,
+            public_progress: None,
             kind,
             session_id,
             usage: &sample_usage(),
@@ -413,8 +459,9 @@ mod tests {
                 thinking: "checking the final step",
                 budget: None,
                 expected: "The invocation was stopped after reaching its time limit.\n\n\
+                           Public progress unavailable; no public output or artifact references were captured.\n\n\
                            --- thinking (excerpt) ---\nchecking the final step\n\n\
-                           You can retry by sending a new message to the same session id `session-timeout` with revised or narrower instructions.\n\n\
+                           Inspect saved public results before sending revised or narrower instructions to the same session id `session-timeout` within a live run. Do not retry unchanged.\n\n\
                            Usage: used 73 budgeted tokens.",
             },
             ThinkingCase {
@@ -423,8 +470,9 @@ mod tests {
                 thinking: "the remaining work",
                 budget: Some(70),
                 expected: "The invocation was stopped because it reached its token budget (used 73 of 70 budgeted tokens).\n\n\
+                           Public progress unavailable; no public output or artifact references were captured.\n\n\
                            --- thinking (excerpt) ---\nthe remaining work\n\n\
-                           You can retry by sending a new message to the same session id `session-budget` with revised or narrower instructions.\n\n\
+                           Inspect saved public results before sending revised or narrower instructions to the same session id `session-budget` within a live run. Do not retry unchanged.\n\n\
                            Usage: used 73 of 70 budgeted tokens.",
             },
         ];
@@ -497,7 +545,7 @@ mod tests {
                     "budgeted": 73
                 },
                 "thinking_excerpt": "last thought",
-                "retry_hint": "You can retry by sending a new message to the same session id `session-json` with revised or narrower instructions."
+                "retry_hint": "Inspect saved public results before sending revised or narrower instructions to the same session id `session-json` within a live run. Do not retry unchanged."
             })
         );
 
@@ -514,6 +562,8 @@ mod tests {
     fn repetition_result_explains_the_stop_and_carries_the_details() {
         let terminal = harnx_core::loop_guard::RepetitionTerminal::tool_calls("fs_read", 4);
         let result = synthesize_terminated_result(TerminationInputs {
+            timeout: None,
+            public_progress: None,
             kind: TerminationKind::Repetition,
             session_id: "child",
             usage: &sample_usage(),
@@ -535,6 +585,8 @@ mod tests {
     #[test]
     fn repetition_details_sit_beside_the_stable_keys_not_in_a_nested_object() {
         let result = synthesize_terminated_result(TerminationInputs {
+            timeout: None,
+            public_progress: None,
             kind: TerminationKind::Repetition,
             session_id: "child",
             usage: &sample_usage(),
@@ -557,7 +609,7 @@ mod tests {
                     "budgeted": 73
                 },
                 "thinking_excerpt": "same call again",
-                "retry_hint": "You can retry by sending a new message to the same session id `child` with revised or narrower instructions.",
+                "retry_hint": "Inspect saved public results and change the repeated approach before continuing the same session id `child` within a live run. Do not retry unchanged.",
                 "source": "tool_calls",
                 "tool": "fs_read",
                 "count": 4
@@ -635,6 +687,8 @@ mod tests {
         let terminal = parse_worker_terminal(&format!("model call failed: {stop}"))
             .expect("the stop text is a worker terminal");
         let result = synthesize_terminated_result(TerminationInputs {
+            timeout: None,
+            public_progress: None,
             kind: terminal.kind(),
             session_id: "child",
             usage: &sample_usage(),

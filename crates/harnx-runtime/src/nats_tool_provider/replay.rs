@@ -67,6 +67,17 @@ impl NatsToolProvider {
                 record.partial_result.as_ref(),
             ));
         }
+        if let Some(context) = &record.request.run_context {
+            let frozen: crate::nats_session_metadata::RunLimitsRecord =
+                serde_json::from_value(context.snapshot.clone())?;
+            if frozen.is_expired_at(chrono::Utc::now()) {
+                return Err(
+                    crate::nats_session_metadata::run_limits::DeadlineExpired::before_dispatch(
+                        &frozen,
+                    ),
+                );
+            }
+        }
         self.dispatch_replay(record, replay, abort).await
     }
 
@@ -102,6 +113,17 @@ impl NatsToolProvider {
             authorization.revalidate().await?;
         }
         anyhow::ensure!(!abort.aborted(), "tool replay aborted before dispatch");
+        if let Some(context) = &request.run_context {
+            let frozen: crate::nats_session_metadata::RunLimitsRecord =
+                serde_json::from_value(context.snapshot.clone())?;
+            if frozen.is_expired_at(chrono::Utc::now()) {
+                return Err(
+                    crate::nats_session_metadata::run_limits::DeadlineExpired::before_dispatch(
+                        &frozen,
+                    ),
+                );
+            }
+        }
         let message = self
             .await_response(pending, abort)
             .await

@@ -30,9 +30,12 @@ async fn seed_and_activate(
     store
         .create(&SessionMetadata::new(session_id, initializer))
         .await?;
-    NatsSessionLog::new_with_replicas(jetstream.clone(), &storage_key, 1)
-        .append_event_async(&append_user_message_entry(message_id, message_id))
-        .await?;
+    crate::worker::append_admitted_fixture_user(
+        &NatsSessionLog::new_with_replicas(jetstream.clone(), &storage_key, 1),
+        message_id,
+        message_id,
+    )
+    .await?;
     publish_session_activate(jetstream, "local", &SessionActivate::new(storage_key), 1).await?;
     Ok(())
 }

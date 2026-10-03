@@ -27,6 +27,15 @@ struct Worker {
     bootstrap: Arc<Bootstrap>,
     client: async_nats::Client,
     prompts: Arc<parking_lot::Mutex<Vec<String>>>,
+    blocked_dropped: CancellationToken,
+    scopes: Arc<
+        parking_lot::Mutex<
+            Vec<(
+                String,
+                harnx_runtime::nats_session_metadata::RunLimitsRecord,
+            )>,
+        >,
+    >,
 }
 
 fn write_agent(config: &Path, name: &str) -> Result<()> {
@@ -92,12 +101,30 @@ impl Worker {
         let bootstrap = Arc::new(fixture.bootstrap(Some("X")).await?);
         let client = async_nats::connect(broker.url()).await?;
         let prompts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let blocked_dropped = CancellationToken::new();
+        let scopes = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let call_fn: AgentCallFn = Arc::new({
             let prompts = prompts.clone();
-            move |input, _config, _abort| {
+            let blocked_dropped = blocked_dropped.clone();
+            let scopes = scopes.clone();
+            move |input, config, _abort| {
+                let cfg = config.read();
+                scopes.lock().push((
+                    cfg.session.as_ref().unwrap().storage_key(),
+                    cfg.run_context
+                        .clone()
+                        .expect("worker freezes scope before model"),
+                ));
+                drop(cfg);
                 let message = input.text();
                 prompts.lock().push(message.clone());
+                let blocked_dropped = blocked_dropped.clone();
                 Box::pin(async move {
+                    if message == "deadline blocked" {
+                        // Ignores AbortSignal: worker supervision must drop the model future.
+                        let _drop = blocked_dropped.drop_guard();
+                        std::future::pending::<()>().await;
+                    }
                     Ok((
                         format!("mock reply: {message}"),
                         None,
@@ -136,6 +163,8 @@ impl Worker {
             bootstrap,
             client,
             prompts,
+            blocked_dropped,
+            scopes,
         })
     }
 
@@ -313,6 +342,37 @@ async fn assert_unlisted(client: &RunningService<RoleClient, ()>, name: &str) ->
     Ok(())
 }
 
+async fn child_limits(
+    worker: &Worker,
+    key: &str,
+    prompt: &str,
+) -> Result<harnx_runtime::nats_session_metadata::RunLimitsRecord> {
+    let events = NatsSessionLog::new(async_nats::jetstream::new(worker.client.clone()), key)
+        .load_events_latest_async()
+        .await?;
+    let id = events
+        .iter()
+        .find_map(|(_, event)| match event {
+            SessionLogEntry::Message {
+                id: Some(id),
+                role,
+                content,
+                ..
+            } if role.is_user() && content.to_text() == prompt => Some(id),
+            _ => None,
+        })
+        .context("admitted prompt missing")?;
+    let store = worker.metadata().await?;
+    let admission = store
+        .prompt_admission(key, id)
+        .await?
+        .context("prompt binding missing")?;
+    store
+        .get_invocation_limits(key, admission.invocation_id.as_str())
+        .await?
+        .context("frozen child limits missing")
+}
+
 async fn agent_continuation(
     client: &RunningService<RoleClient, ()>,
     worker: &Worker,
@@ -327,6 +387,47 @@ async fn agent_continuation(
         .context("session_prompt session_id missing")?
         .to_owned();
     assert_eq!(first["response"], "mock reply: first prompt");
+    let key = harnx_core::session_identity::session_key(Some(agent), &session_id);
+    let original = child_limits(worker, &key, "first prompt").await?;
+    let parent = original
+        .parent_invocation
+        .as_ref()
+        .context("external request scope missing")?;
+    assert_eq!(
+        parent.edge_kind,
+        harnx_runtime::nats_session_metadata::InvocationEdgeKind::Delegation
+    );
+    let root = worker
+        .metadata()
+        .await?
+        .get_run_limits(&owner.session().owner(), original.run_id.as_str())
+        .await?
+        .context("external scope wasn't persisted before dispatch")?;
+    assert!(root.parent_invocation.is_none());
+    assert_eq!(root.run_id, original.run_id);
+    assert_eq!(root.invocation_id, parent.invocation_id);
+    // Transport admission timestamps are millisecond precision; the local fallback can
+    // be slightly earlier than the parent's nanosecond deadline. Assert the actual minimum.
+    assert_eq!(
+        original.deadline,
+        Some(
+            root.deadline.unwrap().min(
+                original.admitted_at
+                    + root
+                        .deadline
+                        .unwrap()
+                        .signed_duration_since(root.admitted_at)
+            )
+        )
+    );
+    assert_eq!(
+        root.deadline
+            .unwrap()
+            .signed_duration_since(root.admitted_at)
+            .num_seconds(),
+        86400,
+        "omitted MCP root must have the finite 24-hour fallback"
+    );
     let second = call(
         client,
         tool,
@@ -336,7 +437,25 @@ async fn agent_continuation(
     let second: serde_json::Value = serde_json::from_str(&text(&second))?;
     assert_eq!(second["session_id"], session_id);
     assert_eq!(second["response"], "mock reply: continued prompt");
-    let key = harnx_core::session_identity::session_key(Some(agent), &session_id);
+    let resumed = child_limits(worker, &key, "continued prompt").await?;
+    assert_ne!(
+        original.run_id, resumed.run_id,
+        "a distinct external request must get a fresh scope"
+    );
+    assert_eq!(
+        original,
+        child_limits(worker, &key, "first prompt").await?,
+        "continuation mutated original scope"
+    );
+    assert_eq!(
+        root,
+        worker
+            .metadata()
+            .await?
+            .get_run_limits(&owner.session().owner(), original.run_id.as_str())
+            .await?
+            .unwrap()
+    );
     let metadata = worker
         .metadata()
         .await?
@@ -705,4 +824,133 @@ fn binary_missing_or_empty_selectors_fail_before_transport() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_external_request_deadline_is_frozen_and_zero_cannot_escape_it() -> Result<()> {
+    let fixture = Fixture::new()?;
+    std::fs::write(
+        fixture.config_dir().join("config.yaml"),
+        "save: false\nstream: false\nrun_limits:\n  timeout_secs: 10\n",
+    )?;
+    let worker = Worker::start(&fixture).await?;
+    let (child, client, _manager) = stdio_client(&fixture, "reviewer_*", None).await?;
+    catalog(&client, &["reviewer_session_prompt"]).await?;
+    let (key, frozen, owner, root, stopped) = {
+        let stop = call(
+            &client,
+            "reviewer_session_prompt",
+            json!({"message": "deadline blocked", "timeout_secs": 0}),
+        );
+        tokio::pin!(stop);
+        tokio::select! {
+            result = &mut stop => anyhow::bail!("request finished before blocked model: {result:?}"),
+            result = tokio::time::timeout(DEADLINE, async {
+                while worker.prompts.lock().is_empty() { tokio::time::sleep(Duration::from_millis(20)).await; }
+            }) => result.context("blocked model never entered")?,
+        }
+        let (key, frozen) = worker.scopes.lock()[0].clone();
+        let store = worker.metadata().await?;
+        let owner = store
+            .get(&key)
+            .await?
+            .unwrap()
+            .metadata
+            .parent
+            .unwrap()
+            .session_id;
+        let root = store
+            .get_run_limits(&owner, frozen.run_id.as_str())
+            .await?
+            .context("MCP root missing during model")?;
+        assert!(root.parent_invocation.is_none());
+        assert_eq!(
+            root.deadline
+                .unwrap()
+                .signed_duration_since(root.admitted_at)
+                .num_seconds(),
+            10
+        );
+        assert_eq!(
+            frozen.deadline,
+            Some(
+                root.deadline.unwrap().min(
+                    frozen.admitted_at
+                        + root
+                            .deadline
+                            .unwrap()
+                            .signed_duration_since(root.admitted_at)
+                )
+            ),
+            "zero must inherit the worker policy and remain clamped by the MCP outer scope"
+        );
+        assert_eq!(
+            frozen.parent_invocation.as_ref().unwrap().invocation_id,
+            root.invocation_id
+        );
+        assert_eq!(
+            store
+                .get_invocation_limits(&owner, root.invocation_id.as_str())
+                .await?,
+            Some(root.clone())
+        );
+        let stopped: serde_json::Value = serde_json::from_str(&text(&stop.await?))?;
+        (key, frozen, owner, root, stopped)
+    };
+    let store = worker.metadata().await?;
+    assert_eq!(stopped["termination"]["kind"], "timeout");
+    let local_deadline = frozen.admitted_at
+        + root
+            .deadline
+            .unwrap()
+            .signed_duration_since(root.admitted_at);
+    let expected_scope = if root.deadline.unwrap() < local_deadline {
+        "inherited_deadline"
+    } else {
+        "local_invocation"
+    };
+    assert_eq!(stopped["termination"]["scope"], expected_scope);
+    assert_eq!(stopped["termination"]["run_id"], frozen.run_id.as_str());
+    assert_eq!(
+        stopped["termination"]["invocation_id"],
+        frozen.invocation_id.as_str()
+    );
+    tokio::time::timeout(DEADLINE, worker.blocked_dropped.cancelled()).await?;
+    let events = NatsSessionLog::new(async_nats::jetstream::new(worker.client.clone()), &key)
+        .load_events_latest_async()
+        .await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. }))
+            .count(),
+        1
+    );
+    let fresh = call(
+        &client,
+        "reviewer_session_prompt",
+        json!({"message": "after deadline", "session_id": stopped["session_id"]}),
+    )
+    .await?;
+    let fresh: serde_json::Value = serde_json::from_str(&text(&fresh))?;
+    assert_eq!(fresh["response"], "mock reply: after deadline");
+    let next = child_limits(&worker, &key, "after deadline").await?;
+    assert_ne!(
+        next.run_id, frozen.run_id,
+        "new external request reused expired scope"
+    );
+    assert_eq!(
+        child_limits(&worker, &key, "deadline blocked").await?,
+        frozen
+    );
+    assert_eq!(
+        store.get_run_limits(&owner, root.run_id.as_str()).await?,
+        Some(root)
+    );
+    assert_eq!(
+        *worker.prompts.lock(),
+        ["deadline blocked", "after deadline"]
+    );
+    close_stdio(child, client).await?;
+    worker.stop().await
 }

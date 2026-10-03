@@ -29,7 +29,12 @@ pub(crate) async fn handle_compact_session_command(
         // For NATS-backed sessions, route through remote_nats_session.
         // If that fails (e.g., NATS connection error), emit the error.
         match remote_session_ops::remote_nats_session(config, abort_signal).await {
-            Ok(session) => emit_compaction_submit_result(session.request_compaction(None).await),
+            Ok(session) => emit_compaction_submit_result(
+                session
+                    .with_external_admission()
+                    .request_compaction(None)
+                    .await,
+            ),
             Err(error) => {
                 emit_compaction_submit_result(Err(error));
             }

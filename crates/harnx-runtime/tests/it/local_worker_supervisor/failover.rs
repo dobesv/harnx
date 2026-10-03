@@ -38,8 +38,13 @@ async fn existing_parent_receives_worker_result_across_broker_owner_exit() -> Re
         create_abort_signal(),
     )
     .await?;
-    let parent =
-        tokio::spawn(async move { session.run_turn("hello", Arc::new(NullSink), None).await });
+    let parent = tokio::spawn(async move {
+        session
+            .clone()
+            .with_external_admission()
+            .run_turn("hello", Arc::new(NullSink), None)
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(10), waiting).await??;
     drop(owner);
     tokio::time::timeout(Duration::from_secs(5), async {

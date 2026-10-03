@@ -43,8 +43,16 @@ async fn same_local_id_has_independent_history_leases_cancellation_and_deletion(
 
     let alpha_lease = acquire_lease(&js, &alpha).await?;
     let beta_lease = acquire_lease(&js, &beta).await?;
-    let alpha_prompt = alpha.enqueue_text("alpha review").await?;
-    let beta_prompt = beta.enqueue_text("beta review").await?;
+    let alpha_prompt = alpha
+        .clone()
+        .with_external_admission()
+        .enqueue_text("alpha review")
+        .await?;
+    let beta_prompt = beta
+        .clone()
+        .with_external_admission()
+        .enqueue_text("beta review")
+        .await?;
     assert_eq!(alpha_prompt.user_msg_seq(), 1);
     assert_eq!(beta_prompt.user_msg_seq(), 1);
 
@@ -257,7 +265,11 @@ async fn explicit_agent_controls_completion_and_info_even_with_other_active_agen
             harnx_runtime::utils::create_abort_signal(),
         )
         .await?;
-        session.enqueue_text(agent).await?;
+        session
+            .clone()
+            .with_external_admission()
+            .enqueue_text(agent)
+            .await?;
     }
     let mut cfg = admin_config(server.url());
     cfg.set_remote_agent("unrelated".into(), "unreachable-cluster".into());

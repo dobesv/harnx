@@ -136,6 +136,8 @@ impl TargetedFixture {
     async fn assert_idle_target_affinity(&self) -> Result<()> {
         self.session("target-only-a", WORKER_A)
             .await?
+            .clone()
+            .with_external_admission()
             .run_turn("only A", Arc::new(NullSink), None)
             .await?;
         assert_eq!(self.counter_a.load(Ordering::SeqCst), 1);
@@ -148,19 +150,30 @@ impl TargetedFixture {
         let blocker = self.acquire_blocker(session_id, "test-blocker").await?;
         let session_a = self.session(session_id, WORKER_A).await?;
         let session_b = self.session(session_id, WORKER_B).await?;
-        let turn_a =
-            tokio::spawn(
-                async move { session_a.run_turn("alpha", Arc::new(NullSink), None).await },
-            );
-        let turn_b =
-            tokio::spawn(async move { session_b.run_turn("beta", Arc::new(NullSink), None).await });
-        wait_for_user_count(&self.jetstream, session_id, 2).await?;
+        let turn_a = tokio::spawn(async move {
+            session_a
+                .with_external_admission()
+                .run_turn("alpha", Arc::new(NullSink), None)
+                .await
+        });
+        wait_for_user_count(&self.jetstream, session_id, 1).await?;
+        let conflict = session_b
+            .clone()
+            .with_external_admission()
+            .run_turn("beta", Arc::new(NullSink), None)
+            .await
+            .unwrap_err();
+        assert!(conflict.to_string().contains("session busy"));
         let before = self.total_calls();
         blocker.release().await?;
         let result_a = tokio::time::timeout(CI_SAFE_TIMEOUT, turn_a).await???;
-        let result_b = tokio::time::timeout(CI_SAFE_TIMEOUT, turn_b).await???;
-        assert!(result_a.error.is_none() && result_b.error.is_none());
-        assert_eq!(self.total_calls() - before, 1);
+        assert!(result_a.error.is_none());
+        let result_b = session_b
+            .with_external_admission()
+            .run_turn("beta", Arc::new(NullSink), None)
+            .await?;
+        assert!(result_b.error.is_none());
+        assert_eq!(self.total_calls() - before, 2);
         Ok(())
     }
 
@@ -172,9 +185,9 @@ impl TargetedFixture {
             harnx_core::session_identity::session_key(None, session_id),
             1,
         );
-        let requested_seq = log
-            .append_event_async(&append_user_message_entry("retained", "run after release"))
-            .await?;
+        let requested_seq =
+            crate::worker::append_admitted_fixture_user(&log, "retained", "run after release")
+                .await?;
         let blocker = self.acquire_blocker(session_id, "other-holder").await?;
         publish_targeted_session_activate(
             &self.jetstream,
@@ -204,6 +217,8 @@ impl TargetedFixture {
         let held_session = self.session(session_id, WORKER_A).await?;
         let held_turn = tokio::spawn(async move {
             held_session
+                .clone()
+                .with_external_admission()
                 .run_turn("hold", Arc::new(NullSink), None)
                 .await
         });
@@ -211,6 +226,9 @@ impl TargetedFixture {
         let injecting_session = self.session(session_id, WORKER_B).await?;
         let injecting_turn = tokio::spawn(async move {
             injecting_session
+                .clone()
+                .with_external_admission()
+                .with_steering_admission()
                 .run_turn("injected", Arc::new(NullSink), None)
                 .await
         });

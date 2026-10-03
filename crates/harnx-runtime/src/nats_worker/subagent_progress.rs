@@ -381,24 +381,6 @@ impl SubagentProgressReporter {
         Self { sink, tx }
     }
 
-    #[cfg(test)]
-    pub(super) fn spawn(
-        invocation: ReportedInvocation,
-        parent_sink: Option<NatsEventSink>,
-        heartbeat: Duration,
-    ) -> Self {
-        Self::spawn_reporter(
-            invocation,
-            parent_sink,
-            ReporterTitleConfig {
-                source: None,
-                initial: None,
-                read_timeout: TITLE_READ_TIMEOUT,
-            },
-            heartbeat,
-        )
-    }
-
     pub(super) fn sink(&self) -> Arc<dyn AgentEventSink> {
         Arc::clone(&self.sink)
     }

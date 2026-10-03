@@ -14,6 +14,7 @@ mod paths_split;
 mod persistence_split;
 mod rag_split;
 pub mod remote_session_ops;
+mod run_limits_resolver;
 mod servers_split;
 pub mod session;
 pub(crate) mod session_externalize;
@@ -302,6 +303,7 @@ fn handoff_tool_declarations_for_agents(
 }
 
 pub struct Config {
+    pub run_context: Option<crate::nats_session_metadata::RunLimitsRecord>,
     pub data: ConfigData,
 
     // Server-config vectors (types live in dependent crates — stay here,
@@ -388,6 +390,7 @@ impl Clone for Config {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
+            run_context: self.run_context.clone(),
             clients: self.clients.clone(),
             nats_servers: self.nats_servers.clone(),
             tool_servers: self.tool_servers.clone(),
@@ -434,6 +437,7 @@ impl Config {
     pub fn fork_session_scope(&self) -> Config {
         Config {
             data: self.data.clone(),
+            run_context: self.run_context.clone(),
             clients: self.clients.clone(),
             nats_servers: self.nats_servers.clone(),
             tool_servers: self.tool_servers.clone(),
@@ -469,6 +473,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data: ConfigData::default(),
+            run_context: None,
 
             clients: vec![],
             nats_servers: vec![],

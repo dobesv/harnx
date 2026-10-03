@@ -5,9 +5,7 @@ async fn append_retracted_user_message(
     message_id: &str,
     content: &str,
 ) -> Result<u64> {
-    let seq = log
-        .append_event_async(&append_user_message_entry(message_id, content))
-        .await?;
+    let seq = crate::worker::append_admitted_fixture_user(log, message_id, content).await?;
     log.append_event_async(&SessionLogEntry::EditEntries {
         from: seq as usize,
         to: seq as usize,
@@ -81,23 +79,9 @@ async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> 
     let session_id = "rewind-worker-test";
     let log = NatsSessionLog::new_with_replicas(js.clone(), storage_key(session_id), 1);
 
-    let first_seq = log
-        .append_event_async(&SessionLogEntry::Message {
-            id: Some("msg-first".to_string()),
-            role: MessageRole::User,
-            content: harnx_core::message::MessageContent::Text("first prompt".to_string()),
-            timestamp: None,
-            fence_token: None,
-        })
-        .await?;
-    log.append_event_async(&SessionLogEntry::Message {
-        id: Some("msg-second".to_string()),
-        role: MessageRole::User,
-        content: harnx_core::message::MessageContent::Text("second prompt".to_string()),
-        timestamp: None,
-        fence_token: None,
-    })
-    .await?;
+    let first_seq =
+        crate::worker::append_admitted_fixture_user(&log, "msg-first", "first prompt").await?;
+    crate::worker::append_admitted_fixture_user(&log, "msg-second", "second prompt").await?;
     log.append_event_async(&SessionLogEntry::Rewind {
         after_seq: usize::try_from(first_seq).expect("JetStream seq fits usize"),
     })
@@ -163,8 +147,7 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
     append_retracted_user_message(&log, "msg-to-retract", "please ignore this").await?;
 
     // Append a valid user message that SHOULD be processed.
-    log.append_event_async(&append_user_message_entry("valid-msg", "hello world"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "valid-msg", "hello world").await?;
 
     // Activate the session.
     activate_session(&js, session_id).await?;

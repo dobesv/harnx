@@ -974,6 +974,26 @@ mod tests {
                 ))
                 .await
                 .expect("seed session metadata");
+            let intent = crate::nats_session_metadata::InvocationAdmission::new(
+                &crate::nats_session_metadata::AdmissionAuthority::External {
+                    admitted_at: chrono::Utc::now(),
+                },
+                "active-cleanup-user".into(),
+                None,
+                None,
+            );
+            self.prepared
+                .runtime
+                .session_metadata
+                .reserve_admission(&storage_key, &intent, &[])
+                .await
+                .expect("admit fixture turn");
+            self.prepared
+                .runtime
+                .session_metadata
+                .bind_prompt_admission(&storage_key, "active-cleanup-user", "active-cleanup-user")
+                .await
+                .expect("bind fixture prompt");
             crate::nats_session_log::NatsSessionLog::new_with_replicas(
                 jetstream.clone(),
                 &storage_key,

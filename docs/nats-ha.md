@@ -1189,6 +1189,9 @@ broker's time-limited message deduplication. Child ID reservations retain the
 invocation identity in canonical metadata, closing the crash window before the
 checkpoint is written. The original timeout includes recovery setup time. A
 completed child's durable result is recovered before applying an expired deadline.
+Run-deadline records (`RunLimitsRecord`) persist before execution and are loaded
+on replay rather than recomputed; this prevents deadline renewal on crash or
+worker restart.
 
 Replies must be persisted before execution ownership is marked stopped: graph
 nodes can be pruned before the parent writes `ToolResults`. Journal records retain

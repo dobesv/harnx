@@ -129,6 +129,7 @@ fn invocation_context(
     progress: harnx_toolset::ToolProgressHandle,
 ) -> ToolInvocationContext {
     ToolInvocationContext {
+        run_context: request.run_context.clone(),
         call_id: request.call_id.clone(),
         invoking_session_id: request.parent_session_id.clone(),
         invoking_session: extract_invoking_session(request),

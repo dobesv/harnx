@@ -57,6 +57,7 @@ async fn the_latest_partial_result_stands_until_the_call_is_answered() {
 async fn a_standalone_call_keeps_its_partial_result_on_its_own_row() {
     let (_server, journal) = common::journal().await;
     let request = ToolRequest {
+        run_context: None,
         parent_session_id: None,
         ..common::request("unused", "standalone-partial")
     };

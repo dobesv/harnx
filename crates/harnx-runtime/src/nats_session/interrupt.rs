@@ -68,6 +68,68 @@ impl NatsSession {
         self
     }
 
+    pub async fn interrupt_prompt(
+        &self,
+        prompt_seq: u64,
+        reason: &str,
+    ) -> Result<InterruptOutcome> {
+        let request = InterruptRequest {
+            session_id: self.storage_key.clone(),
+            cluster: self.config.cluster.clone(),
+            replicas: self.attachment_replicas,
+            cancellation_id: format!("prompt-stop:{prompt_seq}"),
+            requested_by: self.requester_label(),
+            reason: reason.into(),
+        };
+        tokio::time::timeout(
+            INTERRUPT_APPEND_TIMEOUT,
+            interrupt_invocation(
+                &self.jetstream,
+                &self.client,
+                &self.config.activation_route,
+                request,
+                prompt_seq,
+            ),
+        )
+        .await
+        .context("invocation cancellation unconfirmed; external cleanup unknown")?
+    }
+
+    pub async fn interrupt_admitted_invocation(&self, reason: &str) -> Result<InterruptOutcome> {
+        let id = self
+            .invocation_id
+            .as_ref()
+            .context("automatic cancellation has no invocation identity")?;
+        let entries = self.load_durable_entries().await?;
+        let Some(prompt_seq) = self
+            .metadata_store
+            .invocation_prompt_seq(&self.storage_key, id, &entries)
+            .await?
+        else {
+            return Ok(InterruptOutcome::Idle);
+        };
+        let request = InterruptRequest {
+            session_id: self.storage_key.clone(),
+            cluster: self.config.cluster.clone(),
+            replicas: self.attachment_replicas,
+            cancellation_id: format!("invocation-stop:{id}"),
+            requested_by: self.requester_label(),
+            reason: reason.into(),
+        };
+        tokio::time::timeout(
+            INTERRUPT_APPEND_TIMEOUT,
+            interrupt_invocation(
+                &self.jetstream,
+                &self.client,
+                &self.config.activation_route,
+                request,
+                prompt_seq,
+            ),
+        )
+        .await
+        .context("invocation cancellation unconfirmed; external cleanup unknown")?
+    }
+
     /// Interrupting is one fenced `Cancel` append to this session's log. The
     /// log is the sole authority: acceptance means the append landed, not
     /// that any worker has observed it yet.
@@ -111,9 +173,12 @@ impl NatsSession {
     /// output (`LiveEventState::accept_interrupt`) by the same sequence. A
     /// `Cancel` at or below `user_msg_seq` belongs to an earlier turn — this
     /// prompt was typed after the interruption, not stopped by it.
-    pub(super) async fn wait_for_prompt_interrupt(&self, user_msg_seq: u64) -> Result<u64> {
+    pub(super) async fn wait_for_prompt_interrupt(
+        &self,
+        user_msg_seq: u64,
+    ) -> Result<(u64, Option<String>)> {
         let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
-        await_prompt_interrupt(user_msg_seq, move || {
+        await_prompt_interrupt_receipt(user_msg_seq, move || {
             let log = log.clone();
             async move { log.load_events_after_async(user_msg_seq).await }
         })
@@ -122,15 +187,23 @@ impl NatsSession {
 
     /// The sequence of the `Cancel` that interrupted the prompt at
     /// `user_msg_seq`, if the log carries one yet.
-    pub(super) async fn prompt_interrupt_seq(&self, user_msg_seq: u64) -> Result<Option<u64>> {
+    pub(super) async fn prompt_interrupt_receipt(
+        &self,
+        user_msg_seq: u64,
+    ) -> Result<Option<(u64, Option<String>)>> {
         let entries = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone())
             .load_events_after_async(user_msg_seq)
             .await
             .context("failed to load the session log above the prompt")?;
-        Ok(harnx_core::session_reconstruct::prompt_interrupted_at(
-            &entries,
-            user_msg_seq,
-        ))
+        Ok(interrupt_receipt(&entries, user_msg_seq))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn prompt_interrupt_seq(&self, user_msg_seq: u64) -> Result<Option<u64>> {
+        Ok(self
+            .prompt_interrupt_receipt(user_msg_seq)
+            .await?
+            .map(|receipt| receipt.0))
     }
 
     /// The session that invoked this one as a sub-agent child, if any.
@@ -159,7 +232,40 @@ impl NatsSession {
         let entries = self.load_durable_entries().await?;
         let state = harnx_core::session_reconstruct::reconstruct_state_from_nats(&entries);
         let requested_seq = match state.turn_status {
-            harnx_core::session_reconstruct::TurnStatus::Idle => return Ok(false),
+            harnx_core::session_reconstruct::TurnStatus::Idle => {
+                let Some(intent) = self
+                    .metadata_store
+                    .active_admission(&self.storage_key, &entries)
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                let id = intent.invocation_id.as_str();
+                self.metadata_store
+                    .bind_prompt_admission(&self.storage_key, id, id)
+                    .await?;
+                let prompt = match intent.prompt_content.clone() {
+                    Some(content) => {
+                        self.append_user_content_unchecked(content, id.to_owned())
+                            .await?
+                            .user_msg_seq
+                    }
+                    None => {
+                        let log = NatsSessionLog::new(self.jetstream.clone(), &self.storage_key);
+                        log.append_event_with_message_id_async(
+                            &SessionLogEntry::compact_request(
+                                id.to_owned(),
+                                Some("admission recovery".into()),
+                            ),
+                            id,
+                        )
+                        .await?
+                    }
+                };
+                self.publish_control_activation(prompt, None, intent.token_budget)
+                    .await?;
+                return Ok(true);
+            }
             harnx_core::session_reconstruct::TurnStatus::InterruptedPendingWindUp {
                 cancel_seq,
                 ..
@@ -192,7 +298,35 @@ impl NatsSession {
 /// healthy turn as though it had been interrupted. A bounded number of
 /// consecutive failures is retried before the error is passed on; a broker
 /// that is really gone still surfaces, one poll interval later.
-pub async fn await_prompt_interrupt<F, Fut>(user_msg_seq: u64, mut read: F) -> Result<u64>
+pub async fn await_prompt_interrupt<F, Fut>(user_msg_seq: u64, read: F) -> Result<u64>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<(u64, SessionLogEntry)>>>,
+{
+    Ok(await_prompt_interrupt_receipt(user_msg_seq, read).await?.0)
+}
+
+fn interrupt_receipt(
+    entries: &[(u64, SessionLogEntry)],
+    prompt: u64,
+) -> Option<(u64, Option<String>)> {
+    let seq = harnx_core::session_reconstruct::prompt_interrupted_at(entries, prompt)?;
+    let timeout = entries.iter().find_map(|(entry_seq, entry)| match entry {
+        SessionLogEntry::Cancel {
+            requested_by: Some(label),
+            ..
+        } if *entry_seq == seq && crate::parse_timeout_terminal(label).is_some() => {
+            Some(label.clone())
+        }
+        _ => None,
+    });
+    Some((seq, timeout))
+}
+
+async fn await_prompt_interrupt_receipt<F, Fut>(
+    user_msg_seq: u64,
+    mut read: F,
+) -> Result<(u64, Option<String>)>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Vec<(u64, SessionLogEntry)>>>,
@@ -202,10 +336,8 @@ where
         match read().await {
             Ok(entries) => {
                 consecutive_failures = 0;
-                if let Some(cancel_seq) =
-                    harnx_core::session_reconstruct::prompt_interrupted_at(&entries, user_msg_seq)
-                {
-                    return Ok(cancel_seq);
+                if let Some(receipt) = interrupt_receipt(&entries, user_msg_seq) {
+                    return Ok(receipt);
                 }
             }
             Err(error) => {
@@ -240,13 +372,63 @@ pub async fn interrupt_session(
     route: &SessionActivationRoute,
     request: InterruptRequest,
 ) -> Result<InterruptOutcome> {
+    interrupt_target(js, client, route, request, None).await
+}
+
+/// Automatic stops bind the exact immutable prompt admission. A completion or
+/// earlier cancellation wins; CAS retries never retarget a later invocation.
+///
+/// This invocation-fenced cancellation is distinct from session-level
+/// `interrupt_session`, which targets the current turn without an invocation
+/// identity. Worker deadline timeouts, scheduled cancellation, and orphan
+/// cleanup use this fenced path to prevent late timers from canceling
+/// a later independent run.
+pub async fn interrupt_invocation(
+    js: &async_nats::jetstream::Context,
+    client: &async_nats::Client,
+    route: &SessionActivationRoute,
+    request: InterruptRequest,
+    prompt_seq: u64,
+) -> Result<InterruptOutcome> {
+    interrupt_target(js, client, route, request, Some(prompt_seq)).await
+}
+
+async fn interrupt_target(
+    js: &async_nats::jetstream::Context,
+    client: &async_nats::Client,
+    route: &SessionActivationRoute,
+    request: InterruptRequest,
+    prompt_seq: Option<u64>,
+) -> Result<InterruptOutcome> {
     let log = NatsSessionLog::new(js.clone(), request.session_id.clone());
-    let mut entries: Vec<_> = log.last_entry_async().await?.into_iter().collect();
+    let mut entries: Vec<_> = match prompt_seq {
+        Some(_) => log.load_events_latest_async().await?,
+        None => log.last_entry_async().await?.into_iter().collect(),
+    };
     for _ in 0..MAX_CAS_ATTEMPTS {
-        if let Some(outcome) = decide(&entries) {
-            return Ok(outcome);
+        if let Some(prompt) = prompt_seq {
+            if let Some(terminal) = super::invocation_terminal_seq(&entries, prompt) {
+                return Ok(
+                    if entries.iter().any(|(seq, entry)| {
+                        *seq == terminal && matches!(entry, SessionLogEntry::Cancel { .. })
+                    }) {
+                        InterruptOutcome::AlreadyInterrupted {
+                            cancel_seq: terminal,
+                        }
+                    } else {
+                        InterruptOutcome::Idle
+                    },
+                );
+            }
         }
-        let tail = entries.last().map_or(0, |(seq, _)| *seq);
+        if prompt_seq.is_none() {
+            if let Some(outcome) = decide(&entries) {
+                return Ok(outcome);
+            }
+        }
+        let tail = entries
+            .last()
+            .map_or(prompt_seq.unwrap_or(0), |(seq, _)| *seq);
         let entry = SessionLogEntry::cancel_request(
             request.cancellation_id.clone(),
             request.requested_by.clone(),
@@ -263,7 +445,13 @@ pub async fn interrupt_session(
                     request.reason,
                     cancel_seq
                 );
-                announce(js, client, route, Accepted::new(&request, cancel_seq));
+                announce(
+                    js,
+                    client,
+                    route,
+                    Accepted::new(&request, cancel_seq),
+                    prompt_seq.is_none(),
+                );
                 return Ok(InterruptOutcome::Accepted { cancel_seq });
             }
             FencedAppend::Conflict { entries: newer } => {
@@ -276,7 +464,13 @@ pub async fn interrupt_session(
                     )
                 }) {
                     let cancel_seq = *seq;
-                    announce(js, client, route, Accepted::new(&request, cancel_seq));
+                    announce(
+                        js,
+                        client,
+                        route,
+                        Accepted::new(&request, cancel_seq),
+                        prompt_seq.is_none(),
+                    );
                     return Ok(InterruptOutcome::Accepted { cancel_seq });
                 }
                 entries.extend(newer);
@@ -357,6 +551,7 @@ fn announce(
     client: &async_nats::Client,
     route: &SessionActivationRoute,
     accepted: Accepted,
+    session_hint: bool,
 ) {
     let js = js.clone();
     let client = client.clone();
@@ -365,8 +560,11 @@ fn announce(
         let hint = ControlCommand::Interrupt {
             cancellation_id: accepted.cancellation_id.clone(),
         };
-        if let Err(error) = publish_control_command(&client, &accepted.session_id, &hint).await {
-            log::debug!("interrupt hint not published: {error:#}");
+        if session_hint {
+            if let Err(error) = publish_control_command(&client, &accepted.session_id, &hint).await
+            {
+                log::debug!("interrupt hint not published: {error:#}");
+            }
         }
         let result = match &route {
             SessionActivationRoute::ClusterShared => {

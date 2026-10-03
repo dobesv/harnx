@@ -206,7 +206,7 @@ async fn the_interrupt_watch_reads_nothing_below_the_prompt() {
     );
     assert_eq!(
         session.wait_for_prompt_interrupt(prompt_seq).await.unwrap(),
-        cancel_seq
+        (cancel_seq, None)
     );
 }
 
@@ -430,10 +430,9 @@ async fn interrupt_reads_nothing_below_the_tail() {
     assert_eq!(outcome, InterruptOutcome::Accepted { cancel_seq: 6 });
 }
 
-/// Admitting a prompt only needs the tail to fence its append, so it must
-/// not pay for the transcript above it either.
+/// Admission cannot infer a safe run boundary from unreadable durable state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prompt_append_reads_nothing_below_the_tail() {
+async fn prompt_append_fails_closed_on_unreadable_admission_history() {
     let Some(server) = spawn_nats_server().await.unwrap() else {
         return;
     };
@@ -448,10 +447,9 @@ async fn prompt_append_reads_nothing_below_the_tail() {
     log.append_event_async(&turn_end(1)).await.unwrap();
     assert!(log.load_events_async().await.is_err());
 
-    let seq = session
+    assert!(session
         .append_prompt_entry(&log, &user("go"), "m1")
         .await
-        .unwrap();
-
-    assert_eq!(seq, 4);
+        .is_err());
+    assert_eq!(log.last_entry_async().await.unwrap().unwrap().0, 3);
 }

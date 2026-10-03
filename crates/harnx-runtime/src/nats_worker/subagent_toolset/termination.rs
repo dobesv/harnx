@@ -8,13 +8,15 @@ use harnx_core::event::{SubAgentProgress, SubAgentProgressStatus};
 use harnx_core::message::MessageContent;
 use harnx_toolset::ToolInvokeError;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 #[path = "expired_replay_tests.rs"]
 mod expired_replay_tests;
+
+#[cfg(test)]
+mod historical_terminal_tests;
 
 pub(super) fn subagent_error_message(prefix: impl std::fmt::Display, session_id: &str) -> String {
     format!("{prefix} (session_id: {session_id})")
@@ -26,7 +28,6 @@ pub(super) struct PromptParams {
     pub parent_session_id: Option<String>,
     pub tool_call_id: Option<String>,
     pub timeout_secs: Option<u64>,
-    pub token_budget: Option<u64>,
     pub cancel: CancellationToken,
     pub context: harnx_toolset::ToolInvocationContext,
 }
@@ -39,7 +40,26 @@ pub(super) async fn run_prompt(
         return Err(ToolInvokeError::Fatal("sub-agent tool call aborted".into()));
     }
     let cancel = params.cancel.clone();
-    let (session, deadline) = checkpointed_session(toolset, &params).await?;
+    let lineage = params.context.run_context.as_ref().ok_or_else(|| {
+        ToolInvokeError::Fatal("sub-agent execution requires inherited run context".into())
+    })?;
+    let parent: crate::nats_session_metadata::RunLimitsRecord =
+        serde_json::from_value(lineage.snapshot.clone()).map_err(|error| {
+            ToolInvokeError::Fatal(format!("invalid inherited run context: {error}"))
+        })?;
+    let admitted_at = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(lineage.started_at_ms)
+            .map_err(|error| ToolInvokeError::Fatal(error.to_string()))?,
+    )
+    .ok_or_else(|| ToolInvokeError::Fatal("invalid original invocation time".into()))?;
+    let session = checkpointed_session(toolset, &params).await?;
+    let session = session.with_inherited_admission(
+        parent,
+        params.context.call_id.clone(),
+        admitted_at,
+        crate::nats_session_metadata::InvocationEdgeKind::Delegation,
+        params.timeout_secs,
+    );
     record_child(toolset, &params.context, session.session_id()).await;
     // Replay of an already-answered invocation keys off
     // `NatsSession::invocation_id`, so every child needs one bound here. The
@@ -65,9 +85,6 @@ pub(super) async fn run_prompt(
         &buffering_sink,
         AwaitTurnParams {
             content: params.content,
-            timeout: deadline
-                .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now())),
-            token_budget: params.token_budget,
             cancel: params.cancel,
         },
     )
@@ -95,39 +112,54 @@ pub(super) async fn run_prompt(
             }
             Err(error)
         }
-        PromptTurn::TimedOut(cancellation) => {
-            finish_timed_out_turn(child_session_id, &reporter, &buffering_sink, cancellation).await
-        }
     }
 }
 
 async fn checkpointed_session(
     toolset: &SubagentToolset,
     params: &PromptParams,
-) -> Result<(NatsSession, Option<tokio::time::Instant>), ToolInvokeError> {
-    let deadline = remaining_timeout(params.timeout_secs, None)
-        .map(|remaining| tokio::time::Instant::now() + remaining);
+) -> Result<NatsSession, ToolInvokeError> {
     let parent = params.parent_session_id.as_deref();
-    let session_id = params
+    let mut session_id = params
         .context
         .checkpoint
         .as_ref()
         .and_then(|checkpoint| checkpoint["session_id"].as_str())
         .map(str::to_string)
         .or_else(|| params.session_id.clone());
+    if session_id.is_none() {
+        let context = params.context.run_context.as_ref().ok_or_else(|| {
+            ToolInvokeError::Fatal("child allocation requires inherited context".into())
+        })?;
+        let config = toolset
+            .session_config(None, parent, params.tool_call_id.as_deref())
+            .await?;
+        session_id = Some(
+            crate::utils::session_name::reserve_invocation_session_id(
+                &toolset.session_metadata,
+                &config.initializer,
+                &params.context.call_id,
+                context.started_at_ms,
+            )
+            .await
+            .map_err(|error| {
+                ToolInvokeError::Recoverable(format!("reserve child admission: {error:#}"))
+            })?,
+        );
+    }
     let session = toolset
         .create_session(session_id, parent, params.tool_call_id.as_deref())
         .await?;
     let Some(parent) = parent else {
-        return Ok((session, deadline));
+        return Ok(session);
     };
     let Some(store) = params.context.checkpoint_store.as_ref() else {
-        return Ok((session, deadline));
+        return Ok(session);
     };
     // First writer wins: a concurrent or replayed attempt converges on
     // whichever child id landed first, instead of running a second one.
     let stored = store
-        .checkpoint(serde_json::json!({"session_id": session.session_id()}))
+        .checkpoint(serde_json::json!({"session_id": session.session_id(), "storage_key": session.storage_key(), "cluster": toolset.route.cluster()}))
         .await
         .map_err(|error| {
             ToolInvokeError::Fatal(format!("persist sub-agent checkpoint: {error:#}"))
@@ -136,18 +168,15 @@ async fn checkpointed_session(
         .as_str()
         .ok_or_else(|| ToolInvokeError::Fatal("invalid sub-agent checkpoint".into()))?;
     if id == session.session_id() {
-        return Ok((session, deadline));
+        return Ok(session);
     }
-    Ok((
-        toolset
-            .create_session(
-                Some(id.into()),
-                Some(parent),
-                params.tool_call_id.as_deref(),
-            )
-            .await?,
-        deadline,
-    ))
+    toolset
+        .create_session(
+            Some(id.into()),
+            Some(parent),
+            params.tool_call_id.as_deref(),
+        )
+        .await
 }
 
 /// Name the child as the call's partial result, so a call that fails, times
@@ -175,26 +204,12 @@ fn child_source(toolset: &SubagentToolset, session_id: &str) -> harnx_core::even
     }
 }
 
-fn remaining_timeout(seconds: Option<u64>, started_at_ms: Option<u64>) -> Option<Duration> {
-    seconds.filter(|seconds| *seconds > 0).map(|seconds| {
-        let elapsed = started_at_ms.map_or(Duration::ZERO, |started| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH + Duration::from_millis(started))
-                .unwrap_or_default()
-        });
-        Duration::from_secs(seconds).saturating_sub(elapsed)
-    })
-}
-
 struct AwaitTurnParams {
     content: MessageContent,
-    timeout: Option<Duration>,
-    token_budget: Option<u64>,
     cancel: CancellationToken,
 }
 
 struct AwaitCompletionParams {
-    timeout: Option<Duration>,
     cancel: CancellationToken,
 }
 
@@ -217,19 +232,14 @@ async fn await_prompt_turn(
             )))
         }
     }
-    let AwaitTurnParams {
-        content,
-        timeout,
-        token_budget,
-        cancel,
-    } = params;
+    let AwaitTurnParams { content, cancel } = params;
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
     let child = session.clone();
     let sink = buffering_sink.clone();
-    let options = RunTurnOptions {
-        token_budget: token_budget.filter(|budget| *budget > 0),
-        ..Default::default()
-    };
+    // Worker owns the frozen deadline, including target defaults and inheritance.
+    // A second caller timer could misclassify the winning deadline scope.
+    // See `AGENTS.md` under "Run-deadline cancellation is invocation-fenced".
+    let options = RunTurnOptions::default();
     let run_turn = tokio::spawn(async move {
         child
             .run_turn_content_with_options(content, sink, Some(cancel_rx), options)
@@ -239,7 +249,7 @@ async fn await_prompt_turn(
         session,
         run_turn,
         cancel_tx,
-        AwaitCompletionParams { timeout, cancel },
+        AwaitCompletionParams { cancel },
     )
     .await
 }
@@ -250,9 +260,6 @@ async fn await_owned_turn(
     cancel_tx: mpsc::Sender<()>,
     params: AwaitCompletionParams,
 ) -> PromptTurn {
-    let deadline = invocation_deadline(params.timeout);
-    tokio::pin!(deadline);
-
     let turn = tokio::select! {
         result = &mut run_turn => PromptTurn::Completed(result.unwrap_or_else(|error| Err(error.into())).map_err(|error| {
             ToolInvokeError::Recoverable(subagent_error_message(
@@ -263,16 +270,12 @@ async fn await_owned_turn(
         _ = params.cancel.cancelled() => {
             let _ = cancel_tx.try_send(());
             supervise_turn(run_turn);
-            let _ = ensure_timeout_cancellation(session).await;
+            let _ = ensure_parent_cancellation(session).await;
             PromptTurn::Aborted(ToolInvokeError::Fatal(
                 "sub-agent tool call aborted".to_string(),
             ))
         }
-        _ = &mut deadline => {
-            let _ = cancel_tx.try_send(());
-            supervise_turn(run_turn);
-            PromptTurn::TimedOut(ensure_timeout_cancellation(session).await)
-        }
+
     };
 
     turn
@@ -288,20 +291,13 @@ fn supervise_turn(turn: tokio::task::JoinHandle<anyhow::Result<NatsTurnResult>>)
     });
 }
 
-async fn invocation_deadline(timeout: Option<Duration>) {
-    match timeout {
-        Some(duration) => tokio::time::sleep(duration).await,
-        None => std::future::pending::<()>().await,
-    }
-}
-
-async fn ensure_timeout_cancellation(session: &NatsSession) -> Result<(), ToolInvokeError> {
+async fn ensure_parent_cancellation(session: &NatsSession) -> Result<(), ToolInvokeError> {
     let session_id = session.session_id();
     session
-        .interrupt("parent interrupted")
+        .interrupt_admitted_invocation("parent interrupted")
         .await
         .map_err(|error| {
-            timeout_cancellation_error(
+            parent_cancellation_error(
                 session_id,
                 format!("cancellation request failed: {error:#}"),
             )
@@ -309,49 +305,10 @@ async fn ensure_timeout_cancellation(session: &NatsSession) -> Result<(), ToolIn
     Ok(())
 }
 
-fn timeout_cancellation_error(session_id: &str, reason: impl std::fmt::Display) -> ToolInvokeError {
+fn parent_cancellation_error(session_id: &str, reason: impl std::fmt::Display) -> ToolInvokeError {
     ToolInvokeError::Recoverable(format!(
-        "sub-agent timeout: durable cancellation could not be confirmed for session '{session_id}'; not safe to retry: {reason}"
+        "sub-agent abort: durable cancellation could not be confirmed for session '{session_id}'; not safe to retry: {reason}"
     ))
-}
-
-async fn finish_timed_out_turn(
-    session_id: String,
-    reporter: &super::SubagentProgressReporter,
-    buffering_sink: &InvocationBufferingSink,
-    cancellation: Result<(), ToolInvokeError>,
-) -> Result<CompletedSubagentTurn, ToolInvokeError> {
-    // A timeout promises logical stop, not physical termination. The worker
-    // releases execution independently; a late remote side effect cannot be undone.
-    let status = if cancellation.is_ok() {
-        SubAgentProgressStatus::Cancelled
-    } else {
-        SubAgentProgressStatus::Unconfirmed
-    };
-    let progress = finish_progress(reporter, status).await;
-    if let Err(error) = cancellation {
-        if let Err(report_error) = progress {
-            log::debug!("failed to publish terminal sub-agent progress: {report_error:#}");
-        }
-        return Err(error);
-    }
-    let progress = progress?;
-    let termination = synthesize_termination(
-        TerminationSpec {
-            kind: TerminationKind::Timeout,
-            budget: None,
-            repetition: None,
-        },
-        &session_id,
-        &progress,
-        buffering_sink,
-    );
-    Ok(CompletedSubagentTurn {
-        session_id,
-        result: None,
-        progress,
-        termination: Some(termination),
-    })
 }
 
 struct CompletedTurnParams<'a> {
@@ -373,18 +330,28 @@ async fn finish_completed_turn(
         .is_some_and(|spec| spec.kind == TerminationKind::BudgetExceeded);
     let status = completed_progress_status(&params.result, cancelled, budget_exceeded);
     let progress = finish_progress(&params.reporter, status).await?;
-    if cancelled {
+    if cancelled
+        && spec
+            .as_ref()
+            .is_none_or(|s| s.kind != TerminationKind::Timeout)
+    {
         return Err(ToolInvokeError::Recoverable(subagent_error_message(
             "sub-agent turn was cancelled",
             &params.child_session_id,
         )));
     }
+    let durable_progress = if spec.is_some() {
+        load_public_progress(params.toolset, &params.result).await
+    } else {
+        None
+    };
     let termination = spec.map(|spec| {
         synthesize_termination(
             spec,
             &params.child_session_id,
             &progress,
             &params.buffering_sink,
+            durable_progress.as_ref(),
         )
     });
     Ok(CompletedSubagentTurn {
@@ -406,6 +373,7 @@ fn completed_termination_spec(result: &NatsTurnResult) -> Option<TerminationSpec
             kind: terminal.kind(),
             budget: terminal.budget(),
             repetition: terminal.repetition(),
+            timeout: terminal.timeout(),
         })
 }
 
@@ -434,7 +402,37 @@ async fn finish_progress(
     })
 }
 
+async fn load_public_progress(
+    toolset: &SubagentToolset,
+    result: &NatsTurnResult,
+) -> Option<crate::PublicProgress> {
+    let storage =
+        harnx_core::session_identity::session_key(Some(&toolset.agent), &result.session_id);
+    let log = crate::nats_session_log::NatsSessionLog::new(toolset.jetstream.clone(), storage);
+    // Timeout receipt must not wait for optional progress reads or old conversation history.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        log.load_events_after_async(result.user_msg_seq),
+    )
+    .await
+    {
+        Ok(Ok(entries)) => Some(crate::PublicProgress::from_entries(
+            &entries,
+            result.user_msg_seq,
+        )),
+        Ok(Err(error)) => {
+            log::warn!("public progress unavailable: {error:#}");
+            None
+        }
+        Err(_) => {
+            log::warn!("public progress read exceeded 2s; progress unavailable");
+            None
+        }
+    }
+}
+
 struct TerminationSpec {
+    timeout: Option<crate::TimeoutTerminal>,
     kind: TerminationKind,
     budget: Option<u64>,
     repetition: Option<harnx_core::loop_guard::RepetitionTerminal>,
@@ -445,9 +443,16 @@ fn synthesize_termination(
     session_id: &str,
     progress: &SubAgentProgress,
     buffering_sink: &InvocationBufferingSink,
+    durable_progress: Option<&crate::PublicProgress>,
 ) -> SynthesizedResult {
     let thinking_tail = buffering_sink.thinking_tail();
+    let public_progress = durable_progress
+        .cloned()
+        .filter(|p| p.available)
+        .unwrap_or_else(|| buffering_sink.public_progress());
     synthesize_terminated_result(TerminationInputs {
+        timeout: spec.timeout,
+        public_progress: Some(&public_progress),
         kind: spec.kind,
         session_id,
         usage: &progress.usage,
@@ -492,7 +497,6 @@ pub(super) fn result_value(
 enum PromptTurn {
     Completed(Result<NatsTurnResult, ToolInvokeError>),
     Aborted(ToolInvokeError),
-    TimedOut(Result<(), ToolInvokeError>),
 }
 
 #[cfg(test)]
@@ -573,50 +577,5 @@ mod tests {
         assert_eq!(budget.budget, Some(20));
         assert!(budget.repetition.is_none());
         assert!(completed_termination_spec(&turn_with_error("boom")).is_none());
-    }
-
-    #[tokio::test]
-    async fn timeout_cancellation_failure_is_recoverable_and_finishes_reporter() {
-        let reporter = super::super::SubagentProgressReporter::spawn(
-            super::super::ReportedInvocation {
-                agent: "helper".to_string(),
-                session_id: "unsafe-session".to_string(),
-                invocation_id: "invocation".to_string(),
-                tool_call_id: None,
-            },
-            None,
-            Duration::from_secs(60),
-        );
-        let buffering_sink = InvocationBufferingSink::new(reporter.sink());
-        let cancellation = Err(timeout_cancellation_error(
-            "unsafe-session",
-            "durable cancellation request failed",
-        ));
-
-        let error = match finish_timed_out_turn(
-            "unsafe-session".to_string(),
-            &reporter,
-            &buffering_sink,
-            cancellation,
-        )
-        .await
-        {
-            Ok(_) => panic!("unsafe timeout must not return a synthesized retry result"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            error,
-            ToolInvokeError::Recoverable(
-                "sub-agent timeout: durable cancellation could not be confirmed for session 'unsafe-session'; not safe to retry: durable cancellation request failed".to_string()
-            )
-        );
-        let second_finish = tokio::time::timeout(
-            Duration::from_secs(1),
-            reporter.finish(SubAgentProgressStatus::Done),
-        )
-        .await
-        .expect("reporter completion check timed out");
-        assert!(second_finish.is_err(), "reporter must already be finished");
     }
 }

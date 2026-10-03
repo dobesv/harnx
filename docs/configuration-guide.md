@@ -382,6 +382,52 @@ loop_detection:
 The `--check-loop-detection` replay described above also reports the saved
 replies this guard would have stopped.
 
+### Run Execution Limits (`run_limits`)
+
+Autonomous runs have a finite wall-clock deadline. If no positive timeout is set, the global fallback is **86,400 seconds (24 hours)**. This is a policy default, not a measured workload threshold. Only a fresh external admission starts a new run; autonomous delegation, continuation and replay don't renew its deadline.
+
+#### Global and Per-Agent Configuration
+
+Set a global allowance in `config.yaml`:
+
+```yaml
+run_limits:
+  timeout_secs: 86400
+```
+
+Override the local allowance for a target agent in its Markdown front matter (`<config-dir>/agents/<name>.md`):
+
+```yaml
+---
+model: openai:gpt-4o
+run_limits:
+  timeout_secs: 7200
+---
+You are a helpful assistant.
+```
+
+For long work, use a longer finite value. Seven days is `604800` seconds; thirty days is `2592000`:
+
+```yaml
+run_limits:
+  timeout_secs: 2592000
+```
+
+The field accepts integers, not strings. There is no deadline-disable setting. Duration and timestamp arithmetic is checked; values that overflow are rejected.
+
+#### Precedence and Inheritance
+
+1. A positive global `run_limits.timeout_secs` replaces the 24-hour fallback.
+2. A positive target-agent timeout replaces the global allowance. The target worker's effective configuration, including package patches, is authoritative.
+3. A positive delegation `timeout_secs` replaces the target's local allowance for that invocation.
+4. A frozen ancestor deadline clamps the result: `min(admitted_at + local allowance, ancestor deadline)`.
+
+At every configuration and delegation level, **omitted, `null`, zero and negative integers all mean inherit/default**. A target with any of these values uses the global allowance; a global setting with any of these values uses 24 hours. A delegation override with any of these values uses the target's effective policy. None can bypass or extend a shorter inherited deadline.
+
+#### Frozen Admissions
+
+`RunLimitsRecord` captures the original admission timestamp and resolved absolute deadline before execution. Config reloads apply to new admissions; active runs and worker replays retain their saved deadlines. Each newly admitted root has a finite deadline, including macro and incoming MCP request roots. Cancellation remains invocation-fenced and doesn't roll back external side effects.
+
 ### Session Titles
 
 Harnx can automatically generate a short, human-readable title for each session

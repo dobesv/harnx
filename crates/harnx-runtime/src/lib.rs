@@ -55,10 +55,11 @@ pub use nats_session::{
 pub use nats_session_metadata::{SessionInitializer, SessionOverrides};
 pub use nats_worker::{ControlCommand, SessionActivationRoute};
 pub use terminated_result::{
-    budget_terminal_message, parse_budget_terminal, parse_worker_terminal,
-    synthesize_terminated_result, BudgetTerminal, InvocationBufferingSink, SynthesizedResult,
-    TerminationDetails, TerminationInputs, TerminationKind, TerminationUsage, WorkerTerminal,
-    INVOCATION_TEXT_TAIL_CAP_BYTES,
+    budget_terminal_message, parse_budget_terminal, parse_timeout_terminal, parse_worker_terminal,
+    synthesize_terminated_result, BudgetTerminal, InvocationBufferingSink, PublicProgress,
+    SynthesizedResult, TerminationDetails, TerminationInputs, TerminationKind, TerminationUsage,
+    TimeoutScope, TimeoutTerminal, WorkerTerminal, INVOCATION_TEXT_TAIL_CAP_BYTES,
+    PUBLIC_REFERENCE_CAP,
 };
 
 pub use agent_loop::{

@@ -164,7 +164,17 @@ where
         move |input, client, abort| {
             let call_fn = call_fn.clone();
             let config_owned = config_for_closure.clone();
-            Box::pin(async move { call_fn(input, client, &config_owned, abort).await })
+            Box::pin(async move {
+                if config_owned
+                    .read()
+                    .run_context
+                    .as_ref()
+                    .is_some_and(|record| record.is_expired_at(chrono::Utc::now()))
+                {
+                    return Err(crate::nats_session_metadata::run_limits::DeadlineExpired.into());
+                }
+                call_fn(input, client, &config_owned, abort).await
+            })
         },
     )
     .await?;

@@ -68,6 +68,10 @@ impl NatsSession {
     /// Returns `CompactSubmit::Submitted` on success, or one of the skip variants
     /// if the tail indicates a pending or recent compaction.
     pub async fn request_compaction(&self, requested_by: Option<String>) -> Result<CompactSubmit> {
+        let entries = self.load_durable_entries().await?;
+        if let Some(skip) = decide_compact_submit(&entries) {
+            return Ok(skip);
+        }
         let request = CompactionRequest {
             session_id: self.storage_key.clone(),
             cluster: self.config.cluster.clone(),
@@ -76,6 +80,8 @@ impl NatsSession {
             requested_by,
         };
 
+        self.admit_prompt(&request.compaction_id, true, None)
+            .await?;
         tokio::time::timeout(
             COMPACTION_APPEND_TIMEOUT,
             request_compaction_session(

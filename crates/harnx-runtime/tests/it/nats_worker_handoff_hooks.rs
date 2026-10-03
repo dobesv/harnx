@@ -411,6 +411,8 @@ async fn handoff_to_agent_with_hooks_starts_its_hook_enforcement() -> Result<()>
     )
     .await?;
     source
+        .clone()
+        .with_external_admission()
         .run_turn("start handoff", Arc::new(NullSink), None)
         .await?;
 
@@ -489,12 +491,16 @@ async fn completed_agent_turn_cleans_hook_routes_before_next_handoff() -> Result
     )
     .await?;
     source
+        .clone()
+        .with_external_admission()
         .run_turn("complete without tools", Arc::new(NullSink), None)
         .await?;
     assert_hook_routes_cleaned(&client).await?;
 
     wait_for_source_owner_release(&js, source.session_id()).await?;
     source
+        .clone()
+        .with_external_admission()
         .run_turn("handoff now", Arc::new(NullSink), None)
         .await?;
     assert_hook_routes_cleaned(&client).await?;
@@ -546,6 +552,8 @@ async fn cancelled_agent_turn_cleans_hook_routes() -> Result<()> {
     let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(1);
     let turn = tokio::spawn(async move {
         source
+            .clone()
+            .with_external_admission()
             .run_turn("wait for cancellation", Arc::new(NullSink), Some(cancel_rx))
             .await
     });

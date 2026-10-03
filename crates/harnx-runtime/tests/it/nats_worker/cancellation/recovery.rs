@@ -12,7 +12,11 @@ async fn replacement_confirms_durable_cancel_after_dead_owners_lease_expires() -
         .await?
         .context("nats-server required")?;
     let session = session(server.url(), "dead-cancelling-owner").await?;
-    session.enqueue_text("never run the model").await?;
+    session
+        .clone()
+        .with_external_admission()
+        .enqueue_text("never run the model")
+        .await?;
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let lease_config = NatsLeaseConfig {
         ttl: Duration::from_secs(1),

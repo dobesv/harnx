@@ -142,6 +142,9 @@ impl HandoffFixture {
             .await?;
         let stream = self.source_stream(&source).await?;
         source
+            .clone()
+            .with_external_admission()
+            .with_admission_timeout(Some(30))
             .run_turn("explicit handoff", Arc::new(NullSink), None)
             .await?;
         let source_entries = self.log(&source).load_events_async().await?;
@@ -156,6 +159,69 @@ impl HandoffFixture {
 
         let entries = wait_for_handoff_target(explicit_log, "finish explicit work").await?;
         assert_handoff_target_log(&entries, "finish explicit work");
+        let store =
+            harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&self.jetstream, 1)
+                .await?;
+        let source_prompt = source_entries
+            .iter()
+            .find_map(|(_, entry)| match entry {
+                SessionLogEntry::Message {
+                    id: Some(id), role, ..
+                } if role.is_user() => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        let source_admission = store
+            .prompt_admission(source.storage_key(), source_prompt)
+            .await?
+            .unwrap();
+        let source_limits = store
+            .get_invocation_limits(
+                source.storage_key(),
+                source_admission.invocation_id.as_str(),
+            )
+            .await?
+            .unwrap();
+        let target_prompt = entries
+            .iter()
+            .rev()
+            .find_map(|(_, entry)| match entry {
+                SessionLogEntry::Message {
+                    id: Some(id), role, ..
+                } if role.is_user() => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        let target_admission = store
+            .prompt_admission(explicit_log.storage_key(), target_prompt)
+            .await?
+            .unwrap();
+        let target_limits = store
+            .get_invocation_limits(
+                explicit_log.storage_key(),
+                target_admission.invocation_id.as_str(),
+            )
+            .await?
+            .unwrap();
+        assert_eq!(target_limits.run_id, source_limits.run_id);
+        assert_eq!(target_limits.deadline, source_limits.deadline);
+        assert_eq!(
+            target_limits
+                .parent_invocation
+                .as_ref()
+                .unwrap()
+                .invocation_id,
+            source_limits.invocation_id
+        );
+        assert_eq!(
+            target_limits.parent_invocation.as_ref().unwrap().edge_kind,
+            harnx_runtime::nats_session_metadata::InvocationEdgeKind::Handoff
+        );
+        assert_eq!(
+            source_limits.deadline,
+            Some(source_admission.admitted_at + chrono::Duration::seconds(30))
+        );
+
         assert!(entries.iter().any(|(_, entry)| matches!(
             entry,
             SessionLogEntry::Message {
@@ -174,6 +240,8 @@ impl HandoffFixture {
         let stream = self.source_stream(&source).await?;
         let activation_observer = self.observe_target_activation(&source).await?;
         source
+            .clone()
+            .with_external_admission()
             .run_turn("generated handoff", Arc::new(NullSink), None)
             .await?;
         let observed = observe_source_handoff(stream).await?;
@@ -199,6 +267,8 @@ impl HandoffFixture {
             .await?;
         let stream = self.source_stream(&source).await?;
         let result = source
+            .clone()
+            .with_external_admission()
             .run_turn("ownership mismatch", Arc::new(NullSink), None)
             .await?;
         assert!(

@@ -125,6 +125,15 @@ impl AgentLoopContext {
     /// former gate boundary is now just this check.
     pub(crate) fn check_generation(&self, boundary: &str) -> Result<()> {
         anyhow::ensure!(!self.abort_signal.aborted(), "interrupted at {boundary}");
+        if self
+            .config
+            .read()
+            .run_context
+            .as_ref()
+            .is_some_and(|record| record.is_expired_at(chrono::Utc::now()))
+        {
+            return Err(crate::nats_session_metadata::run_limits::DeadlineExpired.into());
+        }
         Ok(())
     }
 }

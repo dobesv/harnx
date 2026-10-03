@@ -8,7 +8,7 @@ use super::session_watcher::InterruptNotice;
 use super::wind_up::{wind_up_interrupted_turn, WindUpInputs, WindUpOutcome};
 use super::{NatsSessionLogBackend, SessionActivate};
 use crate::nats_lease::NatsSessionLease;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use harnx_core::event::{AgentEvent, TurnEvent};
 use harnx_core::session::SessionLogEntry;
 use std::sync::Arc;
@@ -58,6 +58,7 @@ impl FinishCause {
 
 #[derive(Clone)]
 pub(super) struct WorkerExecution {
+    invocation_id: Option<String>,
     /// Who this worker is and what it claimed. Diagnostic only: every append
     /// takes its revision from the live lease, which can have been renewed
     /// since, and is the authority.
@@ -111,7 +112,13 @@ impl WorkerExecution {
             worker_id: lease.worker_id().to_string(),
             fence_token: lease.fence_token(),
             wind_up: None,
+            invocation_id: None,
         }
+    }
+
+    pub fn with_invocation(mut self, id: Option<String>) -> Self {
+        self.invocation_id = id;
+        self
     }
 
     /// Attach what the wind-up of an interrupted turn needs. Called once, by
@@ -134,6 +141,35 @@ impl WorkerExecution {
             "cannot record cancellation after lease loss"
         );
         let entries = backend.load_events_latest_async().await?;
+        if let Some(id) = &self.invocation_id {
+            let store = backend
+                .metadata_store_opt()
+                .context("worker stop has no admission metadata")?;
+            let prompt = store
+                .invocation_prompt_seq(&self.session_id, id, &entries)
+                .await?
+                .context("worker stop has no invocation binding")?;
+            let context = self
+                .wind_up
+                .as_ref()
+                .context("worker stop has no interrupt transport")?;
+            crate::nats_session::interrupt::interrupt_invocation(
+                &context.jetstream,
+                &context.client,
+                &super::SessionActivationRoute::ClusterShared,
+                crate::nats_session::InterruptRequest {
+                    session_id: self.session_id.clone(),
+                    cluster: String::new(),
+                    replicas: context.replicas,
+                    cancellation_id: format!("worker-stop:{id}"),
+                    requested_by: self.worker_id.clone(),
+                    reason: "worker invocation interrupted".into(),
+                },
+                prompt,
+            )
+            .await?;
+            return Ok(());
+        }
         if harnx_core::session_reconstruct::current_turn_is_cancelled(&entries) {
             // A frontend, a parent session or a previous worker already
             // terminated the turn in progress. A second Cancel would say
@@ -362,6 +398,12 @@ impl WorkerExecution {
     /// activation is the only thing that will run it.
     async fn has_queued_input(&self, backend: &NatsSessionLogBackend) -> Result<bool> {
         let entries = backend.load_events_latest_async().await?;
+        if let Some(store) = backend.metadata_store_opt() {
+            return Ok(store
+                .active_admission(&self.session_id, &entries)
+                .await?
+                .is_some());
+        }
         let state = harnx_core::session_reconstruct::reconstruct_state_from_nats(&entries);
         Ok(!state.next_turn_messages.is_empty())
     }

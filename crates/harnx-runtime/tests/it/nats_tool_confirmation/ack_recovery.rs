@@ -36,7 +36,11 @@ impl Fixture {
             create_abort_signal(),
         )
         .await?;
-        source.enqueue_text("await tool approval").await?;
+        source
+            .clone()
+            .with_external_admission()
+            .enqueue_text("await tool approval")
+            .await?;
         let lease = Arc::new(
             NatsSessionLease::acquire(NatsLeaseAcquireParams {
                 jetstream: js.clone(),

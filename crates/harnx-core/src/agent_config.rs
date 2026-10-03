@@ -2,7 +2,7 @@
 //! tools, hooks, retry config, variables. Data + pure methods only; no
 //! file I/O, no inquire, no runtime state. Runtime fields (rag) live on the harnx-side `Agent` wrapper.
 
-use crate::config_data::LoopDetectionOverride;
+use crate::config_data::{LoopDetectionOverride, RunLimitsOverride};
 use crate::hooks::HooksConfig;
 use crate::model::Model;
 use crate::retry_config::RetryConfig;
@@ -152,6 +152,9 @@ pub struct AgentConfig {
     title_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     loop_detection: Option<LoopDetectionOverride>,
+    /// Per-agent run limits override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_limits: Option<RunLimitsOverride>,
     #[serde(default)]
     pub role: AgentRole,
     #[serde(default)]
@@ -205,6 +208,7 @@ impl AgentConfig {
             compaction_tool_output_max_chars: frontmatter.compaction_tool_output_max_chars,
             title_agent: frontmatter.title_agent,
             loop_detection: frontmatter.loop_detection,
+            run_limits: frontmatter.run_limits,
             role: frontmatter.role,
             prompt,
             ..Default::default()
@@ -364,6 +368,11 @@ impl AgentConfig {
 
     pub fn loop_detection(&self) -> Option<&LoopDetectionOverride> {
         self.loop_detection.as_ref()
+    }
+
+    /// Returns this agent's run limits override.
+    pub fn run_limits(&self) -> Option<&RunLimitsOverride> {
+        self.run_limits.as_ref()
     }
 
     pub fn compaction_agent(&self) -> Option<&str> {
@@ -589,6 +598,9 @@ struct AgentFrontMatter {
     title_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     loop_detection: Option<LoopDetectionOverride>,
+    /// Per-agent run limits override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_limits: Option<RunLimitsOverride>,
     #[serde(default)]
     role: AgentRole,
 }
@@ -615,6 +627,7 @@ impl AgentFrontMatter {
             compaction_tool_output_max_chars: config.compaction_tool_output_max_chars,
             title_agent: config.title_agent.clone(),
             loop_detection: config.loop_detection,
+            run_limits: config.run_limits,
             role: config.role,
         }
     }
@@ -653,12 +666,17 @@ impl AgentFrontMatter {
         self.loop_detection.is_none()
     }
 
+    fn run_limits_is_empty(&self) -> bool {
+        self.run_limits.is_none()
+    }
+
     fn is_empty(&self) -> bool {
         self.model_is_empty()
             && self.content_is_empty()
             && self.compaction_is_empty()
             && self.title_is_empty()
             && self.loop_detection_is_empty()
+            && self.run_limits_is_empty()
             && self.role == AgentRole::Assistant
     }
 }
@@ -1015,6 +1033,52 @@ You are a compaction agent.\n";
                 output: None,
             })
         );
+    }
+
+    #[test]
+    fn test_docs_run_limits_frontmatter_examples() {
+        use crate::config_data::RunLimitsConfig;
+        for (value, expected) in [
+            (None, 86400),
+            (Some("null"), 86400),
+            (Some("0"), 86400),
+            (Some("-1"), 86400),
+            (Some("-9223372036854775808"), 86400),
+            (Some("7200"), 7200),
+            (Some("604800"), 604800),
+            (Some("2592000"), 2592000),
+        ] {
+            let frontmatter = value
+                .map(|value| format!("run_limits:\n  timeout_secs: {value}\n"))
+                .unwrap_or_default();
+            let markdown = format!("---\n{frontmatter}---\nTarget agent\n");
+            let agent = AgentConfig::from_markdown("target", &markdown).unwrap();
+            let limits = agent.run_limits().and_then(|limits| limits.timeout_secs);
+            assert_eq!(
+                RunLimitsConfig::default()
+                    .resolve(limits.as_ref())
+                    .timeout_secs
+                    .get(),
+                expected,
+                "{value:?}"
+            );
+        }
+        for value in [
+            "unlimited",
+            "\"7200\"",
+            "1.5",
+            "true",
+            "18446744073709551615",
+        ] {
+            assert!(
+                AgentConfig::from_markdown(
+                    "target",
+                    &format!("---\nrun_limits:\n  timeout_secs: {value}\n---\nTarget\n")
+                )
+                .is_err(),
+                "{value}"
+            );
+        }
     }
 }
 

@@ -280,8 +280,7 @@ async fn claim_survives_ordinary_activation_completion() -> Result<()> {
     let reserved = f.reserve("fs_*").await?;
     let log =
         NatsSessionLog::new_with_replicas(f.js.clone(), storage_key("reservation-session"), 1);
-    log.append_event_async(&append_user_message_entry("reservation-turn", "hello"))
-        .await?;
+    crate::worker::append_admitted_fixture_user(&log, "reservation-turn", "hello").await?;
     publish_session_activate(
         &f.js,
         "local",

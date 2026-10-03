@@ -177,6 +177,7 @@ mod tests {
 
     fn request(capabilities: BTreeSet<String>) -> ToolRequest {
         ToolRequest {
+            run_context: None,
             replay: None,
             operation_id: "operation-1".into(),
             call_id: "call-1".into(),
