@@ -41,6 +41,7 @@ mod hook_crash;
 mod hook_process;
 mod hook_registration;
 mod hook_supervisor;
+mod operator_tools;
 pub mod server_reconciler;
 mod session_turn;
 mod session_watcher;

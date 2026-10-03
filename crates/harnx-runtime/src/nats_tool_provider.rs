@@ -97,6 +97,45 @@ fn resolve_parent_identity(config: &Config) -> (Option<String>, Option<String>, 
     )
 }
 
+enum DiscoveryPolicy<'a> {
+    BestEffort(Option<&'a str>),
+    Strict(Option<&'a str>),
+}
+
+async fn discover_registrations(
+    jetstream: &async_nats::jetstream::Context,
+    instance_id: &ServerScope,
+    strict: bool,
+) -> anyhow::Result<(Option<async_nats::jetstream::kv::Store>, Vec<Registration>)> {
+    match open_registry_store(jetstream).await {
+        Ok(Some(store)) => match registration_snapshot_in(&store, instance_id).await {
+            Ok(registrations) => Ok((Some(store), registrations)),
+            Err(error) => {
+                if strict {
+                    return Err(error);
+                }
+                log::warn!(
+                    "tool registration discovery failed under scope '{}': {error:#}",
+                    instance_id.as_str()
+                );
+                Ok((Some(store), Vec::new()))
+            }
+        },
+        Ok(None) => Ok((None, Vec::new())),
+        Err(error) => {
+            if strict {
+                return Err(error);
+            }
+            // An absent scope is valid; a failed KV scan must still be visible.
+            log::warn!(
+                "tool registration discovery failed under scope '{}': {error:#}",
+                instance_id.as_str()
+            );
+            Ok((None, Vec::new()))
+        }
+    }
+}
+
 impl NatsToolProvider {
     /// Dispatch one trusted frontend request with its already-persisted outer scope.
     /// Keep connection catalogs reusable without sharing a deadline between requests.
@@ -133,6 +172,31 @@ impl NatsToolProvider {
         in_flight: NatsInFlightCalls,
         active_package: Option<&str>,
     ) -> anyhow::Result<Self> {
+        let policy = DiscoveryPolicy::BestEffort(active_package);
+        Self::discover_inner(config, instance_id, in_flight, policy).await
+    }
+
+    /// Operator discovery must distinguish an empty catalog from a failed scan.
+    pub async fn discover_strict(
+        config: &Config,
+        instance_id: ServerScope,
+        in_flight: NatsInFlightCalls,
+        active_package: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let policy = DiscoveryPolicy::Strict(active_package);
+        Self::discover_inner(config, instance_id, in_flight, policy).await
+    }
+
+    async fn discover_inner(
+        config: &Config,
+        instance_id: ServerScope,
+        in_flight: NatsInFlightCalls,
+        policy: DiscoveryPolicy<'_>,
+    ) -> anyhow::Result<Self> {
+        let (active_package, strict) = match policy {
+            DiscoveryPolicy::BestEffort(package) => (package, false),
+            DiscoveryPolicy::Strict(package) => (package, true),
+        };
         let cluster = config.default_cluster_key();
         let journal_replicas = config
             .resolve_nats_server(cluster)
@@ -144,30 +208,8 @@ impl NatsToolProvider {
         client.flush().await?;
 
         let jetstream = async_nats::jetstream::new(client.clone());
-        let (registry, mut registrations) = match open_registry_store(&jetstream).await {
-            Ok(Some(store)) => match registration_snapshot_in(&store, &instance_id).await {
-                Ok(registrations) => (Some(store), registrations),
-                Err(error) => {
-                    log::warn!(
-                        "tool registration discovery failed under scope '{}': {error:#}",
-                        instance_id.as_str()
-                    );
-                    (Some(store), Vec::new())
-                }
-            },
-            Ok(None) => (None, Vec::new()),
-            Err(error) => {
-                // Degrading to zero tools is intended when a scope has none
-                // registered; going silent about a KV scan that outright
-                // failed is not — it looked identical to "no tools configured"
-                // in the logs.
-                log::warn!(
-                    "tool registration discovery failed under scope '{}': {error:#}",
-                    instance_id.as_str()
-                );
-                (None, Vec::new())
-            }
-        };
+        let (registry, mut registrations) =
+            discover_registrations(&jetstream, &instance_id, strict).await?;
         for registration in &registrations {
             anyhow::ensure!(registration.proto_version == harnx_toolset_server::TOOL_PROTOCOL_VERSION,
                 "incompatible tool protocol {} from '{}'; expected v{}; upgrade workers and tool servers together",
@@ -261,6 +303,38 @@ impl NatsToolProvider {
             .cloned()
             .collect()
     }
+    /// Ordinary inference keeps its historical collision policy. Explicit calls
+    /// must not silently choose one of several servers with the same visible name.
+    pub fn ensure_unambiguous(
+        &self,
+        names: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let mut owners = HashMap::new();
+        for registration in &self.registrations {
+            for spec in &registration.tools {
+                let name = ServerIdentity::agent_visible_name(
+                    self.active_package.as_deref(),
+                    registration,
+                    &spec.name,
+                );
+                if !names.contains(&name) {
+                    continue;
+                }
+                let owner = (
+                    ServerIdentity::identity_token(registration),
+                    spec.name.clone(),
+                );
+                if let Some(previous) = owners.insert(name.clone(), owner.clone()) {
+                    anyhow::ensure!(
+                        previous == owner,
+                        "Tool '{name}' is ambiguous between routes {previous:?} and {owner:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn in_flight_calls(&self) -> NatsInFlightCalls {
         self.in_flight.clone()
     }

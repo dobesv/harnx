@@ -88,6 +88,27 @@ impl ChildProcessManager {
             .await
             .map_err(|_| io::Error::other("child process manager stopped during spawn"))?
     }
+
+    /// Stop the Unix process group created by this manager, including descendants.
+    ///
+    /// Call only for a child spawned by this manager, before polling or reaping it:
+    /// the unreaped leader reserves its group ID even after it exits. Callers must
+    /// still stop/reap the direct child. This is a no-op on non-Unix platforms.
+    pub fn stop_process_group(&self, child: &Child) -> io::Result<()> {
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            // SAFETY: managed spawn sets PGID=PID; the unreaped child reserves it.
+            if unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = child;
+        Ok(())
+    }
 }
 
 fn start_manager() -> StartedManager {

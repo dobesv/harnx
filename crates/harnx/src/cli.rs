@@ -115,6 +115,8 @@ pub enum Commands {
     Delete(DeleteArgs),
     /// List resources
     List(ListArgs),
+    /// Call tools directly
+    Call(CallArgs),
     /// Compact session logs to reduce history size.
     ///
     /// Blocks until compaction finishes and streams progress. A "nothing to compact"
@@ -219,6 +221,50 @@ pub struct ListArgs {
 pub enum ListSubcommands {
     /// List sessions (local or remote based on --agent context)
     Sessions,
+    /// List available tools, optionally matching a tool selector
+    Tools(ListToolsArgs),
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct ListToolsArgs {
+    /// Tool or toolset selector (omit to list all available tools)
+    pub pattern: Option<String>,
+    /// Print complete tool declarations as JSON instead of human-readable text
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct InfoToolArgs {
+    /// Exact tool name
+    pub name: String,
+    /// Print complete metadata and parameter schema as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct CallArgs {
+    #[command(subcommand)]
+    pub command: CallSubcommands,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum CallSubcommands {
+    /// Invoke a tool with a JSON object of arguments
+    Tool(CallToolArgs),
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct CallToolArgs {
+    /// Exact tool name
+    pub name: String,
+    /// JSON object of arguments, quoted as one shell argument
+    #[arg(value_name = "ARGS_JSON")]
+    pub args_json: String,
+    /// Print the complete tool result as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -280,6 +326,8 @@ pub struct InfoArgs {
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
 pub enum InfoSubcommands {
+    /// Inspect a tool's complete metadata and parameter schema
+    Tool(InfoToolArgs),
     /// Print fully-rendered agent markdown
     Agent { name: String },
     /// Print saved session metadata (no transcript)
@@ -527,9 +575,9 @@ mod tests {
     fn parses_list_sessions() {
         let cli = Cli::try_parse_from(["harnx", "list", "sessions"]).unwrap();
         match cli.command {
-            Some(Commands::List(args)) => match args.command {
-                ListSubcommands::Sessions => {}
-            },
+            Some(Commands::List(args)) => {
+                assert_eq!(args.command, ListSubcommands::Sessions);
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -772,3 +820,7 @@ mod compact_command_tests {
         assert!(help.contains("session"));
     }
 }
+
+#[cfg(test)]
+#[path = "cli/tool_tests.rs"]
+mod tool_tests;

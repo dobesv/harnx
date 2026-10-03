@@ -3,4 +3,5 @@
 //! dominated build time; nextest still runs every test in its own process.
 
 mod bridge_roundtrip;
+mod direct_call;
 mod sigterm_shutdown;

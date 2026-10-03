@@ -1113,6 +1113,11 @@ pub(super) struct SubAgentSnapshot {
 }
 
 pub(crate) enum TuiEvent {
+    OperatorToolFinished {
+        task: AbortSignal,
+        output: String,
+        error: Option<String>,
+    },
     /// Local commands/startup only. Never used by a live NATS follower.
     LocalAgent(harnx_core::event::AgentEvent),
     Agent {

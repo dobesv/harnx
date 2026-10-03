@@ -1089,6 +1089,21 @@ impl Config {
         Ok(())
     }
 
+    /// Expand configured toolset names before discovery or server activation.
+    /// Keep selectors (including globs) intact until a live inventory is available.
+    pub fn expanded_tool_selectors(&self, use_tools: &str) -> Vec<String> {
+        split_tool_selectors(use_tools)
+            .into_iter()
+            .flat_map(|selector| {
+                let selector = selector.trim();
+                self.toolsets
+                    .get(selector)
+                    .cloned()
+                    .unwrap_or_else(|| vec![selector.to_string()])
+            })
+            .collect()
+    }
+
     pub fn expand_use_tools(
         &self,
         use_tools: Option<&[String]>,
@@ -1101,16 +1116,7 @@ impl Config {
         };
 
         let selectors_str = use_tools.join(",");
-        let expanded_selectors = split_tool_selectors(&selectors_str)
-            .into_iter()
-            .flat_map(|selector| {
-                let selector = selector.trim();
-                self.toolsets
-                    .get(selector)
-                    .cloned()
-                    .unwrap_or_else(|| vec![selector.to_string()])
-            })
-            .collect::<Vec<String>>();
+        let expanded_selectors = self.expanded_tool_selectors(&selectors_str);
 
         // Wildcard "*" → all tools (use tool_declarations_for_use_tools unchanged)
         if expanded_selectors.iter().any(|s| s.trim() == "*") {
@@ -1156,16 +1162,7 @@ impl Config {
         declarations.extend(self.nats_tool_declarations.read().iter().cloned());
         let mut handoff_targets = HashMap::new();
         if let Some(use_tools) = use_tools {
-            let selectors = split_tool_selectors(use_tools)
-                .into_iter()
-                .flat_map(|selector| {
-                    let selector = selector.trim();
-                    self.toolsets
-                        .get(selector)
-                        .cloned()
-                        .unwrap_or_else(|| vec![selector.to_string()])
-                })
-                .collect::<Vec<String>>();
+            let selectors = self.expanded_tool_selectors(use_tools);
             let (filtered_handoff_declarations, filtered_handoff_targets) =
                 self.filtered_handoff_declarations(&selectors, active_pkg);
             declarations.extend(filtered_handoff_declarations);

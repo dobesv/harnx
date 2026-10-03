@@ -147,7 +147,19 @@ Hooks can return these values in `hookSpecificOutput`:
 *   **Payload**: Jaq expressions receive the payload as input. External hook commands receive the same JSON object on `stdin`.
 *   **Chain of Command**: If multiple hooks are configured for the same event, any hook returning `"ask"` or `"deny"` will take precedence.
 
-## 6. Demo
+## 6. Direct Operator Invocation & Scoped Consent
+
+When an operator executes a tool directly through the CLI (`harnx call tool`) or TUI (`.call tool`), the call runs under explicit operator consent:
+
+- **Root Auto-Approval on `ask`**: Because the human operator directly initiated the call, any `PreToolUse` hook returning `"permissionDecision": "ask"` is automatically approved for that specific tool call ID. No interactive confirmation modal is displayed for the root call.
+- **Hook `deny` Enforced**: A hook returning `"permissionDecision": "deny"` (or exiting with code 2) is strictly enforced. The tool does not execute, and Harnx returns a blocked result (`{"error": "<reason>", "blocked_by_hook": true}`) with exit status 1.
+- **Argument Mutations and Validation**: Any argument changes returned by hooks via `mutatedToolInput` are applied to the tool input before execution. Tool parameter schemas are validated normally.
+- **Nested Approval Isolation**: Root consent applies strictly to the single root tool call ID. It does not create a session-wide or global auto-approval grant:
+  - If the invoked tool spawns a child agent turn or triggers nested tool calls, those nested calls do not inherit root consent.
+  - In an interactive TUI session, nested tool calls requiring confirmation present the standard confirmation modal.
+  - In non-interactive CLI executions, nested approval requests safely defer or decline rather than executing unconfirmed.
+
+## 7. Demo
 
 
 To see tool confirmation in action, render the demo recording:
@@ -161,6 +173,6 @@ To see tool confirmation in action, render the demo recording:
 
 The demo shows two tool calls: the first is approved, the second is denied.
 
-## 7. Related
+## 8. Related
 *   [Hooks Guide](hooks-guide.md) — Detailed reference for the hook system.
 *   [Configuration Guide](configuration-guide.md) — How to manage global and agent-level settings.

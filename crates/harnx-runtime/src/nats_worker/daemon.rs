@@ -383,6 +383,7 @@ struct WorkerRuntimeBuild {
 }
 
 struct PreparedWorkerDaemon {
+    _operator_tools: tokio_util::task::AbortOnDropHandle<()>,
     _tool_reservations: tokio_util::task::AbortOnDropHandle<()>,
     _readiness_publisher: tokio_util::task::AbortOnDropHandle<()>,
     runtime: Arc<WorkerRuntime>,
@@ -486,12 +487,14 @@ async fn finish_worker_daemon_runtime(
     else {
         return Ok(None);
     };
+    let operator_tools = super::operator_tools::subscribe(runtime.clone()).await?;
     let readiness_publisher =
         spawn_readiness_publisher(runtime.client.clone(), daemon, &runtime.identity)?;
     Ok(Some(PreparedWorkerDaemon {
         runtime,
         consumer,
         _tool_reservations: tool_reservations,
+        _operator_tools: operator_tools,
         _readiness_publisher: readiness_publisher,
     }))
 }
@@ -605,6 +608,7 @@ pub async fn run_worker_daemon_with_shutdown(
         consumer,
         _tool_reservations,
         _readiness_publisher,
+        _operator_tools,
     }) = prepare_worker_daemon_runtime(setup, &readiness).await?
     else {
         return Ok(());

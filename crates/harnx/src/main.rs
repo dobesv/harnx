@@ -2,7 +2,9 @@ mod agent_event_sink;
 mod cli;
 mod cli_event_sink;
 mod compact;
+mod main_runtime;
 mod oneshot_nats;
+mod tool_cmd;
 
 /// Heap-usage guard installed as the process allocator: aborts with a backtrace
 /// if live heap exceeds `HARNX_HEAP_LIMIT_MB`. Disarmed (plain passthrough to
@@ -127,8 +129,11 @@ fn remote_list_outcome(result: Result<Vec<SessionMeta>, anyhow::Error>) -> ListS
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<std::process::ExitCode> {
+fn main() -> Result<std::process::ExitCode> {
+    main_runtime::run(|| Box::pin(async_main()))
+}
+
+async fn async_main() -> Result<std::process::ExitCode> {
     load_env_file()?;
     let cli = Cli::parse();
     setup_logger(LogSink::File)?;
@@ -167,6 +172,7 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
             | Commands::Open(_)
             | Commands::Delete(_)
             | Commands::List(_)
+            | Commands::Call(_)
             | Commands::Compact(_)),
         ) => {
             let exit_code = run_command(command, &cli).await?;
@@ -190,28 +196,52 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
 async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
     match command {
         Commands::Prompt(_) => bail!("prompt commands use the one-shot execution path"),
-        Commands::Info(info_args) => run_info_command(info_args, cli).await.map(|()| 0),
+        Commands::Call(args) => {
+            let crate::cli::CallSubcommands::Tool(args) = &args.command;
+            tool_cmd::run(
+                cli,
+                harnx_runtime::operator_tools::OperatorToolCommand::Call {
+                    name: args.name.clone(),
+                    args_json: args.args_json.clone(),
+                },
+                args.json,
+            )
+            .await
+        }
+        Commands::Info(info_args) => run_info_command(info_args, cli).await,
         Commands::Dump(dump_args) => run_dump_command(dump_args).await.map(|()| 0),
         Commands::Open(open_args) => run_open_command(open_args).await.map(|()| 0),
         Commands::Delete(delete_args) => run_delete_command(delete_args).await.map(|()| 0),
-        Commands::List(list_args) => run_list_command(list_args, cli).await.map(|()| 0),
+        Commands::List(list_args) => run_list_command(list_args, cli).await,
         Commands::Compact(compact_args) => compact::run_compact_command(compact_args, cli).await,
     }
 }
 
-async fn run_info_command(info_args: &crate::cli::InfoArgs, _cli: &Cli) -> Result<()> {
+async fn run_info_command(info_args: &crate::cli::InfoArgs, cli: &Cli) -> Result<u8> {
     match &info_args.command {
+        InfoSubcommands::Tool(args) => {
+            tool_cmd::run(
+                cli,
+                harnx_runtime::operator_tools::OperatorToolCommand::Info {
+                    name: args.name.clone(),
+                },
+                args.json,
+            )
+            .await
+        }
         InfoSubcommands::Agent { name } => {
             let config = init_frontend_config(WorkingMode::Cmd, true).await?;
             let out = render_agent_dump(&config, name)?;
             println!("{out}");
-            Ok(())
+            Ok(0)
         }
         InfoSubcommands::Session {
             agent_name,
             session_id,
             format,
-        } => run_info_session(agent_name, session_id, format).await,
+        } => run_info_session(agent_name, session_id, format)
+            .await
+            .map(|()| 0),
     }
 }
 
@@ -581,9 +611,19 @@ async fn run_delete_command(delete_args: &crate::cli::DeleteArgs) -> Result<()> 
     }
 }
 
-async fn run_list_command(list_args: &crate::cli::ListArgs, cli: &Cli) -> Result<()> {
+async fn run_list_command(list_args: &crate::cli::ListArgs, cli: &Cli) -> Result<u8> {
     match &list_args.command {
-        ListSubcommands::Sessions => run_list_sessions(cli).await,
+        ListSubcommands::Sessions => run_list_sessions(cli).await.map(|()| 0),
+        ListSubcommands::Tools(args) => {
+            tool_cmd::run(
+                cli,
+                harnx_runtime::operator_tools::OperatorToolCommand::List {
+                    pattern: args.pattern.clone(),
+                },
+                args.json,
+            )
+            .await
+        }
     }
 }
 
