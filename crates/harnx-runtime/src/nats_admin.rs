@@ -58,9 +58,11 @@ pub(crate) async fn delete_remote_session_by_key(
         .await
     {
         Ok(store) => {
-            harnx_toolset_server::invocation_journal::InvocationJournal::from_store(store)
-                .purge_session(session_id)
-                .await?
+            harnx_toolset_server::invocation_journal::InvocationJournal::from_store(
+                &jetstream, store,
+            )
+            .purge_session(session_id)
+            .await?
         }
         Err(error) if kv_bucket_missing(&error) => {}
         Err(error) => return Err(error.into()),

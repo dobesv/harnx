@@ -1061,6 +1061,18 @@ A TUI test that spawns the local broker or worker isolates them with
 other test process in the run, including the persisted broker port, and a port
 still held by a broker another process just stopped fails every spawn attempt.
 
+A single broker can stand in for a replica that lags the stream leader, which no
+real cluster produces on demand. A `mappings` block in the server config diverts
+`$JS.API.DIRECT.GET.<stream>` (and `.>`) to an empty stream, which answers a
+genuine 404 the way a lagging follower does, and `$JS.API.CONSUMER.CREATE.<stream>`
+(and `.>`) to a subject nothing serves. `STREAM.MSG.GET` and `STREAM.INFO`, which
+only the leader answers while the stream has one, still reach the real stream.
+`crates/harnx-toolset-server/tests/it/stale_replica.rs` does this for the
+invocation journal, with a probe that fails the test if the diversion stops
+applying. A leaderless stream, where every replica answers `STREAM.INFO`, is
+simulated the same way: `journal_listing.rs` maps that request to a responder
+that answers as such a replica does.
+
 ## CLI Flag Constraints
 
 The root `Cli.file: Vec<String>` has `#[clap(short, long, global = true, hide = true)]` at

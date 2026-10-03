@@ -62,7 +62,6 @@ impl InvocationJournal {
         value: &serde_json::Value,
     ) -> Result<bool> {
         let entry = self
-            .0
             .entry(key)
             .await?
             .context("durable tool invocation missing")?;
