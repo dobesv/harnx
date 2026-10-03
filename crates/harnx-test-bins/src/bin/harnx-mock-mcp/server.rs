@@ -63,11 +63,22 @@ pub struct MockMcpScript {
     /// instant blip. Defaults to 0 (no delay).
     #[serde(default)]
     pub response_delay_ms: u64,
+    /// Complete typed MCP result, or a protocol error, instead of canned text.
+    #[serde(default)]
+    pub call_result: Option<CallToolResult>,
+    #[serde(default)]
+    pub call_error: Option<ErrorData>,
+    #[serde(default)]
+    pub initialize_error: Option<ErrorData>,
+    #[serde(default)]
+    pub disconnect_on_call: bool,
 }
 
 pub struct MockMcpServer {
     script: MockMcpScript,
     cursor: AtomicUsize,
+    request_log: Option<std::path::PathBuf>,
+    audit_lock: std::sync::Mutex<()>,
 }
 
 impl MockMcpServer {
@@ -81,6 +92,31 @@ impl MockMcpServer {
         Self {
             script,
             cursor: AtomicUsize::new(0),
+            request_log: None,
+            audit_lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn with_request_log(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.request_log = path;
+        self
+    }
+
+    fn record(&self, method: &str, params: Value) {
+        use std::io::Write;
+        if let Some(path) = &self.request_log {
+            let _guard = self.audit_lock.lock().expect("lock request audit");
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("open request audit");
+            writeln!(
+                log,
+                "{}",
+                serde_json::json!({"method":method,"params":params})
+            )
+            .expect("write request audit");
         }
     }
 
@@ -151,11 +187,32 @@ impl ServerHandler for MockMcpServer {
             .with_instructions("Deterministic, script-driven mock MCP server for demo recordings.")
     }
 
+    async fn initialize(
+        &self,
+        request: rmcp::model::InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::InitializeResult, ErrorData> {
+        self.record(
+            "initialize",
+            serde_json::to_value(&request).expect("initialize request JSON"),
+        );
+        context.peer.set_peer_info(request.clone());
+        if let Some(error) = &self.script.initialize_error {
+            return Err(error.clone());
+        }
+        self.negotiate_initialize(&request)
+    }
+
+    async fn on_initialized(&self, _context: rmcp::service::NotificationContext<RoleServer>) {
+        self.record("notifications/initialized", Value::Null);
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        self.record("tools/list", Value::Null);
         Ok(ListToolsResult::with_all_items(self.build_tools()))
     }
 
@@ -182,6 +239,20 @@ impl MockMcpServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.record(
+            "tools/call",
+            serde_json::to_value(&request).expect("call request JSON"),
+        );
+        if self.script.disconnect_on_call {
+            eprintln!("mock fixture disconnected during tools/call");
+            std::process::exit(23);
+        }
+        if let Some(error) = &self.script.call_error {
+            return Err(error.clone());
+        }
+        if let Some(result) = &self.script.call_result {
+            return Ok(result.clone());
+        }
         // Resolve the result first so an unknown tool errors without delay.
         let text = match self.next_response(request.name.as_ref()) {
             Ok(text) => text,

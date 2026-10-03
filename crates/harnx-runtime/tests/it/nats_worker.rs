@@ -43,6 +43,8 @@ mod prompt_injection;
 mod rewind_and_retraction;
 #[path = "nats_worker/support.rs"]
 mod support;
+#[path = "nats_worker/tool_cli.rs"]
+mod tool_cli;
 #[path = "nats_worker/tool_reservation.rs"]
 mod tool_reservation;
 #[path = "nats_worker/tool_reservation_client.rs"]

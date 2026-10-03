@@ -12,6 +12,7 @@ Commands:
   open     Open resources in the system application
   delete   Delete resources
   list     List resources
+  call     Call tools directly
   compact  Compact session logs to reduce history size
   help     Print this message or the help of the given subcommand(s)
 
@@ -32,6 +33,9 @@ harnx -- Tell a joke                           # Same, using an explicit separat
 harnx-serve                                    # Run server (standalone binary)
 harnx-serve --addr 0.0.0.0:8080                # Run server with addr
 
+harnx-mcp-bridge --list-tools -- my-server      # Inspect external MCP tools (standalone binary)
+harnx-mcp-bridge --call-tool query --tool-args '{"q": "test"}' -- my-server
+
 harnx -m openai:gpt-4o                         # Select LLM
 
 harnx -s                                       # Begin a temp session
@@ -50,6 +54,14 @@ harnx open attachment cid:media:...            # Open attachment in default view
 harnx list sessions                            # List sessions
 harnx compact session agent1 session1          # Compact session log
 harnx delete session session1 --agent myagent --cluster local  # Delete session
+harnx list tools                               # List all available tools
+harnx list tools "fs_*"                        # List tools matching selector pattern
+harnx list tools --json                        # List all tools as JSON array
+harnx info tool fs_read                        # View tool metadata and input schema
+harnx info tool fs_read --json                 # View tool declaration as JSON
+harnx call tool fs_read '{"path": "file.txt"}' # Call tool directly with JSON arguments
+harnx call tool fs_read '{"path": "file.txt"}' --json  # Return full tool result as JSON
+harnx -a agent1 call tool fs_read '{"path": "file.txt"}' # Call tool using agent allowlist
 harnx --info                                   # View system info
 harnx --rag rag1 --info                        # View RAG info
 
@@ -319,3 +331,147 @@ Exit status:
 - Exits **0** on successful compaction.
 - Exits **0** when there is nothing to compact (the session does not have enough uncompacted messages or tokens to warrant summarization).
 - Exits **nonzero** if compaction fails or the timeout expires.
+
+### `harnx list tools [<pattern>] [--json]`
+
+Lists available tools, optionally filtered by a selector pattern.
+
+- **`<pattern>`**: Optional tool or toolset selector (for example, `fs_*`, `packaged_read`, or `*`). If omitted, lists all available tools.
+- **`--json`**: Outputs a JSON array of complete tool declarations (`ToolDeclaration` objects including `name`, `description`, `parameters`, `mcp_tool_name`, `mcp_server_name`, `call_template`, `result_template`, `idempotent_hint`, `read_only_hint`, and `kind`).
+- **Default output**: Human-readable format listing each tool with its name, description, runtime metadata, and formatted JSON input schema. If no tools match, prints `No tools found.`.
+- **Targeting an agent**: Accepts `-a <agent>` / `--agent <agent>` (including `<agent>@<cluster>`) to list tools available under that agent's configuration and allowlist.
+
+### `harnx info tool <name> [--json]`
+
+Inspects the metadata and parameter schema for a specific tool.
+
+- **`<name>`**: Exact name of the tool to inspect.
+- **`--json`**: Outputs the complete tool declaration as JSON.
+- **Default output**: Human-readable display showing the tool name, description, runtime metadata, and formatted JSON input schema.
+- **Targeting an agent**: Accepts `-a <agent>` / `--agent <agent>` to inspect tools available in that agent's context.
+- **Exit status**: Exits **0** if the tool is found, or **1** if the tool is not found or not available in the selected context.
+
+### `harnx call tool <name> <args-json> [--json]`
+
+Executes a tool directly without running an LLM model turn or creating an inference turn.
+
+- **`<name>`**: Exact tool name to execute.
+- **`<args-json>`**: Tool arguments as a JSON object, passed as a single quoted shell argument (for example, `'{"path": "README.md"}'`).
+- **`--json`**: Outputs the complete tool result payload as JSON. Preserves all result structures, including text blocks, images, binary attachments, structured content (`structuredContent`), error flags (`isError`), partial indicators (`partial`), and extension metadata (`_meta`).
+- **Default output**: For plain text string results, prints the text content directly; for structured or complex results, prints pretty-printed JSON.
+
+#### Flag Placement and Agent Selection
+
+- **`--json` placement**: `--json` is a subcommand-level option for `info tool`, `list tools`, and `call tool`. Place it after the command arguments:
+  ```sh
+  harnx info tool fs_read --json
+  harnx list tools "fs_*" --json
+  harnx call tool fs_read '{"path": "file.txt"}' --json
+  ```
+- **`--agent` / `-a` placement**: Can be placed before the subcommand or after it:
+  ```sh
+  harnx -a coder info tool fs_read
+  harnx info tool fs_read --agent coder
+  harnx call tool fs_read '{"path": "file.txt"}' -a coder@cluster
+  ```
+- **With `--agent`**: Resolves tools using the named agent's configured toolsets, packages, allowlist, and NATS cluster. Tool execution runs on the agent's worker and appends subagent progress to an empty caller transcript, without running a root model turn.
+- **Without `--agent` (no-agent mode)**:
+  - Direct tool inspection and invocation do not default to an arbitrary agent.
+  - Instead, the CLI opens a virtual-session tool reservation (`ToolReservationHandle`) scoped strictly to the requested tool or pattern.
+  - The CLI runs a strict discovery scan with a private catalog, confirms scope admission, and watches for cluster changes.
+  - When the command finishes, the CLI explicitly closes the reservation before terminating the local worker. If connection to the broker is lost, release is best-effort and the reservation is reclaimed by its server-side TTL.
+
+#### Argument Validation and Shell Quoting
+
+The `<args-json>` argument must parse to a JSON object (`{...}`). Validation occurs immediately during CLI argument processing, before loading configuration, launching background workers, or reserving tools. Passing invalid JSON or a non-object JSON value (such as arrays, numbers, strings, or booleans) fails immediately with exit status 1.
+
+Always quote the argument so your shell does not split on spaces or interpret quotes:
+```sh
+# Correct: quoted JSON object
+harnx call tool bash_exec '{"command": "echo \"two words\""}'
+
+# Fails validation before worker startup (not an object):
+harnx call tool bash_exec '["echo", "two words"]'
+```
+
+#### Timeouts and Cancellation
+
+- **`--timeout-secs <SECONDS>`**: Sets a maximum execution duration for the command.
+- **Default timeout**: Unlike `harnx prompt` (where 0 or omitting the flag means unlimited execution), tool commands use a bounded default timeout of **600 seconds** (10 minutes) when `--timeout-secs` is omitted or passed as `0`.
+- **Cancellation (`Ctrl+C`) and timeout expiration**:
+  - Sets an internal abort signal and allows a 10-second drain window for in-flight calls to settle.
+  - If output was produced during the drain, it is emitted to stdout.
+  - The command terminates with exit code **1** and prints an advisory to stderr:
+    - `error: Operator tool command cancelled; outcome may be unknown`
+    - `error: Operator tool command timed out; outcome may be unknown`
+  - Tool execution is never automatically replayed. Because the external tool may have partially executed or completed before cancellation settled, the command reports an unknown outcome rather than claiming success.
+
+#### Error Handling and Output Contracts
+
+- **Exit codes**: Returns **0** on successful execution; returns **1** on any failure (argument validation error, missing tool, tool execution error, hook rejection, timeout, or reservation failure).
+- **`--json` parseability**: In `--json` mode, stdout remains valid, parseable JSON on all exit paths:
+  - If the tool provider returned an error or partial result, that exact JSON payload is written to stdout.
+  - If failure occurred before a tool result was produced (for example, bad arguments, invalid configuration, or discovery errors), stdout contains `{"isError": true, "error": "<message>"}`.
+  - In all failure cases, a human-readable diagnostic is printed to stderr (`error: <message>`).
+- **Partial results**: If a tool returns a payload flagged with `"partial": true` or `"resultType": "partial"`, Harnx emits the payload but treats the call as a failure (exit code 1). Partial execution is never reported as success.
+
+#### Scoped Consent and Approval Isolation
+
+Tool execution through `harnx call tool` runs with scoped operator consent:
+
+- **Root operator invocation auto-approval**: When an operator runs `harnx call tool`, any `PreToolUse` hook that requests approval (`"permissionDecision": "ask"`) is automatically approved for that specific tool call ID. Because the human operator directly initiated the call, no second interactive approval prompt is presented.
+- **Hook `deny` enforced**: A `PreToolUse` hook that returns `"deny"` (or exits with code 2) is strictly enforced. The tool is blocked immediately, returning a blocked tool result (`"blocked_by_hook": true`) and exiting with code 1.
+- **Hook mutations and schema validation**: Any argument mutations returned by hooks (`mutatedToolInput`) are applied before execution, and tool input schemas are validated normally.
+- **Nested approval isolation**: Root consent applies only to the root tool call ID. If the invoked tool spawns nested sub-agents or secondary tool calls, those nested calls do not inherit root approval. In the non-interactive CLI environment, nested approval requests safely defer or decline rather than executing unconfirmed.
+
+## Standalone MCP Bridge Inspection and Invocation (`harnx-mcp-bridge`)
+
+`harnx-mcp-bridge` wraps external stdio-based Model Context Protocol (MCP) servers and exposes them over NATS. For diagnostics and scripting, the bridge also supports standalone tool listing and direct tool invocation without requiring NATS.
+
+### Syntax
+
+All bridge options must precede the `--` separator. The command and arguments that launch the child MCP server follow `--`:
+
+```sh
+# List tools advertised by an external MCP server
+harnx-mcp-bridge --list-tools [--enable-tool <glob>] [--name <server-name>] -- <command> [args...]
+
+# Invoke a tool directly
+harnx-mcp-bridge --call-tool <tool-name> [--tool-args <json-object>] [--enable-tool <glob>] [--name <server-name>] -- <command> [args...]
+```
+
+### Options
+
+- **`--list-tools`**: Starts the wrapped server, performs the initial MCP handshake, prints the advertised tools (including descriptions and hints), and exits. Incompatible with `--call-tool`.
+- **`--call-tool <name>`**: Starts the wrapped server, invokes the named tool with arguments, prints the full JSON result to stdout, and exits. Incompatible with `--list-tools`.
+- **`--tool-args <json-object>`**: Arguments for the tool call as a JSON object (for example, `'{"timezone": "UTC"}'`). Defaults to `{}` if omitted. Requires `--call-tool`.
+- **`--enable-tool <glob>`**: Repeatable filter pattern. When specified, only matching tools can be registered, listed, or called. If `--call-tool` targets an excluded tool, execution is rejected before invocation.
+- **`--name <server-name>`**: Server name. Required when serving over NATS; optional for standalone inspection and invocation (defaults to `mcp-diagnostic`).
+
+### Argument Validation and Quoting
+
+The `--tool-args` value must parse to a JSON object (`{...}`). Validation occurs before spawning the child process:
+- Passing invalid JSON or non-object JSON values (arrays, strings, numbers, booleans, or null) fails immediately with exit status 1 and prints an error to stderr.
+- Quoting the JSON argument prevents shell word-splitting.
+
+```sh
+# Correct: quoted JSON object
+harnx-mcp-bridge --call-tool search --tool-args '{"query": "rust"}' -- npx -y @modelcontextprotocol/server-everything
+
+# Rejected before spawn (array instead of object):
+harnx-mcp-bridge --call-tool search --tool-args '["rust"]' -- npx -y @modelcontextprotocol/server-everything
+```
+
+### Output and Error Contracts
+
+- **Successful execution**: Prints the complete MCP `CallToolResult` JSON object to stdout and exits with status **0**.
+- **Tool-reported failure (`isError: true`)**: Prints the complete `CallToolResult` JSON object to stdout, prints `error: tool '<name>' reported isError: true` to stderr, and exits with status **1**. Complete response payloads (text, images, embedded resources, structured content, and metadata) are preserved.
+- **Non-complete results**: If a tool returns a payload containing a `resultType` other than `"complete"` (such as `"partial"`), the command exits with status **1**.
+- **Protocol, transport, and discovery errors**: If the child fails to start, the handshake fails, the tool is not found, or the transport disconnects, the error is written to stderr and the command exits with status **1**. No fabricated tool result is emitted to stdout.
+
+### Standalone Mode and Environment Isolation
+
+- **No NATS connection**: Standalone `--list-tools` and `--call-tool` invocations do not connect to NATS or publish registrations.
+- **Environment isolation**: Before spawning the child process, `harnx-mcp-bridge` strips `HARNX_SERVER_SCOPE`, `HARNX_NATS_URL`, and `HARNX_NATS_TOKEN` from the child environment. If the wrapped child command itself requires NATS (such as a native Harnx tool server running in stdio mode), pass those variables explicitly to the child command (for example, `-- env HARNX_NATS_URL=nats://127.0.0.1:4222 harnx-time-tools --mcp-stdio`).
+- **Session-identity limitations**: Tools that require caller session identity (such as attachment creation tools) fail clearly with an error when run through the stdio bridge, because stdio bridge invocations have no session identity context.
+- **Process cleanup**: The bridge manages the child process with `ChildProcessManager`. The child is explicitly stopped and reaped on all exit paths (success, tool error, protocol failure, or startup error), with `kill_on_drop` fallback to prevent orphaned processes.

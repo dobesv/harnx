@@ -31,11 +31,14 @@ pub enum CommandOutcome {
     OpenSessionPicker,
 }
 
-pub static COMMANDS: LazyLock<[Command; 49]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 52]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
         Command::new(".info tools", "List all available tools and their status"),
+        Command::with_usage(".info tool", "<name>", "Inspect an allowed tool in the active session"),
+        Command::with_usage(".list tools", "[pattern]", "List allowed tools in the active session"),
+        Command::with_usage(".call tool", "<name> <args-json>", "Invoke an allowed tool without an inference turn"),
         Command::with_usage(
             ".info env",
             "[name]",
@@ -230,6 +233,22 @@ pub async fn run_command_with_output_and_local_worker(
         if let Some(text_match) = captures.get(1) {
             line = text_match.as_str();
         }
+    }
+    if crate::operator_tools::is_operator_tool_command(line) {
+        let command = crate::operator_tools::parse_operator_line(line)?;
+        let reply = crate::operator_tools::run_session_tool_command(
+            config,
+            &abort_signal,
+            command,
+            false,
+            local_worker,
+        )
+        .await?;
+        writeln!(output, "{}", reply.output)?;
+        if let Some(error) = reply.error {
+            bail!("{error}");
+        }
+        return Ok(CommandOutcome::Continue);
     }
     match parse_command(line) {
         Some((cmd, args)) => match cmd {

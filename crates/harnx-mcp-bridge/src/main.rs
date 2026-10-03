@@ -4,22 +4,37 @@ use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
 use harnx_toolset_server::{
     compile_enable_globs, serve_with_config, FilteredToolset, ServeConfig, ServeLifecycle,
 };
+use std::process::ExitCode;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
     // Before spawning the child: its stderr is forwarded to `log::debug!`, which
     // goes nowhere until a logger exists.
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
-    let telemetry = harnx_telemetry::init_telemetry("harnx-mcp-bridge")?;
+    let telemetry = harnx_telemetry::init_telemetry("harnx-mcp-bridge");
 
     let result = run().await;
-    telemetry.shutdown().await;
-    result
+    if let Ok(t) = telemetry {
+        t.shutdown().await;
+    }
+    match result {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::from(1)
+        }
+    }
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
+    // Clap can waive a required argument when it conflicts with another mode.
+    anyhow::ensure!(
+        args.tool_args.is_none() || args.call_tool.is_some(),
+        "--tool-args requires --call-tool"
+    );
 
     harnx_metrics::init(&args.metrics)?;
     let readiness = harnx_healthz::init(&args.healthz).await?;
@@ -30,10 +45,17 @@ async fn run() -> anyhow::Result<()> {
         filter_set.as_ref().map(|s| Arc::new(s.clone()));
 
     if args.list_tools {
-        let name = args.name.unwrap_or_else(|| "mcp-diagnostic".to_string());
-        let bridge = BridgeToolset::new(name, args.child).await?;
-        print!("{}", report_tools_filtered(&bridge, filter_set.as_ref()));
-        return Ok(());
+        return list_tools(&args, filter_set.as_ref()).await;
+    }
+
+    if let Some(tool_name) = &args.call_tool {
+        anyhow::ensure!(
+            filter_set
+                .as_ref()
+                .is_none_or(|set| set.is_match(tool_name)),
+            "tool '{tool_name}' is excluded by --enable-tool"
+        );
+        return call_tool_direct(tool_name, &args).await;
     }
 
     let name = args
@@ -79,10 +101,84 @@ async fn run() -> anyhow::Result<()> {
     };
 
     tokio::select! {
-        result = serve => result,
+        result = serve => result?,
         _ = child_died.cancelled() => {
             log::warn!("wrapped MCP child exited; shutting down bridge");
             anyhow::bail!("wrapped MCP child exited")
         }
+    };
+
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn list_tools(
+    args: &Args,
+    filter: Option<&harnx_toolset_server::globset::GlobSet>,
+) -> anyhow::Result<ExitCode> {
+    let name = args.name.as_deref().unwrap_or("mcp-diagnostic");
+    let mut bridge = BridgeToolset::new(name, args.child.clone()).await?;
+    let report = report_tools_filtered(&bridge, filter);
+    bridge.shutdown().await?;
+    print!("{report}");
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn call_tool_direct(tool_name: &str, args: &Args) -> anyhow::Result<ExitCode> {
+    let raw = args.tool_args.as_deref().unwrap_or("{}");
+    let tool_args: serde_json::Value =
+        serde_json::from_str(raw).context("invalid JSON in --tool-args")?;
+    anyhow::ensure!(tool_args.is_object(), "--tool-args must be a JSON object");
+
+    let name = args.name.as_deref().unwrap_or("mcp-diagnostic");
+    let mut bridge = BridgeToolset::new(name, args.child.clone())
+        .await
+        .context("failed to connect to MCP child server")?;
+    // Always reap after discovery, including unknown tools and protocol failures.
+    let result = invoke_direct(&bridge, tool_name, tool_args).await;
+    let cleanup = bridge.shutdown().await;
+    match (result, cleanup) {
+        (Ok(result), Ok(())) => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            anyhow::ensure!(
+                result.get("isError").and_then(serde_json::Value::as_bool) != Some(true),
+                "tool '{tool_name}' reported isError: true"
+            );
+            anyhow::ensure!(
+                result
+                    .get("resultType")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|kind| kind == "complete"),
+                "tool '{tool_name}' did not return a completed result"
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        (Ok(result), Err(error)) => {
+            // Cleanup failure must not discard an otherwise complete tool payload.
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Err(error.context("failed to clean up MCP child"))
+        }
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("MCP child cleanup also failed: {cleanup:#}")))
+        }
+        (Err(error), Ok(())) => Err(error),
     }
+}
+
+async fn invoke_direct(
+    bridge: &BridgeToolset,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    anyhow::ensure!(
+        bridge
+            .cached_tools()
+            .iter()
+            .any(|tool| tool.name == tool_name),
+        "tool '{tool_name}' not found in server '{}'",
+        bridge.server_name()
+    );
+    harnx_toolset::Toolset::invoke(bridge, tool_name, arguments, CancellationToken::new())
+        .await
+        .map_err(anyhow::Error::new)
+        .context("tool invocation failed")
 }

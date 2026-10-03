@@ -1711,127 +1711,18 @@ impl Tui {
         line: &str,
         pos: usize,
     ) -> Vec<(String, Option<String>)> {
-        let line = &line[..pos];
-
-        // Split into parts for analysis
-        let mut parts: Vec<(&str, usize)> = vec![];
-        let mut part_start = None;
-        for (i, ch) in line.char_indices() {
-            if ch == ' ' {
-                if let Some(s) = part_start {
-                    parts.push((&line[s..i], s));
-                    part_start = None;
-                }
-            } else if part_start.is_none() {
-                part_start = Some(i);
-            }
-        }
-        if let Some(s) = part_start {
-            parts.push((&line[s..], s));
-        } else {
-            parts.push(("", line.len()));
-        }
-
-        if parts.is_empty() {
+        let parts = crate::completion::command_parts(&line[..pos]);
+        let Some(cmd) = parts.first().copied() else {
+            return vec![];
+        };
+        if !cmd.starts_with('.') {
             return vec![];
         }
-
-        let (cmd, _cmd_start) = parts[0];
-
-        // If we're still typing the first word starting with '.', complete commands
-        if parts.len() == 1 && cmd.starts_with('.') {
+        if parts.len() == 1 {
             return crate::completion::command_name_completions(cmd);
         }
-
-        // For multi-part commands, delegate to config's command_complete
-        if cmd.starts_with('.') {
-            let args: Vec<&str> = parts[1..].iter().map(|p| p.0).collect();
-
-            // File path completion for .attach
-            if cmd == ".attach" {
-                let filter = args.last().copied().unwrap_or("");
-                let (dir_path, prefix) = if filter.contains('/') || filter.contains('\\') {
-                    let p = std::path::Path::new(filter);
-                    let dir_path = p
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."))
-                        .to_path_buf();
-                    let prefix = p
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    (dir_path, prefix)
-                } else {
-                    (std::path::PathBuf::from("."), filter.to_string())
-                };
-                if let Ok(mut entries) = tokio::fs::read_dir(&dir_path).await {
-                    let mut matches = Vec::new();
-                    while let Ok(Some(entry)) = entries.next_entry().await {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with(&prefix) {
-                            let full = if dir_path == std::path::Path::new(".") {
-                                name.clone()
-                            } else {
-                                format!("{}/{}", dir_path.display(), name)
-                            };
-                            let kind = match entry.file_type().await {
-                                Ok(file_type) if file_type.is_dir() => Some("dir".to_string()),
-                                _ => None,
-                            };
-                            matches.push((full, kind));
-                        }
-                    }
-                    return matches;
-                }
-                return vec![];
-            }
-
-            // Attachment name completion for .detach
-            if cmd == ".detach" {
-                let filter = args.last().copied().unwrap_or("");
-                return self
-                    .app
-                    .attachments
-                    .iter()
-                    .filter(|a| a.display_name.starts_with(filter))
-                    .map(|a| (a.display_name.clone(), None))
-                    .collect();
-            }
-
-            let (cmd, args) = match (cmd, args.as_slice()) {
-                (".info" | ".dump", ["session", _, ..]) => (".session", args[1..].to_vec()),
-                _ => (cmd, args),
-            };
-            if cmd == ".agent" && args.iter().all(|arg| arg.is_empty()) {
-                return vec![];
-            }
-
-            if cmd == ".session" && args.len() == 2 {
-                let cfg = self.config.read().clone();
-                let sessions = cfg.list_sessions_for_completion(args[0]).await;
-                return harnx_runtime::utils::fuzzy_filter(
-                    sessions.into_iter().map(|id| (id, None)).collect(),
-                    |value| value.0.as_str(),
-                    args[1],
-                );
-            }
-
-            // Fetch agents for completion using display names.
-            // In cluster-client mode, this omits local/package agents and
-            // strips default-cluster suffix.
-            let precomputed_agents = if matches!(cmd, ".agent" | ".session") && args.len() == 1 {
-                Self::assistant_agents_for_display(&self.config).await
-            } else {
-                Vec::new()
-            };
-
-            return self
-                .config
-                .read()
-                .command_complete(cmd, &args, precomputed_agents);
-        }
-
-        vec![]
+        self.command_argument_completions(cmd, parts[1..].to_vec())
+            .await
     }
 
     pub(crate) async fn open_agent_picker(&mut self) {
@@ -2109,6 +2000,16 @@ impl Tui {
     }
 
     pub(super) async fn run_command(&mut self, line: &str) -> Result<()> {
+        if harnx_runtime::operator_tools::is_operator_tool_command(line) {
+            match harnx_runtime::operator_tools::parse_operator_line(line) {
+                Ok(command) => self.start_operator_tool_command(command),
+                Err(error) => self
+                    .app
+                    .transcript
+                    .push(TranscriptItem::ErrorText(pretty_error_string(&error))),
+            }
+            return Ok(());
+        }
         if self.try_handle_info_overlay(line.trim_start()).await {
             return Ok(());
         }

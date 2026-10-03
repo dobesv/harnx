@@ -4465,7 +4465,6 @@ dependencies = [
  "log",
  "opentelemetry",
  "opentelemetry_sdk",
- "process-wrap",
  "rmcp",
  "serde_json",
  "shell-words",

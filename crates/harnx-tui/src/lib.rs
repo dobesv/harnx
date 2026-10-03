@@ -32,6 +32,7 @@ pub mod types;
 
 mod completion;
 mod detail_view;
+mod operator_tools;
 mod remote_session;
 
 #[cfg(test)]

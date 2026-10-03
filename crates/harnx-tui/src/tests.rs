@@ -90,6 +90,7 @@ mod cancellation_escape_tests;
 mod command_completion;
 mod delegation_tests;
 mod exit_interrupt_tests;
+mod operator_tool_completion;
 mod shared_session_event_tests;
 mod subagent_session_tests;
 mod tool_live_updates_tests;

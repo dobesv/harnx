@@ -305,12 +305,15 @@ pub(super) fn tool_servers_for_view(
     package: Option<&str>,
     selectors: &[String],
 ) -> Vec<ToolServerConfig> {
+    if selectors.is_empty() {
+        return Vec::new();
+    }
     let mut namespaced_selectors = Vec::new();
-    for selector in selectors {
-        if let Some(namespaced) = namespaced_selector(selector, package) {
+    for selector in config.expanded_tool_selectors(&selectors.join(",")) {
+        if let Some(namespaced) = namespaced_selector(&selector, package) {
             namespaced_selectors.push(namespaced);
         }
-        namespaced_selectors.push(selector.clone());
+        namespaced_selectors.push(selector);
     }
     tool_servers_matching_use_tools(&config.tool_servers, package, &namespaced_selectors)
 }
@@ -562,6 +565,31 @@ mod tests {
         assert_eq!(servers[0].command, config.tool_servers[0].command);
         assert!(tool_servers_for_view(&config, None, &[]).is_empty());
         assert!(tool_servers_for_view(&config, None, &["missing_*".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn tool_servers_for_view_expands_toolsets_before_package_activation() {
+        let mut fs = tool_server("fs");
+        fs.package = Some("coding".into());
+        let mut config = Config {
+            tool_servers: vec![fs, tool_server("time")],
+            ..Default::default()
+        };
+        config
+            .toolsets
+            .insert("inspection".into(), vec!["coding__fs_read".into()]);
+        let servers = tool_servers_for_view(&config, None, &["inspection".into()]);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "fs");
+        assert_eq!(servers[0].package.as_deref(), Some("coding"));
+        config
+            .toolsets
+            .insert("local_read".into(), vec!["fs_read".into()]);
+        let servers = tool_servers_for_view(&config, Some("coding"), &["local_read".into()]);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].package.as_deref(), Some("coding"));
+        config.toolsets.insert("empty".into(), vec![]);
+        assert!(tool_servers_for_view(&config, None, &["empty".into()]).is_empty());
     }
 
     #[test]
