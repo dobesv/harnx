@@ -26,7 +26,7 @@ pub(super) enum ActivationNakReason {
 }
 
 impl ActivationNakReason {
-    const fn label(self) -> &'static str {
+    pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Busy => "busy",
             Self::PreflightNotReady => "preflight_not_ready",
@@ -41,6 +41,7 @@ impl ActivationNakReason {
 pub(super) struct ActivationDelivery {
     message: Message,
     failure_key: String,
+    delivered: i64,
     heartbeat_cancel: CancellationToken,
     heartbeat_task: Option<JoinHandle<()>>,
     lease_tx: watch::Sender<Option<watch::Receiver<bool>>>,
@@ -52,6 +53,7 @@ impl ActivationDelivery {
             .info()
             .map_err(|error| anyhow::anyhow!("read SessionActivate delivery info: {error}"))?;
         let failure_key = format!("{}/{}", info.stream, info.stream_sequence);
+        let delivered = info.delivered;
         message.ack_with(AckKind::Progress).await.map_err(|error| {
             anyhow::anyhow!("start SessionActivate progress heartbeat: {error}")
         })?;
@@ -77,6 +79,7 @@ impl ActivationDelivery {
         Ok(Self {
             message,
             failure_key,
+            delivered,
             heartbeat_cancel,
             heartbeat_task: Some(heartbeat_task),
             lease_tx,
@@ -89,6 +92,19 @@ impl ActivationDelivery {
 
     pub(super) fn stream_sequence(&self) -> Option<u64> {
         self.message.info().ok().map(|info| info.stream_sequence)
+    }
+
+    /// How many times JetStream has delivered this activation, this delivery
+    /// included.
+    pub(super) fn delivered(&self) -> i64 {
+        self.delivered
+    }
+
+    /// The session the activation names, when its payload decodes.
+    pub(super) fn session_id(&self) -> Option<String> {
+        serde_json::from_slice::<super::activation::SessionActivate>(&self.message.payload)
+            .ok()
+            .map(|activation| activation.session_id)
     }
 
     pub(super) fn failure_key(&self) -> &str {
