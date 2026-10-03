@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.12 (2026-10-03)
+
+### Features
+
+- Validate the MCP server's selected NATS cluster at startup and share local worker routing across connections. Explicit cluster selection overrides frontend environment routing for reservations, discovery, and calls; an explicit config directory also reaches the local child worker.
+- Add a connection-local MCP handler that lazily reserves tools, advertises only selected provider-backed declarations, and routes calls through the same package-aware snapshot. Refresh catalogs after reservation recovery, preserve MCP text and media results, and cancel outstanding calls before releasing a connection's reservation.
+- Serve selected harnx tools over MCP stdio and stateful Streamable HTTP at `/mcp`. Give each HTTP session its own backing harnx session, cancel pending calls on EOF, DELETE, or inactivity expiry, and stop reservation renewal before release. HTTP retains rmcp's five-minute inactivity timeout and requires a stateful MCP protocol version (2025-11-25 or earlier).
+- Add finite numeric run-limit configuration with a 24-hour fallback, checked deadline resolution, and immutable run/invocation metadata storage. Omitted, null, zero and negative values inherit policy; positive values choose finite allowances. Replay reuses saved admission times and deadlines; worker enforcement is separate.
+- Added a reusable frontend tool reservation handle with durable caller sessions, automatic renewal and worker failover, scope-change notifications, and connection cleanup. Tool provider discovery now follows the caller's selected NATS cluster.
+- Add worker-side tool reservations over NATS. Clients can start and hold selected tool servers without running a model turn, renew the reservation, and release it on disconnect. Abandoned reservations expire automatically.
+
+#### Delegation tools use worker-owned wall-clock deadlines. Independent CLI token budgets and accounting remain.
+
+Delegation tools publish target policy resolved by the worker, including package patches. Omitted, null, zero or negative `timeout_secs` inherits target policy; a positive integer chooses a finite local allowance, and inherited deadlines can shorten it. Worker timeout results include scope, frozen deadline and run/invocation IDs, bounded public progress and artifact references, and scope-specific continuation hints. The finite global fallback is 86,400 seconds (24 hours); strings and deadline-disable values are not supported.
+
+External MCP requests receive a durable outer run scope before tool dispatch. Exported agent calls inherit that scope while keeping worker target policy authoritative; connection reservations and cached tool catalogs do not renew or share execution deadlines.
+
+### Fixes
+
+- update dependency @ag-ui/client to v1.0.1 (#2276)
+- keep NATS round trips out of the config lock (#2274)
+- read the invocation journal from the stream leader (#2282)
+- Fix the TUI staying busy forever after a session was compacted. Compaction writes the messages it keeps to the log again, and the TUI, the front ends' pending-prompt activation and the web follower read the newest of those copies as a prompt no turn had answered yet. They now skip messages compaction re-logged. The web UI also clears an automatic compaction's spinner when the run ends, in case its completion event was lost.
+- Fix tool servers failing new tool calls with `tool invocation recovery: replay has no durable invocation` or `key already exists: wrong last revision` on a replicated NATS cluster. The server read the tool invocation journal with direct gets, which a follower answers from whatever it has applied so far, so a read could miss the row the worker wrote just before dispatching the call. Tool servers and workers now read journal rows, and list a session's rows, from the stream leader, and refuse a listing while the stream has no leader. Existing journal buckets with direct get enabled are covered without changing their configuration.
+- Keep the latest inherited run scope when nested macros return, so later steps can't escape a shorter nested deadline. Reject expired macro steps before polling a ready dot-command. Add real NATS coverage for macro root persistence, nested continuation lineage, frozen configuration, finite default behavior and timeout aborts.
+- Create an empty transcript for tool reservation backing sessions so agents called through MCP can persist parent progress before any prompt has run. Add real-worker MCP integration tests for stdio, HTTP protocol negotiation, caller identity, agent continuation, and package naming.
+- Store plan issue metadata in NATS: `github_issue` identifies a GitHub issue alongside `github_owner_repo`, and `external_task_url` links to a task in any issue tracker. Both fields support creation and existing-plan updates and appear in `get_plan` and `list_plans`. Legacy `parent_issue` records and callers remain readable through an alias. Omitted, null, zero issue numbers, and blank URL updates preserve existing metadata. Task URLs are validated as absolute HTTP/HTTPS URLs without fetching; no tracker synchronization is performed.
+- Fix workers that stopped serving `/healthz` and processing sessions until restarted. A session title write held the session's config lock across a NATS metadata update while the end-of-turn maintenance wait blocked a Tokio worker on the same lock, which left nothing polling for the NATS reply. Titles, `.set` overrides, `.model` and compaction now write to NATS without holding the config lock, polling loops no longer block on it, and a contended config lock now waits without tying up a Tokio worker.
+
 ## 0.34.11 (2026-10-01)
 
 ### Features

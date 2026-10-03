@@ -28,7 +28,7 @@ use_tools:
 - harnx_agent_session_history_read
 - attachments_attachment_read
 description: "Task verification agent — independently verifies work completed by other agents by reading changed files, running tests and diagnostics, and cross-checking claims against actual results. Returns structured PASS/FAIL verdicts with evidence. Named after Argus (AR-gus) Panoptes, the hundred-eyed giant who never slept.\n"
-version: '0.4.11'
+version: '0.4.12'
 variables:
 - name: argus_core
   description: Core verification protocol for argus

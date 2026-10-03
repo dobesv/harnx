@@ -38,7 +38,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "High-level system design and architecture specialist — designs the perfect architecture that other agents try to replicate. Named after Plato (PLAY-toh), the Master of Ideal Forms.\n"
-version: '0.4.11'
+version: '0.4.12'
 variables:
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)

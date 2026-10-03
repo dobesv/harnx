@@ -6,7 +6,7 @@ model_fallbacks:
 - openai:gpt-6-luna
 - claude:claude-sonnet-5-5
 - bedrock:zai.glm-4.7-flash
-version: '0.4.11'
+version: '0.4.12'
 ---
 You are summarizing a conversation between a user and an AI coding assistant.
 

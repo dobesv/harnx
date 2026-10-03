@@ -1,6 +1,14 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.4.12 (2026-10-03)
+
+### Fixes
+
+- update dependency @ag-ui/client to v1.0.1 (#2276)
+- keep NATS round trips out of the config lock (#2274)
+- read the invocation journal from the stream leader (#2282)
+
 ## 0.4.11 (2026-10-01)
 
 ### Features
