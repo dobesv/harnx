@@ -24,14 +24,19 @@ pub async fn update(
                     kv::UpdateErrorKind::TimedOut | kv::UpdateErrorKind::Other
                 ) =>
             {
-                let entry = timeout_at(deadline, crate::recovery::read(|| store.entry(&key)))
-                    .await
-                    .map_err(|error| {
-                        kv::UpdateError::with_source(kv::UpdateErrorKind::TimedOut, error)
-                    })?
-                    .map_err(|error| {
-                        kv::UpdateError::with_source(kv::UpdateErrorKind::Other, error.to_string())
-                    })?;
+                // A follower may not have applied the write whose ack was lost,
+                // and would report the old revision as current.
+                let entry = timeout_at(
+                    deadline,
+                    crate::recovery::read(|| crate::leader_reads::entry(store, &key)),
+                )
+                .await
+                .map_err(|error| {
+                    kv::UpdateError::with_source(kv::UpdateErrorKind::TimedOut, error)
+                })?
+                .map_err(|error| {
+                    kv::UpdateError::with_source(kv::UpdateErrorKind::Other, format!("{error:#}"))
+                })?;
                 let Some(entry) = entry else {
                     return Err(error);
                 };

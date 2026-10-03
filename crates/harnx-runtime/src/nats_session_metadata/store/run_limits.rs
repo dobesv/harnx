@@ -142,7 +142,8 @@ impl SessionMetadataStore {
             Err(error) => {
                 // Never retry a mutation on an ambiguous ack. Read authoritative
                 // state; equality confirms an identical retry, not an overwrite.
-                let entry = harnx_nats_common::recovery::read(|| self.store.entry(key))
+                let entry = self
+                    .leader_entry(key)
                     .await
                     .with_context(|| format!("Limits creation unconfirmed for '{key}': {error}"))?;
                 if let Some(entry) = entry {
@@ -161,7 +162,7 @@ impl SessionMetadataStore {
     }
 
     async fn read_limits(&self, key: &str) -> Result<Option<RunLimitsRecord>> {
-        let entry = harnx_nats_common::recovery::read(|| self.store.entry(key)).await?;
+        let entry = self.leader_entry(key).await?;
         match entry {
             Some(entry) if entry.operation == kv::Operation::Put => {
                 serde_json::from_slice(&entry.value)

@@ -13,45 +13,18 @@
 //! replica answers `STREAM.INFO` from its own store and names no leader in
 //! the answer. A listing page that names none is refused here.
 use super::*;
-use async_nats::jetstream::{
-    message::StreamMessage, response::Response, stream::LastRawMessageErrorKind,
-};
+use async_nats::jetstream::response::Response;
+use harnx_nats_common::leader_reads;
 use std::collections::{BTreeSet, HashMap};
-
-/// The header a KV store writes on the markers that delete and purge a key.
-const KV_OPERATION: &str = "KV-Operation";
 
 impl InvocationJournal {
     /// The latest revision of `key`, which may be a delete or purge marker.
     pub(super) async fn entry(&self, key: &str) -> Result<Option<kv::Entry>> {
-        // The leader takes this subject as a filter, so a wildcard in a call
-        // or session id would answer with some other key's row.
-        ensure!(
-            is_valid_key(key),
-            "invalid tool invocation journal key {key}"
-        );
-        let store = &self.0;
-        let subject = format!("{}{key}", store.prefix);
-        let message = match store.stream.get_last_raw_message_by_subject(&subject).await {
-            Ok(message) => message,
-            Err(error) if matches!(error.kind(), LastRawMessageErrorKind::NoMessageFound) => {
-                return Ok(None);
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("read tool invocation journal key {key}"))
-            }
-        };
-        Ok(Some(kv::Entry {
-            bucket: store.name.clone(),
-            key: key.to_owned(),
-            operation: operation(&message),
-            value: message.payload,
-            revision: message.sequence,
-            delta: 0,
-            created: message.time,
-            seen_current: false,
-        }))
+        // Refuses a key with a wildcard in its call or session id, which the
+        // leader would take as a filter and answer with some other call's row.
+        leader_reads::entry(&self.0, key)
+            .await
+            .with_context(|| format!("read tool invocation journal key {key}"))
     }
 
     /// `key`'s latest revision, or `None` once it has been deleted or purged.
@@ -142,29 +115,4 @@ impl SubjectPage {
                 .is_some_and(|leader| !leader.is_empty())
         })
     }
-}
-
-/// What a revision did to its key, decoded as `kv::Store` decodes it. The
-/// server marks a key it removed itself, for an age limit say, with a marker
-/// reason rather than the KV operation header.
-fn operation(message: &StreamMessage) -> kv::Operation {
-    if let Some(operation) = message.headers.get(KV_OPERATION) {
-        return operation.as_str().parse().unwrap_or(kv::Operation::Put);
-    }
-    let reason = message.headers.get(async_nats::header::NATS_MARKER_REASON);
-    match reason.map(|reason| reason.as_str()) {
-        Some("MaxAge" | "Purge") => kv::Operation::Purge,
-        Some("Remove") => kv::Operation::Delete,
-        _ => kv::Operation::Put,
-    }
-}
-
-/// The keys `kv::Store` itself accepts.
-fn is_valid_key(key: &str) -> bool {
-    !key.is_empty()
-        && !key.starts_with('.')
-        && !key.ends_with('.')
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-/_=.".contains(&byte))
 }

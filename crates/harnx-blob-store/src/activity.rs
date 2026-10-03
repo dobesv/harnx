@@ -85,8 +85,14 @@ async fn get_or_create_metadata_bucket(jetstream: &jetstream::Context) -> Result
 }
 
 async fn update_session_activity(store: &kv::Store, key: &str, now: DateTime<Utc>) -> Result<()> {
-    let activity = match store.entry(key).await {
-        Ok(Some(entry)) if matches!(entry.operation, kv::Operation::Put) => {
+    // The leader has the activity a new session's creator wrote a moment ago,
+    // which a follower may not. Missing it, or failing to read it, would stamp
+    // a first activation on a session that hasn't run yet.
+    let current = harnx_nats_common::leader_reads::entry(store, key)
+        .await
+        .context("read session activity")?;
+    let activity = match current {
+        Some(entry) if matches!(entry.operation, kv::Operation::Put) => {
             let previous: SessionActivity = serde_json::from_slice(&entry.value)
                 .context("failed to deserialize session activity")?;
             SessionActivity {

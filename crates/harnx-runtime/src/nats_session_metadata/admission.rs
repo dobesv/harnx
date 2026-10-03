@@ -104,9 +104,8 @@ fn prompt_key(storage: &str, id: &str) -> String {
 
 impl SessionMetadataStore {
     pub async fn admission(&self, storage: &str, id: &str) -> Result<Option<InvocationAdmission>> {
-        let bytes =
-            harnx_nats_common::recovery::read(|| self.kv_store().get(intent_key(storage, id)))
-                .await?;
+        let key = intent_key(storage, id);
+        let bytes = self.leader_value(&key).await?;
         bytes
             .map(|bytes| {
                 let admission: InvocationAdmission =
@@ -137,9 +136,8 @@ impl SessionMetadataStore {
         storage: &str,
         prompt: &str,
     ) -> Result<Option<InvocationAdmission>> {
-        let bytes =
-            harnx_nats_common::recovery::read(|| self.kv_store().get(prompt_key(storage, prompt)))
-                .await?;
+        let key = prompt_key(storage, prompt);
+        let bytes = self.leader_value(&key).await?;
         match bytes {
             Some(bytes) => self.admission(storage, std::str::from_utf8(&bytes)?).await,
             None => Ok(None),
@@ -220,8 +218,7 @@ impl SessionMetadataStore {
         };
         let head = head_key(storage);
         for _ in 0..16 {
-            let current =
-                harnx_nats_common::recovery::read(|| self.kv_store().entry(&head)).await?;
+            let current = self.leader_entry(&head).await?;
             let revision = current.as_ref().map_or(0, |entry| entry.revision);
             if let Some(entry) = &current {
                 let current_id = std::str::from_utf8(&entry.value)?;
@@ -259,8 +256,8 @@ impl SessionMetadataStore {
         storage: &str,
         entries: &[(u64, SessionLogEntry)],
     ) -> Result<Option<InvocationAdmission>> {
-        let bytes =
-            harnx_nats_common::recovery::read(|| self.kv_store().get(head_key(storage))).await?;
+        let head = head_key(storage);
+        let bytes = self.leader_value(&head).await?;
         let Some(bytes) = bytes else {
             return Ok(None);
         };
@@ -291,7 +288,8 @@ impl SessionMetadataStore {
             .await
             .is_err()
         {
-            let stored = harnx_nats_common::recovery::read(|| self.kv_store().get(&key))
+            let stored = self
+                .leader_value(&key)
                 .await?
                 .context("prompt admission binding unconfirmed")?;
             ensure!(

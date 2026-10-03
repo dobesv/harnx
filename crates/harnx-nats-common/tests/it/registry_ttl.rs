@@ -28,6 +28,12 @@ impl Drop for NatsServerHandle {
 }
 
 async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
+    spawn_configured_nats_server(None).await
+}
+
+/// [`spawn_nats_server`], with `config` loaded as a nats-server configuration
+/// file. The command-line options still win where the two overlap.
+async fn spawn_configured_nats_server(config: Option<&str>) -> Result<Option<NatsServerHandle>> {
     let Some(binary) = nats_server_binary() else {
         eprintln!("skipping NATS integration test: nats-server binary not found");
         return Ok(None);
@@ -37,7 +43,13 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
     for attempt in 1..=MAX_START_ATTEMPTS {
         let store_dir = tempfile::tempdir().context("create NATS test store")?;
         let ports_dir = tempfile::tempdir().context("create NATS ports dir")?;
-        let mut child = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        if let Some(config) = config {
+            let path = store_dir.path().join("nats-server.conf");
+            std::fs::write(&path, config).context("write NATS test config")?;
+            command.arg("-c").arg(path);
+        }
+        let mut child = command
             .arg("-js")
             .arg("-sd")
             .arg(store_dir.path())

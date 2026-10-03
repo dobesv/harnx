@@ -6,15 +6,16 @@ use chrono::Utc;
 impl SessionMetadataStore {
     pub async fn get_activity(&self, session_id: &str) -> Result<Option<SessionActivity>> {
         let key = activity_key(session_id);
-        match self.store.entry(key.clone()).await {
+        match self.leader_entry(&key).await {
             Ok(Some(entry)) if matches!(entry.operation, kv::Operation::Put) => {
                 serde_json::from_slice(&entry.value)
                     .with_context(|| format!("Failed to deserialize session activity '{key}'"))
                     .map(Some)
             }
             Ok(Some(_)) | Ok(None) => Ok(None),
-            Err(error) => Err(anyhow::Error::from(error))
-                .with_context(|| format!("Failed to read session activity key '{key}'")),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to read session activity key '{key}'"))
+            }
         }
     }
 
@@ -27,7 +28,7 @@ impl SessionMetadataStore {
         session_id: &str,
     ) -> Result<Option<SessionActivity>> {
         let key = activity_key(session_id);
-        match self.store.entry(key.clone()).await {
+        match self.leader_entry(&key).await {
             Ok(Some(entry)) if matches!(entry.operation, kv::Operation::Put) => {
                 match serde_json::from_slice(&entry.value) {
                     Ok(activity) => Ok(Some(activity)),
@@ -40,8 +41,9 @@ impl SessionMetadataStore {
                 }
             }
             Ok(Some(_)) | Ok(None) => Ok(None),
-            Err(error) => Err(anyhow::Error::from(error))
-                .with_context(|| format!("Failed to read session activity key '{key}'")),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to read session activity key '{key}'"))
+            }
         }
     }
 
@@ -73,7 +75,7 @@ impl SessionMetadataStore {
     }
 
     async fn activity_snapshot(&self, key: &str) -> Result<(Option<SessionActivity>, u64)> {
-        let Some(entry) = self.store.entry(key.to_string()).await? else {
+        let Some(entry) = self.leader_entry(key).await? else {
             return Ok((None, 0));
         };
         if !matches!(entry.operation, kv::Operation::Put) {

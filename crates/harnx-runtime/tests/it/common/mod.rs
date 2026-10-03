@@ -37,6 +37,20 @@ pub async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
 pub async fn spawn_nats_server_with_options(
     options: SpawnNatsServerOptions,
 ) -> Result<Option<NatsServerHandle>> {
+    spawn_nats_server_from(options, None).await
+}
+
+/// [`spawn_nats_server`], with `config` loaded as a nats-server configuration
+/// file. The command-line options still win where the two overlap.
+#[allow(dead_code)]
+pub async fn spawn_configured_nats_server(config: &str) -> Result<Option<NatsServerHandle>> {
+    spawn_nats_server_from(SpawnNatsServerOptions::default(), Some(config)).await
+}
+
+async fn spawn_nats_server_from(
+    options: SpawnNatsServerOptions,
+    config: Option<&str>,
+) -> Result<Option<NatsServerHandle>> {
     let binary = match nats_server_binary() {
         Some(binary) => binary,
         None => {
@@ -52,7 +66,7 @@ pub async fn spawn_nats_server_with_options(
     // robust instead of intermittently failing (e.g. lease_contention).
     let mut last_err = None;
     for _ in 0..5 {
-        match try_spawn_nats_once(&binary, &options).await {
+        match try_spawn_nats_once(&binary, &options, config).await {
             Ok(handle) => return Ok(Some(handle)),
             Err(e) => last_err = Some(e),
         }
@@ -63,10 +77,16 @@ pub async fn spawn_nats_server_with_options(
 async fn try_spawn_nats_once(
     binary: &std::path::Path,
     options: &SpawnNatsServerOptions,
+    config: Option<&str>,
 ) -> Result<NatsServerHandle> {
     let store_dir = tempfile::tempdir().context("Failed to create temp NATS store dir")?;
     let ports_dir = tempfile::tempdir().context("Failed to create temp NATS ports dir")?;
     let mut command = Command::new(binary);
+    if let Some(config) = config {
+        let path = store_dir.path().join("nats-server.conf");
+        std::fs::write(&path, config).context("Failed to write NATS test config")?;
+        command.arg("-c").arg(path);
+    }
     command
         .arg("-js")
         .arg("-sd")
