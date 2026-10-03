@@ -11,6 +11,7 @@ There is no readline-based REPL.
 
 - **Tab Autocompletion** for dot-commands:
   - `.<tab>` to complete command names.
+  - `.info tool <tab>`, `.list tools <tab>`, and `.call tool <tab>` to complete allowed tool names in the active session.
   - `.model <tab>` to complete chat models.
   - `.set <tab>` to complete config keys.
   - `.set key <tab>` to complete config values.
@@ -205,6 +206,25 @@ The `.info agent`, `.info session`, and `.dump session` commands display detaile
   - Both arguments are required, even when a session is active.
   - Defaults to `text` (human-readable formatting). Supports `--format yaml` and `--format json` (JSONL).
 - **`.info`**, **`.info rag`**, **`.info tools`**: These commands continue to append information directly to the chat transcript.
+- **`.info tool <name>`**: Formats the metadata and parameter schema for an allowed tool and appends it to the chat transcript.
+
+### `.call` / `.info tool` / `.list tools` - inspect and call tools
+
+Inspect available tools and execute tools directly without triggering an LLM inference turn:
+
+```text
+.info tool <name>              Inspect metadata and schema for an allowed tool
+.list tools [pattern]          List allowed tools in the active session
+.call tool <name> <args-json>  Invoke an allowed tool directly with JSON arguments
+```
+
+- **Active session scoping**: These commands operate against the active session's allowed tools (reflecting the active agent's allowlist, package, and toolsets), rather than a global wildcard inventory. If no session is active, or if a tool is not permitted in the current session, the command reports an error.
+- **`.info tool <name>`**: Formats the tool description, runtime metadata, and input parameter schema as readable text and appends it to the chat transcript.
+- **`.list tools [pattern]`**: Lists allowed tools matching the optional glob pattern (e.g. `.list tools fs_*` or `.list tools`). Appends the formatted list to the chat transcript.
+- **`.call tool <name> <args-json>`**: Invokes the tool with `<args-json>`. Unlike CLI execution, `<args-json>` inside the TUI is parsed as the raw remainder following the tool name, preserving interior spaces, quotes, and newlines without shell escaping.
+- **Background execution and cancellation**: Tool commands execute as asynchronous background tasks. The input composer remains responsive during execution, and pressing `Ctrl+C` cancels the in-flight tool call cleanly without modifying the durable session transcript.
+- **Output**: Tool results and diagnostics are appended to the chat transcript as system items. The call does not initiate an LLM model turn or record assistant messages.
+- **Scoped consent**: Direct invocation runs with root operator consent. When a `PreToolUse` hook asks for confirmation (`ask`), the root tool call auto-approves. Hook `deny` decisions, argument transformations, and input validations are strictly enforced. Nested tool calls initiated by delegated child agents do not inherit root consent and present the standard confirmation modal.
 
 ### `.exit` - exit the current scope
 

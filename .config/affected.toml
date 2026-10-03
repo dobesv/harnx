@@ -85,6 +85,11 @@ test = ["harnx-runtime"]
 on-affected = ["harnx-attachment-tools"]
 test = ["harnx-runtime"]
 
+# Runtime CLI tool tests launch harnx and managed tool/hook sidecars by path.
+[[test-edge]]
+on-affected = ["harnx"]
+test = ["harnx-runtime"]
+
 # MCP bootstrap/handler tests launch worker, filesystem, and attachment servers.
 [[test-edge]]
 on-affected = ["harnx-worker", "harnx-fs-tools", "harnx-attachment-tools"]
@@ -105,3 +110,8 @@ test = ["harnx-runtime", "harnx-bash-tools"]
 [[test-path]]
 globs = ["example_config/**"]
 test = ["harnx-proxy-auth"]
+
+# Bridge direct-call fixtures run the SDK-backed mock MCP binary by path.
+[[test-edge]]
+on-affected = ["harnx-test-bins"]
+test = ["harnx-mcp-bridge"]

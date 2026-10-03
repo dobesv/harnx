@@ -196,119 +196,207 @@ pub async fn eval_tool_calls_with_authorization(
     abort_signal: &AbortSignal,
     authorization: Option<&dyn harnx_core::tool::ReplayAuthorization>,
 ) -> Result<Vec<ToolResult>> {
-    let mut output = vec![];
+    eval_tool_calls_inner(
+        ToolEvaluation {
+            ctx,
+            abort_signal,
+            authorization,
+            lossless: false,
+        },
+        calls,
+    )
+    .await
+}
+
+/// Evaluate one explicit operator call through the normal hooks and providers.
+/// Consent applies only to this call ID; it never changes shared configuration
+/// or the confirmation callback used by nested agent evaluations.
+pub async fn eval_operator_tool_call(
+    mut ctx: ToolEvalContext,
+    mut call: ToolCall,
+    abort_signal: &AbortSignal,
+) -> Result<ToolResult> {
+    anyhow::ensure!(
+        ctx.allowed_tool_names.contains(&call.name),
+        "Tool '{}' is not allowed in this context",
+        call.name
+    );
+    ensure_tool_call_ids(std::slice::from_mut(&mut call));
+    let root_name = call.name.clone();
+    let root_id = call.id.clone();
+    let original = ctx.confirm_tool_use_fn.clone();
+    ctx.confirm_tool_use_fn = Arc::new(move |candidate, arguments, reason| {
+        if candidate.id == root_id && candidate.name == root_name {
+            ToolUseConfirmation::Approve
+        } else {
+            original(candidate, arguments, reason)
+        }
+    });
+    let mut results = eval_tool_calls_inner(
+        ToolEvaluation {
+            ctx: &ctx,
+            abort_signal,
+            authorization: None,
+            lossless: true,
+        },
+        vec![call],
+    )
+    .await?;
+    anyhow::ensure!(
+        results.len() == 1,
+        "operator tool evaluation returned no result"
+    );
+    Ok(results.remove(0))
+}
+
+#[derive(Clone, Copy)]
+struct ToolEvaluation<'a> {
+    ctx: &'a ToolEvalContext,
+    abort_signal: &'a AbortSignal,
+    authorization: Option<&'a dyn harnx_core::tool::ReplayAuthorization>,
+    lossless: bool,
+}
+
+enum ToolAdmission {
+    Approved(ApprovedToolCall),
+    Immediate(Box<ToolResult>),
+    Deferred(DeferredToolCall),
+}
+
+async fn eval_tool_calls_inner(
+    evaluation: ToolEvaluation<'_>,
+    mut calls: Vec<ToolCall>,
+) -> Result<Vec<ToolResult>> {
+    let ToolEvaluation {
+        ctx,
+        abort_signal,
+        authorization,
+        lossless,
+    } = evaluation;
     if calls.is_empty() {
-        return Ok(output);
+        return Ok(vec![]);
     }
-    let mut calls = calls;
     ensure_tool_call_ids(&mut calls);
     let calls = ToolCall::dedup(calls);
-
+    let all_calls = calls.clone();
+    let mut output = Vec::new();
     let mut is_all_null = true;
     let mut approved = Vec::new();
     let mut deferred = Vec::new();
-    let all_calls = calls.clone();
-
     for call in calls {
-        work_boundary(ctx, &call, abort_signal, WorkBoundary::Accept).await?;
-
-        let json_data = match parse_call_arguments(&call) {
-            Ok(json_data) => json_data,
-            Err(ToolError::Recoverable(err)) => {
+        match prepare_tool_call(ctx, call, abort_signal).await? {
+            ToolAdmission::Approved(call) => approved.push(call),
+            ToolAdmission::Immediate(result) => {
                 is_all_null = false;
-                let error_result = json!({
-                    "is_error": true,
-                    "error": format!("{err:#}"),
-                });
-                output.push(ToolResult::new(call, error_result));
-                continue;
+                output.push(*result);
             }
-            Err(ToolError::Fatal(err)) => return Err(err),
-        };
-
-        let tool_input = call.arguments.clone();
-        let tool_use_id = call.id.clone().unwrap_or_default();
-        let pre_event = HookEvent::PreToolUse {
-            tool_name: call.name.clone(),
-            tool_input: tool_input.clone(),
-            tool_use_id: tool_use_id.clone(),
-        };
-        let pre_outcome = tokio::select! {
-            outcome = (ctx.dispatch_hook_fn)(pre_event) => outcome,
-            _ = wait_abort_signal(abort_signal) => HookOutcome {
-                control: HookResultControl::Block {
-                    reason: "cancelled by user".to_string(),
-                },
-                result: HookResult::default(),
-            },
-        };
-        work_boundary(ctx, &call, abort_signal, WorkBoundary::Accept).await?;
-        if let HookResultControl::Block { reason } = pre_outcome.control {
-            let blocked_result = json!({"error": reason, "blocked_by_hook": true});
-            (ctx.emit_tool_blocked_fn)(&call, &blocked_result);
-            output.push(ToolResult::new(call, blocked_result));
-            is_all_null = false;
-            continue;
+            ToolAdmission::Deferred(call) => deferred.push(call),
         }
-        let (json_data, tool_input) = if let Some(mutated) = pre_outcome.result.mutated_tool_input {
-            (mutated.clone(), mutated)
-        } else {
-            (json_data, tool_input)
-        };
-
-        if let HookResultControl::Ask { reason } = pre_outcome.control {
-            match (ctx.confirm_tool_use_fn)(&call, &json_data, reason.as_deref()) {
-                ToolUseConfirmation::Approve => {}
-                ToolUseConfirmation::Deny {
-                    reason: deny_reason,
-                } => {
-                    let deny_reason = deny_reason
-                        .or(reason.clone())
-                        .unwrap_or_else(|| "Denied by user".to_string());
-                    let blocked_result = json!({"error": deny_reason, "blocked_by_hook": true});
-                    (ctx.emit_tool_blocked_fn)(&call, &blocked_result);
-                    output.push(ToolResult::new(call, blocked_result));
-                    is_all_null = false;
-                    continue;
-                }
-                ToolUseConfirmation::Defer => {
-                    deferred.push(DeferredToolCall {
-                        call,
-                        arguments: json_data,
-                        reason: reason.clone(),
-                    });
-                    continue;
-                }
-            }
-        }
-
-        work_boundary(ctx, &call, abort_signal, WorkBoundary::Accept).await?;
-        (ctx.emit_tool_call_fn)(&call, &json_data);
-        approved.push(ApprovedToolCall {
-            call,
-            json_data,
-            tool_input,
-            tool_use_id,
-        });
     }
-
     if !deferred.is_empty() {
         return Err(ToolApprovalRequiredError::new(all_calls, deferred).into());
     }
-
     let dispatch_futures = approved
         .iter()
         .map(|call| dispatch_authorized_call(call, ctx, abort_signal, authorization));
     let dispatch_results = join_all(dispatch_futures).await;
     let (completed, dispatched_all_null) =
-        collect_dispatch_results(ctx, approved, dispatch_results, abort_signal).await?;
+        collect_dispatch_results(&evaluation, approved, dispatch_results).await?;
     output.extend(completed);
     is_all_null &= dispatched_all_null;
-
-    if is_all_null {
+    if is_all_null && !lossless {
         output = vec![];
     }
     Ok(output)
+}
+
+async fn prepare_tool_call(
+    ctx: &ToolEvalContext,
+    call: ToolCall,
+    abort_signal: &AbortSignal,
+) -> Result<ToolAdmission> {
+    work_boundary(ctx, &call, abort_signal, WorkBoundary::Accept).await?;
+    let json_data = match parse_call_arguments(&call) {
+        Ok(json_data) => json_data,
+        Err(ToolError::Recoverable(err)) => {
+            let result = json!({"is_error": true, "error": format!("{err:#}")});
+            return Ok(ToolAdmission::Immediate(Box::new(ToolResult::new(
+                call, result,
+            ))));
+        }
+        Err(ToolError::Fatal(err)) => return Err(err),
+    };
+    let approved = ApprovedToolCall {
+        tool_input: call.arguments.clone(),
+        tool_use_id: call.id.clone().unwrap_or_default(),
+        call,
+        json_data,
+    };
+    approve_tool_call(ctx, approved, abort_signal).await
+}
+
+async fn pre_tool_outcome(
+    ctx: &ToolEvalContext,
+    call: &ApprovedToolCall,
+    abort_signal: &AbortSignal,
+) -> HookOutcome {
+    let event = HookEvent::PreToolUse {
+        tool_name: call.call.name.clone(),
+        tool_input: call.tool_input.clone(),
+        tool_use_id: call.tool_use_id.clone(),
+    };
+    tokio::select! {
+        outcome = (ctx.dispatch_hook_fn)(event) => outcome,
+        _ = wait_abort_signal(abort_signal) => HookOutcome {
+            control: HookResultControl::Block { reason: "cancelled by user".to_string() },
+            result: HookResult::default(),
+        },
+    }
+}
+
+fn blocked_admission(ctx: &ToolEvalContext, call: ToolCall, reason: String) -> ToolAdmission {
+    let value = json!({"error": reason, "blocked_by_hook": true});
+    (ctx.emit_tool_blocked_fn)(&call, &value);
+    ToolAdmission::Immediate(Box::new(ToolResult::new(call, value)))
+}
+
+async fn approve_tool_call(
+    ctx: &ToolEvalContext,
+    mut approved: ApprovedToolCall,
+    abort_signal: &AbortSignal,
+) -> Result<ToolAdmission> {
+    let outcome = pre_tool_outcome(ctx, &approved, abort_signal).await;
+    work_boundary(ctx, &approved.call, abort_signal, WorkBoundary::Accept).await?;
+    if let HookResultControl::Block { reason } = outcome.control {
+        return Ok(blocked_admission(ctx, approved.call, reason));
+    }
+    if let Some(mutated) = outcome.result.mutated_tool_input {
+        approved.json_data = mutated.clone();
+        approved.tool_input = mutated;
+    }
+    if let HookResultControl::Ask { reason } = outcome.control {
+        match (ctx.confirm_tool_use_fn)(&approved.call, &approved.json_data, reason.as_deref()) {
+            ToolUseConfirmation::Approve => {}
+            ToolUseConfirmation::Deny {
+                reason: deny_reason,
+            } => {
+                let deny_reason = deny_reason
+                    .or(reason)
+                    .unwrap_or_else(|| "Denied by user".to_string());
+                return Ok(blocked_admission(ctx, approved.call, deny_reason));
+            }
+            ToolUseConfirmation::Defer => {
+                return Ok(ToolAdmission::Deferred(DeferredToolCall {
+                    call: approved.call,
+                    arguments: approved.json_data,
+                    reason,
+                }));
+            }
+        }
+    }
+    work_boundary(ctx, &approved.call, abort_signal, WorkBoundary::Accept).await?;
+    (ctx.emit_tool_call_fn)(&approved.call, &approved.json_data);
+    Ok(ToolAdmission::Approved(approved))
 }
 
 async fn dispatch_authorized_call(
@@ -329,11 +417,13 @@ async fn dispatch_authorized_call(
 }
 
 async fn collect_dispatch_results(
-    ctx: &ToolEvalContext,
+    evaluation: &ToolEvaluation<'_>,
     approved: Vec<ApprovedToolCall>,
     dispatch_results: Vec<Result<ToolProviderOutput, ToolError>>,
-    abort_signal: &AbortSignal,
 ) -> Result<(Vec<ToolResult>, bool)> {
+    let ToolEvaluation {
+        ctx, abort_signal, ..
+    } = *evaluation;
     // Don't turn a terminal provider outcome into sibling post-hooks/results.
     let results = dispatch_results
         .into_iter()
@@ -348,8 +438,7 @@ async fn collect_dispatch_results(
         work_boundary(ctx, &approved_call.call, abort_signal, WorkBoundary::Accept).await?;
         let (completed, was_null) = match result {
             Ok(provider_output) => {
-                complete_successful_tool_call(ctx, &approved_call, provider_output, abort_signal)
-                    .await?
+                complete_successful_tool_call(evaluation, &approved_call, provider_output).await?
             }
             Err(ToolError::Recoverable(error)) => {
                 let completed =
@@ -402,11 +491,16 @@ async fn work_boundary(
 }
 
 async fn complete_successful_tool_call(
-    ctx: &ToolEvalContext,
+    evaluation: &ToolEvaluation<'_>,
     approved: &ApprovedToolCall,
     provider_output: ToolProviderOutput,
-    abort: &AbortSignal,
 ) -> Result<(ToolResult, bool)> {
+    let ToolEvaluation {
+        ctx,
+        abort_signal: abort,
+        lossless,
+        ..
+    } = *evaluation;
     let (mut value, execution_context) = provider_output.into_parts();
     let post_event = HookEvent::PostToolUse {
         tool_name: approved.call.name.clone(),
@@ -419,13 +513,17 @@ async fn complete_successful_tool_call(
     if let Some(mutated_response) = post_outcome.result.mutated_tool_response {
         value = mutated_response;
     }
-    let images = crate::media::extract_image_parts(&value);
+    let images = if lossless {
+        vec![]
+    } else {
+        crate::media::extract_image_parts(&value)
+    };
     if !images.is_empty() {
         crate::media::redact_image_data(&mut value);
     }
     (ctx.emit_tool_result_fn)(&approved.call, &value);
     let was_null = value.is_null();
-    if was_null {
+    if was_null && !lossless {
         value = json!("DONE");
     }
     Ok((

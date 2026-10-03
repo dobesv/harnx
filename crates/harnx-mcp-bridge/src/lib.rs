@@ -6,11 +6,9 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use clap::Parser;
+use harnx_core::child_process::ChildProcessManager;
 use harnx_core::instance::HARNX_SERVER_SCOPE;
 use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
-#[cfg(unix)]
-use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, Implementation, InitializeRequestParams, Tool,
@@ -18,7 +16,7 @@ use rmcp::model::{
 use rmcp::service::{Peer, RoleClient, ServiceError};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio_util::sync::CancellationToken;
 
 const STDERR_TAIL_LINES: usize = 50;
@@ -29,7 +27,8 @@ const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 
 type StderrTail = Arc<Mutex<VecDeque<String>>>;
 type SpawnedChild = (
-    Box<dyn ChildWrapper>,
+    ChildProcessManager,
+    Child,
     ChildStdin,
     ChildStdout,
     Option<ChildStderr>,
@@ -40,7 +39,7 @@ type SpawnedChild = (
 #[command(trailing_var_arg = true)]
 pub struct Args {
     /// Server name used for registration. Required when serving over NATS;
-    /// optional for `--list-tools`, which does not register.
+    /// optional for `--list-tools` and `--call-tool`, which do not register.
     #[arg(long)]
     pub name: Option<String>,
 
@@ -70,6 +69,17 @@ pub struct Args {
     /// If set, only enabled tools are registered and invocable.
     #[arg(long = "enable-tool", action = clap::ArgAction::Append)]
     pub enable_tool: Vec<String>,
+
+    /// Call a tool directly and print its JSON result to stdout, then exit.
+    /// Requires a tool name; arguments default to `{}` if `--tool-args` is not set.
+    /// Incompatible with `--list-tools`.
+    #[arg(long = "call-tool", conflicts_with = "list_tools")]
+    pub call_tool: Option<String>,
+
+    /// JSON object to pass as the tool arguments when using `--call-tool`.
+    /// Must be a JSON object (e.g., `{"path": "/tmp"}`). Defaults to `{}`.
+    #[arg(long = "tool-args", requires = "call_tool")]
+    pub tool_args: Option<String>,
 }
 
 impl Args {
@@ -95,7 +105,9 @@ pub struct BridgeToolset {
     peer: Peer<RoleClient>,
     child_died: CancellationToken,
     _service_watch: tokio::task::JoinHandle<()>,
-    _child: Box<dyn ChildWrapper>,
+    child: Child,
+    // Keep the stable spawning thread alive until after its child is retired.
+    process_manager: ChildProcessManager,
     stderr_tail: StderrTail,
 }
 
@@ -226,7 +238,11 @@ fn spawn_handshake_progress(server_name: &str) -> tokio::task::JoinHandle<()> {
 /// answers the stdio handshake, so the wrapped server is never launched at all.
 const WORKER_NATS_ENV: [&str; 3] = [HARNX_SERVER_SCOPE, "HARNX_NATS_URL", "HARNX_NATS_TOKEN"];
 
-fn spawn_child(server_name: &str, program: &str, args: &[String]) -> anyhow::Result<SpawnedChild> {
+async fn spawn_child(
+    server_name: &str,
+    program: &str,
+    args: &[String],
+) -> anyhow::Result<SpawnedChild> {
     let mut command = Command::new(program);
     for name in WORKER_NATS_ENV {
         command.env_remove(name);
@@ -238,27 +254,21 @@ fn spawn_child(server_name: &str, program: &str, args: &[String]) -> anyhow::Res
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     harnx_telemetry::forward_otel_env_without_credentials(&mut command);
-    configure_child_process(&mut command);
-
-    // A separate process group prevents terminal SIGINT from reaching the child.
-    #[allow(unused_mut)]
-    let mut wrap = CommandWrap::from(command);
-    #[cfg(unix)]
-    wrap.wrap(ProcessGroup::leader());
-
-    let mut child = wrap
-        .spawn()
+    let manager = ChildProcessManager::new();
+    let mut child = manager
+        .spawn(command)
+        .await
         .with_context(|| format!("Failed to spawn MCP server '{server_name}'"))?;
     let stdin = child
-        .stdin()
+        .stdin
         .take()
         .ok_or_else(|| anyhow!("MCP server '{server_name}' stdin not piped"))?;
     let stdout = child
-        .stdout()
+        .stdout
         .take()
         .ok_or_else(|| anyhow!("MCP server '{server_name}' stdout not piped"))?;
-    let stderr = child.stderr().take();
-    Ok((child, stdin, stdout, stderr))
+    let stderr = child.stderr.take();
+    Ok((manager, child, stdin, stdout, stderr))
 }
 
 fn spawn_stderr_reader(server_name: &str, stderr: Option<ChildStderr>) -> StderrTail {
@@ -342,6 +352,25 @@ async fn connect_and_list_tools(
     Ok((service, cached_tools))
 }
 
+fn watch_service(
+    service: rmcp::service::RunningService<RoleClient, BridgeClientHandler>,
+    server_name: String,
+    stderr_tail: StderrTail,
+) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+    let child_died = CancellationToken::new();
+    let watch_token = child_died.clone();
+    // Observe transport closure without moving the process handle out of BridgeToolset.
+    let service_watch = tokio::spawn(async move {
+        let reason = service.waiting().await;
+        log::warn!(
+            "MCP server '{server_name}' connection closed ({reason:?}){}",
+            render_stderr_tail(&stderr_tail)
+        );
+        watch_token.cancel();
+    });
+    (child_died, service_watch)
+}
+
 impl BridgeToolset {
     /// Spawns a stdio MCP server, initializes its client connection, and lists tools once.
     pub async fn new(
@@ -367,7 +396,8 @@ impl BridgeToolset {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|error| format!("<unresolved: {error}>"))
         );
-        let (child, stdin, stdout, stderr) = spawn_child(&server_name, program, args)?;
+        let (manager, mut child, stdin, stdout, stderr) =
+            spawn_child(&server_name, program, args).await?;
         // The pid makes a stalled handshake inspectable from outside: the child
         // is a launcher like `npx`, so knowing which process to look at is the
         // difference between "it is slow" and a `/proc` answer for why.
@@ -381,9 +411,19 @@ impl BridgeToolset {
         let stderr_tail = spawn_stderr_reader(&server_name, stderr);
         let handshake = std::time::Instant::now();
         let progress = spawn_handshake_progress(&server_name);
-        let (service, cached_tools) =
-            connect_and_list_tools(&server_name, stdin, stdout, &stderr_tail).await?;
+        let connected = connect_and_list_tools(&server_name, stdin, stdout, &stderr_tail).await;
         progress.abort();
+        let (service, cached_tools) = match connected {
+            Ok(connected) => connected,
+            Err(error) => {
+                if let Err(cleanup) = retire_child(&manager, &mut child).await {
+                    return Err(
+                        error.context(format!("MCP child cleanup also failed: {cleanup:#}"))
+                    );
+                }
+                return Err(error);
+            }
+        };
         log::info!(
             "MCP server '{server_name}': handshake completed in {:.1}s",
             handshake.elapsed().as_secs_f64()
@@ -394,20 +434,8 @@ impl BridgeToolset {
             cached_tools.len()
         );
         let peer = service.peer().clone();
-        let child_died = CancellationToken::new();
-        let watch_token = child_died.clone();
-        let watch_name = server_name.clone();
-        let watch_stderr = Arc::clone(&stderr_tail);
-        // RunningService owns the transport loop, so its completion reports child stdio closure
-        // without moving the process handle needed for kill_on_drop out of BridgeToolset.
-        let service_watch = tokio::spawn(async move {
-            let reason = service.waiting().await;
-            log::warn!(
-                "MCP server '{watch_name}' connection closed ({reason:?}){}",
-                render_stderr_tail(&watch_stderr)
-            );
-            watch_token.cancel();
-        });
+        let (child_died, service_watch) =
+            watch_service(service, server_name.clone(), Arc::clone(&stderr_tail));
 
         Ok(Self {
             server_name,
@@ -415,9 +443,17 @@ impl BridgeToolset {
             peer,
             child_died,
             _service_watch: service_watch,
-            _child: child,
+            child,
+            process_manager: manager,
             stderr_tail,
         })
+    }
+
+    /// Retire and reap the wrapped process before a standalone diagnostic exits.
+    pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+        let result = retire_child(&self.process_manager, &mut self.child).await;
+        self._service_watch.abort();
+        result
     }
 
     /// Server name used for toolset registration.
@@ -447,7 +483,7 @@ impl BridgeToolset {
 
     /// Process ID of the wrapped MCP server, when available.
     pub fn child_id(&self) -> Option<u32> {
-        self._child.id()
+        self.child.id()
     }
 
     /// Token cancelled when the wrapped server's MCP transport closes.
@@ -551,25 +587,19 @@ impl BridgeToolset {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn configure_child_process(command: &mut Command) {
-    let parent_pid = std::process::id() as libc::pid_t;
-    // SAFETY: pre_exec invokes only async-signal-safe libc calls. ProcessGroup configures setpgid.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != parent_pid {
-                libc::raise(libc::SIGTERM);
-            }
-            Ok(())
-        });
+async fn retire_child(manager: &ChildProcessManager, child: &mut Child) -> anyhow::Result<()> {
+    // Stop descendants before try_wait can reap an exited launcher and lose its PGID.
+    let group_stop = manager.stop_process_group(child);
+    if child
+        .try_wait()
+        .context("poll MCP child during cleanup")?
+        .is_none()
+    {
+        child.start_kill().context("stop MCP child")?;
     }
+    child.wait().await.context("reap MCP child")?;
+    group_stop.context("stop MCP child process group")
 }
-
-#[cfg(not(target_os = "linux"))]
-fn configure_child_process(_command: &mut Command) {}
 
 fn map_tool(tool: Tool) -> ToolSpec {
     let annotations = tool.annotations.as_ref();

@@ -56,6 +56,10 @@ impl Tui {
 
     pub(super) async fn handle_tui_event_inner(&mut self, event: TuiEvent) -> Result<()> {
         match event {
+            event @ (TuiEvent::OperatorToolFinished { .. }
+            | TuiEvent::PromptTaskFinished { .. }) => {
+                self.handle_task_completion(event).await;
+            }
             TuiEvent::LocalAgent(event) => {
                 // Explicit local commands are not worker advisories. A NATS
                 // follower can only enter through the generation-bound sink.
@@ -63,9 +67,6 @@ impl Tui {
             }
             TuiEvent::Agent { task, stamp, event } => {
                 self.handle_prompt_agent_event(task, stamp, event).await;
-            }
-            TuiEvent::PromptTaskFinished { task, error } => {
-                self.finish_prompt_task(task, error).await;
             }
             TuiEvent::SessionActivity {
                 historical,
@@ -113,6 +114,35 @@ impl Tui {
             event @ (TuiEvent::ToolRoundComplete | TuiEvent::PendingMessageConsumed(_)) => {
                 self.handle_pending_prompt_event(event).await;
             }
+            event @ (TuiEvent::ToolConfirmation(_)
+            | TuiEvent::ToolConfirmationEnqueueFinished { .. }) => {
+                self.handle_confirmation_completion(event).await;
+            }
+            event @ (TuiEvent::SessionReadInvalidation { .. } | TuiEvent::RefreshSessionList) => {
+                self.handle_session_refresh_event(event).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_task_completion(&mut self, event: TuiEvent) {
+        match event {
+            TuiEvent::OperatorToolFinished {
+                task,
+                output,
+                error,
+            } => {
+                self.finish_operator_tool_command(task, output, error).await;
+            }
+            TuiEvent::PromptTaskFinished { task, error } => {
+                self.finish_prompt_task(task, error).await;
+            }
+            _ => unreachable!("task completion dispatch received a different event"),
+        }
+    }
+
+    async fn handle_confirmation_completion(&mut self, event: TuiEvent) {
+        match event {
             TuiEvent::ToolConfirmation(event) => {
                 self.handle_tool_confirmation_event(event).await;
             }
@@ -123,11 +153,8 @@ impl Tui {
             } => {
                 self.finish_tool_confirmation_enqueue(confirmation_id, decision, result);
             }
-            event @ (TuiEvent::SessionReadInvalidation { .. } | TuiEvent::RefreshSessionList) => {
-                self.handle_session_refresh_event(event).await;
-            }
+            _ => unreachable!("confirmation dispatch received a different event"),
         }
-        Ok(())
     }
 
     async fn handle_session_refresh_event(&mut self, event: TuiEvent) {

@@ -10,6 +10,8 @@ const FIXED_SUBCOMMANDS: &[(&str, &[&str])] = &[
         ".delete",
         &["agent", "session", "rag", "macro", "agent-data", "message"],
     ),
+    (".call", &["tool"]),
+    (".list", &["tools"]),
     (".drop", &["tool"]),
     (".dump", &["session"]),
     (
@@ -24,6 +26,7 @@ const FIXED_SUBCOMMANDS: &[(&str, &[&str])] = &[
             "agent",
             "rag",
             "tools",
+            "tool",
             "theme",
             "env",
             "terminal_status",

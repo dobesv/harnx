@@ -395,8 +395,12 @@ async fn resolve_nats_providers(
     config: &Config,
     instance_id: &harnx_core::instance::ServerScope,
     active_package: Option<&str>,
-    injected_hook_provider: Option<Arc<NatsHookProvider>>,
+    injected: (Option<Arc<NatsToolProvider>>, Option<Arc<NatsHookProvider>>),
 ) -> (Option<Arc<NatsToolProvider>>, Option<Arc<NatsHookProvider>>) {
+    let (injected_tool_provider, injected_hook_provider) = injected;
+    if let Some(provider) = injected_tool_provider {
+        return (Some(provider), injected_hook_provider);
+    }
     let tool_provider =
         discover_nats_tool_provider_cached(config, instance_id, active_package).await;
     let hook_provider = match injected_hook_provider {
@@ -408,6 +412,21 @@ async fn resolve_nats_providers(
 
 /// Build tool providers, hook dispatch, and rendering state for one tool round.
 pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> ToolEvalContext {
+    build_tool_eval_context_inner(params, None).await
+}
+
+/// Build against an admitted discovery snapshot, without consulting the cache.
+pub async fn build_tool_eval_context_with_provider(
+    params: BuildToolEvalContextParams<'_>,
+    provider: Arc<crate::nats_tool_provider::NatsToolProvider>,
+) -> ToolEvalContext {
+    build_tool_eval_context_inner(params, Some(provider)).await
+}
+
+async fn build_tool_eval_context_inner(
+    params: BuildToolEvalContextParams<'_>,
+    provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
+) -> ToolEvalContext {
     let BuildToolEvalContextParams {
         config,
         instance_id,
@@ -417,30 +436,19 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         nats_hook_provider,
         pending_async_context,
     } = params;
-    let (
-        mut tool_declarations,
+    let ToolRoundSnapshot {
+        declarations: mut tool_declarations,
         handoff_targets,
         session_name,
-        confirm_tool_use_fn,
-        config_snapshot,
-    ) = {
-        let guard = config.read();
-        let (tool_declarations, handoff_targets) = guard
-            .tool_declarations_for_use_tools(agent_use_tools, current_agent_package.as_deref());
-        (
-            tool_declarations,
-            handoff_targets,
-            guard.session.as_ref().map(|s| s.id().to_string()),
-            build_confirm_tool_use_fn(&guard),
-            guard.clone(),
-        )
-    };
+        confirmation: confirm_tool_use_fn,
+        config: config_snapshot,
+    } = snapshot_tool_round(config, agent_use_tools, current_agent_package.as_deref());
 
     let (nats_provider, nats_hook_provider) = resolve_nats_providers(
         &config_snapshot,
         instance_id,
         current_agent_package.as_deref(),
-        nats_hook_provider,
+        (provider, nats_hook_provider),
     )
     .await;
     if let Some(provider) = &nats_provider {
@@ -474,6 +482,33 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         emit_tool_update_fn,
         confirm_tool_use_fn,
         dispatch_hook_fn,
+    }
+}
+
+struct ToolRoundSnapshot {
+    declarations: Vec<ToolDeclaration>,
+    handoff_targets: HashMap<String, String>,
+    session_name: Option<String>,
+    confirmation: Arc<ConfirmToolUseFn>,
+    config: Config,
+}
+
+fn snapshot_tool_round(
+    config: &GlobalConfig,
+    selectors: Option<&str>,
+    package: Option<&str>,
+) -> ToolRoundSnapshot {
+    let guard = config.read();
+    let (declarations, handoff_targets) = guard.tool_declarations_for_use_tools(selectors, package);
+    ToolRoundSnapshot {
+        declarations,
+        handoff_targets,
+        session_name: guard
+            .session
+            .as_ref()
+            .map(|session| session.id().to_string()),
+        confirmation: build_confirm_tool_use_fn(&guard),
+        config: guard.clone(),
     }
 }
 

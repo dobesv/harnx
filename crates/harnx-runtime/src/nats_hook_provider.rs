@@ -137,6 +137,38 @@ impl HookRequestDispatcher for NatsHookRequester {
     }
 }
 
+struct ScopedHookRoute {
+    scope: ServerScope,
+    server: String,
+    dispatcher: Arc<dyn HookRequestDispatcher>,
+}
+
+struct ScopedHookRequester {
+    routes: std::collections::HashMap<String, ScopedHookRoute>,
+}
+
+#[async_trait]
+impl HookRequestDispatcher for ScopedHookRequester {
+    async fn request(
+        &self,
+        _subject: String,
+        payload: Vec<u8>,
+        mut options: HookRequestOptions,
+    ) -> Result<HookOutcome> {
+        let route = self
+            .routes
+            .get(&options.server)
+            .context("unknown scoped hook route")?;
+        let event: HookPayload = serde_json::from_slice(&payload)?;
+        let subject = route
+            .scope
+            .hook_subject(&route.server, event.hook_event.event_name());
+        options.instance_id = route.scope.clone();
+        options.server = route.server.clone();
+        route.dispatcher.request(subject, payload, options).await
+    }
+}
+
 type HookRequestHandler = dyn Fn(&str, HookPayload) -> HookOutcome + Send + Sync;
 
 struct HandlerHookRequester {
@@ -216,6 +248,42 @@ impl NatsHookProvider {
             hooks,
             Arc::new(HandlerHookRequester { handler }),
         )
+    }
+
+    /// Combine invocation-owned hooks without registering them in the worker's
+    /// shared scope. Matchers, ordering, transformations and fail-closed behavior
+    /// still run through the same dispatcher; requests retain their real scopes.
+    pub(crate) fn with_scoped_hooks(mut self, other: Self) -> Self {
+        let mut routes = std::collections::HashMap::new();
+        for hook in &mut self.hooks {
+            let server = hook.server.clone();
+            hook.display_label.get_or_insert_with(|| server.clone());
+            hook.server = format!("0-{server}");
+            routes.insert(
+                hook.server.clone(),
+                ScopedHookRoute {
+                    scope: self.instance_id.clone(),
+                    server,
+                    dispatcher: self.dispatcher.clone(),
+                },
+            );
+        }
+        for mut hook in other.hooks {
+            let server = hook.server.clone();
+            hook.display_label.get_or_insert_with(|| server.clone());
+            hook.server = format!("1-{}-{server}", other.instance_id);
+            routes.insert(
+                hook.server.clone(),
+                ScopedHookRoute {
+                    scope: other.instance_id.clone(),
+                    server,
+                    dispatcher: other.dispatcher.clone(),
+                },
+            );
+            self.hooks.push(hook);
+        }
+        self.dispatcher = Arc::new(ScopedHookRequester { routes });
+        self
     }
 
     pub fn hooks(&self) -> &[DiscoveredHook] {
@@ -416,6 +484,64 @@ impl ContinueResultAccumulator {
     }
 }
 
+async fn request_pre_hook(
+    params: &PreHookDispatch<'_>,
+    hook: &DiscoveredHook,
+    event: &HookEvent,
+) -> Result<Option<HookOutcome>, Box<HookOutcome>> {
+    let payload = HookPayload {
+        session_id: params.meta.session_id.clone(),
+        cwd: params.meta.cwd.clone(),
+        resume_count: params.meta.resume_count,
+        hook_event: event.clone(),
+    };
+    let payload = match encode_hook_payload(&payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return Err(Box::new(unavailable_outcome(
+                hook,
+                hook.spec.fail_policy,
+                error,
+            )));
+        }
+    };
+    let subject = params.instance_id.hook_subject(&hook.server, "PreToolUse");
+    let timeout = hook
+        .spec
+        .timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_HOOK_TIMEOUT);
+    match params
+        .dispatcher
+        .request(
+            subject,
+            payload,
+            HookRequestOptions::new(
+                timeout,
+                params.meta.abort.clone(),
+                params.instance_id.clone(),
+                hook.server.clone(),
+            ),
+        )
+        .await
+    {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(error) if hook.spec.fail_policy == FailPolicy::Open => {
+            log::warn!(
+                "{} hook unavailable (route {}); continuing: {error:#}",
+                hook.label(),
+                hook.server
+            );
+            Ok(None)
+        }
+        Err(error) => Err(Box::new(unavailable_outcome(
+            hook,
+            FailPolicy::Closed,
+            error,
+        ))),
+    }
+}
+
 async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEvent) -> HookOutcome {
     if !matches!(event, HookEvent::PreToolUse { .. }) {
         return continue_outcome(None);
@@ -423,67 +549,38 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
 
     let mut running_event = event.clone();
     let mut final_mutation = None;
+    let mut pending_ask = None;
     let mut accumulated = ContinueResultAccumulator::default();
     for hook in matching_hooks(params.hooks, event.event_name(), event.matcher_text()) {
-        let payload = HookPayload {
-            session_id: params.meta.session_id.clone(),
-            cwd: params.meta.cwd.clone(),
-            resume_count: params.meta.resume_count,
-            hook_event: running_event.clone(),
-        };
-        let payload = match encode_hook_payload(&payload) {
-            Ok(payload) => payload,
-            Err(error) => {
-                return unavailable_outcome(hook, hook.spec.fail_policy, error);
-            }
-        };
-        let subject = params.instance_id.hook_subject(&hook.server, "PreToolUse");
-        let timeout = hook
-            .spec
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_HOOK_TIMEOUT);
-        let outcome = match params
-            .dispatcher
-            .request(
-                subject,
-                payload,
-                HookRequestOptions::new(
-                    timeout,
-                    params.meta.abort.clone(),
-                    params.instance_id.clone(),
-                    hook.server.clone(),
-                ),
-            )
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) if hook.spec.fail_policy == FailPolicy::Open => {
-                log::warn!(
-                    "{} hook unavailable (route {}); continuing: {error:#}",
-                    hook.label(),
-                    hook.server
-                );
-                continue;
-            }
-            Err(error) => return unavailable_outcome(hook, FailPolicy::Closed, error),
+        let outcome = match request_pre_hook(&params, hook, &running_event).await {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => continue,
+            Err(outcome) => return *outcome,
         };
 
-        match outcome.control {
-            HookResultControl::Block { .. } | HookResultControl::Ask { .. } => return outcome,
-            HookResultControl::Continue => {
-                accumulated.push(&outcome.result);
-                if let Some(tool_input) = outcome.result.mutated_tool_input {
-                    running_event = with_pre_tool_input(&running_event, tool_input.clone());
-                    final_mutation = Some(tool_input);
-                }
+        match &outcome.control {
+            HookResultControl::Block { .. } => return outcome,
+            // Ask cannot hide a later Deny. Keep evaluating the chain, retaining
+            // transformations so approval authorizes the final inspected input.
+            HookResultControl::Ask { .. } if pending_ask.is_none() => {
+                pending_ask = Some(outcome.clone());
             }
+            _ => {}
+        }
+        accumulated.push(&outcome.result);
+        if let Some(tool_input) = outcome.result.mutated_tool_input {
+            running_event = with_pre_tool_input(&running_event, tool_input.clone());
+            final_mutation = Some(tool_input);
         }
     }
-    HookOutcome {
-        control: HookResultControl::Continue,
-        result: accumulated.into_result(final_mutation),
-    }
+    let mut result = accumulated.into_result(final_mutation);
+    let control = if let Some(ask) = pending_ask {
+        result.hook_specific_output = ask.result.hook_specific_output;
+        ask.control
+    } else {
+        HookResultControl::Continue
+    };
+    HookOutcome { control, result }
 }
 
 struct EventDispatch<'a> {
@@ -1556,5 +1653,155 @@ mod tests {
             tool_outcome.control,
             HookResultControl::Block { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod operator_scope_tests {
+    use super::*;
+    use harnx_hookset::{FailPolicy, HookSpec};
+    use serde_json::json;
+
+    fn transforming_worker_hooks(
+        scope: ServerScope,
+        hook: DiscoveredHook,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> NatsHookProvider {
+        let captured = seen;
+        NatsHookProvider::from_request_handler(
+            scope,
+            vec![hook],
+            Arc::new(move |subject, _| {
+                captured.lock().unwrap().push(subject.to_owned());
+                HookOutcome {
+                    control: HookResultControl::Continue,
+                    result: HookResult {
+                        mutated_tool_input: Some(json!({"text":"global transformed"})),
+                        ..Default::default()
+                    },
+                }
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn scoped_operator_hooks_keep_real_routes_and_global_input_transformations() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make_hook = || DiscoveredHook {
+            server: "same-name".into(),
+            display_label: None,
+            spec: HookSpec {
+                event: "PreToolUse".into(),
+                matcher: None,
+                priority: 0,
+                timeout_secs: None,
+                fail_policy: FailPolicy::Closed,
+            },
+        };
+        let worker_scope = ServerScope::from_string("worker-scope");
+        let invocation_scope = ServerScope::from_string("invocation-scope");
+        let worker = transforming_worker_hooks(worker_scope.clone(), make_hook(), seen.clone());
+        let captured = seen.clone();
+        let invocation = NatsHookProvider::from_request_handler(
+            invocation_scope.clone(),
+            vec![make_hook()],
+            Arc::new(move |subject, payload| {
+                captured.lock().unwrap().push(subject.to_owned());
+                let HookEvent::PreToolUse { tool_input, .. } = payload.hook_event else {
+                    panic!("expected pre-use")
+                };
+                assert_eq!(tool_input, json!({"text":"global transformed"}));
+                HookOutcome {
+                    control: HookResultControl::Ask {
+                        reason: Some("own policy".into()),
+                    },
+                    result: Default::default(),
+                }
+            }),
+        );
+        let provider = worker.with_scoped_hooks(invocation);
+        let outcome = provider
+            .dispatch_event(
+                HookEvent::PreToolUse {
+                    tool_name: "visible".into(),
+                    tool_input: json!({"text":"raw"}),
+                    tool_use_id: "root-id".into(),
+                },
+                None,
+                HookDispatchMeta {
+                    abort: None,
+                    session_id: "active-session".into(),
+                    cwd: Default::default(),
+                    resume_count: 0,
+                },
+            )
+            .await;
+        assert!(matches!(outcome.control, HookResultControl::Ask { .. }));
+        assert_eq!(
+            outcome.result.mutated_tool_input,
+            Some(json!({"text":"global transformed"}))
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                worker_scope.hook_subject("same-name", "PreToolUse"),
+                invocation_scope.hook_subject("same-name", "PreToolUse")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_operator_ask_does_not_override_later_agent_deny() {
+        let hook = |server: &str| DiscoveredHook {
+            server: server.into(),
+            display_label: None,
+            spec: HookSpec {
+                event: "PreToolUse".into(),
+                matcher: None,
+                priority: 0,
+                timeout_secs: None,
+                fail_policy: FailPolicy::Closed,
+            },
+        };
+        let worker = NatsHookProvider::from_request_handler(
+            ServerScope::from_string("worker-scope"),
+            vec![hook("ask")],
+            Arc::new(|_, _| HookOutcome {
+                control: HookResultControl::Ask {
+                    reason: Some("ask first".into()),
+                },
+                result: Default::default(),
+            }),
+        );
+        let agent = NatsHookProvider::from_request_handler(
+            ServerScope::from_string("agent-scope"),
+            vec![hook("deny")],
+            Arc::new(|_, _| HookOutcome {
+                control: HookResultControl::Block {
+                    reason: "deny after Ask".into(),
+                },
+                result: Default::default(),
+            }),
+        );
+        let outcome = worker
+            .with_scoped_hooks(agent)
+            .dispatch_event(
+                HookEvent::PreToolUse {
+                    tool_name: "visible".into(),
+                    tool_input: json!({}),
+                    tool_use_id: "root-id".into(),
+                },
+                None,
+                HookDispatchMeta {
+                    abort: None,
+                    session_id: "active-session".into(),
+                    cwd: Default::default(),
+                    resume_count: 0,
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome.control, HookResultControl::Block { reason } if reason == "deny after Ask")
+        );
     }
 }

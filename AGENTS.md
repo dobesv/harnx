@@ -153,7 +153,26 @@ Use `--no-sandbox` when the test scope is bash behavior, not sandbox isolation. 
 
 ### Session transcript and PreToolUse hook mutation
 
-Persisted `ToolCalls` entries hold the arguments as received from the LLM, before `PreToolUse` hooks run, except that `null`s for omitted optional parameters are already gone (see "Tool parameter schemas"). `execute_tool_round_with_persistence` (`crates/harnx-runtime/src/tool.rs`) appends calls before hooks apply `mutated_tool_input`. To assert hook-injected env or args, read `ToolResults` or process output instead.
+### Hook command strings must use `shell_words::join`
+
+Hook command strings that embed binary paths or JSON expressions MUST use
+`shell_words::join` on all platforms, including Windows. Unquoted Windows paths
+(`C:\Program Files\...\hook-server.exe`) split on backslashes and spaces when
+passed through `shell_words::split` in the hook server, breaking execution.
+
+Precedent: `crates/harnx-runtime/src/nats_worker/operator_tools/tests.rs:761` and
+`crates/harnx-runtime/tests/it/nats_worker/tool_cli.rs:619`. Existing fixtures
+use `shell_words::join([binary, "--event", "PreToolUse", "--jaq", expression])`
+to preserve Windows paths with backslashes and JSON containing apostrophes.
+
+### Session transcript and PreToolUse hook mutation
+
+Persisted `ToolCalls` entries hold the arguments as received from the LLM, before
+`PreToolUse` hooks run, except that `null`s for omitted optional parameters are
+already gone (see "Tool parameter schemas"). `execute_tool_round_with_persistence`
+(`crates/harnx-runtime/src/tool.rs`) appends calls before hooks apply
+`mutated_tool_input`. To assert hook-injected env or args, read `ToolResults`
+or process output instead.
 
 ### Test skips must probe capability, not timeout
 
@@ -180,6 +199,23 @@ than a SIGKILL would.
 
 When one of these tests fails, check a passing run's timings for the same block
 before blaming the test. If the whole block is slow, the margin is the bug.
+
+### CLI binaries need an 8 MiB stack on Windows
+
+Windows executables start with a 1 MiB stack. Deep debug-build async dispatch frames
+(NATS poll loops, reservation handle state machines) overflow that in unoptimized builds.
+`harnx` and `harnx-worker` both use `run_with_worker_stack`/`main_runtime::run` to spawn
+a named 8 MiB OS thread, build the Tokio runtime there, and `block_on` a boxed async
+future. The same bootstrap runs on every platform so Linux tests exercise the Windows
+code path.
+
+Precedent: `crates/harnx-worker/src/main.rs:134–166` and
+`crates/harnx/src/main_runtime.rs`. New binaries that construct deep async state must
+follow this pattern instead of `#[tokio::main]`.
+
+Tests that reproduce the Windows stack limit on Linux use `pre_exec` to set
+`RLIMIT_STACK` to 1 MiB (`crates/harnx/tests/it/tool_cli.rs`, Linux-only). Those
+tests verify the same bootstrap path that Windows executes unchanged.
 
 ### Telling a flake from a regression
 
