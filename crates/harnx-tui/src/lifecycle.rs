@@ -237,8 +237,12 @@ impl Tui {
 
         let mut app = build_initial_app(config, initial_transcript)?;
 
-        // Keep NATS connection/store setup out of the already-large init frame.
-        app.current_session_unread = Box::pin(Self::fetch_initial_session_unread(config)).await;
+        // Unit-test configs keep `Default` routing with no broker handoff, so
+        // this lookup would start or join the developer's own shared broker.
+        if !cfg!(test) {
+            // Keep NATS connection/store setup out of the already-large init frame.
+            app.current_session_unread = Box::pin(Self::fetch_initial_session_unread(config)).await;
+        }
 
         if !cfg!(test) {
             app.modal = Self::resolve_initial_modal(config).await;

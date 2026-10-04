@@ -86,6 +86,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Notify;
 
+mod broker_isolation_tests;
 mod cancellation_escape_tests;
 mod command_completion;
 mod delegation_tests;
