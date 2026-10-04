@@ -884,6 +884,18 @@ inside `leader_reads::retry_transient` so a leader election isn't a failure.
 `SessionMetadataStore` reads every key that way. See "Read a record that was
 just written" in `docs/nats-ha.md`.
 
+### Adding per-session data
+
+Don't add a typed field to `SessionMetadata`. It denies unknown fields, so
+every older reader fails on the records that carry the field, and during a
+rolling deploy older workers stop running those sessions. Use an extension
+namespace, which older readers keep as opaque JSON. Descriptive values that
+agents or frontends set, such as a user identity, belong in session
+properties (`dev.harnx.session_properties`): a row in `PROPERTY_DEFINITIONS`
+(`nats_session_metadata/session_properties.rs`) brings its validation, its
+line in `harnx_write_session_meta`'s description and whether sub-agent
+sessions inherit it. See "Session properties" in `docs/nats-ha.md`.
+
 ### Crate layering for NATS tool servers
 
 Tool servers that need NATS object/KV storage must depend on `harnx-blob-store`,

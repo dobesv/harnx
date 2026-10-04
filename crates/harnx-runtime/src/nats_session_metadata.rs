@@ -19,6 +19,7 @@ mod initializer;
 mod model;
 mod read_state;
 pub mod run_limits;
+mod session_properties;
 mod store;
 mod tool_context;
 mod view;
@@ -41,6 +42,12 @@ pub use run_limits::{
     CallTimeoutOverride, EffectiveDeadline, InvocationEdgeKind, InvocationIdentity,
     ParentInvocationLink, RunIdentity, RunLimitsError, RunLimitsPolicySource, RunLimitsRecord,
 };
+pub use session_properties::{
+    property_definition, session_properties, Inheritance, PropertyAssignment, PropertyDefinition,
+    PropertySource, SessionProperties, SessionPropertiesUpdate, SessionProperty,
+    CUSTOM_PROPERTIES_MAX, LABELS_PROPERTY, PROPERTY_DEFINITIONS, SESSION_LABELS_MAX,
+    SESSION_PROPERTIES_NAMESPACE, WEB_SESSION_URL_PROPERTY,
+};
 pub use store::{
     activity_key, invalidation_subject, metadata_belongs_to_agent, metadata_key, read_cursor_key,
     read_invalidation_subject, session_prefix, SessionExtensionUpdate, SessionMetadataStore,
@@ -49,8 +56,9 @@ pub use tool_context::{
     tool_context, ToolContext, ToolContextEntry, TOOL_CONTEXT_NAMESPACE, TOOL_CONTEXT_VERSION,
 };
 pub use view::{
-    ListedSession, MetadataRecord, RedactedAgentSource, RedactedRepositoryContext,
-    RedactedSessionMetadata, SessionMetadataPatch, SessionTitlePatch, VariableStatus,
+    repository_contexts, ListedSession, MetadataRecord, RedactedAgentSource,
+    RedactedRepositoryContext, RedactedSessionMetadata, SessionMetadataPatch, SessionTitlePatch,
+    VariableStatus,
 };
 
 #[cfg(test)]

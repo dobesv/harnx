@@ -541,6 +541,9 @@ fn build_tool_providers(
             config.clone(),
         )) as Arc<dyn ToolProvider>,
     );
+    providers.push(Arc::new(crate::session_meta_tool::SessionMetaProvider::new(
+        config.clone(),
+    )) as Arc<dyn ToolProvider>);
     providers
 }
 

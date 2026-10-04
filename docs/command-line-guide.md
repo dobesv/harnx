@@ -214,10 +214,13 @@ Common flags:
 
 ```sh
 harnx-serve --addr 0.0.0.0:8000
+harnx-serve --public-url https://harnx.example.com
 harnx-serve --model claude:claude-3-5-sonnet-20240620
 harnx-serve --dry-run
 harnx-serve --agent-variable env production --agent-variable debug true
 ```
+
+`--public-url` (or `HARNX_SERVE_PUBLIC_URL`) names the address a browser uses to reach the Web UI. harnx-serve records each session's Web UI address from it, and infers the address from request headers when it is unset.
 
 ## Inspect Agents
 

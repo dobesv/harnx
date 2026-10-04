@@ -27,6 +27,16 @@ fn block_on_io<T: Send + 'static>(
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(task))?
 }
 
+/// What a sink's metadata methods return: the session's canonical metadata.
+type MetadataFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<Option<crate::nats_session_metadata::SessionMetadata>>,
+            > + Send
+            + 'a,
+    >,
+>;
+
 const APPEND_ATTEMPTS: usize = 3;
 
 const APPEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
@@ -273,6 +283,17 @@ impl crate::config::session::SessionAppendSink for NatsSessionLogBackend {
     fn load_overrides(&self) -> Result<Option<crate::nats_session_metadata::SessionOverrides>> {
         self.load_overrides_blocking()
     }
+
+    fn load_metadata(&self) -> MetadataFuture<'_> {
+        Box::pin(self.load_metadata_async())
+    }
+
+    fn persist_session_properties<'a>(
+        &'a self,
+        update: &'a crate::nats_session_metadata::SessionPropertiesUpdate,
+    ) -> MetadataFuture<'a> {
+        Box::pin(self.persist_session_properties_async(update, None))
+    }
 }
 
 /// Worker sink bound to one lease owner.
@@ -416,6 +437,25 @@ impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
     fn load_overrides(&self) -> Result<Option<crate::nats_session_metadata::SessionOverrides>> {
         self.backend.load_overrides_blocking()
     }
+
+    fn load_metadata(&self) -> MetadataFuture<'_> {
+        Box::pin(self.backend.load_metadata_async())
+    }
+
+    fn persist_session_properties<'a>(
+        &'a self,
+        update: &'a crate::nats_session_metadata::SessionPropertiesUpdate,
+    ) -> MetadataFuture<'a> {
+        Box::pin(async move {
+            anyhow::ensure!(
+                self.lease.is_held(),
+                "session lease lost before session property update"
+            );
+            self.backend
+                .persist_session_properties_async(update, Some(self.lease.fence_token()))
+                .await
+        })
+    }
 }
 
 impl NatsSessionLogBackend {
@@ -541,6 +581,25 @@ impl NatsSessionLogBackend {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn load_metadata_async(
+        &self,
+    ) -> Result<Option<crate::nats_session_metadata::SessionMetadata>> {
+        let record = self.metadata_store()?.get(&self.session_id).await?;
+        Ok(record.map(|record| record.metadata))
+    }
+
+    async fn persist_session_properties_async(
+        &self,
+        update: &crate::nats_session_metadata::SessionPropertiesUpdate,
+        fence_token: Option<u64>,
+    ) -> Result<Option<crate::nats_session_metadata::SessionMetadata>> {
+        let record = self
+            .metadata_store()?
+            .update_session_properties(&self.session_id, update, fence_token)
+            .await?;
+        Ok(Some(record.metadata))
     }
 
     pub fn session_id(&self) -> &str {

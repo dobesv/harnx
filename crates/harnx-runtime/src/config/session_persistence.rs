@@ -1,7 +1,9 @@
 //! Runtime persistence adapter for in-memory session state.
 
 use super::GlobalConfig;
-use crate::nats_session_metadata::{SessionOverrideUpdate, SessionOverrides};
+use crate::nats_session_metadata::{
+    SessionMetadata, SessionOverrideUpdate, SessionOverrides, SessionPropertiesUpdate,
+};
 use anyhow::{Context, Result};
 use harnx_core::agent_config::AgentVariables;
 use harnx_core::execution_context::ExecutionContextObservation;
@@ -58,6 +60,22 @@ pub trait SessionAppendSink: Send + Sync + Any {
         _observations: &'a [ExecutionContextObservation],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// The session's canonical metadata, or `None` from a sink that keeps none.
+    fn load_metadata(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SessionMetadata>>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Apply an agent's change to the session's properties and return the
+    /// metadata it committed, or `None` from a sink that keeps no metadata.
+    fn persist_session_properties<'a>(
+        &'a self,
+        _update: &'a SessionPropertiesUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SessionMetadata>>> + Send + 'a>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
@@ -199,7 +217,7 @@ pub(super) fn require_authoritative_appends(
 /// Callers take this under a short guard and drop the guard before they
 /// persist anything: the sink's methods are NATS round trips, and the config
 /// lock must never be held across one.
-fn active_session_sink(
+pub(crate) fn active_session_sink(
     config: &GlobalConfig,
     session_id: Option<&str>,
 ) -> Option<Arc<dyn SessionAppendSink>> {

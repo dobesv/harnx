@@ -9,6 +9,8 @@ use_tools:
 - beta_tool
 - snapshot-agent_session_handoff
 - harnx_agent_session_history_read
+- harnx_read_session_meta
+- harnx_write_session_meta
 variables:
 - name: project_name
   description: Project name

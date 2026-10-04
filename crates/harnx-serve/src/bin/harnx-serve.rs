@@ -21,6 +21,10 @@ struct Cli {
     /// Listen address (default from config.yaml or 127.0.0.1:8000)
     #[clap(short = 'a', long, value_name = "ADDRESS")]
     addr: Option<String>,
+    /// URL a browser uses to reach the Web UI, such as https://harnx.example.com
+    /// (default from config.yaml; inferred from each request when unset)
+    #[clap(long, value_name = "URL")]
+    public_url: Option<String>,
     /// Select an LLM model
     #[clap(short = 'm', long)]
     model: Option<String>,
@@ -79,6 +83,9 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
     if cli.dry_run {
         config.write().dry_run = true;
     }
+    if let Some(public_url) = cli.public_url {
+        config.write().serve_public_url = Some(public_url);
+    }
     if let Some(model_id) = &cli.model {
         Config::switch_model(&config, model_id)?;
     }
@@ -125,6 +132,17 @@ mod tests {
         assert_eq!(configured.drain_timeout_seconds, 7);
         assert_eq!(configured.stream_drain_min_jitter_ms, 10);
         assert_eq!(configured.stream_drain_max_jitter_ms, 50);
+    }
+
+    #[test]
+    fn parses_public_url_flag() {
+        assert_eq!(
+            Cli::try_parse_from(["harnx-serve"]).unwrap().public_url,
+            None
+        );
+        let cli = Cli::try_parse_from(["harnx-serve", "--public-url", "https://harnx.example.com"])
+            .unwrap();
+        assert_eq!(cli.public_url.as_deref(), Some("https://harnx.example.com"));
     }
 
     #[test]

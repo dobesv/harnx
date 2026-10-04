@@ -1,4 +1,4 @@
-use super::{ParentLink, SessionAgentSource, SessionOverrides, ToolContext};
+use super::{ParentLink, SessionAgentSource, SessionOverrides, SessionProperties, ToolContext};
 use anyhow::Result;
 use harnx_core::agent_config::AgentVariables;
 use harnx_core::cid_url::SessionRef;
@@ -9,6 +9,9 @@ pub struct SessionInitializer {
     pub variables: AgentVariables,
     pub overrides: SessionOverrides,
     pub tool_context: ToolContext,
+    /// Properties a new session starts with: those a sub-agent session
+    /// inherits from the session that started it.
+    pub properties: SessionProperties,
     /// Set when this session is being created as a sub-agent child, so its
     /// metadata records the parent invocation that created it.
     pub parent: Option<ParentLink>,
@@ -34,6 +37,7 @@ impl SessionInitializer {
             variables,
             overrides: SessionOverrides::default(),
             tool_context: ToolContext::default(),
+            properties: SessionProperties::default(),
             parent: None,
         }
     }
@@ -50,6 +54,7 @@ impl SessionInitializer {
             variables,
             overrides,
             tool_context: ToolContext::default(),
+            properties: SessionProperties::default(),
             parent: None,
         }
     }
@@ -57,6 +62,12 @@ impl SessionInitializer {
     #[must_use]
     pub fn with_tool_context(mut self, tool_context: ToolContext) -> Self {
         self.tool_context = tool_context;
+        self
+    }
+
+    #[must_use]
+    pub fn with_properties(mut self, properties: SessionProperties) -> Self {
+        self.properties = properties;
         self
     }
 

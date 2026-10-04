@@ -21,6 +21,7 @@ pub mod session_actor;
 mod session_actor_types;
 pub(crate) mod session_pagination;
 pub mod session_routes;
+mod web_url;
 
 pub use serve_shutdown::StreamDrainConfig;
 
@@ -32,6 +33,8 @@ pub mod test_support;
 #[cfg(test)]
 mod cid_route_tests;
 #[cfg(test)]
+mod nats_web_session_url_tests;
+#[cfg(test)]
 mod remote_agent_nats_tests;
 
 pub(crate) use agent_resolve::{is_safe_agent_path, is_safe_path_segment, resolve_agent_target};
@@ -40,8 +43,8 @@ pub(crate) use nats_access::{
     serve_nats_jetstream,
 };
 
-use crate::ag_ui::{AgUiError, AppResponse as AgUiAppResponse};
-use crate::ag_ui_rpc::{handle_ag_ui_rpc, PersistenceKind};
+use crate::ag_ui::AgUiError;
+use crate::ag_ui_rpc::{handle_ag_ui_rpc, PersistenceKind, RpcContext};
 use crate::session_actor::{ResolvedAgentTarget, SessionRegistry};
 use crate::session_routes::{AgentSessionRef, SessionsRouteContext};
 use attachments::*;
@@ -298,6 +301,7 @@ pub async fn run_with_shutdown_config(
         }
         None => config.read().serve_addr(),
     };
+    web_url::public_url(&config.read())?;
     let web_assets = resolve_web_assets(web_assets);
     let server = Arc::new(Server::new_with_stream_drain(
         &config,
@@ -831,15 +835,13 @@ impl Server {
                         self.ag_ui_run_route(req, &target, &session_name).await
                     }
                     AgentsRepresentation::AgUiRpc => {
-                        handle_ag_ui_rpc(
-                            req,
-                            &target,
-                            &session_name,
-                            &self.config,
-                            &self.session_registry,
-                            PersistenceKind::Nats,
-                        )
-                        .await
+                        let context = RpcContext {
+                            config: &self.config,
+                            registry: &self.session_registry,
+                            persistence: PersistenceKind::Nats,
+                            web_base_url: web_url::inferred_base_url(req.headers(), req.uri()),
+                        };
+                        handle_ag_ui_rpc(req, &target, &session_name, context).await
                     }
                 }
             }
@@ -1064,10 +1066,22 @@ impl Server {
         target: &ResolvedAgentTarget,
         session: &str,
     ) -> Result<AppResponse> {
-        let req_body = req.collect().await?.to_bytes();
-        self.ag_ui_run(target, session, &req_body)
-            .await
-            .map_err(ag_ui_error_to_anyhow)
+        let web_base_url = web_url::inferred_base_url(req.headers(), req.uri());
+        let body = req.collect().await?.to_bytes();
+        let request = ag_ui::AgUiRunRequest {
+            target,
+            session,
+            body: &body,
+            web_base_url,
+        };
+        ag_ui::ag_ui_run_for_target(
+            &self.config,
+            &self.session_registry,
+            request,
+            self.shutdown.clone(),
+        )
+        .await
+        .map_err(ag_ui_error_to_anyhow)
     }
 
     fn list_rags(&self) -> Result<AppResponse> {
@@ -1101,24 +1115,6 @@ impl Server {
             .header("Content-Type", "application/json; charset=utf-8")
             .body(Full::new(Bytes::from(data.to_string())).boxed())?;
         Ok(res)
-    }
-
-    pub(crate) async fn ag_ui_run(
-        &self,
-        target: &ResolvedAgentTarget,
-        session: &str,
-        req_body: &[u8],
-    ) -> Result<AgUiAppResponse, AgUiError> {
-        ag_ui::ag_ui_run_for_target_with_call_fn(
-            &self.config,
-            &self.session_registry,
-            target,
-            session,
-            req_body,
-            None,
-            self.shutdown.clone(),
-        )
-        .await
     }
 
     async fn embeddings(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {

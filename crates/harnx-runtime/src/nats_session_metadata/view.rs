@@ -53,6 +53,22 @@ pub struct RedactedRepositoryContext {
     pub branch: Option<String>,
 }
 
+/// The repositories and branches tool calls in a session have worked in,
+/// without the workspace paths and provenance the execution context keeps
+/// private. A context that fails to decode counts as none.
+pub fn repository_contexts(metadata: &SessionMetadata) -> Vec<RedactedRepositoryContext> {
+    super::execution_contexts(metadata)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|context| {
+            let repository = context.primary_repository().map(str::to_string);
+            let branch = context.branch().map(str::to_string);
+            (repository.is_some() || branch.is_some())
+                .then_some(RedactedRepositoryContext { repository, branch })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct VariableStatus {
     pub set: bool,
@@ -70,16 +86,7 @@ impl RedactedSessionMetadata {
                 name: None,
             },
         };
-        let repository_contexts = super::execution_contexts(&record.metadata)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|context| {
-                let repository = context.primary_repository().map(str::to_string);
-                let branch = context.branch().map(str::to_string);
-                (repository.is_some() || branch.is_some())
-                    .then_some(RedactedRepositoryContext { repository, branch })
-            })
-            .collect::<Vec<_>>();
+        let repository_contexts = repository_contexts(&record.metadata);
         let repository_contexts = (!repository_contexts.is_empty()).then_some(repository_contexts);
         let mut extensions = record.metadata.extensions;
         extensions.remove(harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE);

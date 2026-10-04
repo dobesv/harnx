@@ -146,6 +146,10 @@ pub struct SessionPromptOptions {
     pub(crate) admitted: Option<harnx_runtime::nats_session::AppendedPrompt>,
     pub working_dir: Option<std::path::PathBuf>,
     pub attachment_refs: Vec<String>,
+    /// The Web UI base inferred from the request the prompt came through,
+    /// which the session records as its address unless a public URL is
+    /// configured.
+    pub web_base_url: Option<String>,
 }
 
 pub enum SessionCommand {

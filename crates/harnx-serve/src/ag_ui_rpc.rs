@@ -40,6 +40,16 @@ struct JsonRpcRequest {
     params: Option<Value>,
 }
 
+/// What a JSON-RPC request is served with.
+pub struct RpcContext<'a> {
+    pub config: &'a harnx_runtime::config::Config,
+    pub registry: &'a SessionRegistry,
+    pub persistence: PersistenceKind,
+    /// The Web UI base inferred from the request; see
+    /// [`SessionPromptOptions::web_base_url`].
+    pub web_base_url: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct PromptParams {
     text: String,
@@ -49,6 +59,9 @@ struct PromptParams {
     attachment_refs: Vec<String>,
     #[serde(default)]
     resume: Vec<InterruptResumeParam>,
+    /// Taken from the request rather than its parameters.
+    #[serde(skip)]
+    web_base_url: Option<String>,
 }
 
 fn prompt_has_content(params: &PromptParams) -> bool {
@@ -69,21 +82,16 @@ pub async fn handle_ag_ui_rpc(
     req: Request<Incoming>,
     target: &ResolvedAgentTarget,
     session: &str,
-    config: &harnx_runtime::config::Config,
-    registry: &SessionRegistry,
-    persistence: PersistenceKind,
+    context: RpcContext<'_>,
 ) -> anyhow::Result<AppResponse> {
     let (parts, body) = req.into_parts();
-    handle_ag_ui_rpc_bytes_for_target(
-        parts.method,
+    let request = RpcRequest {
+        method: parts.method,
         target,
         session,
-        body.collect().await?.to_bytes(),
-        config,
-        registry,
-        persistence,
-    )
-    .await
+        body: body.collect().await?.to_bytes(),
+    };
+    handle_ag_ui_rpc_bytes_for_target(request, context).await
 }
 
 pub async fn handle_ag_ui_rpc_bytes(
@@ -98,27 +106,39 @@ pub async fn handle_ag_ui_rpc_bytes(
     let (target, _) = crate::resolve_agent_target(config, agent_ref)
         .await
         .map_err(crate::ag_ui_error_to_anyhow)?;
-    handle_ag_ui_rpc_bytes_for_target(
+    let request = RpcRequest {
         method,
-        &target,
+        target: &target,
         session,
-        req_body,
+        body: req_body,
+    };
+    let context = RpcContext {
         config,
         registry,
         persistence,
-    )
-    .await
+        web_base_url: None,
+    };
+    handle_ag_ui_rpc_bytes_for_target(request, context).await
+}
+
+/// One JSON-RPC request addressed to a session.
+struct RpcRequest<'a> {
+    method: Method,
+    target: &'a ResolvedAgentTarget,
+    session: &'a str,
+    body: Bytes,
 }
 
 async fn handle_ag_ui_rpc_bytes_for_target(
-    method: Method,
-    target: &ResolvedAgentTarget,
-    session: &str,
-    req_body: Bytes,
-    config: &harnx_runtime::config::Config,
-    registry: &SessionRegistry,
-    persistence: PersistenceKind,
+    request: RpcRequest<'_>,
+    context: RpcContext<'_>,
 ) -> anyhow::Result<AppResponse> {
+    let RpcRequest {
+        method,
+        target,
+        session,
+        body: req_body,
+    } = request;
     if method != Method::POST {
         return json_rpc_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -154,10 +174,16 @@ async fn handle_ag_ui_rpc_bytes_for_target(
     }
 
     let key = SessionKey::new(target.clone(), session);
+    let RpcContext {
+        config,
+        registry,
+        persistence,
+        ..
+    } = context;
 
     match rpc.method.as_str() {
         "session/get" => handle_get(rpc.id, config, registry, key, persistence).await,
-        "session/prompt" => handle_prompt(rpc.id, rpc.params, config, registry, key).await,
+        "session/prompt" => handle_prompt(rpc.id, rpc.params, &context, key).await,
         "session/hitl_decision" => {
             handle_hitl_decision(rpc.id, rpc.params, config, registry, key).await
         }
@@ -221,52 +247,45 @@ async fn handle_get(
     )
 }
 
+/// The prompt's parameters, or the response rejecting them.
+fn prompt_params(
+    id: &Value,
+    params: Option<Value>,
+) -> Result<PromptParams, Box<anyhow::Result<AppResponse>>> {
+    let invalid = |expected: Value| {
+        Box::new(json_rpc_response(
+            StatusCode::BAD_REQUEST,
+            json_rpc_error(
+                id.clone(),
+                -32602,
+                "invalid params",
+                Some(json!({ "expected": expected })),
+            ),
+        ))
+    };
+    let Some(value) = params else {
+        return Err(invalid(json!({ "text": "string" })));
+    };
+    let params: PromptParams = serde_json::from_value(value)
+        .map_err(|_| invalid(json!({ "text": "string", "working_dir": "string?" })))?;
+    if !prompt_has_content(&params) {
+        return Err(invalid(json!({ "text": "non-empty string" })));
+    }
+    Ok(params)
+}
+
 async fn handle_prompt(
     id: Value,
     params: Option<Value>,
-    config: &harnx_runtime::config::Config,
-    registry: &SessionRegistry,
+    context: &RpcContext<'_>,
     key: SessionKey,
 ) -> anyhow::Result<AppResponse> {
-    let params: PromptParams = match params {
-        Some(value) => match serde_json::from_value(value) {
-            Ok(params) => params,
-            Err(_) => {
-                return json_rpc_response(
-                    StatusCode::BAD_REQUEST,
-                    json_rpc_error(
-                        id,
-                        -32602,
-                        "invalid params",
-                        Some(json!({ "expected": { "text": "string", "working_dir": "string?" } })),
-                    ),
-                );
-            }
-        },
-        None => {
-            return json_rpc_response(
-                StatusCode::BAD_REQUEST,
-                json_rpc_error(
-                    id,
-                    -32602,
-                    "invalid params",
-                    Some(json!({ "expected": { "text": "string" } })),
-                ),
-            );
-        }
+    let (config, registry) = (context.config, context.registry);
+    let mut params = match prompt_params(&id, params) {
+        Ok(params) => params,
+        Err(response) => return *response,
     };
-
-    if !prompt_has_content(&params) {
-        return json_rpc_response(
-            StatusCode::BAD_REQUEST,
-            json_rpc_error(
-                id,
-                -32602,
-                "invalid params",
-                Some(json!({ "expected": { "text": "non-empty string" } })),
-            ),
-        );
-    }
+    params.web_base_url = context.web_base_url.clone();
 
     if !registry.has_session(&key) && !session_exists(config, &key).await? {
         return json_rpc_response(
@@ -349,6 +368,7 @@ async fn submit_prompt(
         SessionPromptOptions {
             working_dir: params.working_dir.clone(),
             attachment_refs: params.attachment_refs.clone(),
+            web_base_url: params.web_base_url.clone(),
             ..Default::default()
         },
     )
@@ -691,6 +711,7 @@ mod tests {
             working_dir: None,
             attachment_refs: vec!["cid:image".into()],
             resume: vec![],
+            web_base_url: None,
         };
         assert!(prompt_has_content(&attachment_prompt));
 
@@ -706,6 +727,7 @@ mod tests {
                     reason: None,
                 },
             }],
+            web_base_url: None,
         };
         assert!(prompt_has_content(&resume_prompt));
 
@@ -716,6 +738,7 @@ mod tests {
                     working_dir: None,
                     attachment_refs,
                     resume: vec![],
+                    web_base_url: None,
                 };
                 assert_eq!(
                     prompt_has_content(&prompt),

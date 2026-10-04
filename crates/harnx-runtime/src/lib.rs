@@ -35,6 +35,7 @@ pub mod operator_tools;
 pub mod remote_session_cleanup;
 pub mod server_identity;
 pub mod session_history;
+pub mod session_meta_tool;
 pub mod terminated_result;
 #[cfg(test)]
 mod test_environment;

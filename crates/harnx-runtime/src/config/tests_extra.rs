@@ -20,7 +20,13 @@ fn expand_use_tools_wildcard_returns_concrete_names() {
 
     assert_eq!(
         expanded,
-        vec!["alpha_tool", "beta_tool", crate::session_history::TOOL_NAME,]
+        vec![
+            "alpha_tool",
+            "beta_tool",
+            crate::session_history::TOOL_NAME,
+            crate::session_meta_tool::READ_TOOL_NAME,
+            crate::session_meta_tool::WRITE_TOOL_NAME,
+        ]
     );
 }
 

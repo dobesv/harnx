@@ -249,6 +249,9 @@ pub struct ConfigData {
     pub show_timestamps: bool,
 
     pub serve_addr: Option<String>,
+    /// The URL a browser uses to reach harnx-serve's Web UI, such as
+    /// `https://harnx.example.com`. Unset, it is inferred from each request.
+    pub serve_public_url: Option<String>,
     pub user_agent: Option<String>,
     pub save_shell_history: bool,
     pub sync_models_url: Option<String>,
@@ -329,6 +332,7 @@ impl Default for ConfigData {
             show_timestamps: false,
 
             serve_addr: None,
+            serve_public_url: None,
             user_agent: None,
             save_shell_history: true,
             sync_models_url: None,

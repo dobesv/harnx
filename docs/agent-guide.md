@@ -241,6 +241,48 @@ The `harnx-attachment-tools` server provides tools for reading and storing NATS-
 
 > **Note**: Agents list these tools in `use_tools` as `attachments_attachment_read` and `attachments_attachment_create`. The prefix (`attachments`) is the server's registered name, which by convention matches `tool_servers/attachments.yaml`.
 
+### Session Metadata Tools
+
+Two built-in tools let an agent see and record what its own session is working on. Harnx answers them itself, so they need no tool server, but an agent only gets them by listing them in `use_tools` (or by selecting everything with `*`):
+
+```yaml
+use_tools:
+  - harnx_read_session_meta
+  - harnx_write_session_meta
+```
+
+- **`harnx_read_session_meta()`** returns the session ID, agent, title and creation time, the session's properties, and `observed_repositories`: the repositories and branches the session's tool calls have worked in.
+- **`harnx_write_session_meta(set, clear, add_labels, remove_labels)`** changes properties and returns the same view afterwards. `clear` runs first, then `set`, then `remove_labels`, then `add_labels`.
+
+Each property holds a value and an `inherit` flag. A sub-agent session started from this one copies the properties marked `inherit`, so a delegated child knows the issue and branch it is working on. Harnx knows these properties:
+
+| Property | Value | Copied to sub-agent sessions |
+|---|---|---|
+| `user_id` | The user the session acts for. Read-only for agents; Harnx doesn't record one yet. | by default |
+| `github_owner_repo` | GitHub repository as `owner/repo` | by default |
+| `git_branch` | Git branch | by default |
+| `github_issue` | Issue number in `github_owner_repo` | by default |
+| `github_pull_request` | Pull request number in `github_owner_repo` | by default |
+| `external_task_url` | http(s) URL of the task in another tracker, such as Jira or Linear | by default |
+| `working_directory` | Directory the session works in | by default |
+| `web_session_url` | http(s) URL that opens the session in the Web UI. harnx-serve fills it in when it sends the session a prompt; see [Session properties](nats-ha.md#session-properties). | never |
+| `labels` | List of labels | on request |
+
+Any other name that starts with a lowercase letter and uses only lowercase letters, digits, `_`, `-` and `.` is a custom property holding text, copied only on request. A session keeps at most 32 custom properties and 50 labels.
+
+```json
+{
+  "set": [
+    {"name": "github_owner_repo", "value": "dobesv/harnx"},
+    {"name": "github_issue", "value": 2296},
+    {"name": "customer", "value": "acme", "inherit": true}
+  ],
+  "add_labels": ["in-progress"]
+}
+```
+
+A blank value, `0` for a number, or an empty list removes a property. When `inherit` is omitted an existing property keeps its flag and a new one takes the default above; asking to copy `web_session_url` is an error. Writing a property only records it: it doesn't check out a branch, change directory or contact GitHub.
+
 ## Documents (RAG)
 
 The `documents` field lists files or URLs to include as retrieval-augmented generation (RAG) context. When an agent with documents starts, Harnx offers to initialize a RAG index.

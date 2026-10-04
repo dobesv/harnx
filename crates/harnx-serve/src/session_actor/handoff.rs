@@ -133,6 +133,7 @@ impl SessionActor {
                 text: prompt,
                 options: SessionPromptOptions {
                     runtime_parent: Some(Box::new(parent)),
+                    web_base_url: self.web_address.inferred_base().map(str::to_string),
                     ..Default::default()
                 },
                 reply: reply_tx,
