@@ -14,6 +14,8 @@ use std::{collections::HashMap, fs::File, io::Read};
 
 const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
 
+/// Build an input from prompt text. Naming an `agent` makes the input that
+/// agent's alone: it neither reads nor saves the active session.
 pub fn from_str(config: &GlobalConfig, text: &str, agent: Option<Agent>) -> Input {
     let (agent, with_session, with_agent) = resolve_agent(&config.read(), agent);
     let mut input = Input::new(

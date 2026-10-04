@@ -1,11 +1,11 @@
 use super::session_externalize::{externalize_content, record_externalized};
 #[cfg(test)]
 pub(crate) use super::session_persistence::attach_memory_log;
-use super::session_persistence::require_authoritative_appends;
 pub use super::session_persistence::{
     append_event, persist_active_session_override, persist_session_overrides, record_title,
     session_overrides, SessionAppendSink, TitleRecord,
 };
+use super::session_persistence::{append_event_seq, require_authoritative_appends};
 pub use super::session_tool_results::add_tool_results;
 pub(crate) use super::session_tool_results::{prepare_tool_results, prepare_tool_results_in_place};
 use super::*;
@@ -871,13 +871,16 @@ pub fn add_assistant_text(
 /// `ToolCalls` log entry and pushes a pending in-memory `Tool`
 /// message whose outputs are filled in by a matching
 /// [`add_tool_results`] call.
+///
+/// Returns the entry's durable sequence, the round every call in it is
+/// journaled under, or `None` when the entry was not appended.
 pub fn add_tool_calls(
     session: &mut Session,
     input: &Input,
     output: &str,
     thought: Option<&str>,
     calls: &[crate::tool::ToolCall],
-) -> Result<()> {
+) -> Result<Option<u64>> {
     // Dedup matches what `eval_tool_calls` does before execution. Keeping
     // the two in sync means pending slots, the tool_calls log entry, and
     // the eventual tool_results all describe the same set of calls —
@@ -888,7 +891,7 @@ pub fn add_tool_calls(
     let mut all_appended = begin_turn(session, input, output)?;
     let tool_calls_seq = session.next_seq();
     let tool_message_id = persisted_message_id();
-    all_appended &= append_event(
+    let round = append_event_seq(
         session,
         &SessionLogEntry::ToolCalls {
             text: output.to_string(),
@@ -898,6 +901,7 @@ pub fn add_tool_calls(
             fence_token: None,
         },
     );
+    all_appended &= round.is_some();
     emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned {
         seq: tool_calls_seq,
     }));
@@ -930,7 +934,7 @@ pub fn add_tool_calls(
     session.dirty = !all_appended;
     require_authoritative_appends(session, all_appended, "tool calls")?;
     session.update_tokens();
-    Ok(())
+    Ok(round)
 }
 
 /// Returns `true` when `input` is a genuine tool-call continuation of

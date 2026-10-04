@@ -8,7 +8,8 @@ use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::execution_context::{ToolObservationProvenance, EXECUTION_CONTEXT_NAMESPACE};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::tool::{
-    JsonSchema, ToolDeclaration, ToolError, ToolProgress, ToolProvider, ToolProviderOutput,
+    JsonSchema, ToolCallOrigin, ToolDeclaration, ToolError, ToolProgress, ToolProvider,
+    ToolProviderOutput,
 };
 use harnx_toolset::{
     ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec,
@@ -156,7 +157,10 @@ impl NatsToolProvider {
             request::ToolCallInput {
                 name: tool_name,
                 arguments,
-                id: Some(tool_call_id),
+                origin: ToolCallOrigin {
+                    tool_call_id: Some(tool_call_id),
+                    tool_round: None,
+                },
                 run_context: Some(record),
             },
             abort,
@@ -581,7 +585,10 @@ impl ToolProvider for NatsToolProvider {
             request::ToolCallInput {
                 name: tool_name,
                 arguments,
-                id: tool_call_id,
+                origin: ToolCallOrigin {
+                    tool_call_id,
+                    tool_round: None,
+                },
                 run_context: None,
             },
             abort,
@@ -594,7 +601,7 @@ impl ToolProvider for NatsToolProvider {
         &self,
         tool_name: &str,
         arguments: Value,
-        tool_call_id: Option<&str>,
+        origin: ToolCallOrigin<'_>,
         abort: &AbortSignal,
         progress: std::sync::Arc<dyn ToolProgress>,
     ) -> Result<ToolProviderOutput, ToolError> {
@@ -602,7 +609,7 @@ impl ToolProvider for NatsToolProvider {
             request::ToolCallInput {
                 name: tool_name,
                 arguments,
-                id: tool_call_id,
+                origin,
                 run_context: None,
             },
             abort,
@@ -749,6 +756,14 @@ mod tests {
     use std::time::Duration;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     use tracing_subscriber::layer::SubscriberExt;
+
+    /// A dispatch of the transcript call `id`, made outside any recorded round.
+    fn transcript_call(id: &str) -> harnx_core::tool::ToolCallOrigin<'_> {
+        harnx_core::tool::ToolCallOrigin {
+            tool_call_id: Some(id),
+            tool_round: None,
+        }
+    }
 
     async fn make_test_provider(client: &async_nats::Client) -> NatsToolProvider {
         let instance_id = ServerScope::new();
@@ -1422,14 +1437,14 @@ mod tests {
             provider.call_tool_with_progress(
                 "stream",
                 json!({"label": "alpha"}),
-                Some("logical-alpha"),
+                transcript_call("logical-alpha"),
                 &alpha_abort,
                 alpha.clone(),
             ),
             provider.call_tool_with_progress(
                 "stream",
                 json!({"label": "beta"}),
-                Some("logical-beta"),
+                transcript_call("logical-beta"),
                 &beta_abort,
                 beta.clone(),
             )
@@ -1446,7 +1461,7 @@ mod tests {
                 .call_tool_with_progress(
                     "stream",
                     json!({"label": "fast", "mode": "final_only"}),
-                    Some("logical-fast"),
+                    transcript_call("logical-fast"),
                     &fast_abort,
                     fast.clone(),
                 )
@@ -1470,7 +1485,7 @@ mod tests {
             provider.call_tool_with_progress(
                 "stream",
                 json!({"label": "cancel", "mode": "cancel"}),
-                Some("logical-cancel"),
+                transcript_call("logical-cancel"),
                 &abort,
                 cancel.clone(),
             ),
@@ -1489,7 +1504,7 @@ mod tests {
                 .call_tool_with_progress(
                     "stream",
                     json!({"label": "after", "mode": "final_only"}),
-                    Some("logical-after"),
+                    transcript_call("logical-after"),
                     &after_abort,
                     after_cancel.clone(),
                 )

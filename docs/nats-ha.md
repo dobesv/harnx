@@ -1223,8 +1223,12 @@ replay cursor after a partially successful read.
 ### Resume & Idempotency
 On activation, the worker repairs pending tool calls before asking the model to
 continue. NATS invocations are journaled in `harnx_tool_invocations` before dispatch,
-with the original call identity and durable `ToolCalls` sequence. Recovery reissues
-that request with `ToolRequest.replay`, attested by the current parent owner.
+with the original call identity and durable `ToolCalls` sequence. The dispatcher
+hands that sequence down (`ToolEvalContext::tool_round`): a new round takes it from
+its own append, and a round resumed after approval or a restart takes it from the
+orphan it repairs. Looking it up in the transcript instead costs one JetStream
+request per entry on every call. Recovery reissues the journaled request with
+`ToolRequest.replay`, attested by the current parent owner.
 Dispatch also revalidates the worker's live lease; a graph owner snapshot alone
 cannot prove that the lease remains held. Saved replies can be recovered without
 a current tool registration or live tool server.

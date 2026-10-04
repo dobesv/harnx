@@ -138,13 +138,15 @@ impl PendingExecutionContextPersistence {
 
 /// Append a log entry through the session's runtime persistence sink.
 pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
-    match append_through(sink(session), session.id(), entry) {
-        Some(seq) => {
-            session.log_entry_count = seq as usize;
-            true
-        }
-        None => false,
-    }
+    append_event_seq(session, entry).is_some()
+}
+
+/// [`append_event`], returning the entry's durable sequence, or `None` when
+/// it was not appended.
+pub(crate) fn append_event_seq(session: &mut Session, entry: &SessionLogEntry) -> Option<u64> {
+    let seq = append_through(sink(session), session.id(), entry)?;
+    session.log_entry_count = seq as usize;
+    Some(seq)
 }
 
 /// The session's persistence sink, cloned so a caller can append through it

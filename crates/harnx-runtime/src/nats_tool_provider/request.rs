@@ -4,7 +4,7 @@ use super::*;
 pub(super) struct ToolCallInput<'a> {
     pub name: &'a str,
     pub arguments: Value,
-    pub id: Option<&'a str>,
+    pub origin: ToolCallOrigin<'a>,
     pub run_context: Option<&'a crate::nats_session_metadata::RunLimitsRecord>,
 }
 
@@ -106,7 +106,7 @@ impl NatsToolProvider {
         let pending = self.prepare_request_with_progress(
             call.arguments,
             &route,
-            call.id,
+            call.origin.tool_call_id,
             progress.is_some(),
             run_context,
         )?;
@@ -120,9 +120,13 @@ impl NatsToolProvider {
                 crate::nats_session_metadata::run_limits::DeadlineExpired::before_dispatch(record),
             ));
         }
-        Box::pin(self.record_invocation(&request, call.name, &route.server))
-            .await
-            .map_err(ToolError::Fatal)?;
+        Box::pin(self.record_invocation(
+            &request,
+            (call.name, &route.server),
+            call.origin.tool_round,
+        ))
+        .await
+        .map_err(ToolError::Fatal)?;
         let pending = self.prepare_recorded_request(request.clone(), &route)?;
         let result = async {
             let message = self.await_response(pending, abort).await?;

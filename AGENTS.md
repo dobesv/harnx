@@ -1240,7 +1240,7 @@ replaces on each update and is stored in ACP `_meta.harnx:usage` (`harnx-acp-ser
 
 ## Tool Progress Patch Semantics
 
-`ToolUpdatePatch` and `ToolDisplayState` (`harnx-core/src/tool.rs:258-356`) implement pure merge:
+`ToolUpdatePatch` and `ToolDisplayState` (`harnx-core/src/tool.rs:270-368`) implement pure merge:
 
 - `None`/omitted = unchanged
 - `Some(vec![])` for collections = clear
@@ -1258,13 +1258,13 @@ guard (`display_state_terminal_status_ignored` in `tool.rs:1443`).
 
 ### `call_tool_with_progress` is opt-in
 
-`ToolProvider::call_tool_with_progress` (`harnx-core/src/tool.rs:232-242`) delegates to `call_tool_with_id`
+`ToolProvider::call_tool_with_progress` (`harnx-core/src/tool.rs:243-253`) delegates to `call_tool_with_id`
 by default. Provider decorators/wrappers that forward only legacy methods silently swallow updates.
 Engine dispatch must call the `_with_progress` variant to enable progress.
 
 ### Tool-call ID assignment
 
-Tool calls receive stable UUID IDs via `ensure_tool_call_ids` (`harnx-engine/src/tool.rs:182-188`) before
+Tool calls receive stable UUID IDs via `ensure_tool_call_ids` (`harnx-engine/src/tool.rs:201-207`) before
 session transcript persistence and provider dispatch. The runtime calls the same helper. Empty or missing
 IDs are replaced with fresh UUIDs; existing non-empty IDs are preserved. Legacy orphan repair assigns
 IDs before cloning calls so recovery position matching remains valid.

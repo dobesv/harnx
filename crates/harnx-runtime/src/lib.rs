@@ -66,7 +66,7 @@ pub use terminated_result::{
 
 pub use agent_loop::{
     continue_agent_loop_from_tool_round, run_agent_loop, run_agent_loop_with_local_handoff,
-    AgentCallFn, AgentLoopContext, LoopResult, OnTextResponseFn, OnToolRoundFn,
+    AgentCallFn, AgentLoopContext, LoopResult, OnTextResponseFn, OnToolRoundFn, PendingToolRound,
     ToolApprovalDecision,
 };
 
