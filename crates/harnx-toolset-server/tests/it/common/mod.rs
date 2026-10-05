@@ -383,6 +383,17 @@ pub(crate) async fn journal() -> (NatsServerHandle, InvocationJournal) {
     (server, journal)
 }
 
+/// A round trip on `client`'s own connection. The server handles one
+/// connection's messages in order, so once it answers it has registered every
+/// subscription the client made before and queued to it every message they
+/// had matched. `flush` only writes the client's buffer, which proves neither.
+pub(crate) async fn round_trip(client: &async_nats::Client) -> Result<()> {
+    async_nats::jetstream::new(client.clone())
+        .query_account()
+        .await?;
+    Ok(())
+}
+
 /// A session-scoped `echo` request whose operation ID matches its call ID.
 pub(crate) fn request(session: &str, call_id: &str) -> ToolRequest {
     ToolRequest {
@@ -397,6 +408,15 @@ pub(crate) fn request(session: &str, call_id: &str) -> ToolRequest {
         parent_local_session_id: None,
         tool_call_id: Some("model-call".to_string()),
         capabilities: Default::default(),
+        tool_round: None,
+    }
+}
+
+/// [`request`] as the `ToolCalls` entry at sequence `round` made it.
+pub(crate) fn request_in_round(session: &str, call_id: &str, round: u64) -> ToolRequest {
+    ToolRequest {
+        tool_round: Some(round),
+        ..request(session, call_id)
     }
 }
 

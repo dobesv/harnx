@@ -136,13 +136,11 @@ struct WoundUp {
 impl WindUp<'_> {
     /// One result per interrupted call, in the order the turn made them.
     async fn close_out(&self, orphans: &[OrphanToolCalls]) -> Result<WoundUp> {
-        // One listing answers every orphan: the journal lists a session by
-        // listing its whole bucket, so reading row by row would pay for
-        // that once per call — narrowed to the interrupted rounds, since a
-        // long-lived session may hold far more journal rows than this wind-up
-        // owes results for. A read that FAILS is not a missing reply —
-        // writing a placeholder over a result we simply could not see would
-        // lose it — so the error leaves the whole wind-up for a later attempt.
+        // One listing per interrupted round answers every orphan in it, and
+        // lists nothing from the session's other rounds. A read that FAILS is
+        // not a missing reply — writing a placeholder over a result we simply
+        // could not see would lose it — so the error leaves the whole wind-up
+        // for a later attempt.
         let rounds: Vec<u64> = orphans.iter().map(|orphan| orphan.seq).collect();
         let records = self
             .journal
@@ -239,10 +237,10 @@ impl WindUp<'_> {
     }
 }
 
-/// The journal row that answers one interrupted call, out of the session's
-/// rows. Dispatch mints its own wire id and keys the row by that, so a
-/// transcript id reaches its rows only through the round that made the call —
-/// exactly how a replay finds them.
+/// The journal row that answers one interrupted call, out of its round's
+/// rows. A row is found by the round that made the call and the id the
+/// transcript gave it, exactly as a replay finds it, since the wire id that
+/// ends its key is minted afresh by each dispatch attempt.
 ///
 /// A call retried inside one round leaves a row per attempt. The attempt that
 /// replied is the one that answers the call; with none of them answered the

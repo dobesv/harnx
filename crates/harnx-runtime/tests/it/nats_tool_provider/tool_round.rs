@@ -1,8 +1,9 @@
 //! A tool round journals each NATS call under the sequence of the `ToolCalls`
 //! entry that made it, which is where wind-up and replay look for the row.
 use super::*;
+use futures_util::StreamExt;
 use harnx_core::session::SessionLogEntry;
-use harnx_core::tool::{NoopToolProgress, ToolCallOrigin};
+use harnx_core::tool::{NoopToolProgress, ToolCallOrigin, ToolReplay};
 use harnx_runtime::config::session::SessionAppendSink;
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::nats_session_log::NatsSessionLog;
@@ -167,6 +168,37 @@ impl RoundHarness {
             .map(|row| row.tool_round))
     }
 
+    /// Requests to create the journal's bucket, which is what opening the
+    /// journal sends the server.
+    async fn journal_bucket_creates(&self) -> Result<async_nats::Subscriber> {
+        let creates = self
+            .jetstream
+            .client()
+            .subscribe(format!(
+                "$JS.API.STREAM.CREATE.KV_{}",
+                harnx_toolset_server::invocation_journal::BUCKET
+            ))
+            .await?;
+        // The server handles one connection's messages in order, so once it
+        // answers a round trip it has registered the subscription.
+        self.jetstream.query_account().await?;
+        Ok(creates)
+    }
+
+    /// How many requests to create the journal's bucket `creates` has seen.
+    async fn journal_bucket_opens(&self, mut creates: async_nats::Subscriber) -> Result<usize> {
+        // Once the server answers a round trip on the subscription's own
+        // connection, it has queued to it every request made before.
+        self.jetstream.query_account().await?;
+        let mut seen = 0;
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_millis(100), creates.next()).await
+        {
+            seen += 1;
+        }
+        Ok(seen)
+    }
+
     async fn stop(self) {
         self.tool_server.abort();
         let _ = self.tool_server.await;
@@ -230,6 +262,77 @@ async fn dispatch_journals_the_round_it_is_handed() -> Result<()> {
 
     assert_eq!(harness.journaled_round("in-round").await?, Some(7));
     assert_eq!(harness.journaled_round("no-round").await?, Some(0));
+    harness.stop().await;
+    Ok(())
+}
+
+/// Opening the journal asks the server to create its bucket, a request the
+/// cluster's meta leader has to answer. A provider keeps the journal it
+/// opened, so the calls it journals, the partial result it reads back for a
+/// failed call and a replay all share one open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_opens_the_journal_once_for_all_its_calls() -> Result<()> {
+    let Some(harness) = RoundHarness::start().await? else {
+        return Ok(());
+    };
+    let config = harness.config.read().clone();
+    let provider = NatsToolProvider::discover(
+        &config,
+        harness.instance_id.clone(),
+        NatsInFlightCalls::for_instance(&harness.instance_id),
+        None,
+    )
+    .await?;
+    let creates = harness.journal_bucket_creates().await?;
+
+    for (call_id, timezone) in [
+        ("first", "UTC"),
+        ("second", "UTC"),
+        ("failing", "Mars/Olympus"),
+    ] {
+        let outcome = provider
+            .call_tool_with_progress(
+                "time_get_current_time",
+                json!({"timezone": timezone}),
+                ToolCallOrigin {
+                    tool_call_id: Some(call_id),
+                    tool_round: Some(3),
+                },
+                &create_abort_signal(),
+                Arc::new(NoopToolProgress),
+            )
+            .await;
+        if call_id == "failing" {
+            assert!(
+                matches!(outcome, Err(ToolError::Recoverable(_))),
+                "an unknown timezone fails the call recoverably"
+            );
+        } else {
+            outcome.map_err(tool_error)?;
+        }
+    }
+    let first = time_call("first");
+    provider
+        .replay_tool_call(
+            ToolReplay {
+                session_id: &harness.storage_key,
+                tool_round: 3,
+                call: &first,
+                worker_id: None,
+                fence_token: None,
+                authorization: None,
+            },
+            &create_abort_signal(),
+        )
+        .await
+        .map_err(tool_error)?
+        .context("the first call's saved reply")?;
+
+    assert_eq!(
+        harness.journal_bucket_opens(creates).await?,
+        1,
+        "journal bucket opens"
+    );
     harness.stop().await;
     Ok(())
 }

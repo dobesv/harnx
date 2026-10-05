@@ -1,7 +1,7 @@
 use crate::common;
 use anyhow::{Context, Result};
 use common::{wait_for_registration, TestHarness};
-use harnx_toolset::{ReplayAttempt, ToolReply, ToolRequest};
+use harnx_toolset::{CheckpointStore, ReplayAttempt, ToolReply, ToolRequest};
 use harnx_toolset_server::invocation_journal::InvocationJournal;
 use serde_json::json;
 use std::sync::atomic::Ordering;
@@ -21,7 +21,6 @@ async fn interrupted_call(
         .record(
             &request,
             (&format!("test_{tool}"), "test-scope", "____test"),
-            7,
         )
         .await?;
     request.replay = Some(ReplayAttempt {
@@ -164,7 +163,7 @@ async fn journal_separates_standalone_calls_and_requires_persisted_records() -> 
     let mut request = common::request("standalone", "standalone-call");
     request.parent_session_id = None;
     journal
-        .record(&request, ("test_echo", "test-scope", "____test"), 1)
+        .record(&request, ("test_echo", "test-scope", "____test"))
         .await?;
     let standalone = ToolReply {
         call_id: request.call_id.clone(),
@@ -174,12 +173,12 @@ async fn journal_separates_standalone_calls_and_requires_persisted_records() -> 
     journal.complete(&request, standalone.clone()).await?;
     request.parent_session_id = Some("standalone".into());
     journal
-        .record(&request, ("test_echo", "test-scope", "____test"), 1)
+        .record(&request, ("test_echo", "test-scope", "____test"))
         .await?;
     assert!(journal.get(&request).await?.unwrap().reply.is_none());
     journal.purge_session("standalone").await?;
     assert!(journal
-        .record(&request, ("test_echo", "test-scope", "____test"), 1)
+        .record(&request, ("test_echo", "test-scope", "____test"))
         .await
         .is_err());
     assert!(journal
@@ -187,7 +186,8 @@ async fn journal_separates_standalone_calls_and_requires_persisted_records() -> 
         .await
         .is_err());
     assert!(journal
-        .checkpoint("missing-session", "missing-call", json!({}))
+        .checkpoint_store(&common::request("missing-session", "missing-call"))
+        .checkpoint(json!({}))
         .await
         .is_err());
     request.parent_session_id = None;

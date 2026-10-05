@@ -35,15 +35,8 @@ impl NatsToolProvider {
             );
             return None;
         }
-        let js = async_nats::jetstream::new(self.client.clone());
         let row = tokio::time::timeout(PARTIAL_RESULT_READ_TIMEOUT, async {
-            harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
-                &js,
-                self.journal_replicas,
-            )
-            .await?
-            .get(request)
-            .await
+            self.journal().await?.get(request).await
         })
         .await
         .unwrap_or_else(|_| Err(anyhow!("timed out after {PARTIAL_RESULT_READ_TIMEOUT:?}")));

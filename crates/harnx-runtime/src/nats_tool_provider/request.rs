@@ -19,7 +19,10 @@ impl NatsToolProvider {
         self.prepare_request_with_progress(
             arguments,
             route,
-            tool_call_id,
+            ToolCallOrigin {
+                tool_call_id,
+                tool_round: None,
+            },
             false,
             self.run_context.as_ref(),
         )
@@ -29,7 +32,7 @@ impl NatsToolProvider {
         &self,
         arguments: Value,
         route: &RegisteredTool,
-        tool_call_id: Option<&str>,
+        origin: ToolCallOrigin<'_>,
         enable_progress: bool,
         run_context: Option<&crate::nats_session_metadata::RunLimitsRecord>,
     ) -> Result<PendingToolRequest, ToolError> {
@@ -54,7 +57,8 @@ impl NatsToolProvider {
             parent_session_id: self.parent_session_id.clone(),
             parent_agent: self.parent_agent.clone(),
             parent_local_session_id: self.parent_local_session_id.clone(),
-            tool_call_id: tool_call_id.map(str::to_string),
+            tool_call_id: origin.tool_call_id.map(str::to_string),
+            tool_round: origin.tool_round,
             capabilities,
         };
         self.prepare_recorded_request(request, route)
@@ -106,7 +110,7 @@ impl NatsToolProvider {
         let pending = self.prepare_request_with_progress(
             call.arguments,
             &route,
-            call.origin.tool_call_id,
+            call.origin,
             progress.is_some(),
             run_context,
         )?;
@@ -120,13 +124,9 @@ impl NatsToolProvider {
                 crate::nats_session_metadata::run_limits::DeadlineExpired::before_dispatch(record),
             ));
         }
-        Box::pin(self.record_invocation(
-            &request,
-            (call.name, &route.server),
-            call.origin.tool_round,
-        ))
-        .await
-        .map_err(ToolError::Fatal)?;
+        Box::pin(self.record_invocation(&request, (call.name, &route.server)))
+            .await
+            .map_err(ToolError::Fatal)?;
         let pending = self.prepare_recorded_request(request.clone(), &route)?;
         let result = async {
             let message = self.await_response(pending, abort).await?;

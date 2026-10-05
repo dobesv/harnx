@@ -121,9 +121,9 @@ async fn seed_session_journal_and_attachment(
                 parent_local_session_id: None,
                 tool_call_id: Some("worker-gc-tool-call".into()),
                 capabilities: Default::default(),
+                tool_round: None,
             },
             ("test_tool", "test-scope", "test-server"),
-            1,
         )
         .await?;
     let data_url = format!(

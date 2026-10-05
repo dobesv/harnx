@@ -27,6 +27,7 @@ async fn parked_tool_reply(original_error: Option<&str>) -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     };
     let pending = harness.client.send_request(
         harness.echo_subject(),

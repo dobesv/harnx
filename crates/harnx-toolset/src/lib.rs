@@ -387,6 +387,12 @@ pub struct ToolRequest {
     /// the transcript id survives a worker restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Sequence of the transcript's `ToolCalls` entry that made this call,
+    /// when it came from one. The journal keys the call's row by session,
+    /// round, `tool_call_id` and `call_id`, and every party that reads or
+    /// writes the row rebuilds that key from this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_round: Option<u64>,
     /// Additive capabilities understood by the caller. An absent field means
     /// private result metadata must not be returned.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -733,7 +739,7 @@ mod tests {
     #[test]
     fn wire_types_round_trip_through_serde() {
         assert_round_trip(tool_spec());
-        assert_round_trip(ToolRequest {
+        let request = ToolRequest {
             run_context: None,
             replay: None,
             operation_id: "call-1".to_string(),
@@ -743,24 +749,20 @@ mod tests {
             parent_session_id: Some("parent-session".to_string()),
             parent_agent: None,
             parent_local_session_id: None,
-            tool_call_id: None,
+            tool_call_id: Some("model-call".to_string()),
+            tool_round: Some(7),
             capabilities: BTreeSet::new(),
-        });
+        };
+        assert_round_trip(request.clone());
         assert_round_trip(ToolRequest {
-            run_context: None,
             replay: Some(ReplayAttempt {
                 attempt: 2,
                 requested_by: "worker-b".to_string(),
             }),
-            operation_id: "call-1".to_string(),
-            call_id: "call-1".to_string(),
-            tool: "time_now".to_string(),
-            args: json!({ "timezone": "UTC" }),
             parent_session_id: None,
-            parent_agent: None,
-            parent_local_session_id: None,
             tool_call_id: None,
-            capabilities: BTreeSet::new(),
+            tool_round: None,
+            ..request
         });
         assert_round_trip(ToolReply {
             call_id: "call-1".to_string(),

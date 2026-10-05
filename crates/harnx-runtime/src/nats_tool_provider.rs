@@ -78,6 +78,8 @@ pub struct NatsToolProvider {
     /// and dispatch is usually first, so it has to carry the cluster's
     /// configured count rather than assume a single replica.
     journal_replicas: usize,
+    /// The invocation journal, opened by the first call that needs it.
+    journal: tokio::sync::OnceCell<harnx_toolset_server::invocation_journal::InvocationJournal>,
     // Owns the flushed control subscription and its call-id progress routes.
     progress_dispatcher: ProgressDispatcher,
     in_flight: NatsInFlightCalls,
@@ -241,6 +243,7 @@ impl NatsToolProvider {
             declarations,
             registry,
             journal_replicas,
+            journal: Default::default(),
             progress_dispatcher: ProgressDispatcher::new(control_subscription),
             in_flight,
         })
@@ -784,6 +787,7 @@ mod tests {
             declarations: Vec::new(),
             registry: None,
             journal_replicas: 1,
+            journal: Default::default(),
             progress_dispatcher: ProgressDispatcher::new(control_subscription),
             in_flight: NatsInFlightCalls::default(),
         }
@@ -1313,6 +1317,7 @@ mod tests {
             declarations: Vec::new(),
             registry: None,
             journal_replicas: 1,
+            journal: Default::default(),
             progress_dispatcher: ProgressDispatcher::new(subscription),
             in_flight: NatsInFlightCalls::default(),
         }

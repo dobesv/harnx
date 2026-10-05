@@ -211,11 +211,11 @@ async fn await_wind_up(log: &NatsSessionLog, call_id: &str) -> Result<Vec<(u64, 
     log.load_events_async().await
 }
 
-/// A journal row the way dispatch writes one: keyed by the wire id the
-/// provider minted for this attempt, with the id the transcript's `ToolCalls`
-/// gave the call carried inside. Only the round and that inner id connect a
+/// A journal row the way dispatch writes one: keyed by the round, the id the
+/// transcript's `ToolCalls` gave the call and the wire id the provider minted
+/// for this attempt. Only the round and the transcript's id connect a
 /// transcript call to its row.
-fn journal_request(session_key: &str, call_id: &str) -> ToolRequest {
+fn journal_request(session_key: &str, call_id: &str, round: u64) -> ToolRequest {
     ToolRequest {
         run_context: None,
         replay: None,
@@ -228,6 +228,7 @@ fn journal_request(session_key: &str, call_id: &str) -> ToolRequest {
         parent_local_session_id: None,
         tool_call_id: Some(call_id.into()),
         capabilities: Default::default(),
+        tool_round: Some(round),
     }
 }
 
@@ -241,15 +242,14 @@ fn wire_id(call_id: &str) -> String {
 /// addressed to the wire id, which is the only id the tool ever saw.
 async fn complete_in_journal(
     journal: &InvocationJournal,
-    session_key: &str,
-    call_id: &str,
+    request: &ToolRequest,
     result: serde_json::Value,
 ) -> Result<()> {
     journal
         .complete(
-            &journal_request(session_key, call_id),
+            request,
             ToolReply {
-                call_id: wire_id(call_id),
+                call_id: request.call_id.clone(),
                 result: Ok(result),
                 final_progress: None,
             },
@@ -270,21 +270,21 @@ async fn seed_racing_round(
     js: &async_nats::jetstream::Context,
     journal: &InvocationJournal,
     key: &str,
-) -> Result<()> {
+) -> Result<u64> {
     let round = log(js, key)
         .append_event_async(&tool_calls(&[LOST, WON]))
         .await?;
     for call in [LOST, WON] {
         journal
             .record(
-                &journal_request(key, call),
+                &journal_request(key, call, round),
                 ("slow_tool", "raced-scope", "srv-raced"),
-                round,
             )
             .await?;
     }
-    complete_in_journal(journal, key, WON, json!({"answer": "in time"})).await?;
-    Ok(())
+    let won = journal_request(key, WON, round);
+    complete_in_journal(journal, &won, json!({"answer": "in time"})).await?;
+    Ok(round)
 }
 
 /// Seed the two-call round `resume_after_partial_wind_up_...` resumes: each
@@ -302,13 +302,13 @@ async fn seed_partial_round(
     for (call, server_name) in [(UNANSWERED, "srv-unanswered"), (ANSWERED, "srv-answered")] {
         journal
             .record(
-                &journal_request(key, call),
+                &journal_request(key, call, round),
                 ("slow_tool", orphan_scope.as_str(), server_name),
-                round,
             )
             .await?;
     }
-    complete_in_journal(journal, key, ANSWERED, json!({"answer": "done"})).await?;
+    let answered = journal_request(key, ANSWERED, round);
+    complete_in_journal(journal, &answered, json!({"answer": "done"})).await?;
     Ok(())
 }
 
@@ -469,7 +469,7 @@ async fn placeholder_and_real_result_race_yields_exactly_one_tool_results_entry(
     let journal = InvocationJournal::ensure(&js, 1).await?;
     // One tool got its reply into the journal before the interrupt; the other
     // is still running when wind-up closes the round out.
-    seed_racing_round(&js, &journal, &key).await?;
+    let round = seed_racing_round(&js, &journal, &key).await?;
 
     let cancel_seq = accepted_seq(session.interrupt("client cancel").await?)?;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -493,7 +493,8 @@ async fn placeholder_and_real_result_race_yields_exactly_one_tool_results_entry(
     );
 
     // The slower tool's real result arrives after the placeholder was written.
-    complete_in_journal(&journal, &key, LOST, json!({"answer": "too late"})).await?;
+    let lost = journal_request(&key, LOST, round);
+    complete_in_journal(&journal, &lost, json!({"answer": "too late"})).await?;
     publish_session_activate(
         &js,
         "local",

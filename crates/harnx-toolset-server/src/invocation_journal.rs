@@ -1,6 +1,15 @@
 //! Durable requests and replies outlive a tool-server process and its reply cache.
 //! Records are retained until the owning session is deleted, because a parent
 //! may not have persisted a tool's response by the time the call finishes.
+//!
+//! A call's row is keyed `sessions.<session>.<round>.<tool call>.<call>`: the
+//! transcript round and tool-call id that recovery knows the call by, then the
+//! wire id each dispatch attempt mints. Each part is escaped into one subject
+//! token, so a lookup lists a single round, or one call in it, rather than
+//! every session's rows. A call with no parent session is keyed
+//! `standalone/<call>`. Rows written before this layout, keyed
+//! `sessions/<session>/<call>`, are no longer read, but deleting their
+//! session still deletes them.
 use anyhow::{ensure, Context, Result};
 use async_nats::jetstream::{self, kv};
 use harnx_toolset::{ToolReply, ToolRequest};
@@ -35,9 +44,8 @@ pub struct RecordedInvocation {
 
 impl RecordedInvocation {
     /// Whether this row is one `round` made for the transcript call `call_id`.
-    /// Dispatch keys a row by the wire id it mints per attempt, so this pair
-    /// is the only way back from a transcript call to its rows — and a call
-    /// retried inside one round has more than one row answering to it.
+    /// Only that pair survives a worker restart, and a call retried inside
+    /// one round has a row per attempt answering to it.
     pub fn answers(&self, round: u64, call_id: &str) -> bool {
         self.tool_round == round && self.request.tool_call_id.as_deref() == Some(call_id)
     }
@@ -92,19 +100,17 @@ impl InvocationJournal {
         Self(store, js.clone())
     }
 
-    pub async fn record(
-        &self,
-        request: &ToolRequest,
-        tool: (&str, &str, &str),
-        tool_round: u64,
-    ) -> Result<()> {
+    /// Journal `request` before it is dispatched, as round
+    /// `request.tool_round` of its session made it, or round zero for a call
+    /// no round made.
+    pub async fn record(&self, request: &ToolRequest, tool: (&str, &str, &str)) -> Result<()> {
         self.check_session_retained(request).await?;
         let record = RecordedInvocation {
             request: request.clone(),
             tool_name: tool.0.into(),
             server_scope: tool.1.into(),
             server: tool.2.into(),
-            tool_round,
+            tool_round: request.tool_round.unwrap_or(0),
             started_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_millis()
@@ -155,43 +161,34 @@ impl InvocationJournal {
         self.read(&key(request)).await
     }
 
-    /// Publish a durable job handle before starting work. Concurrent replay
-    /// observers all receive the first handle; no second job may be started.
-    pub async fn checkpoint(
-        &self,
-        session: &str,
-        call_id: &str,
-        value: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        self.first_value(session_key(session, call_id), value, |record| {
-            &mut record.checkpoint
-        })
-        .await
-    }
-
+    /// The row of the call a cancel names by session and wire id alone. Each
+    /// dispatch attempt mints its own wire id, so the round and tool-call
+    /// parts of the key are left for the leader to match.
     pub async fn recorded(
         &self,
         session: &str,
         call_id: &str,
     ) -> Result<Option<RecordedInvocation>> {
-        self.read(&session_key(session, call_id)).await
+        let pattern = format!("{}.*.*.{}", session_prefix(session), token(call_id));
+        decode(self.live_entry_matching(&pattern).await?)
     }
 
     async fn read(&self, key: &str) -> Result<Option<RecordedInvocation>> {
-        self.live_entry(key)
-            .await?
-            .map(|entry| serde_json::from_slice(&entry.value).map_err(Into::into))
-            .transpose()
+        decode(self.live_entry(key).await?)
     }
 
+    /// The row `round` made for the transcript call `call_id`. A call retried
+    /// inside its round has a row per attempt, and replay cannot tell which
+    /// of them to resume, so more than one is an error.
     pub async fn find(
         &self,
         session: &str,
         round: u64,
         call_id: &str,
     ) -> Result<Option<RecordedInvocation>> {
+        let attempts = format!("{}.{round}.{}.*", session_prefix(session), token(call_id));
         let mut found = None;
-        for key in self.session_keys(session).await? {
+        for key in self.keys(&attempts).await? {
             let record = self
                 .read(&key)
                 .await?
@@ -204,11 +201,7 @@ impl InvocationJournal {
         Ok(found)
     }
 
-    /// Every row this session holds, listed and read once.
-    ///
-    /// Listing a session's keys lists every key in the bucket, so a caller
-    /// that wants more than one of a session's rows reads them all here and
-    /// matches in memory rather than paying for that listing per row.
+    /// Every row this session holds.
     ///
     /// A row that will not deserialize is skipped with a warning: it cannot
     /// hold a usable reply, and failing the listing over one unreadable row
@@ -216,7 +209,8 @@ impl InvocationJournal {
     /// transport still propagates, because that row may well hold a reply the
     /// caller simply could not see.
     pub async fn records_for_session(&self, session: &str) -> Result<Vec<RecordedInvocation>> {
-        self.records_matching(session, |_| true).await
+        self.records_under(&format!("{}.>", session_prefix(session)))
+            .await
     }
 
     /// `records_for_session`, narrowed to the rows made in one of `rounds`.
@@ -227,27 +221,26 @@ impl InvocationJournal {
         session: &str,
         rounds: &[u64],
     ) -> Result<Vec<RecordedInvocation>> {
-        self.records_matching(session, |record| rounds.contains(&record.tool_round))
-            .await
+        let mut found = Vec::new();
+        for round in rounds.iter().collect::<std::collections::BTreeSet<_>>() {
+            let pattern = format!("{}.{round}.>", session_prefix(session));
+            found.extend(self.records_under(&pattern).await?);
+        }
+        Ok(found)
     }
 
     /// Shared listing behind `records_for_session` and `records_in_rounds`:
-    /// same skip-corrupt-row-with-warning and abort-on-transport-error
-    /// behaviour either way, differing only in which of the session's rows
-    /// the caller keeps.
-    async fn records_matching(
-        &self,
-        session: &str,
-        keep: impl Fn(&RecordedInvocation) -> bool,
-    ) -> Result<Vec<RecordedInvocation>> {
+    /// the rows under every key `pattern` matches, with an unreadable row
+    /// skipped and a failed read propagated, as `records_for_session`
+    /// describes.
+    async fn records_under(&self, pattern: &str) -> Result<Vec<RecordedInvocation>> {
         let mut found = Vec::new();
-        for key in self.session_keys(session).await? {
+        for key in self.keys(pattern).await? {
             let Some(entry) = self.live_entry(&key).await? else {
                 continue;
             };
             match serde_json::from_slice::<RecordedInvocation>(&entry.value) {
-                Ok(record) if keep(&record) => found.push(record),
-                Ok(_) => {}
+                Ok(record) => found.push(record),
                 Err(error) => {
                     log::warn!("skipping unreadable tool invocation: key={key} error={error}");
                 }
@@ -306,20 +299,66 @@ impl InvocationJournal {
         self.0
             .put(format!("deleted/{session}"), "deleted".into())
             .await?;
-        for key in self.session_keys(session).await? {
+        for key in self.keys(&format!("{}.>", session_prefix(session))).await? {
             self.0.purge(key).await?;
+        }
+        // Rows from before the session was a token of its own are keyed
+        // `sessions/<session>/<call>`. A worker's wire ids are UUIDs, so each
+        // of its rows' keys is one token, and listing single-token keys
+        // leaves out every row in the current layout.
+        let legacy = format!("sessions/{session}/");
+        for key in self.keys("*").await? {
+            if key.starts_with(&legacy) {
+                self.0.purge(key).await?;
+            }
         }
         Ok(())
     }
 }
 
+fn decode(entry: Option<kv::Entry>) -> Result<Option<RecordedInvocation>> {
+    entry
+        .map(|entry| serde_json::from_slice(&entry.value).map_err(Into::into))
+        .transpose()
+}
+
+/// The key every reader and writer of `request`'s row rebuilds from the
+/// request alone.
 fn key(request: &ToolRequest) -> String {
     match &request.parent_session_id {
-        Some(session) => session_key(session, &request.call_id),
+        Some(session) => format!(
+            "{}.{}.{}.{}",
+            session_prefix(session),
+            request.tool_round.unwrap_or(0),
+            token(request.tool_call_id.as_deref().unwrap_or_default()),
+            token(&request.call_id),
+        ),
         None => format!("standalone/{}", request.call_id),
     }
 }
 
-fn session_key(session: &str, call_id: &str) -> String {
-    format!("sessions/{session}/{call_id}")
+/// The tokens every key of `session`'s rows starts with.
+fn session_prefix(session: &str) -> String {
+    format!("sessions.{}", token(session))
+}
+
+/// `id` as one subject token that no other id shares. Bytes outside
+/// `[A-Za-z0-9_-]` are written as `=` and two hex digits, so a `.` cannot
+/// split an id across tokens, `*` or `>` cannot make it a wildcard, and no
+/// escape reads as the character it stands for. The empty id, which no escape
+/// produces, is `=` alone. Stored keys are built with this, so changing it
+/// strands every row already written.
+fn token(id: &str) -> String {
+    if id.is_empty() {
+        return "=".into();
+    }
+    let mut token = String::with_capacity(id.len());
+    for byte in id.bytes() {
+        if byte.is_ascii_alphanumeric() || b"_-".contains(&byte) {
+            token.push(char::from(byte));
+        } else {
+            token.push_str(&format!("={byte:02X}"));
+        }
+    }
+    token
 }
