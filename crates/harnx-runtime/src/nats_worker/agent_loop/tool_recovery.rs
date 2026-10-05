@@ -19,8 +19,11 @@ pub(super) async fn repair_single_orphan(
     orphan: &PendingToolCalls,
     args: &RepairOrphanToolCallsArgs<'_>,
     repair: &ToolRepairContext,
-    eval_ctx: &crate::tool::ToolEvalContext,
+    eval_ctx: &mut crate::tool::ToolEvalContext,
 ) -> Result<Vec<harnx_core::session::ToolOutput>> {
+    // A rerun dispatches this orphan's call afresh, journaled under the round
+    // that made it, which is where a replay after another restart looks.
+    eval_ctx.tool_round = Some(orphan.seq);
     let mut results = vec![Vec::new(); orphan.calls.len()];
     let mut reruns = Vec::new();
     for (index, call) in orphan.calls.iter().enumerate() {

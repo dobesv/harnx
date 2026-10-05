@@ -545,6 +545,9 @@ mod outage;
 #[path = "nats_tool_provider/partial_result.rs"]
 mod partial_result;
 
+#[path = "nats_tool_provider/tool_round.rs"]
+mod tool_round;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> Result<()> {
     let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {

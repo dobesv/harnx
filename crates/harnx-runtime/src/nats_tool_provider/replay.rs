@@ -7,23 +7,30 @@ impl NatsToolProvider {
     pub(super) async fn record_invocation(
         &self,
         request: &ToolRequest,
-        tool_name: &str,
-        server: &str,
+        (tool_name, server): (&str, &str),
+        round: Option<u64>,
     ) -> anyhow::Result<()> {
-        let Some(session) = request.parent_session_id.as_deref() else {
+        if request.parent_session_id.is_none() {
             return Ok(());
-        };
+        }
         let js = async_nats::jetstream::new(self.client.clone());
-        // The round is the transcript sequence whose `ToolCalls` made this
-        // call, and it keys the journal row. A call dispatched outside a
-        // durable round — a direct provider call, a tool a frontend invoked —
-        // has none, which is what zero records, exactly as for a call with no
-        // id at all. Only a transcript orphan is ever replayed by round, and
-        // an orphan by definition has the entry this looks for.
-        let round = match request.tool_call_id.as_deref() {
-            Some(call_id) => invocation_round(&js, session, call_id).await?.unwrap_or(0),
-            None => 0,
-        };
+        // The round is the sequence of the `ToolCalls` entry that made this
+        // call, and it keys the journal row. The dispatcher hands it in: a
+        // fresh round's is the sequence its append returned, and a resumed
+        // round's is the one its orphan detection read. A call dispatched
+        // outside a durable round, such as a direct provider call or a tool
+        // an operator invoked, has none, which is what zero records. Nothing
+        // looks a zero row up by round: only a transcript orphan is replayed
+        // or wound up, and whatever dispatched its calls had the orphan's
+        // `ToolCalls` entry to take the round from.
+        //
+        // Wind-up and replay look the row up by the sequence they read from
+        // the effective log, after `apply_log_mutations`. That agrees with
+        // the round recorded here unless an `EditEntries` replaced the range
+        // holding the `ToolCalls` entry since the dispatcher took its
+        // sequence, because a replacement inherits the `EditEntries`
+        // sequence: the row then no longer matches the entry that asks for
+        // it, and reads as absent.
         harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
             &js,
             self.journal_replicas,
@@ -32,7 +39,7 @@ impl NatsToolProvider {
         .record(
             request,
             (tool_name, self.instance_id.as_str(), server),
-            round,
+            round.unwrap_or(0),
         )
         .await
     }
@@ -157,34 +164,6 @@ pub(crate) fn decode_journaled_reply(
             record.request.call_id.clone(),
         ),
     )
-}
-
-/// The sequence of the `ToolCalls` entry that made `call_id`, or `None` when
-/// this session's transcript never recorded one.
-///
-/// This scans the RAW log, while every caller that hands a round back in —
-/// wind-up and the orphan detection a replay comes from — takes it from the
-/// effective log, after `apply_log_mutations`. The two agree unless an
-/// `EditEntries` replaced the range holding this `ToolCalls` entry, because a
-/// replacement inherits the `EditEntries` sequence: a round journaled before
-/// such an edit no longer matches the entry that asks for it, and the row
-/// reads as absent.
-async fn invocation_round(
-    js: &async_nats::jetstream::Context,
-    session: &str,
-    call_id: &str,
-) -> anyhow::Result<Option<u64>> {
-    let entries = crate::nats_session_log::NatsSessionLog::new(js.clone(), session)
-        .load_events_latest_async()
-        .await?;
-    Ok(entries.iter().rev().find_map(|(seq, entry)| match entry {
-        harnx_core::session::SessionLogEntry::ToolCalls { calls, .. }
-            if calls.iter().any(|call| call.id.as_deref() == Some(call_id)) =>
-        {
-            Some(*seq)
-        }
-        _ => None,
-    }))
 }
 
 fn validate_replay_route(

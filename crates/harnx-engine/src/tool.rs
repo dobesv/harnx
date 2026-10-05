@@ -12,8 +12,8 @@ use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
 use harnx_core::partial_result::{output_with_partial_result, partial_result_of};
 use harnx_core::tool::{
-    SwitchAgentData, ToolCall, ToolError, ToolProvider, ToolProviderOutput, ToolResult,
-    ToolUpdatePatch,
+    SwitchAgentData, ToolCall, ToolCallOrigin, ToolError, ToolProvider, ToolProviderOutput,
+    ToolResult, ToolUpdatePatch,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -109,6 +109,13 @@ pub struct ToolEvalContext {
     pub work_boundary: Option<Arc<WorkBoundaryFn>>,
     /// Worker instance that scopes NATS tool subjects for this evaluation.
     pub instance_id: harnx_core::instance::ServerScope,
+    /// Sequence of the session log's `ToolCalls` entry that made the calls
+    /// being evaluated, handed to every provider dispatch. `None` when no
+    /// transcript round made them. Replay and wind-up find a call's journal
+    /// row only by this round, so a path that dispatches a transcript round's
+    /// calls must set it; left unset, the rows record round zero and recovery
+    /// never finds them.
+    pub tool_round: Option<u64>,
     pub render: Option<ToolEvalRenderContext>,
     /// Ordered tool providers to search when dispatching a call.
     pub providers: Vec<Arc<dyn ToolProvider>>,
@@ -159,6 +166,17 @@ pub struct ToolEvalContext {
     /// at context-construction time and forwards to
     /// `hooks::dispatch::dispatch_hooks`.
     pub dispatch_hook_fn: Arc<DispatchHookFn>,
+}
+
+impl ToolEvalContext {
+    /// What a dispatch of the call `tool_call_id` tells its provider about the
+    /// transcript call it answers.
+    fn origin<'a>(&self, tool_call_id: &'a str) -> ToolCallOrigin<'a> {
+        ToolCallOrigin {
+            tool_call_id: Some(tool_call_id),
+            tool_round: self.tool_round,
+        }
+    }
 }
 
 struct ApprovedToolCall {
@@ -637,7 +655,7 @@ async fn call_tool_with_tracing(
     provider: &dyn ToolProvider,
     tool_name: &str,
     json_data: Value,
-    tool_call_id: Option<&str>,
+    origin: ToolCallOrigin<'_>,
     abort_signal: &AbortSignal,
     progress: Arc<dyn harnx_core::tool::ToolProgress>,
 ) -> Result<ToolProviderOutput, ToolError> {
@@ -655,7 +673,7 @@ async fn call_tool_with_tracing(
         span.record("harnx.tool.arguments_bytes", arguments_bytes);
     }
     let result = provider
-        .call_tool_with_progress(tool_name, json_data, tool_call_id, abort_signal, progress)
+        .call_tool_with_progress(tool_name, json_data, origin, abort_signal, progress)
         .instrument(span.clone())
         .await;
     if result.is_err() {
@@ -744,7 +762,7 @@ async fn dispatch_tool_call(
             provider.as_ref(),
             &tool_name,
             json_data.clone(),
-            Some(&tool_call_id),
+            ctx.origin(&tool_call_id),
             abort_signal,
             progress.clone(),
         )
@@ -982,8 +1000,13 @@ mod tests {
         }
     }
 
+    /// The call id and round of each dispatch, in order.
+    type RecordedOrigins = Arc<std::sync::Mutex<Vec<(Option<String>, Option<u64>)>>>;
+
+    #[derive(Default)]
     struct UpdatingToolProvider {
         retained_progress: Arc<std::sync::Mutex<Option<Arc<dyn harnx_core::tool::ToolProgress>>>>,
+        origins: RecordedOrigins,
     }
 
     impl ToolProvider for UpdatingToolProvider {
@@ -1016,7 +1039,7 @@ mod tests {
             &'life0 self,
             tool_name: &'life1 str,
             _arguments: Value,
-            tool_call_id: Option<&'life2 str>,
+            origin: ToolCallOrigin<'life2>,
             _abort: &'life3 AbortSignal,
             progress: Arc<dyn harnx_core::tool::ToolProgress>,
         ) -> Pin<
@@ -1031,7 +1054,11 @@ mod tests {
         {
             Box::pin(async move {
                 assert_eq!(tool_name, "updating_tool");
-                assert!(tool_call_id.is_some_and(|id| !id.trim().is_empty()));
+                assert!(origin.tool_call_id.is_some_and(|id| !id.trim().is_empty()));
+                self.origins
+                    .lock()
+                    .unwrap()
+                    .push((origin.tool_call_id.map(str::to_string), origin.tool_round));
                 *self.retained_progress.lock().unwrap() = Some(Arc::clone(&progress));
                 progress.update(ToolUpdatePatch {
                     title: Some("first".to_string()),
@@ -1049,6 +1076,29 @@ mod tests {
                 Ok(ToolProviderOutput::new(json!({"ok": true})))
             })
         }
+    }
+
+    /// A provider learns the round the evaluated calls belong to along with
+    /// each call's id, which is what it journals the call under.
+    #[tokio::test]
+    async fn dispatch_tells_the_provider_each_calls_round_and_id() {
+        let provider = Arc::new(UpdatingToolProvider::default());
+        let origins = Arc::clone(&provider.origins);
+        let mut ctx = test_context(vec![provider], |_| continue_hook_outcome());
+        ctx.tool_round = Some(12);
+        let call = ToolCall::new(
+            "updating_tool".to_string(),
+            json!({}),
+            Some("model-call".to_string()),
+            None,
+        );
+        eval_tool_calls(&ctx, vec![call], &create_abort_signal())
+            .await
+            .unwrap();
+        assert_eq!(
+            *origins.lock().unwrap(),
+            [(Some("model-call".to_string()), Some(12))]
+        );
     }
 
     #[derive(Debug)]
@@ -1144,6 +1194,7 @@ mod tests {
         ToolEvalContext {
             work_boundary: None,
             instance_id: harnx_core::instance::ServerScope::new(),
+            tool_round: None,
             render: None,
             providers,
             allowed_tool_names: HashSet::new(),
@@ -1190,10 +1241,8 @@ mod tests {
 
     #[tokio::test]
     async fn emitting_provider_has_stable_identity_coalescing_and_terminal_order() {
-        let retained_progress = Arc::new(std::sync::Mutex::new(None));
-        let provider = Arc::new(UpdatingToolProvider {
-            retained_progress: Arc::clone(&retained_progress),
-        });
+        let provider = Arc::new(UpdatingToolProvider::default());
+        let retained_progress = Arc::clone(&provider.retained_progress);
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let started = Arc::clone(&events);
         let completed = Arc::clone(&events);

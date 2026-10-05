@@ -65,17 +65,19 @@ impl Config {
     /// pending Tool message in-memory.  Must be paired with a
     /// [`append_session_tool_results`] call once outputs are available.
     ///
-    /// No-ops if no session is active; errors if persistence fails.
+    /// Returns the entry's durable sequence, the round its calls are
+    /// journaled under. No-ops and returns `None` if no session is active;
+    /// errors if persistence fails.
     pub fn append_session_tool_calls(
         &mut self,
         input: &Input,
         output: &str,
         thought: Option<&str>,
         calls: &[crate::tool::ToolCall],
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         let request = SessionSaveRequest::new(input, output, thought);
         let Some(session) = self.session_for_save(&request) else {
-            return Ok(());
+            return Ok(None);
         };
         crate::config::session::add_tool_calls(
             session,

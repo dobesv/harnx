@@ -41,19 +41,33 @@ pub struct ToolApprovalInterrupt {
     pub deferred_calls: Vec<DeferredToolCall>,
 }
 
+/// Whether a tool round appends its `ToolCalls` entry or resumes one the
+/// session log already holds.
 #[derive(Debug, Clone, Copy)]
-pub struct ToolRoundPersistence {
-    pub persist_tool_calls: bool,
+pub enum ToolRoundPersistence {
+    /// Append the round's `ToolCalls` entry before dispatching its calls.
+    AppendCalls,
+    /// The log already holds the round's `ToolCalls` entry, at `seq`.
+    ExistingCalls { seq: u64 },
 }
 
 impl ToolRoundPersistence {
-    pub const DEFAULT: Self = Self {
-        persist_tool_calls: true,
-    };
-
-    pub const REUSE_EXISTING_CALLS: Self = Self {
-        persist_tool_calls: false,
-    };
+    /// Open the round `calls` belong to and return its sequence, the one their
+    /// `ToolCalls` entry has. A new round appends that entry here, before any
+    /// call is dispatched. `None` when no durable entry holds the round, as in
+    /// a dry run.
+    fn open_round(self, params: &ToolRoundParams<'_>, calls: &[ToolCall]) -> Result<Option<u64>> {
+        match self {
+            Self::ExistingCalls { seq } => Ok(Some(seq)),
+            Self::AppendCalls if params.config.read().dry_run => Ok(None),
+            Self::AppendCalls => params.config.write().append_session_tool_calls(
+                params.input,
+                params.completion.output,
+                params.completion.thought,
+                calls,
+            ),
+        }
+    }
 }
 
 impl ToolApprovalInterrupt {
@@ -78,7 +92,7 @@ pub async fn execute_tool_round(
     params: ToolRoundParams<'_>,
     tool_calls: Vec<ToolCall>,
 ) -> Result<Vec<ToolResult>> {
-    execute_tool_round_with_persistence(params, tool_calls, ToolRoundPersistence::DEFAULT).await
+    execute_tool_round_with_persistence(params, tool_calls, ToolRoundPersistence::AppendCalls).await
 }
 
 pub async fn execute_tool_round_with_persistence(
@@ -86,11 +100,17 @@ pub async fn execute_tool_round_with_persistence(
     mut tool_calls: Vec<ToolCall>,
     persistence: ToolRoundPersistence,
 ) -> Result<Vec<ToolResult>> {
+    anyhow::ensure!(
+        !params.abort_signal.aborted(),
+        "interrupted during tool execution"
+    );
+    harnx_engine::tool::ensure_tool_call_ids(&mut tool_calls);
+    let tool_round = persistence.open_round(&params, &tool_calls)?;
     let ToolRoundParams {
         config,
         instance_id,
         input,
-        completion,
+        completion: _,
         abort_signal,
         working_dir,
         nats_hook_provider,
@@ -98,24 +118,13 @@ pub async fn execute_tool_round_with_persistence(
         tool_loop_guard,
     } = params;
     let dry_run = config.read().dry_run;
-    anyhow::ensure!(!abort_signal.aborted(), "interrupted during tool execution");
-    harnx_engine::tool::ensure_tool_call_ids(&mut tool_calls);
-
-    if persistence.persist_tool_calls && !dry_run {
-        config.write().append_session_tool_calls(
-            input,
-            completion.output,
-            completion.thought,
-            &tool_calls,
-        )?;
-    }
 
     let agent_use_tools = input.agent().use_tools().map(|v| v.join(","));
     // Derive the active agent's package (e.g. `pantheon` for `pantheon/daedalus`)
     // so bare `_session_handoff` targets resolve to the same package (#709).
     let current_agent_package =
         harnx_core::package_namespace::pkg_from_qualified(input.agent().name()).map(str::to_string);
-    let eval_ctx = build_tool_eval_context(BuildToolEvalContextParams {
+    let mut eval_ctx = build_tool_eval_context(BuildToolEvalContextParams {
         config,
         instance_id,
         agent_use_tools: agent_use_tools.as_deref(),
@@ -125,6 +134,7 @@ pub async fn execute_tool_round_with_persistence(
         pending_async_context,
     })
     .await;
+    eval_ctx.tool_round = tool_round;
     let guard = crate::tool_loop_guard::begin_round(tool_loop_guard.as_deref(), config, input);
     let (to_eval, refused) = screen_tool_round(guard, config, &tool_calls, &eval_ctx).await?;
     let results = match eval_tool_calls(&eval_ctx, to_eval, abort_signal).await {
@@ -469,6 +479,7 @@ async fn build_tool_eval_context_inner(
     ToolEvalContext {
         work_boundary: None,
         instance_id: instance_id.clone(),
+        tool_round: None,
         render: Some(ToolEvalRenderContext {
             decl_map: Arc::clone(&decl_map),
         }),
@@ -1236,6 +1247,7 @@ mod tests {
         let eval_ctx = ToolEvalContext {
             work_boundary: None,
             instance_id: harnx_core::instance::ServerScope::new(),
+            tool_round: None,
             render: Some(ToolEvalRenderContext {
                 decl_map: Arc::new(decl_map),
             }),

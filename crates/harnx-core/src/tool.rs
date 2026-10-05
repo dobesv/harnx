@@ -166,6 +166,18 @@ pub struct ToolReplay<'a> {
     pub authorization: Option<&'a dyn ReplayAuthorization>,
 }
 
+/// Which transcript call a dispatch answers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToolCallOrigin<'a> {
+    /// The call's id: the model's, or one the engine assigned.
+    pub tool_call_id: Option<&'a str>,
+    /// Sequence of the session log's `ToolCalls` entry that made the call,
+    /// or `None` when no transcript round made it, as for a tool an operator
+    /// invoked directly. A provider that journals calls keys its row by this,
+    /// which is how recovery finds the row again.
+    pub tool_round: Option<u64>,
+}
+
 pub enum ToolError {
     Recoverable(anyhow::Error),
     Fatal(anyhow::Error),
@@ -232,11 +244,11 @@ pub trait ToolProvider: Send + Sync {
         &self,
         tool_name: &str,
         arguments: Value,
-        tool_call_id: Option<&str>,
+        origin: ToolCallOrigin<'_>,
         abort: &AbortSignal,
         _progress: Arc<dyn ToolProgress>,
     ) -> Result<ToolProviderOutput, ToolError> {
-        self.call_tool_with_id(tool_name, arguments, tool_call_id, abort)
+        self.call_tool_with_id(tool_name, arguments, origin.tool_call_id, abort)
             .await
     }
 }

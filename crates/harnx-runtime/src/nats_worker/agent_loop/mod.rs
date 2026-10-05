@@ -203,9 +203,7 @@ fn hitl_managed_tool_call_ids(
 
 #[derive(Clone, Debug)]
 struct HitlToolRoundContinuation {
-    output: String,
-    thought: Option<String>,
-    tool_calls: Vec<harnx_core::tool::ToolCall>,
+    round: crate::agent_loop::PendingToolRound,
     decisions: Vec<crate::agent_loop::ToolApprovalDecision>,
 }
 
@@ -259,9 +257,12 @@ fn derive_hitl_tool_round_continuation(
         })
         .collect();
     Ok(Some(HitlToolRoundContinuation {
-        output: orphan.text,
-        thought: orphan.thought,
-        tool_calls: orphan.calls,
+        round: crate::agent_loop::PendingToolRound {
+            seq: orphan.seq,
+            output: orphan.text,
+            thought: orphan.thought,
+            calls: orphan.calls,
+        },
         decisions,
     }))
 }
@@ -874,16 +875,15 @@ async fn run_hitl_continuation_segment(
         );
     }
     let pending_interrupt_ids = continuation
-        .tool_calls
+        .round
+        .calls
         .iter()
         .filter_map(|call| call.id.clone())
         .collect();
     let result = crate::agent_loop::continue_agent_loop_from_tool_round(
         &args.ctx,
         args.input.clone(),
-        continuation.output,
-        continuation.thought,
-        continuation.tool_calls,
+        continuation.round,
         continuation.decisions,
         pending_interrupt_ids,
     )
@@ -1528,11 +1528,11 @@ async fn repair_orphan_tool_calls_with_hints(
     use harnx_core::session::SessionLogEntry;
 
     let tool_repair = build_tool_repair_context(&args.config);
-    let eval_ctx =
+    let mut eval_ctx =
         build_orphan_tool_eval_context(&args.config, args.instance_id, &tool_repair).await;
 
     for orphan in orphan_calls {
-        let results = repair_single_orphan(orphan, &args, &tool_repair, &eval_ctx).await?;
+        let results = repair_single_orphan(orphan, &args, &tool_repair, &mut eval_ctx).await?;
         let entry = apply_optional_fence_token(
             SessionLogEntry::ToolResults {
                 results,
@@ -1968,6 +1968,39 @@ mod tests {
             }],
             timestamp: None,
         }
+    }
+
+    /// An approved round is dispatched under the sequence of its own
+    /// `ToolCalls` entry, which entries written while it waited don't move.
+    #[test]
+    fn hitl_continuation_resumes_the_round_its_tool_calls_entry_made() {
+        let entries = vec![
+            (1, tool_calls_entry("earlier-call")),
+            (2, tool_results_entry("earlier-call")),
+            (3, tool_calls_entry("pending-call")),
+            (
+                4,
+                SessionLogEntry::HitlApprovalRequested {
+                    tool_call_id: "pending-call".to_string(),
+                    summary: "Approve pending call".to_string(),
+                    fence_token: 7,
+                },
+            ),
+            (
+                5,
+                SessionLogEntry::HitlApprovalDecision {
+                    tool_call_id: "pending-call".to_string(),
+                    approved: true,
+                    note: None,
+                    fence_token: 7,
+                },
+            ),
+        ];
+
+        let continuation = derive_hitl_tool_round_continuation(&entries)
+            .expect("derive HITL continuation")
+            .expect("pending round is HITL-managed");
+        assert_eq!(continuation.round.seq, 3);
     }
 
     #[test]

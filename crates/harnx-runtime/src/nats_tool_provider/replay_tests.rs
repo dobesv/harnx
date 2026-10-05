@@ -386,7 +386,7 @@ async fn the_journal_bucket_takes_the_configured_replica_count() -> anyhow::Resu
         capabilities: Default::default(),
     };
     provider
-        .record_invocation(&request, "echo", "srv")
+        .record_invocation(&request, ("echo", "srv"), None)
         .await
         .expect_err("a single-node broker cannot host the three-replica bucket that was asked for");
     let js = async_nats::jetstream::new(provider.client.clone());

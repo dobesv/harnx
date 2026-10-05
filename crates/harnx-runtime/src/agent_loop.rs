@@ -159,8 +159,8 @@ async fn defer_tool_approval(ctx: &AgentLoopContext, error: anyhow::Error) -> Re
 /// Resume a tool round that was interrupted for approval.
 ///
 /// This is the continuation seam for Design B interrupt/resume:
-/// - Takes saved assistant output/thought from the interrupted round
-/// - Takes the pending ToolCalls that were deferred
+/// - Takes the interrupted round: its `ToolCalls` entry's sequence, the saved
+///   assistant output/thought, and the calls that were deferred
 /// - Takes resolved approve/deny decisions for each call
 /// - Executes the approved calls with a preseeded confirm function
 /// - Persists ToolResults via existing session helpers
@@ -168,9 +168,7 @@ async fn defer_tool_approval(ctx: &AgentLoopContext, error: anyhow::Error) -> Re
 pub async fn continue_agent_loop_from_tool_round(
     ctx: &AgentLoopContext,
     mut input: Input,
-    output: String,
-    thought: Option<String>,
-    tool_calls: Vec<ToolCall>,
+    round: PendingToolRound,
     decisions: Vec<ToolApprovalDecision>,
     pending_interrupt_ids: std::collections::BTreeSet<String>,
 ) -> Result<LoopResult> {
@@ -217,12 +215,12 @@ pub async fn continue_agent_loop_from_tool_round(
             config,
             &input,
             CompletionText {
-                output: &output,
-                thought: thought.as_deref(),
+                output: &round.output,
+                thought: round.thought.as_deref(),
             },
         ),
-        tool_calls,
-        crate::tool::ToolRoundPersistence::REUSE_EXISTING_CALLS,
+        round.calls,
+        crate::tool::ToolRoundPersistence::ExistingCalls { seq: round.seq },
     )
     .await;
     config
@@ -237,7 +235,7 @@ pub async fn continue_agent_loop_from_tool_round(
     if !tool_results.is_empty() {
         let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
         let mut merged_input =
-            input.merge_tool_results(output.clone(), thought.clone(), tool_results.clone());
+            input.merge_tool_results(round.output, round.thought, tool_results.clone());
 
         // Invoke on_tool_round callback
         if let Some(ref cb) = ctx.on_tool_round {
@@ -259,6 +257,18 @@ pub async fn continue_agent_loop_from_tool_round(
 
     // Continue the canonical loop from post-tool state
     run_agent_loop(ctx, input).await
+}
+
+/// A tool round the session log holds without its results: the sequence of
+/// its `ToolCalls` entry and what that entry recorded.
+#[derive(Debug, Clone)]
+pub struct PendingToolRound {
+    /// Sequence of the round's `ToolCalls` entry, which its calls are
+    /// journaled under.
+    pub seq: u64,
+    pub output: String,
+    pub thought: Option<String>,
+    pub calls: Vec<ToolCall>,
 }
 
 /// A resolved approval decision for a single pending tool call.

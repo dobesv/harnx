@@ -93,6 +93,7 @@ fn context(
     ToolEvalContext {
         work_boundary: None,
         instance_id: scope,
+        tool_round: None,
         render: Some(ToolEvalRenderContext {
             decl_map: Arc::new(decls),
         }),
