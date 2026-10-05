@@ -6,6 +6,6 @@ overrides:
   '@ag-ui/client': 1.0.1
   # Keep core and store synchronized with @assistant-ui/react to avoid type skew
   # (react 0.15.21 requires core ^0.3.20, store ^0.3.14)
-  '@assistant-ui/core': 0.3.21
-  '@assistant-ui/store': 0.3.15
-  assistant-stream: 0.3.45
+  '@assistant-ui/core': 0.3.22
+  '@assistant-ui/store': 0.3.16
+  assistant-stream: 0.3.46
