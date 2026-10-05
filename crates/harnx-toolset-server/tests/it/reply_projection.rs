@@ -10,7 +10,7 @@ async fn first_reply_wins_and_later_replies_are_dropped() {
     let (_server, journal) = common::journal().await; // spawns nats-server, ensures the journal bucket
     let request: ToolRequest = common::request("sess-1", "call-1");
     journal
-        .record(&request, ("echo", "scope", "srv"), 1)
+        .record(&request, ("echo", "scope", "srv"))
         .await
         .unwrap();
     let first = ToolReply {
@@ -46,14 +46,14 @@ async fn find_rejects_two_rows_answering_the_same_round_and_call() {
     let (_server, journal) = common::journal().await;
     // Two dispatch attempts, keyed by their own wire ids, but both naming the
     // same transcript call — `common::request` always names it "model-call".
-    let first = common::request("sess-ambiguous", "wire-1");
-    let second = common::request("sess-ambiguous", "wire-2");
+    let first = common::request_in_round("sess-ambiguous", "wire-1", 1);
+    let second = common::request_in_round("sess-ambiguous", "wire-2", 1);
     journal
-        .record(&first, ("echo", "scope", "srv-1"), 1)
+        .record(&first, ("echo", "scope", "srv-1"))
         .await
         .unwrap();
     journal
-        .record(&second, ("echo", "scope", "srv-2"), 1)
+        .record(&second, ("echo", "scope", "srv-2"))
         .await
         .unwrap();
 
@@ -67,9 +67,10 @@ async fn find_rejects_two_rows_answering_the_same_round_and_call() {
     );
 }
 
-/// A row is read only by its own key. A cancel names its call by session and
-/// call id, so a call id that matched some other call's row would have the
-/// cancel act on that call's checkpoint.
+/// A cancel names its call by session and call id, so a call id that matched
+/// some other call's row would have the cancel act on that call's checkpoint.
+/// Ids are escaped into literal subject tokens, so wildcard characters in one
+/// name no row at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wildcard_call_id_reads_no_other_calls_row() {
     let (_server, journal) = common::journal().await;
@@ -77,14 +78,13 @@ async fn a_wildcard_call_id_reads_no_other_calls_row() {
         .record(
             &common::request("sess-wildcard", "job.1"),
             ("echo", "scope", "srv"),
-            1,
         )
         .await
         .unwrap();
 
     for call_id in ["job.*", "job.>"] {
         let read = journal.recorded("sess-wildcard", call_id).await;
-        assert!(read.is_err(), "call id {call_id} read {read:?}");
+        assert!(matches!(read, Ok(None)), "call id {call_id} read {read:?}");
     }
 }
 
@@ -103,7 +103,7 @@ async fn a_key_the_server_marked_removed_reads_as_missing() -> Result<()> {
     async_nats::jetstream::new(client)
         .publish_with_headers(
             format!(
-                "$KV.{}.sessions/sess-marker/expired-call",
+                "$KV.{}.sessions.sess-marker.1.model-call.expired-call",
                 harnx_toolset_server::invocation_journal::BUCKET
             ),
             marker,
@@ -121,9 +121,9 @@ async fn a_key_the_server_marked_removed_reads_as_missing() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_listings_skip_a_corrupt_row_and_still_return_the_rest() {
     let (server, journal) = common::journal().await;
-    let good = common::request("sess-corrupt", "wire-good");
+    let good = common::request_in_round("sess-corrupt", "wire-good", 1);
     journal
-        .record(&good, ("echo", "scope", "srv-good"), 1)
+        .record(&good, ("echo", "scope", "srv-good"))
         .await
         .unwrap();
 
@@ -141,7 +141,10 @@ async fn session_listings_skip_a_corrupt_row_and_still_return_the_rest() {
         .await
         .unwrap();
     store
-        .put("sessions/sess-corrupt/wire-bad", "not json".into())
+        .put(
+            "sessions.sess-corrupt.1.model-call.wire-bad",
+            "not json".into(),
+        )
         .await
         .unwrap();
 

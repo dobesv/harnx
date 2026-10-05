@@ -73,6 +73,7 @@ fn request(call_id: &str, supports_progress: bool) -> ToolRequest {
         } else {
             BTreeSet::new()
         },
+        tool_round: None,
     }
 }
 

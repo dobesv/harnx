@@ -44,7 +44,7 @@ async fn invoke_claimed(
         .as_ref()
         .map(ProgressPublisher::handle)
         .unwrap_or_default();
-    let invocation = invocation(request, &recovery, &execution, &cancel, progress_handle);
+    let invocation = invocation(request, &recovery, &cancel, progress_handle);
     let toolset = context.toolset.clone();
     let in_flight = context.in_flight.clone();
     let call_id = request.call_id.clone();
@@ -164,18 +164,13 @@ fn build_invocation(
 fn invocation(
     request: &ToolRequest,
     recovery: &recovery::InvocationRecovery,
-    execution: &execution::InvocationExecution,
     cancel: &CancellationToken,
     progress: harnx_toolset::ToolProgressHandle,
 ) -> ToolInvocation {
     let mut context = invocation_context(
         request,
         recovery.checkpoint(),
-        JournalCheckpointStore {
-            journal: recovery.journal(),
-            session: execution.session_id.clone(),
-            call_id: request.call_id.clone(),
-        },
+        recovery.journal().checkpoint_store(request),
         progress,
     );
     context.partial_result_store = Some(Arc::new(recovery.journal().partial_result_store(request)));
@@ -192,18 +187,10 @@ pub(super) fn orphan_invocation(
     request: &ToolRequest,
     checkpoint: Option<Value>,
 ) -> ToolInvocation {
-    let session = request
-        .parent_session_id
-        .clone()
-        .unwrap_or_else(|| request.call_id.clone());
     let invocation_context = invocation_context(
         request,
         checkpoint,
-        JournalCheckpointStore {
-            journal: context.journal.clone(),
-            session,
-            call_id: request.call_id.clone(),
-        },
+        context.journal.checkpoint_store(request),
         Default::default(),
     );
     let cancel = CancellationToken::new();

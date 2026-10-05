@@ -11,8 +11,12 @@ pub(in crate::nats_worker) async fn recover_completed_before_deadline(
 ) -> Result<()> {
     let entries = backend.load_events_latest_async().await?;
     let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
+    let orphans = find_orphan_tool_calls(&effective);
+    if orphans.is_empty() {
+        return Ok(());
+    }
     let journal = InvocationJournal::ensure(js, replicas).await?;
-    for orphan in find_orphan_tool_calls(&effective) {
+    for orphan in orphans {
         let mut results = Vec::new();
         let mut complete = true;
         for call in &orphan.calls {
@@ -21,18 +25,9 @@ pub(in crate::nats_worker) async fn recover_completed_before_deadline(
                 None => None,
             };
             let saved = match record {
-                Some(record) => {
-                    let reply = match journal.completed_reply(&record.request).await? {
-                        Some(reply) => Some(reply),
-                        None => match recover_child_reply(&record, config).await? {
-                            Some(reply) => Some(journal.complete(&record.request, reply).await?),
-                            None => None,
-                        },
-                    };
-                    reply.map(|reply| {
-                        super::super::wind_up::tool_output_from_reply(call, &record, reply)
-                    })
-                }
+                Some(record) => saved_reply(&journal, &record, config).await?.map(|reply| {
+                    super::super::wind_up::tool_output_from_reply(call, &record, reply)
+                }),
                 None => None,
             };
             match saved {
@@ -58,6 +53,22 @@ pub(in crate::nats_worker) async fn recover_completed_before_deadline(
         }
     }
     Ok(())
+}
+
+/// The reply the journal saved for `record`'s call, or one recovered from the
+/// child session a sub-agent call left behind, which is saved now.
+async fn saved_reply(
+    journal: &InvocationJournal,
+    record: &harnx_toolset_server::invocation_journal::RecordedInvocation,
+    config: &GlobalConfig,
+) -> Result<Option<harnx_toolset::ToolReply>> {
+    if let Some(reply) = journal.completed_reply(&record.request).await? {
+        return Ok(Some(reply));
+    }
+    match recover_child_reply(record, config).await? {
+        Some(reply) => Ok(Some(journal.complete(&record.request, reply).await?)),
+        None => Ok(None),
+    }
 }
 
 async fn recover_child_reply(
@@ -108,3 +119,7 @@ async fn recover_child_reply(
         ),
     }))
 }
+
+#[cfg(test)]
+#[path = "deadline_recovery_tests.rs"]
+mod tests;

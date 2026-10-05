@@ -1,6 +1,7 @@
 use crate::common;
 use anyhow::{Context, Result};
 use common::{request_headers, wait_for_registration, TestHarness};
+use harnx_toolset::CheckpointStore;
 use harnx_toolset::{
     CancelAcceptance, CancellationAcknowledgement, ControlMessage, ToolReply, TOOL_PROTOCOL_VERSION,
 };
@@ -141,15 +142,12 @@ async fn orphan_cancel_delivers_checkpoint_to_toolset_after_caller_restart() {
     let (server, client, journal) = common::serve(Remote { seen: seen.clone() }).await;
     let request = common::request("sess-1", "call-9");
     journal
-        .record(&request, ("start", "scope", server.identity()), 1)
+        .record(&request, ("start", "scope", server.identity()))
         .await
         .unwrap();
     journal
-        .checkpoint(
-            "sess-1",
-            "call-9",
-            serde_json::json!({"remote_session": "r-1"}),
-        )
+        .checkpoint_store(&request)
+        .checkpoint(serde_json::json!({"remote_session": "r-1"}))
         .await
         .unwrap();
     let ack = harnx_toolset_server::cancellation_client::request_cancellation(
