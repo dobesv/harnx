@@ -179,8 +179,8 @@ importers:
         specifier: 0.15.23
         version: 0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       '@assistant-ui/react-ag-ui':
-        specifier: 0.0.62
-        version: 0.0.62(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(assistant-cloud@0.2.4)(react@19.3.0)(zod@4.6.5)
+        specifier: 0.0.63
+        version: 0.0.63(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(assistant-cloud@0.2.4)(react@19.3.0)(zod@4.6.5)
       '@assistant-ui/react-markdown':
         specifier: 0.14.17
         version: 0.14.17(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -304,8 +304,8 @@ packages:
       react:
         optional: true
 
-  '@assistant-ui/react-ag-ui@0.0.62':
-    resolution: {integrity: sha512-WPfspiIiEr5jY7pAOashoePqDT4wncqUoWSYA3OtMEW3rhrmQpsCaPfAjjL4cSyJSzj1k2bIKmm9V6WAObIBPg==}
+  '@assistant-ui/react-ag-ui@0.0.63':
+    resolution: {integrity: sha512-8W0P3Eqy5zNdXcYa/hBQj7omH6RHgttATN8QtgYz+zUc3aGxh5pmZXNIW+K6+fwp0DuOzkOfebkqueiIvwclSw==}
     peerDependencies:
       '@types/react': '*'
       react: ^18 || ^19
@@ -313,8 +313,8 @@ packages:
       '@types/react':
         optional: true
 
-  '@assistant-ui/react-generative-ui@0.0.21':
-    resolution: {integrity: sha512-Ayy/uAdStiYe2CunXBGlLmGr0c0im9Bx3ShXLdfOfk75Uv4ZFg7+9xr1UJYLB0Lhm0+iNDbJbtiiZLH4qY5A9g==}
+  '@assistant-ui/react-generative-ui@0.0.22':
+    resolution: {integrity: sha512-FW9TSjzKb7e3g6udnuJixXZpgboI+dlrDsqy8BsQAHnscjBujbVCEg3NAQUaHcPW59ahhuRfWykDFTyAlz0w7g==}
     peerDependencies:
       '@assistant-ui/react': ^0.15.0
       '@types/react': '*'
@@ -1731,23 +1731,6 @@ packages:
     resolution: {integrity: sha512-Izi8RQcffqCeNVgFigKli1ssklIbpHnCYc6AknXGYoB6grJqyeby7jv12JUQgmTAnIDnbck1uxksT4dzN3PWBA==}
     engines: {node: '>=12'}
 
-  assistant-cloud@0.2.3:
-    resolution: {integrity: sha512-ufe78jldgmQ6XcKJUWLh0978u4WBN7N23IAzBV4hvyLnhSNUHEotlIr3/HKl3GjhJ1VK4+/aMmAtYPAq59DKfQ==}
-    peerDependencies:
-      '@opentelemetry/api': ^1.9.0
-      '@opentelemetry/exporter-trace-otlp-http': '>=0.200.0'
-      '@opentelemetry/sdk-trace-base': ^2.1.0
-      ai: ^6.0.0 || ^7.0.0
-    peerDependenciesMeta:
-      '@opentelemetry/api':
-        optional: true
-      '@opentelemetry/exporter-trace-otlp-http':
-        optional: true
-      '@opentelemetry/sdk-trace-base':
-        optional: true
-      ai:
-        optional: true
-
   assistant-cloud@0.2.4:
     resolution: {integrity: sha512-XxX4WCGs8/0rGuYmpBo2PUMhRzy8wXrXRCtMyB99XmwiX+rxtSl80h5V7evS/V4zkhrU447TWkTFTeqRBT2wvg==}
     peerDependencies:
@@ -2891,11 +2874,11 @@ snapshots:
       - ioredis
       - redis
 
-  '@assistant-ui/react-ag-ui@0.0.62(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(assistant-cloud@0.2.4)(react@19.3.0)(zod@4.6.5)':
+  '@assistant-ui/react-ag-ui@0.0.63(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(assistant-cloud@0.2.4)(react@19.3.0)(zod@4.6.5)':
     dependencies:
       '@ag-ui/client': 1.0.1
       '@assistant-ui/core': 0.3.22(@assistant-ui/store@0.3.16(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0))(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(assistant-cloud@0.2.4)(react@19.3.0)
-      '@assistant-ui/react-generative-ui': 0.0.21(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)(zod@4.6.5)
+      '@assistant-ui/react-generative-ui': 0.0.22(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)(zod@4.6.5)
       '@assistant-ui/store': 0.3.16(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
       assistant-stream: 0.3.46
       fast-json-patch: 3.1.1
@@ -2910,7 +2893,7 @@ snapshots:
       - redis
       - zod
 
-  '@assistant-ui/react-generative-ui@0.0.21(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)(zod@4.6.5)':
+  '@assistant-ui/react-generative-ui@0.0.22(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)(zod@4.6.5)':
     dependencies:
       '@assistant-ui/react': 0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       '@types/json-schema': 7.0.15
@@ -4164,13 +4147,6 @@ snapshots:
   aria-query@5.3.2: {}
 
   assertion-error@2.0.1: {}
-
-  assistant-cloud@0.2.3:
-    dependencies:
-      assistant-stream: 0.3.46
-    transitivePeerDependencies:
-      - ioredis
-      - redis
 
   assistant-cloud@0.2.4:
     dependencies:
