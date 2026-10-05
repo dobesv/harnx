@@ -335,29 +335,42 @@ fn selector_could_match_server_sanitizes_remote_ref_selector_forward() {
 }
 
 #[test]
-fn session_history_tool_declaration_is_gated_by_use_tools() {
+fn builtin_tool_declarations_are_gated_by_use_tools() {
     let config = Config::default();
-    let history_name = crate::session_history::TOOL_NAME;
+    let builtins = [
+        crate::session_history::TOOL_NAME,
+        crate::session_meta_tool::READ_TOOL_NAME,
+        crate::session_meta_tool::WRITE_TOOL_NAME,
+    ];
+    let declared = |selectors: &str| -> Vec<String> {
+        config
+            .tool_declarations_for_use_tools(Some(selectors), None)
+            .0
+            .into_iter()
+            .map(|declaration| declaration.name)
+            .filter(|name| builtins.contains(&name.as_str()))
+            .collect()
+    };
 
-    let selected = config
-        .tool_declarations_for_use_tools(Some(history_name), None)
-        .0;
+    for name in builtins {
+        assert_eq!(
+            declared(name),
+            [name],
+            "selecting {name} must declare it and no other built-in tool"
+        );
+        assert_eq!(
+            declared(&format!("fs_read, {name}")),
+            [name],
+            "{name} must be found among other selectors"
+        );
+    }
     assert!(
-        selected.iter().any(|d| d.name == history_name),
-        "explicitly selecting the tool should include its declaration"
+        declared("some_unrelated_tool").is_empty(),
+        "an unrelated selector must not declare built-in tools"
     );
-
-    let unrelated = config
-        .tool_declarations_for_use_tools(Some("some_unrelated_tool"), None)
-        .0;
-    assert!(
-        !unrelated.iter().any(|d| d.name == history_name),
-        "an unrelated selector must not include the session-history declaration"
-    );
-
-    let wildcard = config.tool_declarations_for_use_tools(Some("*"), None).0;
-    assert!(
-        wildcard.iter().any(|d| d.name == history_name),
-        "a wildcard selector should include the session-history declaration"
+    assert_eq!(
+        declared("*"),
+        builtins,
+        "a wildcard selector should declare every built-in tool"
     );
 }

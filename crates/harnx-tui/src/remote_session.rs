@@ -111,6 +111,7 @@ async fn target_initializer(
         variables: metadata.variables.clone(),
         overrides: metadata.overrides.clone(),
         tool_context: harnx_runtime::nats_session_metadata::tool_context(&metadata)?,
+        properties: Default::default(),
         parent: metadata.parent.clone(),
     };
     Ok((metadata.session_id, initializer))

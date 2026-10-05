@@ -9,6 +9,7 @@ mod cancellation;
 mod compaction;
 mod handoff;
 mod registry;
+mod web_address;
 
 pub use crate::session_actor_types::*;
 pub use registry::SessionRegistry;
@@ -130,6 +131,7 @@ struct SessionActor {
     /// Lease sample from the last durable read: a worker is running a turn this
     /// server never started.
     worker_active: bool,
+    web_address: web_address::WebAddress,
     actor_config: SessionActorConfig,
 }
 
@@ -197,6 +199,7 @@ fn make_session_actor(
         tx: tx.clone(),
         actor_id,
     };
+    let web_address = web_address::WebAddress::new(&actor_config.base_config);
     let actor = SessionActor {
         key,
         actor_id,
@@ -220,6 +223,7 @@ fn make_session_actor(
         tokens_usage: None,
         session_base: None,
         worker_active: false,
+        web_address,
         actor_config,
     };
     (actor, handle)

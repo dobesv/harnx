@@ -191,6 +191,40 @@ impl<'a> SessionSaveRequest<'a> {
     }
 }
 
+/// A built-in tool's name and the function that declares it.
+type BuiltinTool = (&'static str, fn() -> ToolDeclaration);
+
+/// The built-in tools the runtime answers itself, which an agent gets only by
+/// naming them in `use_tools` or selecting everything with `*`.
+const BUILTIN_TOOLS: [BuiltinTool; 3] = [
+    (
+        crate::session_history::TOOL_NAME,
+        crate::session_history::tool_declaration,
+    ),
+    (
+        crate::session_meta_tool::READ_TOOL_NAME,
+        crate::session_meta_tool::read_tool_declaration,
+    ),
+    (
+        crate::session_meta_tool::WRITE_TOOL_NAME,
+        crate::session_meta_tool::write_tool_declaration,
+    ),
+];
+
+fn builtin_tool_declarations(selectors: &[String]) -> Vec<ToolDeclaration> {
+    let selected = |name: &str| {
+        selectors
+            .iter()
+            .map(|selector| selector.trim())
+            .any(|selector| selector == name || selector == "*")
+    };
+    BUILTIN_TOOLS
+        .iter()
+        .filter(|(name, _)| selected(name))
+        .map(|(_, declaration)| declaration())
+        .collect()
+}
+
 /// Compile a `use_tools` entry for matching against tool names, with `*`
 /// stopping at `/`. A malformed glob matches nothing (graceful degradation).
 fn tool_name_selector(selector: &str) -> ToolSelector {
@@ -1167,12 +1201,7 @@ impl Config {
                 self.filtered_handoff_declarations(&selectors, active_pkg);
             declarations.extend(filtered_handoff_declarations);
             handoff_targets.extend(filtered_handoff_targets);
-            if selectors.iter().any(|v| {
-                let v = v.trim();
-                v == crate::session_history::TOOL_NAME || v == "*"
-            }) {
-                declarations.push(crate::session_history::tool_declaration());
-            }
+            declarations.extend(builtin_tool_declarations(&selectors));
         }
 
         let mut seen = HashSet::new();

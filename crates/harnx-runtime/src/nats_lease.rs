@@ -203,6 +203,9 @@ impl NatsSessionLease {
         }
     }
 
+    /// The lease's current KV revision, which durable writes are fenced on.
+    /// Every renewal rewrites the lease and raises it, so compare against the
+    /// token a write actually carried rather than one read afterwards.
     pub fn fence_token(&self) -> u64 {
         self.state.fence_token.load(Ordering::SeqCst)
     }

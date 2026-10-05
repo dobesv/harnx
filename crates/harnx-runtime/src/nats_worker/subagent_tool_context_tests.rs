@@ -5,7 +5,7 @@ use super::tests::{
 };
 use crate::nats_session::test_support::InheritedTestTool;
 use crate::nats_session_log::NatsSessionLog;
-use crate::nats_session_metadata::{SessionMetadataStore, ToolContextEntry};
+use crate::nats_session_metadata::{session_properties, SessionMetadataStore, ToolContextEntry};
 use crate::{NatsSession, NatsSessionConfig, SessionActivationRoute, SessionInitializer};
 use harnx_toolset::{ToolInvocation, ToolInvocationContext, Toolset};
 use serde_json::json;
@@ -81,6 +81,17 @@ async fn create_bound_parent(url: &str) -> ParentBinding {
         )
         .await
         .unwrap();
+    let properties = serde_json::from_value(json!({"set": [
+        {"name": "github_issue", "value": 2296},
+        {"name": "web_session_url", "value": "https://harnx.example/agents/metis/sessions/parent"},
+        {"name": "customer", "value": "acme", "inherit": true},
+        {"name": "scratch", "value": "parent only"},
+    ]}))
+    .unwrap();
+    metadata
+        .update_session_properties(session.storage_key(), &properties, None)
+        .await
+        .unwrap();
     ParentBinding {
         session_id: session.storage_key().to_string(),
         metadata,
@@ -107,17 +118,20 @@ async fn create_inheriting_child(toolset: &SubagentToolset, parent_session_id: &
 }
 
 async fn assert_inherited_context(metadata: &SessionMetadataStore, session_id: &str) {
-    let context = metadata
-        .get_tool_context(&harnx_core::session_identity::session_key(
-            Some("metis"),
-            session_id,
-        ))
-        .await
-        .unwrap()
-        .unwrap();
+    let key = harnx_core::session_identity::session_key(Some("metis"), session_id);
+    let context = metadata.get_tool_context(&key).await.unwrap().unwrap();
     assert_eq!(
         context.values.get("sandbox"),
         Some(&json!({"version": 1, "sandbox_id": "sandbox-inherited"}))
+    );
+    // Only the properties the parent marked inherit carry over.
+    let child = metadata.get(&key).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(session_properties(&child.metadata).unwrap()).unwrap(),
+        json!({
+            "github_issue": {"value": 2296, "inherit": true},
+            "customer": {"value": "acme", "inherit": true},
+        })
     );
 }
 

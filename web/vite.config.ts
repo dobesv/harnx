@@ -20,6 +20,9 @@ export default defineConfig({
       '/v1': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
+        // Forward the browser's host so harnx-serve records session Web UI
+        // addresses on this dev server rather than on its own port.
+        xfwd: true,
         // Ensure SSE (Server-Sent Events) streaming works without buffering
         configure: (proxy, _options) => {
           proxy.on('proxyReq', (proxyReq, req, _res) => {

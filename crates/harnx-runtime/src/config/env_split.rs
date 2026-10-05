@@ -135,9 +135,7 @@ impl Config {
                 self.theme = Some(theme);
             }
         }
-        if let Some(v) = read_env_value::<String>(&get_env_name("serve_addr")) {
-            self.serve_addr = v;
-        }
+        self.load_serve_envs();
         if let Some(v) = read_env_value::<String>(&get_env_name("user_agent")) {
             self.user_agent = v;
         }
@@ -152,6 +150,17 @@ impl Config {
             self.sync_models_url = v;
         }
         self.data.validate().map_err(anyhow::Error::msg)
+    }
+
+    /// harnx-serve's listen address and public URL, outside `load_envs` for
+    /// the same reason as [`Self::load_loop_detection_env`].
+    fn load_serve_envs(&mut self) {
+        if let Some(v) = read_env_value::<String>(&get_env_name("serve_addr")) {
+            self.serve_addr = v;
+        }
+        if let Some(v) = read_env_value::<String>(&get_env_name("serve_public_url")) {
+            self.serve_public_url = v;
+        }
     }
 
     /// `HARNX_LOOP_DETECTION` turns the loop guards on or off together. It

@@ -258,6 +258,7 @@ async fn reap_predicate_rejects_buffered_mailbox_commands() {
         tokens_usage: None,
         session_base: None,
         worker_active: false,
+        web_address: Default::default(),
         actor_config: SessionActorConfig {
             base_config: Config::default(),
             call_fn: Some(noop_call_fn()),

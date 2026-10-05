@@ -159,6 +159,13 @@ impl SessionMetadata {
                     .expect("tool context is JSON-serializable"),
             );
         }
+        if !initializer.properties.is_empty() {
+            extensions.insert(
+                super::SESSION_PROPERTIES_NAMESPACE.to_string(),
+                serde_json::to_value(&initializer.properties)
+                    .expect("session properties are JSON-serializable"),
+            );
+        }
         Self {
             schema_version: SESSION_METADATA_SCHEMA_VERSION,
             session_id: session_id.into(),

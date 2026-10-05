@@ -155,6 +155,18 @@ async fn execute(
         if let Some(selectors) = &request.use_tools {
             session.set_use_tools(Some(selectors.clone()));
         }
+        // The session metadata tools reach the session through its sink. A
+        // direct call holds no lease, so it writes unfenced, as a frontend's
+        // dot commands do; nothing on this path appends to the log.
+        let sink: Arc<dyn crate::config::session::SessionAppendSink> = Arc::new(
+            super::NatsSessionLogBackend::new(
+                runtime.jetstream.clone(),
+                request.session_key.clone(),
+                runtime.lease.replicas,
+            )
+            .with_metadata_store(Some(runtime.session_metadata.clone())),
+        );
+        session.runtime = Some(Arc::new(sink));
         config.session = Some(session);
         // Isolate declaration caches too; Config::clone shares its cache Arc.
         config.nats_tool_declarations = Arc::new(parking_lot::RwLock::new(Vec::new()));

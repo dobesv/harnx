@@ -70,7 +70,11 @@ Harnx automatically manages the following JetStream resources:
 - **KV Bucket**: `harnx_sessions` — canonical session state. Each session uses
   `sessions/{storage_key}/meta` for immutable identity plus CAS-updated title,
   variables, overrides, and extensions, and `sessions/{storage_key}/activity`
-  for frequently renewed lifecycle timestamps. No expiry. The
+  for frequently renewed lifecycle timestamps. No expiry. Keys separate their
+  parts with `/`, not `.`, so a whole key is one subject token: a consumer
+  can't select one kind of key, such as every session's `meta`, and NATS never
+  filters on values. Session listings therefore read the whole bucket in one
+  pass (`store/listing.rs`) and filter in memory. The
   `sessions/{storage_key}/read/{viewer}` key
   stores session-level unread state (see [Session Unread State](#session-unread-state)):
   - `viewer="default"` — the only viewer in current use; session-level (global) unread.
@@ -348,6 +352,62 @@ routing state immediately and then diverge independently. Resume operations do
 not overwrite an existing child's context. During a rolling deployment, update
 workers before relying on inheritance; older workers preserve the unknown
 extension but do not copy it into new sub-agent sessions.
+
+### Session properties
+
+The reserved `dev.harnx.session_properties` extension records what a session
+is working on: the user it acts for, the GitHub repository, branch, issue and
+pull request, an external task URL, a working directory, the Web UI address,
+labels, and custom properties agents define. Agents read and change it with
+the `harnx_read_session_meta` and `harnx_write_session_meta` built-in tools
+(see the [Agent Guide](agent-guide.md#session-metadata-tools)).
+
+The extension is one object keyed by property name. Each entry holds the
+value, an `inherit` flag, and a `source` when Harnx recorded the value itself
+rather than an agent or a person supplying it:
+
+```json
+{
+  "github_issue": {"value": 2296, "inherit": true},
+  "web_session_url": {"value": "https://harnx.example.com/agents/pantheon%2Fatlas/sessions/abc123", "inherit": false, "source": "configured"}
+}
+```
+
+Properties live in an extension rather than in typed fields of the metadata
+record because that record denies unknown fields: a field written by a newer
+frontend would stop an older worker from reading the session at all. An older
+Harnx keeps the extension as opaque JSON, and a writer keeps names and entry
+attributes it doesn't know when it rewrites the object, so adding a property
+needs no migration. The well-known properties, their types, inheritance and
+descriptions are one table, `PROPERTY_DEFINITIONS` in
+`crates/harnx-runtime/src/nats_session_metadata/session_properties.rs`; a new
+row there is all a new property needs.
+
+Writes go through the same compare-and-swap loop as other mutable metadata. A
+worker writes under its lease fence, so a worker that lost its session can't
+overwrite the properties its replacement recorded. Generic extension APIs
+cannot replace or delete this namespace, and redacted HTTP session metadata
+returns it unchanged under `extensions`.
+
+When a sub-agent creates a new session, the child starts with the parent's
+properties whose `inherit` flag is set, alongside the tool context. The table
+says which properties are copied by default, which only on request, and which
+never: `web_session_url` names one session's page, so it is never copied,
+even from a record that says otherwise. A parent whose properties can't be
+decoded still delegates; the child starts without them.
+
+harnx-serve records `web_session_url` when it sends a session a prompt. It
+builds the address from `serve_public_url` (`HARNX_SERVE_PUBLIC_URL`, or
+`harnx-serve --public-url`) when that is set, and the entry's `source` is
+then `configured`. Otherwise it infers the address from the prompt's request,
+with `source` `inferred`: the host from `X-Forwarded-Host`, or else `Host`,
+and the scheme from `X-Forwarded-Proto`, or else http. It fills in a missing
+address, and a configured address replaces one Harnx recorded earlier, whether
+inferred or configured differently. It never replaces an address an agent or a
+person set. A client can send the forwarded headers itself when no proxy
+overwrites them, so treat an inferred address as a hint: set the public URL
+when harnx-serve sits behind a proxy, or when clients reach it at an internal
+address.
 
 ## Configuration
 

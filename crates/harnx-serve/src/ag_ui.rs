@@ -1288,30 +1288,50 @@ pub async fn ag_ui_run_with_call_fn(
     agent_ref: &str,
     session: &str,
     req_body: &[u8],
-    call_fn: Option<AgentCallFn>,
+    _call_fn: Option<AgentCallFn>,
 ) -> Result<AppResponse, AgUiError> {
     let (target, _) = crate::resolve_agent_target(base_config, agent_ref).await?;
-    ag_ui_run_for_target_with_call_fn(
+    let request = AgUiRunRequest {
+        target: &target,
+        session,
+        body: req_body,
+        web_base_url: None,
+    };
+    ag_ui_run_for_target(
         base_config,
         registry,
-        &target,
-        session,
-        req_body,
-        call_fn,
+        request,
         crate::serve_shutdown::ServeShutdown::default(),
     )
     .await
 }
 
-pub(crate) async fn ag_ui_run_for_target_with_call_fn(
+/// One AG-UI run request addressed to a session.
+pub(crate) struct AgUiRunRequest<'a> {
+    pub(crate) target: &'a crate::session_actor::ResolvedAgentTarget,
+    pub(crate) session: &'a str,
+    pub(crate) body: &'a [u8],
+    /// The Web UI base inferred from the request; see
+    /// [`SessionPromptOptions::web_base_url`].
+    pub(crate) web_base_url: Option<String>,
+}
+
+impl AgUiRunRequest<'_> {
+    fn prompt_options(&self) -> SessionPromptOptions {
+        SessionPromptOptions {
+            web_base_url: self.web_base_url.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+pub(crate) async fn ag_ui_run_for_target(
     base_config: &Config,
     registry: &SessionRegistry,
-    target: &crate::session_actor::ResolvedAgentTarget,
-    session: &str,
-    req_body: &[u8],
-    _call_fn: Option<AgentCallFn>,
+    request: AgUiRunRequest<'_>,
     shutdown: crate::serve_shutdown::ServeShutdown,
 ) -> Result<AppResponse, AgUiError> {
+    let (target, session, req_body) = (request.target, request.session, request.body);
     let relaxed_run_input: RelaxedRunAgentInput<JsonValue> = serde_json::from_slice(req_body)
         .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI request body: {err}")))?;
     let run_id = relaxed_run_input
@@ -1339,7 +1359,7 @@ pub(crate) async fn ag_ui_run_for_target_with_call_fn(
     let thread_id_text = thread_id.to_string();
 
     if let Some(text) = requested_prompt.as_deref() {
-        let _ = prompt(&handle, text, SessionPromptOptions::default()).await;
+        let _ = prompt(&handle, text, request.prompt_options()).await;
     }
 
     let stream = if let Some(stream) = crate::ag_ui_remote_follow::resolve_event_stream(

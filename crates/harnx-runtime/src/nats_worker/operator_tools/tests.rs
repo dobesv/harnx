@@ -344,7 +344,13 @@ impl LiveOperatorFixture {
                 .iter()
                 .map(|tool| tool["name"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["fixture_delegate", "fixture_echo", "fixture_wait"]
+            [
+                "fixture_delegate",
+                "fixture_echo",
+                "fixture_wait",
+                crate::session_meta_tool::READ_TOOL_NAME,
+                crate::session_meta_tool::WRITE_TOOL_NAME,
+            ]
         );
         let hidden = call(
             client,
@@ -429,6 +435,42 @@ impl LiveOperatorFixture {
         .await;
         assert!(invalid.error.is_some());
         assert_eq!(seen.lock().unwrap().len(), count);
+        Ok(())
+    }
+
+    /// The built-in session metadata tools act on the operator's session
+    /// through the sink the direct-call path attaches.
+    async fn assert_session_meta_tools(&self) -> Result<()> {
+        let Self {
+            client, request, ..
+        } = self;
+        let written = call(
+            client,
+            request,
+            OperatorToolCommand::Call {
+                name: crate::session_meta_tool::WRITE_TOOL_NAME.into(),
+                args_json: r#"{"set":[{"name":"github_issue","value":2296}]}"#.into(),
+            },
+        )
+        .await;
+        assert!(written.error.is_none(), "{written:?}");
+        let read = call(
+            client,
+            request,
+            OperatorToolCommand::Call {
+                name: crate::session_meta_tool::READ_TOOL_NAME.into(),
+                args_json: "{}".into(),
+            },
+        )
+        .await;
+        assert!(read.error.is_none(), "{read:?}");
+        let result: Value = serde_json::from_str(&read.output)?;
+        let view: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap())?;
+        assert_eq!(view["session_id"], "active-operator");
+        assert_eq!(
+            view["properties"],
+            json!({"github_issue": {"value": 2296, "inherit": true}})
+        );
         Ok(())
     }
 
@@ -638,7 +680,7 @@ async fn live_worker_operator_commands_preserve_active_identity_hooks_allowed_to
     };
     let seeded = seed_remote_config(&url);
     let _env = subagent_test_env(&url, &seeded);
-    std::fs::write(seeded.config_dir().join("agents/metis.md"), "---\nmodel: test:test-model\nuse_tools: [fixture_echo, fixture_wait, fixture_delegate]\n---\nfixture agent\n")?;
+    std::fs::write(seeded.config_dir().join("agents/metis.md"), "---\nmodel: test:test-model\nuse_tools: [fixture_echo, fixture_wait, fixture_delegate, harnx_read_session_meta, harnx_write_session_meta]\n---\nfixture agent\n")?;
     let scope = ServerScope::new();
     let _scope = TestEnvGuard::new("HARNX_SERVER_SCOPE", scope.as_str());
     let client = async_nats::connect(&url).await?;
@@ -650,6 +692,7 @@ async fn live_worker_operator_commands_preserve_active_identity_hooks_allowed_to
         .assert_active_handler(seeded.parent_config.clone())
         .await?;
     fixture.assert_root_hook_policy().await?;
+    fixture.assert_session_meta_tools().await?;
     fixture.assert_cancellation().await?;
     assert_eq!(
         fixture.log().load_events_async().await?,

@@ -14,7 +14,7 @@ impl SessionActor {
     }
 
     pub(super) async fn admit_prompt(
-        &self,
+        &mut self,
         text: &str,
         options: &SessionPromptOptions,
     ) -> anyhow::Result<harnx_runtime::nats_session::AppendedPrompt> {
@@ -25,6 +25,8 @@ impl SessionActor {
             session_id: &self.key.session,
         });
         let session = self.control_session().await?;
+        // Before admission, so the turn this prompt starts can already read it.
+        self.record_web_session_url(&session, options).await;
         let session = match options.runtime_parent.as_deref() {
             Some(parent) => session.with_inherited_admission(
                 parent.clone(),

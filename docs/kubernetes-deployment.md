@@ -62,6 +62,8 @@ Harnx automatically creates the required JetStream streams and KV buckets on con
 
 In Kubernetes, pass `--addr 0.0.0.0:8000` so pods and ingress controllers can reach the server (it defaults to `127.0.0.1:8000`).
 
+Set `HARNX_SERVE_PUBLIC_URL` to the address users open the Web UI at, such as `https://harnx.example.com`. harnx-serve records each session's Web UI address so agents can link to it; without this setting it infers the address from each request's `X-Forwarded-Host`, `X-Forwarded-Proto` and `Host` headers, which only works when the ingress forwards the original host. Setting it later corrects the addresses inferred before.
+
 To run `harnx-serve` against your external cluster, set `HARNX_NATS_SERVER=<name>` (e.g. `remote`) and mount `nats_servers/<name>.yaml` into the configuration directory (`HARNX_CONFIG_DIR`). The server reads connection parameters from that file, which can use `${HARNX_NATS_URL}` and `${HARNX_NATS_TOKEN}` expansion.
 
 Setting only `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` on a front-end no longer joins the cluster. When `HARNX_NATS_SERVER` is unset, `harnx-serve` treats sessions as local (`__local__`), ignores operator `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` for its own routing, and self-hosts a local broker instead. In container environments without `nats-server` installed, that startup fails. Even if a local broker binary were present, sessions would stay confined to the pod instead of routing to your shared `harnx-worker` pool.

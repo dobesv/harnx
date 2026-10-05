@@ -203,19 +203,19 @@ impl SubagentToolset {
         }
         if session_id.is_none() {
             if let Some(parent_session_id) = parent_session_id {
-                let tool_context = self
-                    .session_metadata
-                    .get_tool_context(parent_session_id)
-                    .await
-                    .map_err(|error| {
-                        ToolInvokeError::Recoverable(format!(
-                            "load parent session tool context: {error:#}"
-                        ))
-                    })?;
+                let parent =
+                    self.session_metadata
+                        .get(parent_session_id)
+                        .await
+                        .map_err(|error| {
+                            ToolInvokeError::Recoverable(format!(
+                                "load parent session metadata: {error:#}"
+                            ))
+                        })?;
                 // Older sessions and direct Toolset callers may have no metadata record.
                 // Treat that as an empty context so delegation remains rollout-compatible.
-                if let Some(tool_context) = tool_context {
-                    config.initializer = config.initializer.with_tool_context(tool_context);
+                if let Some(parent) = parent {
+                    config.initializer = inherit_from_parent(config.initializer, &parent.metadata)?;
                 }
             }
         }
@@ -534,6 +534,31 @@ fn require_response(result: &NatsTurnResult) -> Result<&str, ToolInvokeError> {
             &result.session_id,
         ))
     })
+}
+
+/// Start a child with its parent's complete tool context and the properties
+/// the parent marked inherit. Properties are descriptive, so a parent whose
+/// properties can't be decoded still delegates; the child just starts
+/// without them.
+fn inherit_from_parent(
+    initializer: crate::SessionInitializer,
+    parent: &crate::nats_session_metadata::SessionMetadata,
+) -> Result<crate::SessionInitializer, ToolInvokeError> {
+    let tool_context = crate::nats_session_metadata::tool_context(parent).map_err(|error| {
+        ToolInvokeError::Recoverable(format!("load parent session tool context: {error:#}"))
+    })?;
+    let properties = crate::nats_session_metadata::session_properties(parent)
+        .map(|properties| properties.inherited())
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "sub-agent session starts without inherited properties: parent={} error={error:#}",
+                parent.session_id
+            );
+            Default::default()
+        });
+    Ok(initializer
+        .with_tool_context(tool_context)
+        .with_properties(properties))
 }
 
 fn normalize_session_id(session_id: Option<String>) -> Option<String> {

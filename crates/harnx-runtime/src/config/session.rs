@@ -1,4 +1,5 @@
 use super::session_externalize::{externalize_content, record_externalized};
+pub(crate) use super::session_persistence::active_session_sink;
 #[cfg(test)]
 pub(crate) use super::session_persistence::attach_memory_log;
 pub use super::session_persistence::{

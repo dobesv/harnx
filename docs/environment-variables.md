@@ -29,6 +29,7 @@ Harnx can load environment variables from a `.env` file located in the data dire
 - **HARNX_TERMINAL_STATUS**: Enable/disable terminal status emission via OSC escape codes (boolean). Defaults to `true`. Set to `0` or `false` to disable. Emission is also suppressed when stdout is not a TTY, `TERM=dumb`, or `CI` is set. See [Configuration Guide](configuration-guide.md#terminal-status) for details on terminal support.
 - **HARNX_LOOP_DETECTION**: Enable/disable loop detection (boolean). Defaults to `true`. Set to `0` or `false` to turn off both guards: the one for repeated identical tool calls (`loop_detection.tool_calls`) and the one for repeated output (`loop_detection.output`). It sets the global values, so an agent whose front matter sets either key to `true` keeps that guard on. See [Configuration Guide](configuration-guide.md#loop-detection).
 - **HARNX_SERVE_ADDR**: The address to serve the API on.
+- **HARNX_SERVE_PUBLIC_URL**: The URL a browser uses to reach harnx-serve's Web UI, such as `https://harnx.example.com` (config key `serve_public_url`, flag `harnx-serve --public-url`). harnx-serve records each session's Web UI address from it, replacing addresses it inferred earlier. Unset, the address is inferred from each request's `X-Forwarded-Host`, `X-Forwarded-Proto` and `Host` headers. See [Session properties](nats-ha.md#session-properties).
 - **HARNX_USER_AGENT**: The user agent string for API requests.
 - **HARNX_SAVE_SHELL_HISTORY**: Whether to save shell history (boolean).
 - **HARNX_SYNC_MODELS_URL**: The URL to sync models from.
