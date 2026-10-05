@@ -1161,6 +1161,19 @@ does the same for the session metadata bucket, starting its broker with
 replica answers `STREAM.INFO`, is simulated the same way: `journal_listing.rs`
 maps that request to a responder that answers as such a replica does.
 
+To assert what JetStream work an operation costs, subscribe to the API subject on
+the test broker: requests to `$JS.API.STREAM.CREATE.<stream>` (opening a KV
+bucket) and `$JS.API.STREAM.INFO.<stream>` (a key listing, with its
+`subjects_filter` in the payload) reach an ordinary subscriber in the same
+account. Make a round trip on the subscriber's connection, such as
+`query_account`, after subscribing and again before counting: `flush` only
+writes the client's buffer, so without it the subscription may not be
+registered when the operation starts, and a request may still be on its way.
+A test that subscribed and flushed missed its one listing about once in twenty
+stress runs. `journal_layout.rs` checks each journal lookup lists only its own
+round this way, and `nats_tool_provider/tool_round.rs` that a provider opens
+the journal once.
+
 ## CLI Flag Constraints
 
 The root `Cli.file: Vec<String>` has `#[clap(short, long, global = true, hide = true)]` at

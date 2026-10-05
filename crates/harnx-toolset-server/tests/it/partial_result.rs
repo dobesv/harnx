@@ -12,7 +12,7 @@ async fn the_latest_partial_result_stands_until_the_call_is_answered() {
     let (_server, journal) = common::journal().await;
     let request = common::request("sess-partial", "call-partial");
     journal
-        .record(&request, ("echo", "scope", "srv"), 1)
+        .record(&request, ("echo", "scope", "srv"))
         .await
         .unwrap();
     let store = journal.partial_result_store(&request);
@@ -62,7 +62,7 @@ async fn a_standalone_call_keeps_its_partial_result_on_its_own_row() {
         ..common::request("unused", "standalone-partial")
     };
     journal
-        .record(&request, ("echo", "scope", "srv"), 0)
+        .record(&request, ("echo", "scope", "srv"))
         .await
         .unwrap();
 

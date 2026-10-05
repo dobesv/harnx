@@ -4,25 +4,45 @@ use harnx_core::partial_result::{output_with_partial_result, partial_result_of};
 use harnx_toolset::ReplayAttempt;
 
 impl NatsToolProvider {
+    /// The invocation journal, opened by the first call that needs it and
+    /// kept. Opening sends the server a request to create the bucket, which
+    /// the cluster's meta leader answers, so a provider that opened it per
+    /// call made every call wait on that. Opening also raises the bucket's
+    /// replicas to the configured count when it finds fewer. Discovery builds
+    /// a fresh provider whenever it refreshes, and every tool server keeps
+    /// reconciling the bucket while it runs.
+    pub(super) async fn journal(
+        &self,
+    ) -> anyhow::Result<&harnx_toolset_server::invocation_journal::InvocationJournal> {
+        self.journal
+            .get_or_try_init(|| async {
+                let js = async_nats::jetstream::new(self.client.clone());
+                harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
+                    &js,
+                    self.journal_replicas,
+                )
+                .await
+            })
+            .await
+    }
+
     pub(super) async fn record_invocation(
         &self,
         request: &ToolRequest,
         (tool_name, server): (&str, &str),
-        round: Option<u64>,
     ) -> anyhow::Result<()> {
         if request.parent_session_id.is_none() {
             return Ok(());
         }
-        let js = async_nats::jetstream::new(self.client.clone());
-        // The round is the sequence of the `ToolCalls` entry that made this
-        // call, and it keys the journal row. The dispatcher hands it in: a
-        // fresh round's is the sequence its append returned, and a resumed
-        // round's is the one its orphan detection read. A call dispatched
-        // outside a durable round, such as a direct provider call or a tool
-        // an operator invoked, has none, which is what zero records. Nothing
-        // looks a zero row up by round: only a transcript orphan is replayed
-        // or wound up, and whatever dispatched its calls had the orphan's
-        // `ToolCalls` entry to take the round from.
+        // The request's round is the sequence of the `ToolCalls` entry that
+        // made this call, and it keys the journal row. The dispatcher hands
+        // it in: a fresh round's is the sequence its append returned, and a
+        // resumed round's is the one its orphan detection read. A call
+        // dispatched outside a durable round, such as a direct provider call
+        // or a tool an operator invoked, has none, which is what zero
+        // records. Nothing looks a zero row up by round: only a transcript
+        // orphan is replayed or wound up, and whatever dispatched its calls
+        // had the orphan's `ToolCalls` entry to take the round from.
         //
         // Wind-up and replay look the row up by the sequence they read from
         // the effective log, after `apply_log_mutations`. That agrees with
@@ -31,17 +51,10 @@ impl NatsToolProvider {
         // sequence, because a replacement inherits the `EditEntries`
         // sequence: the row then no longer matches the entry that asks for
         // it, and reads as absent.
-        harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
-            &js,
-            self.journal_replicas,
-        )
-        .await?
-        .record(
-            request,
-            (tool_name, self.instance_id.as_str(), server),
-            round.unwrap_or(0),
-        )
-        .await
+        self.journal()
+            .await?
+            .record(request, (tool_name, self.instance_id.as_str(), server))
+            .await
     }
 
     pub(super) async fn replay_recorded_call(
@@ -58,12 +71,7 @@ impl NatsToolProvider {
         let Some(call_id) = call.id.as_deref() else {
             return Ok(None);
         };
-        let js = async_nats::jetstream::new(self.client.clone());
-        let journal = harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
-            &js,
-            self.journal_replicas,
-        )
-        .await?;
+        let journal = self.journal().await?;
         let Some(record) = journal.find(session, round, call_id).await? else {
             return Ok(None);
         };

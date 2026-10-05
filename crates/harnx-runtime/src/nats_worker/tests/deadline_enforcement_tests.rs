@@ -554,9 +554,36 @@ async fn expired_queued_admission_stops_before_model_dispatch_on_first_claim() {
     daemon.abort();
 }
 
+/// Journal `request` as a tool server that has since retired ran it: the
+/// sub-agent call recorded the checkpoint naming its `child` session, and
+/// never replied.
+async fn journal_retired_delegation(
+    journal: &harnx_toolset_server::invocation_journal::InvocationJournal,
+    request: &harnx_toolset::ToolRequest,
+    child: &NatsSession,
+) {
+    use harnx_toolset::CheckpointStore;
+    journal
+        .record(
+            request,
+            ("retired_session_prompt", "retired-scope", "retired-server"),
+        )
+        .await
+        .unwrap();
+    let checkpoint = json!({
+        "session_id": child.session_id(),
+        "storage_key": child.storage_key(),
+        "cluster": "local",
+    });
+    journal
+        .checkpoint_store(request)
+        .checkpoint(checkpoint)
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_worker_replay_recovers_completed_child_without_live_tool_server_or_redispatch() {
-    use harnx_toolset::CheckpointStore;
     let _env_guard = env_lock().await;
     let Some((url, _nats, _dir)) = spawn_test_nats().await else {
         return;
@@ -666,20 +693,13 @@ async fn expired_worker_replay_recovers_completed_child_without_live_tool_server
         parent_local_session_id: Some(root.session_id().into()),
         tool_call_id: Some("completed-call".into()),
         capabilities: Default::default(),
+        tool_round: Some(round),
     };
     let journal =
         harnx_toolset_server::invocation_journal::InvocationJournal::ensure(root.jetstream(), 1)
             .await
             .unwrap();
-    journal
-        .record(
-            &request,
-            ("retired_session_prompt", "retired-scope", "retired-server"),
-            round,
-        )
-        .await
-        .unwrap();
-    harnx_toolset_server::invocation_journal::JournalCheckpointStore { journal: journal.clone(), session: root.storage_key().into(), call_id: request.call_id.clone() }.checkpoint(json!({"session_id": child.session_id(), "storage_key": child.storage_key(), "cluster": "local"})).await.unwrap();
+    journal_retired_delegation(&journal, &request, &child).await;
     assert!(journal.completed_reply(&request).await.unwrap().is_none());
     let calls = Arc::new(AtomicUsize::new(0));
     let call_fn: crate::agent_loop::AgentCallFn = {

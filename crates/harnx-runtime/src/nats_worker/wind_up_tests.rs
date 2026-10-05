@@ -157,6 +157,7 @@ impl InterruptedTurn {
             parent_local_session_id: None,
             tool_call_id: Some(call_id.into()),
             capabilities: Default::default(),
+            tool_round: Some(self.round),
         }
     }
 
@@ -164,11 +165,7 @@ impl InterruptedTurn {
     /// turn's own round.
     async fn dispatched(&self, request: &ToolRequest, owner: &str) {
         self.journal
-            .record(
-                request,
-                ("probe", journal_scope().as_str(), owner),
-                self.round,
-            )
+            .record(request, ("probe", journal_scope().as_str(), owner))
             .await
             .unwrap();
     }

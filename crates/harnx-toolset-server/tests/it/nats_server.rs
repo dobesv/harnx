@@ -30,6 +30,7 @@ fn make_test_tool_request(name: &str, call_id: &str, args: serde_json::Value) ->
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     }
 }
 
@@ -57,6 +58,7 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     };
     for _ in 0..2 {
         let message = harness
@@ -93,6 +95,7 @@ async fn assert_invocation_context(harness: &TestHarness) -> Result<()> {
         parent_local_session_id: Some("armDRA".to_string()),
         tool_call_id: None,
         capabilities: BTreeSet::from(["example-capability".to_string()]),
+        tool_round: None,
     };
     harness
         .client
@@ -167,6 +170,7 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: BTreeSet::from([EXECUTION_CONTEXT_NAMESPACE.to_string()]),
+        tool_round: None,
     };
     let message = harness
         .client
@@ -194,6 +198,7 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: BTreeSet::new(),
+        tool_round: None,
     };
     let message = harness
         .client
@@ -227,6 +232,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     };
     let second = ToolRequest {
         run_context: None,
@@ -240,6 +246,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     };
     let first_call = harness.client.request_with_headers(
         harness.echo_subject(),
@@ -314,6 +321,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     };
     request_early_failure(
         harness,
@@ -334,6 +342,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     };
     let mut headers = async_nats::HeaderMap::new();
     headers.insert(harnx_toolset::HDR_CALL_ID, missing_key.call_id.as_str());
@@ -359,6 +368,7 @@ async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     };
     let slow_request = harness.client.request_with_headers(
         harness.instance_id.tool_subject("____test", "slow"),
@@ -609,6 +619,7 @@ async fn shutdown_drains_in_flight_requests_before_deregistering() -> Result<()>
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     };
     let delayed_request = harness.client.request_with_headers(
         harness.instance_id.tool_subject("____test", "echo"),

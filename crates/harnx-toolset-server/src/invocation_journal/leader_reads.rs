@@ -35,17 +35,28 @@ impl InvocationJournal {
             .filter(|entry| entry.operation == kv::Operation::Put))
     }
 
-    /// Every key `session` has a row under, including rows already purged.
-    pub(super) async fn session_keys(&self, session: &str) -> Result<Vec<String>> {
+    /// The latest revision of the one key `pattern` matches, or `None` once
+    /// it has been deleted or purged. Each `*` token in the pattern matches
+    /// any one token of a key.
+    pub(super) async fn live_entry_matching(&self, pattern: &str) -> Result<Option<kv::Entry>> {
+        let entry = leader_reads::entry_matching(&self.0, pattern)
+            .await
+            .with_context(|| format!("read tool invocation journal key {pattern}"))?;
+        Ok(entry.filter(|entry| entry.operation == kv::Operation::Put))
+    }
+
+    /// Every key `pattern` matches, including keys already purged. A `*`
+    /// token matches any one token of a key, and a final `>` any number.
+    pub(super) async fn keys(&self, pattern: &str) -> Result<Vec<String>> {
         let prefix = self.0.prefix.as_str();
-        let session_prefix = format!("sessions/{session}/");
+        let filter = format!("{prefix}{pattern}");
         // Pages are sorted by subject, so a key created between two page
         // requests shifts the next page and lists one key twice.
         let mut keys = BTreeSet::new();
         let mut offset = 0;
         loop {
             let page = self
-                .subject_page(offset)
+                .subject_page(&filter, offset)
                 .await
                 .context("list tool invocation journal keys")?;
             ensure!(
@@ -55,20 +66,21 @@ impl InvocationJournal {
             let subjects = page.state.subjects.unwrap_or_default();
             offset += subjects.len();
             let listed_all = subjects.is_empty() || offset >= page.total;
-            keys.extend(subjects.into_keys().filter_map(|subject| {
-                let key = subject.strip_prefix(prefix)?;
-                key.starts_with(&session_prefix).then(|| key.to_owned())
-            }));
+            keys.extend(
+                subjects
+                    .into_keys()
+                    .filter_map(|subject| subject.strip_prefix(prefix).map(str::to_owned)),
+            );
             if listed_all {
                 return Ok(keys.into_iter().collect());
             }
         }
     }
 
-    async fn subject_page(&self, offset: usize) -> Result<SubjectPage> {
+    async fn subject_page(&self, filter: &str, offset: usize) -> Result<SubjectPage> {
         let Self(store, js) = self;
         let request = serde_json::json!({
-            "subjects_filter": format!("{}>", store.prefix),
+            "subjects_filter": filter,
             "offset": offset,
         });
         match js

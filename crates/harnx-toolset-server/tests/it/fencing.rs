@@ -31,7 +31,7 @@ impl Fixture {
         request.args = args;
         let journal = InvocationJournal::ensure(&js, 1).await?;
         journal
-            .record(&request, ("test_echo", "scope", "____test"), 1)
+            .record(&request, ("test_echo", "scope", "____test"))
             .await?;
         Ok(Self {
             harness,

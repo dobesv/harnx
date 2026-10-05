@@ -78,9 +78,9 @@ async fn a_listing_without_a_stream_leader_is_refused() -> Result<()> {
     });
     client.flush().await?;
     let journal = InvocationJournal::ensure(&async_nats::jetstream::new(client), 1).await?;
-    let request = common::request("lagging-parent", "journaled-call");
+    let request = common::request_in_round("lagging-parent", "journaled-call", 4);
     journal
-        .record(&request, ("test_echo", "worker-scope", "____test"), 4)
+        .record(&request, ("test_echo", "worker-scope", "____test"))
         .await?;
 
     let found = journal.find("lagging-parent", 4, "model-call").await;
@@ -100,7 +100,6 @@ async fn a_listing_that_fits_one_page_asks_for_it_once() -> Result<()> {
             .record(
                 &common::request("listed-parent", call_id),
                 ("test_echo", "worker-scope", "____test"),
-                1,
             )
             .await?;
     }
@@ -114,13 +113,14 @@ async fn a_listing_that_fits_one_page_asks_for_it_once() -> Result<()> {
             invocation_journal::BUCKET
         ))
         .await?;
-    client.flush().await?;
+    common::round_trip(&client).await?;
 
     let rows = journal.records_for_session("listed-parent").await?;
 
     assert_eq!(rows.len(), 2);
+    common::round_trip(&client).await?;
     let mut seen = 0;
-    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(500), requests.next()).await
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(100), requests.next()).await
     {
         seen += 1;
     }
