@@ -23,21 +23,31 @@ impl InvocationJournal {
 /// [`harnx_toolset::Toolset::cancel`] can act on it once the invocation that
 /// wrote it is gone.
 pub struct JournalCheckpointStore {
-    pub journal: InvocationJournal,
-    pub session: String,
-    pub call_id: String,
+    journal: InvocationJournal,
+    key: String,
 }
 
 #[async_trait::async_trait]
 impl harnx_toolset::CheckpointStore for JournalCheckpointStore {
+    /// Publish a durable job handle before starting work. Concurrent replay
+    /// observers all receive the first handle; no second job may be started.
     async fn checkpoint(&self, value: serde_json::Value) -> Result<serde_json::Value> {
         self.journal
-            .checkpoint(&self.session, &self.call_id, value)
+            .first_value(self.key.clone(), value, |record| &mut record.checkpoint)
             .await
     }
 }
 
 impl InvocationJournal {
+    /// The store a running call records its checkpoint through, keyed like
+    /// the call's own row.
+    pub fn checkpoint_store(&self, request: &ToolRequest) -> JournalCheckpointStore {
+        JournalCheckpointStore {
+            journal: self.clone(),
+            key: key(request),
+        }
+    }
+
     /// The store a running call records its partial result through. It is
     /// keyed like the call's own row, so a call with no parent session writes
     /// to its standalone row.

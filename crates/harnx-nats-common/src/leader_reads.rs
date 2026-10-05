@@ -34,7 +34,26 @@ pub async fn entry(store: &kv::Store, key: &str) -> Result<Option<kv::Entry>> {
         "invalid key {key} in bucket {}",
         store.name
     );
-    let subject = format!("{}{key}", store.prefix);
+    entry_matching(store, key).await
+}
+
+/// The latest revision, which may be a delete or purge marker, of whichever
+/// key matches `pattern`: a key some of whose dot-separated tokens are `*`,
+/// each standing for any one token. The entry names the key that matched.
+///
+/// The leader answers with the most recently written of every matching key,
+/// so callers use this only where at most one key can match.
+pub async fn entry_matching(store: &kv::Store, pattern: &str) -> Result<Option<kv::Entry>> {
+    // A token that only contains a `*`, or a `>`, would match keys the
+    // caller never meant.
+    ensure!(
+        pattern
+            .split('.')
+            .all(|token| token == "*" || (!token.is_empty() && is_valid_key(token))),
+        "invalid key pattern {pattern} in bucket {}",
+        store.name
+    );
+    let subject = format!("{}{pattern}", store.prefix);
     let message = match store.stream.get_last_raw_message_by_subject(&subject).await {
         Ok(message) => message,
         Err(error) if matches!(error.kind(), LastRawMessageErrorKind::NoMessageFound) => {
@@ -42,12 +61,17 @@ pub async fn entry(store: &kv::Store, key: &str) -> Result<Option<kv::Entry>> {
         }
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("read key {key} from bucket {}", store.name));
+                .with_context(|| format!("read key {pattern} from bucket {}", store.name));
         }
     };
+    let key = message
+        .subject
+        .strip_prefix(store.prefix.as_str())
+        .unwrap_or(pattern)
+        .to_owned();
     Ok(Some(kv::Entry {
         bucket: store.name.clone(),
-        key: key.to_owned(),
+        key,
         operation: operation(&message),
         value: message.payload,
         revision: message.sequence,

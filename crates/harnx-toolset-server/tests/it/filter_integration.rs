@@ -151,6 +151,7 @@ async fn invocation_rejected_for_disabled_tool() -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: Some("model-call".to_string()),
         capabilities: Default::default(),
+        tool_round: None,
     };
 
     let message = harness
@@ -203,6 +204,7 @@ async fn idempotent_cache_does_not_bypass_admission_gate() -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: Some("model-call".to_string()),
         capabilities: Default::default(),
+        tool_round: None,
     };
 
     // Send the same request twice with identical idempotency key
@@ -262,10 +264,11 @@ async fn journal_reply_not_returned_for_disabled_tool() -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: Some("model-call".to_string()),
         capabilities: Default::default(),
+        tool_round: None,
     };
 
     journal
-        .record(&request, ("test_fail", "test-scope", "____test"), 1)
+        .record(&request, ("test_fail", "test-scope", "____test"))
         .await?;
 
     let saved_reply = ToolReply {
@@ -334,6 +337,7 @@ async fn enabled_tool_works_normally_with_durable_replay() -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: Some("model-call".to_string()),
         capabilities: Default::default(),
+        tool_round: None,
     };
 
     // First request should succeed
@@ -404,6 +408,7 @@ async fn admission_gate_rejects_disabled_tool_via_wildcard() -> Result<()> {
         parent_local_session_id: None,
         tool_call_id: Some("model-call".to_string()),
         capabilities: Default::default(),
+        tool_round: None,
     };
 
     let message = harness

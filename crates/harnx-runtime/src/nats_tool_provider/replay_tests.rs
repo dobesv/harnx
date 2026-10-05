@@ -116,10 +116,11 @@ async fn a_saved_failure_rolls_forward_with_its_partial_result() -> anyhow::Resu
         parent_local_session_id: None,
         tool_call_id: Some("failed-call".into()),
         capabilities: Default::default(),
+        tool_round: Some(5),
     };
     let journal = InvocationJournal::ensure(&js, 1).await?;
     journal
-        .record(&request, ("retired_echo", "original-scope", "retired"), 5)
+        .record(&request, ("retired_echo", "original-scope", "retired"))
         .await?;
     journal
         .partial_result_store(&request)
@@ -229,9 +230,9 @@ async fn record_retryable_call(js: &async_nats::jetstream::Context) -> anyhow::R
                 parent_local_session_id: None,
                 tool_call_id: Some("retryable-call".into()),
                 capabilities: Default::default(),
+                tool_round: Some(5),
             },
             ("retryable_echo", "original-scope", "retryable"),
-            5,
         )
         .await
 }
@@ -282,10 +283,11 @@ async fn save_reply(js: &async_nats::jetstream::Context) -> anyhow::Result<()> {
         parent_local_session_id: None,
         tool_call_id: Some("model-call".into()),
         capabilities: Default::default(),
+        tool_round: Some(5),
     };
     let journal = InvocationJournal::ensure(js, 1).await?;
     journal
-        .record(&request, ("retired_echo", "original-scope", "retired"), 5)
+        .record(&request, ("retired_echo", "original-scope", "retired"))
         .await?;
     journal
         .complete(
@@ -327,6 +329,7 @@ async fn saved_reply_provider(client: async_nats::Client) -> anyhow::Result<Nats
         declarations: Vec::new(),
         registry: None,
         journal_replicas: 1,
+        journal: Default::default(),
         progress_dispatcher: ProgressDispatcher::new(subscription),
         in_flight: NatsInFlightCalls::default(),
     })
@@ -384,9 +387,10 @@ async fn the_journal_bucket_takes_the_configured_replica_count() -> anyhow::Resu
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     };
     provider
-        .record_invocation(&request, ("echo", "srv"), None)
+        .record_invocation(&request, ("echo", "srv"))
         .await
         .expect_err("a single-node broker cannot host the three-replica bucket that was asked for");
     let js = async_nats::jetstream::new(provider.client.clone());
@@ -460,13 +464,10 @@ async fn expired_pending_replay_reports_scope_but_completed_reply_still_recovers
                 snapshot: serde_json::to_value(&frozen)?,
                 started_at_ms: original.timestamp_millis().try_into()?,
             }),
+            tool_round: Some(5),
         };
         journal
-            .record(
-                &request,
-                ("retryable_echo", "original-scope", "retryable"),
-                5,
-            )
+            .record(&request, ("retryable_echo", "original-scope", "retryable"))
             .await?;
         let error = provider
             .replay_recorded_call(replay_of(&call), &harnx_core::abort::create_abort_signal())

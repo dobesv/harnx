@@ -763,11 +763,12 @@ async fn check_tool_admission(
 /// has nowhere else to record one, and without a row the call has no durable
 /// place for its checkpoint or its reply.
 ///
-/// A row written here is a direct-client row: it carries `tool_round` 0 and this
-/// server's own scope and identity, because a request that nobody journaled came
-/// from no transcript round. [`invocation_journal::InvocationJournal::find`], which resolves a
-/// worker's `ToolCalls` round back to its invocation, therefore never matches
-/// one — correctly, since these calls are not in any worker's transcript.
+/// A row written here is a direct-client row: it carries this server's own
+/// scope and identity, and the round the request names. A direct client names
+/// none, so the row records round zero, and
+/// [`invocation_journal::InvocationJournal::find`], which resolves a worker's
+/// `ToolCalls` round back to its invocation, never matches it — correctly,
+/// since these calls are not in any worker's transcript.
 async fn prepare(context: &ToolRequestContext, request: &ToolRequest) -> Result<()> {
     if context.journal.get(request).await?.is_some() {
         return Ok(());
@@ -781,7 +782,6 @@ async fn prepare(context: &ToolRequestContext, request: &ToolRequest) -> Result<
                 context.server_scope.as_str(),
                 &context.server_identity,
             ),
-            0,
         )
         .await
 }

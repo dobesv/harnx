@@ -203,6 +203,7 @@ fn tool_request(call_id: &str, tool: &str) -> ToolRequest {
         parent_local_session_id: None,
         tool_call_id: None,
         capabilities: Default::default(),
+        tool_round: None,
     }
 }
 

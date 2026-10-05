@@ -10,6 +10,7 @@ mod completion;
 mod fencing;
 mod filter_integration;
 mod filter_unit;
+mod journal_layout;
 mod journal_listing;
 mod name_unit;
 mod nats_server;

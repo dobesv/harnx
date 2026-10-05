@@ -10,7 +10,7 @@ use crate::common;
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, stream};
 use common::{wait_for_registration, NatsServerHandle, TestHarness, TestToolset};
-use harnx_toolset::{ReplayAttempt, ToolErrorPayload, ToolReply};
+use harnx_toolset::{CheckpointStore, ReplayAttempt, ToolErrorPayload, ToolReply};
 use harnx_toolset_server::invocation_journal::{self, InvocationJournal};
 use serde_json::json;
 use std::sync::atomic::Ordering;
@@ -92,10 +92,9 @@ async fn assert_replica_reads_miss_writes(js: &jetstream::Context) -> Result<()>
 async fn journal_call(
     journal: &InvocationJournal,
     request: &harnx_toolset::ToolRequest,
-    round: u64,
 ) -> Result<()> {
     journal
-        .record(request, ("test_echo", "worker-scope", "____test"), round)
+        .record(request, ("test_echo", "worker-scope", "____test"))
         .await
 }
 
@@ -113,7 +112,7 @@ fn replay_attempt() -> Option<ReplayAttempt> {
 async fn worker_journaled_call_runs_while_replicas_lag() -> Result<()> {
     let (mut harness, journal) = serve(TestToolset::default()).await?;
     let request = common::request("lagging-parent", "worker-call");
-    journal_call(&journal, &request, 3).await?;
+    journal_call(&journal, &request).await?;
 
     let reply = harness.call_tool(&request).await?;
 
@@ -134,7 +133,7 @@ async fn worker_journaled_call_runs_while_replicas_lag() -> Result<()> {
 async fn replay_returns_the_journaled_reply_while_replicas_lag() -> Result<()> {
     let (mut harness, journal) = serve(TestToolset::default()).await?;
     let mut request = common::request("lagging-parent", "answered-call");
-    journal_call(&journal, &request, 7).await?;
+    journal_call(&journal, &request).await?;
     let saved = ToolReply {
         call_id: request.call_id.clone(),
         result: Ok(json!({"saved": true})),
@@ -157,13 +156,10 @@ async fn replay_resumes_the_journaled_checkpoint_while_replicas_lag() -> Result<
     toolset.idempotent = true;
     let (mut harness, journal) = serve(toolset).await?;
     let mut request = common::request("lagging-parent", "checkpointed-call");
-    journal_call(&journal, &request, 9).await?;
+    journal_call(&journal, &request).await?;
     journal
-        .checkpoint(
-            "lagging-parent",
-            &request.call_id,
-            json!({"job": "first-attempt"}),
-        )
+        .checkpoint_store(&request)
+        .checkpoint(json!({"job": "first-attempt"}))
         .await?;
     request.replay = replay_attempt();
 
@@ -186,7 +182,7 @@ async fn partial_result_lands_in_the_workers_row_while_replicas_lag() -> Result<
     let (mut harness, journal) = serve(TestToolset::default()).await?;
     let mut request = common::request("lagging-parent", "partial-call");
     request.args = json!({"partial_result": {"pages": 3}, "error": "quota exhausted"});
-    journal_call(&journal, &request, 6).await?;
+    journal_call(&journal, &request).await?;
 
     let reply = harness.call_tool(&request).await?;
 
@@ -206,11 +202,11 @@ async fn partial_result_lands_in_the_workers_row_while_replicas_lag() -> Result<
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn round_lookups_find_the_workers_rows_while_replicas_lag() -> Result<()> {
     let (_server, journal) = stale_replica_broker().await?;
-    let first = common::request("lagging-parent", "first-call");
-    let mut second = common::request("lagging-parent", "second-call");
+    let first = common::request_in_round("lagging-parent", "first-call", 4);
+    let mut second = common::request_in_round("lagging-parent", "second-call", 5);
     second.tool_call_id = Some("later-model-call".into());
-    journal_call(&journal, &first, 4).await?;
-    journal_call(&journal, &second, 5).await?;
+    journal_call(&journal, &first).await?;
+    journal_call(&journal, &second).await?;
 
     let found = journal.find("lagging-parent", 4, "model-call").await?;
     assert_eq!(found.context("round 4's row")?.request, first);
@@ -231,8 +227,7 @@ async fn deleted_session_takes_no_new_calls_while_replicas_lag() -> Result<()> {
     let (_server, journal) = stale_replica_broker().await?;
     journal_call(
         &journal,
-        &common::request("deleted-parent", "before-deletion"),
-        2,
+        &common::request_in_round("deleted-parent", "before-deletion", 2),
     )
     .await?;
 
@@ -248,7 +243,7 @@ async fn deleted_session_takes_no_new_calls_while_replicas_lag() -> Result<()> {
         .await?
         .is_none());
     let late = common::request("deleted-parent", "after-deletion");
-    let error = journal_call(&journal, &late, 3)
+    let error = journal_call(&journal, &late)
         .await
         .expect_err("a deleted session takes no new calls");
     assert!(error.to_string().contains("deleted"), "{error:#}");

@@ -188,6 +188,7 @@ mod tests {
             parent_local_session_id: None,
             tool_call_id: None,
             capabilities,
+            tool_round: None,
         }
     }
 
