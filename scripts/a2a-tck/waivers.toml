@@ -1,0 +1,83 @@
+# Known failures at a2aproject/a2a-tck@263b9cfaf16a554bdfb166a7ba5b67716e946349.
+# Exact pytest node IDs, including class and JSON-RPC parameter, keep scope narrow.
+# Remove an entry when its test passes; strict xfail makes unexpected passes fail CI.
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_artifacts.py::TestTextArtifact::test_task_has_text_artifact[jsonrpc]"
+category = "harness-limitation"
+reason = "The test requires the exact text 'Generated text content' selected by messageId. The real worker uses a deterministic LLM that returns 'Hello world' and does not receive messageId as model input."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_artifacts.py::TestFileArtifact::test_task_has_file_artifact[jsonrpc]"
+category = "harness-limitation"
+reason = "The test selects a raw-file artifact by messageId while sending the same prompt as the other artifact cases. The approved runner maps model output to text artifacts in Tasks, not raw-file artifacts."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_artifacts.py::TestFileUrlArtifact::test_task_has_file_url_artifact[jsonrpc]"
+category = "harness-limitation"
+reason = "The test selects a URL-file artifact by messageId while sending the same prompt as the other artifact cases. The approved runner maps model output to text artifacts in Tasks, not URL-file artifacts."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_artifacts.py::TestDataArtifact::test_task_has_data_artifact[jsonrpc]"
+category = "harness-limitation"
+reason = "The test selects a structured-data artifact by messageId while sending the same prompt as the other artifact cases. The approved runner maps model output to text artifacts in Tasks, not structured-data artifacts."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_artifacts.py::TestMessageResponse::test_returns_message_with_text_part[jsonrpc]"
+category = "harness-limitation"
+reason = "The test selects a direct Message response by messageId while sending the same prompt as the artifact cases. The server returns Tasks with text artifacts and does not switch protocol output types based on messageId."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-SEND-003-jsonrpc]"
+category = "tck-defect"
+reason = "The test omits expected_error, so its validator rejects every error response. The server correctly returns ContentTypeNotSupportedError (-32005) for unsupported raw media."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-001-jsonrpc]"
+category = "design-conflict"
+reason = "The test lists tasks in the client-generated tck-test-context, which the server never allocated. Scoped ListTasks rejects unknown contexts with TaskNotFound rather than creating a session or listing unrelated tasks."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-002-jsonrpc]"
+category = "design-conflict"
+reason = "The pagination test uses the client-generated tck-test-context instead of a returned contextId. Scoped ListTasks rejects that inaccessible context before applying pagination."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-003-jsonrpc]"
+category = "design-conflict"
+reason = "The timestamp-ordering test uses the client-generated tck-test-context instead of a returned contextId. Scoped ListTasks rejects that inaccessible context before listing tasks."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-004-jsonrpc]"
+category = "design-conflict"
+reason = "The final-page token test uses the client-generated tck-test-context instead of a returned contextId. Scoped ListTasks rejects that inaccessible context before applying pagination."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-005-jsonrpc]"
+category = "design-conflict"
+reason = "The projection test uses the client-generated tck-test-context instead of a returned contextId. Scoped ListTasks rejects that inaccessible context before applying history or artifact options."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-EXECUTION-MODE-001-jsonrpc]"
+category = "design-conflict"
+reason = "The test reuses the complete-task messageId from CORE-SEND-001 with different parts. Required message deduplication rejects changed payloads under an existing messageId."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-EXECUTION-MODE-002-jsonrpc]"
+category = "design-conflict"
+reason = "The test reuses the complete-task messageId from CORE-SEND-001 with different parts. Required message deduplication rejects changed payloads under an existing messageId before choosing blocking mode."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-001a-jsonrpc]"
+category = "design-conflict"
+reason = "The test reuses the complete-task messageId from CORE-SEND-001 with different parts. Required message deduplication rejects the changed payload instead of starting another task."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-002a-jsonrpc]"
+category = "tck-defect"
+reason = "The test expects rejection of a client-generated contextId but omits expected_error. Its validator rejects the correct TaskNotFound response before running its custom checks."
+
+[[waiver]]
+test = "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-003-jsonrpc]"
+category = "design-conflict"
+reason = "The test reuses the complete-task messageId from CORE-SEND-001 with different parts. Required message deduplication rejects the changed payload before the terminal-task continuation check."

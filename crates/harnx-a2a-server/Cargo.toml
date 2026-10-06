@@ -1,0 +1,45 @@
+[package]
+name = "harnx-a2a-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A2A server exposing harnx agents over JSON-RPC and SSE"
+
+[dependencies]
+a2a_server_lf = { version = "=0.5.1", package = "a2a-server-lf" }
+a2a_lf = { version = "=0.4.1", package = "a2a-lf" }
+a2a_pb = { version = "=0.3.1", package = "a2a-pb" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+chrono = { workspace = true }
+futures = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+harnx-runtime = { path = "../harnx-runtime" }
+lru = "0.18"
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread", "sync"] }
+tower = { workspace = true, features = ["util"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+process-wrap = { workspace = true, features = ["std"] }
+tokio-util = { workspace = true }
+harnx-healthz = { path = "../harnx-healthz" }
+shell-words = { workspace = true }
+async-nats = { workspace = true }
+http-body-util = { workspace = true }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "harnx-a2a-server"
+path = "src/main.rs"

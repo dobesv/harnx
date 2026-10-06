@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "error": {
+    "code": -32602,
+    "message": "Invalid params",
+    "data": [
+      {
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "domain": "a2a-protocol.org",
+        "reason": "INVALID_PARAMS",
+        "metadata": {
+          "timestamp": "2025-01-15T10:30:00Z"
+        }
+      }
+    ]
+  }
+}

@@ -128,3 +128,14 @@ test = ["harnx-mcp-bridge"]
 [[test-path]]
 globs = ["crates/harnx-runtime/tests/it/common/**"]
 test = ["harnx-serve"]
+
+# A2A runner HITL tests launch the real PreToolUse hook server by path.
+[[test-edge]]
+on-affected = ["harnx-claude-compatible-hook-server"]
+test = ["harnx-a2a-server"]
+
+# A2A e2e tests launch the server executable and CLI session deletion.
+[[test-edge]]
+on-affected = ["harnx-a2a-server", "harnx"]
+test = ["harnx-a2a-server"]
+

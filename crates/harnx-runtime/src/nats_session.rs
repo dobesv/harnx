@@ -471,6 +471,14 @@ pub struct AppendedPrompt {
 }
 
 impl AppendedPrompt {
+    pub fn user_msg_id(&self) -> &str {
+        &self.user_msg_id
+    }
+
+    pub fn user_msg_seq(&self) -> u64 {
+        self.user_msg_seq
+    }
+
     pub fn execution_id(&self) -> Option<&str> {
         self.execution_id.as_deref()
     }
@@ -2489,6 +2497,21 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
             self.events.lock().unwrap().push(event);
         }
+    }
+
+    #[test]
+    fn appended_prompt_exposes_admission_correlation() {
+        harnx_core::require_nextest();
+        let appended = AppendedPrompt {
+            user_msg_id: "admitted-message".to_owned(),
+            user_msg_seq: u64::MAX,
+            execution_id: Some("execution".to_owned()),
+            events: None,
+            live: None,
+        };
+        assert_eq!(appended.user_msg_id(), "admitted-message");
+        assert_eq!(appended.user_msg_seq(), u64::MAX);
+        assert_eq!(appended.execution_id(), Some("execution"));
     }
 
     #[test]

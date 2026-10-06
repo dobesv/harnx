@@ -1,0 +1,16 @@
+{
+  "jsonrpc": "2.0",
+  "id": "chat-001",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "role": "ROLE_USER",
+      "parts": [
+        {
+          "text": "Open the pod bay doors, HAL."
+        }
+      ],
+      "messageId": "d2c9e3f1-5a6b-7c8d-9e0f-1a2b3c4d5e6f"
+    }
+  }
+}

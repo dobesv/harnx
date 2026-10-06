@@ -29,6 +29,7 @@ what you need:
 | `harnx-k8s-sandbox-tools` | Native NATS gateway routing bash and filesystem tools into Kubernetes Agent Sandboxes | [Guide](docs/kubernetes-sandbox-tools.md)       |
 | `harnx-proxy-auth`      | TLS-intercepting auth proxy that injects credentials and runs hooks             | [README](crates/harnx-proxy-auth/README.md)      |
 | `harnx-mcp-server`      | MCP server exposing harnx tools and agents-as-tools over stdio or Streamable HTTP | [README](crates/harnx-mcp-server/README.md)      |
+| `harnx-a2a-server`      | A2A server exposing harnx agents over JSON-RPC and SSE                          | [README](crates/harnx-a2a-server/README.md)      |
 
 Install whichever you need. Most users want `harnx` plus `harnx-worker`:
 `harnx` runs agent turns by handing them to a worker over NATS, and it spawns

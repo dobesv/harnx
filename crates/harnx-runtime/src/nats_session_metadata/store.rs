@@ -4,6 +4,7 @@ use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
 use harnx_nats_common::leader_reads;
 
+mod a2a;
 mod activity;
 mod extension_validation;
 mod extensions;
@@ -14,6 +15,7 @@ mod mutation;
 mod read_state;
 mod run_limits;
 
+pub use a2a::{a2a_message_key, a2a_session_prefix, a2a_task_key, a2a_tasks_prefix};
 pub(super) use extension_validation::validate_extensions;
 pub use extensions::SessionExtensionUpdate;
 pub use keys::{
