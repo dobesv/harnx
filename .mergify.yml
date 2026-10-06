@@ -15,6 +15,7 @@ queue_rules:
       - check-success=All (macos-latest)
       - check-success=All (windows-latest)
       - check-success=Lint Dockerfiles
+      - check-success=Check changesets
       # Web checks always run (on pull_request + merge_group) and report success
       # even when web/** is unchanged, so they are safe as required gates.
       # See .github/workflows/web-ci.yml and web-e2e.yml.

@@ -43,6 +43,7 @@ External MCP requests receive a durable outer run scope before tool dispatch. Ex
 - Stop a model that streams the same text over and over. When the answer or the reasoning ends in at least 2,000 characters of one repeated piece of text, harnx stops the response, retries once with a note telling the model what happened, then tries the next fallback model, and finally ends the turn with a `repetition` stop (`source` `answer` or `thinking`). Turn it off with `loop_detection.output`. `harnx dump session --check-loop-detection` now also reports repeated replies.
 - A tool call that does not succeed now returns what its tool had recorded so far under `partial_result`, whether it failed, lost its tool server, timed out, was interrupted or was replayed after a restart. Sub-agent calls use this to report their child session instead of appending a `SubAgentStarted` entry to the parent's transcript. That append re-read the whole parent transcript on every conflict between sibling sub-agents, which made sub-agent fan-out from long transcripts expensive. Interfaces learn about a running child from its progress snapshots, which now start as soon as the child is bound and name the parent's tool call. harnx-serve no longer emits the `sub_agent_started` AG-UI custom event, so third-party AG-UI clients that consumed it should use `sub_agent_progress` instead.
 - Serve NATS-backed `cid:` media and plan URLs from the Web UI server with safe download and cache headers, and open plan or text links in an in-app document viewer.
+- Read session metadata, activity, and unread state in one NATS snapshot instead of fetching each session separately. Add optional `limit` and opaque `cursor` pagination to `GET /v1/agents/:agent/sessions`; requests without pagination keep the existing JSON array response. Update the web UI to load sessions incrementally with on-demand loading and pagination controls.
 
 ### Fixes
 
@@ -50,6 +51,7 @@ External MCP requests receive a durable outer run scope before tool dispatch. Ex
 - send lossless tool schemas and use OpenAI strict mode (#2267)
 - Compile each `use_tools` selector once per tool-selection pass instead of once for every selector and tool pair. Workers were rebuilding the same glob regexes on every model request and tool round, which took most of their CPU once many agents and tool servers were registered.
 - Fix TUI agent selection so bare default-cluster names and explicit remote names select remote agents instead of local or built-in agents. Reuse async assistant discovery for TUI and CLI listings.
+- Update shipped agents to use GPT-6.1 Sol and Claude Sonnet 5.5. Add GPT-6.1 Sol request patches and high/max reasoning aliases to the model catalog.
 
 #### GPT models on the Responses API (`openai` and `codex` clients) no longer fill optional tool parameters with placeholder values such as `""` or `0`. Each tool is now sent in strict mode: every property is listed as required, and optional ones also accept `null`. harnx removes those `null`s before the tool runs. Strict mode needs a schema it can express, so a tool that takes a free-form map, such as `bash_exec`'s `env` or the fetch tools' `headers`, is sent with `strict: false` and its schema unchanged.
 
@@ -90,6 +92,32 @@ The plans tools also accept placeholders when a model sends them anyway. A blank
 - Allow sub-agent prompts to include canonical `cid:` attachments, with image media sent as image parts and text or plan references added to the prompt.
 - Add name override options to native tool servers so multiple instances of one toolset can register in the same NATS scope without sharing subjects or queue groups.
 
+### Fixes
+
+#### feat: add native harnx-attachment-tools server for cid: URL read/create
+
+Implements PR4 of the NATS attachments & plans architecture:
+
+- New `harnx-attachment-tools` crate with two tools:
+  - `attachment_read(url, ...)`: Read media blobs with truncation params
+    matching fs.read (head_lines, tail_lines, offset, limit, max_output_bytes,
+    grep). Returns image blocks for image MIME types, truncated text for text
+    types, and is_error for non-displayable binary content.
+  - `attachment_create(content, mime_type)`: Create text attachments in the
+    NATS object store. Requires caller session identity; returns is_error
+    when invoked via MCP stdio/HTTP bridges without context.
+
+- Both tools touch session activity on the attachment owner.
+- NATS-only access: no filesystem, no network fetch.
+- Port 3007 for MCP HTTP listener (next in sequence after fetch's 3006).
+
+Tests cover attachment creation, cross-session reading, image reading with
+truncation, and missing-context error handling.
+
+#### fix(k8s-sandbox-tools): stop idle-watcher disconnect from recursing into itself
+
+`harnx-k8s-sandbox-tools` aborted with a Tokio worker stack overflow about 15 minutes after a replica took the idle-watcher lease (#2177). After suspending idle sandboxes, the leader disconnects their MCP sessions through `SessionDisconnect for Arc<dyn McpCaller>`, whose body called `self.disconnect(..)`. Method resolution picked the same `SessionDisconnect` impl instead of `McpCaller::disconnect`, so the first disconnect recursed until the stack ran out. The adapter now calls the inner caller explicitly.
+
 ## 0.34.7 (2026-09-28)
 
 ### Features
@@ -97,6 +125,7 @@ The plans tools also accept placeholders when a model sends them anyway. A blank
 - drive session status from AG-UI events and remove polling (#2125)
 - Route negotiated NATS tool progress to live tool-call updates and add filesystem read, search, find, and edit progress metadata. Addresses #2096.
 - Add capability-gated, bounded live progress updates and final progress snapshots to native toolsets for #2096.
+- Add terminal agent status signaling via OSC escape sequences (OSC 9999 JSON for Orca and OSC 9;4 progress for kitty/JetBrains).
 
 #### Add `session/resume` and `session/close` support to ACP server.
 
@@ -129,6 +158,9 @@ Both capabilities are now advertised in `initialize` responses:
 - End AG-UI runs with `RUN_ERROR` when a turn task panics, no worker claims an activation within 60 seconds, or a remote worker disappears before recording completion.
 - Add `tool_update` SSE custom event for live tool progress. Emits `ToolEvent::Update` fields (title, status, kind, locations, usage, markdown) so web clients can apply in-place updates to tool call cards. Part of Phase 5b (#2096).
 - Drive Web UI sub-agent row status and foreground cancellation resolution from AG-UI lifecycle and control events.
+- Establish session context on ACP `session/load` and rehydrate handoff deactivation state (#1346).
+- Advertise and implement pinned-agent `session/list` in ACP server (#1346).
+- Apply `ToolEvent::Update` in-place to active `ToolCall` rows in the TUI transcript, rendering live title, status, kind icon, locations, and refined markdown without detached `StatusLine` emissions. Addresses #2096.
 
 #### CLI streamed tool progress notices
 
@@ -161,17 +193,81 @@ The `invocation_id` field correlates to the parent tool call. The `SubagentProgr
 
 Addresses #2096.
 
+#### Add static tool kind declarations for better tool categorization (#2096)
+
+Tools now declare their categorization (Read, Edit, Search, Execute, Fetch, etc.)
+statically via `ToolSpec::with_kind()` at registration time. This kind is carried
+through to `ToolEvent::Started` for presentation in UI surfaces.
+
+Changes:
+- `ToolSpec::with_kind()` and `ToolSpec::kind()` for declaring/retrieving kind in meta
+- `ToolDeclaration.kind` field to carry the declared kind
+- `ToolKind` implements `From<ToolProgressKind>` for clean conversion
+- Emit declared kind in `ToolEvent::Started` instead of hardcoded `Other`
+- Native toolsets declare appropriate kinds:
+  - fs: Read/Edit/Search kind based on tool operation
+  - bash: Execute kind for all tools
+  - grep: Search kind
+  - fetch: Fetch kind
+  - plans: Read/Edit/Delete based on operation prefix
+  - time: Other kind
+
 ## 0.34.6 (2026-09-25)
 
 ### Features
 
 - Add capability-gated ACP `session/load` support for ordered, read-only replay of agent- and cluster-scoped durable NATS transcripts.
+- Improve TUI tool confirmation with full YAML/template arguments, scrolling, explicit approve/reject/interrupt controls, and optional messages delivered after the tool result.
+
+#### Add foundation contract for tool live updates (issue #2096)
+
+**Phase 1 — Update contract**
+
+Extends `ToolEvent::Update` with optional fields for progressive status:
+- `title`: concise activity label (distinct from `markdown` body content)
+- `kind`: dynamic `ToolKind` refinement during execution
+- `locations`: affected file/location snapshots (replace semantics)
+- `usage`: per-call display usage snapshot (replaces, not sums)
+
+All new fields have `#[serde(default, skip_serializing_if = "Option::is_none")]` for backward compatibility.
+
+**New types in `harnx-core/src/tool.rs`:**
+- `ToolUpdatePatch`: patch payload mirroring Update fields, all optional
+- `ToolProgress` trait: object-safe progress sink with `fn update(&self, patch)`
+- `NoopToolProgress`: no-op implementation
+- `ToolDisplayState`: reducer implementing patch-merge semantics
+- `ToolProvider::call_tool_with_progress`: new method with default delegation to `call_tool_with_id`
+
+**Patch semantics:**
+- `None`/omitted = unchanged
+- `Some(vec![])` for collections = clear
+- Collections replace (never append)
+- Usage snapshots replace (never summed)
+- Patches cannot set terminal status (Completed/Failed)
+
+No behavior change — this establishes types and traits only. Engine dispatch, rendering, and ACP mapping come in subsequent phases.
 
 ### Fixes
 
 - format tool calls in session dumps (#2100)
 - install rustls crypto provider before startup TLS (#2105)
 - Render tool arguments and configured call/result templates in text session dumps, and keep tool events on separate lines from model prose.
+
+#### fix(k8s-sandbox-tools): install rustls crypto provider before startup TLS
+
+`harnx-k8s-sandbox-tools` panicked on startup with "Could not automatically determine the process-level CryptoProvider": its dependency graph links both `ring` (via async-nats) and `aws-lc-rs` (via the AWS SDK's hyper-rustls stack that `kube` uses), and nothing installed a process default. `kube::Client::try_default` and `reqwest::Client` both build TLS through `rustls::ClientConfig::builder()`, which then can't pick a provider. Pin `ring` as the process default at the top of `main()`, matching the NATS TLS path in `harnx-nats-common`.
+
+#### Wire in-process tool progress updates for live status reporting:
+
+- Add `emit_tool_update_fn` callback to `ToolEvalContext` for progress events
+- Implement `RuntimeToolProgress` with 250ms coalescing and terminal ordering
+- Call `provider.call_tool_with_progress` instead of `call_tool_with_id`
+- Generate stable UUID tool-call IDs if the model doesn't supply one
+- Update ACP mapper to preserve `None` status and map `title`/`kind`/`locations`
+- Store per-call usage in namespaced `_meta.harnx:usage`
+
+Implements Phase 2 of the tool live updates design (#2096).
+Non-emitting tools continue to work unchanged via default implementation.
 
 ## 0.34.5 (2026-09-25)
 
@@ -184,6 +280,31 @@ Addresses #2096.
 ### Fixes
 
 - Stream ACP tool calls, tool results, notices, and flagged model errors to IDE clients, and accept IDE-injected MCP server entries when creating sessions.
+- Update the example agents to use Claude Opus 5.5 and GPT-6 Sol and Luna while retaining GPT-5.6 Terra. Make Opus 5.5 Atlas's primary model and retain Gemini 3.8 Flash as its first fallback.
+
+#### feat: add native harnx-exa-tools server, replacing the npx exa-mcp-server dependency for web search (#1269)
+
+Ports the two default-enabled tools of the external TypeScript `exa-mcp-server`
+(`web_search_exa`, `web_fetch_exa`) to a native Rust toolset server, following the
+`harnx-grep-tools` precedent. The `coding` and `pantheon` package `exa.yaml` configs
+now run `harnx-exa-tools` directly instead of bridging to `npx exa-mcp-server`, so web
+search no longer needs Node.js.
+
+#### feat: add native harnx-fetch-tools server, replacing the npx mcp-fetch-server dependency for URL fetching (#2080)
+
+Ports the six fetch tools (`fetch_html`, `fetch_markdown`, `fetch_txt`, `fetch_json`,
+`fetch_readable`, `fetch_youtube_transcript`) from the external TypeScript
+`mcp-fetch-server` to a native Rust toolset server, following the `harnx-exa-tools`
+precedent. The `coding` and `pantheon` package `fetch.yaml` configs now run
+`harnx-fetch-tools` directly instead of bridging to `npx mcp-fetch-server`, so
+fetching no longer needs Node.js.
+
+New security features:
+- Blocks private IP connections by default (SSRF protection) for all fetch operations,
+  covering initial connections and every redirect hop.
+- Pass `--allow-private-ip` to disable SSRF protection when needed.
+- Uses harnx smart-truncation params (`head_lines`, `tail_lines`, `max_output_bytes`)
+  while maintaining backward compatibility with upstream's `max_length`/`start_index`.
 
 ## 0.34.4 (2026-09-24)
 
@@ -202,6 +323,10 @@ Addresses #2096.
 
 - limit Linux ARM build resource use (#2077)
 - Reduce resource pressure when building Linux ARM release archives.
+
+#### fix(tui): mark sessions read when exiting with Ctrl+D
+
+Idle Ctrl+D now clears durable unread state even when the TUI's cached unread flag hasn't received the latest NATS invalidation yet.
 
 ## 0.34.2 (2026-09-23)
 
@@ -551,6 +676,21 @@ archive, and it ships in the Docker image. Discovery checks
 `HARNX_WORKER_BIN`, then a sibling of the running front-end, then `PATH`.
 `HARNX_BIN` no longer plays a part in it.
 
+#### feat(plans): add `content` param for plan body, reject unknown params, and support `parent_issue` for sub-issue nesting
+
+**Plan body via `content` param**
+- Plans MCP tools now accept a `content` parameter to set the plan body directly
+- Previously only `replace_content`/`append_content`/`replace_in_content` existed for body edits
+- A stray `content` param was silently dropped, creating empty plan bodies
+
+**Reject unknown parameters**
+- Plan tool params now use `deny_unknown_fields` — unknown params are rejected with an error
+- Prevents silent data loss from typos or misnamed parameters
+
+**Sub-issue nesting via `parent_issue`**
+- New create-time-only `parent_issue` parameter allows creating plans as GitHub sub-issues of an originating issue
+- Enables hierarchical task organization in GitHub Issues
+
 ### Fixes
 
 - resolve title agent at top level for package agents (#103) (#1164)
@@ -759,6 +899,8 @@ archive, and it ships in the Docker image. Discovery checks
 - Show server-side run failures, including missing local worker binaries, in the Web UI and log their full cause in harnx-serve.
 - Surface worker session failures in the UI instead of hanging, and load file-backed agent variables in the NATS worker.
 - The NATS worker fails with the variable's name and description when an agent declares a variable nobody supplied, instead of an opaque template error.
+- TUI: show the sub-agent's final reply in the parent session transcript.
+- Fix web UI transcript width and assistant message divider styles. Relaxed the max-width to use screen space better on large displays, and replaced boxed assistant borders with clean spacing and dividers.
 
 #### Fix ACP `session_prompt` failing with a bare "Invalid params" when a sub-agent model passes an empty or made-up `session_id`.
 
@@ -921,17 +1063,57 @@ Reduce worker stack usage during session activation to prevent stack overflows e
 
 Tool call/result display templates rendered under MiniJinja's Lenient undefined mode, which still raises on attribute/index access into an undefined intermediate. The shared plans result template `{{ result.content[0].text | default('') }}` walks into `result.content`, which is absent on recoverable-error results (`{"is_error": true, "error": ...}`), so it raised before `default('')` could apply and every plans/time tool logged a warning on its error path. Templates now render with Chainable undefined behavior so `default()` is honored; syntax errors and other hard failures still surface.
 
+#### fix(commands): decouple `Command.name` from usage hints to fix tab-completion
+
+Commands whose registered name embedded usage syntax (e.g. `.rewind <n>`,
+`.edit message <n>`, `.info env [name]`) tab-completed to the literal usage
+string instead of a real command/subcommand.
+
+- Add a dedicated `Command.usage: Option<&'static str>` field plus a
+  `Command::with_usage()` constructor so `name` stays a clean dispatch/
+  completion key while `.help` still renders the argument syntax.
+- Split placeholder usage out of the affected command names.
+- Deduplicate first-word completions by bare name in the TUI.
+- Add real subcommand completions for `.edit` and `.delete`.
+- Add regression tests asserting completions never surface `<n>`, `[server]`,
+  `[name]`, or `<n>-<m>` literals.
+
 ## 0.33.4 (2026-07-23)
 
 ### Features
 
 - Add OpenAI `/v1/responses` support so gpt-5.6 reasoning models work with function tools and `reasoning_effort` (blocked on `/v1/chat/completions`). New reasoning-level model aliases `gpt-5.6-sol:high|max` and `gpt-5.6-terra:high|max` route to `/v1/responses` via a new `endpoint` model field, with cross-turn reasoning replay (`reasoning.encrypted_content` via `thought_signature`), `store: false` default overridable through a new `patches.responses` client-config key.
 
+#### feat(mcp-remote): add stdio→HTTP MCP proxy binary
+
+Add `harnx-mcp-remote` — a stdio-based MCP proxy for remote HTTP MCP servers. Supports forwarding negotiated MCP capabilities such as tools, prompts, and resources over both streamable HTTP (MCP 2025-03) and legacy SSE (MCP 2024-11) transports via rmcp's unified StreamableHttpClientTransport. Auth via bearer token, custom headers, and mTLS, configurable through CLI flags and most settings via env vars.
+
 ### Fixes
 
 - include failing expression and input kind in runtime error logs (#1088)
 - forward model errors via harnx:error meta instead of plain text (#964) (#1128)
 - Fix Gemini requests failing with a 400 "Role 'function' is not supported" error. Tool-result turns are now sent with the `user` role, which is the only valid container for `functionResponse` parts (Gemini accepts only `user`/`model` roles). Newer Gemini endpoints reject the previously-tolerated `function` role.
+
+#### fix(models): require max_tokens for modern Claude Sonnet/Haiku models
+
+`claude-sonnet-5` (and other 4-5-generation-or-newer Sonnet/Haiku base models)
+were emitted without `require_max_tokens: true`, so requests omitted
+`max_tokens` and the Anthropic Messages API rejected them with
+`max_tokens: Field required (400)`.
+
+`scripts/update_models.py` now derives `require_max_tokens` by model name via a
+new `claude_requires_max_tokens()` helper (Sonnet/Haiku >= 4-5 and any bare
+major >= 5), so current and future releases get the flag automatically. Opus
+models remain governed by the existing adaptive-thinking logic. Regenerated
+`crates/harnx/models.yaml` accordingly.
+
+#### chore(models): add gemini-3.6-flash and gemini-3.5-flash-lite to the catalog
+
+Add the two Gemini models that reached GA on 2026-07-21 as curated entries in
+`crates/harnx/models.yaml`, ahead of their appearance in the upstream LiteLLM
+registry. Pricing is carried forward from the prior flash / flash-lite tier and
+will be overwritten by LiteLLM data on the next `scripts/update_models.py` sync
+(the sync preserves curated models not yet in the registry).
 
 ## 0.33.3 (2026-07-21)
 
@@ -947,6 +1129,7 @@ Tool call/result display templates rendered under MiniJinja's Lenient undefined 
 - Add AG-UI tool summary custom events and context token usage metadata for live and restored sessions.
 - Serialize concurrent mutations in the filesystem MCP server to prevent corruption from parallel edits. Same-file edits (write, edit, insert, re_replace) are now serialized via per-file locks, while `rollback_file` takes an exclusive repository-wide lock so it cannot interleave with concurrent edits to other files in the same repository.
 - Render agent system prompts at request time with current tool and model context instead of storing them in session transcripts.
+- `cargo xtask install` now builds the web UI (`pnpm install` + `pnpm build` in `web/`) and copies the compiled assets into the default directory `harnx-serve` loads from (`<data_dir>/web-assets`, e.g. `~/.local/share/harnx/web-assets`), so a local install serves the web client out of the box. Pass `--skip-web` to install only the Rust binaries. Closes #1040.
 
 #### feat(proxy-auth): send resolved `vars` to executable hooks on each request
 
@@ -1059,6 +1242,7 @@ the example configuration.
 - update dependency @assistant-ui/react-ag-ui to v0.0.45 (#1106)
 - update dependency @assistant-ui/react-markdown to v0.14.6 (#1107)
 - Polish web chat UI with breadcrumb navigation, flatter composer styling, auto-growing input, cleaner token status display, and a real queue for submit-during-run behavior.
+- Harden the AG-UI web client and harnx-serve content-negotiation server, and polish the web UI. Fixes: the SSE `Accept`-header negotiation now uses strict media-type parsing (honors `q=0`, no longer over-routes values like `text/event-streamish`); empty/whitespace prompts are handled consistently between the SSE and RPC planes; the web client preserves attachments when message content is a string, `null`, or `undefined` (previously dropped) and no longer truncates multi-part attachments. The web UI gains a refreshed look in both light and dark themes (design tokens, message bubbles, structured tool-call blocks, a polished composer, and picker cards). Adds a web unit-test suite (vitest) and expands harnx-serve test coverage.
 
 #### fix(example): jira-auth-hook.py injected auth on the wrong Atlassian host
 
@@ -1123,6 +1307,18 @@ to a single space-separated command; verified all arguments now reach
 - Fall back to `ATLASSIAN_EMAIL` when the profile has no email (was producing a
   blank Basic-auth username).
 
+#### fix(tui): only convert large pastes into attachments
+
+Previously any multi-line paste was turned into a text attachment, which was
+annoying for small pastes of just a few lines. A paste now becomes an
+attachment only when it is large — more than 8 lines or more than 512
+characters. Smaller multi-line pastes are inserted inline into the input.
+
+- Line counting uses `str::lines()` so a single trailing newline does not
+  inflate the count.
+- Character counting uses `chars().count()`, so the limit is measured in
+  characters rather than bytes (multibyte text is counted correctly).
+
 ## 0.33.2 (2026-07-09)
 
 ### Features
@@ -1144,6 +1340,8 @@ to a single space-separated command; verified all arguments now reach
 - Adds opt-in background GC for remote sessions stored in NATS KV. Enable via `cleanup_remote_sessions_days` config field or `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS` environment variable. When set, runs hourly to purge stale session index entries across all configured NATS clusters.
 - The web client now allows uploading attachments using `assistant-ui`'s native attachment UI. Images and files are transparently uploaded and their CID references are piped through the JSON-RPC `session/prompt` mechanism to the server.
 - Surface previously-silent errors in the AG-UI web UI: agents-list and sessions-list fetch failures (#983) now show inline error text, and message-send failures (#987) show an inline composer-area error.
+- Add AG-UI tool approval HITL interrupt/resume flow. Tool rounds that need approval now finish with interrupt metadata on `RUN_FINISHED`, sessions expose pending interrupts on reconnect, and clients can resume with approve/deny decisions without re-asking model.
+- Wire the existing web client to handle P1 tool-approval (interrupt/resume) and P2 status display
 
 
 
@@ -1192,6 +1390,22 @@ Remote sessions can now be resumed from the session picker (the picked session i
 - Removed harnx-serve legacy chat-completions proxy, playground, and arena endpoints so AG-UI is sole interactive surface, while preserving configured tools for AG-UI sessions.
 - Fix session-scoped AG-UI RPC routing so web prompts and cancels no longer 404.
 - fix: thin client now waits for assistant reply to current NATS turn instead of returning early on transient Idle state, and returns no stale prior response on abnormal turn termination
+
+#### fix(serve): harden multipart attachment upload against OOM/DoS
+
+**B4 — early size enforcement**
+- Add Content-Length header pre-check: reject payloads > MAX_UPLOAD_BYTES before reading body
+- Stream body with cumulative size check: reject as soon as cumulative bytes exceed 20 MiB limit
+- Prevents OOM from malicious/huge payloads that previously buffered fully before checking size
+
+**B5 — executable-path upload tests**
+- Add 6 tests exercising the multipart upload handler:
+  - `upload_attachments_success_returns_cid_refs`: valid multipart produces cid refs, stores files
+  - `upload_attachments_malformed_multipart_returns_400`: malformed multipart rejected
+  - `upload_attachments_no_parts_returns_400`: no attachment fields returns 400
+  - `upload_attachments_oversized_returns_413`: payload > 20 MiB returns 413
+  - `upload_attachments_oversized_content_length_header_returns_413_early`: oversized Content-Length header rejected early
+  - `upload_attachments_unsupported_content_type_returns_415`: unsupported MIME type returns 415
 
 ## 0.33.1 (2026-06-23)
 
@@ -1270,6 +1484,7 @@ birdcage's public `Exception` API only grants path/env/network exceptions — th
 - Add diagnostic instrumentation for the intermittent out-of-memory crash (#842). The TUI event loop now runs a low-overhead memory watchdog that, once per second, logs (at `warn`) a snapshot of process RSS, transcript item count and text size, and the event-channel backlog whenever RSS crosses a doubling threshold — plus a warning when a single tick drains an abnormal number of events (a flooding producer). Compaction now logs when it starts and finishes (with duration) and flags a compaction triggered while another is still running. These surface in the harnx log file, so the next occurrence shows whether the growth is in the transcript/event path or elsewhere. Enable logging (set a non-`off` log level; `info` captures compaction detail) to collect it.
 - Simplify TUI streamed-assistant-text accumulation. Streamed text now coalesces into a single transcript block per unbroken run; an interleaving item (tool call, tool result, notice, source heading) ends the run so the following text starts a fresh block below it. This replaces the previous per-line splitting and the index-based bookkeeping (`streaming_assistant_idx`) with a single open/closed flag and a "look at the trailing item" rule, removing a fragile multi-branch loop.
 - Fix `cargo xtask install` failing with "Text file busy" (ETXTBSY) when a target binary is currently running. The installer now copies to a temp file and atomically renames it over the destination, matching the old `cp -f` behaviour so install works without stopping existing harnx processes.
+- Stopped appending a numbered tool summary to the agent system prompt. The summary was rendered from the agent's full, unfiltered tool set (`get_all_tools()` across every MCP server and package), so an agent in one package would have tools from other packages — e.g. `coding__*` tools listed for a `pantheon` agent — described in its prompt even though those tools were never offered to it. The list was also redundant: the model already receives every available tool as a structured definition via the API `tools` field, correctly filtered by `use_tools`.
 
 #### Fix package agents losing their delegation tools when activated directly (#826).
 

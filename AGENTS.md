@@ -72,6 +72,7 @@ cargo clippy --workspace --all-targets -- -D warnings         # Lint — treat w
 cargo nextest run $(cargo xtask affected)                    # Run the tests of every package the change can affect, once
 cargo nextest run --workspace -E 'test(=<name>) | ...' --stress-count=20  # Stress only the tests you added or changed
 cs delta origin/HEAD                                          # Run CodeScene code quality analysis on current branch changes
+python3 scripts/check_changesets.py                           # Check that every changeset will reach a changelog
 ```
 
 **Scope the test run to the affected packages.** `cargo xtask affected` diffs
@@ -297,9 +298,32 @@ The key on the left must be one of the packages knope versions:
 - **`pantheon`** — the `packages/pantheon` agent package.
 - **`coding`** — the `packages/coding` agent package.
 
-Keys are **unquoted** in the YAML front matter: `harnx:`, not `"harnx":`.
-Quoted keys (e.g. `"harnx": patch`) are silently ignored — no CHANGELOG entry is generated and no error is raised.
-Individual crate names are not valid keys; `knope release` will error on them.
+Keys and change types are bare words: `harnx: patch`, not `"harnx": patch`
+(the quoting JavaScript's changesets tool uses) or `harnx: "patch"`. knope
+(checked with 0.23.0) reports none of these mistakes:
+
+- It reads only `.md` files directly inside `.changeset/`. A file in
+  `.changesets/` or in a subdirectory is never read and never removed.
+- It skips a quoted key and a key that is not one of the three packages, such
+  as a crate name. A file with no usable key stays in `.changeset/` forever,
+  and its change never reaches a changelog. If the file has a usable key too,
+  knope consumes and deletes it, and the skipped key's entry is lost.
+- It deletes a file whose change type is anything but `major`, `minor` or
+  `patch` (`Patch`, `"patch"`, `patch # note`) without adding that key's
+  entry.
+
+knope does stop the release on a blank line or comment in the front matter, a
+duplicate key, empty front matter, a byte-order mark or a missing front
+matter block, but its error doesn't name the file.
+
+`python3 scripts/check_changesets.py` (Python 3.11 or newer) rejects all of
+these. CI runs it on every pull request, and the Prepare Release workflow runs
+it before `knope release`.
+
+knope renders a one-line description as a bullet. A description of several
+lines becomes a `####` heading made from its first line, followed by the
+remaining lines, so keep the first line a complete sentence and don't
+hard-wrap it.
 
 ## GitHub Actions workflows that open pull requests
 
@@ -390,7 +414,7 @@ The checklist below covers every integration point. Miss any and the release fai
 
 6. **`.gitattributes`** — if the crate ships golden `.txt` fixtures, add `text eol=lf`.
 
-7. **Changeset** — if the change touches `packages/coding/**` or `packages/pantheon/**`, the changeset front-matter must include `"coding"`/`"pantheon"` scopes (separate knope packages with their own CHANGELOGs).
+7. **Changeset** — if the change touches `packages/coding/**` or `packages/pantheon/**`, the changeset front matter must also have unquoted `coding:`/`pantheon:` keys (separate knope packages with their own CHANGELOGs).
 
 8. **MCP HTTP port** — use the next free port in the sequence (e.g., 3006 after exa's 3005).
 

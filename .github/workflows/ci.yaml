@@ -43,6 +43,8 @@ jobs:
               - '!web/**'
               - '!docs/**'
               - '!.changeset/**'
+              - '!scripts/check_changesets.py'
+              - '!scripts/test_check_changesets.py'
               - '!demos/**'
               - '!docker/**'
               - '!*.md'
@@ -259,3 +261,20 @@ jobs:
 
       - name: Check harnx Dockerfile
         run: docker buildx build --check -f docker/harnx.Dockerfile .
+
+  # knope skips or deletes a malformed changeset without a warning, so the
+  # mistake would otherwise surface only as a changelog entry missing from a
+  # release. scripts/check_changesets.py lists the cases.
+  changesets:
+    name: Check changesets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Test the changeset checker
+        run: python3 scripts/test_check_changesets.py
+
+      - name: Check changesets
+        run: python3 scripts/check_changesets.py

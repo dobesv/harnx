@@ -51,6 +51,12 @@ jobs:
           # Persist the bot token for subsequent `git push` from knope.
           persist-credentials: true
 
+      # A changeset knope can't use would be skipped or deleted without a
+      # changelog entry, so stop the release instead. This runs before the
+      # bail-out below because a misnamed directory leaves `.changeset/` empty.
+      - name: Check changesets
+        run: python3 scripts/check_changesets.py
+
       - name: Bail if no changesets
         id: check
         shell: bash
