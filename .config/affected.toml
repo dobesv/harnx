@@ -47,6 +47,12 @@ mark-changed = []
 globs = [".gitattributes", "rust-toolchain.toml", ".github/workflows/ci.yaml"]
 mark-changed = "all"
 
+# Every test runs through the nextest sandbox runner, so a change to it or to
+# the config that registers it can break any package's tests.
+[[determinator.path-rule]]
+globs = ["scripts/nextest-sandbox", ".cargo/config.toml"]
+mark-changed = "all"
+
 # harnx-client compiles harnx's model catalog in with include_str!.
 [[determinator.path-rule]]
 globs = ["crates/harnx/models.yaml"]

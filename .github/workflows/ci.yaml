@@ -158,6 +158,26 @@ jobs:
         echo "${BINDIR}" >> "${GITHUB_PATH}"
       shell: bash
 
+    # Every test runs inside a bubblewrap sandbox (scripts/nextest-sandbox).
+    # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor;
+    # lift that if bwrap can't create them. Then run the runner itself, nested
+    # as the runner's own tests nest it, so a sandbox that can't start fails
+    # here rather than in every test. The sandbox can't reach the host's DNS
+    # stub, so RFC 6761 *.localhost names, which tracing_e2e connects to,
+    # resolve only through nss-myhostname.
+    - name: Install bubblewrap (Linux)
+      if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
+      run: |
+        set -euo pipefail
+        sudo apt-get update -q
+        sudo apt-get install -y -q bubblewrap libnss-myhostname
+        if ! bwrap --unshare-user --ro-bind / / true 2>/dev/null; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+        NEXTEST=1 NEXTEST_ATTEMPT_ID=ci scripts/nextest-sandbox scripts/nextest-sandbox true
+        NEXTEST=1 NEXTEST_ATTEMPT_ID=ci scripts/nextest-sandbox getent hosts probe.localhost
+      shell: bash
+
     # Local execution routes through a shared nats-server, so the one-shot / TUI
     # e2e tests need the binary on every OS (they skip cleanly if it is absent,
     # but we want real coverage here).
