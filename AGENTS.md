@@ -75,6 +75,10 @@ cs delta origin/HEAD                                          # Run CodeScene co
 python3 scripts/check_changesets.py                           # Check that every changeset will reach a changelog
 ```
 
+On Linux, every test runs inside bubblewrap 0.5.0 or later, which needs
+unprivileged user namespaces: install it first (`sudo apt install bubblewrap`)
+and see "Test sandbox".
+
 **Scope the test run to the affected packages.** `cargo xtask affected` diffs
 the working tree, uncommitted and untracked files included, against its merge
 base with `origin/HEAD` (or `--base <rev>`) and prints `-p` arguments for every
@@ -118,6 +122,57 @@ test failures.
 **Do not skip any of these steps or you WILL miss problems**
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
 **CodeScene Health scores MUST NOT decrease as part of the change, only increase**
+
+### Test sandbox
+
+On Linux and macOS, every test nextest runs goes through
+`scripts/nextest-sandbox`, registered as the Cargo target runner in
+`.cargo/config.toml`. Each test gets a private harnx and XDG home
+(`HARNX_*_DIR`, `XDG_*_HOME` and `XDG_RUNTIME_DIR` point inside it; `HOME`
+itself is unchanged) and only an allowlisted part of the ambient environment:
+process basics, Cargo's and nextest's variables, toolchain variables, insta's
+`INSTA_*` switches, `NATS_SERVER_BIN` and `CI`. Credentials, agent and
+session sockets, proxies, tmux and git context, and every `HARNX_*` variable
+are dropped. On Linux the test also runs under bubblewrap with its own
+network namespace (loopback only), PID namespace and `/tmp`, and your real
+harnx directories are covered by empty mounts, so nothing a test starts
+outlives it and no test can reach your broker or another test's. The
+top-level `/tmp` entry that holds the checkout, the target directory or
+`HOME` is shared with the host. No DNS server is reachable inside, so a name
+resolves only through `/etc/hosts` and NSS modules: RFC 6761 `*.localhost`
+names need `myhostname` in `/etc/nsswitch.conf` (`libnss-myhostname` on
+Debian and Ubuntu, which CI installs). On macOS the test
+runs in its own process group, which is killed when the test ends, along with
+any process whose command line names the test's private home, such as its
+broker. A process that moved to its own group without naming the home, such
+as harnx's local worker or a `ChildProcessManager` child, outlives the test.
+macOS gets no masks, network namespace or private `/tmp`, and `HOME` is real
+there too, so code that builds harnx paths from `HOME` instead of the
+variables reaches your real directories.
+
+Linux needs bubblewrap 0.5.0 or later (`sudo apt install bubblewrap`), and
+bubblewrap needs unprivileged user namespaces. Ubuntu 24.04 restricts them
+through AppArmor by default. An AppArmor profile that allows `userns` for
+`/usr/bin/bwrap` lifts that for bubblewrap alone;
+`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts it for
+every program on the host, which CI does only on its throwaway runners.
+Either is the machine owner's decision, so an agent asks rather than changing
+it. Containers and harnx's own sandbox block the namespaces too, so set
+`HARNX_TEST_SANDBOX=off` there. Without bubblewrap, every test fails with an
+install hint. Where an AppArmor restriction, a sysctl or a seccomp filter
+blocks the namespaces, every test fails with a message pointing here.
+This sandbox is unrelated to the bash tool's `--no-sandbox` (see "Bridged tool
+servers in tests").
+
+`HARNX_TEST_SANDBOX=off` runs tests unsandboxed, which is the first thing to
+try when a test fails only under the sandbox. The test then gets your real
+environment, harnx directories and broker. On Linux, a test that needs the
+outside network fails by design. A test killed by a signal shows as exit code
+128+N (139 for SIGSEGV, 134 for SIGABRT) rather than as the signal. A test
+that needs an ambient variable should set it itself; extend the allowlist in
+the script only for variables every test legitimately needs, with a comment
+saying why. `test_sandbox_canary::tests_run_inside_the_sandbox` in
+`harnx-core` fails if tests stop running inside the sandbox.
 
 ### Integration test layout
 
@@ -1158,7 +1213,9 @@ tests that skip when the binary is absent still pass, but real coverage requires
 the installed binary.
 
 In-module `#[cfg(test)]` tests that gate on `HARNX_NATS_TEST_URL` (unset in CI)
-**do not run in CI** — they skip when that env var is missing. Those tests also
+**do not run in CI** — they skip when that env var is missing. The test
+sandbox drops it, so they skip locally too: running them takes
+`HARNX_TEST_SANDBOX=off` as well as the URL. Those tests also
 share one physical server and the global `SESSION_METADATA_BUCKET` when run
 locally, so they contaminate each other's state. New NATS/GC tests that must run
 in CI belong in `crates/harnx-runtime/tests/it/`, use `spawn_nats_server` for
@@ -1167,8 +1224,11 @@ bucket stats. Precedent: `tests/it/worker_remote_session_cleanup.rs`.
 
 A TUI test that spawns the local broker or worker isolates them with
 `TestEnvironment` (`crates/harnx-tui/src/test_utils/environment.rs`) under
-`ENV_LOCK`. Without it the test shares the user's broker directory with every
-other test process in the run, including the persisted broker port, and a port
+`ENV_LOCK`. Under nextest on Linux and macOS the test sandbox already gives
+each test its own harnx data directory, and with it its own broker, but
+Windows and `HARNX_TEST_SANDBOX=off` runs have no sandbox. There a test
+without `TestEnvironment` shares the user's broker directory with every other
+test process in the run, including the persisted broker port, and a port
 still held by a broker another process just stopped fails every spawn attempt.
 
 A single broker can stand in for a replica that lags the stream leader, which no

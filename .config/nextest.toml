@@ -12,6 +12,9 @@
 # surfaces *all* failures in a single run instead of aborting on the first —
 # which makes diagnosing cross-platform failures far faster.
 
+# scripts/nextest-sandbox needs NEXTEST_ATTEMPT_ID, which nextest 0.9.116 added.
+nextest-version = "0.9.116"
+
 [test-groups]
 # Terminal-driving e2e tests contend for the same CPU/process-spawn resources.
 heavy-e2e = { max-threads = 1 }

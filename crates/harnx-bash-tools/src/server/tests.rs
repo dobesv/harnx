@@ -265,7 +265,9 @@ fn enabled_sandbox_config() -> SandboxConfig {
         allowlist: Arc::new(ResolvedAllowlist::new()),
         extra_env_passthrough: vec![],
         env_overrides: vec![],
-        sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
+        // The build's own helper, which sandbox_runtime_works probes; a bare
+        // name would run whatever copy is on PATH, if there is one.
+        sandbox_run_path: sandbox_run_test_path(),
     }
 }
 
