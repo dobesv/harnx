@@ -18,6 +18,7 @@ All notable changes to the `pantheon` agent package will be documented here.
 - stop a model that streams the same text over and over (#2223)
 - return partial results from failed tool calls (#2245)
 - Bundled agents now list attachment_read in use_tools; orchestrators (atlas, sisyphus, daedalus), implementation specialists (apollo, athena, hephaestus, hermes, hestia, iris, peitho, plato), aristarchus, pytheas, zosimus, mnemosyne, and clio also get attachment_create. The coding package adds tool_servers/attachments.yaml and coder gets both tools.
+- Update shipped agents to use GPT-6.1 Sol and Claude Sonnet 5.5. Add GPT-6.1 Sol request patches and high/max reasoning aliases to the model catalog.
 
 ### Fixes
 
@@ -42,6 +43,26 @@ All notable changes to the `pantheon` agent package will be documented here.
 ### Fixes
 
 - Store plans in NATS JetStream KV and identify plans, tasks, notes, and dependencies with canonical `cid:plan:` URLs.
+
+#### feat: add native harnx-attachment-tools server for cid: URL read/create
+
+Implements PR4 of the NATS attachments & plans architecture:
+
+- New `harnx-attachment-tools` crate with two tools:
+  - `attachment_read(url, ...)`: Read media blobs with truncation params
+    matching fs.read (head_lines, tail_lines, offset, limit, max_output_bytes,
+    grep). Returns image blocks for image MIME types, truncated text for text
+    types, and is_error for non-displayable binary content.
+  - `attachment_create(content, mime_type)`: Create text attachments in the
+    NATS object store. Requires caller session identity; returns is_error
+    when invoked via MCP stdio/HTTP bridges without context.
+
+- Both tools touch session activity on the attachment owner.
+- NATS-only access: no filesystem, no network fetch.
+- Port 3007 for MCP HTTP listener (next in sequence after fetch's 3006).
+
+Tests cover attachment creation, cross-session reading, image reading with
+truncation, and missing-context error handling.
 
 ## 0.4.7 (2026-09-28)
 
@@ -69,6 +90,33 @@ All notable changes to the `pantheon` agent package will be documented here.
 ### Features
 
 - add native harnx-exa-tools server for Exa web search (#2079)
+- Update the example agents to use Claude Opus 5.5 and GPT-6 Sol and Luna while retaining GPT-5.6 Terra. Make Opus 5.5 Atlas's primary model and retain Gemini 3.8 Flash as its first fallback.
+
+### Fixes
+
+#### feat: add native harnx-exa-tools server, replacing the npx exa-mcp-server dependency for web search (#1269)
+
+Ports the two default-enabled tools of the external TypeScript `exa-mcp-server`
+(`web_search_exa`, `web_fetch_exa`) to a native Rust toolset server, following the
+`harnx-grep-tools` precedent. The `coding` and `pantheon` package `exa.yaml` configs
+now run `harnx-exa-tools` directly instead of bridging to `npx exa-mcp-server`, so web
+search no longer needs Node.js.
+
+#### feat: add native harnx-fetch-tools server, replacing the npx mcp-fetch-server dependency for URL fetching (#2080)
+
+Ports the six fetch tools (`fetch_html`, `fetch_markdown`, `fetch_txt`, `fetch_json`,
+`fetch_readable`, `fetch_youtube_transcript`) from the external TypeScript
+`mcp-fetch-server` to a native Rust toolset server, following the `harnx-exa-tools`
+precedent. The `coding` and `pantheon` package `fetch.yaml` configs now run
+`harnx-fetch-tools` directly instead of bridging to `npx mcp-fetch-server`, so
+fetching no longer needs Node.js.
+
+New security features:
+- Blocks private IP connections by default (SSRF protection) for all fetch operations,
+  covering initial connections and every redirect hop.
+- Pass `--allow-private-ip` to disable SSRF protection when needed.
+- Uses harnx smart-truncation params (`head_lines`, `tail_lines`, `max_output_bytes`)
+  while maintaining backward compatibility with upstream's `max_length`/`start_index`.
 
 ## 0.4.4 (2026-09-24)
 
@@ -204,6 +252,11 @@ Astra/Fable reasoning aliases with the required request settings. Preserve
 Gemini function-call IDs through tool-result replay and configure Fable 5.1
 to tolerate thinking invalidated by conversation compaction. Packages
 require harnx 0.34.0 or a development build containing these changes.
+
+#### Add natural-writing style guidance to agent prompts to reduce AI-tell phrasing in code comments, documentation, commit messages, and PR text (#1248).
+
+- New shared prompt fragment `agents/shared/natural-writing.md`, wired into the prose-writing pantheon agents (peitho, clio, mnemosyne, aristarchus, atlas, daedalus, sisyphus, and the coder specialists).
+- Inline `## Natural Writing` section added to the `coding` package coder prompt.
 
 ### Fixes
 
@@ -352,6 +405,27 @@ config model. Hook entries now specify only `command` (plus optional
 its event and matcher, so those fields are no longer set in the package config.
 
 ## 0.3.4 (2026-07-23)
+
+### Features
+
+#### chore(pantheon): update agent default models to latest versions
+
+Refresh the default `model:` (and `model_fallbacks`) for Pantheon agents to the
+latest model IDs:
+
+- OpenAI `gpt-5.4`/`gpt-5.5` → `gpt-5.6-sol` (light/mid reasoning) or
+  `gpt-5.6-terra` (heavy critics/orchestration).
+- Anthropic `claude-sonnet-4-6` → `claude-sonnet-5`.
+- Gemini flash tier `gemini-3-flash-preview`/`gemini-3.5-flash` →
+  `gemini-3.6-flash` (GA).
+- Gemini lite tier `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite` (GA), used
+  by the compaction agents.
+
+Also adds `gemini-3.6-flash` and `gemini-3.5-flash-lite` as curated entries in
+`crates/harnx/models.yaml` ahead of their publication in the LiteLLM registry.
+
+Agents already on current models (`claude-opus-4-8`, `gemini-3.1-pro-preview`,
+`bedrock:zai.glm-5`) are unchanged.
 
 ### Fixes
 

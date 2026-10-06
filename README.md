@@ -304,7 +304,9 @@ Added a new feature to the CLI.
 
 The YAML front matter specifies the package and the type of version bump (`patch`, `minor`, or `major`).
 
-The package key must be one of the three that knope versions: `harnx`, `pantheon`, or `coding`. Use `harnx` for any change to the Rust workspace — all `harnx-*` crates share a single version, so individual crate names (e.g. `harnx-core`) are **not** valid keys and will cause `knope release` to error.
+The package key must be one of the three that knope versions: `harnx`, `pantheon`, or `coding`. Use `harnx` for any change to the Rust workspace — all `harnx-*` crates share a single version, so individual crate names (e.g. `harnx-core`) are **not** valid keys. Don't quote keys or change types.
+
+knope doesn't report several common changeset mistakes. It skips a changeset keyed by a crate name or a quoted key, or kept outside `.changeset/`, and it deletes one with an unknown change type without adding it to the changelog. Run `python3 scripts/check_changesets.py` (Python 3.11 or newer) to catch these; CI runs it too.
 
 ### Releasing
 To trigger a new release:

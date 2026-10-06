@@ -23,6 +23,8 @@ globs = [
     "web/**",
     "docs/**",
     ".changeset/**",
+    "scripts/check_changesets.py",
+    "scripts/test_check_changesets.py",
     "demos/**",
     "docker/**",
     "*.md",
