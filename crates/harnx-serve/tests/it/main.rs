@@ -3,6 +3,9 @@
 //! dominated build time; nextest still runs every test in its own process.
 
 #[allow(dead_code)]
+#[path = "../../../harnx-runtime/tests/it/common/mod.rs"]
+mod common;
+#[allow(dead_code)]
 mod support;
 
 mod ag_ui_control_plane;

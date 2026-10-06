@@ -2,9 +2,7 @@
 
 #![cfg(unix)]
 
-#[allow(dead_code)]
-#[path = "../../../harnx-runtime/tests/it/common/mod.rs"]
-mod common;
+use crate::common;
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;

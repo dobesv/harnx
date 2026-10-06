@@ -280,26 +280,14 @@ async fn handle_prompt(
     context: &RpcContext<'_>,
     key: SessionKey,
 ) -> anyhow::Result<AppResponse> {
-    let (config, registry) = (context.config, context.registry);
+    let registry = context.registry;
     let mut params = match prompt_params(&id, params) {
         Ok(params) => params,
         Err(response) => return *response,
     };
     params.web_base_url = context.web_base_url.clone();
 
-    if !registry.has_session(&key) && !session_exists(config, &key).await? {
-        return json_rpc_response(
-            StatusCode::NOT_FOUND,
-            json_rpc_error(
-                id,
-                JSON_RPC_UNKNOWN_SESSION_CODE,
-                "session not found",
-                Some(json!({ "agent": key.agent(), "session": key.session })),
-            ),
-        );
-    }
-
-    let handle = registry.get_or_spawn(key.clone());
+    let handle = registry.get_or_spawn(key);
     let resume = match parse_resume_params(&params.resume) {
         Ok(resume) => resume,
         Err(err) => {
@@ -579,6 +567,7 @@ fn session_state_json(state: &SessionState, worker_active: bool) -> Value {
     match state {
         SessionState::Idle if worker_active => json!({ "status": "running" }),
         SessionState::Idle => json!({ "status": "idle" }),
+        SessionState::Pending => json!({ "status": "running" }),
         SessionState::Running { run_id, started_at } => json!({
             "status": "running",
             "run_id": run_id,
@@ -854,18 +843,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_session_prompt_unknown_session_returns_not_found_without_spawning_actor() {
+    async fn rpc_session_prompt_unknown_session_spawns_actor_and_accepts_prompt() {
         let _guard = TestStateGuard::new(None).await;
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let registry = SessionRegistry::new(crate::session_actor::load_base_config_for_tests());
+        let call_fn: AgentCallFn = Arc::new(|_input, _config, _abort| {
+            Box::pin(async {
+                Ok((
+                    "hello reply".to_string(),
+                    None,
+                    vec![],
+                    harnx_runtime::client::CompletionTokenUsage::default(),
+                ))
+            })
+        });
+        let registry = registry_with_call_fn(call_fn);
         let key = SessionKey::local("plain", "never-prompted");
+        assert!(!registry.has_session(&key));
 
         let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "never-prompted", Bytes::from(json!({"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{"text":"hello"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Nats).await.expect("rpc response");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["error"]["code"], JSON_RPC_UNKNOWN_SESSION_CODE);
-        assert_eq!(body["error"]["message"], "session not found");
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 11);
+        assert_eq!(body["result"]["status"], "accepted");
+        assert!(body["result"]["run_id"].as_str().is_some());
+        assert!(registry.has_session(&key));
+    }
+
+    #[tokio::test]
+    async fn rpc_session_prompt_unknown_agent_does_not_spawn_actor() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        let config = sandbox.config();
+        let registry = SessionRegistry::new(config.clone());
+        let key = SessionKey::local("missing-agent", "never-prompted");
+
+        let error = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "missing-agent",
+            "never-prompted",
+            Bytes::from(json!({"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{"text":"hello"}}).to_string()),
+            &config,
+            &registry,
+            PersistenceKind::Nats,
+        )
+        .await
+        .expect_err("unknown agent must still fail validation");
+        assert_eq!(
+            crate::status_from_error(&error),
+            Some(StatusCode::NOT_FOUND)
+        );
         assert!(!registry.has_session(&key));
     }
 
@@ -1541,5 +1569,18 @@ mod extra_rpc_tests {
         let notification_body = response_json(notification).await;
         assert_eq!(notification_body["id"], Value::Null);
         assert_eq!(notification_body["error"]["code"], -32700);
+    }
+}
+
+#[cfg(test)]
+mod pending_state_tests {
+    use super::*;
+
+    #[test]
+    fn pending_prompt_reports_running_without_local_run_identity() {
+        assert_eq!(
+            session_state_json(&SessionState::Pending, false),
+            json!({"status":"running"})
+        );
     }
 }

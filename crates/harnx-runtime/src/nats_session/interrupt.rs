@@ -270,14 +270,11 @@ impl NatsSession {
                 cancel_seq,
                 ..
             } => cancel_seq,
-            harnx_core::session_reconstruct::TurnStatus::InFlightResumable { .. } => entries
-                .iter()
-                .rev()
-                .find_map(|(seq, e)| {
-                    matches!(e, SessionLogEntry::Message { role, .. } if role.is_user())
-                        .then_some(*seq)
-                })
-                .unwrap_or(0),
+            harnx_core::session_reconstruct::TurnStatus::InFlightResumable { .. } => {
+                harnx_core::session_reconstruct::pending_prompt_seq(&entries)
+                    .or_else(|| harnx_core::session_reconstruct::latest_prompt_seq(&entries))
+                    .unwrap_or(0)
+            }
         };
         self.publish_control_activation(requested_seq, None, None)
             .await?;

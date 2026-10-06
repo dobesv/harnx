@@ -59,7 +59,8 @@ async fn assert_missing_worker_error(
     );
 
     let info = get_info(&handle).await;
-    assert_eq!(info.state, SessionState::Idle);
+    // Startup failed locally, but no durable terminal settled the admitted input.
+    assert_eq!(info.state, SessionState::Pending);
     let (session, _) = crate::load_nats_session(
         &config,
         &crate::session_actor::ResolvedAgentTarget::local("plain"),

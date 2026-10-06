@@ -148,7 +148,7 @@ struct LoadedHistorySnapshot {
 
 /// The session state the durable log implies for a session with no run of this
 /// server's own: an approval gate it is parked at, the `Cancel` that stopped
-/// its turn, or nothing. Deriving it here is what makes an interrupt survive
+/// its turn, or input still waiting for a worker. Deriving it here makes state survive
 /// a history refresh, an actor reap and a server restart alike — the log is
 /// the authority, and this actor only ever caches its answer.
 fn derive_state_from_log(
@@ -157,10 +157,10 @@ fn derive_state_from_log(
     let Some(entries) = entries else {
         return SessionState::Idle;
     };
-    // The `Cancel` is read first: it ends the turn the gate belongs to, and a
-    // session that answered an interrupt must not report itself back at a gate
-    // nobody is waiting on any more.
-    if harnx_core::session_reconstruct::current_turn_is_cancelled(entries) {
+    // A Cancel ends its approval gate, but input admitted after it is pending
+    // work for a new turn. Don't report that input as already interrupted.
+    let pending = harnx_core::session_reconstruct::pending_prompt_seq(entries).is_some();
+    if !pending && harnx_core::session_reconstruct::current_turn_is_cancelled(entries) {
         return SessionState::Interrupted {
             cancel_seq: harnx_core::session_reconstruct::last_terminator_seq(entries),
         };
@@ -170,7 +170,11 @@ fn derive_state_from_log(
             pending: Box::new(PendingInterrupt { metadata }),
         };
     }
-    SessionState::Idle
+    if pending {
+        SessionState::Pending
+    } else {
+        SessionState::Idle
+    }
 }
 
 fn spawn_session_actor(
@@ -628,6 +632,7 @@ impl SessionActor {
                 "outcome": pending.metadata.clone()
             })),
             SessionState::Idle
+            | SessionState::Pending
             | SessionState::Running { .. }
             | SessionState::Interrupting
             | SessionState::Interrupted { .. } => None,
@@ -2074,4 +2079,6 @@ mod tests {
 
     #[path = "worker_startup_tests.rs"]
     mod worker_startup_tests;
+
+    mod pending_tests;
 }

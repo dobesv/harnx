@@ -86,6 +86,8 @@ async fn accepted_stop_interrupts_a_backpressured_remote_output_queue() {
         session_id: storage_key(),
         tx,
         through_seq: 1,
+        claim_watchdog: None,
+        session_base: None,
     }));
     let client = fixture.config.nats_client(LOCAL_CLUSTER_KEY).await.unwrap();
     let envelope = AdvisoryEnvelope::new(
@@ -130,4 +132,74 @@ async fn accepted_stop_interrupts_a_backpressured_remote_output_queue() {
 
 fn storage_key() -> String {
     harnx_core::session_identity::session_key(Some("plain"), "blocked-sse")
+}
+
+async fn claim_test_lease(fixture: &Fixture) -> harnx_runtime::nats_lease::NatsSessionLease {
+    harnx_runtime::nats_lease::NatsSessionLease::acquire(
+        harnx_runtime::nats_lease::NatsLeaseAcquireParams {
+            jetstream: fixture.jetstream.clone(),
+            session_id: &storage_key(),
+            worker_id: "cache-test-worker".into(),
+            generation: 1,
+            config: harnx_runtime::nats_lease::NatsLeaseConfig::default(),
+            session_metadata: None,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("claim test lease")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_lease_bucket_observes_late_claim_release_and_recreation() {
+    let fixture = Fixture::new().await;
+    let mut poller = RemoteTurnPoller::new(fixture.jetstream.clone(), storage_key(), 1, None);
+    assert!(!poller.lease_active().await.unwrap());
+    assert!(
+        poller.lease_bucket.is_none(),
+        "missing bucket should be retried"
+    );
+    let first = claim_test_lease(&fixture).await;
+    assert!(poller.lease_active().await.unwrap());
+    assert!(poller.lease_bucket.is_some());
+    first.release().await.unwrap();
+    assert!(!poller.lease_active().await.unwrap());
+    assert!(
+        poller.lease_bucket.is_some(),
+        "release must retain the cached handle"
+    );
+    fixture
+        .jetstream
+        .delete_key_value(&poller.lease_config.bucket)
+        .await
+        .unwrap();
+    assert!(!poller.lease_active().await.unwrap());
+    let replacement = claim_test_lease(&fixture).await;
+    assert!(poller.lease_active().await.unwrap());
+    replacement.release().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_completion_wins_over_absent_lease() {
+    let mut fixture = Fixture::new().await;
+    let mut poller = RemoteTurnPoller::new(fixture.jetstream.clone(), storage_key(), 1, None);
+    poller.lease_absent_count = LEASE_ABSENT_THRESHOLD - 1;
+    NatsSessionLog::new(fixture.jetstream.clone(), storage_key())
+        .append_event_async(&SessionLogEntry::TurnEnd {
+            through_seq: 1,
+            fence_token: 1,
+            timestamp: None,
+            usage: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        poller.poll(&mut fixture.stream).await.unwrap(),
+        Some(RemoteFollowTerminal::Finished)
+    );
+    assert_eq!(
+        poller.lease_absent_count,
+        LEASE_ABSENT_THRESHOLD - 1,
+        "terminal history must win before another absent-lease count"
+    );
 }

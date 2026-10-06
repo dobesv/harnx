@@ -123,3 +123,8 @@ test = ["harnx-proxy-auth"]
 [[test-edge]]
 on-affected = ["harnx-test-bins"]
 test = ["harnx-mcp-bridge"]
+
+# Serve control-plane and SIGTERM tests reuse the runtime's NATS server fixture.
+[[test-path]]
+globs = ["crates/harnx-runtime/tests/it/common/**"]
+test = ["harnx-serve"]

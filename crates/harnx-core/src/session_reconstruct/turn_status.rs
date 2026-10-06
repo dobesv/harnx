@@ -108,6 +108,39 @@ pub fn latest_prompt_seq(entries: &[(u64, SessionLogEntry)]) -> Option<u64> {
     latest
 }
 
+/// Whether a durable terminal entry covers the prompt at `prompt_seq`.
+/// A TurnEnd can sit after queued input without covering that input.
+pub fn prompt_is_covered(entries: &[(u64, SessionLogEntry)], prompt_seq: u64) -> bool {
+    prompt_terminal_entry(entries, prompt_seq).is_some()
+}
+
+/// First durable terminal covering a prompt, excluding later turns' outcomes.
+pub fn prompt_terminal_entry(
+    entries: &[(u64, SessionLogEntry)],
+    prompt_seq: u64,
+) -> Option<&(u64, SessionLogEntry)> {
+    entries.iter().find(|(seq, entry)| match entry {
+        SessionLogEntry::TurnEnd { through_seq, .. } => *through_seq >= prompt_seq,
+        SessionLogEntry::Error { .. } | SessionLogEntry::Cancel { .. } => *seq > prompt_seq,
+        _ => false,
+    })
+}
+
+/// Newest unanswered prompt, excluding retracted input and compaction copies.
+/// Pending work is not evidence of a live worker: observers still need a bounded
+/// lease-acquisition wait. A missing lease alone doesn't settle input.
+pub fn pending_prompt_seq(entries: &[(u64, SessionLogEntry)]) -> Option<u64> {
+    let effective = super::apply_log_mutations_nats(entries).unwrap_or_else(|_| entries.to_vec());
+    let prompt_seq = latest_prompt_seq(&effective)?;
+    // Error/Cancel are editable transcript rows; TurnEnd is control metadata
+    // omitted by mutation replay and retains coverage independently of edits.
+    let covered = prompt_is_covered(&effective, prompt_seq)
+        || entries.iter().any(|(_, entry)| {
+            matches!(entry, SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq >= prompt_seq)
+        });
+    (!covered).then_some(prompt_seq)
+}
+
 /// Entries strictly after the last terminator.
 pub fn current_turn_entries(entries: &[(u64, SessionLogEntry)]) -> &[(u64, SessionLogEntry)] {
     &entries[after_last(entries, |(_, entry)| is_terminator(entry))..]
@@ -430,5 +463,119 @@ mod tests {
             message(None, MessageRole::User),
         ]);
         assert_eq!(latest_prompt_seq(&log), Some(3));
+    }
+
+    #[test]
+    fn pending_prompt_requires_a_covering_terminal() {
+        let mut log = numbered(vec![user(), user(), turn_end(1)]);
+        assert_eq!(pending_prompt_seq(&log), Some(2));
+        assert!(prompt_is_covered(&log, 1));
+        assert!(!prompt_is_covered(&log, 2));
+        log.push((4, turn_end(2)));
+        assert_eq!(pending_prompt_seq(&log), None);
+        for terminal in [
+            cancel("stop"),
+            SessionLogEntry::Error {
+                message: "failed".into(),
+                fence_token: 1,
+                timestamp: None,
+            },
+        ] {
+            let mut log = numbered(vec![user(), terminal]);
+            assert_eq!(pending_prompt_seq(&log), None);
+            log.push((3, user()));
+            assert_eq!(pending_prompt_seq(&log), Some(3));
+        }
+    }
+
+    #[test]
+    fn pending_prompt_ignores_removed_terminals() {
+        for terminal in [
+            cancel("stop"),
+            SessionLogEntry::Error {
+                message: "failed".into(),
+                fence_token: 1,
+                timestamp: None,
+            },
+        ] {
+            for mutation in [
+                SessionLogEntry::EditEntries {
+                    from: 2,
+                    to: 2,
+                    replacements: vec![],
+                },
+                SessionLogEntry::EditEntries {
+                    from: 2,
+                    to: 2,
+                    replacements: vec![serde_yaml::to_string(&message(
+                        None,
+                        MessageRole::Assistant,
+                    ))
+                    .unwrap()],
+                },
+                SessionLogEntry::Rewind { after_seq: 1 },
+            ] {
+                let log = numbered(vec![user(), terminal.clone(), mutation]);
+                assert_eq!(pending_prompt_seq(&log), Some(1), "{log:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pending_prompt_uses_replacement_terminal_coverage() {
+        let log = numbered(vec![
+            user(),
+            message(None, MessageRole::Assistant),
+            SessionLogEntry::EditEntries {
+                from: 2,
+                to: 2,
+                replacements: vec![serde_yaml::to_string(&cancel("stop")).unwrap()],
+            },
+        ]);
+        assert_eq!(pending_prompt_seq(&log), None);
+    }
+
+    #[test]
+    fn pending_prompt_preserves_turn_end_coverage_after_edits() {
+        let mut log = numbered(vec![
+            user(),
+            message(None, MessageRole::Assistant),
+            turn_end(1),
+            message(None, MessageRole::Assistant),
+            SessionLogEntry::EditEntries {
+                from: 2,
+                to: 4,
+                replacements: vec![],
+            },
+        ]);
+        // TurnEnd isn't a logical row, even when an edit spans its physical seq.
+        assert_eq!(
+            super::super::apply_log_mutations_nats(&log).unwrap().len(),
+            1
+        );
+        assert_eq!(pending_prompt_seq(&log), None);
+        log.push((6, user()));
+        assert_eq!(pending_prompt_seq(&log), Some(6));
+    }
+
+    #[test]
+    fn pending_prompt_ignores_compaction_and_retracted_input() {
+        assert_eq!(pending_prompt_seq(&compacted()), None);
+        for mutation in [
+            SessionLogEntry::Rewind { after_seq: 1 },
+            SessionLogEntry::EditEntries {
+                from: 2,
+                to: 2,
+                replacements: vec![],
+            },
+        ] {
+            let log = numbered(vec![
+                message(Some("old-reply"), MessageRole::Assistant),
+                user(),
+                mutation,
+            ]);
+            assert_eq!(pending_prompt_seq(&log), None);
+        }
+        assert_eq!(pending_prompt_seq(&[]), None);
     }
 }

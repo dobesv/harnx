@@ -237,7 +237,9 @@ Same canonical session URL, negotiated into programmatic control.
   running):
   - `{ "status": "idle" }`
   - `{ "status": "running", "run_id": "…", "started_at": "…" }` — a turn owned
-    by a remote worker reports plain `{ "status": "running" }`, with no run id.
+    by a remote worker, or an admitted prompt waiting for its worker, reports
+    plain `{ "status": "running" }`, with no run id. This means durable work is
+    outstanding, not that a worker necessarily holds the lease.
   - `{ "status": "interrupting" }` — this server's interrupt append is in
     flight.
   - `{ "status": "interrupted", "cancel_seq": 12 }` — a `Cancel` at that log
@@ -245,7 +247,7 @@ Same canonical session URL, negotiated into programmatic control.
   - `{ "status": "awaiting_approval", "pending_interrupts": { … } }` — the turn
     is parked at an approval gate. It is not interrupted; the client's next move
     is a decision, not another cancel.
-- **`session/prompt`**: Sends a new user prompt.
+- **`session/prompt`**: Sends a new user prompt, creating the session if it doesn't exist.
   ```json
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello" } }
   ```
@@ -277,7 +279,7 @@ Same canonical session URL, negotiated into programmatic control.
     - `{ "status": "failed", "detail": "..." }` — prior compaction attempt failed with the error message in `detail`.
 
 **Error Codes:**
-- `-32001`: Unknown session (HTTP 404)
+- `-32001`: Unknown session (HTTP 404) for operations that require an existing session, such as `session/get`, `session/cancel`, `session/compact`, and read-state updates. `session/prompt` creates the session if absent.
 - `-32003`: Session actor unreachable (HTTP 503). Transient: the session's in-process actor could not be reached, so retry the call.
 - `-32601`: Method not found
 - Standard JSON-RPC 2.0 codes (-32700, -32600, -32602)
@@ -287,8 +289,8 @@ Same canonical session URL, negotiated into programmatic control.
 
 ### Client Implementation Flow
 
-1. **Create**: `POST` the session collection and use the returned `session_id` as the URL, NATS stream, and persistence identity.
-2. **Connect**: Open the session event feed and use promptless AG-UI runs to hydrate or join an active run.
+1. **Create**: `POST` the session collection and use the returned `session_id` as the URL, NATS stream, and persistence identity. Clients that choose their own session IDs can skip this POST: send `session/prompt` to the chosen session URL to create the session and admit its first prompt.
+2. **Connect**: Open the session event feed and use promptless AG-UI runs to hydrate or join an active run. An attach after prompt admission waits for a worker or durable completion even before the worker claims the lease. If no worker claims it within `nats_lease_acquisition_timeout_secs` (default 60 seconds), the stream closes with `RUN_ERROR`, not a false `RUN_FINISHED`. This observation timeout doesn't cancel the prompt. Restore the worker and attach again, or explicitly cancel the pending turn; unanswered durable input remains `running` until completed, failed, cancelled, or retracted.
 3. **Drive**: Use JSON-RPC on the same canonical session URL to send prompts
    (`session/prompt`) and interrupt runs (`session/cancel`).
 4. **Stateless UI**: Clients only send new inputs via RPC; they do not need to re-POST full transcript.

@@ -1067,28 +1067,63 @@ Late-joining clients automatically converge to the same state by replaying the d
 
 ### Busy-State Reflection for Remote Workers
 
-When a NATS worker holds the session lease, the Web UI's AG-UI `/run` endpoint
-follows a different path than the local-actor case:
+The Web UI's promptless AG-UI run (`POST /v1/agents/:agent/sessions/:session`
+with `Accept: text/event-stream`) chooses its follow path from local run
+ownership and durable pending input, not just the session lease:
 
 - **Local actor running**: the SSE stream follows the `SessionActor` broadcast,
   which emits real-time `AgentEvent`s from the model/tool loop.
-- **Local actor idle + remote lease active**: the AG-UI endpoint attaches to
-  `SessionEventStream` advisories from the snapshot's last `User` row onward. It
-  translates eligible events to AG-UI frames and ends the stream on the
-  terminator that covers that row — a `TurnEnd` or a `Cancel`.
+- **No local run + remote lease active or unanswered durable prompt**: the
+  endpoint attaches to `SessionEventStream` before waiting for a worker. It
+  translates eligible advisories to AG-UI frames and polls durable history. A
+  `TurnEnd` whose `through_seq` covers the prompt, a later `Cancel` or `Error`,
+  or retraction settles the attachment. If a short turn completes between
+  lease polls, the stream hydrates its durable output before finishing.
 
-Worker death and task failure produce `RUN_ERROR` on both paths. The local-actor
-path wraps its turn task in panic supervision (`session_actor.rs:281`); the
-remote-follow path confirms lease absence before reporting loss
-(`ag_ui_remote_follow.rs:557`). Actor-owned turns additionally enforce a 60s
-acquisition deadline before reporting an unclaimed run as failed
-(`nats_session.rs:89`).
+`session/get` reports unanswered durable input as `running` even before a
+worker claims the lease. This means work is outstanding, not proof of a live
+worker. Both actor-owned turns and remote attachments bound their initial
+claim wait with `nats_lease_acquisition_timeout_secs` (default 60 seconds).
+An unclaimed attachment emits `RUN_ERROR`, never a false `RUN_FINISHED`, when
+that budget expires. Increase the budget for slow worker startup or queue
+backlogs. The timeout ends observation, not the durable prompt, which may run
+later. Clients must distinguish `RUN_ERROR` from successful completion.
+
+After observing a lease, remote follow uses the existing consecutive-absence
+checks to report worker loss. Worker death and task failure produce `RUN_ERROR`
+on both paths; the local-actor path also supervises turn-task panics.
+
+#### Recover an unanswered prompt after a delivery limit
+
+Worker and consumer [delivery limits](#delivery-limits) can stop redelivery
+without writing a terminal entry. An unanswered prompt then stays `running`
+in `session/get` even after an attachment times out. Observers don't invent a
+worker-fenced `Error` or `Cancel` to mark it finished.
+
+1. Check worker availability, cluster subscriptions, and queue backlog. Restore
+   the worker, then re-attach with a promptless run; attachment republishes
+   pending activation so the durable prompt can run.
+2. If the work should not run, send `session/cancel` or retract the user prompt.
+   A durable cancellation or retraction settles pending input.
+3. To send new input, use `session/prompt` on the same session. It admits a new
+   prompt even when earlier input is still pending. Cancel or retract the old
+   input first if it must not be included in the resumed work.
+
+Alert on increases in `harnx_activation_claim_deadlines_total` (frontend or
+parent watchdog expirations) and
+`harnx_activation_claims_total{outcome="delivery_limit_term"}` (worker delivery
+limit terminations). Also alert on sustained JetStream consumer `num_pending`
+backlog, inspected with `nats consumer info <stream> <consumer>` or the NATS
+exporter's `nats_consumer_num_pending` metric. The worker's binary
+`harnx_worker_activations_waiting` gauge is not the cluster backlog. Correlate
+these signals with worker logs; consumer delivery-limit drops don't increment
+the worker's termination counter. See [activation metrics](metrics.md#worker-activation-and-lease-claims).
 
 The session metadata watch endpoint (`GET .../events`, `session_updates` in the
-serve implementation) is separate from the AG-UI `/run` stream and provides
+serve implementation) is separate from the AG-UI run stream and provides
 lightweight `session-updated` notifications that trigger client rehydration.
 Two distinct endpoints keep the AG-UI run stream finite and properly sequenced
-(RUN_STARTED → … → RUN_FINISHED), while the watch channel converges late
+(RUN_STARTED → … → RUN_FINISHED or RUN_ERROR), while the watch channel converges late
 observers on the same durable state.
 
 Tool confirmations are **point-to-point** over NATS: the worker sends the

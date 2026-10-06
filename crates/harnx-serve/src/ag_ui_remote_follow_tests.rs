@@ -1,7 +1,8 @@
 use super::*;
 use crate::ag_ui_remote_follow::{
-    event_frames, remote_terminal_frame, terminal_after_lease_poll, AdvisoryForwarder, QueuedEvent,
-    RemoteFollowTerminal, LEASE_ABSENT_THRESHOLD, WORKER_LOST_MESSAGE,
+    event_frames, remote_terminal_frame, terminal_after_lease_poll, terminal_from_history,
+    AdvisoryForwarder, QueuedEvent, RemoteFollowTerminal, LEASE_ABSENT_THRESHOLD,
+    WORKER_LOST_MESSAGE,
 };
 use harnx_runtime::nats_event_sink::LiveEventState;
 
@@ -112,12 +113,9 @@ fn assert_lifecycle_closed(segments: OpenLifecycleSegments) {
 fn worker_loss_uses_run_error_terminal() {
     let mut absent_count = 0;
     for _ in 1..LEASE_ABSENT_THRESHOLD {
-        assert_eq!(
-            terminal_after_lease_poll(&mut absent_count, false, false),
-            None
-        );
+        assert_eq!(terminal_after_lease_poll(&mut absent_count, false), None);
     }
-    let terminal = terminal_after_lease_poll(&mut absent_count, false, false)
+    let terminal = terminal_after_lease_poll(&mut absent_count, false)
         .expect("confirmed lease absence must terminate the run");
     assert_eq!(
         terminal,
@@ -131,25 +129,29 @@ fn worker_loss_uses_run_error_terminal() {
 fn durable_completion_uses_run_finished_terminal() {
     // The normal-completion path for every remote/TUI-initiated turn: a durable
     // TurnEnd landed, so the poll finishes the run regardless of the lease.
-    let mut absent_count = 0;
-    let terminal = terminal_after_lease_poll(&mut absent_count, true, true)
-        .expect("a durable turn end must terminate the run");
+    let history = vec![(
+        2,
+        harnx_core::session::SessionLogEntry::TurnEnd {
+            through_seq: 1,
+            fence_token: 1,
+            timestamp: None,
+            usage: None,
+        },
+    )];
+    let terminal =
+        terminal_from_history(&history, 1).expect("a durable turn end must terminate the run");
     assert_eq!(terminal, RemoteFollowTerminal::Finished);
 
     assert_terminal_frame(terminal, "RUN_FINISHED", None);
 }
 
 #[test]
-fn durable_completion_wins_over_absent_lease() {
-    // Worker loss and durable completion can be observed on the same poll (the
-    // worker released its lease as it finished). Durable completion is
-    // authoritative: the run finished, it did not fail. A prior run of absences
-    // must not tip an already-completed turn into RUN_ERROR.
+fn lease_return_resets_worker_loss_window() {
     let mut absent_count = LEASE_ABSENT_THRESHOLD - 1;
-    assert_eq!(
-        terminal_after_lease_poll(&mut absent_count, false, true),
-        Some(RemoteFollowTerminal::Finished)
-    );
+    assert_eq!(terminal_after_lease_poll(&mut absent_count, true), None);
+    assert_eq!(absent_count, 0);
+    assert_eq!(terminal_after_lease_poll(&mut absent_count, false), None);
+    assert_eq!(absent_count, 1);
 }
 #[tokio::test]
 async fn completed_remote_path_orders_boundary_before_hydrated_handoff() {
@@ -181,8 +183,7 @@ async fn completed_remote_path_orders_boundary_before_hydrated_handoff() {
         initial_frames,
         snapshot_frame,
         control_frames,
-        &thread_id,
-        &run_id,
+        remote_terminal_frame(RemoteFollowTerminal::Finished, &thread_id, &run_id),
     );
     let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
 
