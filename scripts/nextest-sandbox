@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+#
+# Cargo target runner that gives every test nextest runs a private
+# environment, so tests can't reach each other's state or the developer's own
+# harnx config, data, state and broker. See AGENTS.md, "Test sandbox".
+#
+# Must stay compatible with macOS's bash 3.2.
+
+# Only nextest test runs are sandboxed. nextest sets NEXTEST_ATTEMPT_ID when it
+# runs a test but not when it lists them, and Cargo also uses this runner for
+# `cargo run`, `cargo test` and `cargo bench`; all of those pass through.
+if [ -z "${NEXTEST:-}" ] || [ -z "${NEXTEST_ATTEMPT_ID:-}" ]; then
+    exec "$@"
+fi
+
+case "${HARNX_TEST_SANDBOX:-}" in
+    "") ;;
+    off) exec "$@" ;;
+    *)
+        echo "harnx test sandbox: HARNX_TEST_SANDBOX must be unset or 'off', got '${HARNX_TEST_SANDBOX}'" >&2
+        exit 2
+        ;;
+esac
+
+# Whether an ambient variable may reach the test. Everything not listed is
+# dropped: credentials, agent and session sockets, proxies, tmux and git
+# context, and every HARNX_* variable. Widen this list deliberately.
+allowed() {
+    case "$1" in
+        *TOKEN* | *CREDENTIAL* | *SECRET* | *PASSWORD*) return 1 ;;
+        PATH | HOME | USER | LOGNAME | SHELL | TERM | LANG | LANGUAGE | LC_* | TZ) return 0 ;;
+        CARGO | CARGO_* | NEXTEST | NEXTEST_* | RUST_TEST_*) return 0 ;;
+        LD_LIBRARY_PATH | DYLD_FALLBACK_LIBRARY_PATH | DYLD_LIBRARY_PATH) return 0 ;;
+        RUST_BACKTRACE | RUST_LIB_BACKTRACE | RUST_LOG | RUST_MIN_STACK) return 0 ;;
+        RUSTFLAGS | RUSTDOCFLAGS | RUSTUP_* | ASDF_*) return 0 ;;
+        NATS_SERVER_BIN | CI) return 0 ;;
+        # insta's own switches, such as INSTA_UPDATE, and the variables
+        # `cargo insta test` sets so its tests report which snapshots they
+        # used. Without those, it takes snapshots in use for unreferenced.
+        INSTA_*) return 0 ;;
+    esac
+    return 1
+}
+
+# NAME=VALUE pairs for the test's environment. Names come from the raw
+# environment because Cargo and nextest set names such as
+# CARGO_BIN_EXE_harnx-bash-tools that a bash variable can't hold.
+pairs=()
+if [ -r /proc/self/environ ]; then
+    while IFS= read -r -d '' entry; do
+        allowed "${entry%%=*}" && pairs+=("$entry")
+    done </proc/self/environ
+else
+    while IFS= read -r name; do
+        allowed "$name" || continue
+        # The `.` stops the command substitution from stripping the value's
+        # own trailing newlines; then drop it and the newline printenv adds.
+        value=$(printenv "$name" && echo .) || continue
+        value=${value%.}
+        pairs+=("$name=${value%$'\n'}")
+    done < <(env | sed -n 's/^\([^=][^=]*\)=.*/\1/p' | sort -u)
+fi
+
+# The private home's variables. HARNX_*_DIR point where harnx would derive
+# them from the XDG directories; setting both covers code that ignores XDG.
+add_home_pairs() {
+    pairs+=(
+        "XDG_CONFIG_HOME=$1/config"
+        "XDG_DATA_HOME=$1/data"
+        "XDG_STATE_HOME=$1/state"
+        "XDG_CACHE_HOME=$1/cache"
+        "XDG_RUNTIME_DIR=$1/runtime"
+        "HARNX_CONFIG_DIR=$1/config/harnx"
+        "HARNX_DATA_DIR=$1/data/harnx"
+        "HARNX_STATE_DIR=$1/state/harnx"
+    )
+}
+
+# Whether $1 is one of the other arguments.
+contains() {
+    local item=$1 other
+    shift
+    for other; do
+        [ "$other" = "$item" ] && return 0
+    done
+    return 1
+}
+
+# Adds to `dirs` every place the developer's harnx directory of one kind can
+# be: the override named by $1, under the XDG directory named by $2, and
+# under HOME's default $3. harnx_core::config_paths uses the first that is
+# set, but the others can still hold the developer's files.
+add_developer_dirs() {
+    [ -n "${!1:-}" ] && dirs+=("${!1}")
+    [ -n "${!2:-}" ] && dirs+=("${!2}/harnx")
+    dirs+=("${HOME:-}/$3/harnx")
+}
+
+# Empty tmpfs mounts over the developer's harnx directories catch code that
+# builds harnx paths without the variables. Each path is resolved first,
+# because bwrap creates the --tmpfs mount point inside the new root, where an
+# absolute host symlink in the path can't be followed. A path that doesn't
+# resolve doesn't exist, so bwrap never creates a mount point on the host.
+# Call this after bind_host_tmp_entries: the masks then sit on top of its
+# binds and also cover a directory inside an entry it brought back. Only /tmp
+# itself is skipped, because a mask there would hide those entries again. A
+# mask under an entry that wasn't bound lands in the private /tmp, never on
+# the host. Appends to run_linux's `args`.
+mask_developer_dirs() {
+    local dirs=() masked=() dir
+    add_developer_dirs HARNX_CONFIG_DIR XDG_CONFIG_HOME .config
+    add_developer_dirs HARNX_DATA_DIR XDG_DATA_HOME .local/share
+    add_developer_dirs HARNX_STATE_DIR XDG_STATE_HOME .local/state
+    for dir in "${dirs[@]}"; do
+        dir=$(CDPATH='' cd -P -- "$dir" 2>/dev/null && pwd -P) || continue
+        [ "$dir" = /tmp ] && continue
+        contains "$dir" "${masked[@]}" && continue
+        masked+=("$dir")
+        args+=(--tmpfs "$dir")
+    done
+}
+
+# The private /tmp would hide a checkout, test binary or HOME under the
+# host's /tmp. Binds the top-level /tmp entry holding each of them back in;
+# $1 is the test binary. Appends to run_linux's `args`.
+bind_host_tmp_entries() {
+    local bound=() path entry
+    for path in "$PWD" "$1" "${HOME:-}"; do
+        case "$path" in /tmp/?*) ;; *) continue ;; esac
+        entry=${path#/tmp/}
+        entry=/tmp/${entry%%/*}
+        case "$entry" in /tmp/ | /tmp/. | /tmp/..) continue ;; esac
+        # The private home's own entry (run_linux's $home) stays out. A nested
+        # runner whose cwd, command or HOME is under it would otherwise share
+        # the outer test's private home instead of getting its own.
+        [ "$entry" = "$home" ] && continue
+        contains "$entry" "${bound[@]}" && continue
+        bound+=("$entry")
+        args+=(--bind "$entry" "$entry")
+    done
+}
+
+# `cargo insta test` has every test append to the files these variables
+# name, which are under the host's /tmp unless TMPDIR moves them. Each is
+# created if missing, never truncated, since other tests share it, and bound
+# in at the same path. One that can't be created is left out. Appends to
+# run_linux's `args`.
+bind_insta_files() {
+    local name path
+    for name in INSTA_SNAPSHOT_REFERENCES_FILE INSTA_WARNINGS_FILE; do
+        path=${!name:-}
+        case "$path" in /tmp/?*) ;; *) continue ;; esac
+        : 2>/dev/null >>"$path" || continue
+        args+=(--bind "$path" "$path")
+    done
+}
+
+# Whether the sysctl /proc/sys/$1 reads $2. A missing one reads as nothing.
+sysctl_is() {
+    local value
+    read -r value 2>/dev/null </proc/sys/"$1" && [ "$value" = "$2" ]
+}
+
+# Whether the host may stop bwrap from creating the user namespace it needs:
+# AppArmor's restriction (on by default in Ubuntu 24.04), sysctls that turn
+# unprivileged user namespaces off, or a seccomp filter, as in containers and
+# harnx's own sandbox. Builtins only, so hosts with none of these pay nothing.
+userns_may_be_blocked() {
+    local key value
+    sysctl_is kernel/apparmor_restrict_unprivileged_userns 1 && return 0
+    sysctl_is user/max_user_namespaces 0 && return 0
+    sysctl_is kernel/unprivileged_userns_clone 0 && return 0
+    while read -r key value; do
+        [ "$key" = Seccomp: ] && [ "$value" = 2 ] && return 0
+    done 2>/dev/null </proc/self/status
+    return 1
+}
+
+run_linux() {
+    if ! command -v bwrap >/dev/null 2>&1; then
+        echo "harnx test sandbox: bubblewrap is required on Linux. Install it (e.g. \`sudo apt install bubblewrap\`) or set HARNX_TEST_SANDBOX=off to run unsandboxed." >&2
+        exit 127
+    fi
+
+    local home=/tmp/harnx-test pair error
+    local args=(
+        --die-with-parent
+        --unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts
+        --bind / /
+        --tmpfs /tmp
+        --dev /dev
+        --proc /proc
+    )
+    bind_host_tmp_entries "$1"
+    mask_developer_dirs
+    bind_insta_files
+    args+=(
+        --dir "$home"
+        --dir "$home/config" --dir "$home/config/harnx"
+        --dir "$home/data" --dir "$home/data/harnx"
+        --dir "$home/state" --dir "$home/state/harnx"
+        --dir "$home/cache"
+        --perms 0700 --dir "$home/runtime"
+        --clearenv
+    )
+
+    add_home_pairs "$home"
+    pairs+=("TMPDIR=/tmp" "CARGO_NET_OFFLINE=true")
+    for pair in "${pairs[@]}"; do
+        args+=(--setenv "${pair%%=*}" "${pair#*=}")
+    done
+    args+=(--chdir "$PWD")
+
+    # Where the host may block the namespaces bwrap needs, try the sandbox
+    # once, so that a failure says what to do instead of every test failing
+    # with bwrap's own error.
+    if userns_may_be_blocked && ! error=$(bwrap "${args[@]}" true 2>&1 >/dev/null); then
+        echo "harnx test sandbox: bubblewrap can't start the sandbox here ($error). On Ubuntu 24.04, an AppArmor profile that allows \`userns\` for /usr/bin/bwrap fixes this without lifting the restriction for other programs; see AGENTS.md, \"Test sandbox\". Inside a container or harnx's own sandbox, set HARNX_TEST_SANDBOX=off to run unsandboxed." >&2
+        # A shell's status for a command it found but can't run: bwrap is
+        # there but can't run the test. A missing bwrap gets 127 above.
+        exit 126
+    fi
+    exec bwrap "${args[@]}" "$@"
+}
+
+run_macos() {
+    local home child status
+    # Under /tmp rather than macOS's long per-user TMPDIR: tests create Unix
+    # sockets under the TMPDIR set below, and macOS caps a socket path at 104
+    # bytes. /tmp is a symlink; the resolved path is the one the children are
+    # given, so `pkill -f "$home"` below matches it.
+    home=$(mktemp -d /tmp/harnx-test.XXXXXX) || exit 1
+    home=$(CDPATH='' cd -P -- "$home" && pwd -P) || exit 1
+    mkdir -p "$home/config/harnx" "$home/data/harnx" "$home/state/harnx" \
+        "$home/cache" "$home/runtime" "$home/tmp" || exit 1
+    chmod 700 "$home/runtime"
+
+    add_home_pairs "$home"
+    pairs+=("TMPDIR=$home/tmp" "PWD=$PWD")
+
+    # Job control gives the test its own process group, so whatever it leaves
+    # behind can be killed with it.
+    set -m
+    env -i "${pairs[@]}" "$@" &
+    child=$!
+    # Job control was needed only to give the test its own process group.
+    # Left on, bash 3.2 hands the terminal to every later foreground command.
+    set +m
+    trap 'kill -INT -- "-$child" 2>/dev/null' INT
+    trap 'kill -TERM -- "-$child" 2>/dev/null' TERM
+    trap 'kill -HUP -- "-$child" 2>/dev/null' HUP
+    while :; do
+        wait "$child"
+        status=$?
+        # A trapped signal interrupts `wait`; keep waiting for the test itself.
+        kill -0 "$child" 2>/dev/null || break
+    done
+
+    kill -KILL -- "-$child" 2>/dev/null
+    # A broker that moved to its own process group still names the home in
+    # its command line, and that path is unique to this test.
+    pkill -KILL -f "$home" 2>/dev/null
+    rm -rf "$home"
+    exit "$status"
+}
+
+case "${OSTYPE:-}" in
+    linux*) run_linux "$@" ;;
+    darwin*) run_macos "$@" ;;
+    *)
+        echo "harnx test sandbox: unsupported platform '${OSTYPE:-unknown}'" >&2
+        exit 2
+        ;;
+esac

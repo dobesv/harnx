@@ -73,7 +73,7 @@ pub(crate) fn internal_error(msg: impl Into<Cow<'static, str>>) -> ErrorData {
     ErrorData::internal_error(msg, None)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 pub(crate) fn sandbox_run_test_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/harnx-sandbox-exec")
 }

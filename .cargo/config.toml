@@ -1,6 +1,9 @@
-# Cross-compilation configuration for building/testing Windows targets from Linux.
+# Cargo configuration for the workspace: cross-compiling Windows targets from
+# Linux, the linker for native Windows builds, the `xtask` alias and, at the
+# end, the runner that puts every nextest test on Linux and macOS in the test
+# sandbox (scripts/nextest-sandbox; AGENTS.md, "Test sandbox").
 #
-# Prerequisites (Ubuntu/Debian):
+# Cross-compiling Windows targets from Linux needs (Ubuntu/Debian):
 #   sudo apt-get install -y gcc-mingw-w64-x86-64 wine wine-binfmt
 #   rustup target add x86_64-pc-windows-gnu
 #
@@ -25,3 +28,10 @@ linker = "rust-lld.exe"
 
 [alias]
 xtask = "run --package xtask --"
+
+# Every test nextest runs on Linux and macOS goes through the sandbox runner,
+# which gives it a private environment (AGENTS.md, "Test sandbox"). Cargo
+# resolves this path against the workspace root, and the script passes
+# `cargo run`, `cargo test` and `cargo bench` through untouched.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))']
+runner = "scripts/nextest-sandbox"
