@@ -842,6 +842,8 @@ fn grpc_credential_metadata_forwarded_on_loopback() {
 /// Windows DNS does not resolve RFC 6761 *.localhost subdomains without local hosts file mapping.
 /// The test would time out on Windows CI because `collector.localhost` does not resolve.
 /// Unix systems implement RFC 6761 properly, resolving *.localhost to 127.0.0.1.
+/// Inside the Linux test sandbox no DNS server is reachable, so the name
+/// resolves only through nss-myhostname (libnss-myhostname, which CI installs).
 #[cfg(not(windows))]
 #[test]
 fn grpc_credential_metadata_stripped_on_cleartext_non_loopback() {
