@@ -454,7 +454,7 @@ async fn follow_remote_turn(mut params: FollowTaskParams) -> Result<RemoteFollow
                 match poller.poll(&mut params.event_stream).await {
                     Ok(Some(terminal)) => {
                         let base = params.session_base.as_ref().filter(|_| {
-                            poller.claim_watchdog.is_some() && terminal == RemoteFollowTerminal::Finished
+                            terminal == RemoteFollowTerminal::Finished
                         });
                         pending::hydrate_completion(&tx_for_close, &params.event_stream,
                             &params.session_id, base).await?;

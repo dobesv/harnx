@@ -137,6 +137,50 @@ impl Unclaimed {
     }
 }
 
+fn assert_durable_reply_before_finished(events: &[serde_json::Value]) {
+    let snapshot = events
+        .iter()
+        .position(|event| {
+            event["type"] == "MESSAGES_SNAPSHOT"
+                && event["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|msg| msg["content"] == "durable reply")
+        })
+        .unwrap_or_else(|| panic!("missing completed reply: {events:?}"));
+    let finished = events
+        .iter()
+        .position(|event| event["type"] == "RUN_FINISHED")
+        .unwrap_or_else(|| panic!("missing RUN_FINISHED: {events:?}"));
+    assert!(snapshot < finished, "{events:?}");
+    assert!(!has_event(events, "RUN_ERROR"), "{events:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_lease_completion_without_advisories_hydrates_before_finishing() {
+    let Some(fixture) = Unclaimed::new(15).await else {
+        return;
+    };
+    let lease = fixture.claim().await;
+    // Claim before attaching, so the follower starts without a claim watchdog.
+    let response = fixture.attach().await;
+    let reader = tokio::spawn(read_sse_until(response, Duration::from_secs(10), |read| {
+        has_event(&read.events, "RUN_FINISHED")
+    }));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !reader.is_finished(),
+        "active turn must not finish at attach"
+    );
+    // Only durable writes: no advisory can carry this reply to the follower.
+    fixture.finish().await;
+    lease.release().await.unwrap();
+    let read = reader.await.unwrap();
+    assert_durable_reply_before_finished(&read.events);
+    assert!(!has_event(&read.events, "TEXT_MESSAGE_CONTENT"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unclaimed_prompt_reports_running_and_attach_waits_for_claim() {
     let Some(fixture) = Unclaimed::new(15).await else {
@@ -165,6 +209,7 @@ async fn unclaimed_prompt_reports_running_and_attach_waits_for_claim() {
         .events
         .iter()
         .any(|event| event["delta"] == "live delayed reply"));
+    assert_durable_reply_before_finished(&read.events);
     let get = fixture
         .rpc(json!({"jsonrpc":"2.0","id":3,"method":"session/get"}))
         .await;
