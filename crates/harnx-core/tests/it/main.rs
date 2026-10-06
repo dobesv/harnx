@@ -4,5 +4,9 @@
 
 mod child_output_sink_file;
 mod child_output_sink_stderr;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod nextest_sandbox;
 mod reasoning_provenance;
 mod scope_from_env;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod test_sandbox_canary;

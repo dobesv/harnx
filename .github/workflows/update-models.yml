@@ -66,6 +66,22 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Every test runs inside a bubblewrap sandbox (scripts/nextest-sandbox).
+      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor;
+      # lift that if bwrap can't create them. Then run the runner itself, nested
+      # as the runner's own tests nest it, so a sandbox that can't start fails
+      # here rather than in every test.
+      - name: Install bubblewrap
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          if ! bwrap --unshare-user --ro-bind / / true 2>/dev/null; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          NEXTEST=1 NEXTEST_ATTEMPT_ID=ci scripts/nextest-sandbox scripts/nextest-sandbox true
+        shell: bash
+
       # This PR is auto-merge labelled, so the patch guard has to run here and
       # not only in the PR's own CI.
       - name: Validate shipped request patches
