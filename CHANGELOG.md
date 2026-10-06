@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.13 (2026-10-06)
+
+### Features
+
+- let agents read and record their session's metadata (#2301)
+
+#### Add CLI, TUI, and stdio bridge commands to inspect tools and execute tools directly (#2251, #1045):
+
+- CLI `harnx list tools [<pattern>]`, `harnx info tool <name>`, and `harnx call tool <name> <args-json>`, with `--json` output format and agent targeting via `-a` / `--agent`.
+- TUI `.list tools [pattern]`, `.info tool <name>`, and `.call tool <name> <args-json>` dot-commands with autocompletion and background cancellation.
+- Stdio bridge `harnx-mcp-bridge --call-tool <name> [--tool-args <json>]` standalone direct invocation with JSON output, pre-spawn argument validation, filter enforcement, and child process cleanup.
+- Tool reservations for no-agent CLI commands, selecting tools without a default agent.
+- Scoped operator direct invocation consent, auto-approving root confirmation requests while enforcing hook denials, argument mutations, schema validation, and isolated nested approvals.
+
+#### Let agents read and record what their session is working on (#2296):
+
+- Built-in `harnx_read_session_meta` and `harnx_write_session_meta` tools, available to agents that list them in `use_tools`. They return the session ID, agent, title and the repositories its tool calls observed, and read or change the session's properties: `github_owner_repo`, `git_branch`, `github_issue`, `github_pull_request`, `external_task_url`, `working_directory`, `web_session_url`, `labels`, and custom text properties. `user_id`, the user a session acts for, is read-only to agents.
+- Each property carries an `inherit` flag, and sub-agent sessions start with the properties their parent marked inherited. `web_session_url` is never inherited.
+- harnx-serve records a session's Web UI address when it sends the session a prompt, from `serve_public_url` (`HARNX_SERVE_PUBLIC_URL`, `harnx-serve --public-url`) or else from the request's `X-Forwarded-Host`, `X-Forwarded-Proto` and `Host` headers. A configured address replaces one harnx-serve inferred earlier; an address an agent set is kept.
+
+### Fixes
+
+- read session metadata from the stream leader (#2289)
+- stop redelivering activations whose turn can't start (#2290)
+- update assistant-ui (#2307)
+- update dependency @assistant-ui/react-ag-ui to v0.0.63 (#2308)
+- update dependency @assistant-ui/react-markdown to v0.14.18 (#2311)
+- check changesets in CI and backfill skipped entries (#2325)
+- Stop workers redelivering an activation forever when its turn can never start. A prompt with no durable run admission, such as one sent before run admissions existed, now fails its session on its second delivery with an error asking for the prompt to be sent again, instead of being retried about 80 times a minute. Every other failure before a turn starts, including freezing the run's limits and arming its deadline, now counts toward the ten-failure budget. A worker terminates an activation after 100 deliveries instead of deferring it again, so activations for a session that stays busy no longer live for days. Workers also give the activation consumers `max_deliver` 200 and a backoff, updating consumers that earlier versions created with no limit. Activations already delivered more than 200 times when a worker updates the consumer are never delivered again and get no error; remove them with `nats stream rmm`. A failed attempt no longer leaves a listener subscribed to the session's control subject.
+- Stop tool calls and their recovery from scanning the whole tool invocation journal. Recovering a call after a worker restart or an interrupt listed every key in the `harnx_tool_invocations` bucket, for every session, and then read the session's rows, so replay and wind-up got slower as the cluster's history grew. Journal rows are now keyed by session, tool round, tool-call id and wire call id, and a lookup lists only the round or the call it needs. Workers also open the journal once per tool provider rather than for every call, replay and failed call's partial-result read, and an activation with no unanswered tool calls no longer opens it at all. A tool with no parent session can now record a checkpoint; it used to fail with "durable tool invocation missing" (#2244). Rows written before this release are no longer read: a turn that was interrupted or orphaned before the upgrade recovers as if its calls were never journaled, so its calls get interrupted-call results or, for read-only and idempotent tools, run again, and deleting its session still deletes those rows.
+- Fix sub-agent calls failing with `prompt admission missing after reservation` or `prompt has no admission` on a replicated NATS cluster. A frontend wrote a prompt's admission to the session metadata bucket and read it straight back with a direct get, which a follower answers from whatever it has applied so far. The worker it then activated read the same records the same way, so it could also terminate the activation as metadata-less or refuse the prompt for having no durable run admission. Every read of a session metadata key, including the confirmation after an ambiguous write and the session activity that attachments update, now goes to the stream leader. Existing buckets with direct get enabled are covered without changing their configuration.
+- Stop workers reading the calling session's whole transcript before every NATS tool call. To journal a call, the worker looked up the sequence of the `ToolCalls` entry that made it by loading that transcript, one JetStream request per entry, so each call from a long session paid for a full read; on a bench replaying staging load those reads took 7.9% of worker CPU. The worker now hands down the sequence it got when it appended the entry, or, for a round resumed after approval or a worker restart, the one it read to resume it. Calls an operator runs directly, such as with `harnx call tool`, no longer read the transcript either.
+
 ## 0.34.12 (2026-10-03)
 
 ### Features

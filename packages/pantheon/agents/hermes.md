@@ -38,7 +38,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Quick tasks and minor bugs specialist — handles the small, fast, 'blink-and-you-miss-it' fixes with rapid turnaround. Named after Hermes (HER-meez), the Winged Messenger.\n"
-version: '0.4.12'
+version: '0.4.13'
 variables:
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)

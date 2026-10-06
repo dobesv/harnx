@@ -33,7 +33,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Deep investigation agent — performs multi-step code analysis, reproduces bugs, validates hypotheses, and caches findings as plan notes for other agents. Executes targeted diagnostics and probe scripts without modifying repository source files. Named after Zosimus, the careful investigator.\n"
-version: '0.4.12'
+version: '0.4.13'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

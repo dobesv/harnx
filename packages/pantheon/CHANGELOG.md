@@ -1,6 +1,21 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.13 (2026-10-06)
+
+### Features
+
+- let agents read and record their session's metadata (#2301)
+
+### Fixes
+
+- read session metadata from the stream leader (#2289)
+- stop redelivering activations whose turn can't start (#2290)
+- update assistant-ui (#2307)
+- update dependency @assistant-ui/react-ag-ui to v0.0.63 (#2308)
+- update dependency @assistant-ui/react-markdown to v0.14.18 (#2311)
+- check changesets in CI and backfill skipped entries (#2325)
+
 ## 0.4.12 (2026-10-03)
 
 ### Fixes

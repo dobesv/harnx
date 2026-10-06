@@ -38,7 +38,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Peitho (PY-thoh) - Goddess of Persuasion. She turns technical jargon into eloquent, human-readable documentation. Specialist in documentation, release notes, and user communication.\n"
-version: '0.4.12'
+version: '0.4.13'
 variables:
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)

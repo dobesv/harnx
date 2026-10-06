@@ -26,7 +26,7 @@ use_tools:
 - harnx_agent_session_history_read
 - attachments_attachment_read
 description: "Performance & scalability specialist — reviews diffs for throughput, latency, and resource-usage regressions including N+1 queries, unbounded result sets, missing indexes, superlinear algorithms, render inefficiencies, memory growth, and redundant work. Named after Opis (OH-pis), guardian of accountability and consequences.\n"
-version: '0.4.12'
+version: '0.4.13'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
