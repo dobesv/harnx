@@ -359,28 +359,7 @@ fn event_activity(event: &AgentEvent) -> Option<bool> {
 }
 
 pub(crate) fn history_has_pending_turn(history: &[(u64, SessionLogEntry)]) -> bool {
-    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(history)
-        .unwrap_or_else(|_| history.to_vec());
-    let Some(latest_user_seq) = harnx_core::session_reconstruct::latest_prompt_seq(&effective)
-    else {
-        return false;
-    };
-
-    let has_terminal_failure = effective.iter().any(|(seq, entry)| {
-        *seq > latest_user_seq
-            && matches!(
-                entry,
-                SessionLogEntry::Error { .. } | SessionLogEntry::Cancel { .. }
-            )
-    });
-    let has_completed_turn = history.iter().any(|(_, entry)| {
-        matches!(
-            entry,
-            SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq >= latest_user_seq
-        )
-    });
-
-    !has_terminal_failure && !has_completed_turn
+    harnx_core::session_reconstruct::pending_prompt_seq(history).is_some()
 }
 
 #[cfg(test)]

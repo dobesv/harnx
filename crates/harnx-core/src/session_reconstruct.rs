@@ -6,7 +6,8 @@ use anyhow::{bail, Result};
 mod turn_status;
 pub use turn_status::{
     current_turn_entries, current_turn_is_cancelled, last_terminator_is_cancel,
-    last_terminator_seq, latest_prompt_seq, prompt_interrupted_at, prompt_was_interrupted,
+    last_terminator_seq, latest_prompt_seq, pending_prompt_seq, prompt_interrupted_at,
+    prompt_is_covered, prompt_terminal_entry, prompt_was_interrupted,
 };
 
 /// Apply mutation entries (EditEntries, Rewind) to build the effective entry stream.

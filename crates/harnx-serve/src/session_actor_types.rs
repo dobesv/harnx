@@ -286,6 +286,8 @@ pub struct SessionInfo {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionState {
     Idle,
+    /// Durable input still needs a worker; this actor doesn't own its run.
+    Pending,
     Running {
         run_id: String,
         started_at: DateTime<Utc>,

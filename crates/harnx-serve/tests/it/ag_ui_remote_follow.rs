@@ -32,6 +32,8 @@ use support::{read_sse_for, read_sse_until, AppResponse};
 #[path = "ag_ui_remote_follow/overlap.rs"]
 mod overlap;
 
+mod unclaimed;
+
 struct LeasedSession {
     _sandbox: TestConfigSandbox,
     config: Config,
@@ -250,9 +252,8 @@ async fn session_get(session: &LeasedSession) -> serde_json::Value {
 }
 
 /// A turn this server never prompted — a sub-agent session, or one another
-/// frontend started — has no local run to report. The lease is the only thing
-/// that says it is running, and a client told `idle` would never offer to stop
-/// it.
+/// frontend started — has no local run to report. Durable pending input keeps
+/// it running even when its lease disappears during failover.
 #[tokio::test(flavor = "multi_thread")]
 async fn leased_session_reports_running_without_a_run_this_server_started() {
     let Some(session) = seed_in_progress_leased_session().await else {
@@ -268,8 +269,8 @@ async fn leased_session_reports_running_without_a_run_this_server_started() {
     session.lease.release().await.expect("lease release");
     let released = session_get(&session).await;
     assert_eq!(
-        released["result"]["state"]["status"], "idle",
-        "once the lease is gone nothing is running it: {released:?}"
+        released["result"]["state"]["status"], "running",
+        "unanswered input remains pending during failover: {released:?}"
     );
 }
 

@@ -71,7 +71,7 @@ async fn interrupted_state_is_reconstructed_from_durable_hitl_entries() {
     .expect("append approval decision");
     let replacement = SessionRegistry::new(config);
     let handle = replacement.get_or_spawn(key("plain", &session_id));
-    assert_eq!(get_info(&handle).await.state, SessionState::Idle);
+    assert_eq!(get_info(&handle).await.state, SessionState::Pending);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2,20 +2,25 @@
 //! is being driven by a remote NATS worker.
 //!
 //! When a Web UI client opens a promptless `/run` against a session whose
-//! local `SessionActor` is `Idle` but a remote worker holds the lease,
-//! this module follows the remote worker's advisory event stream instead of
-//! terminating immediately with a synthetic `RUN_FINISHED`.
+//! local actor doesn't own the run, this module follows durable pending work
+//! and the remote worker's advisory stream. Before the first lease it waits
+//! within the configured acquisition budget instead of synthesizing RUN_FINISHED.
 
 mod frames;
 mod isolation;
+mod pending;
 
 #[cfg(test)]
 #[path = "ag_ui_remote_follow/isolation_tests.rs"]
 mod isolation_tests;
 #[cfg(test)]
+mod pending_tests;
+#[cfg(test)]
 pub(crate) use frames::event_frames;
 pub(crate) use frames::{event_frames_with_guard, QueuedEvent};
 use isolation::RemoteInterruptWatch;
+#[cfg(test)]
+pub(crate) use pending::terminal_from_history;
 use std::time::Duration;
 
 use ag_ui_core::event::Event;
@@ -98,7 +103,7 @@ pub(crate) struct EventStreamParams<'a> {
     pub(crate) eligible: bool,
 }
 
-/// Selects remote-follow for a promptless idle actor with an active remote lease.
+/// Selects remote-follow for a promptless actor with durable pending input or a lease.
 /// Returns `None` when caller should use the regular local event stream.
 pub(crate) async fn resolve_event_stream(
     params: EventStreamParams<'_>,
@@ -106,7 +111,13 @@ pub(crate) async fn resolve_event_stream(
     if !params.eligible {
         return Ok(None);
     }
-    if !check_remote_lease(params.config, params.cluster, params.session_id).await? {
+    let pending = params
+        .subscription
+        .log_entries
+        .as_deref()
+        .and_then(harnx_core::session_reconstruct::pending_prompt_seq)
+        .is_some();
+    if !pending && !check_remote_lease(params.config, params.cluster, params.session_id).await? {
         return Ok(None);
     }
 
@@ -140,7 +151,9 @@ async fn check_remote_lease(
 }
 
 fn last_user_sequence(entries: &[(u64, SessionLogEntry)]) -> u64 {
-    harnx_core::session_reconstruct::latest_prompt_seq(entries).unwrap_or(0)
+    harnx_core::session_reconstruct::pending_prompt_seq(entries)
+        .or_else(|| harnx_core::session_reconstruct::latest_prompt_seq(entries))
+        .unwrap_or(0)
 }
 
 struct RemoteFollowStreamParams<'a> {
@@ -220,30 +233,35 @@ async fn build_remote_follow_event_stream(
     let through_seq = last_user_sequence(event_stream.history());
     let interrupt_watch = RemoteInterruptWatch::bind(&jetstream, params.session_id, through_seq);
 
-    if turn_ended(event_stream.history(), through_seq) {
-        // Idle remote session: control-state hydration from durable log.
-        let tokens_usage = params.session_base.as_ref().and_then(|base_session| {
-            compute_usage_context(event_stream.history(), params.session_id, base_session)
-        });
-        let control_events =
-            super::ag_ui::control_snapshot_events(event_stream.history(), tokens_usage.as_ref());
-        let control_frames = control_events
-            .into_iter()
-            .filter_map(|e| super::ag_ui::frame_event(&e).ok().map(Bytes::from));
-        let hydration_frames = params
-            .attachment_frames
-            .into_iter()
-            .chain(control_frames)
-            .collect();
+    if let Some(terminal) = pending::terminal_from_history(event_stream.history(), through_seq) {
+        // The worker may have finished since the actor's subscription snapshot.
+        let hydration_frames = pending::completion_events(
+            event_stream.history(),
+            params.session_id,
+            params.session_base.as_ref(),
+        )?
+        .into_iter()
+        .filter_map(|event| frame_event(&event).ok().map(Bytes::from))
+        .collect();
         return Ok(completed_remote_stream(
             [started_frame, boundary_frame],
-            params.snapshot_frame,
+            params
+                .snapshot_frame
+                .filter(|_| params.session_base.is_none()),
             hydration_frames,
-            params.thread_id,
-            params.run_id,
+            remote_terminal_frame(terminal, params.thread_id, params.run_id),
         ));
     }
 
+    let claim_watchdog = if session_has_active_lease(&jetstream, params.session_id).await? {
+        None
+    } else {
+        Some(
+            harnx_runtime::nats_session::SessionLeaseWatchdog::with_acquisition_timeout(
+                Duration::from_secs(params.config.data.nats_lease_acquisition_timeout_secs),
+            ),
+        )
+    };
     Ok(build_live_follow_stream(LiveFollowParams {
         interrupt_watch,
         event_stream,
@@ -256,6 +274,8 @@ async fn build_remote_follow_event_stream(
         thread_id: params.thread_id.to_string(),
         run_id: params.run_id.to_string(),
         through_seq,
+        claim_watchdog,
+        session_base: params.session_base,
     }))
 }
 
@@ -282,6 +302,8 @@ struct LiveFollowParams {
     thread_id: String,
     run_id: String,
     through_seq: u64,
+    claim_watchdog: Option<harnx_runtime::nats_session::SessionLeaseWatchdog>,
+    session_base: Option<harnx_core::session::Session>,
 }
 
 fn build_live_follow_stream(params: LiveFollowParams) -> GuardedEventStream {
@@ -312,6 +334,8 @@ fn build_live_follow_stream(params: LiveFollowParams) -> GuardedEventStream {
             session_id: params.session_id,
             tx,
             through_seq: params.through_seq,
+            claim_watchdog: params.claim_watchdog,
+            session_base: params.session_base,
         },
         terminal_tx,
     );
@@ -343,15 +367,13 @@ pub(crate) fn completed_remote_stream(
     initial_frames: [Bytes; 2],
     snapshot_frame: Option<Bytes>,
     control_frames: Vec<Bytes>,
-    thread_id: &str,
-    run_id: &str,
+    terminal_frame: Bytes,
 ) -> GuardedEventStream {
-    let finished_frame = Bytes::from(frame_run_boundary_event("RUN_FINISHED", thread_id, run_id));
     let frames: Vec<Bytes> = initial_frames
         .into_iter()
         .chain(snapshot_frame)
         .chain(control_frames)
-        .chain(std::iter::once(finished_frame))
+        .chain(std::iter::once(terminal_frame))
         .collect();
     GuardedEventStream {
         stream: Box::pin(tokio_stream::iter(frames)),
@@ -368,6 +390,8 @@ struct FollowTaskParams {
     session_id: String,
     tx: tokio::sync::mpsc::Sender<QueuedEvent>,
     through_seq: u64,
+    claim_watchdog: Option<harnx_runtime::nats_session::SessionLeaseWatchdog>,
+    session_base: Option<harnx_core::session::Session>,
 }
 
 fn spawn_follow_task(params: FollowTaskParams, terminal_tx: oneshot::Sender<RemoteFollowTerminal>) {
@@ -411,6 +435,7 @@ async fn follow_remote_turn(mut params: FollowTaskParams) -> Result<RemoteFollow
         params.jetstream,
         params.session_id.clone(),
         params.through_seq,
+        params.claim_watchdog,
     );
     let mut lease_poll_interval = tokio::time::interval(LEASE_POLL_INTERVAL);
     lease_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -427,7 +452,14 @@ async fn follow_remote_turn(mut params: FollowTaskParams) -> Result<RemoteFollow
             }
             _ = lease_poll_interval.tick() => {
                 match poller.poll(&mut params.event_stream).await {
-                    Ok(Some(terminal)) => break Ok(terminal),
+                    Ok(Some(terminal)) => {
+                        let base = params.session_base.as_ref().filter(|_| {
+                            poller.claim_watchdog.is_some() && terminal == RemoteFollowTerminal::Finished
+                        });
+                        pending::hydrate_completion(&tx_for_close, &params.event_stream,
+                            &params.session_id, base).await?;
+                        break Ok(terminal);
+                    },
                     Ok(None) => {}
                     Err(err) => break Err(err),
                 }
@@ -503,15 +535,65 @@ struct RemoteTurnPoller {
     session_id: String,
     through_seq: u64,
     lease_absent_count: usize,
+    claim_watchdog: Option<harnx_runtime::nats_session::SessionLeaseWatchdog>,
+    lease_config: harnx_runtime::nats_lease::NatsLeaseConfig,
+    lease_bucket: Option<async_nats::jetstream::kv::Store>,
 }
 
 impl RemoteTurnPoller {
-    fn new(jetstream: JetstreamContext, session_id: String, through_seq: u64) -> Self {
+    fn new(
+        jetstream: JetstreamContext,
+        session_id: String,
+        through_seq: u64,
+        claim_watchdog: Option<harnx_runtime::nats_session::SessionLeaseWatchdog>,
+    ) -> Self {
         Self {
             jetstream,
             session_id,
             through_seq,
             lease_absent_count: 0,
+            claim_watchdog,
+            lease_config: harnx_runtime::nats_lease::NatsLeaseConfig::default(),
+            lease_bucket: None,
+        }
+    }
+
+    async fn lease_active(&mut self) -> Result<bool> {
+        if self.lease_bucket.is_none() {
+            let bucket = harnx_metrics::time_nats_operation(
+                "kv_bucket_open",
+                self.jetstream.get_key_value(&self.lease_config.bucket),
+            )
+            .await;
+            match bucket {
+                Ok(bucket) => self.lease_bucket = Some(bucket),
+                Err(error) if harnx_runtime::nats_admin::kv_bucket_missing(&error) => {
+                    return Ok(false)
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to open NATS lease bucket '{}': {error}",
+                        self.lease_config.bucket
+                    ))
+                }
+            }
+        }
+        // Retry opening a missing bucket on the next poll; retain a successful
+        // handle so steady-state polls only read the lease key.
+        let bucket = self.lease_bucket.as_ref().expect("lease bucket opened");
+        match harnx_runtime::nats_lease::lease_holder_in(
+            bucket,
+            &self.lease_config,
+            &self.session_id,
+        )
+        .await
+        {
+            Ok(holder) => Ok(holder.is_some()),
+            Err(_) => {
+                // The bucket may have been deleted/recreated since it was cached.
+                self.lease_bucket = None;
+                session_has_active_lease(&self.jetstream, &self.session_id).await
+            }
         }
     }
 
@@ -519,25 +601,28 @@ impl RemoteTurnPoller {
         &mut self,
         event_stream: &mut SessionEventStream,
     ) -> Result<Option<RemoteFollowTerminal>> {
-        let lease_active = session_has_active_lease(&self.jetstream, &self.session_id).await?;
+        let lease_active = self.lease_active().await?;
         let _history_updated = event_stream.refresh_history().await?;
-        let durable_turn_ended = turn_ended(event_stream.history(), self.through_seq);
-        let terminal = terminal_after_lease_poll(
-            &mut self.lease_absent_count,
-            lease_active,
-            durable_turn_ended,
-        );
-        match &terminal {
-            Some(RemoteFollowTerminal::Finished) => log::debug!(
-                "Turn end detected in durable history for session {}",
-                self.session_id
-            ),
-            Some(RemoteFollowTerminal::Error(_)) => log::warn!(
+        if let Some(terminal) =
+            pending::terminal_from_history(event_stream.history(), self.through_seq)
+        {
+            return Ok(Some(terminal));
+        }
+        if lease_active {
+            self.claim_watchdog = None;
+        } else if let Some(watchdog) = &mut self.claim_watchdog {
+            return Ok(watchdog
+                .check(&self.jetstream, &self.session_id)
+                .await
+                .map(RemoteFollowTerminal::Error));
+        }
+        let terminal = terminal_after_lease_poll(&mut self.lease_absent_count, lease_active);
+        if terminal.is_some() {
+            log::warn!(
                 "Lease absent for {} consecutive polls with no TurnEnd for session {}, reporting worker loss",
                 self.lease_absent_count,
                 self.session_id
-            ),
-            None => {}
+            );
         }
         Ok(terminal)
     }
@@ -546,11 +631,7 @@ impl RemoteTurnPoller {
 pub(crate) fn terminal_after_lease_poll(
     lease_absent_count: &mut usize,
     lease_active: bool,
-    durable_turn_ended: bool,
 ) -> Option<RemoteFollowTerminal> {
-    if durable_turn_ended {
-        return Some(RemoteFollowTerminal::Finished);
-    }
     if lease_active {
         *lease_absent_count = 0;
         return None;
@@ -559,24 +640,6 @@ pub(crate) fn terminal_after_lease_poll(
     *lease_absent_count += 1;
     (*lease_absent_count >= LEASE_ABSENT_THRESHOLD)
         .then(|| RemoteFollowTerminal::Error(WORKER_LOST_MESSAGE.to_string()))
-}
-
-fn turn_ended(history: &[(u64, SessionLogEntry)], through_seq: u64) -> bool {
-    // Guard: through_seq==0 means no User message found; workers always append
-    // User before running, so this state shouldn't occur. If it does, only
-    // match TurnEnd entries with through_seq > 0 to avoid false positives.
-    if through_seq == 0 {
-        return false;
-    }
-    history.iter().rev().any(|(_, entry)| {
-        matches!(
-            entry,
-            SessionLogEntry::TurnEnd {
-                through_seq: ended_through,
-                ..
-            } if *ended_through >= through_seq
-        )
-    })
 }
 
 impl AgUiSink {
@@ -590,19 +653,4 @@ impl AgUiSink {
     ) -> Self {
         Self::with_snapshot(tx, message_id, false, None)
     }
-}
-
-/// Compute usage context from the history loaded by `SessionEventStream::attach`.
-fn compute_usage_context(
-    entries: &[(u64, SessionLogEntry)],
-    session_id: &str,
-    base_session: &harnx_core::session::Session,
-) -> Option<UsageContextSnapshot> {
-    let session = harnx_runtime::nats_session_log::load_session_from_entries_with_metadata(
-        entries,
-        session_id,
-        base_session.clone(),
-    )
-    .ok()?;
-    Some(UsageContextSnapshot::from_session(&session))
 }

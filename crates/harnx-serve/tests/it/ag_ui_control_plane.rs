@@ -1,4 +1,4 @@
-use crate::support;
+use crate::{common, support};
 
 use support::{read_sse_until as read_sse_until_impl, AppResponse, SseRead};
 
@@ -1266,3 +1266,6 @@ mod cancellation;
 
 #[path = "ag_ui_control_plane/compaction.rs"]
 mod compaction;
+
+#[path = "ag_ui_control_plane/session_creation.rs"]
+mod session_creation;

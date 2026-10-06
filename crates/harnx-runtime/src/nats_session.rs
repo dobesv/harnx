@@ -132,6 +132,11 @@ impl SessionLeaseWatchdog {
         Self::with_orphan_timeout(None)
     }
 
+    /// Observe a remote admission with the same initial-claim budget as a local follower.
+    pub fn with_acquisition_timeout(timeout: std::time::Duration) -> Self {
+        Self::with_timeouts(None, timeout)
+    }
+
     fn with_orphan_timeout(orphan_timeout: Option<std::time::Duration>) -> Self {
         Self::with_timeouts(orphan_timeout, LEASE_ACQUISITION_TIMEOUT)
     }
@@ -348,18 +353,7 @@ pub(crate) fn requested_seq_status_with_effective(
     effective: &[(u64, SessionLogEntry)],
     requested_seq: u64,
 ) -> RequestedSeqStatus {
-    if entries.iter().any(|(_, entry)| {
-        matches!(
-            entry,
-            SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq >= requested_seq
-        )
-    }) || entries.iter().any(|(seq, entry)| {
-        *seq > requested_seq
-            && matches!(
-                entry,
-                SessionLogEntry::Error { .. } | SessionLogEntry::Cancel { .. }
-            )
-    }) {
+    if harnx_core::session_reconstruct::prompt_is_covered(entries, requested_seq) {
         return RequestedSeqStatus::Covered;
     }
 
@@ -1162,14 +1156,10 @@ impl NatsSession {
             .load_events_latest_async()
             .await
             .context("failed to inspect pending session before activation")?;
-        let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
-        let Some(user_msg_seq) = harnx_core::session_reconstruct::latest_prompt_seq(&effective)
+        let Some(user_msg_seq) = harnx_core::session_reconstruct::pending_prompt_seq(&entries)
         else {
             return Ok(None);
         };
-        if requested_seq_status(&entries, user_msg_seq)? == RequestedSeqStatus::Covered {
-            return Ok(None);
-        }
         self.publish_activation(user_msg_seq, confirmation_subject, None)
             .await?;
         Ok(Some(user_msg_seq))
