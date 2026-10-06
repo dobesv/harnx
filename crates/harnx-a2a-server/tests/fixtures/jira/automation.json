@@ -1,0 +1,26 @@
+{
+  "jsonrpc": "2.0",
+  "id": "automation-001",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "role": "ROLE_USER",
+      "parts": [
+        {
+          "text": "This session was started from a Jira automation rule, complete the task as described below."
+        },
+        {
+          "data": {
+            "userAccountId": "22222",
+            "agentAccountId": "11111",
+            "invocationType": "AUTOMATION",
+            "automation": {
+              "prompt": "Summarize the deployment failures from the supplied rule inputs."
+            }
+          }
+        }
+      ],
+      "messageId": "automation-msg-001"
+    }
+  }
+}

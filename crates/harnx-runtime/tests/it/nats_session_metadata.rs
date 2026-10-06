@@ -709,3 +709,5 @@ async fn seed_metadata(store: &SessionMetadataStore, local_id: &str) -> Result<S
     store.create(&metadata).await?;
     Ok(metadata.storage_key())
 }
+
+mod a2a_store;

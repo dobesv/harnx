@@ -19,6 +19,11 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 - **Release tooling:** [knope](https://knope.tech) (see `knope.toml`)
 - **Dependency management:** Renovate (see `renovate.json`)
 
+The workspace enables `serde_json/preserve_order`, so `serde_json::to_string` produces
+JSON with keys in their original insertion order. When hashing JSON for deduplication or
+comparison, call `Value::sort_all_objects()` first. Omitting this produces different
+hashes for semantically-identical payloads with different key ordering.
+
 ## Repository Layout
 
 ```
@@ -49,6 +54,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   ├── harnx-attachment-tools/   # Toolset server: NATS-backed attachment and media management (standalone crate)
 │   ├── harnx-blob-store/        # NATS-backed blob storage for attachments and plans (standalone crate)
 │   ├── harnx-mcp-server/        # MCP server: exports harnx tools and agents-as-tools over stdio or Streamable HTTP (standalone crate)
+│   ├── harnx-a2a-server/        # A2A server: exports harnx agents over JSON-RPC and SSE (standalone crate)
 │   └── harnx-test-bins/        # Internal dev/test binaries (publish = false)
 ├── example_config/             # Example user configuration
 ├── docs/                       # User-facing documentation
@@ -975,6 +981,11 @@ properties (`dev.harnx.session_properties`): a row in `PROPERTY_DEFINITIONS`
 line in `harnx_write_session_meta`'s description and whether sub-agent
 sessions inherit it. See "Session properties" in `docs/nats-ha.md`.
 
+Per-session A2A task keys follow the same pattern: `sessions/{storage_key}/a2a/tasks/{uuid}`.
+These keys are purged automatically by `delete_remote_session_by_key` because it calls
+`purge_session_prefix`. New server crates that need per-session storage should follow this
+layout to reuse existing GC.
+
 ### Crate layering for NATS tool servers
 
 Tool servers that need NATS object/KV storage must depend on `harnx-blob-store`,
@@ -1025,6 +1036,13 @@ independent run in the same session.
 
 This fencing is distinct from lease loss or worker failover, which set a
 nonterminal abort flag without publishing a cancellation.
+
+When running turns across multiple sessions, each `NatsSession` needs its own
+`AbortSignal`. `NatsSession::interrupt` calls `abort_signal.set_ctrlc()`, so a shared
+abort flag poisons every later turn in unrelated sessions. Process-wide abort belongs
+only on the supervisor. A session handle used for orphan reconciliation also cannot be
+reused; its abort flag is now set, and a replacement turn must create a fresh handle.
+
 ### Changing a JetStream consumer's configuration
 
 `Stream::get_or_create_consumer` returns an existing consumer unchanged, so a

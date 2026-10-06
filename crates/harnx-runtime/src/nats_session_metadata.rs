@@ -49,7 +49,8 @@ pub use session_properties::{
     SESSION_PROPERTIES_NAMESPACE, WEB_SESSION_URL_PROPERTY,
 };
 pub use store::{
-    activity_key, invalidation_subject, metadata_belongs_to_agent, metadata_key, read_cursor_key,
+    a2a_message_key, a2a_session_prefix, a2a_task_key, a2a_tasks_prefix, activity_key,
+    invalidation_subject, metadata_belongs_to_agent, metadata_key, read_cursor_key,
     read_invalidation_subject, session_prefix, SessionExtensionUpdate, SessionMetadataStore,
 };
 pub use tool_context::{

@@ -1,0 +1,31 @@
+{
+  "jsonrpc": "2.0",
+  "id": "03fbd406-dc47-472d-9c5c-03b6f2716fce",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "role": "ROLE_USER",
+      "parts": [
+        {
+          "text": "Space Instructions:\nBe concise and cite Jira evidence.\n\nYou have been assigned to a work item \"QA checkout flow updates\". Analyze the details of the work item and get started.\n\nRelevant Context for This Task\nThe following resources have been identified as relevant. Fetch and reference them to get additional context such as prior decisions, related work, team conventions, etc.\n- Checkout design: https://example.com/checkout-design"
+        },
+        {
+          "data": {
+            "userAccountId": "22222",
+            "agentAccountId": "11111",
+            "invocationType": "ISSUE_ASSIGNMENT",
+            "issue": {
+              "id": "21930",
+              "fields": {
+                "key": "AW26-11",
+                "summary": "QA checkout flow updates",
+                "description": "Perform a comprehensive QA review..."
+              }
+            }
+          }
+        }
+      ],
+      "messageId": "a198b5e2-342b-4159-b9e0-c063ba627a4c"
+    }
+  }
+}
