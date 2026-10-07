@@ -1,4 +1,4 @@
-name: A2A TCK (advisory)
+name: A2A TCK
 
 on:
   pull_request:
@@ -24,12 +24,9 @@ defaults:
 
 jobs:
   tck:
-    name: MUST conformance (non-gating)
+    name: MUST conformance
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Pinned TCK has incompatible fixtures and validator bugs. Keep raw failures
-    # visible until upstream supports this server profile; see scripts/a2a-tck/README.md.
-    continue-on-error: true
     env:
       RUSTFLAGS: --deny warnings
     steps:
@@ -39,7 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.14'
+          python-version: '3.12'
       - uses: astral-sh/setup-uv@v7
       - name: Install nats-server
         run: |

@@ -242,6 +242,11 @@ def run_tck(context, host):
         context.work, context.reports, context.env, context.processes
     )
     tck = work / "tck"
+    env = env.copy()
+    plugin_dir = str(Path(__file__).resolve().parent)
+    env["PYTHONPATH"] = os.pathsep.join(
+        path for path in (plugin_dir, env.get("PYTHONPATH")) if path
+    )
     # run_tck.py requires its own repository as cwd.
     with (reports / "tck.log").open("w") as output:
         run = subprocess.Popen(
@@ -255,6 +260,10 @@ def run_tck(context, host):
                 "--level",
                 "must",
                 "-v",
+                "--",
+                "-p",
+                "a2a_waivers",
+                "-rx",
             ],
             cwd=tck,
             env=env,
