@@ -34,8 +34,9 @@ response. The script returns the TCK's pytest exit status.
 The **A2A TCK / MUST conformance** job is gating. The unmodified pinned suite
 produced **56 passed, 16 failed, 163 skipped, 30 deselected**. The 16 known
 failures are listed individually in [`waivers.toml`](waivers.toml), with exact
-pytest node IDs, categories, and reasons. With waivers, the expected pytest
-result is **56 passed, 16 xfailed, 163 skipped, 30 deselected**, with no failures.
+pytest node IDs, categories, reasons, and required `match` regexes. With waivers,
+the expected pytest result is **56 passed, 16 xfailed, 163 skipped, 30 deselected**,
+with no failures.
 Skips include unselected transports, undeclared capabilities, and unmet scenario
 preconditions; neither skips nor waived failures prove conformance.
 
@@ -49,10 +50,28 @@ from ordinary skips. The TCK's own compatibility JSON/HTML reports still record 
 conformance failures; they don't apply our waivers. Use pytest's summary and
 JUnit report for the CI result.
 
+Each waiver applies only to its documented failure. The required `match` field
+is a Python regex searched in the exception message (or failure longrepr when
+no exception is available). The plugin checks the report after pytest's xfail
+handling; a non-matching failure stays a real failure with its traceback and a
+message naming the regex. Source lines alone cannot satisfy the regex. Missing,
+empty, or invalid regexes raise a usage error before tests run.
+
+Patterns are pinned to actual report messages: `task not found` for rejected
+contexts, `messageId was already used with different parts` for deduplication,
+the full unsupported-media error for `CORE-SEND-003`, and each artifact case's
+specific assertion. The TCK's exception text for `CORE-SEND-003` names
+`application/x-unsupported-tck-type`; it doesn't include the numeric -32005 code.
+Don't broaden a regex to hide a new error. Inspect the fresh report first.
+
 Any unwaived failure fails the run. A waived test that passes produces
 `XPASS(strict)` and also fails the run, so an obsolete waiver cannot silently
-remain. A waiver matching no collected test raises a usage error naming its
-node ID, which catches renamed or removed tests when updating the pin. Matching
+remain. An ordinary skip on a waived test becomes a failure saying
+`A2A waiver expected a failure but the test skipped`, including skips during
+setup or teardown. Unwaived skips keep pytest's normal behavior.
+
+A waiver matching no collected test raises a usage error naming its node ID,
+which catches renamed or removed tests when updating the pin. Node ID matching
 is exact, including the class and `[jsonrpc]` parameter; no other transport or
 requirement is waived. Collection validation runs before `-m`/`-k` deselection.
 
@@ -92,12 +111,12 @@ cover streaming, cancel, scoped list, deduplication, and server-owned contexts.
 
 ## Test the waiver plugin
 
-From the repository root, in a Python 3.11+ environment with `pytest` installed
-(the pinned TCK environment already includes it):
+From the repository root, with Python 3.11+ and `uv`:
 
 ```sh
-python3 -m pytest -q scripts/a2a-tck/test_waivers.py
+uv run --with pytest pytest -q scripts/a2a-tck/test_waivers.py
 ```
 
-These tests cover strict xfail, stale and malformed entries, exact node ID
+The pytester cases cover matching and unrelated failures, ordinary skips,
+strict XPASS, invalid regexes, stale and malformed entries, exact node ID
 matching, deselection, empty waiver files, and existing non-strict markers.
