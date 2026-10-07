@@ -241,6 +241,10 @@ impl AgentConfig {
         &self.description
     }
 
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
     pub fn builtin_markdown(_name: &str) -> Option<&'static str> {
         None
     }

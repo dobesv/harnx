@@ -1,0 +1,35 @@
+{
+  "jsonrpc": "2.0",
+  "id": "comment-mention-001",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "role": "ROLE_USER",
+      "parts": [
+        {
+          "text": "You have been mentioned in a comment on a work item \"QA checkout flow updates\". Review the comment and respond appropriately."
+        },
+        {
+          "data": {
+            "userAccountId": "22222",
+            "agentAccountId": "11111",
+            "invocationType": "ISSUE_COMMENT_MENTION",
+            "issue": {
+              "id": "21930",
+              "fields": {
+                "key": "AW26-11",
+                "summary": "QA checkout flow updates",
+                "description": "Perform a comprehensive QA review..."
+              }
+            },
+            "comment": {
+              "id": "91283",
+              "body": "Please review the checkout error log and suggest a fix."
+            }
+          }
+        }
+      ],
+      "messageId": "comment-mention-msg-001"
+    }
+  }
+}

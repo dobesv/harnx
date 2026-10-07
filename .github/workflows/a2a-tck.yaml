@@ -1,0 +1,70 @@
+name: A2A TCK (advisory)
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - '.cargo/**'
+      - 'scripts/a2a-tck/**'
+      - 'scripts/run-a2a-tck.sh'
+      - '.github/workflows/a2a-tck.yaml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tck:
+    name: MUST conformance (non-gating)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Pinned TCK has incompatible fixtures and validator bugs. Keep raw failures
+    # visible until upstream supports this server profile; see scripts/a2a-tck/README.md.
+    continue-on-error: true
+    env:
+      RUSTFLAGS: --deny warnings
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust Toolchain Components
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+      - name: Install nats-server
+        run: |
+          set -euo pipefail
+          VERSION=v2.11.6
+          ASSET="nats-server-${VERSION}-linux-amd64.tar.gz"
+          SHA256=5e5272dd1bdb8da020aedc8cf883fb26c128441809a992f156e0b1ccb28ac5b7
+          BINDIR="${HOME}/.local/bin"
+          DOWNLOAD_DIR="$(mktemp -d)"
+          trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
+          mkdir -p "$BINDIR"
+          curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 2 \
+            --location --silent --show-error --fail --output "$DOWNLOAD_DIR/$ASSET" \
+            "https://github.com/nats-io/nats-server/releases/download/$VERSION/$ASSET"
+          echo "$SHA256  $DOWNLOAD_DIR/$ASSET" | sha256sum --check --status
+          tar -xzf "$DOWNLOAD_DIR/$ASSET" -C "$BINDIR" --strip-components=1 \
+            "nats-server-${VERSION}-linux-amd64/nats-server"
+          echo "$BINDIR" >> "$GITHUB_PATH"
+      - name: Run pinned MUST suite
+        # a2a-pb uses protoc-bin-vendored when PROTOC is unset on CI.
+        run: scripts/run-a2a-tck.sh
+      - name: Upload JUnit and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: a2a-tck-reports
+          path: target/a2a-tck-reports/
+          if-no-files-found: warn

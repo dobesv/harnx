@@ -38,7 +38,7 @@ filter = 'test(/^tmux_e2e::/) | test(/^interrupt_e2e::/)'
 test-group = 'heavy-e2e-local'
 
 [[profile.default.overrides]]
-filter = 'binary(/nats/) | test(/^local_worker_supervisor::/) | test(/nats/) | test(/subagent_replay/) | test(/tool_confirmation/) | test(/nats_tool_provider/) | test(/bootstrap::handler::/) | test(/bootstrap::real_mcp::/)'
+filter = '(package(harnx-a2a-server) & test(/^(runner|unary|streaming|compat|e2e|store_nats)::/)) | binary(/nats/) | test(/^local_worker_supervisor::/) | test(/nats/) | test(/subagent_replay/) | test(/tool_confirmation/) | test(/nats_tool_provider/) | test(/bootstrap::handler::/) | test(/bootstrap::real_mcp::/)'
 test-group = 'broker-e2e-local'
 
 [profile.ci]
@@ -57,5 +57,5 @@ filter = 'test(/^tmux_e2e::/) | test(/^interrupt_e2e::/)'
 test-group = 'heavy-e2e'
 
 [[profile.ci.overrides]]
-filter = 'binary(/nats/) | test(/^local_worker_supervisor::/) | test(/nats/) | test(/subagent_replay/) | test(/tool_confirmation/) | test(/nats_tool_provider/) | test(/bootstrap::handler::/) | test(/bootstrap::real_mcp::/)'
+filter = '(package(harnx-a2a-server) & test(/^(runner|unary|streaming|compat|e2e|store_nats)::/)) | binary(/nats/) | test(/^local_worker_supervisor::/) | test(/nats/) | test(/subagent_replay/) | test(/tool_confirmation/) | test(/nats_tool_provider/) | test(/bootstrap::handler::/) | test(/bootstrap::real_mcp::/)'
 test-group = 'broker-e2e'

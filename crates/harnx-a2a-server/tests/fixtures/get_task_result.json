@@ -1,0 +1,41 @@
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "result": {
+    "id": "task-123e4567-e89b-12d3-a456-426614174000",
+    "contextId": "ctx-987e6543-e21b-43d3-b456-426617174111",
+    "status": {
+      "state": "TASK_STATE_COMPLETED",
+      "message": {
+        "role": "ROLE_AGENT",
+        "parts": [
+          {
+            "text": "Task completed successfully"
+          }
+        ],
+        "messageId": "msg-complete-001"
+      },
+      "timestamp": "2025-01-15T10:35:00Z"
+    },
+    "history": [
+      {
+        "role": "ROLE_USER",
+        "parts": [
+          {
+            "text": "Hello, agent"
+          }
+        ],
+        "messageId": "msg-user-001"
+      },
+      {
+        "role": "ROLE_AGENT",
+        "parts": [
+          {
+            "text": "Task completed successfully"
+          }
+        ],
+        "messageId": "msg-complete-001"
+      }
+    ]
+  }
+}

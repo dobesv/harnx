@@ -1,0 +1,11 @@
+id: 1
+data: {"jsonrpc":"2.0","id":"stream-request","result":{"task":{"id":"task-123e4567-e89b-12d3-a456-426614174000","contextId":"context-1","status":{"state":"TASK_STATE_WORKING"}}}}
+
+id: 2
+data: {"jsonrpc":"2.0","id":"stream-request","result":{"artifactUpdate":{"taskId":"task-123e4567-e89b-12d3-a456-426614174000","contextId":"context-1","artifact":{"artifactId":"answer","parts":[{"text":"Hello "}]}}}}
+
+id: 3
+data: {"jsonrpc":"2.0","id":"stream-request","result":{"artifactUpdate":{"taskId":"task-123e4567-e89b-12d3-a456-426614174000","contextId":"context-1","artifact":{"artifactId":"answer","parts":[{"text":"world"}]},"append":true,"lastChunk":true}}}
+
+id: 4
+data: {"jsonrpc":"2.0","id":"stream-request","result":{"statusUpdate":{"taskId":"task-123e4567-e89b-12d3-a456-426614174000","contextId":"context-1","status":{"state":"TASK_STATE_COMPLETED","message":{"role":"ROLE_AGENT","parts":[{"text":"Hello world"}],"messageId":"msg-done"},"timestamp":"2025-01-15T10:35:00Z"}}}}
