@@ -338,6 +338,7 @@ pub(super) fn spawn_metis_worker_with_hooks(
         },
         agent: Some(crate::config::Agent::new(worker_agent)),
         nats_servers: vec![config::NatsServerConfig {
+            user_id: None,
             name: "local".to_string(),
             url: url.to_string(),
             token: None,

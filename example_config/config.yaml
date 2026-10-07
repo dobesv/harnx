@@ -27,6 +27,9 @@ title_update_interval_secs: 30
 # Maximum time to wait for a worker to claim an activated session (default 60).
 # Must be greater than zero.
 nats_lease_acquisition_timeout_secs: 60
+# Optional default owner of new sessions (also HARNX_USER_ID, including from .env).
+# Explicit or inherited identity and nats_servers/<cluster>.yaml user_id take precedence.
+# user_id: null
 
 # ---- tool-use ----
 tool_use: true

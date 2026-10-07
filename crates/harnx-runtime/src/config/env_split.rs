@@ -152,15 +152,17 @@ impl Config {
         self.data.validate().map_err(anyhow::Error::msg)
     }
 
-    /// harnx-serve's listen address and public URL, outside `load_envs` for
-    /// the same reason as [`Self::load_loop_detection_env`].
-    fn load_serve_envs(&mut self) {
+    /// harnx-serve's listen address, public URL and identity sources, plus the
+    /// global `HARNX_USER_ID`, outside `load_envs` for the same reason as
+    /// [`Self::load_loop_detection_env`].
+    pub(super) fn load_serve_envs(&mut self) {
         if let Some(v) = read_env_value::<String>(&get_env_name("serve_addr")) {
             self.serve_addr = v;
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("serve_public_url")) {
             self.serve_public_url = v;
         }
+        self.load_user_identity_envs();
     }
 
     /// `HARNX_LOOP_DETECTION` turns the loop guards on or off together. It

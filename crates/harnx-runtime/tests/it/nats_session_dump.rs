@@ -31,6 +31,7 @@ fn new_session_id() -> String {
 fn local_nats_config(url: &str) -> Config {
     Config {
         nats_servers: vec![harnx_runtime::config::NatsServerConfig {
+            user_id: None,
             name: "local".to_string(),
             url: url.to_string(),
             token: None,

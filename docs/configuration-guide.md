@@ -214,6 +214,7 @@ The **filename** (without `.yaml`) is used as the cluster key (e.g., `agent@loca
 ```yaml
 url: "nats://localhost:4222" # NATS server URL
 token: "${NATS_TOKEN}"       # Optional auth token
+user_id: "cluster-owner"     # Optional default owner for new sessions on this cluster
 tls: true                    # Enable TLS
 tls_cert: "/path/to/cert"    # Optional client cert
 tls_key: "/path/to/key"      # Optional client key
@@ -523,4 +524,41 @@ Example `config.yaml`:
 
 ```yaml
 cleanup_remote_sessions_days: 30
+```
+
+### Session User Identity
+
+Harnx can record an opaque user identity string (such as a username, email, or account ID) in canonical session metadata (`user_id`). The identity is stored once when the session is created and is never overwritten on subsequent prompts or turns.
+
+Harnx treats user identity as an opaque string; it does not authenticate users itself. Upstream authentication proxies or callers provide the identity. `user_id` is visible in session listings to anyone who can list that agent's sessions; listing is not authorized per user. Don't configure secret-bearing cookies or headers (such as `_oauth2_proxy`, access tokens, or signed JWTs) as sources. Their values would be stored and exposed as-is.
+
+A trusted proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. Header sources use the first comma-separated value, so appending a trusted value still allows spoofing. Cookie identity values must also come from the trusted proxy. `header:NAME` and bare `NAME` select a header; `cookie:NAME` selects an exact, case-sensitive cookie name.
+
+- **user_id** (env: `HARNX_USER_ID`, including from `.env`): Global default user identity for new sessions.
+- **user_id** in `nats_servers/<cluster>.yaml`: Default user identity for new sessions created on that NATS cluster.
+- **serve_user_id_sources** (env: `HARNX_SERVE_USER_ID_SOURCES`): An ordered list of HTTP headers or cookies that `harnx-serve` checks to resolve user identity from incoming requests.
+
+#### Precedence
+
+When a new session is created, user identity resolves in priority order:
+
+1. **Request identity**: Resolved by `harnx-serve` from configured `serve_user_id_sources` (or `--user-id-source` flags).
+2. **Cluster default**: Configured `user_id` in `nats_servers/<cluster>.yaml` for the destination cluster.
+3. **Global default**: Configured `user_id` in `config.yaml`, or the `HARNX_USER_ID` environment variable / `.env` file.
+
+Nonblank explicit or inherited identities (for example, A2A caller identities, sub-agents, or handoff-created sessions inheriting the source's `user_id`) take precedence over destination defaults. Inheritance respects the source property's inheritance flag. Blank explicit or inherited strings count as absent, so defaults apply; invalid HTTP identity sources still return 401 instead of falling back. Handoffs copy user identity, not execution-context properties such as the source branch.
+
+Once metadata is written at session creation, the identity is immutable, including on handoff into an existing session. For concurrent creators, the first successful metadata creation wins. Promptless subscriptions and control commands don't bind session ownership.
+
+Example `config.yaml`:
+
+```yaml
+# Global default identity for new sessions
+user_id: alice
+
+# Identity sources for harnx-serve (first match wins)
+serve_user_id_sources:
+  - "header:X-Forwarded-User"
+  - "header:X-Forwarded-Email"
+  - "cookie:session_user"
 ```

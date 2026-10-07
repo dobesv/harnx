@@ -32,6 +32,7 @@ pub(crate) struct SessionsRouteContext<'a> {
     pub(crate) target: &'a crate::session_actor::ResolvedAgentTarget,
     pub(crate) scoped: &'a harnx_runtime::config::GlobalConfig,
     pub(crate) query: Option<&'a str>,
+    user_id: Option<&'a str>,
 }
 
 impl<'a> SessionsRouteContext<'a> {
@@ -44,7 +45,13 @@ impl<'a> SessionsRouteContext<'a> {
             target,
             scoped,
             query,
+            user_id: None,
         }
+    }
+
+    pub(crate) fn with_user_id(mut self, user_id: Option<&'a str>) -> Self {
+        self.user_id = user_id;
+        self
     }
 }
 
@@ -153,8 +160,12 @@ impl Server {
     ) -> Result<AppResponse> {
         match negotiate_agents_route(method, headers, AgentsRoute::Sessions)? {
             AgentsRepresentation::Json if *method == Method::POST => {
-                self.create_session_json(context.target, context.scoped)
-                    .await
+                self.create_session_json(
+                    context.target,
+                    context.scoped,
+                    context.user_id.map(str::to_string),
+                )
+                .await
             }
             AgentsRepresentation::Json => {
                 self.sessions_json(
@@ -187,9 +198,15 @@ impl Server {
         &self,
         target: &crate::session_actor::ResolvedAgentTarget,
         scoped: &harnx_runtime::config::GlobalConfig,
+        user_id: Option<String>,
     ) -> Result<AppResponse> {
         ensure_frontend_nats_owner(target.cluster()).await?;
-        let session_id = Config::reserve_new_session_id(scoped).await?;
+        let mut initializer = harnx_runtime::SessionInitializer::from_config(&scoped.read())?;
+        if let Some(user_id) = user_id {
+            initializer = initializer.with_user_id(user_id);
+        }
+        let session_id =
+            Config::reserve_new_session_id_with_initializer(scoped, initializer).await?;
         json_response_with_status(StatusCode::CREATED, json!({ "session_id": session_id }))
     }
 
@@ -538,7 +555,7 @@ mod tests {
             .expect("resolve session creator");
 
         let response = server
-            .create_session_json(&target, &scoped)
+            .create_session_json(&target, &scoped, None)
             .await
             .expect("create session response");
 
@@ -877,11 +894,7 @@ mod tests {
                 .handle_sessions_route(
                     &Method::GET,
                     &headers,
-                    SessionsRouteContext {
-                        target: &target,
-                        scoped: &scoped,
-                        query: Some(query),
-                    },
+                    SessionsRouteContext::new(&target, &scoped, Some(query)),
                 )
                 .await
                 .expect_err(&format!("query '{query}' should fail with BAD_REQUEST"));
@@ -912,11 +925,7 @@ mod tests {
             .await
             .expect("resolve agent target");
 
-        let context = SessionsRouteContext {
-            target: &target,
-            scoped: &scoped_agent,
-            query: None,
-        };
+        let context = SessionsRouteContext::new(&target, &scoped_agent, None);
         let all = session_list_json(&server, context).await;
         assert!(all.is_array(), "legacy response must be a plain array");
         assert_eq!(all.as_array().unwrap().len(), 5);

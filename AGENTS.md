@@ -981,6 +981,39 @@ properties (`dev.harnx.session_properties`): a row in `PROPERTY_DEFINITIONS`
 line in `harnx_write_session_meta`'s description and whether sub-agent
 sessions inherit it. See "Session properties" in `docs/nats-ha.md`.
 
+### Session user identity
+
+`user_id` is a read-only session property set only when canonical metadata is
+first created. It is never overwritten on later prompts, handoffs into an
+existing session, or reconnects. Concurrent creators race; the first successful
+metadata write wins and stamps the identity.
+
+Shared request identity resolution lives in `harnx_runtime::identity`
+(`identity.rs`), used by `harnx-a2a-server` and `harnx-serve`. It extracts from
+configured HTTP headers or cookies and is fail-closed: an empty or malformed
+matching source returns an error rather than falling back.
+
+Precedence at metadata creation:
+
+1. Explicit/inherited `user_id` in `SessionInitializer` (A2A caller identity,
+   sub-agent inheritance, handoff).
+2. Request identity resolved by `harnx-serve` from configured sources.
+3. `user_id` in `nats_servers/<cluster>.yaml` for the destination cluster.
+4. Global `user_id` in `config.yaml` / `HARNX_USER_ID`.
+
+Blank explicit or inherited strings count as absent, so defaults apply. Handoffs
+use `SessionProperties::inherited_user_id` to copy only the user identity, not
+execution-context properties like `git_branch`.
+
+Control commands in `harnx-serve` (cancel, compact) must not create metadata.
+They check for an existing canonical record via `control_session()` before
+opening a control handle; without metadata they return idle/not-found rather
+than creating one. Creating it there would stamp only the defaults, and the
+next prompt's request identity could never replace them.
+
+See `docs/configuration-guide.md` under "Session User Identity" and
+`crates/harnx-serve/README.md` under "Request Identity" for user-facing config.
+
 Per-session A2A task keys follow the same pattern: `sessions/{storage_key}/a2a/tasks/{uuid}`.
 These keys are purged automatically by `delete_remote_session_by_key` because it calls
 `purge_session_prefix`. New server crates that need per-session storage should follow this

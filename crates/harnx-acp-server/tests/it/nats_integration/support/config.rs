@@ -25,6 +25,7 @@ pub(crate) fn test_config(url: &str) -> GlobalConfig {
         agent: Some(harnx_runtime::config::Agent::new(agent)),
         model: harnx_core::model::Model::new("test", "test-model"),
         nats_servers: vec![NatsServerConfig {
+            user_id: None,
             name: CLUSTER.to_string(),
             url: url.to_string(),
             token: Some(TOKEN.to_string()),

@@ -203,6 +203,7 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
     let package = harnx_core::package_namespace::pkg_from_qualified(&agent).map(str::to_string);
     let registration_context = jetstream.clone();
     let policy = super::subagent_toolset::TargetRunPolicy::resolve(&config.read(), &agent)?;
+    let default_user_id = config.read().default_user_id_for_cluster(route.cluster());
     let toolset = Arc::new(
         SubagentToolset::new(
             agent,
@@ -215,7 +216,8 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
             )
             .with_lease_acquisition_timeout(lease_acquisition_timeout),
         )
-        .with_run_policy(policy),
+        .with_run_policy(policy)
+        .with_default_user_id(default_user_id),
     );
     let server_name = harnx_toolset::Toolset::name(toolset.as_ref()).to_string();
     let identity_token = harnx_toolset::server_identity_token(package.as_deref(), "", &server_name);

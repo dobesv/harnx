@@ -22,7 +22,7 @@ Usage: harnx-a2a-server [OPTIONS] --agent <SPEC>
 | `--cluster <CLUSTER>` | none | Target NATS cluster name for shared workers. |
 | `--config-dir <PATH>` | `HARNX_CONFIG_DIR` | Path to the harnx configuration directory containing `config.yaml`. |
 | `--public-base-url <URL>` | none | Base URL used in Agent Card interface URLs (for example, `https://agents.example.com`). If omitted, inferred from `X-Forwarded-*` or `Host` headers. |
-| `--user-id-header <NAME>` | none | Trusted header name containing the authenticated end-user ID (repeatable, first matching header wins). Enables user isolation mode. |
+| `--user-id-header <NAME>` | none | Trusted identity source: bare header name, `header:NAME`, or `cookie:NAME` (repeatable, first present source wins). Empty or invalid values fail closed. Enables user isolation mode. |
 | `--max-data-part-bytes <BYTES>` | `65536` | Maximum combined byte budget for rendered data and inline text/JSON file parts per message. Over-limit requests return an invalid params error. |
 
 ### Export Specifications and Startup Validation
@@ -140,7 +140,7 @@ In production, run `harnx-a2a-server` behind a reverse proxy (such as Nginx, Env
 ### Reverse Proxy Responsibilities
 
 1. **Authentication and JWT verification**: The server does not validate tokens or authentication signatures. For Atlassian Forge apps, the reverse proxy must verify the Forge Invocation Token (FIT JWT) signed by Atlassian's JWKS.
-2. **Strip or overwrite user-id headers**: When `--user-id-header` is configured, the proxy **must strip or overwrite** that header on incoming requests from clients. Never allow untrusted clients to spoof the header.
+2. **Strip or overwrite identity sources**: When `--user-id-header` is configured, the proxy **must strip or overwrite** the selected header or cookie on incoming requests from clients. Cookies must contain a proxy-verified user ID, not a token or client-supplied identity. The server doesn't verify cookie signatures.
 3. **Disable SSE response buffering**: Streaming responses use Server-Sent Events (`text/event-stream`). The proxy must disable buffer accumulation (e.g. `proxy_buffering off` in Nginx; `X-Accel-Buffering: no` is emitted by the server).
 4. **Long route timeouts**: Remote agent turns can run for several minutes. Set proxy read and send timeouts to at least **900 seconds** (15 minutes), matching Forge's SSE stream allowance.
 5. **Base URL configuration**: Set `--public-base-url https://agents.example.com` or pass standard forwarding headers (`Host`, `X-Forwarded-Proto`, `X-Forwarded-Host`) so Agent Cards generate reachable public URLs. Set `--public-base-url` in production so the card origin does not depend on request headers.

@@ -991,6 +991,7 @@ async fn dispatch_nats_handoff(
     let admitted_at = chrono::DateTime::from_timestamp_millis(lineage.started_at_ms.try_into()?)
         .context("invalid handoff admission time")?;
     let destination = resolve_handoff_destination(args, &agent).await?;
+    let initializer = handoff_initializer(args, &source_store, &destination).await?;
     args.ctx.check_generation("handoff-create")?;
     if requested_session_id.is_none() {
         let store = crate::nats_session_metadata::SessionMetadataStore::ensure(
@@ -998,8 +999,6 @@ async fn dispatch_nats_handoff(
             destination.replicas,
         )
         .await?;
-        let initializer =
-            crate::SessionInitializer::named(destination.agent.clone(), Default::default());
         requested_session_id = Some(
             crate::utils::session_name::reserve_invocation_session_id(
                 &store,
@@ -1013,10 +1012,7 @@ async fn dispatch_nats_handoff(
     let target_session = NatsSession::new_with_resolved_replicas(
         NatsSessionConfig {
             cluster: destination.cluster,
-            initializer: crate::SessionInitializer::named(
-                destination.agent,
-                harnx_core::agent_config::AgentVariables::default(),
-            ),
+            initializer,
             session_id: requested_session_id,
             activation_route: destination.activation_route,
         },
@@ -1056,6 +1052,29 @@ async fn dispatch_nats_handoff(
         handoff_tool_call_id,
     )
     .await
+}
+
+async fn handoff_initializer(
+    args: &AgentLoopSegmentArgs<'_>,
+    source_store: &crate::nats_session_metadata::SessionMetadataStore,
+    destination: &HandoffDestination,
+) -> Result<crate::SessionInitializer> {
+    let source_metadata = source_store
+        .get(args.source_session_id)
+        .await?
+        .context("handoff source metadata missing")?;
+    let inherited_identity =
+        crate::nats_session_metadata::session_properties(&source_metadata.metadata)?
+            .inherited_user_id();
+    Ok(
+        crate::SessionInitializer::named(destination.agent.clone(), Default::default())
+            .with_properties(inherited_identity)
+            .with_default_user_id(
+                args.config
+                    .read()
+                    .default_user_id_for_cluster(&destination.cluster),
+            ),
+    )
 }
 
 struct HandoffDestination {

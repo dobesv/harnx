@@ -390,6 +390,20 @@ impl SessionActor {
             actor_config.call_fn.is_some(),
         )
         .await;
+        // A stale resume decision cannot create a session before its first prompt
+        // provides the request identity. There is nothing to decide without metadata.
+        let config = prompt_config.read().clone();
+        let jetstream = crate::serve_nats_jetstream(&config, key.cluster()).await?;
+        let store =
+            harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+                .await?;
+        if store
+            .get_for_agent(key.session(), key.agent())
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
         let session = open_actor_nats_session(
             &prompt_config,
             &actor_config.local_worker,
@@ -1113,7 +1127,7 @@ mod tests {
     use anyhow::anyhow;
     use harnx_core::{
         event::{AgentEvent, ContentBlock, ModelEvent},
-        message::Message,
+        message::{Message, MessageContent, MessageRole},
         tool::ToolCall,
     };
     use serde_json::json;
@@ -1195,11 +1209,25 @@ mod tests {
         harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let registry = SessionRegistry::new_for_tests(
-            load_base_config_for_tests(),
-            Duration::from_millis(50),
-            None,
-        );
+        let config = load_base_config_for_tests();
+        // Without canonical metadata, routing returns false before acquiring the worker lock.
+        // Seed a completed log too: Cancel requires an existing stream and the actor stays idle.
+        if !crate::test_support::seed_nats_session(
+            &config,
+            crate::test_support::NatsSessionSeed {
+                agent: "plain",
+                session_id: "approval-mailbox",
+                messages: &[Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::Text("Ready for approval routing.".to_string()),
+                )],
+            },
+        )
+        .await
+        {
+            return;
+        }
+        let registry = SessionRegistry::new_for_tests(config, Duration::from_millis(50), None);
         let local_worker = registry.local_worker_for_tests();
         let handle = registry.get_or_spawn(key("plain", "approval-mailbox"));
         // Establish the broker-backed actor before measuring lock independence;

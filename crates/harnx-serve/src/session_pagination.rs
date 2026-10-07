@@ -251,6 +251,7 @@ mod tests {
             title: Some(format!("Title {id}")),
             modified,
             contexts: vec![],
+            user_id: None,
             unread: false,
         }
     }

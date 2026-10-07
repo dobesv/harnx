@@ -8,6 +8,7 @@ pub struct SessionMeta {
     pub session_id: Option<String>,
     pub agent_name: Option<String>,
     pub title: Option<String>,
+    pub user_id: Option<String>,
     pub modified: Option<SystemTime>,
     pub contexts: Vec<ExecutionContextObservation>,
     /// Whether the session has unread attention.
@@ -210,6 +211,7 @@ mod tests {
             title: None,
             modified: None,
             contexts: Vec::new(),
+            user_id: None,
             unread: false,
         }
     }

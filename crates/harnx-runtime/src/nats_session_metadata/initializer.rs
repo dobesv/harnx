@@ -71,6 +71,38 @@ impl SessionInitializer {
         self
     }
 
+    /// Set an explicit identity for creation. Existing metadata is never changed by an initializer.
+    #[must_use]
+    pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
+        let user_id = user_id.into();
+        if user_id.trim().is_empty() {
+            self.properties.remove("user_id");
+        } else {
+            self.properties
+                .put("user_id", serde_json::Value::String(user_id), None);
+        }
+        self
+    }
+
+    /// Fill an absent identity after parent inheritance and destination routing are resolved.
+    /// Blank strings count as absent. Preserve attributes of any nonblank existing identity.
+    #[must_use]
+    pub fn with_default_user_id(mut self, user_id: Option<String>) -> Self {
+        if self
+            .properties
+            .text("user_id")
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            self.properties.remove("user_id");
+        }
+        if self.properties.get("user_id").is_none() {
+            if let Some(user_id) = user_id.filter(|value| !value.trim().is_empty()) {
+                return self.with_user_id(user_id);
+            }
+        }
+        self
+    }
+
     pub fn agent_name(&self) -> Option<&str> {
         self.agent.name()
     }
@@ -142,5 +174,92 @@ impl SessionInitializer {
             AgentVariables::default()
         };
         Self::named(name, variables)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn default_user_id_preserves_explicit_and_inherited_properties() {
+        harnx_core::require_nextest();
+        let parent =
+            SessionInitializer::named("parent", Default::default()).with_user_id("parent-owner");
+        let inherited = parent.properties.inherited();
+        let child = SessionInitializer::named("child", Default::default())
+            .with_properties(inherited.clone())
+            .with_default_user_id(Some("cluster-default".into()));
+        assert_eq!(child.properties, inherited);
+        assert_eq!(child.properties.text("user_id"), Some("parent-owner"));
+
+        for value in [json!("explicit"), json!(null)] {
+            let properties: SessionProperties = serde_json::from_value(json!({
+                "user_id": {"value": value, "inherit": false, "custom": "preserved"},
+                "customer": {"value": "existing", "inherit": true}
+            }))
+            .unwrap();
+            let initializer = SessionInitializer::named("child", Default::default())
+                .with_properties(properties.clone())
+                .with_default_user_id(Some("cluster-default".into()));
+            assert_eq!(initializer.properties, properties);
+        }
+    }
+
+    #[test]
+    fn blank_explicit_and_inherited_identities_allow_defaults() {
+        harnx_core::require_nextest();
+        for blank in ["", " \t\n"] {
+            let explicit =
+                SessionInitializer::named("agent", Default::default()).with_user_id(blank);
+            assert!(explicit.properties.get("user_id").is_none());
+            assert_eq!(
+                explicit
+                    .with_default_user_id(Some("default-owner".into()))
+                    .properties
+                    .text("user_id"),
+                Some("default-owner")
+            );
+            let properties: SessionProperties = serde_json::from_value(json!({
+                "user_id": {"value": blank, "inherit": true},
+                "customer": {"value": "retained", "inherit": true}
+            }))
+            .unwrap();
+            for inherited in [properties.clone(), properties.inherited()] {
+                let child = SessionInitializer::named("child", Default::default())
+                    .with_properties(inherited)
+                    .with_default_user_id(Some("cluster-owner".into()));
+                assert_eq!(child.properties.text("user_id"), Some("cluster-owner"));
+                assert_eq!(child.properties.text("customer"), Some("retained"));
+            }
+            let absent = SessionInitializer::named("child", Default::default())
+                .with_properties(properties)
+                .with_default_user_id(None);
+            assert!(absent.properties.get("user_id").is_none());
+        }
+    }
+
+    #[test]
+    fn default_user_id_only_adds_nonblank_identity() {
+        harnx_core::require_nextest();
+        for value in [None, Some("".into()), Some(" \t ".into())] {
+            let initializer =
+                SessionInitializer::named("agent", Default::default()).with_default_user_id(value);
+            assert!(initializer.properties.get("user_id").is_none());
+        }
+        let initializer = SessionInitializer::named("agent", Default::default())
+            .with_default_user_id(Some(" opaque owner ".into()));
+        assert_eq!(
+            initializer.properties.text("user_id"),
+            Some(" opaque owner ")
+        );
+        assert!(initializer.properties.get("user_id").unwrap().inherit);
+        assert!(initializer
+            .properties
+            .get("user_id")
+            .unwrap()
+            .source
+            .is_none());
     }
 }

@@ -3,6 +3,7 @@ mod agent_ops_split;
 mod attachments;
 mod compaction;
 mod completion_split;
+mod env_identity;
 mod env_split;
 pub mod input;
 mod loader_split;

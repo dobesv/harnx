@@ -108,6 +108,203 @@ async fn reserve_short_session_id_retries_on_collision() {
     let _ = nats.wait();
 }
 
+fn session_test_config(
+    session_id: Option<String>,
+    initializer: crate::SessionInitializer,
+) -> crate::NatsSessionConfig {
+    crate::NatsSessionConfig {
+        cluster: TEST_CLUSTER.into(),
+        initializer,
+        session_id,
+        activation_route: crate::SessionActivationRoute::ClusterShared,
+    }
+}
+
+async fn assert_reserved_sessions(
+    config: &GlobalConfig,
+    store: &crate::nats_session_metadata::SessionMetadataStore,
+    initializer: &crate::SessionInitializer,
+) -> (String, String) {
+    let reserved = Config::reserve_new_session_id(config).await.unwrap();
+    assert_stored_user_id(
+        store,
+        &initializer.session_key(&reserved),
+        Some("cluster-owner"),
+    )
+    .await;
+    let explicit = Config::reserve_new_session_id_with_initializer(
+        config,
+        initializer.clone().with_user_id("request-owner"),
+    )
+    .await
+    .unwrap();
+    assert_stored_user_id(
+        store,
+        &initializer.session_key(&explicit),
+        Some("request-owner"),
+    )
+    .await;
+    (reserved, explicit)
+}
+
+async fn assert_implicit_session_creations(
+    config: &GlobalConfig,
+    store: &crate::nats_session_metadata::SessionMetadataStore,
+    initializer: &crate::SessionInitializer,
+) {
+    use crate::NatsSession;
+
+    for (id, supplied, expected) in [
+        (
+            Some("implicit-default".into()),
+            initializer.clone(),
+            "cluster-owner",
+        ),
+        (None, initializer.clone(), "cluster-owner"),
+        (
+            Some("blank-explicit".into()),
+            initializer.clone().with_user_id(" \t"),
+            "cluster-owner",
+        ),
+        (
+            Some("blank-inherited".into()),
+            initializer.clone().with_properties(
+                serde_json::from_value(serde_json::json!({
+                    "user_id": {"value":" \t", "inherit":true}
+                }))
+                .unwrap(),
+            ),
+            "cluster-owner",
+        ),
+        (
+            Some("implicit-explicit".into()),
+            initializer.clone().with_user_id("request-owner"),
+            "request-owner",
+        ),
+    ] {
+        let session = NatsSession::from_global_config(
+            session_test_config(id, supplied),
+            config,
+            harnx_core::abort::create_abort_signal(),
+        )
+        .await
+        .unwrap();
+        assert_stored_user_id(store, session.storage_key(), Some(expected)).await;
+    }
+}
+
+struct ExistingSessions<'a> {
+    config: &'a GlobalConfig,
+    store: &'a crate::nats_session_metadata::SessionMetadataStore,
+    initializer: &'a crate::SessionInitializer,
+    reserved: &'a str,
+    explicit: &'a str,
+}
+
+async fn assert_existing_sessions_preserved_across_config_changes(sessions: ExistingSessions<'_>) {
+    let ExistingSessions {
+        config,
+        store,
+        initializer,
+        reserved,
+        explicit,
+    } = sessions;
+    use crate::nats_session_metadata::{session_properties, SessionMetadata};
+    use crate::NatsSession;
+
+    // Existing records without an identity stay anonymous even after defaults are enabled.
+    let anonymous = SessionMetadata::new("existing-anonymous", initializer.clone());
+    store.create(&anonymous).await.unwrap().unwrap();
+    {
+        let mut config = config.write();
+        config.user_id = Some("changed-global".into());
+        config.nats_servers[0].user_id = Some("changed-cluster".into());
+    }
+    for (id, expected) in [
+        (reserved.to_string(), Some("cluster-owner")),
+        (explicit.to_string(), Some("request-owner")),
+        ("existing-anonymous".into(), None),
+    ] {
+        let key = initializer.session_key(&id);
+        let before = store.get(&key).await.unwrap().unwrap();
+        let session = NatsSession::from_global_config(
+            session_test_config(Some(id), initializer.clone().with_user_id("replacement")),
+            config,
+            harnx_core::abort::create_abort_signal(),
+        )
+        .await
+        .unwrap();
+        let after = store.get(session.storage_key()).await.unwrap().unwrap();
+        assert_eq!(before.revision, after.revision);
+        assert_eq!(
+            session_properties(&before.metadata).unwrap(),
+            session_properties(&after.metadata).unwrap()
+        );
+        assert_stored_user_id(store, session.storage_key(), expected).await;
+    }
+}
+
+async fn assert_blank_cluster_default_falls_back_to_global(
+    config: &GlobalConfig,
+    store: &crate::nats_session_metadata::SessionMetadataStore,
+    initializer: &crate::SessionInitializer,
+) {
+    config.write().nats_servers[0].user_id = Some(" \t ".into());
+    let fallback = Config::reserve_new_session_id(config).await.unwrap();
+    assert_stored_user_id(
+        store,
+        &initializer.session_key(&fallback),
+        Some("changed-global"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_id_defaults_cover_reservation_and_implicit_creation_without_overwrite() {
+    harnx_core::require_nextest();
+    use crate::nats_session_metadata::SessionMetadataStore;
+    use crate::SessionInitializer;
+
+    let Some((config, mut nats, _store_dir)) = isolated_session_config().await else {
+        return;
+    };
+    {
+        let mut config = config.write();
+        config.user_id = Some("global-owner".into());
+        config.nats_servers[0].user_id = Some("cluster-owner".into());
+    }
+    let snapshot = config.read().clone();
+    let initializer = SessionInitializer::from_config(&snapshot).unwrap();
+    let jetstream = snapshot.nats_jetstream(TEST_CLUSTER).await.unwrap();
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await.unwrap();
+
+    let (reserved, explicit) = assert_reserved_sessions(&config, &store, &initializer).await;
+    assert_implicit_session_creations(&config, &store, &initializer).await;
+    assert_existing_sessions_preserved_across_config_changes(ExistingSessions {
+        config: &config,
+        store: &store,
+        initializer: &initializer,
+        reserved: &reserved,
+        explicit: &explicit,
+    })
+    .await;
+    assert_blank_cluster_default_falls_back_to_global(&config, &store, &initializer).await;
+    let _ = nats.kill();
+    let _ = nats.wait();
+}
+async fn assert_stored_user_id(
+    store: &crate::nats_session_metadata::SessionMetadataStore,
+    key: &str,
+    expected: Option<&str>,
+) {
+    let record = store.get(key).await.unwrap().unwrap();
+    let properties = crate::nats_session_metadata::session_properties(&record.metadata).unwrap();
+    assert_eq!(properties.text("user_id"), expected);
+    if expected.is_some() {
+        assert!(properties.get("user_id").unwrap().inherit);
+    }
+}
+
 async fn isolated_session_config() -> Option<(
     GlobalConfig,
     crate::nats_worker::tests::TestNatsServer,
@@ -119,6 +316,7 @@ async fn isolated_session_config() -> Option<(
         ..Config::default()
     };
     config.nats_servers.push(NatsServerConfig {
+        user_id: None,
         name: TEST_CLUSTER.to_string(),
         url,
         token: None,

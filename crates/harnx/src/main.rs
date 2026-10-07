@@ -1670,6 +1670,7 @@ mod tests_list_sessions_routing {
             title: None,
             modified: None,
             contexts: vec![],
+            user_id: None,
             unread: false,
         }
     }

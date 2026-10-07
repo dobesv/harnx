@@ -8,6 +8,7 @@ export interface Agent {
 
 export interface SessionRef {
   session_id: string;
+  user_id?: string | null;
   title?: string | null;
   repository?: string | null;
   branch?: string | null;

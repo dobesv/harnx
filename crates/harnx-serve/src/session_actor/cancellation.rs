@@ -24,7 +24,9 @@ impl SessionActor {
             agent_name: self.key.agent(),
             session_id: &self.key.session,
         });
-        let session = self.control_session().await?;
+        let session = self
+            .control_session_with_user_id(options.user_id.as_deref())
+            .await?;
         // Before admission, so the turn this prompt starts can already read it.
         self.record_web_session_url(&session, options).await;
         let session = match options.runtime_parent.as_deref() {
@@ -40,13 +42,37 @@ impl SessionActor {
         session.admit_input(&input, source_dir.as_deref()).await
     }
 
-    pub(super) async fn control_session(&self) -> anyhow::Result<NatsSession> {
+    pub(super) async fn control_session(&self) -> anyhow::Result<Option<NatsSession>> {
+        let config = self.prompt_config().await.read().clone();
+        let jetstream = crate::serve_nats_jetstream(&config, self.key.cluster()).await?;
+        let store =
+            harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+                .await?;
+        // Registry presence only means a frontend attached, not that a prompt created metadata.
+        if store
+            .get_for_agent(self.key.session(), self.key.agent())
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.control_session_with_user_id(None).await.map(Some)
+    }
+
+    async fn control_session_with_user_id(
+        &self,
+        user_id: Option<&str>,
+    ) -> anyhow::Result<NatsSession> {
         let abort = create_abort_signal();
         let config = self.prompt_config().await;
         let initializer = harnx_runtime::SessionInitializer::named_from_config(
             self.key.agent().to_string(),
             &config.read(),
         );
+        let initializer = match user_id {
+            Some(user_id) => initializer.with_user_id(user_id),
+            None => initializer,
+        };
         let cluster = self.key.cluster().to_string();
         NatsSession::from_global_config(
             NatsSessionConfig {
@@ -71,7 +97,9 @@ impl SessionActor {
     /// will retry it. A frontend attaching to the session republishes it, which
     /// is how an interrupted turn still winds up after this server restarted.
     pub(super) async fn republish_pending_activation(&self) {
-        if self.actor_config.call_fn.is_some() {
+        // A promptless subscription must not create metadata with defaults before
+        // the first prompt supplies its request identity.
+        if self.actor_config.call_fn.is_some() || self.session_base.is_none() {
             return;
         }
         match self.publish_pending_activation().await {
@@ -89,10 +117,10 @@ impl SessionActor {
     }
 
     async fn publish_pending_activation(&self) -> anyhow::Result<bool> {
-        self.control_session()
-            .await?
-            .republish_pending_activation()
-            .await
+        match self.control_session().await? {
+            Some(session) => session.republish_pending_activation().await,
+            None => Ok(false),
+        }
     }
 
     /// Interrupt this session: abort whatever this server is running for it,
@@ -125,10 +153,10 @@ impl SessionActor {
     }
 
     async fn interrupt_session(&self) -> anyhow::Result<InterruptOutcome> {
-        self.control_session()
-            .await?
-            .interrupt("user interrupt from web")
-            .await
+        match self.control_session().await? {
+            Some(session) => session.interrupt("user interrupt from web").await,
+            None => Ok(InterruptOutcome::Idle),
+        }
     }
 
     fn abort_active_run(&mut self) {

@@ -29,7 +29,10 @@ async fn new_inherits_context_then_prompt_reuse_and_load_share_one_session_log()
     let _env = subagent_test_env(&url, &seeded);
     let captured = Arc::new(Mutex::new(Vec::new()));
     let daemon = spawn_metis_worker_with_call_fn(&url, echoing_call_fn(Arc::clone(&captured)));
-    let toolset = test_subagent_toolset(&url).await;
+    let toolset = Arc::try_unwrap(test_subagent_toolset(&url).await)
+        .ok()
+        .expect("test owns the toolset")
+        .with_default_user_id(Some("cluster-default".into()));
     let parent = create_bound_parent(&url).await;
 
     let session_id = create_inheriting_child(&toolset, &parent.session_id).await;
@@ -60,7 +63,8 @@ async fn create_bound_parent(url: &str) -> ParentBinding {
     let session = NatsSession::new(
         NatsSessionConfig {
             cluster: "local".to_string(),
-            initializer: SessionInitializer::named("metis", Default::default()),
+            initializer: SessionInitializer::named("metis", Default::default())
+                .with_user_id("parent-owner"),
             session_id: Some(session_id.clone()),
             activation_route: SessionActivationRoute::ClusterShared,
         },
@@ -130,6 +134,7 @@ async fn assert_inherited_context(metadata: &SessionMetadataStore, session_id: &
         serde_json::to_value(session_properties(&child.metadata).unwrap()).unwrap(),
         json!({
             "github_issue": {"value": 2296, "inherit": true},
+            "user_id": {"value": "parent-owner", "inherit": true},
             "customer": {"value": "acme", "inherit": true},
         })
     );

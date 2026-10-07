@@ -10,7 +10,7 @@
 
 use crate::session_actor::SessionKey;
 use anyhow::{ensure, Context, Result};
-use harnx_runtime::config::Config;
+use harnx_runtime::{config::Config, identity::first_value};
 use http::{HeaderMap, Uri};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
@@ -75,18 +75,6 @@ pub(crate) fn inferred_base_url(headers: &HeaderMap, uri: &Uri) -> Option<String
         _ => "http",
     };
     Some(format!("{scheme}://{authority}"))
-}
-
-/// The first entry of a header that proxies may append to, comma-separated.
-fn first_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get(name)?
-        .to_str()
-        .ok()?
-        .split(',')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
 }
 
 /// The address that opens `key`'s session in the Web UI served at `base`,

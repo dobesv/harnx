@@ -32,7 +32,8 @@ impl SessionActor {
         let session = self
             .control_session()
             .await
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(|error| format!("{error:#}"))?
+            .ok_or_else(|| "session not found".to_string())?;
         session
             .with_external_admission()
             .request_compaction(Some("web".to_string()))

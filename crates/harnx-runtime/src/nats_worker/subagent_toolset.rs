@@ -84,6 +84,7 @@ pub(crate) struct SubagentToolset {
     progress_heartbeat: Duration,
     lease_acquisition_timeout: Duration,
     run_policy: Option<TargetRunPolicy>,
+    default_user_id: Option<String>,
 }
 
 pub(crate) struct SubagentNats {
@@ -144,11 +145,17 @@ impl SubagentToolset {
             progress_heartbeat: SUBAGENT_PROGRESS_HEARTBEAT,
             lease_acquisition_timeout: nats.lease_acquisition_timeout,
             run_policy: None,
+            default_user_id: None,
         }
     }
 
     pub(crate) fn with_run_policy(mut self, policy: TargetRunPolicy) -> Self {
         self.run_policy = Some(policy);
+        self
+    }
+
+    pub(crate) fn with_default_user_id(mut self, user_id: Option<String>) -> Self {
+        self.default_user_id = user_id;
         self
     }
 
@@ -219,6 +226,9 @@ impl SubagentToolset {
                 }
             }
         }
+        config.initializer = config
+            .initializer
+            .with_default_user_id(self.default_user_id.clone());
         Ok(config)
     }
 
@@ -985,6 +995,47 @@ fn standalone_context() -> ToolInvocationContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn child_without_parent_identity_uses_worker_route_default() {
+        harnx_core::require_nextest();
+        let Some((url, mut nats, _store_dir)) = super::super::tests::spawn_test_nats().await else {
+            return;
+        };
+        let toolset =
+            std::sync::Arc::try_unwrap(super::super::tests::test_subagent_toolset(&url).await)
+                .ok()
+                .expect("test owns the toolset")
+                .with_default_user_id(Some("cluster-default".into()));
+        let config = toolset.session_config(None, None, None).await.unwrap();
+        assert_eq!(
+            config.initializer.properties.text("user_id"),
+            Some("cluster-default")
+        );
+        let id = crate::utils::session_name::reserve_invocation_session_id(
+            &toolset.session_metadata,
+            &config.initializer,
+            "new-child",
+            1_735_689_600_000,
+        )
+        .await
+        .unwrap();
+        let child = toolset.create_session(Some(id), None, None).await.unwrap();
+        let record = child
+            .metadata_store()
+            .get(child.storage_key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::nats_session_metadata::session_properties(&record.metadata)
+                .unwrap()
+                .text("user_id"),
+            Some("cluster-default")
+        );
+        let _ = nats.kill();
+        let _ = nats.wait();
+    }
 
     #[test]
     fn generates_four_agent_session_tools_with_stable_schemas() {
