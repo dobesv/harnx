@@ -31,6 +31,8 @@ cargo install --path crates/harnx-serve
 | Option | Short | Description |
 | :--- | :--- | :--- |
 | `--addr <ADDRESS>` | `-a` | Listen address (default from `config.yaml` or `127.0.0.1:8000`). |
+| `--user-id-source <SOURCE>` | | Identity source (`header:NAME`, `cookie:NAME`, or bare `NAME`); repeat in priority order. Replaces `serve_user_id_sources` from config. |
+| `--public-url <URL>` | | URL a browser uses to reach the Web UI (default from `config.yaml`; inferred from request when unset). |
 | `--model <MODEL>` | `-m` | Select a specific LLM model to use. |
 | `--dry-run` | | Echo prompts instead of sending them to the LLM. |
 | `--web-assets <PATH>` | | Directory of web-ui static assets to serve (default: `~/.local/share/harnx/web-assets`, XDG-aware). |
@@ -441,6 +443,61 @@ so a reconnecting client sees the correct interrupt snapshot without a subscribe
 - **Durable Refresh:** History reflects the latest durably appended log entries.
   Live notifications are advisory; clients reload the authoritative transcript
   after each notification and on reconnect.
+
+## Request Identity
+
+`harnx-serve` can associate incoming requests with an opaque user identity string, storing it in canonical session metadata (`user_id`).
+
+### Configuration
+
+Identity sources can be configured via `serve_user_id_sources` in `config.yaml`, the `HARNX_SERVE_USER_ID_SOURCES` environment variable, or repeated `--user-id-source` CLI flags. CLI flags replace configuration file sources when supplied.
+
+Each source is an ordered entry:
+- `header:NAME` — reads HTTP request header `NAME` (case-insensitive header name).
+- `cookie:NAME` — reads cookie `NAME` from `Cookie` request headers (case-sensitive cookie name).
+- `NAME` (bare name) — alias for `header:NAME`.
+
+Sources are evaluated in declaration order. The first present source wins:
+- If the first matching source contains a valid, non-empty value, that value becomes the request's user identity.
+- **Fail closed**: If the first matching source is present but empty or malformed, `harnx-serve` immediately rejects the request with HTTP `401 Unauthorized`. It does not fall back to subsequent sources.
+- If no configured source is present on the request, session creation falls back to cluster or global defaults.
+
+### Common Proxy Configurations
+
+#### oauth2-proxy
+`oauth2-proxy` authenticates requests and passes identity in headers such as `X-Forwarded-Email` or `X-Forwarded-User`. While it sets a session cookie (`_oauth2_proxy`), the cookie value is encrypted and cannot be parsed directly by `harnx-serve`. Use the forwarded headers:
+
+```bash
+harnx-serve \
+  --user-id-source "header:X-Forwarded-Email" \
+  --user-id-source "header:X-Forwarded-User"
+```
+
+#### AWS Application Load Balancer (ALB) OIDC
+AWS ALB authenticates callers via OIDC and injects `x-amzn-oidc-identity` (the user's identity/subject claim) and `x-amzn-oidc-data` (a signed JWT payload). Use the raw identity header `x-amzn-oidc-identity`, since `x-amzn-oidc-data` is an unparsed JWT:
+
+```bash
+harnx-serve \
+  --user-id-source "header:x-amzn-oidc-identity"
+```
+
+### Security Warning
+
+`harnx-serve` does not authenticate identity headers or cookies; it treats resolved values as opaque strings. The upstream proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. Header sources use the first comma-separated value, so appending a trusted identity after an untrusted value still permits spoofing. Cookie sources must also contain only proxy-trusted identity values.
+
+`user_id` is visible in session listings to anyone who can list that agent's sessions. There is no per-user listing authorization. Use a non-secret account identifier, not access tokens, signed JWTs, or secret-bearing session cookies such as `_oauth2_proxy`. Values are stored as-is, not decrypted or verified; they remain in session metadata until the session is removed.
+
+### Precedence and Immutability
+
+When a session is first created:
+1. Request identity (resolved from configured sources) takes highest precedence.
+2. If absent, the destination cluster's configured `user_id` in `nats_servers/<cluster>.yaml` applies.
+3. If absent, the global `user_id` from `config.yaml` or `HARNX_USER_ID` applies.
+4. Nonblank explicit initializer properties (such as the A2A server's resolved user) and inherited identities take precedence over cluster and global defaults. Sub-agents and handoff-created sessions inherit the source session's `user_id`, unless its inheritance flag is disabled. If there is no inheritable nonblank identity, the destination defaults apply. Handoffs don't copy execution-context properties such as the source branch.
+
+Blank explicit or inherited identity strings count as absent. Invalid request identity values still fail closed; they don't trigger default fallback.
+
+Session user identity is stored once when the session metadata is created. It is immutable and never overwritten by subsequent prompts, handoffs into an existing session, or reconnecting callers. Concurrent creators use the identity of the first successful metadata creation. Promptless subscriptions and control commands don't create metadata; cancelling a never-prompted attached session is an idle no-op, and compacting it returns session not found.
 
 ## Quickstart
 

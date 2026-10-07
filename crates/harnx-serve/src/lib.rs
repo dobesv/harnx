@@ -16,6 +16,7 @@ mod cid;
 mod interrupt_resume;
 mod models_catalog;
 mod nats_access;
+mod request_identity;
 mod serve_shutdown;
 pub mod session_actor;
 mod session_actor_types;
@@ -33,9 +34,13 @@ pub mod test_support;
 #[cfg(test)]
 mod cid_route_tests;
 #[cfg(test)]
+mod nats_user_identity_tests;
+#[cfg(test)]
 mod nats_web_session_url_tests;
 #[cfg(test)]
 mod remote_agent_nats_tests;
+
+use request_identity::RequestUserId;
 
 pub(crate) use agent_resolve::{is_safe_agent_path, is_safe_path_segment, resolve_agent_target};
 pub(crate) use nats_access::{
@@ -307,7 +312,7 @@ pub async fn run_with_shutdown_config(
         &config,
         web_assets,
         stream_drain,
-    ));
+    )?);
     let listener = TcpListener::bind(&addr).await?;
     // Advertise the bound address so URLs reflect the real host/port even when
     // the request used an ephemeral port (":0") or a bare port. Fall back to
@@ -339,6 +344,7 @@ pub async fn run_with_shutdown_config(
 #[doc(hidden)]
 pub struct Server {
     config: Config,
+    identity_sources: harnx_runtime::identity::IdentitySources,
     models: Vec<Value>,
     agents: Vec<AgentConfig>,
     rags: Vec<String>,
@@ -402,26 +408,31 @@ impl Server {
     #[doc(hidden)]
     pub fn new(config: &GlobalConfig, web_assets: PathBuf) -> Self {
         Self::new_with_stream_drain(config, web_assets, StreamDrainConfig::default())
+            .expect("valid serve configuration")
     }
 
     fn new_with_stream_drain(
         config: &GlobalConfig,
         web_assets: PathBuf,
         stream_drain: StreamDrainConfig,
-    ) -> Self {
+    ) -> Result<Self> {
         let config = config.read().clone();
+        let identity_sources =
+            harnx_runtime::identity::IdentitySources::new(&config.serve_user_id_sources)
+                .context("invalid serve_user_id_sources")?;
         let models = advertised_models(&config);
         let session_registry = SessionRegistry::new(config.clone());
         let agents = config.all_agents();
-        Self {
+        Ok(Self {
             config,
+            identity_sources,
             models,
             agents,
             rags: Config::list_rags(),
             session_registry,
             web_assets,
             shutdown: serve_shutdown::ServeShutdown::new(stream_drain),
-        }
+        })
     }
 
     #[doc(hidden)]
@@ -511,23 +522,14 @@ impl Server {
 
     async fn handle(
         self: Arc<Self>,
-        req: hyper::Request<Incoming>,
+        mut req: hyper::Request<Incoming>,
     ) -> std::result::Result<AppResponse, hyper::Error> {
         let started = Instant::now();
         let method = req.method().clone();
         let uri = req.uri().clone();
         let path = uri.path();
 
-        if method == Method::OPTIONS {
-            let mut res = Response::default();
-            *res.status_mut() = StatusCode::NO_CONTENT;
-            set_cors_header(&mut res);
-            harnx_metrics::record_http_request(
-                method.as_str(),
-                "other",
-                res.status().as_u16(),
-                started.elapsed(),
-            );
+        if let Some(res) = self.prepare_request(&mut req, started) {
             return Ok(res);
         }
 
@@ -783,6 +785,22 @@ impl Server {
         Ok(Some(response))
     }
 
+    async fn ag_ui_rpc_route(
+        &self,
+        req: hyper::Request<Incoming>,
+        target: &ResolvedAgentTarget,
+        session: &str,
+    ) -> Result<AppResponse> {
+        let context = RpcContext {
+            config: &self.config,
+            registry: &self.session_registry,
+            persistence: PersistenceKind::Nats,
+            web_base_url: web_url::inferred_base_url(req.headers(), req.uri()),
+            user_id: RequestUserId::of(&req),
+        };
+        handle_ag_ui_rpc(req, target, session, context).await
+    }
+
     async fn handle_agent_tree(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
@@ -818,7 +836,8 @@ impl Server {
                 self.handle_sessions_route(
                     &method,
                     req.headers(),
-                    SessionsRouteContext::new(&target, &scoped, req.uri().query()),
+                    SessionsRouteContext::new(&target, &scoped, req.uri().query())
+                        .with_user_id(RequestUserId::of(&req).as_deref()),
                 )
                 .await
             }
@@ -835,13 +854,7 @@ impl Server {
                         self.ag_ui_run_route(req, &target, &session_name).await
                     }
                     AgentsRepresentation::AgUiRpc => {
-                        let context = RpcContext {
-                            config: &self.config,
-                            registry: &self.session_registry,
-                            persistence: PersistenceKind::Nats,
-                            web_base_url: web_url::inferred_base_url(req.headers(), req.uri()),
-                        };
-                        handle_ag_ui_rpc(req, &target, &session_name, context).await
+                        self.ag_ui_rpc_route(req, &target, &session_name).await
                     }
                 }
             }
@@ -1066,6 +1079,7 @@ impl Server {
         target: &ResolvedAgentTarget,
         session: &str,
     ) -> Result<AppResponse> {
+        let user_id = RequestUserId::of(&req);
         let web_base_url = web_url::inferred_base_url(req.headers(), req.uri());
         let body = req.collect().await?.to_bytes();
         let request = ag_ui::AgUiRunRequest {
@@ -1073,6 +1087,7 @@ impl Server {
             session,
             body: &body,
             web_base_url,
+            user_id,
         };
         ag_ui::ag_ui_run_for_target(
             &self.config,
@@ -1621,6 +1636,14 @@ pub(crate) fn format_session_summary(session: &harnx_runtime::config::SessionMet
         );
     }
     value.insert(String::from("unread"), Value::Bool(session.unread));
+    value.insert(
+        String::from("user_id"),
+        session
+            .user_id
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
 
     // Derive repository and branch from contexts, mirroring TUI picker_label logic:
     // pick the first context with repo or branch, then take each field independently.
@@ -2675,6 +2698,7 @@ mod tests {
                 title: None,
                 modified: None,
                 contexts: vec![],
+                user_id: None,
                 unread: false,
             },
             SessionMeta {
@@ -2684,6 +2708,7 @@ mod tests {
                 title: None,
                 modified: None,
                 contexts: vec![],
+                user_id: None,
                 unread: false,
             },
             SessionMeta {
@@ -2693,6 +2718,7 @@ mod tests {
                 title: None,
                 modified: None,
                 contexts: vec![],
+                user_id: None,
                 unread: false,
             },
         ];
@@ -2791,6 +2817,7 @@ mod tests {
             title: None,
             modified,
             contexts: vec![],
+            user_id: None,
             unread: false,
         };
 

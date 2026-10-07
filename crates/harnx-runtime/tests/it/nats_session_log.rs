@@ -231,6 +231,7 @@ async fn nats_session_log_round_trips_and_reconstructs() -> Result<()> {
 
     let config = Config {
         nats_servers: vec![harnx_runtime::config::NatsServerConfig {
+            user_id: None,
             name: "local".to_string(),
             url: server.url().to_string(),
             token: None,
@@ -286,6 +287,7 @@ async fn nats_session_log_orphan_repair_matches_file_replay() -> Result<()> {
 
     let config = Config {
         nats_servers: vec![harnx_runtime::config::NatsServerConfig {
+            user_id: None,
             name: "local".to_string(),
             url: server.url().to_string(),
             token: None,

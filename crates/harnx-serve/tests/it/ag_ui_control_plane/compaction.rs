@@ -1,11 +1,28 @@
 use super::*;
 
+async fn seed_canonical_idle_session(config: &Config, agent: &str, session_id: &str) -> bool {
+    // The injected executor doesn't create canonical metadata. Reserve an idle
+    // session explicitly: registry presence alone must not authorize compaction.
+    harnx_serve::test_support::seed_nats_session(
+        config,
+        harnx_serve::test_support::NatsSessionSeed {
+            agent,
+            session_id,
+            messages: &[],
+        },
+    )
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_compact_rpc_returns_submitted_on_idle_session() {
     let _guard = TestStateGuard::new(None).await;
     let sandbox = TestConfigSandbox::new();
     sandbox.write_agent("plain", "You are plain.");
     let config = sandbox.config();
+    if !seed_canonical_idle_session(&config, "plain", "compact-test").await {
+        return;
+    }
 
     // Simple call_fn that completes immediately
     let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {

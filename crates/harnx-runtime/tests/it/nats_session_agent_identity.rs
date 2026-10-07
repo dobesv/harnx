@@ -164,6 +164,7 @@ fn admin_config(url: &str) -> Config {
     admin
         .nats_servers
         .push(harnx_runtime::config::NatsServerConfig {
+            user_id: None,
             name: "local".into(),
             url: url.into(),
             token: None,

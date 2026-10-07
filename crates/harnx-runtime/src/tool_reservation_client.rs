@@ -193,7 +193,8 @@ async fn create_backing_session(
     let session = NatsSession::new_with_resolved_options(
         NatsSessionConfig {
             cluster,
-            initializer: SessionInitializer::inline("", Default::default(), Default::default()),
+            initializer: SessionInitializer::inline("", Default::default(), Default::default())
+                .with_default_user_id(config.default_user_id(Some(&server))),
             session_id: None,
             activation_route: route,
         },

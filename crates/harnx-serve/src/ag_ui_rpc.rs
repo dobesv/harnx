@@ -48,6 +48,8 @@ pub struct RpcContext<'a> {
     /// The Web UI base inferred from the request; see
     /// [`SessionPromptOptions::web_base_url`].
     pub web_base_url: Option<String>,
+    /// Identity resolved from request headers, never from JSON-RPC parameters.
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +119,7 @@ pub async fn handle_ag_ui_rpc_bytes(
         registry,
         persistence,
         web_base_url: None,
+        user_id: None,
     };
     handle_ag_ui_rpc_bytes_for_target(request, context).await
 }
@@ -341,7 +344,17 @@ async fn handle_prompt(
             }),
         );
     }
-    submit_prompt(id, &handle, &params, resume_applied).await
+    submit_prompt(id, &handle, &params, resume_applied, context).await
+}
+
+fn build_prompt_options(params: &PromptParams, context: &RpcContext<'_>) -> SessionPromptOptions {
+    SessionPromptOptions {
+        working_dir: params.working_dir.clone(),
+        attachment_refs: params.attachment_refs.clone(),
+        web_base_url: params.web_base_url.clone(),
+        user_id: context.user_id.clone(),
+        ..Default::default()
+    }
 }
 
 async fn submit_prompt(
@@ -349,19 +362,9 @@ async fn submit_prompt(
     handle: &SessionHandle,
     params: &PromptParams,
     resume_applied: Option<bool>,
+    context: &RpcContext<'_>,
 ) -> anyhow::Result<AppResponse> {
-    let result = match prompt(
-        handle,
-        &params.text,
-        SessionPromptOptions {
-            working_dir: params.working_dir.clone(),
-            attachment_refs: params.attachment_refs.clone(),
-            web_base_url: params.web_base_url.clone(),
-            ..Default::default()
-        },
-    )
-    .await
-    {
+    let result = match prompt(handle, &params.text, build_prompt_options(params, context)).await {
         Ok(result) => result,
         Err(message) => {
             return json_rpc_response(

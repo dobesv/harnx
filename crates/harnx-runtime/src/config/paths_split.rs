@@ -71,20 +71,46 @@ impl Config {
     /// I/O. The reserved session may remain transcript-empty until its first
     /// turn.
     pub async fn reserve_new_session_id(config: &GlobalConfig) -> Result<String> {
-        const RESERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
         let config = config.read().clone();
-        tokio::time::timeout(RESERVATION_TIMEOUT, config.reserve_new_session_id_inner())
+        let initializer = crate::SessionInitializer::from_config(&config)?;
+        config
+            .reserve_new_session_id_with_timeout(initializer)
             .await
-            .context("Timed out reserving a new NATS session ID")?
     }
 
-    async fn reserve_new_session_id_inner(&self) -> Result<String> {
+    /// Reserve using caller-supplied initial properties, such as a request identity.
+    /// Explicit properties win over the destination cluster and global defaults.
+    pub async fn reserve_new_session_id_with_initializer(
+        config: &GlobalConfig,
+        initializer: crate::SessionInitializer,
+    ) -> Result<String> {
+        let config = config.read().clone();
+        config
+            .reserve_new_session_id_with_timeout(initializer)
+            .await
+    }
+
+    async fn reserve_new_session_id_with_timeout(
+        &self,
+        initializer: crate::SessionInitializer,
+    ) -> Result<String> {
+        const RESERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        tokio::time::timeout(
+            RESERVATION_TIMEOUT,
+            self.reserve_new_session_id_inner(initializer),
+        )
+        .await
+        .context("Timed out reserving a new NATS session ID")?
+    }
+
+    async fn reserve_new_session_id_inner(
+        &self,
+        initializer: crate::SessionInitializer,
+    ) -> Result<String> {
         const LOCAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
-        // Validate and snapshot the initializer before entering the local
-        // broker handoff retry loop. Configuration errors are deterministic;
-        // retrying them would turn an actionable failure into a timeout.
-        let initializer = crate::nats_session_metadata::SessionInitializer::from_config(self)?;
+        // The initializer is validated before the local broker handoff retry loop:
+        // configuration errors are deterministic and must not become timeouts.
 
         let cluster = self
             .remote_agent
@@ -145,7 +171,10 @@ impl Config {
             server.replicas.unwrap_or(1),
         )
         .await?;
-        crate::utils::session_name::reserve_short_session_id(&store, initializer).await
+        let initializer = initializer
+            .clone()
+            .with_default_user_id(self.default_user_id(Some(server)));
+        crate::utils::session_name::reserve_short_session_id(&store, &initializer).await
     }
 
     pub fn rag_file(&self, name: &str) -> PathBuf {

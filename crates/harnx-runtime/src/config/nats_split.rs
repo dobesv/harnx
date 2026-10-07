@@ -55,6 +55,9 @@ pub struct NatsServerConfig {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Default identity for sessions created on this cluster, below explicit or inherited identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     /// JetStream replica count for buckets harnx creates on this cluster.
     /// Defaults to 1 when absent; see `docs/nats-ha.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +110,7 @@ pub(crate) async fn resolve_managed_local_nats_server_config() -> Result<NatsSer
         .expect("local NATS server initialized above")
         .status();
     Ok(NatsServerConfig {
+        user_id: None,
         name: LOCAL_CLUSTER_KEY.to_string(),
         url: server.url,
         token: Some(server.token),
@@ -165,6 +169,7 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
     };
 
     Ok(NatsServerConfig {
+        user_id: None,
         name: LOCAL_CLUSTER_KEY.to_string(),
         url,
         token: Some(token),
@@ -179,6 +184,29 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
 }
 
 impl Config {
+    /// Identity default for a new session on `server`. Explicit initializer
+    /// properties take precedence. Blank defaults are ignored; opaque IDs aren't trimmed.
+    pub fn default_user_id(&self, server: Option<&NatsServerConfig>) -> Option<String> {
+        server
+            .filter(|server| server.name != LOCAL_CLUSTER_KEY)
+            .and_then(|server| server.user_id.as_ref())
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                self.user_id
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .cloned()
+    }
+
+    pub(crate) fn default_user_id_for_cluster(&self, cluster: &str) -> Option<String> {
+        self.default_user_id(
+            self.nats_servers
+                .iter()
+                .find(|server| server.name == cluster),
+        )
+    }
+
     pub fn load_nats_servers_from_dir(dir: &Path) -> Result<Vec<NatsServerConfig>> {
         if !dir.exists() {
             return Ok(vec![]);
@@ -326,6 +354,7 @@ impl Config {
     pub(super) fn expand_nats_server_envs(server: &mut NatsServerConfig) {
         server.url = expand_env_string(&server.url);
         expand_env_option(&mut server.token);
+        expand_env_option(&mut server.user_id);
         expand_env_option(&mut server.tls_cert);
         expand_env_option(&mut server.tls_key);
         expand_env_option(&mut server.tls_ca);
@@ -434,6 +463,55 @@ mod tests {
                 "expected error to mention {needle:?}, got: {error}"
             );
         }
+    }
+
+    #[test]
+    fn default_user_id_prefers_destination_cluster_and_ignores_blank_defaults() {
+        harnx_core::require_nextest();
+        let mut config = Config {
+            data: ConfigData {
+                user_id: Some("global-owner".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut server: NatsServerConfig = serde_yaml::from_str(
+            "name: destination\nurl: nats://localhost:4222\nuser_id: cluster-owner\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.default_user_id(Some(&server)).as_deref(),
+            Some("cluster-owner")
+        );
+        assert_eq!(
+            config.default_user_id(None).as_deref(),
+            Some("global-owner")
+        );
+        for blank in [None, Some("".into()), Some(" \t ".into())] {
+            server.user_id = blank;
+            assert_eq!(
+                config.default_user_id(Some(&server)).as_deref(),
+                Some("global-owner")
+            );
+        }
+        server.user_id = Some("cluster-owner".into());
+        server.name = LOCAL_CLUSTER_KEY.into();
+        assert_eq!(
+            config.default_user_id(Some(&server)).as_deref(),
+            Some("global-owner")
+        );
+        config.user_id = Some(" \t ".into());
+        assert_eq!(config.default_user_id(None), None);
+        assert_eq!(config.default_user_id(Some(&server)), None);
+
+        server.name = "destination".into();
+        server.user_id = Some(" opaque owner ".into());
+        config.nats_servers.push(server);
+        assert_eq!(
+            config.default_user_id_for_cluster("destination").as_deref(),
+            Some(" opaque owner ")
+        );
+        assert_eq!(config.default_user_id_for_cluster("absent"), None);
     }
 
     #[test]
@@ -712,6 +790,7 @@ mod tests {
         let _ca = EnvGuard::new("NATS_CA", std::path::Path::new("/tmp/ca.pem"));
 
         let mut server = NatsServerConfig {
+            user_id: None,
             name: "local".into(),
             url: "nats://${NATS_TOKEN}@localhost:4222".into(),
             token: Some("${NATS_TOKEN}".into()),
@@ -831,6 +910,7 @@ tls: false
     async fn connect_nats_server_rejects_partial_client_cert_config() {
         harnx_core::require_nextest();
         let server = NatsServerConfig {
+            user_id: None,
             name: "mtls".into(),
             url: "tls://localhost:4222".into(),
             token: None,

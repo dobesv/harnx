@@ -29,6 +29,8 @@ pub(super) async fn handle(id: Value, session: SessionContext<'_>) -> anyhow::Re
         );
     }
 
+    // A promptless attached actor can cancel as an idle no-op. The actor must
+    // check canonical metadata instead of creating it for this control command.
     let handle = registry.get_or_spawn(key);
     match submit(&handle).await {
         Ok(outcome) => json_rpc_response(

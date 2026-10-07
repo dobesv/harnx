@@ -150,6 +150,8 @@ pub struct SessionPromptOptions {
     /// which the session records as its address unless a public URL is
     /// configured.
     pub web_base_url: Option<String>,
+    /// Identity resolved from this prompt's HTTP request. Used only when metadata is created.
+    pub user_id: Option<String>,
 }
 
 pub enum SessionCommand {

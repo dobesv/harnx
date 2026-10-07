@@ -21,6 +21,10 @@ struct Cli {
     /// Listen address (default from config.yaml or 127.0.0.1:8000)
     #[clap(short = 'a', long, value_name = "ADDRESS")]
     addr: Option<String>,
+    /// Identity source (header:NAME, cookie:NAME, or NAME); repeat in priority order.
+    /// Replaces serve_user_id_sources from config when supplied.
+    #[clap(long = "user-id-source", value_name = "SOURCE", action = clap::ArgAction::Append)]
+    user_id_sources: Vec<String>,
     /// URL a browser uses to reach the Web UI, such as https://harnx.example.com
     /// (default from config.yaml; inferred from each request when unset)
     #[clap(long, value_name = "URL")]
@@ -86,6 +90,9 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
     if let Some(public_url) = cli.public_url {
         config.write().serve_public_url = Some(public_url);
     }
+    if !cli.user_id_sources.is_empty() {
+        config.write().serve_user_id_sources = cli.user_id_sources;
+    }
     if let Some(model_id) = &cli.model {
         Config::switch_model(&config, model_id)?;
     }
@@ -111,6 +118,28 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
 mod tests {
     use super::Cli;
     use clap::Parser;
+
+    #[test]
+    fn parses_ordered_repeatable_user_id_sources() {
+        assert!(Cli::try_parse_from(["harnx-serve"])
+            .unwrap()
+            .user_id_sources
+            .is_empty());
+        let cli = Cli::try_parse_from([
+            "harnx-serve",
+            "--user-id-source",
+            "header:x-user",
+            "--user-id-source",
+            "cookie:owner",
+            "--user-id-source",
+            "x-backup",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.user_id_sources,
+            ["header:x-user", "cookie:owner", "x-backup"]
+        );
+    }
 
     #[test]
     fn drain_timeout_defaults_to_25_seconds_and_is_configurable() {

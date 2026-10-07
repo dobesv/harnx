@@ -887,6 +887,7 @@ mod tests {
     fn test_config(cluster: &str, server_url: &str) -> Config {
         let mut config = Config::default();
         config.nats_servers.push(NatsServerConfig {
+            user_id: None,
             name: cluster.to_string(),
             url: server_url.to_string(),
             token: None,

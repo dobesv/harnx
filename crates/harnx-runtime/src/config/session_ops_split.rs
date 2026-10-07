@@ -21,6 +21,17 @@ fn listed_session_to_meta(record: &ListedSession) -> SessionMeta {
         session_id: Some(record.metadata.session_id.clone()),
         agent_name: record.metadata.agent.name().map(str::to_string),
         title: record.metadata.title.value.clone(),
+        user_id: crate::nats_session_metadata::session_properties(&record.metadata)
+            .unwrap_or_else(|_| {
+                // Deserialization errors can include property values. Don't log identities.
+                log::warn!(
+                    "ignoring invalid retained session properties: session_id={}",
+                    record.metadata.session_id
+                );
+                Default::default()
+            })
+            .text("user_id")
+            .map(str::to_string),
         modified: Some(modified.into()),
         contexts: crate::nats_session_metadata::execution_contexts(&record.metadata)
             .unwrap_or_else(|error| {

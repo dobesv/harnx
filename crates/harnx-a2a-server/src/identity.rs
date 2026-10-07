@@ -1,7 +1,7 @@
-//! Request ownership from proxy-supplied headers, not authentication.
+//! A2A ownership adapters for shared request identity resolution, not authentication.
 //!
-//! The proxy must strip client-supplied identity headers and set trusted values.
-//! Only the resolved user ID may be persisted, never the raw request headers.
+//! The proxy must strip client-supplied identity sources and set trusted values.
+//! Only the resolved user ID may be persisted, never raw request headers or cookies.
 
 use a2a_lf::A2AError;
 use a2a_server_lf::{jsonrpc::MAX_REQUEST_BODY_BYTES, middleware::ServiceParams};
@@ -14,9 +14,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use harnx_runtime::identity::{IdentitySource, IdentitySources};
 use serde_json::{json, Value};
-
-use crate::web_url::first_value;
 
 /// Implementation-defined JSON-RPC server error, outside A2A's -32001..-32009.
 pub const MISSING_IDENTITY_CODE: i32 = -32000;
@@ -38,36 +37,29 @@ impl Principal {
     }
 }
 
-/// Ordered identity header policy. Empty configuration enables shared anonymous mode.
+/// Ordered identity policy. Empty configuration enables shared anonymous mode.
 #[derive(Clone, Debug, Default)]
 pub struct Identity {
-    headers: Vec<HeaderName>,
+    sources: IdentitySources,
 }
 
 impl Identity {
-    /// Validate and normalize header names at startup, preserving CLI precedence.
-    pub fn new(headers: &[String]) -> anyhow::Result<Self> {
-        let headers = headers
-            .iter()
-            .map(|name| {
-                HeaderName::from_bytes(name.as_bytes())
-                    .with_context(|| format!("invalid user-id-header name '{name}'"))
-            })
-            .collect::<anyhow::Result<_>>()?;
-        Ok(Self { headers })
+    /// Validate header/cookie sources at startup, preserving CLI precedence.
+    pub fn new(sources: &[String]) -> anyhow::Result<Self> {
+        Ok(Self {
+            sources: IdentitySources::new(sources).context("invalid user-id-header sources")?,
+        })
     }
 
-    /// First configured header present wins. Empty or invalid values fail closed;
-    /// neither later comma values nor lower-priority headers replace that identity.
+    /// First configured source present wins. Empty or invalid values fail closed.
     pub fn resolve(&self, headers: &HeaderMap) -> Result<Principal, A2AError> {
-        if self.headers.is_empty() {
+        if self.sources.sources().is_empty() {
             return Ok(Principal::Anonymous);
         }
-        self.headers
-            .iter()
-            .find(|name| headers.contains_key(*name))
-            .and_then(|name| first_value(headers, name.as_str()))
-            .map(|value| Principal::User(value.to_owned()))
+        self.sources
+            .resolve(headers)
+            .map_err(|_| missing_identity())?
+            .map(Principal::User)
             .ok_or_else(missing_identity)
     }
 
@@ -75,17 +67,41 @@ impl Identity {
     /// Keep this policy on the handler and resolve before accessing session state.
     pub fn resolve_service_params(&self, params: &ServiceParams) -> Result<Principal, A2AError> {
         let mut headers = HeaderMap::new();
-        for name in &self.headers {
-            if let Some(values) = params.get(name.as_str()) {
-                let value = values
-                    .first()
-                    .and_then(|value| value.parse().ok())
-                    .ok_or_else(missing_identity)?;
-                headers.insert(name.clone(), value);
-                break;
+        for source in self.sources.sources() {
+            Self::add_params_to_headers(source, params, &mut headers)?;
+            // Cookie sources share fields, but each source must be resolved in order.
+            if let Some(user) = source.resolve(&headers).map_err(|_| missing_identity())? {
+                return Ok(Principal::User(user.to_owned()));
             }
         }
         self.resolve(&headers)
+    }
+
+    /// Add values from params to headers for the given source, if not already present.
+    /// Returns `Err` if values exist but are empty.
+    fn add_params_to_headers(
+        source: &IdentitySource,
+        params: &ServiceParams,
+        headers: &mut HeaderMap,
+    ) -> Result<(), A2AError> {
+        let (name, limit) = match source {
+            IdentitySource::Header(name) => (name.clone(), 1),
+            IdentitySource::Cookie(_) => (HeaderName::from_static("cookie"), usize::MAX),
+        };
+        // Several cookie sources share the same header fields. Don't append them twice.
+        if headers.contains_key(&name) {
+            return Ok(());
+        }
+        let Some(values) = params.get(name.as_str()) else {
+            return Ok(());
+        };
+        if values.is_empty() {
+            return Err(missing_identity());
+        }
+        for value in values.iter().take(limit) {
+            headers.append(name.clone(), value.parse().map_err(|_| missing_identity())?);
+        }
+        Ok(())
     }
 }
 
@@ -287,7 +303,68 @@ mod tests {
     fn identity_invalid_header_name_fails_startup() {
         harnx_core::require_nextest();
         for name in ["", "bad header", "user:id", "user\n"] {
-            assert!(Identity::new(&[name.into()]).is_err());
+            assert_eq!(
+                Identity::new(&[name.into()]).unwrap_err().to_string(),
+                "invalid user-id-header sources"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_cookie_service_params_preserve_source_and_field_precedence() {
+        for sources in [
+            vec!["cookie:primary", "x-user", "cookie:fallback"],
+            vec!["cookie:primary", "cookie:fallback", "x-user"],
+            vec!["x-user", "cookie:primary", "cookie:fallback"],
+        ] {
+            let identity = identity(&sources);
+            for cookies in [
+                vec!["fallback=cookie-fallback", "primary=cookie-primary"],
+                vec!["fallback=cookie-fallback"],
+                vec!["primary=", "primary=later-primary"],
+                vec!["primary=bad value"],
+                vec!["unrelated=value"],
+            ] {
+                let mut headers = HeaderMap::new();
+                let mut params = ServiceParams::new();
+                headers.insert("x-user", "header-user".parse().unwrap());
+                params.insert("x-user".into(), vec!["header-user".into()]);
+                for cookie in &cookies {
+                    headers.append("cookie", cookie.parse().unwrap());
+                }
+                params.insert(
+                    "cookie".into(),
+                    cookies.into_iter().map(str::to_owned).collect(),
+                );
+                let http = identity.resolve(&headers).map_err(|error| error.code);
+                let handler = identity
+                    .resolve_service_params(&params)
+                    .map_err(|error| error.code);
+                assert_eq!(http, handler, "{sources:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn identity_service_params_ignore_unusable_lower_priority_headers() {
+        let identity = identity(&["x-primary", "x-fallback"]);
+        let mut params = ServiceParams::new();
+        params.insert(
+            "x-primary".into(),
+            vec!["primary".into(), "invalid\n".into()],
+        );
+        params.insert("x-fallback".into(), vec![]);
+        assert_eq!(
+            identity.resolve_service_params(&params).unwrap().user_id(),
+            Some("primary")
+        );
+        for values in [vec![], vec!["invalid\n".into()], vec!["".into()]] {
+            params.insert("x-primary".into(), values);
+            params.insert("x-fallback".into(), vec!["fallback".into()]);
+            assert_eq!(
+                identity.resolve_service_params(&params).unwrap_err().code,
+                MISSING_IDENTITY_CODE
+            );
         }
     }
 

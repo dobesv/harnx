@@ -205,6 +205,7 @@ async fn session_metadata_bucket_raising_replicas_does_not_fail_startup() -> Res
 fn local_nats_config(url: &str) -> Config {
     Config {
         nats_servers: vec![harnx_runtime::config::NatsServerConfig {
+            user_id: None,
             name: "local".to_string(),
             url: url.to_string(),
             token: None,

@@ -279,11 +279,22 @@ impl SessionProperties {
         )
     }
 
+    /// A handoff carries identity, not the source session's execution context.
+    pub fn inherited_user_id(&self) -> Self {
+        let mut properties = self.inherited();
+        properties.0.retain(|name, _| name == "user_id");
+        properties
+    }
+
+    pub(super) fn remove(&mut self, name: &str) {
+        self.0.remove(name);
+    }
+
     /// Set `name` to `value` as a writer supplied it, so it has no
     /// [`PropertySource`]. An existing property keeps its other attributes
     /// and, unless `inherit` says otherwise, its flag; a new one takes the
     /// property's default.
-    fn put(&mut self, name: &str, value: Value, inherit: Option<bool>) {
+    pub(super) fn put(&mut self, name: &str, value: Value, inherit: Option<bool>) {
         let inheritance = inheritance(name);
         let property = self
             .0

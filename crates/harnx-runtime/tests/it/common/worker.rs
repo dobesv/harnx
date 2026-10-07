@@ -123,6 +123,7 @@ pub fn local_nats_config(spec: NatsServerSpec<'_>) -> Config {
     let mut config = Config {
         model: harnx_core::model::Model::new("test", "test-model"),
         nats_servers: vec![NatsServerConfig {
+            user_id: None,
             name: spec.name.to_string(),
             url: spec.url.to_string(),
             token: spec.token.map(str::to_string),

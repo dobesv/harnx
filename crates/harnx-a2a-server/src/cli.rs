@@ -73,7 +73,8 @@ pub struct Args {
     #[arg(long, value_name = "URL")]
     pub public_base_url: Option<String>,
 
-    /// Trusted User-ID header (repeatable, first match wins; enables user isolation).
+    /// Trusted User-ID source: NAME, header:NAME or cookie:NAME (repeatable, first match wins;
+    /// enables user isolation). Cookies must carry a proxy-verified user ID, not a token.
     #[arg(long, value_name = "NAME")]
     pub user_id_header: Vec<String>,
 

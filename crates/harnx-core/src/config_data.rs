@@ -252,6 +252,11 @@ pub struct ConfigData {
     /// The URL a browser uses to reach harnx-serve's Web UI, such as
     /// `https://harnx.example.com`. Unset, it is inferred from each request.
     pub serve_public_url: Option<String>,
+    /// Ordered header/cookie sources for the identity recorded on new HTTP sessions.
+    pub serve_user_id_sources: Vec<String>,
+    /// Default identity for newly created sessions, unless their cluster or caller supplies one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     pub user_agent: Option<String>,
     pub save_shell_history: bool,
     pub sync_models_url: Option<String>,
@@ -333,6 +338,8 @@ impl Default for ConfigData {
 
             serve_addr: None,
             serve_public_url: None,
+            serve_user_id_sources: Vec::new(),
+            user_id: None,
             user_agent: None,
             save_shell_history: true,
             sync_models_url: None,

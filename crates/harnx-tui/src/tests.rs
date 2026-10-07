@@ -8911,6 +8911,7 @@ async fn session_picker_delivery_path_carries_error() {
     use std::sync::Arc;
 
     let nats_server = NatsServerConfig {
+        user_id: None,
         name: "unreachable-cluster".into(),
         url: "nats://198.51.100.1:4222".into(), // non-routable, guaranteed to fail
         token: None,
@@ -10764,6 +10765,7 @@ async fn session_picker_u_key_does_not_filter_query() {
             title: Some("Test".to_string()),
             modified: None,
             contexts: vec![],
+            user_id: None,
             unread: false,
         }],
         selected: 1, // Select the session (index 0 is "New session")

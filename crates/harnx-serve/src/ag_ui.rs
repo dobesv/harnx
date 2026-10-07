@@ -1297,6 +1297,7 @@ pub async fn ag_ui_run_with_call_fn(
         session,
         body: req_body,
         web_base_url: None,
+        user_id: None,
     };
     ag_ui_run_for_target(
         base_config,
@@ -1315,12 +1316,14 @@ pub(crate) struct AgUiRunRequest<'a> {
     /// The Web UI base inferred from the request; see
     /// [`SessionPromptOptions::web_base_url`].
     pub(crate) web_base_url: Option<String>,
+    pub(crate) user_id: Option<String>,
 }
 
 impl AgUiRunRequest<'_> {
     fn prompt_options(&self) -> SessionPromptOptions {
         SessionPromptOptions {
             web_base_url: self.web_base_url.clone(),
+            user_id: self.user_id.clone(),
             ..Default::default()
         }
     }

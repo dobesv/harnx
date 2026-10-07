@@ -519,6 +519,8 @@ impl NatsSession {
     ///
     /// This function takes the NATS connection components directly to avoid
     /// Send issues with GlobalConfig's parking_lot lock guard across await points.
+    /// Callers resolve defaults with `SessionInitializer::with_default_user_id`
+    /// before calling this constructor; `from_global_config` does that automatically.
     pub async fn new(
         config: NatsSessionConfig,
         client: async_nats::Client,
@@ -611,16 +613,17 @@ impl NatsSession {
 
     /// Convenience constructor that builds NATS connections from GlobalConfig.
     pub async fn from_global_config(
-        config: NatsSessionConfig,
+        mut config: NatsSessionConfig,
         global_config: &crate::config::GlobalConfig,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
         let cluster = config.cluster.clone();
         let config_snapshot = global_config.read().clone();
-        let attachment_replicas = config_snapshot
-            .resolve_nats_server(&cluster)
-            .await?
-            .resolved_replicas();
+        let server = config_snapshot.resolve_nats_server(&cluster).await?;
+        let attachment_replicas = server.resolved_replicas();
+        config.initializer = config
+            .initializer
+            .with_default_user_id(config_snapshot.default_user_id(Some(&server)));
         let lease_acquisition_timeout =
             std::time::Duration::from_secs(config_snapshot.nats_lease_acquisition_timeout_secs);
         let client = config_snapshot

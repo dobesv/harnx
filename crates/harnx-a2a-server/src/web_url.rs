@@ -5,6 +5,7 @@
 
 use anyhow::{ensure, Context, Result};
 use axum::http::{uri::Authority, HeaderMap, Uri};
+use harnx_runtime::identity::first_value;
 
 pub(crate) fn normalize_public_base_url(raw: Option<&str>) -> Result<Option<String>> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
@@ -39,17 +40,6 @@ pub(crate) fn inferred_base_url(headers: &HeaderMap, uri: &Uri) -> Option<String
         _ => "http",
     };
     Some(format!("{scheme}://{authority}"))
-}
-
-pub(crate) fn first_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get(name)?
-        .to_str()
-        .ok()?
-        .split(',')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]

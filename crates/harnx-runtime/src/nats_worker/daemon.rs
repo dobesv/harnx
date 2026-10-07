@@ -911,6 +911,7 @@ mod tests {
             let config = Arc::new(crate::config::ConfigLock::new(Config {
                 model: harnx_core::model::Model::new("test", "test-model"),
                 nats_servers: vec![NatsServerConfig {
+                    user_id: None,
                     name: "local".to_string(),
                     url,
                     token: None,

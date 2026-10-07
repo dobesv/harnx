@@ -424,6 +424,7 @@ url: "nats://localhost:4222"
 ```yaml
 url: "nats://nats.example.com:4222"
 token: "${NATS_TOKEN}"
+user_id: "cluster-owner" # Optional default owner for new sessions on this cluster
 replicas: 3   # JetStream replica count for resources harnx creates; defaults to 1
 tls: true
 tls_cert: "/etc/harnx/client-cert.pem"
@@ -431,6 +432,16 @@ tls_key: "/etc/harnx/client-key.pem"
 # Note: tls_ca + client cert is NOT supported; use trusted certs or drop tls_ca.
 ```
 *Note: Environment variable expansion `${ENV_VAR}` is supported in all fields.*
+
+### Session User Identity
+
+Each NATS cluster config can declare a default `user_id` string for sessions created on that cluster:
+
+```yaml
+user_id: "shared-cluster-user"
+```
+
+When a new session's metadata is first created on the cluster, this value serves as the cluster-level default. Request identity (from `harnx-serve`) and nonblank explicit or inherited initializer values take precedence over the cluster default. Sub-agents and handoff-created sessions inherit the source's `user_id` unless its inheritance flag is disabled; absent or blank inherited identities fall back to destination defaults. If `user_id` is omitted or empty in the cluster configuration, session creation falls back to the global `user_id` setting. Identity values are opaque strings recorded once at session creation and cannot be overwritten. Note that `nats_servers/__local__.yaml` ignores `user_id` because `__local__` is a reserved dynamic broker identity.
 
 ## Running Workers
 
