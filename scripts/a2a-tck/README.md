@@ -1,4 +1,4 @@
-# Run A2A conformance diagnostics
+# Run A2A conformance checks
 
 Run from the repository root (the script also accepts invocation by absolute path):
 
@@ -27,50 +27,96 @@ Reports default to `target/a2a-tck-reports/`. Set `A2A_TCK_REPORT_DIR` to choose
 another directory. Each invocation writes its own subdirectory so stale JUnit
 files can't be mistaken for a new result. Reports include `junitreport.xml`,
 TCK HTML/JSON reports, server/worker/broker logs, LLM requests, and the smoke
-response. Script returns the TCK exit status, including failures.
+response. The script returns the TCK's pytest exit status.
 
-## Why CI is non-gating
+## Gating CI with per-test waivers
 
-Task 12's feasibility fallback applies. Initial unmodified MUST run produced
-**56 passed, 16 failed, 163 skipped, 30 deselected**. The TCK's skips include
-unselected transports, undeclared capabilities, and unmet scenario
-preconditions; they don't prove those behaviors conform.
+The **A2A TCK / MUST conformance** job is gating. The unmodified pinned suite
+produced **56 passed, 16 failed, 163 skipped, 30 deselected**. The 16 known
+failures are listed individually in [`waivers.toml`](waivers.toml), with exact
+pytest node IDs, categories, reasons, and required `match` regexes. With waivers,
+the expected pytest result is **56 passed, 16 xfailed, 163 skipped, 30 deselected**,
+with no failures.
+Skips include unselected transports, undeclared capabilities, and unmet scenario
+preconditions; neither skips nor waived failures prove conformance.
 
-The spike ADR's feasibility verdict was based on inspection, not a real run.
-The pinned TCK cannot serve as a MUST gate for this server profile:
+The harness puts this directory on the TCK subprocess's `PYTHONPATH` and passes
+`-- -p a2a_waivers -rx` to `run_tck.py`. `a2a_waivers.py` reads TOML with Python's
+stdlib `tomllib` and adds `pytest.mark.xfail(strict=True, reason=...)` during
+collection. Waived tests still execute; they aren't skipped or excluded.
+Expected failures show `XFAIL` plus category/reason in console and pytest reports.
+JUnit encodes xfails as skipped elements with `type="pytest.xfail"`, separate
+from ordinary skips. The TCK's own compatibility JSON/HTML reports still record the underlying
+conformance failures; they don't apply our waivers. Use pytest's summary and
+JUnit report for the CI result.
 
-- `tck/requirements/base.py::tck_id` returns the same ID for the same name
-  throughout a run. `CORE-SEND-001`, `CORE-EXECUTION-MODE-001/002`, and
-  `CORE-MULTI-001a/003` reuse `tck-complete-task` with different parts. Our
-  required deduplication rejects changed payloads under the same messageId.
-- `CORE-MULTI-002a` expects rejection of a client-generated contextId, but
-  doesn't set `expected_error`. `test_requirements.py::_validate_response`
-  therefore fails the correct TaskNotFound rejection before custom validators
-  run. `CORE-SEND-003` has the same validator defect: any error fails the test.
-- `CORE-LIST-001` through `CORE-LIST-005` use `tck-test-context`, a
-  client-generated context never allocated by the server. Returning not-found
-  is required by our ownership/context policy. These tests aren't missing a
-  scoped ListTasks implementation; they use an inaccessible scope.
-- `test_artifacts.py` sends identical text (`TCK artifact test`) and selects
-  output by messageId alone. It requires text `Generated text content`, raw
-  files, URL files, structured data, and a direct Message response. Our runner
-  produces text artifacts in Tasks. messageId is protocol bookkeeping, not
-  model input. No deterministic LLM can distinguish these requests or emit
-  those other protocol output types through the approved text-artifact map.
+Each waiver applies only to its documented failure. The required `match` field
+is a Python regex searched in the exception message (or failure longrepr when
+no exception is available). The plugin checks the report after pytest's xfail
+handling; a non-matching failure stays a real failure with its traceback and a
+message naming the regex. Source lines alone cannot satisfy the regex. Missing,
+empty, or invalid regexes raise a usage error before tests run.
 
-No individual tests are waived or deselected beyond the upstream
-`--transport jsonrpc --level must` selection. No patch is applied to the TCK.
-The advisory workflow retains failures and uploads their reports rather than
-claiming MUST conformance. Full crate nextest tests remain the gating coverage
-for streaming, cancel, scoped list, deduplication, and server-owned contexts.
+Patterns are pinned to actual report messages: `task not found` for rejected
+contexts, `messageId was already used with different parts` for deduplication,
+the full unsupported-media error for `CORE-SEND-003`, and each artifact case's
+specific assertion. The TCK's exception text for `CORE-SEND-003` names
+`application/x-unsupported-tck-type`; it doesn't include the numeric -32005 code.
+Don't broaden a regex to hide a new error. Inspect the fresh report first.
 
-The server returns ContentTypeNotSupportedError (`-32005`) for unsupported
-raw media types (per commit 33dcf42cd). The TCK test `CORE-SEND-003` still
-fails because its validator lacks `expected_error` and unconditionally rejects
-any error response.
+Any unwaived failure fails the run. A waived test that passes produces
+`XPASS(strict)` and also fails the run, so an obsolete waiver cannot silently
+remain. An ordinary skip on a waived test becomes a failure saying
+`A2A waiver expected a failure but the test skipped`, including skips during
+setup or teardown. Unwaived skips keep pytest's normal behavior.
 
-Before making this job gating, use a reviewed TCK revision that fixes duplicate
-IDs and expected-error validation and supports a text-Task-only profile with
-server-allocated contexts. Re-run every MUST item and review unmet preconditions.
-Don't add production messageId switches or weaken context ownership to satisfy
-fixtures.
+A waiver matching no collected test raises a usage error naming its node ID,
+which catches renamed or removed tests when updating the pin. Node ID matching
+is exact, including the class and `[jsonrpc]` parameter; no other transport or
+requirement is waived. Collection validation runs before `-m`/`-k` deselection.
+
+### Waiver categories
+
+- **design-conflict (9):** Four requirements (`CORE-EXECUTION-MODE-001/002`,
+  `CORE-MULTI-001a/003`) reuse the `complete-task` messageId from `CORE-SEND-001`
+  with different parts. Required deduplication rejects changed payloads under an
+  existing messageId. Five requirements (`CORE-LIST-001` through `CORE-LIST-005`)
+  use the client-generated `tck-test-context`, not a server-returned contextId.
+  Scoped ListTasks correctly rejects that inaccessible scope.
+- **tck-defect (2):** `CORE-MULTI-002a` expects rejection of a client-generated
+  contextId but omits `expected_error`, so the validator rejects the correct
+  TaskNotFound response before custom checks. `CORE-SEND-003` has the same defect
+  and rejects the server's correct ContentTypeNotSupportedError (`-32005`).
+- **harness-limitation (5):** `test_artifacts.py` sends identical text (`TCK
+  artifact test`) and selects output by messageId alone. It requires exact text
+  `Generated text content`, raw files, URL files, structured data, or a direct
+  Message response. The real runner produces text artifacts in Tasks; messageId
+  isn't model input. A deterministic LLM cannot distinguish these prompts or
+  emit those other protocol types through the approved output mapping.
+
+No patch is applied to the TCK. Don't add production messageId switches or
+weaken context ownership to satisfy fixtures. Full crate nextest tests also
+cover streaming, cancel, scoped list, deduplication, and server-owned contexts.
+
+### Remove a waiver
+
+1. Fix the upstream test, harness limitation, or reviewed design conflict.
+   Updating the TCK pin also requires checking every node ID and unmet precondition.
+2. Run `scripts/run-a2a-tck.sh`. A newly passing waived test fails with
+   `XPASS(strict)` and its reason.
+3. Remove that test's entire `[[waiver]]` entry from `waivers.toml`. Keep unrelated
+   entries unchanged. An empty waiver file is valid when none remain.
+4. Rerun the script and inspect the fresh JUnit report. The test must now pass
+   normally, with no unexpected failures or stale-waiver errors.
+
+## Test the waiver plugin
+
+From the repository root, with Python 3.11+ and `uv`:
+
+```sh
+uv run --with pytest pytest -q scripts/a2a-tck/test_waivers.py
+```
+
+The pytester cases cover matching and unrelated failures, ordinary skips,
+strict XPASS, invalid regexes, stale and malformed entries, exact node ID
+matching, deselection, empty waiver files, and existing non-strict markers.
