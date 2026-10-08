@@ -110,7 +110,7 @@ impl Http {
         self.rpc_call(HttpRpcCall::new(&self.url, "alice", method, params))
             .await
     }
-    async fn working(&self, message: Value) -> Result<Value> {
+    pub(super) async fn working(&self, message: Value) -> Result<Value> {
         let response = self
             .rpc(
                 "SendMessage",
@@ -149,11 +149,11 @@ pub(super) fn message(id: &str, context: Option<&Value>) -> Value {
     }
     message
 }
-fn code(response: &Value, expected: i32) {
+pub(super) fn code(response: &Value, expected: i32) {
     assert_eq!(response["error"]["code"], expected, "{response}");
     assert!(response.get("result").is_none());
 }
-fn fixture(name: &str) -> Value {
+pub(super) fn fixture(name: &str) -> Value {
     serde_json::from_str(
         &std::fs::read_to_string(format!(
             "{}/tests/fixtures/{name}",
@@ -165,20 +165,10 @@ fn fixture(name: &str) -> Value {
 }
 // Compare the golden wire projection. IDs/timestamps and answer text are
 // runtime-generated; optional artifacts/history extend the minimal fixtures.
-fn golden(actual: &Value, expected: &Value, key: &str) {
+pub(super) fn golden(actual: &Value, expected: &Value, key: &str) {
     match expected {
-        Value::Object(fields) => {
-            for (key, value) in fields {
-                assert!(actual.get(key).is_some(), "missing {key}: {actual}");
-                golden(&actual[key], value, key);
-            }
-        }
-        Value::Array(values) => {
-            assert_eq!(actual.as_array().unwrap().len(), values.len());
-            for (a, b) in actual.as_array().unwrap().iter().zip(values) {
-                golden(a, b, key);
-            }
-        }
+        Value::Object(fields) => golden_fields(actual, fields),
+        Value::Array(values) => golden_array(actual, values, key),
         Value::String(_)
             if matches!(
                 key,
@@ -188,6 +178,20 @@ fn golden(actual: &Value, expected: &Value, key: &str) {
             assert!(actual.is_string())
         }
         _ => assert_eq!(actual, expected),
+    }
+}
+
+fn golden_fields(actual: &Value, fields: &serde_json::Map<String, Value>) {
+    for (key, value) in fields {
+        assert!(actual.get(key).is_some(), "missing {key}: {actual}");
+        golden(&actual[key], value, key);
+    }
+}
+
+fn golden_array(actual: &Value, values: &[Value], key: &str) {
+    assert_eq!(actual.as_array().unwrap().len(), values.len());
+    for (a, b) in actual.as_array().unwrap().iter().zip(values) {
+        golden(a, b, key);
     }
 }
 
@@ -216,6 +220,18 @@ async fn persist_canonical_completed_task(http: &Http) -> Result<String> {
     Ok(id)
 }
 
+async fn assert_malformed_task_methods(http: &Http, malformed: &str) -> Result<()> {
+    for method in ["GetTask", "CancelTask", "SubscribeToTask"] {
+        code(&http.rpc(method, json!({"id":malformed})).await?, -32001);
+    }
+    let mut send = message("noncanonical-task-id", None);
+    send["taskId"] = json!(malformed);
+    for method in ["SendMessage", "SendStreamingMessage"] {
+        code(&http.rpc(method, json!({"message":send})).await?, -32001);
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn noncanonical_task_ids_return_not_found_for_all_task_methods() -> Result<()> {
     let http = Http::start().await?;
@@ -230,14 +246,7 @@ async fn noncanonical_task_ids_return_not_found_for_all_task_methods() -> Result
         format!("urn:uuid:{uuid}"),
     ] {
         let malformed = harnx_a2a_server::store::format_task_id(context, &noncanonical);
-        for method in ["GetTask", "CancelTask", "SubscribeToTask"] {
-            code(&http.rpc(method, json!({"id":malformed})).await?, -32001);
-        }
-        let mut send = message("noncanonical-task-id", None);
-        send["taskId"] = json!(malformed);
-        for method in ["SendMessage", "SendStreamingMessage"] {
-            code(&http.rpc(method, json!({"message":send})).await?, -32001);
-        }
+        assert_malformed_task_methods(&http, &malformed).await?;
     }
     Ok(())
 }
@@ -368,105 +377,6 @@ async fn invalid_first_turn_parts_never_create_session_metadata_or_binding() -> 
         }
     }
     assert!(http.h.llm.requests.lock().is_empty());
-    Ok(())
-}
-
-async fn execute_two_turn_history(http: &Http) -> Result<(Value, Value)> {
-    let first = http.working(message("first", None)).await?;
-    golden(
-        &json!({"jsonrpc":"2.0","id":"1","result":{"task":first}}),
-        &fixture("send_message_result.json"),
-        "",
-    );
-    http.h.llm.release.notify_one();
-    http.completed(&first["id"]).await?;
-    let second = http
-        .working(message("second", Some(&first["contextId"])))
-        .await?;
-    assert_ne!(second["id"], first["id"]);
-    assert_eq!(second["contextId"], first["contextId"]);
-    http.h.llm.release.notify_one();
-    http.completed(&second["id"]).await?;
-    let requests = http.h.llm.requests.lock();
-    let followup = requests.last().unwrap().to_string();
-    assert!(
-        followup.contains("Hello world"),
-        "follow-up lost prior answer: {followup}"
-    );
-    assert!(followup.matches("Hello, agent").count() >= 2);
-    Ok((first, second))
-}
-
-async fn assert_get_task_history_options(http: &Http, second_id: &Value) -> Result<()> {
-    for (length, expected) in [(0, 0), (1, 1), (9, 2)] {
-        let response = http
-            .rpc("GetTask", json!({"id":second_id,"historyLength":length}))
-            .await?;
-        assert_eq!(
-            response["result"]["history"].as_array().map_or(0, Vec::len),
-            expected,
-            "{response}"
-        );
-    }
-    code(
-        &http
-            .rpc("GetTask", json!({"id":second_id,"historyLength":-1}))
-            .await?,
-        -32602,
-    );
-    Ok(())
-}
-
-async fn assert_list_tasks_pagination_and_scoping(
-    http: &Http,
-    first_context: &Value,
-) -> Result<()> {
-    let list = http
-        .rpc(
-            "ListTasks",
-            json!({"contextId":first_context,"pageSize":1,"includeArtifacts":false,"historyLength":0}),
-        )
-        .await?;
-    assert_eq!(list["result"]["totalSize"], 2);
-    assert_eq!(list["result"]["tasks"].as_array().unwrap().len(), 1);
-    assert!(list["result"]["tasks"][0].get("artifacts").is_none());
-    let next = http
-        .rpc(
-            "ListTasks",
-            json!({"contextId":first_context,"pageSize":1,"pageToken":list["result"]["nextPageToken"]}),
-        )
-        .await?;
-    assert_eq!(next["result"]["tasks"].as_array().unwrap().len(), 1);
-    assert_ne!(
-        next["result"]["tasks"][0]["id"],
-        list["result"]["tasks"][0]["id"]
-    );
-    code(&http.rpc("ListTasks", json!({})).await?, -32602);
-    code(
-        &http
-            .rpc(
-                "ListTasks",
-                json!({"contextId":first_context,"pageToken":"bogus"}),
-            )
-            .await?,
-        -32602,
-    );
-    let third = http.working(message("third", None)).await?;
-    http.h.llm.release.notify_one();
-    http.completed(&third["id"]).await?;
-    let third_list = http
-        .rpc("ListTasks", json!({"contextId":third["contextId"]}))
-        .await?;
-    assert_eq!(third_list["result"]["tasks"].as_array().unwrap().len(), 1);
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unary_immediate_get_multiturn_history_and_scoped_list() -> Result<()> {
-    let http = Http::start().await?;
-    let (first, second) = execute_two_turn_history(&http).await?;
-    assert_get_task_history_options(&http, &second["id"]).await?;
-    assert_list_tasks_pagination_and_scoping(&http, &first["contextId"]).await?;
     Ok(())
 }
 

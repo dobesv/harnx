@@ -1,8 +1,13 @@
 mod access;
 mod compat;
 mod e2e;
+mod list_costs;
 mod runner;
 mod store_nats;
+mod store_nats_access;
+mod store_nats_index;
 mod streaming;
 mod support;
 mod unary;
+mod unary_listing;
+mod wait_costs;

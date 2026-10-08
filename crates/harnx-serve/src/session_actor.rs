@@ -1255,7 +1255,9 @@ mod tests {
                 .is_err(),
             "routing should still be waiting for the worker lock"
         );
-        tokio::time::timeout(Duration::from_secs(1), cancel(&handle))
+        // Two fresh NATS connections and platform setup can exceed 1s under loaded CI;
+        // keep the guard held so a worker-lock deadlock still hits this bounded timeout.
+        tokio::time::timeout(Duration::from_secs(10), cancel(&handle))
             .await
             .expect("Cancel must remain responsive while approval routing is in flight");
 

@@ -1,5 +1,6 @@
 //! Detached turn supervision. The registry is a single-replica cache; KV is the
-//! source of truth. Context gates fence admission against stale cancellation.
+//! durable state; local live snapshots include not-yet-persisted artifact text.
+//! Context gates fence admission against stale cancellation.
 use std::{
     collections::HashMap,
     sync::{
@@ -34,6 +35,9 @@ use crate::{
 pub use event_map::A2aEvent;
 use event_map::{artifact, status, A2aEventSink, Output, FAILED_MESSAGE};
 pub mod event_map;
+mod failure;
+mod publication;
+use publication::{LiveState, StreamChannels};
 
 pub struct SessionRequest<'a> {
     pub export: &'a Export,
@@ -59,6 +63,7 @@ struct PendingTurn {
 
 pub const EVENT_CAPACITY: usize = 64;
 const ARTIFACT_INTERVAL: Duration = Duration::from_millis(100);
+const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ContextKey {
@@ -97,6 +102,7 @@ struct RunnerHandle {
     cancel_tx: mpsc::Sender<()>,
     events: broadcast::Sender<A2aEvent>,
     done: watch::Receiver<bool>,
+    live: Arc<parking_lot::Mutex<LiveState>>,
 }
 
 #[derive(Default)]
@@ -118,7 +124,7 @@ pub struct StartTurnResult {
 }
 
 pub struct Subscription {
-    /// Emit this first, then drop events whose revision is <= snapshot.revision.
+    /// Emit this first, then drop events whose sequence is <= snapshot.stream_seq.
     pub snapshot: TaskRecord,
     /// RecvError::Lagged must end this subscriber, never cancel the turn.
     pub events: broadcast::Receiver<A2aEvent>,
@@ -270,18 +276,20 @@ impl Runner {
         let (events, rx) = broadcast::channel(EVENT_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::channel(1);
         let (done_tx, done) = watch::channel(false);
+        let live = Arc::new(parking_lot::Mutex::new(LiveState::default()));
         *active = Some(Arc::new(RunnerHandle {
             task_id: task_id.clone(),
             session: pending.session.clone(),
             cancel_tx,
             events: events.clone(),
             done,
+            live: live.clone(),
         }));
         let (admitted_tx, admitted_rx) = oneshot::channel();
         let publisher = Publisher::new(
             self.store.clone(),
             pending.session.storage_key(),
-            events,
+            StreamChannels { events, live },
             active,
         );
         let detached = DetachedTurn {
@@ -343,34 +351,64 @@ impl Runner {
         })
     }
 
-    /// Subscribe before reading KV, also allowing terminal snapshots for send retries.
+    /// Snapshot and subscribe under the publishing lock: events at or below the
+    /// snapshot cursor are already represented, even when KV persistence is throttled.
     pub(crate) async fn stream_snapshot(
         &self,
         export: &Export,
         owner: &Principal,
         task_id: &str,
     ) -> Result<(TaskRecord, Option<broadcast::Receiver<A2aEvent>>)> {
-        let record = self
+        let (context, _) =
+            crate::store::parse_task_id(task_id).map_err(|_| StoreError::NotFound)?;
+        let key = self
             .store
-            .get_task_for_export(export, owner, task_id)
+            .resolve_context(export, owner, context)
             .await?
             .ok_or(StoreError::NotFound)?;
-        let slot = self.slot(&ContextKey::new(export, &record.task.context_id));
+        let slot = self.slot(&ContextKey::new(export, context));
         let active = slot.active.lock().await;
-        // Subscribe first, then read KV. Events <= N are represented by snapshot N.
-        let events = active
-            .as_ref()
-            .filter(|h| h.task_id == task_id)
-            .map(|handle| handle.events.subscribe());
+        if let Some(handle) = active.as_ref().filter(|h| h.task_id == task_id) {
+            let live = handle.live.lock();
+            let events = handle.events.subscribe();
+            let snapshot = live.snapshot().context("missing admitted live snapshot")?;
+            return Ok((snapshot, Some(events)));
+        }
+        let events = None;
         let snapshot = self
             .store
-            .get_task_for_export(export, owner, task_id)
+            .get_task(&key, task_id)
             .await?
             .ok_or(StoreError::NotFound)?;
         if !snapshot.task.status.state.is_terminal() && events.is_none() {
             return Err(RunnerError::Busy.into());
         }
         Ok((snapshot, events))
+    }
+
+    /// Ownership must already have been checked by the caller's point read.
+    pub async fn live_record(&self, export: &Export, record: TaskRecord) -> TaskRecord {
+        let slot = self.slot(&ContextKey::new(export, &record.task.context_id));
+        let active = slot.active.lock().await;
+        active
+            .as_ref()
+            .filter(|h| h.task_id == record.task.id)
+            .and_then(|h| h.live.lock().snapshot())
+            .unwrap_or(record)
+    }
+
+    /// A cloned watch keeps waiting independent of the admission/cancellation gate.
+    pub(crate) async fn completion(
+        &self,
+        export: &Export,
+        record: &TaskRecord,
+    ) -> Option<watch::Receiver<bool>> {
+        let slot = self.slot(&ContextKey::new(export, &record.task.context_id));
+        let active = slot.active.lock().await;
+        active
+            .as_ref()
+            .filter(|h| h.task_id == record.task.id)
+            .map(|h| h.done.clone())
     }
 
     /// Caller rejects terminal tasks. Completion racing cancellation wins.
@@ -427,7 +465,14 @@ impl Runner {
         } = access;
         self.authorize_session(export, owner, session).await?;
         let slot = self.slot(&ContextKey::new(export, session.session_id()));
-        let active = slot.active.lock().await;
+        let mut active = slot.active.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|handle| handle.done.has_changed().is_err() && !*handle.done.borrow())
+        {
+            // The supervisor vanished without settling. Fence its worker as an orphan.
+            *active = None;
+        }
         // A live turn may have completed while this caller waited for the gate.
         let record = self
             .store
@@ -438,13 +483,16 @@ impl Runner {
         if record.task.status.state.is_terminal() {
             return Ok(record);
         }
-        if let Some(handle) = active.as_ref() {
+        if let Some(handle) = active.as_ref().filter(|handle| !*handle.done.borrow()) {
             if handle.task_id == task_id {
-                return Ok(record);
+                return Ok(handle.live.lock().snapshot().unwrap_or(record));
             }
             // Never send a session-wide cancel at a newer live task.
             return Err(RunnerError::Busy.into());
         }
+        // A completed supervisor with nonterminal KV state failed persistence.
+        // Treat it as abandoned, rather than waiting for a writer that has stopped.
+        *active = None;
         if let Err(error) = session.cancel_pending_turn().await {
             warn!(%task_id, %error, "orphan remote cancellation failed");
         }
@@ -587,7 +635,9 @@ struct Publisher {
     store: Arc<A2aStore>,
     storage_key: String,
     events: broadcast::Sender<A2aEvent>,
-    record: Option<TaskRecord>,
+    record: Option<Arc<TaskRecord>>,
+    live: Arc<parking_lot::Mutex<LiveState>>,
+    last_persist: tokio::time::Instant,
     output: Output,
     admission_guard: Option<OwnedMutexGuard<Option<Arc<RunnerHandle>>>>,
 }
@@ -595,26 +645,37 @@ impl Publisher {
     fn new(
         store: Arc<A2aStore>,
         key: &str,
-        events: broadcast::Sender<A2aEvent>,
+        channels: StreamChannels,
         admission_guard: OwnedMutexGuard<Option<Arc<RunnerHandle>>>,
     ) -> Self {
         Self {
             store,
             storage_key: key.into(),
-            events,
+            events: channels.events,
             record: None,
+            live: channels.live,
+            last_persist: tokio::time::Instant::now(),
             output: Output::default(),
             admission_guard: Some(admission_guard),
         }
     }
     fn record(&self) -> &TaskRecord {
         self.record
-            .as_ref()
+            .as_deref()
             .expect("task persisted before admission")
     }
-    fn send(&self, response: StreamResponse) {
+    fn publish_snapshot(&mut self) {
+        let mut live = self.live.lock();
+        live.record = self.record.clone();
+    }
+    fn send(&mut self, response: StreamResponse) {
+        // Updating the snapshot and sending must share the subscription lock.
+        let mut live = self.live.lock();
+        live.sequence += 1;
+        live.record = self.record.clone();
+        live.apply_response(&response);
         let _ = self.events.send(A2aEvent {
-            revision: self.record().revision,
+            sequence: live.sequence,
             response,
         });
     }
@@ -632,7 +693,7 @@ impl Publisher {
                 history.push(message.clone());
                 history
             });
-        self.record = Some(
+        self.record = Some(Arc::new(
             self.store
                 .update_task(
                     TaskVersion {
@@ -643,11 +704,34 @@ impl Publisher {
                     TaskChanges {
                         status: Some(status),
                         history,
-                        ..Default::default()
+                        artifacts: if self.output.sent || !self.output.text.is_empty() {
+                            Some(vec![artifact(self.output.text.clone())])
+                        } else {
+                            record.task.artifacts.clone()
+                        },
                     },
                 )
                 .await?,
-        );
+        ));
+        if self.record().task.status.state.is_terminal() && !self.output.pending.is_empty() {
+            // A failed final flush may have left unpublished text. The status
+            // write includes it durably, so publish its replacement before status.
+            self.send(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                task_id: self.record().task.id.clone(),
+                context_id: self.record().task.context_id.clone(),
+                artifact: artifact(self.output.text.clone()),
+                append: Some(false),
+                last_chunk: Some(true),
+                metadata: None,
+            }));
+            self.output.pending.clear();
+            self.output.sent = true;
+        }
+        self.send_status();
+        Ok(())
+    }
+
+    fn send_status(&mut self) {
         let record = self.record();
         self.send(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
             task_id: record.task.id.clone(),
@@ -655,28 +739,31 @@ impl Publisher {
             status: record.task.status.clone(),
             metadata: None,
         }));
-        Ok(())
     }
+
     async fn flush_artifact(&mut self, last: bool, replace: bool) -> Result<()> {
         if !last && self.output.pending.is_empty() {
             return Ok(());
         }
-        let record = self.record();
-        self.record = Some(
-            self.store
-                .update_task(
-                    TaskVersion {
-                        storage_key: &self.storage_key,
-                        task_id: &record.task.id,
-                        revision: record.revision,
-                    },
-                    TaskChanges {
-                        artifacts: Some(vec![artifact(self.output.text.clone())]),
-                        ..Default::default()
-                    },
-                )
-                .await?,
-        );
+        if last || self.last_persist.elapsed() >= PERSIST_INTERVAL {
+            let record = self.record();
+            self.record = Some(Arc::new(
+                self.store
+                    .update_task(
+                        TaskVersion {
+                            storage_key: &self.storage_key,
+                            task_id: &record.task.id,
+                            revision: record.revision,
+                        },
+                        TaskChanges {
+                            artifacts: Some(vec![artifact(self.output.text.clone())]),
+                            ..Default::default()
+                        },
+                    )
+                    .await?,
+            ));
+            self.last_persist = tokio::time::Instant::now();
+        }
         let text = if replace {
             self.output.text.clone()
         } else {
@@ -712,7 +799,7 @@ impl Publisher {
             history: Some(vec![message]),
             metadata: None,
         };
-        self.record = Some(
+        self.record = Some(Arc::new(
             self.store
                 .create_task(
                     &self.storage_key,
@@ -724,7 +811,7 @@ impl Publisher {
                     },
                 )
                 .await?,
-        );
+        ));
         self.set_status(TaskState::Working, None).await?;
         let route = session
             .tool_confirmation_route(denial_confirmation_handler())
@@ -760,7 +847,7 @@ impl Publisher {
             .admit_input_with_tool_confirmation_route(&input, route)
             .await?;
         let record = self.record();
-        self.record = Some(
+        self.record = Some(Arc::new(
             self.store
                 .update_admission(
                     TaskVersion {
@@ -771,10 +858,13 @@ impl Publisher {
                     &appended,
                 )
                 .await?,
-        );
+        ));
+        self.publish_snapshot();
+        self.last_persist = tokio::time::Instant::now();
         // Cancellation must not land before the admitted user message.
         self.admission_guard.take();
-        let _ = admitted_tx.send(Ok(self.record().clone()));
+        let snapshot = self.live.lock().snapshot().expect("admitted snapshot");
+        let _ = admitted_tx.send(Ok(snapshot));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let follow = session.follow_admitted_prompt(
             appended,
@@ -807,31 +897,6 @@ impl Publisher {
         }
         self.flush_artifact(true, replace).await?;
         self.set_status(state, text.as_deref()).await
-    }
-
-    async fn fail_turn(&mut self, session: &NatsSession, task_id: &str) {
-        if let Err(error) = session.cancel_pending_turn().await {
-            warn!(%task_id, %error, "failed turn cancellation failed");
-        }
-        if self.record.is_none() {
-            return;
-        }
-        self.flush_failed_output(task_id).await;
-        if let Err(error) = self
-            .set_status(TaskState::Failed, Some(FAILED_MESSAGE))
-            .await
-        {
-            warn!(%task_id, %error, "A2A terminal persistence failed");
-        }
-    }
-
-    async fn flush_failed_output(&mut self, task_id: &str) {
-        if !self.output.sent && self.output.text.is_empty() {
-            return;
-        }
-        if let Err(error) = self.flush_artifact(true, false).await {
-            warn!(%task_id, %error, "A2A final artifact persistence failed");
-        }
     }
 }
 

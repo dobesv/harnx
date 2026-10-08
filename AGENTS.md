@@ -1038,7 +1038,7 @@ next prompt's request identity could never replace them.
 See `docs/configuration-guide.md` under "Session User Identity" and
 `crates/harnx-serve/README.md` under "Request Identity" for user-facing config.
 
-Per-session A2A task keys follow the same pattern: `sessions/{storage_key}/a2a/tasks/{uuid}`.
+Per-session A2A task keys follow the same pattern: `sessions/{storage_key}/a2a/tasks/{uuid}`. A task index at `sessions/{storage_key}/a2a/index` enables listing without full-bucket `keys()` scans. The index is written before the task record; crashes leave skippable creation intents. Stream deltas dedupe by in-memory `stream_seq`, not KV `revision`. See `crates/harnx-a2a-server/README.md` for upgrade/size limits and `crates/harnx-a2a-server/src/store.rs` for the index-first creation ordering.
 These keys are purged automatically by `delete_remote_session_by_key` because it calls
 `purge_session_prefix`. New server crates that need per-session storage should follow this
 layout to reuse existing GC.

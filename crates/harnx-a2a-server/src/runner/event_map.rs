@@ -5,10 +5,11 @@ use chrono::Utc;
 use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
 use tokio::sync::mpsc;
 
-/// Revision belongs to the persisted task snapshot, not the wire payload.
+/// Stream cursor stays internal; wire responses contain only protocol fields.
 #[derive(Debug, Clone)]
 pub struct A2aEvent {
-    pub revision: u64,
+    /// Monotonic per-turn cursor, independent of task and bucket KV revisions.
+    pub sequence: u64,
     pub response: StreamResponse,
 }
 

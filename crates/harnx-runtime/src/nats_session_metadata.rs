@@ -28,7 +28,7 @@ pub const SESSION_METADATA_BUCKET: &str = "harnx_sessions";
 pub const SESSION_METADATA_SCHEMA_VERSION: u32 = 1;
 pub const EXTENSION_NAMESPACE_MAX_BYTES: usize = 64 * 1024;
 pub const EXTENSIONS_TOTAL_MAX_BYTES: usize = 256 * 1024;
-const CAS_RETRY_LIMIT: usize = 8;
+pub const CAS_RETRY_LIMIT: usize = 8;
 
 pub use activity::SessionActivity;
 pub use execution_context::execution_contexts;
@@ -49,9 +49,10 @@ pub use session_properties::{
     SESSION_PROPERTIES_NAMESPACE, WEB_SESSION_URL_PROPERTY,
 };
 pub use store::{
-    a2a_message_key, a2a_session_prefix, a2a_task_key, a2a_tasks_prefix, activity_key,
-    invalidation_subject, metadata_belongs_to_agent, metadata_key, read_cursor_key,
-    read_invalidation_subject, session_prefix, SessionExtensionUpdate, SessionMetadataStore,
+    a2a_message_key, a2a_session_prefix, a2a_task_index_key, a2a_task_key, a2a_tasks_prefix,
+    activity_key, invalidation_subject, is_cas_conflict, metadata_belongs_to_agent, metadata_key,
+    read_cursor_key, read_invalidation_subject, session_prefix, SessionExtensionUpdate,
+    SessionMetadataStore, TaskIndex, TaskIndexEntry, TaskState,
 };
 pub use tool_context::{
     tool_context, ToolContext, ToolContextEntry, TOOL_CONTEXT_NAMESPACE, TOOL_CONTEXT_VERSION,
