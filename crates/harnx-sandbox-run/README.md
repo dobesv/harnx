@@ -55,6 +55,8 @@ harnx-sandbox-run --allow-rwx . --allow-rwx ~/.npm -- npm install
 
 If `.` resolves to `$HOME` or an ancestor, `harnx-sandbox-run` prints a warning and ignores it rather than exposing your entire home directory.
 
+A path that is, or goes through, a symlink is granted both as you gave it and as it resolves, so inside the sandbox it works by either name.
+
 ### Disabling network
 ```bash
 harnx-sandbox-run --no-network -- curl google.com

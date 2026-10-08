@@ -22,6 +22,8 @@
 //! | `HARNX_BASH_ENV_PASSTHROUGH` | Comma-separated names | Extra host env var names to pass through |
 
 mod cli;
+#[cfg(unix)]
+mod grants;
 mod hooks;
 mod sandbox;
 

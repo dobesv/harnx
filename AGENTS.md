@@ -129,6 +129,16 @@ test failures.
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
 **CodeScene Health scores MUST NOT decrease as part of the change, only increase**
 
+A clean `cs delta` doesn't guarantee CodeScene's PR check passes. The check
+(`CodeScene Code Health Review (main)`) runs the server's analysis, which
+scores some files differently and can report findings `cs` doesn't: it once
+flagged Low Cohesion in a file where three helper functions had been added,
+while `cs check` scored the same file as improved, and moving the helpers to
+their own module cleared it. Read the PR check's result after pushing, and
+when it fails on something `cs` can't reproduce, satisfy the PR check. A
+check stuck in `queued` restarts with
+`gh api -X POST repos/dobesv/harnx/check-runs/<id>/rerequest`.
+
 ### Test sandbox
 
 On Linux and macOS, every test nextest runs goes through
@@ -248,6 +258,8 @@ or process output instead.
 ### Test skips must probe capability, not timeout
 
 A test that skips on timeout hides real failures. Guard skips with an explicit capability probe (checking `tmux -V`, verifying a sibling binary exists, or testing user namespace availability). A wait-for-X timeout is a test failure, not a skip condition.
+
+A probe must not skip on its own mistakes either. `harnx-sandbox-run`'s integration tests skipped from the day they were written, because their probe passed flags the binary never accepted. When the probe's own invocation is rejected, such as by a usage error, fail the test; skip only when the capability is missing.
 
 ### Broker-backed tests and wall-clock margins
 

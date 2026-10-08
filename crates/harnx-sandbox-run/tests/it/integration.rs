@@ -52,33 +52,41 @@ fn sandbox_runtime_works() -> bool {
     // Try a minimal sandbox invocation
     let result = Command::new(binary_path())
         .args([
-            "--exec",
+            "--allow-exec",
             "/bin",
-            "--exec",
+            "--allow-exec",
             "/usr",
-            "--exec",
+            "--allow-exec",
             "/lib",
-            "--exec",
+            "--allow-exec",
             "/lib64",
-            "--exec",
+            "--allow-exec",
             "/usr/lib",
-            "--exec",
+            "--allow-exec",
             "/usr/lib64",
-            "--exec",
+            "--allow-exec",
             "/tmp",
             "--working-dir",
             "/tmp",
             "--",
             "true",
         ])
-        .status();
+        .output();
 
     match result {
-        Ok(status) if status.success() => true,
-        Ok(status) => {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // A usage error means the probe itself is wrong, and skipping on it
+            // would skip every test here without a word.
+            assert!(
+                !stderr.contains("Usage:"),
+                "the sandbox probe's own arguments were rejected: {stderr}"
+            );
             eprintln!(
-                "sandbox runtime probe: birdcage cannot initialize here (exit={:?}) — skipping",
-                status.code()
+                "sandbox runtime probe: birdcage cannot initialize here (exit={:?}): {} — skipping",
+                output.status.code(),
+                stderr.trim()
             );
             false
         }
@@ -89,29 +97,45 @@ fn sandbox_runtime_works() -> bool {
     }
 }
 
+/// Whether to skip a sandbox test, with a note, because the sandbox can't run
+/// here.
+#[cfg(unix)]
+fn skips_without_sandbox() -> bool {
+    let skip = !sandbox_runtime_works();
+    if skip {
+        eprintln!("skipping: sandbox runtime not available");
+    }
+    skip
+}
+
+/// `harnx-sandbox-run` with `/bin` and `/usr` executable and `/tmp` as the
+/// working directory. Add any other options, then `--` and the command.
+#[cfg(unix)]
+fn sandbox_command() -> Command {
+    let mut command = Command::new(binary_path());
+    command.args([
+        "--allow-exec",
+        "/bin",
+        "--allow-exec",
+        "/usr",
+        "--working-dir",
+        "/tmp",
+    ]);
+    command
+}
+
 // === Unix-only sandbox tests ===
 // These require birdcage to initialize successfully
 
 #[cfg(unix)]
 #[test]
 fn test_basic_echo() {
-    if !sandbox_runtime_works() {
-        eprintln!("skipping: sandbox runtime not available");
+    if skips_without_sandbox() {
         return;
     }
 
-    let output = Command::new(binary_path())
-        .args([
-            "--exec",
-            "/bin",
-            "--exec",
-            "/usr",
-            "--working-dir",
-            "/tmp",
-            "--",
-            "echo",
-            "hello",
-        ])
+    let output = sandbox_command()
+        .args(["--", "echo", "hello"])
         .output()
         .expect("failed to spawn sandbox");
 
@@ -126,24 +150,12 @@ fn test_basic_echo() {
 #[cfg(unix)]
 #[test]
 fn test_exit_code_propagation() {
-    if !sandbox_runtime_works() {
-        eprintln!("skipping: sandbox runtime not available");
+    if skips_without_sandbox() {
         return;
     }
 
-    let output = Command::new(binary_path())
-        .args([
-            "--exec",
-            "/bin",
-            "--exec",
-            "/usr",
-            "--working-dir",
-            "/tmp",
-            "--",
-            "bash",
-            "-c",
-            "exit 42",
-        ])
+    let output = sandbox_command()
+        .args(["--", "bash", "-c", "exit 42"])
         .output()
         .expect("failed to spawn sandbox");
 
@@ -157,19 +169,12 @@ fn test_exit_code_propagation() {
 #[cfg(unix)]
 #[test]
 fn test_env_var_passthrough() {
-    if !sandbox_runtime_works() {
-        eprintln!("skipping: sandbox runtime not available");
+    if skips_without_sandbox() {
         return;
     }
 
-    let output = Command::new(binary_path())
+    let output = sandbox_command()
         .args([
-            "--exec",
-            "/bin",
-            "--exec",
-            "/usr",
-            "--working-dir",
-            "/tmp",
             "--env",
             "TEST_VAR=hello_sandbox",
             "--",
@@ -191,26 +196,14 @@ fn test_env_var_passthrough() {
 #[cfg(unix)]
 #[test]
 fn test_no_network_flag() {
-    if !sandbox_runtime_works() {
-        eprintln!("skipping: sandbox runtime not available");
+    if skips_without_sandbox() {
         return;
     }
 
     // With --no-network, network access should be blocked
     // We test that the flag is accepted and the binary runs
-    let output = Command::new(binary_path())
-        .args([
-            "--no-network",
-            "--exec",
-            "/bin",
-            "--exec",
-            "/usr",
-            "--working-dir",
-            "/tmp",
-            "--",
-            "echo",
-            "isolated",
-        ])
+    let output = sandbox_command()
+        .args(["--no-network", "--", "echo", "isolated"])
         .output()
         .expect("failed to spawn sandbox");
 
@@ -228,24 +221,12 @@ fn test_no_network_flag() {
 #[cfg(unix)]
 #[test]
 fn test_working_dir_option() {
-    if !sandbox_runtime_works() {
-        eprintln!("skipping: sandbox runtime not available");
+    if skips_without_sandbox() {
         return;
     }
 
-    let output = Command::new(binary_path())
-        .args([
-            "--exec",
-            "/bin",
-            "--exec",
-            "/usr",
-            "--working-dir",
-            "/tmp",
-            "--",
-            "bash",
-            "-c",
-            "pwd",
-        ])
+    let output = sandbox_command()
+        .args(["--", "bash", "-c", "pwd"])
         .output()
         .expect("failed to spawn sandbox");
 
@@ -260,8 +241,7 @@ fn test_working_dir_option() {
 #[cfg(unix)]
 #[test]
 fn test_hook_cli_injects_env() {
-    if !sandbox_runtime_works() {
-        eprintln!("skipping: sandbox runtime not available");
+    if skips_without_sandbox() {
         return;
     }
 
@@ -281,9 +261,9 @@ printf '%s' '{"hookSpecificOutput":{"toolInput":{"command":"env","env":{"HOOK_TE
             "claude-command",
             hook_path.to_str().expect("utf8 hook path"),
             ";",
-            "--exec",
+            "--allow-exec",
             "/bin",
-            "--exec",
+            "--allow-exec",
             "/usr",
             "--working-dir",
             "/tmp",
@@ -357,21 +337,20 @@ fn test_invalid_flag_errors() {
 #[cfg(unix)]
 #[test]
 fn test_path_exceptions() {
-    if !sandbox_runtime_works() {
-        eprintln!("skipping: sandbox runtime not available");
+    if skips_without_sandbox() {
         return;
     }
 
     // Test that --read, --write, --exec flags are accepted
     let output = Command::new(binary_path())
         .args([
-            "--read",
+            "--allow-read",
             "/tmp",
-            "--write",
+            "--allow-write",
             "/tmp",
-            "--exec",
+            "--allow-exec",
             "/bin",
-            "--exec",
+            "--allow-exec",
             "/usr",
             "--working-dir",
             "/tmp",
@@ -390,8 +369,7 @@ fn test_path_exceptions() {
 #[cfg(unix)]
 #[test]
 fn test_allow_rwx_flag() {
-    if !sandbox_runtime_works() {
-        eprintln!("skipping: sandbox runtime not available");
+    if skips_without_sandbox() {
         return;
     }
 
@@ -407,11 +385,14 @@ fn test_allow_rwx_flag() {
     );
 }
 
-#[cfg(unix)]
+/// Linux only: the minimum a binary needs differs on macOS, where nothing here
+/// can check it. On merged-/usr systems `/bin`, `/lib` and `/lib64` are
+/// symlinks into `/usr`, and the sandbox has to recreate them, or binaries
+/// can't find their ELF interpreter in `/lib64`.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_no_defaults_flag() {
-    if !sandbox_runtime_works() {
-        eprintln!("skipping: sandbox runtime not available");
+    if skips_without_sandbox() {
         return;
     }
 
@@ -420,15 +401,17 @@ fn test_no_defaults_flag() {
     let output = Command::new(binary_path())
         .args([
             "--no-defaults",
-            "--exec",
+            "--allow-exec",
             "/bin",
-            "--exec",
+            "--allow-exec",
             "/usr",
-            "--exec",
+            "--allow-exec",
             "/lib",
-            "--read",
+            "--allow-exec",
+            "/lib64",
+            "--allow-read",
             "/tmp",
-            "--write",
+            "--allow-write",
             "/tmp",
             "--working-dir",
             "/tmp",
@@ -440,6 +423,40 @@ fn test_no_defaults_flag() {
 
     assert!(
         output.status.success(),
-        "sandbox should exit successfully with --no-defaults and explicit paths"
+        "sandbox should exit successfully with --no-defaults and explicit paths: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A path granted through a symlink stays usable by that path inside the
+/// sandbox, not only by the path it resolves to.
+#[cfg(unix)]
+#[test]
+fn test_symlinked_grant_stays_reachable() {
+    if skips_without_sandbox() {
+        return;
+    }
+
+    // Outside /tmp and the home defaults, so nothing else grants it.
+    let base = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create a test dir");
+    let real = base.path().join("real");
+    fs::create_dir(&real).expect("create the real directory");
+    fs::write(real.join("file"), "reached").expect("write the file");
+    let link = base.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("create the symlink");
+
+    let output = Command::new(binary_path())
+        .arg("--allow-rwx")
+        .arg(&link)
+        .args(["--working-dir", "/tmp", "--", "cat"])
+        .arg(link.join("file"))
+        .output()
+        .expect("failed to spawn sandbox");
+
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "reached",
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
