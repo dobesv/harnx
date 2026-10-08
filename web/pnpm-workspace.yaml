@@ -3,7 +3,7 @@ allowBuilds:
 frozenLockfile: true
 overrides:
   # Bypass ^0.0.59 peer dependency in @assistant-ui/react-ag-ui@0.0.60
-  '@ag-ui/client': 1.0.1
+  '@ag-ui/client': 1.0.2
   # Keep core and store synchronized with @assistant-ui/react to avoid type skew
   # (react 0.15.21 requires core ^0.3.20, store ^0.3.14)
   '@assistant-ui/core': 0.3.22
