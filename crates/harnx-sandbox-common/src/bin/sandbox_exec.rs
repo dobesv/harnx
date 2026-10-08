@@ -18,6 +18,8 @@ use std::process;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 use birdcage::{process::Command, Birdcage, Exception, Sandbox};
+#[cfg(unix)]
+use harnx_sandbox_common::IN_SANDBOX_ENV;
 
 #[cfg(target_os = "macos")]
 use harnx_sandbox_common::macos_sandbox::MacSandbox;
@@ -87,6 +89,7 @@ fn parse_args() -> Result<Option<SandboxConfig>, String> {
             if command.is_empty() {
                 return Err("sandbox-exec: missing command after --".to_string());
             }
+            env_vars.push((IN_SANDBOX_ENV.to_string(), "1".to_string()));
             return Ok(Some(SandboxConfig {
                 exec_paths,
                 write_paths,

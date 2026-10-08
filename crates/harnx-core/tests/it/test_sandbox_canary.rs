@@ -8,14 +8,18 @@ use std::path::PathBuf;
 #[test]
 fn tests_run_inside_the_sandbox() {
     harnx_core::require_nextest();
-    if std::env::var_os("HARNX_TEST_SANDBOX").is_some_and(|value| value == "off") {
+    let mode = std::env::var("HARNX_TEST_SANDBOX").unwrap_or_default();
+    if mode == "off" {
         eprintln!("HARNX_TEST_SANDBOX=off: the sandbox is switched off for this run");
         return;
     }
     assert_private_home();
     assert_no_developer_environment();
+    // The light sandbox, which harnx's own sandbox gets, has no namespaces.
     #[cfg(target_os = "linux")]
-    assert_own_namespaces();
+    if mode != "light" {
+        assert_own_namespaces();
+    }
 }
 
 fn var_path(name: &str) -> PathBuf {
@@ -60,7 +64,12 @@ fn assert_private_home() {
 /// Variables that must never reach a test. This checks categories instead of
 /// mirroring the runner's allowlist, which lives only in the script.
 fn from_developer_environment(name: &str) -> bool {
-    const SET_BY_RUNNER: [&str; 3] = ["HARNX_CONFIG_DIR", "HARNX_DATA_DIR", "HARNX_STATE_DIR"];
+    const SET_BY_RUNNER: [&str; 4] = [
+        "HARNX_CONFIG_DIR",
+        "HARNX_DATA_DIR",
+        "HARNX_STATE_DIR",
+        "HARNX_TEST_SANDBOX",
+    ];
     const SESSION: [&str; 8] = [
         "SSH_AUTH_SOCK",
         "DBUS_SESSION_BUS_ADDRESS",

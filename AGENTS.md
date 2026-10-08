@@ -156,6 +156,14 @@ macOS gets no masks, network namespace or private `/tmp`, and `HOME` is real
 there too, so code that builds harnx paths from `HOME` instead of the
 variables reaches your real directories.
 
+The macOS sandbox is also Linux's light mode, `HARNX_TEST_SANDBOX=light`: a
+private home, the filtered environment and a process group, without
+bubblewrap. harnx's own sandbox (`harnx-sandbox-exec`, which runs the bash
+tool's commands) marks what it runs with `HARNX_IN_SANDBOX=1`, and nothing
+can create namespaces in there, so the runner uses light mode there by itself.
+That is how an agent runs the suite from its bash tool; the tests of what only
+bubblewrap gives skip there.
+
 Linux needs bubblewrap 0.5.0 or later (`sudo apt install bubblewrap`), and
 bubblewrap needs unprivileged user namespaces. Ubuntu 24.04 restricts them
 through AppArmor by default. An AppArmor profile that allows `userns` for
@@ -163,8 +171,8 @@ through AppArmor by default. An AppArmor profile that allows `userns` for
 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts it for
 every program on the host, which CI does only on its throwaway runners.
 Either is the machine owner's decision, so an agent asks rather than changing
-it. Containers and harnx's own sandbox block the namespaces too, so set
-`HARNX_TEST_SANDBOX=off` there. Without bubblewrap, every test fails with an
+it. Containers block the namespaces too; set `HARNX_TEST_SANDBOX=light`
+there, or `off` to run unsandboxed. Without bubblewrap, every test fails with an
 install hint. Where an AppArmor restriction, a sysctl or a seccomp filter
 blocks the namespaces, every test fails with a message pointing here.
 This sandbox is unrelated to the bash tool's `--no-sandbox` (see "Bridged tool
@@ -178,7 +186,8 @@ outside network fails by design. A test killed by a signal shows as exit code
 that needs an ambient variable should set it itself; extend the allowlist in
 the script only for variables every test legitimately needs, with a comment
 saying why. `test_sandbox_canary::tests_run_inside_the_sandbox` in
-`harnx-core` fails if tests stop running inside the sandbox.
+`harnx-core` fails if tests stop running inside the sandbox; in light mode it
+checks the private home and the environment only.
 
 ### Integration test layout
 

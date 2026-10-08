@@ -19,6 +19,13 @@ pub mod root_detection {
 pub use args::build_default_sandbox_args;
 pub use config::SandboxConfig;
 
+/// Set to `1` in the environment of every command `harnx-sandbox-exec` runs.
+/// Nothing inside the sandbox can create namespaces (on Linux birdcage's
+/// seccomp filter rejects them), so a command that would nest a sandbox, such
+/// as the test runner `scripts/nextest-sandbox`, checks this to pick something
+/// that works there.
+pub const IN_SANDBOX_ENV: &str = "HARNX_IN_SANDBOX";
+
 /// XDG Base Directory Specification variables that are safe to pass through
 /// to sandboxed processes. Deny-by-default whitelist: only these XDG vars are
 /// forwarded. Notably EXCLUDES `XDG_RUNTIME_DIR` (locates the DBus session bus

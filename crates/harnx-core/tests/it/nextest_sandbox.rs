@@ -16,16 +16,23 @@ struct Shell {
 
 impl Shell {
     /// nextest running a test, with this test's own `PATH` (so `bwrap`, `env`
-    /// and `sh` resolve) and `home` as `HOME`.
+    /// and `sh` resolve) and `home` as `HOME`. Where the full sandbox can't
+    /// run, the runner can only give the light one, so tests that hold in
+    /// both modes check that one.
     fn test_run(home: &Path) -> Self {
         let path = std::env::var("PATH").expect("PATH is set");
-        Self {
+        let shell = Self {
             vars: BTreeMap::new(),
         }
         .set("PATH", &path)
         .set("HOME", home.to_str().expect("UTF-8 home"))
         .set("NEXTEST", "1")
-        .set("NEXTEST_ATTEMPT_ID", "nextest-sandbox-test")
+        .set("NEXTEST_ATTEMPT_ID", "nextest-sandbox-test");
+        if full_sandbox_available() {
+            shell
+        } else {
+            shell.set("HARNX_TEST_SANDBOX", "light")
+        }
     }
 
     fn set(mut self, name: &str, value: &str) -> Self {
@@ -69,6 +76,52 @@ fn bash() -> PathBuf {
         .map(|dir| dir.join("bash"))
         .find(|candidate| candidate.is_file())
         .expect("bash is on PATH")
+}
+
+/// Whether the runner can give the full sandbox here. On Linux that takes
+/// bubblewrap creating its namespaces, which harnx's own sandbox and hosts
+/// that block unprivileged user namespaces don't allow.
+#[cfg(target_os = "linux")]
+fn full_sandbox_available() -> bool {
+    Command::new("bwrap")
+        .args([
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--bind",
+            "/",
+            "/",
+            "--tmpfs",
+            "/tmp",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "true",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// macOS has only the process-group sandbox, which the runner always gives.
+#[cfg(not(target_os = "linux"))]
+fn full_sandbox_available() -> bool {
+    true
+}
+
+/// For tests of what only bubblewrap gives: whether to skip, with a note,
+/// because it can't run here.
+#[cfg(target_os = "linux")]
+fn skips_without_bubblewrap() -> bool {
+    let skip = !full_sandbox_available();
+    if skip {
+        eprintln!("skipping: bubblewrap can't create namespaces here");
+    }
+    skip
 }
 
 /// Outside `/tmp`, which the sandbox replaces on Linux.
@@ -185,7 +238,7 @@ fn rejects_an_unknown_switch_value() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("HARNX_TEST_SANDBOX must be unset or 'off'"),
+        stderr.contains("HARNX_TEST_SANDBOX must be unset, 'light' or 'off'"),
         "{stderr}"
     );
 }
@@ -481,6 +534,9 @@ fn assert_hidden(shell: &Shell, dirs: &[PathBuf]) {
 #[cfg(target_os = "linux")]
 #[test]
 fn hides_the_developers_harnx_directories() {
+    if skips_without_bubblewrap() {
+        return;
+    }
     let home = fake_home();
     let custom = fake_home();
     let state = custom.path().join("harnx-state");
@@ -505,6 +561,9 @@ fn hides_the_developers_harnx_directories() {
 #[cfg(target_os = "linux")]
 #[test]
 fn hides_every_place_a_harnx_directory_can_be() {
+    if skips_without_bubblewrap() {
+        return;
+    }
     let home = fake_home();
     let custom = fake_home();
     let data = custom.path().join("harnx-data");
@@ -527,6 +586,9 @@ fn hides_every_place_a_harnx_directory_can_be() {
 #[cfg(target_os = "linux")]
 #[test]
 fn hides_developer_directories_reached_through_a_symlink() {
+    if skips_without_bubblewrap() {
+        return;
+    }
     let home = fake_home();
     let real_dir = fake_home();
     let real_path = real_dir.path().to_path_buf();
@@ -550,6 +612,9 @@ fn hides_developer_directories_reached_through_a_symlink() {
 #[cfg(target_os = "linux")]
 #[test]
 fn hides_a_harnx_directory_inside_a_home_under_tmp() {
+    if skips_without_bubblewrap() {
+        return;
+    }
     let home = tmp_dir();
     assert_hidden(
         &Shell::test_run(home.path()),
@@ -560,6 +625,9 @@ fn hides_a_harnx_directory_inside_a_home_under_tmp() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gives_the_test_its_own_network_and_processes() {
+    if skips_without_bubblewrap() {
+        return;
+    }
     let home = fake_home();
     let seen = stdout(&Shell::test_run(home.path()).run(&[
         "sh",
@@ -590,6 +658,7 @@ fn requires_bubblewrap() {
     let home = fake_home();
     let empty = tempfile::tempdir().expect("create an empty PATH directory");
     let output = Shell::test_run(home.path())
+        .remove("HARNX_TEST_SANDBOX")
         .set("PATH", empty.path().to_str().expect("UTF-8 path"))
         .run(&["/usr/bin/env"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -600,17 +669,69 @@ fn requires_bubblewrap() {
     );
 }
 
-#[cfg(target_os = "macos")]
+/// Light mode keeps the private home and the filtered environment without
+/// bubblewrap, for places where it can't create namespaces.
+#[cfg(target_os = "linux")]
+#[test]
+fn light_mode_runs_without_namespaces() {
+    let home = fake_home();
+    let printed = stdout(
+        &Shell::test_run(home.path())
+            .set("HARNX_TEST_SANDBOX", "light")
+            .set("GEMINI_API_KEY", "developer-key")
+            .run(&[
+                "sh",
+                "-c",
+                "echo \"$HARNX_TEST_SANDBOX ${GEMINI_API_KEY:-dropped} $XDG_CONFIG_HOME\"; readlink /proc/self/ns/pid",
+            ]),
+    );
+    let own = std::fs::read_link("/proc/self/ns/pid").expect("read this test's PID namespace");
+    let lines: Vec<&str> = printed.lines().collect();
+    assert_eq!(lines.len(), 2, "{printed}");
+    let fields: Vec<&str> = lines[0].split(' ').collect();
+    assert_eq!(fields[..2], ["light", "dropped"], "{printed}");
+    assert!(fields[2].starts_with("/tmp/harnx-test."), "{printed}");
+    assert_eq!(
+        Path::new(lines[1]),
+        own,
+        "light mode starts no PID namespace"
+    );
+}
+
+/// harnx's own sandbox marks its commands with `HARNX_IN_SANDBOX`. Nothing
+/// can create namespaces there, so the runner picks light mode by itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn picks_light_mode_inside_harnx_sandbox() {
+    let home = fake_home();
+    let env = env_of(
+        &Shell::test_run(home.path())
+            .remove("HARNX_TEST_SANDBOX")
+            .set("HARNX_IN_SANDBOX", "1")
+            .run(&["env"]),
+    );
+    assert_eq!(
+        env.get("HARNX_TEST_SANDBOX").map(String::as_str),
+        Some("light")
+    );
+}
+
+/// The light sandbox, which is the only one on macOS, removes the private home
+/// and kills what the test leaves behind.
 #[test]
 fn removes_the_private_home_and_what_the_test_leaves_behind() {
     let home = fake_home();
     let marker = Marker::new();
-    let printed = stdout(&Shell::test_run(home.path()).run(&[
-        "sh",
-        "-c",
-        "echo \"$XDG_CONFIG_HOME\"; sh -c 'sleep 300; exit 0' \"$0\" >/dev/null 2>&1 & exit 0",
-        marker.as_arg(),
-    ]));
+    let printed = stdout(
+        &Shell::test_run(home.path())
+            .set("HARNX_TEST_SANDBOX", "light")
+            .run(&[
+                "sh",
+                "-c",
+                "echo \"$XDG_CONFIG_HOME\"; sh -c 'sleep 300; exit 0' \"$0\" >/dev/null 2>&1 & exit 0",
+                marker.as_arg(),
+            ]),
+    );
     let private = PathBuf::from(printed.trim())
         .parent()
         .expect("private home")
