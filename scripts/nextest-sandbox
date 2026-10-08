@@ -13,11 +13,20 @@ if [ -z "${NEXTEST:-}" ] || [ -z "${NEXTEST_ATTEMPT_ID:-}" ]; then
     exec "$@"
 fi
 
-case "${HARNX_TEST_SANDBOX:-}" in
-    "") ;;
+# The full sandbox needs bubblewrap on Linux. Light mode gives the private home,
+# the filtered environment and a process group without it; it is the only
+# sandbox on macOS. harnx's own sandbox (harnx-sandbox-exec) marks the commands
+# it runs with HARNX_IN_SANDBOX, and since nothing can create namespaces in
+# there, light mode is the default inside it.
+mode=${HARNX_TEST_SANDBOX:-}
+if [ -z "$mode" ] && [ -n "${HARNX_IN_SANDBOX:-}" ]; then
+    mode=light
+fi
+case "$mode" in
+    "" | light) ;;
     off) exec "$@" ;;
     *)
-        echo "harnx test sandbox: HARNX_TEST_SANDBOX must be unset or 'off', got '${HARNX_TEST_SANDBOX}'" >&2
+        echo "harnx test sandbox: HARNX_TEST_SANDBOX must be unset, 'light' or 'off', got '${HARNX_TEST_SANDBOX}'" >&2
         exit 2
         ;;
 esac
@@ -215,7 +224,7 @@ run_linux() {
     # once, so that a failure says what to do instead of every test failing
     # with bwrap's own error.
     if userns_may_be_blocked && ! error=$(bwrap "${args[@]}" true 2>&1 >/dev/null); then
-        echo "harnx test sandbox: bubblewrap can't start the sandbox here ($error). On Ubuntu 24.04, an AppArmor profile that allows \`userns\` for /usr/bin/bwrap fixes this without lifting the restriction for other programs; see AGENTS.md, \"Test sandbox\". Inside a container or harnx's own sandbox, set HARNX_TEST_SANDBOX=off to run unsandboxed." >&2
+        echo "harnx test sandbox: bubblewrap can't start the sandbox here ($error). On Ubuntu 24.04, an AppArmor profile that allows \`userns\` for /usr/bin/bwrap fixes this without lifting the restriction for other programs; see AGENTS.md, \"Test sandbox\". Inside a container or harnx's own sandbox, set HARNX_TEST_SANDBOX=light for a private home and filtered environment without namespaces, or HARNX_TEST_SANDBOX=off to run unsandboxed." >&2
         # A shell's status for a command it found but can't run: bwrap is
         # there but can't run the test. A missing bwrap gets 127 above.
         exit 126
@@ -223,12 +232,14 @@ run_linux() {
     exec bwrap "${args[@]}" "$@"
 }
 
-run_macos() {
+# The light sandbox: a private home, the filtered environment and a process
+# group, without namespaces, a private /tmp or masks. macOS has nothing else.
+run_in_process_group() {
     local home child status
     # Under /tmp rather than macOS's long per-user TMPDIR: tests create Unix
     # sockets under the TMPDIR set below, and macOS caps a socket path at 104
-    # bytes. /tmp is a symlink; the resolved path is the one the children are
-    # given, so `pkill -f "$home"` below matches it.
+    # bytes. On macOS /tmp is a symlink; the resolved path is the one the
+    # children are given, so `pkill -f "$home"` below matches it.
     home=$(mktemp -d /tmp/harnx-test.XXXXXX) || exit 1
     home=$(CDPATH='' cd -P -- "$home" && pwd -P) || exit 1
     mkdir -p "$home/config/harnx" "$home/data/harnx" "$home/state/harnx" \
@@ -237,6 +248,8 @@ run_macos() {
 
     add_home_pairs "$home"
     pairs+=("TMPDIR=$home/tmp" "PWD=$PWD")
+    # Tells the test, such as the canary, that it got the light sandbox.
+    [ "$mode" = light ] && pairs+=("HARNX_TEST_SANDBOX=light")
 
     # Job control gives the test its own process group, so whatever it leaves
     # behind can be killed with it.
@@ -265,8 +278,14 @@ run_macos() {
 }
 
 case "${OSTYPE:-}" in
-    linux*) run_linux "$@" ;;
-    darwin*) run_macos "$@" ;;
+    linux*)
+        if [ "$mode" = light ]; then
+            run_in_process_group "$@"
+        else
+            run_linux "$@"
+        fi
+        ;;
+    darwin*) run_in_process_group "$@" ;;
     *)
         echo "harnx test sandbox: unsupported platform '${OSTYPE:-unknown}'" >&2
         exit 2
