@@ -33,6 +33,7 @@ pub(crate) struct SessionsRouteContext<'a> {
     pub(crate) scoped: &'a harnx_runtime::config::GlobalConfig,
     pub(crate) query: Option<&'a str>,
     user_id: Option<&'a str>,
+    access: Option<(&'a harnx_core::access_rules::AccessRules, &'a [&'a str])>,
 }
 
 impl<'a> SessionsRouteContext<'a> {
@@ -46,7 +47,16 @@ impl<'a> SessionsRouteContext<'a> {
             scoped,
             query,
             user_id: None,
+            access: None,
         }
+    }
+
+    pub(crate) fn with_access(
+        mut self,
+        access: Option<(&'a harnx_core::access_rules::AccessRules, &'a [&'a str])>,
+    ) -> Self {
+        self.access = access;
+        self
     }
 
     pub(crate) fn with_user_id(mut self, user_id: Option<&'a str>) -> Self {
@@ -171,6 +181,7 @@ impl Server {
                 self.sessions_json(
                     context.target,
                     crate::session_pagination::parse_session_list_query(context.query)?,
+                    context.access,
                 )
                 .await
             }

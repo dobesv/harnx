@@ -10,6 +10,7 @@ mod ag_ui_remote_follow;
 pub mod ag_ui_rpc;
 mod ag_ui_sync;
 mod ag_ui_usage;
+mod agent_access;
 mod agent_resolve;
 mod attachments;
 mod cid;
@@ -18,19 +19,22 @@ mod models_catalog;
 mod nats_access;
 mod request_identity;
 mod serve_shutdown;
+mod session_access;
 pub mod session_actor;
 mod session_actor_types;
 pub(crate) mod session_pagination;
 pub mod session_routes;
 mod web_url;
 
-pub use serve_shutdown::StreamDrainConfig;
+pub use serve_shutdown::{ShutdownConfig, StreamDrainConfig};
 
 // Not `#[cfg(test)]`: the `tests/` integration crates link the library built
 // WITHOUT the `test` cfg, so gating this out would break their
 // `harnx_serve::test_support` imports. Kept public for cross-crate test reuse.
 pub mod test_support;
 
+#[cfg(test)]
+mod access_tests;
 #[cfg(test)]
 mod cid_route_tests;
 #[cfg(test)]
@@ -54,6 +58,7 @@ use crate::session_actor::{ResolvedAgentTarget, SessionRegistry};
 use crate::session_routes::{AgentSessionRef, SessionsRouteContext};
 use attachments::*;
 
+use harnx_core::access_rules::AccessRules;
 #[cfg(test)]
 use harnx_core::agent_ref::AgentRef;
 use harnx_core::message::MessageRole;
@@ -273,13 +278,17 @@ pub async fn run_with_drain_timeout(
     readiness: Option<harnx_healthz::Readiness>,
     drain_timeout: Duration,
 ) -> Result<()> {
+    let access_rules = harnx_runtime::access::load_access_rules(None)?;
     run_with_shutdown_config(
         config,
         addr,
         web_assets,
         readiness,
-        drain_timeout,
-        StreamDrainConfig::default(),
+        ShutdownConfig {
+            drain_timeout,
+            ..ShutdownConfig::default()
+        },
+        access_rules,
     )
     .await
 }
@@ -289,9 +298,13 @@ pub async fn run_with_shutdown_config(
     addr: Option<String>,
     web_assets: Option<PathBuf>,
     readiness: Option<harnx_healthz::Readiness>,
-    drain_timeout: Duration,
-    stream_drain: StreamDrainConfig,
+    shutdown: ShutdownConfig,
+    access_rules: Option<Arc<AccessRules>>,
 ) -> Result<()> {
+    let ShutdownConfig {
+        drain_timeout,
+        stream_drain,
+    } = shutdown;
     log_startup_environment_diagnostics();
 
     let addr = match addr {
@@ -308,10 +321,11 @@ pub async fn run_with_shutdown_config(
     };
     web_url::public_url(&config.read())?;
     let web_assets = resolve_web_assets(web_assets);
-    let server = Arc::new(Server::new_with_stream_drain(
+    let server = Arc::new(Server::build(
         &config,
         web_assets,
         stream_drain,
+        access_rules,
     )?);
     let listener = TcpListener::bind(&addr).await?;
     // Advertise the bound address so URLs reflect the real host/port even when
@@ -345,6 +359,7 @@ pub async fn run_with_shutdown_config(
 pub struct Server {
     config: Config,
     identity_sources: harnx_runtime::identity::IdentitySources,
+    access_rules: Option<Arc<AccessRules>>,
     models: Vec<Value>,
     agents: Vec<AgentConfig>,
     rags: Vec<String>,
@@ -411,21 +426,48 @@ impl Server {
             .expect("valid serve configuration")
     }
 
+    #[doc(hidden)]
+    pub fn new_with_access_rules(
+        config: &GlobalConfig,
+        web_assets: PathBuf,
+        access_rules: Option<Arc<AccessRules>>,
+    ) -> Result<Self> {
+        Self::build(
+            config,
+            web_assets,
+            StreamDrainConfig::default(),
+            access_rules,
+        )
+    }
+
     fn new_with_stream_drain(
         config: &GlobalConfig,
         web_assets: PathBuf,
         stream_drain: StreamDrainConfig,
     ) -> Result<Self> {
+        Self::build(config, web_assets, stream_drain, None)
+    }
+
+    fn build(
+        config: &GlobalConfig,
+        web_assets: PathBuf,
+        stream_drain: StreamDrainConfig,
+        access_rules: Option<Arc<AccessRules>>,
+    ) -> Result<Self> {
         let config = config.read().clone();
         let identity_sources =
             harnx_runtime::identity::IdentitySources::new(&config.serve_user_id_sources)
                 .context("invalid serve_user_id_sources")?;
+        if access_rules.is_some() && identity_sources.sources().is_empty() {
+            bail!("access rules require request identity sources; configure --user-id-source, HARNX_SERVE_USER_ID_SOURCES, or serve_user_id_sources");
+        }
         let models = advertised_models(&config);
         let session_registry = SessionRegistry::new(config.clone());
         let agents = config.all_agents();
         Ok(Self {
             config,
             identity_sources,
+            access_rules,
             models,
             agents,
             rags: Config::list_rags(),
@@ -441,7 +483,12 @@ impl Server {
             .await
             .map_err(ag_ui_error_to_anyhow)?;
         Ok(Value::Array(
-            agent_sessions_json(&self.config, &target).await?,
+            agent_sessions_json(
+                &self.config,
+                &target,
+                self.access_rules.as_deref().map(|rules| (rules, &[][..])),
+            )
+            .await?,
         ))
     }
 
@@ -527,13 +574,47 @@ impl Server {
         let started = Instant::now();
         let method = req.method().clone();
         let uri = req.uri().clone();
-        let path = uri.path();
-
         if let Some(res) = self.prepare_request(&mut req, started) {
             return Ok(res);
         }
 
-        let mut status = StatusCode::OK;
+        let (route, res) = self.dispatch_request(req).await;
+        let status;
+        let mut res = match res {
+            Ok(res) => {
+                status = res.status();
+                info!("{method} {uri} {}", status.as_u16());
+                res
+            }
+            Err(err) => {
+                status = finalize_err_status(StatusCode::OK, &err);
+                error!("{method} {uri} {} {err}", status.as_u16());
+                ret_err(err)
+            }
+        };
+        *res.status_mut() = status;
+        set_cors_header(&mut res);
+        harnx_metrics::record_http_request(
+            method.as_str(),
+            route,
+            res.status().as_u16(),
+            started.elapsed(),
+        );
+        Ok(res)
+    }
+
+    /// Authorize before selecting a route, including direct attachment handlers.
+    /// Return the metric label with the result so failures use the same response path.
+    async fn dispatch_request(
+        self: &Arc<Self>,
+        mut req: hyper::Request<Incoming>,
+    ) -> (&'static str, Result<AppResponse>) {
+        if let Err(err) = self.guard_agent_request(&mut req).await {
+            return ("/v1/agents/*", Err(err));
+        }
+        let method = req.method().clone();
+        let uri = req.uri().clone();
+        let path = uri.path();
         let route;
         let res = if path == "/v1/embeddings" {
             route = "/v1/embeddings";
@@ -546,7 +627,7 @@ impl Server {
             self.list_models()
         } else if path == "/v1/agents" {
             route = "/v1/agents";
-            self.list_agents(req.uri().query()).await
+            self.list_agents(&req).await
         } else if is_session_attachment_blob_path(path) {
             route = "/v1/agents/*/sessions/*/attachments/*";
             self.get_session_attachment(req).await
@@ -567,30 +648,9 @@ impl Server {
             self.serve_web_asset(&method, path, req.headers()).await
         } else {
             route = "other";
-            status = StatusCode::NOT_FOUND;
             Err(anyhow!("Not Found"))
         };
-        let mut res = match res {
-            Ok(res) => {
-                status = res.status();
-                info!("{method} {uri} {}", status.as_u16());
-                res
-            }
-            Err(err) => {
-                status = finalize_err_status(status, &err);
-                error!("{method} {uri} {} {err}", status.as_u16());
-                ret_err(err)
-            }
-        };
-        *res.status_mut() = status;
-        set_cors_header(&mut res);
-        harnx_metrics::record_http_request(
-            method.as_str(),
-            route,
-            res.status().as_u16(),
-            started.elapsed(),
-        );
-        Ok(res)
+        (route, res)
     }
 
     fn list_models(&self) -> Result<AppResponse> {
@@ -601,8 +661,12 @@ impl Server {
         Ok(res)
     }
 
-    async fn list_agents(&self, query: Option<&str>) -> Result<AppResponse> {
-        let agents = self.filter_agents_by_role(query).await?;
+    async fn list_agents<B>(&self, req: &hyper::Request<B>) -> Result<AppResponse> {
+        let mut agents = self.filter_agents_by_role(req.uri().query()).await?;
+        if let Some((rules, identities)) = self.access(req) {
+            let ids: Vec<&str> = identities.iter().map(String::as_str).collect();
+            agents.retain(|agent| rules.can_see_agent(agent.name(), &ids));
+        }
         let data = json!({ "data": agents });
         let res = Response::builder()
             .header("Content-Type", "application/json; charset=utf-8")
@@ -804,12 +868,14 @@ impl Server {
     async fn handle_agent_tree(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
+        let (rules, identities) = self.access(&req).unzip();
+        let identities = identities.unwrap_or_default();
+        let ids: Vec<&str> = identities.iter().map(String::as_str).collect();
+        let access = rules.map(|rules| (rules, ids.as_slice()));
         if let Some((agent_ref, session, route)) =
             session_routes::parse_session_metadata_route(&path)
         {
-            let (target, _) = resolve_agent_target(&self.config, &agent_ref)
-                .await
-                .map_err(ag_ui_error_to_anyhow)?;
+            let (target, _) = self.resolve_request_agent(&req, &agent_ref).await?;
             let session_ref = AgentSessionRef::from_target(&target, &session);
             return self
                 .handle_session_metadata_route(req, session_ref, route)
@@ -817,16 +883,14 @@ impl Server {
         }
         let route = parse_agents_route(&path).ok_or_else(|| anyhow!("Not Found"))?;
         let (agent_ref, session_name, agent_route) = route;
-        let (target, scoped) = resolve_agent_target(&self.config, &agent_ref)
-            .await
-            .map_err(ag_ui_error_to_anyhow)?;
+        let (target, scoped) = self.resolve_request_agent(&req, &agent_ref).await?;
         let display_ref = self.display_ref(&target);
 
         match agent_route {
             AgentsRoute::Agent => {
                 match negotiate_agents_route(&method, req.headers(), agent_route)? {
                     AgentsRepresentation::Html => self.agent_html_page(&display_ref),
-                    AgentsRepresentation::Json => self.agent_json(&target).await,
+                    AgentsRepresentation::Json => self.agent_json(&target, access).await,
                     AgentsRepresentation::AgUiSse | AgentsRepresentation::AgUiRpc => {
                         Err(anyhow!("Not Acceptable"))
                     }
@@ -837,7 +901,8 @@ impl Server {
                     &method,
                     req.headers(),
                     SessionsRouteContext::new(&target, &scoped, req.uri().query())
-                        .with_user_id(RequestUserId::of(&req).as_deref()),
+                        .with_user_id(RequestUserId::of(&req).as_deref())
+                        .with_access(access),
                 )
                 .await
             }
@@ -886,8 +951,12 @@ impl Server {
         Ok(res)
     }
 
-    async fn agent_json(&self, target: &ResolvedAgentTarget) -> Result<AppResponse> {
-        let sessions = agent_sessions_json(&self.config, target).await?;
+    async fn agent_json(
+        &self,
+        target: &ResolvedAgentTarget,
+        access: Option<(&AccessRules, &[&str])>,
+    ) -> Result<AppResponse> {
+        let sessions = agent_sessions_json(&self.config, target, access).await?;
         let display_ref = self.display_ref(target);
         // Look up description using both display name and full @cluster name
         let description = self
@@ -910,16 +979,17 @@ impl Server {
         &self,
         target: &ResolvedAgentTarget,
         params: Option<session_pagination::SessionPaginationQuery>,
+        access: Option<(&AccessRules, &[&str])>,
     ) -> Result<AppResponse> {
         let params = match params {
             Some(params) => params,
             None => {
                 return json_response(Value::Array(
-                    agent_sessions_json(&self.config, target).await?,
+                    agent_sessions_json(&self.config, target, access).await?,
                 ));
             }
         };
-        let sessions = list_target_sessions(&self.config, target).await?;
+        let sessions = list_target_sessions(&self.config, target, access).await?;
         let data = session_pagination::paginate_sessions(&sessions, &params)?;
         json_response(data)
     }
@@ -934,9 +1004,7 @@ impl Server {
             return attachment_error_response(StatusCode::BAD_REQUEST, "malformed attachment cid");
         }
 
-        let (target, _) = resolve_agent_target(&self.config, &agent_ref)
-            .await
-            .map_err(ag_ui_error_to_anyhow)?;
+        let (target, _) = self.resolve_request_agent(&req, &agent_ref).await?;
         let (loaded_session, _entries) = load_nats_session(&self.config, &target, &session).await?;
         if loaded_session.agent_name.as_deref() != Some(target.agent())
             || !collect_cid_refs(&loaded_session.messages)
@@ -1003,9 +1071,7 @@ impl Server {
         .ok() else {
             bail!("Bad Request");
         };
-        let (target, _) = resolve_agent_target(&self.config, &agent_ref)
-            .await
-            .map_err(ag_ui_error_to_anyhow)?;
+        let (target, _) = self.resolve_request_agent(&req, &agent_ref).await?;
         let attachments_dir = Config::agent_data_dir(target.agent())
             .join("attachments")
             .join(&session);
@@ -1458,9 +1524,10 @@ fn negotiate_agents_route(
 
 fn accepts_html(headers: &http::HeaderMap) -> bool {
     headers
-        .get(http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("text/html"))
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.contains("text/html"))
 }
 
 /// Turn a URL-relative request path into a safe relative filesystem path.
@@ -1498,14 +1565,14 @@ fn has_file_extension(path: &Path) -> bool {
 /// Whether the client accepts HTML (a navigation request).
 fn wants_html(headers: &http::HeaderMap) -> bool {
     headers
-        .get(http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
             value
                 .split(',')
                 .any(|item| item.trim().starts_with("text/html"))
         })
-        .unwrap_or(false)
 }
 
 /// Best-effort Content-Type from a file extension. Unknown extensions default
@@ -1533,9 +1600,10 @@ fn content_type_for_path(path: &Path) -> &'static str {
 
 fn accepts_event_stream(headers: &http::HeaderMap) -> bool {
     headers
-        .get(http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(accept_header_allows_event_stream)
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(accept_header_allows_event_stream)
 }
 
 fn accept_header_allows_event_stream(value: &str) -> bool {
@@ -1599,6 +1667,7 @@ pub(crate) fn session_repository_and_branch(
 pub(crate) async fn list_target_sessions(
     config: &Config,
     target: &ResolvedAgentTarget,
+    access: Option<(&AccessRules, &[&str])>,
 ) -> Result<Vec<harnx_runtime::config::SessionMeta>> {
     ensure_frontend_nats_owner(target.cluster()).await?;
     let mut sessions: Vec<_> = config
@@ -1611,6 +1680,13 @@ pub(crate) async fn list_target_sessions(
         .filter(|session| session.agent_name.as_deref() == Some(target.agent()))
         .collect();
 
+    if let Some((rules, identities)) = access {
+        let agent_ref =
+            target.display_ref_with_default_cluster(config.default_cluster_for_display());
+        sessions.retain(|session| {
+            rules.can_access_session(&agent_ref, identities, session.user_id.as_deref())
+        });
+    }
     sessions.sort_by(session_recency_ordering);
     Ok(sessions)
 }
@@ -1660,8 +1736,12 @@ pub(crate) fn format_session_summary(session: &harnx_runtime::config::SessionMet
     Value::Object(value)
 }
 
-async fn agent_sessions_json(config: &Config, target: &ResolvedAgentTarget) -> Result<Vec<Value>> {
-    let sessions = list_target_sessions(config, target).await?;
+async fn agent_sessions_json(
+    config: &Config,
+    target: &ResolvedAgentTarget,
+    access: Option<(&AccessRules, &[&str])>,
+) -> Result<Vec<Value>> {
+    let sessions = list_target_sessions(config, target, access).await?;
     Ok(sessions.iter().map(format_session_summary).collect())
 }
 
@@ -1968,6 +2048,11 @@ mod tests {
     use harnx_core::session::SessionLogEntry;
     use http::HeaderValue;
     use tokio::{io::AsyncWriteExt, net::TcpStream};
+
+    fn agents_request(query: Option<&str>) -> hyper::Request<()> {
+        let uri = query.map_or_else(|| "/v1/agents".to_string(), |q| format!("/v1/agents?{q}"));
+        hyper::Request::builder().uri(uri).body(()).unwrap()
+    }
 
     #[test]
     fn web_assets_warning_reports_missing_or_incomplete_directories() {
@@ -2319,6 +2404,69 @@ mod tests {
     }
 
     #[test]
+    fn negotiate_agents_route_accepts_repeated_accept_fields() {
+        // Repeated Accept fields and a comma-joined field have the same meaning.
+        for accept in ["text/html", "text/event-stream;q=0.5"] {
+            let mut split = http::HeaderMap::new();
+            split.append(
+                http::header::ACCEPT,
+                HeaderValue::from_static("application/json"),
+            );
+            split.append(http::header::ACCEPT, HeaderValue::from_static(accept));
+            split.insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            let mut joined = split.clone();
+            joined.insert(
+                http::header::ACCEPT,
+                format!("application/json, {accept}").parse().unwrap(),
+            );
+            for (method, route) in [
+                (Method::GET, AgentsRoute::Agent),
+                (Method::GET, AgentsRoute::Session),
+                (Method::POST, AgentsRoute::Session),
+                (Method::GET, AgentsRoute::SessionEvents),
+            ] {
+                let negotiate = |headers| {
+                    negotiate_agents_route(&method, headers, route)
+                        .map_err(|error| error.to_string())
+                };
+                assert_eq!(
+                    negotiate(&split),
+                    negotiate(&joined),
+                    "{method} {route:?} {accept}"
+                );
+            }
+            assert_eq!(wants_html(&split), wants_html(&joined));
+        }
+    }
+
+    #[test]
+    fn repeated_accept_fields_preserve_event_stream_quality_checks() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.append(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream;q=0"),
+        );
+        assert!(!accepts_event_stream(&headers));
+        headers.append(
+            http::header::ACCEPT,
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        assert!(!accepts_event_stream(&headers));
+        headers.append(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream;q=0.5"),
+        );
+        assert!(accepts_event_stream(&headers));
+    }
+
+    #[test]
     fn negotiate_agents_route_accepts_ag_ui_post_shape() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -2641,10 +2789,16 @@ mod tests {
         let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
-        let unfiltered = response_json(server.list_agents(None).await.expect("all agents")).await;
+        let unfiltered = response_json(
+            server
+                .list_agents(&agents_request(None))
+                .await
+                .expect("all agents"),
+        )
+        .await;
         let filtered = response_json(
             server
-                .list_agents(Some("role=assistant"))
+                .list_agents(&agents_request(Some("role=assistant")))
                 .await
                 .expect("assistant agents"),
         )
@@ -3884,7 +4038,13 @@ mod tests {
         let config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
-        let agents = response_json(server.list_agents(None).await.expect("agents")).await;
+        let agents = response_json(
+            server
+                .list_agents(&agents_request(None))
+                .await
+                .expect("agents"),
+        )
+        .await;
         let names = agent_names(&agents);
 
         // Default cluster agent should appear without suffix, local with bare name,
@@ -3926,7 +4086,13 @@ mod tests {
         let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
-        let agents = response_json(server.list_agents(None).await.expect("agents")).await;
+        let agents = response_json(
+            server
+                .list_agents(&agents_request(None))
+                .await
+                .expect("agents"),
+        )
+        .await;
         let names = agent_names(&agents);
 
         // Remote agent should appear WITH suffix, local with bare name
@@ -3959,7 +4125,13 @@ mod tests {
         let config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
-        let agents = response_json(server.list_agents(None).await.expect("agents")).await;
+        let agents = response_json(
+            server
+                .list_agents(&agents_request(None))
+                .await
+                .expect("agents"),
+        )
+        .await;
         let names = agent_names(&agents);
 
         // Default cluster agent without suffix, non-default with suffix
@@ -3995,7 +4167,13 @@ mod tests {
         let config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
-        let agents = response_json(server.list_agents(None).await.expect("agents")).await;
+        let agents = response_json(
+            server
+                .list_agents(&agents_request(None))
+                .await
+                .expect("agents"),
+        )
+        .await;
         let agents_list = agents["data"].as_array().expect("agents array");
 
         // Should have exactly one "sisyphus" entry (deduped), not two
@@ -4040,7 +4218,13 @@ mod tests {
         let config = Arc::new(ConfigLock::new(config));
         let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
-        let agents = response_json(server.list_agents(None).await.expect("agents")).await;
+        let agents = response_json(
+            server
+                .list_agents(&agents_request(None))
+                .await
+                .expect("agents"),
+        )
+        .await;
         let matches: Vec<_> = agents["data"]
             .as_array()
             .expect("agents array")
@@ -4085,7 +4269,7 @@ mod tests {
         // Test role=assistant filter
         let filtered = response_json(
             server
-                .list_agents(Some("role=assistant"))
+                .list_agents(&agents_request(Some("role=assistant")))
                 .await
                 .expect("assistant agents"),
         )

@@ -4,6 +4,7 @@
 //! role this crate plays in the multi-crate split.
 
 pub mod abort;
+pub mod access_rules;
 pub mod agent_config;
 pub mod agent_ref;
 pub mod alloc_guard;

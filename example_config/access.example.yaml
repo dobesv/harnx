@@ -1,0 +1,55 @@
+# Access control rules for harnx-serve and harnx-a2a-server
+# Place in <config-dir>/access.yaml or specify with --access-rules / HARNX_ACCESS_RULES.
+# When enabled, callers must provide a trusted identity; requests without identity return 401.
+
+rules:
+  # General engineering access: developers can run and manage their own sessions on core agents.
+  # Reusable user groups and agent lists can be defined on the first rule using standard YAML anchors (&group)
+  # and reused in subsequent rules (*group).
+  - agents: &core_agents
+      - sisyphus
+      - daedalus
+      - "coding/*"
+    scopes:
+      - prompt
+    users: &engineers
+      - "alice@example.com"
+      - "bob@example.com"
+      - "carol@example.com"
+
+  # Remote cluster agents: matched against the full display reference (agent@cluster).
+  - agents:
+      - "sisyphus@shared"
+      - "daedalus@shared"
+    scopes:
+      - prompt
+    users: *engineers
+
+  # Administrative access: operations can inspect, manage, and compact any session or context across all agents.
+  - agents:
+      - "*"
+    scopes:
+      - prompt
+      - admin
+    users: &ops_team
+      - "CN=ops-admin,OU=operations,O=mycorp"
+      - "admin@example.com"
+
+  # Auditing / read-only operators: admin scope without prompt cannot create new sessions,
+  # but can view agents, list sessions, and inspect existing sessions across all users.
+  - agents:
+      - "audit-agent"
+    scopes:
+      - admin
+    users:
+      - "auditor@example.com"
+
+  # Distinguished Name (DN) matching:
+  # Quote DN strings containing commas. The glob pattern matches the entire identity string,
+  # is case-sensitive, and '*' spans commas.
+  - agents:
+      - sisyphus
+    scopes:
+      - prompt
+    users:
+      - "CN=*,OU=engineering,O=mycorp"

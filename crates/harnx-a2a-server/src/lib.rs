@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 pub mod routes;
 
+mod access;
 mod agent_card;
 mod bootstrap;
 pub mod cli;
@@ -30,6 +31,8 @@ pub async fn run(args: cli::Args) -> Result<()> {
     if let Some(dir) = &args.config_dir {
         std::env::set_var("HARNX_CONFIG_DIR", dir);
     }
+    let access_rules = harnx_runtime::access::load_access_rules(args.access_rules.clone())?;
+    identity::Identity::new(&args.user_id_header)?.validate_access_rules(access_rules.is_some())?;
     let exports = exports::resolve_exports(
         &args.agents,
         args.cluster.as_deref(),
@@ -38,13 +41,19 @@ pub async fn run(args: cli::Args) -> Result<()> {
     .await
     .context("resolve agent exports")?;
     let abort = harnx_core::abort::create_abort_signal();
-    let bootstrap =
-        bootstrap::Bootstrap::new(&exports, args.config_dir.as_deref(), abort.clone()).await?;
+    let bootstrap = bootstrap::Bootstrap::new(
+        &exports,
+        args.config_dir.as_deref(),
+        abort.clone(),
+        access_rules.clone(),
+    )
+    .await?;
     let export_count = exports.len();
-    let app = routes::router(
+    let app = routes::router_with_access_rules(
         &exports,
         args.public_base_url.as_deref(),
         &args.user_id_header,
+        access_rules,
         |export, identity| {
             std::sync::Arc::new(handler::HarnxHandler::new(
                 export.clone(),

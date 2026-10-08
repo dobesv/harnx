@@ -58,6 +58,10 @@ pub struct Args {
     #[arg(long, value_name = "PATH", env = "HARNX_CONFIG_DIR")]
     pub config_dir: Option<PathBuf>,
 
+    /// Access rules file (defaults to access.yaml in the configuration directory).
+    #[arg(long, value_name = "PATH", env = "HARNX_ACCESS_RULES")]
+    pub access_rules: Option<PathBuf>,
+
     /// Agent to export: name or alias=name (repeatable, comma-separated).
     /// CLI values replace HARNX_A2A_AGENTS; no default expose-all mode.
     #[arg(
@@ -94,7 +98,7 @@ mod tests {
     impl EnvGuard {
         fn isolated() -> Self {
             harnx_core::require_nextest();
-            let saved = ["HARNX_A2A_AGENTS", "HARNX_CONFIG_DIR"]
+            let saved = ["HARNX_A2A_AGENTS", "HARNX_CONFIG_DIR", "HARNX_ACCESS_RULES"]
                 .into_iter()
                 .map(|key| {
                     let value = std::env::var_os(key);
@@ -248,6 +252,23 @@ mod tests {
     }
 
     #[test]
+    fn cli_access_rules_flag_overrides_env() {
+        let _env = EnvGuard::isolated();
+        std::env::set_var("HARNX_ACCESS_RULES", "env-access.yaml");
+        let args = Args::try_parse_from(["harnx-a2a-server", "--agent", "agent"]).unwrap();
+        assert_eq!(args.access_rules, Some(PathBuf::from("env-access.yaml")));
+        let args = Args::try_parse_from([
+            "harnx-a2a-server",
+            "--agent",
+            "agent",
+            "--access-rules",
+            "cli-access.yaml",
+        ])
+        .unwrap();
+        assert_eq!(args.access_rules, Some(PathBuf::from("cli-access.yaml")));
+    }
+
+    #[test]
     fn cli_help_and_definition() {
         let _env = EnvGuard::isolated();
         Args::command().debug_assert();
@@ -259,6 +280,7 @@ mod tests {
             "--port",
             "--cluster",
             "--config-dir",
+            "--access-rules",
             "--agent",
             "--public-base-url",
             "--user-id-header",

@@ -44,6 +44,12 @@ impl Http {
         Self::from_harness(Harness::start(Script::Text).await?).await
     }
     pub(super) async fn from_harness(h: Harness) -> Result<Self> {
+        Self::with_access_rules(h, None).await
+    }
+    pub(super) async fn with_access_rules(
+        h: Harness,
+        rules: Option<Arc<harnx_core::access_rules::AccessRules>>,
+    ) -> Result<Self> {
         let backend = Arc::new(Backend::new(
             h.runner.clone(),
             h.store.clone(),
@@ -54,18 +60,28 @@ impl Http {
             },
         ));
         let mut exports = vec![h.export.clone(), h.export.clone()];
-        exports[0].lookup_keys = vec!["runner".into(), "alias".into()];
+        exports[0].lookup_keys = vec![
+            "runner".into(),
+            "alias".into(),
+            h.export.public_name.clone(),
+        ];
         exports[1].public_name = "other".into();
         exports[1].agent = "target".into();
         exports[1].lookup_keys = vec!["other".into()];
-        let app = routes::router(&exports, None, &["X-User-ID".into()], |export, identity| {
-            Arc::new(HarnxHandler::new(
-                export.clone(),
-                identity,
-                backend.clone(),
-                InputLimits::default(),
-            ))
-        })?;
+        let app = routes::router_with_access_rules(
+            &exports,
+            None,
+            &["X-User-ID".into()],
+            rules,
+            |export, identity| {
+                Arc::new(HarnxHandler::new(
+                    export.clone(),
+                    identity,
+                    backend.clone(),
+                    InputLimits::default(),
+                ))
+            },
+        )?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/agents/runner", listener.local_addr()?);
         let server = tokio::spawn(async move {

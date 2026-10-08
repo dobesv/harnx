@@ -51,6 +51,14 @@ impl Identity {
         })
     }
 
+    pub(crate) fn validate_access_rules(&self, enabled: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !enabled || !self.sources.sources().is_empty(),
+            "access rules require a trusted identity source; configure --user-id-header"
+        );
+        Ok(())
+    }
+
     /// First configured source present wins. Empty or invalid values fail closed.
     pub fn resolve(&self, headers: &HeaderMap) -> Result<Principal, A2AError> {
         if self.sources.sources().is_empty() {
@@ -105,14 +113,14 @@ impl Identity {
     }
 }
 
-fn missing_identity() -> A2AError {
+pub(crate) fn missing_identity() -> A2AError {
     A2AError::new(
         MISSING_IDENTITY_CODE,
         "missing or empty user identity header",
     )
 }
 
-/// Apply only to RPC routes, before upstream version checks and method dispatch.
+/// Resolve identity before protocol dispatch; protected cards use this layer too.
 pub(crate) async fn require_identity(
     State(identity): State<Identity>,
     mut request: Request,
@@ -123,26 +131,34 @@ pub(crate) async fn require_identity(
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
-        Err(error) => {
-            // Bound unauthenticated input too. An unreadable body has no recoverable id.
-            let id = to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES)
-                .await
-                .ok()
-                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
-                .and_then(|body| body.get("id").cloned())
-                .filter(|id| id.is_string() || id.is_number() || id.is_null())
-                .unwrap_or(Value::Null);
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {"code": error.code, "message": error.message},
-                })),
-            )
-                .into_response()
-        }
+        Err(error) => rpc_error_response(request, StatusCode::UNAUTHORIZED, error).await,
     }
+}
+
+pub(crate) async fn rpc_error_response(
+    request: Request,
+    status: StatusCode,
+    error: A2AError,
+) -> Response {
+    // Bound rejected input too. An unreadable body has no recoverable id.
+    let id = to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES)
+        .await
+        .ok()
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .and_then(|body| body.get("id").cloned())
+        .filter(|id| id.is_string() || id.is_number() || id.is_null())
+        .unwrap_or(Value::Null);
+    let error = if status == StatusCode::UNAUTHORIZED {
+        // Preserve the existing identity error envelope when rules are off.
+        json!({"code": error.code, "message": error.message})
+    } else {
+        json!(error.to_jsonrpc_error())
+    };
+    (
+        status,
+        Json(json!({"jsonrpc": "2.0", "id": id, "error": error})),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

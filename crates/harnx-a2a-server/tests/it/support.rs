@@ -383,6 +383,12 @@ impl Drop for Harness {
 }
 impl Harness {
     pub async fn start(script: Script) -> Result<Self> {
+        Self::start_with_access_rules(script, None).await
+    }
+    pub async fn start_with_access_rules(
+        script: Script,
+        rules: Option<Arc<harnx_core::access_rules::AccessRules>>,
+    ) -> Result<Self> {
         harnx_core::require_nextest();
         let logs = test_logs();
         let (broker, url, client) = Broker::start().await?;
@@ -393,7 +399,7 @@ impl Harness {
         let worker = start_worker(&config).await?;
         let jetstream = async_nats::jetstream::new(client);
         let metadata = SessionMetadataStore::ensure(&jetstream, 1).await?;
-        let store = Arc::new(A2aStore::new(metadata.clone()));
+        let store = Arc::new(A2aStore::new_with_access_rules(metadata.clone(), rules));
         let runner = Runner::new(store.clone());
         let export = runner_export();
         Ok(Self {

@@ -51,19 +51,46 @@ impl Server {
         if req.method() != Method::GET {
             bail!("Method Not Allowed");
         }
+        let protected = self.access_rules.is_some();
         let Some(url) = parse_cid_path(req.uri().path()) else {
-            return cid_error_response(StatusCode::BAD_REQUEST, "malformed cid URL");
+            return cid_error_response(StatusCode::BAD_REQUEST, "malformed cid URL", protected);
         };
+        // Authorization precedes blob reads, activity renewal, and conditional responses.
+        if !self.can_access_cid(&req, &url).await {
+            return cid_error_response(StatusCode::NOT_FOUND, "cid blob not found", protected);
+        }
         let jetstream =
             serve_nats_jetstream(&self.config, self.config.default_cluster_key()).await?;
         let resolved = match harnx_blob_store::resolve(&jetstream, &url).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 debug!("CID blob resolution failed for {url}: {error:#}");
-                return cid_error_response(StatusCode::NOT_FOUND, "cid blob not found");
+                return cid_error_response(StatusCode::NOT_FOUND, "cid blob not found", protected);
             }
         };
-        cid_blob_response(req.headers(), resolved)
+        cid_blob_response(req.headers(), resolved, protected)
+    }
+
+    async fn can_access_cid<B>(&self, req: &hyper::Request<B>, url: &CidUrl) -> bool {
+        let Some((rules, identities)) = self.access(req) else {
+            return true;
+        };
+        let Some(agent) = url.session().agent.as_deref() else {
+            return false;
+        };
+        let owner = match self
+            .read_session_owner(self.config.default_cluster_key(), &url.session().owner())
+            .await
+        {
+            Ok(Some(owner)) => owner,
+            Ok(None) => return false,
+            Err(error) => {
+                debug!("CID session metadata read failed for {url}: {error:#}");
+                return false;
+            }
+        };
+        let ids: Vec<&str> = identities.iter().map(String::as_str).collect();
+        rules.can_access_session(agent, &ids, owner.as_deref())
     }
 }
 
@@ -78,9 +105,12 @@ fn parse_cid_path(path: &str) -> Option<CidUrl> {
 fn cid_blob_response(
     request_headers: &http::HeaderMap,
     resolved: harnx_blob_store::ResolvedBlob,
+    protected: bool,
 ) -> Result<AppResponse> {
     let etag = resolved.etag.as_deref().map(|value| format!("\"{value}\""));
-    let cache_control = if resolved.immutable {
+    let cache_control = if protected {
+        "private, no-store"
+    } else if resolved.immutable {
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"
@@ -148,13 +178,20 @@ pub(crate) fn cid_content_disposition(mime_type: &str) -> &'static str {
     }
 }
 
-fn cid_error_response(status: StatusCode, message: &str) -> Result<AppResponse> {
+fn cid_error_response(status: StatusCode, message: &str, protected: bool) -> Result<AppResponse> {
     let response = Response::builder()
         .status(status)
         .header("Content-Type", "text/plain; charset=utf-8")
         .header("X-Content-Type-Options", "nosniff")
         .header("Content-Security-Policy", CID_CONTENT_SECURITY_POLICY)
-        .header(http::header::CACHE_CONTROL, "no-store")
+        .header(
+            http::header::CACHE_CONTROL,
+            if protected {
+                "private, no-store"
+            } else {
+                "no-store"
+            },
+        )
         .body(Full::new(Bytes::copy_from_slice(message.as_bytes())).boxed())?;
     Ok(response)
 }

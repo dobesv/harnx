@@ -32,6 +32,7 @@ cargo install --path crates/harnx-serve
 | :--- | :--- | :--- |
 | `--addr <ADDRESS>` | `-a` | Listen address (default from `config.yaml` or `127.0.0.1:8000`). |
 | `--user-id-source <SOURCE>` | | Identity source (`header:NAME`, `cookie:NAME`, or bare `NAME`); repeat in priority order. Replaces `serve_user_id_sources` from config. |
+| `--access-rules <PATH>` | | Access rules file (default: `access.yaml` in the harnx config directory; env `HARNX_ACCESS_RULES`). Enables identity-based access control. |
 | `--public-url <URL>` | | URL a browser uses to reach the Web UI (default from `config.yaml`; inferred from request when unset). |
 | `--model <MODEL>` | `-m` | Select a specific LLM model to use. |
 | `--dry-run` | | Echo prompts instead of sending them to the LLM. |
@@ -90,13 +91,15 @@ never used as a persistence or routing key.
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Accept: text/event-stream` | **Subscription Plane**: SSE event stream. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Content-Type: application/json` | **Control Plane**: JSON-RPC 2.0 interface. |
 | `GET` | `/v1/agents/:agent/sessions/:session/attachments/:cid` | `image/*` | Retrieve attachment blob by content-ID. |
-| `GET` | `/v1/cid/:encoded_cid` | `*/*` | Resolve any `cid:` URL as a bearer capability. |
+| `GET` | `/v1/cid/:encoded_cid` | `*/*` | Resolve `cid:` URL (bearer capability when rules are off; session-authorized when rules are on). |
 
 ### CID Resolution
 
 `GET /v1/cid/:encoded_cid` serves content-addressed blobs addressed by canonical `cid:` URLs:
 - `{encoded_cid}` is the full `cid:media:` or `cid:plan:` URL, percent-encoded.
-- **Bearer capability**: the URL itself authorizes access; no session membership check.
+- **Authorization**:
+  - **Rules disabled**: Bearer capability; the URL itself authorizes access without session checks.
+  - **Rules enabled**: The server validates caller permissions against the owning session embedded in the CID. Inline/temporary sessions (`SessionRef.agent == None`) and unauthorized callers return HTTP 404 (with no ETag leaked).
 - Resolves via `harnx_blob_store::resolve`, which handles both media object store and plan KV rendering.
 - **Security headers** on all responses:
   - `X-Content-Type-Options: nosniff`
@@ -105,21 +108,20 @@ never used as a persistence or routing key.
   - `inline`: `text/plain` and non-SVG raster images (`image/jpeg`, `image/png`, `image/gif`, `image/webp`).
   - `attachment`: HTML, SVG, PDF, markdown, and all other types (forced download).
 - **Caching**:
-  - `cid:media`: `public, max-age=31536000, immutable` (content-addressed, never changes).
-  - `cid:plan`: `no-cache` with ETag (revision-based); `If-None-Match` returns `304 Not Modified`.
+  - **Rules disabled**: `cid:media` emits `public, max-age=31536000, immutable`; `cid:plan` emits `no-cache` with ETag (`If-None-Match` returns `304 Not Modified`).
+  - **Rules enabled**: Protected responses (including conditional `304 Not Modified` on plans) emit `Cache-Control: private, no-store`. Shared reverse proxies and CDNs should be purged when enabling access rules.
 
-Errors: 400 for malformed CIDs, 404 if blob not found.
+Errors: 400 for malformed CIDs, 404 if blob not found or caller is unauthorized.
 
 ### Attachment Retrieval
 
 `GET /v1/agents/:agent/sessions/:session/attachments/:cid` returns attachment blob bytes:
 - `{cid}` must be canonical `cid:` + 64 hex characters (URL-encoded as `cid%3A<hex>`).
 - Validates CID membership in the session log before storage access — session scoping is the access control.
+- When access rules are enabled, callers must also have permission to access the session.
 - Reads local content-addressed cache first, falls back to NATS ObjectStore.
 - MIME allowlist: `image/png`, `image/jpeg`, `image/webp`, `image/gif`. Returns `415 Unsupported Media Type` for other types.
 - Headers: `Content-Type: <mime>`, `X-Content-Type-Options: nosniff`, `Cache-Control: private, max-age=86400`.
-
-Note: harnx-serve routes are unauthenticated by design. This is the first route serving raw blob bytes.
 
 ### Session Listing and Pagination
 
@@ -291,7 +293,9 @@ Same canonical session URL, negotiated into programmatic control.
 
 ### Client Implementation Flow
 
-1. **Create**: `POST` the session collection and use the returned `session_id` as the URL, NATS stream, and persistence identity. Clients that choose their own session IDs can skip this POST: send `session/prompt` to the chosen session URL to create the session and admit its first prompt.
+1. **Create**: `POST` the session collection (`POST /v1/agents/{agent}/sessions`) and use the returned `session_id` as the URL, NATS stream, and persistence identity.
+   - When access control rules are active, callers **must** reserve a session ID via this `POST` endpoint before prompting.
+   - When access rules are disabled, clients that choose their own session IDs can skip this POST: send `session/prompt` to the chosen session URL to create the session and admit its first prompt.
 2. **Connect**: Open the session event feed and use promptless AG-UI runs to hydrate or join an active run. An attach after prompt admission waits for a worker or durable completion even before the worker claims the lease. If no worker claims it within `nats_lease_acquisition_timeout_secs` (default 60 seconds), the stream closes with `RUN_ERROR`, not a false `RUN_FINISHED`. This observation timeout doesn't cancel the prompt. Restore the worker and attach again, or explicitly cancel the pending turn; unanswered durable input remains `running` until completed, failed, cancelled, or retracted.
 3. **Drive**: Use JSON-RPC on the same canonical session URL to send prompts
    (`session/prompt`) and interrupt runs (`session/cancel`).
@@ -485,7 +489,7 @@ harnx-serve \
 
 `harnx-serve` does not authenticate identity headers or cookies; it treats resolved values as opaque strings. The upstream proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. Header sources use the first comma-separated value, so appending a trusted identity after an untrusted value still permits spoofing. Cookie sources must also contain only proxy-trusted identity values.
 
-`user_id` is visible in session listings to anyone who can list that agent's sessions. There is no per-user listing authorization. Use a non-secret account identifier, not access tokens, signed JWTs, or secret-bearing session cookies such as `_oauth2_proxy`. Values are stored as-is, not decrypted or verified; they remain in session metadata until the session is removed.
+`user_id` is visible in session listings to callers permitted to view those sessions. When access rules are disabled, there is no per-user listing authorization. Use a non-secret account identifier, not access tokens, signed JWTs, or secret-bearing session cookies such as `_oauth2_proxy`. Values are stored as-is, not decrypted or verified; they remain in session metadata until the session is removed.
 
 ### Precedence and Immutability
 
@@ -499,6 +503,26 @@ Blank explicit or inherited identity strings count as absent. Invalid request id
 
 Session user identity is stored once when the session metadata is created. It is immutable and never overwritten by subsequent prompts, handoffs into an existing session, or reconnecting callers. Concurrent creators use the identity of the first successful metadata creation. Promptless subscriptions and control commands don't create metadata; cancelling a never-prompted attached session is an idle no-op, and compacting it returns session not found.
 
+
+## Access Control (`access.yaml`)
+
+`harnx-serve` supports optional identity-based access control rules gating agent visibility, session access, and attachment downloads. See the comprehensive [Access Control section in the Configuration Guide](../../docs/configuration-guide.md#access-control-accessyaml) for full syntax and examples.
+
+### Enabling Rules
+- Place `access.yaml` in your harnx configuration directory (`~/.config/harnx/access.yaml`), or pass `--access-rules <PATH>` (env `HARNX_ACCESS_RULES`).
+- When access rules are enabled, `harnx-serve` **requires** at least one trusted caller identity source via `--user-id-source` or `serve_user_id_sources` in `config.yaml`. Startup fails closed if rules are enabled without configured identity sources.
+- When no rules file or flag is provided, access control is disabled and `harnx-serve` operates without authorization checks.
+
+### Behavior Under Rules
+- **Authentication**: Unauthenticated requests to `/v1/agents*` and `/v1/cid/*` return HTTP `401 Unauthorized`. Endpoints outside these paths (`/v1/models`, healthz, OPTIONS, and static web assets) remain open.
+- **Agent Visibility**: Agents for which the caller has no scopes are hidden from `GET /v1/agents` and return HTTP `404 Not Found` across all sub-routes, identical to an unknown agent.
+- **Session Scopes**:
+  - `prompt`: Authorizes creating sessions on the agent and accessing sessions owned by the caller.
+  - `admin`: Authorizes viewing, operating, compacting, and cancelling sessions owned by any user (and legacy unowned sessions). Does not grant creation permission.
+  - Callers holding only `admin` scope receive HTTP `403 Forbidden` (`session creation requires prompt scope`) when attempting to create a session.
+- **Pre-allocation Requirement**: Callers must reserve a session ID via `POST /v1/agents/{agent}/sessions` before prompting. Implicit session creation on unreserved session IDs returns HTTP `404 Not Found`.
+- **Session Listings**: `GET /v1/agents/{agent}/sessions` filters results before pagination, showing only sessions the caller is authorized to access.
+- **CID Attachments**: `/v1/cid/*` validates caller access against the owning session embedded in the CID. Protected responses emit `Cache-Control: private, no-store`. Shared proxy caches should be purged when enabling rules.
 ## Quickstart
 
 1. **Start server:**

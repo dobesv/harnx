@@ -20,6 +20,7 @@ mod backend;
 mod errors;
 mod task_view;
 pub use backend::{Backend, BackendConfig};
+pub use errors::PERMISSION_DENIED_CODE;
 use errors::{map_error, not_found};
 use task_view::{history, paginate, project_task, task_matches, validate_history};
 
@@ -60,7 +61,19 @@ impl HarnxHandler {
         }
     }
     fn owner(&self, params: &ServiceParams) -> Result<Principal, A2AError> {
-        self.identity.resolve_service_params(params)
+        let owner = self.identity.resolve_service_params(params)?;
+        if let Some(rules) = self.backend.store.access_rules() {
+            if owner.user_id().is_none() {
+                return Err(crate::identity::missing_identity());
+            }
+            if !rules.can_see_agent(
+                &self.export.agent_ref(),
+                &owner.user_id().into_iter().collect::<Vec<_>>(),
+            ) {
+                return Err(not_found());
+            }
+        }
+        Ok(owner)
     }
     async fn session(
         &self,

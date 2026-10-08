@@ -17,6 +17,17 @@ impl RequestUserId {
 }
 
 impl Server {
+    /// `None` means checks are disabled. Missing request identity keeps checks on
+    /// with an empty identity set, never falling back to session-owner defaults.
+    pub(crate) fn access<B>(
+        &self,
+        req: &hyper::Request<B>,
+    ) -> Option<(&harnx_core::access_rules::AccessRules, Vec<String>)> {
+        self.access_rules
+            .as_deref()
+            .map(|rules| (rules, RequestUserId::of(req).into_iter().collect()))
+    }
+
     pub(super) fn prepare_request(
         &self,
         req: &mut hyper::Request<Incoming>,
@@ -34,6 +45,17 @@ impl Server {
         match self.identity_sources.resolve(req.headers()) {
             Ok(user_id) => {
                 req.extensions_mut().insert(RequestUserId(user_id));
+                let path = req.uri().path();
+                let protected = path == "/v1/agents"
+                    || path.starts_with("/v1/agents/")
+                    || path.starts_with("/v1/cid/");
+                if protected && self.access(req).is_some_and(|(_, ids)| ids.is_empty()) {
+                    return Some(record_early_http_response(
+                        req,
+                        identity_error_response("missing user identity"),
+                        started,
+                    ));
+                }
                 None
             }
             Err(error) => Some(record_early_http_response(
@@ -60,7 +82,7 @@ fn record_early_http_response(
     response
 }
 
-fn identity_error_response(error: harnx_runtime::identity::IdentityError) -> AppResponse {
+fn identity_error_response(error: impl std::fmt::Display) -> AppResponse {
     let mut response = ret_err(error);
     *response.status_mut() = StatusCode::UNAUTHORIZED;
     response
