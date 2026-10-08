@@ -6,7 +6,7 @@
 
 Use `harnx-a2a-server` when you want external A2A clients—such as Atlassian Forge Jira remote agents (`rovo:agentConnector`), the `a2a-python` SDK, Google ADK, `a2a-inspector`, or LangGraph—to invoke harnx agents.
 
-Each exported agent gets its own JSON-RPC endpoint and public Agent Cards under `/agents/{name}`. Incoming requests create or resume durable, NATS-backed harnx sessions. The server handles task supervision, event streaming, deduplication, and session-scoped task persistence.
+Each exported agent gets its own JSON-RPC endpoint and Agent Cards under `/agents/{name}`. Incoming requests create or resume durable, NATS-backed harnx sessions. The server handles task supervision, event streaming, deduplication, and session-scoped task persistence.
 
 ## CLI Flags and Options
 
@@ -21,6 +21,7 @@ Usage: harnx-a2a-server [OPTIONS] --agent <SPEC>
 | `--agent <SPEC>` | *(required)* | Agent export specification: bare `name` or `alias=name`. Repeatable, comma-separated. Environment variable `HARNX_A2A_AGENTS`. Specifying CLI flags replaces `HARNX_A2A_AGENTS`. There is no default "expose all" mode; at least one agent is required. |
 | `--cluster <CLUSTER>` | none | Target NATS cluster name for shared workers. |
 | `--config-dir <PATH>` | `HARNX_CONFIG_DIR` | Path to the harnx configuration directory containing `config.yaml`. |
+| `--access-rules <PATH>` | `<config dir>/access.yaml` if present | Access rules file, also set by `HARNX_ACCESS_RULES`. Requires `--user-id-header` when rules are enabled. |
 | `--public-base-url <URL>` | none | Base URL used in Agent Card interface URLs (for example, `https://agents.example.com`). If omitted, inferred from `X-Forwarded-*` or `Host` headers. |
 | `--user-id-header <NAME>` | none | Trusted identity source: bare header name, `header:NAME`, or `cookie:NAME` (repeatable, first present source wins). Empty or invalid values fail closed. Enables user isolation mode. |
 | `--max-data-part-bytes <BYTES>` | `65536` | Maximum combined byte budget for rendered data and inline text/JSON file parts per message. Over-limit requests return an invalid params error. |
@@ -60,11 +61,11 @@ An agent can be addressed by three URL segment forms:
 
 **Public URLs never contain `%2F`**: In generated Agent Cards, `supportedInterfaces[].url` always uses the explicit alias if configured, or the sanitized `pkg__agent` form. Reverse proxies never receive `%2F` from public cards.
 
-Agent Cards are public discovery documents and never require authentication or user identity headers.
+Agent Cards are public when access rules are disabled. With access rules enabled, cards require a trusted user identity and return HTTP 404 for hidden agents.
 
 ## Context and Task Semantics
 
-- **Server-allocated contexts**: `contextId` is identical to the durable harnx session ID. Contexts are strictly allocated by the server. Incoming requests containing an unknown or foreign `contextId` are rejected with `TaskNotFoundError` (`-32001`). Clients cannot invent context IDs.
+- **Server-allocated contexts**: `contextId` is identical to the durable harnx session ID. Contexts are strictly allocated by the server. Incoming requests containing an unknown or unauthorized `contextId` are rejected with `TaskNotFoundError` (`-32001`). Clients cannot invent context IDs. With access rules enabled, `admin` can operate another user's context on the same export; creating a context still requires `prompt`.
 - **Task ID format**: Task IDs are opaque strings formatted as `{contextId}.{uuid}`. Because harnx session IDs are base64url strings without dots, the dot cleanly delimits the context ID from the task UUID.
 - **One active task per context**: A context can execute only one task at a time. If a client sends a new prompt to a context while a task is still running, the server rejects the request with code `-32000` ("context has an active task; retry later").
 - **Message deduplication**: Requests are deduped by `messageId`.
@@ -121,18 +122,39 @@ The server emits JSON-RPC 2.0 error responses with structured `google.rpc.ErrorI
 | Code | Reason | Description |
 |---|---|---|
 | `-32000` | Server-specific | Missing or empty user identity header (HTTP 401), or busy context (active task in progress). |
-| `-32001` | `TASK_NOT_FOUND` | Task or server-allocated context does not exist, or belongs to another user/export. |
+| `-32001` | `TASK_NOT_FOUND` | Task or server-allocated context does not exist, or the caller can't access its agent, owner or export. |
 | `-32002` | `TASK_NOT_CANCELABLE` | Task is already in a terminal state (`COMPLETED`, `FAILED`, `CANCELED`). |
 | `-32003` | `PUSH_NOT_SUPPORTED` | Push notification configuration requested (push notifications unsupported). |
 | `-32004` | `UNSUPPORTED_OPERATION` | `SubscribeToTask` called on a task that is already terminal, or extended cards requested. |
 | `-32005` | `CONTENT_TYPE_NOT_SUPPORTED` | Unsupported raw file media type in message part. |
 | `-32009` | `VERSION_NOT_SUPPORTED` | Unsupported explicit `A2A-Version` header. |
+| `-32010` | Server-specific permission denial | Access rules are enabled and creating a context requires `prompt` scope (`session creation requires prompt scope`). |
 | `-32600` | `INVALID_REQUEST` | Malformed JSON-RPC envelope or invalid parameters shape. |
 | `-32601` | `METHOD_NOT_FOUND` | Unrecognized JSON-RPC method. |
 | `-32602` | `INVALID_PARAMS` | Validation failure: oversized data part, missing required fields, `ListTasks` missing `contextId`, or duplicate `messageId` with different content. |
 | `-32603` | `INTERNAL_ERROR` | Internal server or worker execution error. |
 | `-32700` | `PARSE_ERROR` | Request body is not valid JSON. |
 
+
+## Access Control (`access.yaml`)
+
+`harnx-a2a-server` supports optional identity-based access control rules gating agent exports, Agent Cards, and task/context lifecycles. See the [Access Control section in the Configuration Guide](../../docs/configuration-guide.md#access-control-accessyaml) for full configuration details.
+
+### Enabling Rules
+- Pass `--access-rules <PATH>` on the CLI or set `HARNX_ACCESS_RULES`. If unspecified, the server automatically checks `<config-dir>/access.yaml`.
+- When access rules are enabled, `--user-id-header` is **required**. Startup fails closed if rules are active without configured identity headers.
+- When no rules file or flag is present, access control is disabled and standard A2A behavior applies.
+
+### Behavior Under Rules
+- **Authentication**: All endpoints under `/agents/{name}`, including Agent Cards and discovery GET requests, require trusted caller identity and return HTTP `401 Unauthorized` (JSON-RPC error code `-32000`) if missing. (When access rules are disabled, Agent Cards remain public).
+- **Agent Reference Matching**: Rules are evaluated against the internal agent reference (`Export::agent_ref()`, such as `coder` or `coder@cluster`), **never** against public export aliases (such as `alias=coder`).
+- **Hidden Exports**: Exports for which the caller has no scope return HTTP `404 Not Found` for HTTP discovery and JSON-RPC `-32001` (`task not found`) for RPC requests, preventing enumeration.
+- **Context and Task Permissions**:
+  - `prompt`: Authorizes creating new contexts/tasks and continuing own contexts.
+  - `admin`: Authorizes listing, reading, and continuing tasks in existing contexts across all users (and legacy unowned contexts). Does not grant creation permission.
+  - Context creation without `prompt` scope returns JSON-RPC permission error code `-32010` (`session creation requires prompt scope`).
+  - Accessing another user's context without `admin` scope returns JSON-RPC `-32001` (`task not found`).
+- **ListTasks Scoping**: `ListTasks` requires `contextId`. Callers with `prompt` scope can list tasks in their own contexts; callers with `admin` scope can list tasks in any authorized context.
 ## Deploying Behind a Reverse Proxy
 
 In production, run `harnx-a2a-server` behind a reverse proxy (such as Nginx, Envoy, or Cloudflare).

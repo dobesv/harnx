@@ -20,18 +20,46 @@ pub fn router<H: a2a_server_lf::handler::RequestHandler>(
     user_id_headers: &[String],
     handler: impl Fn(&Export, identity::Identity) -> Arc<H>,
 ) -> anyhow::Result<Router> {
+    router_with_access_rules(exports, public_base_url, user_id_headers, None, handler)
+}
+
+/// Protect RPC and discovery with rules matched against the internal agent ref.
+pub fn router_with_access_rules<H: a2a_server_lf::handler::RequestHandler>(
+    exports: &[Export],
+    public_base_url: Option<&str>,
+    user_id_headers: &[String],
+    access_rules: Option<Arc<harnx_core::access_rules::AccessRules>>,
+    handler: impl Fn(&Export, identity::Identity) -> Arc<H>,
+) -> anyhow::Result<Router> {
     let public_base_url = web_url::normalize_public_base_url(public_base_url)?;
     let identity = identity::Identity::new(user_id_headers)?;
+    identity.validate_access_rules(access_rules.is_some())?;
     Ok(router_with(exports, |export| {
-        // Layer RPC before merging discovery: cards must remain public.
-        jsonrpc_router(handler(export, identity.clone()))
+        let rpc = jsonrpc_router(handler(export, identity.clone()))
             .route_layer(axum::middleware::from_fn(crate::sse::headers))
-            .route_layer(axum::middleware::from_fn(crate::compat::normalize))
-            .route_layer(axum::middleware::from_fn_with_state(
+            .route_layer(axum::middleware::from_fn(crate::compat::normalize));
+        let cards = agent_card::router(export, public_base_url.as_deref());
+        if let Some(rules) = &access_rules {
+            rpc.merge(cards)
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::access::ExportAccess {
+                        agent_ref: export.agent_ref(),
+                        rules: rules.clone(),
+                    },
+                    crate::access::require_visible_export,
+                ))
+                .layer(axum::middleware::from_fn_with_state(
+                    identity.clone(),
+                    identity::require_identity,
+                ))
+        } else {
+            // Rules off keeps discovery public, even with identity configured.
+            rpc.route_layer(axum::middleware::from_fn_with_state(
                 identity.clone(),
                 identity::require_identity,
             ))
-            .merge(agent_card::router(export, public_base_url.as_deref()))
+            .merge(cards)
+        }
     }))
 }
 

@@ -9,6 +9,23 @@ use crate::ag_ui::{
 };
 use crate::ag_ui_sync::frame_run_error_event;
 
+/// Connection drain deadline and per-stream reconnect delays for server shutdown.
+/// Stream delays are clamped to the remaining connection drain time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShutdownConfig {
+    pub drain_timeout: Duration,
+    pub stream_drain: StreamDrainConfig,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            drain_timeout: crate::DEFAULT_DRAIN_TIMEOUT,
+            stream_drain: StreamDrainConfig::default(),
+        }
+    }
+}
+
 /// Per-stream delay bounds used to stagger AG-UI reconnects during shutdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamDrainConfig {

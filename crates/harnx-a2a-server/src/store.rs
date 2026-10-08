@@ -19,7 +19,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use harnx_core::crypto::sha256;
+use harnx_core::{access_rules::AccessRules, crypto::sha256};
 use harnx_runtime::nats_session_metadata::{a2a_message_key, a2a_task_key, SessionMetadataStore};
 
 use crate::exports::Export;
@@ -138,9 +138,22 @@ pub fn message_fingerprint(parts: &[a2a_lf::Part]) -> String {
 }
 
 /// Check the session binding against the resolved export and owner.
-/// Unknown exports and foreign owners are indistinguishable from missing contexts.
-pub fn validate_binding(binding: &A2aBinding, export: &Export, owner: &Principal) -> bool {
-    binding_matches_export(binding, export) && binding.owner.as_deref() == owner.user_id()
+/// Mismatched exports and unauthorized owners look like missing contexts.
+pub fn validate_binding(
+    binding: &A2aBinding,
+    export: &Export,
+    owner: &Principal,
+    access_rules: Option<&AccessRules>,
+) -> bool {
+    binding_matches_export(binding, export)
+        && match access_rules {
+            Some(rules) => rules.can_access_session(
+                &export.agent_ref(),
+                &owner.user_id().into_iter().collect::<Vec<_>>(),
+                binding.owner.as_deref(),
+            ),
+            None => binding.owner.as_deref() == owner.user_id(),
+        }
 }
 
 fn binding_matches_export(binding: &A2aBinding, export: &Export) -> bool {
@@ -230,15 +243,29 @@ pub struct TaskChanges {
 pub struct A2aStore {
     store: SessionMetadataStore,
     dedupe_lru: DedupeLru,
+    access_rules: Option<Arc<AccessRules>>,
 }
 
 impl A2aStore {
     /// Create a new A2A store wrapper.
     pub fn new(store: SessionMetadataStore) -> Self {
+        Self::new_with_access_rules(store, None)
+    }
+
+    /// Use the same rules for every context lookup, including runner operations.
+    pub fn new_with_access_rules(
+        store: SessionMetadataStore,
+        access_rules: Option<Arc<AccessRules>>,
+    ) -> Self {
         Self {
             store,
             dedupe_lru: create_dedupe_lru(),
+            access_rules,
         }
+    }
+
+    pub fn access_rules(&self) -> Option<&AccessRules> {
+        self.access_rules.as_deref()
     }
 
     /// Resolve and authorize before resuming a runtime session. Never creates metadata.
@@ -252,7 +279,7 @@ impl A2aStore {
         Ok(self
             .get_binding(&key)
             .await?
-            .filter(|binding| validate_binding(binding, export, owner))
+            .filter(|binding| validate_binding(binding, export, owner, self.access_rules()))
             .map(|_| key))
     }
 
@@ -790,9 +817,55 @@ mod tests {
         let (binding, mut export) = binding_fixture();
         export.public_name = case.public_name.into();
         assert_eq!(
-            validate_binding(&binding, &export, &Principal::User(case.owner.into())),
+            validate_binding(&binding, &export, &Principal::User(case.owner.into()), None),
             case.matches
         );
+    }
+
+    #[test]
+    fn access_validate_binding_scopes_preserve_export_version_agent_cluster_checks() {
+        harnx_core::require_nextest();
+        let rules = AccessRules::from_yaml(
+            "rules:\n  - agents: [pkg/agent@local]\n    users: [alice, bob]\n  - agents: [pkg/agent@local]\n    users: [admin]\n    scopes: [admin]\n",
+        ).unwrap();
+        let (binding, export) = binding_fixture();
+        let alice = Principal::User("alice".into());
+        let bob = Principal::User("bob".into());
+        let admin = Principal::User("admin".into());
+        assert!(validate_binding(&binding, &export, &alice, Some(&rules)));
+        assert!(!validate_binding(&binding, &export, &bob, Some(&rules)));
+        assert!(validate_binding(&binding, &export, &admin, Some(&rules)));
+        assert!(!validate_binding(&binding, &export, &admin, None));
+        let mut legacy = binding.clone();
+        legacy.owner = None;
+        assert!(!validate_binding(&legacy, &export, &alice, Some(&rules)));
+        assert!(validate_binding(&legacy, &export, &admin, Some(&rules)));
+        assert!(validate_binding(
+            &legacy,
+            &export,
+            &Principal::Anonymous,
+            None
+        ));
+        assert!(!validate_binding(
+            &legacy,
+            &export,
+            &Principal::Anonymous,
+            Some(&rules)
+        ));
+        for field in ["version", "export", "agent", "cluster"] {
+            let mut wrong = binding.clone();
+            match field {
+                "version" => wrong.version += 1,
+                "export" => wrong.export = "other-export".into(),
+                "agent" => wrong.agent = "other-agent".into(),
+                "cluster" => wrong.cluster = "other-cluster".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                !validate_binding(&wrong, &export, &admin, Some(&rules)),
+                "{field}"
+            );
+        }
     }
 
     #[test]

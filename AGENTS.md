@@ -981,6 +981,21 @@ properties (`dev.harnx.session_properties`): a row in `PROPERTY_DEFINITIONS`
 line in `harnx_write_session_meta`'s description and whether sub-agent
 sessions inherit it. See "Session properties" in `docs/nats-ha.md`.
 
+### HTTP Test Clients and Proxy Environments
+
+Integration tests for harnx-serve that make loopback HTTP requests **must disable ambient proxy configuration** to avoid malformed `Accept` headers. HTTP proxies may aggregate repeated `Accept` fields (e.g. `Accept: text/html` followed by `Accept: text/event-stream`) into a single comma-separated value, which breaks content negotiation.
+
+In the test fixture client, use `.no_proxy()`:
+
+```rust
+let client = Client::builder()
+    .no_proxy()
+    .timeout(Duration::from_secs(60))
+    .build()?;
+```
+
+Tests inherit `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` env vars from the test runner's environment. Sandboxing that strips these variables exposes the real header-handling behavior. The `Accept` multi-field parsing fix (`HeaderMap::get_all`) ensures repeated fields behave identically to comma-joined values.
+
 ### Session user identity
 
 `user_id` is a read-only session property set only when canonical metadata is
@@ -1051,7 +1066,7 @@ URL components:
 - `<slug>` and `<id>`: URL-safe slug identifiers (`[a-z0-9-]+`).
 
 Operational properties:
-- **Capability URL**: The URL is the capability (bearer token). Access is granted by possession of the URL; there are no per-resource ACLs.
+- **Capability URL**: When access rules are off, the URL is the capability (bearer token) — possession grants access without per-resource ACLs. When access rules are enabled, `/v1/cid/*` requires a valid session-authorization check against the caller identity (see `cid.rs` — authorization runs before blob resolution and ETag handling).
 - **Activity renewal**: Any attachment or plan read or write touches the owning session's activity timestamp (`SessionActivity.last_activity_at`), debounced in-process to at most one write per hour. This resets the session retention clock while resources remain in active use.
 - **Session deletion cascade**: Session deletion (`delete_owner`) purges both `media/<owner>/` objects in `harnx_attachments` and `plan/<owner>/` keys in `harnx_plans`.
 - **Plans storage location**: Plans live exclusively in NATS JetStream KV (`harnx_plans`); previous filesystem storage under `.agent` is retired.

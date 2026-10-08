@@ -7,7 +7,7 @@ use crate::{
     store::A2aStore,
 };
 use anyhow::{Context, Result};
-use harnx_core::abort::AbortSignal;
+use harnx_core::{abort::AbortSignal, access_rules::AccessRules};
 use harnx_runtime::{
     config::{Config, ConfigLock, NatsRouting, LOCAL_CLUSTER_KEY},
     local_orchestrator::{activation_route_for_cluster_with_config_dir, LocalWorkerSupervisor},
@@ -32,6 +32,7 @@ impl Bootstrap {
         exports: &[Export],
         config_dir: Option<&Path>,
         abort: AbortSignal,
+        access_rules: Option<Arc<AccessRules>>,
     ) -> Result<Self> {
         let config_path = config_dir
             .map(|dir| dir.join("config.yaml"))
@@ -67,8 +68,9 @@ impl Bootstrap {
                 cluster_config.nats_server(cluster)?.resolved_replicas()
             };
             let jetstream = cluster_config.nats_jetstream(cluster).await?;
-            let store = Arc::new(A2aStore::new(
+            let store = Arc::new(A2aStore::new_with_access_rules(
                 SessionMetadataStore::ensure(&jetstream, replicas).await?,
+                access_rules.clone(),
             ));
             let runner = Runner::new(store.clone());
             let backend = Backend::new(

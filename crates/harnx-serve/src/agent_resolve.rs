@@ -59,7 +59,7 @@ fn resolved_target(
 
 /// Validates path safety after parsing so encoded remote refs cannot hide an unsafe bare agent.
 fn validate_agent_reference(config: &Config, agent_ref: &str) -> Result<(), AgUiError> {
-    let not_found = || AgUiError::NotFound(format!("agent '{agent_ref}' not found"));
+    let not_found = || agent_not_found(agent_ref);
     match AgentRef::parse(agent_ref) {
         AgentRef::Local(agent) => {
             if !is_safe_agent_path(agent.as_ref()) {
@@ -79,4 +79,8 @@ fn validate_agent_reference(config: &Config, agent_ref: &str) -> Result<(), AgUi
                 .map_err(|err| AgUiError::BadRequest(err.to_string()))
         }
     }
+}
+
+pub(crate) fn agent_not_found(agent_ref: &str) -> AgUiError {
+    AgUiError::NotFound(format!("agent '{agent_ref}' not found"))
 }

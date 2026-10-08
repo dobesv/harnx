@@ -2,6 +2,16 @@
 use crate::{input_map::InputMapError, runner::RunnerError, store::StoreError};
 use a2a_lf::A2AError;
 
+/// Server-defined permission error, outside A2A's -32001..-32009 codes.
+pub const PERMISSION_DENIED_CODE: i32 = -32010;
+
+pub(super) fn permission_denied() -> A2AError {
+    A2AError::new(
+        PERMISSION_DENIED_CODE,
+        "session creation requires prompt scope",
+    )
+}
+
 pub(super) fn not_found() -> A2AError {
     A2AError::new(-32001, "task not found")
 }

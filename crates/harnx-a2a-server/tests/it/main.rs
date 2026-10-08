@@ -1,3 +1,4 @@
+mod access;
 mod compat;
 mod e2e;
 mod runner;

@@ -25,6 +25,9 @@ struct Cli {
     /// Replaces serve_user_id_sources from config when supplied.
     #[clap(long = "user-id-source", value_name = "SOURCE", action = clap::ArgAction::Append)]
     user_id_sources: Vec<String>,
+    /// Access rules file (default: access.yaml in the harnx config directory)
+    #[clap(long, value_name = "PATH", env = "HARNX_ACCESS_RULES")]
+    access_rules: Option<PathBuf>,
     /// URL a browser uses to reach the Web UI, such as https://harnx.example.com
     /// (default from config.yaml; inferred from each request when unset)
     #[clap(long, value_name = "URL")]
@@ -102,13 +105,17 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
         Duration::from_millis(cli.stream_drain_min_jitter_ms),
         Duration::from_millis(cli.stream_drain_max_jitter_ms),
     )?;
+    let access_rules = harnx_runtime::access::load_access_rules(cli.access_rules)?;
     Ok(harnx_serve::run_with_shutdown_config(
         config,
         cli.addr,
         cli.web_assets,
         readiness,
-        Duration::from_secs(cli.drain_timeout_seconds),
-        stream_drain,
+        harnx_serve::ShutdownConfig {
+            drain_timeout: Duration::from_secs(cli.drain_timeout_seconds),
+            stream_drain,
+        },
+        access_rules,
     )
     .await
     .err())
@@ -118,6 +125,28 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
 mod tests {
     use super::Cli;
     use clap::Parser;
+
+    #[test]
+    fn access_rules_flag_has_env_fallback_and_cli_precedence() {
+        harnx_core::require_nextest();
+        let previous = std::env::var_os("HARNX_ACCESS_RULES");
+        // Nextest runs this test in its own process; no other tests share this env.
+        unsafe { std::env::set_var("HARNX_ACCESS_RULES", "env-access.yaml") };
+        let from_env = Cli::try_parse_from(["harnx-serve"]);
+        let from_flag = Cli::try_parse_from(["harnx-serve", "--access-rules", "cli-access.yaml"]);
+        match previous {
+            Some(value) => unsafe { std::env::set_var("HARNX_ACCESS_RULES", value) },
+            None => unsafe { std::env::remove_var("HARNX_ACCESS_RULES") },
+        }
+        assert_eq!(
+            from_env.unwrap().access_rules,
+            Some("env-access.yaml".into())
+        );
+        assert_eq!(
+            from_flag.unwrap().access_rules,
+            Some("cli-access.yaml".into())
+        );
+    }
 
     #[test]
     fn parses_ordered_repeatable_user_id_sources() {

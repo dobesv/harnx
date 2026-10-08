@@ -1,6 +1,6 @@
 //! Ordered SendMessage checks under the dedupe/admission gate.
 use super::{
-    errors::{map_error, not_found},
+    errors::{map_error, not_found, permission_denied},
     task_view::validate_history,
     Admission, HarnxHandler,
 };
@@ -96,6 +96,13 @@ impl HarnxHandler {
                 .await
                 .map_err(map_error)?
                 .ok_or_else(not_found)?;
+        } else if self.backend.store.access_rules().is_some_and(|rules| {
+            !rules.can_create_session(
+                &self.export.agent_ref(),
+                &owner.user_id().into_iter().collect::<Vec<_>>(),
+            )
+        }) {
+            return Err(permission_denied());
         }
         match &request.message.task_id {
             Some(id) => self.task(owner, id).await.map(Some),

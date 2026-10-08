@@ -25,6 +25,7 @@ Harnx organizes configuration into the following structure:
 ```text
 ~/.config/harnx/
 ├── config.yaml          # Global settings
+├── access.yaml          # Agent and session access control rules (optional)
 ├── clients/             # LLM provider configurations
 │   ├── openai.yaml
 │   └── claude.yaml
@@ -562,3 +563,126 @@ serve_user_id_sources:
   - "header:X-Forwarded-Email"
   - "cookie:session_user"
 ```
+
+## Access Control (`access.yaml`)
+
+`harnx-serve` and `harnx-a2a-server` support optional, identity-based access control rules defined in `access.yaml`.
+
+When access rules are enabled, incoming requests are matched against the rules by caller identity. The servers decide which agents the caller can see, which sessions they can create or access, and which attachments they can retrieve. When no rules file is configured, access control is disabled and servers remain open as before.
+
+### File Location and Options
+
+**Restart required**: Access rules are compiled once at server startup. Modifying, adding, or removing rules requires a server restart; there is no hot-reload. To revoke access immediately, remove the rules file or update its contents and restart both `harnx-serve` and `harnx-a2a-server`.
+
+- **Default location**: `<user-config-dir>/harnx/access.yaml`. If this file exists, access control is enabled automatically. If it does not exist, access control remains disabled.
+- **Explicit path**: Pass `--access-rules <PATH>` on the CLI or set the `HARNX_ACCESS_RULES` environment variable. When an explicit path is provided, the file must exist; startup fails if the file is missing or invalid.
+- **Identity source requirement**: When access rules are enabled, servers require a trusted identity source (`serve_user_id_sources` or `--user-id-source` in `harnx-serve`, `--user-id-header` in `harnx-a2a-server`). If rules are enabled without configured identity sources, startup fails immediately.
+
+### Rule Format
+
+An `access.yaml` file defines a list of rules under the `rules` key:
+
+```yaml
+rules:
+  - agents:
+      - sisyphus
+      - daedalus
+      - "coding/*"
+    scopes:
+      - prompt
+    users:
+      - "alice@example.com"
+      - "bob@example.com"
+```
+
+Each rule contains:
+- **`agents`** *(required list of strings)*: Globs matching agent references.
+- **`scopes`** *(optional list of strings)*: Granted permissions. Allowed values are `prompt` and `admin`. If omitted, defaults to `[prompt]`. An empty list (`scopes: []`) is a configuration error.
+- **`users`** *(required list of strings)*: Globs matching caller user identity strings.
+
+Unknown YAML fields are rejected (`deny_unknown_fields`).
+
+#### Reusable Groups with YAML Anchors
+
+Standard YAML anchors (`&name`) and aliases (`*name`) allow defining reusable user lists and agent groups within the `rules` list:
+
+```yaml
+rules:
+  - agents: &core_agents
+      - sisyphus
+      - daedalus
+    scopes:
+      - prompt
+    users: &engineers
+      - "alice@example.com"
+      - "bob@example.com"
+
+  - agents: *core_agents
+    scopes:
+      - admin
+    users:
+      - "lead@example.com"
+```
+
+### Glob Matching Semantics
+
+- **Case-sensitive**: Both `agents` and `users` patterns are case-sensitive.
+- **Whole string**: Patterns match the entire identity or agent string, not substrings.
+- **Wildcard spans commas**: The `*` wildcard matches any sequence of characters, including commas (`,`) and slashes (`/`).
+- **Quoting DN strings**: When matching LDAP/X.500 Distinguished Names containing commas, wrap the pattern in quotes:
+  ```yaml
+  users:
+    - "CN=*,OU=engineering,O=mycorp"
+    - "CN=alice,OU=dev,O=mycorp"
+  ```
+
+### Agent References
+
+- **`harnx-serve`**: Evaluated against the client display reference:
+  - Bare name (`sisyphus`) for agents on the default cluster.
+  - Suffix form (`sisyphus@shared`) for agents on remote clusters.
+- **`harnx-a2a-server`**: Evaluated against the internal agent reference (`Export::agent_ref()`, e.g. `coder` or `coder@cluster`), **never** against public export aliases (such as `alias=coder`). This ensures a single `access.yaml` file functions consistently across both servers.
+
+### Scopes and Permissions
+
+Caller scopes on an agent are the union of all matching rules. A request matching no rules receives no scopes.
+
+| Scope | Granted Permissions |
+|---|---|
+| `prompt` | View the agent; create new sessions; list, read, prompt, and manage sessions owned by the caller (`user_id == caller`). |
+| `admin` | View the agent; list, read, prompt, update metadata, compact, and cancel sessions owned by any user, as well as legacy sessions without an owner. Does **not** grant permission to create new sessions. |
+
+Holding either `prompt` or `admin` makes the agent visible in agent listings and detail routes. Creating a new session or context always requires `prompt` scope. Callers with only `admin` scope cannot create sessions.
+
+### HTTP and JSON-RPC Status Responses
+
+When access rules are enabled:
+
+- **Missing caller identity**: HTTP `401 Unauthorized` (JSON error payload `{ "error": { "message": "missing user identity", ... } }` in `harnx-serve`, or JSON-RPC code `-32000` in A2A).
+- **Hidden agent**: An agent on which the caller holds no scopes returns HTTP `404 Not Found` (or JSON-RPC `-32001` `task not found` in A2A). The response is identical to an unknown agent, preventing enumeration.
+- **Foreign or forbidden session**: Accessing a session owned by another user without `admin` scope returns HTTP `404 Not Found` (or JSON-RPC `-32001`).
+- **Session creation without `prompt`**: Attempting to create a session with only `admin` scope returns HTTP `403 Forbidden` (`session creation requires prompt scope`) in `harnx-serve`, or JSON-RPC code `-32010` in `harnx-a2a-server`.
+- **Pre-allocation required in harnx-serve**: When access rules are active, callers must create and reserve a session ID via `POST /v1/agents/{agent}/sessions` before prompting. Implicit session creation on unreserved session IDs returns HTTP `404 Not Found`.
+
+### CID Attachments and Plans (`/v1/cid/*`)
+
+Attachments and plans addressed by canonical `cid:` URLs embed an owning session reference. When access rules are enabled:
+- The server checks the caller's session permissions before resolving the blob or updating activity timestamps.
+- Unauthorized callers receive HTTP `404 Not Found` (with no ETag leaked).
+- Temp or inline sessions without a named agent (`SessionRef.agent == None`) return `404`.
+- **Cache policy**: Responses emit `Cache-Control: private, no-store`.
+- **Cache purge recommendation**: Enabling access rules does not invalidate entries previously cached by shared reverse proxies or CDNs. When turning on access rules in an existing deployment, purge shared HTTP caches for `/v1/cid/*`.
+
+### Routes Left Open
+
+Access rules protect `/v1/agents` and `/v1/cid/*` routes. Other endpoints remain open:
+- Health and readiness endpoints (`/healthz`, `/readyz`).
+- Model listings and utility endpoints (`/v1/models`, `/v1/embeddings`, `/v1/rerank`).
+- Static Web UI assets and the browser SPA shell.
+- Preflight CORS requests (`OPTIONS`).
+
+### Not Yet Supported
+
+- **`harnx-mcp-server`**: Access rules apply only to `harnx-serve` and `harnx-a2a-server`.
+- **User aliases**: Grouping or expanding user identities via alias mappings ([#2317](https://github.com/dobesv/harnx/issues/2317)) is planned for a future release.
+- **ALB JWT payload decoding**: Decoding signed `x-amzn-oidc-data` JWT claims into user DNs is deferred; use the raw identity header `x-amzn-oidc-identity`.
