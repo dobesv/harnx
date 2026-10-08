@@ -134,6 +134,7 @@ pub enum Script {
     Tool,
     Fail,
     Many,
+    Large,
 }
 
 pub struct Llm {
@@ -163,10 +164,11 @@ async fn completion(
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"secret-token /srv/private https://private.invalid", "type":"invalid_request_error"}}))).into_response();
     }
     assert_eq!(body["stream"], true, "worker must call streaming LLM");
-    let many = llm.script == Script::Many;
+    let many = matches!(llm.script, Script::Many | Script::Large);
     let frames = if many {
+        let text = "x".repeat(if llm.script == Script::Large { 1024 } else { 1 });
         let mut frames = vec![
-            chunk(json!({"content":"x"}), Value::Null);
+            chunk(json!({"content":text}), Value::Null);
             harnx_a2a_server::runner::EVENT_CAPACITY + 5
         ];
         frames.push(chunk(json!({}), json!("stop")));
@@ -301,10 +303,12 @@ fn fixture_config(
     for subdir in ["agents", "clients", "nats_servers"] {
         std::fs::create_dir_all(dir.join(subdir))?;
     }
-    std::fs::write(
-        dir.join("config.yaml"),
-        "model: mock:test\nstream: true\nsave: false\n",
-    )?;
+    let mut config_yaml = "model: mock:test\nstream: true\nsave: false\n".to_owned();
+    if script == Script::Large {
+        // The synthetic load repeats text on purpose; don't test the repeat guard.
+        config_yaml.push_str("loop_detection:\n  output: false\n");
+    }
+    std::fs::write(dir.join("config.yaml"), config_yaml)?;
     std::fs::write(
         dir.join("nats_servers/runner.yaml"),
         format!("url: {url:?}\n"),
@@ -473,4 +477,35 @@ pub fn binary(name: &str) -> Result<PathBuf> {
         path.display()
     );
     Ok(path)
+}
+
+pub async fn list_all_tasks_for_test(
+    store: &A2aStore,
+    export: &Export,
+    owner: &Principal,
+    local_id: &str,
+) -> Result<Option<Vec<TaskRecord>>> {
+    let Some(key) = store.resolve_context(export, owner, local_id).await? else {
+        return Ok(None);
+    };
+
+    let (index, _) = store.get_or_migrate_index(&key, Some(local_id)).await?;
+    let mut records = Vec::new();
+    for entry in index.entries {
+        if let Some(record) = store.get_task(&key, &entry.task_id).await? {
+            anyhow::ensure!(
+                record.version == 1 && record.task.context_id == local_id,
+                "invalid task record"
+            );
+            if harnx_a2a_server::store::to_index_state(record.task.status.state.clone())
+                != entry.state
+                || record.task.status.timestamp != entry.status_timestamp
+            {
+                store.repair_index_best_effort(&key, &record).await;
+            }
+            records.push(record);
+        }
+    }
+    records.sort_by(|a, b| a.task.id.cmp(&b.task.id));
+    Ok(Some(records))
 }

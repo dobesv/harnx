@@ -9,7 +9,8 @@ use crate::{
     input_map::message_to_input,
     runner::{RunnerError, TurnRequest},
     store::{
-        message_fingerprint, parse_task_id, ContextAccess, DedupeKey, MessageIdentity, TaskRecord,
+        message_fingerprint, parse_task_id, ContextAccess, DedupeEntry, DedupeKey, MessageIdentity,
+        TaskRecord,
     },
 };
 use a2a_lf::{A2AError, Message, Role, SendMessageRequest};
@@ -159,17 +160,48 @@ impl HarnxHandler {
         let Some(context) = context else {
             return Ok(false);
         };
-        let records = self
+
+        // Fast path: check index for non-terminal tasks
+        let key = self
             .backend
             .store
-            .list_tasks(&self.export, owner, context)
+            .resolve_context(&self.export, owner, context)
             .await
             .map_err(map_error)?
             .ok_or_else(not_found)?;
+
+        let non_terminal_entries = self
+            .backend
+            .store
+            .list_non_terminal_entries(&key)
+            .await
+            .map_err(map_error)?;
+
+        if non_terminal_entries.is_empty() {
+            // No active tasks
+            return Ok(false);
+        }
+
+        // Load and reconcile only non-terminal tasks
         let mut busy = false;
-        for record in records {
-            if record.task.status.state.is_terminal() {
+        for entry in &non_terminal_entries {
+            let record_opt = self
+                .backend
+                .store
+                .get_task(&key, &entry.task_id)
+                .await
+                .map_err(map_error)?;
+
+            let Some(record) = record_opt else {
+                self.handle_missing_entry(&key, entry).await;
                 continue;
+            };
+
+            if record.task.status.state.is_terminal() {
+                self.backend
+                    .store
+                    .repair_index_best_effort(&key, &record)
+                    .await;
             }
             busy |= !self
                 .reconcile(owner, record)
@@ -251,8 +283,10 @@ impl HarnxHandler {
         if context.is_none() {
             self.backend.store.record_dedupe_lru(
                 lru_key,
-                started.snapshot.task.id.clone(),
-                fingerprint,
+                DedupeEntry {
+                    task_id: started.snapshot.task.id.clone(),
+                    fingerprint,
+                },
             );
         }
         Ok(Admission {

@@ -1,11 +1,13 @@
 //! Session-scoped A2A bytes, CAS, and garbage collection.
 use crate::common::spawn_nats_server;
 use anyhow::Result;
+use chrono::Utc;
 use harnx_core::require_nextest;
 use harnx_runtime::nats_session_metadata::SessionMetadataStore;
 use harnx_runtime::nats_session_metadata::{
     a2a_message_key, a2a_session_prefix, a2a_task_key, a2a_tasks_prefix,
 };
+use harnx_runtime::nats_session_metadata::{TaskIndex, TaskIndexEntry, TaskState};
 
 struct ScenarioKeys {
     key: String,
@@ -131,5 +133,132 @@ async fn a2a_store_bytes_cas_prefix_listing_and_gc() -> Result<()> {
     let updated = assert_cas_update_and_stale_rejection(&store, &keys.task, revision).await?;
     assert_records_listing_and_retrieval(&store, &keys, updated).await?;
     assert_purge_and_cross_agent_isolation(&store, &keys).await?;
+    Ok(())
+}
+
+#[test]
+fn a2a_task_index_maintains_sorted_order() {
+    let mut index = TaskIndex::new();
+    let now = Utc::now();
+    index.add(TaskIndexEntry::new(
+        "c.task3".into(),
+        TaskState::Submitted,
+        now,
+    ));
+    index.add(TaskIndexEntry::new(
+        "a.task1".into(),
+        TaskState::Submitted,
+        now,
+    ));
+    index.add(TaskIndexEntry::new(
+        "b.task2".into(),
+        TaskState::Submitted,
+        now,
+    ));
+
+    assert_eq!(index.entries.len(), 3);
+    assert_eq!(index.entries[0].task_id, "a.task1");
+    assert_eq!(index.entries[1].task_id, "b.task2");
+    assert_eq!(index.entries[2].task_id, "c.task3");
+}
+
+#[test]
+fn a2a_task_index_add_updates_with_higher_revision() {
+    let mut index = TaskIndex::new();
+    let now = Utc::now();
+    let mut entry = TaskIndexEntry::new("a.task1".into(), TaskState::Submitted, now);
+    entry.task_revision = 1;
+    index.add(entry);
+
+    let mut newer = TaskIndexEntry::new("a.task1".into(), TaskState::Working, now);
+    newer.task_revision = 2;
+    index.add(newer);
+
+    assert_eq!(index.entries.len(), 1);
+    assert_eq!(index.entries[0].state, TaskState::Working);
+    assert_eq!(index.entries[0].task_revision, 2);
+
+    // Stale update rejected
+    let mut stale = TaskIndexEntry::new("a.task1".into(), TaskState::Failed, now);
+    stale.task_revision = 1;
+    index.add(stale);
+
+    assert_eq!(index.entries.len(), 1);
+    assert_eq!(index.entries[0].state, TaskState::Working);
+}
+
+#[test]
+fn a2a_task_index_backward_compat_deserializes_with_task_uuid() {
+    let json = r#"{
+        "entries": [
+            {
+                "task_uuid": "old-uuid-123",
+                "task_id": "ctx.old-uuid-123",
+                "state": "WORKING",
+                "task_revision": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            }
+        ]
+    }"#;
+
+    let index: TaskIndex = serde_json::from_str(json).unwrap();
+    assert_eq!(index.entries.len(), 1);
+    assert_eq!(index.entries[0].task_id, "ctx.old-uuid-123");
+    assert_eq!(index.entries[0].state, TaskState::Working);
+}
+
+#[test]
+fn a2a_task_index_remove_and_get() {
+    let mut index = TaskIndex::new();
+    let now = Utc::now();
+    index.add(TaskIndexEntry::new("ctx.1".into(), TaskState::Working, now));
+    index.add(TaskIndexEntry::new(
+        "ctx.2".into(),
+        TaskState::Completed,
+        now,
+    ));
+
+    assert!(index.get("ctx.1").is_some());
+    assert!(index.get("ctx.3").is_none());
+
+    let removed = index.remove("ctx.1");
+    assert_eq!(removed.unwrap().task_id, "ctx.1");
+    assert_eq!(index.entries.len(), 1);
+    assert_eq!(index.entries[0].task_id, "ctx.2");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a2a_task_index_load_normalizes_legacy_order() -> Result<()> {
+    require_nextest();
+    let server = spawn_nats_server()
+        .await?
+        .expect("nats-server required for A2A index coverage");
+    let client = async_nats::connect(server.url()).await?;
+    let store = SessionMetadataStore::ensure(&async_nats::jetstream::new(client), 1).await?;
+    let mut legacy = TaskIndex::new();
+    legacy.entries.push(TaskIndexEntry::new(
+        "ctx.2".into(),
+        TaskState::Completed,
+        Utc::now(),
+    ));
+    legacy.entries.push(TaskIndexEntry::new(
+        "ctx.1".into(),
+        TaskState::Working,
+        Utc::now(),
+    ));
+    let key = harnx_runtime::nats_session_metadata::a2a_task_index_key("legacy-order");
+    store
+        .kv_store()
+        .put(key, serde_json::to_vec(&legacy)?.into())
+        .await?;
+    let (mut index, _) = store.get_a2a_task_index("legacy-order").await?.unwrap();
+    assert_eq!(index.entries[0].task_id, "ctx.1");
+    let mut updated = index.entries[0].clone();
+    updated.task_revision = 2;
+    updated.state = TaskState::Failed;
+    index.add(updated);
+    assert_eq!(index.entries.len(), 2);
+    assert_eq!(index.get("ctx.1").unwrap().state, TaskState::Failed);
     Ok(())
 }

@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 use harnx_nats_common::leader_reads;
 
 mod a2a;
+mod a2a_index;
 mod activity;
 mod extension_validation;
 mod extensions;
@@ -16,6 +17,7 @@ mod read_state;
 mod run_limits;
 
 pub use a2a::{a2a_message_key, a2a_session_prefix, a2a_task_key, a2a_tasks_prefix};
+pub use a2a_index::{a2a_task_index_key, TaskIndex, TaskIndexEntry, TaskState};
 pub(super) use extension_validation::validate_extensions;
 pub use extensions::SessionExtensionUpdate;
 pub use keys::{
@@ -23,7 +25,7 @@ pub use keys::{
     read_invalidation_subject, run_limits_key, session_prefix,
 };
 pub use lookup::metadata_belongs_to_agent;
-pub(in crate::nats_session_metadata) use mutation::is_cas_conflict;
+pub use mutation::is_cas_conflict;
 pub(in crate::nats_session_metadata) use mutation::PatchGuard;
 
 #[derive(Clone, Debug)]

@@ -1,4 +1,4 @@
-//! Revision filtering sits below the upstream ProtoJSON/JSON-RPC SSE codec.
+//! Stream sequence filtering sits below the upstream ProtoJSON/JSON-RPC SSE codec.
 use crate::{runner::A2aEvent, store::TaskRecord};
 use a2a_lf::{A2AError, StreamResponse};
 use axum::{extract::Request, middleware::Next, response::Response};
@@ -10,25 +10,25 @@ pub(crate) fn task_stream(
     events: Option<broadcast::Receiver<A2aEvent>>,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
     let terminal = snapshot.task.status.state.is_terminal();
-    let revision = snapshot.revision;
+    let sequence = snapshot.stream_seq;
     let first = stream::once(async move { Ok(StreamResponse::Task(snapshot.task)) });
     let updates = stream::unfold(
-        (events, revision, terminal),
-        |(events, mut revision, done)| async move {
+        (events, sequence, terminal),
+        |(events, mut sequence, done)| async move {
             if done {
                 return None;
             }
             let mut events = events?;
             loop {
                 match events.recv().await {
-                    Ok(event) if event.revision <= revision => continue,
+                    Ok(event) if event.sequence <= sequence => continue,
                     Ok(event) => {
-                        revision = event.revision;
+                        sequence = event.sequence;
                         let terminal = event.is_terminal();
-                        return Some((Ok(event.response), (Some(events), revision, terminal)));
+                        return Some((Ok(event.response), (Some(events), sequence, terminal)));
                     }
                     // A bounded receiver cannot recover its lost deltas. Disconnect
-                    // only this client; it can reconnect using a durable snapshot.
+                    // only this client; it can reconnect using a fresh snapshot.
                     Err(_) => return None,
                 }
             }
@@ -77,14 +77,15 @@ mod tests {
             user_msg_id: String::new(),
             user_msg_seq: 0,
             execution_id: String::new(),
-            revision: 5,
+            revision: 2,
+            stream_seq: 5,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
     }
-    fn event(revision: u64, state: TaskState) -> A2aEvent {
+    fn event(sequence: u64, state: TaskState) -> A2aEvent {
         A2aEvent {
-            revision,
+            sequence,
             response: StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                 task_id: "task".into(),
                 context_id: "context".into(),
@@ -98,10 +99,10 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn filters_snapshot_revisions_and_closes_at_terminal() {
+    async fn filters_snapshot_sequences_and_closes_at_terminal() {
         let (tx, rx) = broadcast::channel(16);
-        for revision in [4, 5, 6, 6] {
-            tx.send(event(revision, TaskState::Working)).unwrap();
+        for sequence in [4, 5, 6, 6] {
+            tx.send(event(sequence, TaskState::Working)).unwrap();
         }
         tx.send(event(7, TaskState::Completed)).unwrap();
         tx.send(event(8, TaskState::Working)).unwrap();
@@ -123,8 +124,8 @@ mod tests {
         let (tx, rx) = broadcast::channel(2);
         let mut stream = task_stream(snapshot(TaskState::Working), Some(rx));
         stream.next().await.unwrap().unwrap();
-        for revision in 6..10 {
-            tx.send(event(revision, TaskState::Working)).unwrap();
+        for sequence in 6..10 {
+            tx.send(event(sequence, TaskState::Working)).unwrap();
         }
         assert!(stream.next().await.is_none());
         let mut healthy = tx.subscribe();

@@ -10,19 +10,20 @@ use crate::{
 use a2a_lf::*;
 use a2a_server_lf::{handler::RequestHandler, middleware::ServiceParams};
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::{stream::BoxStream, StreamExt};
 use harnx_runtime::NatsSession;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 mod admission;
 mod backend;
 mod errors;
-mod task_view;
+mod listing;
+pub mod task_view;
 pub use backend::{Backend, BackendConfig};
 pub use errors::PERMISSION_DENIED_CODE;
 use errors::{map_error, not_found};
-use task_view::{history, paginate, project_task, task_matches, validate_history};
+use task_view::{history, validate_history};
 
 struct Admission {
     snapshot: TaskRecord,
@@ -95,12 +96,14 @@ impl HarnxHandler {
             .map_err(map_error)
     }
     async fn task(&self, owner: &Principal, id: &str) -> Result<TaskRecord, A2AError> {
-        self.backend
+        let record = self
+            .backend
             .store
             .get_task_for_export(&self.export, owner, id)
             .await
             .map_err(map_error)?
-            .ok_or_else(not_found)
+            .ok_or_else(not_found)?;
+        Ok(self.backend.runner.live_record(&self.export, record).await)
     }
     async fn reconcile(
         &self,
@@ -124,16 +127,65 @@ impl HarnxHandler {
             .await
             .map_err(map_error)
     }
-    async fn wait_terminal(
+    /// Wait for an admitted task without owning its turn. The point read checks
+    /// context ownership even when called directly by an in-process client.
+    pub async fn wait_terminal(
         &self,
         owner: &Principal,
-        mut record: TaskRecord,
+        task_id: &str,
     ) -> Result<TaskRecord, A2AError> {
-        // KV is authoritative even if an event receiver lags or closes. Waiting
-        // never owns the turn and dropping this future never sends cancellation.
-        while !record.task.status.state.is_terminal() {
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        let mut record = self.task(owner, task_id).await?;
+        // Dropping a waiter never owns or cancels the detached turn.
+        if record.task.status.state.is_terminal() {
+            return Ok(record);
+        }
+        if let Some(mut done) = self.backend.runner.completion(&self.export, &record).await {
+            tracing::info!(%task_id, "waiting on local task completion");
+            // A dropped supervisor must fall through to orphan reconciliation.
+            let _ = done.wait_for(|finished| *finished).await;
             record = self.task(owner, &record.task.id).await?;
+            if record.task.status.state.is_terminal() {
+                return Ok(record);
+            }
+            // done means no local writer remains. A KV outage may have prevented
+            // final persistence; fence it or fail instead of waiting indefinitely.
+            record = self.reconcile(owner, record).await?;
+            return if record.task.status.state.is_terminal() {
+                Ok(record)
+            } else {
+                Err(A2AError::internal(
+                    "task stopped without terminal persistence",
+                ))
+            };
+        }
+        let key = self
+            .backend
+            .store
+            .resolve_context(&self.export, owner, &record.task.context_id)
+            .await
+            .map_err(map_error)?
+            .ok_or_else(not_found)?;
+        tracing::info!(%task_id, "waiting for task via KV watch");
+        let mut changes = self
+            .backend
+            .store
+            .watch_task(&key, &record.task.id)
+            .await
+            .map_err(map_error)?;
+        // Completion may precede watch creation. Re-read after subscribing, and
+        // fence abandoned tasks rather than waiting forever on a stopped writer.
+        record = self
+            .reconcile(owner, self.task(owner, &record.task.id).await?)
+            .await?;
+        while !record.task.status.state.is_terminal() {
+            changes
+                .next()
+                .await
+                .ok_or_else(|| A2AError::internal("task watch closed"))?
+                .map_err(map_error)?;
+            record = self
+                .reconcile(owner, self.task(owner, &record.task.id).await?)
+                .await?;
         }
         Ok(record)
     }
@@ -168,7 +220,7 @@ impl RequestHandler for HarnxHandler {
         let mut task = if immediate {
             record
         } else {
-            self.wait_terminal(&owner, record).await?
+            self.wait_terminal(&owner, &record.task.id).await?
         }
         .task;
         history(&mut task, length)?;
@@ -222,25 +274,24 @@ impl RequestHandler for HarnxHandler {
             .filter(|id| !id.is_empty())
             .ok_or_else(|| A2AError::invalid_params("ListTasks requires contextId"))?;
         validate_history(req.history_length)?;
-        let records = self
+        let Some((key, index)) = self
             .backend
             .store
-            .list_tasks(&self.export, &owner, context)
+            .list_task_index(&self.export, &owner, context)
             .await
             .map_err(map_error)?
-            .ok_or_else(not_found)?;
-        let mut tasks = Vec::new();
-        for record in records {
-            let mut task = self.reconcile(&owner, record).await?.task;
-            if !task_matches(&task, &req) {
-                continue;
-            }
-            project_task(&mut task, &req)?;
-            tasks.push(task);
-        }
-        paginate(tasks, &req)
-    }
+        else {
+            return Err(not_found());
+        };
 
+        let scope = listing::ListingScope {
+            owner: &owner,
+            key: &key,
+            context,
+        };
+        let candidates = self.list_candidates(scope, index.entries, &req).await?;
+        self.list_page(scope, candidates, &req).await
+    }
     async fn send_streaming_message(
         &self,
         params: &ServiceParams,

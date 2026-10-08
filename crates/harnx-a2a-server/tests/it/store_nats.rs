@@ -18,14 +18,14 @@ use harnx_runtime::nats_session_metadata::{
 };
 use serde_json::json;
 
-async fn start_store() -> Result<(Broker, SessionMetadataStore)> {
+pub(super) async fn start_store() -> Result<(Broker, SessionMetadataStore)> {
     harnx_core::require_nextest();
     let (broker, _, client) = Broker::start().await?;
     let store = SessionMetadataStore::ensure(&async_nats::jetstream::new(client), 1).await?;
     Ok((broker, store))
 }
 
-fn export(agent: &str) -> Export {
+pub(super) fn export(agent: &str) -> Export {
     Export {
         public_name: agent.replace('/', "__"),
         agent: agent.into(),
@@ -39,11 +39,20 @@ fn export(agent: &str) -> Export {
         lookup_keys: vec![],
     }
 }
-fn alice() -> Principal {
+pub(super) fn alice() -> Principal {
     Principal::User("alice".into())
 }
 
-async fn bind(
+pub(super) async fn list_tasks(
+    store: &A2aStore,
+    export: &Export,
+    owner: &Principal,
+    local_id: &str,
+) -> Result<Option<Vec<TaskRecord>>> {
+    crate::support::list_all_tasks_for_test(store, export, owner, local_id).await
+}
+
+pub(super) async fn bind(
     metadata: &SessionMetadataStore,
     store: &A2aStore,
     export: &Export,
@@ -70,7 +79,7 @@ async fn bind(
     Ok(key)
 }
 
-fn snapshot(local_id: &str) -> Task {
+pub(super) fn snapshot(local_id: &str) -> Task {
     let mut task: Task = serde_json::from_value(json!({
         "id": new_task_id(local_id), "contextId": local_id,
         "status": {"state": "TASK_STATE_WORKING"},
@@ -82,7 +91,7 @@ fn snapshot(local_id: &str) -> Task {
     task.status.timestamp = Some(Utc::now());
     task
 }
-async fn create(store: &A2aStore, key: &str, task: Task) -> Result<TaskRecord> {
+pub(super) async fn create(store: &A2aStore, key: &str, task: Task) -> Result<TaskRecord> {
     store
         .create_task(
             key,
@@ -95,7 +104,7 @@ async fn create(store: &A2aStore, key: &str, task: Task) -> Result<TaskRecord> {
         )
         .await
 }
-fn completed() -> TaskStatus {
+pub(super) fn completed() -> TaskStatus {
     TaskStatus {
         state: TaskState::Completed,
         message: None,
@@ -230,8 +239,7 @@ async fn store_binding_mismatch_is_not_found() -> Result<()> {
         .get_task_for_export(&other, &alice(), &record.task.id)
         .await?
         .is_none());
-    assert!(store
-        .list_tasks(&other, &alice(), "abc123")
+    assert!(list_tasks(&store, &other, &alice(), "abc123")
         .await?
         .is_none());
     other = export.clone();
@@ -278,8 +286,7 @@ async fn store_foreign_owner_is_not_found() -> Result<()> {
             .get_task_for_export(&export, &principal, &record.task.id)
             .await?
             .is_none());
-        assert!(store
-            .list_tasks(&export, &principal, "abc123")
+        assert!(list_tasks(&store, &export, &principal, "abc123")
             .await?
             .is_none());
         let error = store
@@ -505,8 +512,7 @@ async fn assert_gc_survivor(store: &A2aStore, agent: &BoundAgent, task: &Task) -
         "fingerprint"
     );
     assert_eq!(
-        store
-            .list_tasks(&agent.export, &alice(), "abc123")
+        list_tasks(store, &agent.export, &alice(), "abc123")
             .await?
             .unwrap()
             .len(),
@@ -523,7 +529,7 @@ async fn store_session_gc_removes_only_its_a2a_keys() -> Result<()> {
     let task = snapshot("abc123");
     seed_gc_records(&store, &agents, &task).await?;
     // This is the exact primitive called by manual deletion and periodic GC.
-    assert_eq!(metadata.purge_session_prefix(&agents.a.key).await?, 4); // meta, activity, task, message
+    assert_eq!(metadata.purge_session_prefix(&agents.a.key).await?, 5); // meta, activity, task, message, index
     assert_gc_removed_records(&metadata, &agents.a, &task).await?;
     assert_gc_removed_context(&store, &agents.a, &task).await?;
     assert_gc_survivor(&store, &agents.b, &task).await?;
@@ -582,8 +588,7 @@ async fn store_dedupe_hit_after_terminal_returns_existing_task() -> Result<()> {
     assert_eq!(hit.revision, terminal.revision);
     assert!(hit.task.status.state.is_terminal());
     assert_eq!(
-        restarted
-            .list_tasks(&export, &alice(), "abc123")
+        list_tasks(&restarted, &export, &alice(), "abc123")
             .await?
             .unwrap()
             .len(),
@@ -670,8 +675,7 @@ async fn store_list_prefix_is_scoped_to_session() -> Result<()> {
     let key_a = bind(&metadata, &store, &a, "abc123").await?;
     let key_b = bind(&metadata, &store, &b, "abc123").await?;
     let other_context = bind(&metadata, &store, &a, "abc1234").await?;
-    assert!(store
-        .list_tasks(&a, &alice(), "abc123")
+    assert!(list_tasks(&store, &a, &alice(), "abc123")
         .await?
         .unwrap()
         .is_empty());
@@ -697,7 +701,7 @@ async fn store_list_prefix_is_scoped_to_session() -> Result<()> {
         .await?;
     let mut expected = vec![task_a.task.id, task_a2.task.id];
     expected.sort();
-    let actual = store.list_tasks(&a, &alice(), "abc123").await?.unwrap();
+    let actual = list_tasks(&store, &a, &alice(), "abc123").await?.unwrap();
     assert_eq!(
         actual
             .into_iter()
@@ -707,16 +711,14 @@ async fn store_list_prefix_is_scoped_to_session() -> Result<()> {
     );
     assert_eq!(metadata.list_a2a_tasks(&key_a).await?.len(), 2);
     assert_eq!(
-        store
-            .list_tasks(&b, &alice(), "abc123")
+        list_tasks(&store, &b, &alice(), "abc123")
             .await?
             .unwrap()
             .len(),
         1
     );
     assert_eq!(
-        store
-            .list_tasks(&a, &alice(), "abc1234")
+        list_tasks(&store, &a, &alice(), "abc1234")
             .await?
             .unwrap()
             .len(),
@@ -764,7 +766,7 @@ async fn store_binding_extension_is_valid_and_write_once() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn store_new_context_lru_is_scoped_and_checks_fingerprint() -> Result<()> {
-    use harnx_a2a_server::store::DedupeKey;
+    use harnx_a2a_server::store::{DedupeEntry, DedupeKey};
     let (_broker, metadata) = start_store().await?;
     let store = A2aStore::new(metadata);
     let key = DedupeKey {
@@ -774,7 +776,13 @@ async fn store_new_context_lru_is_scoped_and_checks_fingerprint() -> Result<()> 
         message_id: "message".into(),
     };
     assert!(store.check_dedupe_lru(&key, "fingerprint")?.is_none());
-    store.record_dedupe_lru(key.clone(), "abc123.task".into(), "fingerprint".into());
+    store.record_dedupe_lru(
+        key.clone(),
+        DedupeEntry {
+            task_id: "abc123.task".into(),
+            fingerprint: "fingerprint".into(),
+        },
+    );
     assert_eq!(
         store.check_dedupe_lru(&key, "fingerprint")?.as_deref(),
         Some("abc123.task")

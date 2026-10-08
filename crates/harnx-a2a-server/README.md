@@ -73,7 +73,34 @@ Agent Cards are public when access rules are disabled. With access rules enabled
   - Sending an existing `messageId` with different content returns `InvalidParams` (`-32602`).
   - First-turn messages (without `contextId`) are deduped through an in-memory LRU cache keyed by `(export, user_id, messageId)`. Follow-up messages within a context are deduped against session KV storage.
 - **Disconnections do not cancel**: Dropping an HTTP connection or closing an SSE stream does not cancel the turn. Execution continues on the worker. Clients can reconnect and resume streaming with `SubscribeToTask`.
+- **Live output and persistence**: Active tasks serve current artifact text from the local runner for `GetTask`, `ListTasks`, and stream reconnects. SSE deltas flush every 100 ms; intermediate artifact snapshots persist at most once every 2 seconds. Final artifacts and status changes persist immediately. After a server crash, orphaned tasks are marked failed with the last durable artifact snapshot; recent live text can be lost.
 - **Durable task storage and session retention**: Task records, persisted Jira payloads, and deduplication entries live in NATS KV under the session's storage key prefix (`sessions/{storage_key}/a2a/...`). They live as long as the backing session does. Remote session GC runs only when the worker setting `cleanup_remote_sessions_days` (environment variable `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS`) is positive; by default, it is unset (`None`), meaning automatic GC is disabled and sessions persist indefinitely. Set `cleanup_remote_sessions_days: <days>` (or `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS=<days>`) in worker configuration to enable hourly cleanup sweeps. Operators can also delete a session explicitly with `harnx delete session <session-id> --agent <agent> --cluster <cluster>`.
+
+## Task index and upgrades
+
+Task metadata lives at `sessions/{storage_key}/a2a/index`. New contexts get an
+empty index when bound. First access to a legacy session without that key scans
+the shared bucket once and builds the index from legacy task records. An
+existing empty index does not trigger a scan.
+
+Only one server version may serve a bucket at a time. Stop the old server
+before starting the new one; don't overlap versions during rolling updates.
+See [Single replica in v1](#limitations).
+After running a pre-index build during a downgrade, delete each affected
+session's `sessions/{storage_key}/a2a/index` key before re-upgrading. Keep the
+task records; first access will rebuild the index.
+
+The index is one KV value and retains all terminal tasks. Its size is capped
+by the bucket's maximum value size and the broker's maximum payload. With a
+1 MiB limit, expect a few thousand tasks per session (IDs and timestamps
+change the exact count). A create that would exceed the limit fails; server
+logs report `task index exceeds maximum size limit`. Clients receive the
+pre-admission error `-32603 "request failed"`. Start a new context instead.
+Missing task records leave creation intents in the index. Intents still
+missing after five minutes are removed on listing or reconciliation.
+
+A crash after the final artifact write but before the terminal status write
+can leave a full artifact on a task marked failed during restart recovery.
 
 ## Data Parts and Rendering
 

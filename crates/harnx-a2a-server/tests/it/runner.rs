@@ -70,7 +70,11 @@ async fn assert_working_update(
         panic!("first update must be Working")
     };
     assert_eq!(update.status.state, TaskState::Working);
-    assert!(h.task(&started.snapshot.task.id).await?.revision >= working.revision);
+    assert!(working.sequence <= started.snapshot.stream_seq);
+    assert_eq!(
+        h.task(&started.snapshot.task.id).await?.task.status.state,
+        TaskState::Working
+    );
     Ok(())
 }
 
@@ -89,10 +93,12 @@ async fn assert_first_chunk(
         _ => unreachable!(),
     };
     assert_eq!(assembled, "Hello ");
+    // Artifact broadcast advances the stream cursor without a durable rewrite.
     assert_eq!(
         h.task(&started.snapshot.task.id).await?.revision,
-        first.revision
+        started.snapshot.revision
     );
+    assert!(first.sequence > started.snapshot.stream_seq);
     Ok((assembled, first))
 }
 
@@ -110,13 +116,13 @@ async fn assert_remaining_chunks(
     mut assembled: String,
 ) -> Result<(String, A2aEvent)> {
     h.llm.release.notify_one();
-    let mut last_revision = first.revision;
+    let mut last_revision = first.sequence;
     let mut last_chunk = false;
     let finished = loop {
         let next = event(&mut started.events).await?;
-        assert!(next.revision > last_revision);
-        last_revision = next.revision;
-        assert!(h.task(&started.snapshot.task.id).await?.revision >= next.revision);
+        assert!(next.sequence > last_revision);
+        last_revision = next.sequence;
+
         if let StreamResponse::ArtifactUpdate(update) = &next.response {
             assert_eq!(update.artifact.artifact_id, "answer");
             append_artifact(&mut assembled, update);
@@ -134,9 +140,12 @@ async fn assert_remaining_chunks(
 fn assert_completed_summary(
     persisted: &harnx_a2a_server::store::TaskRecord,
     assembled: &str,
-    revision: u64,
+    finished: &A2aEvent,
 ) {
-    assert_eq!(persisted.revision, revision);
+    let StreamResponse::StatusUpdate(update) = &finished.response else {
+        panic!("terminal status required")
+    };
+    assert_eq!(persisted.task.status, update.status);
     assert_eq!(persisted.task.status.state, TaskState::Completed);
     assert_eq!(
         text(&persisted.task.status.message.as_ref().unwrap().parts),
@@ -151,7 +160,7 @@ async fn assert_completed_snapshot(
     finished: A2aEvent,
 ) -> Result<()> {
     let persisted = h.task(id).await?;
-    assert_completed_summary(&persisted, &assembled, finished.revision);
+    assert_completed_summary(&persisted, &assembled, &finished);
     assert_eq!(text(&persisted.task.artifacts.unwrap()[0].parts), assembled);
     let StreamResponse::StatusUpdate(update) = finished.response else {
         unreachable!()
@@ -200,7 +209,10 @@ async fn runner_cancel_mid_stream_is_canceled() -> Result<()> {
     .context("cancel deadline")??;
     assert_eq!(canceled.task.status.state, TaskState::Canceled);
     let finished = terminal(&mut started.events).await?;
-    assert_eq!(canceled.revision, finished.revision);
+    let StreamResponse::StatusUpdate(update) = finished.response else {
+        panic!("terminal status required")
+    };
+    assert_eq!(canceled.task.status, update.status);
     assert_eq!(
         h.task(&canceled.task.id).await?.task.status.state,
         TaskState::Canceled
@@ -291,11 +303,15 @@ async fn runner_busy_context_rejects_second_start_and_stale_cancel() -> Result<(
         Some(&RunnerError::Busy)
     );
     assert_eq!(
-        h.store
-            .list_tasks(&h.export, &alice(), session.session_id())
-            .await?
-            .unwrap()
-            .len(),
+        crate::support::list_all_tasks_for_test(
+            &h.store,
+            &h.export,
+            &alice(),
+            session.session_id()
+        )
+        .await?
+        .unwrap()
+        .len(),
         1
     );
     h.llm.release.notify_one();
@@ -493,7 +509,7 @@ async fn resumed_answer(
 ) -> Result<String> {
     loop {
         let next = event(events).await?;
-        if next.revision <= revision {
+        if next.sequence <= revision {
             continue;
         }
         if let StreamResponse::ArtifactUpdate(update) = &next.response {
@@ -516,7 +532,7 @@ async fn runner_subscribe_snapshot_then_deltas_survives_disconnect() -> Result<(
     drop(started);
     let mut sub = h.runner.subscribe(&h.export, &alice(), &id).await?;
     let assembled = text(&sub.snapshot.task.artifacts.as_ref().unwrap()[0].parts);
-    let revision = sub.snapshot.revision;
+    let revision = sub.snapshot.stream_seq;
     h.llm.release.notify_one();
     let assembled = resumed_answer(&mut sub.events, revision, assembled).await?;
     assert_eq!(assembled, "Hello world");
@@ -533,8 +549,11 @@ async fn runner_subscribe_snapshot_then_deltas_survives_disconnect() -> Result<(
     Ok(())
 }
 
-fn assert_failed_snapshot(task: &harnx_a2a_server::store::TaskRecord, revision: u64) {
-    assert_eq!(task.revision, revision);
+fn assert_failed_snapshot(task: &harnx_a2a_server::store::TaskRecord, finished: &A2aEvent) {
+    let StreamResponse::StatusUpdate(update) = &finished.response else {
+        panic!("terminal status required")
+    };
+    assert_eq!(task.task.status, update.status);
     assert_eq!(task.task.status.state, TaskState::Failed);
     assert_eq!(
         text(&task.task.status.message.as_ref().unwrap().parts),
@@ -549,7 +568,7 @@ async fn runner_failure_message_is_sanitized_and_persisted() -> Result<()> {
     let mut started = h.send(&session, prompt()).await?;
     let finished = terminal(&mut started.events).await?;
     let task = h.task(&started.snapshot.task.id).await?;
-    assert_failed_snapshot(&task, finished.revision);
+    assert_failed_snapshot(&task, &finished);
     assert!(!serde_json::to_string(&task)?.contains("secret-token"));
     Ok(())
 }
@@ -581,5 +600,98 @@ async fn runner_lagging_subscriber_errors_without_stopping_turn() -> Result<()> 
         text(&task.task.artifacts.unwrap()[0].parts),
         "x".repeat(harnx_a2a_server::runner::EVENT_CAPACITY + 5)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_throttled_persistence_keeps_midstream_snapshots_exact() -> Result<()> {
+    check_stream_snapshots(Script::Many, 1).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_large_stream_materializes_text_only_for_readers() -> Result<()> {
+    check_stream_snapshots(Script::Large, 1024).await
+}
+
+async fn check_stream_snapshots(script: Script, chunk_size: usize) -> Result<()> {
+    let h = Harness::start(script).await?;
+    let session = h.session(None, &alice()).await?;
+    let mut started = h.send(&session, prompt()).await?;
+    let initial_revision = started.snapshot.revision;
+    let begun = tokio::time::Instant::now();
+    first_artifact(&mut started.events).await?;
+    let id = &started.snapshot.task.id;
+    let mut sub = h.runner.subscribe(&h.export, &alice(), id).await?;
+    let mut assembled = text(&sub.snapshot.task.artifacts.as_ref().unwrap()[0].parts);
+    let mut sequence = sub.snapshot.stream_seq;
+    assert_eq!(assembled, "x".repeat(chunk_size));
+    let chunks = harnx_a2a_server::runner::EVENT_CAPACITY + 5;
+    for count in 2..=chunks {
+        h.llm.release.notify_one();
+        let delta = first_artifact(&mut started.events).await?;
+        let streamed = event(&mut sub.events).await?;
+        assert_eq!(delta.sequence, streamed.sequence);
+        assert!(streamed.sequence > sequence);
+        sequence = streamed.sequence;
+        let StreamResponse::ArtifactUpdate(update) = &streamed.response else {
+            panic!("expected incremental artifact");
+        };
+        append_artifact(&mut assembled, update);
+        assert_eq!(assembled, "x".repeat(count * chunk_size));
+        // Repeated late subscribers must see every already-published delta once.
+        let late = h.runner.subscribe(&h.export, &alice(), id).await?;
+        assert_eq!(late.snapshot.stream_seq, sequence);
+        assert_eq!(
+            text(&late.snapshot.task.artifacts.as_ref().unwrap()[0].parts),
+            assembled
+        );
+        let durable = h.task(id).await?;
+        // Admission can precede this caller's timestamp by a scheduling delay.
+        let max_writes = begun.elapsed().as_secs() / 2 + 1;
+        assert!(durable.revision <= initial_revision + max_writes);
+    }
+    h.llm.release.notify_one();
+    let assembled = resumed_answer(&mut sub.events, sequence, assembled).await?;
+    let durable = h.task(id).await?;
+    assert_eq!(assembled, "x".repeat(chunks * chunk_size));
+    assert_eq!(
+        text(&durable.task.artifacts.as_ref().unwrap()[0].parts),
+        assembled
+    );
+    assert_eq!(durable.task.status.state, TaskState::Completed);
+    assert!(durable.revision < initial_revision + chunks as u64);
+    assert_eq!(
+        durable.stream_seq, 0,
+        "stream cursor is not durable CAS metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_new_context_first_task_does_not_migrate_legacy_keys() -> Result<()> {
+    let h = Harness::start(Script::Text).await?;
+    let session = h.session(None, &alice()).await?;
+    let key = session.storage_key();
+    let (index, _) = h
+        .metadata
+        .get_a2a_task_index(key)
+        .await?
+        .expect("bound index");
+    assert!(index.entries.is_empty());
+
+    // A legacy scan would parse this record and fail. New contexts must not scan it.
+    let hidden_id = new_task_id(session.session_id());
+    let (_, uuid) = harnx_a2a_server::store::parse_task_id(&hidden_id)?;
+    let record_key = harnx_runtime::nats_session_metadata::a2a_task_key(key, uuid);
+    h.metadata
+        .kv_store()
+        .put(record_key, "invalid legacy json".into())
+        .await?;
+    let started = h.send(&session, prompt()).await?;
+    let (index, _) = h.metadata.get_a2a_task_index(key).await?.unwrap();
+    assert_eq!(index.entries.len(), 1);
+    assert_eq!(index.entries[0].task_id, started.snapshot.task.id);
+    assert!(!h.logs.text().contains("migrated legacy tasks to index"));
+    h.runner.shutdown().await;
     Ok(())
 }

@@ -263,7 +263,7 @@ pub(super) fn is_wrong_last_revision(error: &anyhow::Error) -> bool {
 /// Covers both:
 /// - `UpdateError::WrongLastRevision` (revision mismatch on update)
 /// - `CreateError::AlreadyExists` (losing race to create new entry)
-pub(in crate::nats_session_metadata) fn is_cas_conflict(error: &anyhow::Error) -> bool {
+pub fn is_cas_conflict(error: &anyhow::Error) -> bool {
     is_wrong_last_revision(error)
         || error
             .chain()
