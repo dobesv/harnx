@@ -42,9 +42,8 @@ fn find_sandbox_exec() -> PathBuf {
 #[cfg(unix)]
 fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Vec<OsString> {
     use harnx_sandbox_common::{
-        expand_path_var, is_home_or_ancestor, push_env_relative_defaults, resolve_path,
-        system_writable_paths, HOME_EXEC_PATHS, HOME_READ_PATHS, HOME_RWX_PATHS, HOME_WRITE_PATHS,
-        SYSTEM_EXEC_PATHS, SYSTEM_READ_PATHS,
+        push_env_relative_defaults, system_writable_paths, HOME_EXEC_PATHS, HOME_READ_PATHS,
+        HOME_RWX_PATHS, HOME_WRITE_PATHS, SYSTEM_EXEC_PATHS, SYSTEM_READ_PATHS,
     };
 
     let mut args: Vec<OsString> = Vec::new();
@@ -114,75 +113,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         push_env_relative_defaults(&mut args);
     }
 
-    // CLI-provided extra paths
-    for path in &cli.allow_read {
-        let raw = path.to_string_lossy();
-        let Some(expanded) = expand_path_var(&raw, &cwd) else {
-            continue;
-        };
-        let resolved = resolve_path(&expanded);
-        if is_home_or_ancestor(&resolved) {
-            eprintln!(
-                "harnx-sandbox-run: warning: ignoring --allow-read {}: would expose home directory",
-                path.display()
-            );
-            continue;
-        }
-        args.push("--read".into());
-        args.push(resolved.into_os_string());
-    }
-    for path in &cli.allow_write {
-        let raw = path.to_string_lossy();
-        let Some(expanded) = expand_path_var(&raw, &cwd) else {
-            continue;
-        };
-        let resolved = resolve_path(&expanded);
-        if is_home_or_ancestor(&resolved) {
-            eprintln!(
-                "harnx-sandbox-run: warning: ignoring --allow-write {}: would expose home directory",
-                path.display()
-            );
-            continue;
-        }
-        args.push("--write".into());
-        args.push(resolved.into_os_string());
-    }
-    for path in &cli.allow_exec {
-        let raw = path.to_string_lossy();
-        let Some(expanded) = expand_path_var(&raw, &cwd) else {
-            continue;
-        };
-        let resolved = resolve_path(&expanded);
-        if is_home_or_ancestor(&resolved) {
-            eprintln!(
-                "harnx-sandbox-run: warning: ignoring --allow-exec {}: would expose home directory",
-                path.display()
-            );
-            continue;
-        }
-        args.push("--exec".into());
-        args.push(resolved.into_os_string());
-    }
-    for path in &cli.allow_rwx {
-        let raw = path.to_string_lossy();
-        let Some(expanded) = expand_path_var(&raw, &cwd) else {
-            continue;
-        };
-        let resolved = resolve_path(&expanded);
-        if is_home_or_ancestor(&resolved) {
-            eprintln!(
-                "harnx-sandbox-run: warning: ignoring --allow-rwx {}: would expose home directory",
-                path.display()
-            );
-            continue;
-        }
-        args.push("--read".into());
-        args.push(resolved.clone().into_os_string());
-        args.push("--write".into());
-        args.push(resolved.clone().into_os_string());
-        args.push("--exec".into());
-        args.push(resolved.into_os_string());
-    }
+    crate::grants::push_cli_grants(&mut args, cli, &cwd);
 
     if cli.no_network {
         args.push("--no-network".into());
@@ -471,25 +402,63 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
 
-        // Use canonicalize for expected paths: on macOS /var/… resolves to
-        // /private/var/… through a symlink, matching what resolve_path returns.
-        let canon = |p: &std::path::Path| {
-            std::fs::canonicalize(p)
-                .unwrap_or_else(|_| p.to_path_buf())
-                .to_string_lossy()
-                .into_owned()
+        // Each grant is the resolved path, plus the path as given when that
+        // differs: on macOS /var/… resolves to /private/var/… through a
+        // symlink. `.` is given as the working directory, already resolved.
+        let granted = |flag: &str, path: &std::path::Path| {
+            let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let mut args = vec![flag.to_string(), resolved.to_string_lossy().into_owned()];
+            if resolved != path {
+                args.extend([flag.to_string(), path.to_string_lossy().into_owned()]);
+            }
+            args
         };
+        let cwd = std::env::current_dir().expect("current dir");
+        let expected = [
+            granted("--read", &cwd),
+            granted("--read", &child),
+            granted("--write", &child),
+            granted("--exec", &child),
+            vec!["--".to_string()],
+        ]
+        .concat();
+        assert_eq!(args, expected);
+    }
+
+    #[test]
+    fn build_exec_args_grants_a_symlink_as_given_and_resolved() {
+        let _lock = env_lock().lock().expect("lock poisoned");
+        let _env = EnvGuard::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&real).expect("create the real directory");
+        std::os::unix::fs::symlink(&real, &link).expect("create the symlink");
+
+        let cli = Cli {
+            env_vars: vec![],
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_exec: vec![link.clone()],
+            allow_rwx: vec![],
+            no_network: false,
+            working_dir: None,
+            no_defaults: false,
+            command: vec![],
+        };
+
+        let args: Vec<String> = build_exec_args(&cli, &[], false)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let resolved = std::fs::canonicalize(&link).expect("resolve the symlink");
         assert_eq!(
             args,
-            vec![
-                "--read".to_string(),
-                canon(&cwd),
-                "--read".to_string(),
-                canon(&child),
-                "--write".to_string(),
-                canon(&child),
+            [
                 "--exec".to_string(),
-                canon(&child),
+                resolved.to_string_lossy().into_owned(),
+                "--exec".to_string(),
+                link.to_string_lossy().into_owned(),
                 "--".to_string(),
             ]
         );
