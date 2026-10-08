@@ -1282,6 +1282,18 @@ without `TestEnvironment` shares the user's broker directory with every other
 test process in the run, including the persisted broker port, and a port
 still held by a broker another process just stopped fails every spawn attempt.
 
+A test can start a broker without meaning to. Test configs keep `Default`
+routing and get no broker handoff, so any `__local__` lookup starts or joins
+the local broker in the test's harnx data directory. Under the sandbox that is
+a private one, and the test pays for starting it. In an unsandboxed run it is
+your real one: the test joins your broker, or starts it and waits for
+nats-server to recover its whole JetStream store (3s for a 4 GB store), then
+stops it on exit for the next test process to start again. That is why
+`Tui::init` skips its unread lookup under `cfg(test)` and tool rounds skip
+discovery without `HARNX_NATS_URL`. To check a test, run it with
+`HARNX_TEST_SANDBOX=off` and `HARNX_DATA_DIR` set to an empty directory, and
+see whether `nats/v1` appears there.
+
 A single broker can stand in for a replica that lags the stream leader, which no
 real cluster produces on demand. A `mappings` block in the server config diverts
 `$JS.API.DIRECT.GET.<stream>` (and `.>`) to an empty stream, which answers a

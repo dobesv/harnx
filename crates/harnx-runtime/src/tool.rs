@@ -411,6 +411,12 @@ async fn resolve_nats_providers(
     if let Some(provider) = injected_tool_provider {
         return (Some(provider), injected_hook_provider);
     }
+    // Same gate as the declaration refresh. Tests that run the agent loop
+    // in-process have no broker address, and their tool calls would otherwise
+    // start or join the developer's shared broker.
+    if !crate::tool_context::has_broker_address() {
+        return (None, injected_hook_provider);
+    }
     let tool_provider =
         discover_nats_tool_provider_cached(config, instance_id, active_package).await;
     let hook_provider = match injected_hook_provider {
@@ -848,6 +854,30 @@ mod tests {
             build_tool_eval_context(BuildToolEvalContextParams::new(&config, &instance_id)).await;
 
         assert_eq!(context.instance_id, instance_id);
+    }
+
+    #[tokio::test]
+    async fn a_tool_round_without_a_broker_address_starts_no_broker() {
+        use crate::test_environment::{env_lock_async, EnvGuard};
+        let _lock = env_lock_async().await;
+        let data_dir = tempfile::tempdir().expect("create data dir");
+        let _data_dir = EnvGuard::new("HARNX_DATA_DIR", data_dir.path());
+        let _url = EnvGuard::remove(crate::config::HARNX_NATS_URL_ENV);
+        let _token = EnvGuard::remove(crate::config::HARNX_NATS_TOKEN_ENV);
+        let config = Arc::new(ConfigLock::new(Config::default()));
+
+        let context = build_tool_eval_context(BuildToolEvalContextParams::new(
+            &config,
+            &harnx_core::instance::ServerScope::new(),
+        ))
+        .await;
+
+        assert!(
+            !harnx_core::config_paths::nats_runtime_dir().exists(),
+            "tool discovery started or joined the shared local broker"
+        );
+        let providers: Vec<_> = context.providers.iter().map(|p| p.name()).collect();
+        assert!(!providers.contains(&"nats"), "providers: {providers:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

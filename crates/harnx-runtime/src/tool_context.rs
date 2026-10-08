@@ -268,19 +268,26 @@ pub(crate) async fn discover_nats_tool_provider_fresh(
     provider
 }
 
+/// Whether this process was handed a broker to discover tool and hook servers on.
+///
+/// Gate on the broker address, not on `HARNX_SERVER_SCOPE`. The worker creates
+/// its instance id in-process and only ever exports it to the children it
+/// spawns, so an instance-id check is false in the one process that discovers
+/// tools — every turn discovered zero tools and the model saw built-ins only.
+///
+/// `HARNX_NATS_URL` is set on the worker by its supervisor and inherited by its
+/// children, so it marks exactly the processes that already have a broker to
+/// talk to. Without it, `resolve_local_nats_server_config` falls back to
+/// starting or joining the shared local broker. No process should do that just
+/// to look for tools: a broker that has to start recovers its JetStream store
+/// before it accepts a connection, which takes seconds once the store has grown.
+pub(crate) fn has_broker_address() -> bool {
+    std::env::var_os(HARNX_NATS_URL_ENV).is_some()
+}
+
 /// Refresh declarations before completion request construction.
 pub async fn refresh_nats_tool_declarations(config: &GlobalConfig, instance_id: &ServerScope) {
-    // Gate on the broker address, not on `HARNX_SERVER_SCOPE`. The worker creates
-    // its instance id in-process and only ever exports it to the children it
-    // spawns, so an instance-id check is false in the one process that runs this
-    // — every turn discovered zero tools and the model saw built-ins only.
-    //
-    // A guard is still needed: with no broker address `resolve_local_nats_server_config`
-    // falls back to starting a shared NATS server, which a plain front-end must
-    // never do just to build a tool list. `HARNX_NATS_URL` is set on the worker
-    // by its supervisor and inherited by its children, so it marks exactly the
-    // processes that already have a broker to talk to.
-    if std::env::var_os(HARNX_NATS_URL_ENV).is_none() {
+    if !has_broker_address() {
         return;
     }
 
