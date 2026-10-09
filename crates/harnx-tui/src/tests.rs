@@ -91,6 +91,8 @@ mod cancellation_escape_tests;
 mod command_completion;
 mod delegation_tests;
 mod exit_interrupt_tests;
+mod handler_decomposition_tests;
+mod markdown_link_accessibility_tests;
 mod operator_tool_completion;
 mod shared_session_event_tests;
 mod subagent_session_tests;
@@ -7944,7 +7946,7 @@ async fn test_detail_view_shows_full_tool_result_with_assistant_audience() {
         "isError": false
     });
 
-    let items = crate::input::tool_completed_to_transcript_items(&output, None);
+    let items = crate::tool_transcript::tool_completed_to_transcript_items(&output, None);
     assert_eq!(items.len(), 1);
 
     // Push the item to transcript
@@ -9155,6 +9157,7 @@ async fn test_browsing_mode_non_navigable_items_visible_not_focusable() {
         .transcript
         .push(TranscriptItem::ToolResultMarkdown {
             full_detail: None,
+            subagent_reply_owner: None,
             text: "thinking...".to_string(),
             rendered_cache: None,
         });

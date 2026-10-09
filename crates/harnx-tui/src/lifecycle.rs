@@ -116,6 +116,7 @@ fn build_initial_app(
         llm_busy: false,
         scroll_state: ratatui_widget_scrolling::ScrollState::new(),
         streaming_open: false,
+        streamed_text_idx: None,
         main_streamed_text_idx: None,
         cache_valid_width: None,
         last_ui_output_source: None,
@@ -933,7 +934,7 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                         };
                         items.push(TranscriptItem::ToolCall {
                             tool_name: r.call.name.clone(),
-                            body,
+                            body: body.clone(),
                             seq: msg.log_seq,
                             timestamp: msg.log_timestamp,
                             // Historical tool calls from session history are already complete.
@@ -948,6 +949,10 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                             locations: vec![],
                             usage: None,
                         });
+                        // Extract links from Markdown tool call body
+                        if let Some(crate::types::ToolCallBody::Markdown(md)) = body {
+                            append_markdown_links(&mut items, &md);
+                        }
                         if let Some(key) =
                             cluster.and_then(|cluster| subagent_key_from_output(&r.output, cluster))
                         {
@@ -964,7 +969,7 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                                     )
                                 },
                             );
-                            if let Some(item) = subagent_reply_item_from_output(&r.output) {
+                            if let Some(item) = subagent_reply_item_from_output(&r.output, &key) {
                                 if let TranscriptItem::ToolResultMarkdown { ref text, .. } = item {
                                     let item_text = text.clone();
                                     items.push(item);
@@ -991,20 +996,10 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                             &raw_result_fallback,
                             decl_map,
                         );
-                        let rendered = crate::agent_event_sink::render_tool_result_text(
+                        items.extend(crate::tool_transcript::tool_completed_to_transcript_items(
                             &r.output,
                             rendered_result.as_deref(),
-                        );
-                        let trimmed = rendered.trim_end_matches('\n');
-                        if !trimmed.is_empty() {
-                            let full = crate::input::full_tool_result_detail(&r.output);
-                            items.push(TranscriptItem::ToolResultMarkdown {
-                                full_detail: crate::input::full_detail_if_extra(full, trimmed),
-                                text: trimmed.to_string(),
-                                rendered_cache: None,
-                            });
-                            append_markdown_links(&mut items, trimmed);
-                        }
+                        ));
                     }
                 }
             }
@@ -1019,6 +1014,7 @@ pub(crate) fn subagent_response_from_output(output: &serde_json::Value) -> Optio
 
 pub(crate) fn subagent_reply_item_from_output(
     output: &serde_json::Value,
+    key: &crate::types::MonitoredSessionKey,
 ) -> Option<TranscriptItem> {
     let response = subagent_response_from_output(output)?;
     let trimmed = response.trim_end_matches('\n');
@@ -1027,6 +1023,10 @@ pub(crate) fn subagent_reply_item_from_output(
     }
     Some(TranscriptItem::ToolResultMarkdown {
         full_detail: None,
+        subagent_reply_owner: Some((
+            key.clone(),
+            subagent_progress_from_output(output).map(|p| p.invocation_id),
+        )),
         text: crate::strip_ansi(trimmed).to_string(),
         rendered_cache: None,
     })

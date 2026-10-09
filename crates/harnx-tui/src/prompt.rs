@@ -199,6 +199,54 @@ fn test_agent_loop_context(
 }
 
 impl Tui {
+    #[cfg(test)]
+    pub(crate) async fn submit_pending_message(
+        &mut self,
+        pending: crate::types::PendingMessage,
+    ) -> Result<()> {
+        self.submit_pending_message_inner(pending).await
+    }
+
+    #[cfg(not(test))]
+    pub(super) async fn submit_pending_message(
+        &mut self,
+        pending: crate::types::PendingMessage,
+    ) -> Result<()> {
+        self.submit_pending_message_inner(pending).await
+    }
+
+    pub(super) async fn submit_pending_message_inner(
+        &mut self,
+        pending: crate::types::PendingMessage,
+    ) -> Result<()> {
+        self.app.input = Self::new_input();
+        self.app.transcript.push(TranscriptItem::UserText {
+            text: pending.text.clone(),
+            seq: None,
+            timestamp: Some(chrono::Utc::now()),
+        });
+        crate::lifecycle::append_markdown_links(&mut self.app.transcript, &pending.text);
+        self.render_submitted_attachments(&pending.attachments)
+            .await;
+        self.pin_transcript_to_bottom();
+        if pending.text.trim_start().starts_with('.') {
+            self.app.attachments = pending.attachments;
+            self.app.attachment_dir = pending.attachment_dir;
+            self.app.paste_count = pending.paste_count;
+            // Pending commands run under the already-deep turn-end event chain.
+            Box::pin(self.run_command(&pending.text)).await?;
+            self.refresh_input_chrome();
+        } else {
+            // Prompt task cleans the delivered temp dir; drop its live mirror to avoid
+            // re-sending deleted attachment files (#1917).
+            self.app.attachments.clear();
+            self.app.attachment_dir = None;
+            self.app.paste_count = 0;
+            self.start_prompt(pending).await?;
+        }
+        Ok(())
+    }
+
     pub(super) fn clear_tool_confirmation_route(&self) {
         let route = self.tool_confirmation_route.lock().take();
         if let Some(route) = &route {
@@ -402,6 +450,9 @@ impl Tui {
     }
 
     pub(super) async fn complete_main_prompt(&mut self) {
+        self.close_assistant_stream();
+        self.app.main_streamed_text_idx = None;
+        self.app.streamed_text_idx = None;
         self.freeze_main_unfinished_tool_timers();
         // Emit terminal status: turn completed.
         // The emitter's sticky-failure rule drops this if Error/Interrupted was already emitted.

@@ -179,7 +179,10 @@ impl Tui {
                 // Reset streaming index so the next LLM turn creates a fresh
                 // AssistantText item instead of appending to the previous one.
                 // This keeps tool-call rows visually between the two turns.
+                self.close_assistant_stream();
                 self.app.streaming_open = false;
+                self.app.main_streamed_text_idx = None;
+                self.app.streamed_text_idx = None;
                 self.pin_transcript_to_bottom();
             }
             TuiEvent::PendingMessageConsumed(pending) => {

@@ -24,6 +24,7 @@ impl Tui {
         crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Working);
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
+        self.app.streamed_text_idx = None;
 
         let (agent, cluster, session_id) = {
             let guard = self.config.read();

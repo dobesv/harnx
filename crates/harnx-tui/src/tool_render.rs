@@ -238,14 +238,7 @@ pub(crate) fn apply_tool_event_update(
         )
     });
     if let Some(idx) = matched_idx {
-        transcript[idx].apply_tool_update(
-            update.markdown,
-            update.status,
-            update.title,
-            update.kind,
-            update.locations,
-            update.usage,
-        );
+        patch_tool_call(transcript, idx, update);
         return;
     }
 
@@ -274,21 +267,7 @@ pub(crate) fn apply_tool_event_update(
         )
     });
     if let Some(idx) = fallback_idx {
-        if let TranscriptItem::ToolCall {
-            id: ref mut item_id,
-            ..
-        } = &mut transcript[idx]
-        {
-            *item_id = Some(update.id);
-        }
-        transcript[idx].apply_tool_update(
-            update.markdown,
-            update.status,
-            update.title,
-            update.kind,
-            update.locations,
-            update.usage,
-        );
+        patch_tool_call(transcript, idx, update);
         return;
     }
 
@@ -312,6 +291,42 @@ pub(crate) fn apply_tool_event_update(
         locations: update.locations.unwrap_or_default(),
         usage: update.usage,
     });
+    refresh_tool_call_links(transcript, transcript.len() - 1);
+}
+
+fn patch_tool_call(transcript: &mut Vec<TranscriptItem>, idx: usize, update: ToolUpdatePayload) {
+    if let TranscriptItem::ToolCall { id, .. } = &mut transcript[idx] {
+        *id = Some(update.id);
+    }
+    transcript[idx].apply_tool_update(
+        update.markdown,
+        update.status,
+        update.title,
+        update.kind,
+        update.locations,
+        update.usage,
+    );
+    refresh_tool_call_links(transcript, idx);
+}
+
+fn refresh_tool_call_links(transcript: &mut Vec<TranscriptItem>, index: usize) {
+    let mut links = Vec::new();
+    if let TranscriptItem::ToolCall {
+        body: Some(crate::types::ToolCallBody::Markdown(markdown)),
+        ..
+    } = &transcript[index]
+    {
+        crate::lifecycle::append_markdown_links(&mut links, markdown);
+    }
+    // Link rows belong to the immediately preceding body. Stop at the next
+    // non-link row so another tool or its result keeps its own links.
+    let start = index + 1;
+    let end = start
+        + transcript[start..]
+            .iter()
+            .take_while(|item| matches!(item, TranscriptItem::MarkdownLink { .. }))
+            .count();
+    transcript.splice(start..end, links);
 }
 
 /// Complete a running tool call in the transcript, freezing its timer,

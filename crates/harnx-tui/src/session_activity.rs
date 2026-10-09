@@ -109,6 +109,7 @@ impl Tui {
         self.app.transcript = transcript;
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
+        self.app.streamed_text_idx = None;
         self.app.last_ui_output_source = None;
         self.app.transcript_focus = None;
         self.app.transcript_selection_anchor = None;
@@ -131,6 +132,7 @@ impl Tui {
                 crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Working);
                 self.app.streaming_open = false;
                 self.app.main_streamed_text_idx = None;
+                self.app.streamed_text_idx = None;
                 self.refresh_input_chrome();
                 true
             }
