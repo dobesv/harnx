@@ -20,9 +20,10 @@ impl CancelSnapshotGate {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nats_http_cancel_returns_completed_when_completion_wins_after_snapshot() -> Result<()> {
-    let h = Harness::start(Script::Text).await?;
+async fn start_cancel_http(
+    h: &Harness,
+    gate: Arc<CancelSnapshotGate>,
+) -> Result<(String, AbortOnDropHandle<()>)> {
     let backend = Arc::new(Backend::new(
         h.runner.clone(),
         h.store.clone(),
@@ -32,11 +33,6 @@ async fn nats_http_cancel_returns_completed_when_completion_wins_after_snapshot(
             abort: harnx_core::abort::create_abort_signal(),
         },
     ));
-    let (captured_tx, captured_rx) = oneshot::channel();
-    let gate = Arc::new(CancelSnapshotGate {
-        captured: parking_lot::Mutex::new(Some(captured_tx)),
-        resume: Notify::new(),
-    });
     let mut export = h.export.clone();
     export.lookup_keys = vec![export.public_name.clone()];
     let app = crate::routes::router(
@@ -56,9 +52,22 @@ async fn nats_http_cancel_returns_completed_when_completion_wins_after_snapshot(
     )?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}/agents/runner", listener.local_addr()?);
-    let _server = AbortOnDropHandle::new(tokio::spawn(async move {
+    let server = AbortOnDropHandle::new(tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     }));
+
+    Ok((url, server))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nats_http_cancel_returns_completed_when_completion_wins_after_snapshot() -> Result<()> {
+    let h = Harness::start(Script::Text).await?;
+    let (captured_tx, captured_rx) = oneshot::channel();
+    let gate = Arc::new(CancelSnapshotGate {
+        captured: parking_lot::Mutex::new(Some(captured_tx)),
+        resume: Notify::new(),
+    });
+    let (url, _server) = start_cancel_http(&h, gate.clone()).await?;
 
     let session = h.session(None, &alice()).await?;
     let started = h

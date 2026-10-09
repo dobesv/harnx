@@ -2,6 +2,40 @@ use super::*;
 use crate::runner_test_support::{alice, Harness, Script, DEADLINE};
 use a2a_lf::{Part, Role};
 
+fn prune_idle_with_running_turn(
+    runner: &Runner,
+    export: &Export,
+    active_key: &ContextKey,
+    active: &std::sync::Weak<ContextSlot>,
+) -> (ContextKey, Arc<ContextSlot>) {
+    let idle_key = ContextKey::new(export, "idle");
+    let idle_slot = runner.slot(&idle_key);
+    let idle = Arc::downgrade(&idle_slot);
+    drop(idle_slot);
+    assert_eq!(idle.strong_count(), 1);
+    let probe_key = ContextKey::new(export, "probe");
+    let probe = runner.slot(&probe_key);
+    {
+        let contexts = runner.contexts.lock();
+        assert_eq!(contexts.len(), 2);
+        assert!(
+            !contexts.contains_key(&idle_key),
+            "idle registry entry must be pruned"
+        );
+        assert!(
+            active.ptr_eq(&Arc::downgrade(contexts.get(active_key).unwrap())),
+            "pruning must preserve the running turn's original slot"
+        );
+        assert!(Arc::ptr_eq(contexts.get(&probe_key).unwrap(), &probe));
+    }
+    assert!(
+        idle.upgrade().is_none(),
+        "idle slot must be freed, not only hidden"
+    );
+
+    (probe_key, probe)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nats_slot_pruning_retains_running_turn_and_removes_idle_slots() -> Result<()> {
     let h = Harness::start(Script::Text).await?;
@@ -25,30 +59,8 @@ async fn nats_slot_pruning_retains_running_turn_and_removes_idle_slots() -> Resu
         "RunningTurn must retain its delivery slot"
     );
 
-    let idle_key = ContextKey::new(&h.export, "idle");
-    let idle_slot = h.runner.slot(&idle_key);
-    let idle = Arc::downgrade(&idle_slot);
-    drop(idle_slot);
-    assert_eq!(idle.strong_count(), 1);
-    let probe_key = ContextKey::new(&h.export, "probe");
-    let probe = h.runner.slot(&probe_key);
-    {
-        let contexts = h.runner.contexts.lock();
-        assert_eq!(contexts.len(), 2);
-        assert!(
-            !contexts.contains_key(&idle_key),
-            "idle registry entry must be pruned"
-        );
-        assert!(
-            active.ptr_eq(&Arc::downgrade(contexts.get(&active_key).unwrap())),
-            "pruning must preserve the running turn's original slot"
-        );
-        assert!(Arc::ptr_eq(contexts.get(&probe_key).unwrap(), &probe));
-    }
-    assert!(
-        idle.upgrade().is_none(),
-        "idle slot must be freed, not only hidden"
-    );
+    let (probe_key, probe) =
+        prune_idle_with_running_turn(&h.runner, &h.export, &active_key, &active);
 
     h.llm.release.notify_one();
     tokio::time::timeout(DEADLINE, async {

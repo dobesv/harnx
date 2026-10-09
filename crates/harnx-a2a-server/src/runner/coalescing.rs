@@ -31,7 +31,11 @@ impl ArtifactCoalescer {
         loop {
             tokio::select! {
                 _ = self.inbox.ready() => output.accept(self.inbox.take()?, self.limit)?,
-                _ = self.interval.tick() => return Ok(()),
+                _ = self.interval.tick() => {
+                    // Include buffered text even when the tick wins over inbox readiness.
+                    output.accept(self.inbox.take()?, self.limit)?;
+                    return Ok(());
+                }
             }
         }
     }
@@ -139,6 +143,37 @@ mod tests {
         output.committed();
         assert_eq!(output.text, "abcde");
         assert!(output.artifact_update(&task, false, false).is_none());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn artifact_deadline_drains_unaccepted_inbox_text() -> Result<()> {
+        harnx_core::require_nextest();
+        let inbox = Arc::new(TextInbox::new(1024));
+        let sink = super::super::event_map::A2aEventSink(inbox.clone());
+        let mut coalescer = ArtifactCoalescer::new(inbox.clone(), 1024);
+        let mut output = Output::default();
+        assert!(coalescer.ready(&mut output).now_or_never().unwrap().is_ok());
+
+        advance(Duration::from_millis(1)).await;
+        emit(&sink, "a");
+        assert!(coalescer.ready(&mut output).now_or_never().is_none());
+        assert_eq!(output.pending, "a");
+        advance(Duration::from_millis(98)).await;
+        emit(&sink, "b");
+        emit(&sink, "c");
+        // Consume only the notification, leaving its text buffered. This forces
+        // the tick branch without depending on select!'s random ready ordering.
+        inbox.ready().await;
+        assert!(coalescer.ready(&mut output).now_or_never().is_none());
+        advance(Duration::from_millis(1)).await;
+        assert!(coalescer.ready(&mut output).now_or_never().unwrap().is_ok());
+        assert_eq!(
+            output.pending, "abc",
+            "deadline must include unaccepted chunks"
+        );
+        assert_eq!(output.text, "abc");
+        assert_eq!(inbox.take()?, "", "deadline must drain the inbox");
         Ok(())
     }
 }
