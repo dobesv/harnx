@@ -1,6 +1,9 @@
 //! Only user-visible text crosses the A2A boundary. Terminal status comes from
 //! the durable turn result, not a model round's Final event.
-use a2a_lf::{Artifact, Message, Part, Role, StreamResponse, TaskState, TaskStatus};
+use a2a_lf::{
+    Artifact, Message, Part, Role, StreamResponse, Task, TaskArtifactUpdateEvent, TaskState,
+    TaskStatus,
+};
 use chrono::Utc;
 use std::sync::Arc;
 
@@ -37,6 +40,34 @@ impl Output {
         self.text.push_str(&text);
         self.pending.push_str(&text);
         Ok(())
+    }
+
+    pub fn artifact_update(
+        &self,
+        task: &Task,
+        last: bool,
+        replace: bool,
+    ) -> Option<TaskArtifactUpdateEvent> {
+        if !last && self.pending.is_empty() {
+            return None;
+        }
+        Some(TaskArtifactUpdateEvent {
+            task_id: task.id.clone(),
+            context_id: task.context_id.clone(),
+            artifact: artifact(if replace {
+                self.text.clone()
+            } else {
+                self.pending.clone()
+            }),
+            append: Some(self.sent && !replace),
+            last_chunk: Some(last),
+            metadata: None,
+        })
+    }
+
+    pub fn committed(&mut self) {
+        self.sent = true;
+        self.pending.clear();
     }
 }
 

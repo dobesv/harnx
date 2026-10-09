@@ -40,6 +40,7 @@ tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 metrics-util = { workspace = true }
 process-wrap = { workspace = true, features = ["std"] }
 tokio-util = { workspace = true }

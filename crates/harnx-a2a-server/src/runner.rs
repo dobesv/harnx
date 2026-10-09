@@ -38,6 +38,7 @@ mod admission;
 pub(crate) use admission::AllocatedAdmission;
 mod authority;
 mod cancellation;
+mod coalescing;
 pub mod event_map;
 mod failure;
 mod fixed_prompt;
@@ -53,6 +54,8 @@ use authority::OwnedTask;
 pub use supervision::SupervisionConfig;
 mod publication;
 mod publisher;
+#[cfg(test)]
+mod registry_tests;
 mod stored_session;
 use publication::{LiveState, StreamChannels};
 use publisher::Publisher;
@@ -177,6 +180,7 @@ impl Runner {
         let mut contexts = self.contexts.lock();
         // Active turns and concurrent callers hold strong references. Retire
         // idle slots so session GC doesn't leave an unbounded process cache.
+        // Verified by nats_slot_pruning_retains_running_turn_and_removes_idle_slots.
         contexts.retain(|_, slot| Arc::strong_count(slot) > 1);
         contexts.entry(key.clone()).or_default().clone()
     }
