@@ -50,6 +50,16 @@ pub fn validate_binding(
         }
 }
 
+/// Internal recovery checks immutable ownership, not historical request scopes.
+/// Never use this in a client-facing lookup: current memberships must still pass ACLs.
+pub(crate) fn validate_stored_owner(
+    binding: &A2aBinding,
+    export: &Export,
+    owner: &Principal,
+) -> bool {
+    binding_matches_export(binding, export) && binding.owner.as_deref() == owner.user_id()
+}
+
 fn binding_matches_export(binding: &A2aBinding, export: &Export) -> bool {
     let expected = (
         A2A_BINDING_VERSION,

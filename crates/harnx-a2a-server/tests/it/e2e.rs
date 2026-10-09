@@ -13,6 +13,11 @@ use std::{
 };
 use tokio_util::task::AbortOnDropHandle;
 
+#[cfg(unix)]
+mod replicas;
+#[cfg(all(unix, feature = "fault-injection"))]
+mod supervision;
+
 const REAP_DEADLINE: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -127,17 +132,23 @@ fn process_reaping_has_a_deadline() {
 struct Server {
     // Reap the frontend before stopping its worker/broker or removing config.
     _process: Process,
-    h: Harness,
+    h: std::sync::Arc<Harness>,
     client: reqwest::Client,
     base: String,
 }
 impl Server {
     async fn start() -> Result<Self> {
-        let h = Harness::start(Script::Text).await?;
+        Self::start_script(Script::Text).await
+    }
+    async fn start_script(script: Script) -> Result<Self> {
+        let h = std::sync::Arc::new(Harness::start(script).await?);
         let agent = harnx_runtime::config::Config::agent_file("pkg/agent");
         std::fs::create_dir_all(agent.parent().context("package agent directory")?)?;
         std::fs::write(agent, "---\nmodel: /mock:test\ndescription: Package e2e agent\nversion: '1'\n---\nTest package agent\n")?;
-        let log_path = h.config_dir().join("a2a.log");
+        Self::start_replica(h, "a2a.log").await
+    }
+    async fn start_replica(h: std::sync::Arc<Harness>, log_name: &str) -> Result<Self> {
+        let log_path = h.config_dir().join(log_name);
         let log = std::fs::File::create(&log_path)?;
         let mut command = Command::new(binary("harnx-a2a-server")?);
         command
@@ -618,7 +629,7 @@ async fn assert_cli_delete_and_isolation(
     let keys = server.keys(context).await?;
     assert_eq!(
         keys.iter()
-            .filter(|key| key.contains("/a2a/tasks/"))
+            .filter(|key| key.contains("/a2a/archive/"))
             .count(),
         2
     );

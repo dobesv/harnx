@@ -391,7 +391,9 @@ fn replay_log_entries_into_session(
             | SessionLogEntry::HitlApprovalDecision { .. } => {}
             // Compaction request/result are non-mutating markers. They are
             // processed by the worker, not during transcript replay.
-            SessionLogEntry::CompactRequest { .. } | SessionLogEntry::CompactResult { .. } => {}
+            SessionLogEntry::CompactRequest { .. }
+            | SessionLogEntry::CompactResult { .. }
+            | SessionLogEntry::AdmissionClosed { .. } => {}
             SessionLogEntry::EditEntries { .. } | SessionLogEntry::Rewind { .. } => {}
             SessionLogEntry::Unknown => anyhow::ensure!(
                 allow_embedded_metadata,

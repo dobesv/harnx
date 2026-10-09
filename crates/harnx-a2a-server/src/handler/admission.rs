@@ -1,4 +1,5 @@
-//! Ordered SendMessage checks under the dedupe/admission gate.
+//! Ordered checks; local gates reduce contention, shared state decides admission.
+mod first_message;
 use super::{
     errors::{map_error, not_found, permission_denied},
     task_view::validate_history,
@@ -9,8 +10,7 @@ use crate::{
     input_map::message_to_input,
     runner::{RunnerError, TurnRequest},
     store::{
-        message_fingerprint, parse_task_id, ContextAccess, DedupeEntry, DedupeKey, MessageIdentity,
-        TaskRecord,
+        message_fingerprint, parse_task_id, ContextAccess, DedupeKey, MessageIdentity, TaskRecord,
     },
 };
 use a2a_lf::{A2AError, Message, Role, SendMessageRequest};
@@ -75,9 +75,19 @@ impl HarnxHandler {
         let target = self.authorize_target(&owner, &request).await?;
         request.fingerprint = message_fingerprint(&request.message.parts);
         if let Some(record) = self.dedupe(&owner, &request).await? {
-            return Ok(Admission::retry(record));
+            return Ok(Admission::retry(self.reconcile(&owner, record).await?));
         }
+        #[cfg(feature = "fault-injection")]
+        self.backend
+            .runner
+            .fault_hooks()
+            .checkpoint(crate::fault_injection::Boundary::DedupeMiss)
+            .await;
         self.check_running()?;
+        self.check_input_budget(&request.message).await?;
+        if request.context.is_none() {
+            return self.admit_first_message(&owner, request).await;
+        }
         let busy = self
             .reconcile_context(&owner, request.context.as_deref())
             .await?;
@@ -87,6 +97,26 @@ impl HarnxHandler {
             return Err(map_error(RunnerError::Busy.into()));
         }
         self.admit_new_message(&owner, request).await
+    }
+
+    async fn check_input_budget(&self, message: &Message) -> Result<(), A2AError> {
+        let payload_limit = self
+            .backend
+            .store
+            .metadata()
+            .a2a_payload_limit()
+            .await
+            .map_err(map_error)?;
+        if serde_json::to_vec(message)
+            .map_err(|error| map_error(error.into()))?
+            .len()
+            > payload_limit / 2
+        {
+            return Err(A2AError::invalid_params(
+                "serialized message exceeds A2A authority input budget",
+            ));
+        }
+        Ok(())
     }
 
     async fn authorize_target(
@@ -136,15 +166,18 @@ impl HarnxHandler {
                 .await
                 .map_err(map_error);
         }
-        let Some(id) = self
+        let Some(reservation) = self
             .backend
             .store
-            .check_dedupe_lru(&request.lru_key, &request.fingerprint)
+            .first_message_reservation(&request.lru_key, &request.fingerprint)
+            .await
             .map_err(map_error)?
         else {
             return Ok(None);
         };
-        self.task(owner, &id).await.map(Some)
+        self.follow_first_reservation(owner, &reservation)
+            .await
+            .map(Some)
     }
 
     fn check_running(&self) -> Result<(), A2AError> {
@@ -172,10 +205,32 @@ impl HarnxHandler {
             .map_err(map_error)?
             .ok_or_else(not_found)?;
 
+        if let Some(context) = self
+            .backend
+            .store
+            .read_context(&key)
+            .await
+            .map_err(map_error)?
+        {
+            return match context.document.state.active {
+                Some(active) => Ok(!self
+                    .reconcile(owner, active.snapshot)
+                    .await?
+                    .task
+                    .status
+                    .state
+                    .is_terminal()),
+                None => Ok(false),
+            };
+        }
+        self.reconcile_index(owner, &key).await
+    }
+
+    async fn reconcile_index(&self, owner: &RequestIdentity, key: &str) -> Result<bool, A2AError> {
         let non_terminal_entries = self
             .backend
             .store
-            .list_non_terminal_entries(&key)
+            .list_non_terminal_entries(key)
             .await
             .map_err(map_error)?;
 
@@ -190,19 +245,19 @@ impl HarnxHandler {
             let record_opt = self
                 .backend
                 .store
-                .get_task(&key, &entry.task_id)
+                .get_task(key, &entry.task_id)
                 .await
                 .map_err(map_error)?;
 
             let Some(record) = record_opt else {
-                self.handle_missing_entry(&key, entry).await;
+                self.handle_missing_entry(key, entry).await;
                 continue;
             };
 
             if record.task.status.state.is_terminal() {
                 self.backend
                     .store
-                    .repair_index_best_effort(&key, &record)
+                    .repair_index_best_effort(key, &record)
                     .await;
             }
             busy |= !self
@@ -245,17 +300,15 @@ impl HarnxHandler {
         request: MessageAdmission,
     ) -> Result<Admission, A2AError> {
         let MessageAdmission {
-            context,
-            message,
-            fingerprint,
-            lru_key,
+            context, message, ..
         } = request;
         // Only new admissions validate parts. Invalid input must not allocate a session.
         let input =
             message_to_input(&message, self.limits).map_err(|error| map_error(error.into()))?;
         // Orphan fencing mutates the abort flag. Resume a fresh handle after it settles.
         let session = self.session(owner, context.as_deref()).await?;
-        let message_id = message.message_id.clone();
+        let identity = message.message_id.clone();
+        let fingerprint = message_fingerprint(&message.parts);
         let started = self
             .backend
             .runner
@@ -268,33 +321,36 @@ impl HarnxHandler {
                 },
                 input,
             )
-            .await
-            .map_err(map_error)?;
-        self.backend
-            .store
-            .put_message_dedupe(
-                session.storage_key(),
-                MessageIdentity {
-                    message_id: &message_id,
-                    fingerprint: &fingerprint,
-                },
-                &started.snapshot.task.id,
-            )
-            .await
-            .map_err(map_error)?;
-        if context.is_none() {
-            self.backend.store.record_dedupe_lru(
-                lru_key,
-                DedupeEntry {
-                    task_id: started.snapshot.task.id.clone(),
-                    fingerprint,
-                },
-            );
-        }
+            .await;
+        let started = match started {
+            Ok(started) => started,
+            Err(error) if error.downcast_ref::<RunnerError>() == Some(&RunnerError::Busy) => {
+                if let Some(record) = self
+                    .backend
+                    .store
+                    .dedupe_task(
+                        ContextAccess {
+                            export: &self.export,
+                            owner,
+                            local_id: session.session_id(),
+                        },
+                        MessageIdentity {
+                            message_id: &identity,
+                            fingerprint: &fingerprint,
+                        },
+                    )
+                    .await
+                    .map_err(map_error)?
+                {
+                    return Ok(Admission::retry(self.reconcile(owner, record).await?));
+                }
+                return Err(map_error(error));
+            }
+            Err(error) => return Err(map_error(error)),
+        };
         Ok(Admission {
             snapshot: started.snapshot,
-            events: Some(started.events),
-            deduped: false,
+            deduped: started.deduped,
         })
     }
 

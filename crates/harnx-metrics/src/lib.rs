@@ -166,6 +166,11 @@ pub fn init(flags: &MetricsFlags) -> anyhow::Result<()> {
             &ACTIVATION_BUCKETS,
         )
         .context("failed to configure NATS histogram buckets")?
+        .set_buckets_for_metric(
+            Matcher::Prefix("harnx_a2a_".to_owned()),
+            &ACTIVATION_BUCKETS,
+        )
+        .context("failed to configure A2A histogram buckets")?
         .install()
         .context("failed to install Prometheus metrics recorder")?;
     INIT.set(())

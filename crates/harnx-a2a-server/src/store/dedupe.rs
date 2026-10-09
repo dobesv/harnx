@@ -1,4 +1,5 @@
-//! Process-local and durable message deduplication.
+//! Authoritative active identities and immutable message projections; legacy LRU
+//! helpers remain available but production admission does not trust them.
 use super::{parse_task_id, A2aStore, ContextAccess, MessageIdentity, StoreError, TaskRecord};
 use anyhow::{ensure, Result};
 use harnx_core::crypto::sha256;
@@ -17,12 +18,13 @@ pub fn create_dedupe_lru() -> DedupeLru {
     )))
 }
 
-/// Process-local only: new-context retries are lost on restart and cannot coordinate replicas.
+/// Legacy process-local cache. Shared first-message reservations, not this cache,
+/// decide production retries across processes and restarts.
 /// LRU cache keyed by (cluster, export public name, owner, message ID) for dedupe races.
 pub type DedupeLru = Arc<RwLock<LruCache<DedupeKey, (String, String)>>>;
 
 /// Key for the in-process dedupe LRU.
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DedupeKey {
     pub cluster: String,
     pub export: String,
@@ -69,6 +71,18 @@ impl A2aStore {
             .resolve_context(export, owner, local_id)
             .await?
             .ok_or(StoreError::NotFound)?;
+        if let Some(active) = self
+            .read_context(&key)
+            .await?
+            .and_then(|c| c.document.state.active)
+            .filter(|active| active.message.message_id == message_id)
+        {
+            ensure!(
+                active.message.fingerprint == fingerprint,
+                StoreError::FingerprintMismatch
+            );
+            return Ok(Some(active.snapshot));
+        }
         let Some((task_id, existing)) = self.get_message_dedupe(&key, message_id).await? else {
             return Ok(None);
         };
@@ -121,8 +135,20 @@ impl A2aStore {
         });
         let payload = serde_json::to_vec(&record).expect("record serializes");
 
-        self.store.put_a2a_message(&key, payload.into()).await?;
-
+        if self
+            .store
+            .kv_store()
+            .update(&key, payload.into(), 0)
+            .await
+            .is_err()
+        {
+            let saved = self
+                .get_message_dedupe(storage_key, message_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("message mapping unconfirmed"))?;
+            ensure!(saved.1 == fingerprint, StoreError::FingerprintMismatch);
+            ensure!(saved.0 == task_id, "message mapping identity conflict");
+        }
         Ok(())
     }
 

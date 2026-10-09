@@ -99,6 +99,7 @@ Harnx automatically manages the following JetStream resources:
   local IDs remain unchanged. Honours the cluster's configured `replicas` count
   at creation.
   Earlier stream names are not migrated; start fresh sessions after upgrading.
+- **A2A event stream**: `HARNX_A2A_TASK_EVENTS` (`a2a.tasks.>`) uses finite 128 MiB Limits/DiscardNew storage, configured replicas, checkpoint cleanup and coordinated session GC. No event TTL or silent eviction. See [A2A replica operations](a2a-operations.md) for supported versions, budgets, permissions and rollout.
 - **Object Store**: `harnx_attachments` stores binary attachment payloads under
   session-scoped object names. Conversation entries contain only `cid:`
   references; workers hydrate the matching blobs into their local
@@ -137,6 +138,7 @@ count (`None` means 1, no HA):
   - Plans KV bucket (`harnx_plans`)
   - Session transcript streams (`SESSION_<sha256(id)>`)
   - Cluster activation stream (`WORK_NOTIFY_<cluster>`)
+  - A2A task events (`HARNX_A2A_TASK_EVENTS`)
 - **Do not honour `replicas` (by design)**:
   - Local activation stream (`LOCAL_WORK_NOTIFY_V2`) — intentionally R1
     (single-node by design; frontend-local)

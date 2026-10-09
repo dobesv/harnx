@@ -219,6 +219,7 @@ pub(super) fn decide_compact_submit(entries: &[(u64, SessionLogEntry)]) -> Optio
         | SessionLogEntry::Clear
         | SessionLogEntry::EditEntries { .. }
         | SessionLogEntry::Rewind { .. }
+        | SessionLogEntry::AdmissionClosed { .. }
         | SessionLogEntry::Unknown => None,
     }
 }

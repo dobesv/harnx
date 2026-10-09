@@ -1058,10 +1058,10 @@ next prompt's request identity could never replace them.
 See `docs/configuration-guide.md` under "Session User Identity" and
 `crates/harnx-serve/README.md` under "Request Identity" for user-facing config.
 
-Per-session A2A task keys follow the same pattern: `sessions/{storage_key}/a2a/tasks/{uuid}`. A task index at `sessions/{storage_key}/a2a/index` enables listing without full-bucket `keys()` scans. The index is written before the task record; crashes leave skippable creation intents. Stream deltas dedupe by in-memory `stream_seq`, not KV `revision`. See `crates/harnx-a2a-server/README.md` for upgrade/size limits and `crates/harnx-a2a-server/src/store.rs` for the index-first creation ordering.
-These keys are purged automatically by `delete_remote_session_by_key` because it calls
-`purge_session_prefix`. New server crates that need per-session storage should follow this
-layout to reuse existing GC.
+Coordinated A2A admission stores active identity/snapshot in `sessions/{storage_key}/a2a/context` with an owner-checked CAS, then repairs `sessions/{storage_key}/a2a/index`. Admission reads the authority even when index repair lagged. Terminal records use create-only `a2a/archive/{uuid}` projections. Legacy `a2a/tasks/{uuid}` creation keeps index-first ordering and skippable creation intents. First-message reservations are shared create-only keys under `a2a/first-messages/{scope-hash}`, written after a scoped candidate lease but before session effects. Every emitted A2A update commits its snapshot/cursor and one pending event in that context. Independent leader-backed readers capture global watermark before authoritative snapshot, then read task events from watermark+1; no subscriber queue is shared. Retirement requires confirmed stop, archive, mapping and terminal publication. Exact remote cancellation intent lives in the same context document. Create-only `a2a.registry.{storage-hash}` discovery records precede work, and bootstrap starts a bounded leader-read background sweep; worker lease renewal never blocks A2A takeover. See `crates/harnx-a2a-server/src/runner/README.md` for scope, recovery and coordinated GC, and the crate README for upgrade/size limits.
+Session-prefix keys are purged by `delete_remote_session_by_key` through
+`purge_session_prefix`. Coordinated session deletion also removes global first-message reservations, recovery registrations, task event subjects and the scoped A2A lease. It refuses unsettled work and revision-purges authority before the log; purge tombstones fence stale writers. Checkpoint cleanup retains subject predecessors and never purges an active pending envelope. Stream policy, measured payload limits, permissions and drain rollout live in `docs/a2a-operations.md`. New per-session storage
+should use the session prefix to reuse existing GC.
 
 ### Crate layering for NATS tool servers
 

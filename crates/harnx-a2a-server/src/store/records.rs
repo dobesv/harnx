@@ -22,8 +22,9 @@ pub struct TaskRecord {
     pub execution_id: String,
     /// Task-local revision, incremented on each update (not the bucket-wide KV revision).
     pub revision: u64,
-    /// In-process stream cursor. Never used for durable CAS or serialized to KV.
-    #[serde(skip)]
+    /// Durable logical cursor; old records without it deserialize as zero.
+    /// It is not the bucket revision or JetStream global sequence.
+    #[serde(default)]
     pub stream_seq: u64,
     /// When the task was created.
     pub created_at: DateTime<Utc>,
@@ -78,7 +79,11 @@ impl A2aStore {
     ) -> Result<futures::stream::BoxStream<'static, Result<()>>> {
         use futures::StreamExt;
         let (_, uuid) = parse_task_id(task_id)?;
-        let key = a2a_task_key(storage_key, uuid);
+        let key = if self.read_context(storage_key).await?.is_some() {
+            super::context::context_authority_key(storage_key)
+        } else {
+            a2a_task_key(storage_key, uuid)
+        };
         Ok(self
             .store
             .kv_store()
@@ -90,6 +95,26 @@ impl A2aStore {
 
     /// Trusted runner lookup. RPC callers must use `get_task_for_export` for ownership checks.
     pub async fn get_task(&self, storage_key: &str, task_id: &str) -> Result<Option<TaskRecord>> {
+        let authority = self.read_context(storage_key).await?;
+        if let Some(active) = authority
+            .as_ref()
+            .and_then(|context| context.document.state.active.as_ref())
+            .filter(|active| active.snapshot.task.id == task_id)
+        {
+            return Ok(Some(active.snapshot.clone()));
+        }
+        if let Some(archive) = self.read_terminal_archive(storage_key, task_id).await? {
+            return Ok(Some(archive));
+        }
+        let record = self.get_legacy_task(storage_key, task_id).await?;
+        Ok(record.filter(|record| authority.is_none() || record.task.status.state.is_terminal()))
+    }
+
+    async fn get_legacy_task(
+        &self,
+        storage_key: &str,
+        task_id: &str,
+    ) -> Result<Option<TaskRecord>> {
         let (_, uuid) = parse_task_id(task_id)?;
         let key = a2a_task_key(storage_key, uuid);
         match self.store.get_a2a_task(&key).await? {
@@ -111,6 +136,7 @@ impl A2aStore {
 
     /// Create a new task record.
     pub async fn create_task(&self, storage_key: &str, seed: TaskSeed) -> Result<TaskRecord> {
+        self.reject_legacy_write(storage_key).await?;
         let TaskSeed {
             task,
             user_msg_id,
@@ -200,6 +226,7 @@ impl A2aStore {
             task_id,
             revision: expected_revision,
         } = version;
+        self.reject_legacy_write(storage_key).await?;
         let (_, uuid) = parse_task_id(task_id)?;
         let key = a2a_task_key(storage_key, uuid);
 

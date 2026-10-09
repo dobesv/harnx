@@ -11,6 +11,7 @@ use async_nats::jetstream::{
     ErrorCode,
 };
 use std::error::Error as _;
+pub(crate) mod a2a;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDeleteResult {
@@ -51,6 +52,11 @@ pub(crate) async fn delete_remote_session_by_key(
 ) -> Result<SessionDeleteResult> {
     let jetstream = config.nats_jetstream(cluster).await?;
     let lease_bucket = load_optional_lease_bucket(config, cluster).await?;
+    let metadata = a2a::metadata(&jetstream).await?;
+    let a2a_fence = match &metadata {
+        Some(metadata) => a2a::fence(metadata, session_id).await?,
+        None => None,
+    };
     let stream_deleted = delete_session_stream(&jetstream, session_id).await?;
     let lease_deleted = delete_session_lease(lease_bucket, session_id).await?;
     match jetstream
@@ -73,6 +79,9 @@ pub(crate) async fn delete_remote_session_by_key(
     // Legacy attachments are included in delete_owner (media prefix), but keep
     // the result aligned with SessionDeleteResult's attachments_deleted field
     let attachments_deleted = blob_deleted;
+    if let (Some(fence), Some(metadata)) = (a2a_fence, metadata) {
+        fence.finish(&metadata, session_id).await?;
+    }
 
     Ok(SessionDeleteResult {
         stream_deleted,

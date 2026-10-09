@@ -4,7 +4,7 @@ use crate::{
     exports::Export,
     identity::{Identity, RequestIdentity},
     input_map::InputLimits,
-    runner::{A2aEvent, RunnerError, SessionRequest},
+    runner::{RunnerError, SessionRequest},
     store::{TaskAccess, TaskRecord},
 };
 use a2a_lf::*;
@@ -13,13 +13,13 @@ use async_trait::async_trait;
 use futures::{stream::BoxStream, StreamExt};
 use harnx_runtime::NatsSession;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 
 mod admission;
 mod backend;
 mod errors;
 mod listing;
 pub mod task_view;
+mod wait;
 pub use backend::{Backend, BackendConfig};
 pub use errors::PERMISSION_DENIED_CODE;
 use errors::{map_error, not_found};
@@ -27,14 +27,12 @@ use task_view::{history, validate_history};
 
 struct Admission {
     snapshot: TaskRecord,
-    events: Option<broadcast::Receiver<A2aEvent>>,
     deduped: bool,
 }
 impl Admission {
     fn retry(snapshot: TaskRecord) -> Self {
         Self {
             snapshot,
-            events: None,
             deduped: true,
         }
     }
@@ -132,60 +130,26 @@ impl HarnxHandler {
         owner: &RequestIdentity,
         task_id: &str,
     ) -> Result<TaskRecord, A2AError> {
-        let mut record = self.task(owner, task_id).await?;
+        let record = self.task(owner, task_id).await?;
         // Dropping a waiter never owns or cancels the detached turn.
         if record.task.status.state.is_terminal() {
             return Ok(record);
         }
-        if let Some(mut done) = self.backend.runner.completion(&self.export, &record).await {
-            tracing::info!(%task_id, "waiting on local task completion");
-            // A dropped supervisor must fall through to orphan reconciliation.
-            let _ = done.wait_for(|finished| *finished).await;
-            record = self.task(owner, &record.task.id).await?;
-            if record.task.status.state.is_terminal() {
-                return Ok(record);
-            }
-            // done means no local writer remains. A KV outage may have prevented
-            // final persistence; fence it or fail instead of waiting indefinitely.
-            record = self.reconcile(owner, record).await?;
-            return if record.task.status.state.is_terminal() {
-                Ok(record)
-            } else {
-                Err(A2AError::internal(
-                    "task stopped without terminal persistence",
-                ))
-            };
-        }
-        let key = self
+        let storage = harnx_core::session_identity::session_key(
+            Some(&self.export.agent),
+            &record.task.context_id,
+        );
+        if self
             .backend
             .store
-            .resolve_context(&self.export, owner, &record.task.context_id)
+            .read_context(&storage)
             .await
             .map_err(map_error)?
-            .ok_or_else(not_found)?;
-        tracing::info!(%task_id, "waiting for task via KV watch");
-        let mut changes = self
-            .backend
-            .store
-            .watch_task(&key, &record.task.id)
-            .await
-            .map_err(map_error)?;
-        // Completion may precede watch creation. Re-read after subscribing, and
-        // fence abandoned tasks rather than waiting forever on a stopped writer.
-        record = self
-            .reconcile(owner, self.task(owner, &record.task.id).await?)
-            .await?;
-        while !record.task.status.state.is_terminal() {
-            changes
-                .next()
-                .await
-                .ok_or_else(|| A2AError::internal("task watch closed"))?
-                .map_err(map_error)?;
-            record = self
-                .reconcile(owner, self.task(owner, &record.task.id).await?)
-                .await?;
+            .is_some()
+        {
+            return self.wait_shared_terminal(owner, task_id).await;
         }
-        Ok(record)
+        self.wait_legacy_terminal(owner, record).await
     }
 }
 
@@ -297,17 +261,13 @@ impl RequestHandler for HarnxHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let owner = self.owner(params)?;
         let (admission, length) = self.admit_request(owner.clone(), req).await?;
-        let (mut snapshot, events) = if admission.deduped {
-            let record = self.reconcile(&owner, admission.snapshot).await?;
-            // Dedupe retries stream the existing task, including terminal snapshots.
-            self.backend
-                .runner
-                .stream_snapshot(&self.export, &owner, &record.task.id)
-                .await
-                .map_err(map_error)?
-        } else {
-            (admission.snapshot, admission.events)
-        };
+        let record = self.reconcile(&owner, admission.snapshot).await?;
+        let (mut snapshot, events) = self
+            .backend
+            .runner
+            .stream_snapshot(&self.export, &owner, &record.task.id)
+            .await
+            .map_err(map_error)?;
         history(&mut snapshot.task, length)?;
         Ok(crate::sse::task_stream(snapshot, events))
     }

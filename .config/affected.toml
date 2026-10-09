@@ -139,3 +139,7 @@ test = ["harnx-a2a-server"]
 on-affected = ["harnx-a2a-server", "harnx"]
 test = ["harnx-a2a-server"]
 
+# Separate-process A2A tests count real side effects from the native bash binary.
+[[test-edge]]
+on-affected = ["harnx-bash-tools"]
+test = ["harnx-a2a-server"]

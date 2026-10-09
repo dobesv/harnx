@@ -48,6 +48,7 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::Rewind { .. } => "rewind",
         SessionLogEntry::CompactRequest { .. } => "compact_request",
         SessionLogEntry::CompactResult { .. } => "compact_result",
+        SessionLogEntry::AdmissionClosed { .. } => "admission_closed",
         SessionLogEntry::Unknown => "unknown",
     }
 }
@@ -222,7 +223,7 @@ pub fn tool_declaration() -> ToolDeclaration {
         "properties": {
             "index_min": {"type": "integer", "description": "Minimum log entry seq (inclusive)."},
             "index_max": {"type": "integer", "description": "Maximum log entry seq (inclusive)."},
-            "type": {"type": "string", "description": "Filter by entry type: message, tool_calls, tool_results, sub_agent_started, handoff_committed, hitl_approval_requested, hitl_approval_decision, compress, data_urls, clear, cancel, error, turn_end, edit_entries, rewind, unknown."},
+            "type": {"type": "string", "description": "Filter by entry type: message, tool_calls, tool_results, sub_agent_started, handoff_committed, hitl_approval_requested, hitl_approval_decision, compress, data_urls, clear, cancel, error, turn_end, admission_closed, edit_entries, rewind, unknown."},
             "tool_name": {"type": "string", "description": "Keep only entries referencing this tool name."},
             "text_regex": {"type": "string", "description": "Keep entries whose rendered text matches this regular expression."},
             "limit": {"type": "integer", "description": "Maximum number of rows to return."},

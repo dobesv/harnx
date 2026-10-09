@@ -194,6 +194,15 @@ pub enum SessionLogEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timestamp: Option<DateTime<Utc>>,
     },
+    /// Closes a fixed admission without an executable prompt. Unlike Cancel,
+    /// this does not interrupt any other invocation or cover queued input.
+    #[serde(rename = "admission_closed")]
+    AdmissionClosed {
+        invocation_id: String,
+        prompt_id: String,
+        closure_id: String,
+        expected_predecessor: u64,
+    },
     #[serde(other)]
     Unknown,
 }

@@ -17,11 +17,17 @@ use harnx_runtime::nats_session_metadata::SessionMetadataStore;
 use std::sync::Arc;
 
 mod binding;
+pub mod context;
 mod dedupe;
 mod ids;
 mod index;
 mod records;
+pub mod registry;
+mod reservations;
+mod retention;
+pub use reservations::{FirstMessageReservation, TaskAllocation};
 
+pub(crate) use binding::validate_stored_owner;
 pub use binding::{validate_binding, A2aBinding, A2A_BINDING_NAMESPACE, A2A_BINDING_VERSION};
 pub use dedupe::{
     create_dedupe_lru, message_fingerprint, message_id_hash, DedupeEntry, DedupeKey, DedupeLru,
@@ -73,6 +79,8 @@ pub struct A2aStore {
     store: SessionMetadataStore,
     dedupe_lru: DedupeLru,
     access_rules: Option<Arc<AccessRules>>,
+    #[cfg(feature = "fault-injection")]
+    context_hooks: Arc<crate::fault_injection::FaultHooks>,
 }
 
 impl A2aStore {
@@ -90,7 +98,18 @@ impl A2aStore {
             store,
             dedupe_lru: create_dedupe_lru(),
             access_rules,
+            #[cfg(feature = "fault-injection")]
+            context_hooks: Default::default(),
         }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub fn context_fault_hooks(&self) -> Arc<crate::fault_injection::FaultHooks> {
+        self.context_hooks.clone()
+    }
+
+    pub(crate) fn metadata(&self) -> &SessionMetadataStore {
+        &self.store
     }
 
     pub fn access_rules(&self) -> Option<&AccessRules> {

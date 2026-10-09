@@ -2,8 +2,7 @@
 //! the durable turn result, not a model round's Final event.
 use a2a_lf::{Artifact, Message, Part, Role, StreamResponse, TaskState, TaskStatus};
 use chrono::Utc;
-use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
-use tokio::sync::mpsc;
+use std::sync::Arc;
 
 /// Stream cursor stays internal; wire responses contain only protocol fields.
 #[derive(Debug, Clone)]
@@ -19,15 +18,7 @@ impl A2aEvent {
     }
 }
 
-pub(super) struct A2aEventSink(pub mpsc::UnboundedSender<AgentEvent>);
-impl harnx_core::event::AgentEventSink for A2aEventSink {
-    fn emit(&self, event: AgentEvent) {
-        // Persistence and broadcast are handled by one sequential consumer.
-        if matches!(event, AgentEvent::Model(ModelEvent::MessageChunk { .. })) {
-            let _ = self.0.send(event);
-        }
-    }
-}
+pub(super) struct A2aEventSink(pub Arc<super::inbox::TextInbox>);
 
 #[derive(Default)]
 pub(super) struct Output {
@@ -36,15 +27,16 @@ pub(super) struct Output {
     pub sent: bool,
 }
 impl Output {
-    pub fn accept(&mut self, event: AgentEvent) {
-        if let AgentEvent::Model(ModelEvent::MessageChunk { blocks }) = event {
-            for block in blocks {
-                if let ContentBlock::Text(text) = block {
-                    self.text.push_str(&text);
-                    self.pending.push_str(&text);
-                }
-            }
-        }
+    pub fn accept(&mut self, text: String, limit: usize) -> anyhow::Result<()> {
+        let limit = if limit == 0 { 1024 * 1024 } else { limit };
+        anyhow::ensure!(
+            super::limits::encoded_len(&text)
+                <= limit.saturating_sub(super::limits::encoded_len(&self.text)),
+            "task output exceeds NATS payload budget"
+        );
+        self.text.push_str(&text);
+        self.pending.push_str(&text);
+        Ok(())
     }
 }
 
