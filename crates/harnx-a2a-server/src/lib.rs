@@ -23,6 +23,14 @@ mod web_url;
 #[cfg(test)]
 mod test_support;
 
+// Share the real broker/worker fixture with private-state regression tests.
+#[cfg(test)]
+extern crate self as harnx_a2a_server;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/it/support.rs"]
+mod runner_test_support;
+
 /// Separate from native toolset ports (3000–3007) and MCP HTTP (3010).
 pub const DEFAULT_A2A_HTTP_PORT: u16 = 3020;
 

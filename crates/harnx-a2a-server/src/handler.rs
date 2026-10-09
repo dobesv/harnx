@@ -19,6 +19,8 @@ mod backend;
 mod errors;
 mod listing;
 pub mod task_view;
+#[cfg(test)]
+mod tests;
 mod wait;
 pub use backend::{Backend, BackendConfig};
 pub use errors::PERMISSION_DENIED_CODE;
@@ -44,6 +46,8 @@ pub struct HarnxHandler {
     identity: Identity,
     backend: Arc<Backend>,
     limits: InputLimits,
+    #[cfg(test)]
+    cancel_snapshot_gate: Option<Arc<tests::CancelSnapshotGate>>,
 }
 impl HarnxHandler {
     pub fn new(
@@ -57,6 +61,8 @@ impl HarnxHandler {
             identity,
             backend,
             limits,
+            #[cfg(test)]
+            cancel_snapshot_gate: None,
         }
     }
     fn owner(&self, params: &ServiceParams) -> Result<RequestIdentity, A2AError> {
@@ -209,7 +215,14 @@ impl RequestHandler for HarnxHandler {
         let owner = self.owner(params)?;
         let initial = self.task(&owner, &req.id).await?;
         let initially_terminal = initial.task.status.state.is_terminal();
+        #[cfg(test)]
+        if let Some(gate) = &self.cancel_snapshot_gate {
+            gate.after_snapshot(initial.task.status.state.clone()).await;
+        }
         let record = self.reconcile(&owner, initial).await?;
+        // The worker can complete mid-reconcile: we read a Working snapshot but the reconcile
+        // sees Completed. Return the completed task instead of task_not_cancelable.
+        // Verified by nats_http_cancel_returns_completed_when_completion_wins_after_snapshot.
         if !initially_terminal && record.task.status.state == TaskState::Completed {
             return Ok(record.task);
         }

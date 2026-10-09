@@ -114,22 +114,13 @@ impl Publisher {
     }
 
     pub(super) async fn flush_artifact(&mut self, last: bool, replace: bool) -> Result<()> {
-        if !last && self.output.pending.is_empty() {
+        let Some(update) = self
+            .output
+            .artifact_update(&self.record().task, last, replace)
+        else {
             return Ok(());
-        }
-        let text = if replace {
-            self.output.text.clone()
-        } else {
-            self.output.pending.clone()
         };
-        let response = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
-            task_id: self.record().task.id.clone(),
-            context_id: self.record().task.context_id.clone(),
-            artifact: artifact(text),
-            append: Some(self.output.sent && !replace),
-            last_chunk: Some(last),
-            metadata: None,
-        });
+        let response = StreamResponse::ArtifactUpdate(update);
         self.send(
             response,
             TaskChanges {
@@ -138,8 +129,7 @@ impl Publisher {
             },
         )
         .await?;
-        self.output.sent = true;
-        self.output.pending.clear();
+        self.output.committed();
         Ok(())
     }
     pub(super) async fn execute(&mut self, request: ExecutionRequest<'_>) -> Result<()> {
@@ -205,13 +195,14 @@ impl Publisher {
         );
         tokio::pin!(follow);
         let mut cancellation = tokio::time::interval(Duration::from_millis(250));
-        let mut interval = tokio::time::interval(ARTIFACT_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut coalescer = super::coalescing::ArtifactCoalescer::new(inbox.clone(), limit);
         let result = loop {
             tokio::select! {
                 result = &mut follow => break result?,
-                _ = inbox.ready() => self.output.accept(inbox.take()?, limit)?,
-                _ = interval.tick() => self.flush_artifact(false, false).await?,
+                ready = coalescer.ready(&mut self.output) => {
+                    ready?;
+                    self.flush_artifact(false, false).await?;
+                }
                 _ = cancellation.tick() => self.observe_cancel(session).await?,
             }
         };
