@@ -8,7 +8,10 @@ mod agent_card;
 mod bootstrap;
 pub mod cli;
 mod compat;
+mod diagnostics;
 pub mod exports;
+#[cfg(feature = "fault-injection")]
+pub mod fault_injection;
 pub mod handler;
 pub mod identity;
 pub mod input_map;
@@ -27,6 +30,7 @@ pub const DEFAULT_A2A_HTTP_PORT: u16 = 3020;
 ///
 /// Unknown agents and export collisions fail before binding the listener.
 pub async fn run(args: cli::Args) -> Result<()> {
+    harnx_metrics::init(&args.metrics)?;
     // Runtime path helpers read HARNX_CONFIG_DIR during turns as well as startup.
     if let Some(dir) = &args.config_dir {
         std::env::set_var("HARNX_CONFIG_DIR", dir);

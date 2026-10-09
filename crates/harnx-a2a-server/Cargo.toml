@@ -7,12 +7,18 @@ license.workspace = true
 repository.workspace = true
 description = "A2A server exposing harnx agents over JSON-RPC and SSE"
 
+[features]
+# Deterministic integration-test controls; absent from normal builds.
+fault-injection = ["harnx-runtime/fault-injection"]
+
 [dependencies]
 a2a_server_lf = { version = "=0.5.1", package = "a2a-server-lf" }
 a2a_lf = { version = "=0.4.1", package = "a2a-lf" }
 a2a_pb = { version = "=0.3.1", package = "a2a-pb" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+async-nats = { workspace = true }
+harnx-nats-common = { path = "../harnx-nats-common" }
 axum = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
@@ -21,6 +27,8 @@ futures = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-runtime = { path = "../harnx-runtime" }
 lru = "0.18"
+metrics = { workspace = true }
+harnx-metrics = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -32,6 +40,7 @@ tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
+metrics-util = { workspace = true }
 process-wrap = { workspace = true, features = ["std"] }
 tokio-util = { workspace = true }
 harnx-healthz = { path = "../harnx-healthz" }

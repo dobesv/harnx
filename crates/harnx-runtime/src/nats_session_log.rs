@@ -269,10 +269,29 @@ impl NatsSessionLog {
         }
     }
 
+    /// Read a retained admission transcript, refusing a deleted stream or an
+    /// empty retention gap instead of treating it as a new session.
+    pub async fn load_events_latest_required_async(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
+        let mut stream = self.jetstream.get_stream(&self.stream_name).await?;
+        let info = stream.info().await?;
+        anyhow::ensure!(
+            info.state.messages > 0 || info.state.last_sequence == 0,
+            "session log retention gap: admission predecessor unavailable"
+        );
+        self.load_latest_from_stream(stream).await
+    }
+
     pub async fn load_events_latest_async(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
-        let Some(mut stream) = self.open_stream_for_read().await? else {
+        let Some(stream) = self.open_stream_for_read().await? else {
             return Ok(Vec::new());
         };
+        self.load_latest_from_stream(stream).await
+    }
+
+    async fn load_latest_from_stream(
+        &self,
+        mut stream: jetstream::stream::Stream,
+    ) -> Result<Vec<(u64, SessionLogEntry)>> {
         let Some(latest) = self.last_raw_message(&stream).await? else {
             return Ok(Vec::new());
         };

@@ -259,3 +259,20 @@ impl A2aRecordKind {
         }
     }
 }
+
+impl SessionMetadataStore {
+    /// Current serialized value ceiling, including both broker and KV limits.
+    pub async fn a2a_payload_limit(&self) -> Result<usize> {
+        let mut stream = self.kv_store().stream.clone();
+        let stream_max = stream.info().await?.config.max_message_size;
+        let server_max = match self.max_payload() {
+            0 => 1024 * 1024,
+            max => max,
+        };
+        Ok(if stream_max > 0 {
+            server_max.min(stream_max as usize)
+        } else {
+            server_max
+        })
+    }
+}

@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 pub(super) struct Frames {
     response: reqwest::Response,
     buffer: Vec<u8>,
+    pub(super) comments: usize,
 }
 impl Frames {
     async fn open(http: &Http, method: &str, params: Value) -> Result<Self> {
@@ -39,14 +40,16 @@ impl Frames {
         Ok(Self {
             response,
             buffer: vec![],
+            comments: 0,
         })
     }
     async fn frame(&mut self) -> Result<Option<String>> {
         tokio::time::timeout(DEADLINE, async {
             loop {
                 if let Some(end) = self.buffer.windows(2).position(|bytes| bytes == b"\n\n") {
-                    let frame = self.buffer.drain(..end + 2).collect();
-                    return Ok(Some(String::from_utf8(frame)?));
+                    let frame = String::from_utf8(self.buffer.drain(..end + 2).collect())?;
+                    self.comments += usize::from(frame.starts_with(':'));
+                    return Ok(Some(frame));
                 }
                 match self.response.chunk().await? {
                     Some(chunk) => self.buffer.extend_from_slice(&chunk),
@@ -231,44 +234,47 @@ async fn streaming_disconnect_resubscribe_no_duplicate_chunks_and_ownership() ->
 
 #[tokio::test]
 async fn streaming_keep_alive_comment_without_wall_clock_sleep() -> Result<()> {
-    // Worker uses block_in_place, while the HTTP server's clock must be pausable.
-    struct WorkerRuntime(Option<tokio::runtime::Runtime>);
-    impl Drop for WorkerRuntime {
-        fn drop(&mut self) {
-            self.0.take().unwrap().shutdown_background();
-        }
-    }
-    let worker = WorkerRuntime(Some(tokio::runtime::Runtime::new()?));
-    let harness = worker
-        .0
-        .as_ref()
-        .unwrap()
-        .spawn(crate::support::Harness::start(crate::support::Script::Text))
-        .await??;
-    let http = Http::from_harness(harness).await?;
-    let mut frames = Frames::open(
-        &http,
-        "SendStreamingMessage",
-        json!({"message":message("keepalive", None)}),
+    use axum::response::IntoResponse;
+    use futures::{stream, StreamExt};
+    use http_body_util::BodyExt;
+    harnx_core::require_nextest();
+    // Isolate the upstream idle encoder's clock. Advancing a live frontend clock
+    // also expires in-flight NATS request deadlines and can correctly interrupt
+    // its task reader; that isn't a keep-alive failure.
+    let stream = stream::once(async { Ok(json!({"task":{"id":"keepalive"}})) })
+        .chain(stream::pending())
+        .boxed();
+    let response = a2a_server_lf::sse::sse_jsonrpc_stream(
+        a2a_lf::JsonRpcId::String("stream-request".into()),
+        stream,
     )
-    .await?;
-    frames.event().await?.unwrap();
-    let mut answer = String::new();
-    until_artifact(&mut frames, &mut answer).await?;
-    // Pause only after real broker/worker admission and first token. Advance the
-    // upstream 15s KeepAlive timer, then resume before polling network IO.
+    .into_response();
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let mut body = response.into_body();
+    let first = body
+        .frame()
+        .await
+        .context("missing snapshot")??
+        .into_data()
+        .unwrap();
+    assert!(std::str::from_utf8(&first)?.contains("\"jsonrpc\":\"2.0\""));
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(15)).await;
+    let frame = body
+        .frame()
+        .await
+        .context("missing keep-alive")??
+        .into_data()
+        .unwrap();
     tokio::time::resume();
-    let comment = frames.frame().await?.context("missing keep-alive")?;
+    let comment = std::str::from_utf8(&frame)?;
+    assert!(comment.starts_with(':'), "{comment}");
     assert!(
         comment
             .lines()
             .all(|line| line.is_empty() || line.starts_with(':')),
         "{comment}"
     );
-    http.h.llm.release.notify_one();
-    finish(&mut frames, &mut answer).await?;
     Ok(())
 }
 

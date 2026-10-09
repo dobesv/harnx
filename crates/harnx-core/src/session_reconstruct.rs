@@ -144,7 +144,9 @@ pub fn apply_log_mutations_with_name(
             // TurnEnd is durable control metadata, not a logical transcript
             // row. Drop it from effective history so it cannot shift the
             // user-visible logical sequence numbers.
-            SessionLogEntry::TurnEnd { .. } | SessionLogEntry::Unknown => {}
+            SessionLogEntry::TurnEnd { .. }
+            | SessionLogEntry::AdmissionClosed { .. }
+            | SessionLogEntry::Unknown => {}
             _ => effective_entries.push((*seq, entry.clone())),
         }
     }

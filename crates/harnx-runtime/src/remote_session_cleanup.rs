@@ -363,6 +363,12 @@ async fn candidate_is_active(
     context: &CandidateContext<'_>,
     session_id: &str,
 ) -> anyhow::Result<bool> {
+    if crate::nats_admin::a2a::unresolved(context.metadata_store, session_id).await? {
+        return Ok(true);
+    }
+    if scoped_a2a_lease_present(context.lease_store, session_id).await? {
+        return Ok(true);
+    }
     if lease_present(context.lease_store, session_id).await? {
         return Ok(true);
     }
@@ -431,6 +437,20 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+async fn scoped_a2a_lease_present(
+    lease_store: Option<&Store>,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(store) = lease_store else {
+        return Ok(false);
+    };
+    Ok(
+        harnx_nats_common::leader_reads::entry(store, &format!("sessions/{session_id}/a2a/lock"))
+            .await?
+            .is_some_and(|entry| entry.operation == Operation::Put),
+    )
 }
 
 #[cfg(test)]

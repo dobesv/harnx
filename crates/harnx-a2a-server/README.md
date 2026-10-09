@@ -19,6 +19,7 @@ Usage: harnx-a2a-server [OPTIONS] --agent <SPEC>
 | `--host <HOST>` | `127.0.0.1` | HTTP bind host. Set explicitly (for example, `0.0.0.0`) when listening behind a reverse proxy or container gateway. |
 | `--port <PORT>` | `3020` | HTTP bind port. Distinct from toolset ports (3000–3007) and MCP HTTP (3010). |
 | `--agent <SPEC>` | *(required)* | Agent export specification: bare `name` or `alias=name`. Repeatable, comma-separated. Environment variable `HARNX_A2A_AGENTS`. Specifying CLI flags replaces `HARNX_A2A_AGENTS`. There is no default "expose all" mode; at least one agent is required. |
+| `--metrics-addr <ADDR>` | disabled | Optional Prometheus listener (`IP:PORT` or `:PORT`); exports recovery, pending-age and sweep diagnostics. |
 | `--cluster <CLUSTER>` | none | Target NATS cluster name for shared workers. |
 | `--config-dir <PATH>` | `HARNX_CONFIG_DIR` | Path to the harnx configuration directory containing `config.yaml`. |
 | `--access-rules <PATH>` | `<config dir>/access.yaml` if present | Access rules file, also set by `HARNX_ACCESS_RULES`. Requires `--user-id-header` when rules are enabled. |
@@ -73,10 +74,11 @@ Agent Cards are public when access rules are disabled. With access rules enabled
 - **Message deduplication**: Requests are deduped by `messageId`.
   - Retrying an identical `messageId` and content returns the existing task record—even if the task has already reached a terminal state.
   - Sending an existing `messageId` with different content returns `InvalidParams` (`-32602`).
-  - First-turn messages (without `contextId`) are deduped through an in-memory LRU cache keyed by `(export, user_id, messageId)`. Follow-up messages within a context are deduped against session KV storage.
+  - First-turn messages (without `contextId`) use a create-only NATS reservation scoped by `(cluster, export, user_id, messageId)`. Stable context/task/runtime IDs are retained before session creation or prompt append. Follow-up identities live in the CAS context authority before their session KV projection. Local gates and caches don't decide admission.
+  - Initialization retries follow the same reservation. A bounded request can return an initialization error while its candidate lease is still held; retry with the same `messageId`, not a replacement. Owner-loss recovery closes a missing prompt instead of executing it. Reservations have no independent live-identity TTL.
 - **Disconnections do not cancel**: Dropping an HTTP connection or closing an SSE stream does not cancel the turn. Execution continues on the worker. Clients can reconnect and resume streaming with `SubscribeToTask`.
-- **Live output and persistence**: Active tasks serve current artifact text from the local runner for `GetTask`, `ListTasks`, and stream reconnects. SSE deltas flush every 100 ms; intermediate artifact snapshots persist at most once every 2 seconds. Final artifacts and status changes persist immediately. After a server crash, orphaned tasks are marked failed with the last durable artifact snapshot; recent live text can be lost.
-- **Durable task storage and session retention**: Task records, persisted Jira payloads, and deduplication entries live in NATS KV under the session's storage key prefix (`sessions/{storage_key}/a2a/...`). They live as long as the backing session does. Remote session GC runs only when the worker setting `cleanup_remote_sessions_days` (environment variable `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS`) is positive; by default, it is unset (`None`), meaning automatic GC is disabled and sessions persist indefinitely. Set `cleanup_remote_sessions_days: <days>` (or `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS=<days>`) in worker configuration to enable hourly cleanup sweeps. Operators can also delete a session explicitly with `harnx delete session <session-id> --agent <agent> --cluster <cluster>`.
+- **Live output and persistence**: All replicas read committed snapshots and serve independent durable task streams. Coalesced artifact updates flush at 100 ms; each emitted update commits its full snapshot, cursor and one-event outbox before conditional JetStream publication. Streams start with a fresh snapshot, then contiguous updates. Lag, broker errors and retention gaps interrupt the reader; reconnect doesn't need a public cursor. Foreground/background recovery preserves durable completion or closes/stops the exact invocation without replay. Worker lease renewal doesn't block A2A recovery. No failover SLO is promised.
+- **Durable task storage and session retention**: Task records, persisted Jira payloads, and deduplication entries live in NATS KV under the session's storage key prefix (`sessions/{storage_key}/a2a/...`). Those session-prefix records live as long as the backing session does. Global first-message reservations (`a2a/first-messages/{scope-hash}`) and recovery registrations (`a2a.registry.{storage-hash}`) have no independent TTL; coordinated session GC removes them, the task event subject and the scoped lease only after durable task settlement. Unresolved work blocks deletion. Remote session GC runs only when the worker setting `cleanup_remote_sessions_days` (environment variable `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS`) is positive; by default, it is unset (`None`), meaning automatic GC is disabled and sessions persist indefinitely. Set `cleanup_remote_sessions_days: <days>` (or `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS=<days>`) in worker configuration to enable hourly cleanup sweeps. Operators can also delete a session explicitly with `harnx delete session <session-id> --agent <agent> --cluster <cluster>`.
 
 ## Task index and upgrades
 
@@ -87,7 +89,7 @@ existing empty index does not trigger a scan.
 
 Only one server version may serve a bucket at a time. Stop the old server
 before starting the new one; don't overlap versions during rolling updates.
-See [Single replica in v1](#limitations).
+See [replica operations](../../docs/a2a-operations.md) for provisioning, calibrated payload limits, retention, permissions and drain rollout.
 After running a pre-index build during a downgrade, delete each affected
 session's `sessions/{storage_key}/a2a/index` key before re-upgrading. Keep the
 task records; first access will rebuild the index.
@@ -101,8 +103,12 @@ pre-admission error `-32603 "request failed"`. Start a new context instead.
 Missing task records leave creation intents in the index. Intents still
 missing after five minutes are removed on listing or reconciliation.
 
-A crash after the final artifact write but before the terminal status write
-can leave a full artifact on a task marked failed during restart recovery.
+Coordinated admission writes active identity in the context authority before index
+repair. Index lag or a failed repair cannot hide an active task from admission.
+Legacy create-only task writes keep their index-first ordering. Recovery uses the
+original runtime ticket: durable completion wins over owner-loss failure; a missing
+prompt is closed, never replayed. Terminal archives and the terminal event outbox
+must be durable before the context accepts another task.
 
 ## Data Parts and Rendering
 
@@ -276,7 +282,7 @@ remotes:
 ## Limitations
 
 - **No HITL confirmations**: A2A 1.0 does not specify an interactive human-in-the-loop confirmation flow. Any tool execution that requires manual approval is automatically denied (fails closed).
-- **Single replica in v1**: Active turn execution and runner registries are in-memory. Multi-replica routing and distributed execution ownership are not supported in this release.
+- **Multi-replica routing**: Shared admission, ownership, cancellation and streaming work through any backend without sticky sessions. Drain old turns and exclude mixed writers when upgrading; deploy runtime readers before `admission_closed` writers. See [operations](../../docs/a2a-operations.md). Recovery is eventual and TTL-based, not a fixed failover SLO. Interrupted work is never replayed and tool side effects aren't rolled back.
 - **No push notifications**: Push notification methods (`CreateTaskPushNotificationConfig`, etc.) return `PushNotificationNotSupportedError` (`-32003`). `capabilities.pushNotifications` is set to `false`.
 - **Anonymous mode lacks isolation**: When `--user-id-header` is not configured, all requests operate as a single anonymous principal. Any client reaching the endpoint can access or resume sessions.
 - **A2A 0.3 compatibility is input-only**: The server accepts 0.3 method names, legacy `blocking`, and relaxed enum names on incoming requests, but always responds with canonical A2A 1.0 wire payloads. Full 0.3 wire responses are not supported.

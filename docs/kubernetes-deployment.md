@@ -498,3 +498,18 @@ Avoid `:latest` in production:
 - The Web UI interacts directly with `harnx-serve` HTTP routes and payload schemas.
 - Version mismatches between frontend assets and backend APIs can lead to silent errors or UI drift.
 - Because both images share release versioning, upgrading is a coordinated one-line change across image tags.
+
+## A2A backends behind ingress
+
+A2A replicas sharing NATS do not require sticky routing. Follow
+[A2A replica operations](a2a-operations.md) before scaling: configure service
+permissions, provision finite non-evicting task events and size retention for your
+workload. Drain admitted old turns before stopping old writers; don't mix ownership
+implementations. Runtime readers must understand `admission_closed` before its
+writers are enabled. Keep exports configured until unresolved work settles.
+
+Lease-TTL recovery is eventual, with no fixed failover SLO during NATS outages.
+Interrupted work isn't replayed and completed tool side effects aren't rolled back.
+Ingress disconnect is not task cancellation. Preserve the existing trusted-user
+header handling and disable SSE buffering. R3/deployment fanout capacity must be
+measured separately from the R1 regression probes documented in the operations guide.

@@ -42,6 +42,8 @@ impl FromStr for AgentSpec {
 #[derive(Debug, Parser)]
 #[command(name = "harnx-a2a-server", version, about, propagate_version = true)]
 pub struct Args {
+    #[command(flatten)]
+    pub metrics: harnx_metrics::MetricsFlags,
     /// HTTP bind host (set explicitly to expose externally).
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,

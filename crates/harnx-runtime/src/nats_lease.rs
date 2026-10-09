@@ -1,3 +1,4 @@
+mod scope;
 use crate::config::DEFAULT_BUCKET_REPLICAS;
 use crate::nats_metrics;
 use crate::nats_session_metadata::SessionMetadataStore;
@@ -86,6 +87,7 @@ pub struct NatsSessionLease {
     bucket: kv::Store,
     jetstream: jetstream::Context,
     key: String,
+    acquisition_revision: u64,
     state: Arc<LeaseState>,
     renew_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -115,6 +117,15 @@ impl NatsSessionLease {
         params: NatsLeaseAcquireParams<'_>,
         execution_id: Option<String>,
     ) -> Result<Option<Self>> {
+        let key = params.config.key_for_session(params.session_id);
+        Self::acquire_key(params, execution_id, key).await
+    }
+
+    async fn acquire_key(
+        params: NatsLeaseAcquireParams<'_>,
+        execution_id: Option<String>,
+        key: String,
+    ) -> Result<Option<Self>> {
         let NatsLeaseAcquireParams {
             jetstream,
             session_id,
@@ -125,7 +136,6 @@ impl NatsSessionLease {
         } = params;
         config.validate()?;
         let bucket = ensure_lease_bucket(&jetstream, &config).await?;
-        let key = config.key_for_session(session_id);
         let mut record = LeaseRecord::new(worker_id.clone(), generation);
         record.execution_id = execution_id.clone();
         let acquired_at = time::Instant::now();
@@ -166,6 +176,7 @@ impl NatsSessionLease {
             bucket,
             jetstream,
             key,
+            acquisition_revision: revision,
             state,
             renew_task: Mutex::new(Some(renew_task)),
         }))
@@ -448,7 +459,7 @@ async fn create_lease(
 /// is the split-brain guard every session write is fenced against, so a
 /// bucket stuck at R=1 on a cluster configured for R=3 defeats the point of
 /// running a cluster at all.
-pub(crate) async fn ensure_lease_bucket(
+pub async fn ensure_lease_bucket(
     jetstream: &jetstream::Context,
     config: &NatsLeaseConfig,
 ) -> Result<kv::Store> {

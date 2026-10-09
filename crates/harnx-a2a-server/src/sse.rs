@@ -29,7 +29,12 @@ pub(crate) fn task_stream(
                     }
                     // A bounded receiver cannot recover its lost deltas. Disconnect
                     // only this client; it can reconnect using a fresh snapshot.
-                    Err(_) => return None,
+                    Err(_) => {
+                        return Some((
+                            Err(A2AError::internal("task stream interrupted; reconnect")),
+                            (None, sequence, true),
+                        ))
+                    }
                 }
             }
         },
@@ -127,6 +132,7 @@ mod tests {
         for sequence in 6..10 {
             tx.send(event(sequence, TaskState::Working)).unwrap();
         }
+        assert!(stream.next().await.unwrap().is_err());
         assert!(stream.next().await.is_none());
         let mut healthy = tx.subscribe();
         tx.send(event(10, TaskState::Completed)).unwrap();

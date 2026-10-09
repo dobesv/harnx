@@ -10,6 +10,9 @@ repository.workspace = true
 categories.workspace = true
 keywords.workspace = true
 
+[features]
+fault-injection = []
+
 [dependencies]
 anyhow = { workspace = true }
 async-recursion = { workspace = true }

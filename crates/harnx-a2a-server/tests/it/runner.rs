@@ -93,10 +93,10 @@ async fn assert_first_chunk(
         _ => unreachable!(),
     };
     assert_eq!(assembled, "Hello ");
-    // Artifact broadcast advances the stream cursor without a durable rewrite.
+    // Every emitted chunk commits its snapshot/cursor before transport publication.
     assert_eq!(
         h.task(&started.snapshot.task.id).await?.revision,
-        started.snapshot.revision
+        started.snapshot.revision + 1
     );
     assert!(first.sequence > started.snapshot.stream_seq);
     Ok((assembled, first))
@@ -604,12 +604,12 @@ async fn runner_lagging_subscriber_errors_without_stopping_turn() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runner_throttled_persistence_keeps_midstream_snapshots_exact() -> Result<()> {
+async fn runner_durable_publication_keeps_midstream_snapshots_exact() -> Result<()> {
     check_stream_snapshots(Script::Many, 1).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runner_large_stream_materializes_text_only_for_readers() -> Result<()> {
+async fn runner_large_stream_commits_each_coalesced_snapshot() -> Result<()> {
     check_stream_snapshots(Script::Large, 1024).await
 }
 
@@ -618,7 +618,6 @@ async fn check_stream_snapshots(script: Script, chunk_size: usize) -> Result<()>
     let session = h.session(None, &alice()).await?;
     let mut started = h.send(&session, prompt()).await?;
     let initial_revision = started.snapshot.revision;
-    let begun = tokio::time::Instant::now();
     first_artifact(&mut started.events).await?;
     let id = &started.snapshot.task.id;
     let mut sub = h.runner.subscribe(&h.export, &alice().into(), id).await?;
@@ -646,9 +645,8 @@ async fn check_stream_snapshots(script: Script, chunk_size: usize) -> Result<()>
             assembled
         );
         let durable = h.task(id).await?;
-        // Admission can precede this caller's timestamp by a scheduling delay.
-        let max_writes = begun.elapsed().as_secs() / 2 + 1;
-        assert!(durable.revision <= initial_revision + max_writes);
+        assert_eq!(durable.stream_seq, sequence);
+        assert_eq!(durable.revision, initial_revision + count as u64);
     }
     h.llm.release.notify_one();
     let assembled = resumed_answer(&mut sub.events, sequence, assembled).await?;
@@ -659,11 +657,8 @@ async fn check_stream_snapshots(script: Script, chunk_size: usize) -> Result<()>
         assembled
     );
     assert_eq!(durable.task.status.state, TaskState::Completed);
-    assert!(durable.revision < initial_revision + chunks as u64);
-    assert_eq!(
-        durable.stream_seq, 0,
-        "stream cursor is not durable CAS metadata"
-    );
+    assert_eq!(durable.revision, initial_revision + chunks as u64 + 2);
+    assert_eq!(durable.stream_seq, sequence + 2);
     Ok(())
 }
 

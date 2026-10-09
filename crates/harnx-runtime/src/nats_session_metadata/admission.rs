@@ -46,6 +46,8 @@ pub struct InvocationAdmission {
     pub timeout_secs: Option<u64>,
     pub token_budget: Option<u64>,
     pub prompt_content: Option<harnx_core::message::MessageContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_ticket: Option<crate::nats_session::fixed_admission::FixedAdmissionTicket>,
 }
 
 impl InvocationAdmission {
@@ -85,6 +87,7 @@ impl InvocationAdmission {
             timeout_secs,
             token_budget,
             prompt_content: None,
+            fixed_ticket: None,
         }
     }
 }
@@ -175,12 +178,20 @@ impl SessionMetadataStore {
         }
         // Removing or editing the root prompt does not remove its admission or
         // mint a fresh run. Keep the immutable raw root binding as a fallback.
+        let fixed = self
+            .admission(storage, id)
+            .await?
+            .and_then(|a| a.fixed_ticket);
         Ok(entries.iter().find_map(|(seq, entry)| match entry {
             SessionLogEntry::Message {
                 id: Some(prompt),
                 role,
                 ..
-            } if role.is_user() && prompt == id => Some(*seq),
+            } if role.is_user()
+                && (prompt == id || fixed.as_ref().is_some_and(|t| t.prompt_id() == prompt)) =>
+            {
+                Some(*seq)
+            }
             SessionLogEntry::CompactRequest { compaction_id, .. } if compaction_id == id => {
                 Some(*seq)
             }
@@ -188,9 +199,10 @@ impl SessionMetadataStore {
         }))
     }
 
-    /// Reserve one execution invocation. Only its log terminal permits replacement.
-    /// An unbound reservation stays busy; replay must reuse its identity, not mint
-    /// a different run while the original append has an unknown outcome.
+    /// Reserve one execution invocation. Its log terminal permits replacement.
+    /// Ordinary unbound reservations stay busy. Fixed reservations can instead
+    /// prove non-executable closure at their immutable predecessor. An uncertain
+    /// append never permits minting a replacement invocation.
     pub async fn reserve_admission(
         &self,
         storage: &str,
@@ -198,6 +210,20 @@ impl SessionMetadataStore {
         entries: &[(u64, SessionLogEntry)],
     ) -> Result<InvocationAdmission> {
         let id = intent.invocation_id.as_str();
+        ensure!(
+            intent.fixed_ticket.is_some()
+                || !crate::nats_session::fixed_admission::admission_closed(entries, id, id),
+            "fixed admission closed without prompt; cannot reserve ordinary replay"
+        );
+        if let Some(ticket) = &intent.fixed_ticket {
+            ticket.validate()?;
+            ensure!(
+                ticket.storage_key() == storage
+                    && ticket.invocation_id() == id
+                    && intent.prompt_content.is_some(),
+                "invalid fixed admission reservation"
+            );
+        }
         let frozen = match self.admission(storage, id).await? {
             Some(saved) => saved,
             None => {
@@ -216,6 +242,13 @@ impl SessionMetadataStore {
                 }
             }
         };
+        if intent.fixed_ticket.is_some() || frozen.fixed_ticket.is_some() {
+            ensure!(
+                intent.fixed_ticket == frozen.fixed_ticket
+                    && intent.prompt_content == frozen.prompt_content,
+                "fixed admission identity or content mismatch"
+            );
+        }
         let head = head_key(storage);
         for _ in 0..16 {
             let current = self.leader_entry(&head).await?;
@@ -225,14 +258,9 @@ impl SessionMetadataStore {
                 if current_id == id {
                     return Ok(frozen);
                 }
-                let prompt = self
-                    .invocation_prompt_seq(storage, current_id, entries)
-                    .await?;
                 ensure!(
-                    prompt.is_some_and(|seq| crate::nats_session::invocation_terminal_seq(
-                        entries, seq
-                    )
-                    .is_some()),
+                    self.admission_is_terminal(storage, current_id, entries)
+                        .await?,
                     "session busy: invocation {current_id} is active or admission is unconfirmed"
                 );
             }
@@ -262,10 +290,7 @@ impl SessionMetadataStore {
             return Ok(None);
         };
         let id = std::str::from_utf8(&bytes)?;
-        let prompt = self.invocation_prompt_seq(storage, id, entries).await?;
-        if prompt
-            .is_some_and(|seq| crate::nats_session::invocation_terminal_seq(entries, seq).is_some())
-        {
+        if self.admission_is_terminal(storage, id, entries).await? {
             return Ok(None);
         }
         Ok(Some(
@@ -273,6 +298,35 @@ impl SessionMetadataStore {
                 .await?
                 .context("active admission missing")?,
         ))
+    }
+
+    async fn admission_is_terminal(
+        &self,
+        storage: &str,
+        id: &str,
+        entries: &[(u64, SessionLogEntry)],
+    ) -> Result<bool> {
+        if let Some(ticket) = self
+            .admission(storage, id)
+            .await?
+            .and_then(|a| a.fixed_ticket)
+        {
+            use crate::nats_session::fixed_admission::FixedAdmissionOutcome;
+            ensure!(
+                ticket.storage_key() == storage && ticket.invocation_id() == id,
+                "fixed admission identity mismatch"
+            );
+            match ticket.outcome(entries)? {
+                FixedAdmissionOutcome::Closed { .. } | FixedAdmissionOutcome::Fenced { .. } => {
+                    return Ok(true)
+                }
+                _ => {}
+            }
+        }
+        let prompt = self.invocation_prompt_seq(storage, id, entries).await?;
+        Ok(prompt.is_some_and(|seq| {
+            crate::nats_session::invocation_terminal_seq(entries, seq).is_some()
+        }))
     }
 
     pub async fn bind_prompt_admission(

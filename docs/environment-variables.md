@@ -199,3 +199,10 @@ answering its stdio handshake.
 - **NO_COLOR**: Disable colored output.
 - **EDITOR**: The default editor.
 - **XDG_CONFIG_HOME**: The base directory for configuration files on Linux.
+
+### A2A task events
+
+- **HARNX_A2A_EVENT_MAX_BYTES**: Positive byte budget for initial
+  `HARNX_A2A_TASK_EVENTS` creation (default 134217728, 128 MiB). Existing streams
+  aren't resized by this variable. Preserve Limits/DiscardNew and checkpoint
+  predecessors when changing storage policy. See [A2A operations](a2a-operations.md).

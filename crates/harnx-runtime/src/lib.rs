@@ -10,6 +10,7 @@
 #[macro_use]
 extern crate log;
 
+pub mod a2a_events;
 pub mod access;
 pub mod agent_loop;
 pub mod async_session_log;

@@ -208,12 +208,17 @@ async fn wait_terminal_returns_error_after_bounded_terminal_persistence_failure(
         h.task(&started.snapshot.task.id).await?.task.status.state,
         TaskState::Working
     );
-    // Restoring storage lets a subsequent request fence and persist the orphan.
+    // Recovery resolves the durable worker answer before deciding to fail an
+    // abandoned owner. No prompt is replayed when metadata storage returns.
     restore_stream_max_message_size(&h, original_max).await?;
     let failed = handler
         .wait_terminal(&owner, &started.snapshot.task.id)
         .await?;
-    assert_eq!(failed.task.status.state, TaskState::Failed);
+    assert_eq!(failed.task.status.state, TaskState::Completed);
+    assert_eq!(
+        serde_json::to_value(&failed.task)?["status"]["message"]["parts"][0]["text"],
+        "Hello world"
+    );
     Ok(())
 }
 
@@ -239,9 +244,14 @@ async fn terminal_persistence_retry_recovers_full_artifact_after_storage_returns
     h.llm.release.notify_one();
     wait_for_log(&h, "A2A terminal persistence failed").await?;
     restore_stream_max_message_size(&h, original_max).await?;
-    let failed = tokio::time::timeout(DEADLINE, waiter).await???;
-    assert_eq!(failed.task.status.state, TaskState::Failed);
-    let serialized = serde_json::to_value(&failed.task)?;
+    let completed = tokio::time::timeout(DEADLINE, waiter).await???;
+    // A transient frontend write failure can't replace the durable worker answer.
+    assert_eq!(completed.task.status.state, TaskState::Completed);
+    let serialized = serde_json::to_value(&completed.task)?;
+    assert_eq!(
+        serialized["status"]["message"]["parts"][0]["text"],
+        "Hello world"
+    );
     assert_eq!(
         serialized["artifacts"][0]["parts"][0]["text"],
         "Hello world"

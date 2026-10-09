@@ -48,6 +48,32 @@ impl Backend {
             admissions: Default::default(),
         }
     }
+    pub(crate) fn start_supervision(&self, exports: &[crate::exports::Export]) {
+        let cluster = self.config.read().nats_routing.clone();
+        let exports = exports
+            .iter()
+            .filter(|export| match &cluster {
+                harnx_runtime::config::NatsRouting::Cluster(name) => {
+                    export.cluster.as_ref() == Some(name)
+                }
+                _ => {
+                    export
+                        .cluster
+                        .as_deref()
+                        .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+                        == harnx_runtime::config::LOCAL_CLUSTER_KEY
+                }
+            })
+            .cloned()
+            .collect();
+        self.runner
+            .start_supervision(crate::runner::SupervisionConfig {
+                exports,
+                config: self.config.clone(),
+                route: self.route.clone(),
+                abort: self.abort.clone(),
+            });
+    }
     pub(crate) fn with_local_worker(
         mut self,
         worker: LocalWorker,

@@ -76,6 +76,36 @@ impl Drop for Broker {
     }
 }
 impl Broker {
+    #[cfg(all(unix, feature = "fault-injection"))]
+    pub(super) fn signal(&self, signal: &str) -> Result<()> {
+        anyhow::ensure!(
+            Command::new("kill")
+                .args([signal, &self.child.id().to_string()])
+                .status()?
+                .success(),
+            "broker signal failed"
+        );
+        Ok(())
+    }
+    #[cfg(all(unix, feature = "fault-injection"))]
+    pub(super) async fn restart(&mut self) -> Result<()> {
+        let (url, _) = self.wait_for_client().await?;
+        let port = url.rsplit(':').next().context("broker port")?;
+        self.child.kill()?;
+        self.child.wait()?;
+        self.child = Command::new(
+            std::env::var_os("NATS_SERVER_BIN").unwrap_or_else(|| "nats-server".into()),
+        )
+        .args(["-js", "-a", "127.0.0.1", "-p", port, "-sd"])
+        .arg(self._dir.path().join("data"))
+        .arg("--ports_file_dir")
+        .arg(self._dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+        tokio::time::timeout(DEADLINE, self.wait_for_client()).await??;
+        Ok(())
+    }
     pub(super) async fn start() -> Result<(Self, String, async_nats::Client)> {
         let mut broker = Self::spawn()?;
         let (url, client) = tokio::time::timeout(DEADLINE, broker.wait_for_client())
@@ -84,19 +114,39 @@ impl Broker {
         Ok((broker, url, client))
     }
 
+    pub(super) async fn start_with_config(
+        config: &str,
+    ) -> Result<(Self, String, async_nats::Client)> {
+        let mut broker = Self::spawn_config(Some(config))?;
+        let (url, client) = tokio::time::timeout(DEADLINE, broker.wait_for_client())
+            .await
+            .context("broker readiness deadline")??;
+        Ok((broker, url, client))
+    }
+
     fn spawn() -> Result<Self> {
+        Self::spawn_config(None)
+    }
+
+    fn spawn_config(config: Option<&str>) -> Result<Self> {
         let dir = tempfile::tempdir()?;
-        let child = Command::new(
+        let mut command = Command::new(
             std::env::var_os("NATS_SERVER_BIN").unwrap_or_else(|| "nats-server".into()),
-        )
-        .args(["-js", "-a", "127.0.0.1", "-p", "-1", "-sd"])
-        .arg(dir.path().join("data"))
-        .arg("--ports_file_dir")
-        .arg(dir.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("required test broker")?;
+        );
+        if let Some(config) = config {
+            let path = dir.path().join("nats.conf");
+            std::fs::write(&path, config)?;
+            command.arg("--config").arg(path);
+        }
+        let child = command
+            .args(["-js", "-a", "127.0.0.1", "-p", "-1", "-sd"])
+            .arg(dir.path().join("data"))
+            .arg("--ports_file_dir")
+            .arg(dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("required test broker")?;
         Ok(Self { child, _dir: dir })
     }
 
@@ -132,9 +182,12 @@ fn broker_ports_url(path: &std::path::Path) -> Result<Option<String>> {
 pub enum Script {
     Text,
     Tool,
+    CountedTool,
     Fail,
     Many,
     Large,
+    Boundary,
+    Overflow,
 }
 
 pub struct Llm {
@@ -164,16 +217,50 @@ async fn completion(
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"secret-token /srv/private https://private.invalid", "type":"invalid_request_error"}}))).into_response();
     }
     assert_eq!(body["stream"], true, "worker must call streaming LLM");
-    let many = matches!(llm.script, Script::Many | Script::Large);
-    let frames = if many {
-        let text = "x".repeat(if llm.script == Script::Large { 1024 } else { 1 });
+    let many = matches!(llm.script, Script::Many | Script::Large | Script::Boundary);
+    let counted_tool = llm.script == Script::CountedTool
+        && body["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .map(|m| m["role"].as_str())
+            != Some(Some("tool"));
+    let frames = if llm.script == Script::Overflow {
+        vec![
+            chunk(json!({"content":"x".repeat(224 * 1024 + 1)}), Value::Null),
+            chunk(json!({}), json!("stop")),
+            "[DONE]".into(),
+        ]
+    } else if many {
+        let text = "x".repeat(match llm.script {
+            Script::Large => 1024,
+            Script::Boundary => 3324,
+            _ => 1,
+        });
         let mut frames = vec![
             chunk(json!({"content":text}), Value::Null);
             harnx_a2a_server::runner::EVENT_CAPACITY + 5
         ];
+        if llm.script == Script::Boundary {
+            frames[68] = chunk(json!({"content":"x".repeat(3344)}), Value::Null);
+        }
         frames.push(chunk(json!({}), json!("stop")));
         frames.push("[DONE]".into());
         frames
+    } else if counted_tool {
+        let counter = Config::config_dir().join("executions");
+        let command = format!(
+            "printf 'execution\\n' >> {}",
+            shell_words::quote(counter.to_str().expect("counter path"))
+        );
+        vec![
+            chunk(
+                json!({"tool_calls":[{"index":0,"id":"counted-call","type":"function",
+                "function":{"name":"bash_exec","arguments":json!({"command":command}).to_string()}}]}),
+                Value::Null,
+            ),
+            chunk(json!({}), json!("tool_calls")),
+            "[DONE]".into(),
+        ]
     } else if llm.script == Script::Tool && first {
         vec![
             chunk(
@@ -197,7 +284,7 @@ async fn completion(
     };
     // Text turns stop after their first real SSE token until the test observes
     // an A2A artifact. This proves mid-stream behavior, without sleep-based races.
-    let held = llm.script == Script::Text;
+    let held = llm.script == Script::Text || (llm.script == Script::CountedTool && !counted_tool);
     Sse::new(stream::unfold(
         (0, frames, llm),
         move |(index, frames, llm)| async move {
@@ -304,9 +391,21 @@ fn fixture_config(
         std::fs::create_dir_all(dir.join(subdir))?;
     }
     let mut config_yaml = "model: mock:test\nstream: true\nsave: false\n".to_owned();
-    if script == Script::Large {
+    if matches!(script, Script::Large | Script::Boundary | Script::Overflow) {
         // The synthetic load repeats text on purpose; don't test the repeat guard.
         config_yaml.push_str("loop_detection:\n  output: false\n");
+    }
+    if script == Script::CountedTool {
+        let command = binary("harnx-bash-tools")?;
+        std::fs::create_dir_all(dir.join("tool_servers"))?;
+        std::fs::write(
+            dir.join("tool_servers/bash.yaml"),
+            format!(
+                "command: {:?}\nargs: [--name, bash, --no-sandbox, --allow-write, {:?}]\n",
+                command.to_str().context("bash tool path")?,
+                dir.to_str().context("config path")?
+            ),
+        )?;
     }
     std::fs::write(dir.join("config.yaml"), config_yaml)?;
     std::fs::write(
@@ -314,7 +413,9 @@ fn fixture_config(
         format!("url: {url:?}\n"),
     )?;
     std::fs::write(dir.join("clients/mock.yaml"), format!("type: openai-compatible\nname: mock\napi_base: http://{address}/v1\napi_key: test-key\nmodels:\n  - name: test\n    max_input_tokens: 32000\n    max_output_tokens: 1024\n"))?;
-    let agent = if script == Script::Tool {
+    let agent = if script == Script::CountedTool {
+        "---\nmodel: mock:test\nuse_tools: [bash_exec]\n---\nTest counted tool agent\n".into()
+    } else if script == Script::Tool {
         let binary = binary("harnx-claude-compatible-hook-server")?;
         let command = shell_words::join([binary.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^target_session_handoff$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve handoff?\"}}"]);
         format!("---\nmodel: mock:test\nuse_tools:\n- target_session_handoff\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest runner agent\n")
@@ -375,7 +476,7 @@ pub struct Harness {
     pub jetstream: async_nats::jetstream::Context,
     worker: AbortOnDropHandle<Result<()>>,
     http: AbortOnDropHandle<()>,
-    _broker: Broker,
+    pub(super) _broker: Broker,
     _root: tempfile::TempDir,
     _env: Vec<EnvGuard>,
 }
@@ -393,14 +494,51 @@ impl Harness {
         script: Script,
         rules: Option<Arc<harnx_core::access_rules::AccessRules>>,
     ) -> Result<Self> {
+        Self::start_with_broker(script, rules, None).await
+    }
+    pub async fn start_with_broker(
+        script: Script,
+        rules: Option<Arc<harnx_core::access_rules::AccessRules>>,
+        broker_config: Option<&str>,
+    ) -> Result<Self> {
         harnx_core::require_nextest();
         let logs = test_logs();
-        let (broker, url, client) = Broker::start().await?;
+        let (broker, url, client) = match broker_config {
+            Some(config) => Broker::start_with_config(config).await?,
+            None => Broker::start().await?,
+        };
         let (llm, address, http) = start_llm(script).await?;
         let root = tempfile::tempdir()?;
-        let env = isolated_environment(&root, &url)?;
-        let config = fixture_config(&root.path().join("config"), script, &url, address)?;
+        let endpoint = |user: &str, password: &str| {
+            url.replacen("nats://", &format!("nats://{user}:{password}@"), 1)
+        };
+        let worker_url = if broker_config.is_some() {
+            endpoint("worker", "worker_test_password")
+        } else {
+            url.clone()
+        };
+        let env = isolated_environment(&root, &worker_url)?;
+        let config = fixture_config(&root.path().join("config"), script, &worker_url, address)?;
         let worker = start_worker(&config).await?;
+        let (config, client) = if broker_config.is_some() {
+            std::fs::write(
+                root.path().join("config/nats_servers/runner.yaml"),
+                format!(
+                    "url: {:?}\n",
+                    endpoint("a2a_backend", "a2a_backend_test_password")
+                ),
+            )?;
+            let config = Arc::new(ConfigLock::new(Config::load_from_file(
+                &root.path().join("config/config.yaml"),
+            )?));
+            let client = async_nats::ConnectOptions::new()
+                .user_and_password("a2a_backend".into(), "a2a_backend_test_password".into())
+                .connect(&url)
+                .await?;
+            (config, client)
+        } else {
+            (config, client)
+        };
         let jetstream = async_nats::jetstream::new(client);
         let metadata = SessionMetadataStore::ensure(&jetstream, 1).await?;
         let store = Arc::new(A2aStore::new_with_access_rules(metadata.clone(), rules));

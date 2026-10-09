@@ -32,6 +32,7 @@ pub(in crate::nats_session_metadata) use mutation::PatchGuard;
 pub struct SessionMetadataStore {
     store: kv::Store,
     client: async_nats::Client,
+    jetstream: jetstream::Context,
 }
 
 impl SessionMetadataStore {
@@ -73,11 +74,30 @@ impl SessionMetadataStore {
         Ok(Self {
             store,
             client: jetstream.client().clone(),
+            jetstream: jetstream.clone(),
         })
     }
 
     pub fn from_store(store: kv::Store, client: async_nats::Client) -> Self {
-        Self { store, client }
+        Self {
+            store,
+            jetstream: jetstream::new(client.clone()),
+            client,
+        }
+    }
+
+    /// Broker context used by scoped coordination; preserve its API prefix/domain.
+    pub fn jetstream(&self) -> &jetstream::Context {
+        &self.jetstream
+    }
+
+    pub fn replicas(&self) -> usize {
+        self.store.stream.cached_info().config.num_replicas
+    }
+
+    /// Current broker payload ceiling for callers storing coordination documents.
+    pub fn max_payload(&self) -> usize {
+        self.client.server_info().max_payload
     }
 
     pub fn kv_store(&self) -> &kv::Store {

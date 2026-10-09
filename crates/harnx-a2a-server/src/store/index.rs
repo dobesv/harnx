@@ -4,7 +4,7 @@ use crate::{exports::Export, identity::RequestIdentity};
 use anyhow::{bail, ensure, Context, Result};
 pub use harnx_runtime::nats_session_metadata::TaskState as IndexState;
 use harnx_runtime::nats_session_metadata::{
-    a2a_task_key, is_cas_conflict, TaskIndex, TaskIndexEntry, CAS_RETRY_LIMIT,
+    is_cas_conflict, TaskIndex, TaskIndexEntry, CAS_RETRY_LIMIT,
 };
 
 /// Convert a2a_lf TaskState to index TaskState
@@ -182,7 +182,10 @@ impl A2aStore {
         target: &CleanupTarget<'_>,
         reason: &str,
     ) -> Result<bool> {
-        let exists = self.store.get_a2a_task(&target.key).await?.is_some();
+        let exists = self
+            .get_task(target.storage_key, target.task_id)
+            .await?
+            .is_some();
         if exists {
             tracing::debug!(task_id = %target.task_id, storage_key = %target.storage_key, "{reason}");
         }
@@ -229,6 +232,16 @@ impl A2aStore {
 
     /// Repair metadata from an authoritative point read, preserving exact status timestamps.
     pub async fn repair_index(&self, storage_key: &str, record: &TaskRecord) -> Result<()> {
+        let authoritative;
+        let record = if self.read_context(storage_key).await?.is_some() {
+            authoritative = self
+                .get_task(storage_key, &record.task.id)
+                .await?
+                .context("index repair has no authoritative task")?;
+            &authoritative
+        } else {
+            record
+        };
         self.add_task_to_index(IndexWrite::repair(storage_key, record))
             .await?;
         tracing::debug!(task_id = %record.task.id, revision = record.revision, %storage_key, "reconciled task index metadata");
@@ -332,16 +345,14 @@ struct CleanupTarget<'a> {
     storage_key: &'a str,
     task_id: &'a str,
     expected_revision: u64,
-    key: String,
 }
 impl<'a> CleanupTarget<'a> {
     fn new(storage_key: &'a str, task_id: &'a str, expected_revision: u64) -> Result<Self> {
-        let (_, uuid) = parse_task_id(task_id)?;
+        parse_task_id(task_id)?;
         Ok(Self {
             storage_key,
             task_id,
             expected_revision,
-            key: a2a_task_key(storage_key, uuid),
         })
     }
     fn accepts(&self, entry: &TaskIndexEntry) -> bool {

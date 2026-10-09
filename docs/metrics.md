@@ -19,9 +19,9 @@ You can enable metrics using either the CLI flag or an environment variable fall
 
 ## Binary Coverage
 
-Metrics support is implemented across 17 long-running binaries:
+Metrics support is implemented across 18 long-running binaries:
 
-- **Core runtime & proxies**: `harnx-serve`, `harnx-worker`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`
+- **Core runtime & proxies**: `harnx-serve`, `harnx-worker`, `harnx-a2a-server`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`
 - **Tool & hook servers**: `harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-plans-tools`, `harnx-time-tools`, `harnx-claude-compatible-hook-server`
 - **MCP bridges & servers**: `harnx-mcp-bridge`, `harnx-mcp-remote`
 
@@ -464,3 +464,16 @@ harnx_nats_operations_total{op="lease_release",outcome="ok"} 15
 ## Follow-ups
 
 - **Canonical provider label** ([#1592](https://github.com/dobesv/harnx/issues/1592)): Added a distinct `provider` label alongside `client` to reflect the underlying provider backend.
+
+## A2A coordination diagnostics
+
+`harnx-a2a-server --metrics-addr :8456` exports `harnx_a2a_owner_lost_total`,
+`harnx_a2a_pending_age_seconds{phase="admission|cancel|outbox"}`,
+`harnx_a2a_sweep_lag_seconds`,
+`harnx_a2a_events_purged_total{phase="checkpoint|terminal|deleted"}` and
+`harnx_a2a_operations_total{op="publish|recovery|sweep",outcome="ok|error"}`. Ages are
+observations during recovery/publication, not an exact pending-count gauge or
+completion latency. Sweep lag measures elapsed time between completed registry
+scan cycles. Owner loss counts successful takeover of unresolved retained work.
+No dynamic identity labels are added. See [A2A operations](a2a-operations.md) for
+backpressure diagnosis and capacity limits.

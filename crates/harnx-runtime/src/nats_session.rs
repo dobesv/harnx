@@ -47,7 +47,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::nats_event_sink::SessionEventStream;
-use crate::nats_session_log::{FencedAppend, NatsSessionLog};
+use crate::nats_session_log::NatsSessionLog;
 use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
 use crate::nats_worker::{
     publish_control_command, publish_session_activate, publish_targeted_session_activate,
@@ -61,8 +61,12 @@ mod compaction_request_tests;
 mod completion;
 mod hitl;
 pub mod interrupt;
+mod prompt_append;
 pub use compaction_request::{request_compaction_session, CompactSubmit, CompactionRequest};
 pub use completion::completed_subagent_progress;
+pub mod fixed_admission;
+#[cfg(feature = "fault-injection")]
+pub mod fixed_admission_faults;
 pub use interrupt::{interrupt_session, InterruptOutcome, InterruptRequest};
 #[cfg(test)]
 mod replay_tests;
@@ -414,6 +418,8 @@ pub struct NatsSession {
     admission_timeout: Option<u64>,
     admission_token_budget: Option<u64>,
     steering_admission: bool,
+    #[cfg(feature = "fault-injection")]
+    fixed_admission_faults: Option<Arc<fixed_admission_faults::FixedAdmissionFaults>>,
     config: NatsSessionConfig,
     session_id: String,
     storage_key: String,
@@ -607,6 +613,8 @@ impl NatsSession {
             admission_timeout: None,
             admission_token_budget: None,
             steering_admission: false,
+            #[cfg(feature = "fault-injection")]
+            fixed_admission_faults: None,
             invocation_id: None,
         })
     }
@@ -781,6 +789,10 @@ impl NatsSession {
             "execution admission requires explicit frontend authority or inherited run context",
         )?;
         let entries = self.load_durable_entries().await?;
+        anyhow::ensure!(
+            !fixed_admission::admission_closed(&entries, user_msg_id, user_msg_id),
+            "fixed admission closed without prompt; cannot replay through ordinary admission"
+        );
         if steering && matches!(authority, AdmissionAuthority::External { .. }) {
             if let Some(active) = self
                 .metadata_store
@@ -945,55 +957,6 @@ impl NatsSession {
             user_msg_seq: prompt.user_msg_seq,
             was_cancelled: self.abort_signal.aborted(),
         }))
-    }
-
-    /// Retry at the new tail on every conflict; a conflict carrying our own
-    /// message id is our own append whose ack was lost, not a rejection.
-    async fn append_prompt_entry(
-        &self,
-        log: &NatsSessionLog,
-        entry: &SessionLogEntry,
-        message_id: &str,
-    ) -> Result<u64> {
-        let mut entries = log.load_events_latest_async().await?;
-        let mut tail = entries.last().map_or(0, |(seq, _)| *seq);
-        for _ in 0..16 {
-            let admission = self
-                .metadata_store
-                .prompt_admission(&self.storage_key, message_id)
-                .await?
-                .context("prompt has no admission")?;
-            if let Some(seq) = self
-                .metadata_store
-                .invocation_prompt_seq(
-                    &self.storage_key,
-                    admission.invocation_id.as_str(),
-                    &entries,
-                )
-                .await?
-            {
-                anyhow::ensure!(
-                    invocation_terminal_seq(&entries, seq).is_none(),
-                    "session admission already completed; cannot append late steering"
-                );
-            }
-
-            match log.append_fenced(entry, tail, message_id).await? {
-                FencedAppend::Appended(seq) => return Ok(seq),
-                FencedAppend::Conflict { entries } => {
-                    if let Some((seq, _)) = entries.iter().find(|(_, e)| {
-                        matches!(e, SessionLogEntry::Message { id: Some(id), .. } if id == message_id)
-                    }) {
-                        return Ok(*seq);
-                    }
-                    tail = entries.last().map_or(tail, |(seq, _)| *seq);
-                    // Refresh full history before validating the same admission on retry.
-                    // Conflict entries start after the previous tail.
-                }
-            }
-            entries = log.load_events_latest_async().await?;
-        }
-        anyhow::bail!("session log tail kept moving; prompt not appended")
     }
 
     async fn publish_activation(
@@ -2109,6 +2072,7 @@ fn render_log_entry_to_sink(
         | SessionLogEntry::Rewind { .. }
         | SessionLogEntry::CompactRequest { .. }
         | SessionLogEntry::CompactResult { .. }
+        | SessionLogEntry::AdmissionClosed { .. }
         | SessionLogEntry::Unknown => false,
     };
     if rendered {

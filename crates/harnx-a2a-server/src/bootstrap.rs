@@ -72,6 +72,7 @@ impl Bootstrap {
                 SessionMetadataStore::ensure(&jetstream, replicas).await?,
                 access_rules.clone(),
             ));
+            provision_coordination(&store).await?;
             let runner = Runner::new(store.clone());
             let backend = Backend::new(
                 runner,
@@ -82,6 +83,7 @@ impl Bootstrap {
                     abort: bootstrap.abort.clone(),
                 },
             );
+            backend.start_supervision(exports);
             let backend = if cluster == LOCAL_CLUSTER_KEY {
                 backend.with_local_worker(bootstrap.local_worker.clone(), config_dir)
             } else {
@@ -93,4 +95,24 @@ impl Bootstrap {
         }
         Ok(bootstrap)
     }
+}
+
+async fn provision_coordination(store: &A2aStore) -> Result<()> {
+    let metadata = store.metadata();
+    let js = metadata.jetstream();
+    let replicas = metadata.replicas();
+    harnx_runtime::a2a_events::ensure(js, replicas).await?;
+    let leases = harnx_runtime::nats_lease::ensure_lease_bucket(
+        js,
+        &harnx_runtime::nats_lease::NatsLeaseConfig {
+            replicas,
+            ..Default::default()
+        },
+    )
+    .await?;
+    anyhow::ensure!(
+        leases.stream.cached_info().config.num_replicas == replicas,
+        "A2A lease bucket replica count mismatch"
+    );
+    Ok(())
 }

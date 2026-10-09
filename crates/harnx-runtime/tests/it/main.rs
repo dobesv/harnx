@@ -25,6 +25,7 @@ mod nats_connect;
 mod nats_control;
 mod nats_deadline_admission;
 mod nats_event_fanout;
+mod nats_fixed_admission;
 mod nats_hooks_e2e;
 mod nats_lease;
 mod nats_local_server;
