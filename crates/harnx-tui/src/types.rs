@@ -235,9 +235,12 @@ pub(super) struct App {
     /// streaming run that subsequent `MessageChunk`s should be appended to.
     /// Set false at every turn boundary (Final, Error, new prompt) so a
     /// finalized message — or the startup banner — is never appended to.
-    /// Interleaving items (tool calls, notices, headings, …) end a run
-    /// implicitly by becoming the trailing item themselves.
+    /// Interleaving output closes aggregation after projecting the run's links.
+    /// Its tracked row can still receive the canonical Final until a tool round ends.
     pub(super) streaming_open: bool,
+    /// Current source's streamed row, retained across notices until its Final.
+    /// Separate from the parent Final target, which survives child output.
+    pub(super) streamed_text_idx: Option<usize>,
     /// Transcript row containing the latest streamed parent-agent text for
     /// this turn. Sub-agent rows must never become the replacement target for
     /// the parent agent's canonical `ModelEvent::Final` output.
@@ -428,6 +431,7 @@ pub(super) struct MonitoredSessionState {
     pub scroll: ratatui_widget_scrolling::ScrollState,
     pub scroll_to_focused_item: bool,
     pub streaming_open: bool,
+    pub streamed_text_idx: Option<usize>,
 }
 
 impl MonitoredSessionState {
@@ -444,6 +448,7 @@ impl MonitoredSessionState {
             scroll,
             scroll_to_focused_item: false,
             streaming_open: false,
+            streamed_text_idx: None,
         }
     }
 }
@@ -861,6 +866,8 @@ pub enum TranscriptItem {
         /// `Some` only when it differs from `text` (i.e. there is genuinely more
         /// than the collapsed user-facing view). Rendered by the detail overlay.
         full_detail: Option<String>,
+        /// Identity of the subagent reply block; ordinary tool results have no owner.
+        subagent_reply_owner: Option<(MonitoredSessionKey, Option<String>)>,
         rendered_cache: RenderedCache,
     },
     StatusLine(String),
@@ -1027,6 +1034,7 @@ impl Default for App {
             llm_busy: false,
             scroll_state: ratatui_widget_scrolling::ScrollState::new(),
             streaming_open: false,
+            streamed_text_idx: None,
             main_streamed_text_idx: None,
             cache_valid_width: None,
             last_ui_output_source: None,

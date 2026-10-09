@@ -230,6 +230,7 @@ impl Tui {
         state.transcript = transcript;
         state.status = status.clone();
         state.streaming_open = false;
+        state.streamed_text_idx = None;
         if state
             .transcript_focus
             .is_some_and(|focus| focus >= state.transcript.len())
@@ -366,6 +367,7 @@ impl Tui {
         self.app.llm_busy = true;
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
+        self.app.streamed_text_idx = None;
         self.app.last_ui_output_source = None;
         self.app.transcript_focus = None;
         self.app.transcript_selection_anchor = None;
@@ -390,7 +392,8 @@ impl Tui {
         key: &MonitoredSessionKey,
         output: &serde_json::Value,
     ) {
-        let Some(result_item) = crate::lifecycle::subagent_reply_item_from_output(output) else {
+        let Some(result_item) = crate::lifecycle::subagent_reply_item_from_output(output, key)
+        else {
             return;
         };
         let progress = crate::lifecycle::subagent_progress_from_output(output);
@@ -680,50 +683,60 @@ fn handoff_target(agent: &str, inherited_cluster: &str) -> (String, String) {
     }
 }
 
-/// Place `result_item` right before the matched `SubAgentSession` row (falling
-/// back to appending when no matching row exists, preserving the ToolCall ->
-/// ToolResultMarkdown -> SubAgentSession ordering invariant so future maintainers
-/// don't break detail-view pairing).
-/// Skips insertion when an identical reply row is already present to keep
-/// re-delivered terminal events idempotent.
+/// Insert the reply and its links as one block before the invocation's status
+/// row, or append when the status hasn't arrived. Re-delivery replaces the same
+/// reply block, preserving ToolCall -> MarkdownLink* -> ToolResultMarkdown ->
+/// MarkdownLink* -> SubAgentSession ordering and detail-view pairing.
 fn insert_reply_before_status_row(
     transcript: &mut Vec<TranscriptItem>,
     key: &MonitoredSessionKey,
     invocation_id: Option<&str>,
     result_item: TranscriptItem,
 ) {
-    let Some(pos) = transcript.iter().rposition(|item| {
-        let TranscriptItem::SubAgentSession {
-            key: row_key,
-            invocation_id: row_inv_id,
-            ..
-        } = item
-        else {
-            return false;
-        };
-        if row_key != key {
-            return false;
-        }
-        if let Some(inv_id) = invocation_id {
-            row_inv_id.as_deref() == Some(inv_id)
-        } else {
-            true
-        }
-    }) else {
-        transcript.push(result_item);
-        return;
-    };
+    let pos = transcript
+        .iter()
+        .rposition(|item| {
+            let TranscriptItem::SubAgentSession {
+                key: row_key,
+                invocation_id: row_inv_id,
+                ..
+            } = item
+            else {
+                return false;
+            };
+            if row_key != key {
+                return false;
+            }
+            if let Some(inv_id) = invocation_id {
+                row_inv_id.as_deref() == Some(inv_id)
+            } else {
+                true
+            }
+        })
+        .unwrap_or(transcript.len());
 
-    let already_has_result = pos > 0
-        && match (&transcript[pos - 1], &result_item) {
-            (
-                TranscriptItem::ToolResultMarkdown { text: t1, .. },
-                TranscriptItem::ToolResultMarkdown { text: t2, .. },
-            ) => t1 == t2,
-            _ => false,
-        };
-
-    if !already_has_result {
-        transcript.insert(pos, result_item);
+    let mut links = Vec::new();
+    if let TranscriptItem::ToolResultMarkdown { text, .. } = &result_item {
+        crate::lifecycle::append_markdown_links(&mut links, text);
     }
+    // Only a reply tagged with this identity may be replaced. Text equality
+    // would confuse an adjacent ordinary result with the subagent's reply.
+    let owner = (key.clone(), invocation_id.map(str::to_string));
+    let existing = transcript[..pos].iter().rposition(|item| {
+        matches!(
+            item,
+            TranscriptItem::ToolResultMarkdown { subagent_reply_owner: Some(reply_owner), .. }
+                if reply_owner == &owner
+        )
+    });
+    let start = existing.unwrap_or(pos);
+    let end = existing.map_or(pos, |index| {
+        index
+            + 1
+            + transcript[index + 1..pos]
+                .iter()
+                .take_while(|item| matches!(item, TranscriptItem::MarkdownLink { .. }))
+                .count()
+    });
+    transcript.splice(start..end, std::iter::once(result_item).chain(links));
 }

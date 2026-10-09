@@ -1608,9 +1608,26 @@ Configuration: `terminal_status: bool` in `config.yaml` (default `true`) or `HAR
 Auto-disabled when stdout is not a TTY, `TERM=dumb`, or `CI` is set. User-facing docs in
 `docs/configuration-guide.md` under "Terminal Status".
 
+### TUI Markdown link extraction and transcript order
+
+Markdown links in tool bodies and results are extracted into `TranscriptItem::MarkdownLink` rows for keyboard accessibility. Key invariants:
+
+1. **Call-owned links sit between body and result** — `detail_view.rs:323-330` skips `MarkdownLink` items when pairing a `ToolCall` with its result. Updates must not assume `index+1` is the result.
+
+2. **Reply+link blocks are atomic and owned** — `subagent_sessions.rs::insert_reply_before_status_row` splices `ToolResultMarkdown` followed by its `MarkdownLink` rows in a single operation. Re-delivery replaces only rows tagged with the same session key and invocation in `subagent_reply_owner`. Text equality isn't ownership: an adjacent ordinary result can have identical text.
+
+3. **Live/history parity via shared constructor** — `tool_transcript.rs::tool_completed_to_transcript_items` extracts from the untruncated Markdown template when provided, otherwise falls back to full output. Main/child live events and history rebuild (`lifecycle.rs`) delegate to this helper. Preview regression fixtures must put links outside both the terminal-sized head and the non-TTY default tail (75 lines); placing them at the end doesn't prove truncation in CI.
+
+4. **`ToolResultMarkdown` is non-navigable by design** — `types.rs:1003-1007` excludes it from `is_navigable()`. Keyboard focus goes to the preceding `ToolCall`; link rows provide URL visibility and selection.
+
+5. **Intermediate assistant text closes at tool boundaries** — `assistant_transcript.rs` projects links from the complete streamed Markdown before tool rows, thoughts, source changes and turn end. `Started`/`Blocked` end the model response and retire its final-replacement target. Notices, thoughts and child source changes close aggregation but preserve the parent's canonical `Final` target. `streamed_text_idx` tracks the displayed source separately from `main_streamed_text_idx`. Refresh only the contiguous owned link block and rebase focus, selection anchor and tracked stream indices; surviving URLs retain their targets when a canonical final changes link order. Direct cancellation and task-error handlers must close the stream before resetting trackers; event preprocessing doesn't cover those calls. Actual `ThoughtText` stays plain text, with no link extraction.
+
+See tests in `markdown_link_accessibility_tests.rs`, `intermediate_assistant_links.rs` and `subagent_session_tests.rs`.
+
+
 ### TUI tool-call row in-place updates
 
-Live tool progress updates (`ToolEvent::Update`) mutate the active `TranscriptItem::ToolCall` row in-place instead of appending detached `StatusLine` items. Shared reducer logic in `crates/harnx-tui/src/tool_render.rs` (`apply_tool_event_update`, `complete_tool_call`, `fail_tool_call`) handles both main transcript (`input.rs`) and subagent child transcripts (`subagent_transcript.rs`).
+Live tool progress updates (`ToolEvent::Update`) mutate the active `TranscriptItem::ToolCall` row in-place instead of appending detached `StatusLine` items. Shared reducer logic in `crates/harnx-tui/src/tool_render.rs` (`apply_tool_event_update`, `complete_tool_call`, `fail_tool_call`) handles both main transcript (`agent_events.rs`) and subagent child transcripts (`subagent_transcript.rs`).
 
 Key invariants (verified by `test_inplace_tool_call_update_sequence`, `test_tool_update_fallback_late_update_after_completed_ignored`, and related tests in `tool_live_updates_tests.rs`):
 
@@ -1659,7 +1676,7 @@ Pattern for shift-sensitive char bindings:
 ```
 
 Accept `NONE | SHIFT` on char arms (not CONTROL/ALT combinations). Home/End keycodes don't need
-SHIFT tolerance — they're not char keys. See AgentPicker in `input.rs` for the `||` guard variant,
+SHIFT tolerance — they're not char keys. See AgentPicker in `input_modal.rs` for the `||` guard variant,
 and jump-key handlers in `detail_view.rs`/`input.rs`/`subagent_sessions.rs` for the or-pattern form.
 
 

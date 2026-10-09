@@ -316,13 +316,22 @@ fn append_paired_tool_result(
     let Some(entry) = app.transcript.get(index) else {
         return;
     };
-    if !matches!(entry, TranscriptItem::ToolCall { .. }) || index < selection_end {
+    if !matches!(entry, TranscriptItem::ToolCall { .. }) {
         return;
     }
-    let Some(next) = app.transcript.get(index + 1) else {
+    // Call-body links sit between the call and its paired result.
+    let mut next_idx = index + 1;
+    while app
+        .transcript
+        .get(next_idx)
+        .is_some_and(|item| matches!(item, TranscriptItem::MarkdownLink { .. }))
+    {
+        next_idx += 1;
+    }
+    let Some(next) = app.transcript.get(next_idx) else {
         return;
     };
-    if matches!(next, TranscriptItem::ToolResultMarkdown { .. }) {
+    if next_idx > selection_end && matches!(next, TranscriptItem::ToolResultMarkdown { .. }) {
         entries.push(vec![Line::from("")]);
         entries.push(Tui::render_entry_detail(next));
     }

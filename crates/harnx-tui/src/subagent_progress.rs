@@ -152,6 +152,7 @@ impl Tui {
         }
         state.invocation_id = Some(invocation_id.to_string());
         state.streaming_open = false;
+        state.streamed_text_idx = None;
         if let Some(handle) = self.subagent_monitor_handles.remove(key) {
             handle.abort();
         }

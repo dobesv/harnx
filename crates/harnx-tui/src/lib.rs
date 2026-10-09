@@ -4,11 +4,16 @@
 //! Config/Input/Client/tool and dispatches via AgentEventSink.
 
 pub mod agent_event_sink;
+mod agent_events;
+mod assistant_transcript;
 mod cancellation;
 mod event_isolation;
 pub mod event_source;
 mod exit_confirmation;
 pub mod input;
+mod input_attachments;
+mod input_commands;
+mod input_modal;
 pub mod lifecycle;
 pub mod markdown_render;
 pub mod prompt;
@@ -28,6 +33,7 @@ pub mod terminal_status;
 pub mod test_utils;
 mod tool_confirmation;
 pub(crate) mod tool_render;
+mod tool_transcript;
 pub mod types;
 
 mod completion;

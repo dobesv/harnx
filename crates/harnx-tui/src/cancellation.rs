@@ -107,6 +107,7 @@ impl Tui {
     }
 
     pub(super) fn settle_interrupted_prompt(&mut self) {
+        self.close_assistant_stream();
         self.retire_prompt_task();
         self.clear_tool_confirmation_route();
         // Set llm_busy = false BEFORE cancel_tool_confirm() so that
@@ -122,6 +123,7 @@ impl Tui {
         self.active_remote_session = None;
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
+        self.app.streamed_text_idx = None;
         self.app.last_ui_output_source = None;
         self.flush_pending_thought();
         self.refresh_input_chrome();

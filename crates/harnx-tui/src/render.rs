@@ -802,13 +802,7 @@ impl Tui {
         total as u16
     }
 
-    /// Append a streamed assistant text chunk to the open streaming run,
-    /// which is always the trailing `AssistantText` transcript item. If no
-    /// run is open — at turn start, or because an interleaving item (tool
-    /// call, tool result, notice, source heading, …) became the trailing
-    /// item — a fresh `AssistantText` is started. An interleaving item thus
-    /// breaks the surrounding text into separate blocks for free, with no
-    /// per-event bookkeeping.
+    /// Aggregate chunks until a boundary so split Markdown syntax is parsed together.
     pub(super) fn append_streaming_assistant_chunk(&mut self, chunk: &str, is_sub_agent: bool) {
         if chunk.is_empty() {
             return;
@@ -819,12 +813,10 @@ impl Tui {
                 Some(TranscriptItem::AssistantText { .. })
             );
         if !open {
-            self.app.transcript.push(TranscriptItem::AssistantText {
-                text: String::new(),
-                seq: None,
-                timestamp: Some(chrono::Utc::now()),
-                rendered_cache: None,
-            });
+            self.close_assistant_stream();
+            self.app.streamed_text_idx = Some(crate::assistant_transcript::begin_assistant_stream(
+                &mut self.app.transcript,
+            ));
             self.app.streaming_open = true;
         }
         if let Some(TranscriptItem::AssistantText {
@@ -854,6 +846,7 @@ impl Tui {
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
+        self.app.streamed_text_idx = None;
     }
 
     fn input_unread_indicator(unread: bool) -> Option<Span<'static>> {
