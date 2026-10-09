@@ -59,8 +59,11 @@ async fn wait_terminal_without_runner_establishes_watch_and_reconciles_orphan() 
         )
         .await?;
     let handler = handler(&h);
-    let failed =
-        tokio::time::timeout(DEADLINE, handler.wait_terminal(&alice(), &record.task.id)).await??;
+    let failed = tokio::time::timeout(
+        DEADLINE,
+        handler.wait_terminal(&alice().into(), &record.task.id),
+    )
+    .await??;
     assert_eq!(failed.task.status.state, TaskState::Failed);
     assert!(h.logs.text().contains("waiting for task via KV watch"));
     assert_eq!(
@@ -69,13 +72,13 @@ async fn wait_terminal_without_runner_establishes_watch_and_reconciles_orphan() 
     );
     // The same direct API still checks ownership and the already-terminal race.
     let denied = handler
-        .wait_terminal(&Principal::User("bob".into()), &record.task.id)
+        .wait_terminal(&Principal::User("bob".into()).into(), &record.task.id)
         .await
         .unwrap_err();
     assert_eq!(denied.code, -32001);
     assert_eq!(
         handler
-            .wait_terminal(&alice(), &record.task.id)
+            .wait_terminal(&alice().into(), &record.task.id)
             .await?
             .task
             .status
@@ -173,7 +176,7 @@ async fn wait_terminal_returns_error_after_bounded_terminal_persistence_failure(
         .await?;
     wait_for_first_artifact(&mut started.events).await?;
     let handler = handler(&h);
-    let owner = alice();
+    let owner = alice().into();
     let mut waiting = Box::pin(handler.wait_terminal(&owner, &started.snapshot.task.id));
     // Wait for the actual local-watch branch before making persistence fail.
     tokio::time::timeout(DEADLINE, async {
@@ -230,7 +233,7 @@ async fn terminal_persistence_retry_recovers_full_artifact_after_storage_returns
     wait_for_first_artifact(&mut started.events).await?;
     let handler = handler(&h);
     let id = started.snapshot.task.id.clone();
-    let waiter = tokio::spawn(async move { handler.wait_terminal(&alice(), &id).await });
+    let waiter = tokio::spawn(async move { handler.wait_terminal(&alice().into(), &id).await });
     wait_for_log(&h, "waiting on local task completion").await?;
     let original_max = set_stream_max_message_size(&h, 1).await?;
     h.llm.release.notify_one();

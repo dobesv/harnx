@@ -429,7 +429,7 @@ impl Harness {
         self.runner
             .session(SessionRequest {
                 export: &self.export,
-                owner,
+                owner: &owner.clone().into(),
                 local_id,
                 global_config: &self.config,
                 activation_route: SessionActivationRoute::ClusterShared,
@@ -447,7 +447,7 @@ impl Harness {
             self.runner.start_turn(
                 TurnRequest {
                     export: &self.export,
-                    owner: &alice(),
+                    owner: &alice().into(),
                     session: session.clone(),
                     message,
                 },
@@ -459,7 +459,7 @@ impl Harness {
     }
     pub async fn task(&self, id: &str) -> Result<TaskRecord> {
         self.store
-            .get_task_for_export(&self.export, &alice(), id)
+            .get_task_for_export(&self.export, &alice().into(), id)
             .await?
             .context("task missing")
     }
@@ -485,7 +485,10 @@ pub async fn list_all_tasks_for_test(
     owner: &Principal,
     local_id: &str,
 ) -> Result<Option<Vec<TaskRecord>>> {
-    let Some(key) = store.resolve_context(export, owner, local_id).await? else {
+    let Some(key) = store
+        .resolve_context(export, &owner.clone().into(), local_id)
+        .await?
+    else {
         return Ok(None);
     };
 

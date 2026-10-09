@@ -44,7 +44,8 @@ mod nats_web_session_url_tests;
 #[cfg(test)]
 mod remote_agent_nats_tests;
 
-use request_identity::RequestUserId;
+use request_identity::RequestIdentity;
+use session_access::list_target_sessions;
 
 pub(crate) use agent_resolve::{is_safe_agent_path, is_safe_path_segment, resolve_agent_target};
 pub(crate) use nats_access::{
@@ -58,7 +59,7 @@ use crate::session_actor::{ResolvedAgentTarget, SessionRegistry};
 use crate::session_routes::{AgentSessionRef, SessionsRouteContext};
 use attachments::*;
 
-use harnx_core::access_rules::AccessRules;
+use harnx_core::access_rules::{AccessRules, CallerView};
 #[cfg(test)]
 use harnx_core::agent_ref::AgentRef;
 use harnx_core::message::MessageRole;
@@ -359,6 +360,8 @@ pub async fn run_with_shutdown_config(
 pub struct Server {
     config: Config,
     identity_sources: harnx_runtime::identity::IdentitySources,
+    group_headers: harnx_runtime::identity::MembershipHeaders,
+    role_headers: harnx_runtime::identity::MembershipHeaders,
     access_rules: Option<Arc<AccessRules>>,
     models: Vec<Value>,
     agents: Vec<AgentConfig>,
@@ -465,8 +468,16 @@ impl Server {
         let session_registry = SessionRegistry::new(config.clone());
         let agents = config.all_agents();
         Ok(Self {
-            config,
             identity_sources,
+            group_headers: harnx_runtime::identity::MembershipHeaders::new(
+                &config.serve_group_headers,
+            )
+            .context("invalid serve_group_headers")?,
+            role_headers: harnx_runtime::identity::MembershipHeaders::new(
+                &config.serve_role_headers,
+            )
+            .context("invalid serve_role_headers")?,
+            config,
             access_rules,
             models,
             agents,
@@ -486,7 +497,9 @@ impl Server {
             agent_sessions_json(
                 &self.config,
                 &target,
-                self.access_rules.as_deref().map(|rules| (rules, &[][..])),
+                self.access_rules
+                    .as_deref()
+                    .map(|rules| (rules, CallerView::default())),
             )
             .await?,
         ))
@@ -655,19 +668,6 @@ impl Server {
 
     fn list_models(&self) -> Result<AppResponse> {
         let data = json!({ "data": self.models });
-        let res = Response::builder()
-            .header("Content-Type", "application/json; charset=utf-8")
-            .body(Full::new(Bytes::from(data.to_string())).boxed())?;
-        Ok(res)
-    }
-
-    async fn list_agents<B>(&self, req: &hyper::Request<B>) -> Result<AppResponse> {
-        let mut agents = self.filter_agents_by_role(req.uri().query()).await?;
-        if let Some((rules, identities)) = self.access(req) {
-            let ids: Vec<&str> = identities.iter().map(String::as_str).collect();
-            agents.retain(|agent| rules.can_see_agent(agent.name(), &ids));
-        }
-        let data = json!({ "data": agents });
         let res = Response::builder()
             .header("Content-Type", "application/json; charset=utf-8")
             .body(Full::new(Bytes::from(data.to_string())).boxed())?;
@@ -860,7 +860,7 @@ impl Server {
             registry: &self.session_registry,
             persistence: PersistenceKind::Nats,
             web_base_url: web_url::inferred_base_url(req.headers(), req.uri()),
-            user_id: RequestUserId::of(&req),
+            user_id: RequestIdentity::user_id(&req),
         };
         handle_ag_ui_rpc(req, target, session, context).await
     }
@@ -870,8 +870,8 @@ impl Server {
         let path = req.uri().path().to_string();
         let (rules, identities) = self.access(&req).unzip();
         let identities = identities.unwrap_or_default();
-        let ids: Vec<&str> = identities.iter().map(String::as_str).collect();
-        let access = rules.map(|rules| (rules, ids.as_slice()));
+        let caller = identities.caller();
+        let access = rules.map(|rules| (rules, caller.view()));
         if let Some((agent_ref, session, route)) =
             session_routes::parse_session_metadata_route(&path)
         {
@@ -901,7 +901,7 @@ impl Server {
                     &method,
                     req.headers(),
                     SessionsRouteContext::new(&target, &scoped, req.uri().query())
-                        .with_user_id(RequestUserId::of(&req).as_deref())
+                        .with_user_id(RequestIdentity::user_id(&req).as_deref())
                         .with_access(access),
                 )
                 .await
@@ -954,7 +954,7 @@ impl Server {
     async fn agent_json(
         &self,
         target: &ResolvedAgentTarget,
-        access: Option<(&AccessRules, &[&str])>,
+        access: Option<(&AccessRules, CallerView<'_>)>,
     ) -> Result<AppResponse> {
         let sessions = agent_sessions_json(&self.config, target, access).await?;
         let display_ref = self.display_ref(target);
@@ -979,7 +979,7 @@ impl Server {
         &self,
         target: &ResolvedAgentTarget,
         params: Option<session_pagination::SessionPaginationQuery>,
-        access: Option<(&AccessRules, &[&str])>,
+        access: Option<(&AccessRules, CallerView<'_>)>,
     ) -> Result<AppResponse> {
         let params = match params {
             Some(params) => params,
@@ -1145,7 +1145,7 @@ impl Server {
         target: &ResolvedAgentTarget,
         session: &str,
     ) -> Result<AppResponse> {
-        let user_id = RequestUserId::of(&req);
+        let user_id = RequestIdentity::user_id(&req);
         let web_base_url = web_url::inferred_base_url(req.headers(), req.uri());
         let body = req.collect().await?.to_bytes();
         let request = ag_ui::AgUiRunRequest {
@@ -1664,33 +1664,6 @@ pub(crate) fn session_repository_and_branch(
     )
 }
 
-pub(crate) async fn list_target_sessions(
-    config: &Config,
-    target: &ResolvedAgentTarget,
-    access: Option<(&AccessRules, &[&str])>,
-) -> Result<Vec<harnx_runtime::config::SessionMeta>> {
-    ensure_frontend_nats_owner(target.cluster()).await?;
-    let mut sessions: Vec<_> = config
-        .list_remote_sessions_with_meta(target.cluster())
-        .await
-        .map_err(|error| sanitize_nats_cluster_error(target.cluster(), error))?
-        .into_iter()
-        // Per-agent endpoints must not leak sessions without agent attribution or for other agents.
-        // Missing/empty agent_name stays excluded from per-agent lists until a later backfill pass.
-        .filter(|session| session.agent_name.as_deref() == Some(target.agent()))
-        .collect();
-
-    if let Some((rules, identities)) = access {
-        let agent_ref =
-            target.display_ref_with_default_cluster(config.default_cluster_for_display());
-        sessions.retain(|session| {
-            rules.can_access_session(&agent_ref, identities, session.user_id.as_deref())
-        });
-    }
-    sessions.sort_by(session_recency_ordering);
-    Ok(sessions)
-}
-
 pub(crate) fn format_session_summary(session: &harnx_runtime::config::SessionMeta) -> Value {
     let session_id = session.session_id.as_deref().unwrap_or(&session.id);
     let mut value = serde_json::Map::from_iter([(
@@ -1739,7 +1712,7 @@ pub(crate) fn format_session_summary(session: &harnx_runtime::config::SessionMet
 async fn agent_sessions_json(
     config: &Config,
     target: &ResolvedAgentTarget,
-    access: Option<(&AccessRules, &[&str])>,
+    access: Option<(&AccessRules, CallerView<'_>)>,
 ) -> Result<Vec<Value>> {
     let sessions = list_target_sessions(config, target, access).await?;
     Ok(sessions.iter().map(format_session_summary).collect())

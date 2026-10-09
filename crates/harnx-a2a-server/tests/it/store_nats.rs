@@ -144,7 +144,7 @@ async fn store_task_record_round_trip() -> Result<()> {
     // A fresh wrapper must read durable state, not an in-process cache.
     let restarted = A2aStore::new(metadata.clone());
     let loaded = restarted
-        .get_task_for_export(&export, &alice(), &task.id)
+        .get_task_for_export(&export, &alice().into(), &task.id)
         .await?
         .unwrap();
     assert_round_trip(&loaded, &created, &task)?;
@@ -232,11 +232,11 @@ async fn store_binding_mismatch_is_not_found() -> Result<()> {
     let mut other = export.clone();
     other.public_name = "another-export".into();
     assert!(store
-        .resolve_context(&other, &alice(), "abc123")
+        .resolve_context(&other, &alice().into(), "abc123")
         .await?
         .is_none());
     assert!(store
-        .get_task_for_export(&other, &alice(), &record.task.id)
+        .get_task_for_export(&other, &alice().into(), &record.task.id)
         .await?
         .is_none());
     assert!(list_tasks(&store, &other, &alice(), "abc123")
@@ -245,11 +245,11 @@ async fn store_binding_mismatch_is_not_found() -> Result<()> {
     other = export.clone();
     other.cluster = Some("other-cluster".into());
     assert!(store
-        .resolve_context(&other, &alice(), "abc123")
+        .resolve_context(&other, &alice().into(), "abc123")
         .await?
         .is_none());
     assert!(store
-        .resolve_context(&export, &alice(), "missing")
+        .resolve_context(&export, &alice().into(), "missing")
         .await?
         .is_none());
     assert!(metadata
@@ -264,7 +264,7 @@ async fn store_binding_mismatch_is_not_found() -> Result<()> {
         ))
         .await?;
     assert!(store
-        .resolve_context(&export, &alice(), "unbound")
+        .resolve_context(&export, &alice().into(), "unbound")
         .await?
         .is_none());
     Ok(())
@@ -279,11 +279,11 @@ async fn store_foreign_owner_is_not_found() -> Result<()> {
     let record = create(&store, &key, snapshot("abc123")).await?;
     for principal in [Principal::User("bob".into()), Principal::Anonymous] {
         assert!(store
-            .resolve_context(&export, &principal, "abc123")
+            .resolve_context(&export, &principal.clone().into(), "abc123")
             .await?
             .is_none());
         assert!(store
-            .get_task_for_export(&export, &principal, &record.task.id)
+            .get_task_for_export(&export, &principal.clone().into(), &record.task.id)
             .await?
             .is_none());
         assert!(list_tasks(&store, &export, &principal, "abc123")
@@ -293,7 +293,7 @@ async fn store_foreign_owner_is_not_found() -> Result<()> {
             .dedupe_task(
                 ContextAccess {
                     export: &export,
-                    owner: &principal,
+                    owner: &principal.clone().into(),
                     local_id: "abc123",
                 },
                 MessageIdentity {
@@ -312,7 +312,7 @@ async fn store_foreign_owner_is_not_found() -> Result<()> {
         .dedupe_task(
             ContextAccess {
                 export: &export,
-                owner: &alice(),
+                owner: &alice().into(),
                 local_id: "missing",
             },
             MessageIdentity {
@@ -364,7 +364,7 @@ async fn assert_stored_tasks(
     for (export, task) in cases {
         assert_eq!(
             store
-                .get_task_for_export(export, &alice(), &lookup.id)
+                .get_task_for_export(export, &alice().into(), &lookup.id)
                 .await?
                 .unwrap()
                 .task,
@@ -421,7 +421,7 @@ async fn store_same_local_id_is_isolated_by_agent() -> Result<()> {
     let task = snapshot("abc123");
     let record_a = create(&store, &agents.a.key, task.clone()).await?;
     assert!(store
-        .get_task_for_export(&agents.b.export, &alice(), &task.id)
+        .get_task_for_export(&agents.b.export, &alice().into(), &task.id)
         .await?
         .is_none());
     let mut task_b = task.clone();
@@ -495,7 +495,7 @@ async fn assert_gc_removed_context(
 ) -> Result<()> {
     assert!(store.get_binding(&agent.key).await?.is_none());
     assert!(store
-        .get_task_for_export(&agent.export, &alice(), &task.id)
+        .get_task_for_export(&agent.export, &alice().into(), &task.id)
         .await?
         .is_none());
     Ok(())
@@ -574,7 +574,7 @@ async fn store_dedupe_hit_after_terminal_returns_existing_task() -> Result<()> {
         .dedupe_task(
             ContextAccess {
                 export: &export,
-                owner: &alice(),
+                owner: &alice().into(),
                 local_id: "abc123",
             },
             MessageIdentity {
@@ -610,7 +610,7 @@ async fn store_dedupe_fingerprint_mismatch_is_distinct_error() -> Result<()> {
         .dedupe_task(
             ContextAccess {
                 export: &export,
-                owner: &alice(),
+                owner: &alice().into(),
                 local_id: "abc123"
             },
             MessageIdentity {
@@ -634,7 +634,7 @@ async fn store_dedupe_fingerprint_mismatch_is_distinct_error() -> Result<()> {
         .dedupe_task(
             ContextAccess {
                 export: &export,
-                owner: &alice(),
+                owner: &alice().into(),
                 local_id: "abc123",
             },
             MessageIdentity {

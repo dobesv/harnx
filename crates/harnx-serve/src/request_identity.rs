@@ -1,31 +1,83 @@
 //! Resolve API request identity before dispatch and handle unauthenticated preflight.
 
 use super::{ret_err, set_cors_header, AppResponse, Server};
+use harnx_core::access_rules::CallerView;
+use harnx_runtime::identity::IdentityError;
 use http::{Method, Response, StatusCode};
 use hyper::body::Incoming;
 use std::time::Instant;
 
-/// Resolved once at the API boundary, before any route can create metadata.
+/// Owned request-local identity. Only `user_id` can become session metadata.
 #[derive(Clone, Default)]
-pub(super) struct RequestUserId(pub(super) Option<String>);
+pub(super) struct RequestIdentity {
+    pub(super) user_id: Option<String>,
+    pub(super) groups: Vec<String>,
+    pub(super) roles: Vec<String>,
+}
 
-impl RequestUserId {
-    /// Identity `prepare_request` resolved for this request, if any.
-    pub(super) fn of<B>(req: &hyper::Request<B>) -> Option<String> {
-        req.extensions().get::<Self>().and_then(|id| id.0.clone())
+/// Storage for the slices borrowed by the core caller view.
+pub(super) struct RequestCaller<'a> {
+    user: Option<&'a str>,
+    groups: Vec<&'a str>,
+    roles: Vec<&'a str>,
+}
+
+impl RequestCaller<'_> {
+    pub(super) fn view(&self) -> CallerView<'_> {
+        CallerView {
+            users: self.user.as_slice(),
+            groups: &self.groups,
+            roles: &self.roles,
+        }
+    }
+}
+
+impl RequestIdentity {
+    pub(super) fn of<B>(req: &hyper::Request<B>) -> Self {
+        req.extensions().get::<Self>().cloned().unwrap_or_default()
+    }
+
+    pub(super) fn user_id<B>(req: &hyper::Request<B>) -> Option<String> {
+        req.extensions()
+            .get::<Self>()
+            .and_then(|id| id.user_id.clone())
+    }
+
+    pub(super) fn caller(&self) -> RequestCaller<'_> {
+        RequestCaller {
+            user: self.user_id.as_deref(),
+            groups: self.groups.iter().map(String::as_str).collect(),
+            roles: self.roles.iter().map(String::as_str).collect(),
+        }
     }
 }
 
 impl Server {
-    /// `None` means checks are disabled. Missing request identity keeps checks on
-    /// with an empty identity set, never falling back to session-owner defaults.
+    /// Missing identity never disables checks or falls back to session defaults.
     pub(crate) fn access<B>(
         &self,
         req: &hyper::Request<B>,
-    ) -> Option<(&harnx_core::access_rules::AccessRules, Vec<String>)> {
+    ) -> Option<(&harnx_core::access_rules::AccessRules, RequestIdentity)> {
         self.access_rules
             .as_deref()
-            .map(|rules| (rules, RequestUserId::of(req).into_iter().collect()))
+            .map(|rules| (rules, RequestIdentity::of(req)))
+    }
+
+    fn resolve_identity<B>(
+        &self,
+        req: &hyper::Request<B>,
+    ) -> Result<RequestIdentity, IdentityError> {
+        Ok(RequestIdentity {
+            user_id: self.identity_sources.resolve(req.headers())?,
+            groups: self.group_headers.resolve(req.headers())?,
+            roles: self.role_headers.resolve(req.headers())?,
+        })
+    }
+
+    fn requires_user_identity(&self, path: &str) -> bool {
+        let protected =
+            path == "/v1/agents" || path.starts_with("/v1/agents/") || path.starts_with("/v1/cid/");
+        self.access_rules.is_some() && protected
     }
 
     pub(super) fn prepare_request(
@@ -42,20 +94,16 @@ impl Server {
         if !req.uri().path().starts_with("/v1/") {
             return None;
         }
-        match self.identity_sources.resolve(req.headers()) {
-            Ok(user_id) => {
-                req.extensions_mut().insert(RequestUserId(user_id));
-                let path = req.uri().path();
-                let protected = path == "/v1/agents"
-                    || path.starts_with("/v1/agents/")
-                    || path.starts_with("/v1/cid/");
-                if protected && self.access(req).is_some_and(|(_, ids)| ids.is_empty()) {
+        match self.resolve_identity(req) {
+            Ok(identity) => {
+                if self.requires_user_identity(req.uri().path()) && identity.user_id.is_none() {
                     return Some(record_early_http_response(
                         req,
                         identity_error_response("missing user identity"),
                         started,
                     ));
                 }
+                req.extensions_mut().insert(identity);
                 None
             }
             Err(error) => Some(record_early_http_response(

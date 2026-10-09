@@ -211,7 +211,7 @@ async fn unary_live_get_list_and_blocking_dedupe_waiters() -> Result<()> {
     let mut sub = http
         .h
         .runner
-        .subscribe(&http.h.export, &crate::support::alice(), id)
+        .subscribe(&http.h.export, &crate::support::alice().into(), id)
         .await?;
     if sub.snapshot.task.artifacts.is_none() {
         wait_for_stream_artifact(&mut sub.events).await?;

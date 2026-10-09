@@ -89,8 +89,8 @@ impl Server {
                 return false;
             }
         };
-        let ids: Vec<&str> = identities.iter().map(String::as_str).collect();
-        rules.can_access_session(agent, &ids, owner.as_deref())
+        let caller = identities.caller();
+        rules.can_access_session(agent, caller.view(), owner.as_deref())
     }
 }
 

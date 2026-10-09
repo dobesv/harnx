@@ -562,6 +562,14 @@ serve_user_id_sources:
   - "header:X-Forwarded-User"
   - "header:X-Forwarded-Email"
   - "cookie:session_user"
+
+# Trusted raw group membership headers for harnx-serve (all values contribute)
+serve_group_headers:
+  - "X-Forwarded-Groups"
+
+# Trusted raw role membership headers for harnx-serve (all values contribute)
+serve_role_headers:
+  - "X-Forwarded-Roles"
 ```
 
 ## Access Control (`access.yaml`)
@@ -598,9 +606,28 @@ rules:
 Each rule contains:
 - **`agents`** *(required list of strings)*: Globs matching agent references.
 - **`scopes`** *(optional list of strings)*: Granted permissions. Allowed values are `prompt` and `admin`. If omitted, defaults to `[prompt]`. An empty list (`scopes: []`) is a configuration error.
-- **`users`** *(required list of strings)*: Globs matching caller user identity strings.
+- **`users`** *(optional list of strings)*: Globs matching caller user identity strings. Omitted or empty matches nothing.
+- **`groups`** *(optional list of strings)*: Globs matching caller group memberships. Omitted or empty matches nothing.
+- **`roles`** *(optional list of strings)*: Globs matching caller role memberships. Omitted or empty matches nothing.
 
-Unknown YAML fields are rejected (`deny_unknown_fields`).
+At least one selector category (`users`, `groups`, or `roles`) must be non-empty. Unknown YAML fields are rejected (`deny_unknown_fields`).
+
+#### Group and Role Memberships
+
+In addition to user identity, callers can supply group and role memberships via trusted HTTP headers configured on the server:
+- `harnx-serve`: `serve_group_headers` / `serve_role_headers` in `config.yaml`, environment variables `HARNX_SERVE_GROUP_HEADERS` / `HARNX_SERVE_ROLE_HEADERS` (comma-separated header names), or repeatable `--group-header <NAME>` / `--role-header <NAME>` CLI flags. Non-empty CLI flags replace config and environment settings.
+- `harnx-a2a-server`: repeatable `--group-header <NAME>` and `--role-header <NAME>` CLI flags.
+
+Header and membership rules:
+- **No defaults**: No trusted group or role headers are enabled by default. Unconfigured membership headers sent by clients are ignored.
+- **Header parsing**: Every configured header name is read from the request. When a header appears multiple times or contains comma-separated values, each comma-separated entry is trimmed and empty tokens are dropped. All configured membership headers contribute values.
+- **Fail closed on malformed values**: If any configured membership header contains invalid bytes that fail UTF-8 header value conversion, the request is rejected immediately with HTTP 401 Unauthorized without echoing header contents.
+- **Distinct namespaces**: Users, groups, and roles occupy completely distinct namespaces. The same string value in different namespaces never matches across categories.
+- **OR within rules, union across rules**: A rule matches when its `agents` pattern matches AND at least one selector category (`users`, `groups`, or `roles`) matches the caller's request. Scopes are unioned across all matching rules.
+- **Request-local and non-persistent**: Groups and roles are evaluated per request and are never persisted in session metadata, task KV, or NATS properties. Revoking or changing a membership takes effect on the caller's next HTTP request.
+- **User ownership unchanged**: Groups and roles grant access scopes, but they never satisfy session ownership. Sessions are owned solely by immutable user IDs. Callers with `prompt` scope can only access sessions where `user_id == caller.user_id`. Callers with `admin` scope (granted by any user, group, or role rule) can access sessions across all users.
+- **User identity required**: Memberships do not satisfy required caller authentication. When access rules are enabled, protected routes still require a valid user identity.
+- **Reverse proxy trust**: Upstream proxies must authenticate callers and replace or strip all configured user, group, and role headers before forwarding requests.
 
 #### Reusable Groups with YAML Anchors
 

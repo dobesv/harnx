@@ -20,19 +20,24 @@ pub fn router<H: a2a_server_lf::handler::RequestHandler>(
     user_id_headers: &[String],
     handler: impl Fn(&Export, identity::Identity) -> Arc<H>,
 ) -> anyhow::Result<Router> {
-    router_with_access_rules(exports, public_base_url, user_id_headers, None, handler)
+    router_with_access_rules(
+        exports,
+        public_base_url,
+        identity::Identity::new(user_id_headers)?,
+        None,
+        handler,
+    )
 }
 
 /// Protect RPC and discovery with rules matched against the internal agent ref.
 pub fn router_with_access_rules<H: a2a_server_lf::handler::RequestHandler>(
     exports: &[Export],
     public_base_url: Option<&str>,
-    user_id_headers: &[String],
+    identity: identity::Identity,
     access_rules: Option<Arc<harnx_core::access_rules::AccessRules>>,
     handler: impl Fn(&Export, identity::Identity) -> Arc<H>,
 ) -> anyhow::Result<Router> {
     let public_base_url = web_url::normalize_public_base_url(public_base_url)?;
-    let identity = identity::Identity::new(user_id_headers)?;
     identity.validate_access_rules(access_rules.is_some())?;
     Ok(router_with(exports, |export| {
         let rpc = jsonrpc_router(handler(export, identity.clone()))

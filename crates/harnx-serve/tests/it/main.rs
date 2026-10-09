@@ -10,6 +10,7 @@ mod support;
 
 mod access_agents;
 mod access_cid;
+mod access_memberships;
 mod access_sessions;
 mod ag_ui_control_plane;
 mod ag_ui_remote_follow;

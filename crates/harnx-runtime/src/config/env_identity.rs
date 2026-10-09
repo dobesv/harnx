@@ -7,13 +7,22 @@ impl Config {
         if let Some(v) = read_env_value::<String>(&get_env_name("user_id")) {
             self.user_id = v;
         }
-        if let Ok(v) = env::var(get_env_name("serve_user_id_sources")) {
-            self.serve_user_id_sources = v
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
+        for (key, values) in [
+            (
+                "serve_user_id_sources",
+                &mut self.data.serve_user_id_sources,
+            ),
+            ("serve_group_headers", &mut self.data.serve_group_headers),
+            ("serve_role_headers", &mut self.data.serve_role_headers),
+        ] {
+            if let Ok(v) = env::var(get_env_name(key)) {
+                *values = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+            }
         }
     }
 }
@@ -23,6 +32,44 @@ mod tests {
     use super::*;
     use crate::config::test_support::{env_lock, EnvGuard};
 
+    #[test]
+    fn serve_membership_headers_env_overrides_yaml_independently_and_can_clear() {
+        harnx_core::require_nextest();
+        let _lock = env_lock();
+        let _groups = EnvGuard::remove("HARNX_SERVE_GROUP_HEADERS");
+        let _roles = EnvGuard::remove("HARNX_SERVE_ROLE_HEADERS");
+        let _users = EnvGuard::remove("HARNX_SERVE_USER_ID_SOURCES");
+        let mut config = Config {
+            data: serde_yaml::from_str(
+                "serve_group_headers: [x-yaml-groups]\nserve_role_headers: [x-yaml-roles]\nserve_user_id_sources: [cookie:owner]\n",
+            ).unwrap(),
+            ..Default::default()
+        };
+        config.load_serve_envs();
+        assert_eq!(config.serve_group_headers, ["x-yaml-groups"]);
+        assert_eq!(config.serve_role_headers, ["x-yaml-roles"]);
+        {
+            let _groups = EnvGuard::new(
+                "HARNX_SERVE_GROUP_HEADERS",
+                " X-Groups, ,x-other-groups, X-Groups, ",
+            );
+            config.load_serve_envs();
+            assert_eq!(
+                config.serve_group_headers,
+                ["X-Groups", "x-other-groups", "X-Groups"]
+            );
+            assert_eq!(config.serve_role_headers, ["x-yaml-roles"]);
+            let _roles = EnvGuard::new("HARNX_SERVE_ROLE_HEADERS", " x-roles , , X-Other-Roles ,");
+            config.load_envs(false).unwrap();
+            assert_eq!(config.serve_role_headers, ["x-roles", "X-Other-Roles"]);
+        }
+        let _groups = EnvGuard::new("HARNX_SERVE_GROUP_HEADERS", "");
+        let _roles = EnvGuard::new("HARNX_SERVE_ROLE_HEADERS", " , \t , ");
+        config.load_serve_envs();
+        assert!(config.serve_group_headers.is_empty());
+        assert!(config.serve_role_headers.is_empty());
+        assert_eq!(config.serve_user_id_sources, ["cookie:owner"]);
+    }
     #[test]
     fn serve_user_id_sources_env_replaces_yaml_in_order_and_can_clear() {
         harnx_core::require_nextest();

@@ -53,3 +53,38 @@ rules:
       - prompt
     users:
       - "CN=*,OU=engineering,O=mycorp"
+
+  # Group membership access:
+  # Rules can match request-local group memberships provided via trusted HTTP headers
+  # (e.g. --group-header or serve_group_headers).
+  - agents:
+      - "coding/*"
+    scopes:
+      - prompt
+    groups:
+      - developers
+      - contractors
+
+  # Role membership access:
+  # Rules can match request-local role memberships provided via trusted HTTP headers
+  # (e.g. --role-header or serve_role_headers).
+  # Users, groups, and roles occupy distinct namespaces; values never collide across categories.
+  - agents:
+      - "*"
+    scopes:
+      - prompt
+      - admin
+    roles:
+      - cluster-admin
+
+  # Mixed selectors:
+  # A rule matches when its agent pattern matches AND at least one selector category
+  # (users, groups, or roles) matches.
+  - agents:
+      - sisyphus
+    scopes:
+      - prompt
+    users:
+      - "lead@example.com"
+    groups:
+      - core-team

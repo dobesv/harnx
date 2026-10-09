@@ -254,6 +254,10 @@ pub struct ConfigData {
     pub serve_public_url: Option<String>,
     /// Ordered header/cookie sources for the identity recorded on new HTTP sessions.
     pub serve_user_id_sources: Vec<String>,
+    /// Trusted raw HTTP header names for request-local groups. Empty by default.
+    pub serve_group_headers: Vec<String>,
+    /// Trusted raw HTTP header names for request-local roles. Empty by default.
+    pub serve_role_headers: Vec<String>,
     /// Default identity for newly created sessions, unless their cluster or caller supplies one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
@@ -339,6 +343,8 @@ impl Default for ConfigData {
             serve_addr: None,
             serve_public_url: None,
             serve_user_id_sources: Vec::new(),
+            serve_group_headers: Vec::new(),
+            serve_role_headers: Vec::new(),
             user_id: None,
             user_agent: None,
             save_shell_history: true,
@@ -362,6 +368,24 @@ impl Default for ConfigData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_membership_headers_default_to_no_trusted_names() {
+        for data in [ConfigData::default(), serde_yaml::from_str("{}").unwrap()] {
+            assert!(data.serve_group_headers.is_empty());
+            assert!(data.serve_role_headers.is_empty());
+        }
+    }
+
+    #[test]
+    fn serve_membership_headers_yaml_keeps_names_and_categories_separate() {
+        let data: ConfigData = serde_yaml::from_str(
+            "serve_group_headers: [X-Groups, x-other-groups]\nserve_role_headers: [x-roles]\nserve_user_id_sources: [cookie:owner]\n",
+        ).unwrap();
+        assert_eq!(data.serve_group_headers, ["X-Groups", "x-other-groups"]);
+        assert_eq!(data.serve_role_headers, ["x-roles"]);
+        assert_eq!(data.serve_user_id_sources, ["cookie:owner"]);
+    }
 
     #[test]
     fn default_matches_historical_values() {

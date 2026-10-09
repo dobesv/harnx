@@ -50,11 +50,11 @@ async fn access_nats_index_authorizes_before_migration_and_keeps_admin_scope() -
     // A denied lookup must not trigger the legacy full-bucket scan or create an index.
     for user in [Principal::User("bob".into()), Principal::Anonymous] {
         assert!(store
-            .list_task_index(&export, &user, local_id)
+            .list_task_index(&export, &user.clone().into(), local_id)
             .await?
             .is_none());
         assert!(store
-            .get_task_for_export(&export, &user, &task_id)
+            .get_task_for_export(&export, &user.clone().into(), &task_id)
             .await?
             .is_none());
         assert!(metadata.get_a2a_task_index(&key).await?.is_none());
@@ -62,13 +62,13 @@ async fn access_nats_index_authorizes_before_migration_and_keeps_admin_scope() -
 
     let admin = Principal::User("admin".into());
     let (_, index) = store
-        .list_task_index(&export, &admin, local_id)
+        .list_task_index(&export, &admin.clone().into(), local_id)
         .await?
         .unwrap();
     assert_eq!(index.entries.len(), 1);
     assert_eq!(index.entries[0].task_id, task_id);
     assert!(store
-        .get_task_for_export(&export, &admin, &task_id)
+        .get_task_for_export(&export, &admin.clone().into(), &task_id)
         .await?
         .is_some());
     assert_eq!(
@@ -80,11 +80,11 @@ async fn access_nats_index_authorizes_before_migration_and_keeps_admin_scope() -
     let strict = A2aStore::new(metadata);
     assert!(strict.access_rules().is_none());
     assert!(strict
-        .list_task_index(&export, &admin, local_id)
+        .list_task_index(&export, &admin.clone().into(), local_id)
         .await?
         .is_none());
     assert!(strict
-        .list_task_index(&export, &Principal::User("alice".into()), local_id)
+        .list_task_index(&export, &Principal::User("alice".into()).into(), local_id)
         .await?
         .is_some());
     Ok(())

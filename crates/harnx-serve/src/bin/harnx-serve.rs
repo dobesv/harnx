@@ -25,6 +25,14 @@ struct Cli {
     /// Replaces serve_user_id_sources from config when supplied.
     #[clap(long = "user-id-source", value_name = "SOURCE", action = clap::ArgAction::Append)]
     user_id_sources: Vec<String>,
+    /// Trusted raw group header name; repeat to collect values from every header.
+    /// Replaces serve_group_headers from config/environment when supplied.
+    #[clap(long = "group-header", value_name = "NAME", action = clap::ArgAction::Append)]
+    group_headers: Vec<String>,
+    /// Trusted raw role header name; repeat to collect values from every header.
+    /// Replaces serve_role_headers from config/environment when supplied.
+    #[clap(long = "role-header", value_name = "NAME", action = clap::ArgAction::Append)]
+    role_headers: Vec<String>,
     /// Access rules file (default: access.yaml in the harnx config directory)
     #[clap(long, value_name = "PATH", env = "HARNX_ACCESS_RULES")]
     access_rules: Option<PathBuf>,
@@ -84,6 +92,7 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
     let mut config = Config::init_headless(WorkingMode::Serve, false)
         .await
         .context("Failed to init Config")?;
+    cli.apply_identity_overrides(&mut config);
     config.apply_frontend_nats_routing();
     let config = Arc::new(ConfigLock::new(config));
 
@@ -93,9 +102,7 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
     if let Some(public_url) = cli.public_url {
         config.write().serve_public_url = Some(public_url);
     }
-    if !cli.user_id_sources.is_empty() {
-        config.write().serve_user_id_sources = cli.user_id_sources;
-    }
+
     if let Some(model_id) = &cli.model {
         Config::switch_model(&config, model_id)?;
     }
@@ -121,10 +128,56 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
     .err())
 }
 
+impl Cli {
+    fn apply_identity_overrides(&self, config: &mut Config) {
+        for (values, target) in [
+            (
+                &self.user_id_sources,
+                &mut config.data.serve_user_id_sources,
+            ),
+            (&self.group_headers, &mut config.data.serve_group_headers),
+            (&self.role_headers, &mut config.data.serve_role_headers),
+        ] {
+            if !values.is_empty() {
+                target.clone_from(values);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Cli;
     use clap::Parser;
+
+    #[test]
+    fn membership_cli_only_replaces_nonempty_categories() {
+        harnx_core::require_nextest();
+        let mut config = harnx_runtime::config::Config {
+            data: harnx_core::config_data::ConfigData {
+                serve_group_headers: vec!["x-config-group".into()],
+                serve_role_headers: vec!["x-env-role".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let default = Cli::try_parse_from(["harnx-serve"]).unwrap();
+        assert!(default.group_headers.is_empty());
+        assert!(default.role_headers.is_empty());
+        default.apply_identity_overrides(&mut config);
+        assert_eq!(config.serve_group_headers, ["x-config-group"]);
+        let cli = Cli::try_parse_from([
+            "harnx-serve",
+            "--group-header",
+            "X-Groups",
+            "--group-header",
+            "x-other-groups",
+        ])
+        .unwrap();
+        cli.apply_identity_overrides(&mut config);
+        assert_eq!(config.serve_group_headers, ["X-Groups", "x-other-groups"]);
+        assert_eq!(config.serve_role_headers, ["x-env-role"]);
+    }
 
     #[test]
     fn access_rules_flag_has_env_fallback_and_cli_precedence() {

@@ -83,6 +83,13 @@ fn write_fixture_config(root: &std::path::Path, nats_url: Option<&str>) -> Resul
     Ok(())
 }
 
+#[derive(Default)]
+pub(super) struct MembershipSettings<'a> {
+    pub config: &'a str,
+    pub args: &'a [&'a str],
+    pub env: &'a [(&'a str, &'a str)],
+}
+
 pub(super) struct Fixture {
     child: Child,
     root: TempDir,
@@ -99,21 +106,39 @@ impl Drop for Fixture {
 
 impl Fixture {
     async fn start(rules: Option<&str>, default_cluster: Option<&str>) -> Result<Self> {
-        Self::start_with_settings(rules, default_cluster, None).await
+        Self::start_with_settings(rules, default_cluster, None, MembershipSettings::default()).await
     }
 
     pub(super) async fn start_with_nats(rules: Option<&str>, nats_url: &str) -> Result<Self> {
-        Self::start_with_settings(rules, Some("default"), Some(nats_url)).await
+        Self::start_with_settings(
+            rules,
+            Some("default"),
+            Some(nats_url),
+            MembershipSettings::default(),
+        )
+        .await
+    }
+
+    pub(super) async fn start_memberships(
+        rules: Option<&str>,
+        nats_url: Option<&str>,
+        settings: MembershipSettings<'_>,
+    ) -> Result<Self> {
+        Self::start_with_settings(rules, Some("default"), nats_url, settings).await
     }
 
     async fn start_with_settings(
         rules: Option<&str>,
         default_cluster: Option<&str>,
         nats_url: Option<&str>,
+        settings: MembershipSettings<'_>,
     ) -> Result<Self> {
         harnx_core::require_nextest();
         let root = tempfile::tempdir()?;
         write_fixture_config(root.path(), nats_url)?;
+        let config_path = root.path().join("config/config.yaml");
+        let config = fs::read_to_string(&config_path)?;
+        fs::write(&config_path, format!("{config}\n{}", settings.config))?;
         if let Some(rules) = rules {
             fs::write(root.path().join("config/access.yaml"), rules)?;
         }
@@ -140,6 +165,9 @@ impl Fixture {
         if let Some(cluster) = default_cluster {
             command.env("HARNX_NATS_SERVER", cluster);
         }
+        command
+            .args(settings.args)
+            .envs(settings.env.iter().copied());
         // Loopback requests must reach the fixture without ambient proxy header rewriting.
         let client = Client::builder()
             .no_proxy()

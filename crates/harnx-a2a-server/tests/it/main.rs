@@ -2,6 +2,7 @@ mod access;
 mod compat;
 mod e2e;
 mod list_costs;
+mod memberships;
 mod runner;
 mod store_nats;
 mod store_nats_access;

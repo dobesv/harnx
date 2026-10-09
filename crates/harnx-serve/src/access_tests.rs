@@ -6,7 +6,7 @@ use harnx_runtime::config::{ConfigLock, GlobalConfig};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::Value;
 
-use crate::{request_identity::RequestUserId, test_support::TestConfigSandbox, Server};
+use crate::{request_identity::RequestIdentity, test_support::TestConfigSandbox, Server};
 
 fn access_rules() -> Arc<AccessRules> {
     Arc::new(AccessRules::from_yaml("rules:\n  - agents: ['*']\n    users: [alice]\n").unwrap())
@@ -72,15 +72,17 @@ fn access_helper_uses_request_identity_and_keeps_empty_identity_set_enabled() {
         .body(())
         .unwrap();
     let (_, identities) = server.access(&req).expect("checks remain enabled");
-    assert!(identities.is_empty());
-    req.extensions_mut()
-        .insert(RequestUserId(Some("alice".to_string())));
+    assert!(identities.user_id.is_none());
+    req.extensions_mut().insert(RequestIdentity {
+        user_id: Some("alice".into()),
+        ..Default::default()
+    });
     let (actual_rules, identities) = server.access(&req).unwrap();
     // Extracting context must not retain a request borrow: routes consume requests.
     drop(req);
     assert!(std::ptr::eq(actual_rules, rules.as_ref()));
-    assert_eq!(identities, ["alice"]);
-    assert!(actual_rules.can_see_agent("plain", &[identities[0].as_str()]));
+    assert_eq!(identities.user_id.as_deref(), Some("alice"));
+    assert!(actual_rules.can_see_agent("plain", identities.caller().view()));
     let disabled = Server::new(&config, PathBuf::from("web-assets"));
     assert!(disabled.access(&hyper::Request::new(())).is_none());
 }

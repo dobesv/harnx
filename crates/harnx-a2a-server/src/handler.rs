@@ -2,7 +2,7 @@
 
 use crate::{
     exports::Export,
-    identity::{Identity, Principal},
+    identity::{Identity, RequestIdentity},
     input_map::InputLimits,
     runner::{A2aEvent, RunnerError, SessionRequest},
     store::{TaskAccess, TaskRecord},
@@ -61,16 +61,14 @@ impl HarnxHandler {
             limits,
         }
     }
-    fn owner(&self, params: &ServiceParams) -> Result<Principal, A2AError> {
-        let owner = self.identity.resolve_service_params(params)?;
+    fn owner(&self, params: &ServiceParams) -> Result<RequestIdentity, A2AError> {
+        let owner = self.identity.resolve_request_params(params)?;
         if let Some(rules) = self.backend.store.access_rules() {
-            if owner.user_id().is_none() {
+            if owner.principal.user_id().is_none() {
                 return Err(crate::identity::missing_identity());
             }
-            if !rules.can_see_agent(
-                &self.export.agent_ref(),
-                &owner.user_id().into_iter().collect::<Vec<_>>(),
-            ) {
+            let caller = owner.caller();
+            if !rules.can_see_agent(&self.export.agent_ref(), caller.view()) {
                 return Err(not_found());
             }
         }
@@ -78,7 +76,7 @@ impl HarnxHandler {
     }
     async fn session(
         &self,
-        owner: &Principal,
+        owner: &RequestIdentity,
         context: Option<&str>,
     ) -> Result<NatsSession, A2AError> {
         self.backend
@@ -95,7 +93,7 @@ impl HarnxHandler {
             .await
             .map_err(map_error)
     }
-    async fn task(&self, owner: &Principal, id: &str) -> Result<TaskRecord, A2AError> {
+    async fn task(&self, owner: &RequestIdentity, id: &str) -> Result<TaskRecord, A2AError> {
         let record = self
             .backend
             .store
@@ -107,7 +105,7 @@ impl HarnxHandler {
     }
     async fn reconcile(
         &self,
-        owner: &Principal,
+        owner: &RequestIdentity,
         record: TaskRecord,
     ) -> Result<TaskRecord, A2AError> {
         if record.task.status.state.is_terminal() {
@@ -131,7 +129,7 @@ impl HarnxHandler {
     /// context ownership even when called directly by an in-process client.
     pub async fn wait_terminal(
         &self,
-        owner: &Principal,
+        owner: &RequestIdentity,
         task_id: &str,
     ) -> Result<TaskRecord, A2AError> {
         let mut record = self.task(owner, task_id).await?;

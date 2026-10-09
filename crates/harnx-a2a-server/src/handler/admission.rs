@@ -5,7 +5,7 @@ use super::{
     Admission, HarnxHandler,
 };
 use crate::{
-    identity::Principal,
+    identity::RequestIdentity,
     input_map::message_to_input,
     runner::{RunnerError, TurnRequest},
     store::{
@@ -23,7 +23,11 @@ struct MessageAdmission {
 }
 
 impl MessageAdmission {
-    fn new(handler: &HarnxHandler, owner: &Principal, message: Message) -> Result<Self, A2AError> {
+    fn new(
+        handler: &HarnxHandler,
+        owner: &RequestIdentity,
+        message: Message,
+    ) -> Result<Self, A2AError> {
         let context = message_context(&message)?;
         let fingerprint = String::new();
         let lru_key = DedupeKey {
@@ -34,7 +38,7 @@ impl MessageAdmission {
                 .unwrap_or("__local__")
                 .to_owned(),
             export: handler.export.public_name.clone(),
-            owner: owner.user_id().map(str::to_owned),
+            owner: owner.principal.user_id().map(str::to_owned),
             message_id: message.message_id.clone(),
         };
         Ok(Self {
@@ -45,11 +49,11 @@ impl MessageAdmission {
         })
     }
 
-    fn gate_key(&self, handler: &HarnxHandler, owner: &Principal) -> String {
+    fn gate_key(&self, handler: &HarnxHandler, owner: &RequestIdentity) -> String {
         let first_message = self.context.is_none().then_some(&self.message.message_id);
         serde_json::to_string(&(
             &handler.export.public_name,
-            owner.user_id(),
+            owner.principal.user_id(),
             self.context.as_deref(),
             first_message,
         ))
@@ -60,7 +64,7 @@ impl MessageAdmission {
 impl HarnxHandler {
     pub(super) async fn admit(
         &self,
-        owner: Principal,
+        owner: RequestIdentity,
         message: Message,
     ) -> Result<Admission, A2AError> {
         let mut request = MessageAdmission::new(self, &owner, message)?;
@@ -87,7 +91,7 @@ impl HarnxHandler {
 
     async fn authorize_target(
         &self,
-        owner: &Principal,
+        owner: &RequestIdentity,
         request: &MessageAdmission,
     ) -> Result<Option<TaskRecord>, A2AError> {
         if let Some(context) = &request.context {
@@ -98,10 +102,8 @@ impl HarnxHandler {
                 .map_err(map_error)?
                 .ok_or_else(not_found)?;
         } else if self.backend.store.access_rules().is_some_and(|rules| {
-            !rules.can_create_session(
-                &self.export.agent_ref(),
-                &owner.user_id().into_iter().collect::<Vec<_>>(),
-            )
+            let caller = owner.caller();
+            !rules.can_create_session(&self.export.agent_ref(), caller.view())
         }) {
             return Err(permission_denied());
         }
@@ -113,7 +115,7 @@ impl HarnxHandler {
 
     async fn dedupe(
         &self,
-        owner: &Principal,
+        owner: &RequestIdentity,
         request: &MessageAdmission,
     ) -> Result<Option<TaskRecord>, A2AError> {
         if let Some(local_id) = &request.context {
@@ -154,7 +156,7 @@ impl HarnxHandler {
 
     async fn reconcile_context(
         &self,
-        owner: &Principal,
+        owner: &RequestIdentity,
         context: Option<&str>,
     ) -> Result<bool, A2AError> {
         let Some(context) = context else {
@@ -216,7 +218,7 @@ impl HarnxHandler {
 
     async fn reject_terminal_target(
         &self,
-        owner: &Principal,
+        owner: &RequestIdentity,
         target: Option<TaskRecord>,
     ) -> Result<(), A2AError> {
         let Some(target) = target else {
@@ -239,7 +241,7 @@ impl HarnxHandler {
 
     async fn admit_new_message(
         &self,
-        owner: &Principal,
+        owner: &RequestIdentity,
         request: MessageAdmission,
     ) -> Result<Admission, A2AError> {
         let MessageAdmission {
@@ -298,7 +300,7 @@ impl HarnxHandler {
 
     pub(super) async fn admit_request(
         &self,
-        owner: Principal,
+        owner: RequestIdentity,
         req: SendMessageRequest,
     ) -> Result<(Admission, Option<i32>), A2AError> {
         let length = req

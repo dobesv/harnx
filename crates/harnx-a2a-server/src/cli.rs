@@ -82,6 +82,14 @@ pub struct Args {
     #[arg(long, value_name = "NAME")]
     pub user_id_header: Vec<String>,
 
+    /// Trusted group membership header name (repeatable, all values contribute).
+    #[arg(long, value_name = "NAME")]
+    pub group_header: Vec<String>,
+
+    /// Trusted role membership header name (repeatable, all values contribute).
+    #[arg(long, value_name = "NAME")]
+    pub role_header: Vec<String>,
+
     /// Maximum rendered data/inline file part bytes per message.
     #[arg(long, default_value_t = 65536)]
     pub max_data_part_bytes: usize,
@@ -139,6 +147,8 @@ mod tests {
         assert_eq!(args.config_dir, None);
         assert_eq!(args.public_base_url, None);
         assert!(args.user_id_header.is_empty());
+        assert!(args.group_header.is_empty());
+        assert!(args.role_header.is_empty());
         assert_eq!(
             args.agents,
             vec![
@@ -284,10 +294,42 @@ mod tests {
             "--agent",
             "--public-base-url",
             "--user-id-header",
+            "--group-header",
+            "--role-header",
             "--max-data-part-bytes",
         ] {
             assert!(help.contains(flag), "missing {flag}");
         }
         assert!(!help.contains("retention"));
+    }
+    #[test]
+    fn cli_membership_flags_repeat_without_aliases_or_env() {
+        let _env = EnvGuard::isolated();
+        let args = Args::try_parse_from([
+            "harnx-a2a-server",
+            "--agent",
+            "agent",
+            "--group-header",
+            "X-Groups",
+            "--group-header",
+            "X-Other-Groups",
+            "--role-header",
+            "X-Roles",
+            "--role-header",
+            "X-Other-Roles",
+        ])
+        .unwrap();
+        assert_eq!(args.group_header, ["X-Groups", "X-Other-Groups"]);
+        assert_eq!(args.role_header, ["X-Roles", "X-Other-Roles"]);
+        let command = Args::command();
+        for id in ["group_header", "role_header"] {
+            let flag = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap();
+            assert!(flag.get_env().is_none());
+            assert!(flag.get_all_aliases().is_none());
+            assert!(flag.get_value_delimiter().is_none());
+        }
     }
 }

@@ -11,7 +11,7 @@
 //!
 //! Task ID format: `{local_id}.{uuid}` - local_id has no `.` per base64url alphabet.
 
-use crate::{exports::Export, identity::Principal};
+use crate::{exports::Export, identity::RequestIdentity};
 use harnx_core::access_rules::AccessRules;
 use harnx_runtime::nats_session_metadata::SessionMetadataStore;
 use std::sync::Arc;
@@ -51,14 +51,14 @@ impl std::error::Error for StoreError {}
 #[derive(Clone, Copy)]
 pub struct ContextAccess<'a> {
     pub export: &'a Export,
-    pub owner: &'a Principal,
+    pub owner: &'a RequestIdentity,
     pub local_id: &'a str,
 }
 
 #[derive(Clone, Copy)]
 pub struct TaskAccess<'a> {
     pub export: &'a Export,
-    pub owner: &'a Principal,
+    pub owner: &'a RequestIdentity,
     pub task_id: &'a str,
 }
 
@@ -101,7 +101,10 @@ impl A2aStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{exports::Export, identity::Principal};
+    use crate::{
+        exports::Export,
+        identity::{Principal, RequestIdentity},
+    };
     use chrono::Utc;
 
     #[test]
@@ -281,7 +284,12 @@ mod tests {
         let (binding, mut export) = binding_fixture();
         export.public_name = case.public_name.into();
         assert_eq!(
-            validate_binding(&binding, &export, &Principal::User(case.owner.into()), None),
+            validate_binding(
+                &binding,
+                &export,
+                &Principal::User(case.owner.into()).into(),
+                None
+            ),
             case.matches
         );
     }
@@ -292,9 +300,9 @@ mod tests {
             "rules:\n  - agents: [pkg/agent@local]\n    users: [alice, bob]\n  - agents: [pkg/agent@local]\n    users: [admin]\n    scopes: [admin]\n",
         ).unwrap();
         let (binding, export) = binding_fixture();
-        let alice = Principal::User("alice".into());
-        let bob = Principal::User("bob".into());
-        let admin = Principal::User("admin".into());
+        let alice: RequestIdentity = Principal::User("alice".into()).into();
+        let bob: RequestIdentity = Principal::User("bob".into()).into();
+        let admin: RequestIdentity = Principal::User("admin".into()).into();
         assert!(validate_binding(&binding, &export, &alice, Some(&rules)));
         assert!(!validate_binding(&binding, &export, &bob, Some(&rules)));
         assert!(validate_binding(&binding, &export, &admin, Some(&rules)));
@@ -306,13 +314,13 @@ mod tests {
         assert!(validate_binding(
             &legacy,
             &export,
-            &Principal::Anonymous,
+            &Principal::Anonymous.into(),
             None
         ));
         assert!(!validate_binding(
             &legacy,
             &export,
-            &Principal::Anonymous,
+            &Principal::Anonymous.into(),
             Some(&rules)
         ));
         for field in ["version", "export", "agent", "cluster"] {
@@ -344,5 +352,29 @@ mod tests {
     #[test]
     fn validate_binding_wrong_owner() {
         assert_binding_case(&BINDING_CASES[2]);
+    }
+    #[test]
+    fn memberships_binding_authorization_requires_user_and_never_uses_group_owner() {
+        harnx_core::require_nextest();
+        let rules = AccessRules::from_yaml(
+            "rules:\n  - agents: [pkg/agent@local]\n    groups: [team]\n  - agents: [pkg/agent@local]\n    roles: [supervisor]\n    scopes: [admin]\n",
+        ).unwrap();
+        let (binding, export) = binding_fixture();
+        let mut caller = RequestIdentity {
+            principal: Principal::User("bob".into()),
+            groups: vec!["alice".into(), "team".into()],
+            roles: vec![],
+        };
+        assert!(!validate_binding(&binding, &export, &caller, Some(&rules)));
+        caller.principal = Principal::User("alice".into());
+        assert!(validate_binding(&binding, &export, &caller, Some(&rules)));
+        caller.groups.clear();
+        assert!(!validate_binding(&binding, &export, &caller, Some(&rules)));
+        caller.principal = Principal::User("bob".into());
+        caller.roles = vec!["supervisor".into()];
+        assert!(validate_binding(&binding, &export, &caller, Some(&rules)));
+        assert!(!validate_binding(&binding, &export, &caller, None));
+        caller.principal = Principal::Anonymous;
+        assert!(!validate_binding(&binding, &export, &caller, Some(&rules)));
     }
 }

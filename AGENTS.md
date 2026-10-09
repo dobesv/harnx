@@ -1024,6 +1024,14 @@ first created. It is never overwritten on later prompts, handoffs into an
 existing session, or reconnects. Concurrent creators race; the first successful
 metadata write wins and stamps the identity.
 
+**User identity is immutable**. Access rules may grant additional scopes via
+group or role memberships, but these memberships never replace or extend the
+session owner. The persisted `user_id` remains the sole owner for all session
+access checks requiring ownership match (admin scope can bypass ownership). See
+`crates/harnx-runtime/src/nats_session_metadata/session_properties.rs` where
+`user_id` is defined with `read_only: true`, and tests in
+`session_properties_tests.rs` guarding this invariance.
+
 Shared request identity resolution lives in `harnx_runtime::identity`
 (`identity.rs`), used by `harnx-a2a-server` and `harnx-serve`. It extracts from
 configured HTTP headers or cookies and is fail-closed: an empty or malformed

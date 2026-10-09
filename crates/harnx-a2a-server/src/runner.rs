@@ -25,7 +25,7 @@ use tracing::{info, warn};
 
 use crate::{
     exports::Export,
-    identity::Principal,
+    identity::{Principal, RequestIdentity},
     input_map::{message_to_input, InputLimits},
     store::{
         assert_local_id_no_dot, new_task_id, A2aStore, StoreError, TaskAccess, TaskChanges,
@@ -41,7 +41,7 @@ use publication::{LiveState, StreamChannels};
 
 pub struct SessionRequest<'a> {
     pub export: &'a Export,
-    pub owner: &'a Principal,
+    pub owner: &'a RequestIdentity,
     pub local_id: Option<&'a str>,
     pub global_config: &'a GlobalConfig,
     pub activation_route: SessionActivationRoute,
@@ -50,7 +50,7 @@ pub struct SessionRequest<'a> {
 
 pub struct TurnRequest<'a> {
     pub export: &'a Export,
-    pub owner: &'a Principal,
+    pub owner: &'a RequestIdentity,
     pub session: NatsSession,
     pub message: Message,
 }
@@ -164,7 +164,7 @@ impl Runner {
                 .await?
                 .ok_or(StoreError::NotFound)?;
         }
-        let initializer = session_initializer(export, owner, local_id)?;
+        let initializer = session_initializer(export, &owner.principal, local_id)?;
         let session = Box::pin(NatsSession::from_global_config(
             NatsSessionConfig {
                 cluster: export.cluster.clone().unwrap_or_else(|| "__local__".into()),
@@ -179,7 +179,7 @@ impl Runner {
         if local_id.is_none() {
             assert_local_id_no_dot(session.session_id())?;
             self.store
-                .bind_context(session.storage_key(), export, owner)
+                .bind_context(session.storage_key(), export, &owner.principal)
                 .await?;
         }
         Ok(session)
@@ -235,7 +235,7 @@ impl Runner {
     async fn authorize_session(
         &self,
         export: &Export,
-        owner: &Principal,
+        owner: &RequestIdentity,
         session: &NatsSession,
     ) -> Result<()> {
         self.store
@@ -338,7 +338,7 @@ impl Runner {
     pub async fn subscribe(
         &self,
         export: &Export,
-        owner: &Principal,
+        owner: &RequestIdentity,
         task_id: &str,
     ) -> Result<Subscription> {
         let (snapshot, events) = self.stream_snapshot(export, owner, task_id).await?;
@@ -356,7 +356,7 @@ impl Runner {
     pub(crate) async fn stream_snapshot(
         &self,
         export: &Export,
-        owner: &Principal,
+        owner: &RequestIdentity,
         task_id: &str,
     ) -> Result<(TaskRecord, Option<broadcast::Receiver<A2aEvent>>)> {
         let (context, _) =
@@ -415,7 +415,7 @@ impl Runner {
     pub async fn cancel_task(
         &self,
         export: &Export,
-        owner: &Principal,
+        owner: &RequestIdentity,
         task_id: &str,
     ) -> Result<TaskRecord> {
         let record = self
