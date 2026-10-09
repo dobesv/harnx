@@ -14,7 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use harnx_runtime::identity::{IdentitySource, IdentitySources};
+use harnx_runtime::identity::{IdentitySource, IdentitySources, MembershipHeaders};
 use serde_json::{json, Value};
 
 /// Implementation-defined JSON-RPC server error, outside A2A's -32001..-32009.
@@ -37,17 +37,83 @@ impl Principal {
     }
 }
 
+/// Owned request identity. Memberships never become session ownership or metadata.
+#[derive(Clone, Debug)]
+pub struct RequestIdentity {
+    pub principal: Principal,
+    pub groups: Vec<String>,
+    pub roles: Vec<String>,
+}
+
+impl From<Principal> for RequestIdentity {
+    fn from(principal: Principal) -> Self {
+        Self {
+            principal,
+            groups: Vec::new(),
+            roles: Vec::new(),
+        }
+    }
+}
+
+/// Storage for slices borrowed by the core caller view.
+pub struct RequestCaller<'a> {
+    user: Option<&'a str>,
+    groups: Vec<&'a str>,
+    roles: Vec<&'a str>,
+}
+
+impl RequestCaller<'_> {
+    pub fn view(&self) -> harnx_core::access_rules::CallerView<'_> {
+        harnx_core::access_rules::CallerView {
+            users: self.user.as_slice(),
+            groups: &self.groups,
+            roles: &self.roles,
+        }
+    }
+}
+
+impl RequestIdentity {
+    pub fn caller(&self) -> RequestCaller<'_> {
+        RequestCaller {
+            user: self.principal.user_id(),
+            groups: self.groups.iter().map(String::as_str).collect(),
+            roles: self.roles.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
 /// Ordered identity policy. Empty configuration enables shared anonymous mode.
 #[derive(Clone, Debug, Default)]
 pub struct Identity {
     sources: IdentitySources,
+    groups: MembershipHeaders,
+    roles: MembershipHeaders,
+    membership_names: Vec<HeaderName>,
 }
 
 impl Identity {
     /// Validate header/cookie sources at startup, preserving CLI precedence.
     pub fn new(sources: &[String]) -> anyhow::Result<Self> {
+        Self::with_memberships(sources, &[], &[])
+    }
+
+    /// Membership sources are raw header names, not user sources or aliases.
+    pub fn with_memberships(
+        sources: &[String],
+        groups: &[String],
+        roles: &[String],
+    ) -> anyhow::Result<Self> {
+        let group_headers = MembershipHeaders::new(groups).context("invalid group-header names")?;
+        let role_headers = MembershipHeaders::new(roles).context("invalid role-header names")?;
         Ok(Self {
             sources: IdentitySources::new(sources).context("invalid user-id-header sources")?,
+            groups: group_headers,
+            roles: role_headers,
+            membership_names: groups
+                .iter()
+                .chain(roles)
+                .map(|name| name.parse())
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -69,6 +135,63 @@ impl Identity {
             .map_err(|_| missing_identity())?
             .map(Principal::User)
             .ok_or_else(missing_identity)
+    }
+
+    pub fn resolve_request(&self, headers: &HeaderMap) -> Result<RequestIdentity, A2AError> {
+        Ok(RequestIdentity {
+            principal: self.resolve(headers)?,
+            groups: self
+                .groups
+                .resolve(headers)
+                .map_err(|_| missing_identity())?,
+            roles: self
+                .roles
+                .resolve(headers)
+                .map_err(|_| missing_identity())?,
+        })
+    }
+
+    /// HTTP middleware validates raw values before the SDK drops non-text fields.
+    /// Direct handler calls still resolve every configured membership occurrence.
+    ///
+    /// **Gotcha**: The `a2a-server-lf` SDK middleware silently drops headers whose values
+    /// contain non-ASCII bytes, before handlers receive ServiceParams. Membership parsing must
+    /// therefore run against the raw HeaderMap in middleware (`resolve_request`), not against
+    /// ServiceParams. Reordering or skipping this step would allow malicious non-UTF-8 values
+    /// to bypass validation and be silently dropped, resulting in unexpected empty memberships.
+    pub fn resolve_request_params(
+        &self,
+        params: &ServiceParams,
+    ) -> Result<RequestIdentity, A2AError> {
+        let mut headers = HeaderMap::new();
+        for name in &self.membership_names {
+            Self::add_membership_params(name, params, &mut headers)?;
+        }
+        Ok(RequestIdentity {
+            principal: self.resolve_service_params(params)?,
+            groups: self
+                .groups
+                .resolve(&headers)
+                .map_err(|_| missing_identity())?,
+            roles: self
+                .roles
+                .resolve(&headers)
+                .map_err(|_| missing_identity())?,
+        })
+    }
+
+    fn add_membership_params(
+        name: &HeaderName,
+        params: &ServiceParams,
+        headers: &mut HeaderMap,
+    ) -> Result<(), A2AError> {
+        if headers.contains_key(name) {
+            return Ok(());
+        }
+        for value in params.get(name.as_str()).into_iter().flatten() {
+            headers.append(name.clone(), value.parse().map_err(|_| missing_identity())?);
+        }
+        Ok(())
     }
 
     /// RequestHandler receives headers through ServiceParams, not axum extensions.
@@ -126,9 +249,10 @@ pub(crate) async fn require_identity(
     mut request: Request,
     next: Next,
 ) -> Response {
-    match identity.resolve(request.headers()) {
-        Ok(principal) => {
-            request.extensions_mut().insert(principal);
+    match identity.resolve_request(request.headers()) {
+        Ok(caller) => {
+            request.extensions_mut().insert(caller.principal.clone());
+            request.extensions_mut().insert(caller);
             next.run(request).await
         }
         Err(error) => rpc_error_response(request, StatusCode::UNAUTHORIZED, error).await,
@@ -415,3 +539,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod membership_tests;

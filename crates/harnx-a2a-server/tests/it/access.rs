@@ -269,7 +269,7 @@ async fn access_nats_admin_reads_lists_continues_without_taking_ownership() -> R
         .store
         .resolve_context(
             &wrong,
-            &harnx_a2a_server::identity::Principal::User("admin".into()),
+            &harnx_a2a_server::identity::Principal::User("admin".into()).into(),
             alice["contextId"].as_str().unwrap()
         )
         .await?
@@ -318,7 +318,7 @@ async fn access_nats_cards_require_identity_only_with_rules() -> Result<()> {
     let error = harnx_a2a_server::routes::router_with_access_rules::<HarnxHandler>(
         &[],
         None,
-        &[],
+        harnx_a2a_server::identity::Identity::default(),
         Some(rules()),
         |_, _| unreachable!(),
     );

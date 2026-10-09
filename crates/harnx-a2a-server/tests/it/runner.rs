@@ -169,7 +169,7 @@ async fn assert_completed_snapshot(
     // Completion won: a late cancel reads the real state, never sends a remote cancel.
     assert_eq!(
         h.runner
-            .cancel_task(&h.export, &alice(), &persisted.task.id)
+            .cancel_task(&h.export, &alice().into(), &persisted.task.id)
             .await?
             .task
             .status
@@ -203,7 +203,7 @@ async fn runner_cancel_mid_stream_is_canceled() -> Result<()> {
     let canceled = tokio::time::timeout(
         DEADLINE,
         h.runner
-            .cancel_task(&h.export, &alice(), &started.snapshot.task.id),
+            .cancel_task(&h.export, &alice().into(), &started.snapshot.task.id),
     )
     .await
     .context("cancel deadline")??;
@@ -320,7 +320,7 @@ async fn runner_busy_context_rejects_second_start_and_stale_cancel() -> Result<(
     first_artifact(&mut second.events).await?;
     let late = h
         .runner
-        .cancel_task(&h.export, &alice(), &first.snapshot.task.id)
+        .cancel_task(&h.export, &alice().into(), &first.snapshot.task.id)
         .await?;
     assert_eq!(late.task.status.state, TaskState::Completed);
     assert!(
@@ -426,7 +426,7 @@ async fn runner_orphan_reconciliation_marks_failed() -> Result<()> {
         .reconcile_orphan(
             TaskAccess {
                 export: &h.export,
-                owner: &alice(),
+                owner: &alice().into(),
                 task_id: &record.task.id,
             },
             &session,
@@ -439,7 +439,7 @@ async fn runner_orphan_reconciliation_marks_failed() -> Result<()> {
             .reconcile_orphan(
                 TaskAccess {
                     export: &h.export,
-                    owner: &alice(),
+                    owner: &alice().into(),
                     task_id: &record.task.id
                 },
                 &session
@@ -530,7 +530,7 @@ async fn runner_subscribe_snapshot_then_deltas_survives_disconnect() -> Result<(
     first_artifact(&mut started.events).await?;
     let id = started.snapshot.task.id.clone();
     drop(started);
-    let mut sub = h.runner.subscribe(&h.export, &alice(), &id).await?;
+    let mut sub = h.runner.subscribe(&h.export, &alice().into(), &id).await?;
     let assembled = text(&sub.snapshot.task.artifacts.as_ref().unwrap()[0].parts);
     let revision = sub.snapshot.stream_seq;
     h.llm.release.notify_one();
@@ -539,7 +539,7 @@ async fn runner_subscribe_snapshot_then_deltas_survives_disconnect() -> Result<(
     assert_eq!(h.task(&id).await?.task.status.state, TaskState::Completed);
     assert_eq!(
         h.runner
-            .subscribe(&h.export, &alice(), &id)
+            .subscribe(&h.export, &alice().into(), &id)
             .await
             .err()
             .unwrap()
@@ -581,7 +581,7 @@ async fn runner_lagging_subscriber_errors_without_stopping_turn() -> Result<()> 
     first_artifact(&mut started.events).await?;
     let mut slow = h
         .runner
-        .subscribe(&h.export, &alice(), &started.snapshot.task.id)
+        .subscribe(&h.export, &alice().into(), &started.snapshot.task.id)
         .await?;
     for _ in 1..harnx_a2a_server::runner::EVENT_CAPACITY + 5 {
         h.llm.release.notify_one();
@@ -621,7 +621,7 @@ async fn check_stream_snapshots(script: Script, chunk_size: usize) -> Result<()>
     let begun = tokio::time::Instant::now();
     first_artifact(&mut started.events).await?;
     let id = &started.snapshot.task.id;
-    let mut sub = h.runner.subscribe(&h.export, &alice(), id).await?;
+    let mut sub = h.runner.subscribe(&h.export, &alice().into(), id).await?;
     let mut assembled = text(&sub.snapshot.task.artifacts.as_ref().unwrap()[0].parts);
     let mut sequence = sub.snapshot.stream_seq;
     assert_eq!(assembled, "x".repeat(chunk_size));
@@ -639,7 +639,7 @@ async fn check_stream_snapshots(script: Script, chunk_size: usize) -> Result<()>
         append_artifact(&mut assembled, update);
         assert_eq!(assembled, "x".repeat(count * chunk_size));
         // Repeated late subscribers must see every already-published delta once.
-        let late = h.runner.subscribe(&h.export, &alice(), id).await?;
+        let late = h.runner.subscribe(&h.export, &alice().into(), id).await?;
         assert_eq!(late.snapshot.stream_seq, sequence);
         assert_eq!(
             text(&late.snapshot.task.artifacts.as_ref().unwrap()[0].parts),

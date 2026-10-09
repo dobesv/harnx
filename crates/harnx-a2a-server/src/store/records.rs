@@ -1,7 +1,7 @@
 //! Task record lookup, creation, CAS updates and exact-key notifications.
 use super::index::IndexWrite;
 use super::{parse_task_id, A2aStore};
-use crate::{exports::Export, identity::Principal};
+use crate::{exports::Export, identity::RequestIdentity};
 use a2a_lf::{Artifact, Message, Task, TaskStatus};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, Utc};
@@ -58,7 +58,7 @@ impl A2aStore {
     pub async fn get_task_for_export(
         &self,
         export: &Export,
-        owner: &Principal,
+        owner: &RequestIdentity,
         task_id: &str,
     ) -> Result<Option<TaskRecord>> {
         let Ok((local_id, _)) = parse_task_id(task_id) else {

@@ -1,7 +1,7 @@
 //! Index candidate repair and page-only record projection.
 use super::{task_view, HarnxHandler};
 use crate::{
-    identity::Principal,
+    identity::RequestIdentity,
     store::{TaskRecord, DANGLING_TASK_GRACE_PERIOD},
 };
 use a2a_lf::{A2AError, ListTasksRequest, ListTasksResponse};
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
 pub(super) struct ListingScope<'a> {
-    pub owner: &'a Principal,
+    pub owner: &'a RequestIdentity,
     pub key: &'a str,
     pub context: &'a str,
 }

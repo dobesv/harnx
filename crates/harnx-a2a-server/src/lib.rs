@@ -32,7 +32,8 @@ pub async fn run(args: cli::Args) -> Result<()> {
         std::env::set_var("HARNX_CONFIG_DIR", dir);
     }
     let access_rules = harnx_runtime::access::load_access_rules(args.access_rules.clone())?;
-    identity::Identity::new(&args.user_id_header)?.validate_access_rules(access_rules.is_some())?;
+    let identity = startup_identity(&args)?;
+    identity.validate_access_rules(access_rules.is_some())?;
     let exports = exports::resolve_exports(
         &args.agents,
         args.cluster.as_deref(),
@@ -52,7 +53,7 @@ pub async fn run(args: cli::Args) -> Result<()> {
     let app = routes::router_with_access_rules(
         &exports,
         args.public_base_url.as_deref(),
-        &args.user_id_header,
+        identity,
         access_rules,
         |export, identity| {
             std::sync::Arc::new(handler::HarnxHandler::new(
@@ -93,6 +94,14 @@ pub async fn run(args: cli::Args) -> Result<()> {
         .context("run A2A HTTP server")?;
     drop(bootstrap);
     Ok(())
+}
+
+fn startup_identity(args: &cli::Args) -> Result<identity::Identity> {
+    identity::Identity::with_memberships(
+        &args.user_id_header,
+        &args.group_header,
+        &args.role_header,
+    )
 }
 
 async fn shutdown_signal() -> Result<()> {

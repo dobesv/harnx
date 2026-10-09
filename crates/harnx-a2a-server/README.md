@@ -24,6 +24,8 @@ Usage: harnx-a2a-server [OPTIONS] --agent <SPEC>
 | `--access-rules <PATH>` | `<config dir>/access.yaml` if present | Access rules file, also set by `HARNX_ACCESS_RULES`. Requires `--user-id-header` when rules are enabled. |
 | `--public-base-url <URL>` | none | Base URL used in Agent Card interface URLs (for example, `https://agents.example.com`). If omitted, inferred from `X-Forwarded-*` or `Host` headers. |
 | `--user-id-header <NAME>` | none | Trusted identity source: bare header name, `header:NAME`, or `cookie:NAME` (repeatable, first present source wins). Empty or invalid values fail closed. Enables user isolation mode. |
+| `--group-header <NAME>` | none | Trusted group membership header name (repeatable, all values contribute). |
+| `--role-header <NAME>` | none | Trusted role membership header name (repeatable, all values contribute). |
 | `--max-data-part-bytes <BYTES>` | `65536` | Maximum combined byte budget for rendered data and inline text/JSON file parts per message. Over-limit requests return an invalid params error. |
 
 ### Export Specifications and Startup Validation
@@ -182,6 +184,7 @@ The server emits JSON-RPC 2.0 error responses with structured `google.rpc.ErrorI
   - Context creation without `prompt` scope returns JSON-RPC permission error code `-32010` (`session creation requires prompt scope`).
   - Accessing another user's context without `admin` scope returns JSON-RPC `-32001` (`task not found`).
 - **ListTasks Scoping**: `ListTasks` requires `contextId`. Callers with `prompt` scope can list tasks in their own contexts; callers with `admin` scope can list tasks in any authorized context.
+- **Group and Role Memberships**: Callers can supply group and role memberships via `--group-header <NAME>` and `--role-header <NAME>` flags. All configured headers contribute values; repeated headers and comma-separated tokens are split and trimmed. Any invalid header bytes fail closed with JSON-RPC error code `-32000` (HTTP 401). Memberships are evaluated per request and never persisted in session metadata or NATS task storage. Memberships never satisfy context ownership (which remains tied solely to caller `user_id`), but rules granting `admin` scope allow full task management across all contexts.
 ## Deploying Behind a Reverse Proxy
 
 In production, run `harnx-a2a-server` behind a reverse proxy (such as Nginx, Envoy, or Cloudflare).
@@ -189,7 +192,7 @@ In production, run `harnx-a2a-server` behind a reverse proxy (such as Nginx, Env
 ### Reverse Proxy Responsibilities
 
 1. **Authentication and JWT verification**: The server does not validate tokens or authentication signatures. For Atlassian Forge apps, the reverse proxy must verify the Forge Invocation Token (FIT JWT) signed by Atlassian's JWKS.
-2. **Strip or overwrite identity sources**: When `--user-id-header` is configured, the proxy **must strip or overwrite** the selected header or cookie on incoming requests from clients. Cookies must contain a proxy-verified user ID, not a token or client-supplied identity. The server doesn't verify cookie signatures.
+2. **Strip or overwrite identity sources**: When `--user-id-header`, `--group-header`, or `--role-header` are configured, the proxy **must strip or overwrite** the selected headers or cookies on incoming requests from clients. Cookies must contain a proxy-verified user ID, not a token or client-supplied identity. The server doesn't verify cookie signatures.
 3. **Disable SSE response buffering**: Streaming responses use Server-Sent Events (`text/event-stream`). The proxy must disable buffer accumulation (e.g. `proxy_buffering off` in Nginx; `X-Accel-Buffering: no` is emitted by the server).
 4. **Long route timeouts**: Remote agent turns can run for several minutes. Set proxy read and send timeouts to at least **900 seconds** (15 minutes), matching Forge's SSE stream allowance.
 5. **Base URL configuration**: Set `--public-base-url https://agents.example.com` or pass standard forwarding headers (`Host`, `X-Forwarded-Proto`, `X-Forwarded-Host`) so Agent Cards generate reachable public URLs. Set `--public-base-url` in production so the card origin does not depend on request headers.

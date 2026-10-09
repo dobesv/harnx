@@ -50,6 +50,18 @@ impl Http {
         h: Harness,
         rules: Option<Arc<harnx_core::access_rules::AccessRules>>,
     ) -> Result<Self> {
+        Self::with_identity(
+            h,
+            rules,
+            harnx_a2a_server::identity::Identity::new(&["X-User-ID".into()])?,
+        )
+        .await
+    }
+    pub(super) async fn with_identity(
+        h: Harness,
+        rules: Option<Arc<harnx_core::access_rules::AccessRules>>,
+        identity: harnx_a2a_server::identity::Identity,
+    ) -> Result<Self> {
         let backend = Arc::new(Backend::new(
             h.runner.clone(),
             h.store.clone(),
@@ -71,7 +83,7 @@ impl Http {
         let app = routes::router_with_access_rules(
             &exports,
             None,
-            &["X-User-ID".into()],
+            identity,
             rules,
             |export, identity| {
                 Arc::new(HarnxHandler::new(

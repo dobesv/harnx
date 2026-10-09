@@ -1,6 +1,6 @@
 //! Export visibility runs before protocol dispatch and any task lookup.
 
-use crate::identity::{self, Principal};
+use crate::identity::{self, RequestIdentity};
 use a2a_lf::A2AError;
 use axum::{
     extract::{Request, State},
@@ -22,7 +22,7 @@ pub(crate) async fn require_visible_export(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(principal) = request.extensions().get::<Principal>() else {
+    let Some(principal) = request.extensions().get::<RequestIdentity>() else {
         return identity::rpc_error_response(
             request,
             StatusCode::UNAUTHORIZED,
@@ -30,8 +30,8 @@ pub(crate) async fn require_visible_export(
         )
         .await;
     };
-    let identities: Vec<_> = principal.user_id().into_iter().collect();
-    if access.rules.can_see_agent(&access.agent_ref, &identities) {
+    let caller = principal.caller();
+    if access.rules.can_see_agent(&access.agent_ref, caller.view()) {
         return next.run(request).await;
     }
     if request.method() == Method::POST && request.uri().path() == "/" {

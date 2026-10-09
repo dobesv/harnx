@@ -31,7 +31,9 @@ cargo install --path crates/harnx-serve
 | Option | Short | Description |
 | :--- | :--- | :--- |
 | `--addr <ADDRESS>` | `-a` | Listen address (default from `config.yaml` or `127.0.0.1:8000`). |
-| `--user-id-source <SOURCE>` | | Identity source (`header:NAME`, `cookie:NAME`, or bare `NAME`); repeat in priority order. Replaces `serve_user_id_sources` from config. |
+| `--user-id-source <SOURCE>` | | Identity source (`header:NAME`, `cookie:NAME`, or bare `NAME`); repeat in priority order. Replaces `serve_user_id_sources` from config when supplied. |
+| `--group-header <NAME>` | | Trusted raw group header name; repeat to collect values from every header. Replaces `serve_group_headers` from config/environment when supplied. |
+| `--role-header <NAME>` | | Trusted raw role header name; repeat to collect values from every header. Replaces `serve_role_headers` from config/environment when supplied. |
 | `--access-rules <PATH>` | | Access rules file (default: `access.yaml` in the harnx config directory; env `HARNX_ACCESS_RULES`). Enables identity-based access control. |
 | `--public-url <URL>` | | URL a browser uses to reach the Web UI (default from `config.yaml`; inferred from request when unset). |
 | `--model <MODEL>` | `-m` | Select a specific LLM model to use. |
@@ -502,6 +504,16 @@ When a session is first created:
 Blank explicit or inherited identity strings count as absent. Invalid request identity values still fail closed; they don't trigger default fallback.
 
 Session user identity is stored once when the session metadata is created. It is immutable and never overwritten by subsequent prompts, handoffs into an existing session, or reconnecting callers. Concurrent creators use the identity of the first successful metadata creation. Promptless subscriptions and control commands don't create metadata; cancelling a never-prompted attached session is an idle no-op, and compacting it returns session not found.
+
+### Group and Role Memberships
+
+In addition to user identity, `harnx-serve` can extract group and role memberships from trusted HTTP request headers for use in access rules:
+- Configured via `serve_group_headers` and `serve_role_headers` in `config.yaml`, the `HARNX_SERVE_GROUP_HEADERS` and `HARNX_SERVE_ROLE_HEADERS` environment variables (comma-separated header names), or repeated `--group-header` and `--role-header` CLI flags. Non-empty CLI flags replace configuration file and environment settings.
+- **Trusted raw headers**: Header names are validated at startup. By default, no group or role headers are trusted; unconfigured headers are ignored.
+- **Parsing**: Every configured header name contributes values. Repeated headers and comma-separated tokens are split, trimmed, and empty tokens are dropped. All configured membership headers contribute values.
+- **Fail closed**: If any configured membership header contains invalid bytes that fail UTF-8 header value conversion, `harnx-serve` immediately rejects the request with HTTP `401 Unauthorized` without echoing header contents.
+- **Request-local**: Memberships are evaluated on each request and are never persisted in session metadata or NATS properties. Membership changes or revocations take effect on the next HTTP request.
+- **User ownership**: Groups and roles do not satisfy required user identification, do not act as user aliases, and never satisfy session ownership. Sessions are owned solely by immutable user IDs. Admin scope granted by group or role rules retains administrative access across all sessions.
 
 
 ## Access Control (`access.yaml`)

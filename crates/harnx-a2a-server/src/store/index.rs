@@ -1,6 +1,6 @@
 //! Per-session task index migration, revision-fenced mutation and cleanup.
 use super::{parse_task_id, A2aStore, TaskRecord};
-use crate::{exports::Export, identity::Principal};
+use crate::{exports::Export, identity::RequestIdentity};
 use anyhow::{bail, ensure, Context, Result};
 pub use harnx_runtime::nats_session_metadata::TaskState as IndexState;
 use harnx_runtime::nats_session_metadata::{
@@ -42,7 +42,7 @@ impl A2aStore {
     pub async fn list_task_index(
         &self,
         export: &Export,
-        owner: &Principal,
+        owner: &RequestIdentity,
         local_id: &str,
     ) -> Result<Option<(String, TaskIndex)>> {
         let Some(key) = self.resolve_context(export, owner, local_id).await? else {

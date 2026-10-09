@@ -50,10 +50,10 @@ mod tests {
 
         let rules = load_access_rules(Some(path)).expect("load explicit access rules");
         assert!(rules.is_some());
-        assert!(rules
-            .as_ref()
-            .unwrap()
-            .can_see_agent("sisyphus", &["alice"]));
+        assert!(rules.as_ref().unwrap().can_see_agent(
+            "sisyphus",
+            harnx_core::access_rules::CallerView::from_users(&["alice"])
+        ));
     }
 
     #[test]
@@ -78,7 +78,10 @@ mod tests {
         let rules = load_access_rules(None)
             .expect("load default access rules")
             .expect("default file is present");
-        assert!(rules.can_see_agent("sisyphus", &["alice"]));
+        assert!(rules.can_see_agent(
+            "sisyphus",
+            harnx_core::access_rules::CallerView::from_users(&["alice"])
+        ));
     }
 
     #[test]

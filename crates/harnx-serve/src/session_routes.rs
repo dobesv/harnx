@@ -5,6 +5,7 @@ use super::{
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
+use harnx_core::access_rules::{AccessRules, CallerView};
 use harnx_runtime::config::Config;
 #[cfg(test)]
 use harnx_runtime::config::ConfigLock;
@@ -33,7 +34,7 @@ pub(crate) struct SessionsRouteContext<'a> {
     pub(crate) scoped: &'a harnx_runtime::config::GlobalConfig,
     pub(crate) query: Option<&'a str>,
     user_id: Option<&'a str>,
-    access: Option<(&'a harnx_core::access_rules::AccessRules, &'a [&'a str])>,
+    access: Option<(&'a AccessRules, CallerView<'a>)>,
 }
 
 impl<'a> SessionsRouteContext<'a> {
@@ -51,10 +52,7 @@ impl<'a> SessionsRouteContext<'a> {
         }
     }
 
-    pub(crate) fn with_access(
-        mut self,
-        access: Option<(&'a harnx_core::access_rules::AccessRules, &'a [&'a str])>,
-    ) -> Self {
+    pub(crate) fn with_access(mut self, access: Option<(&'a AccessRules, CallerView<'a>)>) -> Self {
         self.access = access;
         self
     }

@@ -15,6 +15,15 @@ struct RequestAgentTarget {
 }
 
 impl Server {
+    pub(super) async fn list_agents<B>(&self, req: &Request<B>) -> Result<crate::AppResponse> {
+        let mut agents = self.filter_agents_by_role(req.uri().query()).await?;
+        if let Some((rules, identities)) = self.access(req) {
+            let caller = identities.caller();
+            agents.retain(|agent| rules.can_see_agent(agent.name(), caller.view()));
+        }
+        crate::json_response(serde_json::json!({ "data": agents }))
+    }
+
     /// Run before dispatch so attachments and metadata can't bypass agent checks.
     /// Session ownership checks belong here too, before any route reads its body.
     pub(crate) async fn guard_agent_request<B>(&self, req: &mut Request<B>) -> Result<()> {
@@ -31,15 +40,16 @@ impl Server {
         let (target, scoped) = resolve_agent_target(&self.config, &agent_ref)
             .await
             .map_err(ag_ui_error_to_anyhow)?;
-        let ids: Vec<&str> = identities.iter().map(String::as_str).collect();
+        let borrowed = identities.caller();
         let display_ref =
             target.display_ref_with_default_cluster(self.default_cluster_for_display());
-        if !rules.can_see_agent(&display_ref, &ids) {
+        let caller = borrowed.view();
+        if !rules.can_see_agent(&display_ref, caller) {
             return Err(ag_ui_error_to_anyhow(agent_not_found(
                 &target.display_ref(),
             )));
         }
-        self.guard_session_request(req, &target, (rules, &ids))
+        self.guard_session_request(req, &target, (rules, caller))
             .await?;
         req.extensions_mut().insert(RequestAgentTarget {
             agent_ref,

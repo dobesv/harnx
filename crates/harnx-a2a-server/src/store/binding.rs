@@ -1,6 +1,9 @@
 //! Session binding and authorization against the resolved export.
 use super::{assert_local_id_no_dot, A2aStore, StoreError};
-use crate::{exports::Export, identity::Principal};
+use crate::{
+    exports::Export,
+    identity::{Principal, RequestIdentity},
+};
 use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, Utc};
 use harnx_core::access_rules::AccessRules;
@@ -29,17 +32,21 @@ pub struct A2aBinding {
 pub fn validate_binding(
     binding: &A2aBinding,
     export: &Export,
-    owner: &Principal,
+    owner: &RequestIdentity,
     access_rules: Option<&AccessRules>,
 ) -> bool {
     binding_matches_export(binding, export)
         && match access_rules {
-            Some(rules) => rules.can_access_session(
-                &export.agent_ref(),
-                &owner.user_id().into_iter().collect::<Vec<_>>(),
-                binding.owner.as_deref(),
-            ),
-            None => binding.owner.as_deref() == owner.user_id(),
+            Some(rules) => {
+                let caller = owner.caller();
+                owner.principal.user_id().is_some()
+                    && rules.can_access_session(
+                        &export.agent_ref(),
+                        caller.view(),
+                        binding.owner.as_deref(),
+                    )
+            }
+            None => binding.owner.as_deref() == owner.principal.user_id(),
         }
 }
 
@@ -64,7 +71,7 @@ impl A2aStore {
     pub async fn resolve_context(
         &self,
         export: &Export,
-        owner: &Principal,
+        owner: &RequestIdentity,
         local_id: &str,
     ) -> Result<Option<String>> {
         let key = harnx_core::session_identity::session_key(Some(&export.agent), local_id);
