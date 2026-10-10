@@ -63,6 +63,7 @@ use harnx_core::access_rules::{AccessRules, CallerView};
 #[cfg(test)]
 use harnx_core::agent_ref::AgentRef;
 use harnx_core::message::MessageRole;
+use harnx_core::user_aliases::UserAliases;
 use harnx_rag::*;
 use harnx_runtime::{client::*, config::*, utils::*};
 use log::{debug, error, info, warn};
@@ -363,6 +364,7 @@ pub struct Server {
     group_headers: harnx_runtime::identity::MembershipHeaders,
     role_headers: harnx_runtime::identity::MembershipHeaders,
     access_rules: Option<Arc<AccessRules>>,
+    user_aliases: Option<Arc<UserAliases>>,
     models: Vec<Value>,
     agents: Vec<AgentConfig>,
     rags: Vec<String>,
@@ -464,6 +466,8 @@ impl Server {
         if access_rules.is_some() && identity_sources.sources().is_empty() {
             bail!("access rules require request identity sources; configure --user-id-source, HARNX_SERVE_USER_ID_SOURCES, or serve_user_id_sources");
         }
+        let user_aliases =
+            harnx_runtime::users::load_user_aliases().context("failed to load user aliases")?;
         let models = advertised_models(&config);
         let session_registry = SessionRegistry::new(config.clone());
         let agents = config.all_agents();
@@ -479,6 +483,7 @@ impl Server {
             .context("invalid serve_role_headers")?,
             config,
             access_rules,
+            user_aliases,
             models,
             agents,
             rags: Config::list_rags(),

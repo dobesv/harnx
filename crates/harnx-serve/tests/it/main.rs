@@ -12,6 +12,7 @@ mod access_agents;
 mod access_cid;
 mod access_memberships;
 mod access_sessions;
+mod access_user_aliases;
 mod ag_ui_control_plane;
 mod ag_ui_remote_follow;
 mod nats_attention_repair;

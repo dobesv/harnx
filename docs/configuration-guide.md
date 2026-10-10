@@ -26,6 +26,7 @@ Harnx organizes configuration into the following structure:
 ~/.config/harnx/
 ├── config.yaml          # Global settings
 ├── access.yaml          # Agent and session access control rules (optional)
+├── users.yaml           # User identity aliases for access checks (optional)
 ├── clients/             # LLM provider configurations
 │   ├── openai.yaml
 │   └── claude.yaml
@@ -711,5 +712,84 @@ Access rules protect `/v1/agents` and `/v1/cid/*` routes. Other endpoints remain
 ### Not Yet Supported
 
 - **`harnx-mcp-server`**: Access rules apply only to `harnx-serve` and `harnx-a2a-server`.
-- **User aliases**: Grouping or expanding user identities via alias mappings ([#2317](https://github.com/dobesv/harnx/issues/2317)) is planned for a future release.
 - **ALB JWT payload decoding**: Decoding signed `x-amzn-oidc-data` JWT claims into user DNs is deferred; use the raw identity header `x-amzn-oidc-identity`.
+
+## User Aliases (`users.yaml`)
+
+`harnx-serve` and `harnx-a2a-server` support optional user alias configuration defined in `users.yaml`.
+
+User aliases expand an authenticated caller's identity into an alias group's identities for HTTP and A2A access checks, agent permissions, and session access, without rewriting stored session ownership or A2A binding records.
+
+### Location and Lifecycle
+
+- **Default location**: `<user-config-dir>/harnx/users.yaml`. Discovered via standard configuration directory resolution (`config_paths::local_path("users.yaml")`). Standard global configuration directory controls—such as `HARNX_CONFIG_DIR`, `XDG_CONFIG_HOME`, or `--config-dir` in `harnx-a2a-server`—apply normally to locate `users.yaml`.
+- **No alias-specific overrides**: There are no alias-specific CLI flags (such as `--users-file`) or dedicated environment variables (such as `HARNX_USERS_FILE`) for specifying an alternative `users.yaml` path.
+- **Optional startup-only loading**: The file is loaded once at server startup. If `users.yaml` is missing, alias expansion is skipped and each caller retains their single authenticated identity.
+- **Fail-on-invalid behavior**: If `users.yaml` exists but is invalid (e.g. malformed YAML, empty file, whitespace-only, comment-only, null document, non-sequence root, missing required fields, or unknown fields), the server fails startup immediately with path context.
+- **No live reload**: Modifying `users.yaml` requires restarting `harnx-serve` and `harnx-a2a-server`. Runtime edits have no effect on running servers.
+
+### Security and Authorization
+
+Alias entries directly alter access control boundaries: mapping caller identity `alice` into an entry containing `bob` allows `alice` to access agents and sessions permitted to `bob`.
+
+**Trusted operator edit only**: Because alias mappings grant authorization, `users.yaml` must be protected with appropriate filesystem permissions and modified only by trusted operators.
+
+### Schema and Format
+
+The configuration file must be a top-level YAML sequence of entries. Mapping roots, scalar roots, null documents, and empty documents are rejected.
+
+Each entry is a YAML mapping with two required fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | String | Human-readable label for the alias entry. Used for display and documentation only; **never** treated as an authenticated principal or caller identity. |
+| `identities` | List of strings | Set of user identity strings associated with this alias. An empty list (`[]`) is valid and acts as a no-op entry. |
+
+Unknown fields in an entry are rejected (`deny_unknown_fields`).
+
+#### Example `users.yaml`
+
+```yaml
+- name: Core Team
+  identities:
+    - "alice@example.com"
+    - "alice-corp"
+    - "alice-dev"
+
+- name: Operations Team
+  identities:
+    - "bob@example.com"
+    - "bob-ops"
+
+- name: Cross-Department Contractor
+  identities:
+    - "contractor@example.com"
+```
+
+An empty sequence (`[]`) is valid. Duplicate identities within an entry (e.g. `[alice, bob, bob]`) are silently accepted without error.
+
+### Resolution Semantics
+
+When an authenticated caller makes a request, the server expands the caller's identity using the following rules:
+
+1. **Ordered scan**: The server scans `users.yaml` entries in order from top to bottom.
+2. **First-match wins**: The lookup stops at the **first** entry whose `identities` list contains the exact caller identity string. The caller's effective identities expand to all strings in that entry's `identities` list.
+3. **Exact and case-sensitive**: Identity matching is exact and case-sensitive. No normalization, trimming, or lowercasing is applied.
+4. **No transitive union**: Overlapping entries do not merge. If entry 1 contains `[alice, bob]` and entry 2 contains `[bob, carol]`, caller `bob` matches entry 1 and receives `[alice, bob]`. Entry 2 is ignored for `bob`.
+5. **Unmatched callers**: If a caller's identity does not match any entry in `users.yaml`, the caller retains their singleton authenticated identity.
+6. **Anonymous callers**: An unauthenticated or anonymous caller (`None`) is never expanded against `users.yaml` and remains anonymous.
+
+### Integration with Servers and Access Control
+
+#### Caller expansion only, stored ownership preserved
+Alias expansion applies **only** to the incoming caller during request authorization:
+- In `harnx-serve`, new sessions created via `POST /v1/agents/{agent}/sessions` record the caller's raw incoming identity (`user_id`) in session metadata, not an alias entry name or other identities in the group.
+- In `harnx-a2a-server`, new contexts and tasks record the caller's raw incoming identity as the stored owner in the A2A binding. Stored owner identities are never expanded.
+- When an authorized caller later accesses or resumes a session, their expanded caller identities are checked against the stored session owner.
+
+#### Behavior without access rules
+- **`harnx-serve`**: When access rules (`access.yaml`) are not configured, `harnx-serve` operates without access restrictions. Sessions and agents remain open, and `users.yaml` does not restrict requests.
+- **`harnx-a2a-server`**: When access rules are absent, `harnx-a2a-server` still enforces owner isolation on stored bindings. A caller is permitted to access a binding if the stored owner is contained in the caller's expanded identities. Anonymous access (`None` stored owner and `None` caller) succeeds. Mixed caller/stored ownership (one anonymous, one authenticated) is denied.
+
+#### Groups and roles unchanged
+`users.yaml` expands only user identities. Request-local group headers (`--group-header`, `serve_group_headers`) and role headers (`--role-header`, `serve_role_headers`) are never expanded or modified by `users.yaml`. User aliases do not grant group or role memberships.

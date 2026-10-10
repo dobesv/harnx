@@ -50,6 +50,10 @@ pub struct Input {
     /// already present in the loaded `session.messages`, so the LLM still sees
     /// them; only the redundant durable append is suppressed.
     pub skip_user_log_append: bool,
+    /// Durable user rows selected for this worker turn. Hydration restores any
+    /// selected rows archived by concurrent compaction without appending them
+    /// again to the log. Identity is the stable message ID (seq for legacy rows).
+    pub durable_user_messages: Vec<crate::message::Message>,
     /// History length before this round's input was persisted. Request building
     /// uses that prefix plus this Input, so request-only patches still reach the
     /// model without duplicating the durable user message. Runtime-local cursor,
@@ -91,6 +95,7 @@ impl Input {
             inject_system_prompt: true,
             injected_user_text: None,
             skip_user_log_append: false,
+            durable_user_messages: Vec::new(),
             session_input_start: None,
             preferred_assistant_message_id: None,
             transient_note: None,

@@ -515,6 +515,17 @@ In addition to user identity, `harnx-serve` can extract group and role membershi
 - **Request-local**: Memberships are evaluated on each request and are never persisted in session metadata or NATS properties. Membership changes or revocations take effect on the next HTTP request.
 - **User ownership**: Groups and roles do not satisfy required user identification, do not act as user aliases, and never satisfy session ownership. Sessions are owned solely by immutable user IDs. Admin scope granted by group or role rules retains administrative access across all sessions.
 
+### User Aliases (`users.yaml`)
+
+`harnx-serve` supports optional user alias configuration via `users.yaml` in the configuration directory (`~/.config/harnx/users.yaml`). See the [User Aliases section in the Configuration Guide](../../docs/configuration-guide.md#user-aliases-usersyaml) for schema, matching semantics, and examples.
+
+- **Startup loading**: Loaded once at startup via `config_paths::local_path("users.yaml")`. Missing `users.yaml` preserves default singleton identity behavior. An invalid present file fails startup immediately with path context. Modifying the file requires a server restart; there is no live reload.
+- **Caller authorization expansion**: An authenticated caller's identity expands into the first matching entry's `identities` list for agent access checks and session visibility under access rules. Overlapping entries do not merge (no transitive union).
+- **Session ownership preserved**: Session creation (`POST /v1/agents/{agent}/sessions`) stores the incoming caller's raw `user_id` in session metadata, never an alias entry name or other group identities. Stored session owners are never expanded.
+- **Behavior without access rules**: When `access.yaml` is absent, `harnx-serve` operates without access restrictions; `users.yaml` alone does not restrict endpoints or session access.
+- **Security notice**: Because alias mappings expand caller permissions, `users.yaml` should be modified only by trusted operators.
+
+
 
 ## Access Control (`access.yaml`)
 

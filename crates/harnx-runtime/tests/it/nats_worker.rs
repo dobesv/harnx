@@ -31,6 +31,8 @@ use worker::{
 };
 #[path = "nats_worker/abort_signal.rs"]
 mod abort_signal;
+#[path = "nats_worker/compaction_continuity.rs"]
+mod compaction_continuity;
 #[path = "nats_worker/dispatch_and_fencing.rs"]
 mod dispatch_and_fencing;
 #[path = "nats_worker/leader_reads.rs"]

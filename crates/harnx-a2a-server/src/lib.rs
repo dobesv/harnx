@@ -109,11 +109,13 @@ pub async fn run(args: cli::Args) -> Result<()> {
 }
 
 fn startup_identity(args: &cli::Args) -> Result<identity::Identity> {
-    identity::Identity::with_memberships(
+    let aliases = harnx_runtime::users::load_user_aliases()?;
+    Ok(identity::Identity::with_memberships(
         &args.user_id_header,
         &args.group_header,
         &args.role_header,
-    )
+    )?
+    .with_user_aliases(aliases))
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -130,3 +132,6 @@ async fn shutdown_signal() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod startup_tests;

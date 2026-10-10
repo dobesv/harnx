@@ -322,15 +322,14 @@ impl TurnWorker {
             .last()
             .and_then(|message| message.log_seq.and_then(|seq| u64::try_from(seq).ok()));
         let folded = next_turn_messages
-            .into_iter()
+            .iter()
             .map(|message| message.content.to_text())
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
-        (
-            crate::config::input::from_str(per_session, &folded, None),
-            seed_cursor,
-        )
+        let mut input = crate::config::input::from_str(per_session, &folded, None);
+        input.durable_user_messages = next_turn_messages;
+        (input, seed_cursor)
     }
 }
 

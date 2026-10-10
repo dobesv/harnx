@@ -393,8 +393,22 @@ impl Config {
             bail!("Nothing to compact");
         }
         let prefix = &session.messages[..split];
-        let transcript =
+        let mut transcript =
             crate::config::compaction::render_transcript(prefix, params.tool_output_max_chars);
+        // Take prior context from the same session snapshot as the prefix. Repeated
+        // compaction must carry completed work forward, not replace it with the tail.
+        if let Some(summary) = session
+            .compaction_summary
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            transcript = format!(
+                "{}Earlier compaction summary:\n{}\n\n---\n\n{}",
+                crate::config::session::RUNTIME_NOTE_PREFIX,
+                summary,
+                transcript
+            );
+        }
         let from = prefix.iter().filter_map(|m| m.log_seq).min();
         let to = prefix.iter().filter_map(|m| m.log_seq).max();
         Ok((transcript, split, (from, to, prefix.len()), session_id))
