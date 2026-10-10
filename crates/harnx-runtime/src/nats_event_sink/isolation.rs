@@ -36,6 +36,12 @@ impl LiveEventState {
     /// (`same_attachment` is `Arc` identity, and this allocates a fresh one),
     /// but it keeps the same cancel fence: an interrupt already observed
     /// still applies to whatever this attachment goes on to read.
+    ///
+    /// Fork only to re-attach to the session the fence came from. The fence
+    /// is a sequence in that session's log, and every log numbers its
+    /// entries from 1, so reading another session through a fork drops that
+    /// session's advisories until its log passes the borrowed sequence. A
+    /// reader of another session starts from `LiveEventState::default()`.
     pub fn fork(&self) -> Self {
         Self {
             attached: Default::default(),

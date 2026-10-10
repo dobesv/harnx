@@ -139,7 +139,8 @@ pub struct Tui {
     /// another client attached to the same session.
     pub(super) session_activity_handle: Option<JoinHandle<()>>,
     /// Root session whose nested sub-agent monitors belong to. Changing the
-    /// root aborts every child monitor and drops their retained views.
+    /// root aborts every child monitor, drops their retained views and
+    /// replaces `live_events`, whose cancel fence came from the old root's log.
     pub(super) subagent_monitor_root: Option<(String, String)>,
     /// Independent live subscriptions for child sessions.
     pub(super) subagent_monitor_handles: HashMap<MonitoredSessionKey, JoinHandle<()>>,

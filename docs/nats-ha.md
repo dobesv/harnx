@@ -1045,6 +1045,16 @@ drops any envelope whose `after_seq` is below it. A worker that has not yet seen
 the `Cancel` cannot have appended anything at or after it, so that comparison
 removes exactly its stale in-flight chatter.
 
+The fence is a sequence in one session's log, and every log numbers its
+entries from 1, so a client following several sessions keeps one
+`LiveEventState` per session: `fork` re-attaches to the same session and keeps
+its fence, and any other session starts from `LiveEventState::default()`. The
+TUI keeps one for its root session, replaced when the root changes, and one for
+each sub-agent session it monitors. A fence borrowed from another session
+silently drops this session's advisories until its log passes the borrowed
+sequence. Durable reconciliation still arrives, so in the TUI the symptom is a
+transcript that stops mid-turn while finished sub-agent rows keep appearing.
+
 ### Upgrading from the execution-control gate
 
 The internal tool protocol is **v5**, and the two server kinds fail differently
