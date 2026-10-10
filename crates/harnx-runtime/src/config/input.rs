@@ -522,3 +522,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "input/compaction_tests.rs"]
+mod compaction_tests;
