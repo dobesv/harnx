@@ -64,6 +64,10 @@ impl Tui {
         if self.app.detail_view_entry.take().is_some() {
             self.app.detail_view_open = false;
         }
+        // The root's cancel fence is a sequence in the old root's log. The
+        // new root's history re-establishes its own fence when its activity
+        // monitor attaches.
+        self.live_events = Default::default();
         self.subagent_monitor_root = desired;
         self.subagent_rows_dirty = true;
     }
@@ -105,7 +109,12 @@ impl Tui {
             handle.abort();
         }
         self.app.monitored_sessions[&key].live_events.retire();
-        let live = self.live_events.fork();
+        // Fork the child's own state, never the root's. A cancel fence is a
+        // sequence in one session's log and every log numbers its entries
+        // from 1, so a child's deadline `Cancel` would otherwise fence the
+        // parent's and each sibling's live output at a sequence their own
+        // logs might never reach.
+        let live = self.app.monitored_sessions[&key].live_events.fork();
         self.app
             .monitored_sessions
             .get_mut(&key)
@@ -415,6 +424,9 @@ fn latest_user_failed(history: &[(u64, SessionLogEntry)]) -> bool {
         })
     })
 }
+
+#[cfg(test)]
+mod fence_tests;
 
 #[cfg(test)]
 mod tests {
