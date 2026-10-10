@@ -13,11 +13,13 @@ pub(super) struct RequestIdentity {
     pub(super) user_id: Option<String>,
     pub(super) groups: Vec<String>,
     pub(super) roles: Vec<String>,
+    // Authorization-only snapshot; session creation keeps the raw user_id.
+    pub(super) expanded_users: Option<Vec<String>>,
 }
 
 /// Storage for the slices borrowed by the core caller view.
 pub(super) struct RequestCaller<'a> {
-    user: Option<&'a str>,
+    users: Vec<&'a str>,
     groups: Vec<&'a str>,
     roles: Vec<&'a str>,
 }
@@ -25,7 +27,7 @@ pub(super) struct RequestCaller<'a> {
 impl RequestCaller<'_> {
     pub(super) fn view(&self) -> CallerView<'_> {
         CallerView {
-            users: self.user.as_slice(),
+            users: &self.users,
             groups: &self.groups,
             roles: &self.roles,
         }
@@ -43,9 +45,13 @@ impl RequestIdentity {
             .and_then(|id| id.user_id.clone())
     }
 
+    /// Borrow authorization users and unchanged memberships from the request snapshot.
     pub(super) fn caller(&self) -> RequestCaller<'_> {
         RequestCaller {
-            user: self.user_id.as_deref(),
+            users: match &self.expanded_users {
+                Some(users) => users.iter().map(String::as_str).collect(),
+                None => self.user_id.iter().map(String::as_str).collect(),
+            },
             groups: self.groups.iter().map(String::as_str).collect(),
             roles: self.roles.iter().map(String::as_str).collect(),
         }
@@ -67,10 +73,20 @@ impl Server {
         &self,
         req: &hyper::Request<B>,
     ) -> Result<RequestIdentity, IdentityError> {
+        let user_id = self.identity_sources.resolve(req.headers())?;
+        let groups = self.group_headers.resolve(req.headers())?;
+        let roles = self.role_headers.resolve(req.headers())?;
+
+        let expanded_users = match (&user_id, self.user_aliases.as_deref()) {
+            (Some(user), Some(aliases)) => Some(aliases.expand_caller(user).as_slice().to_vec()),
+            _ => None,
+        };
+
         Ok(RequestIdentity {
-            user_id: self.identity_sources.resolve(req.headers())?,
-            groups: self.group_headers.resolve(req.headers())?,
-            roles: self.role_headers.resolve(req.headers())?,
+            user_id,
+            groups,
+            roles,
+            expanded_users,
         })
     }
 
@@ -135,3 +151,7 @@ fn identity_error_response(error: impl std::fmt::Display) -> AppResponse {
     *response.status_mut() = StatusCode::UNAUTHORIZED;
     response
 }
+
+#[cfg(test)]
+#[path = "user_alias_tests.rs"]
+mod user_alias_tests;

@@ -379,11 +379,8 @@ mod tests {
             "rules:\n  - agents: [pkg/agent@local]\n    groups: [team]\n  - agents: [pkg/agent@local]\n    roles: [supervisor]\n    scopes: [admin]\n",
         ).unwrap();
         let (binding, export) = binding_fixture();
-        let mut caller = RequestIdentity {
-            principal: Principal::User("bob".into()),
-            groups: vec!["alice".into(), "team".into()],
-            roles: vec![],
-        };
+        let mut caller = RequestIdentity::from(Principal::User("bob".into()));
+        caller.groups = vec!["alice".into(), "team".into()];
         assert!(!validate_binding(&binding, &export, &caller, Some(&rules)));
         caller.principal = Principal::User("alice".into());
         assert!(validate_binding(&binding, &export, &caller, Some(&rules)));

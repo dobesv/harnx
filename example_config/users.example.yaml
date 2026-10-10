@@ -1,0 +1,20 @@
+# Optional user alias configuration for harnx-serve and harnx-a2a-server
+# Place in <config-dir>/users.yaml (e.g. ~/.config/harnx/users.yaml).
+# Loaded once at startup to expand authenticated caller identities for access checks.
+# Security notice: Edits affect authorization. Only trusted operators should edit this file.
+
+- name: Core Team
+  identities:
+    - "alice@example.com"
+    - "alice-corp"
+    - "alice-dev"
+
+- name: Operations Team
+  identities:
+    - "bob@example.com"
+    - "bob-ops"
+
+- name: Shared Operator Alias
+  identities:
+    - "ops-lead@example.com"
+    - "ops-duty"

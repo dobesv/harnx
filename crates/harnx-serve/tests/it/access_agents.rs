@@ -90,6 +90,11 @@ pub(super) struct MembershipSettings<'a> {
     pub env: &'a [(&'a str, &'a str)],
 }
 
+struct AccessSettings<'a> {
+    rules: Option<&'a str>,
+    aliases: Option<&'a str>,
+}
+
 pub(super) struct Fixture {
     child: Child,
     root: TempDir,
@@ -106,17 +111,20 @@ impl Drop for Fixture {
 
 impl Fixture {
     async fn start(rules: Option<&str>, default_cluster: Option<&str>) -> Result<Self> {
-        Self::start_with_settings(rules, default_cluster, None, MembershipSettings::default()).await
-    }
-
-    pub(super) async fn start_with_nats(rules: Option<&str>, nats_url: &str) -> Result<Self> {
         Self::start_with_settings(
-            rules,
-            Some("default"),
-            Some(nats_url),
+            AccessSettings {
+                rules,
+                aliases: None,
+            },
+            default_cluster,
+            None,
             MembershipSettings::default(),
         )
         .await
+    }
+
+    pub(super) async fn start_with_nats(rules: Option<&str>, nats_url: &str) -> Result<Self> {
+        Self::start_memberships(rules, Some(nats_url), MembershipSettings::default()).await
     }
 
     pub(super) async fn start_memberships(
@@ -124,11 +132,30 @@ impl Fixture {
         nats_url: Option<&str>,
         settings: MembershipSettings<'_>,
     ) -> Result<Self> {
-        Self::start_with_settings(rules, Some("default"), nats_url, settings).await
+        Self::start_with_user_aliases(rules, nats_url, settings, None).await
+    }
+
+    pub(super) async fn start_with_user_aliases(
+        rules: Option<&str>,
+        nats_url: Option<&str>,
+        settings: MembershipSettings<'_>,
+        aliases: Option<&str>,
+    ) -> Result<Self> {
+        Self::start_with_settings(
+            AccessSettings { rules, aliases },
+            Some("default"),
+            nats_url,
+            settings,
+        )
+        .await
+    }
+
+    pub(super) fn user_aliases_path(&self) -> PathBuf {
+        self.root.path().join("config/users.yaml")
     }
 
     async fn start_with_settings(
-        rules: Option<&str>,
+        access: AccessSettings<'_>,
         default_cluster: Option<&str>,
         nats_url: Option<&str>,
         settings: MembershipSettings<'_>,
@@ -136,10 +163,13 @@ impl Fixture {
         harnx_core::require_nextest();
         let root = tempfile::tempdir()?;
         write_fixture_config(root.path(), nats_url)?;
+        if let Some(aliases) = access.aliases {
+            fs::write(root.path().join("config/users.yaml"), aliases)?;
+        }
         let config_path = root.path().join("config/config.yaml");
         let config = fs::read_to_string(&config_path)?;
         fs::write(&config_path, format!("{config}\n{}", settings.config))?;
-        if let Some(rules) = rules {
+        if let Some(rules) = access.rules {
             fs::write(root.path().join("config/access.yaml"), rules)?;
         }
         let log_path = root.path().join("server.log");
