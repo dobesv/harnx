@@ -35,10 +35,10 @@ pub fn validate_binding(
     owner: &RequestIdentity,
     access_rules: Option<&AccessRules>,
 ) -> bool {
+    let caller = owner.caller();
     binding_matches_export(binding, export)
         && match access_rules {
             Some(rules) => {
-                let caller = owner.caller();
                 owner.principal.user_id().is_some()
                     && rules.can_access_session(
                         &export.agent_ref(),
@@ -46,7 +46,11 @@ pub fn validate_binding(
                         binding.owner.as_deref(),
                     )
             }
-            None => binding.owner.as_deref() == owner.principal.user_id(),
+            None => match (binding.owner.as_deref(), owner.principal.user_id()) {
+                (Some(stored), Some(_)) => caller.view().users.contains(&stored),
+                (None, None) => true,
+                _ => false,
+            },
         }
 }
 

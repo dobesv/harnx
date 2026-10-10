@@ -14,8 +14,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use harnx_core::user_aliases::UserAliases;
 use harnx_runtime::identity::{IdentitySource, IdentitySources, MembershipHeaders};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 /// Implementation-defined JSON-RPC server error, outside A2A's -32001..-32009.
 pub const MISSING_IDENTITY_CODE: i32 = -32000;
@@ -43,6 +45,8 @@ pub struct RequestIdentity {
     pub principal: Principal,
     pub groups: Vec<String>,
     pub roles: Vec<String>,
+    // Authorization-only snapshot; ownership always uses the raw principal.
+    expanded_users: Option<Vec<String>>,
 }
 
 impl From<Principal> for RequestIdentity {
@@ -51,13 +55,14 @@ impl From<Principal> for RequestIdentity {
             principal,
             groups: Vec::new(),
             roles: Vec::new(),
+            expanded_users: None,
         }
     }
 }
 
 /// Storage for slices borrowed by the core caller view.
 pub struct RequestCaller<'a> {
-    user: Option<&'a str>,
+    users: Vec<&'a str>,
     groups: Vec<&'a str>,
     roles: Vec<&'a str>,
 }
@@ -65,7 +70,7 @@ pub struct RequestCaller<'a> {
 impl RequestCaller<'_> {
     pub fn view(&self) -> harnx_core::access_rules::CallerView<'_> {
         harnx_core::access_rules::CallerView {
-            users: self.user.as_slice(),
+            users: &self.users,
             groups: &self.groups,
             roles: &self.roles,
         }
@@ -75,7 +80,10 @@ impl RequestCaller<'_> {
 impl RequestIdentity {
     pub fn caller(&self) -> RequestCaller<'_> {
         RequestCaller {
-            user: self.principal.user_id(),
+            users: match &self.expanded_users {
+                Some(users) => users.iter().map(String::as_str).collect(),
+                None => self.principal.user_id().into_iter().collect(),
+            },
             groups: self.groups.iter().map(String::as_str).collect(),
             roles: self.roles.iter().map(String::as_str).collect(),
         }
@@ -89,6 +97,7 @@ pub struct Identity {
     groups: MembershipHeaders,
     roles: MembershipHeaders,
     membership_names: Vec<HeaderName>,
+    aliases: Option<Arc<UserAliases>>,
 }
 
 impl Identity {
@@ -106,6 +115,7 @@ impl Identity {
         let group_headers = MembershipHeaders::new(groups).context("invalid group-header names")?;
         let role_headers = MembershipHeaders::new(roles).context("invalid role-header names")?;
         Ok(Self {
+            aliases: None,
             sources: IdentitySources::new(sources).context("invalid user-id-header sources")?,
             groups: group_headers,
             roles: role_headers,
@@ -137,9 +147,24 @@ impl Identity {
             .ok_or_else(missing_identity)
     }
 
+    /// Share startup-only aliases without changing the principal used for ownership.
+    pub fn with_user_aliases(mut self, aliases: Option<Arc<UserAliases>>) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    fn caller_users(&self, principal: &Principal) -> Option<Vec<String>> {
+        match (principal.user_id(), self.aliases.as_deref()) {
+            (Some(user), Some(aliases)) => Some(aliases.expand_caller(user).as_slice().to_vec()),
+            _ => None,
+        }
+    }
+
     pub fn resolve_request(&self, headers: &HeaderMap) -> Result<RequestIdentity, A2AError> {
+        let principal = self.resolve(headers)?;
         Ok(RequestIdentity {
-            principal: self.resolve(headers)?,
+            expanded_users: self.caller_users(&principal),
+            principal,
             groups: self
                 .groups
                 .resolve(headers)
@@ -167,8 +192,10 @@ impl Identity {
         for name in &self.membership_names {
             Self::add_membership_params(name, params, &mut headers)?;
         }
+        let principal = self.resolve_service_params(params)?;
         Ok(RequestIdentity {
-            principal: self.resolve_service_params(params)?,
+            expanded_users: self.caller_users(&principal),
+            principal,
             groups: self
                 .groups
                 .resolve(&headers)
@@ -542,3 +569,6 @@ mod tests {
 
 #[cfg(test)]
 mod membership_tests;
+
+#[cfg(test)]
+mod alias_tests;

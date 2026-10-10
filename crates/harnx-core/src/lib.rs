@@ -46,6 +46,7 @@ pub mod sink;
 pub mod system_vars;
 pub mod text;
 pub mod tool;
+pub mod user_aliases;
 pub mod working_mode;
 
 pub mod jaq;

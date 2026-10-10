@@ -191,6 +191,13 @@ The server emits JSON-RPC 2.0 error responses with structured `google.rpc.ErrorI
   - Accessing another user's context without `admin` scope returns JSON-RPC `-32001` (`task not found`).
 - **ListTasks Scoping**: `ListTasks` requires `contextId`. Callers with `prompt` scope can list tasks in their own contexts; callers with `admin` scope can list tasks in any authorized context.
 - **Group and Role Memberships**: Callers can supply group and role memberships via `--group-header <NAME>` and `--role-header <NAME>` flags. All configured headers contribute values; repeated headers and comma-separated tokens are split and trimmed. Any invalid header bytes fail closed with JSON-RPC error code `-32000` (HTTP 401). Memberships are evaluated per request and never persisted in session metadata or NATS task storage. Memberships never satisfy context ownership (which remains tied solely to caller `user_id`), but rules granting `admin` scope allow full task management across all contexts.
+- **User Aliases (`users.yaml`)**: Optional user alias configuration loaded once at startup from `<config-dir>/users.yaml`. See the [User Aliases section in the Configuration Guide](../../docs/configuration-guide.md#user-aliases-usersyaml) for schema, semantics, and examples.
+  - An authenticated caller's identity expands into the first matching entry's `identities` list for agent export visibility and context access.
+  - Stored owner identities in A2A bindings are never expanded. New contexts record the caller's raw incoming identity in the binding.
+  - When access rules are disabled, owner isolation still applies: callers can access bindings where the stored owner is in their expanded identities. Anonymous access (`None` stored owner and `None` caller) succeeds; mixed anonymous/authenticated access fails.
+  - Missing `users.yaml` preserves singleton identity behavior. An invalid present file fails startup immediately with path context. Modifying the file requires a server restart; there is no live reload.
+  - Because alias mappings grant authorization, `users.yaml` should be edited only by trusted operators.
+
 ## Deploying Behind a Reverse Proxy
 
 In production, run `harnx-a2a-server` behind a reverse proxy (such as Nginx, Envoy, or Cloudflare).

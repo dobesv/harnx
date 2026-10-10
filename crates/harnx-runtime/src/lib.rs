@@ -49,6 +49,7 @@ pub mod tool_loop_guard;
 pub mod tool_output;
 pub mod tool_reservation_client;
 mod tool_selector;
+pub mod users;
 pub mod utils;
 mod worker_identity;
 
