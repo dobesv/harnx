@@ -1136,7 +1136,28 @@ pub fn echo_messages(session: &Session, input: &Input) -> String {
 /// back into inline `data:` URIs for transmission. Expansion is transient —
 /// it affects only the returned messages, never the stored session.
 pub fn build_messages(session: &Session, input: &Input) -> Result<Vec<Message>> {
-    let messages = build_messages_inner(session, input)?;
+    let mut messages = build_messages_inner(session, input)?;
+    if let Some(summary) = session
+        .compaction_summary
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        // Request-only context, before the exact live suffix, including edit modes.
+        // Archived rows differ before/after replay and must never be resurrected.
+        let index = messages
+            .iter()
+            .take_while(|m| m.role == MessageRole::System)
+            .count();
+        messages.insert(
+            index,
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text(format!(
+                    "{RUNTIME_NOTE_PREFIX}Earlier conversation summary:\n\n{summary}"
+                )),
+            ),
+        );
+    }
     Ok(messages)
 }
 
@@ -1222,22 +1243,6 @@ fn inject_fresh_system_prompt(messages: &mut Vec<Message>, input: &Input) -> Res
     Ok(())
 }
 
-/// Prepend the tail of the compressed transcript to a single-message history
-/// from its last user message on, so a compacted session keeps recent context
-/// in chronological order.
-fn prepend_compressed_tail(session: &Session, messages: &mut Vec<Message>) {
-    if messages.len() != 1 || session.compressed_messages.len() < 2 {
-        return;
-    }
-    if let Some(index) = session
-        .compressed_messages
-        .iter()
-        .rposition(|v| v.role == MessageRole::User)
-    {
-        messages.splice(0..0, session.compressed_messages[index..].iter().cloned());
-    }
-}
-
 fn build_messages_inner(session: &Session, input: &Input) -> Result<Vec<Message>> {
     let mut messages = session.messages.clone();
     if input.continue_output().is_some() {
@@ -1260,7 +1265,6 @@ fn build_messages_inner(session: &Session, input: &Input) -> Result<Vec<Message>
         messages = input.agent().build_messages(input)?;
         false
     } else {
-        prepend_compressed_tail(session, &mut messages);
         !history_already_has_input_text(input, &messages)
     };
     inject_fresh_system_prompt(&mut messages, input)?;
@@ -2937,7 +2941,7 @@ replacements:
     }
 
     #[test]
-    fn build_messages_prepends_compressed_tail_before_single_live_message() {
+    fn build_messages_provides_compaction_summary_instead_of_archived_tail() {
         let mut session = test_session();
         session.compressed_messages = vec![
             Message::new(
@@ -2953,6 +2957,7 @@ replacements:
             MessageRole::User,
             MessageContent::Text("live question".to_string()),
         )];
+        session.compaction_summary = Some("PRIOR WORK SUMMARY".to_string());
 
         let input = Input::new(
             "next question".to_string(),
@@ -2964,16 +2969,20 @@ replacements:
         assert_eq!(
             message_view(&messages),
             vec![
-                (MessageRole::User, "archived question".to_string()),
-                (MessageRole::Assistant, "archived answer".to_string()),
-                (MessageRole::User, "live question".to_string()),
-                (MessageRole::User, "next question".to_string()),
+                (
+                    MessageRole::User,
+                    format!(
+                        "{RUNTIME_NOTE_PREFIX}Earlier conversation summary:\n\nPRIOR WORK SUMMARY"
+                    )
+                ),
+                (MessageRole::User, "live question".into()),
+                (MessageRole::User, "next question".into()),
             ]
         );
     }
 
     #[test]
-    fn build_messages_reinjects_system_prompt_after_compaction() {
+    fn build_messages_injects_summary_after_system_prompt() {
         let mut session = test_session();
         session.agent_instructions = "Agent prompt with {{ agent.model }}".to_string();
         session.model_id = "openai:gpt-4o-mini".to_string();
@@ -2991,10 +3000,20 @@ replacements:
         );
         let messages = super::build_messages(&session, &input).unwrap();
 
-        assert_eq!(messages[0].role, MessageRole::System);
         assert_eq!(
-            messages[0].content.to_text(),
-            "Agent prompt with openai:gpt-4o-mini"
+            message_view(&messages),
+            vec![
+                (
+                    MessageRole::System,
+                    "Agent prompt with openai:gpt-4o-mini".into()
+                ),
+                (
+                    MessageRole::User,
+                    format!("{RUNTIME_NOTE_PREFIX}Earlier conversation summary:\n\nsummary")
+                ),
+                (MessageRole::User, "recent question".into()),
+                (MessageRole::User, "next question".into()),
+            ]
         );
     }
 
