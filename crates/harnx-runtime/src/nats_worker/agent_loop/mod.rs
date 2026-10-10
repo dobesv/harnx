@@ -274,20 +274,6 @@ fn fold_user_messages(messages: &[Message]) -> String {
         .join("\n\n")
 }
 
-#[allow(dead_code)]
-pub(crate) fn last_fed_user_log_seq(_input: &Input) -> Option<u64> {
-    // DEPRECATED: This function cannot meaningfully derive a cursor from Input.
-    // The cursor MUST be derived from the log seq of messages that went into
-    // the turn input. Callers should use the `seed_cursor` returned by
-    // `derive_turn_input` or pass messages directly.
-    //
-    // Kept for compatibility with resumable path which passes a synthesized
-    // Input from resumable_ctx.last_user, but the cursor must come from
-    // `resumable_ctx.last_user.log_seq` directly at the call site.
-    #[allow(dead_code)]
-    None
-}
-
 pub(crate) use selected_input::fold_new_user_messages_since;
 
 pub(crate) fn build_mid_turn_injection_callback(
@@ -476,7 +462,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
     };
     // Journal/gate I/O adds depth below tool dispatch. Keep segment construction
     // out of this activation frame as well as the enclosing daemon frame.
-    let result = segment_args.run(hitl_continuation).await;
+    let result = Box::pin(run_agent_loop_segment(segment_args, hitl_continuation)).await;
 
     finish_agent_loop(hook_supervisor, attachment_sync, result).await
 }
@@ -781,7 +767,13 @@ async fn agent_hook_start_config(
     }
 }
 
-async fn run_agent_loop_segment(args: AgentLoopSegmentArgs<'_>) -> Result<NatsAgentLoopOutcome> {
+async fn run_agent_loop_segment(
+    args: AgentLoopSegmentArgs<'_>,
+    continuation: Option<HitlToolRoundContinuation>,
+) -> Result<NatsAgentLoopOutcome> {
+    if let Some(continuation) = continuation {
+        return Box::pin(run_hitl_continuation_segment(args, continuation)).await;
+    }
     let args_ref = &args;
     let result = Box::pin(crate::agent_loop::run_agent_loop_with_before_end(
         &args.ctx,
@@ -1777,5 +1769,3 @@ mod hitl_attention_tests {
 mod compaction_continuity_tests;
 
 mod selected_input;
-
-mod segment_dispatch;
