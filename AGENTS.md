@@ -1035,7 +1035,10 @@ access checks requiring ownership match (admin scope can bypass ownership). See
 Shared request identity resolution lives in `harnx_runtime::identity`
 (`identity.rs`), used by `harnx-a2a-server` and `harnx-serve`. It extracts from
 configured HTTP headers or cookies and is fail-closed: an empty or malformed
-matching source returns an error rather than falling back.
+matching source returns an error rather than falling back. User aliases
+(`users.yaml`) may also assign configured `groups` and `roles` to matched callers;
+these are merged with header memberships but never grant ownership. See
+`docs/configuration-guide.md` under "User Aliases" for the merge semantics.
 
 Precedence at metadata creation:
 

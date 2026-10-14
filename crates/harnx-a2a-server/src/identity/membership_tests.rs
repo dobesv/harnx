@@ -110,6 +110,35 @@ fn memberships_absent_empty_and_unconfigured_values_are_not_grants() {
     assert!(legacy.resolve_request(&headers).unwrap().groups.is_empty());
 }
 
+#[test]
+fn memberships_merge_through_service_params() {
+    // Test that merge happens correctly through resolve_request_params
+    let policy = Identity::with_memberships(
+        &["x-user".into()],
+        &["x-groups".into()],
+        &["x-roles".into()],
+    )
+    .unwrap()
+    .with_user_aliases(Some(Arc::new(
+        UserAliases::from_yaml(
+            "- name: Alice\n  identities: [alice]\n  groups: [engineering, ops]\n  roles: [admin]\n",
+        )
+        .unwrap(),
+    )));
+
+    let params = ServiceParams::from([
+        ("x-user".into(), vec!["alice".into()]),
+        ("x-groups".into(), vec!["team, ops".into()]),
+        ("x-roles".into(), vec!["viewer".into()]),
+    ]);
+
+    let request = policy.resolve_request_params(&params).unwrap();
+    let caller = request.caller();
+    let view = caller.view();
+    assert_eq!(view.groups, &["team", "ops", "engineering"]);
+    assert_eq!(view.roles, &["viewer", "admin"]);
+}
+
 #[tokio::test]
 async fn memberships_invalid_config_fails_before_exports_with_or_without_rules() {
     let sandbox = TestConfigSandbox::new();

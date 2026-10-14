@@ -112,3 +112,110 @@ fn aliases_literal_empty_user_is_distinct_from_anonymous_snapshot() {
     let anonymous = RequestIdentity::default();
     assert!(anonymous.caller().view().users.is_empty());
 }
+
+#[test]
+fn aliases_configured_memberships_apply_without_trusted_headers() -> Result<()> {
+    let sandbox = TestConfigSandbox::new();
+    harnx_core::require_nextest();
+    let mut config = sandbox.config();
+    config.serve_user_id_sources = vec!["x-user".into()];
+    config.serve_group_headers.clear();
+    config.serve_role_headers.clear();
+    let config = Arc::new(ConfigLock::new(config));
+    std::fs::write(
+        local_path("users.yaml"),
+        "- name: Display\n  identities: [alice, bob]\n  groups: [' eng, ops ', eng, '']\n  roles: [' admin, operator ', admin]\n",
+    )?;
+    let server = Server::new_with_access_rules(&config, PathBuf::new(), None)?;
+    for user in ["alice", "bob"] {
+        let request = hyper::Request::builder()
+            .header("x-user", user)
+            .header("x-groups", "ignored")
+            .header("x-roles", "ignored")
+            .body(())?;
+        let identity = server.resolve_identity(&request)?;
+        assert_eq!(identity.user_id.as_deref(), Some(user));
+        let caller = identity.caller();
+        assert_eq!(caller.view().users, &["alice", "bob"]);
+        assert_eq!(caller.view().groups, &["eng", "ops"]);
+        assert_eq!(caller.view().roles, &["admin", "operator"]);
+    }
+    for user in [Some("unknown"), None] {
+        let mut request = hyper::Request::new(());
+        if let Some(user) = user {
+            request.headers_mut().insert("x-user", user.parse()?);
+        }
+        let identity = server.resolve_identity(&request)?;
+        assert_eq!(identity.user_id.as_deref(), user);
+        assert!(identity.groups.is_empty());
+        assert!(identity.roles.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn aliases_merge_memberships_preserving_header_values() -> Result<()> {
+    let sandbox = TestConfigSandbox::new();
+    let config = config(&sandbox);
+    std::fs::write(
+        local_path("users.yaml"),
+        "- name: Display\n  identities: [alice, bob]\n  groups: [' eng, ops ', ops]\n  roles: [' operator, admin ', admin]\n",
+    )?;
+    let server = Server::new_with_access_rules(&config, PathBuf::new(), None)?;
+    for (user, groups, roles) in [
+        (
+            Some("alice"),
+            vec!["eng", "eng", "team", "ops"],
+            vec!["operator", "operator", "reader", "admin"],
+        ),
+        (
+            Some("unknown"),
+            vec!["eng", "eng", "team"],
+            vec!["operator", "operator", "reader"],
+        ),
+        (
+            None,
+            vec!["eng", "eng", "team"],
+            vec!["operator", "operator", "reader"],
+        ),
+    ] {
+        let mut request = hyper::Request::builder()
+            .header("x-groups", " eng, eng, , team ")
+            .header("x-roles", " operator, operator, , reader ")
+            .body(())?;
+        if let Some(user) = user {
+            request.headers_mut().insert("x-user", user.parse()?);
+        }
+        let identity = server.resolve_identity(&request)?;
+        assert_eq!(identity.user_id.as_deref(), user);
+        assert_eq!(identity.groups, groups);
+        assert_eq!(identity.roles, roles);
+    }
+    Ok(())
+}
+
+#[test]
+fn aliases_configured_memberships_do_not_mask_malformed_headers() -> Result<()> {
+    let sandbox = TestConfigSandbox::new();
+    let config = config(&sandbox);
+    std::fs::write(
+        local_path("users.yaml"),
+        "- name: Display\n  identities: [alice]\n  groups: [eng]\n  roles: [admin]\n",
+    )?;
+    let server = Server::new_with_access_rules(&config, PathBuf::new(), None)?;
+    for name in ["x-groups", "x-roles"] {
+        let mut request = hyper::Request::builder()
+            .header("x-user", "alice")
+            .header("x-groups", "eng")
+            .header("x-roles", "admin")
+            .body(())?;
+        request
+            .headers_mut()
+            .append(name, http::HeaderValue::from_bytes(b"\xff")?);
+        assert!(matches!(
+            server.resolve_identity(&request),
+            Err(harnx_runtime::identity::IdentityError::InvalidValue)
+        ));
+    }
+    Ok(())
+}

@@ -117,7 +117,7 @@ test = ["harnx-runtime", "harnx-bash-tools"]
 # The example auth hooks are executed by harnx-proxy-auth's tests.
 [[test-path]]
 globs = ["example_config/**"]
-test = ["harnx-proxy-auth"]
+test = ["harnx-proxy-auth", "harnx-core"]
 
 # Bridge direct-call fixtures run the SDK-backed mock MCP binary by path.
 [[test-edge]]

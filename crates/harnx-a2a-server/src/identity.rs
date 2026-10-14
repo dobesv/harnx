@@ -15,7 +15,9 @@ use axum::{
     Json,
 };
 use harnx_core::user_aliases::UserAliases;
-use harnx_runtime::identity::{IdentitySource, IdentitySources, MembershipHeaders};
+use harnx_runtime::identity::{
+    merge_memberships, IdentitySource, IdentitySources, MembershipHeaders,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -153,27 +155,27 @@ impl Identity {
         self
     }
 
-    fn caller_users(&self, principal: &Principal) -> Option<Vec<String>> {
+    /// Expand caller once and return users, groups, and roles.
+    /// Avoids redundant `expand_caller` calls; returned membership values are cloned.
+    fn expand_caller_all(
+        &self,
+        principal: &Principal,
+    ) -> (Option<Vec<String>>, Vec<String>, Vec<String>) {
         match (principal.user_id(), self.aliases.as_deref()) {
-            (Some(user), Some(aliases)) => Some(aliases.expand_caller(user).as_slice().to_vec()),
-            _ => None,
+            (Some(user), Some(aliases)) => {
+                let expanded = aliases.expand_caller(user);
+                let users = expanded.as_slice().to_vec();
+                let groups = expanded.groups().to_vec();
+                let roles = expanded.roles().to_vec();
+                (Some(users), groups, roles)
+            }
+            _ => (None, Vec::new(), Vec::new()),
         }
     }
 
     pub fn resolve_request(&self, headers: &HeaderMap) -> Result<RequestIdentity, A2AError> {
         let principal = self.resolve(headers)?;
-        Ok(RequestIdentity {
-            expanded_users: self.caller_users(&principal),
-            principal,
-            groups: self
-                .groups
-                .resolve(headers)
-                .map_err(|_| missing_identity())?,
-            roles: self
-                .roles
-                .resolve(headers)
-                .map_err(|_| missing_identity())?,
-        })
+        self.resolve_with_memberships(principal, headers)
     }
 
     /// HTTP middleware validates raw values before the SDK drops non-text fields.
@@ -193,17 +195,31 @@ impl Identity {
             Self::add_membership_params(name, params, &mut headers)?;
         }
         let principal = self.resolve_service_params(params)?;
+        self.resolve_with_memberships(principal, &headers)
+    }
+
+    fn resolve_with_memberships(
+        &self,
+        principal: Principal,
+        headers: &HeaderMap,
+    ) -> Result<RequestIdentity, A2AError> {
+        // Reject malformed headers before alias expansion or merging configured memberships.
+        let header_groups = self
+            .groups
+            .resolve(headers)
+            .map_err(|_| missing_identity())?;
+        let header_roles = self
+            .roles
+            .resolve(headers)
+            .map_err(|_| missing_identity())?;
+        // Expand caller once and merge configured memberships with header memberships.
+        let (expanded_users, configured_groups, configured_roles) =
+            self.expand_caller_all(&principal);
         Ok(RequestIdentity {
-            expanded_users: self.caller_users(&principal),
+            expanded_users,
             principal,
-            groups: self
-                .groups
-                .resolve(&headers)
-                .map_err(|_| missing_identity())?,
-            roles: self
-                .roles
-                .resolve(&headers)
-                .map_err(|_| missing_identity())?,
+            groups: merge_memberships(header_groups, &configured_groups),
+            roles: merge_memberships(header_roles, &configured_roles),
         })
     }
 

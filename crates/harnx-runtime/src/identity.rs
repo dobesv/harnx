@@ -9,7 +9,7 @@ use anyhow::{bail, Context};
 use http::{header::COOKIE, HeaderMap, HeaderName};
 
 mod membership;
-pub use membership::MembershipHeaders;
+pub use membership::{merge_memberships, MembershipHeaders};
 
 /// First comma-separated entry of the first header field, trimmed.
 ///

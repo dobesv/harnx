@@ -25,6 +25,12 @@ pub struct UserAliasEntry {
     pub name: String,
     /// Identity set for expansion. May be empty (valid no-op).
     pub identities: Vec<String>,
+    /// Groups assigned to callers matching this entry.
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// Roles assigned to callers matching this entry.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 /// Validated user aliases configuration.
@@ -100,7 +106,7 @@ impl UserAliases {
         // Find first entry containing the exact caller (avoid String allocation)
         for entry in &self.entries {
             if entry.identities.iter().any(|id| id == caller) {
-                return ExpandedIdentities::matched(&entry.identities);
+                return ExpandedIdentities::matched(&entry.identities, &entry.groups, &entry.roles);
             }
         }
 
@@ -127,13 +133,17 @@ impl UserAliases {
 #[derive(Debug, Clone)]
 pub struct ExpandedIdentities<'a> {
     identities: std::borrow::Cow<'a, [String]>,
+    groups: &'a [String],
+    roles: &'a [String],
 }
 
 impl<'a> ExpandedIdentities<'a> {
     /// Create from a matching entry (borrowed identities).
-    fn matched(identities: &'a [String]) -> Self {
+    fn matched(identities: &'a [String], groups: &'a [String], roles: &'a [String]) -> Self {
         Self {
             identities: std::borrow::Cow::Borrowed(identities),
+            groups,
+            roles,
         }
     }
 
@@ -141,7 +151,19 @@ impl<'a> ExpandedIdentities<'a> {
     fn unmatched(caller: &str) -> Self {
         Self {
             identities: std::borrow::Cow::Owned(vec![caller.to_string()]),
+            groups: &[],
+            roles: &[],
         }
+    }
+
+    /// Access groups configured on the matched alias entry.
+    pub fn groups(&self) -> &[String] {
+        self.groups
+    }
+
+    /// Access roles configured on the matched alias entry.
+    pub fn roles(&self) -> &[String] {
+        self.roles
     }
 
     /// Access the expanded identity slice.
@@ -468,6 +490,38 @@ identities: [alice]
     }
 
     #[test]
+    fn matched_caller_exposes_configured_groups_and_roles() {
+        let aliases = aliases("- name: team-a\n  identities: [alice, bob]\n  groups: [engineering]\n  roles: [admin, reviewer]\n").unwrap();
+        let result = aliases.expand_caller("alice");
+        assert_eq!(result.groups(), &["engineering"]);
+        assert_eq!(result.roles(), &["admin", "reviewer"]);
+    }
+
+    #[test]
+    fn omitted_groups_and_roles_default_empty_and_unknown_fields_rejected() {
+        let aliases = aliases("- name: team-a\n  identities: [alice]\n").unwrap();
+        let result = aliases.expand_caller("alice");
+        assert!(result.groups().is_empty());
+        assert!(result.roles().is_empty());
+        assert!(super::UserAliases::from_yaml(
+            "- name: team-a\n  identities: [alice]\n  extra: x\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unmatched_caller_has_no_groups_or_roles() {
+        let aliases = aliases(
+            "- name: team-a\n  identities: [alice]\n  groups: [engineering]\n  roles: [admin]\n",
+        )
+        .unwrap();
+        let result = aliases.expand_caller("unknown");
+        assert_eq!(expand(&aliases, "unknown"), vec!["unknown"]);
+        assert!(result.groups().is_empty());
+        assert!(result.roles().is_empty());
+    }
+
+    #[test]
     fn empty_sequence_is_valid() {
         // Explicit empty sequence is valid no-op configuration
         let aliases = aliases("[]").unwrap();
@@ -531,5 +585,38 @@ identities: [alice]
 
         let error = UserAliases::load(&path).unwrap_err();
         assert!(error.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn users_example_yaml_parses_successfully() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let example_path = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("find workspace root")
+            .join("example_config/users.example.yaml");
+
+        let content = std::fs::read_to_string(&example_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", example_path.display()));
+        let parsed = UserAliases::from_yaml(&content)
+            .unwrap_or_else(|e| panic!("failed to parse {}: {e}", example_path.display()));
+
+        let alice = parsed.expand_caller("alice@example.com");
+        assert_eq!(
+            alice.as_slice(),
+            &["alice@example.com", "alice-corp", "alice-dev"]
+        );
+        assert_eq!(alice.groups(), &["developers", "backend"]);
+        assert_eq!(alice.roles(), &["admin"]);
+
+        let bob = parsed.expand_caller("bob-ops");
+        assert_eq!(bob.as_slice(), &["bob@example.com", "bob-ops"]);
+        assert_eq!(bob.groups(), &["ops"]);
+        assert!(bob.roles().is_empty());
+
+        let ops_lead = parsed.expand_caller("ops-lead@example.com");
+        assert_eq!(ops_lead.as_slice(), &["ops-lead@example.com", "ops-duty"]);
+        assert!(ops_lead.groups().is_empty());
+        assert!(ops_lead.roles().is_empty());
     }
 }

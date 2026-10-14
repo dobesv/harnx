@@ -8,11 +8,18 @@
     - "alice@example.com"
     - "alice-corp"
     - "alice-dev"
+  groups:
+    - developers
+    - backend
+  roles:
+    - admin
 
 - name: Operations Team
   identities:
     - "bob@example.com"
     - "bob-ops"
+  groups:
+    - ops
 
 - name: Shared Operator Alias
   identities:

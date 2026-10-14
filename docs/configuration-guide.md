@@ -732,18 +732,20 @@ User aliases expand an authenticated caller's identity into an alias group's ide
 
 Alias entries directly alter access control boundaries: mapping caller identity `alice` into an entry containing `bob` allows `alice` to access agents and sessions permitted to `bob`.
 
-**Trusted operator edit only**: Because alias mappings grant authorization, `users.yaml` must be protected with appropriate filesystem permissions and modified only by trusted operators.
+**Trusted operator edit only**: Because alias mappings grant authorization, `users.yaml` must be protected with appropriate filesystem permissions and modified only by trusted operators. The server trusts the identity header set by the upstream proxy; forged identity inherits that alias's groups and roles, so the proxy must strip client-supplied identity headers.
 
 ### Schema and Format
 
 The configuration file must be a top-level YAML sequence of entries. Mapping roots, scalar roots, null documents, and empty documents are rejected.
 
-Each entry is a YAML mapping with two required fields:
+Each entry is a YAML mapping with two required fields and two optional fields:
 
 | Field | Type | Description |
 |---|---|---|
-| `name` | String | Human-readable label for the alias entry. Used for display and documentation only; **never** treated as an authenticated principal or caller identity. |
-| `identities` | List of strings | Set of user identity strings associated with this alias. An empty list (`[]`) is valid and acts as a no-op entry. |
+| `name` | String | Human-readable label for the alias entry. Used for display and documentation only; **never** treated as an authenticated principal or caller identity. Required. |
+| `identities` | List of strings | Set of user identity strings associated with this alias. An empty list (`[]`) is valid and acts as a no-op entry. Required. |
+| `groups` | List of strings | Optional list of group names assigned to callers matching this entry. Defaults to `[]`. |
+| `roles` | List of strings | Optional list of role names assigned to callers matching this entry. Defaults to `[]`. |
 
 Unknown fields in an entry are rejected (`deny_unknown_fields`).
 
@@ -755,11 +757,18 @@ Unknown fields in an entry are rejected (`deny_unknown_fields`).
     - "alice@example.com"
     - "alice-corp"
     - "alice-dev"
+  groups:
+    - developers
+    - backend
+  roles:
+    - admin
 
 - name: Operations Team
   identities:
     - "bob@example.com"
     - "bob-ops"
+  groups:
+    - ops
 
 - name: Cross-Department Contractor
   identities:
@@ -773,11 +782,11 @@ An empty sequence (`[]`) is valid. Duplicate identities within an entry (e.g. `[
 When an authenticated caller makes a request, the server expands the caller's identity using the following rules:
 
 1. **Ordered scan**: The server scans `users.yaml` entries in order from top to bottom.
-2. **First-match wins**: The lookup stops at the **first** entry whose `identities` list contains the exact caller identity string. The caller's effective identities expand to all strings in that entry's `identities` list.
+2. **First-match wins**: The lookup stops at the **first** entry whose `identities` list contains the exact caller identity string. The caller's effective identities expand to all strings in that entry's `identities` list, and any configured `groups` and `roles` from that entry are assigned to the caller.
 3. **Exact and case-sensitive**: Identity matching is exact and case-sensitive. No normalization, trimming, or lowercasing is applied.
-4. **No transitive union**: Overlapping entries do not merge. If entry 1 contains `[alice, bob]` and entry 2 contains `[bob, carol]`, caller `bob` matches entry 1 and receives `[alice, bob]`. Entry 2 is ignored for `bob`.
-5. **Unmatched callers**: If a caller's identity does not match any entry in `users.yaml`, the caller retains their singleton authenticated identity.
-6. **Anonymous callers**: An unauthenticated or anonymous caller (`None`) is never expanded against `users.yaml` and remains anonymous.
+4. **No transitive union**: Overlapping entries do not merge. If entry 1 contains `[alice, bob]` and entry 2 contains `[bob, carol]`, caller `bob` matches entry 1 and receives `[alice, bob]` (and entry 1's groups/roles). Entry 2 is ignored for `bob`.
+5. **Unmatched callers**: If a caller's identity does not match any entry in `users.yaml`, the caller retains their singleton authenticated identity and receives no configured groups or roles.
+6. **Anonymous callers**: An unauthenticated or anonymous caller (`None`) is never expanded against `users.yaml` and receives no configured groups or roles.
 
 ### Integration with Servers and Access Control
 
@@ -785,11 +794,17 @@ When an authenticated caller makes a request, the server expands the caller's id
 Alias expansion applies **only** to the incoming caller during request authorization:
 - In `harnx-serve`, new sessions created via `POST /v1/agents/{agent}/sessions` record the caller's raw incoming identity (`user_id`) in session metadata, not an alias entry name or other identities in the group.
 - In `harnx-a2a-server`, new contexts and tasks record the caller's raw incoming identity as the stored owner in the A2A binding. Stored owner identities are never expanded.
-- When an authorized caller later accesses or resumes a session, their expanded caller identities are checked against the stored session owner.
+- When an authorized caller later accesses or resumes a session, their expanded caller identities are checked against the stored session owner. Configured groups and roles never grant session or context ownership.
 
 #### Behavior without access rules
 - **`harnx-serve`**: When access rules (`access.yaml`) are not configured, `harnx-serve` operates without access restrictions. Sessions and agents remain open, and `users.yaml` does not restrict requests.
 - **`harnx-a2a-server`**: When access rules are absent, `harnx-a2a-server` still enforces owner isolation on stored bindings. A caller is permitted to access a binding if the stored owner is contained in the caller's expanded identities. Anonymous access (`None` stored owner and `None` caller) succeeds. Mixed caller/stored ownership (one anonymous, one authenticated) is denied.
 
-#### Groups and roles unchanged
-`users.yaml` expands only user identities. Request-local group headers (`--group-header`, `serve_group_headers`) and role headers (`--role-header`, `serve_role_headers`) are never expanded or modified by `users.yaml`. User aliases do not grant group or role memberships.
+#### Configured groups and roles
+In both `harnx-serve` and `harnx-a2a-server`, configured `groups` and `roles` on the matched alias entry participate in request authorization:
+- **Comma-separated values**: List items such as `"a, b"` are split on commas, like membership header values.
+- **Merged with header memberships**: When membership headers (`--group-header`, `--role-header`, `serve_group_headers`, `serve_role_headers`) are configured and present, header values come first and retain their exact order and duplicates. Configured values from `users.yaml` are normalized (split on commas, trimmed, empty tokens dropped) and appended without adding duplicates of values already present.
+- **Applies without membership headers**: If no membership headers are configured on the server (or none are supplied in the request), matching an alias entry still assigns its configured groups and roles to the caller.
+- **Header failures fail closed**: Malformed membership headers (such as non-UTF-8 bytes) fail closed immediately with HTTP 401 Unauthorized (or JSON-RPC `-32000`). Configured groups and roles do not bypass or mask header validation failures.
+- **Matched against access rules**: Effective groups and roles match `groups:` and `roles:` selectors in `access.yaml`. The user, group, and role namespaces remain completely distinct.
+- **No ownership or persistence**: Configured memberships grant access scopes (such as `prompt` or `admin`), but they never grant session ownership and are never stored in session metadata or NATS task KV. Anonymous and unmatched callers get no configured memberships.

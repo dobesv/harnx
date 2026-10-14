@@ -176,42 +176,136 @@ async fn aliases_access_anonymous_mode_keeps_shared_owner() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn aliases_access_memberships_never_expand_or_become_owner() -> Result<()> {
-    let rules = Arc::new(AccessRules::from_yaml(
-        "rules:\n  - agents: [runner@runner]\n    users: [bob, unknown]\n  - agents: [runner@runner]\n    groups: [team]\n  - agents: [runner@runner]\n    roles: [supervisor]\n    scopes: [admin]\n",
-    )?);
-    let aliases = Arc::new(UserAliases::from_yaml(
-        "- name: User\n  identities: [alice, bob]\n- name: Role\n  identities: [operator, supervisor]\n- name: Group\n  identities: [team, supervisors]\n",
-    )?);
+async fn configured_memberships(rules: &str, aliases: &str, trust_headers: bool) -> Result<Http> {
+    harnx_core::require_nextest();
+    let rules = Arc::new(AccessRules::from_yaml(rules)?);
+    let aliases = Arc::new(UserAliases::from_yaml(aliases)?);
     let h = Harness::start_with_access_rules(Script::Text, Some(rules.clone())).await?;
-    let identity = Identity::with_memberships(
-        &["X-User-ID".into()],
-        &["X-Groups".into()],
-        &["X-Roles".into()],
-    )?
+    let identity = if trust_headers {
+        Identity::with_memberships(
+            &["X-User-ID".into()],
+            &["X-Groups".into()],
+            &["X-Roles".into()],
+        )?
+    } else {
+        Identity::new(&["X-User-ID".into()])?
+    }
     .with_user_aliases(Some(aliases));
-    let http = Http::with_identity(h, Some(rules), identity).await?;
-    let first = send(&http, "bob", "membership-owner", None).await?;
-    for (groups, roles, allowed) in [
-        ("alice, team", "", false),
-        ("", "operator", false),
-        ("", "supervisor", true),
+    Http::with_identity(h, Some(rules), identity).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_group_admits_without_headers_but_role_and_unmatched_caller_do_not() -> Result<()>
+{
+    let http = configured_memberships(
+        "rules:\n  - agents: [runner@runner]\n    groups: [engineering]\n  - agents: [runner@runner]\n    roles: [engineering]\n    scopes: [admin]\n",
+        "- name: Group member\n  identities: [alice]\n  groups: [engineering]\n- name: Role member\n  identities: [carol]\n  roles: [engineering]\n",
+        false,
+    ).await?;
+    let task = send(&http, "alice", "configured-group", None).await?;
+    assert_raw_owner(&http, &task["contextId"], Some("alice")).await?;
+    // The role is active (admin read), but cannot satisfy the prompt group.
+    let read = rpc(&http, "carol", "GetTask", json!({"id":task["id"]})).await?;
+    assert_eq!(read["result"]["id"], task["id"], "{read}");
+    for (user, expected) in [
+        ("carol", harnx_a2a_server::handler::PERMISSION_DENIED_CODE),
+        ("unknown", -32001),
     ] {
+        code(
+            &rpc(
+                &http,
+                user,
+                "SendMessage",
+                json!({"message":message(user, None)}),
+            )
+            .await?,
+            expected,
+        );
+    }
+    assert_eq!(http.h.llm.requests.lock().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aliases_access_memberships_merge_with_configured_groups_and_roles() -> Result<()> {
+    // Config grants prompt, header grants admin. Neither source alone can
+    // both create a context and operate another user's context.
+    let http = configured_memberships(
+        "rules:\n  - agents: [runner@runner]\n    groups: [engineering]\n  - agents: [runner@runner]\n    roles: [reviewer]\n  - agents: [runner@runner]\n    groups: [operators]\n    scopes: [admin]\n",
+        "- name: Owner\n  identities: [bob]\n  groups: [engineering]\n- name: Group member\n  identities: [alice]\n  groups: [engineering]\n- name: Role member\n  identities: [carol]\n  roles: [reviewer]\n",
+        true,
+    ).await?;
+    let first = send(&http, "bob", "membership-owner", None).await?;
+    for user in ["alice", "carol"] {
+        code(
+            &rpc(&http, user, "GetTask", json!({"id":first["id"]})).await?,
+            -32001,
+        );
+    }
+    for user in ["alice", "carol"] {
+        http.h.llm.release.notify_one();
         let response: Value = http.client.post(&http.url)
             .header("a2a-version", "1.0")
-            .header("X-User-ID", "unknown")
-            .header("X-Groups", groups)
-            .header("X-Roles", roles)
-            .json(&json!({"jsonrpc":"2.0", "id":"memberships", "method":"GetTask", "params":{"id":first["id"]}}))
+            .header("X-User-ID", user)
+            .header("X-Groups", "operators")
+            .json(&json!({"jsonrpc":"2.0", "id":"merge", "method":"SendMessage", "params":{"message":message(user, None)}}))
             .send().await?.json().await?;
-        if allowed {
-            assert_eq!(response["result"]["id"], first["id"], "{response}");
-        } else {
-            code(&response, -32001);
-        }
+        assert!(response["error"].is_null(), "{response}");
+        let task = &response["result"]["task"];
+        assert_eq!(
+            task["status"]["state"], "TASK_STATE_COMPLETED",
+            "{response}"
+        );
+        assert_raw_owner(&http, &task["contextId"], Some(user)).await?;
+        let response: Value = http.client.post(&http.url)
+            .header("a2a-version", "1.0")
+            .header("X-User-ID", user)
+            .header("X-Groups", "operators")
+            .json(&json!({"jsonrpc":"2.0", "id":"merged-read", "method":"GetTask", "params":{"id":first["id"]}}))
+            .send().await?.json().await?;
+        assert_eq!(response["result"]["id"], first["id"], "{response}");
     }
+    // Header-only admin can't pass the creation assertion above.
+    let response: Value = http.client.post(&http.url)
+        .header("a2a-version", "1.0")
+        .header("X-User-ID", "unknown")
+        .header("X-Groups", "operators")
+        .json(&json!({"jsonrpc":"2.0", "id":"header-only", "method":"SendMessage", "params":{"message":message("header-only", None)}}))
+        .send().await?.json().await?;
+    code(&response, harnx_a2a_server::handler::PERMISSION_DENIED_CODE);
     assert_raw_owner(&http, &first["contextId"], Some("bob")).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aliases_access_memberships_configured_does_not_grant_ownership() -> Result<()> {
+    // Membership names equal the owner to catch leakage into user identities.
+    let http = configured_memberships(
+        "rules:\n  - agents: [runner@runner]\n    groups: [owner]\n  - agents: [runner@runner]\n    roles: [owner]\n",
+        "- name: Owner\n  identities: [owner]\n  groups: [owner]\n- name: Group member\n  identities: [alice]\n  groups: [owner]\n- name: Role member\n  identities: [carol]\n  roles: [owner]\n",
+        false,
+    ).await?;
+    let first = send(&http, "owner", "no-ownership-transfer", None).await?;
+    for user in ["alice", "carol"] {
+        let own = send(&http, user, user, None).await?;
+        assert_raw_owner(&http, &own["contextId"], Some(user)).await?;
+        code(
+            &rpc(&http, user, "GetTask", json!({"id":first["id"]})).await?,
+            -32001,
+        );
+        code(
+            &rpc(
+                &http,
+                user,
+                "SendMessage",
+                json!({"message":message("not-owner", Some(&first["contextId"]))}),
+            )
+            .await?,
+            -32001,
+        );
+    }
+    assert_raw_owner(&http, &first["contextId"], Some("owner")).await?;
+    assert_eq!(http.h.llm.requests.lock().len(), 3);
     Ok(())
 }
 
