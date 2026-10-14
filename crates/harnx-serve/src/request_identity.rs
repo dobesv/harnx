@@ -2,7 +2,7 @@
 
 use super::{ret_err, set_cors_header, AppResponse, Server};
 use harnx_core::access_rules::CallerView;
-use harnx_runtime::identity::IdentityError;
+use harnx_runtime::identity::{merge_memberships, IdentityError};
 use http::{Method, Response, StatusCode};
 use hyper::body::Incoming;
 use std::time::Instant;
@@ -45,7 +45,7 @@ impl RequestIdentity {
             .and_then(|id| id.user_id.clone())
     }
 
-    /// Borrow authorization users and unchanged memberships from the request snapshot.
+    /// Borrow authorization users and memberships from the request snapshot.
     pub(super) fn caller(&self) -> RequestCaller<'_> {
         RequestCaller {
             users: match &self.expanded_users {
@@ -74,11 +74,16 @@ impl Server {
         req: &hyper::Request<B>,
     ) -> Result<RequestIdentity, IdentityError> {
         let user_id = self.identity_sources.resolve(req.headers())?;
-        let groups = self.group_headers.resolve(req.headers())?;
-        let roles = self.role_headers.resolve(req.headers())?;
+        let mut groups = self.group_headers.resolve(req.headers())?;
+        let mut roles = self.role_headers.resolve(req.headers())?;
 
         let expanded_users = match (&user_id, self.user_aliases.as_deref()) {
-            (Some(user), Some(aliases)) => Some(aliases.expand_caller(user).as_slice().to_vec()),
+            (Some(user), Some(aliases)) => {
+                let expanded = aliases.expand_caller(user);
+                groups = merge_memberships(groups, expanded.groups());
+                roles = merge_memberships(roles, expanded.roles());
+                Some(expanded.as_slice().to_vec())
+            }
             _ => None,
         };
 

@@ -4,6 +4,55 @@ use super::IdentityError;
 use anyhow::Context;
 use http::{HeaderMap, HeaderName};
 
+/// Normalize string values by splitting on comma, trimming whitespace, and filtering empty entries.
+///
+/// This function accepts owned strings; merge normalizes configured values via `normalize_membership_iter`.
+/// Preserves duplicates and order from the input.
+pub(crate) fn normalize_membership_values(values: Vec<String>) -> Vec<String> {
+    normalize_membership_iter(values.iter().map(|s| s.as_str()))
+}
+
+/// Shared normalization logic that works over an iterator of string slices.
+fn normalize_membership_iter<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    values
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .collect()
+}
+
+/// Merge header-supplied and configured memberships.
+///
+/// Header values are kept exactly as given (order + duplicates), then normalized
+/// configured values are appended if not already present. Configured values are also
+/// deduplicated among themselves.
+pub fn merge_memberships(header: Vec<String>, configured: &[String]) -> Vec<String> {
+    // Start with header values exactly as given (duplicates and order preserved)
+    let mut result = header;
+
+    // Normalize configured values using shared helper (split, trim, filter empties, dedupe among themselves)
+    let normalized_config = normalize_membership_iter(configured.iter().map(String::as_str));
+
+    let mut seen_config = std::collections::HashSet::new();
+    for value in normalized_config {
+        // Check if already present in header (case-sensitive exact match)
+        let already_in_header = result.iter().any(|h| h == &value);
+        if !already_in_header {
+            // Also dedupe against already-added configured values
+            if seen_config.insert(value.clone()) {
+                result.push(value);
+            }
+        }
+    }
+
+    result
+}
+
 /// Header-only membership policy, separate from ordered user identity sources.
 ///
 /// No headers are trusted by default. Configure separate policies for groups and
@@ -36,20 +85,27 @@ impl MembershipHeaders {
     /// Errors never contain header values. Returned memberships are request-local,
     /// not session metadata.
     pub fn resolve(&self, headers: &HeaderMap) -> Result<Vec<String>, IdentityError> {
-        let mut memberships = Vec::new();
+        // Collect raw header values, fail closed if any invalid UTF-8
+        let mut raw_values = Vec::new();
+        let mut has_invalid = false;
+
         for name in &self.names {
             for field in headers.get_all(name) {
-                let value = field.to_str().map_err(|_| IdentityError::InvalidValue)?;
-                memberships.extend(
-                    value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|entry| !entry.is_empty())
-                        .map(String::from),
-                );
+                match field.to_str() {
+                    Ok(value) => raw_values.push(value),
+                    Err(_) => has_invalid = true,
+                }
             }
         }
-        Ok(memberships)
+
+        // Fail closed: any invalid UTF-8 rejects the whole extraction
+        if has_invalid {
+            return Err(IdentityError::InvalidValue);
+        }
+
+        Ok(normalize_membership_values(
+            raw_values.into_iter().map(String::from).collect(),
+        ))
     }
 }
 
@@ -181,5 +237,103 @@ mod tests {
         headers.insert("x-roles", HeaderValue::from_static("reviewer"));
         assert_eq!(groups.resolve(&headers).unwrap(), ["engineering"]);
         assert_eq!(roles.resolve(&headers).unwrap(), ["reviewer"]);
+    }
+
+    // Tests for normalize_membership_values and merge_memberships
+
+    #[test]
+    fn normalize_membership_values_basic() {
+        harnx_core::require_nextest();
+        let values = vec![
+            "engineering".into(),
+            "ops , support ".into(),
+            ",,admin,".into(),
+        ];
+        let result = normalize_membership_values(values);
+        assert_eq!(result, ["engineering", "ops", "support", "admin"]);
+    }
+
+    #[test]
+    fn normalize_membership_values_preserves_duplicates() {
+        harnx_core::require_nextest();
+        let values = vec!["ops,ops".into(), "ops".into()];
+        let result = normalize_membership_values(values);
+        assert_eq!(result, ["ops", "ops", "ops"]);
+    }
+
+    #[test]
+    fn normalize_membership_values_filters_empty() {
+        harnx_core::require_nextest();
+        let values = vec!["".into(), "   ".into(), ",,".into()];
+        let result = normalize_membership_values(values);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn merge_memberships_header_only() {
+        harnx_core::require_nextest();
+        let header = vec!["engineering".into(), "ops".into()];
+        let configured: Vec<String> = vec![];
+        let result = merge_memberships(header.clone(), &configured);
+        assert_eq!(result, header); // Order and duplicates preserved
+    }
+
+    #[test]
+    fn merge_memberships_header_only_with_duplicates() {
+        harnx_core::require_nextest();
+        let header = vec!["ops".into(), "ops".into(), "engineering".into()];
+        let configured: Vec<String> = vec![];
+        let result = merge_memberships(header.clone(), &configured);
+        assert_eq!(result, header); // All duplicates kept
+    }
+
+    #[test]
+    fn merge_memberships_config_only() {
+        harnx_core::require_nextest();
+        let header: Vec<String> = vec![];
+        let configured = vec!["engineering".into(), "ops".into()];
+        let result = merge_memberships(header, &configured);
+        assert_eq!(result, ["engineering", "ops"]);
+    }
+
+    #[test]
+    fn merge_memberships_config_only_with_commas_and_whitespace() {
+        harnx_core::require_nextest();
+        let header: Vec<String> = vec![];
+        let configured = vec!["engineering , ops ".into(), " support ".into()];
+        let result = merge_memberships(header, &configured);
+        // Normalized and deduplicated among configured
+        assert_eq!(result, ["engineering", "ops", "support"]);
+    }
+
+    #[test]
+    fn merge_memberships_overlap_no_new_duplicates() {
+        harnx_core::require_nextest();
+        let header = vec!["engineering".into(), "ops".into()];
+        let configured = vec!["ops".into(), "support".into()];
+        let result = merge_memberships(header, &configured);
+        // Header values kept, configured values added only if not in header
+        assert_eq!(result, ["engineering", "ops", "support"]);
+    }
+
+    #[test]
+    fn merge_memberships_config_deduplicates_itself() {
+        harnx_core::require_nextest();
+        let header: Vec<String> = vec![];
+        let configured = vec!["ops".into(), "ops".into(), "engineering".into()];
+        let result = merge_memberships(header, &configured);
+        // Deduplicated among configured
+        assert_eq!(result, ["ops", "engineering"]);
+    }
+
+    #[test]
+    fn merge_memberships_config_with_duplicates_in_header() {
+        harnx_core::require_nextest();
+        let header = vec!["ops".into(), "ops".into(), "engineering".into()];
+        let configured = vec!["ops".into(), "support".into()];
+        let result = merge_memberships(header, &configured);
+        // Header kept as-is (including its duplicates), configured added only if not present
+        // "ops" already in header, so only "support" added
+        assert_eq!(result, ["ops", "ops", "engineering", "support"]);
     }
 }

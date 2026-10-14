@@ -21,22 +21,31 @@ struct Fixture {
 
 impl Fixture {
     async fn start(rules: Option<&str>, aliases: Option<&str>) -> Result<Self> {
+        Self::start_with_memberships(
+            rules,
+            aliases,
+            MembershipSettings {
+                config: "serve_group_headers: [x-groups]\nserve_role_headers: [x-roles]\n",
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn start_with_memberships(
+        rules: Option<&str>,
+        aliases: Option<&str>,
+        memberships: MembershipSettings<'_>,
+    ) -> Result<Self> {
         harnx_core::require_nextest();
         let nats = common::spawn_nats_server()
             .await?
             .context("NATS required for alias integration")?;
         let client = async_nats::connect(nats.url()).await?;
         let store = SessionMetadataStore::ensure(&async_nats::jetstream::new(client), 1).await?;
-        let http = HttpFixture::start_with_user_aliases(
-            rules,
-            Some(nats.url()),
-            MembershipSettings {
-                config: "serve_group_headers: [x-groups]\nserve_role_headers: [x-roles]\n",
-                ..Default::default()
-            },
-            aliases,
-        )
-        .await?;
+        let http =
+            HttpFixture::start_with_user_aliases(rules, Some(nats.url()), memberships, aliases)
+                .await?;
         let fixture = Self {
             http,
             store,
@@ -353,7 +362,7 @@ async fn aliases_without_access_rules_keep_http_unrestricted_and_anonymous() -> 
 }
 
 #[tokio::test]
-async fn aliases_do_not_expand_memberships_or_replace_user_ownership() -> Result<()> {
+async fn aliases_membership_headers_do_not_expand_or_become_owner() -> Result<()> {
     let f = Fixture::start(Some(RULES), Some(ALIASES)).await?;
     for (groups, roles, allowed) in [
         ("alice, team", "", false),
@@ -414,5 +423,117 @@ async fn aliases_use_immutable_startup_snapshot_and_require_identity_with_rules(
         .send()
         .await?;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_group_admits_without_headers_but_role_and_unmatched_caller_do_not() -> Result<()>
+{
+    let rules = "rules:\n  - agents: [allowed]\n    groups: [engineering]\n  - agents: [blocked]\n    roles: [engineering]\n";
+    let aliases = "- name: Group member\n  identities: [alice]\n  groups: [engineering]\n- name: Role member\n  identities: [carol]\n  roles: [engineering]\n";
+    let f =
+        Fixture::start_with_memberships(Some(rules), Some(aliases), MembershipSettings::default())
+            .await?;
+    for (user, status) in [
+        ("alice", StatusCode::CREATED),
+        ("carol", StatusCode::NOT_FOUND),
+        ("unknown", StatusCode::NOT_FOUND),
+    ] {
+        let response = f
+            .request(Method::POST, "/v1/agents/allowed/sessions", Some(user))
+            .send()
+            .await?;
+        assert_eq!(response.status(), status, "{user}");
+        if status == StatusCode::CREATED {
+            let body: Value = response.json().await?;
+            let id = body["session_id"].as_str().context("created session")?;
+            assert_eq!(f.owner(id).await?.as_deref(), Some(user));
+            f.assert_session_status(id, Some(user), StatusCode::OK)
+                .await?;
+        }
+    }
+    // Same configured name grants via roles on a different agent, not groups.
+    let response = f
+        .request(Method::POST, "/v1/agents/blocked/sessions", Some("carol"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_prompt_memberships_combine_with_header_admin_group() -> Result<()> {
+    // Separate scopes make both sources observable: config admits creation,
+    // while the header permits access to another user's session.
+    let rules = "rules:\n  - agents: [allowed]\n    groups: [engineering]\n  - agents: [allowed]\n    roles: [reviewer]\n  - agents: [allowed]\n    groups: [operators]\n    scopes: [admin]\n";
+    let aliases = "- name: Group member\n  identities: [alice]\n  groups: [engineering]\n- name: Role member\n  identities: [carol]\n  roles: [reviewer]\n";
+    let f = Fixture::start(Some(rules), Some(aliases)).await?;
+    for user in ["alice", "carol"] {
+        f.assert_session_status("unrelated-owner", Some(user), StatusCode::NOT_FOUND)
+            .await?;
+        let response = f
+            .request(Method::POST, "/v1/agents/allowed/sessions", Some(user))
+            .header("x-groups", "operators")
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED, "{user}");
+        let body: Value = response.json().await?;
+        assert_eq!(
+            f.owner(body["session_id"].as_str().unwrap())
+                .await?
+                .as_deref(),
+            Some(user)
+        );
+        let response = f
+            .request(
+                Method::GET,
+                "/v1/agents/allowed/sessions/unrelated-owner/metadata",
+                Some(user),
+            )
+            .header("x-groups", "operators")
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{user}");
+    }
+    // Header admin alone must not accidentally satisfy the creation assertion.
+    let response = f
+        .request(Method::POST, "/v1/agents/allowed/sessions", Some("unknown"))
+        .header("x-groups", "operators")
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        f.owner("unrelated-owner").await?.as_deref(),
+        Some("unrelated")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_prompt_group_and_role_do_not_satisfy_session_ownership() -> Result<()> {
+    // Membership names equal the stored owner to catch namespace leakage.
+    let rules = "rules:\n  - agents: [allowed]\n    groups: [unrelated]\n  - agents: [allowed]\n    roles: [unrelated]\n";
+    let aliases = "- name: Group member\n  identities: [alice]\n  groups: [unrelated]\n- name: Role member\n  identities: [carol]\n  roles: [unrelated]\n";
+    let f =
+        Fixture::start_with_memberships(Some(rules), Some(aliases), MembershipSettings::default())
+            .await?;
+    for user in ["alice", "carol"] {
+        let response = f
+            .request(Method::POST, "/v1/agents/allowed/sessions", Some(user))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED, "{user}");
+        let body: Value = response.json().await?;
+        let id = body["session_id"].as_str().context("created session")?;
+        assert_eq!(f.owner(id).await?.as_deref(), Some(user));
+        f.assert_session_status(id, Some(user), StatusCode::OK)
+            .await?;
+        f.assert_session_status("unrelated-owner", Some(user), StatusCode::NOT_FOUND)
+            .await?;
+    }
+    assert_eq!(
+        f.owner("unrelated-owner").await?.as_deref(),
+        Some("unrelated")
+    );
     Ok(())
 }

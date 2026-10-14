@@ -521,7 +521,8 @@ In addition to user identity, `harnx-serve` can extract group and role membershi
 
 - **Startup loading**: Loaded once at startup via `config_paths::local_path("users.yaml")`. Missing `users.yaml` preserves default singleton identity behavior. An invalid present file fails startup immediately with path context. Modifying the file requires a server restart; there is no live reload.
 - **Caller authorization expansion**: An authenticated caller's identity expands into the first matching entry's `identities` list for agent access checks and session visibility under access rules. Overlapping entries do not merge (no transitive union).
-- **Session ownership preserved**: Session creation (`POST /v1/agents/{agent}/sessions`) stores the incoming caller's raw `user_id` in session metadata, never an alias entry name or other group identities. Stored session owners are never expanded.
+- **Configured groups and roles**: Entries can declare optional `groups` and `roles`. When a caller matches an entry, its configured memberships are merged into the request memberships (appended after header values and deduped) for matching against `access.yaml` rules. Configured values apply even when no membership headers are configured.
+- **Session ownership preserved**: Session creation (`POST /v1/agents/{agent}/sessions`) stores the incoming caller's raw `user_id` in session metadata, never an alias entry name or other group identities. Configured groups and roles never grant session ownership and are not stored in session metadata. Stored session owners are never expanded.
 - **Behavior without access rules**: When `access.yaml` is absent, `harnx-serve` operates without access restrictions; `users.yaml` alone does not restrict endpoints or session access.
 - **Security notice**: Because alias mappings expand caller permissions, `users.yaml` should be modified only by trusted operators.
 
