@@ -157,9 +157,12 @@ three times.
 Before every proxied bash/fs call, the gateway:
 
 1. loads the claim and best-effort extends a nearly expired shutdown time;
-2. changes a suspended backing `Sandbox` to `spec.operatingMode: Running`;
-3. waits for the claim's `Ready=True` condition and a pod IP; and
-4. updates the last-activity annotation.
+2. updates the last-activity annotation so an in-flight wake is not mistaken for idle;
+3. changes a suspended backing `Sandbox` to `spec.operatingMode: Running`;
+4. waits for the claim's `Ready=True` condition, sending keep-alive activity updates every 60 seconds while polling so slow starts stay protected;
+5. re-wakes the sandbox up to 2 recovery attempts (3 wakes total) if the idle watcher suspends it again during readiness, failing fast if suspensions continue;
+6. updates the last-activity annotation once ready; and
+7. resolves the sandbox pod IP.
 
 `sandbox_status` is observational: it neither wakes the sandbox, extends its
 TTL, nor updates activity. With `timeout_secs`, it polls until ready, deleted,

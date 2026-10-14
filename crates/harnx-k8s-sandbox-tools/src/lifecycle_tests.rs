@@ -23,6 +23,7 @@ struct MockState {
 struct MockApi {
     state: Mutex<MockState>,
     list_started: tokio::sync::Notify,
+    set_replicas_notify: tokio::sync::Notify,
 }
 
 impl MockApi {
@@ -94,6 +95,11 @@ impl SandboxApi for MockApi {
         if let Some(record) = state.records.get_mut(id) {
             record.replicas = Some(replicas);
         }
+        {
+            drop(state); // Release lock before notifying
+        }
+        // notify_one stores a permit, so a waiter registered after the wake still sees it.
+        self.set_replicas_notify.notify_one();
         Ok(())
     }
 

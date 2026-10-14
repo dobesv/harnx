@@ -11,11 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+mod activation;
 mod idle;
 mod status;
 mod wait;
 
-use status::{assess, deleted_status, ensure_waitable, pending_status};
+use activation::ActivationWait;
+use status::{assess, deleted_status, pending_status};
 use wait::{is_deadline, WaitContext};
 
 // Keep the existing activity annotation so upgraded gateways retain idle history.
@@ -164,8 +166,13 @@ impl SandboxManager {
             .await?
             .with_context(|| format!("sandbox not found: {id}"))?;
         self.maybe_extend(&record, &context).await;
-        self.wake_if_hibernated(id, &record, &context).await?;
-        let record = self.wait_until_ready(id, record, &context).await?;
+        self.retry_api(&context.with_operation("bump_activity"), || {
+            self.api.bump_activity(id, Utc::now())
+        })
+        .await?;
+        let woke = self.wake_if_hibernated(id, &record, &context).await?;
+        let activation = ActivationWait::new(record, woke);
+        let record = self.wait_until_ready(id, activation, &context).await?;
         let activity_time = Utc::now();
         let activity = context.with_operation("bump_activity");
         self.retry_api(&activity, || self.api.bump_activity(id, activity_time))
@@ -178,36 +185,15 @@ impl SandboxManager {
         id: &str,
         record: &SandboxRecord,
         context: &WaitContext<'_>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if record.sandbox_name.is_none() || record.replicas != Some(0) {
-            return Ok(());
+            return Ok(false);
         }
         let wake = context.with_operation("wake");
         self.retry_api(&wake, || self.api.set_replicas(id, 1))
             .await?;
         metrics::counter!("harnx_sandbox_wakes_total").increment(1);
-        Ok(())
-    }
-
-    async fn wait_until_ready(
-        &self,
-        id: &str,
-        mut record: SandboxRecord,
-        context: &WaitContext<'_>,
-    ) -> Result<SandboxRecord> {
-        let ready = context.with_operation("wait_until_ready");
-        loop {
-            let status = assess(&record);
-            if status.ready {
-                return Ok(record);
-            }
-            ensure_waitable(id, status)?;
-            self.wait(&ready, self.config.poll_interval).await?;
-            record = self
-                .retry_api(&ready, || self.api.get(id))
-                .await?
-                .with_context(|| format!("sandbox not found: {id}"))?;
-        }
+        Ok(true)
     }
 
     async fn wait_for_pod_ip(
