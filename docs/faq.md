@@ -67,6 +67,15 @@ Several things can prevent tool calls from working:
 
 3. **Input not related to available tools.** The LLM won't call tools if your prompt doesn't relate to any of the registered tool functions.
 
+## Why do sub-agent prompts run words together?
+
+A delegation prompt sometimes arrives with spaces missing, as in "reproducedOOMat2GBwith6–8KBanswers". The model wrote it that way. harnx keeps the text of tool-call arguments as the provider sent it, and for OpenAI and Codex models it logs a warning in `harnx.log` if the streamed arguments ever differ from the complete copy the API sends when the call finishes.
+
+Two things make this easy to misread:
+
+- **The status line shows the agent's configured model**, not a fallback that answered instead. `harnx.log` has an `llm_request` line for every attempt, naming the client and model (`gen_ai.system`, `gen_ai.request.model`), followed by `otel.status_code="ERROR"` when the attempt failed. Lines from different sessions interleave; the number after the log level is the worker's process id.
+- **Models copy the style of their own earlier messages.** Once a few squashed prompts are in the history, the next one tends to come out the same way or worse. Compacting the session (`.compact session` in the TUI, or `harnx compact session <agent> <session>`) replaces that history with a summary, which usually clears it.
+
 ## What is an agent?
 
 An agent is a Markdown file that combines a system prompt with model configuration, tools, variables, documents, and more. Agents are stored at `<harnx-config-dir>/agents/<name>.md` and use YAML front-matter for configuration.

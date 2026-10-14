@@ -591,6 +591,43 @@ fn responses_function_arguments_delta(state: &mut ResponsesStreamState, data: &V
     }
 }
 
+/// The event that finishes a call (`function_call_arguments.done` or
+/// `output_item.done`) carries the complete arguments string, so it replaces
+/// whatever the deltas assembled. The deltas stand in only when a provider
+/// leaves that string out or sends it empty.
+fn responses_adopt_final_arguments(
+    state: &mut ResponsesStreamState,
+    item_id: &str,
+    arguments: Option<&str>,
+) {
+    let Some(arguments) = arguments.filter(|arguments| !arguments.is_empty()) else {
+        return;
+    };
+    let Some(pending) = state.pending_tool_calls.get_mut(item_id) else {
+        return;
+    };
+    if pending.arguments == arguments {
+        return;
+    }
+    if !pending.arguments.is_empty() {
+        warn!(
+            "Tool call '{}': streamed arguments differ from the final arguments string; using the final string",
+            pending.name
+        );
+    }
+    pending.arguments = arguments.to_string();
+}
+
+fn responses_function_arguments_done(
+    state: &mut ResponsesStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    let item_id = data["item_id"].as_str().unwrap_or_default();
+    responses_adopt_final_arguments(state, item_id, data["arguments"].as_str());
+    responses_finalize_tool_call(state, handler, item_id)
+}
+
 fn responses_finalize_tool_call(
     state: &mut ResponsesStreamState,
     handler: &mut SseHandler,
@@ -625,7 +662,9 @@ fn responses_output_item_done(
             Ok(())
         }
         Some("function_call") => {
-            responses_finalize_tool_call(state, handler, item["id"].as_str().unwrap_or_default())
+            let item_id = item["id"].as_str().unwrap_or_default();
+            responses_adopt_final_arguments(state, item_id, item["arguments"].as_str());
+            responses_finalize_tool_call(state, handler, item_id)
         }
         _ => Ok(()),
     }
@@ -675,6 +714,7 @@ fn responses_stream_error(data: &Value) -> Result<()> {
 /// - `response.output_item.added`: Record new item (function_call or reasoning)
 /// - `response.function_call_arguments.delta`: Accumulate args for pending tool call
 /// - `response.function_call_arguments.done` / `response.output_item.done`: Finalize tool call
+///   with the event's complete `arguments` string
 /// - `response.completed`: Usage stats → `handler.set_usage`
 /// - Error events → `catch_error`
 ///
@@ -682,7 +722,8 @@ fn responses_stream_error(data: &Value) -> Result<()> {
 ///
 /// - Usage is nested under `data["response"]["usage"]` on `response.completed`
 /// - Reasoning `encrypted_content` is on the item under `data["encrypted_content"]`
-/// - Function call `arguments` arrives as JSON string deltas, finalized via `arguments.done`
+/// - Function call `arguments` arrives as JSON string deltas, and again in full on
+///   `arguments.done` and `output_item.done`; the full string wins when present
 pub(crate) fn openai_handle_responses_event(
     state: &mut ResponsesStreamState,
     handler: &mut SseHandler,
@@ -714,11 +755,7 @@ pub(crate) fn openai_handle_responses_event(
 
         // Function call arguments done: finalize and emit
         "response.function_call_arguments.done" => {
-            responses_finalize_tool_call(
-                state,
-                handler,
-                data["item_id"].as_str().unwrap_or_default(),
-            )?;
+            responses_function_arguments_done(state, handler, data)?;
         }
 
         // Output item done: capture reasoning encrypted_content, finalize function_call
@@ -1955,6 +1992,83 @@ mod tests {
         assert_eq!(calls[0].name, "get_weather");
         assert_eq!(calls[0].id, Some("call_abc".to_string()));
         assert_eq!(calls[0].arguments, json!({"city": "NYC"}));
+    }
+
+    /// Stream a `delegate` call whose argument deltas join to `{"message":"ab"}`.
+    fn stream_call_deltas(state: &mut ResponsesStreamState, handler: &mut crate::SseHandler) {
+        let events = [
+            (
+                "response.output_item.added",
+                json!({"item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "name": "delegate",
+                    "call_id": "call_1"
+                }}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"item_id": "fc_1", "delta": "{\"message\":\"a"}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"item_id": "fc_1", "delta": "b\"}"}),
+            ),
+        ];
+        for (event, data) in events {
+            openai_handle_responses_event(state, handler, event, &data).expect("Should handle");
+        }
+    }
+
+    #[test]
+    fn streaming_tool_call_takes_arguments_from_the_event_that_finishes_it() {
+        // The deltas join to "ab"; the complete string on the finishing event says "a b".
+        let finishing_events = [
+            (
+                "response.function_call_arguments.done",
+                json!({"item_id": "fc_1", "arguments": "{\"message\":\"a b\"}"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "name": "delegate",
+                    "call_id": "call_1",
+                    "arguments": "{\"message\":\"a b\"}"
+                }}),
+            ),
+        ];
+        for (event, data) in finishing_events {
+            let (mut handler, _rx) = test_handler();
+            let mut state = ResponsesStreamState::default();
+            stream_call_deltas(&mut state, &mut handler);
+            openai_handle_responses_event(&mut state, &mut handler, event, &data)
+                .expect("Should handle");
+
+            let (_text, _thought, calls, _usage) = handler.take();
+            assert_eq!(calls.len(), 1, "{event}");
+            assert_eq!(calls[0].arguments, json!({"message": "a b"}), "{event}");
+        }
+    }
+
+    #[test]
+    fn streaming_tool_call_keeps_streamed_arguments_when_final_string_is_empty() {
+        let (mut handler, _rx) = test_handler();
+        let mut state = ResponsesStreamState::default();
+        stream_call_deltas(&mut state, &mut handler);
+        let data = json!({"item_id": "fc_1", "arguments": ""});
+        openai_handle_responses_event(
+            &mut state,
+            &mut handler,
+            "response.function_call_arguments.done",
+            &data,
+        )
+        .expect("Should handle");
+
+        let (_text, _thought, calls, _usage) = handler.take();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, json!({"message": "ab"}));
     }
 
     #[test]
