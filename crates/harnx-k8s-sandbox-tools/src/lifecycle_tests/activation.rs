@@ -19,7 +19,8 @@ async fn ensure_active_wakes_extends_and_records_activity() {
     let state = api.state.lock();
     assert_eq!(state.replica_updates, [("claim-2".to_string(), 1)]);
     assert_eq!(state.shutdown_updates, ["claim-2"]);
-    assert_eq!(state.activity_updates, ["claim-2"]);
+    // Two bumps: pre-wake (before waiting) + post-ready (after pod is ready)
+    assert_eq!(state.activity_updates, ["claim-2", "claim-2"]);
 }
 
 #[tokio::test]

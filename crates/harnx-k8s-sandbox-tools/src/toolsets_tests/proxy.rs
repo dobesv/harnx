@@ -48,7 +48,11 @@ async fn proxy_requires_or_resolves_an_ambient_session_binding() -> Result<()> {
 
     assert_eq!(result["content"][0]["text"], "proxied");
     assert_eq!(fixture.api.seen_ids.lock().as_slice(), ["claim-ambient"]);
-    assert_eq!(fixture.api.activity.lock().as_slice(), ["claim-ambient"]);
+    // Two bumps: pre-wake (before waiting) + post-ready (after pod is ready)
+    assert_eq!(
+        fixture.api.activity.lock().as_slice(),
+        ["claim-ambient", "claim-ambient"]
+    );
     {
         let calls = fixture.caller.calls.lock();
         assert_eq!(calls.len(), 1);
