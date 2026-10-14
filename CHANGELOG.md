@@ -5,6 +5,110 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.15 (2026-10-14)
+
+### Features
+
+- add user alias configuration for HTTP and A2A callers (#2389)
+
+#### feat(a2a-server): add harnx-a2a-server binary for A2A 1.0 JSON-RPC and SSE agent exports (#2315)
+
+Add `harnx-a2a-server` to expose explicitly selected harnx agents over the Agent2Agent (A2A 1.0) protocol. Each agent receives a dedicated JSON-RPC endpoint and Agent Card under `/agents/{name}`.
+
+Key features:
+- **Server-allocated contexts**: Context IDs match durable harnx session IDs; task IDs use `{contextId}.{uuid}`.
+- **Durable task lifecycle**: Supervised turn execution with unary (`SendMessage`, `GetTask`, `CancelTask`, `ListTasks`) and SSE streaming (`SendStreamingMessage`, `SubscribeToTask`) methods.
+- **Message deduplication**: In-memory LRU cache for new sessions and session KV deduplication for subsequent turns by `messageId`.
+- **Payload mapping**: Structured data parts rendered as fenced JSON blocks for the LLM; inline image raw files passed as multimodal media inputs; rendered data capped by `--max-data-part-bytes`.
+- **Input compatibility**: Accepts A2A 0.3 method aliases, legacy `blocking`, and relaxed enum formats, emitting canonical A2A 1.0 responses.
+- **User isolation**: Optional `--user-id-header` mode ensures sessions and tasks are restricted to their authenticated owners.
+
+Task listing uses per-session metadata indexes and loads only requested page records (plus records needed for reconciliation or filters). Streaming keeps 100 ms deltas and fresh live snapshots for GetTask and reconnects, with intermediate artifact persistence at most every 2 seconds and full final persistence. Blocking sends wait on completion notifications instead of polling KV. After a server crash, interrupted tasks keep the last durable artifact snapshot, which can trail live output.
+
+New contexts start with empty task indexes without scanning the shared bucket. Task indexes migrate legacy sessions on first access. Stop old servers before starting a new version against the same bucket. After a downgrade to a pre-index build, delete affected sessions’ `a2a/index` keys before re-upgrading so they are rebuilt. Index size is bounded by the bucket/broker limit; terminal tasks are retained.
+
+#### feat(access): optional access rules for harnx-serve and harnx-a2a-server (#2316)
+
+Add optional identity-based access control rules (`access.yaml`) gating agents, sessions, and attachments in `harnx-serve` and `harnx-a2a-server`:
+- Load rules from `<config_dir>/access.yaml` or an explicit path via `--access-rules <PATH>` / `HARNX_ACCESS_RULES`. When no file is present and no flag/env is supplied, access control is disabled and existing behavior is preserved.
+- When access rules are active, require trusted caller identity sources (`serve_user_id_sources` / `--user-id-source` in `harnx-serve`, `--user-id-header` in `harnx-a2a-server`); startup fails closed if rules are active without configured identity sources.
+- Protected endpoints (`/v1/agents*` and `/v1/cid/*` in `harnx-serve`, all export and discovery routes in `harnx-a2a-server`) return HTTP 401 Unauthorized when a request lacks caller identity.
+- Rule matching uses case-sensitive whole-string globs across agent references and user identity strings (where `*` spans commas, supporting full DN strings). Rules define `prompt` and `admin` scopes (omitted scopes default to `[prompt]`). Matching scopes union across rules.
+- Agents without granted scope are hidden from listings and return 404 (or JSON-RPC `-32001` in A2A).
+- Gated session access: callers with `prompt` scope can create sessions and access sessions they own; callers with `admin` scope can view, operate, and compact any session (including legacy sessions without owner `user_id`). Creating a new session or context requires `prompt` scope; callers with only `admin` receive HTTP 403 in `harnx-serve` or JSON-RPC `-32010` in `harnx-a2a-server`.
+- In `harnx-serve`, callers must reserve a session ID via `POST /v1/agents/{agent}/sessions` before prompting when access rules are active.
+- Gated CID retrieval (`/v1/cid/*`): attachments and plans are authorized against the owning session's access rules. When rules are enabled, responses emit `Cache-Control: private, no-store` (operators should purge shared caches when turning rules on).
+- Agent reference matching: `harnx-serve` matches against display references (`agent` on the default cluster, `agent@cluster` otherwise); `harnx-a2a-server` matches against internal agent references (`agent` or `agent@cluster`), not public export aliases.
+
+#### feat(access): group and role access rules for harnx-serve and harnx-a2a-server (#2369)
+
+Extend trusted request identity and access control rules with group and role memberships:
+- Configure trusted group and role headers via `serve_group_headers` / `serve_role_headers` in `config.yaml`, environment variables `HARNX_SERVE_GROUP_HEADERS` / `HARNX_SERVE_ROLE_HEADERS`, or repeatable `--group-header <NAME>` and `--role-header <NAME>` CLI flags in `harnx-serve`.
+- Configure trusted group and role headers via repeatable `--group-header <NAME>` and `--role-header <NAME>` CLI flags in `harnx-a2a-server`.
+- No membership headers are trusted by default; unconfigured client headers are ignored. Header names are validated at startup.
+- All configured membership headers contribute values; repeated headers and comma-delimited tokens are split, trimmed, and empty tokens are dropped. Any header byte failing UTF-8 conversion fails closed immediately with HTTP 401 (JSON-RPC code `-32000`) without echoing header contents.
+- Access rules support distinct `users`, `groups`, and `roles` selector categories. Each category defaults to an empty list; rules require at least one non-empty selector category. Users, groups, and roles form distinct namespaces that never match across categories.
+- Rule matching uses OR semantics across selector categories: a rule matches when its agent glob matches and at least one user, group, or role selector matches. Caller scopes union across all matching rules.
+- Group and role rules can be group-only, role-only, or mixed with users. Existing user-only access rules remain fully compatible.
+- Memberships are request-local and evaluated per request; revoking or altering a membership takes effect on the next HTTP request and is never persisted in session metadata, task storage, or NATS properties.
+- Groups and roles do not replace caller authentication: protected endpoints still require a trusted user identity. Memberships grant scopes but never satisfy session ownership, which remains tied solely to immutable user IDs. Admin scope granted by any matching rule allows managing sessions across all users.
+
+#### feat(session): record user identity with each session (#2295)
+
+Add user identity tracking to canonical session metadata:
+- Store an opaque user identity string in session property `user_id` when a session is created. Identity is immutable and never overwritten on subsequent turns.
+- Configure default user identity globally via `user_id` in `config.yaml` or `HARNX_USER_ID` (including `.env`).
+- Configure cluster-level default user identity via `user_id` in `nats_servers/<cluster>.yaml`.
+- Support request-derived user identity in `harnx-serve` via `serve_user_id_sources` in `config.yaml`, `HARNX_SERVE_USER_ID_SOURCES`, or repeated `--user-id-source` CLI flags.
+- Identity sources support `header:NAME`, `cookie:NAME`, and bare `NAME` syntax with first-present-wins evaluation and fail-closed validation (HTTP 401 on empty or malformed values).
+- Expose `user_id` in `harnx-serve` session summaries and Web UI `SessionRef`.
+- Handoff sessions inherit the source session's `user_id`, like sub-agent sessions.
+- `session/cancel` on a session that was never prompted is now a no-op, and `session/compact` on one returns 404 (JSON-RPC `-32001`), so control calls can't create a session without its request identity.
+
+#### feat(access): optional startup user alias configuration (#2317)
+
+Add optional user alias configuration (`users.yaml`) to expand authenticated caller identities for access checks and session visibility in `harnx-serve` and `harnx-a2a-server`:
+- Load aliases once at startup from the default configuration directory (`<config_dir>/users.yaml`). When absent, alias expansion is skipped and callers retain their single authenticated identity. Present but malformed files (invalid YAML, empty, whitespace-only, comment-only, null documents, or schema violations) fail startup immediately with path context.
+- Configuration is a top-level YAML sequence of entries with required `name` and `identities` fields; unknown fields are rejected. The `name` field is display metadata, never treated as an authenticated principal. An empty sequence or empty `identities` list is a valid no-op.
+- Caller identity lookup scans entries in order and returns identities from the first matching entry. Matching is exact and case-sensitive. Overlapping entries do not merge (no transitive union), duplicate identities in an entry are silently accepted, and unmatched callers retain their singleton identity.
+- Expanded identities apply only to caller authorization checks (agent visibility and session access under access rules). Original caller identity is preserved: new sessions in `harnx-serve` record the incoming raw user ID in session metadata, and new contexts in `harnx-a2a-server` record the raw user ID in the A2A binding. Stored session owners are never expanded.
+- In `harnx-serve`, requests remain unrestricted when access rules (`access.yaml`) are absent; aliases alone never restrict access. In `harnx-a2a-server` without access rules, owner isolation checks accept stored owners contained in the caller's expanded identities, while preserving anonymous access and rejecting mixed anonymous/authenticated access.
+- Request-local group and role memberships remain unexpanded and distinct from user identities.
+- Alias configuration affects authorization boundaries and should be edited only by trusted operators.
+
+### Fixes
+
+- keep tests off the developer's shared local NATS broker (#2371)
+- let agents run the test suite inside harnx's sandbox (#2373)
+- update dependency @ag-ui/client to v1.0.2 (#2379)
+- run harnx-sandbox-run's integration tests and keep symlinked grants (#2378)
+- keep each session's cancel fence to its own log (#2393)
+- keep waking sandboxes alive against idle watcher (#2406)
+- Include buffered A2A output in the current artifact update when the coalescing deadline fires before inbox readiness is selected.
+- Preserve current group and role ACL facts across distributed A2A admission, cancellation, streams and waiters. Keep first-message dedup scoped to the caller's immutable principal, and keep the original session owner in recovery metadata when an admin admits a follow-up. Background recovery settles retained work after access revocation without persisting memberships or replaying missing prompts.
+- Fix conversation continuity after compaction (#2388). Model requests now include the stored summary before the retained conversation, without resurrecting archived turns or duplicating user messages after reload. Repeated compaction carries the prior summary forward. Workers skip re-logged copies of completed prompts by stable message ID and preserve new input arriving during compaction.
+- Persist exact A2A task cancellation across replicas and recover abandoned tasks from a durable background registry without client traffic. Recovery preserves durable completion, otherwise closes or interrupts the original invocation without replay. Broker uncertainty retains unresolved work; worker lease renewal doesn't prevent A2A takeover. Cross-replica intermediate streaming and coordinated global retention remain separate work.
+- Deliver A2A updates and blocking results through any replica using a durable one-event outbox and independent JetStream task readers. Each update commits its snapshot and cursor before publication; reconnects start with an authoritative snapshot, then contiguous updates. Retention gaps, broker failures and lag interrupt the reader instead of silently dropping deltas. Interrupted work isn't replayed. Global event/registry retention and production capacity calibration remain separate work.
+- Add fixed runtime admission tickets and non-executable closure for coordinated frontends. Delayed prompt appends cannot move past a closed admission, and retries resolve the original identity without duplicate prompts. Deploy readers that understand the new `admission_closed` transcript entry before enabling writers.
+- Fix an issue where waking sandboxes could be suspended by the idle watcher before becoming ready (#2405). The gateway now records activity before waking a sandbox and sends keep-alive activity updates every 60 seconds while waiting for readiness. If an idle scan suspends a sandbox during activation, the gateway re-wakes it up to two recovery times (three wake attempts total) or fails fast with an explanatory error instead of hanging for 30 minutes.
+- Commands harnx runs in its sandbox now see `HARNX_IN_SANDBOX=1`, so a tool that would start a sandbox of its own can tell it is already inside one. The test runner uses it to give tests a lighter sandbox there, so agents can run harnx's test suite from their bash tool.
+- `harnx-sandbox-run` now grants a path that is, or goes through, a symlink both as given and as it resolves, so it works by either name inside the sandbox. Before, only the resolved path was available on Linux. That also made `--no-defaults` fail on merged-/usr systems, where binaries reach their ELF interpreter through the `/lib64` symlink.
+- Coordinate A2A admission across replicas with create-only first-message reservations, scoped context ownership and fixed runtime tickets. Retries retain the same context/task/prompt IDs, and foreground recovery closes or stops abandoned admission without replay. Task writes now use owner-checked context CAS, with durable terminal projections before context reuse. Background supervision, remote cancellation and intermediate event streaming remain separate work; drain legacy active turns and exclude mixed writers when upgrading.
+- Fix the TUI transcript freezing mid-turn after a sub-agent was cancelled, for example by an invocation deadline, when only finished sub-agent rows kept appearing. Each session's live output is now fenced only by `Cancel` entries in its own log, so a cancelled child no longer hides live output from its parent or its siblings, an interrupted parent no longer hides it from later children, and switching sessions no longer carries the previous session's fence.
+
+#### Bound A2A task events with 128 MiB Limits/DiscardNew storage and checkpoint-covered cleanup that preserves publication predecessors. Coordinate session deletion with global message reservations, recovery discovery, task events and the scoped lease; refuse unsettled work instead of losing pending publication.
+
+Validate NATS stream policy at startup, enforce serialized authority/input/answer budgets, and export optional recovery diagnostics with `--metrics-addr`. Add real broker capacity, GC and backend/worker permission tests. Existing event streams need the documented drain and policy migration before startup; don't mix writers or automatically replay interrupted work.
+
+#### Show full, keyboard-selectable URLs from Markdown tool bodies, tool results,
+
+and subagent prompts and replies. Expose links in streamed assistant text before
+and between tool calls, without waiting for the final reply. Extract result links
+before preview truncation, including links added by custom result templates. Replace tool-body links on live
+updates and keep subagent reply links ordered and deduplicated on repeated events.
+Preserve tool-result detail pairing and match live link extraction when restoring
+session history.
+
 ## 0.34.14 (2026-10-06)
 
 ### Fixes

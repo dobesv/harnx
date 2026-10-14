@@ -1,6 +1,21 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.4.14 (2026-10-14)
+
+### Features
+
+- add user alias configuration for HTTP and A2A callers (#2389)
+
+### Fixes
+
+- keep tests off the developer's shared local NATS broker (#2371)
+- let agents run the test suite inside harnx's sandbox (#2373)
+- update dependency @ag-ui/client to v1.0.2 (#2379)
+- run harnx-sandbox-run's integration tests and keep symlinked grants (#2378)
+- keep each session's cancel fence to its own log (#2393)
+- keep waking sandboxes alive against idle watcher (#2406)
+
 ## 0.4.13 (2026-10-06)
 
 ### Features
