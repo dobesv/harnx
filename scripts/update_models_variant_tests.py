@@ -40,7 +40,7 @@ class TestOpenAIEffortVariants(unittest.TestCase):
             patch = variant["patches"][0]
             self.assertIn("del(.body.temperature)", patch)
             self.assertIn("del(.body.top_p)", patch)
-            self.assertIn(f'{{"effort":"{effort}"}}', patch)
+            self.assertIn(f'{{"effort":"{effort}","summary":"auto"}}', patch)
 
     def test_base_patch_is_programmatic(self) -> None:
         for name in (
@@ -56,7 +56,10 @@ class TestOpenAIEffortVariants(unittest.TestCase):
                 model = self._base(name)
                 model["patches"] = ["stale"]
                 um.apply_openai_base_patches(model, "openai")
-                self.assertEqual(model["patches"], [um.OPENAI_NO_SAMPLING_PATCH])
+                self.assertEqual(
+                    model["patches"],
+                    [f'{um.OPENAI_NO_SAMPLING_PATCH} | .body.reasoning = {{"summary":"auto"}}'],
+                )
 
     def test_astra_exposes_high_and_max_with_refreshed_prices(self) -> None:
         base = self._base("gpt-6-astra")
@@ -103,9 +106,174 @@ class TestOpenAIEffortVariants(unittest.TestCase):
 
 
 class TestProviderModelRegeneration(unittest.TestCase):
+    def _refresh_catalog(self, provider: str, old: dict[str, dict]) -> dict[str, dict]:
+        # Simulate registry data without harnx fields or generated aliases, so
+        # preservation must go through both the field merge and the generator.
+        fetched = {
+            name: um.merge_old_fields(
+                {key: value for key, value in model.items() if key not in um.HARNX_ONLY_FIELDS},
+                model,
+            )
+            for name, model in old.items()
+            if not um.is_generated_variant_name(provider, name)
+        }
+        return {
+            model["name"]: model
+            for model in um.regenerate_provider_models(provider, old, fetched, [])
+        }
+
+    def _assert_request_settings_preserved(self, old: dict, refreshed: dict) -> None:
+        for field in ("patches", "max_output_tokens", "require_max_tokens", "real_name"):
+            self.assertEqual(refreshed.get(field), old.get(field), field)
+
+    def test_claude_summary_patches_survive_refresh_and_alias_regeneration(self) -> None:
+        _, providers = um.load_existing_data()
+        for provider, minimum_summarized in (("claude", 36), ("vertexai", 58)):
+            old = providers[provider]
+            refreshed = self._refresh_catalog(provider, old)
+            checked = 0
+            for name, model in old.items():
+                if not name.startswith("claude-"):
+                    continue
+                with self.subTest(provider=provider, name=name):
+                    self._assert_request_settings_preserved(model, refreshed[name])
+                if any('"display":"summarized"' in patch for patch in model.get("patches", [])):
+                    checked += 1
+            self.assertGreaterEqual(checked, minimum_summarized, provider)
+
+    def test_bedrock_summary_patches_survive_refresh_without_changing_older_models(self) -> None:
+        _, providers = um.load_existing_data()
+        old = providers["bedrock"]
+        refreshed = self._refresh_catalog("bedrock", old)
+        summarized = set()
+        older_thinking = 0
+        for name, model in old.items():
+            if not name.startswith("us.anthropic.claude-"):
+                continue
+            with self.subTest(name=name):
+                self._assert_request_settings_preserved(model, refreshed[name])
+            patches = model.get("patches", [])
+            if any('"display":"summarized"' in patch for patch in patches):
+                summarized.add(name)
+            elif name.endswith(":thinking"):
+                older_thinking += 1
+                with self.subTest(older_alias=name):
+                    self.assertNotIn("display", " ".join(refreshed[name]["patches"]))
+        self.assertEqual(summarized, {
+            "us.anthropic.claude-fable-5:thinking",
+            "us.anthropic.claude-fable-5-1:thinking",
+            "us.anthropic.claude-opus-5:thinking",
+            "us.anthropic.claude-sonnet-5:thinking",
+            "us.anthropic.claude-sonnet-5-5:thinking",
+        })
+        self.assertGreater(older_thinking, 0)
+
+    def test_openai_summary_patches_survive_refresh_and_alias_regeneration(self) -> None:
+        _, providers = um.load_existing_data()
+        old = providers["openai"]
+        fetched = {
+            name: um.merge_old_fields(
+                {key: value for key, value in model.items() if key not in um.HARNX_ONLY_FIELDS},
+                model,
+            )
+            for name, model in old.items()
+            if not um.is_generated_variant_name("openai", name)
+        }
+        regenerated = {
+            model["name"]: model
+            for model in um.regenerate_provider_models("openai", old, fetched, [])
+        }
+        checked = 0
+        for name, model in old.items():
+            if model.get("endpoint") != "responses":
+                continue
+            with self.subTest(name=name):
+                self.assertEqual(regenerated[name].get("patches"), model.get("patches"))
+            if any('"summary":"auto"' in patch for patch in model.get("patches", [])):
+                checked += 1
+        self.assertGreater(checked, 0)
+
+    def _assert_gemini_provider_patches_survive_refresh(
+        self, provider: str, models: dict[str, dict]
+    ) -> int:
+        old = {
+            name: model
+            for name, model in models.items()
+            if not name.startswith("claude-")
+        }
+        fetched = {
+            name: um.merge_old_fields(
+                {key: value for key, value in model.items() if key not in um.HARNX_ONLY_FIELDS},
+                model,
+            )
+            for name, model in old.items()
+        }
+        regenerated = {
+            model["name"]: model
+            for model in um.regenerate_provider_models(provider, old, fetched, [])
+        }
+        checked = 0
+        for name, model in old.items():
+            with self.subTest(provider=provider, name=name):
+                self.assertEqual(regenerated[name].get("patches"), model.get("patches"))
+            if any('"includeThoughts":true' in patch for patch in model.get("patches", [])):
+                checked += 1
+        return checked
+
+    def test_gemini_thought_patches_survive_refresh(self) -> None:
+        _, providers = um.load_existing_data()
+        checked = sum(
+            self._assert_gemini_provider_patches_survive_refresh(provider, providers[provider])
+            for provider in ("gemini", "vertexai")
+        )
+        self.assertGreaterEqual(checked, 25)
+
+    def test_unowned_gemini_alias_keeps_its_own_thinking_patch(self) -> None:
+        base_name = "gemini-2.5-pro"
+        alias_name = f"{base_name}:high"
+        patch = (
+            '.body.generationConfig.thinkingConfig = '
+            '{"thinkingLevel":"high","includeThoughts":true}'
+        )
+        for provider in ("gemini", "vertexai"):
+            old = {alias_name: {"name": alias_name, "real_name": base_name, "patches": [patch]}}
+            regenerated = {
+                model["name"]: model
+                for model in um.regenerate_provider_models(provider, old, {base_name: {"name": base_name}}, [])
+            }
+            self.assertEqual(regenerated[alias_name], old[alias_name])
+            self.assertNotIn("patches", regenerated[base_name])
+
     def test_bedrock_opus_5_5_does_not_generate_fixed_budget_variant(self) -> None:
         name = "us.anthropic.claude-opus-5-5"
         self.assertEqual(um.thinking_variants({"name": name}, "bedrock"), [])
+
+    def test_bedrock_sonnet_5_5_adaptive_correction_survives_regeneration(self) -> None:
+        _, providers = um.load_existing_data()
+        name = "us.anthropic.claude-sonnet-5-5"
+        alias = f"{name}:thinking"
+        old = {key: providers["bedrock"][key] for key in (name, alias)}
+        fetched = {name: dict(old[name], input_price=3)}
+        regenerated = {
+            model["name"]: model
+            for model in um.regenerate_provider_models("bedrock", old, fetched, [])
+        }
+        variant = regenerated[alias]
+        self.assertEqual(variant["patches"], old[alias]["patches"])
+        self.assertEqual(variant["real_name"], name)
+        self.assertEqual(variant["max_output_tokens"], 24000)
+        self.assertTrue(variant["require_max_tokens"])
+        self.assertEqual(variant["input_price"], 3)
+        patch = variant["patches"][0]
+        self.assertIn('"type":"adaptive","display":"summarized"', patch)
+        self.assertIn('"output_config":{"effort":"high"}', patch)
+        self.assertNotIn("budget_tokens", patch)
+        self.assertNotIn("patches", regenerated[name])
+        self.assertEqual(regenerated[name]["max_output_tokens"], 128000)
+
+        # Only the probed model changes; don't migrate older aliases here.
+        older = um.thinking_variants({"name": "us.anthropic.claude-sonnet-4-6"}, "bedrock")[0]
+        self.assertIn('"type":"enabled","budget_tokens":16000', older["patches"][0])
 
     def test_adaptive_models_regenerate_variants_with_required_limit(self) -> None:
         for name, input_price, base_effort in (
@@ -171,7 +339,8 @@ class TestProviderModelRegeneration(unittest.TestCase):
         self.assertEqual(by_name["gpt-5.6-sol:max"]["output_price"], 20)
         self.assertEqual(by_name["custom:max"]["patches"], [".body.custom = true"])
         self.assertEqual(
-            by_name["gpt-5.6-sol"]["patches"], [um.OPENAI_NO_SAMPLING_PATCH]
+            by_name["gpt-5.6-sol"]["patches"],
+            [f'{um.OPENAI_NO_SAMPLING_PATCH} | .body.reasoning = {{"summary":"auto"}}'],
         )
         self.assertEqual(len(warnings), 1)
         self.assertIn("custom:max", warnings[0])

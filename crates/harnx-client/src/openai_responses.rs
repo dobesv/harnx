@@ -104,9 +104,10 @@ fn responses_tool_history_items(
 /// - `store`: hard default `false` (server default is `true`).
 /// - `include`: always `["reasoning.encrypted_content"]`.
 /// - `max_output_tokens`: from `model.max_tokens_param()`, clamped to min 16.
-/// - `reasoning`: NOT emitted by this builder; alias patches assign the whole
-///   object, e.g. `.body.reasoning = {"effort":"high"}`. jaq won't create the
-///   missing parent for `.body.reasoning.effort = ...`.
+/// - `reasoning`: NOT emitted by this builder; catalog patches own effort and summary.
+///   They assign the whole object, e.g.
+///   `.body.reasoning = {"effort":"high","summary":"auto"}`, because jaq won't create
+///   the missing parent for `.body.reasoning.effort = ...`.
 /// - `temperature`/`top_p`: included only if provided; alias patches may `del(.body.temperature)`
 ///   for reasoning models that reject these params.
 /// - `seed`: NOT supported by Responses API; never emitted.
@@ -2185,6 +2186,130 @@ mod tests {
         );
     }
 
+    fn summary_and_encrypted_reasoning_events() -> [(&'static str, Value); 8] {
+        [
+            (
+                "response.output_item.added",
+                json!({"item": {"type": "reasoning", "id": "rs_summary"}}),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({"item_id": "rs_summary", "delta": "Analyzing "}),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({"item_id": "rs_summary", "delta": "the request."}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"item": {
+                    "type": "reasoning",
+                    "id": "rs_summary",
+                    "summary": [{"type": "summary_text", "text": "Analyzing the request."}],
+                    "encrypted_content": "ENCRYPTED_SUMMARY_BLOB"
+                }}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"item": {
+                    "type": "function_call", "id": "fc_summary",
+                    "call_id": "call_summary", "name": "search"
+                }}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"item_id": "fc_summary", "delta": "{\"q\":\"test\"}"}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"item_id": "fc_summary"}),
+            ),
+            ("response.completed", json!({"response": {}})),
+        ]
+    }
+
+    fn assert_streamed_summary_call(
+        text: &str,
+        thought: Option<&str>,
+        calls: &[ToolCall],
+        model: &Model,
+    ) {
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance};
+
+        assert_eq!(
+            (text, thought, calls.len()),
+            ("", Some("Analyzing the request."), 1)
+        );
+        let call = &calls[0];
+        assert_eq!(
+            (
+                &call.arguments,
+                call.thought_signature.as_deref(),
+                &call.reasoning_provenance
+            ),
+            (
+                &json!({"q": "test"}),
+                Some("ENCRYPTED_SUMMARY_BLOB"),
+                &Some(ReasoningProvenance {
+                    protocol: ReasoningProtocol::OpenAiEncryptedReasoning,
+                    model: Some(model.real_name().to_string()),
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn test_streaming_summary_and_encrypted_reasoning_roundtrip() {
+        let model = test_model();
+        let (mut handler, mut rx) = test_handler();
+        let mut state = ResponsesStreamState::for_model(&model);
+        let events = summary_and_encrypted_reasoning_events();
+        for (event_type, data) in events {
+            openai_handle_responses_event(&mut state, &mut handler, event_type, &data).unwrap();
+        }
+
+        assert!(
+            matches!(rx.try_recv().unwrap(), crate::SseEvent::Text(text) if text == "<think>\nAnalyzing ")
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), crate::SseEvent::Text(text) if text == "the request.")
+        );
+        let (text, thought, calls, _usage) = handler.take();
+        assert_streamed_summary_call(&text, thought.as_deref(), &calls, &model);
+
+        let body = openai_build_responses_body(
+            ChatCompletionsData {
+                messages: vec![Message::new(
+                    MessageRole::Tool,
+                    MessageContent::ToolCalls(MessageContentToolCalls::new(
+                        calls
+                            .into_iter()
+                            .map(|call| ToolResult::new(call, json!({"ok": true})))
+                            .collect(),
+                        text,
+                        thought,
+                    )),
+                )],
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: None,
+            },
+            &model,
+        );
+        assert_eq!(
+            imported_items(&body, "reasoning"),
+            vec![&json!({
+                "type": "reasoning",
+                "encrypted_content": "ENCRYPTED_SUMMARY_BLOB",
+                "summary": [],
+            })]
+        );
+        assert!(!body.to_string().contains("Analyzing the request."));
+        assert_eq!(assert_matching_correlation_ids(&body), ["call_summary"]);
+    }
+
     #[test]
     fn test_streaming_completed_without_usage_preserves_existing_usage() {
         let (mut handler, _rx) = test_handler();
@@ -2966,6 +3091,27 @@ mod tests {
         let body = imported_history_body(vec![legacy]);
         assert_imported_without_reasoning(&body, "legacy-signature");
         assert_eq!(assert_matching_correlation_ids(&body), ["legacy-call"]);
+    }
+
+    #[test]
+    fn openai_builder_omits_summary_only_reasoning_without_encrypted_content() {
+        let model = test_model();
+        for provenance in [None, Some(openai_reasoning_provenance(model.real_name()))] {
+            let call = ToolCall::new(
+                "SummaryOnlyTool".to_string(),
+                json!({}),
+                Some("summary-only-call".to_string()),
+                None,
+            )
+            .with_provenance(provenance);
+            let body = imported_history_body(vec![call]);
+            assert!(imported_items(&body, "reasoning").is_empty());
+            assert!(!body.to_string().contains("foreign thought"));
+            assert_eq!(
+                assert_matching_correlation_ids(&body),
+                ["summary-only-call"]
+            );
+        }
     }
 
     #[test]

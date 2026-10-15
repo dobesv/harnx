@@ -567,7 +567,7 @@ Compatibility rules (verified in `ToolCall::compatible_signature`):
 
 Import handling when signature is incompatible or unknown (legacy sessions lack provenance):
 - **Gemini**: first `functionCall` of each step must carry `thoughtSignature`. Use placeholder
-  `"skip_thought_signature_validator"` for imported/unknown history (per Google docs).
+  `"skip_thought_signature_validator"` for imported/unknown history (per Google docs). Thought text parts (`{"text": "...", "thought": true}`) are routed to thought rather than answer text; replay emits that shape, while `thoughtSignature` remains on the first `functionCall` part.
 - **Anthropic**: omit the `thinking` block entirely. Missing signature → 400.
 - **OpenAI**: omit the `reasoning` input item. Safe because harnx uses `function_call` with
   `call_id`, not OpenAI-internal `id`/`fc_` which would trigger reasoning-pairing validation.
@@ -620,6 +620,8 @@ Read a Bedrock model card's "Usage Considerations and Limitations" before
 adopting it, and probe a *two-turn tool-calling* exchange against the client
 type you actually deploy. A single-turn smoke test cannot reproduce this class
 of failure, and a probe on one client type says nothing about the other.
+To verify reasoning summaries, streaming, and tool replay across providers,
+run the live probe script (`scripts/probe_reasoning_summaries.*`).
 
 
 ### Adding a Provider Client

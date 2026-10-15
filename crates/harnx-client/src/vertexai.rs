@@ -1,17 +1,17 @@
 use crate::access_token::*;
 use crate::claude::*;
+pub use crate::gemini_upload::GeminiAttachmentEncoder;
 use crate::openai::*;
 use crate::*;
-use harnx_core::tool::ToolCall;
-pub use crate::gemini_upload::GeminiAttachmentEncoder;
 use harnx_core::attachments::ExpandedAttachment;
+use harnx_core::tool::ToolCall;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration, Utc};
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{path::PathBuf, str::FromStr, collections::HashMap};
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 pub const GEMINI_IMPORTED_HISTORY_PLACEHOLDER: &str = "skip_thought_signature_validator";
 
@@ -122,7 +122,9 @@ fn prepare_chat_completions(
     let body = match model_category {
         // Vertex AI does NOT support Gemini Files API; images must be base64-inlined.
         // The runtime base64 pre-pass handles this (expands all cid: to data: URLs).
-        ModelCategory::Gemini => gemini_build_chat_completions_body(data, &self_.model, HashMap::new())?,
+        ModelCategory::Gemini => {
+            gemini_build_chat_completions_body(data, &self_.model, HashMap::new())?
+        }
         ModelCategory::Claude => {
             let mut body = claude_build_chat_completions_body(data, &self_.model, &HashMap::new())?;
             if let Some(body_obj) = body.as_object_mut() {
@@ -191,14 +193,20 @@ pub async fn gemini_chat_completions(
     gemini_extract_chat_completions_text(&data, model)
 }
 
-fn gemini_handle_part(handler: &mut SseHandler, part: &Value, index: usize, model: &Model) -> Result<()> {
-    if let Some(text) = part["text"].as_str() {
+fn gemini_handle_part(
+    handler: &mut SseHandler,
+    part: &Value,
+    index: usize,
+    model: &Model,
+) -> Result<()> {
+    // String-valued `thought` was a local fixture format, not a Gemini wire part.
+    if let (Some(true), Some(thought)) = (part["thought"].as_bool(), part["text"].as_str()) {
+        handler.thought(thought)?;
+    } else if let Some(text) = part["text"].as_str() {
         if index > 0 {
             handler.text("\n\n")?;
         }
         handler.text(text)?;
-    } else if let Some(thought) = part["thought"].as_str() {
-        handler.thought(thought)?;
     } else if let (Some(name), Some(args)) = (
         part["functionCall"]["name"].as_str(),
         part["functionCall"]["args"].as_object(),
@@ -237,8 +245,13 @@ fn gemini_handle_stream_chunk(handler: &mut SseHandler, data: &Value, model: &Mo
         return crate::catch_error(data, 500, None);
     }
     if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
-        for (i, part) in parts.iter().enumerate() {
-            gemini_handle_part(handler, part, i, model)?;
+        // Thought and tool-call parts must not add leading answer separators.
+        let mut text_index = 0;
+        for part in parts {
+            gemini_handle_part(handler, part, text_index, model)?;
+            if part["text"].is_string() && part["thought"].as_bool() != Some(true) {
+                text_index += 1;
+            }
         }
     } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
         .as_str()
@@ -316,17 +329,20 @@ struct EmbeddingsResBodyPredictionEmbeddings {
     values: Vec<f32>,
 }
 
-fn gemini_extract_chat_completions_text(data: &Value, model: &Model) -> Result<ChatCompletionsOutput> {
+fn gemini_extract_chat_completions_text(
+    data: &Value,
+    model: &Model,
+) -> Result<ChatCompletionsOutput> {
     let mut text_parts = vec![];
     let mut thought_parts = vec![];
     let mut tool_calls = vec![];
     if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
         for part in parts {
-            if let Some(text) = part["text"].as_str() {
-                text_parts.push(text);
-            }
-            if let Some(thought) = part["thought"].as_str() {
+            if let (Some(true), Some(thought)) = (part["thought"].as_bool(), part["text"].as_str())
+            {
                 thought_parts.push(thought);
+            } else if let Some(text) = part["text"].as_str() {
+                text_parts.push(text);
             }
             if let (Some(name), Some(args)) = (
                 part["functionCall"]["name"].as_str(),
@@ -387,7 +403,7 @@ fn gemini_extract_chat_completions_text(data: &Value, model: &Model) -> Result<C
 }
 
 /// Builds the request body for Gemini chat completions.
-/// 
+///
 /// For Gemini native (API key auth): expands `cid:` refs to `fileData` (via pre-expansion)
 /// or `inlineData` (fallback). The caller pre-expands cid: refs and passes the map.
 ///
@@ -403,7 +419,7 @@ pub fn gemini_build_chat_completions_body(
         top_p,
         functions,
         stream: _,
-        attachments_dir: _,  // Already used for expansion, don't need it here
+        attachments_dir: _, // Already used for expansion, don't need it here
     } = data;
 
     // Use ExpandedAttachment to emit proper JSON
@@ -420,9 +436,7 @@ pub fn gemini_build_chat_completions_body(
         if let Some(expanded) = expanded_attachments.get(url) {
             match expanded {
                 ExpandedAttachment::RemoteRef {
-                    ref_id,
-                    mime_type,
-                    ..
+                    ref_id, mime_type, ..
                 } => json!({ "fileData": { "mimeType": mime_type, "fileUri": ref_id } }),
                 ExpandedAttachment::DataUri { data, mime_type } => {
                     json!({ "inlineData": { "mimeType": mime_type, "data": data } })
@@ -481,9 +495,9 @@ pub fn gemini_build_chat_completions_body(
                                 model.real_name(),
                             ).is_some()
                         }).unwrap_or(false);
-                        if let Some(thought) = thought {
+                        if let Some(thought) = thought.filter(|thought| !thought.is_empty()) {
                             if is_gemini_native {
-                                model_parts.push(json!({ "thought": thought }));
+                                model_parts.push(json!({ "text": thought, "thought": true }));
                             }
                         }
                         if !text.is_empty() {
@@ -584,13 +598,10 @@ pub fn gemini_build_chat_completions_body(
         );
     }
 
-    let mut body = json!({ "contents": contents, "generationConfig": {} }); 
+    let mut body = json!({ "contents": contents, "generationConfig": {} });
 
     if let Some(parts) = system_message {
-        let gemini_parts: Vec<Value> = parts
-            .iter()
-            .map(|text| json!({"text": text}))
-            .collect();
+        let gemini_parts: Vec<Value> = parts.iter().map(|text| json!({"text": text})).collect();
         body["systemInstruction"] = json!({"parts": gemini_parts});
     }
 
@@ -743,7 +754,6 @@ fn strip_model_version(name: &str) -> &str {
     }
 }
 
-
 /// A tool-result turn is serialized as a `user` role turn whose parts carry
 /// `functionResponse` objects (Gemini only accepts `user`/`model` roles).
 /// Tests locate that turn by its payload rather than a role string.
@@ -817,7 +827,8 @@ mod tests {
             None,
         );
         first_tool_call.thought_signature = Some("sig_1".to_string());
-        let mut first_tool_result = harnx_core::tool::ToolResult::new(first_tool_call, json!({"status": "ok"}));
+        let mut first_tool_result =
+            harnx_core::tool::ToolResult::new(first_tool_call, json!({"status": "ok"}));
         first_tool_result.content = vec![MessageContentPart::ImageUrl {
             image_url: ImageUrl {
                 url: "data:image/png;base64,aGVsbG8=".to_string(),
@@ -830,7 +841,8 @@ mod tests {
             Some("call_2".to_string()),
             None,
         );
-        let second_tool_result = harnx_core::tool::ToolResult::new(second_tool_call, json!({"status": "ok2"}));
+        let second_tool_result =
+            harnx_core::tool::ToolResult::new(second_tool_call, json!({"status": "ok2"}));
 
         let messages = vec![
             Message::new(
@@ -867,12 +879,32 @@ mod tests {
             .expect("tool results must serialize to a functionResponse turn");
         assert_eq!(function_turn["role"], "user");
         let parts = function_turn["parts"].as_array().unwrap();
+        assert_gemini_tool_image_parts(parts);
+    }
+
+    fn assert_gemini_tool_image_parts(parts: &[Value]) {
         assert_eq!(parts.len(), 4);
-        assert_eq!(parts[0]["functionResponse"]["name"], "first_tool");
-        assert_eq!(parts[1]["functionResponse"]["name"], "second_tool");
-        assert_eq!(parts[2]["text"], "[Tool first_tool returned image]");
-        assert_eq!(parts[3]["inlineData"]["mimeType"], "image/png");
-        assert_eq!(parts[3]["inlineData"]["data"], "aGVsbG8=");
+        let response_names = [
+            &parts[0]["functionResponse"]["name"],
+            &parts[1]["functionResponse"]["name"],
+        ];
+        assert_eq!(
+            response_names,
+            [&json!("first_tool"), &json!("second_tool")]
+        );
+        let image_fields = [
+            &parts[2]["text"],
+            &parts[3]["inlineData"]["mimeType"],
+            &parts[3]["inlineData"]["data"],
+        ];
+        assert_eq!(
+            image_fields,
+            [
+                &json!("[Tool first_tool returned image]"),
+                &json!("image/png"),
+                &json!("aGVsbG8=")
+            ]
+        );
     }
 
     #[test]
@@ -982,7 +1014,8 @@ mod tests {
             ]}}]
         });
         let model = Model::new("vertexai", "gemini-2.0-flash");
-        gemini_handle_stream_chunk(&mut handler, &chunk, &model).expect("stream chunk should process");
+        gemini_handle_stream_chunk(&mut handler, &chunk, &model)
+            .expect("stream chunk should process");
 
         let calls = handler.tool_calls();
         assert_eq!(calls.len(), 2);
@@ -990,12 +1023,118 @@ mod tests {
         assert_eq!(calls[1].arguments, json!({"cmd": "ls"}));
     }
 
+    #[test]
+    fn boolean_thought_flag_does_not_hide_function_call_signature() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let response = json!({
+            "candidates": [{"content": {"parts": [{
+                "functionCall": {"name": "Bash", "args": {"cmd": "pwd"}},
+                "thought": true,
+                "thoughtSignature": "sig_gemini_xyz"
+            }]}}]
+        });
+        let model = Model::new("gemini", "gemini-2.5-pro");
+
+        gemini_handle_stream_chunk(&mut handler, &response, &model).unwrap();
+        let (_, _, tool_calls, _) = handler.take();
+        let output = gemini_extract_chat_completions_text(&response, &model).unwrap();
+
+        for calls in [tool_calls, output.tool_calls] {
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].thought_signature.as_deref(),
+                Some("sig_gemini_xyz")
+            );
+            assert!(calls[0].reasoning_provenance.is_some());
+        }
+    }
+
+    #[test]
+    fn streaming_boolean_thought_parts_are_separate_from_answer() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let response = json!({
+            "candidates": [{"content": {"parts": [
+                {"text": "plan A", "thought": true},
+                {"text": "answer"}
+            ]}}]
+        });
+        let model = Model::new("gemini", "gemini-2.5-pro");
+
+        gemini_handle_stream_chunk(&mut handler, &response, &model).unwrap();
+
+        let (text, thought, tool_calls, _) = handler.take();
+        assert_eq!(thought.as_deref(), Some("plan A"));
+        assert_eq!(text, "answer");
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn non_streaming_boolean_thought_parts_are_separate_from_answer() {
+        let response = json!({
+            "candidates": [{"content": {"parts": [
+                {"text": "plan A", "thought": true},
+                {"text": "answer"}
+            ]}}]
+        });
+        let model = Model::new("gemini", "gemini-2.5-pro");
+
+        let output = gemini_extract_chat_completions_text(&response, &model).unwrap();
+
+        assert_eq!(output.thought.as_deref(), Some("plan A"));
+        assert_eq!(output.text, "answer");
+        assert!(output.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn false_thought_flag_is_answer_text_in_streaming_and_non_streaming() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let response = json!({
+            "candidates": [{"content": {"parts": [
+                {"text": "x", "thought": false}
+            ]}}]
+        });
+        let model = Model::new("gemini", "gemini-2.5-pro");
+
+        gemini_handle_stream_chunk(&mut handler, &response, &model).unwrap();
+        let (text, thought, _, _) = handler.take();
+        assert_eq!(text, "x");
+        assert_eq!(thought, None);
+
+        let output = gemini_extract_chat_completions_text(&response, &model).unwrap();
+        assert_eq!(output.text, "x");
+        assert_eq!(output.thought, None);
+    }
+
+    #[test]
+    fn streaming_separates_answer_parts_without_counting_thought_parts() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let response = json!({
+            "candidates": [{"content": {"parts": [
+                {"text": "plan A", "thought": true},
+                {"text": "answer"},
+                {"text": "plan B", "thought": true},
+                {"text": "x", "thought": false}
+            ]}}]
+        });
+        let model = Model::new("gemini", "gemini-2.5-pro");
+
+        gemini_handle_stream_chunk(&mut handler, &response, &model).unwrap();
+
+        let (text, thought, _, _) = handler.take();
+        assert_eq!(text, "answer\n\nx");
+        assert_eq!(thought.as_deref(), Some("plan Aplan B"));
+    }
+
     fn streaming_thought_output() -> (String, Option<String>, Vec<ToolCall>, Model) {
         let (tx, _rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, create_abort_signal());
         let chunk = json!({
             "candidates": [{"content": {"parts": [
-                {"thought": "Plan the call."},
+                {"text": "Plan the call.", "thought": true},
                 {"text": "Running ls."},
                 {
                     "functionCall": {"id": "gemini-call-17", "name": "Bash", "args": {"cmd": "ls"}},
@@ -1006,22 +1145,22 @@ mod tests {
         let model = Model::new("gemini", "gemini-2.5-pro");
         gemini_handle_stream_chunk(&mut handler, &chunk, &model).unwrap();
         let non_stream = gemini_extract_chat_completions_text(&chunk, &model).unwrap();
-        assert_eq!(non_stream.tool_calls[0].id.as_deref(), Some("gemini-call-17"));
+        assert_gemini_streamed_thought(
+            &non_stream.text,
+            non_stream.thought.as_deref(),
+            &non_stream.tool_calls,
+        );
+        assert_eq!(
+            non_stream.tool_calls[0].id.as_deref(),
+            Some("gemini-call-17")
+        );
         let (text, thought, tool_calls, _) = handler.take();
         assert_eq!(tool_calls[0].id.as_deref(), Some("gemini-call-17"));
         (text, thought, tool_calls, model)
     }
 
-    fn assert_gemini_streamed_thought(
-        text: &str,
-        thought: Option<&str>,
-        tool_calls: &[ToolCall],
-    ) {
-        // Gemini prepends "\n\n" for non-first parts (gemini_handle_part).
-        assert!(
-            text.contains("Running ls."),
-            "text part flows to text buffer; got {text:?}"
-        );
+    fn assert_gemini_streamed_thought(text: &str, thought: Option<&str>, tool_calls: &[ToolCall]) {
+        assert_eq!(text, "Running ls.");
         assert_eq!(
             thought,
             Some("Plan the call."),
@@ -1031,6 +1170,10 @@ mod tests {
             !text.contains("Plan the call."),
             "thought must not leak into text buffer; got {text:?}"
         );
+        assert_gemini_signed_call(tool_calls);
+    }
+
+    fn assert_gemini_signed_call(tool_calls: &[ToolCall]) {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(
             tool_calls[0].thought_signature.as_deref(),
@@ -1039,14 +1182,22 @@ mod tests {
         );
     }
 
+    fn assert_gemini_replayed_text(parts: &[Value]) {
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            (&parts[0], parts[0].get("thoughtSignature"), &parts[1]),
+            (
+                &json!({"text": "Plan the call.", "thought": true}),
+                None,
+                &json!({"text": "Running ls."})
+            )
+        );
+    }
+
     /// End-to-end thought + thoughtSignature round-trip for Gemini/Vertex AI.
     ///
-    /// Gemini's protocol carries `thought: <text>` parts and a
-    /// `thoughtSignature` on functionCall parts. Dropping either on the
-    /// round-trip leaves the model's tool calls orphaned on the next turn.
-    /// The streaming code routes `part["thought"]` to `handler.thought()`
-    /// and captures `thoughtSignature` on tool_call emission; this test
-    /// pins both behaviours AND verifies the serialiser echoes them back.
+    /// Verifies Gemini's boolean thought flag and that `thoughtSignature` on a
+    /// functionCall survives parsing and replay.
     #[test]
     fn gemini_streaming_thought_roundtrips_into_next_request_body() {
         use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
@@ -1086,25 +1237,21 @@ mod tests {
             .find(|c| c["role"] == "model")
             .expect("must have a model role turn after the user message");
         let parts = model_turn["parts"].as_array().unwrap();
-        let thought_part = parts
-            .iter()
-            .find(|p| p["thought"].is_string())
-            .expect("model turn must include a thought part on the round-trip");
-        assert_eq!(thought_part["thought"], "Plan the call.");
-        let fcall_part = parts
-            .iter()
-            .find(|p| p["functionCall"].is_object())
-            .expect("model turn must include a functionCall part");
+        assert_gemini_replayed_text(parts);
+        let fcall_part = &parts[2];
+        assert!(fcall_part["functionCall"].is_object());
         assert_eq!(fcall_part["functionCall"]["id"], "gemini-call-17");
-        let response = contents.iter().flat_map(|c| c["parts"].as_array().unwrap())
-            .find_map(|p| p.get("functionResponse")).unwrap();
+        let response = contents
+            .iter()
+            .flat_map(|c| c["parts"].as_array().unwrap())
+            .find_map(|p| p.get("functionResponse"))
+            .unwrap();
         assert_eq!(response["id"], "gemini-call-17");
         assert_eq!(
             fcall_part["thoughtSignature"], "sig_gemini_xyz",
             "thoughtSignature must be echoed verbatim alongside the functionCall"
         );
     }
-
 
     #[test]
     fn gemini_producers_tag_provenance_on_streaming_and_non_streaming() {
@@ -1202,6 +1349,88 @@ mod tests {
     }
 
     #[test]
+    fn gemini_builder_replays_native_thought_before_signed_function_call() {
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance};
+
+        let model = Model::new("gemini", "gemini-2.5-pro");
+        let call = ToolCall::new(
+            "Bash".to_string(),
+            json!({"cmd": "ls"}),
+            Some("native-call".to_string()),
+            Some("native-signature".to_string()),
+        )
+        .with_provenance(Some(ReasoningProvenance {
+            protocol: ReasoningProtocol::GeminiThoughtSignature,
+            model: Some(model.real_name().to_string()),
+        }));
+        let body = gemini_build_chat_completions_body(
+            test_completion_data(vec![reasoning_tool_message(call, "Plan the call.")]),
+            &model,
+            HashMap::new(),
+        )
+        .unwrap();
+        let parts = gemini_model_parts(&body);
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            *parts[0],
+            json!({"text": "Plan the call.", "thought": true})
+        );
+        assert_eq!(
+            *parts[1],
+            json!({
+                "functionCall": {"name": "Bash", "args": {"cmd": "ls"}, "id": "native-call"},
+                "thoughtSignature": "native-signature"
+            })
+        );
+    }
+
+    #[test]
+    fn gemini_builder_omits_empty_or_missing_thought_without_losing_signature() {
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance, ToolResult};
+
+        let model = Model::new("gemini", "gemini-2.5-pro");
+        let call = ToolCall::new(
+            "Bash".to_string(),
+            json!({"cmd": "ls"}),
+            None,
+            Some("native-signature".to_string()),
+        )
+        .with_provenance(Some(ReasoningProvenance {
+            protocol: ReasoningProtocol::GeminiThoughtSignature,
+            model: Some(model.real_name().to_string()),
+        }));
+        for thought in [None, Some(String::new())] {
+            let history = vec![Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![ToolResult::new(call.clone(), json!({"ok": true}))],
+                    String::new(),
+                    thought,
+                )),
+            )];
+            let body = gemini_build_chat_completions_body(
+                test_completion_data(history),
+                &model,
+                HashMap::new(),
+            )
+            .unwrap();
+            let parts = gemini_model_parts(&body);
+
+            assert_eq!(parts.len(), 1);
+            let part = parts[0];
+            assert_eq!(
+                (
+                    part["functionCall"].is_object(),
+                    &part["thoughtSignature"],
+                    part.get("thought")
+                ),
+                (true, &json!("native-signature"), None)
+            );
+        }
+    }
+
+    #[test]
     fn gemini_builder_imports_anthropic_and_legacy_history() {
         let legacy: ToolCall = serde_json::from_str(
             r#"{"name":"LegacyTool","arguments":{},"id":"legacy-call","thought_signature":"legacy-signature"}"#,
@@ -1233,7 +1462,10 @@ mod tests {
         let saved_legacy = serde_json::to_string(&legacy).unwrap();
         assert!(!saved_legacy.contains("reasoning_provenance"));
         let restored: ToolCall = serde_json::from_str(&saved_legacy).unwrap();
-        assert_eq!(restored.thought_signature.as_deref(), Some("legacy-signature"));
+        assert_eq!(
+            restored.thought_signature.as_deref(),
+            Some("legacy-signature")
+        );
         assert_eq!(restored.reasoning_provenance, None);
     }
 
@@ -1262,7 +1494,9 @@ mod tests {
             HashMap::new(),
         )
         .unwrap();
-        let function_calls: Vec<_> = gemini_model_parts(&body)
+        let parts = gemini_model_parts(&body);
+        assert!(parts.iter().all(|part| part.get("thought").is_none()));
+        let function_calls: Vec<_> = parts
             .into_iter()
             .filter(|part| part["functionCall"].is_object())
             .collect();
@@ -1310,18 +1544,19 @@ mod tests {
 
     #[test]
     fn tools_are_declared_with_their_full_json_schema() {
-        let declaration = |name: &str, parameters: serde_json::Value| harnx_core::tool::ToolDeclaration {
-            name: name.into(),
-            description: format!("{name} tool"),
-            parameters: harnx_core::tool::JsonSchema::new(parameters),
-            mcp_tool_name: None,
-            mcp_server_name: None,
-            call_template: None,
-            result_template: None,
-            idempotent_hint: None,
-            read_only_hint: None,
-            kind: None,
-        };
+        let declaration =
+            |name: &str, parameters: serde_json::Value| harnx_core::tool::ToolDeclaration {
+                name: name.into(),
+                description: format!("{name} tool"),
+                parameters: harnx_core::tool::JsonSchema::new(parameters),
+                mcp_tool_name: None,
+                mcp_server_name: None,
+                call_template: None,
+                result_template: None,
+                idempotent_hint: None,
+                read_only_hint: None,
+                kind: None,
+            };
         let schema = json!({
             "type": "object",
             "properties": {"issue": {"type": ["integer", "null"], "minimum": 0}},
@@ -1329,7 +1564,10 @@ mod tests {
         });
         let body = gemini_build_chat_completions_body(
             ChatCompletionsData {
-                messages: vec![Message::new(MessageRole::User, MessageContent::Text("Hi".into()))],
+                messages: vec![Message::new(
+                    MessageRole::User,
+                    MessageContent::Text("Hi".into()),
+                )],
                 temperature: None,
                 top_p: None,
                 functions: Some(vec![
@@ -1357,13 +1595,12 @@ mod tests {
 #[cfg(test)]
 mod attachment_emission_tests {
     use super::*;
+    use chrono::{Duration, Utc};
     use harnx_core::attachments::ExpandedAttachment;
     use harnx_core::message::{
-        ImageUrl, Message, MessageContent, MessageContentPart, MessageContentToolCalls,
-        MessageRole,
+        ImageUrl, Message, MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole,
     };
     use harnx_core::tool::{ToolCall, ToolResult};
-    use chrono::{Duration, Utc};
 
     #[test]
     fn gemini_body_emits_file_data_for_cached_remote_ref() {
@@ -1384,8 +1621,12 @@ mod attachment_emission_tests {
         let messages = vec![Message {
             role: MessageRole::User,
             content: MessageContent::Array(vec![
-                MessageContentPart::Text { text: "Describe this image".to_string() },
-                MessageContentPart::ImageUrl { image_url: ImageUrl { url: cid.clone() } },
+                MessageContentPart::Text {
+                    text: "Describe this image".to_string(),
+                },
+                MessageContentPart::ImageUrl {
+                    image_url: ImageUrl { url: cid.clone() },
+                },
             ]),
             ..Default::default()
         }];
@@ -1401,19 +1642,31 @@ mod attachment_emission_tests {
             },
             &Model::new("gemini", "gemini-2.5-pro"),
             expanded,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify fileData emission
         let contents = body["contents"].as_array().unwrap();
         let user_turn = contents.iter().find(|c| c["role"] == "user").unwrap();
         let parts = user_turn["parts"].as_array().unwrap();
-        
+
         // Find the fileData part
-        let file_data_part = parts.iter().find(|p| p.get("fileData").is_some()).expect("should have fileData");
+        let file_data_part = parts
+            .iter()
+            .find(|p| p.get("fileData").is_some())
+            .expect("should have fileData");
         let file_data = file_data_part["fileData"].as_object().unwrap();
-        
+
         assert_eq!(file_data["fileUri"], ref_id);
         assert_eq!(file_data["mimeType"], "image/png");
+    }
+
+    fn cached_image_ref(ref_id: &str) -> ExpandedAttachment {
+        ExpandedAttachment::RemoteRef {
+            ref_id: ref_id.to_string(),
+            mime_type: "image/png".to_string(),
+            expires_at: None,
+        }
     }
 
     #[test]
@@ -1421,23 +1674,13 @@ mod attachment_emission_tests {
         let top_level_cid = "cid:top-level".to_string();
         let tool_cid = "cid:tool-result".to_string();
         let ref_id = "https://files.example/tool-result";
-        let mut expanded = HashMap::new();
-        expanded.insert(
-            top_level_cid.clone(),
-            ExpandedAttachment::RemoteRef {
-                ref_id: "https://files.example/top-level".to_string(),
-                mime_type: "image/png".to_string(),
-                expires_at: None,
-            },
-        );
-        expanded.insert(
-            tool_cid.clone(),
-            ExpandedAttachment::RemoteRef {
-                ref_id: ref_id.to_string(),
-                mime_type: "image/png".to_string(),
-                expires_at: None,
-            },
-        );
+        let expanded = HashMap::from([
+            (
+                top_level_cid.clone(),
+                cached_image_ref("https://files.example/top-level"),
+            ),
+            (tool_cid.clone(), cached_image_ref(ref_id)),
+        ]);
 
         let tool_call = ToolCall::new("show_image".to_string(), json!({}), None, None);
         let mut tool_result = ToolResult::new(tool_call, json!({"status": "ok"}));
@@ -1486,7 +1729,9 @@ mod attachment_emission_tests {
         assert_eq!(function_turn["role"], "user");
         let parts = function_turn["parts"].as_array().unwrap();
 
-        assert!(parts.iter().any(|p| p["text"] == "[Tool show_image returned image]"));
+        assert!(parts
+            .iter()
+            .any(|p| p["text"] == "[Tool show_image returned image]"));
         let file_data = parts
             .iter()
             .find_map(|p| p.get("fileData"))
@@ -1535,7 +1780,9 @@ mod attachment_emission_tests {
             .expect("should have a functionResponse turn");
         assert_eq!(function_turn["role"], "user");
         let parts = function_turn["parts"].as_array().unwrap();
-        assert!(parts.iter().any(|p| p["text"] == "[Tool show_image returned image]"));
+        assert!(parts
+            .iter()
+            .any(|p| p["text"] == "[Tool show_image returned image]"));
         assert!(parts.iter().any(|p| {
             p["text"]
                 .as_str()
@@ -1604,8 +1851,12 @@ mod attachment_emission_tests {
         let messages = vec![Message {
             role: MessageRole::User,
             content: MessageContent::Array(vec![
-                MessageContentPart::Text { text: "What's in this image?".to_string() },
-                MessageContentPart::ImageUrl { image_url: ImageUrl { url: cid.clone() } },
+                MessageContentPart::Text {
+                    text: "What's in this image?".to_string(),
+                },
+                MessageContentPart::ImageUrl {
+                    image_url: ImageUrl { url: cid.clone() },
+                },
             ]),
             ..Default::default()
         }];
@@ -1621,17 +1872,21 @@ mod attachment_emission_tests {
             },
             &Model::new("gemini", "gemini-2.5-pro"),
             expanded,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify inlineData emission
         let contents = body["contents"].as_array().unwrap();
         let user_turn = contents.iter().find(|c| c["role"] == "user").unwrap();
         let parts = user_turn["parts"].as_array().unwrap();
-        
+
         // Find the inlineData part
-        let inline_data_part = parts.iter().find(|p| p.get("inlineData").is_some()).expect("should have inlineData");
+        let inline_data_part = parts
+            .iter()
+            .find(|p| p.get("inlineData").is_some())
+            .expect("should have inlineData");
         let inline_data = inline_data_part["inlineData"].as_object().unwrap();
-        
+
         assert_eq!(inline_data["data"], "QUJDREVGR0g=");
         assert_eq!(inline_data["mimeType"], "image/jpeg");
     }
@@ -1639,8 +1894,8 @@ mod attachment_emission_tests {
     #[test]
     fn gemini_streaming_error_event_fails() {
         use harnx_core::abort::create_abort_signal;
-        use tokio::sync::mpsc::unbounded_channel;
         use harnx_core::error::LlmError;
+        use tokio::sync::mpsc::unbounded_channel;
 
         let (tx, _rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, create_abort_signal());
@@ -1657,7 +1912,9 @@ mod attachment_emission_tests {
         let result = gemini_handle_stream_chunk(&mut handler, &event, &model);
         assert!(result.is_err(), "Stream error event should return an error");
         let err = result.unwrap_err();
-        let llm_err = err.downcast_ref::<LlmError>().expect("Should be an LlmError");
+        let llm_err = err
+            .downcast_ref::<LlmError>()
+            .expect("Should be an LlmError");
         assert_eq!(llm_err.status, 500);
         assert!(llm_err.is_retryable());
         assert!(llm_err.message.contains("User location is not supported"));
