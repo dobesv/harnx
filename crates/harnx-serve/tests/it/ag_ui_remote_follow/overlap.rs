@@ -215,3 +215,40 @@ async fn a_stopped_turns_late_chunk_never_reaches_the_next_prompts_reader() {
 fn storage_key(session: &LeasedSession) -> String {
     harnx_core::session_identity::session_key(Some("plain"), &session.session_id)
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_live_sse_timeout_emits_run_error() {
+    assert_remote_live_sse_interrupt(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_live_sse_manual_cancel_emits_run_finished() {
+    assert_remote_live_sse_interrupt(false).await;
+}
+
+async fn assert_remote_live_sse_interrupt(timeout: bool) {
+    let fixture = InterruptedRemote::new().await;
+    let response = open_promptless_sse(&fixture.session).await;
+    // Attachment is established before the receipt lands; keep the remote lease
+    // held so observing Cancel is the only way to close this live stream.
+    fixture
+        .log()
+        .append_event_async(&SessionLogEntry::cancel_request(
+            "live-stop".into(),
+            if timeout {
+                harnx_serve::test_support::timeout_terminal_message()
+            } else {
+                "client:test".into()
+            },
+        ))
+        .await
+        .unwrap();
+    let body = tokio::time::timeout(Duration::from_secs(15), response.into_body().collect())
+        .await
+        .expect("remote SSE must close after interrupt")
+        .unwrap()
+        .to_bytes();
+    harnx_serve::test_support::assert_sse_interrupt_terminal(&body, timeout);
+    assert!(fixture.session.lease.revalidate_ownership().await.unwrap());
+    fixture.session.lease.release().await.unwrap();
+}

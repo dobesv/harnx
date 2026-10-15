@@ -418,11 +418,14 @@ async fn remote_follow_task(params: FollowTaskParams) -> Result<RemoteFollowTerm
             // Fence first, then detach: anything still queued from below the
             // `Cancel` is output the interrupt already ended, and the fence
             // outlives this attachment where `retire` does not.
-            if let Ok(cancel_seq) = &result {
+            if let Ok((cancel_seq, _)) = &result {
                 live.accept_interrupt(*cancel_seq);
             }
             live.retire();
-            result.map(|_| RemoteFollowTerminal::Finished)
+            result.map(|(_, timeout)| match timeout {
+                Some(message) => RemoteFollowTerminal::Error(message),
+                None => RemoteFollowTerminal::Finished,
+            })
         }
         result = follow_remote_turn(params) => result,
     }

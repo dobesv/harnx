@@ -517,7 +517,7 @@ There is no deadline-disable setting. The 24-hour fallback is user-chosen policy
 
 Autonomous run deadlines belong to the runtime, not the delegating model:
 
-- **Root run boundary**: A trusted external admission (such as an interactive user command or a top-level CLI prompt) mints an immutable `RunIdentity` and sets the initial run deadline.
+- **Root run boundary**: A trusted external admission (such as an interactive user command, a top-level CLI prompt, or an HTTP request via `harnx-serve`) mints an immutable `RunIdentity` and sets the initial run deadline. HTTP callers can only shorten this deadline at admission; they cannot extend it beyond configured policy.
 - **Inheritance across delegations**: All child delegations, handoffs, and resumed sessions within that autonomous run inherit the root run's deadline (`parent.deadline`). Autonomous activity cannot renew or extend this deadline.
 - **Worker-owned enforcement**: The worker daemon enforces deadlines independently while awaiting models, tool executions, retries, and nested sub-agents. If a calling process disconnects or dies while waiting, the detached worker continues running under its independent deadline and terminates cleanly when that deadline expires.
 

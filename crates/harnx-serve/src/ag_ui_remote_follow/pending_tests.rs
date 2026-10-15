@@ -61,6 +61,35 @@ fn terminal_history_distinguishes_durable_failure_and_cancellation() {
 }
 
 #[test]
+fn terminal_history_distinguishes_timeout_from_cancellation() {
+    // Timeout terminal in Cancel.requested_by yields RUN_ERROR
+    let timeout_marker = format!(
+        "worker deadline: harnx:timeout {}",
+        serde_json::to_string(&harnx_runtime::TimeoutTerminal {
+            scope: harnx_runtime::TimeoutScope::OuterRun,
+            deadline: chrono::Utc::now(),
+            run_id: "run-1".into(),
+            invocation_id: "inv-1".into(),
+        })
+        .unwrap()
+    );
+    let timeout_cancel = SessionLogEntry::cancel_request("stop".into(), timeout_marker.clone());
+    let log = vec![(1, user()), (2, timeout_cancel)];
+    assert_eq!(
+        terminal_from_history(&log, 1),
+        Some(RemoteFollowTerminal::Error(timeout_marker))
+    );
+
+    // Manual cancellation yields RUN_FINISHED
+    let manual_cancel = SessionLogEntry::cancel_request("stop".into(), "user:cancel".into());
+    let log = vec![(1, user()), (2, manual_cancel)];
+    assert_eq!(
+        terminal_from_history(&log, 1),
+        Some(RemoteFollowTerminal::Finished)
+    );
+}
+
+#[test]
 fn terminal_history_ignores_outcomes_of_later_turns() {
     let log = vec![(1, user()), (2, end(1)), (3, user()), (4, error())];
     assert_eq!(

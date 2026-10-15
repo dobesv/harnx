@@ -51,18 +51,6 @@ impl Fixture {
     }
 }
 
-/// Interrupt the way a frontend does: one `Cancel` appended to the log.
-async fn interrupt(jetstream: &JetstreamContext) {
-    NatsSessionLog::new(jetstream.clone(), storage_key())
-        .with_replicas(1)
-        .append_event_async(&SessionLogEntry::cancel_request(
-            "queue-stop".into(),
-            "client:test".into(),
-        ))
-        .await
-        .unwrap();
-}
-
 /// Two claims about a reader that was already attached when the interrupt
 /// landed. The stop watch has to stay pollable while a full output queue holds
 /// the follower — nothing will ever drain that queue if the interrupt cannot
@@ -72,6 +60,15 @@ async fn interrupt(jetstream: &JetstreamContext) {
 /// fork, which keeps the fence and drops this attachment's detachment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn accepted_stop_interrupts_a_backpressured_remote_output_queue() {
+    assert_backpressured_interrupt(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeout_interrupts_a_backpressured_remote_output_queue_with_error() {
+    assert_backpressured_interrupt(Some(crate::test_support::timeout_terminal_message())).await;
+}
+
+async fn assert_backpressured_interrupt(timeout: Option<String>) {
     let fixture = Fixture::new().await;
     // The seeded prompt is the only user message: sequence 1 is this follow's.
     let interrupt_watch = RemoteInterruptWatch::bind(&fixture.jetstream, &storage_key(), 1);
@@ -112,12 +109,23 @@ async fn accepted_stop_interrupts_a_backpressured_remote_output_queue() {
     })
     .await
     .unwrap();
-    interrupt(&fixture.jetstream).await;
-    tokio::time::timeout(Duration::from_secs(5), task)
+    NatsSessionLog::new(fixture.jetstream.clone(), storage_key())
+        .append_event_async(&SessionLogEntry::cancel_request(
+            "queue-stop".into(),
+            timeout.clone().unwrap_or_else(|| "client:test".into()),
+        ))
+        .await
+        .unwrap();
+    let terminal = tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+    match (terminal, timeout) {
+        (RemoteFollowTerminal::Finished, None) => {}
+        (RemoteFollowTerminal::Error(message), Some(expected)) => assert_eq!(message, expected),
+        _ => panic!("incorrect interrupt terminal"),
+    }
     drop(probe);
     let frames: Vec<_> = event_frames(rx, live.clone(), attached_seq).collect().await;
     assert!(
