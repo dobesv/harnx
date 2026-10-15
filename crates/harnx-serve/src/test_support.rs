@@ -12,6 +12,18 @@ use std::{
 static TEST_CONFIG_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TEST_CONFIG_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Worker-owned deadline receipt for deterministic terminal propagation tests.
+pub fn timeout_terminal_message() -> String {
+    harnx_runtime::TimeoutTerminal {
+        scope: harnx_runtime::TimeoutScope::OuterRun,
+        deadline: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        run_id: "timeout-test-run".into(),
+        invocation_id: "timeout-test-invocation".into(),
+    }
+    .message()
+}
 pub struct TestConfigSandbox {
     _lock: std::sync::MutexGuard<'static, ()>,
     root: PathBuf,
@@ -255,4 +267,35 @@ pub(crate) async fn wait_for_state(
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for session to become {description}"))
+}
+
+/// Assert a closed SSE body has one terminal event and retains deadline details.
+pub fn assert_sse_interrupt_terminal(body: &[u8], timeout: bool) {
+    let events: Vec<serde_json::Value> = std::str::from_utf8(body)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert!(
+        events.iter().any(|event| event["type"] == "RUN_STARTED"),
+        "{events:?}"
+    );
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event["type"].as_str(), Some("RUN_ERROR" | "RUN_FINISHED")))
+        .collect();
+    assert_eq!(terminals.len(), 1, "{events:?}");
+    assert_eq!(
+        terminals[0]["type"],
+        if timeout { "RUN_ERROR" } else { "RUN_FINISHED" },
+        "{events:?}"
+    );
+    if timeout {
+        assert!(
+            harnx_runtime::parse_timeout_terminal(terminals[0]["message"].as_str().unwrap())
+                .is_some(),
+            "{events:?}"
+        );
+    }
 }

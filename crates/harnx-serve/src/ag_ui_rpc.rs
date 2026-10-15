@@ -64,6 +64,13 @@ struct PromptParams {
     /// Taken from the request rather than its parameters.
     #[serde(skip)]
     web_base_url: Option<String>,
+    /// Maximum run duration in seconds. Positive values can only shorten
+    /// the target agent's configured run limits policy.
+    #[serde(
+        default,
+        deserialize_with = "harnx_core::config_data::deserialize_timeout_override"
+    )]
+    timeout_secs: Option<u64>,
 }
 
 fn prompt_has_content(params: &PromptParams) -> bool {
@@ -353,6 +360,7 @@ fn build_prompt_options(params: &PromptParams, context: &RpcContext<'_>) -> Sess
         attachment_refs: params.attachment_refs.clone(),
         web_base_url: params.web_base_url.clone(),
         user_id: context.user_id.clone(),
+        timeout_secs: params.timeout_secs,
         ..Default::default()
     }
 }
@@ -704,6 +712,7 @@ mod tests {
             attachment_refs: vec!["cid:image".into()],
             resume: vec![],
             web_base_url: None,
+            timeout_secs: None,
         };
         assert!(prompt_has_content(&attachment_prompt));
 
@@ -720,6 +729,7 @@ mod tests {
                 },
             }],
             web_base_url: None,
+            timeout_secs: None,
         };
         assert!(prompt_has_content(&resume_prompt));
 
@@ -731,6 +741,7 @@ mod tests {
                     attachment_refs,
                     resume: vec![],
                     web_base_url: None,
+                    timeout_secs: None,
                 };
                 assert_eq!(
                     prompt_has_content(&prompt),
@@ -1587,3 +1598,7 @@ mod pending_state_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ag_ui_rpc_timeout_tests.rs"]
+mod timeout_tests;

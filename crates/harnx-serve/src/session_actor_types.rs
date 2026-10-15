@@ -152,6 +152,10 @@ pub struct SessionPromptOptions {
     pub web_base_url: Option<String>,
     /// Identity resolved from this prompt's HTTP request. Used only when metadata is created.
     pub user_id: Option<String>,
+    /// Maximum run duration in seconds. Omitted, null, zero, or negative inherit
+    /// the target agent's run limits policy. Positive values shorten that policy;
+    /// they cannot extend beyond the configured limit.
+    pub timeout_secs: Option<u64>,
 }
 
 pub enum SessionCommand {

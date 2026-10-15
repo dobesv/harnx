@@ -427,6 +427,8 @@ The field accepts integers, not strings. There is no deadline-disable setting. D
 
 At every configuration and delegation level, **omitted, `null`, zero and negative integers all mean inherit/default**. A target with any of these values uses the global allowance; a global setting with any of these values uses 24 hours. A delegation override with any of these values uses the target's effective policy. None can bypass or extend a shorter inherited deadline.
 
+An HTTP caller (AG-UI SSE or JSON-RPC `session/prompt`) may set `timeout_secs` to shorten the run. The value is clamped at or below the target agent's configured policy and cannot extend the policy deadline (see `harnx-serve` README for request parameters).
+
 #### Frozen Admissions
 
 `RunLimitsRecord` captures the original admission timestamp and resolved absolute deadline before execution. Config reloads apply to new admissions; active runs and worker replays retain their saved deadlines. Each newly admitted root has a finite deadline, including macro and incoming MCP request roots. Cancellation remains invocation-fenced and doesn't roll back external side effects.

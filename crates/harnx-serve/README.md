@@ -208,6 +208,12 @@ Provides AG-UI events for a run. The body's **last message** selects the mode:
   (or `RUN_ERROR`). The stream **terminates** after the
   terminal event so the client's `runAgent()` promise resolves. No
   `MESSAGES_SNAPSHOT` is emitted (it would predate the just-sent user message).
+
+  The request body may include `timeout_secs` to limit run duration. Positive
+  values can only shorten the target agent's configured run limits; they cannot
+  extend beyond the policy. Omitted, null, zero, or negative values inherit the
+  agent/global timeout policy. A deadline stop ends the stream with `RUN_ERROR`;
+  manual cancellation still ends with `RUN_FINISHED`.
 - **Promptless join** (no non-empty trailing user message): hydrates with a
   synthetic `RUN_STARTED` → `session_attach_boundary` → `MESSAGES_SNAPSHOT`.
   For an idle session it appends
@@ -258,6 +264,13 @@ Same canonical session URL, negotiated into programmatic control.
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello" } }
   ```
   **Result:** `{ "status": "accepted", "run_id": "..." }` (idle) or `{ "status": "enqueued", "run_id": "..." }` (running).
+
+  Optional `timeout_secs` parameter limits run duration. Positive values can only
+  shorten the target agent's configured run limits policy; they cannot extend
+  beyond it. Omitted, null, zero, or negative values inherit the agent's default.
+  ```json
+  { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello", "timeout_secs": 300 } }
+  ```
 - **`session/cancel`**: Interrupts the session's current turn by appending one
   durable `Cancel` to its session log. Takes no parameters — an interrupt always
   targets whatever turn is running. It returns as soon as that append is

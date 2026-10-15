@@ -320,7 +320,9 @@ fn interrupt_receipt(
     Some((seq, timeout))
 }
 
-async fn await_prompt_interrupt_receipt<F, Fut>(
+/// Wait for a prompt's interrupt fence and preserve its deadline error, if any.
+/// Manual cancellation returns no error message.
+pub async fn await_prompt_interrupt_receipt<F, Fut>(
     user_msg_seq: u64,
     mut read: F,
 ) -> Result<(u64, Option<String>)>

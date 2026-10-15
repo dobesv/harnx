@@ -6,9 +6,13 @@
 //! SSE output queue is full and nothing else can make progress. A `Cancel`
 //! below it stopped an earlier turn — this prompt was typed after the
 //! interruption, and ending on it would close the stream the moment it opened.
+//!
+//! The `Cancel` may carry a deadline error message (`harnx:timeout {...}`). Such
+//! timeouts map to `RemoteFollowTerminal::Error` so the SSE stream emits
+//! `RUN_ERROR`. Manual cancellation (no timeout marker) still yields `Finished`.
 use anyhow::Result;
 use harnx_runtime::nats_event_sink::JetstreamContext;
-use harnx_runtime::nats_session::interrupt::await_prompt_interrupt;
+use harnx_runtime::nats_session::interrupt::await_prompt_interrupt_receipt;
 use harnx_runtime::nats_session_log::NatsSessionLog;
 
 #[derive(Clone)]
@@ -34,10 +38,10 @@ impl RemoteInterruptWatch {
     /// those are read — once per follower per poll, for as long as the turn
     /// runs. A read that fails is retried rather than propagated: it would
     /// otherwise retire a live attachment whose turn is still healthy.
-    pub(super) async fn wait_for_stop(&self) -> Result<u64> {
+    pub(super) async fn wait_for_stop(&self) -> Result<(u64, Option<String>)> {
         let log = self.log.clone();
         let prompt_seq = self.prompt_seq;
-        await_prompt_interrupt(prompt_seq, move || {
+        await_prompt_interrupt_receipt(prompt_seq, move || {
             let log = log.clone();
             async move { log.load_events_after_async(prompt_seq).await }
         })

@@ -233,6 +233,21 @@ fn make_session_actor(
     (actor, handle)
 }
 
+/// Manual cancellation completes normally; deadline receipts remain errors.
+fn check_admitted_turn_result(
+    result: anyhow::Result<harnx_runtime::NatsTurnResult>,
+) -> anyhow::Result<harnx_runtime::LoopResult> {
+    let turn = result?;
+    if turn.was_cancelled {
+        if let Some(message) = turn
+            .error
+            .filter(|error| harnx_runtime::parse_timeout_terminal(error).is_some())
+        {
+            anyhow::bail!("run deadline expired: {message}");
+        }
+    }
+    Ok(harnx_runtime::LoopResult::Completed)
+}
 async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime::LoopResult> {
     if let Some(call_fn) = params.call_fn {
         return test_executor::run_local_test_turn(test_executor::LocalTestTurnParams {
@@ -264,10 +279,10 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         result => result?,
     };
     if let Some(admitted) = params.admitted {
-        return session
+        let result = session
             .follow_admitted_prompt(admitted, params.sink, None, None, Default::default())
-            .await
-            .map(|_| harnx_runtime::LoopResult::Completed);
+            .await;
+        return check_admitted_turn_result(result);
     }
     let input = build_input(&params.prompt_config, &params.text, &params.attachment_refs)?;
     let attachments_dir = if params.attachment_refs.is_empty() {
@@ -697,37 +712,8 @@ impl SessionActor {
     ) -> RunId {
         self.cancel_reap(reap_sleep);
         let prompt_config = self.prompt_config().await;
-        // Injected executors are a test/embed seam. Production handoffs run in
-        // NATS workers, but this seam must not mint new outer scopes either.
         if self.actor_config.call_fn.is_some() {
-            let (global, target) = {
-                let cfg = prompt_config.read();
-                (
-                    cfg.data.run_limits,
-                    cfg.agent.as_ref().map(|agent| agent.clone().into_config()),
-                )
-            };
-            let now = Utc::now();
-            let resolved = match options.runtime_parent.as_deref() {
-                Some(parent) => harnx_runtime::nats_session_metadata::RunLimitsRecord::admit_child(
-                    parent,
-                    Default::default(),
-                    harnx_runtime::nats_session_metadata::InvocationEdgeKind::Handoff,
-                    now,
-                    global,
-                    target.as_ref(),
-                    harnx_runtime::nats_session_metadata::CallTimeoutOverride::Omitted,
-                ),
-                None => harnx_runtime::nats_session_metadata::RunLimitsRecord::admit_root(
-                    Default::default(),
-                    Default::default(),
-                    now,
-                    global,
-                    target.as_ref(),
-                    harnx_runtime::nats_session_metadata::CallTimeoutOverride::Omitted,
-                ),
-            };
-            prompt_config.write().run_context = resolved.ok();
+            self.admit_injected_run(&prompt_config, &options).await;
         }
         let limits = prompt_config.read().run_context.clone();
         let run_id = RunId::random();
@@ -2111,4 +2097,6 @@ mod tests {
     mod worker_startup_tests;
 
     mod pending_tests;
+
+    mod timeout_tests;
 }

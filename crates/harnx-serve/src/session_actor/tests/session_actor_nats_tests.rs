@@ -641,3 +641,100 @@ async fn serve_local_nats_smoke_streams_sse_events_and_cancel_publishes_control(
     assert_cancel_reached_worker(&config, &session_id).await;
     mock.task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_live_sse_timeout_emits_run_error() {
+    assert_local_live_sse_interrupt(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_live_sse_manual_cancel_emits_run_finished() {
+    assert_local_live_sse_interrupt(false).await;
+}
+
+async fn assert_local_live_sse_interrupt(timeout: bool) {
+    use http_body_util::BodyExt;
+    harnx_core::require_nextest();
+    let Some(binary) = live_worker_binary() else {
+        return;
+    };
+    let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    let mock = start_serve_smoke_openai().await;
+    sandbox.write_mock_openai_client(&mock.api_base);
+    sandbox.write_agent_with_front_matter(
+        "plain",
+        "model: mock:test\nstream: true\nrun_limits:\n  timeout_secs: 600",
+        "Complete the turn.",
+    );
+    let config = sandbox.config();
+    let supervisor = LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal())
+        .await
+        .expect("start local worker");
+    let registry = SessionRegistry::new_with_local_worker_for_tests(config.clone(), supervisor);
+    let session_id = format!("local-sse-interrupt-{}", uuid::Uuid::new_v4());
+    let response = crate::ag_ui::ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        &session_id,
+        &serde_json::to_vec(&json!({
+            "messages": [{"id": "input", "role": "user", "content": "wait for interrupt"}],
+            "timeout_secs": 120,
+        }))
+        .unwrap(),
+        None,
+    )
+    .await
+    .expect("open local SSE");
+    tokio::time::timeout(Duration::from_secs(30), mock.first_request)
+        .await
+        .expect("worker reached gated model request")
+        .unwrap();
+    let log = assert_live_timeout_admission(&config, &session_id).await;
+    // Use the worker's durable timeout receipt instead of waiting for wall time.
+    // The model gate proves this is a live local follow, not history replay.
+    if timeout {
+        log.append_event_async(&harnx_core::session::SessionLogEntry::cancel_request(
+            "deadline-stop".into(),
+            crate::test_support::timeout_terminal_message(),
+        ))
+        .await
+        .unwrap();
+    } else {
+        cancel(&registry.get_or_spawn(key("plain", &session_id))).await;
+    }
+    let body = tokio::time::timeout(Duration::from_secs(30), response.into_body().collect())
+        .await
+        .expect("SSE must close after interrupt")
+        .unwrap()
+        .to_bytes();
+    crate::test_support::assert_sse_interrupt_terminal(&body, timeout);
+    mock.task.abort();
+}
+
+async fn assert_live_timeout_admission(
+    config: &Config,
+    session_id: &str,
+) -> harnx_runtime::nats_session_log::NatsSessionLog {
+    let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await.unwrap();
+    let storage = harnx_core::session_identity::session_key(Some("plain"), session_id);
+    let log =
+        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream.clone(), storage.clone());
+    let entries = log.load_events_latest_async().await.unwrap();
+    let metadata =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .unwrap();
+    let admission = metadata
+        .active_admission(&storage, &entries)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        admission.timeout_secs,
+        Some(120),
+        "AG-UI timeout reaches durable admission"
+    );
+    log
+}

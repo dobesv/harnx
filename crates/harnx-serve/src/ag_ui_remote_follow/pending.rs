@@ -24,6 +24,10 @@ pub(super) async fn hydrate_completion(
 }
 
 /// Read the first terminal that answers this prompt, never a later run's error.
+///
+/// Deadline timeouts (`harnx:timeout {...}` in `requested_by`) map to `Error`
+/// so the history-based hydration emits `RUN_ERROR`. Manual cancellation returns
+/// `Finished`.
 pub(crate) fn terminal_from_history(
     history: &[(u64, SessionLogEntry)],
     prompt_seq: u64,
@@ -31,18 +35,27 @@ pub(crate) fn terminal_from_history(
     if prompt_seq == 0 {
         return None;
     }
-    if let Some((_, entry)) =
+    let Some((_, entry)) =
         harnx_core::session_reconstruct::prompt_terminal_entry(history, prompt_seq)
-    {
-        return Some(match entry {
-            SessionLogEntry::Error { message, .. } => RemoteFollowTerminal::Error(message.clone()),
-            _ => RemoteFollowTerminal::Finished,
-        });
+    else {
+        // Retraction/rewind can settle input without a TurnEnd.
+        return harnx_core::session_reconstruct::pending_prompt_seq(history)
+            .is_none()
+            .then_some(RemoteFollowTerminal::Finished);
+    };
+    Some(terminal_for_entry(entry))
+}
+
+fn terminal_for_entry(entry: &SessionLogEntry) -> RemoteFollowTerminal {
+    match entry {
+        SessionLogEntry::Error { message, .. } => RemoteFollowTerminal::Error(message.clone()),
+        SessionLogEntry::Cancel { requested_by, .. } => requested_by
+            .as_deref()
+            .filter(|message| harnx_runtime::parse_timeout_terminal(message).is_some())
+            .map(|message| RemoteFollowTerminal::Error(message.to_owned()))
+            .unwrap_or(RemoteFollowTerminal::Finished),
+        _ => RemoteFollowTerminal::Finished,
     }
-    // Retraction/rewind can settle input without a TurnEnd.
-    harnx_core::session_reconstruct::pending_prompt_seq(history)
-        .is_none()
-        .then_some(RemoteFollowTerminal::Finished)
 }
 
 pub(super) fn completion_events(

@@ -37,9 +37,78 @@ impl SessionActor {
                 harnx_runtime::nats_session_metadata::InvocationEdgeKind::Handoff,
                 None,
             ),
-            None => session.with_external_admission().with_steering_admission(),
+            None => {
+                let timeout_override = self.clamp_timeout_override(options.timeout_secs).await;
+                session
+                    .with_external_admission()
+                    .with_steering_admission()
+                    .with_admission_timeout(timeout_override)
+            }
         };
         session.admit_input(&input, source_dir.as_deref()).await
+    }
+
+    /// Clamp client timeout request against configured agent policy.
+    ///
+    /// HTTP callers can only shorten, never extend, the target agent's
+    /// run limits. Positive values less than the configured limit are
+    /// passed through. Otherwise, `None` is returned to inherit policy.
+    pub(super) async fn clamp_timeout_override(&self, requested: Option<u64>) -> Option<u64> {
+        let requested = requested?;
+        if requested == 0 {
+            return None;
+        }
+        let prompt_config = self.prompt_config().await;
+        let cfg = prompt_config.read();
+        let agent_config = cfg.agent.as_deref();
+        let resolved = cfg.resolve_run_limits(agent_config);
+        let configured_secs = resolved.timeout_secs.get();
+        // Clamp: client cannot extend beyond configured policy
+        if requested < configured_secs {
+            Some(requested)
+        } else {
+            None
+        }
+    }
+
+    /// The test/embed executor uses the same shortening-only policy as NATS admission.
+    pub(super) async fn admit_injected_run(
+        &self,
+        prompt_config: &GlobalConfig,
+        options: &SessionPromptOptions,
+    ) {
+        let (global, target) = {
+            let cfg = prompt_config.read();
+            (
+                cfg.data.run_limits,
+                cfg.agent.as_ref().map(|agent| agent.clone().into_config()),
+            )
+        };
+        let now = Utc::now();
+        let timeout_override =
+            harnx_runtime::nats_session_metadata::CallTimeoutOverride::from_optional(
+                self.clamp_timeout_override(options.timeout_secs).await,
+            );
+        let resolved = match options.runtime_parent.as_deref() {
+            Some(parent) => harnx_runtime::nats_session_metadata::RunLimitsRecord::admit_child(
+                parent,
+                Default::default(),
+                harnx_runtime::nats_session_metadata::InvocationEdgeKind::Handoff,
+                now,
+                global,
+                target.as_ref(),
+                timeout_override,
+            ),
+            None => harnx_runtime::nats_session_metadata::RunLimitsRecord::admit_root(
+                Default::default(),
+                Default::default(),
+                now,
+                global,
+                target.as_ref(),
+                timeout_override,
+            ),
+        };
+        prompt_config.write().run_context = resolved.ok();
     }
 
     pub(super) async fn control_session(&self) -> anyhow::Result<Option<NatsSession>> {

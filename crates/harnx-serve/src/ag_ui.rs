@@ -83,6 +83,13 @@ struct RelaxedRunAgentInput<TState = JsonValue> {
     resume: Vec<InterruptResumeParam>,
     #[serde(rename = "forwardedProps", default)]
     forwarded_props: serde_json::Map<String, serde_json::Value>,
+    /// Maximum run duration in seconds. Positive values can only shorten
+    /// the target agent's configured run limits policy.
+    #[serde(
+        default,
+        deserialize_with = "harnx_core::config_data::deserialize_timeout_override"
+    )]
+    timeout_secs: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1320,10 +1327,11 @@ pub(crate) struct AgUiRunRequest<'a> {
 }
 
 impl AgUiRunRequest<'_> {
-    fn prompt_options(&self) -> SessionPromptOptions {
+    fn prompt_options(&self, timeout_secs: Option<u64>) -> SessionPromptOptions {
         SessionPromptOptions {
             web_base_url: self.web_base_url.clone(),
             user_id: self.user_id.clone(),
+            timeout_secs,
             ..Default::default()
         }
     }
@@ -1338,6 +1346,7 @@ pub(crate) async fn ag_ui_run_for_target(
     let (target, session, req_body) = (request.target, request.session, request.body);
     let relaxed_run_input: RelaxedRunAgentInput<JsonValue> = serde_json::from_slice(req_body)
         .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI request body: {err}")))?;
+    let prompt_options = request.prompt_options(relaxed_run_input.timeout_secs);
     let run_id = relaxed_run_input
         .run_id
         .clone()
@@ -1363,7 +1372,7 @@ pub(crate) async fn ag_ui_run_for_target(
     let thread_id_text = thread_id.to_string();
 
     if let Some(text) = requested_prompt.as_deref() {
-        let _ = prompt(&handle, text, request.prompt_options()).await;
+        let _ = prompt(&handle, text, prompt_options).await;
     }
 
     let stream = if let Some(stream) = crate::ag_ui_remote_follow::resolve_event_stream(
@@ -1966,3 +1975,7 @@ mod tests;
 #[cfg(test)]
 #[path = "ag_ui_subagent_tests.rs"]
 mod subagent_tests;
+
+#[cfg(test)]
+#[path = "ag_ui_timeout_tests.rs"]
+mod timeout_tests;
