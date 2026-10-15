@@ -1,8 +1,8 @@
 //! Proves that a SIGTERM sent directly to a running `harnx-time-tools`
-//! process (as Kubernetes would send to a pod) triggers deregistration, not
-//! just that the plumbing between a `CancellationToken` and the serve loop
-//! is wired correctly. `harnx-toolset-server`'s own tests cover the latter;
-//! this covers the actual signal path end to end.
+//! process (as Kubernetes would send to a pod) triggers graceful shutdown.
+//! The default registration shutdown policy is `Expire`, which retains the
+//! registration for TTL expiry rather than deleting it immediately. This is
+//! correct for both singleton and HA deployments.
 
 #![cfg(unix)]
 
@@ -152,7 +152,7 @@ async fn wait_for_key_presence(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sigterm_removes_the_registration() -> Result<()> {
+async fn sigterm_retains_the_registration_after_exit() -> Result<()> {
     harnx_core::require_nextest();
     let Some(server) = spawn_nats_server().await? else {
         return Ok(());
@@ -200,16 +200,20 @@ async fn sigterm_removes_the_registration() -> Result<()> {
     let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     assert_eq!(killed, 0, "failed to send SIGTERM to harnx-time-tools");
 
-    wait_for_key_presence(
-        &jetstream,
-        &key,
-        false,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await
-    .context("registration should be gone soon after SIGTERM, not left to expire")?;
+    wait_for_process_exit(&mut time_server.0, Instant::now() + Duration::from_secs(5))
+        .await
+        .context("harnx-time-tools did not exit after SIGTERM")?;
 
-    let _ = time_server.0.wait();
+    // Check after exit: presence while the process is still running cannot
+    // distinguish TTL retention from deletion during shutdown cleanup.
+    let registry = jetstream
+        .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
+        .await?;
+    assert!(
+        registry.get(&key).await?.is_some(),
+        "registration must remain after process exit for TTL expiry"
+    );
+
     Ok(())
 }
 
@@ -266,4 +270,22 @@ fn first_nats_client_url(dir: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Poll for process exit under a deadline instead of `Child::wait()`, which
+/// blocks forever if the child never exits and would hang the whole suite.
+async fn wait_for_process_exit(child: &mut Child, deadline: Instant) -> Result<()> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(status.success(), "process exited unsuccessfully: {status}");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "process (pid {:?}) did not exit before the deadline",
+                child.id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

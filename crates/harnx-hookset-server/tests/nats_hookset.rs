@@ -22,6 +22,8 @@ const TOKEN: &str = "hookset-server-test-token";
 
 #[path = "nats_hookset/cancellation.rs"]
 mod cancellation;
+#[path = "nats_hookset/registration_shutdown.rs"]
+mod registration_shutdown;
 
 struct NatsServerHandle {
     url: String,
@@ -366,8 +368,8 @@ async fn spawn_echo_hook_server(
 /// A rolling deploy publishes the replacement's registration under the same
 /// `{scope}.{server}` key before the old instance finishes shutting down
 /// (new pod ready before old pod terminates is Kubernetes' normal sequence).
-/// The old instance's shutdown must delete only its own registration, never
-/// the replacement's.
+/// Shutting down the old instance must leave the replacement's exact revision.
+/// The replacement's later shutdown also leaves registration for TTL expiry.
 #[tokio::test(flavor = "multi_thread")]
 async fn old_instances_shutdown_does_not_delete_a_replacements_registration() -> Result<()> {
     harnx_core::require_nextest();
@@ -391,11 +393,10 @@ async fn old_instances_shutdown_does_not_delete_a_replacements_registration() ->
     let new_revision = wait_for_revision_beyond(&client, &key, old_revision).await?;
     assert!(new_revision > old_revision);
 
-    // Now tell the OLD instance to shut down. Its unconditional delete used
-    // to remove whatever is currently at `key` -- the replacement's entry.
     old_shutdown.cancel();
-    old_task
+    tokio::time::timeout(Duration::from_secs(10), old_task)
         .await
+        .context("old instance shutdown timed out")?
         .context("join old instance task")?
         .context("old instance exited with an error")?;
 
@@ -413,16 +414,20 @@ async fn old_instances_shutdown_does_not_delete_a_replacements_registration() ->
         "the surviving registration must be the replacement's, not a re-published old one"
     );
 
-    // The replacement's own shutdown should still delete its own, current
-    // registration -- the conditional delete must not become a no-op.
+    registration_shutdown::assert_echo_hook_works(&client, &instance_id).await?;
     new_shutdown.cancel();
-    new_task
+    tokio::time::timeout(Duration::from_secs(10), new_task)
         .await
+        .context("replacement shutdown timed out")?
         .context("join replacement task")?
         .context("replacement exited with an error")?;
     assert!(
-        store.get(&key).await?.is_none(),
-        "the replacement's own shutdown must delete its own current registration"
+        store.get(&key).await?.is_some(),
+        "replacement shutdown must leave its registration for TTL expiry"
+    );
+    assert_eq!(
+        registration_revision(&client, &key).await?,
+        Some(new_revision)
     );
 
     drop(server);

@@ -78,6 +78,9 @@ pub async fn serve_with_client(
 /// Serve a hook using an existing NATS connection, exiting cleanly (and
 /// running exit cleanup while the connection is still usable) when the
 /// lifecycle's shutdown token is cancelled, in addition to the usual failure exits.
+///
+/// Shutdown leaves the shared registration for surviving replicas to refresh.
+/// When all replicas stop, the bucket TTL removes it 90 seconds after the last refresh.
 pub async fn serve_with_shutdown(
     hook: Arc<dyn Hook>,
     instance_id: ServerScope,
@@ -127,7 +130,7 @@ pub async fn serve_with_shutdown(
     };
     let jetstream = jetstream::new(client.clone());
     let registry = ensure_hook_registry_bucket(&jetstream, replicas).await?;
-    let mut revision = publish_hook_registration(&registry, &instance_id, &registration).await?;
+    publish_hook_registration(&registry, &instance_id, &registration).await?;
 
     let active: HookRegistry = Arc::default();
     let outcome = serve_requests(
@@ -143,7 +146,6 @@ pub async fn serve_with_shutdown(
             registry: &registry,
             instance_id: &instance_id,
             registration: &registration,
-            revision: &mut revision,
         },
     )
     .await;
@@ -153,32 +155,9 @@ pub async fn serve_with_shutdown(
         r.not_ready();
     }
 
-    // Best-effort: the TTL is the backstop when this cannot run.
-    let key = hook_registration_key(&instance_id, &server);
-    delete_own_registration(&registry, &key, revision).await;
+    // Replicas share this key, so even owning its latest revision does not
+    // permit deletion. Survivors keep refreshing; TTL removes abandoned keys.
     outcome
-}
-
-/// Delete `key` on shutdown, but only if `revision` (our own last-published
-/// one) is still current. On a rolling deploy, a replacement instance
-/// publishes under this same key before this one finishes shutting down
-/// (new pod ready before old pod terminates is Kubernetes' normal sequence);
-/// an unconditional delete here would remove the replacement's registration
-/// instead of this one's. `delete_expect_revision` fails harmlessly in that
-/// case, so it's not treated as an error worth warning about.
-async fn delete_own_registration(registry: &kv::Store, key: &str, revision: u64) {
-    match registry.delete_expect_revision(key, Some(revision)).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == kv::DeleteErrorKind::WrongLastRevision => {
-            log::debug!(
-                "hook registration '{key}' was already replaced by a newer instance; \
-                 not deleting it"
-            );
-        }
-        Err(error) => {
-            log::warn!("could not remove hook registration '{key}' on shutdown: {error}");
-        }
-    }
 }
 
 /// Everything `serve_requests` needs to keep the KV registration alive, bundled
@@ -187,11 +166,6 @@ struct RegistrationRefresh<'a> {
     registry: &'a kv::Store,
     instance_id: &'a ServerScope,
     registration: &'a HookRegistration,
-    /// The revision of our own last-published registration, so shutdown can
-    /// delete it conditionally instead of unconditionally (see the delete
-    /// call in `serve_with_shutdown`). Updated after every successful
-    /// refresh publish, not just the initial one.
-    revision: &'a mut u64,
 }
 
 /// The subscriptions `serve_requests` polls, the registry of hook calls
@@ -245,11 +219,8 @@ async fn serve_requests(
                 });
             }
             Some(renewal) = renewals.next() => {
-                match renewal {
-                    Ok(new_revision) => *refresh.revision = new_revision,
-                    Err(error) => {
-                        log::warn!("refresh hook registration failed; retrying next interval: {error:#}");
-                    }
+                if let Err(error) = renewal {
+                    log::warn!("refresh hook registration failed; retrying next interval: {error:#}");
                 }
             }
             _ = subscriptions.shutdown.cancelled() => {
@@ -300,8 +271,8 @@ pub async fn publish_hook_registration(
 
 /// Read hook server settings from the environment and serve over NATS.
 ///
-/// Wires SIGTERM/Ctrl+C to a graceful stop so a pod killed by Kubernetes gets
-/// a chance to remove its own registration instead of leaving it for the TTL.
+/// Wires SIGTERM/Ctrl+C to a graceful stop. Shared registrations remain until
+/// the 90-second TTL elapses after the last replica's final refresh.
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
     run_hookset_main_with_readiness(hook, None).await
 }

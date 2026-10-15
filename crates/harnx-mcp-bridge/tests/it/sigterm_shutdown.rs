@@ -1,9 +1,8 @@
 //! Proves that a SIGTERM sent directly to a running `harnx-mcp-bridge`
-//! process (as Kubernetes would send to a pod) triggers deregistration.
-//! Mirrors `harnx-time-tools/tests/sigterm_shutdown.rs`: before switching
-//! `main.rs` from `serve_with_client` (whose shutdown token is never
-//! cancelled) to `serve_with_shutdown`, no signal reached the bridge's own
-//! cleanup at all.
+//! process (as Kubernetes would send to a pod) triggers graceful shutdown.
+//! The default registration shutdown policy is `Expire`, which retains the
+//! registration for TTL expiry rather than deleting it immediately. This is
+//! correct for both singleton and HA deployments.
 
 #![cfg(unix)]
 
@@ -175,7 +174,7 @@ async fn wait_for_key_presence(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sigterm_removes_the_bridge_registration() -> Result<()> {
+async fn sigterm_retains_the_bridge_registration_after_exit() -> Result<()> {
     harnx_core::require_nextest();
     let Some(server) = spawn_nats_server().await? else {
         return Ok(());
@@ -222,16 +221,19 @@ async fn sigterm_removes_the_bridge_registration() -> Result<()> {
     let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     assert_eq!(killed, 0, "failed to send SIGTERM to harnx-mcp-bridge");
 
-    wait_for_key_presence(
-        &jetstream,
-        &key,
-        false,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await
-    .context("registration should be gone soon after SIGTERM, not left to expire")?;
+    wait_for_process_exit(&mut bridge.0, Instant::now() + Duration::from_secs(5))
+        .await
+        .context("harnx-mcp-bridge did not exit after SIGTERM")?;
 
-    let _ = bridge.0.wait();
+    // Check after exit so deletion during shutdown cannot pass as retention.
+    let registry = jetstream
+        .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
+        .await?;
+    assert!(
+        registry.get(&key).await?.is_some(),
+        "bridge registration must remain after process exit for TTL expiry"
+    );
+
     Ok(())
 }
 
@@ -288,4 +290,22 @@ fn first_nats_client_url(dir: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Poll for process exit under a deadline instead of `Child::wait()`, which
+/// blocks forever if the child never exits and would hang the whole suite.
+async fn wait_for_process_exit(child: &mut Child, deadline: Instant) -> Result<()> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(status.success(), "process exited unsuccessfully: {status}");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "process (pid {:?}) did not exit before the deadline",
+                child.id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

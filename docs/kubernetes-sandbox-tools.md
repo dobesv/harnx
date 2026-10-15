@@ -115,12 +115,14 @@ Serving routes through NATS:
   immediately leaves the queue group. New calls route to surviving siblings. The
   terminating replica finishes dispatching buffered requests and waits for
   in-flight handlers to complete within the 10-second drain budget.
-- **HA registration preservation**: Replicas use the
-  `RegistrationShutdown::Expire` policy on shutdown. Terminating replicas skip
-  deleting the shared registration key in the `harnx_tool_registry` KV bucket so
-  a rolling pod does not unregister tools while siblings are actively serving.
-  The registry's 90-second bucket TTL reaps the key only after the last replica
-  exits.
+- **HA registration preservation**: `RegistrationShutdown::Expire` is the
+  default for all tool servers, not an HA opt-in. The gateway's explicit setting
+  selects the same default. Terminating replicas leave the shared registration
+  key in the `harnx_tool_registry` KV bucket so a rolling pod does not unregister
+  tools while siblings are actively serving. Surviving replicas refresh the key
+  every 30 seconds. When all replicas stop, discovery can remain stale for up to
+  90 seconds after the final refresh, until the bucket TTL removes the key.
+  Process shutdown does not mean the shared toolset has been removed.
 - **Idle watcher election**: Exactly one idle watcher per namespace is elected
   via a NATS lease (`harnx_leases` bucket, key
   `sessions/k8s-sandbox-idle-watcher/{namespace}/lock`, 30s TTL, 10s renew).

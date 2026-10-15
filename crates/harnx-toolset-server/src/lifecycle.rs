@@ -6,26 +6,36 @@ use super::REGISTRATION_REFRESH_INTERVAL;
 
 /// Policy for registration cleanup on server shutdown.
 ///
-/// In HA deployments with multiple replicas sharing one registration key,
-/// use `Expire` to skip delete-on-shutdown and let the KV bucket TTL reap
-/// the key after the last replica exits. Singleton servers use the default
-/// `DeleteIfCurrent` to remove their registration promptly on shutdown.
+/// The default is `Expire`, which is safe for both singleton and HA deployments.
+/// `DeleteIfCurrent` is preserved for backward compatibility but is unsafe for
+/// shared registration keys and should only be used by singletons that never
+/// share their identity across multiple replicas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RegistrationShutdown {
-    /// Delete the registration key on shutdown if our revision is still current.
-    ///
-    /// This is the default for singleton tool servers. On a rolling deploy,
-    /// a replacement instance may have already overwritten the key; in that
-    /// case, the delete is a no-op (wrong revision).
-    #[default]
-    DeleteIfCurrent,
-
     /// Skip registration deletion on shutdown; let the bucket TTL expire it.
     ///
-    /// Used by HA gateway replicas that share a registration key. Surviving
-    /// replicas continue refreshing; the key is removed only after the last
-    /// replica exits and the TTL elapses.
+    /// This is the default. NATS KV registrations have a 90-second TTL and
+    /// servers refresh every 30 seconds. When a replica shuts down, surviving
+    /// replicas continue refreshing. The key is removed only after all replicas
+    /// exit and the TTL (90 seconds from the last refresh) elapses.
+    ///
+    /// This policy works for both singleton servers and HA deployments where
+    /// multiple replicas share the same registration key.
+    #[default]
     Expire,
+
+    /// Delete the registration key on shutdown if our revision is still current.
+    ///
+    /// **Warning**: This policy is unsafe for shared registration keys. If multiple
+    /// replicas share the same key (via identical instance ID and identity token),
+    /// a shutting-down replica that holds the latest revision will delete the key
+    /// that surviving replicas still need. Survivors cannot be discovered until they
+    /// refresh and republish, which may take up to 30 seconds.
+    ///
+    /// Only use this policy for singleton servers that are guaranteed never to share
+    /// their registration identity. The revision CAS check only prevents deletion of
+    /// a newer replacement's key; it cannot prove exclusive ownership of a shared key.
+    DeleteIfCurrent,
 }
 
 /// Shutdown and readiness controls for a running toolset server.
@@ -39,7 +49,8 @@ pub struct ServeLifecycle {
 impl ServeLifecycle {
     /// Combine shutdown and readiness handles for `serve_with_shutdown`.
     ///
-    /// Uses the default `RegistrationShutdown::DeleteIfCurrent` policy.
+    /// Uses the default `RegistrationShutdown::Expire` policy, which is
+    /// safe for both singleton and HA deployments.
     pub fn new(shutdown: CancellationToken, readiness: Option<harnx_healthz::Readiness>) -> Self {
         Self {
             shutdown,
@@ -51,8 +62,9 @@ impl ServeLifecycle {
 
     /// Set the registration shutdown policy.
     ///
-    /// Use `RegistrationShutdown::Expire` for HA gateway replicas that share
-    /// a registration key across multiple instances.
+    /// The default (`Expire`) is safe for HA deployments with shared keys.
+    /// Use `DeleteIfCurrent` only for singleton servers that never share
+    /// their registration identity.
     pub fn with_registration_shutdown(mut self, policy: RegistrationShutdown) -> Self {
         self.registration_shutdown = policy;
         self
