@@ -7,12 +7,17 @@ from typing import Any
 
 CLAUDE_THINKING_PATCH = (
     "del(.body.temperature) | del(.body.top_p) | "
-    '.body.thinking = {"type":"enabled","budget_tokens":16000}'
+    '.body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}'
 )
 BEDROCK_THINKING_PATCH = (
     '.body.inferenceConfig = {"temperature":null,"topP":null} | '
     ".body.additionalModelRequestFields = "
     '{"thinking":{"type":"enabled","budget_tokens":16000}}'
+)
+BEDROCK_SUMMARIZED_THINKING_PATCH = (
+    '.body.inferenceConfig = {"temperature":null,"topP":null} | '
+    ".body.additionalModelRequestFields = "
+    '{"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}'
 )
 
 # Opus 4.7+ and Opus 5.5 only accept adaptive thinking plus the effort
@@ -99,7 +104,7 @@ def claude_adaptive_patch(effort: str) -> str:
     """Request patch enabling adaptive Claude thinking at one effort level."""
     return (
         "del(.body.temperature) | del(.body.top_p) | "
-        '.body.thinking = {"type":"adaptive"} | '
+        '.body.thinking = {"type":"adaptive","display":"summarized"} | '
         f'.body.output_config = {{"effort":"{effort}"}}'
     )
 
@@ -110,7 +115,7 @@ def adaptive_model_patch(name: str, effort: str, provider: str) -> str:
         # Harnx can compact history and rebuild dynamic system prompts. Ask the
         # API to drop invalidated thinking rather than reject the next tool turn.
         patch = patch.replace(
-            '{"type":"adaptive"}',
+            '{"type":"adaptive","display":"summarized"}',
             '{"type":"adaptive","display":"summarized",'
             '"block_binding":{"prefix_mismatch_behavior":"drop_block"}}',
         )
@@ -174,7 +179,9 @@ def apply_openai_base_patches(model: dict[str, Any], provider: str) -> None:
         "gpt-6.1-sol",
         "gpt-6-luna",
     ):
-        model["patches"] = [OPENAI_NO_SAMPLING_PATCH]
+        model["patches"] = [
+            f'{OPENAI_NO_SAMPLING_PATCH} | .body.reasoning = {{"summary":"auto"}}'
+        ]
 
 
 def apply_base_model_rules(model: dict[str, Any], provider: str) -> None:
@@ -184,8 +191,66 @@ def apply_base_model_rules(model: dict[str, Any], provider: str) -> None:
     if provider == "gemini" and model["name"] == "gemini-3.8-flash":
         model["patches"] = [
             ".body.generationConfig = ((.body.generationConfig // {}) | "
-            "del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount))"
+            "del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | "
+            ".body.generationConfig.thinkingConfig = "
+            '((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})'
         ]
+
+
+def _claude_thinking_variants(
+    base_model: dict[str, Any], provider: str
+) -> list[dict[str, Any]]:
+    name = base_model["name"]
+    if is_adaptive_only_claude(name):
+        return [
+            _variant_from_base(
+                base_model,
+                effort,
+                adaptive_model_patch(name, effort, provider),
+                max_output_tokens=base_model.get("max_output_tokens"),
+            )
+            for effort in ADAPTIVE_EFFORT_VARIANTS
+        ]
+    return [
+        _variant_from_base(
+            base_model, "thinking", CLAUDE_THINKING_PATCH, max_output_tokens=24000
+        )
+    ]
+
+
+def _bedrock_thinking_patch(name: str) -> str:
+    if name == "us.anthropic.claude-sonnet-5-5":
+        # Converse rejects enabled + budget_tokens for this probed alias.
+        # Use Sonnet 5.5's documented default, not a budget-to-effort mapping:
+        # https://platform.claude.com/docs/en/build-with-claude/effort
+        # Delete sampling fields without discarding the builder's maxTokens.
+        return (
+            ".body.inferenceConfig = ((.body.inferenceConfig // {}) | "
+            "del(.temperature) | del(.topP)) | "
+            ".body.additionalModelRequestFields = "
+            '{"thinking":{"type":"adaptive","display":"summarized"},'
+            '"output_config":{"effort":"high"}}'
+        )
+    if name in (
+        "us.anthropic.claude-fable-5",
+        "us.anthropic.claude-fable-5-1",
+        "us.anthropic.claude-opus-5",
+        "us.anthropic.claude-sonnet-5",
+    ):
+        # Preserve shipped summary requests without opting older aliases in.
+        return BEDROCK_SUMMARIZED_THINKING_PATCH
+    return BEDROCK_THINKING_PATCH
+
+
+def _bedrock_thinking_variants(base_model: dict[str, Any]) -> list[dict[str, Any]]:
+    name = base_model["name"]
+    if is_adaptive_only_opus(name):
+        return []
+    return [
+        _variant_from_base(
+            base_model, "thinking", _bedrock_thinking_patch(name), max_output_tokens=24000
+        )
+    ]
 
 
 def thinking_variants(base_model: dict[str, Any], provider: str) -> list[dict[str, Any]]:
@@ -194,28 +259,17 @@ def thinking_variants(base_model: dict[str, Any], provider: str) -> list[dict[st
     if is_generated_variant_name(provider, name):
         return []
     if provider in ("claude", "vertexai") and name.startswith("claude-"):
-        if is_adaptive_only_claude(name):
-            return [
-                _variant_from_base(
-                    base_model,
-                    effort,
-                    adaptive_model_patch(name, effort, provider),
-                    max_output_tokens=base_model.get("max_output_tokens"),
-                )
-                for effort in ADAPTIVE_EFFORT_VARIANTS
-            ]
-        patch = CLAUDE_THINKING_PATCH
-    elif provider == "bedrock" and name.startswith("us.anthropic.claude-"):
-        if is_adaptive_only_opus(name):
-            return []
-        patch = BEDROCK_THINKING_PATCH
-    else:
-        return []
-    return [_variant_from_base(base_model, "thinking", patch, max_output_tokens=24000)]
+        return _claude_thinking_variants(base_model, provider)
+    if provider == "bedrock" and name.startswith("us.anthropic.claude-"):
+        return _bedrock_thinking_variants(base_model)
+    return []
 
 
 def _openai_effort_variant(base_model: dict[str, Any], effort: str) -> dict[str, Any]:
-    patch = f'{OPENAI_NO_SAMPLING_PATCH} | .body.reasoning = {{"effort":"{effort}"}}'
+    patch = (
+        f'{OPENAI_NO_SAMPLING_PATCH} | '
+        f'.body.reasoning = {{"effort":"{effort}","summary":"auto"}}'
+    )
     variant = _variant_from_base(
         base_model,
         effort,

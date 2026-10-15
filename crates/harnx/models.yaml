@@ -11,6 +11,8 @@
       cache_read_price: 0.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: chatgpt-4o-latest
       max_input_tokens: 128000
@@ -26,6 +28,8 @@
       output_price: 12
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: daybreak-blue-latest
       max_input_tokens: 922000
@@ -36,6 +40,8 @@
       cache_write_price: 5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: daybreak-red-latest
       max_input_tokens: 400000
@@ -46,6 +52,8 @@
       cache_write_price: 15.625
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: ft:gpt-3.5-turbo
       max_input_tokens: 16385
@@ -383,6 +391,8 @@
       cache_read_price: 0.125
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5-2025-08-07
       max_input_tokens: 272000
@@ -392,6 +402,8 @@
       cache_read_price: 0.125
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5-chat
       max_input_tokens: 128000
@@ -401,6 +413,8 @@
       cache_read_price: 0.125
       supports_vision: true
       supports_tool_use: false
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5-chat-latest
       max_input_tokens: 128000
@@ -409,6 +423,8 @@
       output_price: 10
       supports_vision: true
       supports_tool_use: false
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5-mini
       max_input_tokens: 272000
@@ -418,6 +434,8 @@
       cache_read_price: 0.025
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5-mini-2025-08-07
       max_input_tokens: 272000
@@ -427,6 +445,8 @@
       cache_read_price: 0.025
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5-nano
       max_input_tokens: 272000
@@ -436,6 +456,8 @@
       cache_read_price: 0.005
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5-nano-2025-08-07
       max_input_tokens: 272000
@@ -445,6 +467,8 @@
       cache_read_price: 0.005
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5-search-api
       max_input_tokens: 272000
@@ -470,6 +494,8 @@
       cache_read_price: 0.125
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.1-2025-11-13
       max_input_tokens: 272000
@@ -479,6 +505,8 @@
       cache_read_price: 0.125
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.1-chat-latest
       max_input_tokens: 128000
@@ -487,6 +515,8 @@
       output_price: 10
       supports_vision: true
       supports_tool_use: false
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.2
       max_input_tokens: 272000
@@ -496,6 +526,8 @@
       cache_read_price: 0.175
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.2-2025-12-11
       max_input_tokens: 272000
@@ -505,6 +537,8 @@
       cache_read_price: 0.175
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.2-chat-latest
       max_input_tokens: 128000
@@ -513,6 +547,8 @@
       output_price: 14
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.3-chat-latest
       max_input_tokens: 128000
@@ -521,6 +557,8 @@
       output_price: 14
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.4
       max_input_tokens: 1050000
@@ -530,6 +568,8 @@
       cache_read_price: 0.25
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.4-2026-03-05
       max_input_tokens: 1050000
@@ -539,6 +579,8 @@
       cache_read_price: 0.25
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.4-mini
       max_input_tokens: 272000
@@ -548,6 +590,8 @@
       cache_read_price: 0.075
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.4-mini-2026-03-17
       max_input_tokens: 272000
@@ -557,6 +601,8 @@
       cache_read_price: 0.075
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.4-nano
       max_input_tokens: 272000
@@ -566,6 +612,8 @@
       cache_read_price: 0.02
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.4-nano-2026-03-17
       max_input_tokens: 272000
@@ -575,6 +623,8 @@
       cache_read_price: 0.02
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.5
       max_input_tokens: 1050000
@@ -584,6 +634,8 @@
       cache_read_price: 0.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.5-2026-04-23
       max_input_tokens: 1050000
@@ -593,6 +645,8 @@
       cache_read_price: 0.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.5-cyber
       input_price: 12.5
@@ -607,6 +661,8 @@
       cache_write_price: 5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.6-cyber
       max_input_tokens: 400000
@@ -617,6 +673,8 @@
       cache_write_price: 15.625
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.6-luna
       max_input_tokens: 922000
@@ -628,7 +686,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p)
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.6-sol
       max_input_tokens: 922000
@@ -640,7 +698,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p)
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.6-sol:high
       real_name: gpt-5.6-sol
@@ -653,7 +711,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high","summary":"auto"}
       endpoint: responses
     - name: gpt-5.6-sol:max
       real_name: gpt-5.6-sol
@@ -666,7 +724,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max","summary":"auto"}
       endpoint: responses
     - name: gpt-5.6-terra
       max_input_tokens: 922000
@@ -678,7 +736,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p)
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.6-terra:high
       real_name: gpt-5.6-terra
@@ -691,7 +749,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high","summary":"auto"}
       endpoint: responses
     - name: gpt-6-astra
       max_input_tokens: 922000
@@ -703,7 +761,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p)
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-6-astra:high
       real_name: gpt-6-astra
@@ -716,7 +774,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high","summary":"auto"}
       endpoint: responses
     - name: gpt-6-astra:max
       real_name: gpt-6-astra
@@ -729,7 +787,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max","summary":"auto"}
       endpoint: responses
     - name: gpt-6-luna
       max_input_tokens: 922000
@@ -741,7 +799,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p)
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-6-sol
       max_input_tokens: 922000
@@ -753,7 +811,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p)
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-6-sol:high
       real_name: gpt-6-sol
@@ -766,7 +824,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high","summary":"auto"}
       endpoint: responses
     - name: gpt-6-sol:max
       real_name: gpt-6-sol
@@ -779,7 +837,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max","summary":"auto"}
       endpoint: responses
     - name: gpt-6.1-sol
       max_input_tokens: 922000
@@ -791,7 +849,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p)
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-6.1-sol:high
       real_name: gpt-6.1-sol
@@ -804,7 +862,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high","summary":"auto"}
       endpoint: responses
     - name: gpt-6.1-sol:max
       real_name: gpt-6.1-sol
@@ -817,7 +875,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max","summary":"auto"}
       endpoint: responses
     - name: gpt-audio
       max_input_tokens: 128000
@@ -948,6 +1006,8 @@
       cache_read_price: 0.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: o3-2025-04-16
       max_input_tokens: 200000
@@ -957,6 +1017,8 @@
       cache_read_price: 0.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: o3-mini
       max_input_tokens: 200000
@@ -1040,6 +1102,8 @@
       output_price: 0
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-2.5-flash-lite
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -1047,6 +1111,8 @@
       output_price: 0
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-2.5-pro
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -1054,10 +1120,14 @@
       output_price: 0
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3-flash-preview
       max_input_tokens: 1048576
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.1-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -1065,10 +1135,14 @@
       output_price: 1.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -1076,6 +1150,8 @@
       output_price: 9
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.5-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -1083,6 +1159,8 @@
       output_price: 1.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.6-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -1090,6 +1168,8 @@
       output_price: 9
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.8-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -1098,7 +1178,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.generationConfig = ((.body.generationConfig // {}) | del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount))
+      - .body.generationConfig = ((.body.generationConfig // {}) | del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemma-3-27b-it
       max_input_tokens: 131072
       max_output_tokens: 8192
@@ -1133,7 +1213,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-4-opus-20250514
       max_input_tokens: 200000
       max_output_tokens: 32000
@@ -1151,7 +1231,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-4-sonnet-20250514
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -1169,7 +1249,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1191,7 +1271,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-fable-5-1
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1252,7 +1332,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-haiku-4-5-20251001
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -1275,7 +1355,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-mythos-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1297,7 +1377,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-mythos-5-1
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1319,7 +1399,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-mythos-preview
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1341,7 +1421,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-1
       max_input_tokens: 200000
       max_output_tokens: 32000
@@ -1359,7 +1439,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-1-20250805
       max_input_tokens: 200000
       max_output_tokens: 32000
@@ -1377,7 +1457,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -1399,7 +1479,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-5-20251101
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -1422,7 +1502,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-6
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1445,7 +1525,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-6-20260205
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1467,7 +1547,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1479,7 +1559,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
     - name: claude-opus-4-7:max
       real_name: claude-opus-4-7
       max_input_tokens: 1000000
@@ -1492,7 +1572,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-7:xhigh
       real_name: claude-opus-4-7
       max_input_tokens: 1000000
@@ -1505,7 +1585,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-4-7-20260416
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1517,7 +1597,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
     - name: claude-opus-4-7-20260416:max
       real_name: claude-opus-4-7-20260416
       max_input_tokens: 1000000
@@ -1530,7 +1610,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-7-20260416:xhigh
       real_name: claude-opus-4-7-20260416
       max_input_tokens: 1000000
@@ -1543,7 +1623,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1555,7 +1635,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
     - name: claude-opus-4-8:max
       real_name: claude-opus-4-8
       max_input_tokens: 1000000
@@ -1568,7 +1648,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-8:xhigh
       real_name: claude-opus-4-8
       max_input_tokens: 1000000
@@ -1581,7 +1661,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1603,7 +1683,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1615,7 +1695,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"medium"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
     - name: claude-opus-5-5:max
       real_name: claude-opus-5-5
       max_input_tokens: 1000000
@@ -1628,7 +1708,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-5-5:xhigh
       real_name: claude-opus-5-5
       max_input_tokens: 1000000
@@ -1641,7 +1721,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-sonnet-4-5
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -1664,7 +1744,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-4-5-20250929
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -1687,7 +1767,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-4-6
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1710,7 +1790,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1733,7 +1813,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1756,7 +1836,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
 
 # Links:
 #  - https://docs.mistral.ai/getting-started/models/models_overview/
@@ -2718,7 +2798,7 @@
       output_price: 5
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-5-haiku@20241022
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -2734,7 +2814,7 @@
       output_price: 5
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-5-sonnet
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -2752,7 +2832,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-5-sonnet@20240620
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -2770,7 +2850,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-haiku
       max_input_tokens: 200000
       max_output_tokens: 4096
@@ -2788,7 +2868,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-haiku@20240307
       max_input_tokens: 200000
       max_output_tokens: 4096
@@ -2806,7 +2886,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-opus
       max_input_tokens: 200000
       max_output_tokens: 4096
@@ -2824,7 +2904,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-opus@20240229
       max_input_tokens: 200000
       max_output_tokens: 4096
@@ -2842,7 +2922,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-sonnet
       max_input_tokens: 200000
       max_output_tokens: 4096
@@ -2860,7 +2940,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-sonnet@20240229
       max_input_tokens: 200000
       max_output_tokens: 4096
@@ -2878,7 +2958,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -2900,7 +2980,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-fable-5-1
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -2912,7 +2992,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
     - name: claude-fable-5-1:max
       real_name: claude-fable-5-1
       max_input_tokens: 1000000
@@ -2925,7 +3005,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-fable-5-1:xhigh
       real_name: claude-fable-5-1
       max_input_tokens: 1000000
@@ -2938,7 +3018,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-fable-5-1@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -2950,7 +3030,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
     - name: claude-fable-5-1@default:max
       real_name: claude-fable-5-1@default
       max_input_tokens: 1000000
@@ -2963,7 +3043,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-fable-5-1@default:xhigh
       real_name: claude-fable-5-1@default
       max_input_tokens: 1000000
@@ -2976,7 +3056,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-fable-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -2998,7 +3078,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-haiku-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -3021,7 +3101,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-haiku-4-5@20251001
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -3044,7 +3124,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4
       max_input_tokens: 200000
       max_output_tokens: 32000
@@ -3062,7 +3142,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-1
       max_input_tokens: 200000
       max_output_tokens: 32000
@@ -3080,7 +3160,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-1@20250805
       max_input_tokens: 200000
       max_output_tokens: 32000
@@ -3098,7 +3178,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -3120,7 +3200,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-5@20251101
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -3143,7 +3223,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-6
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3166,7 +3246,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-6@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3188,7 +3268,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3200,7 +3280,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
     - name: claude-opus-4-7:max
       real_name: claude-opus-4-7
       max_input_tokens: 1000000
@@ -3213,7 +3293,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-7:xhigh
       real_name: claude-opus-4-7
       max_input_tokens: 1000000
@@ -3226,7 +3306,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-4-7@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3238,7 +3318,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
     - name: claude-opus-4-7@default:max
       real_name: claude-opus-4-7@default
       max_input_tokens: 1000000
@@ -3251,7 +3331,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-7@default:xhigh
       real_name: claude-opus-4-7@default
       max_input_tokens: 1000000
@@ -3264,7 +3344,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3276,7 +3356,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
     - name: claude-opus-4-8:max
       real_name: claude-opus-4-8
       max_input_tokens: 1000000
@@ -3289,7 +3369,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-8:xhigh
       real_name: claude-opus-4-8
       max_input_tokens: 1000000
@@ -3302,7 +3382,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-4-8@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3314,7 +3394,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
     - name: claude-opus-4-8@default:max
       real_name: claude-opus-4-8@default
       max_input_tokens: 1000000
@@ -3327,7 +3407,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-8@default:xhigh
       real_name: claude-opus-4-8@default
       max_input_tokens: 1000000
@@ -3340,7 +3420,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-4@20250514
       max_input_tokens: 200000
       max_output_tokens: 32000
@@ -3358,7 +3438,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3380,7 +3460,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3392,7 +3472,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"medium"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
     - name: claude-opus-5-5:max
       real_name: claude-opus-5-5
       max_input_tokens: 1000000
@@ -3405,7 +3485,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-5-5:xhigh
       real_name: claude-opus-5-5
       max_input_tokens: 1000000
@@ -3418,7 +3498,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-5-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3430,7 +3510,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"medium"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
     - name: claude-opus-5-5@default:max
       real_name: claude-opus-5-5@default
       max_input_tokens: 1000000
@@ -3443,7 +3523,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-5-5@default:xhigh
       real_name: claude-opus-5-5@default
       max_input_tokens: 1000000
@@ -3456,7 +3536,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3478,7 +3558,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-4
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -3496,7 +3576,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -3519,7 +3599,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-4-5@20250929
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -3542,7 +3622,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-4-6
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -3565,7 +3645,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-4-6@default
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -3588,7 +3668,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-4@20250514
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -3606,7 +3686,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3629,7 +3709,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3652,7 +3732,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-5-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3675,7 +3755,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-sonnet-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3698,7 +3778,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: codestral-2
       max_input_tokens: 128000
       max_output_tokens: 128000
@@ -3776,6 +3856,8 @@
       output_price: 2.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-2.5-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3783,6 +3865,8 @@
       output_price: 0.4
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-2.5-pro
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3790,6 +3874,8 @@
       output_price: 10
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3-flash-preview
       max_input_tokens: 1048576
       max_output_tokens: 65535
@@ -3798,6 +3884,8 @@
       cache_read_price: 0.05
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3-pro-preview
       max_input_tokens: 1048576
       max_output_tokens: 65535
@@ -3806,6 +3894,8 @@
       cache_read_price: 0.2
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.1-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3814,6 +3904,8 @@
       cache_read_price: 0.025
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.1-flash-lite-preview
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3822,6 +3914,8 @@
       cache_read_price: 0.025
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3830,6 +3924,8 @@
       cache_read_price: 0.2
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.1-pro-preview-customtools
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3838,6 +3934,8 @@
       cache_read_price: 0.2
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65535
@@ -3846,6 +3944,8 @@
       cache_read_price: 0.15
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.5-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3854,6 +3954,8 @@
       cache_read_price: 0.03
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.6-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3862,6 +3964,8 @@
       cache_read_price: 0.075
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.7-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3870,6 +3974,8 @@
       cache_read_price: 0.075
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.8-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3878,6 +3984,8 @@
       cache_read_price: 0.075
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.8-flash-cyber
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -3886,6 +3994,8 @@
       cache_read_price: 0.15
       supports_vision: true
       supports_tool_use: false
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-embedding-2
       max_input_tokens: 8192
       input_price: 0.2
@@ -4842,7 +4952,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
+      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}
     - name: us.anthropic.claude-fable-5-1
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -4864,7 +4974,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
+      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}
     - name: us.anthropic.claude-haiku-4-5-20251001-v1:0
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -5084,7 +5194,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
+      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}
     - name: us.anthropic.claude-opus-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5183,7 +5293,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
+      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}
     - name: us.anthropic.claude-sonnet-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5205,7 +5315,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"high"}}
     - name: us.cohere.embed-v4:0
       max_input_tokens: 128000
       input_price: 0.12

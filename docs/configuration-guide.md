@@ -77,7 +77,7 @@ api_base: https://...     # Optional custom endpoint
 extra:
   connect_timeout: 10     # seconds to establish TCP/TLS connection (default 10)
   read_timeout: 120       # seconds of read inactivity before stalled response fails (default 120)
-patches:                  # Patch API requests using jq expressions
+patches:                  # Patch API requests using jaq expressions
   chat_completions:
     - '.body.cache_control = {"type":"ephemeral"}'
 ```
@@ -86,9 +86,9 @@ patches:                  # Patch API requests using jq expressions
 
 ### Per-Model Patches
 
-The `patches.chat_completions`, `patches.embeddings`, and `patches.rerank` fields are arrays of **jq filter strings**. Each filter receives the full request object as JSON (`{url, headers, body}`) and must return the modified version.
+The `patches.chat_completions`, `patches.responses`, `patches.embeddings`, and `patches.rerank` fields are arrays of jaq filter strings. Each filter receives the full request object as JSON (`{url, headers, body}`) and must return the modified version.
 
-Filters are applied in sequence. If an expression fails, the request fails with the jq error and the name of the patch source — a skipped patch would send the very request body the patch exists to correct.
+Filters are applied in sequence. If an expression fails, the request fails with the jaq error and the name of the patch source — a skipped patch would send the very request body the patch exists to correct.
 
 Harnx evaluates filters with [jaq](https://github.com/01mf02/jaq), which does not create missing intermediate objects the way jq does. Assign the whole container rather than a nested path:
 
@@ -116,6 +116,44 @@ For prefix or pattern matching, use `test` within the expression:
 patches:
   chat_completions:
     - 'if (.body.model | test("gpt-5.*")) then .body.reasoning_effort = "high" end'
+```
+
+### Reasoning Summaries and Defaults
+
+Reasoning models stream no readable reasoning text unless the request explicitly asks for it. To prevent thinking phases from appearing stalled, Harnx catalog entries in `models.yaml` request reasoning summaries by default:
+
+| Provider family | Default catalog parameter | Target location |
+|---|---|---|
+| OpenAI Responses / Codex | `reasoning.summary: "auto"` | `.body.reasoning = {"summary":"auto", ...}` |
+| Claude (Anthropic) | `thinking.display: "summarized"` | `.body.thinking = {"type":"adaptive", "display":"summarized", ...}` |
+| Gemini / Vertex AI | `generationConfig.thinkingConfig.includeThoughts: true` | `.body.generationConfig.thinkingConfig = {"includeThoughts":true, ...}` |
+| Bedrock Claude | `additionalModelRequestFields.thinking.display: "summarized"` | `.body.additionalModelRequestFields = {"thinking":{"display":"summarized", ...}}` (provisional pending live probe) |
+
+Frontends (TUI, CLI, ACP) render incoming reasoning summary chunks automatically.
+
+#### Overriding Reasoning Summaries on a Client
+
+To override catalog defaults without modifying `models.yaml`, set `patches` on the client config (such as `clients/openai.yaml`). Client patches evaluate after model catalog patches, letting you change the summary level or turn it off entirely.
+
+Because jaq does not create missing parent objects, always assign or replace the full parent object. When altering an OpenAI Responses model, remember that OpenAI rejects `"none"` as a summary value; disable summaries by removing the summary property from the reasoning object or deleting `.body.reasoning.summary`:
+
+```yaml
+# clients/openai.yaml
+type: openai
+patches:
+  responses:
+    # Switch reasoning summary level to concise for all responses models:
+    - 'if .body.reasoning then .body.reasoning.summary = "concise" else . end'
+    # Or turn off summaries entirely:
+    # - 'if .body.reasoning then del(.body.reasoning.summary) else . end'
+```
+
+For models that do not already have `.body.reasoning` set, assign the entire container object:
+
+```yaml
+patches:
+  responses:
+    - '.body.reasoning = {"effort":"high","summary":"auto"}'
 ```
 
 ## Tool Servers (`tool_servers/`)
