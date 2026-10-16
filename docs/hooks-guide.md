@@ -670,7 +670,7 @@ Hooks are scoped according to where they are configured:
 NATS hook servers register their capabilities in a JetStream Key-Value bucket and handle event invocation requests over dedicated NATS subjects.
 
 * **Registry Bucket**: `harnx_hook_registry` (constant `HOOK_REGISTRY_BUCKET`).
-* **Registration**: Hook servers publish a `HookRegistration` payload containing their server ID, registered `HookSpec` list, `schema_version`, and `proto_version`. Registrations feature a 60-second TTL refreshed every 30 seconds.
+* **Registration**: Hook servers publish a `HookRegistration` payload containing their server ID, registered `HookSpec` list, `schema_version`, and `proto_version`. Registrations feature a 90-second TTL refreshed every 30 seconds. The registration key is retained on shutdown and expires by TTL, which is correct for both singleton and HA deployments where multiple replicas share a registration key.
 * **Subject Scheme**: `{instance}.hook.{server}.{event}`.
 * **Request/Reply**: `NatsHookProvider` queries active registrations, matches events against configured matchers (regex on bare tool names like `bash_exec`), orders matching hooks by ascending priority, then by registered server name (supervisor-assigned nonce), then by discovery-list index, and posts `HookPayload` requests to collect `HookOutcome` replies.
 

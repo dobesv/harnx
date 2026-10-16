@@ -43,7 +43,14 @@ async fn registers_and_serves_every_toolset_as_one_lifecycle() -> Result<()> {
     shutdown.cancel();
     task.await??;
     assert!(!readiness.is_ready());
-    assert_registrations_removed(&registry, &keys).await
+    // Default policy is Expire, so registrations remain until TTL
+    for key in &keys {
+        assert!(
+            registry.get(key).await?.is_some(),
+            "registration '{key}' must NOT be deleted with default Expire policy"
+        );
+    }
+    Ok(())
 }
 
 async fn connect(url: &str) -> Result<async_nats::Client> {
@@ -152,6 +159,8 @@ async fn invoke_named(client: &async_nats::Client, scope: &ServerScope, name: &s
     Ok(())
 }
 
+// Helper no longer needed after default changed to Expire
+#[allow(dead_code)]
 async fn assert_registrations_removed(registry: &kv::Store, keys: &[String]) -> Result<()> {
     for key in keys {
         assert!(registry.get(key).await?.is_none());

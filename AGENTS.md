@@ -1086,6 +1086,21 @@ carries `agent: Option<String>` and `session_id: String` (6-char local id).
 definitions to avoid circular dependencies; convert between them manually.
 See `crates/harnx-toolset-server/src/invocation.rs` for construction.
 
+### Shared registration shutdown policy
+
+Tool servers shared by multiple replicas use `RegistrationShutdown::Expire`
+(default) so a terminating replica cannot delete a key that survivors still need.
+Hook servers unconditionally retain registrations on shutdown—no policy API exists.
+The NATS KV bucket TTL (90s, refreshed every 30s) handles cleanup in both cases.
+
+For tool servers, `DeleteIfCurrent` is preserved for backward compatibility but is
+unsafe for shared keys: CAS on the revision only prevents deleting a newer replacement's
+key; it cannot prove exclusive ownership when replicas share the same instance ID.
+A departing replica holding the latest revision will delete the key, leaving survivors
+undiscoverable until their next refresh (up to 30s). Only use `DeleteIfCurrent` for
+singletons that are guaranteed never to share their registration identity.
+
+
 ### Canonical `cid:` URL scheme
 
 Attachments and plans use canonical `cid:` URLs that identify resources by owning session and path or content digest:

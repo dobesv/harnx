@@ -314,10 +314,11 @@ async fn wait_for_key_presence(
 
 /// Proves that a SIGTERM sent directly to a running
 /// `harnx-claude-compatible-hook-server` process (as Kubernetes would send
-/// to a pod) triggers deregistration, not just that the plumbing between a
-/// `CancellationToken` and the serve loop is wired correctly.
+/// to a pod) triggers graceful shutdown. The registration is retained for
+/// TTL expiry rather than deleted immediately, which is correct for HA
+/// deployments where multiple hook server replicas share a registration key.
 #[tokio::test(flavor = "multi_thread")]
-async fn sigterm_removes_the_hook_registration() -> Result<()> {
+async fn sigterm_retains_the_hook_registration_after_exit() -> Result<()> {
     harnx_core::require_nextest();
     let Some(server) = spawn_nats_server().await? else {
         return Ok(());
@@ -366,18 +367,18 @@ async fn sigterm_removes_the_hook_registration() -> Result<()> {
         "failed to send SIGTERM to harnx-claude-compatible-hook-server"
     );
 
-    wait_for_key_presence(
-        &client,
-        &key,
-        false,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await
-    .context("hook registration should be gone soon after SIGTERM, not left to expire")?;
-
     wait_for_process_exit(&mut hook_server.0, Instant::now() + Duration::from_secs(5))
         .await
         .context("harnx-claude-compatible-hook-server did not exit after SIGTERM")?;
+
+    // Check after exit so deletion during shutdown cannot pass as retention.
+    let registry = async_nats::jetstream::new(client.clone())
+        .get_key_value(HOOK_REGISTRY_BUCKET)
+        .await?;
+    assert!(
+        registry.get(&key).await?.is_some(),
+        "hook registration must remain after process exit for TTL expiry"
+    );
     Ok(())
 }
 
@@ -388,7 +389,8 @@ async fn sigterm_removes_the_hook_registration() -> Result<()> {
 /// propagates that error, so the child is cleaned up either way.
 async fn wait_for_process_exit(child: &mut Child, deadline: Instant) -> Result<()> {
     loop {
-        if child.try_wait()?.is_some() {
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(status.success(), "process exited unsuccessfully: {status}");
             return Ok(());
         }
         if Instant::now() >= deadline {

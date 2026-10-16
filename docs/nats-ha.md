@@ -86,9 +86,9 @@ Harnx automatically manages the following JetStream resources:
 - **KV Bucket**: `harnx_tool_registry` — tool server discovery, with a
   per-registration TTL.
 - **KV Buckets**: `harnx_hook_registry` and `harnx_hook_expectations` — hook
-  server discovery and its fail-closed fallback routes. Only the copies
-  opened by the standalone `harnx-hookset-server` binary carry a TTL; the
-  worker daemon's own copy of the same buckets does not set one.
+  server discovery and its fail-closed fallback routes. The registration TTL
+  is set on the bucket and applies to all registrations, including those
+  opened by the worker daemon.
 - **Streams**: `SESSION_<sha256(id)>` (Subject: `sessions.{id}.log`) stores only the
   durable append-only conversation history. Agent identity, settings, rendered
   prompts, and titles do not belong in this stream. Hash the exact, case-sensitive
