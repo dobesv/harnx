@@ -946,7 +946,17 @@ async fn prepare_round_input(
     apply_round_embeddings(input, &ctx.config, &ctx.abort_signal, with_embeddings).await?;
     inject_shared_pending_context(input, ctx.pending_async_context.as_ref()).await;
     ctx.check_generation("before-model")?;
-    ctx.config.write().before_chat_completion(input)
+    ctx.config.write().before_chat_completion(input)?;
+    crate::config::session_timing::prepare_notice(&ctx.config, input, chrono::Utc::now())?;
+    ctx.check_generation("timing-persisted")
+}
+
+fn begin_agent_loop(ctx: &AgentLoopContext, mut input: Input) -> Input {
+    record_agent_turn_attributes(ctx);
+    // A logical loop entry must not replay a saved request-only suffix.
+    input.timing_context = None;
+    crate::config::session_timing::start_run(&ctx.config, chrono::Utc::now());
+    input
 }
 
 #[tracing::instrument(
@@ -959,11 +969,9 @@ async fn prepare_round_input(
     )
 )]
 async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> Result<LoopResult> {
-    record_agent_turn_attributes(ctx);
-
     let config = &ctx.config;
     let abort_signal = &ctx.abort_signal;
-    let mut input = initial_input;
+    let mut input = begin_agent_loop(ctx, initial_input);
     let mut resume_count: u32 = ctx.initial_resume_count;
     let mut with_embeddings = ctx.initial_with_embeddings;
     let mut emitted_text_turns: u32 = 0;
@@ -1018,6 +1026,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
         // Input was persisted before the model call. Clear this one-shot field
         // before on_tool_round can supply the next pending user message.
         input.injected_user_text = None;
+        input.timing_context = None;
 
         emit_text_turn_status(ctx, &usage, tool_results.is_empty(), emitted_text_turns);
 

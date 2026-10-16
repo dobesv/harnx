@@ -219,38 +219,46 @@ pub async fn run_command_with_output(
         .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_command_with_output_and_local_worker(
-    config: &GlobalConfig,
-    abort_signal: AbortSignal,
-    mut line: &str,
-    output: &mut (dyn Write + Send),
-    local_worker: &Arc<
-        tokio::sync::Mutex<Option<crate::local_orchestrator::LocalWorkerSupervisor>>,
-    >,
-) -> Result<CommandOutcome> {
+fn normalize_command_line(line: &str) -> &str {
     if let Ok(Some(captures)) = MULTILINE_RE.captures(line) {
         if let Some(text_match) = captures.get(1) {
-            line = text_match.as_str();
+            return text_match.as_str();
         }
     }
-    if crate::operator_tools::is_operator_tool_command(line) {
-        let command = crate::operator_tools::parse_operator_line(line)?;
-        let reply = crate::operator_tools::run_session_tool_command(
-            config,
-            &abort_signal,
-            command,
-            false,
-            local_worker,
-        )
-        .await?;
-        writeln!(output, "{}", reply.output)?;
-        if let Some(error) = reply.error {
-            bail!("{error}");
+    line
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_command_with_output_and_local_worker<'a>(
+    config: &'a GlobalConfig,
+    abort_signal: AbortSignal,
+    line: &'a str,
+    output: &'a mut (dyn Write + Send),
+    local_worker: &'a Arc<
+        tokio::sync::Mutex<Option<crate::local_orchestrator::LocalWorkerSupervisor>>,
+    >,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CommandOutcome>> + Send + 'a>> {
+    // Every command otherwise embeds the largest agent-execution branch in its
+    // callers' futures. Heap allocation keeps nested dispatch within worker stacks.
+    Box::pin(async move {
+        let line = normalize_command_line(line);
+        if crate::operator_tools::is_operator_tool_command(line) {
+            let command = crate::operator_tools::parse_operator_line(line)?;
+            let reply = crate::operator_tools::run_session_tool_command(
+                config,
+                &abort_signal,
+                command,
+                false,
+                local_worker,
+            )
+            .await?;
+            writeln!(output, "{}", reply.output)?;
+            if let Some(error) = reply.error {
+                bail!("{error}");
+            }
+            return Ok(CommandOutcome::Continue);
         }
-        return Ok(CommandOutcome::Continue);
-    }
-    match parse_command(line) {
+        match parse_command(line) {
         Some((cmd, args)) => match cmd {
             ".help" => {
                 dump_help(output)?;
@@ -615,13 +623,13 @@ pub async fn run_command_with_output_and_local_worker(
                         abort_signal.clone(),
                     )
                     .await?;
-                    ask(
+                    Box::pin(ask(
                         config,
                         local_worker,
                         abort_signal.clone(),
                         input,
                         true,
-                    )
+                    ))
                     .await?;
                 }
                 None => crate::utils::emit_info(
@@ -854,7 +862,8 @@ pub async fn run_command_with_output_and_local_worker(
         }
     }
 
-    Ok(CommandOutcome::Continue)
+        Ok(CommandOutcome::Continue)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

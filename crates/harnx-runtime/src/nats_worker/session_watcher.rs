@@ -144,53 +144,57 @@ async fn watch_from(ctx: &SessionWatcherCtx, cursor: &mut u64) -> anyhow::Result
         if seq <= ctx.own_appends.load(Ordering::Relaxed) {
             continue; // our own append, not a foreign interrupt
         }
-        let entry = match crate::nats_session_log::deserialize_entry(&message.payload) {
-            Ok(entry) => entry,
+        match crate::nats_session_log::deserialize_entry(&message.payload) {
+            Ok(entry) => handle_watcher_entry(ctx, seq, entry).await,
             Err(error) => {
-                // Restarting the consumer over one bad entry would replay
-                // everything since `*cursor` and re-fire any Cancel already
-                // handled. Skip just this one; `*cursor` already moved past it.
+                // Cursor already moved past this row. Restarting would replay
+                // earlier Cancel entries, so skip only the undecodable entry.
                 log::warn!(
                     "session watcher skipping undecodable entry: session_id={} seq={seq} error={error:#}",
                     ctx.session_id
                 );
-                continue;
             }
-        };
-        match entry {
-            SessionLogEntry::Cancel {
-                cancellation_id, ..
-            } => {
-                ctx.interrupted.lock().replace(InterruptNotice {
-                    cancel_seq: seq,
-                    cancellation_id: cancellation_id.clone(),
-                });
-                let id = cancellation_id.unwrap_or_else(|| format!("cancel-{seq}"));
-                // Awaits only the in-flight snapshot and the (synchronous)
-                // spawn of the publish fan-out below, so both happen before
-                // `set_ctrlc` even if this task is aborted the instant that
-                // fires — which is exactly what `execute_session` does.
-                let sent =
-                    cancel_in_flight_calls(&ctx.client, &ctx.in_flight, &ctx.session_id, &id).await;
-                ctx.abort_signal.set_ctrlc();
-                log::info!(
-                    "session interrupted: session_id={} cancel_seq={seq} tool_cancels={sent}",
-                    ctx.session_id
-                );
-            }
-            SessionLogEntry::CompactRequest { compaction_id, .. } => {
-                handle_compact_request(ctx, compaction_id);
-            }
-            SessionLogEntry::CompactResult { compaction_id, .. } => {
-                handle_compact_result(ctx, compaction_id);
-            }
-            SessionLogEntry::Message { role, .. } if role.is_user() => {
-                ctx.pending_input.store(true, Ordering::Relaxed);
-            }
-            _ => {}
         }
     }
     Ok(())
+}
+
+async fn handle_cancel_entry(ctx: &SessionWatcherCtx, seq: u64, cancellation_id: Option<String>) {
+    ctx.interrupted.lock().replace(InterruptNotice {
+        cancel_seq: seq,
+        cancellation_id: cancellation_id.clone(),
+    });
+    let id = cancellation_id.unwrap_or_else(|| format!("cancel-{seq}"));
+    // Snapshot and publish fan-out must happen before ctrl-c can abort this task.
+    let sent = cancel_in_flight_calls(&ctx.client, &ctx.in_flight, &ctx.session_id, &id).await;
+    ctx.abort_signal.set_ctrlc();
+    log::info!(
+        "session interrupted: session_id={} cancel_seq={seq} tool_cancels={sent}",
+        ctx.session_id
+    );
+}
+
+async fn handle_watcher_entry(ctx: &SessionWatcherCtx, seq: u64, entry: SessionLogEntry) {
+    match entry {
+        SessionLogEntry::Cancel {
+            cancellation_id, ..
+        } => {
+            handle_cancel_entry(ctx, seq, cancellation_id).await;
+        }
+        SessionLogEntry::CompactRequest { compaction_id, .. } => {
+            handle_compact_request(ctx, compaction_id);
+        }
+        SessionLogEntry::CompactResult { compaction_id, .. } => {
+            handle_compact_result(ctx, compaction_id);
+        }
+        SessionLogEntry::Message { role, content, .. }
+            if role.is_user()
+                && !harnx_core::timing_identity::is_timing_notice(&content.to_text()) =>
+        {
+            ctx.pending_input.store(true, Ordering::Relaxed);
+        }
+        _ => {}
+    }
 }
 
 fn handle_compact_request(ctx: &SessionWatcherCtx, compaction_id: String) {

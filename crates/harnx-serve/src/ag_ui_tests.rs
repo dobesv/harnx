@@ -2185,13 +2185,7 @@ async fn ag_ui_run_echoes_client_nanoid_run_id_in_boundary_events() {
     );
 }
 
-#[tokio::test]
-async fn ag_ui_run_resume_same_session_persists_only_new_turn() {
-    let sandbox = TestConfigSandbox::new();
-    sandbox.write_agent("plain", "You are plain.");
-    let config = sandbox.config();
-    let session_id = "resume-session";
-
+async fn execute_initial_resume_turn(config: &Config, session_id: &str) -> (Vec<String>, String) {
     let first_body = json!({
         "threadId": Uuid::new_v4(),
         "runId": Uuid::new_v4(),
@@ -2207,9 +2201,9 @@ async fn ag_ui_run_resume_same_session_persists_only_new_turn() {
             Ok(("assistant1".into(), None, vec![], usage))
         })
     });
-    let registry = ag_ui_test_registry(&config, Some(first_call_fn));
+    let registry = ag_ui_test_registry(config, Some(first_call_fn));
     let first_response = ag_ui_run_with_call_fn(
-        &config,
+        config,
         &registry,
         "plain",
         session_id,
@@ -2226,19 +2220,21 @@ async fn ag_ui_run_resume_same_session_persists_only_new_turn() {
         })
         .await,
     );
-    let first_messages = load_session_texts(&config, "plain", session_id);
-    assert_eq!(
-        first_messages,
-        vec!["user1".to_string(), "assistant1".to_string()]
-    );
-
-    let persisted_messages = load_session_messages(&config, "plain", session_id);
+    let first_messages = load_session_texts(config, "plain", session_id);
+    let persisted_messages = load_session_messages(config, "plain", session_id);
     let persisted_assistant_id = persisted_messages
         .iter()
         .find(|msg| msg.role.is_assistant())
         .and_then(|msg| msg.id.clone())
         .expect("persisted assistant id");
+    (first_messages, persisted_assistant_id)
+}
 
+async fn execute_resumed_turn(
+    config: &Config,
+    session_id: &str,
+    persisted_assistant_id: &str,
+) -> Vec<String> {
     let second_body = json!({
         "threadId": Uuid::new_v4(),
         "runId": Uuid::new_v4(),
@@ -2266,9 +2262,9 @@ async fn ag_ui_run_resume_same_session_persists_only_new_turn() {
             Ok(("assistant2".into(), None, vec![], usage))
         })
     });
-    let registry = ag_ui_test_registry(&config, Some(second_call_fn));
+    let registry = ag_ui_test_registry(config, Some(second_call_fn));
     let second_response = ag_ui_run_with_call_fn(
-        &config,
+        config,
         &registry,
         "plain",
         session_id,
@@ -2285,7 +2281,24 @@ async fn ag_ui_run_resume_same_session_persists_only_new_turn() {
         })
         .await,
     );
-    let second_messages = load_session_texts(&config, "plain", session_id);
+    load_session_texts(config, "plain", session_id)
+}
+
+#[tokio::test]
+async fn ag_ui_run_resume_same_session_persists_only_new_turn() {
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "You are plain.");
+    let config = sandbox.config();
+    let session_id = "resume-session";
+
+    let (first_messages, persisted_assistant_id) =
+        execute_initial_resume_turn(&config, session_id).await;
+    assert_eq!(
+        first_messages,
+        vec!["user1".to_string(), "assistant1".to_string()]
+    );
+
+    let second_messages = execute_resumed_turn(&config, session_id, &persisted_assistant_id).await;
     assert_eq!(second_messages.len(), first_messages.len() + 2);
     assert_eq!(
         second_messages,
@@ -2295,6 +2308,12 @@ async fn ag_ui_run_resume_same_session_persists_only_new_turn() {
             "user2".to_string(),
             "assistant2".to_string(),
         ]
+    );
+    assert!(
+        crate::session_actor::load_test_session_messages("plain", session_id)
+            .iter()
+            .any(|msg| harnx_core::timing_identity::is_timing_notice(&msg.content.to_text())),
+        "timing notice should be persisted in session log"
     );
 }
 
@@ -2410,20 +2429,25 @@ fn assert_run_finished(events: Vec<Value>) {
     );
 }
 
-fn load_session_texts(config: &Config, agent: &str, session_id: &str) -> Vec<String> {
-    let _ = config;
-    crate::session_actor::load_test_session_messages(agent, session_id)
-        .iter()
-        .filter(|msg| msg.role.is_user() || msg.role.is_assistant())
-        .map(|msg| msg.content.to_text())
-        .collect()
+fn is_conversation_history_message(msg: &HistoryMsg) -> bool {
+    msg.role.is_assistant()
+        || (msg.role.is_user()
+            && !harnx_core::timing_identity::is_timing_notice(&msg.content.to_text()))
 }
+
 fn load_session_messages(config: &Config, agent: &str, session_id: &str) -> Vec<HistoryMsg> {
     let _ = config;
     crate::session_actor::load_test_session_messages(agent, session_id)
         .iter()
-        .filter(|msg| msg.role.is_user() || msg.role.is_assistant())
+        .filter(|msg| is_conversation_history_message(msg))
         .cloned()
+        .collect()
+}
+
+fn load_session_texts(config: &Config, agent: &str, session_id: &str) -> Vec<String> {
+    load_session_messages(config, agent, session_id)
+        .into_iter()
+        .map(|msg| msg.content.to_text())
         .collect()
 }
 

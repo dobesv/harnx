@@ -366,3 +366,63 @@ fn fold_new_user_messages_since_cursor_semantics_with_retracts() {
         "latest_seq must track max consumed user-message seq"
     );
 }
+
+#[test]
+fn timing_recovery_compaction_archives_context_but_keeps_raw_progress() {
+    use crate::config::session_timing::recover_progress;
+    use crate::nats_session_metadata::{
+        InvocationIdentity, RunIdentity, RunLimitsPolicySource, RunLimitsRecord,
+    };
+    use crate::timing_notice::{evaluate_timing, TimingInput};
+    use harnx_core::timing_identity::{MilestoneCoverage, TimingReceipt, TIMING_HEADER};
+
+    let origin = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+    let limits = RunLimitsRecord {
+        run_id: RunIdentity::from_string("root".into()),
+        invocation_id: InvocationIdentity::from_string("active".into()),
+        admitted_at: origin,
+        deadline: Some(origin + chrono::Duration::seconds(7200)),
+        policy_source: RunLimitsPolicySource::GlobalDefault,
+        parent_invocation: None,
+    };
+    let receipt = TimingReceipt::new(
+        origin,
+        "active".into(),
+        MilestoneCoverage::INITIAL | MilestoneCoverage::PERCENT_50,
+        4,
+    );
+    let entries = numbered(vec![
+        user("current", "work in progress"),
+        user(
+            "timing",
+            &format!("{TIMING_HEADER}{} | any prose", receipt.to_json()),
+        ),
+        SessionLogEntry::Compress {
+            prompt: "older work complete".into(),
+        },
+        user("current", "work in progress"),
+    ]);
+    let config = crate::config::Config::default();
+    let session = crate::config::session::new(&config, "compacted", None).unwrap();
+    let active = crate::nats_session_log::load_session_from_entries_with_metadata(
+        &entries,
+        "compacted",
+        session,
+    )
+    .unwrap();
+    assert!(!active
+        .messages
+        .iter()
+        .any(|m| harnx_core::timing_identity::is_timing_notice(&m.content.to_text())));
+    let mut input =
+        TimingInput::from_run_limits(origin + chrono::Duration::seconds(3600), limits.clone());
+    input.committed_progress = recover_progress(&entries, Some(&limits));
+    assert_eq!(input.committed_progress, Some(receipt));
+    assert!(
+        !evaluate_timing(&input).emit,
+        "active-context loss doesn't renew milestones"
+    );
+    let (prompts, _) = fold_new_user_messages_since(&entries, None);
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].content.to_text(), "work in progress");
+}

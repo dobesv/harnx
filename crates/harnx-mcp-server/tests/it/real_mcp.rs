@@ -3,6 +3,7 @@
 use super::*;
 use harnx_core::{cid_url::CidUrl, session::SessionLogEntry};
 use harnx_mcp_server::transport::run_http;
+use harnx_runtime::nats_session_metadata::RunLimitsRecord;
 use harnx_runtime::{
     nats_session_log::NatsSessionLog, nats_session_metadata::SessionMetadataStore, AgentCallFn,
 };
@@ -28,14 +29,7 @@ struct Worker {
     client: async_nats::Client,
     prompts: Arc<parking_lot::Mutex<Vec<String>>>,
     blocked_dropped: CancellationToken,
-    scopes: Arc<
-        parking_lot::Mutex<
-            Vec<(
-                String,
-                harnx_runtime::nats_session_metadata::RunLimitsRecord,
-            )>,
-        >,
-    >,
+    scopes: Arc<parking_lot::Mutex<Vec<(String, RunLimitsRecord)>>>,
 }
 
 fn write_agent(config: &Path, name: &str) -> Result<()> {
@@ -342,11 +336,7 @@ async fn assert_unlisted(client: &RunningService<RoleClient, ()>, name: &str) ->
     Ok(())
 }
 
-async fn child_limits(
-    worker: &Worker,
-    key: &str,
-    prompt: &str,
-) -> Result<harnx_runtime::nats_session_metadata::RunLimitsRecord> {
+async fn child_limits(worker: &Worker, key: &str, prompt: &str) -> Result<RunLimitsRecord> {
     let events = NatsSessionLog::new(async_nats::jetstream::new(worker.client.clone()), key)
         .load_events_latest_async()
         .await?;
@@ -373,13 +363,46 @@ async fn child_limits(
         .context("frozen child limits missing")
 }
 
-async fn agent_continuation(
+fn assert_root_invocation_identity(
+    root: &RunLimitsRecord,
+    original: &RunLimitsRecord,
+    parent_invocation_id: &harnx_runtime::nats_session_metadata::InvocationIdentity,
+) {
+    assert!(root.parent_invocation.is_none());
+    assert_eq!(root.run_id, original.run_id);
+    assert_eq!(&root.invocation_id, parent_invocation_id);
+}
+
+fn assert_root_and_child_deadlines(root: &RunLimitsRecord, original: &RunLimitsRecord) {
+    assert_eq!(
+        original.deadline,
+        Some(
+            root.deadline.unwrap().min(
+                original.admitted_at
+                    + root
+                        .deadline
+                        .unwrap()
+                        .signed_duration_since(root.admitted_at)
+            )
+        )
+    );
+    assert_eq!(
+        root.deadline
+            .unwrap()
+            .signed_duration_since(root.admitted_at)
+            .num_seconds(),
+        86400,
+        "omitted MCP root must have the finite 24-hour fallback"
+    );
+}
+
+async fn execute_initial_prompt(
     client: &RunningService<RoleClient, ()>,
     worker: &Worker,
     tool: &str,
     agent: &str,
     owner: &CidUrl,
-) -> Result<String> {
+) -> Result<(String, String, RunLimitsRecord, RunLimitsRecord)> {
     let first = call(client, tool, json!({"message": "first prompt"})).await?;
     let first: serde_json::Value = serde_json::from_str(&text(&first))?;
     let session_id = first["session_id"]
@@ -403,91 +426,110 @@ async fn agent_continuation(
         .get_run_limits(&owner.session().owner(), original.run_id.as_str())
         .await?
         .context("external scope wasn't persisted before dispatch")?;
-    assert!(root.parent_invocation.is_none());
-    assert_eq!(root.run_id, original.run_id);
-    assert_eq!(root.invocation_id, parent.invocation_id);
-    // Transport admission timestamps are millisecond precision; the local fallback can
-    // be slightly earlier than the parent's nanosecond deadline. Assert the actual minimum.
-    assert_eq!(
-        original.deadline,
-        Some(
-            root.deadline.unwrap().min(
-                original.admitted_at
-                    + root
-                        .deadline
-                        .unwrap()
-                        .signed_duration_since(root.admitted_at)
-            )
-        )
-    );
-    assert_eq!(
-        root.deadline
-            .unwrap()
-            .signed_duration_since(root.admitted_at)
-            .num_seconds(),
-        86400,
-        "omitted MCP root must have the finite 24-hour fallback"
-    );
+    assert_root_invocation_identity(&root, &original, &parent.invocation_id);
+    assert_root_and_child_deadlines(&root, &original);
+    Ok((session_id, key, original, root))
+}
+
+struct ContinuationScope<'a> {
+    tool: &'a str,
+    agent: &'a str,
+    owner: &'a CidUrl,
+    session_id: &'a str,
+    key: &'a str,
+    original: &'a RunLimitsRecord,
+    root: &'a RunLimitsRecord,
+}
+
+async fn execute_continued_prompt(
+    client: &RunningService<RoleClient, ()>,
+    worker: &Worker,
+    scope: &ContinuationScope<'_>,
+) -> Result<()> {
     let second = call(
         client,
-        tool,
-        json!({"message": "continued prompt", "session_id": session_id}),
+        scope.tool,
+        json!({"message": "continued prompt", "session_id": scope.session_id}),
     )
     .await?;
     let second: serde_json::Value = serde_json::from_str(&text(&second))?;
-    assert_eq!(second["session_id"], session_id);
+    assert_eq!(second["session_id"], scope.session_id);
     assert_eq!(second["response"], "mock reply: continued prompt");
-    let resumed = child_limits(worker, &key, "continued prompt").await?;
+    let resumed = child_limits(worker, scope.key, "continued prompt").await?;
     assert_ne!(
-        original.run_id, resumed.run_id,
+        scope.original.run_id, resumed.run_id,
         "a distinct external request must get a fresh scope"
     );
     assert_eq!(
-        original,
-        child_limits(worker, &key, "first prompt").await?,
+        *scope.original,
+        child_limits(worker, scope.key, "first prompt").await?,
         "continuation mutated original scope"
     );
     assert_eq!(
-        root,
+        *scope.root,
         worker
             .metadata()
             .await?
-            .get_run_limits(&owner.session().owner(), original.run_id.as_str())
+            .get_run_limits(
+                &scope.owner.session().owner(),
+                scope.original.run_id.as_str()
+            )
             .await?
             .unwrap()
     );
     let metadata = worker
         .metadata()
         .await?
-        .get(&key)
+        .get(scope.key)
         .await?
         .context("child metadata missing")?;
-    assert_eq!(metadata.metadata.agent.name(), Some(agent));
+    assert_eq!(metadata.metadata.agent.name(), Some(scope.agent));
     assert_eq!(
         metadata
             .metadata
             .parent
             .context("caller parent link missing")?
             .session_id,
-        owner.session().owner()
+        scope.owner.session().owner()
     );
+    Ok(())
+}
+
+async fn verify_continuation_session_events(
+    worker: &Worker,
+    agent: &str,
+    session_id: &str,
+) -> Result<()> {
     let events = NatsSessionLog::for_agent(
         async_nats::jetstream::new(worker.client.clone()),
         agent,
-        &session_id,
+        session_id,
     )
     .load_events_async()
     .await?;
-    let messages: Vec<_> = events
+    let raw_messages: Vec<_> = events
         .into_iter()
         .filter_map(|(_, event)| match event {
-            SessionLogEntry::Message { role, content, .. } => Some((role, content)),
+            SessionLogEntry::Message { role, content, .. } => Some((role, content.to_text())),
             _ => None,
         })
         .collect();
-    let messages: Vec<_> = messages
+    let timing_notices: Vec<_> = raw_messages
+        .iter()
+        .filter(|(role, content)| {
+            role.is_user() && harnx_core::timing_identity::is_timing_notice(content)
+        })
+        .collect();
+    assert_eq!(
+        timing_notices.len(),
+        2,
+        "timing notice must be persisted for each continuation turn"
+    );
+    let messages: Vec<_> = raw_messages
         .into_iter()
-        .map(|(role, content)| (role, content.to_text()))
+        .filter(|(role, content)| {
+            !(role.is_user() && harnx_core::timing_identity::is_timing_notice(content))
+        })
         .collect();
     assert_eq!(
         messages,
@@ -511,6 +553,29 @@ async fn agent_continuation(
         ],
         "continuation must preserve exactly one copy of each turn"
     );
+    Ok(())
+}
+
+async fn agent_continuation(
+    client: &RunningService<RoleClient, ()>,
+    worker: &Worker,
+    tool: &str,
+    agent: &str,
+    owner: &CidUrl,
+) -> Result<String> {
+    let (session_id, key, original, root) =
+        execute_initial_prompt(client, worker, tool, agent, owner).await?;
+    let scope = ContinuationScope {
+        tool,
+        agent,
+        owner,
+        session_id: &session_id,
+        key: &key,
+        original: &original,
+        root: &root,
+    };
+    execute_continued_prompt(client, worker, &scope).await?;
+    verify_continuation_session_events(worker, agent, &session_id).await?;
     Ok(session_id)
 }
 

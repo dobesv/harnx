@@ -18,10 +18,17 @@ fn capture_prompt_content(
         let captured = Arc::clone(&captured);
         Box::pin(async move {
             let messages = crate::config::input::build_messages(input, config)?;
+            assert!(messages.iter().any(|message| message.role.is_user()
+                && harnx_core::timing_identity::is_timing_notice(&message.content.to_text())));
             let content = messages
                 .iter()
                 .rev()
-                .find(|message| message.role == MessageRole::User)
+                .find(|message| {
+                    message.role == MessageRole::User
+                        && !harnx_core::timing_identity::is_timing_notice(
+                            &message.content.to_text(),
+                        )
+                })
                 .expect("child request includes user prompt")
                 .content
                 .clone();

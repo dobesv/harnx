@@ -465,8 +465,15 @@ impl WorkerRuntime {
         let entries = backend.load_events_latest_async().await?;
         let requested_seq = activation.requested_seq.or_else(|| {
             entries.iter().rev().find_map(|(seq, entry)| match entry {
-                harnx_core::session::SessionLogEntry::Message { role, .. } if role.is_user() => {
-                    Some(*seq)
+                harnx_core::session::SessionLogEntry::Message { role, content, .. }
+                    if role.is_user() =>
+                {
+                    // Skip timing notices — use shared classifier to ensure only valid notices skipped
+                    if harnx_core::timing_identity::is_timing_notice(&content.to_text()) {
+                        None
+                    } else {
+                        Some(*seq)
+                    }
                 }
                 _ => None,
             })

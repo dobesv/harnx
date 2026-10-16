@@ -610,6 +610,28 @@ Expired admission or pre-dispatch failures also identify the exhausted scope and
 - **Bounded clock skew**: Distributed nodes assume bounded clock skew across machines for UTC deadline evaluation.
 - **Tool metadata snapshots**: Tool descriptions advertise target policy resolved at worker registration. Modifying agent front-matter or package patches after registration requires re-registering or restarting the worker to advertise updated descriptions, though worker admissions resolve against current files on disk.
 
+#### Current-Run Timing Notices
+
+The runtime delivers timing notices when due at safe boundaries before model calls. These are informative messages about the current run's elapsed time and deadline progress, not executable prompts. They don't advance the turn cursor, require admissions, or create new invocations.
+
+The clock measures the current run, not the conversation's lifetime. Admitted runs start at the saved admission timestamp, including setup time before execution. A child run uses its own admission timestamp and its effective deadline, clamped to its ancestor's deadline. Retries and worker recovery don't reset or extend these saved limits.
+
+**What gets delivered:**
+- **Initial notice** (after the first user prompt in a run): The run's start timestamp, current timestamp, elapsed time, and effective deadline, remaining time, and total budget when a deadline exists.
+- **Deadline warnings** (at 50%, 75%, 90% of the deadline budget): Updated timing context, including elapsed time, remaining time, and total budget.
+- **Elapsed updates** (every 15 minutes of run time): The total elapsed time, even when there's no deadline.
+
+**Delivery behavior:**
+- Timing notices are delivered at the **safe boundary** between tool result return and the next model call. Long-running tools may delay these notices — they don't interrupt in-progress work or create additional model calls.
+- Notices are coalesced: if multiple milestones are reached before a safe boundary, the notice covers all of them in a single receipt.
+- Unmanaged runs without a deadline receive initial and elapsed-time notices, not deadline warnings. Admitted roots still have a finite deadline, including the default 24-hour fallback.
+- The initial notice repeats on every new run. A new root admission (external prompt), child invocation, or handoff invocation starts a fresh timing context; retries within the same invocation don't re-emit already-covered milestones.
+- Timing notices are persisted in the session log as `[Runtime note]` messages with a reserved identity, even when ordinary user-input appends are skipped (`skip_user_log_append`). Stable append IDs prevent retry duplicates. Recovery reads receipts from the raw log, so compaction can archive old timing context without losing milestone progress.
+
+**What this doesn't guarantee:** Timing notices inform the model about remaining budget, but they don't guarantee the model can finish before the deadline. Long tools may still run beyond the boundary where a warning would be delivered.
+
+**Deployment compatibility:** Pre-receipt workers treat durable timing rows as executable prompts and can refuse activation for missing admission. Writers are always on, so use the [hard-cutover and retained-reader rollback procedure](kubernetes-deployment.md#timing-receipt-compatibility-cutover-and-rollback). Draining sessions alone does not permit an old-reader rollback; completed histories still contain receipts.
+
 ### Live Event Streaming for User Interfaces
 
 Because sub-agents run as standard NATS agent sessions, their execution events (LLM streaming chunks, tool invocations, notices) publish in real time to NATS:

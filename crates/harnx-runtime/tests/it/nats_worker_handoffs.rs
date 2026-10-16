@@ -54,6 +54,107 @@ impl Drop for EnvVarGuard {
     }
 }
 
+fn find_user_prompt_id(entries: &[(u64, SessionLogEntry)], from_end: bool) -> &str {
+    fn extract_user_id(entry: &SessionLogEntry) -> Option<&str> {
+        match entry {
+            SessionLogEntry::Message {
+                id: Some(id),
+                role,
+                content,
+                ..
+            } if role.is_user()
+                && !harnx_core::timing_identity::is_timing_notice(&content.to_text()) =>
+            {
+                Some(id.as_str())
+            }
+            _ => None,
+        }
+    }
+    if from_end {
+        entries
+            .iter()
+            .rev()
+            .find_map(|(_, entry)| extract_user_id(entry))
+            .unwrap()
+    } else {
+        entries
+            .iter()
+            .find_map(|(_, entry)| extract_user_id(entry))
+            .unwrap()
+    }
+}
+
+struct HandoffEndpoint<'a> {
+    storage_key: &'a str,
+    prompt_id: &'a str,
+}
+
+async fn fetch_invocation_limits(
+    store: &SessionMetadataStore,
+    endpoint: &HandoffEndpoint<'_>,
+) -> Result<(
+    harnx_runtime::nats_session_metadata::InvocationAdmission,
+    harnx_runtime::nats_session_metadata::RunLimitsRecord,
+)> {
+    let admission = store
+        .prompt_admission(endpoint.storage_key, endpoint.prompt_id)
+        .await?
+        .unwrap();
+    let limits = store
+        .get_invocation_limits(endpoint.storage_key, admission.invocation_id.as_str())
+        .await?
+        .unwrap();
+    Ok((admission, limits))
+}
+
+fn assert_handoff_run_and_parent(
+    target_limits: &harnx_runtime::nats_session_metadata::RunLimitsRecord,
+    source_limits: &harnx_runtime::nats_session_metadata::RunLimitsRecord,
+) {
+    assert_eq!(target_limits.run_id, source_limits.run_id);
+    assert_eq!(target_limits.deadline, source_limits.deadline);
+    assert_eq!(
+        target_limits
+            .parent_invocation
+            .as_ref()
+            .unwrap()
+            .invocation_id,
+        source_limits.invocation_id
+    );
+}
+
+fn assert_handoff_edge_and_source_deadline(
+    target_limits: &harnx_runtime::nats_session_metadata::RunLimitsRecord,
+    source_limits: &harnx_runtime::nats_session_metadata::RunLimitsRecord,
+    source_admitted_at: chrono::DateTime<chrono::Utc>,
+) {
+    assert_eq!(
+        target_limits.parent_invocation.as_ref().unwrap().edge_kind,
+        harnx_runtime::nats_session_metadata::InvocationEdgeKind::Handoff
+    );
+    assert_eq!(
+        source_limits.deadline,
+        Some(source_admitted_at + chrono::Duration::seconds(30))
+    );
+}
+
+async fn assert_handoff_invocation_limits(
+    store: &SessionMetadataStore,
+    source: HandoffEndpoint<'_>,
+    target: HandoffEndpoint<'_>,
+) -> Result<()> {
+    let (source_admission, source_limits) = fetch_invocation_limits(store, &source).await?;
+    let (_target_admission, target_limits) = fetch_invocation_limits(store, &target).await?;
+
+    assert_handoff_run_and_parent(&target_limits, &source_limits);
+    assert_handoff_edge_and_source_deadline(
+        &target_limits,
+        &source_limits,
+        source_admission.admitted_at,
+    );
+    Ok(())
+}
+
 struct HandoffFixture {
     _server: NatsServerHandle,
     _root: tempfile::TempDir,
@@ -162,65 +263,20 @@ impl HandoffFixture {
         let store =
             harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&self.jetstream, 1)
                 .await?;
-        let source_prompt = source_entries
-            .iter()
-            .find_map(|(_, entry)| match entry {
-                SessionLogEntry::Message {
-                    id: Some(id), role, ..
-                } if role.is_user() => Some(id),
-                _ => None,
-            })
-            .unwrap();
-        let source_admission = store
-            .prompt_admission(source.storage_key(), source_prompt)
-            .await?
-            .unwrap();
-        let source_limits = store
-            .get_invocation_limits(
-                source.storage_key(),
-                source_admission.invocation_id.as_str(),
-            )
-            .await?
-            .unwrap();
-        let target_prompt = entries
-            .iter()
-            .rev()
-            .find_map(|(_, entry)| match entry {
-                SessionLogEntry::Message {
-                    id: Some(id), role, ..
-                } if role.is_user() => Some(id),
-                _ => None,
-            })
-            .unwrap();
-        let target_admission = store
-            .prompt_admission(explicit_log.storage_key(), target_prompt)
-            .await?
-            .unwrap();
-        let target_limits = store
-            .get_invocation_limits(
-                explicit_log.storage_key(),
-                target_admission.invocation_id.as_str(),
-            )
-            .await?
-            .unwrap();
-        assert_eq!(target_limits.run_id, source_limits.run_id);
-        assert_eq!(target_limits.deadline, source_limits.deadline);
-        assert_eq!(
-            target_limits
-                .parent_invocation
-                .as_ref()
-                .unwrap()
-                .invocation_id,
-            source_limits.invocation_id
-        );
-        assert_eq!(
-            target_limits.parent_invocation.as_ref().unwrap().edge_kind,
-            harnx_runtime::nats_session_metadata::InvocationEdgeKind::Handoff
-        );
-        assert_eq!(
-            source_limits.deadline,
-            Some(source_admission.admitted_at + chrono::Duration::seconds(30))
-        );
+        let source_prompt = find_user_prompt_id(&source_entries, false);
+        let target_prompt = find_user_prompt_id(&entries, true);
+        assert_handoff_invocation_limits(
+            &store,
+            HandoffEndpoint {
+                storage_key: source.storage_key(),
+                prompt_id: source_prompt,
+            },
+            HandoffEndpoint {
+                storage_key: explicit_log.storage_key(),
+                prompt_id: target_prompt,
+            },
+        )
+        .await?;
 
         assert!(entries.iter().any(|(_, entry)| matches!(
             entry,
@@ -527,15 +583,23 @@ fn assert_explicit_events(observed: ObservedHandoff, durable_handoff_seq: u64) {
     assert_eq!(observed.order, ["requested", "committed", "ended"]);
 }
 
-fn assert_generated_events(observed: &ObservedHandoff, agent: &str, target_id: &str) {
+fn assert_generated_target_identity(agent: &str, target_id: &str) {
     assert_eq!(agent, "delegate-agent@local");
     assert!(!target_id.trim().is_empty());
     assert_ne!(target_id, "nats-handoff-generated-root");
+}
+
+fn assert_observed_handoff_sequence(observed: &ObservedHandoff) {
     assert_eq!(
         observed.requested,
         Some(("delegate-agent".to_string(), None))
     );
     assert_eq!(observed.order, ["requested", "committed", "ended"]);
+}
+
+fn assert_generated_events(observed: &ObservedHandoff, agent: &str, target_id: &str) {
+    assert_generated_target_identity(agent, target_id);
+    assert_observed_handoff_sequence(observed);
 }
 
 fn spawn_activation_observer(
@@ -615,6 +679,10 @@ fn target_completed(entries: &[(u64, SessionLogEntry)], expected_prompt: &str) -
 }
 
 fn assert_handoff_target_log(entries: &[(u64, SessionLogEntry)], expected_prompt: &str) {
+    assert_eq!(entries.iter().filter(|(_, entry)| matches!(entry,
+        SessionLogEntry::Message { role, content, .. }
+            if role.is_user() && harnx_core::timing_identity::is_timing_notice(&content.to_text())
+    )).count(), 1, "target persists its own initial timing notice");
     assert_eq!(
         entries
             .iter()

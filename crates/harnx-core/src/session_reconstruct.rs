@@ -419,8 +419,13 @@ impl ReplayAccumulator {
                 log_seq.map_or(0, |s| u64::try_from(s).unwrap_or(0)),
                 cancellation_id.clone(),
             ),
-            SessionLogEntry::Message { role, .. } if role.is_user() => {
-                self.on_user_message_with_seq(log_seq, entry)
+            SessionLogEntry::Message { role, content, .. } if role.is_user() => {
+                // Timing notices are non-executable context: don't treat them as prompts.
+                // Use the shared classifier to ensure only valid timing notices are skipped.
+                let is_timing = crate::timing_identity::is_timing_notice(&content.to_text());
+                if !is_timing {
+                    self.on_user_message_with_seq(log_seq, entry)
+                }
             }
             SessionLogEntry::Message { role, .. } if role.is_assistant() => {
                 self.on_assistant_message(entry)
@@ -1536,5 +1541,238 @@ mod tests {
             requested_by: None,
             timestamp: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod timing_non_executable_tests {
+    use super::*;
+    use crate::message::{MessageContent, MessageRole};
+    use crate::timing_identity::{TimingReceipt, TIMING_HEADER};
+    use chrono::{TimeZone, Utc};
+
+    /// Create a valid timing notice with proper JSON receipt
+    fn timing_notice() -> SessionLogEntry {
+        let origin = Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap();
+        let receipt = TimingReceipt::initial(origin, "inv-123".to_string());
+        SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(format!(
+                "{}{} | Elapsed: 0s",
+                TIMING_HEADER,
+                receipt.to_json()
+            )),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    /// Create a user prompt with reserved header prefix but invalid JSON - should execute normally
+    fn user_prompt_with_reserved_prefix(text: &str) -> SessionLogEntry {
+        // User prompt with timing-like text but NOT a valid timing notice
+        SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(format!("{} {}", TIMING_HEADER, text)),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn assert_idle_queued_prompts(state: &ReconstructedState, expected: &[&str]) {
+        assert!(matches!(state.turn_status, TurnStatus::Idle));
+        let actual: Vec<String> = state
+            .next_turn_messages
+            .iter()
+            .map(|m| m.content.to_text())
+            .collect();
+        assert_eq!(actual.as_slice(), expected);
+    }
+
+    fn user_prompt(text: &str, seq: u64) -> (u64, SessionLogEntry) {
+        (
+            seq,
+            SessionLogEntry::Message {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(text.to_string()),
+                timestamp: None,
+                fence_token: None,
+            },
+        )
+    }
+
+    #[test]
+    fn timing_notice_between_tool_results_and_user_does_not_advance_prompt_cursor() {
+        // Scenario: tool calls -> tool results -> timing notice -> user prompt
+        // The timing notice should NOT count as a prompt for next_turn_messages
+        let log: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt("first prompt", 1),
+            (
+                2,
+                SessionLogEntry::ToolCalls {
+                    text: String::new(),
+                    thought: None,
+                    calls: vec![],
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                3,
+                SessionLogEntry::ToolResults {
+                    results: vec![],
+                    timestamp: None,
+                },
+            ),
+            (4, timing_notice()),
+            user_prompt("second prompt", 5),
+            // An assistant message acts as barrier
+            (
+                6,
+                SessionLogEntry::Message {
+                    id: None,
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text("response".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+        ];
+
+        let state = reconstruct_state_from_nats(&log);
+        // Timing notice skipped, second prompt bound to assistant response
+        // Turn is now Idle (assistant acted as barrier)
+        assert!(matches!(state.turn_status, TurnStatus::Idle));
+        // next_turn_messages should be empty since assistant consumed the pending prompt
+        assert!(state.next_turn_messages.is_empty());
+    }
+
+    #[test]
+    fn interleaved_timing_notices_and_user_prompts_preserve_order() {
+        // Multiple timing notices interleaved with real user prompts
+        let log: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt("prompt one", 1),
+            (2, timing_notice()),
+            user_prompt("prompt two", 3),
+            (4, timing_notice()),
+            user_prompt("prompt three", 5),
+        ];
+
+        let state = reconstruct_state_from_nats(&log);
+        // All timing notices skipped, prompts are queued
+        assert_idle_queued_prompts(&state, &["prompt one", "prompt two", "prompt three"]);
+    }
+
+    #[test]
+    fn pending_prompt_seq_ignores_timing_notices() {
+        use crate::session_reconstruct::pending_prompt_seq;
+
+        let entries: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt("first", 1),
+            (2, timing_notice()),
+            user_prompt("second", 3),
+        ];
+
+        // pending_prompt_seq should return seq 3 (second prompt), skipping timing notice at 2
+        assert_eq!(pending_prompt_seq(&entries), Some(3));
+    }
+
+    #[test]
+    fn latest_prompt_seq_skips_timing_notices() {
+        use crate::session_reconstruct::latest_prompt_seq;
+
+        let entries: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt("first", 1),
+            (2, timing_notice()),
+            user_prompt("second", 3),
+        ];
+
+        // latest_prompt_seq should return 3 (second prompt), skipping timing notice at 2
+        assert_eq!(latest_prompt_seq(&entries), Some(3));
+    }
+
+    #[test]
+    fn timing_notice_does_not_create_invocation_or_demand_admission() {
+        // In resumable context (tool calls pending), timing notice should not clear state
+        let log: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt("start", 1),
+            (
+                2,
+                SessionLogEntry::ToolCalls {
+                    text: "working".to_string(),
+                    thought: None,
+                    calls: vec![],
+                    timestamp: None,
+                    fence_token: Some(100),
+                },
+            ),
+            (3, timing_notice()),
+        ];
+
+        let state = reconstruct_state_from_nats(&log);
+        // Should still be resumable (timing notice didn't clear state or become a prompt)
+        assert!(matches!(
+            state.turn_status,
+            TurnStatus::InFlightResumable { .. }
+        ));
+        assert!(state.resumable_ctx.is_some());
+        // next_turn_messages should be empty (timing notice skipped, no new user)
+        assert!(state.next_turn_messages.is_empty());
+    }
+
+    #[test]
+    fn user_prompt_with_reserved_prefix_but_invalid_receipt_executes_normally() {
+        // Regression: User prompt starting with reserved header but without valid JSON
+        // must NOT be silenced - it should be treated as a real user prompt
+        let log: Vec<(u64, SessionLogEntry)> = vec![(
+            1,
+            user_prompt_with_reserved_prefix("Please explain the timing budget"),
+        )];
+
+        let state = reconstruct_state_from_nats(&log);
+        // Should be Idle with the "fake timing" prompt queued for execution
+        assert!(matches!(state.turn_status, TurnStatus::Idle));
+        assert_eq!(state.next_turn_messages.len(), 1);
+        let msg = &state.next_turn_messages[0];
+        // The message should contain the full text including the reserved prefix
+        let text = msg.content.to_text();
+        assert!(text.starts_with(TIMING_HEADER));
+        assert!(text.contains("Please explain the timing budget"));
+    }
+
+    #[test]
+    fn latest_prompt_seq_includes_user_prompts_with_reserved_prefix_invalid_receipt() {
+        use crate::session_reconstruct::latest_prompt_seq;
+
+        // Real user prompts with reserved header but invalid receipt should count as prompts
+        let entries: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt("first", 1),
+            (
+                2,
+                user_prompt_with_reserved_prefix("second - invalid receipt"),
+            ),
+            user_prompt("third", 3),
+        ];
+
+        // latest_prompt_seq should return 3 (third prompt), NOT skip the "fake timing" at seq 2
+        assert_eq!(latest_prompt_seq(&entries), Some(3));
+    }
+
+    #[test]
+    fn pending_prompt_seq_includes_user_prompts_with_reserved_prefix_invalid_receipt() {
+        use crate::session_reconstruct::pending_prompt_seq;
+
+        let entries: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt("first", 1),
+            (
+                2,
+                user_prompt_with_reserved_prefix("second - invalid receipt"),
+            ),
+        ];
+
+        // pending_prompt_seq should return 2 (the fake timing prompt), not skip it
+        assert_eq!(pending_prompt_seq(&entries), Some(2));
     }
 }

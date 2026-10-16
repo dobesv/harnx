@@ -236,6 +236,17 @@ impl TargetedFixture {
         self.hold_release.notify_one();
         tokio::time::timeout(CI_SAFE_TIMEOUT, held_turn).await???;
         tokio::time::timeout(CI_SAFE_TIMEOUT, injecting_turn).await???;
+        let log = NatsSessionLog::new_with_replicas(
+            self.jetstream.clone(),
+            harnx_core::session_identity::session_key(None, session_id),
+            1,
+        );
+        let entries = log.load_events_async().await?;
+        assert_eq!(user_message_texts(&entries), ["hold", "injected"]);
+        assert_eq!(entries.iter().filter(|(_, entry)| matches!(entry,
+            SessionLogEntry::Message { role, content, .. }
+                if role.is_user() && harnx_core::timing_identity::is_timing_notice(&content.to_text())
+        )).count(), 1, "steering shares the active invocation's timing notice");
         assert_eq!(self.counter_a.load(Ordering::SeqCst), before_a + 2);
         assert_eq!(self.counter_b.load(Ordering::SeqCst), before_b);
         Ok(())

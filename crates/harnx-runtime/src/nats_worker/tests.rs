@@ -17,6 +17,7 @@ use anyhow::{bail, Context};
 use futures_util::StreamExt;
 use harnx_core::agent_config::AgentConfig;
 use harnx_core::event::{AgentEvent, AgentEventSink};
+use harnx_core::message::MessageRole;
 use harnx_core::session::{SessionLogEntry, ToolOutput};
 use harnx_core::session_reconstruct::{reconstruct_state_from_nats, TurnStatus};
 use harnx_core::tool::{ToolCall, ToolDeclaration, ToolProvider};
@@ -25,6 +26,108 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+
+fn assert_turn_one_prefix(texts: &[String], context: &str) {
+    assert_eq!(texts.len(), 3, "{context}");
+    assert_eq!(texts[0], "delegate over nats");
+}
+
+fn assert_turn_one_timing_and_reply(texts: &[String]) {
+    assert!(
+        harnx_core::timing_identity::is_timing_notice(&texts[1]),
+        "turn 1 timing notice preserved"
+    );
+    assert_eq!(texts[2], "stub remote reply over nats");
+}
+
+fn assert_turn_one_with_timing_preserved(texts: &[String], context: &str) {
+    assert_turn_one_prefix(texts, context);
+    assert_turn_one_timing_and_reply(texts);
+}
+
+fn assert_two_turns_first_turn(texts: &[String]) {
+    assert_eq!(
+        texts.len(),
+        6,
+        "after edit should have 4 conversation messages plus 2 timing notices"
+    );
+    assert_eq!(texts[0], "delegate over nats");
+    assert!(
+        harnx_core::timing_identity::is_timing_notice(&texts[1]),
+        "first turn timing notice"
+    );
+}
+
+fn assert_two_turns_second_turn(texts: &[String]) {
+    assert_eq!(texts[2], "stub remote reply over nats");
+    assert_eq!(texts[3], "delegate over nats");
+    assert!(
+        harnx_core::timing_identity::is_timing_notice(&texts[4]),
+        "second turn timing notice"
+    );
+}
+
+fn assert_two_turns_final_reply(texts: &[String]) {
+    assert_eq!(texts[5], "stub remote reply over nats");
+}
+
+fn assert_two_turns_with_timing_notices(texts: &[String]) {
+    assert_two_turns_first_turn(texts);
+    assert_two_turns_second_turn(texts);
+    assert_two_turns_final_reply(texts);
+}
+
+fn assert_leading_prompts(row_texts: &[(MessageRole, String)]) {
+    assert_eq!(row_texts.len(), 5);
+    assert_eq!(row_texts[0], (MessageRole::User, "leading one".to_string()));
+    assert_eq!(row_texts[1], (MessageRole::User, "leading two".to_string()));
+}
+
+fn assert_delegated_prompt_and_timing(row_texts: &[(MessageRole, String)]) {
+    assert_eq!(
+        row_texts[2],
+        (MessageRole::User, "delegate over nats".to_string())
+    );
+    assert_eq!(row_texts[3].0, MessageRole::User);
+    assert!(
+        harnx_core::timing_identity::is_timing_notice(&row_texts[3].1),
+        "row 3 must be a timing notice"
+    );
+}
+
+fn assert_remote_reply(row_texts: &[(MessageRole, String)]) {
+    assert_eq!(
+        row_texts[4],
+        (
+            MessageRole::Assistant,
+            "stub remote reply over nats".to_string()
+        )
+    );
+}
+
+fn assert_leading_user_rows_with_timing(row_texts: &[(MessageRole, String)]) {
+    assert_leading_prompts(row_texts);
+    assert_delegated_prompt_and_timing(row_texts);
+    assert_remote_reply(row_texts);
+}
+
+fn assert_effective_log_preserves_prompt_and_timing(effective: &[(u64, SessionLogEntry)]) {
+    assert_eq!(effective.len(), 2, "prompt and timing notice preserved");
+    assert!(
+        effective.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::Message { content, .. } if harnx_core::timing_identity::is_timing_notice(&content.to_text())
+        )),
+        "timing row should be preserved"
+    );
+    assert!(
+        effective.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::Message { content, role, .. } if role.is_user() && !harnx_core::timing_identity::is_timing_notice(&content.to_text())
+        )),
+        "real prompt should be preserved"
+    );
+}
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
@@ -1831,7 +1934,7 @@ async fn remote_delete_turn_matches_local_any_role_parity() {
     let global_config = Arc::new(crate::config::ConfigLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    delete_remote_message_range(&global_config, 1, 1, &abort)
+    delete_remote_message_range(&global_config, 2, 2, &abort)
         .await
         .expect("delete assistant row by logical row");
 
@@ -1848,8 +1951,8 @@ async fn remote_delete_turn_matches_local_any_role_parity() {
         } => {
             assert_eq!(
                 (*from, *to),
-                (2, 2),
-                "assistant message must map to physical seq 2"
+                (3, 3),
+                "assistant message must map to physical seq 3"
             );
             assert!(
                 replacements.is_empty(),
@@ -1858,6 +1961,10 @@ async fn remote_delete_turn_matches_local_any_role_parity() {
         }
         other => panic!("expected EditEntries, got {other:?}"),
     }
+
+    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&after_raw)
+        .expect("reconstruct effective log");
+    assert_effective_log_preserves_prompt_and_timing(&effective);
 
     let after_effective =
         harnx_core::session_reconstruct::reconstruct_state_from_nats(&after_raw).next_turn_messages;
@@ -2188,11 +2295,7 @@ async fn remote_edit_preserves_canonical_transcript_messages() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        texts.len(),
-        4,
-        "after edit should have 4 messages (U1, A1, U2, A2)"
-    );
+    assert_two_turns_with_timing_notices(&texts);
 
     worker.abort();
     let _ = worker.await;
@@ -2237,7 +2340,7 @@ async fn remote_delete_after_older_edit_deletes_exact_late_range() {
     edit_remote_message_range(&global_config, 0, 0, &abort)
         .await
         .expect("edit older user message");
-    delete_remote_message_range(&global_config, 2, 3, &abort)
+    delete_remote_message_range(&global_config, 3, 5, &abort)
         .await
         .expect("delete later logical range");
 
@@ -2259,12 +2362,9 @@ async fn remote_delete_after_older_edit_deletes_exact_late_range() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        texts,
-        vec![
-            "delegate over nats".to_string(),
-            "stub remote reply over nats".to_string(),
-        ]
+    assert_turn_one_with_timing_preserved(
+        &texts,
+        "turn 1 preserved with timing notice, turn 2 deleted",
     );
 
     worker.abort();
@@ -2310,7 +2410,7 @@ async fn remote_rewind_after_older_edit_preserves_correct_logical_prefix() {
     edit_remote_message_range(&global_config, 0, 0, &abort)
         .await
         .expect("edit older user message");
-    rewind_remote_session(&global_config, 1, &abort)
+    rewind_remote_session(&global_config, 2, &abort)
         .await
         .expect("rewind logical suffix");
 
@@ -2332,12 +2432,9 @@ async fn remote_rewind_after_older_edit_preserves_correct_logical_prefix() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        texts,
-        vec![
-            "delegate over nats".to_string(),
-            "stub remote reply over nats".to_string(),
-        ]
+    assert_turn_one_with_timing_preserved(
+        &texts,
+        "prefix up to turn 1 preserved with timing notice",
     );
 
     worker.abort();
@@ -2383,7 +2480,7 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
     edit_remote_message_range(&global_config, 0, 0, &abort)
         .await
         .expect("edit older user message");
-    crate::commands::run_command(&global_config, abort.clone(), ".delete message 2-3")
+    crate::commands::run_command(&global_config, abort.clone(), ".delete message 3-5")
         .await
         .expect("remote delete command succeeds");
 
@@ -2406,13 +2503,7 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        texts,
-        vec![
-            "delegate over nats".to_string(),
-            "stub remote reply over nats".to_string(),
-        ]
-    );
+    assert_turn_one_with_timing_preserved(&texts, "logical docs should contain turn 1 plus timing");
 
     // Fetch jetstream without holding lock across await
     let js = {
@@ -2438,13 +2529,9 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        effective_texts,
-        vec![
-            "delegate over nats".to_string(),
-            "stub remote reply over nats".to_string(),
-        ],
-        "reconstructed log must have correct message content"
+    assert_turn_one_with_timing_preserved(
+        &effective_texts,
+        "reconstructed log must have turn 1 plus timing",
     );
 
     worker.abort();
@@ -2490,7 +2577,7 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
     edit_remote_message_range(&global_config, 0, 0, &abort)
         .await
         .expect("edit older user message");
-    crate::commands::run_command(&global_config, abort.clone(), ".rewind 1")
+    crate::commands::run_command(&global_config, abort.clone(), ".rewind 2")
         .await
         .expect("remote rewind command succeeds");
 
@@ -2513,13 +2600,7 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        texts,
-        vec![
-            "delegate over nats".to_string(),
-            "stub remote reply over nats".to_string(),
-        ]
-    );
+    assert_turn_one_with_timing_preserved(&texts, "logical docs should contain turn 1 plus timing");
 
     // Fetch jetstream without holding lock across await
     let js = {
@@ -2553,13 +2634,9 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        effective_texts,
-        vec![
-            "delegate over nats".to_string(),
-            "stub remote reply over nats".to_string(),
-        ],
-        "reconstructed log must have correct message content"
+    assert_turn_one_with_timing_preserved(
+        &effective_texts,
+        "reconstructed log must have turn 1 plus timing",
     );
 
     worker.abort();
@@ -2643,10 +2720,10 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         .filter_map(|message| message.log_seq)
         .collect();
     // Metadata is outside the transcript. Rows are numbered from zero:
-    // leading one=0, leading two=1, "delegate over nats"=2, assistant=3.
+    // leading one=0, leading two=1, "delegate over nats"=2, timing=3, assistant=4.
     assert_eq!(
         row_seqs,
-        vec![0, 1, 2, 3],
+        vec![0, 1, 2, 3, 4],
         "shared-seq leading-user rows must get distinct contiguous logical seqs, not collapse"
     );
     let mut sorted = row_seqs.clone();
@@ -2662,18 +2739,7 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         .iter()
         .map(|message| (message.role, message.content.to_text()))
         .collect();
-    assert_eq!(
-        row_texts,
-        vec![
-            (MessageRole::User, "leading one".to_string()),
-            (MessageRole::User, "leading two".to_string()),
-            (MessageRole::User, "delegate over nats".to_string()),
-            (
-                MessageRole::Assistant,
-                "stub remote reply over nats".to_string()
-            ),
-        ]
-    );
+    assert_leading_user_rows_with_timing(&row_texts);
 
     worker.abort();
     let _ = worker.await;

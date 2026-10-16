@@ -177,7 +177,15 @@ fn assert_retry_response(mock: &MockOpenAiServer, calls_before_retry: usize, ret
     let requests = mock.get_request_log();
     assert_eq!(requests.len(), calls_before_retry + 1);
     let messages = requests.last().unwrap()["messages"].as_array().unwrap();
-    assert_eq!(messages.last().unwrap()["content"], "retry after timeout");
+    let notice = messages.last().unwrap();
+    assert_eq!(notice["role"], "user");
+    assert!(harnx_core::timing_identity::is_timing_notice(
+        notice["content"].as_str().expect("timing notice text")
+    ));
+    assert_eq!(
+        messages[messages.len() - 2]["content"],
+        "retry after timeout"
+    );
 }
 
 #[test]

@@ -260,7 +260,26 @@ async fn cancel_during_tool_keeps_admitted_prompt_and_returns_idle() -> Result<(
         .admit_input(&input, None)
         .await?;
     tokio::time::timeout(CI_SAFE_TIMEOUT, fixture.tool.entered.notified()).await?;
-    assert_user_history(&fixture.entries().await?, &[PROMPT])?;
+    let held_entries = fixture.entries().await?;
+    assert_user_history(&held_entries, &[PROMPT])?;
+    let timing_count = held_entries.iter().filter(|(_, entry)| matches!(
+        entry,
+        SessionLogEntry::Message { role, content, .. }
+            if role.is_user() && harnx_core::timing_identity::is_timing_notice(&content.to_text())
+    )).count();
+    assert_eq!(
+        timing_count, 1,
+        "initial timing is durable before tool execution"
+    );
+    assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tool.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !held_entries.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::Cancel { .. } | SessionLogEntry::TurnEnd { .. }
+        )),
+        "timing must not interrupt the barrier-held tool or end its turn"
+    );
     let admitted_seq = fixture.opening_prompt_seq().await?;
 
     cancel_and_wait(&fixture).await?;

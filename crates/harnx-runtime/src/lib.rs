@@ -43,6 +43,7 @@ pub mod terminated_result;
 #[cfg(test)]
 mod test_environment;
 pub mod test_utils;
+pub mod timing_notice;
 pub mod tool;
 pub mod tool_context;
 pub mod tool_loop_guard;

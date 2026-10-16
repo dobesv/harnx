@@ -203,60 +203,75 @@ impl SessionTurn {
         }
         let next = self.derive_input(high_water).await?;
         if let Some((_, seed)) = &next {
-            let entries = self.backend.load_events_latest_async().await?;
-            let prompt_id = entries
-                .iter()
-                .rev()
-                .find_map(|(seq, entry)| match entry {
-                    harnx_core::session::SessionLogEntry::Message {
-                        id: Some(id), role, ..
-                    } if role.is_user() && *seq <= *seed => Some(id),
-                    _ => None,
-                })
-                .context("worker input has no admitted prompt")?;
-            let admission = self
-                .worker
-                .session_metadata
-                .prompt_admission(&self.activation.session_id, prompt_id)
-                .await?
-                .context("worker input has no durable admission")?;
-            let current = self
-                .per_session
-                .read()
-                .run_context
-                .clone()
-                .context("worker run policy is not finalized")?;
-            if admission.invocation_id != current.invocation_id {
-                // A later independent run has its own durable activation. Do not
-                // drain it under this activation's abort signal or frozen policy.
+            if !self.validate_input_admissions(*seed).await? {
                 return Ok(None);
-            }
-            let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
-            for (seq, entry) in &effective {
-                if let harnx_core::session::SessionLogEntry::Message { id, role, .. } = entry {
-                    if role.is_user()
-                        && crate::nats_session::requested_seq_status_with_effective(
-                            &entries, &effective, *seq,
-                        ) == crate::nats_session::RequestedSeqStatus::Pending
-                    {
-                        let prompt = id
-                            .as_deref()
-                            .context("unmapped executable user row has no admission identity")?;
-                        let bound = self
-                            .worker
-                            .session_metadata
-                            .prompt_admission(&self.activation.session_id, prompt)
-                            .await?
-                            .context("unmapped executable user row has no durable admission")?;
-                        anyhow::ensure!(
-                            bound.invocation_id == current.invocation_id,
-                            "cannot coalesce different execution admissions"
-                        );
-                    }
-                }
             }
         }
         Ok(next)
+    }
+
+    async fn validate_input_admissions(&self, seed: u64) -> Result<bool> {
+        let entries = self.backend.load_events_latest_async().await?;
+        let prompt_id = entries
+            .iter()
+            .rev()
+            .find_map(|(seq, entry)| {
+                if *seq > seed {
+                    return None;
+                }
+                super::agent_loop::executable_user_message_id(entry).flatten()
+            })
+            .context("worker input has no admitted prompt")?;
+        let admission = self
+            .worker
+            .session_metadata
+            .prompt_admission(&self.activation.session_id, prompt_id)
+            .await?
+            .context("worker input has no durable admission")?;
+        let current = self
+            .per_session
+            .read()
+            .run_context
+            .clone()
+            .context("worker run policy is not finalized")?;
+        if admission.invocation_id != current.invocation_id {
+            // A later run has its own activation and frozen execution policy.
+            return Ok(false);
+        }
+        self.validate_pending_input_admissions(&entries, &current.invocation_id)
+            .await?;
+        Ok(true)
+    }
+
+    async fn validate_pending_input_admissions(
+        &self,
+        entries: &[(u64, harnx_core::session::SessionLogEntry)],
+        invocation_id: &crate::nats_session_metadata::InvocationIdentity,
+    ) -> Result<()> {
+        let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)?;
+        for (seq, entry) in &effective {
+            let Some(prompt) = super::agent_loop::executable_user_message_id(entry) else {
+                continue;
+            };
+            if crate::nats_session::requested_seq_status_with_effective(entries, &effective, *seq)
+                != crate::nats_session::RequestedSeqStatus::Pending
+            {
+                continue;
+            }
+            let prompt =
+                prompt.context("unmapped executable user row has no admission identity")?;
+            let bound = self
+                .worker
+                .session_metadata
+                .prompt_admission(&self.activation.session_id, prompt)
+                .await?
+                .context("unmapped executable user row has no durable admission")?;
+            anyhow::ensure!(
+                bound.invocation_id == *invocation_id,
+                "cannot coalesce different execution admissions"
+            );
+        }
+        Ok(())
     }
 
     async fn prepare_turn(&mut self) -> Result<bool> {
@@ -621,6 +636,57 @@ impl SessionTurn {
     }
 }
 
+#[derive(Default)]
+struct CompactionScanState {
+    found_request: bool,
+    found_compress: bool,
+    found_any_compact_result_after_compress: bool,
+    found_turn_end_after_compress: bool,
+    has_new_user_content: bool,
+}
+
+impl CompactionScanState {
+    fn update(&mut self, entry: &harnx_core::session::SessionLogEntry, compaction_id: &str) {
+        use harnx_core::session::SessionLogEntry;
+        match entry {
+            SessionLogEntry::CompactRequest {
+                compaction_id: id, ..
+            } => {
+                self.found_request |= id == compaction_id;
+            }
+            SessionLogEntry::Compress { .. } => {
+                self.found_compress |= self.found_request;
+            }
+            SessionLogEntry::CompactResult { .. } => {
+                self.found_any_compact_result_after_compress |= self.found_compress;
+            }
+            SessionLogEntry::TurnEnd { .. } => {
+                self.found_turn_end_after_compress |= self.found_compress;
+            }
+            SessionLogEntry::Message { role, content, .. } => self.note_user_content(role, content),
+            _ => {}
+        }
+    }
+
+    fn note_user_content(
+        &mut self,
+        role: &harnx_core::message::MessageRole,
+        content: &harnx_core::message::MessageContent,
+    ) {
+        let post_compaction =
+            self.found_any_compact_result_after_compress || self.found_turn_end_after_compress;
+        if !post_compaction {
+            return;
+        }
+        self.has_new_user_content |=
+            role.is_user() && !harnx_core::timing_identity::is_timing_notice(&content.to_text());
+    }
+
+    fn is_already_compacted(&self) -> bool {
+        self.found_request && self.found_compress && !self.has_new_user_content
+    }
+}
+
 /// Check if a Compress marker already landed after the CompactRequest.
 /// Returns Some(outcome) if we should skip running compaction.
 ///
@@ -633,54 +699,11 @@ pub(crate) fn detect_already_compacted(
     entries: &[(u64, harnx_core::session::SessionLogEntry)],
     compaction_id: &str,
 ) -> Option<harnx_core::session::CompactOutcome> {
-    let mut found_request = false;
-    let mut found_compress = false;
-    // Track ANY CompactResult after Compress (automatic compaction may have different ID)
-    let mut found_any_compact_result_after_compress = false;
-    // Track TurnEnd after Compress as another boundary for new user content
-    let mut found_turn_end_after_compress = false;
-    let mut has_new_user_content = false;
-
+    let mut state = CompactionScanState::default();
     for (_, entry) in entries {
-        match entry {
-            harnx_core::session::SessionLogEntry::CompactRequest {
-                compaction_id: id, ..
-            } => {
-                if id == compaction_id {
-                    found_request = true;
-                }
-            }
-            harnx_core::session::SessionLogEntry::Compress { .. } => {
-                if found_request {
-                    found_compress = true;
-                }
-            }
-            harnx_core::session::SessionLogEntry::CompactResult { .. } => {
-                // ANY CompactResult after Compress marks compaction as done
-                if found_compress {
-                    found_any_compact_result_after_compress = true;
-                }
-            }
-            harnx_core::session::SessionLogEntry::TurnEnd { .. } => {
-                if found_compress {
-                    found_turn_end_after_compress = true;
-                }
-            }
-            harnx_core::session::SessionLogEntry::Message { role, .. }
-                if role.is_user()
-                    && (found_any_compact_result_after_compress
-                        || found_turn_end_after_compress) =>
-            {
-                // New user content after compaction completed or turn ended
-                has_new_user_content = true;
-            }
-            _ => {}
-        }
+        state.update(entry, compaction_id);
     }
-
-    // AlreadyCompacted if we found Compress after our request and no new user content.
-    // The re-logged suffix messages between Compress and CompactResult/TurnEnd don't count as new.
-    if found_request && found_compress && !has_new_user_content {
+    if state.is_already_compacted() {
         Some(harnx_core::session::CompactOutcome::Unchanged(
             harnx_core::session::UnchangedReason::AlreadyCompacted,
         ))

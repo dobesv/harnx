@@ -11,6 +11,10 @@ use harnx_core::model::Model;
 use harnx_core::session::ToolOutput;
 
 /// Number of recent user-turns kept verbatim (not summarized) by default.
+///
+/// Timing notices are not counted as turns: they are non-executable context
+/// preserved during compaction analysis but excluded from `keep_recent_turns`
+/// calculations and split-point decisions.
 pub const DEFAULT_KEEP_RECENT_TURNS: usize = 3;
 /// Token budget for the verbatim recent suffix (estimated tokens).
 pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 8000;
@@ -172,6 +176,11 @@ pub fn render_transcript(messages: &[Message], max_tool_chars: usize) -> String 
     sections.join("\n\n")
 }
 
+fn is_turn_prompt(message: &Message) -> bool {
+    message.role.is_user()
+        && !harnx_core::timing_identity::is_timing_notice(&message.content.to_text())
+}
+
 /// Earliest index still within both the turn-count and token budgets, scanning
 /// backward from the end.
 fn recent_suffix_floor(
@@ -186,7 +195,7 @@ fn recent_suffix_floor(
     let mut tokens = 0usize;
     for i in (0..len).rev() {
         let t = model.messages_tokens(std::slice::from_ref(&messages[i]));
-        let is_user = messages[i].role == MessageRole::User;
+        let is_user = is_turn_prompt(&messages[i]);
         let over_turn_budget = is_user && turns >= keep_turns;
         let over_token_budget = tokens + t > keep_tokens;
         if over_turn_budget || over_token_budget {
@@ -203,11 +212,10 @@ fn recent_suffix_floor(
 
 /// Index in `messages` where the verbatim recent suffix begins; messages before
 /// it are compacted. Keeps at most `keep_turns` recent user-turns and
-/// `keep_tokens` estimated tokens, snapping the boundary forward to a `User`
-/// message. When `len >= 2` and the slice contains a user message — which the
-/// compaction caller guarantees by checking `has_user_messages` first — at
-/// least the first message is compacted. (A multi-message slice with no user
-/// message at all returns `len`, i.e. compacts nothing.)
+/// `keep_tokens` estimated tokens, snapping the boundary forward to a genuine
+/// user prompt, never a timing notice. When `len >= 2`, at least the first
+/// message is compacted. Returns `len` when no genuine prompt can start a kept
+/// suffix.
 pub fn split_index(
     messages: &[Message],
     model: &Model,
@@ -219,8 +227,8 @@ pub fn split_index(
         return len;
     }
     let mut idx = recent_suffix_floor(messages, model, keep_turns, keep_tokens);
-    // Snap forward to a User boundary so a kept reply always has its prompt.
-    while idx < len && messages[idx].role != MessageRole::User {
+    // Timing context isn't a turn boundary: a kept reply still needs its prompt.
+    while idx < len && !is_turn_prompt(&messages[idx]) {
         idx += 1;
     }
     // Never compact zero messages when there is something to compact: if the
@@ -231,7 +239,7 @@ pub fn split_index(
     if idx == 0 {
         idx = messages
             .iter()
-            .rposition(|m| m.role == MessageRole::User)
+            .rposition(is_turn_prompt)
             .filter(|&p| p >= 1)
             .unwrap_or(len);
     }
@@ -359,6 +367,46 @@ summarize\n";
         let idx = split_index(&messages, &model, 1, 100_000);
         assert_eq!(idx, 5);
         assert_eq!(messages[idx].role, User);
+    }
+
+    #[test]
+    fn timing_recovery_compaction_counts_prompts_not_notices_as_turns() {
+        use harnx_core::timing_identity::{TimingReceipt, TIMING_HEADER};
+        use MessageRole::*;
+        let receipt =
+            TimingReceipt::initial("2026-01-15T12:00:00Z".parse().unwrap(), "active".into());
+        let notice = msg(
+            User,
+            &format!("{TIMING_HEADER}{} | any prose", receipt.to_json()),
+        );
+        let messages = vec![
+            msg(System, "sys"),
+            msg(User, "u1"),
+            notice.clone(),
+            msg(Assistant, "a1"),
+            msg(User, "u2"),
+            notice.clone(),
+            msg(Assistant, "a2"),
+            msg(User, "u3"),
+            notice,
+            msg(Assistant, "a3"),
+        ];
+        let model = Model::default();
+        assert_eq!(split_index(&messages, &model, 1, 100_000), 7);
+        assert_eq!(split_index(&messages, &model, 2, 100_000), 4);
+        assert_eq!(split_index(&messages, &model, 100, 100_000), 1);
+        assert_eq!(
+            split_index(&messages[1..], &model, 100, 100_000),
+            6,
+            "fallback split starts at genuine prompt, not last timing context"
+        );
+        for budget in 0..=model.messages_tokens(&messages) {
+            let idx = split_index(&messages, &model, 2, budget);
+            assert!(
+                idx == messages.len() || is_turn_prompt(&messages[idx]),
+                "token budget cannot split at a timing-only boundary"
+            );
+        }
     }
 
     #[test]

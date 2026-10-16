@@ -471,6 +471,8 @@ An HTTP caller (AG-UI SSE or JSON-RPC `session/prompt`) may set `timeout_secs` t
 
 `RunLimitsRecord` captures the original admission timestamp and resolved absolute deadline before execution. Config reloads apply to new admissions; active runs and worker replays retain their saved deadlines. Each newly admitted root has a finite deadline, including macro and incoming MCP request roots. Cancellation remains invocation-fenced and doesn't roll back external side effects.
 
+> **Timing notices:** Active runs receive progress notices delivered before model calls — see [Current-Run Timing Notices](agent-guide.md#current-run-timing-notices) in the agent guide.
+
 ### Session Titles
 
 Harnx can automatically generate a short, human-readable title for each session

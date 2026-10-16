@@ -8,6 +8,8 @@ static LATE_MSG_ROUNDS: AtomicUsize = AtomicUsize::new(0);
 static LATE_MSG_INJECTIONS: AtomicUsize = AtomicUsize::new(0);
 static WIRE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static WIRE_PROMPT_COPIES: AtomicUsize = AtomicUsize::new(0);
+static WIRE_TIMING_NOTICES: LazyLock<std::sync::Mutex<Vec<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 /// A tool-call round while `round <= max_rounds`, then a final "done" text.
 /// Shared by the stub call_fns below, which differ only in how they detect
@@ -85,16 +87,31 @@ fn repeated_round_injection_call_fn() -> harnx_runtime::agent_loop::AgentCallFn 
 fn wire_message_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
     Arc::new(move |input, config, _abort| {
         if WIRE_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
-            let copies = harnx_runtime::config::input::build_messages(input, config)
-                .map(|messages| {
-                    messages
-                        .iter()
-                        .filter(|message| {
-                            message.role.is_user() && message.content.to_text() == "seed message"
-                        })
-                        .count()
+            assert!(
+                input.skip_user_log_append,
+                "worker prompts are already durable"
+            );
+            let messages = harnx_runtime::config::input::build_messages(input, config).unwrap();
+            let copies = messages
+                .iter()
+                .filter(|message| {
+                    message.role.is_user() && message.content.to_text() == "seed message"
                 })
-                .unwrap_or(0);
+                .count();
+            *WIRE_TIMING_NOTICES.lock().unwrap() = messages
+                .iter()
+                .filter_map(|message| {
+                    let text = message.content.to_text();
+                    (message.role.is_user() && harnx_core::timing_identity::is_timing_notice(&text))
+                        .then_some(text)
+                })
+                .collect();
+            assert!(
+                harnx_core::timing_identity::is_timing_notice(
+                    &messages.last().unwrap().content.to_text()
+                ),
+                "initial timing follows initiating prompt"
+            );
             WIRE_PROMPT_COPIES.store(copies, Ordering::SeqCst);
         }
         Box::pin(async move {
@@ -245,6 +262,7 @@ async fn worker_turn_sends_the_prompt_to_the_model_once() -> Result<()> {
     reset_test_state();
     WIRE_CALLS.store(0, Ordering::SeqCst);
     WIRE_PROMPT_COPIES.store(0, Ordering::SeqCst);
+    WIRE_TIMING_NOTICES.lock().unwrap().clear();
     require_nextest();
     let Some(server) = spawn_nats_server().await? else {
         eprintln!("Skipping test: nats-server not available");
@@ -270,6 +288,39 @@ async fn worker_turn_sends_the_prompt_to_the_model_once() -> Result<()> {
         WIRE_PROMPT_COPIES.load(Ordering::SeqCst),
         1,
         "the model must see the prompt exactly once"
+    );
+    assert_eq!(
+        WIRE_CALLS.load(Ordering::SeqCst),
+        1,
+        "timing creates no follow-up turn"
+    );
+    let entries = log.load_events_async().await?;
+    let durable_notices = entries
+        .iter()
+        .filter_map(|(_, entry)| match entry {
+            SessionLogEntry::Message {
+                role,
+                content,
+                fence_token,
+                ..
+            } if role.is_user()
+                && harnx_core::timing_identity::is_timing_notice(&content.to_text()) =>
+            {
+                assert!(fence_token.is_some(), "worker timing append must be fenced");
+                Some(content.to_text())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        durable_notices.len(),
+        1,
+        "timing persists despite skip_user_log_append"
+    );
+    assert_eq!(
+        durable_notices,
+        *WIRE_TIMING_NOTICES.lock().unwrap(),
+        "wire notice matches authoritative log"
     );
 
     daemon.abort();

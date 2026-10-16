@@ -72,7 +72,10 @@ fn user_message_texts(entries: &[(u64, SessionLogEntry)]) -> Vec<String> {
     entries
         .iter()
         .filter_map(|(_, entry)| match entry {
-            SessionLogEntry::Message { role, content, .. } if role.is_user() => {
+            SessionLogEntry::Message { role, content, .. }
+                if role.is_user()
+                    && !harnx_core::timing_identity::is_timing_notice(&content.to_text()) =>
+            {
                 Some(content.to_text())
             }
             _ => None,
