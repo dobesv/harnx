@@ -72,21 +72,33 @@ pub(super) fn is_activation_refusal(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<ActivationRefusal>().is_some())
 }
 
-/// The id of the latest prompt, or compaction request, at or before
-/// `requested`.
+fn is_executable_user_prompt(
+    role: &harnx_core::message::MessageRole,
+    content: &harnx_core::message::MessageContent,
+) -> bool {
+    role.is_user() && !harnx_core::timing_identity::is_timing_notice(&content.to_text())
+}
+
+/// The id of the latest prompt or compaction request at or before `requested`.
 fn latest_prompt_id(
     entries: &[(u64, harnx_core::session::SessionLogEntry)],
     requested: u64,
 ) -> Option<String> {
     use harnx_core::session::SessionLogEntry;
-    entries.iter().rev().find_map(|(seq, entry)| match entry {
-        SessionLogEntry::Message {
-            id: Some(id), role, ..
-        } if role.is_user() && *seq <= requested => Some(id.clone()),
-        SessionLogEntry::CompactRequest { compaction_id, .. } if *seq <= requested => {
-            Some(compaction_id.clone())
+    entries.iter().rev().find_map(|(seq, entry)| {
+        if *seq > requested {
+            return None;
         }
-        _ => None,
+        match entry {
+            SessionLogEntry::Message {
+                id: Some(id),
+                role,
+                content,
+                ..
+            } if is_executable_user_prompt(role, content) => Some(id.clone()),
+            SessionLogEntry::CompactRequest { compaction_id, .. } => Some(compaction_id.clone()),
+            _ => None,
+        }
     })
 }
 
@@ -1391,5 +1403,41 @@ mod attention_tests {
         lease.release().await.unwrap();
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod timing_admission_tests {
+    use super::latest_prompt_id;
+    use harnx_core::{
+        message::{MessageContent, MessageRole},
+        session::SessionLogEntry,
+        timing_identity::{TimingReceipt, TIMING_HEADER},
+    };
+
+    #[test]
+    fn timing_recovery_admission_selector_skips_notices_not_real_runtime_prose() {
+        let message = |id: &str, text: String| SessionLogEntry::Message {
+            id: Some(id.into()),
+            role: MessageRole::User,
+            content: MessageContent::Text(text),
+            timestamp: None,
+            fence_token: None,
+        };
+        let receipt =
+            TimingReceipt::initial("2026-01-15T12:00:00Z".parse().unwrap(), "invocation".into());
+        let notice = message(
+            "timing",
+            format!("{TIMING_HEADER}{} | any prose", receipt.to_json()),
+        );
+        let mut entries = vec![(1, message("prompt", "work".into())), (2, notice.clone())];
+        assert_eq!(latest_prompt_id(&entries, 2), Some("prompt".into()));
+        assert_eq!(latest_prompt_id(&[(1, notice)], 1), None);
+        entries.push((
+            3,
+            message("real", "[Runtime note] deadline question".into()),
+        ));
+        assert_eq!(latest_prompt_id(&entries, 3), Some("real".into()));
+        assert_eq!(latest_prompt_id(&entries, 2), Some("prompt".into()));
     }
 }

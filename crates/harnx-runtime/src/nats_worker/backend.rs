@@ -131,6 +131,21 @@ enum ConflictOutcome {
     Retry(u64),
 }
 
+// Timing preparation retains one candidate across append failures. Reuse its
+// durable identity as the JetStream dedup ID too, without changing IDs for
+// ordinary transcript writes or the interrupted-tool wind-up writer.
+fn timing_append_message_id(entry: &harnx_core::session::SessionLogEntry) -> Option<String> {
+    let harnx_core::session::SessionLogEntry::Message {
+        id, role, content, ..
+    } = entry
+    else {
+        return None;
+    };
+    (role.is_user() && harnx_core::timing_identity::is_timing_notice(&content.to_text()))
+        .then(|| id.clone())
+        .flatten()
+}
+
 /// Decide what a fenced append should do after losing the tail race, or refuse
 /// to retry at all. `entries` is everything appended past the expected tail.
 ///
@@ -685,7 +700,8 @@ impl NatsSessionLogBackend {
             FencedWrite {
                 expected_tail,
                 rule: WriterRule::Turn,
-                message_id: uuid::Uuid::new_v4().to_string(),
+                message_id: timing_append_message_id(entry)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             },
         )
         .await
@@ -817,7 +833,8 @@ impl NatsSessionLogBackend {
         log: &crate::nats_session_log::NatsSessionLog,
         entry: &harnx_core::session::SessionLogEntry,
     ) -> Result<u64> {
-        let message_id = uuid::Uuid::new_v4().to_string();
+        let message_id =
+            timing_append_message_id(entry).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut last_error = None;
         let mut appended_seq = None;
         for attempt in 1..=APPEND_ATTEMPTS {
@@ -1035,6 +1052,43 @@ mod tests {
         assert!(
             matches!(outcome, ConflictOutcome::Retry(9)),
             "nothing here answers this wind-up's calls"
+        );
+    }
+}
+
+#[cfg(test)]
+mod timing_append_tests {
+    use super::timing_append_message_id;
+    use harnx_core::message::{MessageContent, MessageRole};
+    use harnx_core::session::SessionLogEntry;
+    use harnx_core::timing_identity::{TimingReceipt, TIMING_HEADER};
+
+    #[test]
+    fn timing_append_reuses_stable_id_only_for_valid_user_receipts() {
+        let receipt = TimingReceipt::initial(chrono::Utc::now(), "invocation".into());
+        let mut entry = SessionLogEntry::Message {
+            id: Some("timing-receipt-id".into()),
+            role: MessageRole::User,
+            content: MessageContent::Text(format!("{TIMING_HEADER}{}", receipt.to_json())),
+            timestamp: None,
+            fence_token: None,
+        };
+        assert_eq!(
+            timing_append_message_id(&entry).as_deref(),
+            Some("timing-receipt-id")
+        );
+        if let SessionLogEntry::Message { role, .. } = &mut entry {
+            *role = MessageRole::Assistant;
+        }
+        assert_eq!(timing_append_message_id(&entry), None);
+        if let SessionLogEntry::Message { role, content, .. } = &mut entry {
+            *role = MessageRole::User;
+            *content = MessageContent::Text(format!("{TIMING_HEADER}explain this prefix"));
+        }
+        assert_eq!(
+            timing_append_message_id(&entry),
+            None,
+            "real prompts keep existing append IDs"
         );
     }
 }

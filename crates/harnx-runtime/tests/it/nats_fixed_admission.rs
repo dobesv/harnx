@@ -12,6 +12,28 @@ use std::sync::{
     Arc,
 };
 
+fn assert_single_user_and_timing_notice(entries: &[(u64, SessionLogEntry)], timing_msg: &str) {
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(_, e)| matches!(e, SessionLogEntry::Message { role, content, .. }
+                if role.is_user() && !harnx_core::timing_identity::is_timing_notice(&content.to_text())))
+            .count(),
+        1
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(_, entry)| matches!(entry,
+                SessionLogEntry::Message { role, content, .. }
+                    if role.is_user() && harnx_core::timing_identity::is_timing_notice(&content.to_text())
+            ))
+            .count(),
+        1,
+        "{timing_msg}"
+    );
+}
+
 async fn open(url: &str, id: &str) -> Result<NatsSession> {
     let client = async_nats::connect(url).await?;
     NatsSession::new(
@@ -141,12 +163,9 @@ async fn closed_unbound_reservation_reconstructs_idle_and_normal_worker_runs_onc
     assert_eq!(result.response.as_deref(), Some("done"));
     assert_eq!(count.load(Ordering::SeqCst), 1);
     let entries = log.load_events_latest_async().await?;
-    assert_eq!(
-        entries
-            .iter()
-            .filter(|(_, e)| matches!(e, SessionLogEntry::Message { role, .. } if role.is_user()))
-            .count(),
-        1
+    assert_single_user_and_timing_notice(
+        &entries,
+        "one persisted initial notice, not another admitted prompt",
     );
     assert_eq!(
         entries
@@ -201,13 +220,7 @@ async fn prompt_win_close_returns_same_execution_and_retry_never_duplicates() ->
         .await?
         .load_events_latest_async()
         .await?;
-    assert_eq!(
-        entries
-            .iter()
-            .filter(|(_, e)| matches!(e, SessionLogEntry::Message { role, .. } if role.is_user()))
-            .count(),
-        1
-    );
+    assert_single_user_and_timing_notice(&entries, "retry must not duplicate the initial notice");
     assert!(!entries.iter().any(|(_, e)| matches!(
         e,
         SessionLogEntry::AdmissionClosed { .. } | SessionLogEntry::Cancel { .. }

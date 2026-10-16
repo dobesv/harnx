@@ -60,6 +60,11 @@ pub struct Input {
     /// not execution authority; reset for a new tool round or injected message.
     pub session_input_start: Option<usize>,
     pub preferred_assistant_message_id: Option<String>,
+    /// Durable timing context for this logical round. Request builders add it
+    /// after user/tool context when the history prefix doesn't contain its receipt.
+    /// Transport retries and fallback models retain it; the loop clears it only
+    /// when advancing to the next logical round.
+    pub timing_context: Option<TimingContext>,
     /// A harness note sent after everything else in a request. It belongs to
     /// the retry layer, which sets it only when a reply was stopped for
     /// repeating itself, to tell the model so. Every request of that call
@@ -68,6 +73,12 @@ pub struct Input {
     /// beforehand is discarded, and again after a successful model call. It is
     /// never persisted.
     pub transient_note: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimingContext {
+    pub receipt: crate::timing_identity::TimingReceipt,
+    pub message: crate::message::Message,
 }
 
 impl Input {
@@ -98,6 +109,7 @@ impl Input {
             durable_user_messages: Vec::new(),
             session_input_start: None,
             preferred_assistant_message_id: None,
+            timing_context: None,
             transient_note: None,
         }
     }

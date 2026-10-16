@@ -213,6 +213,19 @@ pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Messag
             MessageContent::Text(text.clone()),
         ))
     }
+    if let Some(timing) = &input.timing_context {
+        let already_present = messages.iter().any(|message| {
+            message.role.is_user()
+                && harnx_core::timing_identity::TimingReceipt::from_notice_line(
+                    &message.content.to_text(),
+                )
+                .as_ref()
+                    == Some(&timing.receipt)
+        });
+        if !already_present {
+            messages.push(timing.message.clone());
+        }
+    }
     if let Some(note) = &input.transient_note {
         messages.push(Message::new(
             MessageRole::User,

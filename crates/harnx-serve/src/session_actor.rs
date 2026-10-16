@@ -1492,29 +1492,40 @@ mod tests {
         assert_persisted_user_message("plain", "inject", "queued follow-up").await;
     }
 
-    #[tokio::test]
-    async fn session_actor_running_prompt_preserves_multiple_mid_loop_injections_fifo() {
-        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
-        let sandbox = TestConfigSandbox::new();
-        sandbox.write_agent("plain", "You are plain.");
+    struct FifoInjectionHarness {
+        first_tool_round_started: Arc<Notify>,
+        release_first_tool_round: Arc<Notify>,
+        second_tool_round_started: Arc<Notify>,
+        release_second_tool_round: Arc<Notify>,
+        third_tool_round_started: Arc<Notify>,
+        release_third_tool_round: Arc<Notify>,
+        seen_injected: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+        call_count: Arc<AtomicUsize>,
+    }
 
-        let first_tool_round_started = Arc::new(Notify::new());
-        let release_first_tool_round = Arc::new(Notify::new());
-        let second_tool_round_started = Arc::new(Notify::new());
-        let release_second_tool_round = Arc::new(Notify::new());
-        let third_tool_round_started = Arc::new(Notify::new());
-        let release_third_tool_round = Arc::new(Notify::new());
-        let seen_injected = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let call_fn: AgentCallFn = {
-            let first_tool_round_started = first_tool_round_started.clone();
-            let release_first_tool_round = release_first_tool_round.clone();
-            let second_tool_round_started = second_tool_round_started.clone();
-            let release_second_tool_round = release_second_tool_round.clone();
-            let third_tool_round_started = third_tool_round_started.clone();
-            let release_third_tool_round = release_third_tool_round.clone();
-            let seen_injected = seen_injected.clone();
-            let call_count = call_count.clone();
+    impl FifoInjectionHarness {
+        fn new() -> Self {
+            Self {
+                first_tool_round_started: Arc::new(Notify::new()),
+                release_first_tool_round: Arc::new(Notify::new()),
+                second_tool_round_started: Arc::new(Notify::new()),
+                release_second_tool_round: Arc::new(Notify::new()),
+                third_tool_round_started: Arc::new(Notify::new()),
+                release_third_tool_round: Arc::new(Notify::new()),
+                seen_injected: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                call_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn build_call_fn(&self) -> AgentCallFn {
+            let first_tool_round_started = self.first_tool_round_started.clone();
+            let release_first_tool_round = self.release_first_tool_round.clone();
+            let second_tool_round_started = self.second_tool_round_started.clone();
+            let release_second_tool_round = self.release_second_tool_round.clone();
+            let third_tool_round_started = self.third_tool_round_started.clone();
+            let release_third_tool_round = self.release_third_tool_round.clone();
+            let seen_injected = self.seen_injected.clone();
+            let call_count = self.call_count.clone();
             Arc::new(move |input, _config, _abort| {
                 let first_tool_round_started = first_tool_round_started.clone();
                 let release_first_tool_round = release_first_tool_round.clone();
@@ -1575,36 +1586,42 @@ mod tests {
                     }
                 })
             })
-        };
-        let registry = registry_with_call_fn(call_fn);
-        let handle = registry.get_or_spawn(key("plain", "inject-fifo"));
-        let _sub = subscribe(&handle).await;
+        }
 
-        let accepted = prompt(&handle, "initial user request").await;
-        assert!(matches!(accepted, PromptResult::Accepted { .. }));
-        first_tool_round_started.notified().await;
+        async fn drive_injections(&self, handle: &SessionHandle) {
+            let accepted = prompt(handle, "initial user request").await;
+            assert!(matches!(accepted, PromptResult::Accepted { .. }));
+            self.first_tool_round_started.notified().await;
 
-        let second_prompt = prompt(&handle, "second").await;
-        assert!(matches!(second_prompt, PromptResult::Enqueued { .. }));
-        let third_prompt = prompt(&handle, "third").await;
-        assert!(matches!(third_prompt, PromptResult::Enqueued { .. }));
+            let second_prompt = prompt(handle, "second").await;
+            assert!(matches!(second_prompt, PromptResult::Enqueued { .. }));
+            let third_prompt = prompt(handle, "third").await;
+            assert!(matches!(third_prompt, PromptResult::Enqueued { .. }));
 
-        release_first_tool_round.notify_one();
-        second_tool_round_started.notified().await;
-        release_second_tool_round.notify_one();
-        third_tool_round_started.notified().await;
-        release_third_tool_round.notify_one();
-        wait_for_state(&handle, "idle", |state| *state == SessionState::Idle).await;
+            self.release_first_tool_round.notify_one();
+            self.second_tool_round_started.notified().await;
+            self.release_second_tool_round.notify_one();
+            self.third_tool_round_started.notified().await;
+            self.release_third_tool_round.notify_one();
+            wait_for_state(handle, "idle", |state| *state == SessionState::Idle).await;
+        }
+    }
 
-        let seen_injected = seen_injected.lock().await.clone();
-        assert_eq!(
-            seen_injected,
-            vec![None, Some("second".to_string()), Some("third".to_string())]
+    fn assert_fifo_persisted_messages(agent: &str, session_id: &str) {
+        let all_persisted = load_session_messages(agent, session_id);
+        assert!(
+            all_persisted.iter().any(|msg| {
+                msg.role.is_user()
+                    && harnx_core::timing_identity::is_timing_notice(&msg.content.to_text())
+            }),
+            "timing notice should be persisted in session log"
         );
-
-        let user_texts: Vec<String> = load_session_messages("plain", "inject-fifo")
+        let user_texts: Vec<String> = all_persisted
             .iter()
-            .filter(|msg| msg.role.is_user())
+            .filter(|msg| {
+                msg.role.is_user()
+                    && !harnx_core::timing_identity::is_timing_notice(&msg.content.to_text())
+            })
             .map(|msg| msg.content.to_text())
             .collect();
         assert_eq!(
@@ -1615,6 +1632,27 @@ mod tests {
                 "third".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn session_actor_running_prompt_preserves_multiple_mid_loop_injections_fifo() {
+        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+
+        let harness = FifoInjectionHarness::new();
+        let registry = registry_with_call_fn(harness.build_call_fn());
+        let handle = registry.get_or_spawn(key("plain", "inject-fifo"));
+        let _sub = subscribe(&handle).await;
+
+        harness.drive_injections(&handle).await;
+
+        let seen_injected = harness.seen_injected.lock().await.clone();
+        assert_eq!(
+            seen_injected,
+            vec![None, Some("second".to_string()), Some("third".to_string())]
+        );
+        assert_fifo_persisted_messages("plain", "inject-fifo");
     }
 
     #[tokio::test]

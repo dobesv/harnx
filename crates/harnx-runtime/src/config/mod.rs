@@ -26,6 +26,7 @@ mod session_ops_core;
 mod session_ops_split;
 pub mod session_ops_title;
 mod session_persistence;
+pub(crate) mod session_timing;
 mod session_tool_results;
 mod settings_split;
 mod tool_selection;
@@ -339,6 +340,9 @@ fn handoff_tool_declarations_for_agents(
 
 pub struct Config {
     pub run_context: Option<crate::nats_session_metadata::RunLimitsRecord>,
+    /// One active invocation's committed timing progress and pending append.
+    #[doc(hidden)]
+    pub timing_run: Option<session_timing::TimingRun>,
     pub data: ConfigData,
 
     // Server-config vectors (types live in dependent crates — stay here,
@@ -426,6 +430,7 @@ impl Clone for Config {
         Self {
             data: self.data.clone(),
             run_context: self.run_context.clone(),
+            timing_run: self.timing_run.clone(),
             clients: self.clients.clone(),
             nats_servers: self.nats_servers.clone(),
             tool_servers: self.tool_servers.clone(),
@@ -473,6 +478,7 @@ impl Config {
         Config {
             data: self.data.clone(),
             run_context: self.run_context.clone(),
+            timing_run: None,
             clients: self.clients.clone(),
             nats_servers: self.nats_servers.clone(),
             tool_servers: self.tool_servers.clone(),
@@ -509,6 +515,7 @@ impl Default for Config {
         Self {
             data: ConfigData::default(),
             run_context: None,
+            timing_run: None,
 
             clients: vec![],
             nats_servers: vec![],

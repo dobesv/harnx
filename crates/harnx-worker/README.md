@@ -57,6 +57,9 @@ different build SHA when their readiness protocol is compatible. After an
 upgrade that changes the local protocol, restart all local frontend and worker
 processes; durable session history is preserved.
 
+Readiness protocol compatibility does not imply durable history compatibility.
+The timing-receipt release requires a [coordinated hard cutover](../../docs/kubernetes-deployment.md#timing-receipt-compatibility-cutover-and-rollback): stop all old readers before always-on receipt writers start. Rollback must retain receipt-compatible readers, including frontend-owned children. Draining work does not remove incompatible rows from saved histories.
+
 The frontend finds `harnx-worker` in this order:
 
 1. The path in `HARNX_WORKER_BIN`.

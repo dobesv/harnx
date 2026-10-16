@@ -395,6 +395,185 @@ See [Customizing pantheon agents for your environment](../packages/pantheon/READ
 
 ---
 
+## Timing receipt compatibility cutover and rollback
+
+Use this procedure for the release that introduces durable `[Runtime note] ⏱ v1`
+User-role timing receipts (`timing-v1-…` message IDs, issue #2411). **This is a
+coordinated hard cutover, not a rolling upgrade.** Writers are always on; there
+is no setting that makes a mixed old/new execution fleet safe.
+
+Pre-receipt workers treat these rows as executable prompts and can fail with
+`refusing executable prompt without durable run admission`. Draining active
+turns does not remove receipts from completed sessions. Compaction, process
+restart, lease expiry and matching frontend/worker readiness protocols do not
+make an old reader compatible. Never grant admissions to receipts to bypass
+this check. Existing admissions and deadlines must remain unchanged.
+
+### Scope and release gates
+
+The commands below use the `harnx-serve` and `harnx-worker` Deployments and labels
+from this guide. They require Bash, kubectl and jq. Run them only during an
+approved maintenance window; they stop service. They do not stop NATS or tool
+servers and must not delete streams, consumers, KV admissions or session logs.
+
+Before running them, record in the release ticket:
+
+- NATS account/cluster and **every** process that can access its histories:
+  worker pools in all namespaces, CLI/TUI clients, `harnx-serve`, MCP/A2A
+  backends, jobs and frontend-owned local worker children. A different cluster
+  profile name does not isolate processes using the same account and logs.
+- Desired replica counts, current manifests/image digests, and the exact new
+  image digest built from the receipt-compatible release (this implementation
+  includes `harnx-core::timing_identity` and its worker reader filters). Keep
+  that artifact available as the minimum compatible recovery image. A
+  pre-#2411 image is **not** a rollback candidate after first receipt emission.
+- Maintenance access restrictions that prevent external clients from reconnecting
+  and prevent old binaries from restarting. Pause GitOps/release automation,
+  HPA/KEDA and scheduled jobs for the inventory. Restrict deployment rights to
+  the release operator until the gates pass. Keep old images out of approved
+  deployment manifests after cutover. If these controls or the inventory cannot
+  be established, **abort before starting any new worker**.
+- Passing isolated verification below on the exact release source, and a staging
+  receipt-bearing session check using the chosen image. Readiness alone is not
+  a semantic compatibility test.
+
+For fleets beyond these two Deployments, repeat the stop/absence/image gates
+for every inventoried workload before starting any of them. Do not copy the
+two-Deployment example unchanged into a larger fleet.
+
+### Full-stop upgrade
+
+1. Close public ingress and all other prompt submission paths using the site's
+   maintenance controls. Let admitted turns reach durable completion or use
+   existing cancellation controls and confirm the durable stop. Do not infer
+   task drain from closed HTTP connections. Follow [A2A operations](a2a-operations.md#upgrade-without-mixed-writers)
+   for A2A work. Record unresolved work; never extend its frozen deadline or
+   replay tool side effects to make the release pass.
+2. Stop **all** inventoried frontends and workers, including external clients and
+   supervised children. For this guide's two-Deployment topology:
+
+   ```bash
+   set -euo pipefail
+   : "${NS:?set the target Kubernetes namespace}"
+   : "${COMPAT_IMAGE:?set ghcr.io/dobesv/harnx@sha256:<approved digest>}"
+   [[ "$COMPAT_IMAGE" =~ ^ghcr\.io/dobesv/harnx@sha256:[0-9a-f]{64}$ ]]
+   kubectl -n "$NS" get deploy harnx-serve harnx-worker -o yaml > timing-cutover-before.yaml
+   kubectl -n "$NS" scale deploy/harnx-serve deploy/harnx-worker --replicas=0
+   kubectl -n "$NS" wait --for=delete pod -l 'app in (harnx-serve,harnx-worker)' --timeout=300s
+   test "$(kubectl -n "$NS" get pods -l 'app in (harnx-serve,harnx-worker)' -o json | jq '.items | length')" -eq 0
+   ```
+
+   **Stop gate:** every old process is gone, not merely unready or draining;
+   automated/external restarts remain blocked. Record the empty pod list and
+   equivalent evidence for the rest of the inventory. Do not proceed on a wait
+   timeout. Scaling only shared workers is insufficient if a frontend can
+   respawn an old child.
+3. With replicas still zero, update each runtime image. Do not apply saved old
+   manifests or use `kubectl rollout undo` against the pre-receipt release.
+
+   ```bash
+   kubectl -n "$NS" set image deploy/harnx-worker harnx-worker="$COMPAT_IMAGE"
+   kubectl -n "$NS" set image deploy/harnx-serve harnx-serve="$COMPAT_IMAGE"
+   for name in harnx-worker harnx-serve; do
+     test "$(kubectl -n "$NS" get deploy "$name" -o jsonpath='{.spec.replicas}')" -eq 0
+     test "$(kubectl -n "$NS" get deploy "$name" -o jsonpath='{.spec.template.spec.containers[0].image}')" = "$COMPAT_IMAGE"
+   done
+   ```
+
+4. Start one compatible worker with submission paths still closed. Queued
+   activations can emit receipts immediately, so this is the compatibility
+   point of no return for old readers, even before reopening ingress.
+
+   ```bash
+   kubectl -n "$NS" scale deploy/harnx-worker --replicas=1
+   kubectl -n "$NS" rollout status deploy/harnx-worker --timeout=300s
+   kubectl -n "$NS" get pods -l app=harnx-worker -o json |
+     jq -e --arg image "$COMPAT_IMAGE" '.items | length > 0 and all(.[]; all(.spec.containers[]; .image == $image))'
+   kubectl -n "$NS" get pods -l app=harnx-worker -o wide
+   ```
+
+   Record running image IDs (`kubectl get pods -o json`) and worker logs.
+   Use only upgraded operator clients for the receipt-session probe below.
+   If it fails, leave ingress closed and follow retained-reader rollback.
+5. Restore the recorded worker/frontend replica counts using the **updated**
+   manifests, wait for rollout readiness, and verify every runtime image against
+   the approved digest. Reopen submission paths only after the inventory and
+   receipt-session gates pass. Resume automation only with updated manifests
+   and image restrictions; do not let it restore an old ReplicaSet or CLI image.
+
+For local installations, close every frontend sharing the broker and confirm
+its child has exited before replacing binaries. Upgrade `harnx`, `harnx-serve`
+and `harnx-worker` together, plus other runtime backends in the inventory.
+Check `HARNX_WORKER_BIN`, the frontend's sibling binary and PATH; a stale override
+can start an old worker despite an upgraded frontend. Restart frontends only
+after all those paths resolve to compatible artifacts. See [worker binary resolution](../crates/harnx-worker/README.md#frontend-managed-local-workers).
+
+### Rollback: retain compatible readers
+
+Once a new worker has started, assume the whole account contains receipts.
+**Do not downgrade its runtime readers to a pre-receipt binary, even when all
+sessions are idle.** There is no supported in-place receipt-stripping repair
+or automatic quarantine in this release.
+
+1. Close submission paths and stop automation again. Drain/cancel and stop the
+   runtime fleet using the same full-stop and absence gates above.
+2. Revert only configuration or surrounding infrastructure that works with the
+   compatible runtime. Keep `COMPAT_IMAGE` pinned to the tested receipt-compatible
+   artifact, or use a forward-fixed compatible image after the same tests. On
+   the first receipt release, retaining this runtime may be the only rollback
+   option. If it cannot run safely, keep service stopped while preparing a fix.
+3. Reapply runtime image pins at zero replicas (step 3), start one compatible
+   worker (step 4), and run the receipt-bearing probe against the **same stored
+   session**. Restore capacity/ingress only after it passes. Do not restore a
+   pre-upgrade NATS snapshot: that loses admitted work and may replay side effects.
+4. Record retained image IDs, preserved session/receipt identities and probe
+   results. Keep old runtime deployments blocked for as long as those histories,
+   backups or imported copies can be read. No zero-coordination rollback claim.
+
+An emergency pre-receipt binary must use a separate isolated account with no
+access to receipt-bearing histories, not this rollback path. Any migration or
+history repair requires a separately reviewed procedure and evidence; stopping
+writers or hiding rows with compaction is not such a procedure.
+
+### Receipt-bearing verification
+
+Run this isolated check from the release checkout; it starts only disposable
+NATS/test workers, uses mock model calls, and cannot reach deployed services
+under the repository test sandbox:
+
+```bash
+command -v nats-server
+PROTOC=/usr/bin/protoc cargo nextest run -p harnx-runtime \
+  -E 'test(timing_receipt_hard_cutover_and_retained_reader_rollback) | test(timing_recovery)' --no-fail-fast
+PROTOC=/usr/bin/protoc cargo nextest run -p harnx-runtime \
+  -E 'test(timing_receipt_hard_cutover_and_retained_reader_rollback)' --stress-count=20
+```
+
+`timing_receipt_hard_cutover_and_retained_reader_rollback` starts with a
+receipt-free admitted prompt, cold-starts a compatible worker, completes/drains
+it, stops that worker, then cold-starts a retained compatible reader over the
+unchanged receipt-bearing history. A new genuinely admitted turn completes
+once; the original log prefix and frozen limits stay unchanged, and receipts
+never receive prompt admissions. Its negative control copies the baseline
+`5a6c2cba3` User-row selector and confirms it selects an unadmitted receipt
+after drain. This is **not** an old-binary execution test or a cross-version
+rollback guarantee. The retained reader is the same compatible runtime build.
+The existing recovery tests also cover interrupted admitted runs and compacted
+raw receipts. Missing nats-server fails the cutover test, rather than counting
+an unexercised check as passing.
+
+Before production cutover, repeat a receipt-session probe in isolated staging
+with the approved image and real frontend route: submit a harmless prompt,
+save `harnx dump session <agent>@<cluster> <session-id> --format json`, and confirm
+a durable timing receipt and normal completion. Stop all runtime processes,
+restart only compatible images as in the rollback steps, submit a second
+prompt to that same session and dump it again. Require the old receipt/log
+prefix unchanged, a fresh initial receipt only for the new invocation, no
+admission refusal and no timing-only extra turn. Record both dumps, image IDs
+and logs in the release ticket. Repository tests verify reader/history behavior;
+they do not verify a site's Kubernetes access controls or claim this staging
+or production deployment has been performed.
+
 ## Tool Servers
 
 Harnx native tool servers are long-running processes that connect to NATS as consumers and register themselves in the `harnx_tool_registry` KV bucket. They do not run as per-call stdio processes.

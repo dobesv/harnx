@@ -248,6 +248,15 @@ async fn cancel_model(tool_calls: bool) -> Result<()> {
         })
     };
     entered.wait().await;
+    let before_cancel = h.entries().await?;
+    assert_eq!(before_cancel.len(), admitted.len() + 1);
+    assert_eq!(
+        serde_json::to_value(&before_cancel[..admitted.len()])?,
+        serde_json::to_value(&admitted)?
+    );
+    assert!(matches!(&before_cancel.last().unwrap().1,
+        SessionLogEntry::Message { role, content, .. }
+            if role.is_user() && harnx_core::timing_identity::is_timing_notice(&content.to_text())));
     let cancel_seq = h.interrupt().await?;
     release.wait().await;
     let error = worker.await?.err().context("must interrupt")?;
@@ -259,11 +268,17 @@ async fn cancel_model(tool_calls: bool) -> Result<()> {
     let (interrupted, tail) = entries.split_at(entries.len() - 1);
     assert_eq!(
         serde_json::to_value(interrupted)?,
-        serde_json::to_value(admitted)?,
-        "admitted input survives; no assistant, tool calls, results, or TurnEnd"
+        serde_json::to_value(before_cancel)?,
+        "admitted input and pre-model timing notice survive; no assistant, tool calls, results, or TurnEnd"
     );
     assert!(matches!(&tail[0], (seq, SessionLogEntry::Cancel { .. }) if *seq == cancel_seq));
-    assert_eq!(config.read().session.as_ref().unwrap().messages.len(), 1);
+    let guard = config.read();
+    let messages = &guard.session.as_ref().unwrap().messages;
+    assert_eq!(messages.len(), 2);
+    assert!(harnx_core::timing_identity::is_timing_notice(
+        &messages[1].content.to_text()
+    ));
+    drop(guard);
     let events = events.0.lock().unwrap();
     assert!(!events.iter().any(|event| matches!(
         event,

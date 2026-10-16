@@ -67,6 +67,10 @@ pub(crate) fn fold_new_user_messages_since(
         if !role.is_user() {
             continue;
         }
+        // Skip timing notices — use shared classifier to ensure only valid notices skipped
+        if harnx_core::timing_identity::is_timing_notice(&content.to_text()) {
+            continue;
+        }
         // Register identities before cursor filtering: compaction copies have
         // newer physical sequences, but still represent the original admission.
         // ID-less legacy entries retain sequence-based behavior.
@@ -155,5 +159,126 @@ mod tests {
                 (None, Some(6))
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod timing_fold_tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use harnx_core::message::{MessageContent, MessageRole};
+    use harnx_core::session::SessionLogEntry;
+    use harnx_core::timing_identity::{TimingReceipt, TIMING_HEADER};
+
+    /// Create a valid timing notice entry with proper JSON receipt
+    fn timing_notice(seq: u64) -> (u64, SessionLogEntry) {
+        let origin = Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap();
+        let receipt = TimingReceipt::initial(origin, "inv-123".to_string());
+        (
+            seq,
+            SessionLogEntry::Message {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(format!(
+                    "{}{} | Elapsed: 0s",
+                    TIMING_HEADER,
+                    receipt.to_json()
+                )),
+                timestamp: None,
+                fence_token: None,
+            },
+        )
+    }
+
+    fn user_prompt(seq: u64, text: &str) -> (u64, SessionLogEntry) {
+        (
+            seq,
+            SessionLogEntry::Message {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(text.to_string()),
+                timestamp: None,
+                fence_token: None,
+            },
+        )
+    }
+
+    /// Create a user prompt with reserved header prefix but invalid JSON
+    fn user_prompt_with_reserved_prefix(seq: u64, text: &str) -> (u64, SessionLogEntry) {
+        user_prompt(seq, &format!("{} {}", TIMING_HEADER, text))
+    }
+
+    #[test]
+    fn fold_new_user_messages_since_skips_timing_notices() {
+        let entries: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt(1, "prompt one"),
+            timing_notice(2),
+            user_prompt(3, "prompt two"),
+        ];
+
+        let (messages, latest_seq) = fold_new_user_messages_since(&entries, None);
+        // Only real prompts should be returned, timing notice at seq 2 skipped
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content.to_text(), "prompt one");
+        assert_eq!(messages[1].content.to_text(), "prompt two");
+        assert_eq!(latest_seq, Some(3));
+    }
+
+    #[test]
+    fn fold_timing_notice_with_concurrent_user_preserves_real_user() {
+        // Timing notice interleaved with concurrent real user messages
+        let entries: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt(1, "initial prompt"),
+            timing_notice(2),
+            timing_notice(3),
+            user_prompt(4, "second prompt"),
+        ];
+
+        let (messages, latest_seq) = fold_new_user_messages_since(&entries, None);
+        // All timing notices skipped
+        assert_eq!(messages.len(), 2);
+        assert_eq!(latest_seq, Some(4));
+    }
+
+    #[test]
+    fn fold_cursor_tracks_real_users_not_timing_notices() {
+        // Cursor should track real user prompts, not timing notices
+        let entries: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt(1, "first"),
+            timing_notice(2),
+            user_prompt(3, "second"),
+        ];
+
+        // After first user at seq 1, next fold should skip timing and return second
+        let (messages1, cursor1) = fold_new_user_messages_since(&entries, None);
+        assert_eq!(messages1.len(), 2);
+        assert_eq!(cursor1, Some(3));
+
+        // After second user at seq 3, should return empty
+        let (messages2, cursor2) = fold_new_user_messages_since(&entries, Some(3));
+        assert!(messages2.is_empty());
+        assert_eq!(cursor2, Some(3));
+    }
+
+    #[test]
+    fn fold_includes_user_prompts_with_reserved_prefix_but_invalid_receipt() {
+        // Regression: Real user prompts starting with reserved header but without valid JSON
+        // must NOT be skipped - they should be treated as normal user prompts
+        let entries: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt(1, "first"),
+            user_prompt_with_reserved_prefix(2, "second - invalid timing format"),
+            user_prompt(3, "third"),
+        ];
+
+        let (messages, latest_seq) = fold_new_user_messages_since(&entries, None);
+        // All 3 prompts should be returned (invalid timing format is NOT skipped)
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content.to_text(), "first");
+        assert!(messages[1]
+            .content
+            .to_text()
+            .contains("invalid timing format"));
+        assert_eq!(messages[2].content.to_text(), "third");
+        assert_eq!(latest_seq, Some(3));
     }
 }

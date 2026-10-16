@@ -80,7 +80,14 @@ pub fn prompt_interrupted_at(entries: &[(u64, SessionLogEntry)], user_msg_seq: u
 }
 
 fn is_queued_user_message(entry: &SessionLogEntry) -> bool {
-    matches!(entry, SessionLogEntry::Message { role, .. } if role.is_user())
+    // Timing notices are non-executable context, not queued user prompts.
+    // Use shared classifier to ensure only valid timing notices are skipped.
+    if let SessionLogEntry::Message { role, content, .. } = entry {
+        if role.is_user() {
+            return !crate::timing_identity::is_timing_notice(&content.to_text());
+        }
+    }
+    false
 }
 
 /// Sequence of the newest user message that asks for a turn, skipping the
@@ -97,9 +104,16 @@ pub fn latest_prompt_seq(entries: &[(u64, SessionLogEntry)]) -> Option<u64> {
     let mut seen_ids = std::collections::HashSet::new();
     let mut latest = None;
     for (seq, entry) in entries {
-        let SessionLogEntry::Message { id, role, .. } = entry else {
+        let SessionLogEntry::Message {
+            id, role, content, ..
+        } = entry
+        else {
             continue;
         };
+        // Skip timing notices — use shared classifier to ensure only valid notices skipped
+        if crate::timing_identity::is_timing_notice(&content.to_text()) {
+            continue;
+        }
         let is_copy = id.as_deref().is_some_and(|id| !seen_ids.insert(id));
         if role.is_user() && !is_copy {
             latest = Some(*seq);

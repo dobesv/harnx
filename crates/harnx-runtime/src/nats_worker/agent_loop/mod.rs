@@ -15,7 +15,7 @@ use crate::nats_hook_provider::{
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
 use crate::nats_session::{NatsSession, NatsSessionConfig};
-use crate::nats_session_metadata::SessionMetadataStore;
+use crate::nats_session_metadata::{SessionMetadata, SessionMetadataStore};
 use crate::tool_context::{discover_nats_hook_provider_fresh, discover_nats_tool_provider_fresh};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
@@ -290,6 +290,41 @@ pub(crate) fn last_fed_user_log_seq(_input: &Input) -> Option<u64> {
 
 pub(crate) use selected_input::fold_new_user_messages_since;
 
+// Some(None) is an executable row missing its required admission identity.
+pub(super) fn executable_user_message_id(entry: &SessionLogEntry) -> Option<Option<&str>> {
+    match entry {
+        SessionLogEntry::Message {
+            id, role, content, ..
+        } if role.is_user()
+            && !harnx_core::timing_identity::is_timing_notice(&content.to_text()) =>
+        {
+            Some(id.as_deref())
+        }
+        _ => None,
+    }
+}
+
+async fn verify_injected_prompt_admission(
+    store: &SessionMetadataStore,
+    session_id: &str,
+    entry: &SessionLogEntry,
+    invocation_id: &str,
+) -> Result<()> {
+    let Some(id_opt) = executable_user_message_id(entry) else {
+        return Ok(());
+    };
+    let id = id_opt.context("injected user row has no admission identity")?;
+    let admission = store
+        .prompt_admission(session_id, id)
+        .await?
+        .context("injected user row has no durable admission")?;
+    anyhow::ensure!(
+        admission.invocation_id.as_str() == invocation_id,
+        "cannot inject a competing execution admission"
+    );
+    Ok(())
+}
+
 pub(crate) fn build_mid_turn_injection_callback(
     backend: NatsSessionLogBackend,
     cursor: Arc<AtomicU64>,
@@ -319,23 +354,16 @@ pub(crate) fn build_mid_turn_injection_callback(
             let store = backend
                 .metadata_store_opt()
                 .context("injection requires admission metadata")?;
+            let min_seq = current.unwrap_or(0);
             for (seq, entry) in &effective {
-                if *seq > current.unwrap_or(0) {
-                    if let SessionLogEntry::Message { id, role, .. } = entry {
-                        if role.is_user() {
-                            let id = id
-                                .as_deref()
-                                .context("injected user row has no admission identity")?;
-                            let admission = store
-                                .prompt_admission(backend.session_id(), id)
-                                .await?
-                                .context("injected user row has no durable admission")?;
-                            anyhow::ensure!(
-                                admission.invocation_id.as_str() == invocation_id,
-                                "cannot inject a competing execution admission"
-                            );
-                        }
-                    }
+                if *seq > min_seq {
+                    verify_injected_prompt_admission(
+                        store,
+                        backend.session_id(),
+                        entry,
+                        &invocation_id,
+                    )
+                    .await?;
                 }
             }
             merged_input.set_injected_user_text(fold_user_messages(&messages));
@@ -383,101 +411,104 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     run_agent_loop_with_nats_outcome(args).await.map(drop)
 }
 
+async fn setup_agent_loop_context(
+    params: AgentContextParams,
+    session_origin: SessionOrigin,
+    session_id: &str,
+) -> crate::agent_loop::AgentLoopContext {
+    let ctx = Box::pin(build_agent_loop_context(params)).await;
+    dispatch_context_session_start(&ctx, session_origin, session_id).await;
+    ctx
+}
+
+async fn run_nats_loop_segment(
+    segment_args: AgentLoopSegmentArgs<'_>,
+    jetstream_ctx: jetstream::Context,
+    session_id: &str,
+    replicas: usize,
+) -> Result<NatsAgentLoopOutcome> {
+    let backend = NatsSessionLogBackend::new(jetstream_ctx, session_id, replicas);
+    let hitl_continuation = derive_hitl_tool_round_continuation(&backend.load_events_blocking()?)?;
+    segment_args.run(hitl_continuation).await
+}
+
+async fn prepare_session_for_agent_loop(
+    args: &RunAgentLoopArgs<'_>,
+) -> Result<(jetstream::Context, SessionOrigin, SessionAttachmentSync)> {
+    Box::pin(prepare_agent_session(PrepareAgentSessionParams {
+        cluster_key: args.cluster_key,
+        session_id: args.session_id,
+        config: &args.config,
+        instance_id: &args.instance_id,
+        abort_signal: &args.abort_signal,
+        lease: args.lease.as_ref(),
+        after_seq_observer: args.after_seq_observer.clone(),
+        session_metadata: args.session_metadata,
+        selected_user_messages: &args.initial_input.durable_user_messages,
+        replay_unmanaged: args.initial_input.skip_user_log_append,
+    }))
+    .await
+}
+
 pub(crate) async fn run_agent_loop_with_nats_outcome(
     args: RunAgentLoopArgs<'_>,
 ) -> Result<NatsAgentLoopOutcome> {
-    let RunAgentLoopArgs {
-        cluster_key,
-        manage_servers,
-        session_id,
-        config,
-        instance_id,
-        initial_input,
-        abort_signal,
-        token_budget,
-        call_fn,
-        lease,
-        activation_route,
-        event_sink,
-        after_seq_observer,
-        session_metadata,
-        on_tool_round,
-        working_dir,
-    } = args;
-
     let (jetstream_ctx, session_origin, attachment_sync) =
-        Box::pin(prepare_agent_session(PrepareAgentSessionParams {
-            cluster_key,
-            session_id,
-            config: &config,
-            instance_id: &instance_id,
-            abort_signal: &abort_signal,
-            lease: lease.as_ref(),
-            after_seq_observer: after_seq_observer.clone(),
-            session_metadata,
-            selected_user_messages: &initial_input.durable_user_messages,
-        }))
-        .await?;
+        prepare_session_for_agent_loop(&args).await?;
 
     let hook_supervisor = setup_agent_hooks(
-        manage_servers,
-        &config,
+        args.manage_servers,
+        &args.config,
         &jetstream_ctx,
-        &instance_id,
-        session_id,
+        &args.instance_id,
+        args.session_id,
     )
     .await;
 
-    let on_hitl_approval_required = lease.as_ref().map(|lease| {
+    let on_hitl_approval_required = args.lease.as_ref().map(|lease| {
         hitl_attention::build_hitl_approval_request_callback(hitl_attention::HitlCallbackContext {
             jetstream: &jetstream_ctx,
-            session_id,
+            session_id: args.session_id,
             lease,
-            event_sink: event_sink.as_ref(),
-            after_seq_observer: after_seq_observer.as_ref(),
-            metadata_store: session_metadata,
+            event_sink: args.event_sink.as_ref(),
+            after_seq_observer: args.after_seq_observer.as_ref(),
+            metadata_store: args.session_metadata,
             replicas: attachment_sync.replicas(),
         })
     });
 
-    let ctx = Box::pin(build_agent_loop_context(AgentContextParams {
-        config: config.clone(),
-        instance_id,
-        abort_signal: abort_signal.clone(),
-        token_budget,
-        call_fn,
-        on_tool_round,
-        on_hitl_approval_required,
-        working_dir,
-    }))
+    let ctx = setup_agent_loop_context(
+        AgentContextParams {
+            config: args.config.clone(),
+            instance_id: args.instance_id,
+            abort_signal: args.abort_signal.clone(),
+            token_budget: args.token_budget,
+            call_fn: args.call_fn,
+            on_tool_round: args.on_tool_round,
+            on_hitl_approval_required,
+            working_dir: args.working_dir,
+        },
+        session_origin,
+        args.session_id,
+    )
     .await;
 
-    dispatch_context_session_start(&ctx, session_origin, session_id).await;
-
-    let backend = NatsSessionLogBackend::new(
-        jetstream_ctx.clone(),
-        session_id,
-        attachment_sync.replicas(),
-    );
-    let hitl_continuation = derive_hitl_tool_round_continuation(&backend.load_events_blocking()?)?;
-
+    let replicas = attachment_sync.replicas();
+    let session_id = args.session_id;
     let segment_args = AgentLoopSegmentArgs {
         source_session_id: session_id,
-        cluster_key,
-        config: config.clone(),
+        cluster_key: args.cluster_key,
+        config: args.config,
         ctx,
-        input: initial_input,
-        abort_signal,
+        input: args.initial_input,
+        abort_signal: args.abort_signal,
         jetstream_ctx: jetstream_ctx.clone(),
-        activation_route,
-        event_sink,
-        lease,
-        replicas: attachment_sync.replicas(),
+        activation_route: args.activation_route,
+        event_sink: args.event_sink,
+        lease: args.lease,
+        replicas,
     };
-    // Journal/gate I/O adds depth below tool dispatch. Keep segment construction
-    // out of this activation frame as well as the enclosing daemon frame.
-    let result = segment_args.run(hitl_continuation).await;
-
+    let result = run_nats_loop_segment(segment_args, jetstream_ctx, session_id, replicas).await;
     finish_agent_loop(hook_supervisor, attachment_sync, result).await
 }
 
@@ -529,6 +560,7 @@ struct PrepareAgentSessionParams<'a> {
     after_seq_observer: Option<Arc<AtomicU64>>,
     session_metadata: Option<&'a SessionMetadataStore>,
     selected_user_messages: &'a [Message],
+    replay_unmanaged: bool,
 }
 
 async fn prepare_agent_session(
@@ -545,16 +577,18 @@ async fn prepare_agent_session(
         backend = backend.with_after_seq_observer(observer);
     }
     abort_resume_if_fenced(&backend, params.lease.map(Arc::as_ref))?;
-    let (mut session, origin) = load_or_repair_session(LoadOrRepairSessionParams {
-        backend: &backend,
-        config: params.config,
-        instance_id: params.instance_id,
-        lease: params.lease.map(Arc::as_ref),
-        session_metadata: params.session_metadata,
-        session_id: params.session_id,
-        abort_signal: params.abort_signal,
-    })
-    .await?;
+    let (mut session, origin, timing_progress) =
+        load_or_repair_session(LoadOrRepairSessionParams {
+            backend: &backend,
+            config: params.config,
+            instance_id: params.instance_id,
+            lease: params.lease.map(Arc::as_ref),
+            session_metadata: params.session_metadata,
+            session_id: params.session_id,
+            abort_signal: params.abort_signal,
+            replay_unmanaged: params.replay_unmanaged,
+        })
+        .await?;
     selected_input::restore_selected_user_messages(&mut session, params.selected_user_messages);
     attach_session_to_config(AttachSessionParams {
         config: params.config,
@@ -563,6 +597,7 @@ async fn prepare_agent_session(
         lease: params.lease,
         metadata: params.session_metadata,
     });
+    crate::config::session_timing::hydrate_run(params.config, timing_progress);
     // Get the SessionRef from the loaded session
     let session_ref = SessionRef::new(
         session
@@ -1239,13 +1274,64 @@ struct LoadOrRepairSessionParams<'a> {
     session_metadata: Option<&'a SessionMetadataStore>,
     session_id: &'a str,
     abort_signal: &'a AbortSignal,
+    replay_unmanaged: bool,
 }
 
-/// Load a conversation-only transcript into state initialized from canonical
-/// metadata, repairing orphan tool calls when resuming an interrupted turn.
+fn recover_session_timing_progress(
+    config: &GlobalConfig,
+    entries: &[(u64, SessionLogEntry)],
+    replay_unmanaged: bool,
+) -> Option<harnx_core::timing_identity::TimingReceipt> {
+    let cfg = config.read();
+    // Only replay may restore an unfinished unmanaged turn's clock.
+    if cfg.run_context.is_some() || replay_unmanaged {
+        crate::config::session_timing::recover_progress(entries, cfg.run_context.as_ref())
+    } else {
+        None
+    }
+}
+
+fn hydrate_session_from_metadata(
+    config: &GlobalConfig,
+    metadata: &SessionMetadata,
+    entries: &[(u64, SessionLogEntry)],
+    session_id: &str,
+    preserve_hitl_pending: bool,
+) -> Result<harnx_core::session::Session> {
+    let mut session = crate::config::session::new(&config.read(), &metadata.session_id, None)?;
+    session.id = metadata.session_id.clone();
+    session.session_id = Some(metadata.session_id.clone());
+    session.working_dir = None;
+    session.git_branch = None;
+    session.git_remote = None;
+    session.terminal_session_id = None;
+    session.agent_variables = metadata.variables.clone();
+    session.title = metadata.title.value.clone();
+    session.title_last_updated_tokens = if metadata.title.manual {
+        usize::MAX
+    } else {
+        metadata.title.last_updated_tokens
+    };
+    if preserve_hitl_pending {
+        crate::nats_session_log::load_session_from_entries_with_metadata_preserving_pending(
+            entries, session_id, session,
+        )
+    } else {
+        crate::nats_session_log::load_session_from_entries_with_metadata(
+            entries, session_id, session,
+        )
+    }
+}
+
+/// Load a conversation-only transcript from canonical metadata, repairing
+/// orphan tool calls when resuming an interrupted turn.
 async fn load_or_repair_session(
     params: LoadOrRepairSessionParams<'_>,
-) -> Result<(harnx_core::session::Session, SessionOrigin)> {
+) -> Result<(
+    harnx_core::session::Session,
+    SessionOrigin,
+    Option<harnx_core::timing_identity::TimingReceipt>,
+)> {
     let LoadOrRepairSessionParams {
         backend,
         config,
@@ -1254,6 +1340,7 @@ async fn load_or_repair_session(
         session_metadata,
         session_id,
         abort_signal,
+        replay_unmanaged,
     } = params;
     let store = session_metadata.context("NATS worker requires canonical session metadata")?;
     let metadata = store
@@ -1273,6 +1360,7 @@ async fn load_or_repair_session(
     };
 
     let mut entries_vec = backend.load_events_blocking()?;
+    let timing_progress = recover_session_timing_progress(config, &entries_vec, replay_unmanaged);
     let effective_entries =
         harnx_core::session_reconstruct::apply_log_mutations_nats(&entries_vec)?;
     let preserve_hitl_pending = tool_recovery::preserves_hitl_pending(&effective_entries);
@@ -1287,35 +1375,15 @@ async fn load_or_repair_session(
         entries_vec: &mut entries_vec,
     })
     .await?;
-    let mut session = crate::config::session::new(&config.read(), &metadata.session_id, None)?;
-    session.id = metadata.session_id.clone();
-    session.session_id = Some(metadata.session_id.clone());
-    session.working_dir = None;
-    session.git_branch = None;
-    session.git_remote = None;
-    session.terminal_session_id = None;
-    session.agent_variables = metadata.variables.clone();
-    session.title = metadata.title.value.clone();
-    session.title_last_updated_tokens = if metadata.title.manual {
-        usize::MAX
-    } else {
-        metadata.title.last_updated_tokens
-    };
-    let session = if preserve_hitl_pending {
-        crate::nats_session_log::load_session_from_entries_with_metadata_preserving_pending(
-            &entries_vec,
-            session_id,
-            session,
-        )?
-    } else {
-        crate::nats_session_log::load_session_from_entries_with_metadata(
-            &entries_vec,
-            session_id,
-            session,
-        )?
-    };
+    let session = hydrate_session_from_metadata(
+        config,
+        &metadata,
+        &entries_vec,
+        session_id,
+        preserve_hitl_pending,
+    )?;
     store.mark_activated(session_id).await?;
-    Ok((session, origin))
+    Ok((session, origin, timing_progress))
 }
 
 struct RepairOrphanCallsParams<'a> {

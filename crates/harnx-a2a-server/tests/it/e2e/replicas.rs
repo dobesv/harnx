@@ -109,11 +109,24 @@ async fn one_prompt(h: &Harness, context: &Value) -> Result<()> {
                 e,
                 SessionLogEntry::Message {
                     role: MessageRole::User,
+                    content,
                     ..
-                }
+                } if !harnx_core::timing_identity::is_timing_notice(&content.to_text())
             ))
             .count(),
-        1
+        1,
+        "expected exactly one non-timing user prompt"
+    );
+    assert!(
+        events.iter().any(|(_, e)| matches!(
+            e,
+            SessionLogEntry::Message {
+                role: MessageRole::User,
+                content,
+                ..
+            } if harnx_core::timing_identity::is_timing_notice(&content.to_text())
+        )),
+        "timing notice must be persisted in session log"
     );
     Ok(())
 }
