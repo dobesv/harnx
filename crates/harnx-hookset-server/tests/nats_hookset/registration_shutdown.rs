@@ -37,17 +37,20 @@ pub(super) async fn assert_echo_hook_works(
     Ok(())
 }
 
-/// Stop polling A after its initial registration so it cannot refresh while B
-/// publishes and shuts down. No production refresh override or timing race.
-#[tokio::test(flavor = "multi_thread")]
-async fn latest_writer_shutdown_retains_shared_registration() -> Result<()> {
-    harnx_core::require_nextest();
-    let Some(server) = spawn_nats_server().await? else {
-        return Ok(());
-    };
-    let scope = ServerScope::new();
-    let key = hook_registration_key(&scope, "echo");
-    let client = connect_test_client(&server.url).await?;
+struct PausedSurvivor {
+    shutdown: CancellationToken,
+    task: tokio::task::JoinHandle<Result<()>>,
+    resume: oneshot::Sender<()>,
+    revision: u64,
+}
+
+/// Complete the pause/flush handshake before another replica can publish.
+async fn spawn_paused_survivor(
+    url: &str,
+    scope: &ServerScope,
+    client: &async_nats::Client,
+) -> Result<PausedSurvivor> {
+    let key = hook_registration_key(scope, "echo");
     let shutdown_a = CancellationToken::new();
     let (pause, pause_rx) = oneshot::channel();
     let (paused, paused_rx) = oneshot::channel();
@@ -56,7 +59,7 @@ async fn latest_writer_shutdown_retains_shared_registration() -> Result<()> {
         let scope = scope.clone();
         let shutdown = shutdown_a.clone();
         let connection = NatsConnection {
-            client: connect_test_client(&server.url).await?,
+            client: connect_test_client(url).await?,
             replicas: 1,
         };
         async move {
@@ -83,7 +86,7 @@ async fn latest_writer_shutdown_retains_shared_registration() -> Result<()> {
             serving.await
         }
     });
-    wait_for_revision_beyond(&client, &key, 0).await?;
+    wait_for_revision_beyond(client, &key, 0).await?;
     pause
         .send(())
         .map_err(|_| anyhow::anyhow!("survivor A exited before pause"))?;
@@ -91,14 +94,35 @@ async fn latest_writer_shutdown_retains_shared_registration() -> Result<()> {
         .await
         .context("survivor A did not pause")?
         .context("survivor A exited before acknowledging pause")?;
-    let revision_a = registration_revision(&client, &key)
+    let revision = registration_revision(client, &key)
         .await?
         .context("paused survivor A registration")?;
 
+    Ok(PausedSurvivor {
+        shutdown: shutdown_a,
+        task: server_a,
+        resume,
+        revision,
+    })
+}
+
+/// Stop polling A after its initial registration so it cannot refresh while B
+/// publishes and shuts down. No production refresh override or timing race.
+#[tokio::test(flavor = "multi_thread")]
+async fn latest_writer_shutdown_retains_shared_registration() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let scope = ServerScope::new();
+    let key = hook_registration_key(&scope, "echo");
+    let client = connect_test_client(&server.url).await?;
+    let survivor = spawn_paused_survivor(&server.url, &scope, &client).await?;
+
     let shutdown_b = CancellationToken::new();
     let server_b = spawn_echo_hook_server(&server.url, scope.clone(), shutdown_b.clone()).await?;
-    let revision_b = wait_for_revision_beyond(&client, &key, revision_a).await?;
-    assert!(revision_b > revision_a);
+    let revision_b = wait_for_revision_beyond(&client, &key, survivor.revision).await?;
+    assert!(revision_b > survivor.revision);
     shutdown_b.cancel();
     tokio::time::timeout(Duration::from_secs(10), server_b)
         .await
@@ -118,12 +142,13 @@ async fn latest_writer_shutdown_retains_shared_registration() -> Result<()> {
         "B's registration must survive before A is allowed to refresh"
     );
 
-    resume
+    survivor
+        .resume
         .send(())
         .map_err(|_| anyhow::anyhow!("survivor A exited while paused"))?;
     assert_echo_hook_works(&client, &scope).await?;
-    shutdown_a.cancel();
-    tokio::time::timeout(Duration::from_secs(10), server_a)
+    survivor.shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), survivor.task)
         .await
         .context("survivor A shutdown timed out")?
         .context("join survivor A")??;
