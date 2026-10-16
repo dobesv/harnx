@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.16 (2026-10-16)
+
+### Features
+
+- Users.yaml entries can declare optional groups and roles that are merged into caller memberships in harnx serve and A2A.
+
+#### Add `timeout_secs` to AG-UI and JSON-RPC session/prompt APIs, allowing HTTP clients
+
+to shorten (but not extend) configured run limits. Deadline terminations emit explicit
+RUN_ERROR on local/remote follow and replay, distinguishable from manual cancellation.
+
+#### Deliver persisted current-run timing notices at safe pre-model boundaries in agent and sub-agent runs when timing milestones are due. Initial notice includes admission timestamp, elapsed time, and deadline if set. Deadline warnings at 50%/75%/90% budget thresholds, elapsed updates every 15 minutes. Notices are informative context, not executable prompts, and persist durably across replays and compaction.
+
+Deployment requires a coordinated hard cutover: stop all old runtime readers before new always-on receipt writers start. Rollback must retain receipt-compatible readers; draining work does not make saved histories safe for pre-receipt binaries. Follow “Timing receipt compatibility cutover and rollback” in `docs/kubernetes-deployment.md`.
+
+### Fixes
+
+- prefer complete Responses tool-call arguments over deltas (#2412)
+- OpenAI and Codex tool calls now take their arguments from the complete string the Responses API sends when each call finishes, instead of the streamed fragments, and harnx logs a warning if the two ever differ.
+- Tool and hook servers now retain registration on shutdown by default, letting the 90-second bucket TTL handle cleanup. This fixes a bug where a terminating replica would delete a shared registration key that surviving replicas still need, causing discovery gaps of up to 30 seconds. The default `RegistrationShutdown::Expire` policy is safe for both singleton and HA deployments. The explicit `DeleteIfCurrent` policy is preserved for backward compatibility but is now documented as unsafe for shared keys. Hook servers no longer delete their registration on shutdown. Registrations now correctly expire up to 90 seconds after the final refresh rather than being immediately removed. Issue #2409.
+
 ## 0.34.15 (2026-10-14)
 
 ### Features

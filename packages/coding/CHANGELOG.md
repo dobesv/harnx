@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.4.15 (2026-10-16)
+
+### Fixes
+
+- prefer complete Responses tool-call arguments over deltas (#2412)
+
 ## 0.4.14 (2026-10-14)
 
 ### Features
