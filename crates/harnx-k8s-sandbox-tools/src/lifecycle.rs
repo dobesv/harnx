@@ -204,20 +204,28 @@ impl SandboxManager {
     ) -> Result<String> {
         let deadline = tokio::time::Instant::now() + self.config.pod_ip_timeout;
         let context = WaitContext::new("wait_for_pod_ip", cancel, deadline);
-        loop {
-            if let Some(ip) = record.pod_ips.first() {
-                return Ok(ip.clone());
+        async {
+            loop {
+                if let Some(ip) = record.pod_ips.first() {
+                    return Ok(ip.clone());
+                }
+                self.wait(&context, self.config.poll_interval).await?;
+                record = self
+                    .retry_api(&context, || self.api.get(id))
+                    .await?
+                    .with_context(|| format!("sandbox not found: {id}"))?;
             }
-            self.wait(&context, self.config.poll_interval)
-                .await
-                .with_context(|| {
-                    format!("sandbox {id} has no pod IP yet; it may still be starting")
-                })?;
-            record = self
-                .retry_api(&context, || self.api.get(id))
-                .await?
-                .with_context(|| format!("sandbox not found: {id}"))?;
         }
+        .await
+        .map_err(|error| {
+            if is_deadline(&error) {
+                error.context(format!(
+                    "sandbox {id} has no pod IP yet; it may still be starting"
+                ))
+            } else {
+                error
+            }
+        })
     }
 
     async fn maybe_extend(&self, record: &SandboxRecord, context: &WaitContext<'_>) {

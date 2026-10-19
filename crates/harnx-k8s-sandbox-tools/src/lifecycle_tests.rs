@@ -12,6 +12,7 @@ struct MockState {
     deletes: Vec<String>,
     get_errors_remaining: usize,
     get_calls: usize,
+    hold_get_call: Option<usize>,
     get_error_calls: VecDeque<usize>,
     scripted_get_errors: VecDeque<anyhow::Error>,
     scripted_gets: VecDeque<Option<SandboxRecord>>,
@@ -22,6 +23,7 @@ struct MockState {
 #[derive(Default)]
 struct MockApi {
     state: Mutex<MockState>,
+    get_started: tokio::sync::Notify,
     list_started: tokio::sync::Notify,
     set_replicas_notify: tokio::sync::Notify,
 }
@@ -52,24 +54,33 @@ impl SandboxApi for MockApi {
     }
 
     async fn get(&self, id: &str) -> Result<Option<SandboxRecord>> {
-        let mut state = self.state.lock();
-        state.get_calls += 1;
-        let get_call = state.get_calls;
-        if let Some(error) = state.scripted_get_errors.pop_front() {
-            return Err(error);
+        let (record, hold) = {
+            let mut state = self.state.lock();
+            state.get_calls += 1;
+            let get_call = state.get_calls;
+            if let Some(error) = state.scripted_get_errors.pop_front() {
+                return Err(error);
+            }
+            if state.get_errors_remaining > 0 {
+                state.get_errors_remaining -= 1;
+                anyhow::bail!("transient Kubernetes error");
+            }
+            if state.get_error_calls.front() == Some(&get_call) {
+                state.get_error_calls.pop_front();
+                anyhow::bail!("transient Kubernetes error");
+            }
+            let record = state
+                .scripted_gets
+                .pop_front()
+                .unwrap_or_else(|| state.records.get(id).cloned());
+            (record, state.hold_get_call == Some(get_call))
+        };
+        if hold {
+            self.get_started.notify_one();
+            std::future::pending().await
+        } else {
+            Ok(record)
         }
-        if state.get_errors_remaining > 0 {
-            state.get_errors_remaining -= 1;
-            anyhow::bail!("transient Kubernetes error");
-        }
-        if state.get_error_calls.front() == Some(&get_call) {
-            state.get_error_calls.pop_front();
-            anyhow::bail!("transient Kubernetes error");
-        }
-        if let Some(record) = state.scripted_gets.pop_front() {
-            return Ok(record);
-        }
-        Ok(state.records.get(id).cloned())
     }
 
     async fn list(&self) -> Result<Vec<SandboxRecord>> {
