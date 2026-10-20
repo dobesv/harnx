@@ -1,5 +1,9 @@
 //! Detached NATS handoff lifecycle integration coverage.
 
+mod identity;
+mod provider;
+mod transcript;
+
 use crate::common;
 
 use anyhow::Result;
@@ -38,7 +42,7 @@ struct EnvVarGuard {
 }
 
 impl EnvVarGuard {
-    fn set_path(key: &'static str, value: &Path) -> Self {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
         unsafe { std::env::set_var(key, value) };
         Self { key, previous }
@@ -165,10 +169,16 @@ struct HandoffFixture {
     client: async_nats::Client,
     jetstream: async_nats::jetstream::Context,
     daemon: tokio::task::JoinHandle<Result<()>>,
+    _provider: Option<tokio_util::task::AbortOnDropHandle<Result<()>>>,
+    _provider_env: Vec<EnvVarGuard>,
 }
 
 impl HandoffFixture {
     async fn start() -> Result<Option<Self>> {
+        Self::start_with_provider(false).await
+    }
+
+    async fn start_with_provider(provider: bool) -> Result<Option<Self>> {
         let Some(server) = spawn_nats_server().await? else {
             eprintln!("skipping: nats-server not available");
             return Ok(None);
@@ -181,9 +191,17 @@ impl HandoffFixture {
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(&state_dir)?;
 
-        let config_guard = EnvVarGuard::set_path("HARNX_CONFIG_DIR", &config_dir);
-        let data_guard = EnvVarGuard::set_path("HARNX_DATA_DIR", &data_dir);
-        let state_guard = EnvVarGuard::set_path("HARNX_STATE_DIR", &state_dir);
+        let config_guard = EnvVarGuard::set("HARNX_CONFIG_DIR", &config_dir);
+        let data_guard = EnvVarGuard::set("HARNX_DATA_DIR", &data_dir);
+        let state_guard = EnvVarGuard::set("HARNX_STATE_DIR", &state_dir);
+        let provider_env = if provider {
+            vec![
+                EnvVarGuard::set("HARNX_NATS_URL", server.url()),
+                EnvVarGuard::set("HARNX_NATS_TOKEN", "provider-test"),
+            ]
+        } else {
+            vec![]
+        };
         let config = Arc::new(ConfigLock::new(Config::load_from_file(
             &config_dir.join("config.yaml"),
         )?));
@@ -195,7 +213,17 @@ impl HandoffFixture {
             )
         };
         SessionMetadataStore::ensure(&jetstream, 1).await?;
-        let worker_config = WorkerDaemonConfig::managing("local", "worker-handoff");
+        let mut provider_env = provider_env;
+        let tool_server = if provider {
+            Some(provider::start_tool_server(&client, &jetstream, &mut provider_env).await?)
+        } else {
+            None
+        };
+        let worker_config = if provider {
+            WorkerDaemonConfig::new("local", "worker-handoff")
+        } else {
+            WorkerDaemonConfig::managing("local", "worker-handoff")
+        };
         let worker_runtime = Arc::clone(&config);
         let daemon = tokio::spawn(async move {
             run_worker_daemon(worker_runtime, worker_config, Some(handoff_call_fn()), None).await
@@ -212,6 +240,8 @@ impl HandoffFixture {
             client,
             jetstream,
             daemon,
+            _provider: tool_server,
+            _provider_env: provider_env,
         }))
     }
 
@@ -250,6 +280,7 @@ impl HandoffFixture {
             .await?;
         let source_entries = self.log(&source).load_events_async().await?;
         assert_explicit_source(&source_entries);
+        assert_durable_handoff_target(&source_entries, Some(EXPLICIT_TARGET_ID));
         let handoff_seq = source_entries
             .iter()
             .find_map(|(seq, entry)| {
@@ -300,18 +331,24 @@ impl HandoffFixture {
             .with_external_admission()
             .run_turn("generated handoff", Arc::new(NullSink), None)
             .await?;
+        let source_entries = self.log(&source).load_events_async().await?;
+        let persisted_target_id = assert_durable_handoff_target(&source_entries, None);
         let observed = observe_source_handoff(stream).await?;
         let (agent, target_id, _) = observed
             .committed
             .as_ref()
             .expect("generated handoff must commit a destination");
         assert_generated_events(&observed, agent, target_id);
+        assert_eq!(persisted_target_id, *target_id);
         assert_eq!(
             tokio::time::timeout(CI_SAFE_TIMEOUT, activation_observer).await???,
             harnx_core::session_identity::session_key(Some("delegate-agent"), target_id)
         );
-        let target_log =
-            NatsSessionLog::for_agent(self.jetstream.clone(), "delegate-agent", target_id);
+        let target_log = NatsSessionLog::for_agent(
+            self.jetstream.clone(),
+            "delegate-agent",
+            &persisted_target_id,
+        );
         let entries = wait_for_handoff_target(&target_log, "finish generated work").await?;
         assert_handoff_target_log(&entries, "finish generated work");
         Ok(())
@@ -336,7 +373,7 @@ impl HandoffFixture {
         assert_eq!(
             observed.requested,
             Some((
-                "delegate-agent".to_string(),
+                "delegate-agent@local".to_string(),
                 Some(OTHER_TARGET_ID.to_string())
             ))
         );
@@ -395,7 +432,7 @@ fn write_test_config(config_dir: &Path, nats_url: &str) -> Result<()> {
     write_agent(
         config_dir,
         "source-agent",
-        "---\nmodel: openai:test-model\nuse_tools: delegate-agent_session_handoff\n---\nSource instructions\n",
+        "---\nmodel: openai:test-model\nuse_tools: delegate-agent_session_handoff,fixture_handoff\n---\nSource instructions\n",
     )?;
     write_agent(
         config_dir,
@@ -444,26 +481,10 @@ fn handoff_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
         let prompt = input.text().to_string();
         Box::pin(async move {
             if agent == "source-agent" {
-                let (session_id, target_prompt) = if let Some(id) =
-                    prompt.strip_prefix("identity-explicit:")
-                {
-                    (Some(id), "finish generated work")
-                } else {
-                    match prompt.as_str() {
-                        "explicit handoff" => (Some(EXPLICIT_TARGET_ID), "finish explicit work"),
-                        "ownership mismatch" => (Some(OTHER_TARGET_ID), "finish reused-ID work"),
-                        _ => (None, "finish generated work"),
-                    }
-                };
                 Ok((
                     "handoff requested".to_string(),
                     None,
-                    vec![ToolCall::new(
-                        "delegate-agent_session_handoff".to_string(),
-                        json!({"prompt": target_prompt, "session_id": session_id}),
-                        Some("handoff-call-1".to_string()),
-                        None,
-                    )],
+                    vec![source_handoff_call(&prompt)],
                     CompletionTokenUsage::default(),
                 ))
             } else {
@@ -476,6 +497,44 @@ fn handoff_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
             }
         })
     })
+}
+
+fn handoff_prompt(prompt: &str) -> (Option<&str>, &str) {
+    if let Some(id) = prompt.strip_prefix("identity-explicit:") {
+        (Some(id), "finish generated work")
+    } else {
+        match prompt {
+            "explicit handoff" | "provider explicit" => {
+                (Some(EXPLICIT_TARGET_ID), "finish explicit work")
+            }
+            "ownership mismatch" => (Some(OTHER_TARGET_ID), "finish reused-ID work"),
+            _ => (None, "finish generated work"),
+        }
+    }
+}
+
+fn source_handoff_call(prompt: &str) -> ToolCall {
+    let (session_id, target_prompt) = handoff_prompt(prompt);
+    let provider = prompt.starts_with("provider");
+    let mut arguments = json!({"prompt": target_prompt, "session_id": session_id});
+    if provider {
+        arguments["action"] = json!("switch_agent");
+        arguments["agent"] = json!("delegate-agent");
+        if session_id.is_none() {
+            arguments.as_object_mut().unwrap().remove("session_id");
+        }
+    }
+    ToolCall::new(
+        if provider {
+            "fixture_handoff"
+        } else {
+            "delegate-agent_session_handoff"
+        }
+        .to_string(),
+        arguments,
+        Some("handoff-call-1".to_string()),
+        None,
+    )
 }
 
 async fn append_prior_turn(log: &NatsSessionLog) -> Result<()> {
@@ -545,12 +604,75 @@ async fn observe_source_handoff(mut stream: SessionEventStream) -> Result<Observ
     }
 }
 
+/// Compare persisted JSON, switch data and the durable commit before following
+/// the marker's ID to the target log that contains the child's completed turn.
+fn assert_durable_handoff_target(
+    entries: &[(u64, SessionLogEntry)],
+    requested_id: Option<&str>,
+) -> String {
+    let (commit_seq, target_agent, target_session_id) = entries
+        .iter()
+        .find_map(|(seq, entry)| match entry {
+            SessionLogEntry::HandoffCommitted {
+                target_agent,
+                target_session_id,
+                handoff_tool_call_id,
+                ..
+            } => {
+                assert_eq!(handoff_tool_call_id.as_deref(), Some("handoff-call-1"));
+                Some((*seq, target_agent, target_session_id))
+            }
+            _ => None,
+        })
+        .expect("parent has durable handoff commit");
+    let results: Vec<_> = entries
+        .iter()
+        .flat_map(|(seq, entry)| match entry {
+            SessionLogEntry::ToolResults { results, .. } => results
+                .iter()
+                .filter(|result| result.id.as_deref() == Some("handoff-call-1"))
+                .map(|result| (*seq, result))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    assert_eq!(results.len(), 1, "handoff result is persisted exactly once");
+    let (result_seq, result) = results[0];
+    assert!(
+        result_seq < commit_seq,
+        "result is durable before dispatch commits"
+    );
+    assert_eq!(
+        result.output["handoff"],
+        json!({
+            "agent": target_agent,
+            "session_id": target_session_id,
+        })
+    );
+    assert_eq!(result.output["session_id"], *target_session_id);
+    let switch = result.switch_agent.as_ref().expect("handoff switch data");
+    assert_eq!(switch.agent, *target_agent);
+    assert_eq!(
+        switch.session_id.as_deref(),
+        Some(target_session_id.as_str())
+    );
+    let text = result.output["content"][0]["text"]
+        .as_str()
+        .expect("handoff text");
+    assert!(text.contains(target_agent));
+    assert!(text.contains(target_session_id));
+    if let Some(requested_id) = requested_id {
+        assert_eq!(target_session_id, requested_id, "caller ID is preserved");
+    }
+    target_session_id.clone()
+}
+
 fn assert_explicit_source(entries: &[(u64, SessionLogEntry)]) {
     assert!(entries.iter().any(|(_, entry)| matches!(
         entry,
         SessionLogEntry::ToolResults { results, .. }
             if results.iter().any(|result| result.switch_agent.as_ref().is_some_and(|switch| {
-                switch.agent == "delegate-agent"
+                switch.agent == "delegate-agent@local"
                     && switch.session_id.as_deref() == Some(EXPLICIT_TARGET_ID)
             }))
     )));
@@ -568,7 +690,7 @@ fn assert_explicit_events(observed: ObservedHandoff, durable_handoff_seq: u64) {
     assert_eq!(
         observed.requested,
         Some((
-            "delegate-agent".to_string(),
+            "delegate-agent@local".to_string(),
             Some(EXPLICIT_TARGET_ID.to_string())
         ))
     );
@@ -592,7 +714,10 @@ fn assert_generated_target_identity(agent: &str, target_id: &str) {
 fn assert_observed_handoff_sequence(observed: &ObservedHandoff) {
     assert_eq!(
         observed.requested,
-        Some(("delegate-agent".to_string(), None))
+        observed
+            .committed
+            .as_ref()
+            .map(|(agent, id, _)| (agent.clone(), Some(id.clone())))
     );
     assert_eq!(observed.order, ["requested", "committed", "ended"]);
 }
@@ -716,195 +841,36 @@ async fn handoffs_queue_top_level_sessions_preserve_history_and_scope_ids_by_age
     Ok(())
 }
 
-struct IdentityInheritanceCase {
-    case: &'static str,
-    source_user: Option<&'static str>,
-    inherit: bool,
-    expected: &'static str,
-}
-
-fn identity_inheritance_cases() -> [IdentityInheritanceCase; 5] {
-    [
-        IdentityInheritanceCase {
-            case: "owned",
-            source_user: Some("source-owner"),
-            inherit: true,
-            expected: "source-owner",
-        },
-        IdentityInheritanceCase {
-            case: "anonymous",
-            source_user: None,
-            inherit: true,
-            expected: "destination-default",
-        },
-        IdentityInheritanceCase {
-            case: "blank",
-            source_user: Some(" \t"),
-            inherit: true,
-            expected: "destination-default",
-        },
-        IdentityInheritanceCase {
-            case: "private",
-            source_user: Some("private-owner"),
-            inherit: false,
-            expected: "destination-default",
-        },
-        IdentityInheritanceCase {
-            case: "existing",
-            source_user: Some("source-owner"),
-            inherit: true,
-            expected: "existing-owner",
-        },
-    ]
-}
-
-async fn seed_existing_target_metadata(
-    store: &SessionMetadataStore,
-    target_id: &str,
-) -> Result<()> {
-    store
-        .create(&harnx_runtime::nats_session_metadata::SessionMetadata::new(
-            target_id,
-            SessionInitializer::named("delegate-agent", Default::default())
-                .with_user_id("existing-owner"),
-        ))
-        .await?
-        .expect("seed existing target");
-    Ok(())
-}
-
-async fn setup_identity_source_session(
-    fixture: &HandoffFixture,
-    source_id: &str,
-    source_user: Option<&str>,
-    inherit: bool,
-) -> Result<NatsSession> {
-    let mut source_config = session_config("source-agent", Some(source_id));
-    if let Some(user) = source_user {
-        source_config.initializer =
-            source_config
-                .initializer
-                .with_properties(serde_json::from_value(json!({
-                    "user_id": {"value": user, "inherit": inherit},
-                    "git_branch": {"value": "source-only", "inherit": true}
-                }))?);
-    }
-    // Raw creation preserves legacy blank properties so the inheritance
-    // path, not just with_user_id(), must normalize them before defaults.
-    NatsSession::new(
-        source_config,
-        fixture.client.clone(),
-        fixture.jetstream.clone(),
-        create_abort_signal(),
-    )
-    .await
-}
-
-async fn execute_identity_handoff_turn(
-    fixture: &HandoffFixture,
-    source: NatsSession,
-    explicit: bool,
-    target_id: &str,
-) -> Result<String> {
-    let stream = fixture.source_stream(&source).await?;
-    let prompt = if explicit {
-        format!("identity-explicit:{target_id}")
-    } else {
-        "generated handoff".to_string()
-    };
-    source
-        .with_external_admission()
-        .run_turn(&prompt, Arc::new(NullSink), None)
-        .await?;
-    let observed = observe_source_handoff(stream).await?;
-    let (_, committed_id, _) = observed.committed.expect("handoff committed");
-    if explicit {
-        assert_eq!(committed_id, target_id);
-    }
-    Ok(committed_id)
-}
-
-struct HandoffTarget<'a> {
-    committed_id: &'a str,
-    expected: &'a str,
-    case: &'a str,
-    explicit: bool,
-}
-
-async fn assert_identity_handoff_target(
-    fixture: &HandoffFixture,
-    store: &SessionMetadataStore,
-    target: HandoffTarget<'_>,
-) -> Result<()> {
-    let HandoffTarget {
-        committed_id,
-        expected,
-        case,
-        explicit,
-    } = target;
-    let target_log =
-        NatsSessionLog::for_agent(fixture.jetstream.clone(), "delegate-agent", committed_id);
-    wait_for_handoff_target(&target_log, "finish generated work").await?;
-    let record = store
-        .get_for_agent(committed_id, "delegate-agent")
-        .await?
-        .expect("target metadata");
-    let properties = harnx_runtime::nats_session_metadata::session_properties(&record.metadata)?;
-    assert_eq!(
-        properties.text("user_id"),
-        Some(expected),
-        "case={case}, explicit={explicit}"
-    );
-    assert_ne!(properties.text("git_branch"), Some("source-only"));
-    Ok(())
-}
-
-async fn run_identity_inheritance_case(
-    fixture: &HandoffFixture,
-    store: &SessionMetadataStore,
-    explicit: bool,
-    test_case: &IdentityInheritanceCase,
-) -> Result<()> {
-    let source_id = format!("identity-{}-{explicit}", test_case.case);
-    let target_id = format!("target-{}-{explicit}", test_case.case);
-    if test_case.case == "existing" {
-        seed_existing_target_metadata(store, &target_id).await?;
-    }
-    let source = setup_identity_source_session(
-        fixture,
-        &source_id,
-        test_case.source_user,
-        test_case.inherit,
-    )
-    .await?;
-    let committed_id = execute_identity_handoff_turn(fixture, source, explicit, &target_id).await?;
-    assert_identity_handoff_target(
-        fixture,
-        store,
-        HandoffTarget {
-            committed_id: &committed_id,
-            expected: test_case.expected,
-            case: test_case.case,
-            explicit,
-        },
-    )
-    .await
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handoffs_inherit_nonblank_user_identity_before_destination_defaults() -> Result<()> {
+async fn generated_handoff_result_links_to_committed_child_session() -> Result<()> {
     require_nextest();
     let Some(fixture) = HandoffFixture::start().await? else {
         return Ok(());
     };
-    let store = SessionMetadataStore::ensure(&fixture.jetstream, 1).await?;
-    for explicit in [false, true] {
-        for test_case in identity_inheritance_cases() {
-            if test_case.case == "existing" && !explicit {
-                continue;
-            }
-            run_identity_inheritance_case(&fixture, &store, explicit, &test_case).await?;
-        }
-    }
-    Ok(())
+    fixture.run_generated_scenario().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_handoff_result_preserves_caller_child_session_id() -> Result<()> {
+    require_nextest();
+    let Some(fixture) = HandoffFixture::start().await? else {
+        return Ok(());
+    };
+    let explicit_log = fixture.seed_destinations().await?;
+    fixture.run_explicit_scenario(&explicit_log).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handoffs_inherit_nonblank_user_identity_before_destination_defaults() -> Result<()> {
+    identity::run_scenario().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_handoff_without_session_id_reserves_and_dispatches() -> Result<()> {
+    provider::run_provider_handoff(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_handoff_preserves_supplied_session_id() -> Result<()> {
+    provider::run_provider_handoff(true).await
 }

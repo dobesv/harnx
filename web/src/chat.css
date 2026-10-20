@@ -1390,6 +1390,43 @@ body {
 .aui-sub-agent-stop { padding: .4rem .7rem; cursor: pointer; }
 .aui-sub-agent-status-unconfirmed .aui-sub-agent-status-icon { animation: none; }
 
+/* Static handoff link row in tool card */
+.aui-handoff-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.35rem 0.6rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+
+.aui-tool-call .aui-handoff-row:last-child {
+  border-bottom: none;
+}
+
+.aui-handoff-identity {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+  flex: 1;
+}
+
+.aui-handoff-agent {
+  flex: 0 0 auto;
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.aui-handoff-session {
+  min-width: 0;
+  font-family: var(--mono);
+  color: var(--text-muted, var(--text));
+  overflow-wrap: anywhere;
+}
+
 /* Connection status banner & connecting states */
 .aui-connection-banner {
   display: flex;

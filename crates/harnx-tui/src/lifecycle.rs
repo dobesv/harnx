@@ -99,6 +99,7 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
             TranscriptItem::SubAgentSession { key, .. } => key.agent.len() + key.session_id.len(),
             TranscriptItem::MarkdownLink { text, url } => text.len() + url.len(),
             TranscriptItem::Plan(_) | TranscriptItem::SourceHeading(_) => 0,
+            TranscriptItem::HandoffSession { agent, session_id } => agent.len() + session_id.len(),
         })
         .sum();
     (items.len(), bytes)
@@ -1049,6 +1050,18 @@ pub(crate) fn subagent_key_from_output(
     })
 }
 
+/// Extract handoff marker from tool result output for static navigation row.
+/// Used by both live and restored session transcript construction.
+pub(crate) fn handoff_key_from_output(output: &serde_json::Value) -> Option<(String, String)> {
+    let marker = output.get("handoff")?;
+    let agent = marker.get("agent")?.as_str()?;
+    let session_id = marker.get("session_id")?.as_str()?;
+    if agent.trim().is_empty() || session_id.trim().is_empty() {
+        return None;
+    }
+    Some((agent.to_string(), session_id.to_string()))
+}
+
 pub(crate) fn subagent_progress_from_output(
     output: &serde_json::Value,
 ) -> Option<harnx_core::event::SubAgentProgress> {
@@ -1099,6 +1112,9 @@ fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mu
         )),
         TranscriptItem::MarkdownLink { text, url } => {
             lines.push(format!("{text}: {url}"));
+        }
+        TranscriptItem::HandoffSession { agent, session_id } => {
+            lines.push(format!("handoff {} [{session_id}]", agent));
         }
     }
 }

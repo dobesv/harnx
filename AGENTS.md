@@ -975,6 +975,13 @@ The worker appends the durable `HandoffCommitted` entry **before** emitting the 
 handoff's sequence is strictly greater than any attach boundary captured before the commit,
 enabling clients to gate navigation on `after_seq > attached_seq`.
 
+The handoff tool result in parent `ToolResults` is prepared before dispatch: the runtime
+reserves the child session ID during tool execution, and the result includes both the target
+agent and child session ID in text (`"Handing off to <agent>; target session: <id>."`) and in
+a structured `handoff: {agent, session_id}` marker without a user-only audience restriction.
+Subsequent dispatch reuses the reserved ID, ensuring parent model context, session dumps, web,
+and TUI interfaces link to the exact child session.
+
 Worker appends go through `FencedSessionLogSink`, which carries the lease fence and
 the expected tail. Stream-tail CAS is the authority: JetStream's finite dedup window
 alone is not enough, so keep the same message ID and expected-last-sequence across a

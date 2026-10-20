@@ -17,6 +17,9 @@ import { MarkdownLink } from './markdownLink';
 import { markdownUrlTransform } from './markdownUrl';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { parseHandoffMarker } from './handoffMarker';
+import { HandoffRow } from './HandoffRow';
+import { SessionNavigationContext, type SessionNavigateFn } from './SessionNavigationContext';
 
 const markdownComponents = {
   a: MarkdownLink,
@@ -663,9 +666,17 @@ function resolveToolHeaderProps({
   };
 }
 
-export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
-  const { toolName, args, argsText, result, isError, status, toolCallId } = props as any;
+export interface ToolCallCardProps extends Partial<ToolCallMessagePartProps> {
+  onNavigateSession?: SessionNavigateFn;
+  [key: string]: unknown;
+}
+
+export const ToolCallCard: React.FC<ToolCallCardProps> = (props) => {
+  const { toolName, args, argsText, result, isError, status, toolCallId, onNavigateSession } = props as any;
   const { toolSummaries, toolUpdates } = useContext(UsageContext);
+  const contextNavigateSession = useContext(SessionNavigationContext).navigateSession;
+  const navigateSession = onNavigateSession ?? contextNavigateSession;
+  const handoff = parseHandoffMarker(result);
   const effectiveId = toolCallId || (props as any).id;
   const liveUpdate = toolUpdates.get(effectiveId);
   const content = resolveToolContent({
@@ -702,6 +713,14 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
   return (
     <div className="aui-tool-call" style={{ borderLeft: `4px solid ${borderColor}` }}>
       <ToolCallHeader {...headerProps} />
+
+      {handoff && (
+        <HandoffRow
+          agent={handoff.agent}
+          sessionId={handoff.sessionId}
+          onNavigate={navigateSession}
+        />
+      )}
 
       {expanded && (
         <ToolCallDetails

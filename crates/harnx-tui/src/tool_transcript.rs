@@ -54,6 +54,20 @@ pub(super) fn tool_completed_to_transcript_items(
     output: &serde_json::Value,
     markdown: Option<&str>,
 ) -> Vec<TranscriptItem> {
+    // Check for handoff marker first — if present, emit a HandoffSession row
+    // and skip the plain result to avoid duplicates.
+    if let Some((agent, session_id)) = crate::lifecycle::handoff_key_from_output(output) {
+        let mut items = vec![TranscriptItem::HandoffSession { agent, session_id }];
+        let full = full_tool_result_detail(output);
+        let link_source = markdown
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(strip_ansi)
+            .unwrap_or(full);
+        crate::lifecycle::append_markdown_links(&mut items, &link_source);
+        return items;
+    }
+
     let raw = match output {
         serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
         _ => output.clone(),
@@ -229,5 +243,76 @@ mod tests {
             TranscriptItem::MarkdownLink { text, url }
                 if text == "Hidden Link" && url == "https://hidden.example.com"
         )));
+    }
+
+    #[test]
+    fn handoff_result_produces_handoff_session_item() {
+        // Handoff marker with agent and session_id produces HandoffSession row
+        let output = serde_json::json!({
+            "content": [{"type": "text", "text": "Handing off to pantheon/atlas; target session: abc123."}],
+            "action": "switch_agent",
+            "agent": "pantheon/atlas",
+            "session_id": "abc123",
+            "handoff": {
+                "agent": "pantheon/atlas",
+                "session_id": "abc123"
+            }
+        });
+
+        let items = tool_completed_to_transcript_items(&output, None);
+        // Should produce exactly one HandoffSession item (no ToolResultMarkdown duplicate)
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            TranscriptItem::HandoffSession { agent, session_id } => {
+                assert_eq!(agent, "pantheon/atlas");
+                assert_eq!(session_id, "abc123");
+            }
+            other => panic!("expected HandoffSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handoff_result_without_marker_uses_normal_result() {
+        // Output without handoff marker produces normal ToolResultMarkdown
+        let output = serde_json::json!({
+            "content": [{"type": "text", "text": "Operation completed"}],
+            "isError": false
+        });
+
+        let items = tool_completed_to_transcript_items(&output, None);
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::ToolResultMarkdown { .. })));
+        assert!(!items
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::HandoffSession { .. })));
+    }
+
+    #[test]
+    fn handoff_result_blank_fields_ignored() {
+        // Handoff marker with blank agent or session_id is ignored
+        let output_blank_agent = serde_json::json!({
+            "content": [{"type": "text", "text": "Done"}],
+            "handoff": {
+                "agent": "",
+                "session_id": "abc123"
+            }
+        });
+        let items = tool_completed_to_transcript_items(&output_blank_agent, None);
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::ToolResultMarkdown { .. })));
+
+        let output_blank_session = serde_json::json!({
+            "content": [{"type": "text", "text": "Done"}],
+            "handoff": {
+                "agent": "pantheon/atlas",
+                "session_id": "  "
+            }
+        });
+        let items = tool_completed_to_transcript_items(&output_blank_session, None);
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::ToolResultMarkdown { .. })));
     }
 }

@@ -19,8 +19,9 @@ pub use harnx_core::tool::{
 };
 use harnx_engine::tool::ToolEvalRenderContext;
 pub use harnx_engine::tool::{
-    eval_tool_calls, ConfirmToolUseFn, DeferredToolCall, DispatchHookFn, ToolApprovalRequiredError,
-    ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn, ToolUseConfirmation,
+    eval_tool_calls, ConfirmToolUseFn, DeferredToolCall, DispatchHookFn, PrepareHandoffFn,
+    PreparedHandoff, ToolApprovalRequiredError, ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn,
+    ToolUseConfirmation,
 };
 
 /// The LLM text completion that immediately preceded a tool round.
@@ -114,6 +115,7 @@ pub async fn execute_tool_round_with_persistence(
         abort_signal,
         working_dir,
         nats_hook_provider,
+        prepare_handoff_fn,
         pending_async_context,
         tool_loop_guard,
     } = params;
@@ -131,6 +133,7 @@ pub async fn execute_tool_round_with_persistence(
         current_agent_package,
         working_dir,
         nats_hook_provider,
+        prepare_handoff_fn,
         pending_async_context,
     })
     .await;
@@ -450,6 +453,7 @@ async fn build_tool_eval_context_inner(
         current_agent_package,
         working_dir,
         nats_hook_provider,
+        prepare_handoff_fn,
         pending_async_context,
     } = params;
     let ToolRoundSnapshot {
@@ -499,6 +503,7 @@ async fn build_tool_eval_context_inner(
         emit_tool_update_fn,
         confirm_tool_use_fn,
         dispatch_hook_fn,
+        prepare_handoff_fn,
     }
 }
 
@@ -796,6 +801,26 @@ mod tests {
     use crate::config::ConfigLock;
     use serde_json::json;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn handoff_preparation_stays_lazy_in_tool_eval_context() {
+        let config = Arc::new(ConfigLock::new(Config::default()));
+        let instance_id = harnx_core::instance::ServerScope::new();
+        let prepare: Arc<PrepareHandoffFn> =
+            Arc::new(|_, _, _| panic!("building a tool context must not prepare a handoff"));
+        let mut params = BuildToolEvalContextParams::new(&config, &instance_id);
+        params.prepare_handoff_fn = Some(prepare.clone());
+
+        let context = build_tool_eval_context(params).await;
+
+        assert!(Arc::ptr_eq(
+            context
+                .prepare_handoff_fn
+                .as_ref()
+                .expect("runtime callback"),
+            &prepare,
+        ));
+    }
 
     #[tokio::test]
     async fn a_stop_whose_results_cannot_be_persisted_still_reports_the_stop() {
@@ -1301,6 +1326,7 @@ mod tests {
                     }
                 })
             }),
+            prepare_handoff_fn: None,
         };
 
         let results = populate_result_markdown(

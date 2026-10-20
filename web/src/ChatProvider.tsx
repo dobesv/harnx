@@ -14,6 +14,7 @@ import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
 import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type MessageAttachmentMeta, type CompactionOutcome } from './harnxCustomEvents';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
+import { SessionNavigationContext } from './SessionNavigationContext';
 import { MessageAttachmentsContext } from './MessageAttachmentsContext';
 import { reduceMessageAttachments } from './messageAttachments';
 import { reduceToolUpdates, type ToolUpdatesState, type ToolCallUpdatePatch } from './toolUpdates';
@@ -27,6 +28,7 @@ export interface ChatProviderProps {
   isFreshSession: boolean;
   onHandoff?: (agent: string, sessionId: string) => void;
   onOpenSubAgent: (agent: string, sessionId: string) => void;
+  onNavigateSession?: (agent: string, sessionId: string) => void;
   onReadUpdated?: () => void;
   children: React.ReactNode;
 }
@@ -279,6 +281,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   isFreshSession,
   onHandoff,
   onOpenSubAgent,
+  onNavigateSession,
   onReadUpdated,
   children,
 }) => {
@@ -451,6 +454,10 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     dispatch: dispatchSubAgentEvent,
   }), [onOpenSubAgent, subAgentState.notes, dispatchSubAgentEvent]);
 
+  const sessionNavigationContext = useMemo(() => ({
+    navigateSession: onNavigateSession ?? onOpenSubAgent,
+  }), [onNavigateSession, onOpenSubAgent]);
+
   const messageAttachmentsContext = useMemo(() => ({
     agent: agentName,
     session: sessionId,
@@ -460,6 +467,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   return (
     <CancellationContext.Provider value={cancellation}>
     <CompactionContext.Provider value={compactionPhase}>
+    <SessionNavigationContext.Provider value={sessionNavigationContext}>
     <SubAgentNotesContext.Provider value={subAgentContext}>
     <MessageAttachmentsContext.Provider value={messageAttachmentsContext}>
       <PendingContext.Provider value={{ 
@@ -483,6 +491,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       </PendingContext.Provider>
     </MessageAttachmentsContext.Provider>
     </SubAgentNotesContext.Provider>
+    </SessionNavigationContext.Provider>
     </CompactionContext.Provider>
     </CancellationContext.Provider>
   );

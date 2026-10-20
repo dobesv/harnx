@@ -4,6 +4,28 @@ use harnx_core::tool::{
 };
 use serde_json::json;
 
+#[tokio::test]
+async fn orphan_tool_context_preserves_lazy_handoff_preparation() {
+    let config = Arc::new(crate::config::ConfigLock::new(
+        crate::config::Config::default(),
+    ));
+    let scope = harnx_core::instance::ServerScope::new();
+    let repair = build_tool_repair_context(&config);
+    let prepare: Arc<crate::tool::PrepareHandoffFn> =
+        Arc::new(|_, _, _| panic!("building a recovery context must not prepare a handoff"));
+
+    let context =
+        build_orphan_tool_eval_context(&config, &scope, &repair, Some(prepare.clone())).await;
+
+    assert!(Arc::ptr_eq(
+        context
+            .prepare_handoff_fn
+            .as_ref()
+            .expect("recovery callback"),
+        &prepare,
+    ));
+}
+
 struct MixedRecovery;
 
 #[async_trait::async_trait]
@@ -54,6 +76,7 @@ fn mixed_context(scope: harnx_core::instance::ServerScope) -> crate::tool::ToolE
                 }
             })
         }),
+        prepare_handoff_fn: None,
     }
 }
 
@@ -72,6 +95,7 @@ async fn mixed_recovery_preserves_original_positions_including_anonymous_calls()
     let abort = crate::utils::create_abort_signal();
     let (_server, log) = recovery_fixture().await?;
     let args = RepairOrphanToolCallsArgs {
+        prepare_handoff_fn: None,
         config,
         instance_id: &scope,
         fence_token: None,
@@ -175,6 +199,7 @@ async fn each_orphans_reruns_are_dispatched_under_its_round() -> Result<()> {
     let abort = crate::utils::create_abort_signal();
     let (_server, log) = recovery_fixture().await?;
     let args = RepairOrphanToolCallsArgs {
+        prepare_handoff_fn: None,
         config,
         instance_id: &scope,
         fence_token: None,

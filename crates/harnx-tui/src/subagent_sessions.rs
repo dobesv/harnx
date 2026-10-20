@@ -96,6 +96,9 @@ impl Tui {
             self.open_link(&url, LinkTarget::Root).await;
             return;
         }
+        if self.open_focused_root_handoff_session().await {
+            return;
+        }
         if !self.open_focused_root_subagent() {
             self.open_detail_view_for_focused_item();
         }
@@ -107,6 +110,64 @@ impl Tui {
             return None;
         };
         Some(url.clone())
+    }
+
+    /// Open the target session for a focused HandoffSession row.
+    /// Returns true if the focused row was handled, including navigation errors.
+    async fn open_focused_root_handoff_session(&mut self) -> bool {
+        let focus = match self.app.transcript_focus {
+            Some(f) => f,
+            None => return false,
+        };
+        let Some(item) = self.app.transcript.get(focus).cloned() else {
+            return false;
+        };
+        let TranscriptItem::HandoffSession { agent, session_id } = item else {
+            return false;
+        };
+        if self.app.llm_busy {
+            // Completion persistence uses the active session from this shared config.
+            self.app.transcript.push(TranscriptItem::StatusLine(
+                "Cannot open handoff session while a turn is running.".into(),
+            ));
+            self.pin_transcript_to_bottom();
+            return true;
+        }
+
+        let (origin_session, origin_agent) = {
+            let config = self.config.read();
+            (
+                config
+                    .session
+                    .as_ref()
+                    .map(|session| session.id().to_string()),
+                config.active_agent_ref(),
+            )
+        };
+        let inherited_cluster = self.current_session_cluster();
+        let (target_ref, _) = handoff_target(&agent, &inherited_cluster);
+        if let Err(error) = harnx_runtime::config::Config::use_agent(
+            &self.config,
+            &target_ref,
+            Some(&session_id),
+            harnx_runtime::utils::create_abort_signal(),
+        )
+        .await
+        {
+            self.app.transcript.push(TranscriptItem::ErrorText(format!(
+                "Handoff target '{agent}/{session_id}' could not be opened: {error:#}"
+            )));
+            self.pin_transcript_to_bottom();
+            return true;
+        }
+
+        // Opening a saved link is navigation, not a new live handoff. Keep turn
+        // ownership intact and let the activity monitor discover the child's state.
+        self.reconcile_transcript_after_command(origin_session, origin_agent, ".session")
+            .await;
+        self.refresh_input_chrome();
+        self.sync_session_activity_monitor();
+        true
     }
 
     pub(super) async fn handle_subagent_view_key(&mut self, key: KeyEvent) {

@@ -392,10 +392,17 @@ The optional `session_id` follows the same rules as `{agent}_session_prompt`:
 - IDs are local to the target agent: another agent can use the same ID independently.
   For example, two review agents can each use `review-12345` without sharing history.
 
-Do not invent an ID when a generated session is desired. The committed target
-ID is reported only after the prompt is persisted and worker activation is
-published. Bare and package-qualified targets stay on the current cluster;
-explicit `agent@cluster` targets use that configured cluster.
+Do not invent an ID when a generated session is desired. When omitted, the
+tool reserves the new target session ID during tool execution and dispatches
+to that same ID. The tool result carries the target agent and child session ID
+(text `"Handing off to <agent>; target session: <id>."` and a structured
+`handoff: {agent, session_id}` marker without a user-only audience restriction),
+making the target identity visible in both parent model context and session
+dumps. Web and TUI interfaces render a static navigable row pointing to the
+child session. The committed target ID is confirmed after the prompt is
+persisted and worker activation is published. Bare and package-qualified
+targets stay on the current cluster; explicit `agent@cluster` targets use that
+configured cluster.
 
 The source session keeps its agent configuration, history, hooks, persistence
 backend, and lease. The target's normal activation independently loads its

@@ -3,7 +3,7 @@ use crate::config::HARNX_NATS_URL_ENV;
 use crate::config::{Config, GlobalConfig, Input};
 use crate::nats_hook_provider::NatsHookProvider;
 use crate::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
-use crate::tool::CompletionText;
+use crate::tool::{CompletionText, PrepareHandoffFn};
 use crate::utils::AbortSignal;
 use harnx_core::instance::ServerScope;
 use std::collections::HashMap;
@@ -22,6 +22,7 @@ pub struct ToolRoundParams<'a> {
     pub completion: CompletionText<'a>,
     pub abort_signal: &'a AbortSignal,
     pub working_dir: Option<&'a Path>,
+    pub prepare_handoff_fn: Option<Arc<PrepareHandoffFn>>,
     pub nats_hook_provider: Option<Arc<NatsHookProvider>>,
     pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
     pub tool_loop_guard: Option<crate::tool_loop_guard::ToolLoopGuardHandle>,
@@ -34,6 +35,7 @@ pub struct BuildToolEvalContextParams<'a> {
     pub agent_use_tools: Option<&'a str>,
     pub current_agent_package: Option<String>,
     pub working_dir: Option<&'a Path>,
+    pub prepare_handoff_fn: Option<Arc<PrepareHandoffFn>>,
     pub nats_hook_provider: Option<Arc<NatsHookProvider>>,
     pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
 }
@@ -46,6 +48,7 @@ impl<'a> BuildToolEvalContextParams<'a> {
             agent_use_tools: None,
             current_agent_package: None,
             working_dir: None,
+            prepare_handoff_fn: None,
             nats_hook_provider: None,
             pending_async_context: None,
         }
@@ -76,6 +79,7 @@ impl AgentLoopContext {
             completion,
             abort_signal: &self.abort_signal,
             working_dir: self.working_dir.as_deref(),
+            prepare_handoff_fn: self.prepare_handoff_fn.clone(),
             nats_hook_provider: self.nats_hook_provider.clone(),
             pending_async_context: self.pending_async_context.clone(),
             tool_loop_guard: Some(self.tool_loop_guard.clone()),

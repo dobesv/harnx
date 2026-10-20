@@ -1,5 +1,7 @@
 //! Agent loop entrypoint for NATS-backed sessions.
 
+mod handoff;
+
 mod deadline_recovery;
 mod hitl_attention;
 mod tool_recovery;
@@ -376,6 +378,7 @@ pub(crate) fn build_mid_turn_injection_callback(
 }
 
 struct RepairOrphanToolCallsArgs<'a> {
+    prepare_handoff_fn: Option<Arc<crate::tool::PrepareHandoffFn>>,
     config: GlobalConfig,
     instance_id: &'a harnx_core::instance::ServerScope,
     fence_token: Option<u64>,
@@ -434,9 +437,15 @@ async fn run_nats_loop_segment(
 
 async fn prepare_session_for_agent_loop(
     args: &RunAgentLoopArgs<'_>,
-) -> Result<(jetstream::Context, SessionOrigin, SessionAttachmentSync)> {
+) -> Result<(
+    jetstream::Context,
+    SessionOrigin,
+    SessionAttachmentSync,
+    Arc<crate::tool::PrepareHandoffFn>,
+)> {
     Box::pin(prepare_agent_session(PrepareAgentSessionParams {
         cluster_key: args.cluster_key,
+        activation_route: &args.activation_route,
         session_id: args.session_id,
         config: &args.config,
         instance_id: &args.instance_id,
@@ -453,7 +462,7 @@ async fn prepare_session_for_agent_loop(
 pub(crate) async fn run_agent_loop_with_nats_outcome(
     args: RunAgentLoopArgs<'_>,
 ) -> Result<NatsAgentLoopOutcome> {
-    let (jetstream_ctx, session_origin, attachment_sync) =
+    let (jetstream_ctx, session_origin, attachment_sync, prepare_handoff_fn) =
         prepare_session_for_agent_loop(&args).await?;
 
     let hook_supervisor = setup_agent_hooks(
@@ -486,6 +495,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
             call_fn: args.call_fn,
             on_tool_round: args.on_tool_round,
             on_hitl_approval_required,
+            prepare_handoff_fn,
             working_dir: args.working_dir,
         },
         session_origin,
@@ -552,6 +562,7 @@ async fn shutdown_agent_hooks(mut supervisor: Option<HookServerSupervisor>) {
 
 struct PrepareAgentSessionParams<'a> {
     cluster_key: &'a str,
+    activation_route: &'a super::SessionActivationRoute,
     session_id: &'a str,
     config: &'a GlobalConfig,
     instance_id: &'a harnx_core::instance::ServerScope,
@@ -565,13 +576,27 @@ struct PrepareAgentSessionParams<'a> {
 
 async fn prepare_agent_session(
     params: PrepareAgentSessionParams<'_>,
-) -> Result<(jetstream::Context, SessionOrigin, SessionAttachmentSync)> {
+) -> Result<(
+    jetstream::Context,
+    SessionOrigin,
+    SessionAttachmentSync,
+    Arc<crate::tool::PrepareHandoffFn>,
+)> {
     let cfg_snapshot = params.config.read().clone();
     let replicas = cfg_snapshot
         .resolve_nats_server(params.cluster_key)
         .await?
         .resolved_replicas();
     let jetstream = cfg_snapshot.nats_jetstream(params.cluster_key).await?;
+    let prepare_handoff_fn = handoff::NatsHandoffContext {
+        config: params.config.clone(),
+        source_session_id: params.session_id.to_string(),
+        cluster_key: params.cluster_key.to_string(),
+        jetstream_ctx: jetstream.clone(),
+        activation_route: params.activation_route.clone(),
+        replicas,
+    }
+    .callback(params.abort_signal.clone());
     let mut backend = NatsSessionLogBackend::new(jetstream.clone(), params.session_id, replicas);
     if let Some(observer) = params.after_seq_observer {
         backend = backend.with_after_seq_observer(observer);
@@ -587,6 +612,7 @@ async fn prepare_agent_session(
             session_id: params.session_id,
             abort_signal: params.abort_signal,
             replay_unmanaged: params.replay_unmanaged,
+            prepare_handoff_fn: Some(prepare_handoff_fn.clone()),
         })
         .await?;
     selected_input::restore_selected_user_messages(&mut session, params.selected_user_messages);
@@ -614,10 +640,11 @@ async fn prepare_agent_session(
         session_ref,
     )
     .await?;
-    Ok((jetstream, origin, attachment_sync))
+    Ok((jetstream, origin, attachment_sync, prepare_handoff_fn))
 }
 
 struct AgentContextParams {
+    prepare_handoff_fn: Arc<crate::tool::PrepareHandoffFn>,
     config: GlobalConfig,
     instance_id: harnx_core::instance::ServerScope,
     abort_signal: AbortSignal,
@@ -663,6 +690,7 @@ async fn build_agent_loop_context(
         initial_resume_count: 0,
         max_resume: None,
         nats_hook_provider,
+        prepare_handoff_fn: Some(params.prepare_handoff_fn),
         pending_async_context: Some(Arc::new(tokio::sync::Mutex::new(None))),
         working_dir: params.working_dir,
         tool_loop_guard: Default::default(),
@@ -916,98 +944,35 @@ async fn dispatch_nats_handoff(
     prompt: String,
     handoff_tool_call_id: Option<String>,
 ) -> Result<()> {
-    let mut requested_session_id = session_id.filter(|session_id| !session_id.trim().is_empty());
-    let parent = args
-        .ctx
-        .config
-        .read()
-        .run_context
-        .clone()
-        .context("handoff requires inherited run context")?;
     let handoff_id = handoff_tool_call_id
         .as_deref()
         .context("handoff requires durable tool-call identity")?;
-    let source_js = args.jetstream_ctx.clone();
-    let entries =
-        crate::nats_session_log::NatsSessionLog::new(source_js.clone(), args.source_session_id)
-            .load_events_latest_async()
-            .await?;
-    let round = entries
-        .iter()
-        .rev()
-        .find_map(|(seq, entry)| match entry {
-            SessionLogEntry::ToolCalls { calls, .. }
-                if calls
-                    .iter()
-                    .any(|call| call.id.as_deref() == Some(handoff_id)) =>
-            {
-                Some(*seq)
-            }
-            _ => None,
-        })
-        .context("handoff has no durable tool round")?;
-    let edge = format!("{round}:{handoff_id}");
-    let invocation_id =
-        harnx_core::session_identity::session_key(Some(parent.invocation_id.as_str()), &edge);
-    let source_store =
-        crate::nats_session_metadata::SessionMetadataStore::ensure(&source_js, args.replicas)
-            .await?;
-    let key = format!(
-        "sessions/{}/handoff_admissions/{invocation_id}",
-        args.source_session_id
-    );
-    let proposed = harnx_toolset::AutonomousRunContext {
-        snapshot: serde_json::to_value(&parent)?,
-        started_at_ms: chrono::Utc::now().timestamp_millis().try_into()?,
-    };
-    let lineage = match source_store.leader_value(&key).await? {
-        Some(bytes) => serde_json::from_slice::<harnx_toolset::AutonomousRunContext>(&bytes)?,
-        None => {
-            if source_store
-                .kv_store()
-                .update(&key, serde_json::to_vec(&proposed)?.into(), 0)
-                .await
-                .is_err()
-            {
-                serde_json::from_slice(
-                    &source_store
-                        .leader_value(&key)
-                        .await?
-                        .context("handoff admission unconfirmed")?,
-                )?
-            } else {
-                proposed
-            }
-        }
-    };
-    let parent: crate::nats_session_metadata::RunLimitsRecord =
-        serde_json::from_value(lineage.snapshot)?;
-    let admitted_at = chrono::DateTime::from_timestamp_millis(lineage.started_at_ms.try_into()?)
-        .context("invalid handoff admission time")?;
-    let destination = resolve_handoff_destination(args, &agent).await?;
-    let initializer = handoff_initializer(args, &source_store, &destination).await?;
-    args.ctx.check_generation("handoff-create")?;
-    if requested_session_id.is_none() {
-        let store = crate::nats_session_metadata::SessionMetadataStore::ensure(
-            &destination.jetstream,
-            destination.replicas,
-        )
-        .await?;
-        requested_session_id = Some(
-            crate::utils::session_name::reserve_invocation_session_id(
-                &store,
-                &initializer,
-                &invocation_id,
-                lineage.started_at_ms,
-            )
-            .await?,
-        );
+    // Admission CAS is durable and retry-stable, so resolving again here yields the same destination without carrying extra provenance state.
+    let target = handoff::NatsHandoffContext {
+        config: args.config.clone(),
+        source_session_id: args.source_session_id.to_string(),
+        cluster_key: args.cluster_key.to_string(),
+        jetstream_ctx: args.jetstream_ctx.clone(),
+        activation_route: args.activation_route.clone(),
+        replicas: args.replicas,
     }
+    .resolve_target(&agent, handoff_id)
+    .await?;
+    args.ctx.check_generation("handoff-create")?;
+    // Provider switch_agent results bypass synthetic-tool preparation.
+    let session_id = target.resolve_session_id(session_id).await?;
+    let handoff::HandoffTarget {
+        destination,
+        initializer,
+        parent,
+        invocation_id,
+        admitted_at,
+    } = target;
     let target_session = NatsSession::new_with_resolved_replicas(
         NatsSessionConfig {
             cluster: destination.cluster,
             initializer,
-            session_id: requested_session_id,
+            session_id: Some(session_id),
             activation_route: destination.activation_route,
         },
         destination.replicas,
@@ -1046,91 +1011,6 @@ async fn dispatch_nats_handoff(
         handoff_tool_call_id,
     )
     .await
-}
-
-async fn handoff_initializer(
-    args: &AgentLoopSegmentArgs<'_>,
-    source_store: &crate::nats_session_metadata::SessionMetadataStore,
-    destination: &HandoffDestination,
-) -> Result<crate::SessionInitializer> {
-    let source_metadata = source_store
-        .get(args.source_session_id)
-        .await?
-        .context("handoff source metadata missing")?;
-    let inherited_identity =
-        crate::nats_session_metadata::session_properties(&source_metadata.metadata)?
-            .inherited_user_id();
-    Ok(
-        crate::SessionInitializer::named(destination.agent.clone(), Default::default())
-            .with_properties(inherited_identity)
-            .with_default_user_id(
-                args.config
-                    .read()
-                    .default_user_id_for_cluster(&destination.cluster),
-            ),
-    )
-}
-
-struct HandoffDestination {
-    agent: String,
-    cluster: String,
-    activation_route: super::SessionActivationRoute,
-    committed_agent: String,
-    replicas: usize,
-    client: async_nats::Client,
-    jetstream: jetstream::Context,
-}
-
-async fn resolve_handoff_destination(
-    args: &AgentLoopSegmentArgs<'_>,
-    agent: &str,
-) -> Result<HandoffDestination> {
-    use harnx_core::agent_ref::AgentRef;
-
-    match AgentRef::parse(agent) {
-        AgentRef::Local(target_agent) => {
-            let target_agent = target_agent.into_owned();
-            let committed_agent = match args.activation_route {
-                super::SessionActivationRoute::ClusterShared => {
-                    format!("{target_agent}@{}", args.cluster_key)
-                }
-                super::SessionActivationRoute::WorkerTargeted { .. } => target_agent.clone(),
-            };
-            Ok(HandoffDestination {
-                agent: target_agent,
-                cluster: args.cluster_key.to_string(),
-                activation_route: args.activation_route.clone(),
-                committed_agent,
-                replicas: args.replicas,
-                client: args.jetstream_ctx.client().clone(),
-                jetstream: args.jetstream_ctx.clone(),
-            })
-        }
-        AgentRef::Remote {
-            agent: target_agent,
-            cluster,
-        } => {
-            let target_cluster = cluster.into_owned();
-            let config = args.config.read().clone();
-            let replicas = config
-                .resolve_nats_server(&target_cluster)
-                .await?
-                .resolved_replicas();
-            let client = config
-                .nats_client(&target_cluster)
-                .await
-                .with_context(|| format!("connect to handoff target cluster '{target_cluster}'"))?;
-            Ok(HandoffDestination {
-                agent: target_agent.into_owned(),
-                cluster: target_cluster,
-                activation_route: super::SessionActivationRoute::ClusterShared,
-                committed_agent: agent.to_string(),
-                replicas,
-                jetstream: jetstream::new(client.clone()),
-                client,
-            })
-        }
-    }
 }
 
 async fn emit_handoff_committed(
@@ -1267,6 +1147,7 @@ fn abort_resume_if_fenced(
 
 /// Parameters for [`load_or_repair_session`].
 struct LoadOrRepairSessionParams<'a> {
+    prepare_handoff_fn: Option<Arc<crate::tool::PrepareHandoffFn>>,
     backend: &'a NatsSessionLogBackend,
     config: &'a GlobalConfig,
     instance_id: &'a harnx_core::instance::ServerScope,
@@ -1333,6 +1214,7 @@ async fn load_or_repair_session(
     Option<harnx_core::timing_identity::TimingReceipt>,
 )> {
     let LoadOrRepairSessionParams {
+        prepare_handoff_fn,
         backend,
         config,
         instance_id,
@@ -1365,6 +1247,7 @@ async fn load_or_repair_session(
         harnx_core::session_reconstruct::apply_log_mutations_nats(&entries_vec)?;
     let preserve_hitl_pending = tool_recovery::preserves_hitl_pending(&effective_entries);
     repair_orphan_tool_calls_if_any(RepairOrphanCallsParams {
+        prepare_handoff_fn,
         backend,
         config,
         instance_id,
@@ -1387,6 +1270,7 @@ async fn load_or_repair_session(
 }
 
 struct RepairOrphanCallsParams<'a> {
+    prepare_handoff_fn: Option<Arc<crate::tool::PrepareHandoffFn>>,
     backend: &'a NatsSessionLogBackend,
     config: &'a GlobalConfig,
     instance_id: &'a harnx_core::instance::ServerScope,
@@ -1403,6 +1287,7 @@ struct RepairOrphanCallsParams<'a> {
 /// effective log has no orphans.
 async fn repair_orphan_tool_calls_if_any(params: RepairOrphanCallsParams<'_>) -> Result<()> {
     let RepairOrphanCallsParams {
+        prepare_handoff_fn,
         backend,
         config,
         instance_id,
@@ -1437,6 +1322,7 @@ async fn repair_orphan_tool_calls_if_any(params: RepairOrphanCallsParams<'_>) ->
         backend,
         &orphan_calls,
         RepairOrphanToolCallsArgs {
+            prepare_handoff_fn,
             config: config.clone(),
             instance_id,
             fence_token: lease.map(|l| l.fence_token()),
@@ -1574,8 +1460,13 @@ async fn repair_orphan_tool_calls_with_hints(
     use harnx_core::session::SessionLogEntry;
 
     let tool_repair = build_tool_repair_context(&args.config);
-    let mut eval_ctx =
-        build_orphan_tool_eval_context(&args.config, args.instance_id, &tool_repair).await;
+    let mut eval_ctx = build_orphan_tool_eval_context(
+        &args.config,
+        args.instance_id,
+        &tool_repair,
+        args.prepare_handoff_fn.clone(),
+    )
+    .await;
 
     for orphan in orphan_calls {
         let results = repair_single_orphan(orphan, &args, &tool_repair, &mut eval_ctx).await?;
@@ -1629,10 +1520,12 @@ async fn build_orphan_tool_eval_context(
     config: &GlobalConfig,
     instance_id: &harnx_core::instance::ServerScope,
     repair: &ToolRepairContext,
+    prepare_handoff_fn: Option<Arc<crate::tool::PrepareHandoffFn>>,
 ) -> crate::tool::ToolEvalContext {
     crate::tool::build_tool_eval_context(crate::tool::BuildToolEvalContextParams {
         config,
         instance_id,
+        prepare_handoff_fn,
         agent_use_tools: repair.agent_use_tools.as_deref(),
         current_agent_package: repair.current_agent_package.clone(),
         working_dir: None,

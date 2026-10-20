@@ -924,6 +924,13 @@ pub enum TranscriptItem {
         text: String,
         url: String,
     },
+    /// Static navigable handoff row produced from the `handoff` marker in a
+    /// handoff tool result. Links to the child session without live status/timer.
+    /// Distinct from SubAgentSession (which carries status, metrics, cancellation).
+    HandoffSession {
+        agent: String,
+        session_id: String,
+    },
 }
 
 impl TranscriptItem {
@@ -1021,6 +1028,7 @@ impl TranscriptItem {
                 | TranscriptItem::CompactionMarker { .. }
                 | TranscriptItem::SubAgentSession { .. }
                 | TranscriptItem::MarkdownLink { .. }
+                | TranscriptItem::HandoffSession { .. }
         )
     }
 }

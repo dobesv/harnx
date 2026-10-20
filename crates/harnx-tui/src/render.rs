@@ -240,27 +240,7 @@ impl Tui {
                 if let Some(suffix) =
                     Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
-                    // Attach suffix to first line of first Paragraph block.
-                    // If no paragraph block exists (all tables), insert a
-                    // suffix-only paragraph so metadata is never silently dropped.
-                    let mut attached = false;
-                    for block in &mut entry.blocks {
-                        if let MarkdownBlockData::Paragraph { lines, .. } = block {
-                            if let Some(first_line) = lines.first_mut() {
-                                first_line.spans.push(suffix.clone());
-                                attached = true;
-                            }
-                            break;
-                        }
-                    }
-                    if !attached {
-                        let suffix_line = Line::from(suffix);
-                        entry.total_height += 1;
-                        entry.blocks.push(MarkdownBlockData::Paragraph {
-                            lines: vec![suffix_line],
-                            height: 1,
-                        });
-                    }
+                    Self::append_markdown_suffix(&mut entry, suffix);
                 }
                 // Match the prior trailing-spacing rule: pad after a
                 // single-line message (so the next entry has breathing
@@ -429,8 +409,9 @@ impl Tui {
                 }
                 entry
             }
-            item @ TranscriptItem::SubAgentSession { .. } => {
-                render_subagent_row(item, state.spinner_index, width)
+            item @ (TranscriptItem::SubAgentSession { .. }
+            | TranscriptItem::HandoffSession { .. }) => {
+                Self::render_session_row(item, state.spinner_index, width)
             }
             TranscriptItem::AttachmentHeader(text) => {
                 let lines = Self::render_text_entry(
@@ -469,6 +450,90 @@ impl Tui {
                 Self::render_markdown_link(text, url, width)
             }
         }
+    }
+
+    fn append_markdown_suffix(entry: &mut RenderedEntry, suffix: Span<'static>) {
+        // Attach suffix to first line of first Paragraph block.
+        // If no paragraph block exists (all tables), insert a
+        // suffix-only paragraph so metadata is never silently dropped.
+        let mut attached = false;
+        for block in &mut entry.blocks {
+            if let MarkdownBlockData::Paragraph { lines, .. } = block {
+                if let Some(first_line) = lines.first_mut() {
+                    first_line.spans.push(suffix.clone());
+                    attached = true;
+                }
+                break;
+            }
+        }
+        if !attached {
+            let suffix_line = Line::from(suffix);
+            entry.total_height += 1;
+            entry.blocks.push(MarkdownBlockData::Paragraph {
+                lines: vec![suffix_line],
+                height: 1,
+            });
+        }
+    }
+
+    fn render_session_row(
+        item: &TranscriptItem,
+        spinner_index: usize,
+        width: u16,
+    ) -> RenderedEntry {
+        match item {
+            TranscriptItem::HandoffSession { agent, session_id } => {
+                Self::render_handoff_session(agent, session_id, width)
+            }
+            item @ TranscriptItem::SubAgentSession { .. } => {
+                render_subagent_row(item, spinner_index, width)
+            }
+            _ => unreachable!("render_session_row only accepts session transcript items"),
+        }
+    }
+
+    /// Render a static handoff row with handoff icon, agent name, and short session ID.
+    /// Format: "↪ handoff @ {agent} [{short_id}]" with cyan styling.
+    fn render_handoff_session(agent: &str, session_id: &str, width: u16) -> RenderedEntry {
+        let max_w = usize::from(width);
+        let prefix = "  ↪ handoff @ ";
+        let prefix_w = UnicodeWidthStr::width(prefix);
+        if max_w <= prefix_w {
+            let truncated: String = prefix.chars().take(max_w).collect();
+            return RenderedEntry::from_lines(
+                vec![Line::from(vec![Span::styled(
+                    truncated,
+                    Style::default().fg(Color::DarkGray),
+                )])],
+                width,
+            );
+        }
+
+        // Use first 8 chars of session_id for display (char-safe for multibyte UTF-8)
+        let short_id: String = session_id.chars().take(8).collect();
+
+        let remaining = max_w - prefix_w;
+        let identity = format!("{} [{}]", agent, short_id);
+        let display = if UnicodeWidthStr::width(identity.as_str()) <= remaining {
+            identity
+        } else {
+            let agent_budget =
+                remaining.saturating_sub(3 + UnicodeWidthStr::width(short_id.as_str())); // 3 for " []"
+            if agent_budget > 0 {
+                let truncated_agent = truncate_display_str(agent, agent_budget);
+                format!("{} [{}]", truncated_agent, short_id)
+            } else {
+                truncate_display_str(&identity, remaining)
+            }
+        };
+
+        RenderedEntry::from_lines(
+            vec![Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                Span::styled(display, Style::default().fg(Color::Cyan)),
+            ])],
+            width,
+        )
     }
 
     fn render_markdown_link(text: &str, url: &str, width: u16) -> RenderedEntry {
@@ -1327,6 +1392,11 @@ impl Tui {
                 lines.push(Line::from(Span::styled("── link ──", label_style)));
                 push_field!("text", text);
                 push_field!("url", url);
+            }
+            TranscriptItem::HandoffSession { agent, session_id } => {
+                lines.push(Line::from(Span::styled("── handoff ──", label_style)));
+                push_field!("agent", agent);
+                push_field!("session_id", session_id);
             }
         }
         lines
