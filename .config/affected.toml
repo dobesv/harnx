@@ -119,6 +119,11 @@ test = ["harnx-runtime", "harnx-bash-tools"]
 globs = ["example_config/**"]
 test = ["harnx-proxy-auth", "harnx-core"]
 
+# Example compaction prompts are checked by harnx-runtime's tests.
+[[test-path]]
+globs = ["example_config/agents/**"]
+test = ["harnx-runtime"]
+
 # Bridge direct-call fixtures run the SDK-backed mock MCP binary by path.
 [[test-edge]]
 on-affected = ["harnx-test-bins"]

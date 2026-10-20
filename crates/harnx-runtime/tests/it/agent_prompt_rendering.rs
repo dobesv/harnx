@@ -687,3 +687,60 @@ fn shared_sandbox_workflow_fragments_are_pure_markdown_and_harnx_native() {
         failures.join("\n")
     );
 }
+
+const COMPACTION_PROMPT_PHRASES: [&str; 2] = [
+    "someone reading only the summary should be able to tell what the user last asked and what the agent last answered",
+    "If the latest user prompt isn't kept verbatim after the summary, quote it",
+];
+
+fn compaction_prompt_paths(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for package in PACKAGES {
+        let agents_dir = workspace_root.join("packages").join(package).join("agents");
+        let entries = fs::read_dir(&agents_dir)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", agents_dir.display()));
+        paths.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("compact-") && name.ends_with(".md"))
+                }),
+        );
+    }
+    paths.push(workspace_root.join("example_config/agents/example-compaction-agent.md"));
+    paths
+}
+
+fn assert_compaction_prompt_contains_phrases(path: &Path) {
+    let content = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let missing: Vec<_> = COMPACTION_PROMPT_PHRASES
+        .iter()
+        .filter(|phrase| !content.contains(**phrase))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} is missing compaction instruction phrases: {:?}",
+        path.display(),
+        missing
+    );
+}
+
+/// Verify all packaged compaction prompts and the example compaction agent.
+#[test]
+fn compaction_prompts_contain_shared_request_reply_instruction() {
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let prompt_paths = compaction_prompt_paths(&workspace_root);
+    assert!(
+        prompt_paths.len() >= 10,
+        "expected at least 10 markdown compaction prompts to be checked"
+    );
+    prompt_paths
+        .iter()
+        .for_each(|path| assert_compaction_prompt_contains_phrases(path));
+}

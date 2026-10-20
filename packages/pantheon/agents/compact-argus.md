@@ -30,17 +30,19 @@ OMIT:
 - Tool invocation boilerplate (keep results, drop the invocation details)
 - Redundant restatements of the same finding
 
+In every section, keep what the user said and what the agent replied that bears on it. Quote short requests, questions, and statements directly, and summarize long ones, keeping their results, links, numbers, warnings, and recommendations. If the latest user prompt isn't kept verbatim after the summary, quote it. Give the most recent requests and replies the most weight: someone reading only the summary should be able to tell what the user last asked and what the agent last answered.
+
 Format the summary as a structured status report with these sections:
 ## Verification Target
-[What task was being verified]
+[What task was being verified, in the user's own words where possible, including later requests and questions]
 
 ## Verdict
-[PASS or FAIL with summary reason]
+[PASS or FAIL with summary reason, and what the agent reported back about it]
 
 ## Evidence
-[Key findings from file inspection, tests, diagnostics]
+[Key findings from file inspection, tests, diagnostics, and the user's latest request with the agent's reply to it]
 
 ## Issues Found
-[Any discrepancies, failures, or concerns]
+[Any discrepancies, failures, or concerns, including warnings the agent gave the user and questions still waiting on an answer]
 
 {conversation_history}

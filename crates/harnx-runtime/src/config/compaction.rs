@@ -85,7 +85,7 @@ context window. Write a concise summary (about 200 words) that preserves: the \
 user's request and intent, key decisions and facts established, files or commands \
 examined or changed, errors encountered and how they were resolved, and any \
 pending or next steps. Write plainly; do not invent details not present in the \
-transcript.";
+transcript. In every section, keep what the user said and what the agent replied that bears on it. Quote short requests, questions, and statements directly, and summarize long ones, keeping their results, links, numbers, warnings, and recommendations. If the latest user prompt isn't kept verbatim after the summary, quote it. Give the most recent requests and replies the most weight: someone reading only the summary should be able to tell what the user last asked and what the agent last answered.";
 
 /// Truncate `text` to at most `max_chars`, keeping the head and tail and
 /// inserting an elision marker in the middle. Returns the input unchanged when
@@ -369,6 +369,15 @@ mod tests {
 
     fn msg(role: MessageRole, text: &str) -> Message {
         Message::new(role, MessageContent::Text(text.into()))
+    }
+
+    #[test]
+    fn default_prompt_preserves_latest_request_guard_and_reply_instruction() {
+        assert!(DEFAULT_COMPACT_SYSTEM_PROMPT
+            .contains("If the latest user prompt isn't kept verbatim after the summary, quote it"));
+        assert!(DEFAULT_COMPACT_SYSTEM_PROMPT.contains(
+            "someone reading only the summary should be able to tell what the user last asked and what the agent last answered"
+        ));
     }
 
     #[test]
