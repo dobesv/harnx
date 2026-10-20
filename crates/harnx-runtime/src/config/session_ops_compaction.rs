@@ -1,4 +1,5 @@
 use super::*;
+use harnx_core::compaction_summary::append_recovery_note;
 use std::io::Write;
 
 use crate::utils::AbortSignal;
@@ -417,21 +418,6 @@ impl Config {
             session_id,
         ))
     }
-}
-
-/// Append short recovery note describing compacted range so future
-/// reader knows detail is recoverable from the NATS log.
-fn append_recovery_note(summary: String, covered: (Option<usize>, Option<usize>, usize)) -> String {
-    let (from, to, count) = covered;
-    let range = match (from, to) {
-        (Some(a), Some(b)) => format!(" (log entries {a}–{b})"),
-        _ => String::new(),
-    };
-    format!(
-        "{summary}\n\n[Earlier conversation: {count} message(s){range} were summarized above. \
-The full pre-compaction transcript remains in this session's log; use the \
-`harnx_agent_session_history_read` tool to search it by entry index, type, tool name, or text.]"
-    )
 }
 
 impl Config {
