@@ -31,20 +31,22 @@ OMIT:
 - Redundant restatements of the same information
 - Tool invocation boilerplate (keep results, drop the invocation details)
 
+In every section, keep what the user said and what the agent replied that bears on it. Quote short requests, questions, and statements directly, and summarize long ones, keeping their results, links, numbers, warnings, and recommendations. If the latest user prompt isn't kept verbatim after the summary, quote it. Give the most recent requests and replies the most weight: someone reading only the summary should be able to tell what the user last asked and what the agent last answered.
+
 Format the summary as a structured status report with these sections:
 ## Plan
 [Plan URL, plan title, and current phase (Interview/Pre-Analysis/Research/Planning/Review/Execution)]
 
 ## User Requirements
-[What the user asked for, constraints, acceptance criteria]
+[What the user asked for, constraints, acceptance criteria, in the user's own words where possible, including later requests and questions]
 
 ## Research Findings
-[Key findings from Metis, Pytheas, Librarian, Oracle]
+[Key findings from Metis, Pytheas, Librarian, Oracle, and what the agent reported back about them]
 
 ## Key Decisions
-[Important decisions made and their rationale]
+[Important decisions made and their rationale, and warnings the agent gave the user]
 
 ## Current Status
-[Where we are in the pipeline, what is next]
+[Where we are in the pipeline, what is next, the user's latest request with the agent's reply to it, and follow-ups recommended]
 
 {conversation_history}
