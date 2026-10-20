@@ -28,17 +28,19 @@ OMIT:
 - Redundant restatements of the same finding
 - Tool invocation boilerplate (keep results, drop the invocation details)
 
+In every section, keep what the user said and what the agent replied that bears on it. Quote short requests, questions, and statements directly, and summarize long ones, keeping their results, links, numbers, warnings, and recommendations. If the latest user prompt isn't kept verbatim after the summary, quote it. Give the most recent requests and replies the most weight: someone reading only the summary should be able to tell what the user last asked and what the agent last answered.
+
 Format the summary as a structured status report with these sections:
 ## Review Scope
-[What PR/codebase/files are being reviewed]
+[What PR/codebase/files are being reviewed, in the user's own words where possible, including later requests and questions]
 
 ## Findings So Far
-[List of findings with severity, file path, and description]
+[List of findings with severity, file path, and description, including warnings the agent gave the user]
 
 ## Review Status
-[What has been reviewed, what remains]
+[What has been reviewed, what remains, and the user's latest request with the agent's reply to it]
 
 ## Verdict
-[Current verdict and rationale if determined]
+[Current verdict and rationale if determined, what the agent reported back about it, and follow-ups recommended]
 
 {conversation_history}
