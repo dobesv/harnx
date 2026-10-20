@@ -1,14 +1,23 @@
 //! Builds the session-compaction request. Compaction renders dropped messages
-//! into a flattened-text transcript for the summarizer. Recent turns, or the
-//! latest prompt plus a round-safe tail, are kept verbatim.
-//! See `session_ops_compaction::compact_session`.
+//! into a sanitized, budgeted transcript for the summarizer. Recent turns, or
+//! the latest prompt plus a round-safe tail, are kept verbatim.
+//! See `session_ops_compaction::Config::compact_session`.
 
 use harnx_core::agent_config::AgentConfig;
-use harnx_core::message::{
-    Message, MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole,
-};
+use harnx_core::message::{Message, MessageContent, MessageRole};
 use harnx_core::model::Model;
 use harnx_core::session::ToolOutput;
+
+mod completion;
+mod request;
+mod transcript;
+#[cfg(test)]
+mod transcript_tests;
+pub(crate) use request::fetch_summary;
+#[cfg(test)]
+use transcript::render_transcript;
+use transcript::strip_data_urls;
+pub(crate) use transcript::Transcript;
 
 /// Number of recent user-turns kept verbatim (not summarized) by default.
 ///
@@ -120,89 +129,15 @@ pub fn render_tool_output(out: &ToolOutput, max_chars: usize) -> String {
         .and_then(|m| m.get("harnx.dev/compaction"))
         .and_then(|v| v.as_str())
     {
-        return text.to_string();
+        return strip_data_urls(text).into_owned();
     }
     // Tier 2: existing user-audience summary.
     if let Some(text) = harnx_core::tool::extract_user_display_text(&out.output) {
-        return truncate_middle(&text, max_chars);
+        return truncate_middle(&strip_data_urls(&text), max_chars);
     }
     // Tier 3: redacted output JSON, truncated.
     let full = serde_json::to_string(&out.output).unwrap_or_default();
-    truncate_middle(&full, max_chars)
-}
-
-/// Render image/text content parts to plain text, replacing images with a
-/// `[image: <ref>]` placeholder so no base64 enters the transcript.
-fn render_parts(parts: &[MessageContentPart]) -> String {
-    let mut out = Vec::new();
-    for part in parts {
-        match part {
-            MessageContentPart::Text { text } => out.push(text.clone()),
-            MessageContentPart::ImageUrl { image_url } => {
-                out.push(format!("[image: {}]", image_url.url))
-            }
-        }
-    }
-    out.join("\n")
-}
-
-/// Render a tool-call turn: the assistant's preceding text, each tool call
-/// header, and each tool result via the three-tier renderer.
-fn render_tool_calls(calls: &MessageContentToolCalls, max_tool_chars: usize) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    if !calls.text.is_empty() {
-        lines.push(format!("── assistant ──\n{}", calls.text));
-    }
-    for result in &calls.tool_results {
-        let args = serde_json::to_string(&result.call.arguments).unwrap_or_default();
-        lines.push(format!("── tool call: {} ──\n{}", result.call.name, args));
-        let out = ToolOutput {
-            id: result.call.id.clone(),
-            name: result.call.name.clone(),
-            output: result.output.clone(),
-            markdown: result.markdown.clone(),
-            content: result.content.clone(),
-            switch_agent: result.switch_agent.clone(),
-        };
-        lines.push(format!(
-            "── tool result ──\n{}",
-            render_tool_output(&out, max_tool_chars)
-        ));
-    }
-    lines.join("\n\n")
-}
-
-/// Render borrowed messages into a single flattened, labeled transcript for
-/// summarization. Images are placeholdered; tool results use the three-tier
-/// `render_tool_output`. `max_tool_chars` caps each tool result.
-pub fn render_transcript<'a>(
-    messages: impl IntoIterator<Item = &'a Message>,
-    max_tool_chars: usize,
-) -> String {
-    let mut sections: Vec<String> = Vec::new();
-    for message in messages {
-        match (&message.role, &message.content) {
-            (MessageRole::System, content) => {
-                sections.push(format!("── system ──\n{}", content.to_text()));
-            }
-            (MessageRole::User, MessageContent::Array(parts)) => {
-                sections.push(format!("── user ──\n{}", render_parts(parts)));
-            }
-            (MessageRole::User, content) => {
-                sections.push(format!("── user ──\n{}", content.to_text()));
-            }
-            (MessageRole::Assistant, content) => {
-                sections.push(format!("── assistant ──\n{}", content.to_text()));
-            }
-            (MessageRole::Tool, MessageContent::ToolCalls(calls)) => {
-                sections.push(render_tool_calls(calls, max_tool_chars));
-            }
-            (MessageRole::Tool, content) => {
-                sections.push(format!("── tool result ──\n{}", content.to_text()));
-            }
-        }
-    }
-    sections.join("\n\n")
+    truncate_middle(&strip_data_urls(&full), max_chars)
 }
 
 fn is_turn_prompt(message: &Message) -> bool {
@@ -365,6 +300,7 @@ fn recent_suffix_floor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harnx_core::message::MessageContentToolCalls;
     use serde_json::json;
 
     fn msg(role: MessageRole, text: &str) -> Message {
