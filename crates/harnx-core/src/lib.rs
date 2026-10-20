@@ -13,6 +13,7 @@ pub mod attachments;
 pub mod child_process;
 pub mod cid_url;
 pub mod cli;
+pub mod compaction_summary;
 pub mod config_data;
 pub mod config_paths;
 pub mod context;
@@ -47,6 +48,7 @@ pub mod system_vars;
 pub mod text;
 pub mod timing_identity;
 pub mod tool;
+pub mod transcript_view;
 pub mod user_aliases;
 pub mod working_mode;
 
