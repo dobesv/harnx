@@ -15,7 +15,7 @@ Harnx can load environment variables from a `.env` file located in the data dire
 - **HARNX_WRAP**: Whether to wrap the output text (boolean).
 - **HARNX_WRAP_CODE**: Whether to wrap code blocks (boolean).
 - **HARNX_SAVE_SESSION**: Whether to save the session (boolean).
-- **HARNX_COMPRESS_THRESHOLD**: The threshold for compressing the session history.
+- **HARNX_COMPRESS_THRESHOLD**: The configured threshold for compressing session history (default `150000` tokens). When the model reports an input-token limit, the effective threshold is capped at 90% of that limit.
 - **HARNX_TOOL_USE**: Enable or disable tool use (boolean). Note: renamed from `AICHAT_FUNCTION_CALLING`.
 - **HARNX_USE_TOOLS**: Specify which tools to use.
 - **HARNX_RAG_EMBEDDING_MODEL**: The model used for embeddings in RAG.

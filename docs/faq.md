@@ -55,7 +55,7 @@ The Chat API is stateless, so the full conversation history is sent with every r
 1. **Increased latency and cost.** Larger payloads take longer to process and consume more tokens.
 2. **May exceed LLM capacity.** Models have a maximum context window. Long conversations can hit that limit.
 
-Harnx addresses this with automatic session compression. When consumed tokens exceed the `compress_threshold`, Harnx compresses the conversation history automatically.
+Harnx addresses this with automatic session compression. By default, Harnx compresses history at 150,000 tokens, or at 90% of the model's input-token limit when that is lower. The `compress_threshold` setting changes the configured threshold, but it is still capped at 90% of a known model limit.
 
 ## Why don't LLMs call tools even though they support tool use?
 

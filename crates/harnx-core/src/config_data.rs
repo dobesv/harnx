@@ -323,7 +323,7 @@ impl Default for ConfigData {
 
             nats_lease_acquisition_timeout_secs: default_nats_lease_acquisition_timeout_secs(),
             cleanup_remote_sessions_days: None,
-            compress_threshold: 180000,
+            compress_threshold: 150000,
 
             rag_embedding_model: None,
             rag_reranker_model: None,
@@ -398,7 +398,7 @@ mod tests {
         assert!(d.tool_use);
         assert!(d.highlight);
         assert!(d.save_shell_history);
-        assert_eq!(d.compress_threshold, 180_000);
+        assert_eq!(d.compress_threshold, 150_000);
         assert_eq!(d.rag_top_k, 5);
     }
 

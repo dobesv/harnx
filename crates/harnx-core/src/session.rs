@@ -407,6 +407,27 @@ pub struct Session {
     pub runtime: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
+/// Percent of the model input-token limit used as the compaction ceiling.
+pub const COMPRESS_THRESHOLD_MODEL_LIMIT_PERCENT: usize = 90;
+
+/// Resolve configured compaction threshold against model context window.
+///
+/// The remaining 10% is the only buffer for system prompts, tool schemas, and
+/// images, since session token counts include messages only.
+pub fn effective_compress_threshold(
+    model: &Model,
+    configured: Option<usize>,
+    default: usize,
+) -> usize {
+    let threshold = configured.unwrap_or(default);
+    model
+        .max_input_tokens()
+        .map(|limit| {
+            threshold.min(limit.saturating_mul(COMPRESS_THRESHOLD_MODEL_LIMIT_PERCENT) / 100)
+        })
+        .unwrap_or(threshold)
+}
+
 impl Session {
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty() && self.compressed_messages.is_empty()
@@ -571,7 +592,11 @@ impl Session {
         if self.compressing {
             return false;
         }
-        let threshold = self.compress_threshold.unwrap_or(global_compress_threshold);
+        let threshold = effective_compress_threshold(
+            self.model(),
+            self.compress_threshold,
+            global_compress_threshold,
+        );
         if threshold < 1 {
             return false;
         }
@@ -1553,5 +1578,73 @@ mod compact_entry_tests {
         // Cancel IS a terminator (for comparison)
         let cancel = SessionLogEntry::cancel_request("cancel-1".into(), "test".into());
         assert!(matches!(cancel, SessionLogEntry::Cancel { .. }));
+    }
+}
+
+#[cfg(test)]
+mod compress_threshold_tests {
+    use super::{effective_compress_threshold, Session};
+    use crate::model::{Model, ModelData};
+
+    fn model_with_limit(limit: Option<usize>) -> Model {
+        let mut data = ModelData::new("test");
+        data.max_input_tokens = limit;
+        Model::from_config("test", &[data]).remove(0)
+    }
+
+    #[test]
+    fn effective_threshold_uses_model_limit_and_default() {
+        assert_eq!(
+            effective_compress_threshold(&model_with_limit(Some(128_000)), None, 150_000),
+            115_200
+        );
+        assert_eq!(
+            effective_compress_threshold(&model_with_limit(Some(1_000_000)), None, 150_000),
+            150_000
+        );
+        assert_eq!(
+            effective_compress_threshold(&model_with_limit(None), None, 150_000),
+            150_000
+        );
+    }
+
+    #[test]
+    fn need_compress_uses_effective_model_threshold() {
+        let mut session = Session {
+            model: model_with_limit(Some(128_000)),
+            tokens: 115_201,
+            ..Session::default()
+        };
+        assert!(session.need_compress(150_000));
+
+        session.tokens = 115_200;
+        assert!(!session.need_compress(150_000));
+
+        session.set_compress_threshold(Some(50_000));
+        session.tokens = 50_001;
+        assert!(session.need_compress(150_000));
+        session.tokens = 50_000;
+        assert!(!session.need_compress(150_000));
+
+        session.set_compress_threshold(Some(0));
+        session.tokens = 1;
+        assert!(!session.need_compress(150_000));
+
+        session.set_compress_threshold(None);
+        session.set_compressing(true);
+        session.tokens = 200_000;
+        assert!(!session.need_compress(150_000));
+    }
+
+    #[test]
+    fn effective_threshold_clamps_explicit_value() {
+        assert_eq!(
+            effective_compress_threshold(&model_with_limit(Some(128_000)), Some(200_000), 150_000),
+            115_200
+        );
+        assert_eq!(
+            effective_compress_threshold(&model_with_limit(None), Some(200_000), 150_000),
+            200_000
+        );
     }
 }
