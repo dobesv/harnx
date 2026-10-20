@@ -6,7 +6,7 @@ use crate::utils::AbortSignal;
 /// Rendered transcript of the messages to compact, plus the kept set, the
 /// covered log-seq range `(from, to, count)`, and the session id.
 type CompactionTranscript = (
-    String,
+    crate::config::compaction::Transcript,
     crate::config::compaction::KeepPlan,
     (Option<usize>, Option<usize>, usize),
     String,
@@ -284,15 +284,8 @@ impl Config {
             }
         }
 
-        let mut input = harnx_core::input::Input::new(
-            transcript.clone(),
-            (transcript, vec![]),
-            summarizer_agent,
-        );
-        input.with_session = false;
-        input.with_agent = true;
-
-        let summary = crate::config::input::fetch_chat_text(&mut input, config).await?;
+        let summary =
+            crate::config::compaction::fetch_summary(transcript, summarizer_agent, config).await?;
 
         let summary_with_note = append_recovery_note(summary, covered);
 
@@ -409,24 +402,12 @@ impl Config {
             .enumerate()
             .filter(|(i, _)| !keep_plan.contains(*i))
             .map(|(_, message)| message);
-        let mut transcript = crate::config::compaction::render_transcript(
+        // Keep prior context in the same snapshot and budget as the dropped messages.
+        let transcript = crate::config::compaction::Transcript::new(
             compacted_msgs.clone(),
             params.tool_output_max_chars,
+            session.compaction_summary.as_deref(),
         );
-        // Take prior context from the same session snapshot. Repeated
-        // compaction must carry completed work forward, not replace it with the tail.
-        if let Some(summary) = session
-            .compaction_summary
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
-            transcript = format!(
-                "{}Earlier compaction summary:\n{}\n\n---\n\n{}",
-                crate::config::session::RUNTIME_NOTE_PREFIX,
-                summary,
-                transcript
-            );
-        }
         let from = compacted_msgs.clone().filter_map(|m| m.log_seq).min();
         let to = compacted_msgs.filter_map(|m| m.log_seq).max();
         Ok((
@@ -512,7 +493,10 @@ mod tests {
                 plan.prompt_idx, expected_prompt,
                 "limit={limit:?}, configured={configured:?}"
             );
-            assert_eq!(transcript.contains("word word"), expected_prompt.is_none());
+            assert_eq!(
+                transcript.fit(usize::MAX).contains("word word"),
+                expected_prompt.is_none()
+            );
         }
     }
 
