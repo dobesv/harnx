@@ -253,6 +253,7 @@ async fn reap_predicate_rejects_buffered_mailbox_commands() {
         reap_ttl: Duration::from_millis(50),
         reap_deadline: Some(Instant::now() - Duration::from_millis(1)),
         history_snapshot: Vec::new(),
+        compaction: None,
         history_warnings: Vec::new(),
         log_entries: None,
         tokens_usage: None,

@@ -278,14 +278,19 @@ impl HarnxAgent {
                 "ACP client connection unavailable for session replay"
             ))
         })?;
-        let entries = self.load_scoped_entries(&session_id).await?;
+        let raw = self.load_raw_scoped_entries(&session_id).await?;
+        let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)
+            .context("failed to reconstruct durable session transcript")
+            .map_err(acp_error)?;
         let (sink, drain_rx) = AcpEventSink::for_replay(session_id.clone(), self.cluster.clone());
         let sink = Arc::new(sink);
         let drain_handle = tokio::spawn(drain_updates(Some(connection), drain_rx));
 
-        harnx_runtime::replay_entries_to_sink(&entries, sink.clone());
+        let replay =
+            harnx_runtime::replay_default_view_to_sink(&raw, 0, &HashMap::new(), sink.clone());
         sink.signal_complete();
         finish_update_drain(drain_handle).await;
+        replay.map_err(acp_error)?;
 
         // Establish session context for subsequent prompt/cancel operations
         self.establish_session_context(&session_id, &entries)
@@ -349,6 +354,16 @@ impl HarnxAgent {
         &self,
         session_id: &str,
     ) -> acp::Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
+        let raw = self.load_raw_scoped_entries(session_id).await?;
+        harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)
+            .context("failed to reconstruct durable session transcript")
+            .map_err(acp_error)
+    }
+
+    async fn load_raw_scoped_entries(
+        &self,
+        session_id: &str,
+    ) -> acp::Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
         let (_route, global_config) = self.backend_config().await?;
         let config = global_config.read().clone();
         let agent_ref = self.scoped_agent_ref()?;
@@ -357,14 +372,10 @@ impl HarnxAgent {
                 .await
                 .context("failed to resolve scoped session identity")
                 .map_err(acp_error)?;
-        let entries =
-            harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, metadata.storage_key())
-                .load_events_async()
-                .await
-                .context("failed to load durable session transcript")
-                .map_err(acp_error)?;
-        harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)
-            .context("failed to reconstruct durable session transcript")
+        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, metadata.storage_key())
+            .load_events_async()
+            .await
+            .context("failed to load durable session transcript")
             .map_err(acp_error)
     }
 

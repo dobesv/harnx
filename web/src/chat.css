@@ -1689,3 +1689,91 @@ body {
     padding: 1rem;
   }
 }
+
+/* Compaction Marker */
+.aui-compaction-marker {
+  align-self: stretch;
+  width: 100%;
+  margin: 1.5rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.aui-compaction-divider {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  width: 100%;
+}
+
+.aui-compaction-divider-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.aui-compaction-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.65rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted, var(--text));
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  user-select: none;
+}
+
+.aui-compaction-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  padding: 0.85rem 1.1rem;
+  box-shadow: var(--shadow);
+}
+
+.aui-compaction-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.aui-compaction-title {
+  margin: 0;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-h);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.aui-compaction-hint {
+  font-size: 0.75rem;
+  color: var(--text-muted, var(--text));
+}
+
+.aui-compaction-summary {
+  font-size: 0.92rem;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.aui-compaction-summary .overflow-x-auto {
+  outline: none;
+}
+
+.aui-compaction-summary .overflow-x-auto:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-md);
+}

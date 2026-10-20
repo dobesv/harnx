@@ -1,7 +1,8 @@
 # Shared compaction transcript
 
 `compaction-history.json` is the single fixture for transcript parity tests in
-Rust and web. It's already the JSON export: an array of `[physical_seq, entry]`
+Rust and web. New D2/D3/D4 parity tests must import this file and assert against
+the expected default-view sequences documented below. It's already the JSON export: an array of `[physical_seq, entry]`
 pairs using `SessionLogEntry`'s serde format. Import this file directly rather
 than maintaining a second web copy.
 
@@ -64,6 +65,6 @@ From a test under `web/src/__tests__/`:
 import entries from '../../../crates/harnx-core/tests/fixtures/compaction-history.json';
 ```
 
-Backend view types are serializable as `{ compaction, entries }`. D2–D4 tests
-can use this raw fixture to construct their adapter-specific snapshots. No UI
-snapshot format or HTTP API is introduced by D1.
+Backend view types are serializable as `{ compaction, entries }`. D2–D4 web tests
+can use this raw fixture to construct their adapter-specific snapshots. New Rust parity
+tests (serve/TUI/CLI) should use the example above.

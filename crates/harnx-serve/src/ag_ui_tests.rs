@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 mod handoff_tests;
 #[path = "ag_ui_lifecycle_tests.rs"]
 mod lifecycle_tests;
+#[path = "ag_ui_tests/promptless_history.rs"]
+mod promptless_history;
 #[path = "ag_ui_remote_follow_tests.rs"]
 mod remote_follow_tests;
 
@@ -39,6 +41,15 @@ fn assert_event_type_sequence(events: &[Value], expected: &[&str]) {
         .map(|event| event["type"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(event_types, expected);
+}
+
+fn assert_compaction_cleared(event: &Value) {
+    assert_eq!(
+        event,
+        &json!({
+            "type": "CUSTOM", "name": "session_compaction", "value": { "compaction": null },
+        })
+    );
 }
 
 fn assert_attach_boundary(event: &Value, attached_seq: u64) {
@@ -1162,6 +1173,7 @@ fn ag_ui_sink_maps_compaction_completed_to_custom_and_snapshot() {
         }
         other => panic!("expected compaction custom, got: {other:?}"),
     }
+    assert_compaction_cleared(&serde_json::to_value(rx.try_recv().expect("metadata")).unwrap());
     match rx.try_recv().expect("snapshot") {
         Event::MessagesSnapshot(event) => {
             assert_eq!(event.messages.len(), 1);
@@ -1231,6 +1243,7 @@ fn ag_ui_sink_maps_compaction_events_with_compaction_id_and_outcome() {
         other => panic!("expected completed custom, got: {other:?}"),
     }
     // Snapshot follows completed
+    assert_compaction_cleared(&serde_json::to_value(rx.try_recv().expect("metadata")).unwrap());
     match rx.try_recv().expect("snapshot") {
         Event::MessagesSnapshot(_) => {}
         other => panic!("expected MessagesSnapshot, got: {other:?}"),
@@ -1892,7 +1905,13 @@ async fn ag_ui_run_idle_join_snapshot_and_close() {
     .await;
     assert_event_type_sequence(
         &events,
-        &["RUN_STARTED", "CUSTOM", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
+        &[
+            "RUN_STARTED",
+            "CUSTOM",
+            "CUSTOM",
+            "MESSAGES_SNAPSHOT",
+            "RUN_FINISHED",
+        ],
     );
 }
 
@@ -1951,120 +1970,12 @@ async fn ag_ui_run_empty_messages_join_only_snapshot_no_new_run() {
     )
     .await
     .expect("join only");
-    let events = read_sse_events_until(response, |events| events.len() >= 4).await;
+    let events = read_sse_events_until(response, |events| events.len() >= 5).await;
     assert_eq!(events[0]["type"], "RUN_STARTED");
     assert_eq!(events[1]["name"], "session_attach_boundary");
-    assert_eq!(events[2]["type"], "MESSAGES_SNAPSHOT");
-    assert_eq!(events[3]["type"], "RUN_FINISHED");
-}
-
-#[tokio::test]
-async fn ag_ui_run_promptless_join_returns_persisted_history_in_snapshot() {
-    // Issue #959: promptless join must return MESSAGES_SNAPSHOT with prior history.
-    // Previously Subscribe sent stale (empty) snapshot; now it refreshes first.
-    let sandbox = TestConfigSandbox::new();
-    sandbox.write_agent("plain", "You are plain.");
-    let config = sandbox.config();
-    let session_id = "promptless-history-session";
-
-    // First run: user + assistant message to seed history
-    let first_body = json!({
-        "threadId": Uuid::new_v4(),
-        "runId": Uuid::new_v4(),
-        "messages": [{
-            "id": Uuid::new_v4(),
-            "role": "user",
-            "content": "first user prompt"
-        }]
-    });
-    let first_call_fn: AgentCallFn = Arc::new(|_input, _config, _abort| {
-        Box::pin(async {
-            let usage = CompletionTokenUsage::new(Some(1), Some(1), Some(0));
-            Ok(("first assistant reply".into(), None, vec![], usage))
-        })
-    });
-    let registry = ag_ui_test_registry(&config, Some(first_call_fn));
-    let first_response = ag_ui_run_with_call_fn(
-        &config,
-        &registry,
-        "plain",
-        session_id,
-        &serde_json::to_vec(&first_body).unwrap(),
-        None,
-    )
-    .await
-    .expect("first run");
-    let _ = read_sse_events_until(first_response, |events| {
-        events
-            .iter()
-            .any(|event| event["type"].as_str() == Some("RUN_FINISHED"))
-    })
-    .await;
-
-    // Promptless join: empty messages array
-    let join_body = json!({
-        "threadId": Uuid::new_v4(),
-        "runId": Uuid::new_v4(),
-        "messages": []
-    });
-    let response = ag_ui_run_with_call_fn(
-        &config,
-        &registry,
-        "plain",
-        session_id,
-        &serde_json::to_vec(&join_body).unwrap(),
-        None,
-    )
-    .await
-    .expect("promptless join");
-    let events = read_sse_events_until(response, |events| events.len() >= 4).await;
-
-    assert_eq!(events[0]["type"], "RUN_STARTED");
-    assert_eq!(events[1]["name"], "session_attach_boundary");
-    assert_eq!(events[2]["type"], "MESSAGES_SNAPSHOT");
-    assert_eq!(events[3]["type"], "RUN_FINISHED");
-
-    // Verify snapshot contains the seeded history (at minimum user + assistant)
-    let snapshot = &events[2]["messages"];
-    assert!(
-        snapshot.is_array(),
-        "MESSAGES_SNAPSHOT should have messages array"
-    );
-    let messages = snapshot.as_array().expect("messages array");
-    assert!(
-        messages.len() >= 2,
-        "snapshot should have at least user + assistant"
-    );
-
-    // Find user and assistant messages by role (history may include system/tool entries)
-    let user_msg = messages
-        .iter()
-        .find(|m| m["role"] == "user")
-        .expect("should find user message in snapshot");
-    assert_eq!(
-        user_msg["content"].as_str().unwrap_or(""),
-        "first user prompt"
-    );
-
-    let assistant_msg = messages
-        .iter()
-        .find(|m| m["role"] == "assistant")
-        .expect("should find assistant message in snapshot");
-    // Content may be null for empty-text assistant messages in snapshot
-    let content = assistant_msg["content"].as_str().unwrap_or("");
-    assert!(
-        content == "first assistant reply"
-            || content.is_empty()
-            || assistant_msg["content"].is_null(),
-        "assistant content should match or be empty: got {:?}",
-        assistant_msg["content"]
-    );
-
-    // Synthetic RUN_FINISHED must NOT have 'result' key (per P1 spec)
-    assert!(
-        events[2].get("result").is_none(),
-        "promptless synthetic RUN_FINISHED must not have result key"
-    );
+    assert_compaction_cleared(&events[2]);
+    assert_eq!(events[3]["type"], "MESSAGES_SNAPSHOT");
+    assert_eq!(events[4]["type"], "RUN_FINISHED");
 }
 
 #[tokio::test]
@@ -3537,7 +3448,13 @@ async fn ag_ui_run_empty_last_user_message_joins_only_and_does_not_start_run() {
     assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_event_type_sequence(
         &read.events,
-        &["RUN_STARTED", "CUSTOM", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
+        &[
+            "RUN_STARTED",
+            "CUSTOM",
+            "CUSTOM",
+            "MESSAGES_SNAPSHOT",
+            "RUN_FINISHED",
+        ],
     );
     assert!(
         load_session_messages(&config, "plain", "empty-last-user").is_empty(),

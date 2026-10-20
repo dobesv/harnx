@@ -84,7 +84,7 @@ never used as a persistence or routing key.
 | `GET` | `/v1/agents/:agent` | `application/json` | Agent details (name, description, active sessions). |
 | `GET` | `/v1/agents/:agent/sessions` | `application/json` | List sessions for the agent. |
 | `POST` | `/v1/agents/:agent/sessions` | `application/json` | Reserve a canonical short session ID. |
-| `GET` | `/v1/agents/:agent/sessions/:session` | `application/json` | Session history in AG-UI format. |
+| `GET` | `/v1/agents/:agent/sessions/:session` | `application/json` | Session history in AG-UI format. Compacted sessions include `compaction` metadata and a synthetic assistant marker message. |
 | `GET` | `/v1/agents/:agent/sessions/:session/metadata` | `application/json` | Read redacted canonical session metadata. |
 | `PATCH` | `/v1/agents/:agent/sessions/:session/metadata` | `application/json` | Update title, variables, or explicit session overrides. |
 | `PUT` | `/v1/agents/:agent/sessions/:session/metadata/extensions/:namespace` | `application/json` | Atomically replace one extension namespace. |
@@ -215,7 +215,7 @@ Provides AG-UI events for a run. The body's **last message** selects the mode:
   agent/global timeout policy. A deadline stop ends the stream with `RUN_ERROR`;
   manual cancellation still ends with `RUN_FINISHED`.
 - **Promptless join** (no non-empty trailing user message): hydrates with a
-  synthetic `RUN_STARTED` → `session_attach_boundary` → `MESSAGES_SNAPSHOT`.
+  synthetic `RUN_STARTED` → `session_attach_boundary` → `session_compaction` → `MESSAGES_SNAPSHOT`.
   For an idle session it appends
   a synthetic `RUN_FINISHED` and closes; for a running or interrupted session it
   follows that run's live events through the real terminal event.
@@ -242,7 +242,9 @@ Same canonical session URL, negotiated into programmatic control.
   ```json
   { "jsonrpc": "2.0", "id": 1, "method": "session/get" }
   ```
-  **Result:** `{ "state": { … }, "history_snapshot": [...], "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }`
+  **Result:** `{ "state": { … }, "history_snapshot": [...], "compaction": { … }, "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }`
+  `compaction` is optional and omitted until the session has been compacted. See
+  [Compacted history snapshots](#compacted-history-snapshots) for its shape.
 
   `state` is one of five shapes, derived from the durable session log (plus the
   session lease, so a turn this server never started is still reported as
@@ -367,6 +369,67 @@ See `ag_ui_lifecycle.rs` for the guard implementation and
 Cross-process live synchronization and durable session persistence use NATS.
 
 
+### Compacted history snapshots
+
+`session/get` returns the shared default transcript view: the latest compaction
+summary, followed by kept messages and later activity. Archived messages aren't
+rendered inline. Even a compaction that kept no messages has one summary row.
+The summary is an ordinary AG-UI assistant message with string `content`, so
+history consumers that only read `role` and `content` can display it unchanged.
+
+Example result excerpt after the first compaction in the shared history fixture:
+
+```json
+{
+  "history_snapshot": [
+    {
+      "id": "a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3",
+      "role": "assistant",
+      "content": "The session log stores tool calls and results separately. No messages were kept."
+    }
+  ],
+  "compaction": {
+    "message_id": "a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3",
+    "compaction_seq": 5,
+    "summary": "The session log stores tool calls and results separately. No messages were kept.",
+    "from_seq": 1,
+    "to_seq": 4,
+    "kept_count": 0
+  }
+}
+```
+
+`message_id` is a deterministic UUIDv5 using the existing `wire_message_id`
+namespace (URL namespace, name `harnx-message:compaction:<compaction_seq>`).
+Identify the summary row by matching `compaction.message_id`, not by an ID
+prefix. `summary` excludes the trailing runtime recovery note. `from_seq` and
+`to_seq` are inclusive archive bounds, excluding compaction markers; an empty
+archive has `from_seq > to_seq`. Optional `earlier_compaction` identifies the
+previous compaction. Optional `kept_count` is omitted when unknown; clients
+mustn't rely on it being present.
+
+Every live, attach, and lag-recovery snapshot is preceded immediately by:
+
+```json
+{
+  "type": "CUSTOM",
+  "name": "session_compaction",
+  "value": { "compaction": null }
+}
+```
+
+For a compacted session, replace `null` with the same `compaction` object as
+`session/get`; the following `MESSAGES_SNAPSHOT.messages` contains the same
+summary-first view. `null` clears stale compaction metadata after a session
+switch or rewind. `session/get` instead omits the field when uncompacted.
+Prompted attaches still omit the initial snapshot and metadata pair.
+
+`session_compacting_completed` retains `outcome` and optional `compaction_id`,
+and adds optional `summary`, `from_seq`, `to_seq`, and `compaction_seq` from
+the current view. The completed event precedes `session_compaction` and
+`MESSAGES_SNAPSHOT`. Without an available compaction marker, those four fields
+are omitted.
+
 ### AgentEvent → AG-UI mapping
 
 | harnx `AgentEvent` | AG-UI event(s) | Notes |
@@ -379,7 +442,7 @@ Cross-process live synchronization and durable session persistence use NATS.
 | `Turn::RetryAttempt` / `ModelFallback` / `HandoffRequested` | `CUSTOM` | Names: `turn_retry_attempt`, `turn_model_fallback`, `turn_handoff_requested`. A handoff request is informational; clients must not navigate on it. Navigation uses the static handoff row from the tool result marker or the confirmed `session_handoff` event. |
 | `Session::HandoffCommitted` | `CUSTOM` | Name: `session_handoff`. Emitted only after the target prompt is accepted for dispatch, with nonempty `agent`, resolved `session_id`, optional `handoff_tool_call_id`, and optional durable `after_seq`. Hydration always sets `after_seq` from the handoff log entry's sequence. |
 | Attach boundary | `CUSTOM` | Name: `session_attach_boundary`. Emitted immediately after `RUN_STARTED` with `attached_seq` set to the durable log tail observed at attach time, before snapshot, hydrated control, or live events. |
-| `Session::Compacting*` | `CUSTOM` (+ `MESSAGES_SNAPSHOT` on completed) | Names: `session_compacting_started`, `session_compacting_completed`, `session_compacting_failed`. Completion re-snapshots transcript because compaction mutates history. |
+| `Session::Compacting*` | `CUSTOM` (+ `MESSAGES_SNAPSHOT` on completed) | Names: `session_compacting_started`, `session_compacting_completed`, `session_compacting_failed`. Completion adds optional `summary`, `from_seq`, `to_seq`, `compaction_seq`, then emits `session_compaction` metadata and re-snapshots the transcript. |
 | `Session::TitleUpdated` / `TitleGenerationFailed` | `CUSTOM` | Names: `session_title_updated`, `session_title_generation_failed`. |
 | `Session::Saved` / `AgentInitializing` / `ModelChanged` / `RagIndexing` / `Generic` | `CUSTOM` | Stable names prefixed with `session_...`. |
 | `Session::LogSeqAssigned` | dropped | Persistence bookkeeping for local transcript patching; not useful on AG-UI wire. |

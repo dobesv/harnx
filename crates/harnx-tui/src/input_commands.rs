@@ -209,13 +209,12 @@ impl Tui {
             .load_events_async()
             .await
             .with_context(|| format!("Failed to load NATS session '{session_id}'"))?;
+        if matches!(format, SessionFormat::Text) {
+            return crate::session_overlay::render_transcript_text(&raw);
+        }
         let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
-
         match format {
-            SessionFormat::Text => {
-                let lines = crate::session_overlay::render_transcript_text(&entries);
-                Ok(lines)
-            }
+            SessionFormat::Text => unreachable!(),
             SessionFormat::Yaml => dump_entries_yaml(entries.iter().map(|(_, e)| e)),
             SessionFormat::Json => dump_entries_jsonl(entries.iter().map(|(_, e)| e)),
         }

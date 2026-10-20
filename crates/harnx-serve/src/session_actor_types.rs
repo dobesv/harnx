@@ -1,3 +1,4 @@
+pub use crate::transcript_snapshot::SessionCompaction;
 use ag_ui_core::types::ids::RunId;
 use ag_ui_core::{event::Event, types::message::Message as AgUiMessage};
 use chrono::{DateTime, Utc};
@@ -251,6 +252,7 @@ mod identity_tests {
 }
 pub struct SubscribeResult {
     pub snapshot: Vec<AgUiMessage>,
+    pub compaction: Option<SessionCompaction>,
     pub history_warnings: Vec<String>,
     pub state: SessionState,
     pub events: broadcast::Receiver<Event>,
@@ -285,6 +287,7 @@ pub struct SessionInfo {
     /// even when `state` has no run this server started.
     pub worker_active: bool,
     pub history_snapshot: Vec<AgUiMessage>,
+    pub compaction: Option<SessionCompaction>,
     pub history_warnings: Vec<String>,
     pub capabilities: SessionCapabilities,
 }

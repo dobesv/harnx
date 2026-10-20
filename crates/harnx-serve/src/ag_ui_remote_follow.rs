@@ -42,7 +42,7 @@ use crate::ag_ui::{GuardedEventStream, UsageContextSnapshot};
 
 use crate::{
     ag_ui::{frame_event, AgUiError, AgUiSink},
-    ag_ui_attach::{session_attach_boundary_event, snapshot_event},
+    ag_ui_attach::session_attach_boundary_event,
     ag_ui_sync::{frame_run_boundary_event, frame_run_error_event, history_warning_event},
     session_actor::SubscribeResult,
 };
@@ -168,15 +168,19 @@ struct RemoteFollowStreamParams<'a> {
 async fn build_remote_follow_ag_ui_stream(
     params: RemoteFollowStreamParams<'_>,
 ) -> Result<GuardedEventStream, AgUiError> {
-    let initial_events = std::iter::once(snapshot_event(params.subscription.snapshot.clone()))
-        .chain(
-            params
-                .subscription
-                .history_warnings
-                .iter()
-                .cloned()
-                .map(history_warning_event),
-        );
+    let initial_events = crate::transcript_snapshot::snapshot_events(
+        params.subscription.snapshot.clone(),
+        params.subscription.compaction.as_ref(),
+    )
+    .into_iter()
+    .chain(
+        params
+            .subscription
+            .history_warnings
+            .iter()
+            .cloned()
+            .map(history_warning_event),
+    );
     let initial_frames = initial_events
         .filter_map(|event| {
             frame_event(&event)
@@ -433,7 +437,8 @@ async fn remote_follow_task(params: FollowTaskParams) -> Result<RemoteFollowTerm
 
 async fn follow_remote_turn(mut params: FollowTaskParams) -> Result<RemoteFollowTerminal> {
     let tx_for_close = params.tx.clone();
-    let mut forwarder = AdvisoryForwarder::new(params.tx);
+    let mut forwarder =
+        AdvisoryForwarder::new(params.tx).with_session_base(params.session_base.clone());
     let mut poller = RemoteTurnPoller::new(
         params.jetstream,
         params.session_id.clone(),
@@ -447,8 +452,8 @@ async fn follow_remote_turn(mut params: FollowTaskParams) -> Result<RemoteFollow
         tokio::select! {
             envelope = params.event_stream.next() => {
                 if !forwarder
-                    .forward(&params.event_stream, envelope, &params.session_id)
-                    .await
+                    .forward(&mut params.event_stream, envelope, &params.session_id)
+                    .await?
                 {
                     break Ok(RemoteFollowTerminal::Finished);
                 }
@@ -476,6 +481,7 @@ pub(crate) struct AdvisoryForwarder {
     sink: AgUiSink,
     event_rx: UnboundedReceiver<Event>,
     tx: tokio::sync::mpsc::Sender<QueuedEvent>,
+    session_base: harnx_core::session::Session,
 }
 
 impl AdvisoryForwarder {
@@ -486,28 +492,69 @@ impl AdvisoryForwarder {
             sink: AgUiSink::new_for_remote_follow(event_tx, message_id),
             event_rx,
             tx,
+            session_base: Default::default(),
         }
+    }
+
+    fn with_session_base(mut self, base: Option<harnx_core::session::Session>) -> Self {
+        self.session_base = base.unwrap_or_default();
+        self
     }
 
     async fn forward(
         &mut self,
-        event_stream: &SessionEventStream,
+        event_stream: &mut SessionEventStream,
         envelope: Option<AdvisoryEnvelope>,
         session_id: &str,
-    ) -> bool {
+    ) -> Result<bool> {
         let Some(envelope) = envelope else {
             log::debug!("Remote advisory subscription closed for session {session_id}");
-            return false;
+            return Ok(false);
         };
         if !event_stream.should_render(&envelope) {
-            return true;
+            return Ok(true);
         }
         // Carry the advisory's sequence with the frames it maps to: the queue
         // re-checks it against the fence when they reach the wire, which may be
         // long after an interrupt has landed.
         let after_seq = envelope.after_seq;
-        self.sink.emit(envelope.event);
-        self.drain_events(after_seq).await
+        if matches!(
+            envelope.event,
+            harnx_core::event::AgentEvent::Session(
+                harnx_core::event::SessionEvent::CompactingCompleted { .. }
+            )
+        ) {
+            // Advisory receipt advances generation state, not durable history.
+            if let Err(error) = event_stream.refresh_history().await {
+                log::warn!(
+                    "Failed to refresh compaction history for session {session_id}: {error:#}"
+                );
+            }
+        }
+        self.emit_with_history(envelope.event, event_stream.history());
+        Ok(self.drain_events(after_seq).await)
+    }
+
+    fn emit_with_history(
+        &self,
+        event: harnx_core::event::AgentEvent,
+        history: &[(u64, SessionLogEntry)],
+    ) {
+        let harnx_core::event::AgentEvent::Session(
+            completed @ harnx_core::event::SessionEvent::CompactingCompleted { .. },
+        ) = event
+        else {
+            self.sink.emit(event);
+            return;
+        };
+        let snapshot = crate::transcript_snapshot::HistorySnapshot::from_entries(
+            history,
+            &self.session_base,
+            true,
+        )
+        .map_err(|error| log::warn!("Failed to refresh compacted transcript: {error:#}"))
+        .ok();
+        self.sink.emit_compacting_completed(completed, snapshot);
     }
 
     async fn drain_events(&mut self, after_seq: u64) -> bool {
@@ -657,3 +704,6 @@ impl AgUiSink {
         Self::with_snapshot(tx, message_id, false, None)
     }
 }
+
+#[cfg(test)]
+mod compaction_tests;

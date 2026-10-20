@@ -24,6 +24,8 @@ import { MessageAttachments } from './MessageAttachments';
 import { sendPrompt, submitHitlDecision, uploadAttachment, markRead, markUnread } from './api';
 import { CancellationContext, type CancellationControl } from './CancellationContext';
 import { CompactionContext } from './CompactionContext';
+import { useCompactionMetadata } from './CompactionMetadataContext';
+import { CompactionMarker } from './CompactionMarker';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import { AttachIcon, SendIcon, StopIcon } from './icons';
@@ -75,8 +77,18 @@ export const MessageContent = () => (
 
 // eslint-disable-next-line react-refresh/only-export-components
 export const MyMessage = () => {
+  const messageId = useAuiState((s) => s.message.id);
+  const compactionMetadata = useCompactionMetadata();
+  if (compactionMetadata && compactionMetadata.message_id === messageId) {
+    return <CompactionMarker metadata={compactionMetadata} />;
+  }
+  return <ChatMessage />;
+};
+
+const ChatMessage = () => {
   const role = useAuiState((s) => s.message.role);
   const messageId = useAuiState((s) => s.message.id);
+
   // An assistant message with no parts still gets .aui-message padding, so it
   // shows up as a blank gap in the transcript. The promptless subscribe that
   // hydrates a session leaves one behind: assistant-ui creates the message
@@ -88,6 +100,7 @@ export const MyMessage = () => {
   );
   const [systemExpanded, setSystemExpanded] = useState(false);
   const { notes, openSession } = useContext(SubAgentNotesContext);
+
   const messageNotes = role === 'assistant'
     ? notes.filter((note) => note.parentMessageId === messageId)
     : [];

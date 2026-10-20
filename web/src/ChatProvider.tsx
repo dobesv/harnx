@@ -1,6 +1,8 @@
 import { CancellationContext } from './CancellationContext';
 import { useCancellation } from './useCancellation';
 import { CompactionContext, compactionAfterRunTerminal, type CompactionPhase } from './CompactionContext';
+import { CompactionMetadataContext } from './CompactionMetadataContext';
+import type { CompactionMetadata } from './compactionMetadata';
 import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
@@ -108,6 +110,7 @@ export interface HarnxHttpAgentOptions {
   onCompactingStarted?: (compactionId?: string) => void;
   onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
   onCompactingFailed?: (error: string, compactionId?: string) => void;
+  onSessionCompaction?: (compaction: CompactionMetadata | null) => void;
   onToolUpdate?: (patch: import('./toolUpdates').ToolCallUpdatePatch) => void;
   onRunTerminal?: () => void;
   onTurnInterrupted?: () => void;
@@ -144,6 +147,7 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onCompactingStarted?: (compactionId?: string) => void;
   private readonly onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
   private readonly onCompactingFailed?: (error: string, compactionId?: string) => void;
+  private readonly onSessionCompaction?: (compaction: CompactionMetadata | null) => void;
   private readonly onToolUpdate?: (patch: import('./toolUpdates').ToolCallUpdatePatch) => void;
   private readonly onRunTerminalCb?: () => void;
   private readonly onTurnInterruptedCb?: () => void;
@@ -163,6 +167,7 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onCompactingStarted = options.onCompactingStarted;
     this.onCompactingCompleted = options.onCompactingCompleted;
     this.onCompactingFailed = options.onCompactingFailed;
+    this.onSessionCompaction = options.onSessionCompaction;
     this.onToolUpdate = options.onToolUpdate;
     this.onRunTerminalCb = options.onRunTerminal;
     this.onTurnInterruptedCb = options.onTurnInterrupted;
@@ -189,6 +194,7 @@ export class HarnxHttpAgent extends HttpAgent {
       onCompactingStarted: this.onCompactingStarted,
       onCompactingCompleted: this.onCompactingCompleted,
       onCompactingFailed: this.onCompactingFailed,
+      onSessionCompaction: this.onSessionCompaction,
       onToolUpdate: this.onToolUpdate,
       onTurnInterrupted: () => {
         this.onTurnInterruptedCb?.();
@@ -295,6 +301,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [usage, setUsage] = useState<UsageData | null>(null);
   const [toolSummaries, setToolSummaries] = useState<Map<string, string>>(new Map());
+  const [compactionMetadata, setCompactionMetadata] = useState<CompactionMetadata | null>(null);
   const [compactionPhase, setCompactionPhase] = useState<{ phase: CompactionPhase; compactionId?: string }>({ phase: 'idle' });
   const [subAgentState, dispatchSubAgentEvent] = useReducer(
     reduceSubAgentNotes,
@@ -425,6 +432,9 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       setCompactionPhase({ phase: 'failed' });
       setErrorText(error);
     },
+    onSessionCompaction: (metadata) => {
+      setCompactionMetadata(metadata);
+    },
     onToolUpdate: (patch: ToolCallUpdatePatch) => {
       dispatchToolUpdate({ type: 'TOOL_UPDATE', patch });
     },
@@ -441,6 +451,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     setStatusText(null);
     setErrorText(null);
     setStatusMessage(null);
+    setCompactionMetadata(null);
     setCompactionPhase({ phase: 'idle' });
     dispatchSubAgentEvent({ type: 'RESET' });
     dispatchAttachments({ type: 'RESET', agent: agentName, session: sessionId });
@@ -467,6 +478,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   return (
     <CancellationContext.Provider value={cancellation}>
     <CompactionContext.Provider value={compactionPhase}>
+    <CompactionMetadataContext.Provider value={compactionMetadata}>
     <SessionNavigationContext.Provider value={sessionNavigationContext}>
     <SubAgentNotesContext.Provider value={subAgentContext}>
     <MessageAttachmentsContext.Provider value={messageAttachmentsContext}>
@@ -492,6 +504,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     </MessageAttachmentsContext.Provider>
     </SubAgentNotesContext.Provider>
     </SessionNavigationContext.Provider>
+    </CompactionMetadataContext.Provider>
     </CompactionContext.Provider>
     </CancellationContext.Provider>
   );

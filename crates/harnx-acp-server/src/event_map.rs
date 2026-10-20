@@ -58,6 +58,11 @@ pub fn agent_event_to_replay_update(
         AgentEvent::Model(ModelEvent::Final { output, .. }) => {
             text_chunk(output, false).map(SessionUpdate::AgentMessageChunk)
         }
+        // Default-view replay carries its compaction marker as an Info notice.
+        // Keep live Info filtering unchanged.
+        AgentEvent::Notice(NoticeEvent::Info(message)) => {
+            text_chunk(message, false).map(SessionUpdate::AgentMessageChunk)
+        }
         event => agent_event_to_update_inner(event, source_cluster, false),
     }
 }

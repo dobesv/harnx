@@ -21,6 +21,7 @@ import { sendPrompt, uploadAttachment, submitHitlDecision, markRead } from '../a
 import { PendingContext } from '../PendingContext';
 import { UsageContext } from '../UsageContext';
 import { MessageAttachmentsContext } from '../MessageAttachmentsContext';
+import { CompactionMetadataContext } from '../CompactionMetadataContext';
 import * as agUi from '@assistant-ui/react-ag-ui';
 import * as aui from '@assistant-ui/react';
 import { vi } from 'vitest';
@@ -74,7 +75,7 @@ vi.mock('@assistant-ui/react', async (importOriginal) => {
       ),
     },
     MessagePrimitive: {
-      Root: ({ className, children }: any) => <div className={className}>{children}</div>,
+      Root: ({ className, children, ...props }: any) => <div className={className} {...props}>{children}</div>,
       Content: () => null,
     },
   };
@@ -882,5 +883,87 @@ describe('MyMessage attachment rendering', () => {
       'src',
       '/v1/agents/agent-1/sessions/session-1/attachments/cid%3Aimg456',
     );
+  });
+});
+
+describe('MyMessage compaction marker rendering', () => {
+  const compaction = {
+    message_id: 'a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3',
+    compaction_seq: 5,
+    summary: 'The session log stores tool calls and results separately. No messages were kept.',
+    from_seq: 1,
+    to_seq: 4,
+    kept_count: 0,
+  };
+
+  it('renders synthetic assistant message as a compaction marker when message.id === compaction.message_id', () => {
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) =>
+      selector({
+        message: {
+          id: 'a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3',
+          role: 'assistant',
+          content: [
+            {
+              type: 'text',
+              text: 'The session log stores tool calls and results separately. No messages were kept.',
+            },
+          ],
+        },
+      }),
+    );
+
+    render(
+      <CompactionMetadataContext.Provider value={compaction}>
+        <MyMessage />
+      </CompactionMetadataContext.Provider>,
+    );
+
+    expect(screen.getByTestId('compaction-marker')).toBeInTheDocument();
+    expect(screen.getByTestId('compaction-summary')).toBeInTheDocument();
+    expect(screen.getByText('Compaction')).toBeInTheDocument();
+    expect(screen.getByText('Summary of earlier conversation')).toBeInTheDocument();
+    expect(screen.getByText('Earlier history archived')).toBeInTheDocument();
+  });
+
+  it('renders normal assistant reply when message.id !== compaction.message_id', () => {
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) =>
+      selector({
+        message: {
+          id: 'regular-assistant-reply',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Normal assistant response' }],
+        },
+      }),
+    );
+
+    const { container } = render(
+      <CompactionMetadataContext.Provider value={compaction}>
+        <MyMessage />
+      </CompactionMetadataContext.Provider>,
+    );
+
+    expect(screen.queryByTestId('compaction-marker')).not.toBeInTheDocument();
+    expect(container.querySelector('.aui-assistant-message')).toBeInTheDocument();
+  });
+
+  it('renders normal assistant reply when compaction is null', () => {
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) =>
+      selector({
+        message: {
+          id: 'a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Some text' }],
+        },
+      }),
+    );
+
+    const { container } = render(
+      <CompactionMetadataContext.Provider value={null}>
+        <MyMessage />
+      </CompactionMetadataContext.Provider>,
+    );
+
+    expect(screen.queryByTestId('compaction-marker')).not.toBeInTheDocument();
+    expect(container.querySelector('.aui-assistant-message')).toBeInTheDocument();
   });
 });

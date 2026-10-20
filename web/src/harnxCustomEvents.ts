@@ -2,6 +2,8 @@ import type { UsageData } from './UsageContext';
 import { setDocumentTitle } from './sessionTitle';
 import type { ToolCallUpdatePatch } from './toolUpdates';
 import { parseToolUpdateEvent } from './toolUpdates';
+import { parseCompactionMetadata, type CompactionMetadata } from './compactionMetadata';
+export { parseCompactionMetadata } from './compactionMetadata';
 
 /**
  * Internal Harnx control and metadata events that drive navigation, sequencing,
@@ -15,6 +17,7 @@ export const NAVIGATION_CONTROL_EVENTS = [
   'session_attach_boundary',
   'session_handoff',
   'message_attachments',
+  'session_compaction',
 ] as const;
 
 export interface MessageAttachmentMeta {
@@ -45,6 +48,8 @@ export interface HarnxCustomEventCallbacks {
   onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
   /** Called when session_compacting_failed is received. */
   onCompactingFailed?: (error: string, compactionId?: string) => void;
+  /** Called when session_compaction CUSTOM event is received. */
+  onSessionCompaction?: (compaction: CompactionMetadata | null) => void;
   /** Called when a tool_update CUSTOM event is received. */
   onToolUpdate?: (patch: ToolCallUpdatePatch) => void;
   /** Called when turn_interrupted is received. */
@@ -219,6 +224,11 @@ const handlers: Record<string, CustomEventHandler> = {
     const error = stringField(value, 'error') || 'Compaction failed';
     const compactionId = stringField(value, 'compaction_id');
     callbacks.onCompactingFailed?.(error, compactionId);
+  },
+  session_compaction: (callbacks, value) => {
+    const rec = eventRecord(value);
+    const compaction = parseCompactionMetadata(rec.compaction);
+    callbacks.onSessionCompaction?.(compaction);
   },
   tool_update: (callbacks, value) => {
     const patch = parseToolUpdateEvent(value);

@@ -67,3 +67,8 @@ pub use harnx_tui::test_utils::TuiTestHarness;
 pub use interrupt::*;
 pub use mock_openai_server::*;
 pub use tmux_harness::*;
+
+#[cfg(unix)]
+pub mod capture;
+#[cfg(unix)]
+pub use capture::capture_output;

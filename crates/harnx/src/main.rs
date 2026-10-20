@@ -1,9 +1,12 @@
 mod agent_event_sink;
 mod cli;
 mod cli_event_sink;
+mod cli_replay_sink;
 mod compact;
 mod main_runtime;
 mod oneshot_nats;
+#[cfg(test)]
+mod session_dump;
 mod tool_cmd;
 
 /// Heap-usage guard installed as the process allocator: aborts with a backtrace
@@ -444,18 +447,21 @@ fn tool_decl_map(config: &Config) -> HashMap<String, harnx_core::tool::ToolDecla
 }
 
 fn new_text_dump_sink() -> Arc<dyn AgentEventSink> {
-    let render_options = harnx_render::RenderOptions::default();
-    let abort_signal = harnx_core::abort::create_abort_signal();
-    Arc::new(crate::cli_event_sink::CliAgentEventSink::new(
-        false,
-        render_options,
-        abort_signal,
-    ))
+    Arc::new(crate::cli_replay_sink::CliReplayEventSink::default())
 }
 
-/// The session's stored entries with edits and rewinds applied, so every
-/// command that reads the transcript sees the same history.
+/// Effective entries for structured exports and loop analysis. Text dumps use
+/// the raw log so the shared view can resolve mutations and compaction ancestry.
 async fn load_session_entries(
+    config: &Config,
+    agent_name: &str,
+    session_id: &str,
+) -> Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
+    let raw = load_raw_session_entries(config, agent_name, session_id).await?;
+    harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)
+}
+
+async fn load_raw_session_entries(
     config: &Config,
     agent_name: &str,
     session_id: &str,
@@ -464,8 +470,7 @@ async fn load_session_entries(
         harnx_runtime::config::session_metadata_for_agent(config, agent_name, session_id).await?;
     let log =
         harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, metadata.storage_key());
-    let raw = log.load_events_async().await?;
-    harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)
+    log.load_events_async().await
 }
 
 async fn run_dump_session_once(
@@ -475,7 +480,12 @@ async fn run_dump_session_once(
 ) -> Result<()> {
     let config = init_frontend_config(WorkingMode::Cmd, true).await?;
     let decl_map = tool_decl_map(&config);
-    let entries = load_session_entries(&config, agent_name, session_id).await?;
+    let entries = match format {
+        harnx_runtime::config::SessionFormat::Text => {
+            load_raw_session_entries(&config, agent_name, session_id).await?
+        }
+        _ => load_session_entries(&config, agent_name, session_id).await?,
+    };
 
     replay_dump_entries(&entries, format, &decl_map, None).await?;
     Ok(())
@@ -559,6 +569,7 @@ async fn flush_new_entries(
     use std::io::Write;
 
     let old_len = stream.history().len();
+    let after_seq = stream.last_applied_seq();
     let refreshed = match stream.refresh_history().await {
         Ok(refreshed) => refreshed,
         Err(error) => {
@@ -566,13 +577,19 @@ async fn flush_new_entries(
             return Ok(());
         }
     };
-    if refreshed {
-        let new_entries = &stream.history()[old_len..];
-        if !new_entries.is_empty() {
-            replay_dump_entries(new_entries, format, decl_map, sink).await?;
-            std::io::stdout().flush()?;
-        }
+    if !refreshed {
+        return Ok(());
     }
+    match format {
+        harnx_runtime::config::SessionFormat::Text => harnx_runtime::replay_default_view_to_sink(
+            stream.history(),
+            after_seq,
+            decl_map,
+            sink.cloned().unwrap_or_else(new_text_dump_sink),
+        )?,
+        _ => replay_dump_entries(&stream.history()[old_len..], format, decl_map, sink).await?,
+    }
+    std::io::stdout().flush()?;
     Ok(())
 }
 
@@ -587,7 +604,7 @@ async fn replay_dump_entries(
     match format {
         SessionFormat::Text => {
             let sink = sink.cloned().unwrap_or_else(new_text_dump_sink);
-            harnx_runtime::replay_entries_to_sink_with_decls(entries, decl_map, sink);
+            harnx_runtime::replay_default_view_to_sink(entries, 0, decl_map, sink)?;
         }
         SessionFormat::Yaml => {
             for (_, entry) in entries {

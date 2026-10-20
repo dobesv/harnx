@@ -1,0 +1,29 @@
+---
+source: crates/harnx-tui/src/session_overlay/compaction_tests.rs
+expression: render(&fixture())
+---
+── Compaction 15: earlier history archived ──
+Earlier log inspection is archived. The latest prompt, verification round and final reply remain verbatim.
+
+── user ──
+Implement the shared transcript view and verify paging.
+
+── tool call ──
+→ exec
+command: cargo nextest run -p harnx-core transcript_view
+
+── chunk ──
+Check the transcript view tests.
+
+── tool result ──
+exit_code: 0
+stdout: Transcript view tests passed.
+
+── assistant ──
+The shared view is implemented. Paging tests passed.
+
+── user ──
+Show the previous compaction's history.
+
+── assistant ──
+The earlier window contains the original prompt and both tool rounds.

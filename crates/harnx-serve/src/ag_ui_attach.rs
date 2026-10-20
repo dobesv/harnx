@@ -37,13 +37,14 @@ pub(crate) fn snapshot_event(messages: Vec<AgUiMessage>) -> Event {
 }
 
 pub(crate) fn initial_attach_frame(
-    snapshot: Vec<AgUiMessage>,
+    snapshot: crate::transcript_snapshot::HistorySnapshot,
     history_warnings: Vec<String>,
     include_snapshot: bool,
 ) -> Option<Bytes> {
     let frames = include_snapshot
-        .then(|| snapshot_event(snapshot))
+        .then(|| snapshot.events())
         .into_iter()
+        .flatten()
         .chain(history_warnings.into_iter().map(history_warning_event))
         .filter_map(|event| {
             frame_event(&event)

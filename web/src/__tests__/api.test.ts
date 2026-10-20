@@ -5,6 +5,7 @@ import {
   fetchCidContent,
   getAgent,
   getCidUrl,
+  getSession,
   listAgents,
   listSessions,
   sendPrompt,
@@ -313,4 +314,86 @@ describe('api.ts', () => {
       });
       await expect(sendPrompt('agent', 'session', { text: 'hi' })).rejects.toThrow('RPC call failed with HTTP 500');
     });
-  });});
+  });
+
+  describe('getSession', () => {
+    it('encodes session routes and forwards cancellation signals', async () => {
+      fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ result: {} }) });
+      const signal = new AbortController().signal;
+      await getSession('coding/coder@shared', 'session/name', { signal });
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/v1/agents/coding%2Fcoder%40shared/sessions/session%2Fname',
+        expect.objectContaining({ method: 'POST', signal }),
+      );
+    });
+
+    it.each([
+      [{ error: { code: -32001, message: 'session not found' } }, 'RPC Error: session not found'],
+      [{ error: { code: -32001 } }, 'RPC Error: -32001'],
+      [{}, 'RPC call failed with HTTP 500'],
+    ])('keeps RPC error precedence over HTTP failures: %j', async (body, error) => {
+      fetchMock.mockResolvedValueOnce({ ok: false, status: 500, json: async () => body });
+      await expect(getSession('agent', 'session')).rejects.toThrow(error);
+    });
+
+    it.each([true, false])('handles malformed JSON with HTTP ok=%s', async (ok) => {
+      fetchMock.mockResolvedValueOnce({
+        ok, status: 500, json: async () => { throw new Error('no body'); },
+      });
+      const result = getSession('agent', 'session');
+      if (ok) await expect(result).resolves.toEqual({});
+      else await expect(result).rejects.toThrow('RPC call failed with HTTP 500');
+    });
+
+    it('calls session/get and returns history_snapshot and compaction metadata', async () => {
+      const mockResult = {
+        state: 'idle',
+        canPrompt: true,
+        canCancel: false,
+        history_snapshot: [
+          {
+            role: 'assistant',
+            id: 'a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3',
+            content: 'The session log stores tool calls and results separately. No messages were kept.',
+          },
+        ],
+        compaction: {
+          message_id: 'a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3',
+          compaction_seq: 5,
+          summary: 'The session log stores tool calls and results separately. No messages were kept.',
+          from_seq: 1,
+          to_seq: 4,
+          kept_count: 0,
+        },
+      };
+
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          result: mockResult,
+        }),
+      });
+
+      const res = await getSession('agent-1', 'session-1');
+      expect(res).toEqual(mockResult);
+
+      const callArgs = fetchMock.mock.calls[0];
+      expect(callArgs[0]).toBe('/v1/agents/agent-1/sessions/session-1');
+      expect(JSON.parse(callArgs[1].body)).toEqual({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/get',
+      });
+    });
+
+    it('throws on JSON-RPC error', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ error: { code: -32001, message: 'session not found' } }),
+      });
+      await expect(getSession('agent1', 'session1')).rejects.toThrow('RPC Error: session not found');
+    });
+  });
+});

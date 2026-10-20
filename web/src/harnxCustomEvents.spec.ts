@@ -171,4 +171,84 @@ describe('harnx compaction events', () => {
 
     expect(onCompactingFailed).toHaveBeenCalledWith('Compaction failed', undefined);
   });
+
+  it('is included in NAVIGATION_CONTROL_EVENTS to prevent assistant-ui forwarding', () => {
+    expect(NAVIGATION_CONTROL_EVENTS).toContain('session_compaction');
+  });
+
+  it('calls onSessionCompaction with valid compaction metadata', () => {
+    const onSessionCompaction = vi.fn();
+    handleHarnxCustomEvent(
+      'session_compaction',
+      {
+        compaction: {
+          message_id: 'a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3',
+          compaction_seq: 5,
+          summary: 'The session log stores tool calls and results separately. No messages were kept.',
+          from_seq: 1,
+          to_seq: 4,
+          kept_count: 0,
+        },
+      },
+      { ...callbacks(true), onSessionCompaction },
+    );
+
+    expect(onSessionCompaction).toHaveBeenCalledWith({
+      message_id: 'a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3',
+      compaction_seq: 5,
+      summary: 'The session log stores tool calls and results separately. No messages were kept.',
+      from_seq: 1,
+      to_seq: 4,
+      kept_count: 0,
+    });
+  });
+
+  it('calls onSessionCompaction with null when compaction is null (clearing metadata)', () => {
+    const onSessionCompaction = vi.fn();
+    handleHarnxCustomEvent(
+      'session_compaction',
+      { compaction: null },
+      { ...callbacks(true), onSessionCompaction },
+    );
+
+    expect(onSessionCompaction).toHaveBeenCalledWith(null);
+  });
+
+  it('calls onSessionCompaction with null when compaction is invalid/malformed', () => {
+    const onSessionCompaction = vi.fn();
+    handleHarnxCustomEvent(
+      'session_compaction',
+      { compaction: { invalid: true } },
+      { ...callbacks(true), onSessionCompaction },
+    );
+
+    expect(onSessionCompaction).toHaveBeenCalledWith(null);
+  });
+
+  it('calls onSessionCompaction with earlier_compaction field', () => {
+    const onSessionCompaction = vi.fn();
+    handleHarnxCustomEvent(
+      'session_compaction',
+      {
+        compaction: {
+          message_id: 'bbdf1d00-eab3-5347-91b7-d9d60d285b7f',
+          compaction_seq: 15,
+          summary: 'Earlier log inspection is archived. The latest prompt, verification round and final reply remain verbatim.',
+          from_seq: 6,
+          to_seq: 14,
+          earlier_compaction: 5,
+        },
+      },
+      { ...callbacks(true), onSessionCompaction },
+    );
+
+    expect(onSessionCompaction).toHaveBeenCalledWith({
+      message_id: 'bbdf1d00-eab3-5347-91b7-d9d60d285b7f',
+      compaction_seq: 15,
+      summary: 'Earlier log inspection is archived. The latest prompt, verification round and final reply remain verbatim.',
+      from_seq: 6,
+      to_seq: 14,
+      earlier_compaction: 5,
+    });
+  });
 });

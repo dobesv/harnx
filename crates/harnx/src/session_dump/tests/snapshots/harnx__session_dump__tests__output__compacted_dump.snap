@@ -1,0 +1,16 @@
+---
+source: crates/harnx/src/session_dump/tests/output.rs
+expression: dump(&fixture())
+---
+── Compaction 15: earlier history archived ──
+Earlier log inspection is archived. The latest prompt, verification round and final reply remain verbatim.
+
+Implement the shared transcript view and verify paging.
+[tool] exec
+command: cargo nextest run -p harnx-core transcript_view
+Check the transcript view tests.
+exit_code: 0
+stdout: Transcript view tests passed.
+The shared view is implemented. Paging tests passed.
+Show the previous compaction's history.
+The earlier window contains the original prompt and both tool rounds.

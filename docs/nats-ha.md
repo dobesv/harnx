@@ -1413,6 +1413,17 @@ In NATS mode, compaction execution routes to the worker holding the session leas
 
 Log layout: `CompactRequest` → `Compress` marker → re-logged kept messages → `CompactResult`. The `Compress` marker is not the tail entry; kept messages (latest prompt plus a round-safe tail, or whole recent turns) follow it so replay can reconstruct the transcript without stored indices. The `CompactResult` receipt is the deterministic final entry for manual compaction.
 
+### Default View After Compaction
+
+All interfaces (web, TUI transcript, CLI dump, ACP `load_session`, `session/get`) render the same
+default view: display-safe compaction marker → kept messages → later activity. Archived messages
+(`compressed_messages`) are **not** shown inline. The marker summarizes what was archived and links
+to the prior compaction; browse-back (D3/D4) loads archived content on demand.
+
+Web and serve render via `harnx_core::transcript_view::default_view`; CLI, ACP and TUI `.dump session`
+use `harnx_runtime::replay_default_view_to_sink`. See AGENTS.md under "Compaction-aware transcript
+rendering" for the shared view contract and fixture path.
+
 ### Model Context After Compaction
 
 The model receives the stored `compaction_summary` before the retained suffix—never archived messages resurrected from `compressed_messages`. The summary is a transient runtime note, not a durable log entry. Subsequent compactions include the prior summary in the summarizer transcript, preserving completed work across multiple rounds. The worker's cursor folding deduplicates re-logged suffix entries by stable message ID, preventing completed prompts from being scheduled as fresh input.

@@ -42,7 +42,8 @@ the terminal handle selection. To copy the entire last response, use `.copy`.
 When the input is blank, `↑` enters transcript navigation. Navigable rows
 include user and assistant messages, tool calls, compaction markers,
 sub-agent sessions, and markdown links. Press `Enter` on a focused sub-agent
-row to open it in the fullscreen transcript surface. On a markdown link,
+row to open it in the fullscreen transcript surface. On a compaction marker,
+`Enter` opens the archived history view (pre-compaction messages). On a markdown link,
 `Enter` opens the URL in your default browser (`http`/`https`). Plan and text
 `cid:` URLs open in a fullscreen document viewer; image and binary attachments
 open in their system application.
@@ -205,6 +206,8 @@ The `.info agent`, `.info session`, and `.dump session` commands display detaile
 - **`.dump session <agent> <id> [--format text|yaml|json]`**: Shows the full session transcript dump in an overlay.
   - Both arguments are required, even when a session is active.
   - Defaults to `text` (human-readable formatting). Supports `--format yaml` and `--format json` (JSONL).
+  - For compacted sessions, text output shows marker → kept messages → later activity. Archived
+    history is not shown inline.
 - **`.info`**, **`.info rag`**, **`.info tools`**: These commands continue to append information directly to the chat transcript.
 - **`.info tool <name>`**: Formats the metadata and parameter schema for an allowed tool and appends it to the chat transcript.
 

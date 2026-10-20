@@ -24,6 +24,7 @@ pub mod session_actor;
 mod session_actor_types;
 pub(crate) mod session_pagination;
 pub mod session_routes;
+mod transcript_snapshot;
 mod web_url;
 
 pub use serve_shutdown::{ShutdownConfig, StreamDrainConfig};

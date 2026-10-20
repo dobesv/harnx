@@ -508,3 +508,6 @@ fn load_fixture_entries() -> Vec<SessionLogEntry> {
         // Sessions with handoffs are tested separately in session_load_handed_off_session_deactivates_and_rejects_prompt.
     ]
 }
+
+#[path = "persistence/compaction.rs"]
+mod compaction;

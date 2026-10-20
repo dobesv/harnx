@@ -239,22 +239,23 @@ async fn handle_get(
     };
     json_rpc_response(
         StatusCode::OK,
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "state": session_state_json(&info.state, info.worker_active),
-                "canPrompt": info.capabilities.can_prompt,
-                "canCancel": info.capabilities.can_cancel,
-                "history_snapshot": info.history_snapshot,
-                "history_warnings": info.history_warnings,
-                "capabilities": {
-                    "multiClient": true,
-                    "persistence": persistence.as_str(),
-                }
-            }
-        }),
+        json!({ "jsonrpc": "2.0", "id": id, "result": session_get_result(&info, persistence.as_str()) }),
     )
+}
+
+pub(crate) fn session_get_result(info: &SessionInfo, persistence: &str) -> Value {
+    let mut result = json!({
+        "state": session_state_json(&info.state, info.worker_active),
+        "canPrompt": info.capabilities.can_prompt,
+        "canCancel": info.capabilities.can_cancel,
+        "history_snapshot": info.history_snapshot,
+        "history_warnings": info.history_warnings,
+        "capabilities": { "multiClient": true, "persistence": persistence },
+    });
+    if let Some(compaction) = &info.compaction {
+        result["compaction"] = json!(compaction);
+    }
+    result
 }
 
 /// The prompt's parameters, or the response rejecting them.
