@@ -1,0 +1,156 @@
+[
+  [1, {
+    "type": "message",
+    "id": "first-prompt",
+    "role": "user",
+    "content": "Inspect the session log format.",
+    "timestamp": "2026-10-20T00:00:01Z"
+  }],
+  [2, {
+    "type": "message",
+    "id": "first-reply",
+    "role": "assistant",
+    "content": "Tool calls and results are separate log entries.",
+    "timestamp": "2026-10-20T00:00:02Z"
+  }],
+  [3, {
+    "type": "turn_end",
+    "through_seq": 1,
+    "fence_token": 1
+  }],
+  [4, {
+    "type": "compact_request",
+    "compaction_id": "keep-nothing"
+  }],
+  [5, {
+    "type": "compress",
+    "prompt": "The session log stores tool calls and results separately. No messages were kept.\n\n[Earlier conversation: 2 message(s) (log entries 1–2) were summarized above. The full pre-compaction transcript remains in this session's log; use the `harnx_agent_session_history_read` tool to search it by entry index, type, tool name, or text.]"
+  }],
+  [6, {
+    "type": "compact_result",
+    "compaction_id": "keep-nothing",
+    "outcome": { "status": "compacted" }
+  }],
+  [7, {
+    "type": "message",
+    "id": "retained-prompt",
+    "role": "user",
+    "content": "Implement the shared transcript view and verify paging.",
+    "timestamp": "2026-10-20T00:01:00Z"
+  }],
+  [8, {
+    "type": "tool_calls",
+    "text": "Inspect the archived middle of the turn.",
+    "calls": [{
+      "name": "read",
+      "arguments": { "path": "crates/harnx-core/src/session.rs" },
+      "id": "archived-round"
+    }],
+    "timestamp": "2026-10-20T00:01:01Z"
+  }],
+  [9, {
+    "type": "tool_results",
+    "results": [{
+      "id": "archived-round",
+      "name": "read",
+      "output": { "text": "Compress archives the previous window; kept messages are re-logged." }
+    }],
+    "timestamp": "2026-10-20T00:01:01Z"
+  }],
+  [10, {
+    "type": "tool_calls",
+    "text": "Check the transcript view tests.",
+    "calls": [{
+      "name": "exec",
+      "arguments": { "command": "cargo nextest run -p harnx-core transcript_view" },
+      "id": "retained-round"
+    }],
+    "timestamp": "2026-10-20T00:01:02Z"
+  }],
+  [11, {
+    "type": "tool_results",
+    "results": [{
+      "id": "retained-round",
+      "name": "exec",
+      "output": { "exit_code": 0, "stdout": "Transcript view tests passed." }
+    }],
+    "timestamp": "2026-10-20T00:01:02Z"
+  }],
+  [12, {
+    "type": "message",
+    "id": "retained-reply",
+    "role": "assistant",
+    "content": "The shared view is implemented. Paging tests passed.",
+    "timestamp": "2026-10-20T00:01:03Z"
+  }],
+  [13, {
+    "type": "turn_end",
+    "through_seq": 7,
+    "fence_token": 1
+  }],
+  [14, {
+    "type": "compact_request",
+    "compaction_id": "keep-prompt-and-tail"
+  }],
+  [15, {
+    "type": "compress",
+    "prompt": "Earlier log inspection is archived. The latest prompt, verification round and final reply remain verbatim.\n\n[Earlier conversation: 1 message(s) (log entries 8–8) were summarized above. The full pre-compaction transcript remains in this session's log; use the `harnx_agent_session_history_read` tool to search it by entry index, type, tool name, or text.]"
+  }],
+  [16, {
+    "type": "message",
+    "id": "retained-prompt",
+    "role": "user",
+    "content": "Implement the shared transcript view and verify paging.",
+    "timestamp": "2026-10-20T00:01:00Z"
+  }],
+  [17, {
+    "type": "tool_calls",
+    "text": "Check the transcript view tests.",
+    "calls": [{
+      "name": "exec",
+      "arguments": { "command": "cargo nextest run -p harnx-core transcript_view" },
+      "id": "retained-round"
+    }],
+    "timestamp": "2026-10-20T00:01:02Z"
+  }],
+  [18, {
+    "type": "tool_results",
+    "results": [{
+      "id": "retained-round",
+      "name": "exec",
+      "output": { "exit_code": 0, "stdout": "Transcript view tests passed." }
+    }],
+    "timestamp": "2026-10-20T00:01:02Z"
+  }],
+  [19, {
+    "type": "message",
+    "id": "retained-reply",
+    "role": "assistant",
+    "content": "The shared view is implemented. Paging tests passed.",
+    "timestamp": "2026-10-20T00:01:03Z"
+  }],
+  [20, {
+    "type": "compact_result",
+    "compaction_id": "keep-prompt-and-tail",
+    "outcome": { "status": "compacted" }
+  }],
+  [21, {
+    "type": "message",
+    "id": "later-prompt",
+    "role": "user",
+    "content": "Show the previous compaction's history.",
+    "timestamp": "2026-10-20T00:02:00Z"
+  }],
+  [22, {
+    "type": "message",
+    "id": "later-reply",
+    "role": "assistant",
+    "content": "The earlier window contains the original prompt and both tool rounds.",
+    "timestamp": "2026-10-20T00:02:01Z"
+  }],
+  [23, {
+    "type": "turn_end",
+    "through_seq": 21,
+    "fence_token": 1
+  }]
+]
