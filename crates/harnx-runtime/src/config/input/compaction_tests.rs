@@ -6,6 +6,9 @@ use harnx_core::session::SessionLogEntry;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
+#[path = "compaction_tests/budget.rs"]
+mod budget;
+
 #[derive(Default)]
 struct CaptureLog(Mutex<Vec<(usize, SessionLogEntry)>>);
 
@@ -360,6 +363,10 @@ fn stored_summary(config: &GlobalConfig) -> String {
 }
 
 fn session_with_large_middle() -> (GlobalConfig, Arc<CaptureLog>) {
+    session_with_middle_output(json!({"text": "word ".repeat(10000)}))
+}
+
+fn session_with_middle_output(output: Value) -> (GlobalConfig, Arc<CaptureLog>) {
     let suffix = tool_suffix();
     let mut dropped = suffix[1..3].to_vec();
     if let SessionLogEntry::ToolCalls { calls, .. } = &mut dropped[0] {
@@ -367,7 +374,7 @@ fn session_with_large_middle() -> (GlobalConfig, Arc<CaptureLog>) {
     }
     if let SessionLogEntry::ToolResults { results, .. } = &mut dropped[1] {
         results[0].id = Some("dropped-call".into());
-        results[0].output = json!({"text": "word ".repeat(10000)});
+        results[0].output = output;
     }
     let mut entries = vec![
         entry(MessageRole::User, "archived question"),
