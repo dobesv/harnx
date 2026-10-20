@@ -365,6 +365,9 @@ pub struct Session {
     #[serde(skip)]
     pub compaction_summary: Option<String>,
 
+    /// Archived messages, which can be a non-contiguous dropped set when
+    /// compaction keeps a prompt plus a tail. Replay archives the whole old
+    /// window, including originals of messages re-logged after `Compress`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compressed_messages: Vec<Message>,
     pub messages: Vec<Message>,

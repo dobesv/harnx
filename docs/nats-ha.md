@@ -1411,7 +1411,7 @@ In NATS mode, compaction execution routes to the worker holding the session leas
 3. Manual and automatic compaction serialize via the `compressing` flag. If already compacting, the worker skips redundant execution and reports `AlreadyCompacted`.
 4. If the transcript has too few uncompacted messages or tokens to warrant summarization, the worker yields `Unchanged` (`Nothing to compact`). This is treated across all interfaces as a neutral success (exit 0 / status message), not an error.
 
-Log layout: `CompactRequest` → `Compress` marker → re-logged suffix messages → `CompactResult`. The `Compress` marker is not the tail entry; suffix messages follow it so replay can reconstruct the transcript without stored indices. The `CompactResult` receipt is the deterministic final entry for manual compaction.
+Log layout: `CompactRequest` → `Compress` marker → re-logged kept messages → `CompactResult`. The `Compress` marker is not the tail entry; kept messages (latest prompt plus a round-safe tail, or whole recent turns) follow it so replay can reconstruct the transcript without stored indices. The `CompactResult` receipt is the deterministic final entry for manual compaction.
 
 ### Model Context After Compaction
 

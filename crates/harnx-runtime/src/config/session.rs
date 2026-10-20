@@ -643,16 +643,20 @@ pub fn compress(session: &mut Session, prompt: String) {
     }
 }
 
-/// Compact only the prefix `messages[..keep_from]`, keeping `messages[keep_from..]`
-/// verbatim. The prefix moves to `compressed_messages`; the new message list is
-/// just preserved suffix, while summary stays in `session.compaction_summary`.
+/// Compact messages before `keep_from`, keeping `messages[keep_from..]` verbatim.
+/// The dropped messages move to `compressed_messages`; the new message list is
+/// the kept suffix, while summary stays in `session.compaction_summary`.
 ///
-/// Log layout: `Compress` marker → re-logged suffix messages → `CompactResult`.
-/// The `Compress` entry is NOT the final entry; suffix messages follow it so replay
+/// Log layout: `Compress` marker → re-logged kept messages → `CompactResult`.
+/// The `Compress` entry is NOT the final entry; kept messages follow it so replay
 /// can reconstruct the active transcript without stored indices. `CompactResult`
 /// (manual) or `TurnEnd` (automatic) terminates the compaction span.
 pub fn compress_keeping_recent(session: &mut Session, prompt: String, keep_from: usize) {
-    let appended = CompactionLog::plan(session, prompt, keep_from).append();
+    let plan = super::compaction::KeepPlan {
+        prompt_idx: None,
+        tail_from: keep_from,
+    };
+    let appended = CompactionLog::plan(session, prompt, plan).append();
     appended.apply(session);
 }
 
@@ -663,45 +667,52 @@ pub(crate) struct CompactionLog {
     session_id: String,
     sink: Option<Arc<dyn SessionAppendSink>>,
     summary: String,
-    keep_from: usize,
+    /// Indices of messages to keep, in order (prompt first, then tail).
+    /// May be non-contiguous when the latest prompt precedes the tail.
+    kept_indices: Vec<usize>,
     message_count: usize,
     log_entry_count: usize,
-    /// The entries that re-log each kept message, in order.
-    suffix: Vec<Vec<SessionLogEntry>>,
+    /// The entries that re-log each kept message, in kept order.
+    entries: Vec<Vec<SessionLogEntry>>,
 }
 
 /// A [`CompactionLog`] after its entries were appended, ready to apply.
 pub(crate) struct AppendedCompaction {
     summary: String,
-    keep_from: usize,
+    /// Indices of kept messages in the original message list, in kept order.
+    kept_indices: Vec<usize>,
     message_count: usize,
     /// The log seq each kept message takes: the log length before its first entry.
-    suffix_seqs: Vec<usize>,
+    entry_seqs: Vec<usize>,
     log_entry_count: usize,
     all_appended: bool,
 }
 
 impl CompactionLog {
-    pub(crate) fn plan(session: &Session, summary: String, keep_from: usize) -> Self {
-        let keep_from = keep_from.min(session.messages.len());
+    pub(crate) fn plan(
+        session: &Session,
+        summary: String,
+        keep_plan: super::compaction::KeepPlan,
+    ) -> Self {
+        let kept_indices = keep_plan.kept_indices(session.messages.len());
+        let entries: Vec<Vec<SessionLogEntry>> = kept_indices
+            .iter()
+            .filter_map(|&idx| session.messages.get(idx).map(relog_entries))
+            .collect();
         Self {
             session_id: session.id().to_string(),
             sink: super::session_persistence::detached_sink(session),
             summary,
-            keep_from,
+            kept_indices,
             message_count: session.messages.len(),
             log_entry_count: session.log_entry_count,
-            suffix: session.messages[keep_from..]
-                .iter()
-                .map(relog_entries)
-                .collect(),
+            entries,
         }
     }
 
-    /// Append the `Compress` marker, then re-log the kept suffix. Hard cut:
-    /// the marker archives the prefix and carries the summary; the fresh
-    /// suffix entries let replay rebuild the active transcript without any
-    /// stored index.
+    /// Append `Compress`, then re-log the kept set in order (prompt, then tail).
+    /// Replay archives the old window at the marker and rebuilds the active
+    /// transcript from the fresh entries without any stored indices.
     pub(crate) fn append(self) -> AppendedCompaction {
         let mut log_entry_count = self.log_entry_count;
         let mut all_appended = self.append_one(
@@ -710,18 +721,18 @@ impl CompactionLog {
             },
             &mut log_entry_count,
         );
-        let mut suffix_seqs = Vec::with_capacity(self.suffix.len());
-        for entries in &self.suffix {
-            suffix_seqs.push(log_entry_count);
+        let mut entry_seqs = Vec::with_capacity(self.entries.len());
+        for entries in &self.entries {
+            entry_seqs.push(log_entry_count);
             for entry in entries {
                 all_appended &= self.append_one(entry, &mut log_entry_count);
             }
         }
         AppendedCompaction {
             summary: self.summary,
-            keep_from: self.keep_from,
+            kept_indices: self.kept_indices,
             message_count: self.message_count,
-            suffix_seqs,
+            entry_seqs,
             log_entry_count,
             all_appended,
         }
@@ -747,15 +758,25 @@ impl AppendedCompaction {
                 session.messages.len()
             );
         }
-        let keep_from = self.keep_from.min(session.messages.len());
-        let suffix: Vec<Message> = session.messages.split_off(keep_from);
-        session.compressed_messages.append(&mut session.messages);
-        session.compaction_summary = Some(self.summary);
-        for (index, mut msg) in suffix.into_iter().enumerate() {
-            if let Some(seq) = self.suffix_seqs.get(index) {
-                msg.log_seq = Some(*seq);
+        let mut kept_indices = self.kept_indices.into_iter().peekable();
+        for (index, message) in std::mem::take(&mut session.messages)
+            .into_iter()
+            .enumerate()
+        {
+            if kept_indices.peek() == Some(&index) {
+                kept_indices.next();
+                session.messages.push(message);
+            } else if index >= self.message_count {
+                // Don't archive input that arrived while the config lock was
+                // released for persistence; it wasn't in the summarizer input.
+                session.messages.push(message);
+            } else {
+                session.compressed_messages.push(message);
             }
-            session.messages.push(msg);
+        }
+        session.compaction_summary = Some(self.summary);
+        for (message, seq) in session.messages.iter_mut().zip(self.entry_seqs) {
+            message.log_seq = Some(seq);
         }
         session.log_entry_count = session.log_entry_count.max(self.log_entry_count);
         if !self.all_appended {
@@ -766,7 +787,7 @@ impl AppendedCompaction {
 }
 
 /// The entry (or the `ToolCalls`+`ToolResults` pair) an in-memory message
-/// round-trips from. Used to re-log the preserved suffix after a `Compress`
+/// round-trips from. Used to re-log kept messages after a `Compress`
 /// event so the NATS log is self-describing (no stored index).
 fn relog_entries(msg: &Message) -> Vec<SessionLogEntry> {
     if msg.role == MessageRole::Tool {
@@ -2911,6 +2932,49 @@ replacements:
              the user re-asked and loops on 'Let me look at the current state…'. \
              messages: {messages:#?}"
         );
+    }
+
+    #[test]
+    fn compaction_apply_preserves_messages_added_after_planning() {
+        let mut session = test_session();
+        session.messages = vec![
+            Message::new(MessageRole::User, MessageContent::Text("prompt".into())),
+            Message::new(
+                MessageRole::Assistant,
+                MessageContent::Text("dropped".into()),
+            ),
+            Message::new(MessageRole::Assistant, MessageContent::Text("reply".into())),
+            Message::new(MessageRole::User, MessageContent::Text("new input".into())),
+        ];
+        session.messages[3].log_seq = Some(30);
+        super::AppendedCompaction {
+            summary: "summary".into(),
+            kept_indices: vec![0, 2],
+            message_count: 3,
+            entry_seqs: vec![20, 21],
+            log_entry_count: 22,
+            all_appended: true,
+        }
+        .apply(&mut session);
+        let active: Vec<_> = session
+            .messages
+            .iter()
+            .map(|m| (m.content.to_text(), m.log_seq))
+            .collect();
+        assert_eq!(
+            active,
+            vec![
+                ("prompt".into(), Some(20)),
+                ("reply".into(), Some(21)),
+                ("new input".into(), Some(30))
+            ]
+        );
+        let archived: Vec<_> = session
+            .compressed_messages
+            .iter()
+            .map(|m| m.content.to_text())
+            .collect();
+        assert_eq!(archived, vec!["dropped"]);
     }
 
     #[test]

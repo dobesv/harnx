@@ -345,13 +345,17 @@ async fn test_apply_compaction_summary_skips_swapped_session() {
         .as_ref()
         .map(|last| last.continuous);
     let split = 2;
+    let keep_plan = crate::config::compaction::KeepPlan {
+        prompt_idx: None,
+        tail_from: split,
+    };
 
     let mut swapped_session = original_session.clone();
     swapped_session.id = "swapped-session".to_string();
     config.write().session = Some(swapped_session);
 
     let applied =
-        Config::apply_compaction_summary(&config, &original_id, "summary".to_string(), split);
+        Config::apply_compaction_summary(&config, &original_id, "summary".to_string(), keep_plan);
 
     let guard = config.read();
     let active = guard.session.as_ref().unwrap();
@@ -362,4 +366,50 @@ async fn test_apply_compaction_summary_skips_swapped_session() {
         guard.last_message.as_ref().map(|last| last.continuous),
         original_continuous
     );
+}
+
+#[tokio::test]
+async fn test_compact_session_zero_keep_recent_turns_summarizes_everything() {
+    let temp = tempfile::TempDir::new().unwrap();
+    write_agent(
+        &temp.path().join("agents"),
+        "zero-compactor",
+        "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_keep_recent_turns: 0\n---\nSummarize everything.\n",
+    );
+    let config = with_session(
+        config_with_agent(
+            "main",
+            "---\ncompaction_agent: zero-compactor\n---\nMain agent.",
+        ),
+        vec![
+            (MessageRole::User, "old question".into()),
+            (MessageRole::Assistant, "old answer".into()),
+            (MessageRole::User, "latest question".into()),
+            (MessageRole::Assistant, "latest answer".into()),
+        ],
+    );
+    let (mock, _guard) = install_summarizer_mock().await;
+    let _env_lock = env_lock_async().await;
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    Config::compact_session(&config).await.unwrap();
+    let history = mock.conversation_history();
+    assert_eq!(history.conversation_history.len(), 1);
+    let transcript = rendered_transcript(&history.conversation_history[0].messages);
+    for text in [
+        "old question",
+        "old answer",
+        "latest question",
+        "latest answer",
+    ] {
+        assert!(transcript.contains(text), "{transcript}");
+    }
+    let guard = config.read();
+    let session = guard.session.as_ref().unwrap();
+    assert!(session.messages.is_empty());
+    assert_eq!(session.compressed_messages.len(), 4);
+    assert!(session
+        .compaction_summary
+        .as_deref()
+        .unwrap()
+        .contains("Compacted."));
 }

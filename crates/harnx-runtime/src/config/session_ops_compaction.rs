@@ -3,9 +3,14 @@ use std::io::Write;
 
 use crate::utils::AbortSignal;
 
-/// Rendered transcript of the messages to compact, plus the split index, the
+/// Rendered transcript of the messages to compact, plus the kept set, the
 /// covered log-seq range `(from, to, count)`, and the session id.
-type CompactionTranscript = (String, usize, (Option<usize>, Option<usize>, usize), String);
+type CompactionTranscript = (
+    String,
+    crate::config::compaction::KeepPlan,
+    (Option<usize>, Option<usize>, usize),
+    String,
+);
 
 enum CompactionClaim {
     Claimed,
@@ -266,7 +271,7 @@ impl Config {
         };
         let params = crate::config::compaction::compaction_params(&summarizer_agent);
 
-        let (transcript, split, covered, session_id) =
+        let (transcript, keep_plan, covered, session_id) =
             Self::build_compaction_transcript(config, &params)?;
 
         {
@@ -291,7 +296,7 @@ impl Config {
 
         let summary_with_note = append_recovery_note(summary, covered);
 
-        if !Self::apply_compaction_summary(config, &session_id, summary_with_note, split) {
+        if !Self::apply_compaction_summary(config, &session_id, summary_with_note, keep_plan) {
             log::warn!("compaction skipped because the active session changed");
         }
 
@@ -312,7 +317,7 @@ impl Config {
     /// active session is still the one we compacted (it may have been swapped).
     /// Returns whether the summary was applied.
     ///
-    /// The `Compress` marker and the re-logged suffix are one NATS append
+    /// The `Compress` marker and the re-logged kept messages are one NATS append
     /// each, so they are written between two short guards rather than under
     /// one. Nothing else appends to the session meanwhile: compaction is
     /// single-flight through `compressing`, and the worker holds the next
@@ -322,14 +327,14 @@ impl Config {
         config: &GlobalConfig,
         session_id: &str,
         summary_with_note: String,
-        split: usize,
+        keep_plan: crate::config::compaction::KeepPlan,
     ) -> bool {
         let log = {
             let guard = config.read();
             let Some(session) = guard.session.as_ref().filter(|s| s.id == session_id) else {
                 return false;
             };
-            crate::config::session::CompactionLog::plan(session, summary_with_note, split)
+            crate::config::session::CompactionLog::plan(session, summary_with_note, keep_plan)
         };
         let appended = log.append();
         let mut guard = config.write();
@@ -373,8 +378,8 @@ impl Config {
         }
     }
 
-    /// Compute the prefix split point and render the transcript of messages to
-    /// be compacted, along with the covered log-seq range and session id.
+    /// Plan the kept set and render its dropped complement, along with the
+    /// covered log-seq range and session id.
     fn build_compaction_transcript(
         config: &GlobalConfig,
         params: &crate::config::compaction::CompactionParams,
@@ -383,19 +388,32 @@ impl Config {
         let session = guard.session.as_ref().context("No session")?;
         let session_id = session.id.clone();
         let model = session.model().clone();
-        let split = crate::config::compaction::split_index(
+        let threshold = harnx_core::session::effective_compress_threshold(
+            &model,
+            session.compress_threshold,
+            guard.compress_threshold,
+        );
+        let keep_plan = crate::config::compaction::plan_compaction(
             &session.messages,
             &model,
-            params.keep_recent_turns,
-            params.keep_recent_tokens,
+            params,
+            threshold,
         );
-        if split == 0 {
+        let compacted_count = session.messages.len() - keep_plan.kept_count(session.messages.len());
+        if compacted_count == 0 {
             bail!("Nothing to compact");
         }
-        let prefix = &session.messages[..split];
-        let mut transcript =
-            crate::config::compaction::render_transcript(prefix, params.tool_output_max_chars);
-        // Take prior context from the same session snapshot as the prefix. Repeated
+        let compacted_msgs = session
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !keep_plan.contains(*i))
+            .map(|(_, message)| message);
+        let mut transcript = crate::config::compaction::render_transcript(
+            compacted_msgs.clone(),
+            params.tool_output_max_chars,
+        );
+        // Take prior context from the same session snapshot. Repeated
         // compaction must carry completed work forward, not replace it with the tail.
         if let Some(summary) = session
             .compaction_summary
@@ -409,9 +427,14 @@ impl Config {
                 transcript
             );
         }
-        let from = prefix.iter().filter_map(|m| m.log_seq).min();
-        let to = prefix.iter().filter_map(|m| m.log_seq).max();
-        Ok((transcript, split, (from, to, prefix.len()), session_id))
+        let from = compacted_msgs.clone().filter_map(|m| m.log_seq).min();
+        let to = compacted_msgs.filter_map(|m| m.log_seq).max();
+        Ok((
+            transcript,
+            keep_plan,
+            (from, to, compacted_count),
+            session_id,
+        ))
     }
 }
 
@@ -452,6 +475,46 @@ mod tests {
     use super::*;
     use harnx_core::event::{AgentEvent, AgentEventSink, SessionEvent};
     use std::sync::{Arc, Mutex};
+
+    fn threshold_test_config(limit: Option<usize>, configured: Option<usize>) -> GlobalConfig {
+        use harnx_core::message::{Message, MessageContent, MessageRole};
+        let mut config = Config::default();
+        let mut session = crate::config::session::new(&config, "threshold", None).unwrap();
+        session.model.data_mut().max_input_tokens = limit;
+        session.compress_threshold = configured;
+        session.messages = vec![
+            Message::new(MessageRole::User, MessageContent::Text("word ".repeat(100))),
+            Message::new(MessageRole::Assistant, MessageContent::Text("reply".into())),
+        ];
+        config.session = Some(session);
+        Arc::new(crate::config::ConfigLock::new(config))
+    }
+
+    #[test]
+    fn compaction_prompt_retention_uses_model_aware_threshold() {
+        let params = crate::config::compaction::CompactionParams {
+            keep_recent_turns: 3,
+            keep_recent_tokens: 1,
+            tool_output_max_chars: 2000,
+        };
+        let cases = [
+            (Some(128), None, None),
+            (Some(128), Some(200_000), None),
+            (None, None, Some(0)),
+            (None, Some(100), None),
+            (None, Some(1_000), Some(0)),
+        ];
+        for (limit, configured, expected_prompt) in cases {
+            let config = threshold_test_config(limit, configured);
+            let (transcript, plan, _, _) =
+                Config::build_compaction_transcript(&config, &params).unwrap();
+            assert_eq!(
+                plan.prompt_idx, expected_prompt,
+                "limit={limit:?}, configured={configured:?}"
+            );
+            assert_eq!(transcript.contains("word word"), expected_prompt.is_none());
+        }
+    }
 
     #[derive(Default)]
     struct CollectingSink {
