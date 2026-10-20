@@ -51,6 +51,10 @@ impl Tui {
         prev_agent: Option<String>,
         command_was: &str,
     ) {
+        // Shared session-switch reconciliation. Clears stale focus, selection,
+        // streaming state, detail/document overlays, and rebuilds the transcript.
+        // Called after .session navigation, handoff Enter, rewind/delete edits,
+        // and agent/session switching via input_modal.rs or lifecycle.rs.
         let (curr_session, curr_agent) = {
             let cfg = self.config.read();
             let s = cfg.session.as_ref().map(|s| s.id().to_string());
@@ -81,6 +85,14 @@ impl Tui {
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
         self.app.streamed_text_idx = None;
+        self.app.last_ui_output_source = None;
+        self.app.transcript_focus = None;
+        self.app.transcript_selection_anchor = None;
+        self.app.transcript_browsing = false;
+        self.app.detail_view_open = false;
+        self.app.detail_view_entry = None;
+        self.app.doc_view = None;
+        self.app.doc_history.clear();
         // Reset scroll state so the widget doesn't subtract-overflow when
         // the rebuilt transcript is shorter than the previous one.
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();

@@ -509,6 +509,7 @@ fn model_context(
         initial_with_embeddings: false,
         initial_resume_count: 0,
         max_resume: Some(0),
+        prepare_handoff_fn: None,
         nats_hook_provider: None,
         pending_async_context: None,
         working_dir: None,

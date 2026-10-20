@@ -67,6 +67,7 @@ struct SessionActorConfig {
 }
 
 struct RunFinished {
+    handoff: handoff::HandoffPreparation,
     limits: Option<harnx_runtime::nats_session_metadata::RunLimitsRecord>,
     run_id: RunId,
     result: anyhow::Result<harnx_runtime::LoopResult>,
@@ -81,6 +82,7 @@ struct HitlApprovalFinished {
 }
 
 struct ActorTurnParams {
+    handoff: handoff::HandoffPreparation,
     admitted: Option<harnx_runtime::nats_session::AppendedPrompt>,
     prompt_config: GlobalConfig,
     call_fn: Option<AgentCallFn>,
@@ -251,6 +253,7 @@ fn check_admitted_turn_result(
 async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime::LoopResult> {
     if let Some(call_fn) = params.call_fn {
         return test_executor::run_local_test_turn(test_executor::LocalTestTurnParams {
+            handoff: params.handoff,
             prompt_config: params.prompt_config,
             call_fn,
             abort_signal: params.abort_signal,
@@ -623,20 +626,29 @@ impl SessionActor {
                 session_id,
                 prompt,
                 tool_call_id,
-            }) => {
-                self.dispatch_handoff_to_target(
-                    &done,
-                    handoff::HandoffRequest {
-                        agent: agent.clone(),
-                        session_id: session_id.clone(),
-                        prompt: prompt.clone(),
-                        handoff_tool_call_id: tool_call_id.clone(),
-                    },
-                )
-                .await;
-            }
+            }) => match done
+                .handoff
+                .take(tool_call_id.as_deref(), agent, session_id.clone())
+                .await
+            {
+                Ok(prepared) => {
+                    self.dispatch_handoff_to_target(
+                        &done,
+                        handoff::HandoffRequest {
+                            prepared,
+                            prompt: prompt.clone(),
+                            handoff_tool_call_id: tool_call_id.clone(),
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => self.fail_handoff(&done, error),
+            },
             Err(err) => {
-                let message = format!("{err:#}");
+                let message = done
+                    .handoff
+                    .take_failure()
+                    .unwrap_or_else(|| format!("{err:#}"));
                 log::error!(
                     "session run failed: agent={} session_id={} run_id={}: {message}",
                     self.key.display_ref(),
@@ -704,6 +716,23 @@ impl SessionActor {
         }
     }
 
+    fn broadcast_run_started(&self, run_id: &RunId, thread_id: &ThreadId) {
+        let _ = self.broadcast_tx.send(Event::RunStarted(RunStartedEvent {
+            base: base_event(),
+            thread_id: thread_id.clone(),
+            run_id: run_id.clone(),
+        }));
+    }
+
+    fn run_event_sink(&self, prompt_config: &GlobalConfig) -> Arc<BroadcastEventSender> {
+        let event_prompt_config = Arc::new(ConfigLock::new(prompt_config.read().clone()));
+        Arc::new(BroadcastEventSender::new(
+            self.broadcast_tx.clone(),
+            MessageId::random(),
+            self.event_context(event_prompt_config),
+        ))
+    }
+
     async fn start_run(
         &mut self,
         text: String,
@@ -722,24 +751,20 @@ impl SessionActor {
         let abort_signal = create_abort_signal();
         let (inject_tx, inject_rx) = test_injection_channel(self.actor_config.call_fn.is_some());
 
-        let _ = self.broadcast_tx.send(Event::RunStarted(RunStartedEvent {
-            base: base_event(),
-            thread_id: thread_id.clone(),
-            run_id: run_id.clone(),
-        }));
+        self.broadcast_run_started(&run_id, &thread_id);
 
         let done_tx = self.run_done_tx.clone();
         let run_id_for_task = run_id.clone();
         let thread_id_for_task = thread_id.clone();
-        let event_prompt_config = Arc::new(ConfigLock::new(prompt_config.read().clone()));
-        let sink = Arc::new(BroadcastEventSender::new(
-            self.broadcast_tx.clone(),
-            MessageId::random(),
-            self.event_context(event_prompt_config),
-        ));
+        let sink = self.run_event_sink(&prompt_config);
         let sink_for_task = sink.clone();
         let attachment_refs = options.attachment_refs.clone();
+        let handoff = handoff::HandoffPreparation::new(
+            self.actor_config.base_config.clone(),
+            self.registry.clone(),
+        );
         let turn = ActorTurnParams {
+            handoff: handoff.clone(),
             admitted: options.admitted,
             prompt_config,
             call_fn: self.actor_config.call_fn.clone(),
@@ -757,6 +782,7 @@ impl SessionActor {
             let loop_result = run_actor_turn_supervised(turn).await;
             let _ = done_tx
                 .send(RunFinished {
+                    handoff,
                     limits,
                     run_id: run_id_for_task,
                     result: loop_result,
@@ -989,6 +1015,7 @@ impl harnx_core::event::AgentEventSink for BroadcastEventSender {
 }
 
 fn build_loop_ctx(
+    handoff: handoff::HandoffPreparation,
     prompt_config: GlobalConfig,
     call_fn: Option<AgentCallFn>,
     abort_signal: AbortSignal,
@@ -1013,13 +1040,15 @@ fn build_loop_ctx(
             Ok(())
         })
     });
-    harnx_session::build_context(
+    let mut ctx = harnx_session::build_context(
         prompt_config,
         call_fn,
         abort_signal,
         Some(on_tool_round),
         working_dir,
-    )
+    );
+    ctx.prepare_handoff_fn = Some(handoff.callback());
+    ctx
 }
 
 async fn prompt_config_for_agent_session_from_global(
@@ -1984,38 +2013,15 @@ mod tests {
         assert_eq!(idle.state, SessionState::Idle);
     }
 
-    #[tokio::test]
-    async fn session_actor_handoff_dispatches_to_target_actor() {
-        // When HandoffRequested fires, the serve actor ends its run cleanly
-        // and dispatches the handoff prompt to the TARGET session's actor.
-        // The target actor then executes the delegated turn.
-        //
-        // This test uses the real handoff mechanism: the source agent has
-        // `use_tools: target-agent_session_handoff` and the call_fn returns
-        // a tool call with that name, triggering run_agent_loop to return
-        // HandoffRequested. The SessionActor then re-dispatches to the target.
-        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
-        let sandbox = TestConfigSandbox::new();
-
-        // Write source agent WITH handoff tool enabled - required for handoff detection
-        sandbox.write_agent_with_front_matter(
-            "source-agent",
-            "model: openai:gpt-4o\nuse_tools: target-agent_session_handoff",
-            "You are the source agent.",
-        );
-        sandbox.write_agent("target-agent", "You are the target agent.");
-        if !crate::test_support::ensure_test_nats().await {
-            return;
-        }
-
-        // Track invocations per agent
-        let source_count = Arc::new(AtomicUsize::new(0));
-        let target_count = Arc::new(AtomicUsize::new(0));
-        let source_count_clone = source_count.clone();
-        let target_count_clone = target_count.clone();
+    fn handoff_dispatch_call_fn(
+        source_count: Arc<AtomicUsize>,
+        target_count: Arc<AtomicUsize>,
+    ) -> AgentCallFn {
+        let source_count_clone = source_count;
+        let target_count_clone = target_count;
 
         // Stateful call_fn: source returns handoff tool call, target returns text
-        let call_fn: AgentCallFn = Arc::new(move |_input, config, _abort| {
+        Arc::new(move |_input, config, _abort| {
             let source_count = source_count_clone.clone();
             let target_count = target_count_clone.clone();
             let agent_name = config
@@ -2052,19 +2058,13 @@ mod tests {
                     panic!("unexpected agent: {}", agent_name);
                 }
             })
-        });
+        })
+    }
 
-        let registry = registry_with_call_fn(call_fn);
-        let source_handle = registry.get_or_spawn(key("source-agent", "source-session"));
-        let mut source_sub = subscribe(&source_handle).await.events;
-
-        // Prompt the source agent
-        let result = prompt(&source_handle, "start handoff").await;
-        let source_run_id = match result {
-            PromptResult::Accepted { run_id } => run_id,
-            other => panic!("expected Accepted, got {other:?}"),
-        };
-
+    async fn wait_for_handoff_finish(
+        source_sub: &mut broadcast::Receiver<Event>,
+        source_run_id: &str,
+    ) -> String {
         let mut handoff_session_id = None;
 
         // Wait for source run to finish (RUN_FINISHED) and observe handoff event
@@ -2088,6 +2088,67 @@ mod tests {
         .await
         .expect("timed out waiting for source run to finish");
 
+        handoff_session_id.expect("session_handoff event should be emitted")
+    }
+
+    fn assert_persisted_handoff_result(handoff_session_id: &str) {
+        let entries = test_log::test_session_log(&key("source-agent", "source-session")).entries();
+        let result = entries
+            .iter()
+            .find_map(|entry| match entry {
+                harnx_core::session::SessionLogEntry::ToolResults { results, .. } => results
+                    .iter()
+                    .find(|result| result.id.as_deref() == Some("handoff-call-1")),
+                _ => None,
+            })
+            .expect("persisted handoff tool result");
+        assert_eq!(
+            result.output["handoff"],
+            json!({
+                "agent": "target-agent", "session_id": handoff_session_id,
+            })
+        );
+        assert_eq!(result.output["session_id"], handoff_session_id);
+        assert!(result.output["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(handoff_session_id));
+    }
+
+    #[tokio::test]
+    async fn session_actor_handoff_dispatches_to_target_actor() {
+        // Exercise real handoff tool detection and dispatch into the target actor.
+        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+
+        // Write source agent WITH handoff tool enabled - required for handoff detection
+        sandbox.write_agent_with_front_matter(
+            "source-agent",
+            "model: openai:gpt-4o\nuse_tools: target-agent_session_handoff",
+            "You are the source agent.",
+        );
+        sandbox.write_agent("target-agent", "You are the target agent.");
+        if !crate::test_support::ensure_test_nats().await {
+            return;
+        }
+
+        let source_count = Arc::new(AtomicUsize::new(0));
+        let target_count = Arc::new(AtomicUsize::new(0));
+        let call_fn = handoff_dispatch_call_fn(source_count.clone(), target_count.clone());
+
+        let registry = registry_with_call_fn(call_fn);
+        let source_handle = registry.get_or_spawn(key("source-agent", "source-session"));
+        let mut source_sub = subscribe(&source_handle).await.events;
+
+        // Prompt the source agent
+        let result = prompt(&source_handle, "start handoff").await;
+        let source_run_id = match result {
+            PromptResult::Accepted { run_id } => run_id,
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+
+        let handoff_session_id = wait_for_handoff_finish(&mut source_sub, &source_run_id).await;
+
         // Verify source call_fn was invoked exactly once
         assert_eq!(
             source_count.load(Ordering::SeqCst),
@@ -2095,14 +2156,14 @@ mod tests {
             "source agent should be invoked once"
         );
 
-        let handoff_session_id =
-            handoff_session_id.expect("session_handoff event should be emitted");
         assert_eq!(handoff_session_id.len(), 6);
         assert!(
             harnx_runtime::utils::session_name::decode_timestamp_session_id(&handoff_session_id)
                 .is_some(),
             "handoff without an explicit session ID should reserve a short ID"
         );
+
+        assert_persisted_handoff_result(&handoff_session_id);
 
         assert_persisted_user_message("target-agent", &handoff_session_id, "delegated work").await;
         assert_eq!(

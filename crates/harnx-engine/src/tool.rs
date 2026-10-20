@@ -89,6 +89,38 @@ impl std::error::Error for ToolApprovalRequiredError {}
 pub type DispatchHookFn =
     dyn Fn(HookEvent) -> Pin<Box<dyn Future<Output = HookOutcome> + Send>> + Send + Sync;
 
+/// Result of preparing a handoff through the optional callback.
+///
+/// The preparation callback is invoked by the engine after target resolution
+/// and before building the handoff result. It returns the resolved agent and
+/// session ID. Runtime-specific context stays in callback closure state.
+#[derive(Debug, Clone)]
+pub struct PreparedHandoff {
+    /// The routable agent reference (cluster-qualified where required).
+    pub agent: String,
+    /// The resolved session ID for the child session.
+    pub session_id: String,
+}
+
+/// Callback invoked before building a handoff result, after target resolution.
+///
+/// The callback receives:
+/// - `target_agent`: The resolved routable agent reference
+/// - `requested_session_id`: The caller-supplied session ID, if any
+/// - `tool_call_id`: The tool call ID for this handoff
+///
+/// Returns `Ok(PreparedHandoff)` on success, or `Err` if preparation/reservation
+/// fails. Runtime-specific context can be kept in callback closure state.
+/// Per the contract, reservation failures remain fatal and do not become
+/// recoverable tool errors.
+pub type PrepareHandoffFn = dyn Fn(
+        String,         // target_agent
+        Option<String>, // requested_session_id
+        String,         // tool_call_id
+    ) -> Pin<Box<dyn Future<Output = Result<PreparedHandoff>> + Send>>
+    + Send
+    + Sync;
+
 #[derive(Clone)]
 pub struct ToolEvalRenderContext {
     pub decl_map: Arc<HashMap<String, harnx_core::tool::ToolDeclaration>>,
@@ -166,6 +198,19 @@ pub struct ToolEvalContext {
     /// at context-construction time and forwards to
     /// `hooks::dispatch::dispatch_hooks`.
     pub dispatch_hook_fn: Arc<DispatchHookFn>,
+    /// Optional callback invoked after target resolution and before building
+    /// the handoff result. The runtime implements this to reserve a child
+    /// session ID and carry provenance through to dispatch.
+    ///
+    /// When present:
+    /// - The handoff result includes `handoff: {agent, session_id}`
+    /// - The text includes "target session: <id>"
+    /// - `SwitchAgentData.session_id` reflects the resolved id
+    ///
+    /// When absent (engine-only tests):
+    /// - Legacy behavior: session_id = caller value or null
+    /// - `handoff` marker only when an id exists
+    pub prepare_handoff_fn: Option<Arc<PrepareHandoffFn>>,
 }
 
 impl ToolEvalContext {
@@ -682,6 +727,124 @@ async fn call_tool_with_tracing(
     result
 }
 
+fn handoff_agent(tool_name: &str, ctx: &ToolEvalContext) -> String {
+    // Strip exactly one `_session_handoff` suffix (not all repeats, which
+    // `trim_end_matches` would do) so an agent named `*_session_handoff`
+    // resolves correctly.
+    let bare_target = tool_name
+        .strip_suffix("_session_handoff")
+        .unwrap_or(tool_name);
+    // Resolve package-aware display names through the exact lookup table
+    // first. Map values are already the canonical agent name ("pkg/stem"
+    // for package agents, bare "stem" for top-level agents), so they are
+    // used verbatim — re-resolving a bare top-level value against the
+    // current package would wrongly qualify it (e.g. `global` →
+    // `pantheon/global`). Only the legacy fallback path (no map entry,
+    // e.g. test/no-context contexts) applies package-relative resolution.
+    match ctx.handoff_targets.get(bare_target) {
+        Some(mapped) => mapped.clone(),
+        None => harnx_core::package_namespace::resolve_package_relative_name(
+            bare_target,
+            ctx.current_agent_package.as_deref(),
+        ),
+    }
+}
+
+async fn dispatch_session_handoff(
+    call: ToolCall,
+    json_data: Value,
+    ctx: &ToolEvalContext,
+) -> Result<ToolProviderOutput, ToolError> {
+    if !ctx.allowed_tool_names.contains(&call.name) {
+        return Err(ToolError::Recoverable(anyhow!(
+            "No tool provider configured for '{}'",
+            call.name
+        )));
+    }
+    let agent = handoff_agent(&call.name, ctx);
+    let prompt = json_data["prompt"].as_str().ok_or_else(|| {
+        ToolError::Recoverable(anyhow!("Missing 'prompt' argument for session handoff"))
+    })?;
+    let caller_session_id = json_data["session_id"]
+        .as_str()
+        .filter(|session_id| !session_id.trim().is_empty())
+        .map(ToString::to_string);
+
+    // Tool call ID is guaranteed to be assigned by ensure_tool_call_ids above.
+    let tool_call_id = call
+        .id
+        .as_deref()
+        .expect("tool call ID assigned")
+        .to_string();
+
+    let (resolved_agent, resolved_session_id) = if let Some(prepare_fn) = &ctx.prepare_handoff_fn {
+        let prepared = prepare_fn(
+            agent.clone(),
+            caller_session_id.clone(),
+            tool_call_id.clone(),
+        )
+        .await
+        .map_err(|e| {
+            // Reservation failures remain fatal per contract
+            ToolError::Fatal(anyhow!("Handoff preparation failed: {}", e))
+        })?;
+        (prepared.agent, prepared.session_id)
+    } else {
+        (agent, caller_session_id.unwrap_or_default())
+    };
+
+    Ok(handoff_tool_output(&resolved_agent, &resolved_session_id, prompt, &tool_call_id).into())
+}
+
+fn handoff_tool_output(
+    resolved_agent: &str,
+    resolved_session_id: &str,
+    prompt: &str,
+    tool_call_id: &str,
+) -> Value {
+    // Build result per contract:
+    // - Text: "Handing off to <agent>; target session: <id>." (no user-only audience)
+    // - handoff marker: {agent, session_id}
+    // - Agent ref consistent with HandoffCommitted.target_agent
+    let text = if resolved_session_id.is_empty() {
+        format!("Handing off to {}.", resolved_agent)
+    } else {
+        format!(
+            "Handing off to {}; target session: {}.",
+            resolved_agent, resolved_session_id
+        )
+    };
+
+    // Build the handoff marker when we have a resolved session ID
+    let handoff_marker = if resolved_session_id.is_empty() {
+        None
+    } else {
+        Some(json!({
+            "agent": resolved_agent,
+            "session_id": resolved_session_id,
+        }))
+    };
+
+    let mut result = json!({
+        "content": [{
+            "type": "text",
+            "text": text,
+        }],
+        "action": "switch_agent",
+        "agent": resolved_agent,
+        "prompt": prompt,
+        "session_id": if resolved_session_id.is_empty() { Value::Null } else { json!(resolved_session_id) },
+        "tool_call_id": tool_call_id,
+    });
+
+    // Add handoff marker when present
+    if let Some(marker) = handoff_marker {
+        result["handoff"] = marker;
+    }
+
+    result
+}
+
 async fn dispatch_tool_call(
     mut call: ToolCall,
     json_data: Value,
@@ -689,57 +852,8 @@ async fn dispatch_tool_call(
     abort_signal: &AbortSignal,
 ) -> Result<ToolProviderOutput, ToolError> {
     ensure_tool_call_ids(std::slice::from_mut(&mut call));
-    let allowed_tool_names = &ctx.allowed_tool_names;
-
     if call.name.ends_with("_session_handoff") {
-        if !allowed_tool_names.contains(&call.name) {
-            return Err(ToolError::Recoverable(anyhow!(
-                "No tool provider configured for '{}'",
-                call.name
-            )));
-        }
-        // Strip exactly one `_session_handoff` suffix (not all repeats, which
-        // `trim_end_matches` would do) so an agent named `*_session_handoff`
-        // resolves correctly.
-        let bare_target = call
-            .name
-            .strip_suffix("_session_handoff")
-            .unwrap_or(&call.name);
-        // Resolve package-aware display names through the exact lookup table
-        // first. Map values are already the canonical agent name ("pkg/stem"
-        // for package agents, bare "stem" for top-level agents), so they are
-        // used verbatim — re-resolving a bare top-level value against the
-        // current package would wrongly qualify it (e.g. `global` →
-        // `pantheon/global`). Only the legacy fallback path (no map entry,
-        // e.g. test/no-context contexts) applies package-relative resolution.
-        let agent = match ctx.handoff_targets.get(bare_target) {
-            Some(mapped) => mapped.clone(),
-            None => harnx_core::package_namespace::resolve_package_relative_name(
-                bare_target,
-                ctx.current_agent_package.as_deref(),
-            ),
-        };
-        let prompt = json_data["prompt"].as_str().ok_or_else(|| {
-            ToolError::Recoverable(anyhow!("Missing 'prompt' argument for session handoff"))
-        })?;
-        let session_id = json_data["session_id"]
-            .as_str()
-            .filter(|session_id| !session_id.trim().is_empty())
-            .map(ToString::to_string);
-
-        return Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": format!("Handing off to {}…", agent),
-                "annotations": { "audience": ["user"] }
-            }],
-            "action": "switch_agent",
-            "agent": agent,
-            "prompt": prompt,
-            "session_id": session_id,
-            "tool_call_id": call.id,
-        })
-        .into());
+        return dispatch_session_handoff(call, json_data, ctx).await;
     }
 
     let tool_call_id = call
@@ -1209,6 +1323,7 @@ mod tests {
                 let outcome = dispatch_hook(event);
                 Box::pin(async move { outcome })
             }),
+            prepare_handoff_fn: None,
         }
     }
 
@@ -2062,6 +2177,177 @@ mod tests {
         let agent = dispatched_handoff_agent(&ctx, "atlas_session_handoff").await;
         assert_eq!(agent, "pantheon/atlas");
     }
+
+    // ================================================================
+    // Handoff preparation callback tests.
+    // ================================================================
+
+    /// Test that a prepare_handoff callback populates the handoff marker
+    /// and text with the session ID.
+    #[tokio::test]
+    async fn handoff_with_prepare_callback_includes_marker_and_session_id() {
+        use std::sync::Arc;
+
+        // Mock prepare callback that returns a fixed session ID
+        let prepared_session_id = "reserved-session-123";
+        let prepared_agent = "pantheon/atlas".to_string();
+        let prepared_agent_clone = prepared_agent.clone();
+        let prepare_fn: Arc<PrepareHandoffFn> =
+            Arc::new(move |_agent, _requested_id, _tool_call_id| {
+                let agent = prepared_agent_clone.clone();
+                let session_id = prepared_session_id.to_string();
+                Box::pin(async move { Ok(PreparedHandoff { agent, session_id }) })
+            });
+
+        let mut ctx = handoff_context(Some("pantheon"), "atlas_session_handoff", HashMap::new());
+        let mut targets = HashMap::new();
+        targets.insert("atlas".to_string(), "pantheon/atlas".to_string());
+        ctx.handoff_targets = targets;
+        ctx.prepare_handoff_fn = Some(prepare_fn);
+
+        let result =
+            dispatched_handoff(&ctx, "atlas_session_handoff", json!({ "prompt": "go" })).await;
+
+        // Result should have handoff marker
+        assert!(
+            result.get("handoff").is_some(),
+            "result should have handoff marker"
+        );
+        let handoff = result
+            .get("handoff")
+            .unwrap()
+            .as_object()
+            .expect("handoff should be an object");
+        assert_eq!(
+            handoff.get("agent").and_then(|v| v.as_str()),
+            Some("pantheon/atlas")
+        );
+        assert_eq!(
+            handoff.get("session_id").and_then(|v| v.as_str()),
+            Some("reserved-session-123")
+        );
+
+        // Session ID at top level should match
+        assert_eq!(
+            result.get("session_id").and_then(|v| v.as_str()),
+            Some("reserved-session-123")
+        );
+
+        // Text should include session ID
+        let content = result
+            .get("content")
+            .expect("content")
+            .as_array()
+            .expect("content array");
+        assert_eq!(content.len(), 1);
+        let text = content[0]
+            .get("text")
+            .expect("text")
+            .as_str()
+            .expect("text string");
+        assert!(
+            text.contains("target session: reserved-session-123"),
+            "text should include session id: {}",
+            text
+        );
+
+        // Text should NOT have user-only audience
+        assert!(
+            content[0].get("annotations").is_none(),
+            "text should not have annotations"
+        );
+
+        // SwitchAgentData should reflect the resolved session ID
+        let switch_agent = detect_switch_agent(&result).expect("handoff result");
+        assert_eq!(
+            switch_agent.session_id.as_deref(),
+            Some("reserved-session-123")
+        );
+        assert_eq!(switch_agent.agent, "pantheon/atlas");
+    }
+
+    /// Test that caller-supplied session ID is passed through to prepare callback unchanged.
+    #[tokio::test]
+    async fn handoff_prepare_callback_receives_caller_session_id() {
+        let captured_requested_id = Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured_clone = captured_requested_id.clone();
+
+        let prepare_fn: Arc<PrepareHandoffFn> =
+            Arc::new(move |_agent, requested_id, _tool_call_id| {
+                let mut guard = captured_clone.lock().unwrap();
+                *guard = requested_id.clone();
+                let session_id = requested_id.unwrap_or_else(|| "fallback-id".to_string());
+                Box::pin(async move {
+                    Ok(PreparedHandoff {
+                        agent: "pantheon/atlas".to_string(),
+                        session_id,
+                    })
+                })
+            });
+
+        let mut ctx = handoff_context(Some("pantheon"), "atlas_session_handoff", HashMap::new());
+        let mut targets = HashMap::new();
+        targets.insert("atlas".to_string(), "pantheon/atlas".to_string());
+        ctx.handoff_targets = targets;
+        ctx.prepare_handoff_fn = Some(prepare_fn);
+
+        let _result = dispatched_handoff(
+            &ctx,
+            "atlas_session_handoff",
+            json!({ "prompt": "go", "session_id": "caller-session-456" }),
+        )
+        .await;
+
+        // The callback should have received the caller-supplied ID
+        let guard = captured_requested_id.lock().unwrap();
+        assert_eq!(*guard, Some("caller-session-456".to_string()));
+    }
+
+    /// Test that without a prepare callback, the legacy behavior is preserved.
+    #[tokio::test]
+    async fn handoff_without_prepare_callback_uses_legacy_behavior() {
+        // Legacy: session_id from caller or null
+        let ctx = handoff_context(None, "atlas_session_handoff", HashMap::new());
+
+        // With explicit session_id
+        let result = dispatched_handoff(
+            &ctx,
+            "atlas_session_handoff",
+            json!({ "prompt": "go", "session_id": "legacy-session" }),
+        )
+        .await;
+        assert_eq!(
+            result.get("session_id").and_then(|v| v.as_str()),
+            Some("legacy-session")
+        );
+
+        // handoff marker should be present when session_id exists
+        assert!(
+            result.get("handoff").is_some(),
+            "handoff marker should be present with session_id"
+        );
+        let handoff = result
+            .get("handoff")
+            .unwrap()
+            .as_object()
+            .expect("handoff object");
+        assert_eq!(
+            handoff.get("session_id").and_then(|v| v.as_str()),
+            Some("legacy-session")
+        );
+
+        // Without session_id
+        let result =
+            dispatched_handoff(&ctx, "atlas_session_handoff", json!({ "prompt": "go" })).await;
+        assert_eq!(result.get("session_id"), Some(&Value::Null));
+
+        // handoff marker should NOT be present without session_id
+        assert!(
+            result.get("handoff").is_none(),
+            "handoff marker should not be present without session_id"
+        );
+    }
+
     #[tokio::test]
     async fn handoff_strips_only_one_suffix() {
         // An agent literally named `worker_session_handoff` must keep its name:

@@ -109,6 +109,8 @@ pub struct AgentLoopContext {
     pub initial_with_embeddings: bool,
     pub initial_resume_count: u32,
     pub max_resume: Option<u32>,
+    /// Runtime-owned, lazy handoff identity preparation before result persistence.
+    pub prepare_handoff_fn: Option<Arc<crate::tool::PrepareHandoffFn>>,
     pub nats_hook_provider: Option<Arc<crate::nats_hook_provider::NatsHookProvider>>,
     pub pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
     /// Optional per-session working directory. When unset, runtime falls back
@@ -1538,6 +1540,7 @@ mod tests {
             initial_with_embeddings: false,
             initial_resume_count: 0,
             max_resume: Some(0),
+            prepare_handoff_fn: None,
             nats_hook_provider: None,
             pending_async_context: None,
             working_dir: None,
@@ -1711,6 +1714,7 @@ mod tests {
             initial_with_embeddings: false,
             initial_resume_count: 0,
             max_resume: Some(0),
+            prepare_handoff_fn: None,
             nats_hook_provider: None,
             pending_async_context: None,
             tool_loop_guard: Default::default(),

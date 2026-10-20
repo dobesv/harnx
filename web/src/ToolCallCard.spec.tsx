@@ -2,6 +2,7 @@ import { render, screen, fireEvent, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ToolCallCard } from './ToolCallCard';
 import { UsageContext } from './UsageContext';
+import { SessionNavigationContext } from './SessionNavigationContext';
 import type { ToolCallState } from './toolUpdates';
 
 vi.mock('@assistant-ui/react-markdown', () => ({
@@ -875,6 +876,171 @@ describe('ToolCallCard', () => {
       expect(screen.getByText(/b\.rs:1/)).toBeInTheDocument();
       expect(screen.getByText(/c\.rs/)).toBeInTheDocument();
       expect(screen.getByText(/\+2 more/)).toBeInTheDocument();
+    });
+  });
+
+  describe('static handoff row', () => {
+    const handoffPayload = {
+      content: [{ type: 'text', text: 'Handing off to pantheon/atlas; target session: abc123.' }],
+      action: 'switch_agent',
+      agent: 'pantheon/atlas',
+      prompt: 'continue task',
+      session_id: 'abc123',
+      tool_call_id: 'call_handoff_1',
+      handoff: {
+        agent: 'pantheon/atlas',
+        session_id: 'abc123',
+      },
+    };
+
+    function renderHandoffCard(result: unknown, overrides: Record<string, unknown> = {}) {
+      const props = {
+        toolName: 'atlas_session_handoff',
+        toolCallId: 'call_handoff_test',
+        result,
+        status: { type: 'complete' },
+        ...overrides,
+      };
+      return renderWithContext(props);
+    }
+
+    function expectHandoffRow(container: HTMLElement, agent: string, sessionId: string) {
+      const row = container.querySelector('.aui-handoff-row');
+      expect(row).toBeInTheDocument();
+      expect(screen.getByText(agent)).toBeInTheDocument();
+      expect(screen.getByText(sessionId)).toBeInTheDocument();
+
+      const link = row?.querySelector('a.aui-handoff-open');
+      expect(link).toBeInTheDocument();
+      expect(link).toHaveAttribute(
+        'href',
+        `/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(sessionId)}`,
+      );
+      return { row, link };
+    }
+
+    it('renders static handoff row with agent, session ID, and LinkButton from object result', () => {
+      const { container } = renderHandoffCard(handoffPayload, {
+        toolName: 'pantheon/atlas_session_handoff',
+        toolCallId: 'call_handoff_1',
+      });
+      const { link } = expectHandoffRow(container, 'pantheon/atlas', 'abc123');
+      expect(link).toHaveAttribute('aria-label', 'Open pantheon/atlas session abc123');
+    });
+
+    it('renders static handoff row from serialized JSON-string result', () => {
+      const { container } = renderHandoffCard(JSON.stringify(handoffPayload), {
+        toolCallId: 'call_handoff_2',
+      });
+      expectHandoffRow(container, 'pantheon/atlas', 'abc123');
+    });
+
+    it('properly encodes agent ref containing slashes in LinkButton href', () => {
+      const { container } = renderHandoffCard(
+        {
+          handoff: {
+            agent: 'org/team/sub-agent:v2',
+            session_id: 'sess/xyz#1',
+          },
+        },
+        {
+          toolName: 'custom_handoff',
+          toolCallId: 'call_handoff_slash',
+        },
+      );
+      expectHandoffRow(container, 'org/team/sub-agent:v2', 'sess/xyz#1');
+    });
+
+    it('clicking LinkButton navigates via onNavigateSession callback prop', () => {
+      const onNavigateSession = vi.fn();
+      const { container } = renderHandoffCard(handoffPayload, {
+        toolCallId: 'call_handoff_nav',
+        onNavigateSession,
+      });
+
+      const link = container.querySelector('.aui-handoff-row a.aui-handoff-open');
+      expect(link).toBeInTheDocument();
+
+      fireEvent.click(link!);
+      expect(onNavigateSession).toHaveBeenCalledTimes(1);
+      expect(onNavigateSession).toHaveBeenCalledWith('pantheon/atlas', 'abc123');
+    });
+
+    it('clicking LinkButton navigates via SessionNavigationContext when prop is not passed', () => {
+      const navigateSession = vi.fn();
+      const props = {
+        toolName: 'atlas_session_handoff',
+        toolCallId: 'call_handoff_ctx',
+        result: handoffPayload,
+        status: { type: 'complete' },
+      } as any;
+
+      const { container } = render(
+        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map(), toolUpdates: new Map() }}>
+          <SessionNavigationContext.Provider value={{ navigateSession }}>
+            <ToolCallCard {...props} />
+          </SessionNavigationContext.Provider>
+        </UsageContext.Provider>,
+      );
+
+      const link = container.querySelector('.aui-handoff-row a.aui-handoff-open');
+      expect(link).toBeInTheDocument();
+
+      fireEvent.click(link!);
+      expect(navigateSession).toHaveBeenCalledTimes(1);
+      expect(navigateSession).toHaveBeenCalledWith('pantheon/atlas', 'abc123');
+    });
+
+    it('does not render handoff row when handoff marker is absent', () => {
+      const cases = [
+        { name: 'no handoff field in object', result: { content: [{ type: 'text', text: 'no marker' }] } },
+        { name: 'legacy switch_agent shape without handoff marker', result: { action: 'switch_agent', agent: 'pantheon/atlas', session_id: 'abc123' } },
+        { name: 'string result without marker', result: '{"content":[]}' },
+        { name: 'plain text result', result: 'some non-json text' },
+        { name: 'null result', result: null },
+        { name: 'undefined result', result: undefined },
+      ];
+
+      for (const { result } of cases) {
+        const { container } = renderHandoffCard(result, {
+          toolName: 'my_tool',
+          toolCallId: 'call_no_marker',
+        });
+        expect(container.querySelector('.aui-handoff-row')).toBeNull();
+      }
+    });
+
+    it('renders handoff row in both collapsed and expanded states', () => {
+      const { container } = renderHandoffCard(handoffPayload, {
+        toolCallId: 'call_handoff_expand',
+      });
+      const header = container.querySelector('.aui-tool-call-header')!;
+
+      // Collapsed state
+      expect(header).toHaveAttribute('aria-expanded', 'false');
+      expect(container.querySelector('.aui-handoff-row')).toBeInTheDocument();
+
+      // Expand accordion
+      fireEvent.click(header);
+      expect(header).toHaveAttribute('aria-expanded', 'true');
+      expect(container.querySelector('.aui-handoff-row')).toBeInTheDocument();
+      // Details view should also be open
+      expect(screen.getByText('View Source')).toBeInTheDocument();
+    });
+
+    it('clicking LinkButton does not toggle tool call header expansion', () => {
+      const { container } = renderHandoffCard(handoffPayload, {
+        toolCallId: 'call_handoff_no_toggle',
+        onNavigateSession: vi.fn(),
+      });
+      const header = container.querySelector('.aui-tool-call-header')!;
+      expect(header).toHaveAttribute('aria-expanded', 'false');
+
+      const link = container.querySelector('.aui-handoff-row a.aui-handoff-open')!;
+      fireEvent.click(link);
+
+      // Header should remain collapsed
+      expect(header).toHaveAttribute('aria-expanded', 'false');
     });
   });
 });

@@ -123,6 +123,7 @@ fn context(
                 .await
             })
         }),
+        prepare_handoff_fn: None,
     }
 }
 

@@ -92,6 +92,7 @@ mod command_completion;
 mod delegation_tests;
 mod exit_interrupt_tests;
 mod handler_decomposition_tests;
+mod handoff_session_tests;
 mod markdown_link_accessibility_tests;
 mod operator_tool_completion;
 mod shared_session_event_tests;

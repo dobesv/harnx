@@ -847,6 +847,9 @@ impl Tui {
                     Some(format!("{text}: {url}"))
                 }
             }
+            TranscriptItem::HandoffSession { agent, session_id } => {
+                Some(format!("@ {} [{}]", agent, session_id))
+            }
             _ => None,
         }
     }

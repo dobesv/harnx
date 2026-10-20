@@ -191,6 +191,7 @@ fn test_agent_loop_context(
         initial_with_embeddings: true,
         initial_resume_count: 0,
         max_resume: None,
+        prepare_handoff_fn: None,
         nats_hook_provider: None,
         pending_async_context: None,
         working_dir: None,

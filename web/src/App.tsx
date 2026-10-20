@@ -1030,6 +1030,7 @@ export default function App() {
                 isFreshSession={isFreshSession}
                 onHandoff={handleHandoff}
                 onOpenSubAgent={navigateSession}
+                onNavigateSession={navigateSession}
                 onReadUpdated={refreshSessions}
               >
                 <MyThread

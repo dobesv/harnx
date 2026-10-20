@@ -8,6 +8,7 @@ use tokio::sync::{broadcast, mpsc};
 use super::{build_input, build_loop_ctx, BroadcastEventSender};
 
 pub(super) struct LocalTestTurnParams {
+    pub handoff: super::handoff::HandoffPreparation,
     pub prompt_config: GlobalConfig,
     pub call_fn: AgentCallFn,
     pub abort_signal: AbortSignal,
@@ -26,6 +27,7 @@ pub(super) async fn run_local_test_turn(
     params: LocalTestTurnParams,
 ) -> anyhow::Result<harnx_runtime::LoopResult> {
     let loop_ctx = build_loop_ctx(
+        params.handoff,
         params.prompt_config.clone(),
         Some(params.call_fn),
         params.abort_signal,
