@@ -3,6 +3,7 @@ use crate::client::TestStateGuard;
 use crate::config::{session, session_persistence::SessionAppendSink, ConfigLock};
 use crate::test_utils::{MockClient, MockTurnBuilder};
 use harnx_core::session::SessionLogEntry;
+use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -127,11 +128,15 @@ fn assert_compacted_request(suffix: Vec<SessionLogEntry>, prompt: &str) {
     let (config, log) = setup(&entries, prompt);
     let live_suffix = config.read().session.as_ref().unwrap().messages[2..].to_vec();
     let id = config.read().session.as_ref().unwrap().id.clone();
+    let keep_plan = crate::config::compaction::KeepPlan {
+        prompt_idx: None,
+        tail_from: 2,
+    };
     assert!(Config::apply_compaction_summary(
         &config,
         &id,
         "completed prior work".into(),
-        2
+        keep_plan
     ));
     let client = MockClient::builder().build();
     let mut expected = vec![];
@@ -199,11 +204,15 @@ fn prepare_completion_data_keeps_logged_user_once_with_queued_and_transient_inpu
     ];
     let (config, log) = setup(&entries, "");
     let id = config.read().session.as_ref().unwrap().id.clone();
+    let keep_plan = crate::config::compaction::KeepPlan {
+        prompt_idx: None,
+        tail_from: 2,
+    };
     assert!(Config::apply_compaction_summary(
         &config,
         &id,
         "done work".into(),
-        2
+        keep_plan
     ));
     let client = MockClient::builder().build();
     for reloaded in [false, true] {
@@ -348,4 +357,331 @@ fn stored_summary(config: &GlobalConfig) -> String {
         .compaction_summary
         .clone()
         .unwrap()
+}
+
+fn session_with_large_middle() -> (GlobalConfig, Arc<CaptureLog>) {
+    let suffix = tool_suffix();
+    let mut dropped = suffix[1..3].to_vec();
+    if let SessionLogEntry::ToolCalls { calls, .. } = &mut dropped[0] {
+        calls[0].id = Some("dropped-call".into());
+    }
+    if let SessionLogEntry::ToolResults { results, .. } = &mut dropped[1] {
+        results[0].id = Some("dropped-call".into());
+        results[0].output = json!({"text": "word ".repeat(10000)});
+    }
+    let mut entries = vec![
+        entry(MessageRole::User, "archived question"),
+        entry(MessageRole::Assistant, "archived answer"),
+        suffix[0].clone(),
+    ];
+    entries.extend(dropped);
+    entries.extend_from_slice(&suffix[1..]);
+    setup(&entries, "system instructions")
+}
+
+fn split_compacted_session() -> (GlobalConfig, Arc<CaptureLog>) {
+    let (config, log) = session_with_large_middle();
+    let (id, plan, expected) = {
+        let guard = config.read();
+        let sess = guard.session.as_ref().unwrap();
+        let budget = sess.model().messages_tokens(&sess.messages[4..])
+            + sess.model().messages_tokens(&sess.messages[2..=2]);
+        let plan = crate::config::compaction::plan_compaction(
+            &sess.messages,
+            sess.model(),
+            &crate::config::compaction::CompactionParams {
+                keep_recent_turns: 3,
+                keep_recent_tokens: budget,
+                tool_output_max_chars: 2000,
+            },
+            180_000,
+        );
+        assert_eq!(plan.prompt_idx, Some(2));
+        assert_eq!(plan.tail_from, 4);
+        let expected = vec![
+            sess.messages[2].clone(),
+            sess.messages[4].clone(),
+            sess.messages[5].clone(),
+        ];
+        (sess.id.clone(), plan, expected)
+    };
+    assert!(Config::apply_compaction_summary(
+        &config,
+        &id,
+        "completed prior work".into(),
+        plan
+    ));
+    assert_eq!(
+        view(&config.read().session.as_ref().unwrap().messages),
+        view(&expected)
+    );
+    (config, log)
+}
+
+#[test]
+fn compaction_noncontiguous_kept_set_round_trips_through_log() {
+    let (config, log) = split_compacted_session();
+    let messages = {
+        let guard = config.read();
+        let sess = guard.session.as_ref().unwrap();
+        assert_eq!(sess.compressed_messages.len(), 3);
+        serde_json::to_value(&sess.messages).unwrap()
+    };
+    let entries = log.0.lock().unwrap();
+    let marker = entries
+        .iter()
+        .rposition(|(_, e)| matches!(e, SessionLogEntry::Compress { .. }))
+        .unwrap();
+    assert_eq!(entries.len() - marker, 5); // Compress, prompt, calls, results, reply
+    assert!(!format!("{:?}", &entries[marker..]).contains("dropped-call"));
+    drop(entries);
+    reload(&config, &log);
+    let guard = config.read();
+    let sess = guard.session.as_ref().unwrap();
+    assert_eq!(serde_json::to_value(&sess.messages).unwrap(), messages);
+}
+
+fn split_compacted_request() -> ChatCompletionsData {
+    let (config, _log) = split_compacted_session();
+    let client = MockClient::builder().build();
+    let mut input = from_str(&config, "next request", None);
+    prepare_completion_data(&mut input, &config, client.model(), false, &client).unwrap()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Provider {
+    Claude,
+    OpenAI,
+    Gemini,
+}
+
+impl Provider {
+    fn body(self, data: ChatCompletionsData) -> Value {
+        match self {
+            Self::Claude => harnx_client::claude::claude_build_chat_completions_body(
+                data,
+                &Model::new("claude", "claude-sonnet-4"),
+                &Default::default(),
+            )
+            .unwrap(),
+            Self::OpenAI => harnx_client::openai::openai_build_chat_completions_body(
+                data,
+                &Model::new("openai", "gpt-4o"),
+            ),
+            Self::Gemini => harnx_client::vertexai::gemini_build_chat_completions_body(
+                data,
+                &Model::new("gemini", "gemini-2.5-pro"),
+                Default::default(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn messages(self, body: &Value) -> &[Value] {
+        let key = match self {
+            Self::Gemini => "contents",
+            _ => "messages",
+        };
+        body[key].as_array().unwrap()
+    }
+
+    fn assistant_role(self) -> &'static str {
+        match self {
+            Self::Gemini => "model",
+            _ => "assistant",
+        }
+    }
+}
+
+fn assert_roles(messages: &[Value], expected: &[&str]) {
+    let roles: Vec<_> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, expected);
+}
+
+fn assert_text_contains(value: &Value, text: &str) {
+    assert!(
+        value.to_string().contains(text),
+        "expected {text:?} in {value}"
+    );
+}
+
+fn assert_claude_tool_round(messages: &[Value]) {
+    let call = messages[0]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["type"] == "tool_use")
+        .unwrap();
+    let result = &messages[1]["content"][0];
+    assert_eq!(call["id"], "edit-1");
+    assert_eq!(result["type"], "tool_result");
+    assert_eq!(result["tool_use_id"], call["id"]);
+}
+
+fn assert_openai_tool_round(messages: &[Value]) {
+    let call_id = &messages[0]["tool_calls"][0]["id"];
+    assert_eq!(call_id, "edit-1");
+    assert_eq!(messages[1]["tool_call_id"], *call_id);
+}
+
+fn assert_gemini_tool_round(messages: &[Value]) {
+    let call = messages[0]["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|p| p.get("functionCall"))
+        .unwrap();
+    let result = &messages[1]["parts"][0]["functionResponse"];
+    assert_eq!(call["id"], "edit-1");
+    assert_eq!(result["name"], call["name"]);
+    assert_eq!(result["response"]["content"], json!({"ok": true}));
+}
+
+#[test]
+fn compaction_claude_serialized_request_preserves_prompt_and_tool_round() {
+    let body = Provider::Claude.body(split_compacted_request());
+    let messages = Provider::Claude.messages(&body);
+    assert_roles(
+        messages,
+        &["user", "user", "assistant", "user", "assistant", "user"],
+    );
+    assert_text_contains(&messages[0]["content"], "completed prior work");
+    assert_text_contains(&messages[1]["content"], "remove hex");
+    assert_claude_tool_round(&messages[2..4]);
+    assert_text_contains(&messages[4]["content"], "hex removed and verified");
+    assert!(!body.to_string().contains("dropped-call"));
+}
+
+#[test]
+fn compaction_openai_serialized_request_preserves_prompt_and_tool_round() {
+    let body = Provider::OpenAI.body(split_compacted_request());
+    let messages = Provider::OpenAI.messages(&body);
+    assert_roles(
+        messages,
+        &[
+            "system",
+            "user",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "user",
+        ],
+    );
+    assert_text_contains(&messages[1]["content"], "completed prior work");
+    assert_eq!(messages[2]["content"], "remove hex");
+    assert_openai_tool_round(&messages[3..5]);
+    assert_eq!(messages[5]["content"], "hex removed and verified");
+    assert!(!body.to_string().contains("dropped-call"));
+}
+
+#[test]
+fn compaction_gemini_serialized_request_preserves_prompt_and_tool_round() {
+    let body = Provider::Gemini.body(split_compacted_request());
+    let messages = Provider::Gemini.messages(&body);
+    assert_roles(
+        messages,
+        &["user", "user", "model", "user", "model", "user"],
+    );
+    assert_text_contains(&messages[0]["parts"], "completed prior work");
+    assert_eq!(messages[1]["parts"][0]["text"], "remove hex");
+    assert_gemini_tool_round(&messages[2..4]);
+    assert_eq!(messages[4]["parts"][0]["text"], "hex removed and verified");
+    assert!(!body.to_string().contains("dropped-call"));
+}
+
+#[tokio::test]
+async fn compaction_summarizer_receives_only_complement_of_prompt_and_tail() {
+    let (config, log) = session_with_large_middle();
+    let client = Arc::new(
+        MockClient::builder()
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_text_chunk("middle summarized")
+                    .build(),
+            )
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(client.clone())).await;
+    Config::compact_session(&config).await.unwrap();
+    let history = client.conversation_history();
+    let transcript = history.conversation_history[0]
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::User)
+        .unwrap()
+        .content
+        .to_text();
+    assert!(transcript.contains("archived question"));
+    assert!(transcript.contains("word word"));
+    assert!(!transcript.contains("remove hex"));
+    assert!(!transcript.contains("hex removed and verified"));
+    assert!(!transcript.contains("\"ok\":true"));
+    let kept = view(&config.read().session.as_ref().unwrap().messages);
+    assert_eq!(kept.len(), 3);
+    reload(&config, &log);
+    assert_eq!(
+        view(&config.read().session.as_ref().unwrap().messages),
+        kept
+    );
+}
+
+fn reply_only_compacted_session() -> (GlobalConfig, Arc<CaptureLog>) {
+    let (config, log) = setup(&tool_suffix(), "");
+    let (id, plan) = {
+        let guard = config.read();
+        let sess = guard.session.as_ref().unwrap();
+        let budget = sess.model().messages_tokens(&sess.messages[..1])
+            + sess.model().messages_tokens(&sess.messages[2..]);
+        let plan = crate::config::compaction::plan_compaction(
+            &sess.messages,
+            sess.model(),
+            &crate::config::compaction::CompactionParams {
+                keep_recent_turns: 3,
+                keep_recent_tokens: budget,
+                tool_output_max_chars: 2000,
+            },
+            180_000,
+        );
+        assert_eq!(plan.kept_indices(sess.messages.len()), vec![0, 2]);
+        (sess.id.clone(), plan)
+    };
+    assert!(Config::apply_compaction_summary(
+        &config,
+        &id,
+        "middle summarized".into(),
+        plan
+    ));
+    (config, log)
+}
+
+fn assert_reply_only_request(config: &GlobalConfig, provider: Provider) {
+    let client = MockClient::builder().build();
+    let mut input = from_str(config, "", None);
+    input.skip_user_log_append = true;
+    let data = prepare_completion_data(&mut input, config, client.model(), false, &client).unwrap();
+    let body = provider.body(data);
+    let messages = provider.messages(&body);
+    assert_roles(messages, &["user", "user", provider.assistant_role()]);
+    for (message, text) in messages.iter().zip([
+        "Earlier conversation summary:",
+        "remove hex",
+        "hex removed and verified",
+    ]) {
+        assert_text_contains(message, text);
+    }
+    assert_text_contains(&messages[0], "middle summarized");
+}
+
+#[test]
+fn compaction_reply_only_tail_serializes_for_claude_openai_and_gemini() {
+    for provider in [Provider::Claude, Provider::OpenAI, Provider::Gemini] {
+        let (config, log) = reply_only_compacted_session();
+        assert_reply_only_request(&config, provider);
+        reload(&config, &log);
+        assert_reply_only_request(&config, provider);
+    }
 }

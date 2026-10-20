@@ -1,7 +1,7 @@
-//! Builds the session-compaction request. Compaction renders the older prefix
-//! of the conversation into a single flattened-text transcript (keeping base64
-//! attachments out of the request) and sends it to a summarizer; the most
-//! recent turns are kept verbatim. See `session_ops_split::compact_session`.
+//! Builds the session-compaction request. Compaction renders dropped messages
+//! into a flattened-text transcript for the summarizer. Recent turns, or the
+//! latest prompt plus a round-safe tail, are kept verbatim.
+//! See `session_ops_compaction::compact_session`.
 
 use harnx_core::agent_config::AgentConfig;
 use harnx_core::message::{
@@ -22,15 +22,41 @@ pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 8000;
 pub const DEFAULT_TOOL_OUTPUT_MAX_CHARS: usize = 2000;
 
 /// Resolved compaction tuning values for a single compaction run.
-///
-/// A `keep_recent_turns` of `0` is the degenerate "keep no recent turns
-/// verbatim" case and is safe: `recent_suffix_floor`/`split_index` compare
-/// turn counts with `>=` only, so there is no underflow.
+/// Setting `keep_recent_turns` to zero disables verbatim retention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionParams {
     pub keep_recent_turns: usize,
     pub keep_recent_tokens: usize,
     pub tool_output_max_chars: usize,
+}
+
+/// Ordered kept set: an optional latest-turn prompt followed by a suffix.
+/// Invariant: `prompt_idx < tail_from` when `prompt_idx` is present. `tail_from == len`
+/// means no tail; `None` plus `len` means everything is summarized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepPlan {
+    pub prompt_idx: Option<usize>,
+    pub tail_from: usize,
+}
+
+impl KeepPlan {
+    /// Whether an in-bounds message index belongs to the kept set.
+    pub fn contains(&self, index: usize) -> bool {
+        index >= self.tail_from || self.prompt_idx == Some(index)
+    }
+
+    pub fn kept_count(&self, len: usize) -> usize {
+        len.saturating_sub(self.tail_from)
+            + usize::from(self.prompt_idx.is_some_and(|i| i < self.tail_from.min(len)))
+    }
+
+    pub fn kept_indices(&self, len: usize) -> Vec<usize> {
+        self.prompt_idx
+            .filter(|&i| i < self.tail_from.min(len))
+            .into_iter()
+            .chain(self.tail_from.min(len)..len)
+            .collect()
+    }
 }
 
 /// Resolve the compaction tuning values from the compaction agent's config,
@@ -146,10 +172,13 @@ fn render_tool_calls(calls: &MessageContentToolCalls, max_tool_chars: usize) -> 
     lines.join("\n\n")
 }
 
-/// Render a slice of messages into a single flattened, labeled transcript for
+/// Render borrowed messages into a single flattened, labeled transcript for
 /// summarization. Images are placeholdered; tool results use the three-tier
 /// `render_tool_output`. `max_tool_chars` caps each tool result.
-pub fn render_transcript(messages: &[Message], max_tool_chars: usize) -> String {
+pub fn render_transcript<'a>(
+    messages: impl IntoIterator<Item = &'a Message>,
+    max_tool_chars: usize,
+) -> String {
     let mut sections: Vec<String> = Vec::new();
     for message in messages {
         match (&message.role, &message.content) {
@@ -181,6 +210,129 @@ fn is_turn_prompt(message: &Message) -> bool {
         && !harnx_core::timing_identity::is_timing_notice(&message.content.to_text())
 }
 
+/// ToolCalls stores the assistant invocation and all results in one message.
+/// An assistant reply is its own boundary, so an oversized last tool round can
+/// be summarized without also dropping the final reply.
+fn is_round_boundary(message: &Message) -> bool {
+    message.role == MessageRole::Assistant
+        || matches!(message.content, MessageContent::ToolCalls(_))
+}
+
+/// Keep whole recent turns when they fit; otherwise keep the latest prompt and
+/// a round-safe suffix of that turn. Always summarize at least one message.
+/// A transcript consisting only of a prompt must summarize that prompt.
+pub fn plan_compaction(
+    messages: &[Message],
+    model: &Model,
+    params: &CompactionParams,
+    effective_threshold: usize,
+) -> KeepPlan {
+    if params.keep_recent_turns == 0 {
+        return KeepPlan {
+            prompt_idx: None,
+            tail_from: messages.len(),
+        };
+    }
+    let tail_from = whole_turn_suffix(messages, model, params);
+    if tail_from < messages.len() {
+        return KeepPlan {
+            prompt_idx: None,
+            tail_from,
+        };
+    }
+    split_latest_turn(
+        messages,
+        model,
+        params.keep_recent_tokens,
+        effective_threshold,
+    )
+    .leave_something_to_compact(messages)
+}
+
+fn whole_turn_suffix(messages: &[Message], model: &Model, params: &CompactionParams) -> usize {
+    let floor = recent_suffix_floor(
+        messages,
+        model,
+        params.keep_recent_turns,
+        params.keep_recent_tokens,
+    );
+    let tail_from = (floor..messages.len())
+        .find(|&i| is_turn_prompt(&messages[i]))
+        .unwrap_or(messages.len());
+    if tail_from == 0 {
+        // A forced compaction still needs input when the whole session fits.
+        return messages
+            .iter()
+            .rposition(is_turn_prompt)
+            .filter(|&i| i > 0)
+            .unwrap_or(messages.len());
+    }
+    tail_from
+}
+
+fn split_latest_turn(
+    messages: &[Message],
+    model: &Model,
+    keep_tokens: usize,
+    effective_threshold: usize,
+) -> KeepPlan {
+    let latest_prompt = messages.iter().rposition(is_turn_prompt);
+    let prompt_tokens = latest_prompt
+        .map(|i| model.messages_tokens(&messages[i..=i]))
+        .unwrap_or(0);
+    let prompt_idx = latest_prompt.filter(|_| {
+        prompt_tokens <= keep_tokens || prompt_tokens < effective_threshold.div_ceil(2)
+    });
+    let reserved = prompt_idx.map_or(0, |_| prompt_tokens);
+    let tail_from = round_safe_tail(
+        messages,
+        model,
+        latest_prompt.map_or(0, |i| i + 1),
+        keep_tokens.saturating_sub(reserved),
+    );
+    KeepPlan {
+        prompt_idx,
+        tail_from,
+    }
+}
+
+fn round_safe_tail(
+    messages: &[Message],
+    model: &Model,
+    after_prompt: usize,
+    budget: usize,
+) -> usize {
+    let mut tail_from = messages.len();
+    let mut tokens = 0usize;
+    for i in (after_prompt..messages.len()).rev() {
+        tokens = tokens.saturating_add(model.messages_tokens(&messages[i..=i]));
+        if tokens > budget {
+            break;
+        }
+        if is_round_boundary(&messages[i]) {
+            tail_from = i;
+        }
+    }
+    tail_from
+}
+
+impl KeepPlan {
+    fn leave_something_to_compact(mut self, messages: &[Message]) -> Self {
+        if messages.is_empty() || self.kept_count(messages.len()) < messages.len() {
+            return self;
+        }
+        // Drop the oldest post-prompt round, or summarize a lone prompt.
+        if self.tail_from == messages.len() {
+            self.prompt_idx = None;
+            return self;
+        }
+        self.tail_from = (self.tail_from + 1..messages.len())
+            .find(|&i| is_round_boundary(&messages[i]))
+            .unwrap_or(messages.len());
+        self
+    }
+}
+
 /// Earliest index still within both the turn-count and token budgets, scanning
 /// backward from the end.
 fn recent_suffix_floor(
@@ -210,45 +362,14 @@ fn recent_suffix_floor(
     idx
 }
 
-/// Index in `messages` where the verbatim recent suffix begins; messages before
-/// it are compacted. Keeps at most `keep_turns` recent user-turns and
-/// `keep_tokens` estimated tokens, snapping the boundary forward to a genuine
-/// user prompt, never a timing notice. When `len >= 2`, at least the first
-/// message is compacted. Returns `len` when no genuine prompt can start a kept
-/// suffix.
-pub fn split_index(
-    messages: &[Message],
-    model: &Model,
-    keep_turns: usize,
-    keep_tokens: usize,
-) -> usize {
-    let len = messages.len();
-    if len <= 1 {
-        return len;
-    }
-    let mut idx = recent_suffix_floor(messages, model, keep_turns, keep_tokens);
-    // Timing context isn't a turn boundary: a kept reply still needs its prompt.
-    while idx < len && !is_turn_prompt(&messages[idx]) {
-        idx += 1;
-    }
-    // Never compact zero messages when there is something to compact: if the
-    // budget would keep everything, fall back to splitting at the last user
-    // turn so at least the prefix before it is compacted. When the only user
-    // message is at index 0 there is no earlier turn to keep, so we compact
-    // everything (idx = len).
-    if idx == 0 {
-        idx = messages
-            .iter()
-            .rposition(is_turn_prompt)
-            .filter(|&p| p >= 1)
-            .unwrap_or(len);
-    }
-    idx.min(len)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn msg(role: MessageRole, text: &str) -> Message {
+        Message::new(role, MessageContent::Text(text.into()))
+    }
 
     #[test]
     fn compaction_params_uses_agent_overrides_then_defaults() {
@@ -265,8 +386,7 @@ mod tests {
         let md = "---\n\
 compaction_keep_recent_turns: 1\n\
 compaction_tool_output_max_chars: 50\n\
----\n\
-summarize\n";
+---\n\nsummarize\n";
         let agent = AgentConfig::from_markdown("c", md).unwrap();
         let p = compaction_params(&agent);
         assert_eq!(p.keep_recent_turns, 1);
@@ -328,33 +448,124 @@ summarize\n";
     }
 
     #[test]
-    fn tool_result_tier3_truncates_full_output() {
+    fn tool_result_tier3_truncates_json() {
         use harnx_core::session::ToolOutput;
         use serde_json::json;
-        let big = "x".repeat(5000);
         let out = ToolOutput {
             id: None,
             name: "bash".into(),
-            output: json!({ "data": big }),
+            output: json!({
+                "stdout": "a".repeat(5000),
+                "stderr": "",
+                "exit_code": 0
+            }),
             markdown: None,
             content: vec![],
             switch_agent: None,
         };
-        let rendered = render_tool_output(&out, 200);
-        assert!(rendered.chars().count() <= 200);
+        let rendered = render_tool_output(&out, 100);
         assert!(rendered.contains("[truncated]"));
     }
 
-    fn msg(role: harnx_core::message::MessageRole, text: &str) -> harnx_core::message::Message {
-        use harnx_core::message::{Message, MessageContent};
-        Message::new(role, MessageContent::Text(text.into()))
+    fn plan(messages: &[Message], turns: usize, tokens: usize) -> KeepPlan {
+        plan_with_threshold(messages, turns, tokens, 180_000)
+    }
+
+    fn plan_with_threshold(
+        messages: &[Message],
+        turns: usize,
+        tokens: usize,
+        threshold: usize,
+    ) -> KeepPlan {
+        let params = CompactionParams {
+            keep_recent_turns: turns,
+            keep_recent_tokens: tokens,
+            tool_output_max_chars: DEFAULT_TOOL_OUTPUT_MAX_CHARS,
+        };
+        plan_compaction(messages, &Model::default(), &params, threshold)
+    }
+
+    fn tool_round(id: &str, words: usize) -> Message {
+        use harnx_core::tool::{ToolCall, ToolResult};
+        Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(MessageContentToolCalls {
+                text: "checking".into(),
+                thought: None,
+                sequence: false,
+                tool_results: vec![ToolResult {
+                    call: ToolCall::new("read".into(), json!({}), Some(id.into()), None),
+                    output: json!({"text": "word ".repeat(words)}),
+                    markdown: None,
+                    content: vec![],
+                    switch_agent: None,
+                    execution_context: None,
+                }],
+            }),
+        )
     }
 
     #[test]
-    fn split_index_keeps_recent_user_turns() {
-        use harnx_core::message::MessageRole::*;
-        use harnx_core::model::Model;
-        let model = Model::default();
+    fn keep_plan_membership_and_count_match_indices() {
+        for len in 0..=6 {
+            for tail_from in 0..=len + 1 {
+                for prompt_idx in std::iter::once(None).chain((0..=len).map(Some)) {
+                    let plan = KeepPlan {
+                        prompt_idx,
+                        tail_from,
+                    };
+                    let indices = plan.kept_indices(len);
+                    assert_eq!(plan.kept_count(len), indices.len());
+                    for index in 0..len {
+                        assert_eq!(plan.contains(index), indices.contains(&index));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_handles_tool_first_sessions() {
+        use MessageRole::*;
+        let messages = vec![
+            tool_round("old", 100),
+            msg(User, "latest prompt"),
+            tool_round("new", 100),
+            msg(Assistant, "reply"),
+        ];
+        let budget = Model::default().messages_tokens(&[messages[1].clone(), messages[3].clone()]);
+        assert_eq!(
+            plan(&messages, 3, budget),
+            KeepPlan {
+                prompt_idx: Some(1),
+                tail_from: 3
+            }
+        );
+        let messages = vec![
+            tool_round("old", 100),
+            tool_round("new", 100),
+            msg(Assistant, "reply"),
+        ];
+        let budget = Model::default().messages_tokens(&messages[2..]);
+        assert_eq!(
+            plan(&messages, 3, budget),
+            KeepPlan {
+                prompt_idx: None,
+                tail_from: 2
+            }
+        );
+        assert_eq!(
+            plan(&messages, 3, 8000),
+            KeepPlan {
+                prompt_idx: None,
+                tail_from: 1
+            }
+        );
+    }
+
+    #[test]
+    fn compaction_keeps_recent_user_turns() {
+        use MessageRole::*;
         let messages = vec![
             msg(System, "sys"),
             msg(User, "u1"),
@@ -364,9 +575,23 @@ summarize\n";
             msg(User, "u3"),
             msg(Assistant, "a3"),
         ];
-        let idx = split_index(&messages, &model, 1, 100_000);
-        assert_eq!(idx, 5);
-        assert_eq!(messages[idx].role, User);
+        assert_eq!(
+            plan(&messages, 1, 100_000),
+            KeepPlan {
+                prompt_idx: None,
+                tail_from: 5
+            }
+        );
+        assert!(plan(&messages, 0, 100_000)
+            .kept_indices(messages.len())
+            .is_empty());
+        assert_eq!(
+            plan(&messages[1..], 100, 100_000),
+            KeepPlan {
+                prompt_idx: None,
+                tail_from: 4
+            }
+        );
     }
 
     #[test]
@@ -391,41 +616,185 @@ summarize\n";
             notice,
             msg(Assistant, "a3"),
         ];
-        let model = Model::default();
-        assert_eq!(split_index(&messages, &model, 1, 100_000), 7);
-        assert_eq!(split_index(&messages, &model, 2, 100_000), 4);
-        assert_eq!(split_index(&messages, &model, 100, 100_000), 1);
+        for (turns, expected_tail) in [(1, 7), (2, 4), (100, 1)] {
+            assert_eq!(plan(&messages, turns, 100_000).tail_from, expected_tail);
+        }
+        assert_eq!(plan(&messages[1..], 100, 100_000).tail_from, 6);
+        for budget in 0..=Model::default().messages_tokens(&messages) {
+            let p = plan(&messages, 2, budget);
+            assert_timing_prompt_kept(&messages, p);
+            assert_tail_boundary(&messages, p);
+        }
+    }
+
+    fn assert_timing_prompt_kept(messages: &[Message], plan: KeepPlan) {
+        let kept = plan.kept_indices(messages.len());
+        assert!(!kept.is_empty(), "{plan:?}");
+        assert!(kept.contains(&7), "latest prompt lost: {plan:?}");
+        assert!(is_turn_prompt(&messages[kept[0]]));
+    }
+
+    #[test]
+    fn compaction_keeps_prompt_and_latest_rounds_over_8k() {
+        use MessageRole::*;
+        let messages = vec![
+            msg(User, "investigate"),
+            tool_round("oldest", 2500),
+            tool_round("old", 2500),
+            tool_round("middle", 2500),
+            tool_round("new", 2500),
+            msg(Assistant, "found it"),
+        ];
+        assert!(Model::default().messages_tokens(&messages) > 8000);
         assert_eq!(
-            split_index(&messages[1..], &model, 100, 100_000),
-            6,
-            "fallback split starts at genuine prompt, not last timing context"
+            plan(&messages, 3, 8000),
+            KeepPlan {
+                prompt_idx: Some(0),
+                tail_from: 3
+            }
         );
-        for budget in 0..=model.messages_tokens(&messages) {
-            let idx = split_index(&messages, &model, 2, budget);
-            assert!(
-                idx == messages.len() || is_turn_prompt(&messages[idx]),
-                "token budget cannot split at a timing-only boundary"
+    }
+
+    #[test]
+    fn compaction_summarizes_oversized_round_but_keeps_reply() {
+        use MessageRole::*;
+        let messages = vec![
+            msg(User, "investigate"),
+            tool_round("huge", 10000),
+            msg(Assistant, "found it"),
+        ];
+        assert_eq!(
+            plan(&messages, 3, 8000).kept_indices(messages.len()),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn compaction_keeps_only_latest_prompt_separately() {
+        use MessageRole::*;
+        let messages = vec![
+            msg(User, "old question"),
+            msg(Assistant, "old answer"),
+            msg(User, "latest question"),
+            tool_round("huge", 10000),
+            msg(Assistant, "found it"),
+        ];
+        assert_eq!(
+            plan(&messages, 3, 8000),
+            KeepPlan {
+                prompt_idx: Some(2),
+                tail_from: 4
+            }
+        );
+    }
+
+    #[test]
+    fn compaction_prompt_over_budget_respects_half_threshold() {
+        use MessageRole::*;
+        let messages = vec![msg(User, &"word ".repeat(100)), msg(Assistant, "reply")];
+        let model = Model::default();
+        let tokens = model.messages_tokens(&messages[..1]);
+        let cases = [
+            (1, tokens * 2 + 1, Some(0)),
+            (1, tokens * 2, None),
+            (1, tokens, None),
+            // A prompt within the keep budget doesn't need the threshold exception.
+            (tokens, 0, Some(0)),
+        ];
+        for (budget, threshold, expected_prompt) in cases {
+            assert_eq!(
+                plan_with_threshold(&messages, 3, budget, threshold).prompt_idx,
+                expected_prompt
             );
         }
     }
 
     #[test]
-    fn split_index_compacts_at_least_one_message() {
-        use harnx_core::message::MessageRole::*;
-        use harnx_core::model::Model;
-        let model = Model::default();
-        let messages = vec![msg(User, "u1"), msg(Assistant, "a1")];
-        let idx = split_index(&messages, &model, 100, 100_000);
-        assert!(idx >= 1 && idx <= messages.len());
+    fn compaction_single_prompt_session_compacts_at_least_one_message() {
+        use MessageRole::*;
+        let messages = vec![msg(User, "only prompt")];
+        assert!(plan(&messages, 3, 8000).kept_indices(1).is_empty());
+        let messages = vec![msg(User, "only prompt"), msg(Assistant, "reply")];
+        assert_eq!(plan(&messages, 3, 8000).kept_indices(2), vec![0]);
+        let messages = vec![
+            msg(User, "only prompt"),
+            tool_round("first", 10),
+            tool_round("last", 10),
+            msg(Assistant, "reply"),
+        ];
+        assert_eq!(plan(&messages, 3, 8000).kept_indices(4), vec![0, 2, 3]);
     }
 
     #[test]
-    fn split_index_single_message_keeps_all() {
-        use harnx_core::message::MessageRole::*;
-        use harnx_core::model::Model;
+    fn compaction_budget_sweep_keeps_atomic_rounds_and_compacts_something() {
+        use MessageRole::*;
+        let messages = vec![
+            msg(User, "old prompt"),
+            msg(Assistant, "old answer"),
+            msg(User, "latest prompt"),
+            tool_round("one", 20),
+            tool_round("two", 30),
+            msg(Assistant, "reply"),
+        ];
         let model = Model::default();
-        let messages = vec![msg(User, "only")];
-        assert_eq!(split_index(&messages, &model, 3, 8000), messages.len());
+        for budget in 0..=model.messages_tokens(&messages) {
+            assert_budgeted_plan(&messages, plan(&messages, 3, budget), budget);
+        }
+        assert!(plan(&[], 3, 8000).kept_indices(0).is_empty());
+    }
+
+    fn assert_budgeted_plan(messages: &[Message], plan: KeepPlan, budget: usize) {
+        let kept = plan.kept_indices(messages.len());
+        let latest_prompt = messages.iter().rposition(is_turn_prompt).unwrap();
+        assert!(kept.len() < messages.len(), "{plan:?}");
+        assert!(kept.contains(&latest_prompt), "{plan:?}");
+        assert!(plan
+            .prompt_idx
+            .is_none_or(|i| i == latest_prompt && i < plan.tail_from));
+        assert_tail_boundary(messages, plan);
+        assert_kept_rounds(messages, &kept);
+        assert_kept_budget(messages, &kept, budget);
+    }
+
+    fn assert_tail_boundary(messages: &[Message], plan: KeepPlan) {
+        assert!(plan.tail_from <= messages.len());
+        if plan.prompt_idx.is_some() && plan.tail_from < messages.len() {
+            assert!(is_round_boundary(&messages[plan.tail_from]));
+        }
+    }
+
+    fn assert_kept_rounds(messages: &[Message], kept: &[usize]) {
+        for &index in kept
+            .iter()
+            .filter(|&&i| messages[i].role == MessageRole::Tool)
+        {
+            assert_complete_round(&messages[index]);
+            let position = kept.iter().position(|&i| i == index).unwrap();
+            assert_eq!(
+                &kept[position..],
+                &(index..messages.len()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn assert_complete_round(message: &Message) {
+        let MessageContent::ToolCalls(calls) = &message.content else {
+            panic!("not a round")
+        };
+        assert_eq!(calls.tool_results.len(), 1);
+        assert!(calls.tool_results[0].call.id.is_some());
+        assert!(calls.tool_results[0].output.get("text").is_some());
+    }
+
+    fn assert_kept_budget(messages: &[Message], kept: &[usize], budget: usize) {
+        let model = Model::default();
+        let cost: usize = kept
+            .iter()
+            .map(|&i| model.messages_tokens(&messages[i..=i]))
+            .sum();
+        let latest_prompt = messages.iter().rposition(is_turn_prompt).unwrap();
+        let prompt_cost = model.messages_tokens(&messages[latest_prompt..=latest_prompt]);
+        assert!(cost <= budget || (kept == [latest_prompt] && budget < prompt_cost));
     }
 
     #[test]

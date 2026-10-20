@@ -177,11 +177,15 @@ fn compaction_appends_without_the_config_lock() {
     });
     let session_id = active_session_id(&config);
 
+    let keep_plan = crate::config::compaction::KeepPlan {
+        prompt_idx: None,
+        tail_from: 2,
+    };
     assert!(Config::apply_compaction_summary(
         &config,
         &session_id,
         "summary".to_string(),
-        2
+        keep_plan
     ));
 
     sink.assert_called_without_lock("append");
@@ -200,6 +204,7 @@ fn compaction_appends_without_the_config_lock() {
     let session = guard.session.as_ref().unwrap();
     assert_eq!(session.compaction_summary.as_deref(), Some("summary"));
     assert_eq!(session.compressed_messages.len(), 2);
+    assert_eq!(session.messages.len(), 3);
     let kept_seqs: Vec<_> = session.messages.iter().map(|m| m.log_seq).collect();
     // A message's log seq is the log length before its first entry. The
     // kept messages follow the `Compress` marker at seq 1, and the tool round
