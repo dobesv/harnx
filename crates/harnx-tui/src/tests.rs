@@ -9486,13 +9486,15 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
             .count(),
         0
     );
+    // D2: Archived messages are NOT shown inline (seed_compressed_session puts them in compressed_messages)
     assert_eq!(
         tui.app
             .transcript
             .iter()
             .filter(|item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Old question"))
             .count(),
-        1
+        0,
+        "D2: Old question should NOT appear inline after compaction"
     );
     assert_eq!(
         tui.app
@@ -9500,16 +9502,13 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
             .iter()
             .filter(|item| matches!(item, TranscriptItem::AssistantText { text, .. } if text == "Old answer"))
             .count(),
-        1
+        0,
+        "D2: Old answer should NOT appear inline after compaction"
     );
-    assert_eq!(
-        tui.app
-            .transcript
-            .iter()
-            .filter(|item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Current question"))
-            .count(),
-        1
-    );
+    // Kept message "Current question" is shown
+    assert!(tui.app.transcript.iter().any(
+        |item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Current question")
+    ));
     // seed_compressed_session assigns log_seq 0,1,2 to the compressed
     // messages, so the marker must span that full range.
     let marker_idx = tui
@@ -9518,32 +9517,14 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
         .iter()
         .position(|item| matches!(item, TranscriptItem::CompactionMarker { .. }))
         .expect("compaction marker present");
-    assert_eq!(marker_idx, 2);
-    assert!(matches!(
-        tui.app.transcript.first(),
-        Some(TranscriptItem::UserText { text, .. }) if text == "Old question"
-    ));
-    assert!(matches!(
-        tui.app.transcript.get(1),
-        Some(TranscriptItem::AssistantText { text, .. }) if text == "Old answer"
-    ));
-    assert!(matches!(
-        tui.app.transcript.get(marker_idx),
-        Some(TranscriptItem::CompactionMarker {
-            text,
-            summary_text,
-            detail_text,
-            from_seq,
-            to_seq,
-        })
-            if text == "─── session compacted ───"
-                && summary_text.is_empty()
-                && detail_text.contains("archived messages: 3")
-                && detail_text.contains("Old question")
-                && detail_text.contains("Old answer")
-                && *from_seq == Some(0)
-                && *to_seq == Some(2)
-    ));
+    // The marker comes at the start of the default view
+    assert_eq!(marker_idx, 0);
+    // Verify detail_text has archived content
+    if let TranscriptItem::CompactionMarker { detail_text, .. } = &tui.app.transcript[marker_idx] {
+        assert!(detail_text.contains("archived messages: 3"));
+        assert!(detail_text.contains("Old question"));
+        assert!(detail_text.contains("Old answer"));
+    }
     assert!(tui.app.transcript[marker_idx].is_navigable());
     assert!(!tui.app.streaming_open);
     assert_eq!(tui.app.transcript_focus, None);
@@ -9551,25 +9532,27 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
 }
 
 #[tokio::test]
-async fn session_history_compaction_keeps_archived_history_visible_inline() {
+async fn session_history_compaction_marker_before_kept_messages() {
     let config = test_config_with_mock_client_and_agent("test-agent", None);
     seed_compressed_session(&config);
     let tui = Tui::init(&config).await.unwrap();
 
-    let old_question_idx = tui
-        .app
-        .transcript
-        .iter()
-        .position(
-            |item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Old question"),
-        )
-        .expect("old question present");
-    let old_answer_idx = tui
-        .app
-        .transcript
-        .iter()
-        .position(|item| matches!(item, TranscriptItem::AssistantText { text, .. } if text == "Old answer"))
-        .expect("old answer present");
+    // D2: Archived messages are NOT rendered inline in default view
+    assert!(
+        !tui.app.transcript.iter().any(|item| matches!(
+            item,
+            TranscriptItem::UserText { text, .. } if text == "Old question"
+        )),
+        "archived old question should NOT appear inline"
+    );
+    assert!(
+        !tui.app.transcript.iter().any(|item| matches!(
+            item,
+            TranscriptItem::AssistantText { text, .. } if text == "Old answer"
+        )),
+        "archived old answer should NOT appear inline"
+    );
+
     let marker_idx = tui
         .app
         .transcript
@@ -9583,9 +9566,11 @@ async fn session_history_compaction_keeps_archived_history_visible_inline() {
         .position(|item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Current question"))
         .expect("current question present");
 
-    assert!(old_question_idx < old_answer_idx);
-    assert!(old_answer_idx < marker_idx);
-    assert!(marker_idx < current_question_idx);
+    // Layout: marker -> kept messages
+    assert!(
+        marker_idx < current_question_idx,
+        "marker must precede kept messages"
+    );
 }
 
 #[tokio::test]
@@ -9594,8 +9579,7 @@ async fn session_history_compaction_marker_carries_summary_text() {
     seed_compressed_session_with_summary(&config);
     let tui = Tui::init(&config).await.unwrap();
 
-    // The System summary from the head of the active window is surfaced on the
-    // marker as `summary_text` rather than being silently dropped.
+    // The summary is surfaced on the marker as display-safe summary_text.
     let summary_text = tui
         .app
         .transcript
@@ -9616,15 +9600,21 @@ async fn session_history_compaction_marker_carries_summary_text() {
         TranscriptItem::SystemText(text) if text.contains("Prior conversation summary line")
     )));
 
-    // Archived history stays visible, and the preserved suffix follows.
-    assert!(tui.app.transcript.iter().any(
-        |item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Old question")
-    ));
+    // D2: Archived messages are NOT shown inline (only keepers shown)
+    assert!(
+        !tui.app.transcript.iter().any(|item| matches!(
+            item,
+            TranscriptItem::UserText { text, .. } if text == "Old question"
+        )),
+        "archived old question should NOT appear inline"
+    );
+    // Kept message is shown
     assert!(tui.app.transcript.iter().any(
         |item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Current question")
     ));
 }
 
+/// D2: Compaction marker summary shows in default view (not archived messages).
 #[tokio::test]
 async fn compaction_marker_summary_rendered_inline() {
     let config = test_config_with_mock_client_and_agent("test-agent", None);
@@ -9632,14 +9622,21 @@ async fn compaction_marker_summary_rendered_inline() {
     let mut harness = TuiTestHarness::with_config(config).await;
     harness.render();
     let contents = harness.screen_contents();
+    // The summary text shows on the marker
     assert!(
         contents.contains("Prior conversation summary line"),
-        "summary should render inline in the transcript, screen was:\n{contents}"
+        "summary should render within the marker, screen was:\n{contents}"
+    );
+    // Archived messages are NOT shown in default view
+    assert!(
+        !contents.contains("Old question"),
+        "archived 'Old question' should NOT appear in default view, screen was:\n{contents}"
     );
 }
 
+/// D2 default view: marker -> kept -> later. Archived messages NOT shown inline.
 #[test]
-fn build_transcript_with_compaction_orders_history_marker_and_suffix() {
+fn build_transcript_with_compaction_shows_marker_kept_then_later() {
     use harnx_core::message::{MessageContent, MessageRole};
     use std::collections::HashMap;
 
@@ -9669,54 +9666,63 @@ fn build_transcript_with_compaction_orders_history_marker_and_suffix() {
         &decl_map,
     );
 
-    let archived_q = items
-        .iter()
-        .position(
-            |item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Archived question"),
-        )
-        .expect("archived question rendered inline");
-    let marker = items
+    // D2: Archived messages are NOT rendered inline. Only marker -> kept/active.
+    assert!(
+        !items.iter().any(|item| matches!(
+            item,
+            TranscriptItem::UserText { text, .. } if text == "Archived question"
+        )),
+        "archived question should NOT be rendered inline"
+    );
+    assert!(
+        !items.iter().any(|item| matches!(
+            item,
+            TranscriptItem::AssistantText { text, .. } if text == "Archived answer"
+        )),
+        "archived answer should NOT be rendered inline"
+    );
+
+    let marker_idx = items
         .iter()
         .position(|item| matches!(item, TranscriptItem::CompactionMarker { .. }))
         .expect("compaction marker present");
-    let fresh_q = items
+    let fresh_q_idx = items
         .iter()
         .position(
             |item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Fresh question"),
         )
         .expect("preserved suffix rendered");
 
-    // Layout: [...archived history, marker, ...preserved suffix].
-    assert!(archived_q < marker, "archived history must precede marker");
-    assert!(marker < fresh_q, "marker must precede preserved suffix");
+    // Layout: [marker, ...preserved suffix].
+    assert!(
+        marker_idx < fresh_q_idx,
+        "marker must precede kept messages"
+    );
 
-    // Marker carries exactly one compaction event with the summary and range.
-    let markers: Vec<_> = items
-        .iter()
-        .filter(|item| matches!(item, TranscriptItem::CompactionMarker { .. }))
-        .collect();
-    assert_eq!(markers.len(), 1);
-    match markers[0] {
+    // Marker carries the display-safe summary and range metadata.
+    match &items[marker_idx] {
         TranscriptItem::CompactionMarker {
             summary_text,
             from_seq,
             to_seq,
+            detail_text,
             ..
         } => {
+            // display_summary strips trailing recovery note
             assert!(summary_text.contains("Summary of the past"));
             assert_eq!(*from_seq, Some(0));
             assert_eq!(*to_seq, Some(1));
+            // Detail view still has archived content for ENTER
+            assert!(detail_text.contains("archived messages: 2"));
+            assert!(detail_text.contains("Archived question"));
+            assert!(detail_text.contains("Archived answer"));
         }
         _ => unreachable!(),
     }
 
-    // No archived messages => no marker, only the active messages render.
-    let no_compaction = crate::lifecycle::build_transcript_with_compaction(
-        &[],
-        &active,
-        Some("Summary of the past"),
-        &decl_map,
-    );
+    // No archive or summary means there was no compaction.
+    let no_compaction =
+        crate::lifecycle::build_transcript_with_compaction(&[], &active, None, &decl_map);
     assert!(!no_compaction
         .iter()
         .any(|item| matches!(item, TranscriptItem::CompactionMarker { .. })));
@@ -9927,12 +9933,19 @@ async fn session_history_compaction_is_single_navigable_item() {
         .collect();
     assert_eq!(compaction_items.len(), 1);
     assert!(compaction_items[0].is_navigable());
-    assert!(tui.app.transcript.iter().any(
-        |item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Old question")
-    ));
-    assert!(tui.app.transcript.iter().any(
-        |item| matches!(item, TranscriptItem::AssistantText { text, .. } if text == "Old answer")
-    ));
+    // D2: Archived messages are NOT shown inline, only in detail view
+    assert!(
+        !tui.app.transcript.iter().any(
+            |item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Old question")
+        ),
+        "archived old question should NOT appear inline"
+    );
+    assert!(
+        !tui.app.transcript.iter().any(
+            |item| matches!(item, TranscriptItem::AssistantText { text, .. } if text == "Old answer")
+        ),
+        "archived old answer should NOT appear inline"
+    );
 }
 
 #[tokio::test]
@@ -9986,8 +9999,7 @@ async fn enter_on_compaction_marker_opens_full_detail_view() {
     let config = test_config();
     seed_compressed_session(&config);
     let mut harness = TuiTestHarness::with_config(config).await;
-    // Archived messages now render inline before the marker, so locate the
-    // compaction marker dynamically rather than assuming a fixed index.
+    // Bootstrap rows may precede the session transcript.
     let marker_idx = harness
         .tui()
         .app
@@ -12702,3 +12714,5 @@ async fn pending_markdown_link_is_appended_after_user_text() {
         ]) if text.contains("Harnx") && link_text == "Harnx" && url == "https://harnx.dev"
     ));
 }
+
+mod d2_fixture;

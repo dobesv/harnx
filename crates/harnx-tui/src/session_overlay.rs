@@ -3,19 +3,21 @@
 //! Provides formatting for `.info session` (metadata) and `.dump session` (transcript)
 //! overlay display in the TUI.
 
+use anyhow::Result;
 use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, UserEvent};
 use harnx_core::session::SessionLogEntry;
-use harnx_runtime::nats_session::replay_entries_to_sink;
+use harnx_runtime::nats_session::replay_default_view_to_sink;
 use harnx_runtime::utils::pretty_yaml_block;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::strip_ansi;
 
-/// Render session transcript entries as text for overlay display.
-pub fn render_transcript_text(entries: &[(u64, SessionLogEntry)]) -> String {
+/// Render the default transcript view from the complete raw session log.
+pub fn render_transcript_text(entries: &[(u64, SessionLogEntry)]) -> Result<String> {
     let sink = Arc::new(BufferSink::default());
-    replay_entries_to_sink(entries, sink.clone());
-    sink.lines()
+    replay_default_view_to_sink(entries, 0, &HashMap::new(), sink.clone())?;
+    Ok(sink.lines())
 }
 
 /// Internal sink that collects transcript events into formatted text lines.
@@ -72,14 +74,17 @@ impl harnx_core::event::AgentEventSink for BufferSink {
                     buf.push(format!("── tool result ──\n{clean}"));
                 }
             }
-            AgentEvent::Notice(NoticeEvent::Warning(msg)) => {
-                buf.push(format!("⚠ {msg}"));
-            }
-            AgentEvent::Notice(NoticeEvent::Error(msg)) => {
-                buf.push(format!("error: {msg}"));
-            }
+            AgentEvent::Notice(notice) => buf.push(notice_text(notice)),
             _ => {}
         }
+    }
+}
+
+fn notice_text(notice: NoticeEvent) -> String {
+    match notice {
+        NoticeEvent::Info(message) => message.trim_end_matches('\n').to_owned(),
+        NoticeEvent::Warning(message) => format!("⚠ {message}"),
+        NoticeEvent::Error(message) => format!("error: {message}"),
     }
 }
 
@@ -117,7 +122,7 @@ mod tests {
     #[test]
     fn render_transcript_text_formats_user_message() {
         let entries = vec![text_entry(MessageRole::User, "Hello")];
-        let output = render_transcript_text(&entries);
+        let output = render_transcript_text(&entries).unwrap();
         assert!(output.contains("── user ──"));
         assert!(output.contains("Hello"));
     }
@@ -125,7 +130,7 @@ mod tests {
     #[test]
     fn render_transcript_text_formats_assistant_message() {
         let entries = vec![text_entry(MessageRole::Assistant, "Hi there")];
-        let output = render_transcript_text(&entries);
+        let output = render_transcript_text(&entries).unwrap();
         assert!(output.contains("── assistant ──"));
         assert!(output.contains("Hi there"));
     }
@@ -140,19 +145,11 @@ mod tests {
                 timestamp: None,
             },
         )];
-        let output = render_transcript_text(&entries);
+        let output = render_transcript_text(&entries).unwrap();
         // Error entries are replayed as notice events
         assert!(!output.is_empty());
     }
 
-    /// Test BufferSink handles all 7 event types derived from SessionLogEntry:
-    /// - UserEvent::Message
-    /// - ModelEvent::Final
-    /// - ModelEvent::MessageChunk
-    /// - ToolEvent::Started
-    /// - ToolEvent::Completed
-    /// - NoticeEvent::Error
-    /// - NoticeEvent::Warning (Warning is tested separately; Cancel doesn't exist)
     #[test]
     fn buffer_sink_formats_user_message_event() {
         let sink = Arc::new(BufferSink::default());
@@ -219,20 +216,12 @@ mod tests {
     }
 
     #[test]
-    fn buffer_sink_formats_notice_cancel_event() {
-        // Note: NoticeEvent::Cancel doesn't exist in harnx_core::event::NoticeEvent.
-        // The NoticeEvent enum has Info, Warning, and Error variants.
-        // This test verifies we handle the existing variants correctly.
+    fn buffer_sink_formats_info_notice_event() {
         let sink = Arc::new(BufferSink::default());
         sink.emit(AgentEvent::Notice(NoticeEvent::Info(
-            "cancellation notice".into(),
+            "earlier history archived\n".into(),
         )));
-        let output = sink.lines();
-        // Info events don't produce output in the current implementation
-        assert!(
-            output.is_empty() || !output.contains("error"),
-            "info should not error"
-        );
+        assert_eq!(sink.lines(), "earlier history archived");
     }
 
     #[test]
@@ -257,3 +246,6 @@ mod tests {
         assert!(output.contains("deprecation notice"), "output: {output}");
     }
 }
+
+#[cfg(test)]
+mod compaction_tests;

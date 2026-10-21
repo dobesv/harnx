@@ -8,7 +8,9 @@ mod test_log;
 mod cancellation;
 mod compaction;
 mod handoff;
+mod history;
 mod registry;
+mod snapshot;
 mod web_address;
 
 pub use crate::session_actor_types::*;
@@ -121,6 +123,7 @@ struct SessionActor {
     reap_ttl: Duration,
     reap_deadline: Option<Instant>,
     history_snapshot: Vec<AgUiMessage>,
+    compaction: Option<SessionCompaction>,
     history_warnings: Vec<String>,
     /// Cached durable log entries for control-state hydration on promptless subscribe.
     /// Set by `refresh_history_snapshot` when loading from NATS.
@@ -140,6 +143,7 @@ struct SessionActor {
 #[derive(Default)]
 struct LoadedHistorySnapshot {
     messages: Vec<AgUiMessage>,
+    compaction: Option<SessionCompaction>,
     warnings: Vec<String>,
     entries: Option<Vec<(u64, harnx_core::session::SessionLogEntry)>>,
     tokens_usage: Option<crate::ag_ui::UsageContextSnapshot>,
@@ -224,6 +228,7 @@ fn make_session_actor(
         reap_ttl,
         reap_deadline: None,
         history_snapshot: Vec::new(),
+        compaction: None,
         history_warnings: Vec::new(),
         log_entries: None,
         tokens_usage: None,
@@ -269,6 +274,17 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         .await;
     }
 
+    let (event_sink, relay) = snapshot::TurnEventRelay::new(&params);
+    // Nested NATS follow futures exceed the debug-build actor stack when inline.
+    relay
+        .run(Box::pin(run_nats_actor_turn(params, event_sink)))
+        .await
+}
+
+async fn run_nats_actor_turn(
+    params: ActorTurnParams,
+    sink: Arc<dyn harnx_core::event::AgentEventSink>,
+) -> anyhow::Result<harnx_runtime::LoopResult> {
     let abort_signal = params.abort_signal.clone();
     let session = match open_actor_nats_session(
         &params.prompt_config,
@@ -283,7 +299,7 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
     };
     if let Some(admitted) = params.admitted {
         let result = session
-            .follow_admitted_prompt(admitted, params.sink, None, None, Default::default())
+            .follow_admitted_prompt(admitted, sink, None, None, Default::default())
             .await;
         return check_admitted_turn_result(result);
     }
@@ -301,7 +317,7 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
     };
     session
         .with_external_admission()
-        .run_turn_input(&input, attachments_dir.as_deref(), params.sink, None)
+        .run_turn_input(&input, attachments_dir.as_deref(), sink, None)
         .await
         .map(|_| harnx_runtime::LoopResult::Completed)
 }
@@ -495,15 +511,7 @@ impl SessionActor {
                 self.cancel_reap(reap_sleep);
                 self.refresh_history_snapshot().await;
                 self.republish_pending_activation().await;
-                let _ = reply.send(SubscribeResult {
-                    snapshot: self.history_snapshot.clone(),
-                    history_warnings: self.history_warnings.clone(),
-                    state: self.state.clone(),
-                    events: self.broadcast_tx.subscribe(),
-                    log_entries: self.log_entries.clone(),
-                    tokens_usage: self.tokens_usage.clone(),
-                    session_base: self.session_base.clone(),
-                });
+                let _ = reply.send(self.subscription());
             }
             SessionCommand::Prompt {
                 text,
@@ -816,6 +824,7 @@ impl SessionActor {
             // running anyway.
             worker_active: self.worker_active,
             history_snapshot: self.history_snapshot.clone(),
+            compaction: self.compaction.clone(),
             history_warnings: self.history_warnings.clone(),
             capabilities: SessionCapabilities {
                 // A prompt is always admissible: the session log orders it
@@ -885,77 +894,6 @@ impl SessionActor {
             && self.subscribers == 0
             && !self.is_running()
             && self.rx.is_empty()
-    }
-
-    async fn refresh_history_snapshot(&mut self) {
-        let loaded = self.load_history_snapshot().await;
-        // `Interrupting` is this actor's own append. The actor answers one
-        // command at a time, so today no refresh can run while one is in
-        // flight; the guard is here to keep the state machine right if the
-        // append ever moves off the command path.
-        if self.active_run.is_none() && !matches!(self.state, SessionState::Interrupting) {
-            self.state = derive_state_from_log(loaded.entries.as_deref());
-        }
-        self.history_snapshot = loaded.messages;
-        self.history_warnings = loaded.warnings;
-        self.log_entries = loaded.entries;
-        self.tokens_usage = loaded.tokens_usage;
-        self.session_base = loaded.session_base;
-        self.worker_active = loaded.worker_active;
-    }
-
-    async fn load_history_snapshot(&self) -> LoadedHistorySnapshot {
-        if self.actor_config.call_fn.is_some() {
-            return self.test_history_snapshot().await;
-        }
-        match crate::load_nats_session_state(
-            &self.actor_config.base_config,
-            self.key.target(),
-            &self.key.session,
-        ).await {
-            Ok(loaded) if loaded.session.agent_name.as_deref() == Some(self.key.agent()) => {
-                LoadedHistorySnapshot {
-                    messages: crate::ag_ui::history_messages_for_snapshot(&loaded.session.messages),
-                    tokens_usage: Some(crate::ag_ui::UsageContextSnapshot::from_session(&loaded.session)),
-                    warnings: loaded.session.replay_warnings,
-                    entries: Some(loaded.entries),
-                    session_base: Some(loaded.base_session),
-                    worker_active: loaded.worker_active,
-                }
-            }
-            Ok(loaded) => LoadedHistorySnapshot {
-                warnings: vec![format!(
-                    "Failed to load session history: session belongs to agent '{}' rather than '{}'",
-                    loaded.session.agent_name.as_deref().unwrap_or("unknown"), self.key.agent()
-                )],
-                ..Default::default()
-            },
-            Err(error) if error.to_string().contains("Not Found") => Default::default(),
-            Err(error) => LoadedHistorySnapshot {
-                warnings: vec![format!("Failed to load session history: {error:#}")],
-                ..Default::default()
-            },
-        }
-    }
-
-    async fn test_history_snapshot(&self) -> LoadedHistorySnapshot {
-        let prompt_config = prompt_config_for_agent_session_from_global(
-            &self.actor_config.base_config,
-            &self.key,
-            true,
-        )
-        .await;
-        let messages = prompt_config
-            .read()
-            .session
-            .as_ref()
-            .map(|session| crate::ag_ui::history_messages_for_snapshot(&session.messages))
-            .unwrap_or_default();
-        // The test executor has no durable NATS log or metadata base.
-        LoadedHistorySnapshot {
-            messages,
-            ..Default::default()
-        }
     }
 }
 

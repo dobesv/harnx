@@ -1,4 +1,13 @@
-import type { Agent, AgentDetail, JsonRpcResponse, PaginatedSessions, PromptResult, SessionRef } from './types';
+import { sessionRpcResponse } from './sessionRpcResponse';
+import type {
+  Agent,
+  AgentDetail,
+  JsonRpcResponse,
+  PaginatedSessions,
+  PromptResult,
+  SessionInfo,
+  SessionRef,
+} from './types';
 import { fetchJsonWithRetry, observedFetch, PermanentError } from './httpClient';
 
 export const API_BASE = '/v1';
@@ -200,15 +209,7 @@ export async function submitHitlDecision(
       params: { tool_call_id: toolCallId, approved, note }
     })
   });
-  let json: JsonRpcResponse<{ applied: boolean }> | undefined;
-  try {
-    json = await res.json() as JsonRpcResponse<{ applied: boolean }>;
-  } catch {
-    json = undefined;
-  }
-  if (json?.error) throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
-  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
-  return json?.result || { applied: false };
+  return sessionRpcResponse<{ applied: boolean }>(res, { applied: false });
 }
 
 export interface SessionTarget {
@@ -230,15 +231,7 @@ async function sessionRpcStatusCall(
       method,
     }),
   });
-  let json: JsonRpcResponse<{ status: string }> | undefined;
-  try {
-    json = await res.json() as JsonRpcResponse<{ status: string }>;
-  } catch {
-    json = undefined;
-  }
-  if (json?.error) throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
-  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
-  return json?.result || { status: 'ok' };
+  return sessionRpcResponse<{ status: string }>(res, { status: 'ok' });
 }
 
 export async function markRead(
@@ -258,3 +251,24 @@ export async function markUnread(
 export { cancel, CANCELLATION_TIMEOUT_MS } from './cancellationApi';
 export { compactSession, COMPACTION_TIMEOUT_MS, type CompactSubmit, type CompactOutcome } from './compactionApi';
 
+
+export async function getSession(
+  agent: string,
+  session: string,
+  options?: { signal?: AbortSignal }
+): Promise<SessionInfo> {
+  const res = await observedFetch(
+    `${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`,
+    {
+      method: 'POST',
+      signal: options?.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/get',
+      }),
+    }
+  );
+  return sessionRpcResponse<SessionInfo>(res, {});
+}

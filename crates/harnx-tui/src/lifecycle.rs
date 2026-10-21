@@ -1160,20 +1160,29 @@ fn append_message_compaction_detail_sections(
     }
 }
 
-fn build_compaction_marker(
-    messages: &[Message],
+/// Build a compaction marker for display in the transcript.
+/// Uses display-safe summary (strips trailing recovery note).
+fn build_compaction_marker_for_display(
+    compressed_messages: &[Message],
     summary_text: String,
     decl_map: &HashMap<String, ToolDeclaration>,
 ) -> TranscriptItem {
-    let from_seq = messages.iter().filter_map(|msg| msg.log_seq).min();
-    let to_seq = messages.iter().filter_map(|msg| msg.log_seq).max();
-    let archived_count = messages.len();
+    let from_seq = compressed_messages
+        .iter()
+        .filter_map(|msg| msg.log_seq)
+        .min();
+    let to_seq = compressed_messages
+        .iter()
+        .filter_map(|msg| msg.log_seq)
+        .max();
+    // Build detail text with archived messages for ENTER view
+    let archived_count = compressed_messages.len();
     let mut detail_sections = Vec::new();
     if !summary_text.is_empty() {
         detail_sections.push(format!("── summary ──\n{summary_text}"));
     }
     detail_sections.push(format!("archived messages: {archived_count}"));
-    for message in messages {
+    for message in compressed_messages {
         append_message_compaction_detail_sections(&mut detail_sections, message, decl_map);
     }
     let detail_text = detail_sections.join("\n\n");
@@ -1188,10 +1197,11 @@ fn build_compaction_marker(
 
 /// Build the transcript for a (possibly compacted) session view.
 ///
-/// When `compressed_messages` is non-empty the archived history is rendered
-/// inline first so it stays visible, followed by a single compaction marker
-/// carrying summary text, then the active/preserved messages. Shared by local
-/// and remote resume paths to keep layout in lockstep (#904).
+/// Shows: compaction marker (with display-safe summary) → kept messages → later activity.
+/// Archived messages (`compressed_messages`) are NOT rendered inline — they remain
+/// available through the detail view (ENTER on marker). The marker sequence matches
+/// `harnx_core::transcript_view::default_view` for the same session log.
+/// Shared by local and remote resume paths to keep layout in lockstep.
 pub(crate) fn build_transcript_with_compaction(
     compressed_messages: &[Message],
     active_messages: &[Message],
@@ -1215,15 +1225,15 @@ pub(crate) fn build_transcript_with_compaction_for_cluster(
     cluster: Option<&str>,
 ) -> Vec<TranscriptItem> {
     let mut items = Vec::new();
-    if !compressed_messages.is_empty() {
-        items.extend(messages_to_transcript_items_for_cluster(
+    // Compress can exist without archived messages (for example, a truncated log).
+    // The summary still belongs in the default view in that case.
+    if compaction_summary.is_some() || !compressed_messages.is_empty() {
+        let display_summary =
+            harnx_core::compaction_summary::display_summary(compaction_summary.unwrap_or_default())
+                .to_owned();
+        items.push(build_compaction_marker_for_display(
             compressed_messages,
-            decl_map,
-            cluster,
-        ));
-        items.push(build_compaction_marker(
-            compressed_messages,
-            compaction_summary.unwrap_or_default().to_string(),
+            display_summary,
             decl_map,
         ));
     }

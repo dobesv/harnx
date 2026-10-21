@@ -1441,15 +1441,45 @@ When implementing `--follow` or live-tail rendering (CLI or TUI):
 
 `--follow` is read-only observation; it does not interrupt or cancel the running session.
 
+### Compaction-aware transcript rendering
+
+Compacted sessions show a default view: marker (display-safe summary) → kept messages → later
+activity. Archived messages are **never** rendered inline.
+
+All interfaces that display session history must use one of two paths:
+
+1. **`harnx_core::transcript_view::default_view`** — returns `TranscriptView { compaction, entries }`
+   for frontend projection (`crates/harnx-core/src/transcript_view.rs`). Web and serve use this
+   directly; D1 fixture parity tests import
+   `crates/harnx-core/tests/fixtures/compaction-history.json`.
+
+2. **`harnx_runtime::replay_default_view_to_sink`** — replays the default view through an
+   `AgentEventSink` as `NoticeEvent::Info` for the marker, then entries via the existing renderer
+   (`crates/harnx-runtime/src/nats_session.rs`). CLI dump, ACP `load_session`, and TUI
+   `.dump session` use this shared adapter.
+
+When adding a new history interface, call one of these and add a parity test against the shared
+fixture. Do not introduce a third view model or bypass the shared compaction logic.
+
+Wire contract for `session/get` and live snapshots (AG-UI `MESSAGES_SNAPSHOT` /
+CUSTOM `session_compaction`): the synthetic summary message is an AG-UI **assistant** role with
+string `content`. External consumers (e.g. workflow-bot) read only `role` + string content and
+ignore new fields. New metadata fields (`compaction.*`, optional) are additive; do not change
+the shape of existing `history_snapshot` rows.
+
 ### Entry rendering for text output
 
-`replay_entries_to_sink()` (`nats_session.rs:1473`) renders `SessionLogEntry` tuples through a
+`replay_entries_to_sink()` (`nats_session.rs`) renders `SessionLogEntry` tuples through a
 frontend's `AgentEventSink`. Callers must first apply log mutations (edits/rewinds) if they need
 an effective snapshot — the helper renders entries in the supplied order without resolution.
 Control entries (`TurnEnd`, `HandoffCommitted`, `HitlApproval*`) are silent
 in text rendering because their state hydrates separately from human transcript output.
 Legacy `SubAgentStarted` entries are silent too and hydrate no frontend state;
 they still render a runtime note into model context.
+
+For compacted sessions, prefer `replay_default_view_to_sink()` instead — it emits the marker
+first, then the default-view entries. Use `replay_entries_to_sink` only when rendering a specific
+explicitly-sliced window (e.g. D3 browse-back pages).
 
 `MessageContent::to_text()` (`harnx-core/src/message.rs`) extracts text only and drops image
 parts — it's for LLM-facing contexts. Human-readable transcripts (CLI dump/`--follow`, TUI

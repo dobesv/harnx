@@ -148,3 +148,9 @@ test = ["harnx-a2a-server"]
 [[test-edge]]
 on-affected = ["harnx-bash-tools"]
 test = ["harnx-a2a-server"]
+
+# Parity tests in serve, the CLI dump, ACP and the TUI load the shared
+# compaction history fixture.
+[[test-path]]
+globs = ["crates/harnx-core/tests/fixtures/**"]
+test = ["harnx", "harnx-acp-server", "harnx-serve", "harnx-tui"]

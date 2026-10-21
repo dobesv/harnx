@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[cfg(test)]
+use crate::ag_ui_attach::snapshot_event;
+use crate::transcript_snapshot::HistorySnapshot;
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
@@ -6,9 +9,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::ag_ui_attach::{
-    initial_attach_frame, keep_alive_frame, session_attach_boundary_frame, snapshot_event,
-};
+use crate::ag_ui_attach::{initial_attach_frame, keep_alive_frame, session_attach_boundary_frame};
 pub use crate::ag_ui_events::frame_event;
 pub(crate) use crate::ag_ui_events::frame_terminal_after_lifecycle_closes;
 use crate::ag_ui_events::{
@@ -505,10 +506,36 @@ impl AgUiSink {
         format!("turn-{turn}")
     }
 
-    fn emit_history_snapshot(&self) {
-        if let Some(history_snapshot) = &self.history_snapshot {
-            self.send(snapshot_event(history_snapshot()));
+    fn emit_history_snapshot(&self, snapshot: Option<HistorySnapshot>) {
+        for event in snapshot.into_iter().flat_map(HistorySnapshot::events) {
+            self.send(event);
         }
+    }
+
+    pub(crate) fn emit_compacting_completed(
+        &self,
+        event: SessionEvent,
+        snapshot: Option<HistorySnapshot>,
+    ) {
+        let SessionEvent::CompactingCompleted {
+            compaction_id,
+            outcome,
+        } = event
+        else {
+            return;
+        };
+        let mut payload = json!({ "outcome": outcome });
+        if let Some(id) = compaction_id {
+            payload["compaction_id"] = json!(id);
+        }
+        if let Some(compaction) = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.compaction.as_ref())
+        {
+            compaction.extend_completed(&mut payload);
+        }
+        self.emit_custom("session_compacting_completed", payload);
+        self.emit_history_snapshot(snapshot);
     }
 
     fn emit_tool_result(&self, tool_call_id: String, content: String) {
@@ -836,16 +863,12 @@ impl AgUiSink {
                 }
                 self.emit_custom("session_compacting_started", payload);
             }
-            SessionEvent::CompactingCompleted {
-                compaction_id,
-                outcome,
-            } => {
-                let mut payload = json!({ "outcome": outcome });
-                if let Some(id) = compaction_id {
-                    payload["compaction_id"] = json!(id);
-                }
-                self.emit_custom("session_compacting_completed", payload);
-                self.emit_history_snapshot();
+            event @ SessionEvent::CompactingCompleted { .. } => {
+                let snapshot = self
+                    .history_snapshot
+                    .as_ref()
+                    .map(|provider| HistorySnapshot::from(provider()));
+                self.emit_compacting_completed(event, snapshot);
             }
             SessionEvent::CompactingFailed {
                 compaction_id,
@@ -919,14 +942,14 @@ pub struct NewMsg {
 }
 
 fn initial_attach_frame_with_attachment_metadata(
-    snapshot: Vec<AgUiMessage>,
+    snapshot: HistorySnapshot,
     history_warnings: Vec<String>,
     log_entries: Option<&[(u64, harnx_core::session::SessionLogEntry)]>,
     hydrate_history: bool,
 ) -> Option<Bytes> {
     let attachment_events = if hydrate_history {
         log_entries
-            .map(|entries| message_attachment_snapshot_events(&snapshot, entries))
+            .map(|entries| message_attachment_snapshot_events(&snapshot.messages, entries))
             .unwrap_or_default()
     } else {
         Vec::new()
@@ -1193,6 +1216,7 @@ pub(crate) fn build_ag_ui_event_stream(
     let guard = Arc::new(Mutex::new(LiveStreamGuard::default()));
     let SubscribeResult {
         snapshot,
+        compaction,
         history_warnings,
         state,
         events,
@@ -1215,7 +1239,10 @@ pub(crate) fn build_ag_ui_event_stream(
         | crate::session_actor::SessionState::Interrupted { .. } => None,
     };
     let initial_frame = initial_attach_frame_with_attachment_metadata(
-        snapshot,
+        HistorySnapshot {
+            messages: snapshot,
+            compaction,
+        },
         history_warnings,
         log_entries.as_deref(),
         has_prompt.is_none(),

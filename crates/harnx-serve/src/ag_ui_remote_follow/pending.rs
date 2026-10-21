@@ -71,12 +71,13 @@ pub(super) fn completion_events(
         session_id,
         base.clone(),
     )?;
-    let snapshot = crate::ag_ui::history_messages_for_snapshot(&session.messages);
+    let snapshot = crate::transcript_snapshot::HistorySnapshot::from_entries(history, base, false)?;
     let usage = UsageContextSnapshot::from_session(&session);
-    Ok(std::iter::once(snapshot_event(snapshot.clone()))
-        .chain(crate::ag_ui::message_attachment_snapshot_events(
-            &snapshot, history,
-        ))
+    let attachments = crate::ag_ui::message_attachment_snapshot_events(&snapshot.messages, history);
+    Ok(snapshot
+        .events()
+        .into_iter()
+        .chain(attachments)
         .chain(crate::ag_ui::control_snapshot_events(history, Some(&usage)))
         .collect())
 }

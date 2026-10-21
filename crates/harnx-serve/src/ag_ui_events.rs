@@ -14,7 +14,6 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::ag_ui::{AgUiError, SharedLiveStreamGuard};
-use crate::ag_ui_attach::snapshot_event;
 use crate::ag_ui_lifecycle::LiveStreamGuard;
 use crate::ag_ui_sync::frame_run_error_event;
 use crate::session_actor::{SessionCommand, SessionHandle};
@@ -53,7 +52,7 @@ pub(crate) fn live_subscription_events(
         let handle = handle.clone();
         async move {
             match item {
-                Ok(event) => Some(event),
+                Ok(event) => vec![event],
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => {
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                     handle
@@ -62,12 +61,15 @@ pub(crate) fn live_subscription_events(
                         .await
                         .expect("send get");
                     let info = reply_rx.await.expect("recv get");
-                    Some(snapshot_event(info.history_snapshot))
+                    crate::transcript_snapshot::snapshot_events(
+                        info.history_snapshot,
+                        info.compaction.as_ref(),
+                    )
                 }
             }
         }
     });
-    tokio_stream::StreamExt::filter_map(events, |event| event)
+    futures_util::StreamExt::flat_map(events, tokio_stream::iter)
 }
 
 /// Whether local run state blocks idle or remote-follow stream handling.

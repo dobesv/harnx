@@ -1,3 +1,5 @@
+import type { CompactionMetadata } from './compactionMetadata';
+
 export interface Agent {
   name: string;
   model: string;
@@ -57,3 +59,13 @@ export interface PromptResult {
   run_id: string;
 }
 
+export interface SessionInfo {
+  state?: unknown;
+  canPrompt?: boolean;
+  canCancel?: boolean;
+  history_snapshot?: HistoryMessage[];
+  compaction?: CompactionMetadata;
+  history_warnings?: unknown[];
+  capabilities?: Record<string, unknown>;
+  [key: string]: unknown;
+}

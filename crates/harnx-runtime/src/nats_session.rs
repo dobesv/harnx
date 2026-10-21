@@ -2003,6 +2003,39 @@ pub struct NatsTurnResult {
     pub user_msg_id: String,
 }
 
+/// Replay the default transcript view from the complete raw session log.
+///
+/// Emits a display-safe compaction block as `NoticeEvent::Info`, then kept and
+/// later entries using the existing message/tool renderer. Sinks must display
+/// Info notices for the marker to be visible.
+///
+/// `after_seq` is zero for a snapshot, then the last observed physical sequence
+/// for append-only follow. Always pass the full raw log, not effective entries
+/// or a follow delta: the shared view resolves mutations and marker ancestry.
+/// A new compaction starts a new view block; previously printed text stays put.
+pub fn replay_default_view_to_sink(
+    entries: &[(u64, SessionLogEntry)],
+    after_seq: u64,
+    decl_map: &HashMap<String, ToolDeclaration>,
+    sink: Arc<dyn AgentEventSink>,
+) -> Result<()> {
+    use harnx_core::event::NoticeEvent;
+
+    let mut view = harnx_core::transcript_view::default_view(entries)?;
+    if let Some(marker) = view
+        .compaction
+        .filter(|marker| marker.compaction_seq > after_seq)
+    {
+        sink.emit(AgentEvent::Notice(NoticeEvent::Info(format!(
+            "── Compaction {}: earlier history archived ──\n{}\n",
+            marker.compaction_seq, marker.summary
+        ))));
+    }
+    view.entries.retain(|(seq, _)| *seq > after_seq);
+    replay_entries_to_sink_with_decls(&view.entries, decl_map, sink);
+    Ok(())
+}
+
 /// Replay stored transcript entries synchronously through a frontend's text sink.
 ///
 /// Entries are rendered in the supplied order, including every user message.

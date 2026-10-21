@@ -1,0 +1,14 @@
+---
+source: crates/harnx-tui/src/tests/d2_fixture.rs
+expression: "display_rows(items).join(\"\\n\")"
+---
+marker: Earlier log inspection is archived. The latest prompt, verification round and final reply remain verbatim.
+user Some(16): Implement the shared transcript view and verify paging.
+assistant Some(17): Check the transcript view tests.
+tool Some(17): exec
+Some(Yaml("command: cargo nextest run -p harnx-core transcript_view"))
+result: exit_code: 0
+stdout: Transcript view tests passed.
+assistant Some(19): The shared view is implemented. Paging tests passed.
+user Some(21): Show the previous compaction's history.
+assistant Some(22): The earlier window contains the original prompt and both tool rounds.
