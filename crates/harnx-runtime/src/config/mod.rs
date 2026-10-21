@@ -32,6 +32,7 @@ mod settings_split;
 mod tool_selection;
 mod tool_servers_split;
 
+pub(crate) use self::compaction::is_turn_prompt;
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;
 pub use self::nats_split::{

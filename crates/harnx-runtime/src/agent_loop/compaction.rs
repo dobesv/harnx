@@ -14,7 +14,14 @@ pub(super) async fn preflight(ctx: &AgentLoopContext, input: &mut Input) -> Resu
     }
     ctx.check_generation("before-compaction")?;
     if request_needs_compaction(&ctx.config, input)? {
-        compact_in_turn(ctx).await?;
+        if let Err(error) = compact_in_turn(ctx).await {
+            ctx.check_generation("compaction-failed")?;
+            // The estimate has headroom; a failed summarizer doesn't prove the
+            // main request won't fit. Provider overflow recovery stays strict.
+            log::warn!(
+                "Preflight compaction failed; continuing with uncompacted history: {error:#}"
+            );
+        }
         ctx.check_generation("after-compaction")?;
     }
     Ok(())
@@ -44,16 +51,27 @@ fn request_needs_compaction(config: &GlobalConfig, input: &mut Input) -> Result<
 }
 
 /// Await the ordinary compaction path and emit the same lifecycle as maintenance.
-/// Overflow recovery can call this after classifying an error, without another threshold check.
+/// Overflow recovery uses `compact_preserving` for already prepared input.
 pub(super) async fn compact_in_turn(ctx: &AgentLoopContext) -> Result<()> {
+    compact_preserving(ctx, None).await
+}
+
+pub(super) async fn compact_preserving(
+    ctx: &AgentLoopContext,
+    protected_from: Option<usize>,
+) -> Result<()> {
     let Some(flight) = CompactionFlight::begin(&ctx.config) else {
+        anyhow::ensure!(
+            protected_from.is_none(),
+            "session compaction already in progress during overflow recovery"
+        );
         return Ok(());
     };
     let started = std::time::Instant::now();
     let result = tokio::select! {
         biased;
         _ = harnx_core::abort::wait_abort_signal(&ctx.abort_signal) => Err(anyhow::anyhow!("interrupted by user")),
-        result = Box::pin(Config::compact_session(&ctx.config)) => result,
+        result = Box::pin(Config::compact_session_preserving(&ctx.config, protected_from)) => result,
     };
     Config::handle_compaction_result(&result, started, flight.message_count, None);
     result

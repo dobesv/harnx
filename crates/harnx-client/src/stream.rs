@@ -342,10 +342,18 @@ async fn sse_status_error(res: reqwest::Response) -> Result<()> {
         "Provider SSE HTTP error: status={status}, content-type={:?}, retry-after={retry_after:?}",
         res.headers().get(reqwest::header::CONTENT_TYPE)
     );
-    let data: Value = res.json().await.map_err(|_| harnx_core::error::LlmError {
-        status,
-        message: "Provider returned a non-JSON error response to a streaming request".into(),
-        retry_after,
+    let body = res.text().await?;
+    let data: Value = serde_json::from_str(&body).map_err(|_| {
+        let mut error = harnx_core::error::LlmError {
+            status,
+            message: body,
+            retry_after,
+        };
+        if !error.is_context_overflow() {
+            error.message =
+                "Provider returned a non-JSON error response to a streaming request".into();
+        }
+        error
     })?;
     catch_error(&data, status, retry_after)?;
     bail!("Unexpected provider event-stream status: {status}; expected 200")

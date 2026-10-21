@@ -262,6 +262,14 @@ impl Config {
     }
 
     pub async fn compact_session(config: &GlobalConfig) -> Result<()> {
+        Self::compact_session_preserving(config, None).await
+    }
+
+    /// Overflow recovery protects input that was already persisted for this request.
+    pub(crate) async fn compact_session_preserving(
+        config: &GlobalConfig,
+        protected_from: Option<usize>,
+    ) -> Result<()> {
         Self::ensure_compactable(config)?;
 
         let summarizer_agent = match Self::resolve_compaction_agent(config) {
@@ -273,7 +281,7 @@ impl Config {
         let params = crate::config::compaction::compaction_params(&summarizer_agent);
 
         let (transcript, keep_plan, covered, session_id) =
-            Self::build_compaction_transcript(config, &params)?;
+            Self::build_compaction_transcript_preserving(config, &params, protected_from)?;
 
         {
             let guard = config.read();
@@ -374,9 +382,10 @@ impl Config {
 
     /// Plan the kept set and render its dropped complement, along with the
     /// covered log-seq range and session id.
-    fn build_compaction_transcript(
+    fn build_compaction_transcript_preserving(
         config: &GlobalConfig,
         params: &crate::config::compaction::CompactionParams,
+        protected_from: Option<usize>,
     ) -> Result<CompactionTranscript> {
         let guard = config.read();
         let session = guard.session.as_ref().context("No session")?;
@@ -392,9 +401,17 @@ impl Config {
             &model,
             params,
             threshold,
-        );
+        )
+        .protect_suffix(protected_from);
         let compacted_count = session.messages.len() - keep_plan.kept_count(session.messages.len());
-        if compacted_count == 0 {
+        // A protected first input may be the only active message while an old
+        // summary still fills the window. Recovery can shrink that summary alone.
+        let resummarize = protected_from.is_some()
+            && session
+                .compaction_summary
+                .as_ref()
+                .is_some_and(|summary| !summary.is_empty());
+        if compacted_count == 0 && !resummarize {
             bail!("Nothing to compact");
         }
         let compacted_msgs = session
@@ -474,7 +491,7 @@ mod tests {
         for (limit, configured, expected_prompt) in cases {
             let config = threshold_test_config(limit, configured);
             let (transcript, plan, _, _) =
-                Config::build_compaction_transcript(&config, &params).unwrap();
+                Config::build_compaction_transcript_preserving(&config, &params, None).unwrap();
             assert_eq!(
                 plan.prompt_idx, expected_prompt,
                 "limit={limit:?}, configured={configured:?}"

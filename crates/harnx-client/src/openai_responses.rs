@@ -698,9 +698,9 @@ fn responses_stream_error(data: &Value) -> Result<()> {
         data.get("response")
             .and_then(|response| response.get("error"))
     }) {
-        return crate::catch_error(&json!({"error": err_obj}), 500, None);
+        return crate::catch_stream_error(&json!({"error": err_obj}));
     }
-    bail!("Responses stream error: {}", data)
+    crate::catch_stream_error(data)
 }
 
 /// Process a single Responses SSE event.

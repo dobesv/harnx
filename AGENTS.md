@@ -1792,9 +1792,21 @@ GitHub Issues is the issue/task tracker for this project.
 
 Mid-turn compaction fires once per tool round, before preparing the next model request (`agent_loop/compaction.rs`). It never fires for fresh user input or sessionless inputs. The timing matters: compacting after input preparation would invalidate `session_input_start`, which the next request's cursor depends on.
 
+Preflight compaction is best-effort: after a summarizer failure, keep the failed lifecycle event and attempt the uncompacted request. `check_generation("compaction-failed")` checks both the abort signal and the run-context deadline before continuing; retain the after-compaction check too. Failed summary generation leaves history unchanged, and `CompactionFlight::drop` clears the single-flight flag. Provider-overflow recovery remains strict, even after a failed preflight attempt.
+
 The NATS worker inherits this behavior through the shared `run_agent_loop_inner` (`nats_worker/agent_loop/mod.rs`). No duplicate worker path exists.
 
 `through_seq` capture in `TurnEventSender::emit` (`session_actor/snapshot.rs`) is synchronous: it reads `session.next_seq()` before the runtime resumes, fencing the snapshot to the compaction event's sequence boundary. This prevents mid-turn history snapshots from including entries whose streaming events haven't arrived yet.
 
 The request estimator (`Model::estimate_request_tokens`) covers messages, tool definitions, images (1500 tokens each), and a 10% margin. Not exact — tokenizer mismatch is why the threshold applies at 90% of the model's `max_input_tokens`.
+
+### Context overflow recovery
+
+When a provider rejects a request with a context-overflow error (HTTP 400/413 with recognized error phrases), the shared agent loop forces compaction and retries once (`agent_loop/overflow.rs`). Threshold is ignored — this runs even when `compress_threshold: 0`.
+
+`LlmError::is_context_overflow` (`harnx-core/src/error.rs`) matches provider-specific phrases for OpenAI, Anthropic, Gemini, and Bedrock. Adding a new provider requires extending this classifier and the streaming parser's error mapping.
+
+First-request handling: NATS loads selected input before the turn starts, so overflow on the first request preserves those rows. Local mode finds the prompt via `prompt_start`. New user input is never appended twice — the retry uses the same `Input` with its request-only patch intact.
+
+Recovery failure says "compaction was tried" in the error chain. If there's nothing older to compact without losing the new prompt, recovery fails rather than summarizing that prompt away.
 

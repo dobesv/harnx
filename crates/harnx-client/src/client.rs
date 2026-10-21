@@ -490,59 +490,8 @@ pub async fn noop_rerank(_builder: RequestBuilder, _model: &Model) -> Result<Rer
     bail!("The client doesn't support rerank api")
 }
 
-pub fn catch_error(data: &Value, status: u16, retry_after: Option<Duration>) -> Result<()> {
-    if (200..300).contains(&status) {
-        return Ok(());
-    }
-    debug!("Invalid response, status: {status}, data: {data}");
-    let message = if let Some(error) = data["error"].as_object() {
-        if let (Some(typ), Some(message)) = (
-            json_str_from_map(error, "type"),
-            json_str_from_map(error, "message"),
-        ) {
-            format!("{message} (type: {typ})")
-        } else if let (Some(typ), Some(message)) = (
-            json_str_from_map(error, "code"),
-            json_str_from_map(error, "message"),
-        ) {
-            format!("{message} (code: {typ})")
-        } else {
-            format!("Invalid response data: {data} (status: {status})")
-        }
-    } else if let Some(error) = data["errors"][0].as_object() {
-        if let (Some(code), Some(message)) = (
-            error.get("code").and_then(|v| v.as_u64()),
-            json_str_from_map(error, "message"),
-        ) {
-            format!("{message} (status: {code})")
-        } else {
-            format!("Invalid response data: {data} (status: {status})")
-        }
-    } else if let Some(error) = data[0]["error"].as_object() {
-        if let (Some(err_status), Some(message)) = (
-            json_str_from_map(error, "status"),
-            json_str_from_map(error, "message"),
-        ) {
-            format!("{message} (status: {err_status})")
-        } else {
-            format!("Invalid response data: {data} (status: {status})")
-        }
-    } else if let (Some(detail), Some(code)) = (data["detail"].as_str(), data["status"].as_i64()) {
-        format!("{detail} (status: {code})")
-    } else if let Some(error) = data["error"].as_str() {
-        error.to_string()
-    } else if let Some(message) = data["message"].as_str() {
-        message.to_string()
-    } else {
-        format!("Invalid response data: {data} (status: {status})")
-    };
-    Err(LlmError {
-        status,
-        message,
-        retry_after,
-    }
-    .into())
-}
+mod error;
+pub use error::{catch_error, catch_stream_error};
 
 pub fn json_str_from_map<'a>(
     map: &'a serde_json::Map<String, Value>,

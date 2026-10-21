@@ -354,7 +354,7 @@ fn claude_handle_stream_event(
         "content_block_stop" => claude_handle_content_block_stop(state, handler, model)?,
         "error" => {
             let _ = data;
-            return crate::catch_error(data, 500, None);
+            return crate::catch_stream_error(data);
         }
         _ => {}
     }
@@ -1330,6 +1330,16 @@ system_prompt_prefix:
             tool_calls.is_empty(),
             "no tool_use blocks were sent; tool_calls must stay empty"
         );
+    }
+
+    #[test]
+    fn claude_streaming_context_overflow_is_not_transient() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(tx, harnx_core::abort::create_abort_signal());
+        let mut state = ClaudeStreamState::default();
+        let data = json!({"type": "error", "error": {"type": "invalid_request_error", "message": "prompt is too long: 213009 tokens > 200000 maximum"}});
+        let error = handle_test_stream_event(&mut state, &mut handler, &data).unwrap_err();
+        assert!(error.downcast_ref::<harnx_core::error::LlmError>().unwrap().is_context_overflow());
     }
 
     #[test]
