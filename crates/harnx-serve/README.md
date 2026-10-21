@@ -84,7 +84,8 @@ never used as a persistence or routing key.
 | `GET` | `/v1/agents/:agent` | `application/json` | Agent details (name, description, active sessions). |
 | `GET` | `/v1/agents/:agent/sessions` | `application/json` | List sessions for the agent. |
 | `POST` | `/v1/agents/:agent/sessions` | `application/json` | Reserve a canonical short session ID. |
-| `GET` | `/v1/agents/:agent/sessions/:session` | `application/json` | Session history in AG-UI format. Compacted sessions include `compaction` metadata and a synthetic assistant marker message. |
+| `GET` | `/v1/agents/:agent/sessions/:session` | `application/json` | Legacy active-history message array. Use JSON-RPC `session/get` for the compaction-aware default snapshot. |
+| `GET` | `/v1/agents/:agent/sessions/:session/history` | `application/json` | Read-only transcript page, selected by compaction or inclusive sequence range. |
 | `GET` | `/v1/agents/:agent/sessions/:session/metadata` | `application/json` | Read redacted canonical session metadata. |
 | `PATCH` | `/v1/agents/:agent/sessions/:session/metadata` | `application/json` | Update title, variables, or explicit session overrides. |
 | `PUT` | `/v1/agents/:agent/sessions/:session/metadata/extensions/:namespace` | `application/json` | Atomically replace one extension namespace. |
@@ -261,6 +262,10 @@ Same canonical session URL, negotiated into programmatic control.
   - `{ "status": "awaiting_approval", "pending_interrupts": { … } }` — the turn
     is parked at an approval gate. It is not interrupted; the client's next move
     is a decision, not another cancel.
+- **`session/history`**: Reads archived transcript pages without changing the session or model context. Takes `before_compaction` or inclusive `from_seq`/`to_seq`, plus optional `limit`; subsequent pages take an opaque `cursor`. See [History paging](#history-paging).
+  ```json
+  { "jsonrpc": "2.0", "id": 8, "method": "session/history", "params": { "before_compaction": 15, "limit": 2 } }
+  ```
 - **`session/prompt`**: Sends a new user prompt, creating the session if it doesn't exist.
   ```json
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello" } }
@@ -300,13 +305,112 @@ Same canonical session URL, negotiated into programmatic control.
     - `{ "status": "failed", "detail": "..." }` — prior compaction attempt failed with the error message in `detail`.
 
 **Error Codes:**
-- `-32001`: Unknown session (HTTP 404) for operations that require an existing session, such as `session/get`, `session/cancel`, `session/compact`, and read-state updates. `session/prompt` creates the session if absent.
-- `-32003`: Session actor unreachable (HTTP 503). Transient: the session's in-process actor could not be reached, so retry the call.
+- `-32001`: Unknown session (HTTP 404) for operations that require an existing session, such as `session/get`, `session/history`, `session/cancel`, `session/compact`, and read-state updates. `session/prompt` creates the session if absent.
+- `-32003`: Session actor or history storage unavailable (HTTP 503). Transient: retry the call.
 - `-32601`: Method not found
 - Standard JSON-RPC 2.0 codes (-32700, -32600, -32602)
 
 `session/cancel` on an idle session is not an error; it returns
 `{ "outcome": "idle" }`.
+
+### History paging
+
+Use `session/history` on the canonical session URL to browse a transcript window.
+It doesn't append entries, admit prompts, mark the session read, or re-inject
+archived messages into the model context. Authentication, agent visibility, and
+session ownership checks are the same as `session/get`, including cached pages.
+
+Initial params select exactly one window:
+
+- `{ "before_compaction": 15, "limit": 2 }`: the view immediately before the
+  `Compress` at physical sequence 15. Later edits and rewinds don't change this
+  historical view. It starts with the previous compaction marker, if any.
+- `{ "from_seq": 5, "to_seq": 14, "limit": 2 }`: inclusive sequence bounds within
+  one window. Bounds must satisfy `0 < from_seq <= to_seq` and lie within the
+  stored log's extent. Gaps and control-only ranges can return empty pages.
+  A range crossing a compaction boundary is rejected; open each archive using
+  `before_compaction` instead. A marker exactly at `from_seq` is included.
+
+`limit` defaults to 100 and accepts 1–1000. It counts **logical groups**, not
+physical log entries or AG-UI rows: one ordinary message, one marker, or one
+complete tool round. A round can expand into an assistant call row and several
+result rows, all on the same page. Selecting either half of a call/result pair
+includes the entire round. Edited replacement rows sharing a physical sequence
+keep their replay order and remain independently pageable. Pages are oldest-first.
+
+Example result for `before_compaction: 15, limit: 2` using the shared fixture:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "result": {
+    "history_snapshot": [
+      {
+        "role": "assistant",
+        "id": "a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3",
+        "content": "The session log stores tool calls and results separately. No messages were kept."
+      },
+      {
+        "role": "user",
+        "id": "3e3bc161-3752-5646-a160-c7da8062e7c0",
+        "content": "Implement the shared transcript view and verify paging."
+      }
+    ],
+    "compaction": {
+      "message_id": "a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3",
+      "compaction_seq": 5,
+      "summary": "The session log stores tool calls and results separately. No messages were kept.",
+      "from_seq": 1,
+      "to_seq": 4,
+      "kept_count": 0
+    },
+    "next_cursor": "<opaque cursor>",
+    "prev_cursor": null,
+    "earlier_compaction": 5
+  }
+}
+```
+
+`history_snapshot` uses the same AG-UI shape as `session/get`. `compaction` uses
+[the same metadata](#compacted-history-snapshots) and is omitted on pages without
+the synthetic marker. Match the marker by `compaction.message_id`, not an ID prefix.
+`earlier_compaction` identifies the marker whose archive can be opened next and
+is present on **every** page of this window, even if the marker isn't in the
+selected range/page. It is `null` when there is no earlier marker. Here, call
+`before_compaction: 5` to reach the original first prompt and reply.
+
+Pass `next_cursor` or `prev_cursor` back without the original selector:
+
+```json
+{ "jsonrpc": "2.0", "id": 9, "method": "session/history", "params": { "cursor": "<opaque cursor>" } }
+```
+
+Cursors are session/cluster scoped and freeze the original raw-log boundary.
+Appends, edits, and rewinds after that boundary don't move subsequent pages.
+Keep cursors opaque. They aren't authorization tokens. Don't combine a cursor
+with sequence selectors; if `limit` is supplied again it must equal the original
+limit. Cursors are `null` at the first/last page boundary. Empty pages have both
+cursors `null`. A bounded server cache avoids full-log reload/replay for sequential
+pages; eviction or another server can rebuild the frozen page from the durable
+log. Deleting/recreating the session invalidates its old cursors.
+
+HTTP equivalent, with the same parameters as query strings:
+
+```http
+GET /v1/agents/plain/sessions/my-session/history?before_compaction=15&limit=2
+Accept: application/json
+```
+
+HTTP success returns the bare `result` object above with `Cache-Control: private, no-store`. This is a new route;
+`GET /v1/agents/:agent/sessions/:session` keeps its legacy message-array response.
+HTTP errors use `{ "error": { "message": "...", "type": "invalid_request_error" } }`.
+JSON-RPC errors use `-32602` with an explanatory `error.data.detail` for invalid
+selectors, unknown/non-Compress compaction sequences, out-of-range bounds, and
+invalid/wrong-session cursors (HTTP 400). Missing sessions use `-32001` (HTTP 404),
+and unavailable history storage uses `-32003` (HTTP 503). Access rules can hide
+unauthorized or missing sessions behind the existing HTTP 404 response before
+RPC dispatch. Unauthenticated requests retain the server's HTTP 401 behavior.
 
 ### Client Implementation Flow
 

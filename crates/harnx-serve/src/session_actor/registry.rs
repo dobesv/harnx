@@ -14,6 +14,7 @@ pub struct SessionRegistry {
     pub(super) map: SessionMap,
     reap_ttl: Duration,
     actor_config: SessionActorConfig,
+    pub(crate) history_cache: Arc<std::sync::Mutex<crate::session_history::HistoryCache>>,
 }
 
 impl SessionRegistry {
@@ -37,6 +38,7 @@ impl SessionRegistry {
             map: Arc::new(DashMap::new()),
             reap_ttl,
             actor_config,
+            history_cache: Arc::default(),
         }
     }
 

@@ -22,6 +22,7 @@ mod serve_shutdown;
 mod session_access;
 pub mod session_actor;
 mod session_actor_types;
+mod session_history;
 pub(crate) mod session_pagination;
 pub mod session_routes;
 mod transcript_snapshot;
@@ -415,6 +416,7 @@ enum AgentsRoute {
     Sessions,
     Session,
     SessionEvents,
+    SessionHistory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -913,21 +915,16 @@ impl Server {
                 .await
             }
             AgentsRoute::Session => {
-                let session_name = session_name.expect("session route always has session name");
-                match negotiate_agents_route(&method, req.headers(), agent_route)? {
-                    AgentsRepresentation::Html => {
-                        self.session_html_page(&display_ref, &session_name)
-                    }
-                    AgentsRepresentation::Json => {
-                        self.session_history_json(&target, &session_name).await
-                    }
-                    AgentsRepresentation::AgUiSse => {
-                        self.ag_ui_run_route(req, &target, &session_name).await
-                    }
-                    AgentsRepresentation::AgUiRpc => {
-                        self.ag_ui_rpc_route(req, &target, &session_name).await
-                    }
-                }
+                self.handle_agent_session(
+                    req,
+                    &target,
+                    session_name.as_deref().expect("session route has a name"),
+                )
+                .await
+            }
+            AgentsRoute::SessionHistory => {
+                let name = session_name.expect("history route has a session name");
+                self.session_history_page(req, target, name).await
             }
             AgentsRoute::SessionEvents => {
                 let session_name = session_name.expect("session events route has a session name");
@@ -938,6 +935,37 @@ impl Server {
                 )
                 .await
             }
+        }
+    }
+
+    async fn session_history_page(
+        &self,
+        req: hyper::Request<Incoming>,
+        target: ResolvedAgentTarget,
+        session: String,
+    ) -> Result<AppResponse> {
+        negotiate_agents_route(req.method(), req.headers(), AgentsRoute::SessionHistory)?;
+        let key = session_actor::SessionKey::new(target, session);
+        session_history::http(
+            req.uri().query(),
+            (&self.config, &self.session_registry, key),
+        )
+        .await
+    }
+
+    async fn handle_agent_session(
+        &self,
+        req: hyper::Request<Incoming>,
+        target: &ResolvedAgentTarget,
+        session: &str,
+    ) -> Result<AppResponse> {
+        match negotiate_agents_route(req.method(), req.headers(), AgentsRoute::Session)? {
+            AgentsRepresentation::Html => {
+                self.session_html_page(&self.display_ref(target), session)
+            }
+            AgentsRepresentation::Json => self.session_history_json(target, session).await,
+            AgentsRepresentation::AgUiSse => self.ag_ui_run_route(req, target, session).await,
+            AgentsRepresentation::AgUiRpc => self.ag_ui_rpc_route(req, target, session).await,
         }
     }
 
@@ -1447,6 +1475,11 @@ fn parse_agents_route(path: &str) -> Option<RouteMatch> {
             Some(percent_decode(session)),
             AgentsRoute::Session,
         )),
+        [agent, "sessions", session, "history"] => Some((
+            percent_decode(agent),
+            Some(percent_decode(session)),
+            AgentsRoute::SessionHistory,
+        )),
         [agent, "sessions", session, "events"] => Some((
             percent_decode(agent),
             Some(percent_decode(session)),
@@ -1511,6 +1544,7 @@ fn negotiate_agents_route(
                 Ok(AgentsRepresentation::Json)
             }
         }
+        (&Method::GET, AgentsRoute::SessionHistory) => Ok(AgentsRepresentation::Json),
         (&Method::GET | &Method::POST, AgentsRoute::Sessions) => Ok(AgentsRepresentation::Json),
         (&Method::GET, AgentsRoute::SessionEvents) if accepts_event_stream(headers) => {
             Ok(AgentsRepresentation::AgUiSse)
@@ -2196,6 +2230,31 @@ mod tests {
         assert!(!query_requests_assistant_role(None));
         assert!(!query_requests_assistant_role(Some("role=subagent")));
         assert!(!query_requests_assistant_role(Some("assistants=true")));
+    }
+
+    #[test]
+    fn parse_agents_route_matches_history_with_decoded_agent_and_session() {
+        for (path, agent, session) in [
+            (
+                "/v1/agents/plain/sessions/my-session/history",
+                "plain",
+                "my-session",
+            ),
+            (
+                "/v1/agents/coding%2Fcoder/sessions/thread%2F1/history",
+                "coding/coder",
+                "thread/1",
+            ),
+        ] {
+            assert_eq!(
+                parse_agents_route(path),
+                Some((
+                    agent.to_string(),
+                    Some(session.to_string()),
+                    AgentsRoute::SessionHistory,
+                ))
+            );
+        }
     }
 
     #[test]

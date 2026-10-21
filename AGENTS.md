@@ -1461,6 +1461,10 @@ All interfaces that display session history must use one of two paths:
 When adding a new history interface, call one of these and add a parity test against the shared
 fixture. Do not introduce a third view model or bypass the shared compaction logic.
 
+For browse-back UI (D4), clients call `session/history` via JSON-RPC or HTTP GET. This API is
+read-only, uses the same guards as `session/get`, and returns pages with frozen cursors that
+survive cache eviction or server switches. See `crates/harnx-serve/README.md#history-paging`.
+
 Wire contract for `session/get` and live snapshots (AG-UI `MESSAGES_SNAPSHOT` /
 CUSTOM `session_compaction`): the synthetic summary message is an AG-UI **assistant** role with
 string `content`. External consumers (e.g. workflow-bot) read only `role` + string content and
