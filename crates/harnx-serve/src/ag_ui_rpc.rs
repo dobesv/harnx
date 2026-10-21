@@ -193,6 +193,9 @@ async fn handle_ag_ui_rpc_bytes_for_target(
 
     match rpc.method.as_str() {
         "session/get" => handle_get(rpc.id, config, registry, key, persistence).await,
+        "session/history" => {
+            crate::session_history::rpc(rpc.id, rpc.params, (config, registry, key)).await
+        }
         "session/prompt" => handle_prompt(rpc.id, rpc.params, &context, key).await,
         "session/hitl_decision" => {
             handle_hitl_decision(rpc.id, rpc.params, config, registry, key).await
@@ -629,7 +632,7 @@ async fn get_info(handle: &SessionHandle) -> Result<SessionInfo, String> {
         .map_err(|_| "session actor dropped get reply".to_string())
 }
 
-fn json_rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
+pub(crate) fn json_rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -642,7 +645,7 @@ fn json_rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> V
     })
 }
 
-fn json_rpc_response(status: StatusCode, data: Value) -> anyhow::Result<AppResponse> {
+pub(crate) fn json_rpc_response(status: StatusCode, data: Value) -> anyhow::Result<AppResponse> {
     Ok(Response::builder()
         .status(status)
         .header("Content-Type", "application/json; charset=utf-8")

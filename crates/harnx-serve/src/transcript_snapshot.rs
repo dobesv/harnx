@@ -45,7 +45,7 @@ impl From<CompactionMarker> for SessionCompaction {
 }
 
 impl SessionCompaction {
-    fn message(&self) -> AgUiMessage {
+    pub(crate) fn message(&self) -> AgUiMessage {
         AgUiMessage::Assistant {
             id: self
                 .message_id
