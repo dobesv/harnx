@@ -288,3 +288,29 @@ fn a_disabled_guard_stops_nothing() {
     stream_repeatedly(|text| handler.text(text), "the ", 4_000).unwrap();
     stream_repeatedly(|text| handler.thought(text), "the ", 4_000).unwrap();
 }
+
+#[tokio::test]
+async fn streaming_http_context_overflow_preserves_json_and_plaintext_diagnostics() {
+    for body in [
+        r#"{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Invalid input"}}"#,
+        "BadRequestError: maximum context length is 202752 tokens (parameter=input_tokens)",
+    ] {
+        let builder = response_builder(400, "", body).await;
+        let error = sse_stream(builder, |_| Ok(false)).await.unwrap_err();
+        assert!(error
+            .downcast_ref::<LlmError>()
+            .unwrap()
+            .is_context_overflow());
+    }
+}
+
+#[tokio::test]
+async fn responses_stream_context_overflow_reaches_recovery_for_flat_and_nested_events() {
+    for body in [
+        "event: error\ndata: {\"type\":\"error\",\"code\":\"context_length_exceeded\",\"message\":\"Invalid input\"}\n\n",
+        "event: response.failed\ndata: {\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"Invalid input\"}}}\n\n",
+    ] {
+        let error = codex_response(200, "Content-Type: text/event-stream\r\n", body).await.err().unwrap();
+        assert!(error.downcast_ref::<LlmError>().unwrap().is_context_overflow());
+    }
+}

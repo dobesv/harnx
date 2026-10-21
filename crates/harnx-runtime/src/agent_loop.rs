@@ -940,6 +940,7 @@ fn enforce_token_budget(ctx: &AgentLoopContext) -> Result<()> {
 }
 
 mod compaction;
+mod overflow;
 
 async fn prepare_round_input(
     ctx: &AgentLoopContext,
@@ -994,7 +995,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
             break;
         }
 
-        let llm_result = Box::pin(committed_agent_model(ctx, &mut input)).await;
+        let llm_result = Box::pin(overflow::call(ctx, &mut input)).await;
 
         let (output, thought, tool_calls, usage) = match llm_result {
             Ok(result) => result,
@@ -1102,6 +1103,8 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
 mod tests {
     mod compaction_tests;
     mod input_persistence_tests;
+    mod overflow_tests;
+    mod preflight_failure_tests;
     mod tool_loop_guard_tests;
 
     use super::*;

@@ -11,14 +11,14 @@ pub(super) fn restore_selected_user_messages(session: &mut Session, selected: &[
         let existing = session
             .messages
             .iter()
-            .position(|live| same_identity(live, message));
+            .position(|live| live.same_identity(message));
         if let Some(index) = existing {
             insert_at = index;
         } else if let Some(archived) = session
             .compressed_messages
             .iter()
             .rev()
-            .find(|archived| same_identity(archived, message))
+            .find(|archived| archived.same_identity(message))
         {
             // Use effective replay content so a newer edit wins and a retraction
             // (absent from both live and archived history) isn't resurrected.
@@ -26,14 +26,6 @@ pub(super) fn restore_selected_user_messages(session: &mut Session, selected: &[
         }
     }
     session.update_tokens();
-}
-
-fn same_identity(a: &Message, b: &Message) -> bool {
-    if let Some(id) = b.id.as_ref() {
-        a.id.as_ref() == Some(id)
-    } else {
-        b.log_seq.is_some() && a.log_seq == b.log_seq
-    }
 }
 
 pub(crate) fn fold_new_user_messages_since(

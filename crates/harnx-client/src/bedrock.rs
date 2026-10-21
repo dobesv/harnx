@@ -424,6 +424,23 @@ fn bedrock_handle_stream_event(
     Ok(())
 }
 
+fn bedrock_stream_exception(payload: &[u8], smithy_type: &str) -> Result<()> {
+    // Converse exceptions are JSON frames; older gateways base64-encode them.
+    let data = serde_json::from_slice::<Value>(payload)
+        .or_else(|_| serde_json::from_slice(&base64_decode(payload).unwrap_or_default()))
+        .unwrap_or_else(|_| json!({"message": String::from_utf8_lossy(payload)}));
+    let message = data["message"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| data.to_string());
+    let error = json!({"error": {"message": message, "type": smithy_type}});
+    match smithy_type {
+        "validationException" => catch_error(&error, 400, None),
+        "accessDeniedException" => catch_error(&error, 403, None),
+        _ => crate::catch_stream_error(&error),
+    }
+}
+
 async fn chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
@@ -466,10 +483,7 @@ async fn chat_completions_streaming(
                     bedrock_handle_stream_event(&mut state, handler, smithy_type, &data)?;
                 }
                 ("exception", _) => {
-                    let payload = base64_decode(message.payload())?;
-                    let data = String::from_utf8_lossy(&payload);
-
-                    bail!("Invalid response data: {data} (smithy_type: {smithy_type})")
+                    return bedrock_stream_exception(message.payload(), smithy_type);
                 }
                 _ => {
                     bail!("Unrecognized message, message_type: {message_type}, smithy_type: {smithy_type}",);
@@ -1667,3 +1681,6 @@ mod tests {
         assert_eq!(call_id, result_id);
     }
 }
+
+#[cfg(test)]
+mod stream_exception_tests;

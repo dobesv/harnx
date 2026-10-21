@@ -285,7 +285,7 @@ pub(crate) fn openai_handle_stream_event(
     model: &Model,
 ) -> Result<()> {
     if let Some(_err) = data["error"].as_object() {
-        return crate::catch_error(data, 500, None);
+        return crate::catch_stream_error(data);
     }
     openai_handle_text_delta(state, handler, data)?;
     openai_handle_tool_call_delta(state, handler, data)?;
@@ -1117,6 +1117,16 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn openai_streaming_context_overflow_keeps_specific_code() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(tx, harnx_core::abort::create_abort_signal());
+        let mut state = OpenAiStreamState::default();
+        let data = json!({"error": {"type": "invalid_request_error", "code": "context_length_exceeded", "message": "Invalid input"}});
+        let error = openai_handle_stream_event(&mut state, &mut handler, &data, &Model::default()).unwrap_err();
+        assert!(error.downcast_ref::<harnx_core::error::LlmError>().unwrap().is_context_overflow());
     }
 
     #[test]

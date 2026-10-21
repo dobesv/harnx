@@ -57,7 +57,9 @@ The Chat API is stateless, so the full conversation history is sent with every r
 
 Harnx addresses this with automatic session compression. By default, Harnx compresses history at 150,000 tokens, or at 90% of the model's input-token limit when that is lower. The `compress_threshold` setting changes the configured threshold, but it is still capped at 90% of a known model limit.
 
-Compression normally runs at the end of a turn. During a tool-heavy turn, Harnx also checks the estimated next request size after every completed tool round. This estimate includes the system prompt, tool definitions, 1,500 tokens per image, and a 10% margin. If it exceeds the threshold, Harnx compresses before sending the next request and continues the same turn. It doesn't compress when you submit a new prompt. Set `compress_threshold` to `0` to disable automatic compression.
+Compression normally runs at the end of a turn. During a tool-heavy turn, Harnx also checks the estimated next request size after every completed tool round. This estimate includes the system prompt, tool definitions, 1,500 tokens per image, and a 10% margin. If it exceeds the threshold, Harnx compresses before sending the next request and continues the same turn. If this best-effort compression fails, Harnx reports the failure and sends the next request with the original history, unless the turn was interrupted or its deadline expired. Submitting a new prompt doesn't trigger this preflight check. Set `compress_threshold` to `0` to disable threshold-based compression.
+
+If a provider rejects a request because it exceeds the context window, Harnx forces compression and retries that request once, even when threshold-based compression is disabled. This also applies to a turn's first request, but only after that request has failed. Newly submitted input stays verbatim and isn't appended again. If the retry fails, the error says compaction was tried. If there's no older content to compress without losing the new prompt, recovery stops with an error instead of summarizing that prompt away.
 
 ## Why don't LLMs call tools even though they support tool use?
 

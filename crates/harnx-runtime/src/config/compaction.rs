@@ -143,9 +143,15 @@ pub fn render_tool_output(out: &ToolOutput, max_chars: usize) -> String {
     truncate_middle(&strip_data_urls(&full), max_chars)
 }
 
-fn is_turn_prompt(message: &Message) -> bool {
-    message.role.is_user()
-        && !harnx_core::timing_identity::is_timing_notice(&message.content.to_text())
+pub(crate) fn is_turn_prompt(message: &Message) -> bool {
+    if !message.role.is_user() {
+        return false;
+    }
+    let text = match &message.content {
+        MessageContent::Text(text) => std::borrow::Cow::Borrowed(text.as_str()),
+        _ => std::borrow::Cow::Owned(message.content.to_text()),
+    };
+    !harnx_core::timing_identity::is_timing_notice(&text)
 }
 
 /// ToolCalls stores the assistant invocation and all results in one message.
@@ -255,6 +261,16 @@ fn round_safe_tail(
 }
 
 impl KeepPlan {
+    /// A failed request's prepared input must survive recovery verbatim, even
+    /// when the ordinary keep budget would summarize it. Other splits stay C2's.
+    pub(crate) fn protect_suffix(mut self, protected_from: Option<usize>) -> Self {
+        if let Some(from) = protected_from {
+            self.tail_from = self.tail_from.min(from);
+            self.prompt_idx = self.prompt_idx.filter(|&i| i < self.tail_from);
+        }
+        self
+    }
+
     fn leave_something_to_compact(mut self, messages: &[Message]) -> Self {
         if messages.is_empty() || self.kept_count(messages.len()) < messages.len() {
             return self;
@@ -317,6 +333,65 @@ mod tests {
         assert!(DEFAULT_COMPACT_SYSTEM_PROMPT.contains(
             "someone reading only the summary should be able to tell what the user last asked and what the agent last answered"
         ));
+    }
+
+    #[test]
+    fn turn_prompt_classification_preserves_text_and_multipart_timing_semantics() {
+        use harnx_core::message::{ImageUrl, MessageContentPart};
+        use harnx_core::timing_identity::{TimingReceipt, TIMING_HEADER};
+
+        let receipt = TimingReceipt::initial(chrono::Utc::now(), "turn".into());
+        let notice = format!("{TIMING_HEADER}{}", receipt.to_json());
+        let (head, tail) = notice.split_once(',').unwrap();
+        let text = |text: String| MessageContentPart::Text { text };
+        let contents = [
+            (MessageContent::Text("prompt".into()), true),
+            (MessageContent::Text(notice.clone()), false),
+            (MessageContent::Text(TIMING_HEADER.into()), true),
+            (MessageContent::Array(vec![text(notice.clone())]), false),
+            (
+                MessageContent::Array(vec![text(format!("{head},")), text(tail.into())]),
+                false,
+            ),
+            (
+                MessageContent::Array(vec![text(notice.clone()), text("not JSON".into())]),
+                true,
+            ),
+            (
+                MessageContent::Array(vec![text(format!("{TIMING_HEADER}{{")), text("}".into())]),
+                true,
+            ),
+            (
+                MessageContent::Array(vec![
+                    text(format!("{notice} | context")),
+                    text("more".into()),
+                ]),
+                false,
+            ),
+            (
+                MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "cid:image".into(),
+                    },
+                }]),
+                true,
+            ),
+        ];
+        for (content, expected) in contents {
+            for role in [
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::System,
+                MessageRole::Tool,
+            ] {
+                let message = Message::new(role, content.clone());
+                assert_eq!(
+                    is_turn_prompt(&message),
+                    role.is_user() && expected,
+                    "{message:?}"
+                );
+            }
+        }
     }
 
     #[test]

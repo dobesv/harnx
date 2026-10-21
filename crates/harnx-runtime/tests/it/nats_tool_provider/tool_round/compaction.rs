@@ -156,3 +156,83 @@ fn assert_finished_session(config: &GlobalConfig, summarizer: &MockClient) {
         MessageRole::Assistant
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_overflow_after_tool_round_compacts_then_retries_without_restoring_results(
+) -> Result<()> {
+    let Some(harness) = RoundHarness::start_with_toolset(LargeOutput, "____large").await? else {
+        return Ok(());
+    };
+    let mock = overflow_client();
+    let _mock = harnx_runtime::client::TestStateGuard::new(Some(mock.clone())).await;
+    harness.config.write().stream = false;
+    harness.config.write().compress_threshold = 0;
+    let mut ctx = harness.loop_context();
+    ctx.call_fn = None;
+    let events = Arc::new(Events::default());
+    let result = harnx_core::sink::with_agent_event_sink(
+        events.clone(),
+        run_agent_loop(&ctx, harness.input()),
+    )
+    .await?;
+    assert!(matches!(result, LoopResult::Completed));
+    assert_single_compaction(&events);
+    assert_overflow_retry(&mock);
+    Ok(())
+}
+
+fn overflow_client() -> Arc<MockClient> {
+    Arc::new(
+        MockClient::builder()
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_tool_call_with_id("large_output", json!({"round": 0}), "overflow-call-0")
+                    .build(),
+            )
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_tool_call_with_id("large_output", json!({"round": 1}), "overflow-call-1")
+                    .build(),
+            )
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_error(
+                        harnx_core::error::LlmError {
+                            status: 400,
+                            message: "prompt is too long".into(),
+                            retry_after: None,
+                        }
+                        .into(),
+                    )
+                    .build(),
+            )
+            .add_turn(MockTurnBuilder::new().add_text_chunk("Summary.").build())
+            .add_turn(MockTurnBuilder::new().add_text_chunk("Finished").build())
+            .build(),
+    )
+}
+
+fn assert_overflow_retry(mock: &MockClient) {
+    let history = mock.conversation_history();
+    assert_eq!(history.conversation_history.len(), 5);
+    let retry = &history.conversation_history[4].messages;
+    assert_eq!(
+        retry
+            .iter()
+            .filter(|message| message.content.to_text() == "what time is it")
+            .count(),
+        1
+    );
+    let rounds: Vec<_> = retry
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::ToolCalls(calls) => calls.tool_results[0].call.id.as_deref(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rounds,
+        ["overflow-call-1"],
+        "archived round must not return from Input.tool_calls"
+    );
+}

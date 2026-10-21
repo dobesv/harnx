@@ -52,6 +52,16 @@ impl Message {
         }
     }
 
+    /// Match a persisted selection by its stable ID, or its log sequence for
+    /// legacy selections without an ID. Unpersisted messages have no identity.
+    pub fn same_identity(&self, selected: &Self) -> bool {
+        if let Some(id) = selected.id.as_ref() {
+            self.id.as_ref() == Some(id)
+        } else {
+            selected.log_seq.is_some() && self.log_seq == selected.log_seq
+        }
+    }
+
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self
@@ -252,7 +262,7 @@ pub fn extract_system_message(messages: &mut Vec<Message>) -> Option<Vec<String>
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageUrl, MessageContent, MessageContentPart};
+    use super::{ImageUrl, Message, MessageContent, MessageContentPart};
 
     fn text(text: &str) -> MessageContentPart {
         MessageContentPart::Text {
@@ -265,6 +275,34 @@ mod tests {
             image_url: ImageUrl {
                 url: url.to_string(),
             },
+        }
+    }
+
+    #[test]
+    fn same_identity_prefers_selected_id_and_falls_back_to_legacy_sequence() {
+        let message = |id: Option<&str>, log_seq| Message {
+            id: id.map(str::to_owned),
+            log_seq,
+            ..Default::default()
+        };
+        for (live_id, live_seq, selected_id, selected_seq, expected) in [
+            (Some("prompt"), Some(10), Some("prompt"), Some(1), true),
+            (Some("other"), Some(1), Some("prompt"), Some(1), false),
+            (None, Some(1), Some("prompt"), Some(1), false),
+            (None, Some(1), None, Some(1), true),
+            (Some("new-id"), Some(1), None, Some(1), true),
+            (None, Some(2), None, Some(1), false),
+            (None, None, None, None, false),
+            (None, Some(1), None, None, false),
+            (Some("prompt"), None, Some("prompt"), None, true),
+        ] {
+            let live = message(live_id, live_seq);
+            let selected = message(selected_id, selected_seq);
+            assert_eq!(
+                live.same_identity(&selected),
+                expected,
+                "live: {live:?}, selected: {selected:?}"
+            );
         }
     }
 

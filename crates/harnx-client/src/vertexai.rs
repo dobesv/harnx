@@ -242,7 +242,7 @@ fn gemini_handle_part(
 /// parts — so no state struct is needed.
 fn gemini_handle_stream_chunk(handler: &mut SseHandler, data: &Value, model: &Model) -> Result<()> {
     if let Some(_err) = data["error"].as_object() {
-        return crate::catch_error(data, 500, None);
+        return crate::catch_stream_error(data);
     }
     if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
         // Thought and tool-call parts must not add leading answer separators.
@@ -1889,6 +1889,15 @@ mod attachment_emission_tests {
 
         assert_eq!(inline_data["data"], "QUJDREVGR0g=");
         assert_eq!(inline_data["mimeType"], "image/jpeg");
+    }
+
+    #[test]
+    fn gemini_streaming_context_overflow_is_not_transient() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(tx, harnx_core::abort::create_abort_signal());
+        let data = json!({"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "The input token count exceeds the maximum number of tokens allowed (1048576)."}});
+        let error = gemini_handle_stream_chunk(&mut handler, &data, &Model::default()).unwrap_err();
+        assert!(error.downcast_ref::<harnx_core::error::LlmError>().unwrap().is_context_overflow());
     }
 
     #[test]
