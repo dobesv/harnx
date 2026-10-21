@@ -90,6 +90,20 @@ The web client is integrated into the `.github/workflows/web-ci.yml` lane. It ru
 
 Single-binary embedding via `rust-embed` (embedding the `web/dist` assets into the `harnx-serve` binary) is deferred and does not gate the v1 release. See the `harnx-webui-parity` backlog for details. Currently, the web client is served exclusively via the Vite dev server or a standalone static host.
 
+### Compaction snapshots during streaming
+
+`patches/@assistant-ui__react-ag-ui@0.0.63.patch` fixes the pinned adapter's
+snapshot handling. A snapshot between tool rounds must discard the accumulator's
+completed parts and anchor the next reply on the new transcript head. Open text,
+reasoning and pending tool state stay live. Status-only events after a snapshot
+don't create an empty assistant row.
+
+Keep the source and distributed JavaScript changes in sync when updating this
+patch. `ChatProviderCompactionStreaming.test.tsx` uses the real runtime and must
+pass before removing the patch during an adapter upgrade. Ship the patched web
+bundle with or before the runtime that emits mid-turn compaction snapshots.
+Compaction lifecycle CUSTOM events update Harnx state but aren't chat message parts.
+
 ## HTTP Layer Architecture
 
 HTTP calls span two modules, not one: `web/src/api.ts` and `web/src/cancellationApi.ts` (added in PR #1817). Shared primitives live in `web/src/httpClient.ts` to avoid circular imports.

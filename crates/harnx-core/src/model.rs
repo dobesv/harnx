@@ -15,6 +15,9 @@ use std::sync::{Mutex, OnceLock};
 
 const PER_MESSAGES_TOKENS: usize = 5;
 const BASIS_TOKENS: usize = 2;
+/// Rough image token allowance for request-size estimation.
+/// Compaction decisions use this instead of provider-specific vision tokenizers.
+const ESTIMATED_IMAGE_TOKENS: usize = 1500;
 
 #[derive(Debug, Clone)]
 pub struct Model {
@@ -283,6 +286,30 @@ impl Model {
                 }
             })
             .sum()
+    }
+
+    /// Rough request size for mid-turn compaction decisions.
+    ///
+    /// Includes: assembled messages (with system prompt), serialized tool definitions,
+    /// images at `ESTIMATED_IMAGE_TOKENS` each, and a 10% margin. Not a provider
+    /// tokenization bound — use `messages_tokens` for per-message accounting.
+    pub fn estimate_request_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[crate::tool::ToolDeclaration],
+    ) -> usize {
+        let images = messages
+            .iter()
+            .map(|message| request_image_count(&message.content))
+            .sum::<usize>();
+        let tools = serde_json::to_string(tools)
+            .map(|json| estimate_token_length(&json))
+            .unwrap_or_default();
+        let tokens = self
+            .messages_tokens(messages)
+            .saturating_add(images.saturating_mul(ESTIMATED_IMAGE_TOKENS))
+            .saturating_add(tools);
+        tokens.saturating_add(tokens.div_ceil(10))
     }
 
     pub fn total_tokens(&self, messages: &[Message]) -> usize {
@@ -593,6 +620,28 @@ pub struct ModelsOverride {
     pub version: String,
     pub list: Vec<ProviderModels>,
 }
+
+fn request_image_count(content: &MessageContent) -> usize {
+    let count = |parts: &[MessageContentPart]| {
+        parts
+            .iter()
+            .filter(|part| matches!(part, MessageContentPart::ImageUrl { .. }))
+            .count()
+    };
+    match content {
+        MessageContent::Text(_) => 0,
+        MessageContent::Array(parts) => count(parts),
+        MessageContent::ToolCalls(calls) => calls
+            .tool_results
+            .iter()
+            .map(|result| count(&result.content))
+            .sum(),
+    }
+}
+
+#[cfg(test)]
+#[path = "model/request_estimate_tests.rs"]
+mod request_estimate_tests;
 
 #[cfg(test)]
 mod tests {

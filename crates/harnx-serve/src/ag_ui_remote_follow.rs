@@ -531,7 +531,9 @@ impl AdvisoryForwarder {
                 );
             }
         }
-        self.emit_with_history(envelope.event, event_stream.history());
+        let history = event_stream.history();
+        let end = history.partition_point(|(seq, _)| *seq <= after_seq);
+        self.emit_with_history(envelope.event, &history[..end]);
         Ok(self.drain_events(after_seq).await)
     }
 

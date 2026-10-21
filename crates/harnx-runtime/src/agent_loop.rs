@@ -939,6 +939,8 @@ fn enforce_token_budget(ctx: &AgentLoopContext) -> Result<()> {
     Ok(())
 }
 
+mod compaction;
+
 async fn prepare_round_input(
     ctx: &AgentLoopContext,
     input: &mut Input,
@@ -947,6 +949,7 @@ async fn prepare_round_input(
     wait_for_session_compaction(&ctx.config).await;
     apply_round_embeddings(input, &ctx.config, &ctx.abort_signal, with_embeddings).await?;
     inject_shared_pending_context(input, ctx.pending_async_context.as_ref()).await;
+    compaction::preflight(ctx, input).await?;
     ctx.check_generation("before-model")?;
     ctx.config.write().before_chat_completion(input)?;
     crate::config::session_timing::prepare_notice(&ctx.config, input, chrono::Utc::now())?;
@@ -1097,6 +1100,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
 
 #[cfg(test)]
 mod tests {
+    mod compaction_tests;
     mod input_persistence_tests;
     mod tool_loop_guard_tests;
 

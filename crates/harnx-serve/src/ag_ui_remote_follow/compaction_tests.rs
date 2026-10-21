@@ -89,7 +89,7 @@ fn compacted_event() -> AgentEvent {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_compaction_refreshes_history_before_projecting_advisory() {
+async fn remote_compaction_refreshes_history_without_projecting_after_advisory_boundary() {
     harnx_core::require_nextest();
     let sandbox = crate::test_support::TestConfigSandbox::new();
     let config = sandbox.config();
@@ -114,7 +114,7 @@ async fn remote_compaction_refreshes_history_before_projecting_advisory() {
     let mut stream = SessionEventStream::attach(jetstream, client, &storage_key)
         .await
         .unwrap();
-    append_compaction_after_attach(&log).await;
+    append_compaction_after_attach(&log, 23).await;
     assert_eq!(stream.last_applied_seq(), 3);
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let mut forwarder = AdvisoryForwarder::new(tx);
@@ -126,12 +126,15 @@ async fn remote_compaction_refreshes_history_before_projecting_advisory() {
         )
         .await
         .unwrap();
-    assert_eq!(stream.last_applied_seq(), 6);
+    assert_eq!(stream.last_applied_seq(), 23);
     assert_refreshed_remote_events(&mut rx);
 }
 
-async fn append_compaction_after_attach(log: &harnx_runtime::nats_session_log::NatsSessionLog) {
-    for (_, entry) in fixture(6).into_iter().filter(|(seq, _)| *seq > 3) {
+async fn append_compaction_after_attach(
+    log: &harnx_runtime::nats_session_log::NatsSessionLog,
+    through: u64,
+) {
+    for (_, entry) in fixture(through).into_iter().filter(|(seq, _)| *seq > 3) {
         log.append_event_async(&entry).await.unwrap();
     }
 }

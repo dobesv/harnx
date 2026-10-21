@@ -1786,3 +1786,15 @@ Implementation details in [`docs/nats-ha.md#session-unread-state`](docs/nats-ha.
 
 
 GitHub Issues is the issue/task tracker for this project.
+
+
+### Compaction snapshots during streaming
+
+Mid-turn compaction fires once per tool round, before preparing the next model request (`agent_loop/compaction.rs`). It never fires for fresh user input or sessionless inputs. The timing matters: compacting after input preparation would invalidate `session_input_start`, which the next request's cursor depends on.
+
+The NATS worker inherits this behavior through the shared `run_agent_loop_inner` (`nats_worker/agent_loop/mod.rs`). No duplicate worker path exists.
+
+`through_seq` capture in `TurnEventSender::emit` (`session_actor/snapshot.rs`) is synchronous: it reads `session.next_seq()` before the runtime resumes, fencing the snapshot to the compaction event's sequence boundary. This prevents mid-turn history snapshots from including entries whose streaming events haven't arrived yet.
+
+The request estimator (`Model::estimate_request_tokens`) covers messages, tool definitions, images (1500 tokens each), and a 10% margin. Not exact — tokenizer mismatch is why the threshold applies at 90% of the model's `max_input_tokens`.
+

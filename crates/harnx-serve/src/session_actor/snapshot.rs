@@ -2,18 +2,42 @@ use super::*;
 use harnx_core::event::{AgentEvent, AgentEventSink, SessionEvent};
 use std::future::Future;
 
-struct TurnEventSender(mpsc::UnboundedSender<AgentEvent>);
+struct TurnEventSender {
+    tx: mpsc::UnboundedSender<TurnEvent>,
+    config: GlobalConfig,
+}
+
+struct TurnEvent {
+    event: AgentEvent,
+    through_seq: Option<u64>,
+}
 
 impl AgentEventSink for TurnEventSender {
     fn emit(&self, event: AgentEvent) {
-        let _ = self.0.send(event);
+        // Capture before the runtime resumes: reading the log later can include
+        // a response whose streaming events are still behind this snapshot.
+        // Synchronous capture fences the snapshot to the compaction's `through_seq`,
+        // preventing mid-turn history snapshots from seeing future entries.
+        let through_seq = matches!(
+            event,
+            AgentEvent::Session(SessionEvent::CompactingCompleted { .. })
+        )
+        .then(|| {
+            self.config
+                .read()
+                .session
+                .as_ref()
+                .map(|s| s.next_seq() as u64)
+        })
+        .flatten();
+        let _ = self.tx.send(TurnEvent { event, through_seq });
     }
 }
 
 /// Refresh compaction from the durable log without blocking a synchronous sink
 /// callback. Drain before returning so the actor's terminal event can't overtake it.
 pub(super) struct TurnEventRelay {
-    rx: mpsc::UnboundedReceiver<AgentEvent>,
+    rx: mpsc::UnboundedReceiver<TurnEvent>,
     sink: Arc<BroadcastEventSender>,
     config: GlobalConfig,
     key: SessionKey,
@@ -28,7 +52,13 @@ impl TurnEventRelay {
             config: params.prompt_config.clone(),
             key: params.key.clone(),
         };
-        (Arc::new(TurnEventSender(tx)), relay)
+        (
+            Arc::new(TurnEventSender {
+                tx,
+                config: params.prompt_config.clone(),
+            }),
+            relay,
+        )
     }
 
     pub(super) async fn run<T>(mut self, turn: impl Future<Output = T>) -> T {
@@ -45,14 +75,14 @@ impl TurnEventRelay {
         result
     }
 
-    async fn forward(&self, event: AgentEvent) {
+    async fn forward(&self, TurnEvent { event, through_seq }: TurnEvent) {
         let AgentEvent::Session(completed @ SessionEvent::CompactingCompleted { .. }) = event
         else {
             self.sink.emit(event);
             return;
         };
         let snapshot = self
-            .load_snapshot()
+            .load_snapshot(through_seq)
             .await
             .map_err(|error| log::warn!("Failed to refresh compacted transcript: {error:#}"))
             .ok();
@@ -61,12 +91,20 @@ impl TurnEventRelay {
             .emit_compacting_completed(completed, snapshot);
     }
 
-    async fn load_snapshot(&self) -> anyhow::Result<crate::transcript_snapshot::HistorySnapshot> {
+    async fn load_snapshot(
+        &self,
+        through_seq: Option<u64>,
+    ) -> anyhow::Result<crate::transcript_snapshot::HistorySnapshot> {
         let config = self.config.read().clone();
         let loaded =
             crate::load_nats_session_state(&config, self.key.target(), self.key.session()).await?;
+        let end = through_seq.map_or(loaded.entries.len(), |seq| {
+            loaded
+                .entries
+                .partition_point(|(entry_seq, _)| *entry_seq <= seq)
+        });
         crate::transcript_snapshot::HistorySnapshot::from_entries(
-            &loaded.entries,
+            &loaded.entries[..end],
             &loaded.base_session,
             loaded.worker_active,
         )

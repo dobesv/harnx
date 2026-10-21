@@ -962,16 +962,21 @@ pub fn add_tool_calls(
 }
 
 /// Returns `true` when `input` is a genuine tool-call continuation of
-/// `session` — i.e. the session's last message is a `Tool` result AND
-/// the input carries accumulated tool-call results from `merge_tool_results`.
+/// `session`: the input carries accumulated results from `merge_tool_results`.
+/// Compaction may have dropped the last round, or even all active messages;
+/// the remaining history must not decide whether to repeat the original prompt.
 ///
 /// Used in both `begin_turn` (persistence) and `build_messages` (wire
 /// format) so that future edits to the heuristic only need to happen
 /// in one place.  Fixes #390: without the `tool_calls.is_some()` guard,
 /// a fresh user prompt arriving after an interrupted/resumed session that
 /// ended with a `Tool` message was silently dropped.
-fn is_tool_continuation(input: &Input, messages: &[Message]) -> bool {
-    input.tool_calls.is_some() && messages.last().is_some_and(|m| m.role == MessageRole::Tool)
+///
+/// M1 invariant: compaction can produce non-contiguous kept sets (prompt +
+/// tail), so continuation detection must not depend on history tail. The
+/// `tool_calls` flag on input is authoritative.
+fn is_tool_continuation(input: &Input) -> bool {
+    input.tool_calls.is_some()
 }
 
 /// Persist input before model work. Cancellation may reject every output from
@@ -1000,9 +1005,9 @@ fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<boo
         return Ok(true);
     }
     let mut all_appended = true;
-    let is_continuation = is_tool_continuation(input, &session.messages);
+    let is_continuation = is_tool_continuation(input);
 
-    if session.messages.is_empty() {
+    if session.messages.is_empty() && !is_continuation {
         all_appended &= append_initial_agent_messages(session, input)?;
     } else if !is_continuation && !input.skip_user_log_append {
         // `skip_user_log_append` is set by the NATS HA worker: the user
@@ -1228,9 +1233,9 @@ fn trim_trailing_non_user(messages: &mut Vec<Message>) {
 
 /// Whether the trailing `input.message_content()` user message must be
 /// suppressed because the history already carries that text.
-fn history_already_has_input_text(input: &Input, messages: &[Message]) -> bool {
+fn history_already_has_input_text(input: &Input) -> bool {
     // Mid-tool-round: the pending call/result pair is already in the history.
-    is_tool_continuation(input, messages)
+    is_tool_continuation(input)
         // The NATS worker folds its user text out of the durable log, so the
         // session loaded for this turn already ends with those messages.
         // Pushing them again would send the prompt to the model twice — once
@@ -1282,11 +1287,11 @@ fn build_messages_inner(session: &Session, input: &Input) -> Result<Vec<Message>
         );
         messages.truncate(history_end);
     }
-    let need_add_msg = if messages.is_empty() {
+    let need_add_msg = if messages.is_empty() && !is_tool_continuation(input) {
         messages = input.agent().build_messages(input)?;
         false
     } else {
-        !history_already_has_input_text(input, &messages)
+        !history_already_has_input_text(input)
     };
     inject_fresh_system_prompt(&mut messages, input)?;
     if need_add_msg {
@@ -1294,6 +1299,10 @@ fn build_messages_inner(session: &Session, input: &Input) -> Result<Vec<Message>
     }
     Ok(messages)
 }
+
+#[cfg(test)]
+#[path = "session/continuation_tests.rs"]
+mod continuation_tests;
 
 #[cfg(test)]
 mod tests {
