@@ -57,6 +57,8 @@ The Chat API is stateless, so the full conversation history is sent with every r
 
 Harnx addresses this with automatic session compression. By default, Harnx compresses history at 150,000 tokens, or at 90% of the model's input-token limit when that is lower. The `compress_threshold` setting changes the configured threshold, but it is still capped at 90% of a known model limit.
 
+Compression normally runs at the end of a turn. During a tool-heavy turn, Harnx also checks the estimated next request size after every completed tool round. This estimate includes the system prompt, tool definitions, 1,500 tokens per image, and a 10% margin. If it exceeds the threshold, Harnx compresses before sending the next request and continues the same turn. It doesn't compress when you submit a new prompt. Set `compress_threshold` to `0` to disable automatic compression.
+
 ## Why don't LLMs call tools even though they support tool use?
 
 Several things can prevent tool calls from working:

@@ -173,7 +173,14 @@ describe('harnx compaction events', () => {
   });
 
   it('is included in NAVIGATION_CONTROL_EVENTS to prevent assistant-ui forwarding', () => {
-    expect(NAVIGATION_CONTROL_EVENTS).toContain('session_compaction');
+    expect(NAVIGATION_CONTROL_EVENTS).toEqual(
+      expect.arrayContaining([
+        'session_compaction',
+        'session_compacting_started',
+        'session_compacting_completed',
+        'session_compacting_failed',
+      ]),
+    );
   });
 
   it('calls onSessionCompaction with valid compaction metadata', () => {

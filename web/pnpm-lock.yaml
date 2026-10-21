@@ -168,6 +168,9 @@ overrides:
   '@assistant-ui/store': 0.3.16
   assistant-stream: 0.3.46
 
+patchedDependencies:
+  '@assistant-ui/react-ag-ui@0.0.63': 4d26551b54c9c6117622a11cfeba7534ffb1dcaaa99e302ce2dd3373a8e5b31a
+
 importers:
 
   .:
@@ -180,7 +183,7 @@ importers:
         version: 0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       '@assistant-ui/react-ag-ui':
         specifier: 0.0.63
-        version: 0.0.63(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(assistant-cloud@0.2.4)(react@19.3.1)(zod@4.6.5)
+        version: 0.0.63(patch_hash=4d26551b54c9c6117622a11cfeba7534ffb1dcaaa99e302ce2dd3373a8e5b31a)(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(assistant-cloud@0.2.4)(react@19.3.1)(zod@4.6.5)
       '@assistant-ui/react-markdown':
         specifier: 0.14.18
         version: 0.14.18(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
@@ -2866,7 +2869,7 @@ snapshots:
       - ioredis
       - redis
 
-  '@assistant-ui/react-ag-ui@0.0.63(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(assistant-cloud@0.2.4)(react@19.3.1)(zod@4.6.5)':
+  '@assistant-ui/react-ag-ui@0.0.63(patch_hash=4d26551b54c9c6117622a11cfeba7534ffb1dcaaa99e302ce2dd3373a8e5b31a)(@assistant-ui/react@0.15.23(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(assistant-cloud@0.2.4)(react@19.3.1)(zod@4.6.5)':
     dependencies:
       '@ag-ui/client': 1.0.2
       '@assistant-ui/core': 0.3.22(@assistant-ui/store@0.3.16(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1))(@assistant-ui/tap@0.9.20(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(assistant-cloud@0.2.4)(react@19.3.1)

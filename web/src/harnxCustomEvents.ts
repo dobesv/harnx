@@ -18,6 +18,9 @@ export const NAVIGATION_CONTROL_EVENTS = [
   'session_handoff',
   'message_attachments',
   'session_compaction',
+  'session_compacting_started',
+  'session_compacting_completed',
+  'session_compacting_failed',
 ] as const;
 
 export interface MessageAttachmentMeta {

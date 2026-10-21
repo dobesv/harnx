@@ -79,7 +79,7 @@ async fn attached_history(
     let stream = SessionEventStream::attach(proxy.context.clone(), client, storage_key)
         .await
         .unwrap();
-    append_compaction_after_attach(&log).await;
+    append_compaction_after_attach(&log, 6).await;
     (stream, proxy)
 }
 

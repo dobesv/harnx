@@ -79,7 +79,10 @@ fn relay(
     ));
     let (tx, rx) = mpsc::unbounded_channel();
     (
-        Arc::new(TurnEventSender(tx)),
+        Arc::new(TurnEventSender {
+            tx,
+            config: config.clone(),
+        }),
         TurnEventRelay {
             rx,
             sink,
@@ -152,3 +155,5 @@ async fn broadcast_lag_recovers_compaction_metadata_before_snapshot() {
         );
     }
 }
+
+mod mid_turn;

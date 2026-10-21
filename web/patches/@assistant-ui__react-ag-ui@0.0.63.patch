@@ -1,0 +1,163 @@
+diff --git a/dist/runtime/AgUiThreadRuntimeCore.js b/dist/runtime/AgUiThreadRuntimeCore.js
+index 2649e1462fa3d7e57e9c8b023e4bf2610c3516dc..5b2600de173f1144b75c5567c57ddcb9ab301c78 100644
+--- a/dist/runtime/AgUiThreadRuntimeCore.js
++++ b/dist/runtime/AgUiThreadRuntimeCore.js
+@@ -676,7 +676,7 @@ var AgUiThreadRuntimeCore = class {
+ 		const historicalMessages = [...shouldEagerlyInsertAssistant ? this.session.tryGetMessages(parentId) ?? this.session.getMessages() : this.session.getMessages()];
+ 		const runStartMessageIds = new Set(this.getMessageRepository().messages.map(({ message }) => message.id));
+ 		let pendingError = null;
+-		const assistantParentId = parent ? parentId : this.session.headId;
++		let assistantParentId = parent ? parentId : this.session.headId;
+ 		let assistantMessageId;
+ 		let assistantCollided = false;
+ 		const ensureAssistant = (allowRecreate = false) => {
+@@ -691,8 +691,10 @@ var AgUiThreadRuntimeCore = class {
+ 			return created;
+ 		};
+ 		if (shouldEagerlyInsertAssistant) ensureAssistant();
++		let snapshotCheckpoint = false;
+ 		const applyUpdate = (update) => {
+ 			const hasStreamContent = Array.isArray(update.content) && update.content.some((part) => part.type !== "data");
++			if (snapshotCheckpoint && assistantMessageId === void 0 && !hasStreamContent) return;
+ 			const resolved = this.updateAssistantMessage(ensureAssistant(hasStreamContent), update);
+ 			if (resolved !== assistantMessageId) assistantMessageId = resolved;
+ 		};
+@@ -736,7 +738,14 @@ var AgUiThreadRuntimeCore = class {
+ 		const dispatch = (event) => {
+ 			if (this.abortController !== abortController) return;
+ 			const nextAssistantMessageId = this.handleEvent(aggregator, event, assistantMessageId);
+-			if (event.type === "MESSAGES_SNAPSHOT") assistantMessageId = nextAssistantMessageId;
++			if (event.type === "MESSAGES_SNAPSHOT") {
++				assistantMessageId = nextAssistantMessageId;
++				snapshotCheckpoint = assistantMessageId === void 0;
++				if (snapshotCheckpoint) {
++					assistantParentId = this.session.headId;
++					assistantCollided = false;
++				}
++			}
+ 		};
+ 		this.abortController = abortController;
+ 		const runAgentInstance = this.agent;
+@@ -1085,6 +1094,10 @@ var AgUiThreadRuntimeCore = class {
+ 				}
+ 				break;
+ 			case "MESSAGES_SNAPSHOT": {
++				if (aggregator.checkpointSnapshot()) {
++					this.importMessagesSnapshot(event.messages);
++					return void 0;
++				}
+ 				const previousHeadId = this.session.headId;
+ 				const activeAssistant = activeAssistantId === void 0 ? void 0 : this.session.tryGetMessage(activeAssistantId)?.message;
+ 				const hasActiveText = activeAssistant?.role === "assistant" && activeAssistant.content.some((part) => part.type === "text");
+diff --git a/dist/runtime/adapter/run-aggregator.d.ts b/dist/runtime/adapter/run-aggregator.d.ts
+index 71f1a07db4fb6703b4852a78af06b4dedef2b877..f07490ff778e6c7faa51f283e8a69e6858b2a6df 100644
+--- a/dist/runtime/adapter/run-aggregator.d.ts
++++ b/dist/runtime/adapter/run-aggregator.d.ts
+@@ -76,6 +76,7 @@ export declare class RunAggregator {
+     private firstTokenTime;
+     private totalChunks;
+     constructor(options: RunAggregatorOptions);
++    checkpointSnapshot(): boolean;
+     hasToolCall(toolCallId: string): boolean;
+     handle(event: AgUiEvent): void;
+     private handleActivityDelta;
+diff --git a/dist/runtime/adapter/run-aggregator.js b/dist/runtime/adapter/run-aggregator.js
+index 6509c488280b631ac3bca0536584f4208e0d3b60..e5be1704febabc016ca7819ba628b521b8c7cdf9 100644
+--- a/dist/runtime/adapter/run-aggregator.js
++++ b/dist/runtime/adapter/run-aggregator.js
+@@ -122,6 +122,19 @@ var RunAggregator = class {
+ 		this.onServerMessageId = options.onServerMessageId;
+ 		this.onTextMessageStart = options.onTextMessageStart;
+ 	}
++	checkpointSnapshot() {
++		if (
++		  this.activeTextMessageIdByScope.size > 0 ||
++		  this.activeReasoningKeyByScope.size > 0 ||
++		  this.hiddenActiveReasoning !== "none" ||
++		  Array.from(this.toolCalls.values()).some((call) => call.result === undefined)
++		) return false;
++		this.resetMessageParts();
++		this.serverMessageIdReported = false;
++		this.reportedServerMessageId = void 0;
++		this.lastTextMessageId = void 0;
++		return true;
++	}
+ 	hasToolCall(toolCallId) {
+ 		return this.toolCalls.has(toolCallId);
+ 	}
+diff --git a/src/runtime/AgUiThreadRuntimeCore.ts b/src/runtime/AgUiThreadRuntimeCore.ts
+index 804e123297423610ae8e6f2e1cd691f6a75136d8..dba6971a2025ca2ff1b218293e92efc1467bf68b 100644
+--- a/src/runtime/AgUiThreadRuntimeCore.ts
++++ b/src/runtime/AgUiThreadRuntimeCore.ts
+@@ -1193,7 +1193,7 @@ export class AgUiThreadRuntimeCore {
+     );
+ 
+     let pendingError: Error | null = null;
+-    const assistantParentId = parent ? parentId : this.session.headId;
++    let assistantParentId = parent ? parentId : this.session.headId;
+     let assistantMessageId: string | undefined;
+     // A snapshot the preserve gate declines still evicts the in-flight
+     // assistant; recreating under the cached id on the next content-bearing
+@@ -1232,10 +1232,12 @@ export class AgUiThreadRuntimeCore {
+ 
+     if (shouldEagerlyInsertAssistant) ensureAssistant();
+ 
++    let snapshotCheckpoint = false;
+     const applyUpdate = (update: ChatModelRunResult) => {
+       const hasStreamContent =
+         Array.isArray(update.content) &&
+         update.content.some((part) => part.type !== "data");
++      if (snapshotCheckpoint && assistantMessageId === undefined && !hasStreamContent) return;
+       const resolved = this.updateAssistantMessage(
+         ensureAssistant(hasStreamContent),
+         update,
+@@ -1302,6 +1304,11 @@ export class AgUiThreadRuntimeCore {
+       );
+       if (event.type === "MESSAGES_SNAPSHOT") {
+         assistantMessageId = nextAssistantMessageId;
++        snapshotCheckpoint = assistantMessageId === undefined;
++        if (snapshotCheckpoint) {
++          assistantParentId = this.session.headId;
++          assistantCollided = false;
++        }
+       }
+     };
+ 
+@@ -1816,6 +1823,10 @@ export class AgUiThreadRuntimeCore {
+         break;
+       }
+       case "MESSAGES_SNAPSHOT": {
++        if (aggregator.checkpointSnapshot()) {
++          this.importMessagesSnapshot(event.messages);
++          return undefined;
++        }
+         const previousHeadId = this.session.headId;
+         const activeAssistant =
+           activeAssistantId === undefined
+diff --git a/src/runtime/adapter/run-aggregator.ts b/src/runtime/adapter/run-aggregator.ts
+index 6badaf11999c56a2172821c5a5fe8db7d0406b65..eea36dc878979892f95da0eb65b19ff5b592b36b 100644
+--- a/src/runtime/adapter/run-aggregator.ts
++++ b/src/runtime/adapter/run-aggregator.ts
+@@ -272,6 +272,22 @@ export class RunAggregator {
+     this.onTextMessageStart = options.onTextMessageStart;
+   }
+ 
++  // A closed round is now represented by durable snapshot rows. Don't emit its
++  // buffered parts again when the next model message starts. Open text stays live.
++  checkpointSnapshot(): boolean {
++    if (
++      this.activeTextMessageIdByScope.size > 0 ||
++      this.activeReasoningKeyByScope.size > 0 ||
++      this.hiddenActiveReasoning !== "none" ||
++      Array.from(this.toolCalls.values()).some((call) => call.result === undefined)
++    ) return false;
++    this.resetMessageParts();
++    this.serverMessageIdReported = false;
++    this.reportedServerMessageId = undefined;
++    this.lastTextMessageId = undefined;
++    return true;
++  }
++
+   hasToolCall(toolCallId: string): boolean {
+     return this.toolCalls.has(toolCallId);
+   }

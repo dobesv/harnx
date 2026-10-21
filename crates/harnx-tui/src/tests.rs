@@ -12716,3 +12716,5 @@ async fn pending_markdown_link_is_appended_after_user_text() {
 }
 
 mod d2_fixture;
+
+mod mid_turn_compaction;

@@ -14,9 +14,15 @@
       "groupName": "assistant-ui"
     },
     {
-      "description": "Queue non-major updates for Mergify",
+      "description": "Queue non-major updates for Mergify, except the locally patched AG-UI adapter",
       "matchUpdateTypes": ["minor", "patch", "digest", "pin"],
+      "excludePackageNames": ["@assistant-ui/react-ag-ui"],
       "addLabels": ["automerge"]
+    },
+    {
+      "description": "The local pnpm patch for @assistant-ui/react-ag-ui must be re-validated on every bump",
+      "matchPackageNames": ["@assistant-ui/react-ag-ui"],
+      "automerge": false
     },
     {
       "description": "determinator 0.12 (xtask) takes guppy 0.17's PackageGraph; a newer guppy breaks the build until determinator moves",

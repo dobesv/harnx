@@ -11,6 +11,9 @@ use harnx_runtime::tool::{CompletionText, ToolRoundParams, ToolRoundPersistence}
 use harnx_runtime::{AgentLoopContext, LoopResult, PendingToolRound, ToolApprovalDecision};
 use harnx_toolset_server::invocation_journal::InvocationJournal;
 
+#[path = "tool_round/compaction.rs"]
+mod compaction;
+
 /// A session whose log lives on the broker, and a time tool server registered
 /// under the scope its tool rounds discover.
 struct RoundHarness {
@@ -25,6 +28,13 @@ struct RoundHarness {
 
 impl RoundHarness {
     async fn start() -> Result<Option<Self>> {
+        Self::start_with_toolset(TimeToolset::new(), "____time").await
+    }
+
+    async fn start_with_toolset(
+        toolset: impl Toolset + 'static,
+        identity: &str,
+    ) -> Result<Option<Self>> {
         let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
             auth_token: Some(TOKEN.to_string()),
         })
@@ -37,13 +47,13 @@ impl RoundHarness {
         let server_url = server.url.clone();
         let server_instance = instance_id.clone();
         let tool_server = tokio::spawn(async move {
-            serve_over_nats(TimeToolset::new(), server_instance, &server_url, TOKEN).await
+            serve_over_nats(toolset, server_instance, &server_url, TOKEN).await
         });
         let client = async_nats::ConnectOptions::new()
             .token(TOKEN.to_string())
             .connect(server.url())
             .await?;
-        wait_for_registry(&client, &instance_id, "____time").await?;
+        wait_for_registry(&client, &instance_id, identity).await?;
 
         let jetstream = async_nats::jetstream::new(client);
         let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
