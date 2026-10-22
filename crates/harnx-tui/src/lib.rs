@@ -36,6 +36,7 @@ pub(crate) mod tool_render;
 mod tool_transcript;
 pub mod types;
 
+mod compaction_history;
 mod completion;
 mod detail_view;
 mod operator_tools;

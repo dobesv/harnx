@@ -69,3 +69,16 @@ export interface SessionInfo {
   capabilities?: Record<string, unknown>;
   [key: string]: unknown;
 }
+
+export interface SessionHistoryResult {
+  history_snapshot: HistoryMessage[];
+  compaction?: CompactionMetadata;
+  next_cursor: string | null;
+  prev_cursor: string | null;
+  earlier_compaction: number | null;
+}
+
+export type SessionHistoryParams =
+  | { before_compaction: number; limit?: number }
+  | { from_seq: number; to_seq: number; limit?: number }
+  | { cursor: string; limit?: number };

@@ -62,6 +62,14 @@ Inside a child transcript:
 - `PgUp` / `PgDn` or mouse-wheel scrolling moves through the displayed child.
 - `Esc` returns to the parent transcript one level at a time.
 
+Inside an archived history view:
+
+- `↑` / `↓` moves between navigable rows and keeps the focused row visible.
+- `Enter` opens an earlier archive only when focused on a compaction marker; it
+  does nothing on other rows.
+- `PgUp` / `PgDn` or mouse-wheel scrolling moves through the displayed history.
+- `Esc` returns to the previous archive level.
+
 Child activity is monitored separately from the root turn, so it does not
 change the root input, busy indicator, or streaming message. Completed child
 views remain available while the same root session is selected; switching the

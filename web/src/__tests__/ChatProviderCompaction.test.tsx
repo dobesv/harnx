@@ -16,7 +16,7 @@ vi.mock('../RuntimeSessionSubscriber', () => ({ RuntimeSessionSubscriber: () => 
 
 import { ChatProvider } from '../ChatProvider';
 import { CompactionContext } from '../CompactionContext';
-import { CompactionMetadataContext } from '../CompactionMetadataContext';
+import { useCompactionMetadata } from '../CompactionMetadataContext';
 
 function CompactionPhase() {
   const { phase } = useContext(CompactionContext);
@@ -24,7 +24,8 @@ function CompactionPhase() {
 }
 
 function CompactionMetadataView() {
-  const metadata = useContext(CompactionMetadataContext);
+  const context = useCompactionMetadata();
+  const metadata = context?.metadata;
   return (
     <div data-testid="compaction-metadata">
       {metadata ? (

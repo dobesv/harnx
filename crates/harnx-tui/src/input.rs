@@ -355,6 +355,12 @@ impl Tui {
     }
 
     async fn handle_exclusive_view_key(&mut self, key: KeyEvent) -> Option<Result<()>> {
+        if self.app.modal.is_none() && self.app.archive_browser.is_some() {
+            if self.app.detail_view_open {
+                return Some(self.handle_detail_view_key(key).await);
+            }
+            return Some(self.handle_archive_key(key));
+        }
         if self.handle_cancellation_or_child_key(key) {
             return Some(Ok(()));
         }
@@ -378,17 +384,18 @@ impl Tui {
             _ => return,
         };
         if let Some(ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
-            for _ in 0..3 {
-                if up {
-                    state.scroll.scroll_up();
-                } else {
-                    state.scroll.scroll_down();
-                }
-            }
+            scroll_mouse_state(&mut state.scroll, up);
             return;
         }
         let state = if self.app.detail_view_open {
             &mut self.app.detail_view_scroll
+        } else if let Some(view) = self
+            .app
+            .archive_browser
+            .as_mut()
+            .and_then(|browser| browser.views.last_mut())
+        {
+            &mut view.scroll
         } else if self.scroll_open_subagent(up) {
             return;
         } else if self.app.transcript_browsing {
@@ -396,13 +403,7 @@ impl Tui {
         } else {
             &mut self.app.scroll_state
         };
-        for _ in 0..3 {
-            if up {
-                state.scroll_up();
-            } else {
-                state.scroll_down();
-            }
-        }
+        scroll_mouse_state(state, up);
     }
 
     /// Clear the shared pending message so the prompt task does not consume a
@@ -936,5 +937,15 @@ impl Tui {
             _ => None,
         };
         self.app.modal = Some(crate::types::ModalState::ConfirmRewind { seq, user_text });
+    }
+}
+
+fn scroll_mouse_state(state: &mut ratatui_widget_scrolling::ScrollState, up: bool) {
+    for _ in 0..3 {
+        if up {
+            state.scroll_up();
+        } else {
+            state.scroll_down();
+        }
     }
 }

@@ -1,0 +1,19 @@
+---
+source: crates/harnx/src/session_dump/tests/output/history.rs
+assertion_line: 36
+expression: "archive(&fixture(), \"15\")"
+---
+── Compaction 5: harnx dump session plain history --before-compaction 5 ──
+The session log stores tool calls and results separately. No messages were kept.
+
+Implement the shared transcript view and verify paging.
+[tool] read
+path: crates/harnx-core/src/session.rs
+Inspect the archived middle of the turn.
+text: Compress archives the previous window; kept messages are re-logged.
+[tool] exec
+command: cargo nextest run -p harnx-core transcript_view
+Check the transcript view tests.
+exit_code: 0
+stdout: Transcript view tests passed.
+The shared view is implemented. Paging tests passed.

@@ -2,7 +2,7 @@
 source: crates/harnx/src/session_dump/tests/output.rs
 expression: dump(&fixture())
 ---
-── Compaction 15: earlier history archived ──
+── Compaction 15: harnx dump session plain history --before-compaction 15 ──
 Earlier log inspection is archived. The latest prompt, verification round and final reply remain verbatim.
 
 Implement the shared transcript view and verify paging.

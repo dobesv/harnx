@@ -9995,7 +9995,7 @@ async fn transcript_navigation_can_focus_compaction_marker() {
 }
 
 #[tokio::test]
-async fn enter_on_compaction_marker_opens_full_detail_view() {
+async fn enter_on_unpersisted_compaction_reports_unavailable_history() {
     let config = test_config();
     seed_compressed_session(&config);
     let mut harness = TuiTestHarness::with_config(config).await;
@@ -10016,13 +10016,14 @@ async fn enter_on_compaction_marker_opens_full_detail_view() {
         .unwrap();
 
     assert!(harness.tui().app.detail_view_open);
-    let detail = harness.tui().app.detail_view_text.clone();
-    assert!(detail.as_deref().is_some_and(|text| {
-        text.contains("── user ──")
-            && text.contains("Old question")
-            && text.contains("── assistant ──")
-            && text.contains("Old answer")
-    }));
+    assert!(harness.tui().app.archive_browser.is_none());
+    assert!(harness
+        .tui()
+        .app
+        .detail_view_text
+        .as_deref()
+        .unwrap()
+        .contains("no session agent"));
 }
 
 fn assert_info_overlay_open(tui: &crate::Tui, initial_transcript_len: Option<usize>) -> &str {
@@ -12718,3 +12719,5 @@ async fn pending_markdown_link_is_appended_after_user_text() {
 mod d2_fixture;
 
 mod mid_turn_compaction;
+
+mod d4_fixture;
