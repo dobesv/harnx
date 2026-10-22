@@ -2019,21 +2019,34 @@ pub fn replay_default_view_to_sink(
     decl_map: &HashMap<String, ToolDeclaration>,
     sink: Arc<dyn AgentEventSink>,
 ) -> Result<()> {
+    let mut view = harnx_core::transcript_view::default_view(entries)?;
+    view.compaction = view
+        .compaction
+        .filter(|marker| marker.compaction_seq > after_seq);
+    view.entries.retain(|(seq, _)| *seq > after_seq);
+    replay_transcript_view_to_sink(&view, None, decl_map, sink);
+    Ok(())
+}
+
+/// Replay a selected default or historical view, with an optional frontend hint.
+/// The caller selects the view and any follow cursor before rendering. Sinks
+/// must render Info notices to display the marker and sanitize them as needed.
+pub fn replay_transcript_view_to_sink(
+    view: &harnx_core::transcript_view::TranscriptView,
+    marker_hint: Option<&str>,
+    decl_map: &HashMap<String, ToolDeclaration>,
+    sink: Arc<dyn AgentEventSink>,
+) {
     use harnx_core::event::NoticeEvent;
 
-    let mut view = harnx_core::transcript_view::default_view(entries)?;
-    if let Some(marker) = view
-        .compaction
-        .filter(|marker| marker.compaction_seq > after_seq)
-    {
+    if let Some(marker) = &view.compaction {
+        let hint = marker_hint.unwrap_or("earlier history archived");
         sink.emit(AgentEvent::Notice(NoticeEvent::Info(format!(
-            "── Compaction {}: earlier history archived ──\n{}\n",
+            "── Compaction {}: {hint} ──\n{}\n",
             marker.compaction_seq, marker.summary
         ))));
     }
-    view.entries.retain(|(seq, _)| *seq > after_seq);
     replay_entries_to_sink_with_decls(&view.entries, decl_map, sink);
-    Ok(())
 }
 
 /// Replay stored transcript entries synchronously through a frontend's text sink.

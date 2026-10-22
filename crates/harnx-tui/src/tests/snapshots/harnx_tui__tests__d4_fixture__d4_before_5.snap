@@ -1,0 +1,6 @@
+---
+source: crates/harnx-tui/src/tests/d4_fixture.rs
+expression: "display_rows(&view.items).join(\"\\n\")"
+---
+user Some(1): Inspect the session log format.
+assistant Some(2): Tool calls and results are separate log entries.

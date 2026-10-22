@@ -57,7 +57,7 @@ fn summary_entries(summary: &str) -> Vec<(u64, SessionLogEntry)> {
     entries
 }
 
-fn assert_safe_summary(output: &str, case: &ControlCase) {
+fn assert_safe_summary(output: &str, case: &ControlCase, marker_seq: u64) {
     assert!(
         output
             .chars()
@@ -66,7 +66,7 @@ fn assert_safe_summary(output: &str, case: &ControlCase) {
         case.name
     );
     let prefix = format!(
-        "── Compaction 15: earlier history archived ──\n{}\n\n",
+        "── Compaction {marker_seq}: harnx dump session plain history --before-compaction {marker_seq} ──\n{}\n\n",
         case.visible
     );
     assert!(output.starts_with(&prefix), "{}: {output:?}", case.name);
@@ -75,14 +75,14 @@ fn assert_safe_summary(output: &str, case: &ControlCase) {
 #[test]
 fn dump_summary_strips_terminal_controls() {
     for case in CASES {
-        assert_safe_summary(&dump(&summary_entries(case.input)), case);
+        assert_safe_summary(&dump(&summary_entries(case.input)), case, 15);
     }
 }
 
 #[test]
 fn follow_summary_strips_terminal_controls() {
     for case in CASES {
-        assert_safe_summary(&dump_after(&summary_entries(case.input), 14), case);
+        assert_safe_summary(&dump_after(&summary_entries(case.input), 14), case, 15);
     }
 }
 
@@ -116,4 +116,18 @@ fn live_info_preserves_renderer_generated_ansi() {
         sink.emit(AgentEvent::Notice(NoticeEvent::Info(text.into())));
     });
     assert_eq!(output, format!("{text}\n"));
+}
+
+#[test]
+fn archived_summary_strips_terminal_controls_without_changing_the_log() {
+    let args = parse_dump("harnx dump session plain history --before-compaction 15");
+    for case in CASES {
+        let mut entries = fixture();
+        entries[4].1 = SessionLogEntry::Compress {
+            prompt: case.input.into(),
+        };
+        let original = entries.clone();
+        assert_safe_summary(&dump_with_args(&entries, &args), case, 5);
+        assert_eq!(entries, original);
+    }
 }

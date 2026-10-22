@@ -334,6 +334,8 @@ impl Tui {
     ) -> bool {
         if self.app.detail_view_open {
             self.render_detail_view(frame, size);
+        } else if self.app.archive_browser.is_some() {
+            self.render_archive_view(frame, size);
         } else if !self.app.subagent_view_stack.is_empty() {
             self.render_subagent_session_view(frame, size);
         } else if self.app.transcript_browsing {

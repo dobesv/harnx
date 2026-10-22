@@ -475,10 +475,16 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     attachmentsByMessageId: attachmentsState.attachmentsByMessageId,
   }), [agentName, sessionId, attachmentsState.attachmentsByMessageId]);
 
+  const compactionMetadataContextValue = useMemo(() => ({
+    metadata: compactionMetadata,
+    agent: agentName,
+    session: sessionId,
+  }), [compactionMetadata, agentName, sessionId]);
+
   return (
     <CancellationContext.Provider value={cancellation}>
     <CompactionContext.Provider value={compactionPhase}>
-    <CompactionMetadataContext.Provider value={compactionMetadata}>
+    <CompactionMetadataContext.Provider value={compactionMetadataContextValue}>
     <SessionNavigationContext.Provider value={sessionNavigationContext}>
     <SubAgentNotesContext.Provider value={subAgentContext}>
     <MessageAttachmentsContext.Provider value={messageAttachmentsContext}>

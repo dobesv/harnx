@@ -92,6 +92,9 @@ impl Tui {
     }
 
     pub(super) async fn open_focused_root_item(&mut self) {
+        if self.open_focused_compaction().await {
+            return;
+        }
         if let Some(url) = self.focused_root_link() {
             self.open_link(&url, LinkTarget::Root).await;
             return;

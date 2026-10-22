@@ -164,5 +164,33 @@ describe('Compaction fixture and marker rendering', () => {
       expect(container.querySelector('.aui-user-message')).toBeInTheDocument();
       expect(screen.getByText('Implement the shared transcript view and verify paging.')).toBeInTheDocument();
     });
+
+    it('shows action button when history context and session are present, else hint', () => {
+      vi.mocked(aui.useAuiState).mockImplementation((selector: any) =>
+        selector({
+          message: {
+            id: promptAndTailCompaction.message_id,
+            role: 'assistant',
+            content: [{ type: 'text', text: promptAndTailCompaction.summary }],
+          },
+        }),
+      );
+
+      // With agent and session
+      render(
+        <CompactionMetadataContext.Provider
+          value={{
+            metadata: promptAndTailCompaction,
+            agent: 'agent-1',
+            session: 'session-1',
+          }}
+        >
+          <MyMessage />
+        </CompactionMetadataContext.Provider>,
+      );
+
+      // Without ArchivedHistoryProvider context, still falls back to hint
+      expect(screen.getByText('Earlier history archived')).toBeInTheDocument();
+    });
   });
 });

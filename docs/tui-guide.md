@@ -54,11 +54,12 @@ link. `Backspace` or `Esc` returns to the previous document, then closes the
 viewer at the start of its history. Use `PgUp`/`PgDn`, `Home`/`End`, or
 `g`/`G` to scroll.
 
-Inside a child transcript:
+Inside a child transcript or archived history view:
 
 - `↑` / `↓` moves between navigable rows and keeps the focused row visible.
 - `Enter` opens full details for a regular row or drills into a focused nested
-  sub-agent session.
+  sub-agent session. On an earlier compaction marker in an archived view,
+  `Enter` opens that earlier archive window.
 - `PgUp` / `PgDn` or mouse-wheel scrolling moves through the displayed child.
 - `Esc` returns to the parent transcript one level at a time.
 

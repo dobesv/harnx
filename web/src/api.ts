@@ -5,6 +5,8 @@ import type {
   JsonRpcResponse,
   PaginatedSessions,
   PromptResult,
+  SessionHistoryParams,
+  SessionHistoryResult,
   SessionInfo,
   SessionRef,
 } from './types';
@@ -271,4 +273,32 @@ export async function getSession(
     }
   );
   return sessionRpcResponse<SessionInfo>(res, {});
+}
+
+export async function getSessionHistory(
+  agent: string,
+  session: string,
+  params: SessionHistoryParams,
+  options?: { signal?: AbortSignal }
+): Promise<SessionHistoryResult> {
+  const res = await observedFetch(
+    `${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`,
+    {
+      method: 'POST',
+      signal: options?.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/history',
+        params,
+      }),
+    }
+  );
+  return sessionRpcResponse<SessionHistoryResult>(res, {
+    history_snapshot: [],
+    next_cursor: null,
+    prev_cursor: null,
+    earlier_compaction: null,
+  });
 }

@@ -1465,6 +1465,31 @@ For browse-back UI (D4), clients call `session/history` via JSON-RPC or HTTP GET
 read-only, uses the same guards as `session/get`, and returns pages with frozen cursors that
 survive cache eviction or server switches. See `crates/harnx-serve/README.md#history-paging`.
 
+### Modal and overlay patterns in web
+
+Archived history browse-back (`ArchivedHistoryViewer`) and other modal overlays follow these
+invariants:
+
+1. **Focus trap** — `useHistoryDialog` traps Tab/Shift+Tab within the dialog using
+   `FOCUSABLE_SELECTOR` (`web/src/ArchivedHistoryViewer.tsx`). Focus moves to the close button
+   on mount and restores the previously-focused element on unmount (ESC or close button).
+
+2. **Background inert** — The opening effect sets `inert` and `aria-hidden="true"` on
+   `.app-container` and `overflow: hidden` on `document.body`. The cleanup effect removes both
+   attributes and restores the previous scroll state, even on unexpected unmount (session
+   switch, provider unmount, navigation).
+
+3. **Stale fetch guard** — `loadPage` combines a generation counter (`activeRequestIdRef`) and
+   `AbortController` to abort superseded requests. State updates check the current generation
+   before applying. The abort signal is passed to `getSessionHistory`.
+
+4. **Read-only transcript** — Archived history rendering uses the same markdown components as the
+   main transcript (`MarkdownCode` with `SyntaxHighlighter`, accessible table wrapper). No
+   composer, execution actions, or context injection.
+
+See `web/src/ArchivedHistoryViewer.tsx` and `web/src/__tests__/archivedHistory.spec.tsx` for
+implementation and test coverage.
+
 Wire contract for `session/get` and live snapshots (AG-UI `MESSAGES_SNAPSHOT` /
 CUSTOM `session_compaction`): the synthetic summary message is an AG-UI **assistant** role with
 string `content`. External consumers (e.g. workflow-bot) read only `role` + string content and

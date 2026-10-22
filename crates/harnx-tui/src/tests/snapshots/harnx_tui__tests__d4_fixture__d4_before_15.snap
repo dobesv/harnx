@@ -1,0 +1,16 @@
+---
+source: crates/harnx-tui/src/tests/d4_fixture.rs
+expression: "display_rows(&view.items).join(\"\\n\")"
+---
+marker: The session log stores tool calls and results separately. No messages were kept.
+user Some(7): Implement the shared transcript view and verify paging.
+assistant Some(8): Inspect the archived middle of the turn.
+tool Some(8): read
+Some(Yaml("path: crates/harnx-core/src/session.rs"))
+result: text: Compress archives the previous window; kept messages are re-logged.
+assistant Some(10): Check the transcript view tests.
+tool Some(10): exec
+Some(Yaml("command: cargo nextest run -p harnx-core transcript_view"))
+result: exit_code: 0
+stdout: Transcript view tests passed.
+assistant Some(12): The shared view is implemented. Paging tests passed.

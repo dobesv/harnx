@@ -151,6 +151,7 @@ fn build_initial_app(
             s
         },
         detail_view_open: false,
+        archive_browser: None,
         doc_view: None,
         doc_history: Vec::new(),
         detail_view_text: None,

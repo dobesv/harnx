@@ -12,20 +12,8 @@ impl Tui {
         self.app.doc_view = None;
         self.app.doc_history.clear();
         self.app.detail_view_entry = None;
-        let focused_item = self
-            .app
-            .transcript_focus
-            .and_then(|focus| self.app.transcript.get(focus));
-        match focused_item {
-            Some(TranscriptItem::CompactionMarker { detail_text, .. }) => {
-                self.app.detail_view_text = Some(detail_text.clone());
-                self.app.detail_view_title = Some("Compacted session".to_string());
-            }
-            _ => {
-                self.app.detail_view_text = None;
-                self.app.detail_view_title = None;
-            }
-        }
+        self.app.detail_view_text = None;
+        self.app.detail_view_title = None;
         self.app.detail_view_open = true;
     }
 

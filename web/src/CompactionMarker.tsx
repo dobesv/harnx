@@ -6,6 +6,8 @@ import remarkGfm from 'remark-gfm';
 import type { CompactionMetadata } from './compactionMetadata';
 import { MarkdownLink } from './markdownLink';
 import { markdownUrlTransform } from './markdownUrl';
+import { useArchivedHistory } from './ArchivedHistoryContext';
+import { useCompactionMetadata } from './CompactionMetadataContext';
 
 const SyntaxHighlighter = makeLightAsyncSyntaxHighlighter({ useInlineStyles: false });
 
@@ -14,6 +16,20 @@ export interface CompactionMarkerProps {
 }
 
 export function CompactionMarker({ metadata }: CompactionMarkerProps) {
+  const historyContext = useArchivedHistory();
+  const metadataContext = useCompactionMetadata();
+
+  const handleShowEarlierHistory = () => {
+    if (historyContext && metadataContext?.agent && metadataContext?.session) {
+      historyContext.openHistory({
+        agent: metadataContext.agent,
+        session: metadataContext.session,
+        beforeCompaction: metadata.compaction_seq,
+        title: `History before compaction ${metadata.compaction_seq}`,
+      });
+    }
+  };
+
   return (
     <MessagePrimitive.Root
       className="aui-compaction-marker"
@@ -29,7 +45,18 @@ export function CompactionMarker({ metadata }: CompactionMarkerProps) {
       <div className="aui-compaction-card">
         <div className="aui-compaction-card-header">
           <h3 className="aui-compaction-title">Summary of earlier conversation</h3>
-          <span className="aui-compaction-hint">Earlier history archived</span>
+          {historyContext && metadataContext?.agent && metadataContext?.session ? (
+            <button
+              type="button"
+              className="aui-compaction-action-btn"
+              onClick={handleShowEarlierHistory}
+              data-testid="show-earlier-history-btn"
+            >
+              Show earlier history
+            </button>
+          ) : (
+            <span className="aui-compaction-hint">Earlier history archived</span>
+          )}
         </div>
         <div className="aui-compaction-summary" data-testid="compaction-summary">
           <MessagePrimitive.Content

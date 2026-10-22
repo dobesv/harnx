@@ -32,6 +32,7 @@ import { AttachIcon, SendIcon, StopIcon } from './icons';
 import { MarkdownLink } from './markdownLink';
 import { markdownUrlTransform } from './markdownUrl';
 import { CidDocumentProvider } from './CidDocumentProvider';
+import { ArchivedHistoryProvider } from './ArchivedHistoryProvider';
 import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './composer/AgentSessionMenu';
 import { ConnectionBanner } from './ConnectionBanner';
 import { useConnectionStatus, useRetryCountdownSeconds } from './useConnectionStatus';
@@ -78,7 +79,8 @@ export const MessageContent = () => (
 // eslint-disable-next-line react-refresh/only-export-components
 export const MyMessage = () => {
   const messageId = useAuiState((s) => s.message.id);
-  const compactionMetadata = useCompactionMetadata();
+  const compactionContext = useCompactionMetadata();
+  const compactionMetadata = compactionContext?.metadata ?? null;
   if (compactionMetadata && compactionMetadata.message_id === messageId) {
     return <CompactionMarker metadata={compactionMetadata} />;
   }
@@ -1006,8 +1008,9 @@ export default function App() {
   const suppressBanner = !selectedAgent && !hasLoadedAgents;
 
   return (
-    <CidDocumentProvider>
-      <div className="app-container">
+    <ArchivedHistoryProvider>
+      <CidDocumentProvider>
+        <div className="app-container">
         <ConnectionBanner suppress={suppressBanner} />
         {!selectedAgent ? (
           <AgentPicker
@@ -1063,7 +1066,8 @@ export default function App() {
             </div>
           </div>
         )}
-      </div>
-    </CidDocumentProvider>
+        </div>
+      </CidDocumentProvider>
+    </ArchivedHistoryProvider>
   );
 }
