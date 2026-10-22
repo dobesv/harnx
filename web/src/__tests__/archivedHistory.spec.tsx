@@ -196,6 +196,95 @@ describe('ArchivedHistoryViewer (D4 browse-back)', () => {
     );
   });
 
+  it('keeps focus inside the dialog after next/prev page loads rather than dropping to body', async () => {
+    mockGetSessionHistory
+      .mockResolvedValueOnce(window15Page1)
+      .mockResolvedValueOnce(window15Page2)
+      .mockResolvedValueOnce(window15Page1);
+
+    render(
+      <ArchivedHistoryViewer
+        initialTarget={{
+          agent: 'coder',
+          session: 's-1',
+          beforeCompaction: 15,
+        }}
+        onClose={() => {}}
+      />,
+    );
+
+    const dialog = await screen.findByRole('dialog');
+    const nextBtn = await screen.findByRole('button', { name: 'Next page' });
+
+    // Focus next page button and click it
+    nextBtn.focus();
+    expect(document.activeElement).toBe(nextBtn);
+    fireEvent.click(nextBtn);
+
+    // Wait for page 2 to load
+    await waitFor(() => {
+      expect(
+        screen.getByText('The shared view is implemented. Paging tests passed.'),
+      ).toBeInTheDocument();
+    });
+
+    // Active element must not be document.body, and must be the content container with class archived-history-content
+    expect(document.activeElement).not.toBe(document.body);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toHaveClass('archived-history-content');
+
+    // Now click Previous page
+    const prevBtn = screen.getByRole('button', { name: 'Previous page' });
+    prevBtn.focus();
+    expect(document.activeElement).toBe(prevBtn);
+    fireEvent.click(prevBtn);
+
+    // Wait for page 1 to load
+    await waitFor(() => {
+      expect(
+        screen.getByText('Implement the shared transcript view and verify paging.'),
+      ).toBeInTheDocument();
+    });
+
+    // Active element must remain inside the dialog on the content container
+    expect(document.activeElement).not.toBe(document.body);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toHaveClass('archived-history-content');
+  });
+
+  it('recovers focus to the content container when paging fails with an error', async () => {
+    mockGetSessionHistory
+      .mockResolvedValueOnce(window15Page1)
+      .mockRejectedValueOnce(new Error('Network error on page 2'));
+
+    render(
+      <ArchivedHistoryViewer
+        initialTarget={{
+          agent: 'coder',
+          session: 's-1',
+          beforeCompaction: 15,
+        }}
+        onClose={() => {}}
+      />,
+    );
+
+    const dialog = await screen.findByRole('dialog');
+    const nextBtn = await screen.findByRole('button', { name: 'Next page' });
+
+    nextBtn.focus();
+    expect(document.activeElement).toBe(nextBtn);
+    fireEvent.click(nextBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText('Network error on page 2')).toBeInTheDocument();
+    });
+
+    // Focus must not drop to body; it must recover to archived-history-content
+    expect(document.activeElement).not.toBe(document.body);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toHaveClass('archived-history-content');
+  });
+
   it('walks back through 2 compactions to the first message (nested compaction walk) and goes back', async () => {
     mockGetSessionHistory
       .mockResolvedValueOnce(window15Page1) // before_compaction: 15

@@ -1,6 +1,7 @@
 //! Read-only transcript windows, frozen at the first archive read.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -14,6 +15,11 @@ use ratatui_widget_scrolling::ScrollState;
 use crate::types::{TranscriptItem, Tui};
 
 mod render;
+
+// Enter runs on the event loop, so bound connection setup and the full log read
+// together, like Ctrl+D's mark-read, before returning control to the keyboard.
+// Match runtime READ_TIMEOUT: sequential per-entry reads can take seconds on a healthy connection.
+const ARCHIVE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) struct ArchiveBrowser {
     entries: Vec<(u64, SessionLogEntry)>,
@@ -130,10 +136,16 @@ impl Tui {
                 })
             })
             .context("no session agent")?;
-        let jetstream = cfg.nats_jetstream(&cluster).await?;
-        let entries = NatsSessionLog::for_agent(jetstream, &agent, session.id())
-            .load_events_async()
-            .await?;
+        let entries = tokio::time::timeout(ARCHIVE_READ_TIMEOUT, async {
+            let jetstream = cfg.nats_jetstream(&cluster).await?;
+            NatsSessionLog::for_agent(jetstream, &agent, session.id())
+                .load_events_async()
+                .await
+        })
+        .await
+        .with_context(|| {
+            format!("earlier history read timed out after {ARCHIVE_READ_TIMEOUT:?}")
+        })??;
         let marker = transcript_view::default_view(&entries)?
             .compaction
             .context("no compaction in session log")?;

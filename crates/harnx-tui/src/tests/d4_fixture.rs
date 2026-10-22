@@ -266,6 +266,50 @@ async fn d4_open_archive_is_isolated_from_live_transcript_changes_nats() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn d4_archive_timeout_shows_error_and_keyboard_still_responds() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _environment = TestEnvironment::set(temp.path());
+    let config = super::test_config();
+    config.write().session = Some(replay(&fixture()));
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
+    select_marker(harness.tui()).await;
+
+    // Keep the socket open without sending NATS INFO, so connecting cannot finish.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    {
+        let mut cfg = config.write();
+        cfg.remote_agent = Some(("archive".into(), "stalled".into()));
+        cfg.nats_servers.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "stalled",
+                "url": format!("nats://{}", listener.local_addr().unwrap()),
+            }))
+            .unwrap(),
+        );
+    }
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        press(harness.tui(), KeyCode::Enter),
+    )
+    .await
+    .expect("Enter must return control to the event loop after the archive deadline");
+    assert!(harness.tui().app.archive_browser.is_none());
+    assert!(harness.tui().app.detail_view_open);
+    harness.render();
+    let screen = harness.screen_contents();
+    assert!(screen.contains("Earlier history unavailable"));
+    assert!(screen.contains("earlier history read timed out after 10s"));
+
+    press(harness.tui(), KeyCode::Esc).await;
+    assert!(!harness.tui().app.detail_view_open);
+    press(harness.tui(), KeyCode::Esc).await;
+    press(harness.tui(), KeyCode::Char('x')).await;
+    assert_eq!(harness.tui().app.input.lines(), ["x"]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn d4_stale_marker_reports_reload_instead_of_showing_wrong_archive_nats() {
     let temp = tempfile::TempDir::new().unwrap();

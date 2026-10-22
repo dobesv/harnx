@@ -15,19 +15,37 @@ export interface CompactionMarkerProps {
   metadata: CompactionMetadata;
 }
 
+interface ActionContextTarget {
+  historyContext: NonNullable<ReturnType<typeof useArchivedHistory>>;
+  agent: string;
+  session: string;
+}
+
+function resolveActionContext(
+  historyContext: ReturnType<typeof useArchivedHistory>,
+  metadataContext: ReturnType<typeof useCompactionMetadata>,
+): ActionContextTarget | null {
+  if (!historyContext) return null;
+  const agent = metadataContext?.agent;
+  if (!agent) return null;
+  const session = metadataContext?.session;
+  if (!session) return null;
+  return { historyContext, agent, session };
+}
+
 export function CompactionMarker({ metadata }: CompactionMarkerProps) {
   const historyContext = useArchivedHistory();
   const metadataContext = useCompactionMetadata();
+  const actionTarget = resolveActionContext(historyContext, metadataContext);
 
   const handleShowEarlierHistory = () => {
-    if (historyContext && metadataContext?.agent && metadataContext?.session) {
-      historyContext.openHistory({
-        agent: metadataContext.agent,
-        session: metadataContext.session,
-        beforeCompaction: metadata.compaction_seq,
-        title: `History before compaction ${metadata.compaction_seq}`,
-      });
-    }
+    if (!actionTarget) return;
+    actionTarget.historyContext.openHistory({
+      agent: actionTarget.agent,
+      session: actionTarget.session,
+      beforeCompaction: metadata.compaction_seq,
+      title: `History before compaction ${metadata.compaction_seq}`,
+    });
   };
 
   return (
@@ -45,7 +63,7 @@ export function CompactionMarker({ metadata }: CompactionMarkerProps) {
       <div className="aui-compaction-card">
         <div className="aui-compaction-card-header">
           <h3 className="aui-compaction-title">Summary of earlier conversation</h3>
-          {historyContext && metadataContext?.agent && metadataContext?.session ? (
+          {actionTarget ? (
             <button
               type="button"
               className="aui-compaction-action-btn"
