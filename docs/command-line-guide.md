@@ -257,17 +257,46 @@ Options:
 
 This command does not output transcript entries, does not include the system prompt, and does not launch MCP servers.
 
-### `harnx dump session <agent-name> <session-id> [--format text|yaml|json] [--follow | --check-loop-detection]`
+### `harnx dump session <agent-name> <session-id> [--format text|yaml|json] [--follow | --check-loop-detection | --before-compaction <SEQ|N back>]`
 
 Dumps the session transcript (history).
 
 Formats:
-- `--format text` (default): Syntax-highlighted, human-readable output matching one-shot `harnx prompt` rendering. Reconstructs messages and tool calls/results into clean terminal output. Compacted sessions start with a `Compaction <seq>: earlier history archived` header and summary, then kept messages once and later activity. Archived history is omitted from text dumps.
+- `--format text` (default): Syntax-highlighted, human-readable output matching one-shot `harnx prompt` rendering. Reconstructs messages and tool calls/results into clean terminal output. Compacted sessions start with a `Compaction <seq>` header and summary, then kept messages once and later activity. The header prints the exact command to open earlier history. Archived messages stay out of the default view.
 - `--format yaml`: Prints all durable transcript entries as `---`-separated `SessionLogEntry` YAML documents (includes messages, tool calls, tool results, and control entries).
 - `--format json`: Prints transcript entries as **JSONL** (JSON Lines) with exactly one `SessionLogEntry` JSON object per line. This is NOT a single JSON array `[...]` — each line is an independent JSON object, making it streamable and directly parseable with `jq -c` or line-by-line scripts without loading the entire transcript into memory at once.
 
+Text output keeps the existing terminal channels: markers and streamed text use stdout; user messages, tool output, and final replies use stderr. To save the complete text transcript, redirect both streams:
+
+```sh
+harnx dump session plain history --before-compaction "1 back" > history.txt 2>&1
+```
+
+Earlier history with `--before-compaction`:
+- `--before-compaction 15`: Prints the view immediately before the compaction at physical log sequence 15. It starts with the previous compaction's marker and summary, if any, then the messages archived by compaction 15, including originals of messages later kept.
+- `--before-compaction "1 back"`: Opens the latest compaction's archive. `"2 back"` opens the next older archive, and so on. Quote the whole value. Relative counts follow the current view's compaction ancestry, ignoring branches removed by edits or rewinds.
+- Each marker prints a copyable command for the same agent and session, with an exact sequence number. Keep following these commands until the view has no marker and starts at the first message. Hints preserve explicit `agent@cluster` selectors and quote shell-sensitive names.
+- Browsing is read-only: it doesn't change the session or restore archived messages to model context. Later edits or rewinds don't change a historical view; an exact sequence can still open a compaction removed from the current view while it remains in the log.
+- Sequence numbers and relative counts must be positive. Unknown sequences, non-compaction sequences, and counts beyond the available history fail with an error.
+- This flag supports **text only**. `--format json` and `--format yaml` are rejected with it; without the flag, their existing full-log exports are unchanged. `--follow` and `--check-loop-detection` cannot be combined with `--before-compaction`.
+- Replayed summary notices strip terminal control characters except newlines and tabs, as in the default text dump. Stored summaries and structured exports are unchanged.
+
+For a session with compactions at 5 and 15, the default header is:
+
+```text
+── Compaction 15: harnx dump session plain history --before-compaction 15 ──
+```
+
+Running that command shows the archived window with this earlier header:
+
+```text
+── Compaction 5: harnx dump session plain history --before-compaction 5 ──
+```
+
+Running the second command reaches the first window, with no compaction header.
+
 Live tail with `--follow`:
-- `--follow`: Runs a `tail -f`-style live follow mode. Replays existing history to stdout, then listens for newly committed durable entries and streams them until interrupted with `Ctrl-C`.
+- `--follow`: Runs a `tail -f`-style live follow mode. Replays existing history, then listens for newly committed durable entries and streams them until interrupted with `Ctrl-C`.
 - Read-only observation: `--follow` observes the session stream and does not interrupt, cancel, or modify the running session or agent.
 
 Loop check with `--check-loop-detection`:

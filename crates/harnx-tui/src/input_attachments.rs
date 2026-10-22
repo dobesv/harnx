@@ -100,7 +100,8 @@ pub(crate) async fn render_attachment_preview(path: &Path) -> Option<String> {
 
 impl Tui {
     fn can_accept_paste(&self) -> bool {
-        let overlay_open = self.app.detail_view_open
+        let overlay_open = self.app.archive_browser.is_some()
+            || self.app.detail_view_open
             || self.app.transcript_browsing
             || !self.app.subagent_view_stack.is_empty();
         !overlay_open && (!self.has_root_cancellation() || self.cancellation_editor_restored())

@@ -9,14 +9,14 @@ use harnx_runtime::config::session::replay_nats_entries_into_session;
 use crate::lifecycle::{build_transcript_with_compaction, messages_to_transcript_items};
 use crate::types::TranscriptItem;
 
-fn fixture() -> Vec<(u64, SessionLogEntry)> {
+pub(super) fn fixture() -> Vec<(u64, SessionLogEntry)> {
     serde_json::from_str(include_str!(
         "../../../harnx-core/tests/fixtures/compaction-history.json"
     ))
     .expect("shared compaction fixture")
 }
 
-fn replay(entries: &[(u64, SessionLogEntry)]) -> Session {
+pub(super) fn replay(entries: &[(u64, SessionLogEntry)]) -> Session {
     let entries = entries
         .iter()
         .map(|(seq, entry)| (usize::try_from(*seq).unwrap(), entry.clone()))
@@ -36,7 +36,7 @@ fn transcript(entries: &[(u64, SessionLogEntry)]) -> Vec<TranscriptItem> {
 }
 
 // Ignore render caches and wall-clock tool anchors, but retain every displayed row.
-fn display_rows(items: &[TranscriptItem]) -> Vec<String> {
+pub(super) fn display_rows(items: &[TranscriptItem]) -> Vec<String> {
     items.iter().map(display_row).collect()
 }
 
@@ -197,27 +197,20 @@ fn d2_fixture_summary_survives_an_empty_archive() {
     assert_summary_only_transcript(&entries, None, &["archived messages: 0"]);
 }
 
-#[tokio::test]
-async fn d2_fixture_enter_opens_archived_transcript() {
-    let config = super::test_config();
-    config.write().session = Some(replay(&fixture()));
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d2_fixture_enter_opens_archived_transcript_nats() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let _lock = super::ENV_LOCK.lock().await;
+    let _environment = super::TestEnvironment::set(temp.path());
+    let config = super::d4_fixture::fixture_config(&fixture()).await;
     let mut harness = super::TuiTestHarness::with_config(config).await;
-    let tui = harness.tui();
-    let expected_detail = marker(&tui.app.transcript).1.to_owned();
-    tui.app.transcript_focus = tui
-        .app
-        .transcript
+    super::d4_fixture::select_marker(harness.tui()).await;
+    super::d4_fixture::press(harness.tui(), crossterm::event::KeyCode::Enter).await;
+    let view = super::d4_fixture::archive(harness.tui());
+    assert_eq!(view.before, 15);
+    assert_eq!(view.marker.as_ref().unwrap().compaction_seq, 5);
+    assert!(view
+        .items
         .iter()
-        .position(|item| matches!(item, TranscriptItem::CompactionMarker { .. }));
-    tui.handle_key(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Enter,
-        crossterm::event::KeyModifiers::NONE,
-    ))
-    .await
-    .unwrap();
-    assert!(tui.app.detail_view_open);
-    assert_eq!(
-        tui.app.detail_view_text.as_deref(),
-        Some(expected_detail.as_str())
-    );
+        .any(|item| matches!(item, TranscriptItem::ToolCall { .. })));
 }

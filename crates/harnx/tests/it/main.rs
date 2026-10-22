@@ -7,5 +7,6 @@ mod engine_smoke;
 mod interrupt_e2e;
 mod openai_responses_e2e;
 mod session_cli_e2e;
+mod session_dump_history_nats;
 mod tmux_e2e;
 mod tool_cli;

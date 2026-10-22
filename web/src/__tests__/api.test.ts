@@ -6,6 +6,7 @@ import {
   getAgent,
   getCidUrl,
   getSession,
+  getSessionHistory,
   listAgents,
   listSessions,
   sendPrompt,
@@ -394,6 +395,101 @@ describe('api.ts', () => {
         json: async () => ({ error: { code: -32001, message: 'session not found' } }),
       });
       await expect(getSession('agent1', 'session1')).rejects.toThrow('RPC Error: session not found');
+    });
+  });
+
+  describe('getSessionHistory', () => {
+    it('calls session/history with before_compaction and returns result', async () => {
+      const mockResult = {
+        history_snapshot: [
+          {
+            role: 'assistant',
+            id: 'a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3',
+            content: 'The session log stores tool calls and results separately.',
+          },
+          {
+            role: 'user',
+            id: '3e3bc161-3752-5646-a160-c7da8062e7c0',
+            content: 'Implement the shared transcript view and verify paging.',
+          },
+        ],
+        compaction: {
+          message_id: 'a0b1fe9f-c77c-568a-8ffc-7272dd4a5cc3',
+          compaction_seq: 5,
+          summary: 'The session log stores tool calls and results separately.',
+          from_seq: 1,
+          to_seq: 4,
+          kept_count: 0,
+        },
+        next_cursor: 'cursor-token-123',
+        prev_cursor: null,
+        earlier_compaction: 5,
+      };
+
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          result: mockResult,
+        }),
+      });
+
+      const res = await getSessionHistory('agent-1', 'session-1', { before_compaction: 15, limit: 2 });
+      expect(res).toEqual(mockResult);
+
+      const callArgs = fetchMock.mock.calls[0];
+      expect(callArgs[0]).toBe('/v1/agents/agent-1/sessions/session-1');
+      expect(JSON.parse(callArgs[1].body)).toEqual({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/history',
+        params: {
+          before_compaction: 15,
+          limit: 2,
+        },
+      });
+    });
+
+    it('calls session/history with cursor', async () => {
+      const mockResult = {
+        history_snapshot: [],
+        next_cursor: null,
+        prev_cursor: 'prev-cursor-token',
+        earlier_compaction: 5,
+      };
+
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          result: mockResult,
+        }),
+      });
+
+      const res = await getSessionHistory('agent-1', 'session-1', { cursor: 'next-cursor-token' });
+      expect(res).toEqual(mockResult);
+
+      const callArgs = fetchMock.mock.calls[0];
+      expect(JSON.parse(callArgs[1].body)).toEqual({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/history',
+        params: {
+          cursor: 'next-cursor-token',
+        },
+      });
+    });
+
+    it('throws on JSON-RPC error', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ error: { code: -32602, message: 'invalid sequence' } }),
+      });
+      await expect(
+        getSessionHistory('agent1', 'session1', { before_compaction: 999 }),
+      ).rejects.toThrow('RPC Error: invalid sequence');
     });
   });
 });

@@ -5,7 +5,6 @@ mod cli_replay_sink;
 mod compact;
 mod main_runtime;
 mod oneshot_nats;
-#[cfg(test)]
 mod session_dump;
 mod tool_cmd;
 
@@ -295,20 +294,16 @@ async fn fetch_session_metadata(
 
 async fn run_dump_command(dump_args: &crate::cli::DumpArgs) -> Result<()> {
     match &dump_args.command {
-        DumpSubcommands::Session {
-            agent_name,
-            session_id,
-            format,
-            follow,
-            check_loop_detection,
-        } => {
-            if *check_loop_detection {
-                return run_check_loop_detection(session_id, agent_name, format).await;
+        DumpSubcommands::Session(args) => {
+            args.validate()?;
+            if args.check_loop_detection {
+                return run_check_loop_detection(&args.session_id, &args.agent_name, &args.format)
+                    .await;
             }
-            if *follow {
-                return run_dump_session_follow(session_id, agent_name, *format).await;
+            if args.follow {
+                return run_dump_session_follow(args).await;
             }
-            run_dump_session_once(session_id, agent_name, format).await
+            run_dump_session_once(args).await
         }
         DumpSubcommands::Attachment { url, output } => {
             run_dump_attachment(url, output.as_deref()).await
@@ -473,22 +468,17 @@ async fn load_raw_session_entries(
     log.load_events_async().await
 }
 
-async fn run_dump_session_once(
-    session_id: &str,
-    agent_name: &str,
-    format: &harnx_runtime::config::SessionFormat,
-) -> Result<()> {
+async fn run_dump_session_once(args: &crate::cli::DumpSessionArgs) -> Result<()> {
     let config = init_frontend_config(WorkingMode::Cmd, true).await?;
-    let decl_map = tool_decl_map(&config);
-    let entries = match format {
+    let entries = match args.format {
         harnx_runtime::config::SessionFormat::Text => {
-            load_raw_session_entries(&config, agent_name, session_id).await?
+            load_raw_session_entries(&config, &args.agent_name, &args.session_id).await?
         }
-        _ => load_session_entries(&config, agent_name, session_id).await?,
+        _ => load_session_entries(&config, &args.agent_name, &args.session_id).await?,
     };
-
-    replay_dump_entries(&entries, format, &decl_map, None).await?;
-    Ok(())
+    let renderer =
+        session_dump::DumpRenderer::new(args, tool_decl_map(&config), new_text_dump_sink());
+    renderer.replay(&entries, 0)
 }
 
 async fn run_check_loop_detection(
@@ -511,18 +501,17 @@ async fn run_check_loop_detection(
     Ok(())
 }
 
-async fn run_dump_session_follow(
-    session_id: &str,
-    agent_name: &str,
-    format: harnx_runtime::config::SessionFormat,
-) -> Result<()> {
+async fn run_dump_session_follow(args: &crate::cli::DumpSessionArgs) -> Result<()> {
     use std::io::Write;
 
     let config = init_frontend_config(WorkingMode::Cmd, true).await?;
-    let decl_map = tool_decl_map(&config);
-    let (_, cluster) = config.resolve_session_agent(agent_name)?;
-    let (jetstream, metadata) =
-        harnx_runtime::config::session_metadata_for_agent(&config, agent_name, session_id).await?;
+    let (_, cluster) = config.resolve_session_agent(&args.agent_name)?;
+    let (jetstream, metadata) = harnx_runtime::config::session_metadata_for_agent(
+        &config,
+        &args.agent_name,
+        &args.session_id,
+    )
+    .await?;
     let client = config.nats_client(&cluster).await?;
     let mut stream = harnx_runtime::nats_event_sink::SessionEventStream::attach(
         jetstream,
@@ -530,11 +519,11 @@ async fn run_dump_session_follow(
         &metadata.storage_key(),
     )
     .await?;
-    let text_sink =
-        matches!(format, harnx_runtime::config::SessionFormat::Text).then(new_text_dump_sink);
+    let renderer =
+        session_dump::DumpRenderer::new(args, tool_decl_map(&config), new_text_dump_sink());
 
     // Replay initial history
-    replay_dump_entries(stream.history(), &format, &decl_map, text_sink.as_ref()).await?;
+    renderer.replay(stream.history(), 0)?;
     std::io::stdout().flush()?;
 
     // Follow loop: durable-only, with periodic poll timeout for lossy advisories
@@ -555,7 +544,7 @@ async fn run_dump_session_follow(
         }
 
         // On wake, check for new durable entries
-        flush_new_entries(&mut stream, &format, &decl_map, text_sink.as_ref()).await?;
+        flush_new_entries(&mut stream, &args.format, &renderer).await?;
     }
 }
 
@@ -563,8 +552,7 @@ async fn run_dump_session_follow(
 async fn flush_new_entries(
     stream: &mut harnx_runtime::nats_event_sink::SessionEventStream,
     format: &harnx_runtime::config::SessionFormat,
-    decl_map: &HashMap<String, harnx_core::tool::ToolDeclaration>,
-    sink: Option<&Arc<dyn AgentEventSink>>,
+    renderer: &session_dump::DumpRenderer<'_>,
 ) -> Result<()> {
     use std::io::Write;
 
@@ -580,45 +568,12 @@ async fn flush_new_entries(
     if !refreshed {
         return Ok(());
     }
-    match format {
-        harnx_runtime::config::SessionFormat::Text => harnx_runtime::replay_default_view_to_sink(
-            stream.history(),
-            after_seq,
-            decl_map,
-            sink.cloned().unwrap_or_else(new_text_dump_sink),
-        )?,
-        _ => replay_dump_entries(&stream.history()[old_len..], format, decl_map, sink).await?,
-    }
+    let entries = match format {
+        harnx_runtime::config::SessionFormat::Text => stream.history(),
+        _ => &stream.history()[old_len..],
+    };
+    renderer.replay(entries, after_seq)?;
     std::io::stdout().flush()?;
-    Ok(())
-}
-
-async fn replay_dump_entries(
-    entries: &[(u64, harnx_core::session::SessionLogEntry)],
-    format: &harnx_runtime::config::SessionFormat,
-    decl_map: &HashMap<String, harnx_core::tool::ToolDeclaration>,
-    sink: Option<&Arc<dyn AgentEventSink>>,
-) -> Result<()> {
-    use harnx_runtime::config::SessionFormat;
-
-    match format {
-        SessionFormat::Text => {
-            let sink = sink.cloned().unwrap_or_else(new_text_dump_sink);
-            harnx_runtime::replay_default_view_to_sink(entries, 0, decl_map, sink)?;
-        }
-        SessionFormat::Yaml => {
-            for (_, entry) in entries {
-                let doc = harnx_runtime::config::yaml_doc(entry)?;
-                print!("{doc}");
-            }
-        }
-        SessionFormat::Json => {
-            for (_, entry) in entries {
-                let line = harnx_runtime::config::jsonl_line(entry)?;
-                print!("{line}");
-            }
-        }
-    }
     Ok(())
 }
 
@@ -1312,15 +1267,11 @@ mod tests {
         )];
         let recording = Arc::new(DumpRecordingSink::default());
         let sink: Arc<dyn AgentEventSink> = recording.clone();
-        let decl_map = HashMap::new();
-        let format = harnx_runtime::config::SessionFormat::Text;
+        let args = session_dump::tests::dump_args();
+        let renderer = session_dump::DumpRenderer::new(&args, HashMap::new(), sink);
 
-        replay_dump_entries(&call_entries, &format, &decl_map, Some(&sink))
-            .await
-            .unwrap();
-        replay_dump_entries(&result_entries, &format, &decl_map, Some(&sink))
-            .await
-            .unwrap();
+        renderer.replay(&call_entries, 0).unwrap();
+        renderer.replay(&result_entries, 0).unwrap();
 
         let events = recording.0.lock().unwrap();
         assert_eq!(events.len(), 4);

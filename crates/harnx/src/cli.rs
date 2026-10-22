@@ -5,6 +5,9 @@ use is_terminal::IsTerminal;
 use std::io::{stdin, Read};
 use std::path::PathBuf;
 
+mod compaction_selector;
+pub use compaction_selector::CompactionSelector;
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -276,21 +279,7 @@ pub struct DumpArgs {
 #[derive(Subcommand, Debug, PartialEq, Eq)]
 pub enum DumpSubcommands {
     /// Dump session transcript entries
-    Session {
-        agent_name: String,
-        session_id: String,
-        /// Output format: text (human-readable), yaml (--- documents), json (JSONL)
-        #[arg(long, default_value = "text")]
-        format: SessionFormat,
-        /// Follow live updates (stream mode)
-        #[arg(long)]
-        follow: bool,
-        /// Replay the session through harnx's loop protection and report
-        /// where it would have warned, refused a call, or ended the turn, and
-        /// which replies the output guard would have stopped
-        #[arg(long, conflicts_with = "follow")]
-        check_loop_detection: bool,
-    },
+    Session(DumpSessionArgs),
     /// Dump an attachment
     Attachment {
         /// The cid: URL to dump
@@ -300,6 +289,37 @@ pub enum DumpSubcommands {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct DumpSessionArgs {
+    pub agent_name: String,
+    pub session_id: String,
+    /// Output format: text (human-readable), yaml (--- documents), json (JSONL)
+    #[arg(long, default_value = "text")]
+    pub format: SessionFormat,
+    /// Follow live updates (stream mode)
+    #[arg(long)]
+    pub follow: bool,
+    /// Replay the session through harnx's loop protection and report
+    /// where it would have warned, refused a call, or ended the turn, and
+    /// which replies the output guard would have stopped
+    #[arg(long, conflicts_with = "follow")]
+    pub check_loop_detection: bool,
+    /// Show history before a compaction sequence or "N back" (e.g. "1 back").
+    /// Text only; each marker prints a command to open its earlier history.
+    #[arg(long, value_name = "SEQ|N back", conflicts_with_all = ["follow", "check_loop_detection"])]
+    pub before_compaction: Option<CompactionSelector>,
+}
+
+impl DumpSessionArgs {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.before_compaction.is_none() || self.format == SessionFormat::Text,
+            "--before-compaction supports only --format text; JSON/YAML export the full log"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -434,18 +454,20 @@ mod tests {
         .unwrap();
         match cli.command {
             Some(Commands::Dump(args)) => match args.command {
-                DumpSubcommands::Session {
-                    agent_name,
-                    session_id,
-                    format,
-                    follow,
-                    check_loop_detection,
-                } => {
-                    assert_eq!(agent_name, "a");
-                    assert_eq!(session_id, "id");
-                    assert_eq!(format, SessionFormat::Json);
-                    assert!(follow);
-                    assert!(!check_loop_detection);
+                DumpSubcommands::Session(args) => {
+                    assert_eq!(
+                        (args.agent_name.as_str(), args.session_id.as_str()),
+                        ("a", "id")
+                    );
+                    assert_eq!(args.format, SessionFormat::Json);
+                    assert_eq!(
+                        (
+                            args.follow,
+                            args.check_loop_detection,
+                            args.before_compaction
+                        ),
+                        (true, false, None)
+                    );
                 }
                 other => panic!("unexpected dump subcommand: {other:?}"),
             },
@@ -467,14 +489,10 @@ mod tests {
         let Some(Commands::Dump(args)) = cli.command else {
             panic!("expected dump")
         };
-        let DumpSubcommands::Session {
-            check_loop_detection,
-            ..
-        } = args.command
-        else {
+        let DumpSubcommands::Session(args) = args.command else {
             panic!("expected dump session")
         };
-        assert!(check_loop_detection);
+        assert!(args.check_loop_detection);
         assert!(Cli::try_parse_from([
             "harnx",
             "dump",
@@ -610,9 +628,9 @@ mod tests {
         // Should either error or parse `json` as a file, not as format
         if let Ok(cli) = result {
             if let Some(Commands::Dump(args)) = cli.command {
-                if let DumpSubcommands::Session { format, .. } = args.command {
+                if let DumpSubcommands::Session(args) = args.command {
                     // If it parses, -f was interpreted as --file, not --format
-                    assert_eq!(format, SessionFormat::Text);
+                    assert_eq!(args.format, SessionFormat::Text);
                     assert!(cli.file.contains(&"json".to_string()));
                 }
             }
@@ -824,3 +842,6 @@ mod compact_command_tests {
 #[cfg(test)]
 #[path = "cli/tool_tests.rs"]
 mod tool_tests;
+
+#[cfg(test)]
+mod dump_tests;

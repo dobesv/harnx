@@ -15,10 +15,14 @@ fn session_help(command: &str, subject: &str) -> String {
 }
 
 #[test]
-fn cli_dump_session_help_shows_format_and_follow() {
+fn cli_dump_session_help_shows_format_follow_and_before_compaction() {
     let stdout = session_help("dump", "session");
     assert!(stdout.contains("--format"), "stdout: {stdout}");
     assert!(stdout.contains("--follow"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("--before-compaction <SEQ|N back>"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]

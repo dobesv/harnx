@@ -4,14 +4,18 @@ use harnx_runtime::config::SessionFormat;
 use serde::Deserialize;
 
 fn dump_format(entries: &[(u64, SessionLogEntry)], format: SessionFormat) -> String {
+    let args = DumpSessionArgs {
+        format,
+        ..dump_args()
+    };
+    dump_with_args(entries, &args)
+}
+
+fn dump_with_args(entries: &[(u64, SessionLogEntry)], args: &DumpSessionArgs) -> String {
     capture_output(|| {
-        tokio_test::block_on(crate::replay_dump_entries(
-            entries,
-            &format,
-            &HashMap::new(),
-            None,
-        ))
-        .unwrap();
+        DumpRenderer::new(args, HashMap::new(), crate::new_text_dump_sink())
+            .replay(entries, 0)
+            .unwrap();
     })
 }
 
@@ -67,7 +71,7 @@ fn text_dump_output_matches_shared_compaction_fixture() {
 fn text_dump_output_with_zero_kept_is_summary_only() {
     assert_eq!(
         dump(&fixture_through(6)),
-        format!("── Compaction 5: earlier history archived ──\n{EMPTY_SUMMARY}\n\n")
+        format!("── Compaction 5: harnx dump session plain history --before-compaction 5 ──\n{EMPTY_SUMMARY}\n\n")
     );
 }
 
@@ -148,3 +152,4 @@ fn yaml_dump_preserves_durable_entries_and_raw_summaries() {
 }
 
 mod controls;
+mod history;
