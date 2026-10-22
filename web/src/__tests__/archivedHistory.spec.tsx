@@ -474,6 +474,85 @@ describe('ArchivedHistoryViewer (D4 browse-back)', () => {
     document.body.removeChild(appContainer);
   });
 
+  it('restores focus to opener only after inert is removed from app container', async () => {
+    mockGetSessionHistory.mockResolvedValueOnce(window15Page1);
+
+    const appContainer = document.createElement('div');
+    appContainer.className = 'app-container';
+    const openerBtn = document.createElement('button');
+    openerBtn.textContent = 'Open history';
+    appContainer.appendChild(openerBtn);
+    document.body.appendChild(appContainer);
+
+    openerBtn.focus();
+    expect(document.activeElement).toBe(openerBtn);
+
+    let inertStateWhenOpenerFocused: string | null = 'not-called';
+    const originalFocus = openerBtn.focus.bind(openerBtn);
+    vi.spyOn(openerBtn, 'focus').mockImplementation(() => {
+      inertStateWhenOpenerFocused = appContainer.getAttribute('inert');
+      originalFocus();
+    });
+
+    const { unmount } = render(
+      <ArchivedHistoryViewer
+        initialTarget={{
+          agent: 'coder',
+          session: 's-1',
+          beforeCompaction: 15,
+        }}
+        onClose={() => {}}
+      />,
+    );
+
+    await screen.findByRole('button', { name: 'Close archived history viewer' });
+    expect(appContainer.getAttribute('inert')).toBe('');
+
+    unmount();
+
+    expect(inertStateWhenOpenerFocused).toBeNull();
+    expect(document.activeElement).toBe(openerBtn);
+
+    document.body.removeChild(appContainer);
+  });
+
+  it('does not attempt to focus opener if it was removed from DOM', async () => {
+    mockGetSessionHistory.mockResolvedValueOnce(window15Page1);
+
+    const appContainer = document.createElement('div');
+    appContainer.className = 'app-container';
+    const openerBtn = document.createElement('button');
+    openerBtn.textContent = 'Ephemeral opener';
+    appContainer.appendChild(openerBtn);
+    document.body.appendChild(appContainer);
+
+    openerBtn.focus();
+    const focusSpy = vi.spyOn(openerBtn, 'focus');
+
+    const { unmount } = render(
+      <ArchivedHistoryViewer
+        initialTarget={{
+          agent: 'coder',
+          session: 's-1',
+          beforeCompaction: 15,
+        }}
+        onClose={() => {}}
+      />,
+    );
+
+    await screen.findByRole('button', { name: 'Close archived history viewer' });
+
+    // Remove opener from DOM before viewer unmounts
+    appContainer.removeChild(openerBtn);
+    expect(openerBtn.isConnected).toBe(false);
+    focusSpy.mockClear();
+
+    expect(() => unmount()).not.toThrow();
+    expect(focusSpy).not.toHaveBeenCalled();
+
+    document.body.removeChild(appContainer);
+  });
+
   it('aborts stale in-flight requests and avoids race conditions', async () => {
     let resolveFirst: ((val: SessionHistoryResult) => void) | null = null;
     const firstPromise = new Promise<SessionHistoryResult>((resolve) => {

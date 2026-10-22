@@ -68,6 +68,14 @@ function restoreAttribute(el: HTMLElement, attr: string, value: string | null | 
   }
 }
 
+function restoreBackdrop(appContainer: HTMLElement | null, prevInert: string | null | undefined, prevAriaHidden: string | null | undefined, prevBodyOverflow: string): void {
+  if (appContainer) {
+    restoreAttribute(appContainer, 'inert', prevInert);
+    restoreAttribute(appContainer, 'aria-hidden', prevAriaHidden);
+  }
+  globalThis.document.body.style.overflow = prevBodyOverflow;
+}
+
 function useDialogInertBackdrop(): void {
   useEffect(() => {
     const appContainer = globalThis.document.querySelector<HTMLElement>('.app-container');
@@ -81,13 +89,7 @@ function useDialogInertBackdrop(): void {
     }
     globalThis.document.body.style.overflow = 'hidden';
 
-    return () => {
-      if (appContainer) {
-        restoreAttribute(appContainer, 'inert', prevInert);
-        restoreAttribute(appContainer, 'aria-hidden', prevAriaHidden);
-      }
-      globalThis.document.body.style.overflow = prevBodyOverflow;
-    };
+    return () => restoreBackdrop(appContainer, prevInert, prevAriaHidden, prevBodyOverflow);
   }, []);
 }
 
@@ -96,7 +98,9 @@ function useDialogInitialFocus(closeButtonRef: RefObject<HTMLButtonElement | nul
     const previouslyFocused = globalThis.document.activeElement;
     closeButtonRef.current?.focus();
     return () => {
-      if (previouslyFocused instanceof HTMLElement) previouslyFocused.focus();
+      if (previouslyFocused instanceof HTMLElement && previouslyFocused.isConnected) {
+        previouslyFocused.focus();
+      }
     };
   }, [closeButtonRef]);
 }
@@ -106,7 +110,9 @@ export function useHistoryDialog(
   closeButtonRef: RefObject<HTMLButtonElement | null>,
   onClose: () => void,
 ): void {
+  // Declare before initial focus: effect cleanups run in declaration order, so inert must be removed before restoring opener focus.
+  // The "restores focus to opener only after inert is removed from app container" test guards this browser behavior.
+  useDialogInertBackdrop();
   useDialogInitialFocus(closeButtonRef);
   useDialogEscapeAndTab(dialogRef, onClose);
-  useDialogInertBackdrop();
 }
