@@ -1471,7 +1471,7 @@ Archived history browse-back (`ArchivedHistoryViewer`) and other modal overlays 
 invariants:
 
 1. **Focus trap** — `useHistoryDialog` traps Tab/Shift+Tab within the dialog using
-   `FOCUSABLE_SELECTOR` (`web/src/ArchivedHistoryViewer.tsx`). Focus moves to the close button
+   `FOCUSABLE_SELECTOR` (`web/src/useHistoryDialog.ts`). Focus moves to the close button
    on mount and restores the previously-focused element on unmount (ESC or close button).
 
 2. **Background inert** — The opening effect sets `inert` and `aria-hidden="true"` on
@@ -1479,7 +1479,7 @@ invariants:
    attributes and restores the previous scroll state, even on unexpected unmount (session
    switch, provider unmount, navigation).
 
-3. **Stale fetch guard** — `loadPage` combines a generation counter (`activeRequestIdRef`) and
+3. **Stale fetch guard** — `executeFetch` in `web/src/useHistoryPageLoader.ts` combines a generation counter (`activeRequestIdRef`) and
    `AbortController` to abort superseded requests. State updates check the current generation
    before applying. The abort signal is passed to `getSessionHistory`.
 
@@ -1487,7 +1487,9 @@ invariants:
    main transcript (`MarkdownCode` with `SyntaxHighlighter`, accessible table wrapper). No
    composer, execution actions, or context injection.
 
-See `web/src/ArchivedHistoryViewer.tsx` and `web/src/__tests__/archivedHistory.spec.tsx` for
+See `web/src/ArchivedHistoryViewer.tsx`, `web/src/ArchivedHistoryMessages.tsx`,
+`web/src/useHistoryDialog.ts`, `web/src/useHistoryNavigation.ts`,
+`web/src/useHistoryPageLoader.ts`, and `web/src/__tests__/archivedHistory.spec.tsx` for
 implementation and test coverage.
 
 Wire contract for `session/get` and live snapshots (AG-UI `MESSAGES_SNAPSHOT` /
