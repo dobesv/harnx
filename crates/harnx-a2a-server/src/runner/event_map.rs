@@ -57,7 +57,7 @@ impl Output {
         last: bool,
         replace: bool,
     ) -> Option<TaskArtifactUpdateEvent> {
-        if !last && self.pending.is_empty() {
+        if !last && !replace && self.pending.is_empty() {
             return None;
         }
         Some(TaskArtifactUpdateEvent {

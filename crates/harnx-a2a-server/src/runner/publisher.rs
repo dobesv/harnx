@@ -12,6 +12,9 @@ pub(super) struct Publisher {
     pub(super) admission_guard: Option<OwnedMutexGuard<Option<Arc<RunnerHandle>>>>,
     pub(super) authority: OwnedTask,
     pub(super) stop_observed: bool,
+    pub(super) suspending: bool,
+    pub(super) resumed: bool,
+    pub(super) replace_output: bool,
     #[cfg(feature = "fault-injection")]
     pub(super) hooks: Arc<crate::fault_injection::FaultHooks>,
 }
@@ -43,6 +46,9 @@ impl Publisher {
             admission_guard: Some(admission_guard),
             authority,
             stop_observed: false,
+            suspending: false,
+            resumed: false,
+            replace_output: false,
             #[cfg(feature = "fault-injection")]
             hooks: Default::default(),
         }
@@ -114,9 +120,9 @@ impl Publisher {
     }
 
     pub(super) async fn flush_artifact(&mut self, last: bool, replace: bool) -> Result<()> {
-        let Some(update) = self
-            .output
-            .artifact_update(&self.record().task, last, replace)
+        let Some(update) =
+            self.output
+                .artifact_update(&self.record().task, last, replace || self.replace_output)
         else {
             return Ok(());
         };
@@ -130,6 +136,7 @@ impl Publisher {
         )
         .await?;
         self.output.committed();
+        self.replace_output = false;
         Ok(())
     }
     pub(super) async fn execute(&mut self, request: ExecutionRequest<'_>) -> Result<()> {
@@ -139,43 +146,58 @@ impl Publisher {
             cancel_rx,
             admitted_tx,
         } = request;
-        self.set_status(TaskState::Working, None).await?;
-        let route = session
-            .tool_confirmation_route(denial_confirmation_handler())
-            .await?;
+        if self.resumed {
+            self.drain_outbox().await?;
+            self.publish_snapshot();
+        } else {
+            self.set_status(TaskState::Working, None).await?;
+        }
         let session = session.clone().with_external_admission().with_admission_id(
             self.authority
                 .ticket(&self.storage_key)?
                 .invocation_id()
                 .into(),
         );
-        let result = self
-            .follow_turn(
-                &session,
-                &route,
-                AdmittedTurn {
-                    input,
-                    cancel_rx,
-                    admitted_tx,
-                },
-            )
-            .await;
-        route.close().await;
-        result
+        self.follow_turn(
+            &session,
+            AdmittedTurn {
+                input,
+                cancel_rx,
+                admitted_tx,
+            },
+        )
+        .await
     }
 
-    async fn follow_turn(
-        &mut self,
-        session: &NatsSession,
-        route: &harnx_runtime::nats_tool_confirmation::ToolConfirmationRoute,
-        turn: AdmittedTurn,
-    ) -> Result<()> {
+    async fn follow_turn(&mut self, session: &NatsSession, turn: AdmittedTurn) -> Result<()> {
         let AdmittedTurn {
             input,
             cancel_rx,
             admitted_tx,
         } = turn;
-        let appended = self.admit_fixed_prompt(session, &input).await?;
+        let appended = match input {
+            Some(input) => self.admit_fixed_prompt(session, &input).await?,
+            None => session
+                .fixed_prompt_handle(&self.authority.ticket(&self.storage_key)?)
+                .await?
+                .context("resume fixed prompt missing")?,
+        };
+        let after_request_seq = if self.resumed {
+            Some(
+                self.authority
+                    .context
+                    .document
+                    .state
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.hitl_checkpoint.as_ref())
+                    .context("resume HITL checkpoint missing")?
+                    .request
+                    .request_seq,
+            )
+        } else {
+            None
+        };
         // Cancellation must not land before the admitted user message.
         self.admission_guard.take();
         let snapshot = self.live.lock().snapshot().expect("admitted snapshot");
@@ -186,12 +208,14 @@ impl Publisher {
         self.hooks
             .checkpoint(crate::fault_injection::Boundary::Activation)
             .await;
-        let follow = session.follow_admitted_prompt(
+        let follow = session.follow_admitted_prompt_until_boundary(
             appended,
             Arc::new(A2aEventSink(inbox.clone())),
             Some(cancel_rx),
-            Some(route.subject()),
-            RunTurnOptions::default(),
+            FollowBoundaryOptions {
+                after_request_seq,
+                ..Default::default()
+            },
         );
         tokio::pin!(follow);
         let mut cancellation = tokio::time::interval(Duration::from_millis(250));
@@ -206,9 +230,26 @@ impl Publisher {
                 _ = cancellation.tick() => self.observe_cancel(session).await?,
             }
         };
-        self.output.accept(inbox.take()?, limit)?;
-        self.confirm_stop(session).await?;
-        self.complete_turn(result).await
+        match result {
+            FollowBoundary::InputRequired(pending) => {
+                // From here, persistence/transport failures must never interrupt
+                // the invocation or synthesize a terminal A2A failure.
+                self.suspending = true;
+                self.output.accept(inbox.take()?, limit)?;
+                self.suspend(pending).await
+            }
+            FollowBoundary::Terminal(mut result) => {
+                self.output.accept(inbox.take()?, limit)?;
+                if self.resumed {
+                    self.reconcile_output(None).await?;
+                    if !result.was_cancelled && result.error.is_none() {
+                        result.response = Some(self.output.text.clone());
+                    }
+                }
+                self.confirm_stop(session).await?;
+                self.complete_turn(result).await
+            }
+        }
     }
 
     async fn complete_turn(&mut self, result: harnx_runtime::NatsTurnResult) -> Result<()> {

@@ -182,6 +182,7 @@ fn broker_ports_url(path: &std::path::Path) -> Result<Option<String>> {
 pub enum Script {
     Text,
     Tool,
+    SerialTool,
     CountedTool,
     Fail,
     Many,
@@ -261,11 +262,24 @@ async fn completion(
             chunk(json!({}), json!("tool_calls")),
             "[DONE]".into(),
         ]
-    } else if llm.script == Script::Tool && first {
+    } else if (llm.script == Script::Tool && first)
+        || (llm.script == Script::SerialTool && llm.requests.lock().len() <= 2)
+    {
+        let id = if first {
+            "runner-handoff"
+        } else {
+            "runner-handoff-2"
+        };
+        let text = if first {
+            "Before approval. "
+        } else {
+            "Between approvals. "
+        };
         vec![
+            chunk(json!({"content":text}), Value::Null),
             chunk(
-                json!({"tool_calls":[{"index":0,"id":"runner-handoff", "type":"function",
-            "function":{"name":"target_session_handoff", "arguments":"{\"prompt\":\"must not run\",\"session_id\":\"denied-target\"}"}}]}),
+                json!({"tool_calls":[{"index":0,"id":id, "type":"function",
+                "function":{"name":"target_session_handoff", "arguments":"{\"prompt\":\"must not run\",\"session_id\":\"denied-target\"}"}}]}),
                 Value::Null,
             ),
             chunk(json!({}), json!("tool_calls")),
@@ -415,7 +429,7 @@ fn fixture_config(
     std::fs::write(dir.join("clients/mock.yaml"), format!("type: openai-compatible\nname: mock\napi_base: http://{address}/v1\napi_key: test-key\nmodels:\n  - name: test\n    max_input_tokens: 32000\n    max_output_tokens: 1024\n"))?;
     let agent = if script == Script::CountedTool {
         "---\nmodel: mock:test\nuse_tools: [bash_exec]\n---\nTest counted tool agent\n".into()
-    } else if script == Script::Tool {
+    } else if matches!(script, Script::Tool | Script::SerialTool) {
         let binary = binary("harnx-claude-compatible-hook-server")?;
         let command = shell_words::join([binary.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^target_session_handoff$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve handoff?\"}}"]);
         format!("---\nmodel: mock:test\nuse_tools:\n- target_session_handoff\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest runner agent\n")

@@ -17,11 +17,11 @@ use anyhow::{Context, Result};
 use futures::FutureExt;
 use harnx_core::{abort::AbortSignal, input::Input};
 use harnx_runtime::{
-    config::GlobalConfig, nats_tool_confirmation::ToolConfirmationHandler, NatsSession,
-    NatsSessionConfig, RunTurnOptions, SessionActivationRoute, SessionInitializer,
+    config::GlobalConfig, FollowBoundary, FollowBoundaryOptions, NatsSession, NatsSessionConfig,
+    SessionActivationRoute, SessionInitializer,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, OwnedMutexGuard};
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{
     exports::Export,
@@ -39,6 +39,7 @@ pub(crate) use admission::AllocatedAdmission;
 mod authority;
 mod cancellation;
 mod coalescing;
+mod durable_output;
 pub mod event_map;
 mod failure;
 mod fixed_prompt;
@@ -49,7 +50,9 @@ mod persistence;
 mod reconciler;
 mod recovery;
 mod remote;
+mod resume;
 mod supervision;
+mod suspension;
 use authority::OwnedTask;
 pub use supervision::SupervisionConfig;
 mod publication;
@@ -254,7 +257,7 @@ impl Runner {
     async fn launch_turn(
         self: &Arc<Self>,
         slot: Arc<ContextSlot>,
-        mut active: OwnedMutexGuard<Option<Arc<RunnerHandle>>>,
+        active: OwnedMutexGuard<Option<Arc<RunnerHandle>>>,
         pending: PendingTurn,
     ) -> Result<StartTurnResult> {
         let PendingTurn {
@@ -263,7 +266,34 @@ impl Runner {
             allocation,
             authority,
         } = pending;
-        let task_id = allocation.task_id.clone();
+        anyhow::ensure!(
+            Some(allocation.task_id) == authority.context.version()?.task_id,
+            "allocated segment task mismatch"
+        );
+        self.launch_segment(slot, active, session, Some(input), authority)
+            .await
+    }
+
+    async fn launch_segment(
+        self: &Arc<Self>,
+        slot: Arc<ContextSlot>,
+        mut active: OwnedMutexGuard<Option<Arc<RunnerHandle>>>,
+        session: NatsSession,
+        input: Option<Input>,
+        authority: OwnedTask,
+    ) -> Result<StartTurnResult> {
+        let ticket = authority.ticket(session.storage_key())?;
+        let task_id = authority
+            .context
+            .document
+            .state
+            .active
+            .as_ref()
+            .context("segment task missing")?
+            .snapshot
+            .task
+            .id
+            .clone();
         let (events, rx) = broadcast::channel(EVENT_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::channel(1);
         let (done_tx, done) = watch::channel(false);
@@ -274,12 +304,17 @@ impl Runner {
             fence: authority.context.version()?.owner,
             session: session
                 .clone()
-                .with_admission_id(allocation.invocation_id.clone()),
+                .with_admission_id(ticket.invocation_id().into()),
             cancel_tx,
             done,
         }));
         let (admitted_tx, admitted_rx) = oneshot::channel();
-        let publisher = Publisher::new(
+        let constructor = if input.is_some() {
+            Publisher::new
+        } else {
+            Publisher::resume
+        };
+        let publisher = constructor(
             self.store.clone(),
             &session,
             StreamChannels { events, live },
@@ -469,13 +504,13 @@ async fn shutdown_turn(handle: &RunnerHandle) {
 
 struct ExecutionRequest<'a> {
     session: &'a NatsSession,
-    input: Input,
+    input: Option<Input>,
     cancel_rx: mpsc::Receiver<()>,
     admitted_tx: oneshot::Sender<Result<TaskRecord>>,
 }
 
 struct AdmittedTurn {
-    input: Input,
+    input: Option<Input>,
     cancel_rx: mpsc::Receiver<()>,
     admitted_tx: oneshot::Sender<Result<TaskRecord>>,
 }
@@ -484,7 +519,7 @@ struct DetachedTurn {
     publisher: Publisher,
     slot: Arc<ContextSlot>,
     session: NatsSession,
-    input: Input,
+    input: Option<Input>,
     task_id: String,
     cancel_rx: mpsc::Receiver<()>,
     admitted_tx: oneshot::Sender<Result<TaskRecord>>,
@@ -513,16 +548,27 @@ impl DetachedTurn {
             .catch_unwind()
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("turn runner panicked")));
-        if let Err(error) = result {
-            warn!(%task_id, %error, "A2A turn failed");
-            publisher.fail_turn(&session, &task_id).await;
-        }
-        if let Err(error) = publisher
+        let release = if let Err(error) = result {
+            publisher
+                .handle_execution_error(&session, &task_id, &error)
+                .await
+        } else {
+            true
+        };
+        let fence = publisher
             .authority
-            .release(&publisher.store, &publisher.storage_key)
-            .await
-        {
-            warn!(%task_id, %error, "A2A context release unresolved");
+            .context
+            .version()
+            .ok()
+            .map(|version| version.owner);
+        if release {
+            if let Err(error) = publisher
+                .authority
+                .release(&publisher.store, &publisher.storage_key)
+                .await
+            {
+                warn!(%task_id, %error, "A2A context release unresolved");
+            }
         }
         publisher.admission_guard.take();
         done_tx.send_replace(true);
@@ -530,7 +576,7 @@ impl DetachedTurn {
         let mut active = slot.active.lock().await;
         if active
             .as_ref()
-            .is_some_and(|handle| handle.task_id == task_id)
+            .is_some_and(|handle| handle.task_id == task_id && Some(handle.fence.clone()) == fence)
         {
             *active = None;
         }
@@ -557,13 +603,4 @@ fn turn_outcome(
 struct AdmissionOwnership {
     guard: OwnedMutexGuard<Option<Arc<RunnerHandle>>>,
     authority: OwnedTask,
-}
-
-fn denial_confirmation_handler() -> Arc<ToolConfirmationHandler> {
-    Arc::new(|request| {
-        Box::pin(async move {
-            info!(tool = %request.tool_name, tool_call_id = ?request.tool_call_id, "A2A tool confirmation denied");
-            false
-        })
-    })
 }

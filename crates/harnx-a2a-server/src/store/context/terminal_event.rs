@@ -29,6 +29,11 @@ pub(crate) async fn publish_pending(
     if let Some(since) = pending.committed_at {
         crate::diagnostics::age("outbox", since);
     }
+    #[cfg(feature = "fault-injection")]
+    anyhow::ensure!(
+        !store.context_hooks.take_event_publish_failure(),
+        "injected event publish failure"
+    );
     let result = publish_committed(store, &stream, &subject, pending).await;
     crate::diagnostics::outcome("publish", result.is_ok());
     result

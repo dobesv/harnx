@@ -34,6 +34,81 @@ replace a recovered task. Active task mutations use `OwnedTask::update`, which
 checks the lease and CASes the same context document's owner/task/revision.
 Legacy task CRUD is refused on activated contexts.
 
+## HITL publisher segments
+
+A2A uses durable deferred approval, with no live confirmation route or automatic
+denial. `follow_admitted_prompt_until_boundary` always uses a `None` confirmation
+subject. An `InputRequired` boundary drains runtime text, reconciles persisted
+assistant output, flushes the answer artifact, then atomically stages the plain
+challenge, `HitlCheckpoint { phase: Waiting, ... }` and status event through one
+`OwnedTask::update`. Its event ID is `{task_id}:hitl:{request_seq}:input-required`.
+After publication/checkpoint, the detached supervisor CAS-releases the context
+owner, releases the scoped lease and removes only its own fenced local handle.
+The task, original message, fixed admission ticket and invocation stay active.
+Suspension never confirms stop, completes the turn or fails the invocation.
+
+Suspension publication retries three times using the same pending envelope. A
+transient transport error doesn't become a failed turn. If publication remains
+uncertain, the outbox and owner remain durable, lease renewal stops when the
+segment drops, and a successor can retry after lease expiry. The supervisor also
+checks durable HITL when a coalescer write fails before it observes the boundary.
+Ordinary terminal execution still uses `confirm_stop` and `complete_turn`.
+
+### Resume entry points
+
+Reply admission and parked-task recovery are separate from this publisher API.
+They must retain the exact original `ApprovalRef`; don't use a new prompt or call
+`start_turn` to continue it.
+
+For a caller already holding `OwnedTask` in a runner module:
+
+1. Deliver the saved decision with `session.decide_hitl_approval_for(&request,
+   approved, note)`. Query `fixed_prompt_progress(ticket)` after the outcome;
+   stale/conflicting decisions must not target a newer request.
+2. Drain the old outbox, persist reply dedupe if applicable, then use
+   `advance_hitl_to_following(storage, version, &request, &outcome)`. Refresh the
+   owned context after this helper's CAS. It stages the `Working` event.
+3. Call `runner.resume_owned_hitl(export, session, authority).await`. It consumes
+   ownership and spawns a detached publisher. The publisher drains `Working`
+   before sending its admitted snapshot, so streaming can start from that result.
+   No new user message, ticket, run or deadline is created.
+
+For trusted in-process callers that released ownership after step 2, public
+`runner.resume_hitl_turn(export, request_identity, session).await` authorizes the
+stored session, acquires the scoped lease and claims the existing context. It
+requires `AdmissionPhase::Admitted`, status `Working`, and checkpoint `Following`.
+It isn't a reply parser or HTTP admission route. Both entries return
+`StartTurnResult` for the original task. Capture the challenged `stream_seq`
+**before** accepting a reply and use `wait_response(..., Some(q1_stream_seq))`.
+
+`Publisher::resume` restores the stored `answer` artifact and its text. It obtains
+`fixed_prompt_handle` for the same ticket and follows with
+`after_request_seq: Some(checkpoint.request.request_seq)`. At each boundary it
+reconstructs effective `ToolCalls.text` and assistant messages between the original
+prompt and the request/first raw terminal. This catches output written before
+attachment. Reconciliation happens after the sink drains, not before subscription,
+so history and live chunks aren't counted twice. A replacement artifact repairs
+missed text; resumed completion retains earlier segment text rather than replacing
+it with only the last assistant response.
+
+### Frozen run deadline while parked
+
+There is no A2A approval-specific timeout or automatic rejection. The existing
+outer run limit still applies: `RunLimitsConfig::resolve` defaults to 86,400 seconds
+and doesn't support unlimited execution. Worker
+`daemon_session_exec::start_invocation_deadline` deliberately detaches its timer
+across approval pauses. Wall-clock time continues while parked, and expiry can
+interrupt the original invocation even without an A2A owner. Reactivation reloads
+the immutable invocation limits; approval does **not** reset or extend the deadline.
+Literal indefinite approval lifetime would require a separate runtime policy
+change. Don't claim suspension pauses this clock.
+
+Current integration boundary: publisher suspension/resume is implemented here;
+HTTP reply admission and HITL-aware owner-loss recovery are follow-up work. Until
+that recovery exists, the old orphan policy can still fail a parked task when a
+foreground/background reconciler claims it. Don't deploy this partial flow as
+restart-safe approval handling or mix old replicas with parked-task-aware writers.
+
 ## Request memberships and stored owners
 
 Request-facing admission, reads, cancellation, streams and waiters carry the full

@@ -83,6 +83,9 @@ async fn fault_committed(store: &A2aStore, active: &ActiveTask) {
     use crate::fault_injection::Boundary;
     let hooks = store.context_fault_hooks();
     hooks.checkpoint(Boundary::OutboxCommitted).await;
+    if active.snapshot.task.status.state == TaskState::InputRequired {
+        hooks.checkpoint(Boundary::HitlOutboxCommitted).await;
+    }
     if active.snapshot.task.status.state.is_terminal() {
         hooks.checkpoint(Boundary::TerminalOutboxCommitted).await;
     }
