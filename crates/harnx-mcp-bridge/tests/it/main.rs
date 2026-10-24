@@ -5,3 +5,5 @@
 mod bridge_roundtrip;
 mod direct_call;
 mod sigterm_shutdown;
+
+mod result_limits;

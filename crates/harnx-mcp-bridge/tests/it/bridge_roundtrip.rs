@@ -21,10 +21,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-const TOKEN: &str = "mcp-bridge-roundtrip-token";
+pub(super) const TOKEN: &str = "mcp-bridge-roundtrip-token";
 
-struct NatsServerHandle {
-    url: String,
+pub(super) struct NatsServerHandle {
+    pub(super) url: String,
     _store_dir: TempDir,
     _ports_dir: TempDir,
     child: Child,
@@ -47,7 +47,7 @@ fn nats_server_binary() -> Option<PathBuf> {
     which::which("nats-server").ok()
 }
 
-async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
+pub(super) async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
     let Some(binary) = nats_server_binary() else {
         eprintln!("skipping NATS integration test: nats-server binary not found");
         return Ok(None);
@@ -167,7 +167,7 @@ fn mock_mcp_binary() -> Result<PathBuf> {
     )
 }
 
-async fn wait_for_registration(
+pub(super) async fn wait_for_registration(
     client: &async_nats::Client,
     instance_id: &ServerScope,
     identity_token: &str,
@@ -190,7 +190,7 @@ async fn wait_for_registration(
     }
 }
 
-fn tool_request(call_id: &str, tool: &str) -> ToolRequest {
+pub(super) fn tool_request(call_id: &str, tool: &str) -> ToolRequest {
     ToolRequest {
         run_context: None,
         replay: None,
