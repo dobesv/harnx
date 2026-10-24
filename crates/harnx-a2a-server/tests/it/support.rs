@@ -183,6 +183,7 @@ pub enum Script {
     Text,
     Tool,
     SerialTool,
+    SameRoundTools,
     CountedTool,
     Fail,
     Many,
@@ -262,6 +263,19 @@ async fn completion(
             chunk(json!({}), json!("tool_calls")),
             "[DONE]".into(),
         ]
+    } else if llm.script == Script::SameRoundTools && first {
+        let mut frames = vec![chunk(json!({"content":"Before approval. "}), Value::Null)];
+        // Separate indexed deltas still form one completion/ToolCalls round.
+        for (index, id) in ["first-approval", "second-approval"]
+            .into_iter()
+            .enumerate()
+        {
+            frames.push(chunk(json!({"tool_calls":[{"index":index,"id":id,"type":"function",
+                "function":{"name":"time_get_current_time","arguments":"{\"timezone\":\"UTC\"}"}}]}), Value::Null));
+        }
+        frames.push(chunk(json!({}), json!("tool_calls")));
+        frames.push("[DONE]".into());
+        frames
     } else if (llm.script == Script::Tool && first)
         || (llm.script == Script::SerialTool && llm.requests.lock().len() <= 2)
     {
@@ -429,6 +443,20 @@ fn fixture_config(
     std::fs::write(dir.join("clients/mock.yaml"), format!("type: openai-compatible\nname: mock\napi_base: http://{address}/v1\napi_key: test-key\nmodels:\n  - name: test\n    max_input_tokens: 32000\n    max_output_tokens: 1024\n"))?;
     let agent = if script == Script::CountedTool {
         "---\nmodel: mock:test\nuse_tools: [bash_exec]\n---\nTest counted tool agent\n".into()
+    } else if script == Script::SameRoundTools {
+        std::fs::create_dir_all(dir.join("tool_servers"))?;
+        std::fs::write(
+            dir.join("tool_servers/time.yaml"),
+            format!(
+                "command: {:?}\n",
+                binary("harnx-time-tools")?
+                    .to_str()
+                    .context("time tool path")?
+            ),
+        )?;
+        let hook = binary("harnx-claude-compatible-hook-server")?;
+        let command = shell_words::join([hook.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^time_get_current_time$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve time lookup?\"}}"]);
+        format!("---\nmodel: mock:test\nuse_tools: [time_get_current_time]\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest same-round approvals\n")
     } else if matches!(script, Script::Tool | Script::SerialTool) {
         let binary = binary("harnx-claude-compatible-hook-server")?;
         let command = shell_words::join([binary.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^target_session_handoff$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve handoff?\"}}"]);

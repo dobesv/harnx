@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 mod admission;
 mod auth;
+mod hitl;
 mod operations;
 mod streaming;
 mod supervision;

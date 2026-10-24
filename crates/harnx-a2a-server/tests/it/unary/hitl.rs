@@ -347,3 +347,84 @@ async fn unary_hitl_replies_preserve_owner_pairing_and_terminal_validation() -> 
     assert_eq!(decisions(&entries(&http, &task).await?), 1);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unary_hitl_same_round_approvals_keep_one_task_and_invocation() -> Result<()> {
+    let http = Http::from_harness(Harness::start(Script::SameRoundTools).await?).await?;
+    let task = challenge(&http).await?;
+    let id = task["id"].as_str().context("task id")?;
+    let original = http.h.task(id).await?;
+    let storage = harnx_core::session_identity::session_key(
+        Some(&http.h.export.agent),
+        task["contextId"].as_str().context("context id")?,
+    );
+    let mut requests = Vec::new();
+    for (index, expected) in ["TASK_STATE_INPUT_REQUIRED", "TASK_STATE_COMPLETED"]
+        .into_iter()
+        .enumerate()
+    {
+        let context = http
+            .h
+            .store
+            .read_context(&storage)
+            .await?
+            .context("context")?;
+        let request = context
+            .document
+            .state
+            .active
+            .as_ref()
+            .unwrap()
+            .hitl_checkpoint
+            .as_ref()
+            .unwrap()
+            .request
+            .clone();
+        requests.push(request);
+        let response = http.rpc("SendMessage", json!({"message":reply(&format!("same-round-{index}"), &task, "y audit only", index == 0)})).await?;
+        assert_eq!(response["result"]["task"]["id"], task["id"], "{response}");
+        assert_eq!(response["result"]["task"]["contextId"], task["contextId"]);
+        assert_eq!(
+            response["result"]["task"]["status"]["state"], expected,
+            "{response}"
+        );
+        assert_eq!(
+            http.h.llm.requests.lock().len(),
+            index + 1,
+            "Q2 must not call the model"
+        );
+    }
+    assert_eq!(requests[0].invocation_id, requests[1].invocation_id);
+    assert_eq!(requests[0].tool_round_seq, requests[1].tool_round_seq);
+    assert!(requests[0].request_seq < requests[1].request_seq);
+    assert_eq!(requests[0].tool_call_id, "first-approval");
+    assert_eq!(requests[1].tool_call_id, "second-approval");
+    let final_record = http.h.task(id).await?;
+    assert_eq!(final_record.execution_id, original.execution_id);
+    assert_eq!(final_record.user_msg_seq, original.user_msg_seq);
+    let log = entries(&http, &task).await?;
+    assert_eq!(external_prompts(&log), 1);
+    assert_eq!(decisions(&log), 2);
+    let requests = http.h.llm.requests.lock();
+    assert!(!requests[1].to_string().contains("audit only"));
+    let results: Vec<_> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .collect();
+    assert_eq!(
+        results.len(),
+        2,
+        "both native tools must execute: {results:?}"
+    );
+    for result in results {
+        let output: Value = serde_json::from_str(result["content"].as_str().unwrap())?;
+        assert_eq!(output["timezone"], "UTC", "{output}");
+        assert!(
+            output["datetime"].is_string(),
+            "native tool must succeed: {output}"
+        );
+    }
+    Ok(())
+}

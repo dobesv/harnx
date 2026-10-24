@@ -607,3 +607,57 @@ async fn streaming_hitl_unrecognized_reply_returns_ephemeral_challenge_and_close
     assert_eq!(http.h.llm.requests.lock().len(), 1);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_hitl_same_round_closes_each_gate_then_completes() -> Result<()> {
+    use crate::{
+        support::{Harness, Script},
+        unary::hitl::reply,
+    };
+    let http = Http::from_harness(Harness::start(Script::SameRoundTools).await?).await?;
+    let mut initial = Frames::open(
+        &http,
+        "SendStreamingMessage",
+        json!({"message":message("same-round-stream", None)}),
+    )
+    .await?;
+    let task = initial.event().await?.context("initial snapshot")?["task"].clone();
+    let mut interrupted = false;
+    while let Some(event) = initial.event().await? {
+        if let Some(state) = event["statusUpdate"]["status"]["state"].as_str() {
+            assert_eq!(state, "TASK_STATE_INPUT_REQUIRED");
+            interrupted = true;
+        }
+    }
+    assert!(interrupted);
+    assert_eq!(http.h.llm.requests.lock().len(), 1);
+    for (index, expected) in ["TASK_STATE_INPUT_REQUIRED", "TASK_STATE_COMPLETED"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut frames = Frames::open(
+            &http,
+            "SendStreamingMessage",
+            json!({"message":reply(&format!("same-round-stream-{index}"), &task, "y", false)}),
+        )
+        .await?;
+        let first = frames.event().await?.context("resumed snapshot")?;
+        assert_eq!(first["task"]["id"], task["id"]);
+        assert_eq!(first["task"]["contextId"], task["contextId"]);
+        assert_eq!(first["task"]["status"]["state"], "TASK_STATE_WORKING");
+        let mut states = Vec::new();
+        while let Some(event) = frames.event().await? {
+            if let Some(state) = event["statusUpdate"]["status"]["state"].as_str() {
+                assert_eq!(event["statusUpdate"]["taskId"], task["id"]);
+                states.push(state.to_owned());
+            }
+        }
+        assert_eq!(states, vec![expected]);
+        assert_eq!(http.h.llm.requests.lock().len(), index + 1);
+    }
+    let final_record = http.h.task(task["id"].as_str().unwrap()).await?;
+    let text = serde_json::to_value(&final_record.task.artifacts)?.to_string();
+    assert!(text.contains("Before approval. "), "{text}");
+    assert!(text.contains("Hello world"), "{text}");
+    Ok(())
+}
