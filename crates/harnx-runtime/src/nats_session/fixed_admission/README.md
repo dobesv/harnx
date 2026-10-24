@@ -86,6 +86,61 @@ receipts respect effective transcript mutations and are joined within their own
 round, so a reused provider tool call ID doesn't inherit an older decision.
 Tool name and arguments come from persisted `ToolCalls`, not unpersisted hook edits.
 
+## Follow one approval segment
+
+`NatsSession::follow_admitted_prompt_until_boundary` takes an existing
+`AppendedPrompt`, the same `Arc<dyn AgentEventSink>` and optional cancel receiver
+as `follow_admitted_prompt`, and `FollowBoundaryOptions`. It returns public
+`FollowBoundary::InputRequired(PendingHitlApproval)` or
+`FollowBoundary::Terminal(NatsTurnResult)`. Both boundary types are exported from
+`harnx_runtime` and `harnx_runtime::nats_session`. No confirmation subject is
+accepted: activation always passes `None`, so the worker defers tool approval.
+
+For a new A2A segment, append the fixed prompt once, obtain its handle with
+`fixed_prompt_handle(&ticket)`, and follow with `FollowBoundaryOptions::default()`.
+On `InputRequired`, save the approval reference and publish the challenge. Don't
+close admission, interrupt the invocation, or treat suspension as a completed turn.
+
+After delivering a decision for Q1, reconstruct the handle from the **same ticket**
+and call the same follow method with:
+
+```rust
+FollowBoundaryOptions {
+    after_request_seq: Some(q1.request_seq),
+    run: original_run_options,
+}
+```
+
+`after_request_seq` is a checkpoint watermark, not an event-log offset. Decisions
+are excluded by durable request derivation, so a decided Q1 can't reappear. A
+still-undecided request at or before the watermark is returned again rather than
+silently skipped. A next approval already written before attachment is returned
+from history. Terminal proof always wins, even below the watermark. Don't use this
+field as permission to target a newer request with an older reply.
+
+Attachment subscribes before reading history. Typed follow then refreshes durable
+facts before activation, including when reusing an admission-time subscription.
+An already-pending approval or terminal result needs no activation. Otherwise it
+activates the original prompt and follows until a durable boundary. It reuses the
+legacy event loop, generation/cancel fencing, logical-sequence decoration, and
+final buffered-event drain. `follow_admitted_prompt` retains its existing return
+value and compatibility behavior.
+
+Text arrives at the supplied sink as `AgentEvent::Model(ModelEvent::MessageChunk)`
+throughout each live segment, including a resumed segment. Reuse the publisher's
+sink/inbox and preserve accumulated artifact text between segments. Like the
+legacy follower, this API doesn't replay historical text or make advisory chunks
+durable. A publisher attaching after output was already emitted must recover
+persisted `ToolCalls.text`/assistant messages and reconcile its artifact; terminal
+`NatsTurnResult.response` contains the final assistant response, not all prior
+segment text. The approval watermark doesn't deduplicate artifact output.
+
+A typed `Terminal` requires a durable terminal entry or confirmed cancel receipt.
+Log failures, a closed event stream without a boundary, or an orphaned worker
+without terminal proof return an error, not a synthetic successful completion.
+The existing `RunTurnOptions` are carried in `FollowBoundaryOptions.run`; following
+never admits a new prompt or creates a fresh run/deadline.
+
 ## Decide an exact approval
 
 Call `NatsSession::decide_hitl_approval_for(&reference, approved, note)` with the

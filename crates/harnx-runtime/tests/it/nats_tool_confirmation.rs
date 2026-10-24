@@ -11,6 +11,8 @@ use harnx_runtime::nats_session_log::NatsSessionLog;
 #[path = "nats_tool_confirmation/fencing.rs"]
 mod fencing;
 use crate::generation;
+#[path = "nats_tool_confirmation/follow_boundary.rs"]
+mod follow_boundary;
 #[path = "nats_tool_confirmation/multi_client.rs"]
 mod multi_client;
 

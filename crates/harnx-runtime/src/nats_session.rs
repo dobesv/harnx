@@ -58,6 +58,9 @@ mod compaction_request;
 #[cfg(test)]
 mod compaction_request_tests;
 mod completion;
+mod follow;
+use follow::FollowResult;
+pub use follow::{FollowBoundary, FollowBoundaryOptions};
 mod hitl;
 mod hitl_decision;
 pub use hitl::{
@@ -1399,6 +1402,28 @@ impl NatsSession {
         tool_confirmation_subject: Option<&str>,
         options: RunTurnOptions,
     ) -> Result<NatsTurnResult> {
+        Ok(self
+            .follow_prompt(
+                appended,
+                event_sink,
+                pending_cancel,
+                tool_confirmation_subject,
+                options,
+                None,
+            )
+            .await?
+            .result)
+    }
+
+    async fn follow_prompt(
+        &self,
+        appended: AppendedPrompt,
+        event_sink: Arc<dyn AgentEventSink>,
+        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+        tool_confirmation_subject: Option<&str>,
+        options: RunTurnOptions,
+        boundary_options: Option<FollowBoundaryOptions>,
+    ) -> Result<FollowResult> {
         let user_msg_seq = appended.user_msg_seq;
         let mut stopped_result = NatsTurnResult {
             response: None,
@@ -1417,11 +1442,14 @@ impl NatsSession {
                 let (cancel_seq, timeout) = cancel_seq?;
                 stopped_result.error = timeout;
                 if let Some(live) = &live { live.accept_interrupt(cancel_seq); }
-                return Ok(stopped_result);
+                return Ok(stopped_result.into());
             }
-            result = Box::pin(self.follow_prompt_inner(appended, event_sink, pending_cancel, tool_confirmation_subject, options)) => result,
+            result = Box::pin(self.follow_prompt_inner(appended, event_sink, pending_cancel, tool_confirmation_subject, options, boundary_options)) => result,
         };
-        if result.as_ref().is_ok_and(|result| result.was_cancelled) {
+        if result
+            .as_ref()
+            .is_ok_and(|result| result.result.was_cancelled)
+        {
             return result;
         }
         // Completion and the interrupt watch can become ready together. The
@@ -1431,7 +1459,7 @@ impl NatsSession {
             if let Some(live) = &live {
                 live.accept_interrupt(cancel_seq);
             }
-            return Ok(stopped_result);
+            return Ok(stopped_result.into());
         }
         result
     }
@@ -1443,7 +1471,9 @@ impl NatsSession {
         pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
         tool_confirmation_subject: Option<&str>,
         options: RunTurnOptions,
-    ) -> Result<NatsTurnResult> {
+        boundary_options: Option<FollowBoundaryOptions>,
+    ) -> Result<FollowResult> {
+        let invocation_id = appended.execution_id.clone();
         let user_msg_id = appended.user_msg_id;
         let user_msg_seq = appended.user_msg_seq;
 
@@ -1490,28 +1520,55 @@ impl NatsSession {
         // Step 3: Publish the live frontend route with the activation. Route
         // construction subscribes and flushes before this method is called, so
         // a fast worker cannot send an approval request before it is ready.
-        self.publish_activation(
-            user_msg_seq,
-            tool_confirmation_subject,
-            options.token_budget,
-        )
-        .await?;
+        // A retained admission-time subscription can carry older history. Read
+        // fresh facts without advancing its display cursor, so buffered text is
+        // still drained below instead of being hidden by the boundary snapshot.
+        let initial_entries = if boundary_options.is_some() {
+            completion::bounded_refresh(self.load_durable_entries()).await?
+        } else {
+            event_stream.history().to_vec()
+        };
+        let initial_boundary = match boundary_options {
+            Some(boundary_options) => self.observe_follow_boundary(
+                &initial_entries,
+                invocation_id
+                    .as_deref()
+                    .context("boundary follow has no invocation identity")?,
+                &user_msg_id,
+                user_msg_seq,
+                boundary_options,
+            )?,
+            None => None,
+        };
+        if initial_boundary.is_none() {
+            self.publish_activation(
+                user_msg_seq,
+                tool_confirmation_subject,
+                options.token_budget,
+            )
+            .await?;
+        }
 
         // Step 4: Stream events and handle control until turn completion.
         let mut event_stream = event_stream;
         let mut final_response: Option<String> = None;
         let mut turn_error: Option<String> = None;
         let mut turn_complete = false;
+        let mut observed_boundary = initial_boundary;
         // Cached effective log for emitting LogSeqAssigned on live advisory
         // events. Refreshed on throttled durable reloads so we avoid O(N^2)
         // full-log load per streaming token.
-        let mut cached_effective: Option<Vec<(u64, SessionLogEntry)>> = None;
+        let mut cached_effective = if observed_boundary.is_some() {
+            harnx_core::session_reconstruct::apply_log_mutations_nats(&initial_entries).ok()
+        } else {
+            None
+        };
         let mut pending_advisories = VecDeque::new();
         let mut emitted_logical_seqs = HashSet::new();
         let mut completion_updates = Box::pin(completion::updates(
             self.jetstream.clone(),
             self.storage_key.clone(),
-            event_stream.history().to_vec(),
+            initial_entries,
             options.orphan_timeout,
             self.lease_acquisition_timeout,
         ));
@@ -1520,11 +1577,18 @@ impl NatsSession {
         // Wrap channel in Option for select! handling.
         let mut pending_cancel_rx = pending_cancel;
         let mut was_cancelled = false;
+        let mut cancel_confirmed = false;
         let mut saw_terminal_model_error = false;
 
         // Main event loop with abort signal handling
         let abort_signal_clone = self.abort_signal.clone();
         loop {
+            if let Some(boundary) = &observed_boundary {
+                final_response = boundary.result.response.clone();
+                turn_error = boundary.result.error.clone();
+                turn_complete = true;
+                break;
+            }
             tokio::select! {
                 // Check for cancellation via wait_abort_signal
                 _ = wait_abort_signal(&abort_signal_clone) => {
@@ -1532,6 +1596,7 @@ impl NatsSession {
                     log::info!("nats session: abort signal received, publishing cancel");
                     if let Some(cancel_seq) = self.interrupt_prompt(user_msg_seq, "client cancel").await?.cancel_seq() {
                         live.accept_interrupt(cancel_seq);
+                        cancel_confirmed = true;
                     }
                     break;
                 }
@@ -1548,6 +1613,7 @@ impl NatsSession {
                     log::info!("nats session: pending cancel received, publishing cancel");
                     if let Some(cancel_seq) = self.interrupt_prompt(user_msg_seq, "client cancel").await?.cancel_seq() {
                         live.accept_interrupt(cancel_seq);
+                        cancel_confirmed = true;
                     }
                     break;
                 }
@@ -1561,10 +1627,21 @@ impl NatsSession {
                         event_stream.refresh_generation().await?;
                         // Refresh cached effective log for live LogSeqAssigned.
                         let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).ok();
-                        let completion_visible = Self::is_turn_completion_visible(
-                            &entries,
-                            effective.as_deref(),
-                            user_msg_seq);
+                        observed_boundary = match boundary_options {
+                            Some(boundary_options) => self.observe_follow_boundary(
+                                &entries,
+                                invocation_id.as_deref().context("boundary follow has no invocation identity")?,
+                                &user_msg_id,
+                                user_msg_seq,
+                                boundary_options,
+                            )?,
+                            None => None,
+                        };
+                        let completion_visible = if boundary_options.is_some() {
+                            observed_boundary.is_some()
+                        } else {
+                            Self::is_turn_completion_visible(&entries, effective.as_deref(), user_msg_seq)
+                        };
                         if let Some(effective) = effective {
                             cached_effective = Some(effective);
                             emit_all_logical_seqs_for_window(
@@ -1595,6 +1672,10 @@ impl NatsSession {
                             break;
                         }
                         if let Some(reason) = orphaned {
+                            if boundary_options.is_some() {
+                                completion_error = Some(anyhow::anyhow!("Cannot confirm durable follow boundary: {reason}"));
+                                break;
+                            }
                             // Workers predating durable TurnEnd release their
                             // lease after persisting the assistant row. Treat
                             // that confirmed release as their durable-compatible
@@ -1653,6 +1734,24 @@ impl NatsSession {
         }
 
         if was_cancelled {
+            if let Some(boundary_options) = boundary_options.filter(|_| !cancel_confirmed) {
+                let entries = completion::bounded_refresh(self.load_durable_entries()).await?;
+                if let Some(terminal) = self
+                    .observe_follow_boundary(
+                        &entries,
+                        invocation_id
+                            .as_deref()
+                            .context("boundary follow has no invocation identity")?,
+                        &user_msg_id,
+                        user_msg_seq,
+                        boundary_options,
+                    )?
+                    .filter(|boundary| boundary.pending.is_none())
+                {
+                    return Ok(terminal);
+                }
+                anyhow::bail!("cancellation has no durable follow boundary");
+            }
             // Receipt is the completion boundary. No final log/status read may
             // delay acceptance or return a later generation's response.
             return Ok(NatsTurnResult {
@@ -1662,7 +1761,8 @@ impl NatsSession {
                 error: None,
                 user_msg_seq,
                 user_msg_id,
-            });
+            }
+            .into());
         }
         event_stream.refresh_generation().await?;
 
@@ -1676,6 +1776,17 @@ impl NatsSession {
         if !turn_complete && final_reload_error.is_none() {
             match completion::bounded_refresh(self.load_durable_entries()).await {
                 Ok(entries) => {
+                    if let Some(boundary_options) = boundary_options {
+                        observed_boundary = self.observe_follow_boundary(
+                            &entries,
+                            invocation_id
+                                .as_deref()
+                                .context("boundary follow has no invocation identity")?,
+                            &user_msg_id,
+                            user_msg_seq,
+                            boundary_options,
+                        )?;
+                    }
                     (final_response, turn_error) =
                         Self::extract_turn_outcome(&entries, user_msg_seq);
                     if let Ok(effective) =
@@ -1748,6 +1859,12 @@ impl NatsSession {
             }
         }
 
+        if let Some(observed) = observed_boundary {
+            return Ok(observed);
+        }
+        if boundary_options.is_some() {
+            anyhow::bail!("event stream closed without a durable follow boundary");
+        }
         Ok(NatsTurnResult {
             response: final_response,
             session_id: self.session_id.clone(),
@@ -1755,7 +1872,8 @@ impl NatsSession {
             error: turn_error,
             user_msg_seq,
             user_msg_id,
-        })
+        }
+        .into())
     }
 
     /// Retract (delete) a queued user message by appending an EditEntries delete.
