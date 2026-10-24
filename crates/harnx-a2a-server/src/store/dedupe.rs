@@ -32,6 +32,17 @@ pub struct DedupeKey {
     pub message_id: String,
 }
 
+/// Key for reply dedupe: uses separate storage from initial message dedupe.
+/// Reply mappings survive task retirement.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReplyDedupeKey {
+    pub cluster: String,
+    pub export: String,
+    pub owner: Option<String>,
+    pub message_id: String,
+}
+
 /// Task and message fingerprint retained for a new-context retry.
 pub struct DedupeEntry {
     pub task_id: String,
@@ -175,5 +186,77 @@ impl A2aStore {
             }
             None => Ok(None),
         }
+    }
+
+    // ========================================================================
+    // Reply dedupe (Task 5)
+    // ========================================================================
+
+    /// Key for reply dedupe storage. Uses separate namespace from initial messages.
+    fn reply_dedupe_key(storage_key: &str, message_id_hash: &str) -> String {
+        format!("sessions/{storage_key}/a2a/reply/{message_id_hash}")
+    }
+
+    /// Check existing reply dedupe mapping. Returns (task_id, fingerprint) if found.
+    pub async fn get_reply_dedupe(
+        &self,
+        storage_key: &str,
+        message_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let hash = message_id_hash(message_id);
+        let key = Self::reply_dedupe_key(storage_key, &hash);
+        match harnx_nats_common::leader_reads::entry(self.store.kv_store(), &key).await? {
+            Some(entry) if entry.operation == async_nats::jetstream::kv::Operation::Put => {
+                let value: serde_json::Value = serde_json::from_slice(&entry.value)?;
+                let task_id = value["task_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing task_id"))?
+                    .to_string();
+                let fingerprint = value["fingerprint"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing fingerprint"))?
+                    .to_string();
+                Ok(Some((task_id, fingerprint)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Write a reply dedupe record. Reply mappings survive task retirement.
+    pub async fn put_reply_dedupe(
+        &self,
+        storage_key: &str,
+        message_id: &str,
+        task_id: &str,
+        fingerprint: &str,
+    ) -> Result<()> {
+        ensure!(
+            !message_id.is_empty() && !fingerprint.is_empty(),
+            "missing reply mapping identity"
+        );
+        parse_task_id(task_id)?;
+        let hash = message_id_hash(message_id);
+        let key = Self::reply_dedupe_key(storage_key, &hash);
+        let record = serde_json::json!({
+            "task_id": task_id,
+            "fingerprint": fingerprint,
+        });
+        let payload = serde_json::to_vec(&record).expect("record serializes");
+
+        if self
+            .store
+            .kv_store()
+            .update(&key, payload.into(), 0)
+            .await
+            .is_err()
+        {
+            let saved = self
+                .get_reply_dedupe(storage_key, message_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("reply mapping unconfirmed"))?;
+            ensure!(saved.1 == fingerprint, StoreError::FingerprintMismatch);
+            ensure!(saved.0 == task_id, "reply mapping identity conflict");
+        }
+        Ok(())
     }
 }

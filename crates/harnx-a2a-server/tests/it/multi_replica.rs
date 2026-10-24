@@ -116,6 +116,7 @@ impl TwoBackends {
             .await
     }
 }
+// Runtime timing notices use User role but aren't admitted client prompts.
 async fn prompts(log: &NatsSessionLog) -> Result<Vec<(u64, String)>> {
     Ok(log
         .load_events_async()
@@ -125,8 +126,11 @@ async fn prompts(log: &NatsSessionLog) -> Result<Vec<(u64, String)>> {
             SessionLogEntry::Message {
                 role: MessageRole::User,
                 id: Some(id),
+                content,
                 ..
-            } => Some((seq, id)),
+            } if !harnx_core::timing_identity::is_timing_notice(&content.to_text()) => {
+                Some((seq, id))
+            }
             _ => None,
         })
         .collect())

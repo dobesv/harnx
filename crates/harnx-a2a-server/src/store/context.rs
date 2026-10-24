@@ -8,6 +8,8 @@ use harnx_nats_common::leader_reads;
 use harnx_runtime::nats_lease::NatsSessionLease;
 
 mod cancellation;
+pub mod hitl;
+mod hitl_writes;
 mod projections;
 mod schema;
 pub(crate) mod terminal_event;

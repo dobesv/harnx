@@ -1,21 +1,11 @@
 //! One committed envelope at a time; publication precedes cursor checkpoint.
 use super::*;
-use crate::store::context::{ActiveTask, PendingEvent};
+use crate::store::context::ActiveTask;
 
 pub(super) fn stage_event(active: &mut ActiveTask, response: StreamResponse, commit_id: &str) {
-    assert!(
-        active.publication.pending.is_none(),
-        "unresolved event outbox"
-    );
-    active.snapshot.stream_seq += 1;
-    active.publication.stream_seq = active.snapshot.stream_seq;
-    active.publication.pending = Some(PendingEvent {
-        committed_at: Some(chrono::Utc::now()),
-        commit_id: commit_id.into(),
-        task_sequence: active.snapshot.stream_seq,
-        expected_subject_sequence: active.publication.subject_sequence,
-        response,
-    });
+    active
+        .stage_event(response, commit_id)
+        .expect("event staging");
 }
 
 impl OwnedTask {

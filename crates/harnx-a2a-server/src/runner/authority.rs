@@ -151,6 +151,7 @@ impl OwnedTask {
             publication: Default::default(),
             projections: Default::default(),
             stop_confirmed: false,
+            hitl_checkpoint: None,
         };
         let write = store
             .prepare_context_update(

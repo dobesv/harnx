@@ -1,3 +1,4 @@
+//! Context write transactions and HITL checkpoint helpers.
 use super::*;
 use harnx_core::crypto::sha256;
 
@@ -47,11 +48,29 @@ impl A2aStore {
         operation_id: &str,
         mutate: impl FnOnce(&mut ContextState),
     ) -> Result<ContextWrite> {
+        self.prepare_context_update_checked(storage_key, expected, operation_id, |state| {
+            mutate(state);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Fallible mutation uses the same owner check and exact-predecessor CAS.
+    /// Rejection creates no write ticket and cannot consume an operation receipt.
+    pub async fn prepare_context_update_checked(
+        &self,
+        storage_key: &str,
+        expected: &ContextVersion,
+        operation_id: &str,
+        mutate: impl FnOnce(&mut ContextState) -> Result<()>,
+    ) -> Result<ContextWrite> {
         let current = self.owner_document(storage_key, expected).await?;
         self.verify_archive_projection(storage_key, &current.document.state)
             .await?;
         let mut next = current.document.clone();
-        mutate(&mut next.state);
+        mutate(&mut next.state)?;
+        self.verify_hitl_transition(storage_key, &current.document.state, &next.state)
+            .await?;
         self.validate_new_task(storage_key, &current.document.state, &next.state)
             .await?;
         validate_transition(&current.document.state, &mut next.state)?;
