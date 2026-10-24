@@ -34,7 +34,9 @@ Reads an attachment or plan by its canonical `cid:` URL (`cid:media:` or `cid:pl
 - Text media and plan documents return formatted text with line numbers and pagination.
 - Non-displayable binary content returns an error directing users to dump to file or open in an external viewer.
 
-Parameters:
+Two paging modes are available:
+
+**Line-based paging (default):**
 - `url` (string, required): The canonical `cid:` URL to read.
 - `offset` (integer, optional): Line number to start reading from (1-indexed).
 - `limit` (integer, optional): Maximum number of lines to return from offset.
@@ -42,6 +44,17 @@ Parameters:
 - `tail_lines` (integer, optional): Return only the last N lines.
 - `max_output_bytes` (integer, optional): Maximum output size in bytes.
 - `grep` (string, optional): Regex pattern to filter lines before truncation.
+
+**Byte-based paging:**
+- `url` (string, required): The canonical `cid:` URL to read.
+- `byte_offset` (integer, optional): Zero-based byte position to start reading.
+- `byte_limit` (integer, optional): Maximum number of bytes to return from byte_offset.
+
+Note: Line-based and byte-based selectors cannot be combined. The result includes `next_byte_offset` metadata when more content is available.
+
+MIME types with parameters (e.g., `text/plain; charset=utf-8`) are normalized for dispatch while preserving the original MIME type in the resource link.
+
+**Memory consideration:** Whole objects are downloaded into memory before paging is applied. For text larger than 5 MiB, use `byte_offset` and `byte_limit` to read in bounded pages.
 
 ### `attachment_create`
 

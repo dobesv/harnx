@@ -16,13 +16,27 @@ const ATTACHMENT_READ_DESCRIPTION: &str = "Read an attachment or plan by its cid
 Returns image content as image blocks, text and rendered plans as truncated
 text with line numbers, and errors for non-displayable binary content.
 
-Truncation parameters follow the same semantics as fs.read:
+Two paging modes are available - line-based (default) or byte-based:
+
+**Line-based paging** (default):
 - head_lines: return only the first N lines
 - tail_lines: return only the last N lines (combined with head_lines shows both ends)
 - offset: start reading at this line (1-indexed)
 - limit: maximum number of lines
 - max_output_bytes: maximum output size in bytes
 - grep: filter lines by regex pattern before truncation
+
+**Byte-based paging** (alternative to line selectors):
+- byte_offset: zero-based byte position to start reading
+- byte_limit: maximum number of bytes to return
+
+Cannot combine line selectors with byte selectors.
+
+Note: Whole object is downloaded into memory before paging is applied.
+Streaming is not supported; large attachments consume memory proportional
+to their size. For text larger than 5 MiB, use byte_offset/byte_limit to
+read in bounded pages. Binary content that is not a supported image type
+will return an error.
 ";
 
 const ATTACHMENT_CREATE_DESCRIPTION: &str = "Create a text attachment in the NATS object store.
@@ -110,6 +124,16 @@ impl Toolset for AttachmentToolset {
                         "grep": {
                             "type": "string",
                             "description": "Filter lines by regex pattern"
+                        },
+                        "byte_offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Zero-based byte offset to start reading. Cannot combine with line selectors. Must be at a valid UTF-8 character boundary."
+                        },
+                        "byte_limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum bytes to return from byte_offset. Defaults to 64 KiB when byte_offset is provided without byte_limit."
                         }
                     },
                     "required": ["url"]
