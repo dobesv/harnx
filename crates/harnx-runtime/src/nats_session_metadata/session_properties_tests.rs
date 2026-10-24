@@ -480,3 +480,31 @@ fn an_unknown_source_reads_as_none() {
     }));
     assert_eq!(properties.get("web_session_url").unwrap().source, None);
 }
+
+#[test]
+fn an_explicit_write_clears_worker_provenance_but_keeps_unknown_attributes() {
+    for source in [Some("configured"), None] {
+        let mut properties = self::properties(json!({
+            "web_session_url": {
+                "value": "https://harnx.example/",
+                "inherit": false,
+                "source": source,
+                "recorded_by": "worker",
+                "future_attribute": 42,
+            },
+        }));
+        assert!(applied(
+            &mut properties,
+            json!({"set": [{"name": "web_session_url", "value": "https://harnx.example/"}]}),
+        )
+        .unwrap());
+        assert_eq!(
+            serde_json::to_value(&properties).unwrap(),
+            json!({"web_session_url": {
+                "value": "https://harnx.example/",
+                "inherit": false,
+                "future_attribute": 42,
+            }})
+        );
+    }
+}

@@ -31,6 +31,10 @@ struct Broker {
 }
 
 async fn broker() -> Result<Option<Broker>> {
+    broker_with_properties(json!({})).await
+}
+
+async fn broker_with_properties(properties: Value) -> Result<Option<Broker>> {
     let Some(server) = spawn_nats_server().await? else {
         return Ok(None);
     };
@@ -38,10 +42,13 @@ async fn broker() -> Result<Option<Broker>> {
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
     let local_id = format!("properties-{}", uuid::Uuid::new_v4());
-    let metadata = SessionMetadata::new(
+    let mut metadata = SessionMetadata::new(
         &local_id,
         SessionInitializer::named("metis", Default::default()),
     );
+    metadata
+        .extensions
+        .insert(SESSION_PROPERTIES_NAMESPACE.to_string(), properties);
     store.create(&metadata).await?;
     Ok(Some(Broker {
         _server: server,
@@ -312,5 +319,240 @@ async fn tools_write_under_the_worker_lease() -> Result<()> {
         "{error}"
     );
     assert_eq!(broker.properties().await?, written["properties"]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_address_is_inserted_only_when_absent() -> Result<()> {
+    require_nextest();
+    let Some(broker) = broker().await? else {
+        return Ok(());
+    };
+    let store = &broker.store;
+    let session_id = &broker.session_id;
+    for invalid in ["", "javascript:alert(1)"] {
+        assert!(store
+            .record_web_session_url_if_absent(session_id, invalid)
+            .await
+            .is_err());
+    }
+    assert!(broker.properties().await?.as_object().unwrap().is_empty());
+    assert!(
+        store
+            .record_web_session_url_if_absent(session_id, "https://worker.example/a")
+            .await?
+    );
+    assert_eq!(
+        broker.properties().await?,
+        json!({"web_session_url": {
+            "value": "https://worker.example/a",
+            "inherit": false,
+            "source": "configured",
+            "recorded_by": "worker",
+        }})
+    );
+    let before = store.get(session_id).await?.context("metadata exists")?;
+    assert!(
+        !store
+            .record_web_session_url_if_absent(session_id, "https://other-worker.example/a")
+            .await?
+    );
+    let after = store.get(session_id).await?.context("metadata exists")?;
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.metadata, before.metadata);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_address_never_replaces_an_existing_property() -> Result<()> {
+    require_nextest();
+    for source in [Some("configured"), Some("inferred"), None] {
+        for marker in [Some("worker"), None] {
+            let mut properties = json!({"web_session_url": {
+                "value": "https://existing.example/a",
+                "inherit": false,
+                "source": source,
+                "recorded_by": marker,
+            }});
+            properties["web_session_url"]
+                .as_object_mut()
+                .unwrap()
+                .retain(|_, value| !value.is_null());
+            let Some(broker) = broker_with_properties(properties).await? else {
+                return Ok(());
+            };
+            let store = &broker.store;
+            let session_id = &broker.session_id;
+            let before = store.get(session_id).await?.context("metadata exists")?;
+            assert!(
+                !store
+                    .record_web_session_url_if_absent(session_id, "https://worker.example/a")
+                    .await?
+            );
+            let after = store.get(session_id).await?.context("metadata exists")?;
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(after.metadata, before.metadata);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_inferred_address_replaces_a_worker_address() -> Result<()> {
+    require_nextest();
+    let Some(broker) = broker().await? else {
+        return Ok(());
+    };
+    let store = &broker.store;
+    let session_id = &broker.session_id;
+    assert!(
+        store
+            .record_web_session_url_if_absent(session_id, "https://worker.example/a")
+            .await?
+    );
+    assert!(
+        store
+            .record_web_session_url(
+                session_id,
+                "https://serve.example/a",
+                PropertySource::Inferred
+            )
+            .await?
+    );
+    assert_eq!(
+        broker.properties().await?,
+        json!({"web_session_url": {
+            "value": "https://serve.example/a", "inherit": false, "source": "inferred",
+        }})
+    );
+    assert!(
+        !store
+            .record_web_session_url_if_absent(session_id, "https://worker.example/a")
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_same_url_takeover_clears_worker_provenance() -> Result<()> {
+    require_nextest();
+    for source in [PropertySource::Configured, PropertySource::Inferred] {
+        let url = "https://shared.example/a";
+        let Some(broker) = broker_with_properties(json!({"web_session_url": {
+            "value": url,
+            "inherit": false,
+            "source": "configured",
+            "recorded_by": "worker",
+            "future_attribute": 42,
+        }}))
+        .await?
+        else {
+            return Ok(());
+        };
+        let store = &broker.store;
+        let session_id = &broker.session_id;
+        assert!(
+            store
+                .record_web_session_url(session_id, url, source)
+                .await?
+        );
+        assert_eq!(
+            broker.properties().await?,
+            json!({"web_session_url": {
+                "value": url, "inherit": false, "source": source, "future_attribute": 42,
+            }})
+        );
+        let before = store.get(session_id).await?.context("metadata exists")?;
+        assert!(
+            !store
+                .record_web_session_url(session_id, url, source)
+                .await?
+        );
+        assert!(
+            !store
+                .record_web_session_url(
+                    session_id,
+                    "https://other.example/a",
+                    PropertySource::Inferred
+                )
+                .await?
+        );
+        let after = store.get(session_id).await?.context("metadata exists")?;
+        assert_eq!(after.revision, before.revision);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_address_with_stale_worker_marker_is_protected() -> Result<()> {
+    require_nextest();
+    let properties = json!({"web_session_url": {
+        "value": "https://chosen.example/a", "inherit": false, "recorded_by": "worker",
+    }});
+    let Some(broker) = broker_with_properties(properties.clone()).await? else {
+        return Ok(());
+    };
+    for source in [PropertySource::Inferred, PropertySource::Configured] {
+        assert!(
+            !broker
+                .store
+                .record_web_session_url(&broker.session_id, "https://serve.example/a", source)
+                .await?
+        );
+    }
+    assert_eq!(broker.properties().await?, properties);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_worker_and_serve_addresses_leave_serve_authoritative() -> Result<()> {
+    require_nextest();
+    for source in [PropertySource::Inferred, PropertySource::Configured] {
+        let Some(broker) = broker().await? else {
+            return Ok(());
+        };
+        let store = &broker.store;
+        let session_id = &broker.session_id;
+        let (worker, serve) = tokio::join!(
+            store.record_web_session_url_if_absent(session_id, "https://worker.example/a"),
+            store.record_web_session_url(session_id, "https://serve.example/a", source),
+        );
+        worker?;
+        assert!(serve?);
+        assert_eq!(
+            broker.properties().await?,
+            json!({"web_session_url": {
+                "value": "https://serve.example/a", "inherit": false, "source": source,
+            }})
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_worker_addresses_insert_exactly_once() -> Result<()> {
+    require_nextest();
+    let Some(broker) = broker().await? else {
+        return Ok(());
+    };
+    let store = &broker.store;
+    let session_id = &broker.session_id;
+    let first_url = "https://first-worker.example/a";
+    let second_url = "https://second-worker.example/a";
+    let (first, second) = tokio::join!(
+        store.record_web_session_url_if_absent(session_id, first_url),
+        store.record_web_session_url_if_absent(session_id, second_url),
+    );
+    let (first, second) = (first?, second?);
+    assert_ne!(first, second, "exactly one worker inserts the address");
+    assert_eq!(
+        broker.properties().await?,
+        json!({"web_session_url": {
+            "value": if first { first_url } else { second_url },
+            "inherit": false,
+            "source": "configured",
+            "recorded_by": "worker",
+        }})
+    );
     Ok(())
 }

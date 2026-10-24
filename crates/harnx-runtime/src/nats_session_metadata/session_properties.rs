@@ -20,6 +20,8 @@ use std::collections::BTreeMap;
 pub const SESSION_PROPERTIES_NAMESPACE: &str = "dev.harnx.session_properties";
 /// The property holding the address that opens a session in the Web UI.
 pub const WEB_SESSION_URL_PROPERTY: &str = "web_session_url";
+const RECORDED_BY_KEY: &str = "recorded_by";
+const WORKER_RECORDER: &str = "worker";
 /// The property holding a session's labels.
 pub const LABELS_PROPERTY: &str = "labels";
 /// Most labels one session keeps.
@@ -217,7 +219,7 @@ fn inheritance(name: &str) -> Inheritance {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PropertySource {
-    /// harnx-serve's configured public URL.
+    /// harnx-serve's or a worker's configured public URL.
     Configured,
     /// The headers of the request that carried a prompt.
     Inferred,
@@ -291,9 +293,9 @@ impl SessionProperties {
     }
 
     /// Set `name` to `value` as a writer supplied it, so it has no
-    /// [`PropertySource`]. An existing property keeps its other attributes
-    /// and, unless `inherit` says otherwise, its flag; a new one takes the
-    /// property's default.
+    /// [`PropertySource`] or recorder marker. An existing property keeps its
+    /// other attributes and, unless `inherit` says otherwise, its flag; a new
+    /// one takes the property's default.
     pub(super) fn put(&mut self, name: &str, value: Value, inherit: Option<bool>) {
         let inheritance = inheritance(name);
         let property = self
@@ -307,6 +309,7 @@ impl SessionProperties {
             });
         property.value = value;
         property.source = None;
+        property.other.remove(RECORDED_BY_KEY);
         property.inherit = inheritance != Inheritance::Never && inherit.unwrap_or(property.inherit);
     }
 
@@ -601,11 +604,43 @@ impl SessionMetadataStore {
         .await
     }
 
+    /// Record a worker's configured Web UI address only when none exists.
+    /// Returns whether this call inserted the address. The recorder marker
+    /// lets harnx-serve replace it later, even with an inferred address.
+    pub async fn record_web_session_url_if_absent(
+        &self,
+        session_id: &str,
+        url: &str,
+    ) -> Result<bool> {
+        let value = property_definition(WEB_SESSION_URL_PROPERTY)
+            .context("web_session_url is a well-known property")?
+            .normalize(&Value::from(url))?
+            .context("web_session_url must not be empty")?;
+        let mut recorded = false;
+        self.patch_guarded_if_changed(session_id, PatchGuard::default(), |metadata| {
+            let mut properties = session_properties(metadata)?;
+            recorded = properties.get(WEB_SESSION_URL_PROPERTY).is_none();
+            if recorded {
+                properties.put(WEB_SESSION_URL_PROPERTY, value.clone(), None);
+                if let Some(property) = properties.0.get_mut(WEB_SESSION_URL_PROPERTY) {
+                    property.source = Some(PropertySource::Configured);
+                    property
+                        .other
+                        .insert(RECORDED_BY_KEY.to_string(), Value::from(WORKER_RECORDER));
+                }
+                store_properties(metadata, &properties)?;
+            }
+            Ok(recorded)
+        })
+        .await?;
+        Ok(recorded)
+    }
+
     /// Record the Web UI address harnx-serve worked out for a session. It
-    /// fills in a missing address, and a configured one replaces an address
-    /// Harnx recorded earlier, which may have been inferred or configured
-    /// differently. An address an agent or person set is left alone. Returns
-    /// whether this call changed the address.
+    /// fills in a missing address or replaces one recorded by a worker. A
+    /// configured address also replaces a different address Harnx recorded
+    /// earlier. An address an agent or person set is left alone. Returns
+    /// whether this call changed the address or its provenance.
     pub async fn record_web_session_url(
         &self,
         session_id: &str,
@@ -623,9 +658,10 @@ impl SessionMetadataStore {
                 .0
                 .get(WEB_SESSION_URL_PROPERTY)
                 .is_none_or(|existing| {
-                    source == PropertySource::Configured
-                        && existing.source.is_some()
-                        && existing.value != value
+                    existing.source.is_some()
+                        && (existing.other.get(RECORDED_BY_KEY).and_then(Value::as_str)
+                            == Some(WORKER_RECORDER)
+                            || (source == PropertySource::Configured && existing.value != value))
                 });
             if recorded {
                 properties.put(WEB_SESSION_URL_PROPERTY, value.clone(), None);

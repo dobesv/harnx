@@ -9,23 +9,9 @@
 //! configured one replaces it.
 
 use crate::session_actor::SessionKey;
-use anyhow::{ensure, Context, Result};
-use harnx_runtime::{config::Config, identity::first_value};
+use anyhow::Result;
+use harnx_runtime::{config::Config, identity::first_value, web_url::normalize_public_url};
 use http::{HeaderMap, Uri};
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
-
-/// What `encodeURIComponent` leaves unescaped, so an address built here is
-/// the one the Web UI builds for the same session.
-const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'!')
-    .remove(b'~')
-    .remove(b'*')
-    .remove(b'\'')
-    .remove(b'(')
-    .remove(b')');
 
 /// The configured `serve_public_url`, checked and without a trailing slash.
 /// It may carry a path when the Web UI is served under a prefix.
@@ -40,24 +26,6 @@ pub(crate) fn public_url_or_warn(config: &Config) -> Option<String> {
         log::warn!("ignoring serve_public_url: {error:#}");
         None
     })
-}
-
-fn normalize_public_url(raw: Option<&str>) -> Result<Option<String>> {
-    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok(None);
-    };
-    let url = reqwest::Url::parse(raw)
-        .with_context(|| format!("serve_public_url '{raw}' is not a URL"))?;
-    ensure!(
-        matches!(url.scheme(), "http" | "https")
-            && url.has_host()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none(),
-        "serve_public_url '{raw}' must be an http or https URL without credentials, query or fragment"
-    );
-    Ok(Some(url.as_str().trim_end_matches('/').to_string()))
 }
 
 /// The base URL a request reached this server at: the host and scheme a
@@ -84,11 +52,7 @@ pub(crate) fn session_url(base: &str, key: &SessionKey, default_cluster: Option<
     let agent = key
         .target()
         .display_ref_with_default_cluster(default_cluster);
-    format!(
-        "{base}/agents/{}/sessions/{}",
-        utf8_percent_encode(&agent, URI_COMPONENT),
-        utf8_percent_encode(key.session(), URI_COMPONENT)
-    )
+    harnx_runtime::web_url::session_url(base, &agent, key.session())
 }
 
 #[cfg(test)]
@@ -106,10 +70,6 @@ mod tests {
 
     fn base(pairs: &[(&'static str, &'static str)]) -> Option<String> {
         inferred_base_url(&headers(pairs), &Uri::from_static("/agents/a/sessions/s"))
-    }
-
-    fn configured(value: &str) -> Result<Option<String>> {
-        normalize_public_url(Some(value))
     }
 
     #[test]
@@ -151,28 +111,6 @@ mod tests {
             Some("http://harnx.example.com:8443"),
             "an absolute request URI still names its host"
         );
-    }
-
-    #[test]
-    fn configured_public_url_is_checked_and_normalized() {
-        assert_eq!(configured("  ").unwrap(), None);
-        assert_eq!(
-            configured("https://Harnx.Example.com/").unwrap().as_deref(),
-            Some("https://harnx.example.com")
-        );
-        assert_eq!(
-            configured("https://example.com/harnx/").unwrap().as_deref(),
-            Some("https://example.com/harnx")
-        );
-        for invalid in [
-            "harnx.example.com",
-            "ftp://harnx.example.com",
-            "https://user:secret@harnx.example.com",
-            "https://harnx.example.com/?x=1",
-            "https://harnx.example.com/#top",
-        ] {
-            assert!(configured(invalid).is_err(), "{invalid}");
-        }
     }
 
     #[test]

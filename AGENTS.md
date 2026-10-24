@@ -965,6 +965,14 @@ named `session_id` carry this key; public metadata, tool results, hooks, and
 confirmation requests retain the local ID.
 See `docs/nats-ha.md` under “Session identity”. Do not pass a local ID to by-key APIs.
 
+The storage key (SHA-256 of JSON `[agent, local_id]`) is distinct from the bare
+local ID used in web routes. A web session URL `/agents/{agent}/sessions/{session}`
+uses the bare `local_id` (percent-encoded), while storage keys go to KV buckets
+under `sessions/{storage_key}/...`. The `web_session_url` property records the web
+route, not the storage key. See `harnx_core::session_identity::session_key` for
+derivation and `crates/harnx-runtime/src/nats_worker/web_session_url.rs` for an
+example of the distinction.
+
 Client/control code can append to another session's log via
 `NatsSessionLog::new(jetstream, storage_key)`. Worker/tool output must instead go
 through the session log backend while holding the lease, so the append is fenced
@@ -1325,6 +1333,11 @@ from the container environment. Because the worker never calls
 The seam is `resolve_nats_server()` at `nats_split.rs:234`:
 `NatsRouting::Default` → reads env handoff; `NatsRouting::Cluster` → bails;
 `NatsRouting::FrontendLocal` → resolves auto-managed local broker.
+
+Workers may read `nats_routing_from_env()` for display purposes only (e.g.,
+deriving `web_session_url` display default). This returns `Cluster(name)` or
+`Default` without affecting routing resolution. Never call
+`apply_frontend_nats_routing()` in a worker process.
 
 ### NATS/GC tests: CI coverage and isolation
 

@@ -4915,6 +4915,7 @@ dependencies = [
  "os_info",
  "parking_lot",
  "path-absolutize",
+ "percent-encoding",
  "pretty_assertions",
  "rand 0.10.3",
  "rcgen",

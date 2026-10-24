@@ -33,6 +33,11 @@ When session retention is configured (`cleanup_remote_sessions_days` /
 garbage collection. Passes are leader-elected across workers, ensuring one
 cleanup pass runs per wall-clock hour per cluster.
 
+When `serve_public_url` (`HARNX_SERVE_PUBLIC_URL`) is set, workers record
+`web_session_url` in session metadata before turn 1 for named-agent sessions
+that do not yet have an address (such as handoffs, sub-agents, or A2A tasks).
+See [Session properties](../../docs/nats-ha.md#session-properties).
+
 ## Frontend-managed local workers
 
 `harnx` and `harnx-serve` each supervise one worker for their own process
