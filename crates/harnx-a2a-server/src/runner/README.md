@@ -312,3 +312,23 @@ and use existing fixed-ticket interruption/terminal settlement. Foreground task
 reads don't treat HITL checkpoints as ordinary orphan evidence. Background sweeps
 reinspect parked tasks and recover accepted intent or cross-frontend decisions
 through the progress classification above.
+
+## Approval regression matrix
+
+Tests under `tests/it/` use real admission, JetStream and a worker, not only seeded
+context documents. `support.rs::Script::SameRoundTools` emits two native time-tool
+calls in one model completion and uses a real `PreToolUse` hook to defer them.
+
+- `unary/hitl.rs` covers approval, model-visible full rejection reasons, context-only
+  replies, unrecognized messages, parked cancellation and same-round approval identity.
+- `streaming.rs::streaming_hitl_same_round_closes_each_gate_then_completes` checks
+  initial and resumed SSE boundaries, Working snapshots and accumulated output.
+- `multi_replica/hitl.rs` races replies across independent runners/stores. It holds
+  a Q1-bound loser until Q2 is parked, then checks duplicates remain idempotent and
+  conflicting losers cannot answer Q2.
+- `multi_replica/supervision/recovery/hitl.rs` covers accepted-intent recovery,
+  external runtime/web decisions and read-only parked sweeps. `e2e/supervision.rs`
+  kills and restarts the actual A2A server fleet while a task is parked.
+
+The client contract is documented in
+[Interactive tool approval](../../README.md#interactive-tool-approval).

@@ -287,9 +287,73 @@ remotes:
       - compute
 ```
 
+## Interactive tool approval
+
+When a tool requires confirmation (for example, a `PreToolUse` hook returns
+`permissionDecision: ask`), the task pauses at `TASK_STATE_INPUT_REQUIRED`.
+Its agent status message contains a plain-text Markdown challenge with the tool
+name, persisted JSON arguments (truncated above 8 KiB), and approval reason.
+Blocking `SendMessage` returns at this boundary. `SendStreamingMessage` and
+`SubscribeToTask` close after the interrupted status; the task is **not terminal**.
+
+Send another `SendMessage` or `SendStreamingMessage` to answer. Preserve the
+returned `contextId`. Include the same `taskId`, or send only `contextId` to answer
+that context's active challenge (as Jira/Rovo does). A `taskId`-only reply also
+works; a mismatched task/context pair is rejected. Replies resume the original
+task and invocation, not a new prompt. Multiple approval-requiring calls, including
+calls in one tool round, produce successive challenges on that same task.
+
+The first whitespace-delimited word selects the decision, case-insensitively:
+
+| Decision | Accepted first words | Example |
+| --- | --- | --- |
+| Approve | `y`, `yes`, `go`, `approve` | `yes please proceed` |
+| Reject | `n`, `no`, `reject`, `deny` | `n use a read-only command instead` |
+
+Trailing `.`, `!`, and `,` on the first word are accepted (`Y!`, `no.`).
+The rest is an optional note. Approval notes are **audit-only**, not new messages
+to the model. Rejection notes are **model-visible** in the blocked-tool result.
+Only text parts are accepted as decisions. Data parts, mixed text/data messages,
+and unrecognized words such as `yesterday` return the challenge and reply
+instructions without adding agent context, calling the model, or deciding anything.
+There is no A2UI or structured JSON approval format.
+
+For example, reply using values returned by the challenge:
+
+```json
+{
+  "message": {
+    "messageId": "approval-reply-1",
+    "role": "ROLE_USER",
+    "contextId": "<returned contextId>",
+    "taskId": "<returned taskId>",
+    "parts": [{"text": "y"}]
+  }
+}
+```
+
+Keep `messageId` unchanged when retrying the same reply. Its durable receipt is
+bound to that exact challenge, so a duplicate cannot answer a later approval.
+Concurrent conflicting replies are first-wins; a stale loser cannot decide the
+next challenge. Use a new message ID for each new answer. Accepted replies publish
+`TASK_STATE_WORKING` before the next challenge or terminal result. `CancelTask`
+also works while approval is pending.
+
+Parked tasks release A2A ownership and survive backend/fleet restarts. Replies
+can reach any replica without sticky routing. The reconciler also discovers
+runtime decisions made through another frontend, such as the web UI, and resumes
+the original continuation. **Upgrade all A2A replicas together**: old replicas
+can mistake parked tasks for interrupted work. Upgrade runtime workers before
+enabling exact-reference decisions; old workers don't enforce request fencing.
+
+There is no approval-specific timeout. The existing frozen invocation deadline
+still counts while parked (24 hours by default); approval doesn't pause or reset
+it. This means pending approval isn't an unlimited execution budget. See
+[publisher segments and frozen deadlines](src/runner/README.md#hitl-publisher-segments)
+and the [tool confirmation guide](../../docs/tool-confirmation-guide.md).
+
 ## Limitations
 
-- **HITL integration in progress**: Tools needing approval now park the task at `INPUT_REQUIRED` with a plain-text challenge instead of automatic denial. Publisher continuation uses the same fixed runtime ticket. Plain-text `y` / `n [reason]` replies with `taskId` or `contextId` resume that task without admitting another prompt. Parked tasks survive backend restarts; recovery delivers accepted decisions or follows decisions made by other frontends under the original ticket. Upgrade all A2A replicas together, since old replicas can interrupt parked tasks. Existing frozen run deadlines continue during approval pauses (24 hours by default). See [publisher segments](src/runner/README.md#hitl-publisher-segments).
 - **Multi-replica routing**: Shared admission, ownership, cancellation and streaming work through any backend without sticky sessions. Drain old turns and exclude mixed writers when upgrading; deploy runtime readers before `admission_closed` writers. See [operations](../../docs/a2a-operations.md). Recovery is eventual and TTL-based, not a fixed failover SLO. Interrupted work is never replayed and tool side effects aren't rolled back.
 - **No push notifications**: Push notification methods (`CreateTaskPushNotificationConfig`, etc.) return `PushNotificationNotSupportedError` (`-32003`). `capabilities.pushNotifications` is set to `false`.
 - **Anonymous mode lacks isolation**: When `--user-id-header` is not configured, all requests operate as a single anonymous principal. Any client reaching the endpoint can access or resume sessions.

@@ -27,11 +27,11 @@ Harnx uses the hooks system for tool confirmation. When a `PreToolUse` hook retu
 
 1. The model requests a tool such as `bash_exec`.
 2. The worker runs matching `PreToolUse` hooks.
-3. The worker sends a confirmation request over NATS to the attached TUI.
-4. The TUI shows the tool name, full arguments, hook reason, and optional message area.
+3. With a live confirmation route, the worker sends a request over NATS to the attached frontend. The TUI shows the tool name, full arguments, hook reason, and optional message area.
+4. Without a confirmation route, the worker persists a durable HITL approval request and suspends the invocation. A2A uses this path; the tool isn't automatically denied.
 5. Approving runs the tool. Rejecting returns a synthetic blocked tool result so the agent can continue.
 
-Production confirmation always uses this worker-to-frontend NATS route. The old test-only local confirmation bridge has been removed.
+Durable approvals can be decided through the runtime API or web UI. A2A exposes the same pending request as an `INPUT_REQUIRED` task challenge. The old test-only local confirmation bridge has been removed.
 
 ## 3. Configuration Methods
 
@@ -91,7 +91,44 @@ On approval or `Ctrl+D`, a non-empty optional message is durably queued to the o
 
 TUI confirmation prompts have no time limit. Cancelling the turn, closing the route, or detaching the TUI ends the wait. If message enqueue fails, the modal stays open with the draft intact so you can retry.
 
-If no TUI is attached, a tool call requiring confirmation is denied. A rejected tool call produces a result such as `{"error": "Denied by user", "blocked_by_hook": true}`.
+Without a live confirmation route, the worker defers to durable HITL instead of denying the tool. This differs from a live route closing during a TUI wait. A rejected tool call produces a result such as `{"error": "Denied by user", "blocked_by_hook": true}`.
+
+## A2A approval replies
+
+A2A parks the existing task at `TASK_STATE_INPUT_REQUIRED` with a plain-text
+challenge. Blocking sends return there, and streams close after the challenge.
+Reply on the same task using `taskId` and `contextId`, or `contextId` alone.
+Clients must preserve the returned `contextId` to continue the conversation.
+Each additional approval pauses that same task again, including multiple tools
+from one model round.
+
+Use a text part whose first word is one of:
+
+- Approve: `y`, `yes`, `go`, `approve`.
+- Reject: `n`, `no`, `reject`, `deny`.
+
+Matching is case-insensitive, and trailing `.`, `!`, or `,` on the first word is
+accepted. `Y!` approves; `no.` rejects; `yes please proceed` approves with an
+audit-only note; `n use a read-only command` rejects with a reason shown to the
+model in the blocked-tool result. Unlike the TUI's queued-message behavior,
+approval notes on the durable A2A path don't become model messages.
+
+Unrecognized text, data parts, or mixed text/data messages restate the challenge
+without appending agent context or calling the model. There is no rich approval
+UI or structured JSON reply format. Reuse the reply's `messageId` on retries;
+use a new ID for a new answer. Duplicate and conflicting in-flight replies can't
+answer a later challenge.
+
+Parked tasks survive replica/fleet restarts and accept replies on any replica.
+The reconciler discovers decisions made directly through the runtime/web path.
+`CancelTask` stops a parked task. There is no approval-specific timeout, but the
+frozen invocation deadline still runs while parked (24 hours by default) and
+isn't reset by approval. Upgrade all A2A replicas together, since old replicas
+can fail parked tasks. Upgrade runtime workers before enabling exact-reference
+approval decisions so request fencing is enforced.
+
+See [Interactive tool approval](../crates/harnx-a2a-server/README.md#interactive-tool-approval)
+for the wire message example and deployment details.
 
 ## 5. Advanced: Conditional Confirmation
 

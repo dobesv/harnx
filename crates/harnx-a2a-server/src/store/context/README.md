@@ -102,7 +102,11 @@ park active `InputRequired` work with `owner = None`. That isn't a stop proof an
 never permits retirement. The original message, ticket and admission stay intact.
 Publisher, reply admission and recovery share this lifecycle. Recovery reinspects
 runtime progress without claiming an unchanged parked task; a durable decision
-resumes only the original fixed ticket. Old replicas must not recover parked tasks.
+resumes only the original fixed ticket. This includes decisions made through the
+runtime/web API without an A2A reply receipt. Missing A2A ownership alone is never
+proof that a parked invocation stopped. Old replicas must not recover parked tasks.
+See [Interactive tool approval](../../../README.md#interactive-tool-approval)
+for the client reply and rollout contract.
 
 Helpers in `hitl_writes.rs` use `prepare_context_update_checked`, the fallible
 variant of the existing exact-owner/task/revision CAS. Missing checkpoints,

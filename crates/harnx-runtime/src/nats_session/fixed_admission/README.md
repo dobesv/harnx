@@ -3,7 +3,7 @@
 Coordinated frontends use `NatsSession::prepare_fixed_admission`,
 `append_fixed_prompt`, `resolve_fixed_admission` and `close_fixed_admission`.
 Ordinary runtime admission keeps its existing steering and worker lease behavior.
-The A2A runner uses these APIs after its owner-checked context CAS. Shared first-message reservations and foreground recovery preserve the ticket; background supervision restores the same ticket. Remote event readers are separate work.
+The A2A runner uses these APIs after its owner-checked context CAS. Shared first-message reservations and foreground recovery preserve the ticket; background supervision restores the same ticket. A parked `InputRequired` task can have no A2A owner while its runtime admission remains busy. Resuming an accepted HITL continuation never allocates a replacement ticket or prompt.
 
 ## Persist before append
 
