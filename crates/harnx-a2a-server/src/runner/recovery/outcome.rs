@@ -67,6 +67,17 @@ pub(super) async fn recovery_outcome(
     }
     match session.close_fixed_admission(ticket).await? {
         FixedAdmissionOutcome::Admitted { prompt_sequence } => {
+            if !canceled {
+                match session.fixed_prompt_progress(ticket).await? {
+                    harnx_runtime::PromptProgress::Terminal(result) => {
+                        return Ok(completed_outcome(result, false, output_limit));
+                    }
+                    harnx_runtime::PromptProgress::Running {
+                        last_decision: None,
+                    } => {}
+                    _ => anyhow::bail!("HITL continuation requires progress recovery"),
+                }
+            }
             session
                 .interrupt_prompt(prompt_sequence, "A2A admission owner lost")
                 .await?;

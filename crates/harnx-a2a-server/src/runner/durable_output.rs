@@ -53,16 +53,31 @@ fn invocation_text(
         .collect())
 }
 
+pub(super) async fn load_invocation_text(
+    store: &A2aStore,
+    storage: &str,
+    prompt: u64,
+    through: Option<u64>,
+) -> Result<String> {
+    let entries = NatsSessionLog::new_with_replicas(
+        store.metadata().jetstream().clone(),
+        storage,
+        store.metadata().replicas(),
+    )
+    .load_events_latest_required_async()
+    .await?;
+    invocation_text(&entries, prompt, through)
+}
+
 impl Publisher {
     pub(super) async fn reconcile_output(&mut self, through: Option<u64>) -> Result<()> {
-        let entries = NatsSessionLog::new_with_replicas(
-            self.store.metadata().jetstream().clone(),
+        let text = load_invocation_text(
+            &self.store,
             &self.storage_key,
-            self.store.metadata().replicas(),
+            self.record().user_msg_seq,
+            through,
         )
-        .load_events_latest_required_async()
         .await?;
-        let text = invocation_text(&entries, self.record().user_msg_seq, through)?;
         let limit = super::limits::task_output_limit(&self.store, &self.authority.context).await?;
         if text != self.output.text {
             let mut recovered = Output::default();

@@ -57,6 +57,10 @@ impl Publisher {
     }
 
     pub(super) async fn suspend(&mut self, pending: PendingHitlApproval) -> Result<()> {
+        #[cfg(feature = "fault-injection")]
+        self.hooks
+            .checkpoint(crate::fault_injection::Boundary::HitlRequestObserved)
+            .await;
         // Retries reuse the committed envelope and replacement artifact, never
         // append the same text twice or invent another challenge generation.
         for attempt in 0..3 {

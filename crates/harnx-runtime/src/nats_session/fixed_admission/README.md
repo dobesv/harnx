@@ -39,7 +39,11 @@ change the original admission. An unavailable broker is an error, not proof of c
   recovery calls close, never append.
 - `Admitted { prompt_sequence }`: prompt won. `fixed_prompt_handle` returns the
   same invocation/prompt for observation through `follow_admitted_prompt`.
-  Recovery must inspect durable completion or interrupt this exact invocation.
+  Recovery must inspect durable completion and approval progress before interrupting
+  this exact invocation. A durable pending HITL request parks it; an accepted exact
+  reply or committed decision may reactivate its existing continuation and attach
+  `follow_admitted_prompt_until_boundary` under this same ticket. That isn't prompt
+  replay. Without HITL evidence the ordinary orphan interruption policy is unchanged.
   **Admitted does not mean stopped.** Don't mark a stop checkpoint merely because
   close returned Admitted, and don't automatically activate interrupted work.
 - `Closed { closure_sequence }`: closure won. No executable prompt exists.

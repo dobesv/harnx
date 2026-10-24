@@ -20,8 +20,14 @@ pub(super) struct OwnedTask {
 }
 impl OwnedTask {
     pub fn ticket(&self, storage: &str) -> Result<FixedAdmissionTicket> {
-        let admission = &self
-            .context
+        Self::ticket_from_context(&self.context, storage)
+    }
+
+    pub fn ticket_from_context(
+        context: &ContextSnapshot,
+        storage: &str,
+    ) -> Result<FixedAdmissionTicket> {
+        let admission = &context
             .document
             .state
             .active

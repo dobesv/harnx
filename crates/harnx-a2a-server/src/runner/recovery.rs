@@ -1,9 +1,10 @@
-//! Shared foreground/background settlement. Never activates or appends a missing
-//! prompt; only durable completion, closure or exact scoped stop permits release.
+//! Shared terminal settlement. HITL recovery can follow an existing continuation,
+//! but never appends a missing prompt or changes its fixed ticket.
 use super::authority::{stage_terminal, OwnedTask, TaskReservation};
 use super::*;
 use crate::store::context::AdmissionPhase;
 mod artifact;
+mod hitl;
 mod outcome;
 use outcome::{recovery_outcome, recovery_status};
 
@@ -27,13 +28,28 @@ impl Runner {
             return authority.project_terminal(&self.store, session).await;
         }
         let ticket = authority.ticket(session.storage_key())?;
-        let (state, text, phase, prompt) = recovery_outcome(
-            session,
-            &ticket,
-            active.cancel.is_some(),
-            super::limits::task_output_limit(&self.store, &authority.context).await?,
-        )
-        .await?;
+        if active.cancel.is_none() && active.hitl_checkpoint.is_some() {
+            anyhow::ensure!(
+                session.fixed_prompt_completion(&ticket).await?.is_some(),
+                "HITL continuation requires progress recovery"
+            );
+        }
+        self.repair_hitl_mapping(session, authority).await?;
+        let has_hitl = active.hitl_checkpoint.is_some();
+        let output_limit =
+            super::limits::task_output_limit(&self.store, &authority.context).await?;
+        let (mut state, mut text, phase, prompt) =
+            recovery_outcome(session, &ticket, active.cancel.is_some(), output_limit).await?;
+        if has_hitl && state == TaskState::Completed {
+            let recovered = super::durable_output::load_invocation_text(
+                &self.store,
+                session.storage_key(),
+                prompt.context("completed HITL prompt missing")?,
+                None,
+            )
+            .await?;
+            (state, text) = super::limits::bounded_outcome((state, Some(recovered)), output_limit);
+        }
         if let Some(text) = text.as_deref().filter(|_| state == TaskState::Completed) {
             artifact::recover_artifact(authority, &self.store, session, text).await?;
         }
@@ -64,7 +80,7 @@ impl Runner {
         authority.project_terminal(&self.store, session).await
     }
     pub(super) async fn reconcile_coordinated(
-        &self,
+        self: &Arc<Self>,
         export: &Export,
         session: &NatsSession,
         record: TaskRecord,
@@ -81,17 +97,13 @@ impl Runner {
                 .context("active task missing")?;
             return Ok(self.live_record(export, record).await);
         };
-        let mut authority = self.claim_context(session, lease).await?;
-        self.recover_admission(session, &mut authority).await?;
-        let record = self
-            .store
+        let authority = self.claim_context(session, lease).await?;
+        // Keep the continuation launch future off blocking waiters' stack frames.
+        Box::pin(self.recover_registered_task(export, session.clone(), authority)).await?;
+        self.store
             .get_task(session.storage_key(), &record.task.id)
             .await?
-            .context("recovered task missing")?;
-        authority
-            .release(&self.store, session.storage_key())
-            .await?;
-        Ok(record)
+            .context("recovered task missing")
     }
 }
 

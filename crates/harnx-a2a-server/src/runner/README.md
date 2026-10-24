@@ -103,11 +103,9 @@ the immutable invocation limits; approval does **not** reset or extend the deadl
 Literal indefinite approval lifetime would require a separate runtime policy
 change. Don't claim suspension pauses this clock.
 
-Current integration boundary: publisher suspension/resume is implemented here;
-HTTP reply admission and HITL-aware owner-loss recovery are follow-up work. Until
-that recovery exists, the old orphan policy can still fail a parked task when a
-foreground/background reconciler claims it. Don't deploy this partial flow as
-restart-safe approval handling or mix old replicas with parked-task-aware writers.
+Reply admission and owner-loss recovery use the same continuation APIs. Upgrade
+all A2A replicas together: old replicas treat parked tasks as ordinary orphans and
+can interrupt them. The frozen runtime deadline above still applies after restart.
 
 ## Request memberships and stored owners
 
@@ -135,10 +133,34 @@ stale owners, role-admin follow-ups and independent replica retries.
 
 Foreground retries/Get/New Send and background supervision may acquire the expired owner's scoped lease and
 CAS-take over. Recovery restores the original ticket, checks durable completion,
-then closes its fixed predecessor or interrupts the exact admitted prompt. It never
-calls append/activation to repair an absent prompt. A first-message crash before
-allocation reconstructs a non-executable task from the reservation, then closes it;
-that isn't prompt replay. Runtime completion inspection doesn't activate work.
+then classifies runtime progress before owner-loss interruption, including tasks
+still stored as `Working`. Without HITL evidence it closes the fixed predecessor or
+interrupts the exact admitted prompt. It never appends or activates an absent
+prompt. A first-message crash before allocation reconstructs a non-executable task
+from the reservation, then closes it; that isn't prompt replay.
+
+`recovery/hitl.rs` handles existing HITL continuations:
+
+- An undecided request reconstructs the challenge and stable status outbox, drains
+  publication, and releases ownership without stop or terminal proof.
+- An accepted reply repairs durable dedupe first. Only its exact pending reference
+  can receive its decision. The full note is parsed from saved task history, never
+  from the bounded inline receipt. Missing or inconsistent history leaves intent
+  unresolved for a later sweep.
+- A durable decision stages `Following`/`Working` and attaches the typed follower
+  from `fixed_prompt_handle(original_ticket)`. Its normal activation is pinned to
+  the original prompt. No new admission, message, run or deadline is created.
+- A newer pending request replaces the old checkpoint only after accepted reply
+  dedupe is durable. The old answer never targets that request.
+- Terminal proof and cancellation retain the existing settlement/stop ordering.
+  Recovered terminal artifacts include durable text from earlier HITL segments.
+
+Each sweep reloads runtime progress for a released unchanged `Waiting` task before
+acquiring a lease. It doesn't repeatedly claim or rewrite that parked task, but
+still notices decisions made by another frontend. Uncertain outbox publication
+retains its exact envelope and owner for lease-expiry takeover. Other inconsistent
+facts release unused ownership without failing the invocation and retry later.
+Foreground orphan repair uses the same progress classification.
 
 Only confirmed closure/interruption/completion permits terminal settlement. Broker
 uncertainty leaves the same identity unresolved and returns an error. Completion
@@ -287,5 +309,6 @@ task after retirement, without appending history twice.
 `Runner::cancel_hitl_task` handles foreground cancellation of parked work: persist
 cancel intent, claim the released scoped lease, repair any accepted reply mapping,
 and use existing fixed-ticket interruption/terminal settlement. Foreground task
-reads don't treat HITL checkpoints as ordinary orphan evidence. Background restart
-and cross-frontend continuation recovery remain separate recovery work.
+reads don't treat HITL checkpoints as ordinary orphan evidence. Background sweeps
+reinspect parked tasks and recover accepted intent or cross-frontend decisions
+through the progress classification above.

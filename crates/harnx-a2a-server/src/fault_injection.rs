@@ -30,6 +30,10 @@ pub enum Boundary {
     HitlOutboxCommitted,
     HitlReplyBound,
     HitlReplyIntentCommitted,
+    HitlRequestObserved,
+    HitlDecisionCommitted,
+    HitlParkedInspected,
+    HitlRecoveryDeferred,
 }
 impl Boundary {
     fn index(self) -> usize {
@@ -54,7 +58,7 @@ impl Default for Point {
 
 #[derive(Default)]
 pub struct FaultHooks {
-    points: [Point; Boundary::HitlReplyIntentCommitted as usize + 1],
+    points: [Point; Boundary::HitlRecoveryDeferred as usize + 1],
     context_ack_loss: AtomicBool,
     first_ack_loss: AtomicBool,
     terminal_ack_loss: AtomicBool,

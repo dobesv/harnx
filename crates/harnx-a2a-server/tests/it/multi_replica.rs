@@ -93,7 +93,10 @@ struct TwoBackends {
 }
 impl TwoBackends {
     async fn start() -> Result<Self> {
-        let h = Harness::start(Script::Text).await?;
+        Self::start_script(Script::Text).await
+    }
+    async fn start_script(script: Script) -> Result<Self> {
+        let h = Harness::start(script).await?;
         let a = Replica::new(&h, h.store.clone(), h.runner.clone())?;
         let store_b = Arc::new(A2aStore::new(h.metadata.clone()));
         let b = Replica::new(&h, store_b.clone(), Runner::new(store_b))?;

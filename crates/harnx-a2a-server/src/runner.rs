@@ -435,7 +435,7 @@ impl Runner {
     /// Handler calls this AFTER dedupe, BEFORE busy/terminal rejection or admit.
     /// Missing live runner doesn't prove the worker stopped. Fence it first.
     pub async fn reconcile_orphan(
-        &self,
+        self: &Arc<Self>,
         access: TaskAccess<'_>,
         session: &NatsSession,
     ) -> Result<TaskRecord> {

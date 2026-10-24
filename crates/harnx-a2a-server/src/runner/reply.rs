@@ -183,6 +183,10 @@ impl Runner {
         let outcome = session
             .decide_hitl_approval_for(request, receipt.approved, note)
             .await?;
+        #[cfg(feature = "fault-injection")]
+        self.hooks
+            .checkpoint(crate::fault_injection::Boundary::HitlDecisionCommitted)
+            .await;
         let progress = session
             .fixed_prompt_progress(&authority.ticket(session.storage_key())?)
             .await?;

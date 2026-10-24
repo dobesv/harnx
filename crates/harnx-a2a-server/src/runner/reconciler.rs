@@ -12,7 +12,7 @@ enum RecoveryTarget {
 
 impl Runner {
     pub(super) async fn reconcile_registration(
-        &self,
+        self: &Arc<Self>,
         export: &Export,
         entry: &RecoveryRegistration,
         settings: &SupervisionConfig,
@@ -25,8 +25,15 @@ impl Runner {
         let Some(target) = self.recovery_target(export, entry).await? else {
             return Ok(());
         };
-        let Some(lease) = self.candidate_lease(storage).await? else {
-            return Ok(());
+        // First-message initialization still needs its lease before any create.
+        // Active sessions can be inspected without claiming a parked approval.
+        let lease = if matches!(&target, RecoveryTarget::First(_)) {
+            let Some(lease) = self.candidate_lease(storage).await? else {
+                return Ok(());
+            };
+            Some(lease)
+        } else {
+            None
         };
         let owner = entry
             .owner
@@ -45,14 +52,30 @@ impl Runner {
         // identity. Revocation must deny new requests without preventing stop.
         let session = self.stored_session(request, &entry.allocation).await?;
         if let RecoveryTarget::First(first) = target {
-            self.recover_first_reservation(&session, &first, lease)
-                .await?;
+            self.recover_first_reservation(
+                &session,
+                &first,
+                lease.context("first recovery lease missing")?,
+            )
+            .await?;
         } else {
-            let mut authority = self.claim_context(&session, lease).await?;
-            if authority.context.document.state.active.is_some() {
-                self.recover_admission(&session, &mut authority).await?;
+            if self.unchanged_parked(&session).await? {
+                #[cfg(feature = "fault-injection")]
+                self.hooks
+                    .checkpoint(crate::fault_injection::Boundary::HitlParkedInspected)
+                    .await;
+                return Ok(());
             }
-            authority.release(&self.store, storage).await?;
+            let Some(lease) = self.candidate_lease(storage).await? else {
+                return Ok(());
+            };
+            let authority = self.claim_context(&session, lease).await?;
+            if authority.context.document.state.active.is_some() {
+                self.recover_registered_task(export, session, authority)
+                    .await?;
+            } else {
+                authority.release(&self.store, storage).await?;
+            }
         }
         Ok(())
     }

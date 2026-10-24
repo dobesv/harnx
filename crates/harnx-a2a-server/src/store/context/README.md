@@ -100,8 +100,9 @@ missing server limit metadata falls back to 1 MiB, matching runtime conventions.
 `Following` stays present when execution returns to `Working`. Owner release may
 park active `InputRequired` work with `owner = None`. That isn't a stop proof and
 never permits retirement. The original message, ticket and admission stay intact.
-The store supports this lifecycle; publisher/admission/recovery integration is
-separate work. Old replicas must not recover parked tasks.
+Publisher, reply admission and recovery share this lifecycle. Recovery reinspects
+runtime progress without claiming an unchanged parked task; a durable decision
+resumes only the original fixed ticket. Old replicas must not recover parked tasks.
 
 Helpers in `hitl_writes.rs` use `prepare_context_update_checked`, the fallible
 variant of the existing exact-owner/task/revision CAS. Missing checkpoints,
