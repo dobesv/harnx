@@ -30,12 +30,29 @@ use task_view::{history, validate_history};
 struct Admission {
     snapshot: TaskRecord,
     deduped: bool,
+    response_after: Option<u64>,
+    direct: bool,
+    events: Option<tokio::sync::broadcast::Receiver<crate::runner::A2aEvent>>,
 }
 impl Admission {
+    fn reply_snapshot(snapshot: TaskRecord) -> Self {
+        let direct = crate::runner::ends_response(&snapshot.task.status.state);
+        Self {
+            snapshot,
+            deduped: false,
+            response_after: None,
+            direct,
+            events: None,
+        }
+    }
+
     fn retry(snapshot: TaskRecord) -> Self {
         Self {
             snapshot,
             deduped: true,
+            response_after: None,
+            direct: false,
+            events: None,
         }
     }
 }
@@ -115,6 +132,11 @@ impl HarnxHandler {
         if record.task.status.state.is_terminal() {
             return Ok(record);
         }
+        // Foreground reads must not interrupt deliberately parked HITL work.
+        // Restart/reconciler continuation policy is handled separately.
+        if self.hitl_task(owner, &record).await? {
+            return self.task(owner, &record.task.id).await;
+        }
         let session = self.session(owner, Some(&record.task.context_id)).await?;
         self.backend
             .runner
@@ -129,6 +151,28 @@ impl HarnxHandler {
             .await
             .map_err(map_error)
     }
+    async fn hitl_task(
+        &self,
+        owner: &RequestIdentity,
+        record: &TaskRecord,
+    ) -> Result<bool, A2AError> {
+        let storage = self
+            .backend
+            .store
+            .resolve_context(&self.export, owner, &record.task.context_id)
+            .await
+            .map_err(map_error)?
+            .ok_or_else(not_found)?;
+        Ok(self
+            .backend
+            .store
+            .read_context(&storage)
+            .await
+            .map_err(map_error)?
+            .and_then(|c| c.document.state.active)
+            .is_some_and(|a| a.snapshot.task.id == record.task.id && a.hitl_checkpoint.is_some()))
+    }
+
     /// Compatibility entry point: wait until the task ends this response,
     /// including InputRequired and AuthRequired (neither ends the invocation).
     pub async fn wait_terminal(
@@ -202,10 +246,11 @@ impl RequestHandler for HarnxHandler {
         } else {
             record
         };
-        let mut task = if immediate {
+        let mut task = if immediate || admission.direct {
             record
         } else {
-            self.wait_response(&owner, &record.task.id, None).await?
+            self.wait_response(&owner, &record.task.id, admission.response_after)
+                .await?
         }
         .task;
         history(&mut task, length)?;
@@ -235,6 +280,16 @@ impl RequestHandler for HarnxHandler {
         #[cfg(test)]
         if let Some(gate) = &self.cancel_snapshot_gate {
             gate.after_snapshot(initial.task.status.state.clone()).await;
+        }
+        if !initially_terminal && self.hitl_task(&owner, &initial).await? {
+            let session = self.session(&owner, Some(&initial.task.context_id)).await?;
+            return Ok(self
+                .backend
+                .runner
+                .cancel_hitl_task(&self.export, &owner, &session, &req.id)
+                .await
+                .map_err(map_error)?
+                .task);
         }
         let record = self.reconcile(&owner, initial).await?;
         // The worker can complete mid-reconcile: we read a Working snapshot but the reconcile
@@ -291,6 +346,11 @@ impl RequestHandler for HarnxHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let owner = self.owner(params)?;
         let (admission, length) = self.admit_request(owner.clone(), req).await?;
+        if admission.direct || admission.events.is_some() {
+            let mut snapshot = admission.snapshot;
+            history(&mut snapshot.task, length)?;
+            return Ok(crate::sse::task_stream(snapshot, admission.events));
+        }
         let record = self.reconcile(&owner, admission.snapshot).await?;
         let (mut snapshot, events) = self
             .backend

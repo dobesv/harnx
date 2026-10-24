@@ -530,3 +530,80 @@ async fn stream_closes_after_input_required_and_interrupted_snapshot() -> Result
     assert!(!http.h.task(id).await?.task.status.state.is_terminal());
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_hitl_reply_starts_working_then_next_challenge_and_terminal() -> Result<()> {
+    use crate::{
+        support::{Harness, Script},
+        unary::hitl::{challenge, reply},
+    };
+    let http = Http::from_harness(Harness::start(Script::SerialTool).await?).await?;
+    let task = challenge(&http).await?;
+    for (index, expected) in [
+        (1, "TASK_STATE_INPUT_REQUIRED"),
+        (2, "TASK_STATE_COMPLETED"),
+    ] {
+        let mut frames = Frames::open(
+            &http,
+            "SendStreamingMessage",
+            json!({"message":reply(&format!("stream-no-{index}"), &task, "n no handoff", false)}),
+        )
+        .await?;
+        let first = frames.event().await?.context("resumed snapshot")?;
+        assert_eq!(first["task"]["id"], task["id"]);
+        assert_eq!(
+            first["task"]["status"]["state"], "TASK_STATE_WORKING",
+            "{first}"
+        );
+        let mut states = Vec::new();
+        while let Some(event) = frames.event().await? {
+            if let Some(state) = event["statusUpdate"]["status"]["state"].as_str() {
+                states.push(state.to_owned());
+            }
+        }
+        assert_eq!(states, vec![expected]);
+    }
+    assert_eq!(http.h.llm.requests.lock().len(), 3);
+    let mut unknown = Frames::open(
+        &http,
+        "SendStreamingMessage",
+        json!({"message":reply("stream-no-1", &task, "n no handoff", true)}),
+    )
+    .await?;
+    assert_eq!(
+        unknown.event().await?.unwrap()["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+    assert!(unknown.event().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_hitl_unrecognized_reply_returns_ephemeral_challenge_and_closes() -> Result<()> {
+    use crate::{
+        support::{Harness, Script},
+        unary::hitl::{challenge, reply},
+    };
+    let http = Http::from_harness(Harness::start(Script::Tool).await?).await?;
+    let task = challenge(&http).await?;
+    let mut frames = Frames::open(
+        &http,
+        "SendStreamingMessage",
+        json!({"message":reply("stream-unknown",&task,"what?",true)}),
+    )
+    .await?;
+    let snapshot = frames.event().await?.context("challenge")?;
+    assert_eq!(
+        snapshot["task"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
+    assert!(snapshot["task"]["status"]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("Reply not recognized"));
+    assert!(frames.event().await?.is_none());
+    let stored = http.h.task(task["id"].as_str().unwrap()).await?;
+    assert!(!serde_json::to_string(&stored)?.contains("Reply not recognized"));
+    assert_eq!(http.h.llm.requests.lock().len(), 1);
+    Ok(())
+}

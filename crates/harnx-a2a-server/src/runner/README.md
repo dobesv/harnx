@@ -248,3 +248,44 @@ deployment/load verification remains end-to-end work.
 ```sh
 PROTOC=/usr/bin/protoc HARNX_TEST_SANDBOX=light cargo nextest run -p harnx-a2a-server --features fault-injection -E 'test(multi_replica)' --stress-count=20
 ```
+
+## Reply admission and delivery
+
+`handler/admission/reply.rs` resolves active `InputRequired` / `DecisionIntent`
+tasks before busy rejection, including `contextId`-only Jira replies. Authorization
+and task/context binding still run first. Durable reply mappings (or an inline
+receipt whose mapping isn't written yet) precede grammar and terminal checks.
+Unrecognized text or any non-text part returns an ephemeral challenge snapshot;
+it doesn't claim ownership, append history, admit a prompt, or stage an event.
+
+`Runner::reply_hitl(TurnRequest, ApprovalRef)` is crate-private. The handler captures
+the exact checkpoint reference and Q1 `stream_seq` before attempting ownership.
+The runner claims the scoped lease/context and retries pure intent CAS writes
+against that same reference. A changed generation or another accepted message
+returns conflict, never a decision against the new request.
+
+Intent and the full user message enter task history in one CAS. Only the inline
+receipt note is truncated to 4096 bytes. Delivery parses the saved history message
+to recover the full plain-text note, writes reply dedupe before runtime effects,
+and calls `decide_hitl_approval_for` with the saved reference. History is task
+history only, not a new session prompt. Approval notes remain audit-only; rejection
+notes become the blocked-tool reason under the runtime's existing semantics.
+
+After every decision outcome, query `fixed_prompt_progress` on the original ticket.
+The invocation may already be terminal or awaiting Q2. Applied decisions stage and
+publish Working/Following, then pass the same `OwnedTask` into
+`resume_owned_hitl`. Stale/conflicting outcomes with advanced runtime progress
+attach that same follower to project progress without answering Q2. An unchanged
+pending request stays parked for retry rather than inventing decision success.
+
+Unary replies wait after the original Q1 `stream_seq`, not the later Working
+cursor. Streaming starts with the resumed Working snapshot and its segment event
+receiver, so even an already-durable next boundary follows Working. Duplicate
+replies can finish an unresolved intent, or return the associated current/archive
+task after retirement, without appending history twice.
+
+`Runner::cancel_hitl_task` handles foreground cancellation of parked work: persist
+cancel intent, claim the released scoped lease, repair any accepted reply mapping,
+and use existing fixed-ticket interruption/terminal settlement. Foreground task
+reads don't treat HITL checkpoints as ordinary orphan evidence. Background restart
+and cross-frontend continuation recovery remain separate recovery work.

@@ -1,5 +1,6 @@
 //! Ordered checks; local gates reduce contention, shared state decides admission.
 mod first_message;
+mod reply;
 use super::{
     errors::{map_error, not_found, permission_denied},
     task_view::validate_history,
@@ -74,6 +75,9 @@ impl HarnxHandler {
         let _guard = gate.lock().await;
         let target = self.authorize_target(&owner, &request).await?;
         request.fingerprint = message_fingerprint(&request.message.parts);
+        if let Some(reply) = self.admit_reply(&owner, &request).await? {
+            return Ok(reply);
+        }
         if let Some(record) = self.dedupe(&owner, &request).await? {
             return Ok(Admission::retry(self.reconcile(&owner, record).await?));
         }
@@ -351,6 +355,9 @@ impl HarnxHandler {
         Ok(Admission {
             snapshot: started.snapshot,
             deduped: started.deduped,
+            response_after: None,
+            direct: false,
+            events: None,
         })
     }
 

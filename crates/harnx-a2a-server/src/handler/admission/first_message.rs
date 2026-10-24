@@ -77,6 +77,9 @@ impl HarnxHandler {
         Ok(Admission {
             snapshot: started.snapshot,
             deduped: false,
+            response_after: None,
+            direct: false,
+            events: None,
         })
     }
     pub(super) async fn follow_first_reservation(

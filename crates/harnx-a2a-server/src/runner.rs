@@ -50,6 +50,7 @@ mod persistence;
 mod reconciler;
 mod recovery;
 mod remote;
+mod reply;
 mod resume;
 mod supervision;
 mod suspension;

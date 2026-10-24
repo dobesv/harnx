@@ -429,3 +429,388 @@ async fn runner_hitl_resume_publishes_next_approval_already_pending_before_attac
     assert_eq!(h.llm.requests.lock().len(), 2);
     Ok(())
 }
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_hitl_bound_reply_never_retargets_a_newer_checkpoint() -> Result<()> {
+    use crate::unary::{hitl::reply, Http};
+    use harnx_a2a_server::fault_injection::Boundary;
+    use serde_json::json;
+    let h = Harness::start(Script::SerialTool).await?;
+    let session = h.session(None, &alice()).await?;
+    let (started, context) = challenge(&h, &session).await?;
+    let http = Http::from_harness(h).await?;
+    let task = serde_json::to_value(&started.snapshot.task)?;
+    let hooks = http.h.runner.fault_hooks();
+    let mut bound = hooks.pause(Boundary::HitlReplyBound, 1);
+    let send = http.rpc(
+        "SendMessage",
+        json!({"message":reply("late-y", &task, "y", true)}),
+    );
+    tokio::pin!(send);
+    tokio::select! {
+        response = &mut send => anyhow::bail!("reply returned before binding: {response:?}"),
+        reached = tokio::time::timeout(DEADLINE, bound.reached()) => { reached?; }
+    }
+    let request = &context
+        .document
+        .state
+        .active
+        .as_ref()
+        .unwrap()
+        .hitl_checkpoint
+        .as_ref()
+        .unwrap()
+        .request;
+    session
+        .decide_hitl_approval_for(request, false, None)
+        .await?;
+    following(&http.h, &session, &context).await?;
+    let mut resumed = http
+        .h
+        .runner
+        .resume_hitl_turn(&http.h.export, &alice().into(), session.clone())
+        .await?;
+    while !event(&mut resumed.events).await?.ends_response() {}
+    let newer = parked(&http.h, &session).await?;
+    assert!(
+        newer
+            .document
+            .state
+            .active
+            .as_ref()
+            .unwrap()
+            .hitl_checkpoint
+            .as_ref()
+            .unwrap()
+            .request
+            .request_seq
+            > request.request_seq
+    );
+    drop(bound);
+    let response = send.await?;
+    crate::unary::code(&response, -32602);
+    let entries =
+        NatsSessionLog::new_with_replicas(http.h.jetstream.clone(), session.storage_key(), 1)
+            .load_events_latest_required_async()
+            .await?;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. }))
+            .count(),
+        1
+    );
+    let latest = http.h.task(&started.snapshot.task.id).await?;
+    assert_eq!(latest.task.status.state, TaskState::InputRequired);
+    assert!(!latest
+        .task
+        .history
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|m| m.message_id == "late-y"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_hitl_duplicate_finishes_saved_intent_without_new_admission() -> Result<()> {
+    use crate::unary::{hitl::reply, Http};
+    use harnx_a2a_server::store::{context::ReplyReceipt, message_fingerprint};
+    use serde_json::json;
+    let h = Harness::start(Script::Tool).await?;
+    let session = h.session(None, &alice()).await?;
+    let (started, context) = challenge(&h, &session).await?;
+    let task = serde_json::to_value(&started.snapshot.task)?;
+    let answer = reply("saved-no", &task, "n saved full reason", false);
+    let message: a2a_lf::Message = serde_json::from_value(answer.clone())?;
+    let request = context
+        .document
+        .state
+        .active
+        .as_ref()
+        .unwrap()
+        .hitl_checkpoint
+        .as_ref()
+        .unwrap()
+        .request
+        .clone();
+    let lease = NatsSessionLease::acquire_scoped(
+        NatsLeaseAcquireParams {
+            jetstream: h.jetstream.clone(),
+            session_id: session.storage_key(),
+            worker_id: "seed-intent".into(),
+            generation: 1,
+            config: NatsLeaseConfig {
+                replicas: 1,
+                ..Default::default()
+            },
+            session_metadata: None,
+        },
+        "a2a",
+    )
+    .await?
+    .context("lease")?;
+    let write = h
+        .store
+        .prepare_context_claim(
+            ContextIdentity {
+                storage_key: session.storage_key(),
+                local_id: session.session_id(),
+            },
+            &lease,
+            "seed-claim",
+        )
+        .await?;
+    let owned = h.store.commit_context(&write).await?;
+    let write = h
+        .store
+        .prepare_context_update_checked(
+            session.storage_key(),
+            &owned.version()?,
+            "seed-reply",
+            |state| {
+                let active = state.active.as_mut().unwrap();
+                let checkpoint = active.hitl_checkpoint.as_mut().unwrap();
+                checkpoint.phase = HitlPhase::DecisionIntent;
+                checkpoint.reply = Some(ReplyReceipt::new(
+                    message.message_id.clone(),
+                    message_fingerprint(&message.parts),
+                    request.clone(),
+                    false,
+                    Some("saved full reason".into()),
+                ));
+                active.snapshot.task.history.as_mut().unwrap().push(message);
+                Ok(())
+            },
+        )
+        .await?;
+    let owned = h.store.commit_context(&write).await?;
+    let write = h
+        .store
+        .prepare_context_release(session.storage_key(), &owned.version()?, "seed-release")
+        .await?;
+    h.store.commit_context(&write).await?;
+    lease.release().await?;
+    assert!(h
+        .store
+        .get_reply_dedupe(session.storage_key(), "saved-no")
+        .await?
+        .is_none());
+    let http = Http::from_harness(h).await?;
+    let response = http.rpc("SendMessage", json!({"message":answer})).await?;
+    assert_eq!(
+        response["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{response}"
+    );
+    assert_eq!(response["result"]["task"]["id"], task["id"]);
+    assert!(http
+        .h
+        .store
+        .get_reply_dedupe(session.storage_key(), "saved-no")
+        .await?
+        .is_some());
+    assert_eq!(
+        http.h
+            .task(&started.snapshot.task.id)
+            .await?
+            .task
+            .history
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|m| m.message_id == "saved-no")
+            .count(),
+        1
+    );
+    let entries =
+        NatsSessionLog::new_with_replicas(http.h.jetstream.clone(), session.storage_key(), 1)
+            .load_events_latest_required_async()
+            .await?;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(entries.iter().filter(|(_, entry)| matches!(entry, SessionLogEntry::Message { role, content, .. } if role.is_user() && !harnx_core::timing_identity::is_timing_notice(&content.to_text()))).count(), 1);
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+async fn reply_after_external_decision(script: Script, terminal: bool) -> Result<()> {
+    use crate::unary::{hitl::reply, Http};
+    use harnx_a2a_server::fault_injection::Boundary;
+    use serde_json::json;
+    let h = Harness::start(script).await?;
+    let session = h.session(None, &alice()).await?;
+    let (started, context) = challenge(&h, &session).await?;
+    let fixed = ticket(&context, session.storage_key())?;
+    let request = context
+        .document
+        .state
+        .active
+        .as_ref()
+        .unwrap()
+        .hitl_checkpoint
+        .as_ref()
+        .unwrap()
+        .request
+        .clone();
+    let http = Http::from_harness(h).await?;
+    let task = serde_json::to_value(&started.snapshot.task)?;
+    let mut committed = http
+        .h
+        .runner
+        .fault_hooks()
+        .pause(Boundary::HitlReplyIntentCommitted, 1);
+    let send = http.rpc(
+        "SendMessage",
+        json!({"message":reply("external-race",&task,"y",false)}),
+    );
+    tokio::pin!(send);
+    tokio::select! {
+        response = &mut send => anyhow::bail!("reply returned before intent: {response:?}"),
+        reached = tokio::time::timeout(DEADLINE, committed.reached()) => { reached?; }
+    }
+    assert!(http
+        .h
+        .store
+        .get_reply_dedupe(session.storage_key(), "external-race")
+        .await?
+        .is_none());
+    session
+        .decide_hitl_approval_for(&request, false, Some("external decision".into()))
+        .await?;
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            match session.fixed_prompt_progress(&fixed).await? {
+                PromptProgress::Terminal(_) if terminal => return Ok::<_, anyhow::Error>(()),
+                PromptProgress::InputRequired(p)
+                    if !terminal && p.request_seq > request.request_seq =>
+                {
+                    return Ok(())
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await??;
+    drop(committed);
+    let response = send.await?;
+    assert_eq!(response["result"]["task"]["id"], task["id"], "{response}");
+    assert_eq!(
+        response["result"]["task"]["status"]["state"],
+        if terminal {
+            "TASK_STATE_COMPLETED"
+        } else {
+            "TASK_STATE_INPUT_REQUIRED"
+        },
+        "{response}"
+    );
+    let entries =
+        NatsSessionLog::new_with_replicas(http.h.jetstream.clone(), session.storage_key(), 1)
+            .load_events_latest_required_async()
+            .await?;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. }))
+            .count(),
+        1
+    );
+    assert!(http
+        .h
+        .store
+        .get_reply_dedupe(session.storage_key(), "external-race")
+        .await?
+        .is_some());
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_hitl_reply_requeries_already_terminal_progress() -> Result<()> {
+    reply_after_external_decision(Script::Tool, true).await
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_hitl_reply_requeries_already_pending_next_challenge() -> Result<()> {
+    reply_after_external_decision(Script::SerialTool, false).await
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_hitl_duplicate_inflight_on_other_backend_returns_next_boundary_once() -> Result<()>
+{
+    use crate::unary::{hitl::reply, spawn_strict_limits_server, Http, HttpRpcCall};
+    use harnx_a2a_server::fault_injection::Boundary;
+    use serde_json::json;
+    let h = Harness::start(Script::SerialTool).await?;
+    let session = h.session(None, &alice()).await?;
+    let (started, _) = challenge(&h, &session).await?;
+    let http = Http::from_harness(h).await?;
+    // Separate Backend means no shared request gate. Its stricter data-part
+    // limit cannot alter an already accepted plain-text control message.
+    let (url, _server) = spawn_strict_limits_server(&http).await?;
+    let task = serde_json::to_value(&started.snapshot.task)?;
+    let answer = reply("same-inflight", &task, "n", false);
+    let mut bound = http
+        .h
+        .runner
+        .fault_hooks()
+        .pause(Boundary::HitlReplyBound, 1);
+    let send = http.rpc("SendMessage", json!({"message":answer}));
+    tokio::pin!(send);
+    tokio::select! {
+        response = &mut send => anyhow::bail!("reply returned before binding: {response:?}"),
+        reached = tokio::time::timeout(DEADLINE, bound.reached()) => { reached?; }
+    }
+    let winner = http
+        .rpc_call(HttpRpcCall::new(
+            &url,
+            "alice",
+            "SendMessage",
+            json!({"message":answer}),
+        ))
+        .await?;
+    assert_eq!(
+        winner["result"]["task"]["status"]["state"], "TASK_STATE_INPUT_REQUIRED",
+        "{winner}"
+    );
+    drop(bound);
+    let duplicate = send.await?;
+    assert_eq!(duplicate["result"]["task"]["id"], task["id"], "{duplicate}");
+    assert_eq!(
+        duplicate["result"]["task"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
+    let entries =
+        NatsSessionLog::new_with_replicas(http.h.jetstream.clone(), session.storage_key(), 1)
+            .load_events_latest_required_async()
+            .await?;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        http.h
+            .task(&started.snapshot.task.id)
+            .await?
+            .task
+            .history
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|m| m.message_id == "same-inflight")
+            .count(),
+        1
+    );
+    assert_eq!(http.h.llm.requests.lock().len(), 2);
+    Ok(())
+}

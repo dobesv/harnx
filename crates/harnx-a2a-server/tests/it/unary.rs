@@ -550,7 +550,7 @@ async fn unary_dedupe_busy_terminal_and_fingerprint_mismatch() -> Result<()> {
     Ok(())
 }
 
-async fn spawn_strict_limits_server(
+pub(super) async fn spawn_strict_limits_server(
     http: &Http,
 ) -> Result<(String, tokio_util::task::AbortOnDropHandle<()>)> {
     let backend = Arc::new(Backend::new(
@@ -1128,3 +1128,5 @@ async fn response_boundary_after_skips_stale_input_required_and_observes_next() 
     assert_eq!(h.llm.requests.lock().len(), 1);
     Ok(())
 }
+
+pub(crate) mod hitl;

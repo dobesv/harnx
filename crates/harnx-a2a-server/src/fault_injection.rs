@@ -28,6 +28,8 @@ pub enum Boundary {
     ReaderCreated,
     TerminalOutboxCommitted,
     HitlOutboxCommitted,
+    HitlReplyBound,
+    HitlReplyIntentCommitted,
 }
 impl Boundary {
     fn index(self) -> usize {
@@ -52,7 +54,7 @@ impl Default for Point {
 
 #[derive(Default)]
 pub struct FaultHooks {
-    points: [Point; 20],
+    points: [Point; Boundary::HitlReplyIntentCommitted as usize + 1],
     context_ack_loss: AtomicBool,
     first_ack_loss: AtomicBool,
     terminal_ack_loss: AtomicBool,
