@@ -13,6 +13,7 @@ pub mod exports;
 #[cfg(feature = "fault-injection")]
 pub mod fault_injection;
 pub mod handler;
+mod hitl;
 pub mod identity;
 pub mod input_map;
 pub mod runner;
