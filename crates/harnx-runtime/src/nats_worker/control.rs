@@ -34,6 +34,9 @@ pub enum ControlCommand {
         tool_call_id: String,
         approved: bool,
         note: Option<String>,
+        /// Expected approval generation. None retains tool-ID-only legacy routing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_seq: Option<u64>,
     },
     /// Latency hint that a `CompactRequest` entry was appended to this session's log.
     /// The log is authoritative; the worker detects and runs compaction at a safe boundary.
@@ -105,8 +108,9 @@ impl SessionControlHandler {
                 tool_call_id,
                 approved,
                 note,
+                request_seq,
             } => {
-                self.apply_hitl_decision(tool_call_id, approved, note, reply)
+                self.apply_hitl_decision(tool_call_id, approved, note, request_seq, reply)
                     .await
             }
             ControlCommand::Compact { .. } => {
@@ -149,6 +153,7 @@ impl SessionControlHandler {
         tool_call_id: String,
         approved: bool,
         note: Option<String>,
+        request_seq: Option<u64>,
         reply: Option<async_nats::Subject>,
     ) {
         if !should_append_control_log_entry(&self.lease) {
@@ -168,10 +173,19 @@ impl SessionControlHandler {
                 return;
             }
         };
-        if !pending
-            .iter()
-            .any(|approval| approval.tool_call_id == tool_call_id)
-        {
+        if !pending.iter().any(|approval| {
+            approval.tool_call_id == tool_call_id
+                && request_seq.is_none_or(|expected| expected == approval.request_seq)
+                && !entries.iter().any(|(seq, entry)| {
+                    *seq > approval.tool_round_seq
+                        && matches!(
+                            entry,
+                            harnx_core::session::SessionLogEntry::TurnEnd { .. }
+                                | harnx_core::session::SessionLogEntry::Cancel { .. }
+                                | harnx_core::session::SessionLogEntry::Error { .. }
+                        )
+                })
+        }) {
             return;
         }
         if !self.lease.is_held() {
@@ -349,3 +363,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "control_hitl_tests.rs"]
+mod hitl_tests;

@@ -86,6 +86,48 @@ receipts respect effective transcript mutations and are joined within their own
 round, so a reused provider tool call ID doesn't inherit an older decision.
 Tool name and arguments come from persisted `ToolCalls`, not unpersisted hook edits.
 
+## Decide an exact approval
+
+Call `NatsSession::decide_hitl_approval_for(&reference, approved, note)` with the
+saved `ApprovalRef`, not a fresh reference selected during retry. It returns public
+`HitlDecisionOutcome` (exported alongside the progress types):
+
+- `Applied`: the request was pending when inspected, an activation was published
+  for its original invocation, and a matching durable decision was then observed.
+  This includes recovery after a lost acknowledgement and a concurrent same-answer
+  decision. It proves the answer, not which caller wrote it.
+- `AlreadyApplied { approved, note }`: the same answer was already durable, the
+  request hasn't been superseded, and the invocation is non-terminal. Activation
+  is published again before returning. The original note is returned; retry notes
+  don't replace it. Idempotency compares the boolean answer, not the note.
+- `Conflicting`: this exact request has the opposite durable answer. A conflict
+  found at entry doesn't activate work. A conflict found after a delivery race
+  can follow an activation already published for that original invocation.
+- `Stale`: invocation identity doesn't match, the request was removed or replaced,
+  a different approval is current, or the invocation is already terminal. A stale
+  reference found at entry neither activates nor sends a decision. If replacement
+  happens during delivery, the earlier activation is still pinned to the original
+  prompt; no retry retargets the replacement request.
+
+Terminal proof and a newer pending request win over historical decisions at API
+entry. After an attempt starts, a matching commit for that exact request can still
+return `Applied` even if the worker has since finished or reached the next gate.
+Recovery should query `fixed_prompt_progress` after every outcome before projecting
+current state. Broker, log, activation, and unresolved delivery failures return an
+error rather than inventing an outcome. Activation publishes existing work; it
+neither appends a prompt nor guarantees a worker has already resumed.
+
+The tool-ID-only `decide_hitl_approval` API remains for web callers. It selects the
+current generation once and uses the fenced path, but keeps its historical boolean
+idempotency after completion. Its already-decided live path now reactivates work.
+
+Workers check optional `ControlCommand::HitlApprovalDecision.request_seq` against
+the current request and use the same snapshot's stream tail for the lease-fenced
+CAS append. A replaced generation or intervening write can't inherit the decision.
+Missing `request_seq` retains legacy tool-ID routing; old receivers ignore the new
+field. Wire compatibility does **not** add fencing to old workers. Upgrade workers
+before enabling exact-reference decisions in coordinated frontends.
+
 ## Deployment and tests
 
 `AdmissionClosed` is a new durable transcript entry. Older readers reject it.

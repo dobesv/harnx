@@ -122,6 +122,9 @@ pub(crate) fn derive_pending_hitl_approvals(
                         SessionLogEntry::HitlApprovalDecision {
                             tool_call_id: decided_id,
                             ..
+                        } | SessionLogEntry::HitlApprovalRequested {
+                            tool_call_id: decided_id,
+                            ..
                         } if decided_id == tool_call_id
                     )
             }) =>

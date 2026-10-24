@@ -48,6 +48,24 @@ pub struct HitlDecisionReceipt {
     pub note: Option<String>,
 }
 
+/// Result of deciding an exact approval generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HitlDecisionOutcome {
+    /// Request was pending at entry; a matching durable answer was observed after delivery.
+    Applied,
+    /// Same boolean answer was already durable. Note is the original audit note,
+    /// not the retry's note. The non-terminal invocation was reactivated.
+    AlreadyApplied {
+        approved: bool,
+        note: Option<String>,
+    },
+    /// This exact request has the opposite durable boolean answer.
+    Conflicting,
+    /// Request identity, invocation, or current generation no longer matches,
+    /// or the invocation was already terminal when the call inspected it.
+    Stale,
+}
+
 /// Durable progress of an admitted fixed invocation. An approval is a suspension,
 /// not a terminal result; observing progress doesn't activate the worker.
 #[derive(Clone, Debug)]
@@ -66,6 +84,22 @@ impl NatsSession {
         session_id: &str,
         entries: &[(u64, SessionLogEntry)],
     ) -> Result<PromptProgress> {
+        Self::invocation_progress_from_entries(
+            ticket.invocation_id(),
+            ticket.prompt_id(),
+            prompt_sequence,
+            session_id,
+            entries,
+        )
+    }
+
+    pub(super) fn invocation_progress_from_entries(
+        invocation_id: &str,
+        prompt_id: &str,
+        prompt_sequence: u64,
+        session_id: &str,
+        entries: &[(u64, SessionLogEntry)],
+    ) -> Result<PromptProgress> {
         // Fixed admission excludes a new invocation until this one has a raw
         // terminator. Check that proof before looking at any later approval.
         if let Some(terminal) = super::invocation_terminal_seq(entries, prompt_sequence) {
@@ -74,7 +108,7 @@ impl NatsSession {
                 response,
                 error,
                 session_id: session_id.into(),
-                user_msg_id: ticket.prompt_id().into(),
+                user_msg_id: prompt_id.into(),
                 user_msg_seq: prompt_sequence,
                 was_cancelled: entries.iter().any(|(seq, entry)| {
                     *seq == terminal && matches!(entry, SessionLogEntry::Cancel { .. })
@@ -121,7 +155,7 @@ impl NatsSession {
                     if let Some((tool_round_seq, request_seq)) = requests.remove(tool_call_id) {
                         last_decision = Some(HitlDecisionReceipt {
                             request: ApprovalRef {
-                                invocation_id: ticket.invocation_id().into(),
+                                invocation_id: invocation_id.into(),
                                 tool_round_seq,
                                 request_seq,
                                 tool_call_id: tool_call_id.clone(),
@@ -164,7 +198,24 @@ impl ApprovalRequest<'_> {
         Ok(Some(self.decision(&effective) == Some(approved)))
     }
 
+    pub(super) fn decision_with_note(
+        &self,
+        entries: &[(u64, SessionLogEntry)],
+    ) -> Result<Option<(bool, Option<String>)>> {
+        let effective = apply_log_mutations_nats(entries)?;
+        Ok(self
+            .decision_entry(&effective)
+            .map(|(approved, note)| (approved, note.clone())))
+    }
+
     fn decision(&self, effective: &[(u64, SessionLogEntry)]) -> Option<bool> {
+        self.decision_entry(effective).map(|(approved, _)| approved)
+    }
+
+    fn decision_entry<'a>(
+        &self,
+        effective: &'a [(u64, SessionLogEntry)],
+    ) -> Option<(bool, &'a Option<String>)> {
         let round = effective.iter().position(|(seq, entry)| {
             *seq == self.tool_round_seq && round_contains(entry, self.tool_call_id)
         })?;
@@ -197,7 +248,10 @@ pub(super) fn already_decided(
     else {
         return Ok(false);
     };
-    Ok(decision_after_request(&entries[request + 1..], tool_call_id) == Some(approved))
+    Ok(
+        decision_after_request(&entries[request + 1..], tool_call_id)
+            .is_some_and(|(decided, _)| decided == approved),
+    )
 }
 
 fn round_contains(entry: &SessionLogEntry, tool_call_id: &str) -> bool {
@@ -227,7 +281,10 @@ fn round_entries(entries: &[(u64, SessionLogEntry)], round: usize) -> &[(u64, Se
     &entries[..end]
 }
 
-fn decision_after_request(entries: &[(u64, SessionLogEntry)], tool_call_id: &str) -> Option<bool> {
+fn decision_after_request<'a>(
+    entries: &'a [(u64, SessionLogEntry)],
+    tool_call_id: &str,
+) -> Option<(bool, &'a Option<String>)> {
     entries
         .iter()
         .take_while(|(_, entry)| !is_request(entry, tool_call_id))
@@ -235,10 +292,44 @@ fn decision_after_request(entries: &[(u64, SessionLogEntry)], tool_call_id: &str
             SessionLogEntry::HitlApprovalDecision {
                 tool_call_id: id,
                 approved,
+                note,
                 ..
-            } if id == tool_call_id => Some(*approved),
+            } if id == tool_call_id => Some((*approved, note)),
             _ => None,
         })
+}
+
+impl<'a> From<&'a ApprovalRef> for ApprovalRequest<'a> {
+    fn from(reference: &'a ApprovalRef) -> Self {
+        Self {
+            tool_call_id: &reference.tool_call_id,
+            tool_round_seq: reference.tool_round_seq,
+            request_seq: reference.request_seq,
+        }
+    }
+}
+
+pub(super) fn latest_request<'a>(
+    entries: &[(u64, SessionLogEntry)],
+    tool_call_id: &'a str,
+) -> Result<Option<ApprovalRequest<'a>>> {
+    let effective = apply_log_mutations_nats(entries)?;
+    let Some(round) = effective
+        .iter()
+        .rposition(|(_, entry)| round_contains(entry, tool_call_id))
+    else {
+        return Ok(None);
+    };
+    Ok(round_entries(&effective, round)
+        .iter()
+        .rev()
+        .find_map(|(seq, entry)| {
+            is_request(entry, tool_call_id).then_some(ApprovalRequest {
+                tool_call_id,
+                tool_round_seq: effective[round].0,
+                request_seq: *seq,
+            })
+        }))
 }
 
 #[cfg(test)]

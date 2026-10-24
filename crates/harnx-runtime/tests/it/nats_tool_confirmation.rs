@@ -1425,3 +1425,65 @@ async fn seed_pending_hitl_round(harness: &ConfirmationHarness) -> Result<()> {
     lease.release().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_prompt_hitl_decision_for_applies_exact_request() -> Result<()> {
+    use harnx_runtime::{HitlDecisionOutcome, PromptProgress};
+    let harness = ConfirmationHarness::start()
+        .await?
+        .context("nats-server required")?;
+    let session = harness.source.clone().with_external_admission();
+    let ticket = session
+        .prepare_fixed_admission(
+            "exact-hitl".into(),
+            "exact-hitl-prompt".into(),
+            "exact-hitl-closed".into(),
+        )
+        .await?;
+    session
+        .append_fixed_prompt(&ticket, MessageContent::Text("start handoff".into()))
+        .await?;
+    session
+        .follow_admitted_prompt(
+            session
+                .fixed_prompt_handle(&ticket)
+                .await?
+                .context("fixed handle")?,
+            Arc::new(NullSink),
+            None,
+            None,
+            Default::default(),
+        )
+        .await?;
+    let PromptProgress::InputRequired(pending) = session.fixed_prompt_progress(&ticket).await?
+    else {
+        anyhow::bail!("expected fixed invocation pending approval");
+    };
+    let reference = pending.approval_ref(ticket.invocation_id());
+    assert_eq!(
+        session
+            .decide_hitl_approval_for(&reference, false, Some("exact rejection reason".into()))
+            .await?,
+        HitlDecisionOutcome::Applied
+    );
+    let entries = wait_for_source_entry(&harness.jetstream, |entry| {
+        matches!(entry, SessionLogEntry::TurnEnd { .. })
+    })
+    .await?;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(_, entry)| matches!(entry, SessionLogEntry::HitlApprovalDecision { .. }))
+            .count(),
+        1
+    );
+    assert!(entries.iter().any(|(_, entry)| matches!(entry, SessionLogEntry::HitlApprovalDecision { tool_call_id, approved: false, note: Some(note), .. } if tool_call_id == &reference.tool_call_id && note == "exact rejection reason")));
+    assert_eq!(
+        session
+            .decide_hitl_approval_for(&reference, false, None)
+            .await?,
+        HitlDecisionOutcome::Stale,
+        "terminal invocation cannot be reactivated by an exact retry"
+    );
+    Ok(())
+}

@@ -51,8 +51,7 @@ use crate::nats_session_log::NatsSessionLog;
 use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
 use crate::nats_worker::{
     publish_control_command, publish_session_activate, publish_targeted_session_activate,
-    request_control_command, ControlCommand, LocalWorkerTarget, SessionActivate,
-    SessionActivationRoute,
+    ControlCommand, LocalWorkerTarget, SessionActivate, SessionActivationRoute,
 };
 use crate::utils::AbortSignal;
 mod compaction_request;
@@ -60,7 +59,10 @@ mod compaction_request;
 mod compaction_request_tests;
 mod completion;
 mod hitl;
-pub use hitl::{ApprovalRef, HitlDecisionReceipt, PendingHitlApproval, PromptProgress};
+mod hitl_decision;
+pub use hitl::{
+    ApprovalRef, HitlDecisionOutcome, HitlDecisionReceipt, PendingHitlApproval, PromptProgress,
+};
 pub mod interrupt;
 mod prompt_append;
 pub use compaction_request::{request_compaction_session, CompactSubmit, CompactionRequest};
@@ -1138,70 +1140,6 @@ impl NatsSession {
         self.publish_activation(user_msg_seq, confirmation_subject, None)
             .await?;
         Ok(Some(user_msg_seq))
-    }
-
-    /// Route a tool-approval decision to the lease holder and wait until its
-    /// fenced durable decision entry has been applied. Matching decisions are
-    /// idempotent, including when the worker's acknowledgement was lost.
-    pub async fn decide_hitl_approval(
-        &self,
-        tool_call_id: &str,
-        approved: bool,
-        note: Option<String>,
-    ) -> Result<bool> {
-        let entries = self.load_durable_entries().await?;
-        let pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?;
-        let Some(pending) = pending
-            .iter()
-            .find(|item| item.tool_call_id == tool_call_id)
-        else {
-            return hitl::already_decided(&entries, tool_call_id, approved);
-        };
-        let request = hitl::ApprovalRequest {
-            tool_call_id,
-            tool_round_seq: pending.tool_round_seq,
-            request_seq: pending.request_seq,
-        };
-        let Some(_) = self.activate_pending_turn().await? else {
-            let entries = self.load_durable_entries().await?;
-            if let Some(outcome) = request.outcome(&entries, approved)? {
-                return Ok(outcome);
-            }
-            anyhow::bail!(
-                "pending HITL approval '{}' has no activatable durable turn",
-                tool_call_id
-            );
-        };
-        let command = ControlCommand::HitlApprovalDecision {
-            tool_call_id: tool_call_id.to_string(),
-            approved,
-            note,
-        };
-        let deadline = tokio::time::Instant::now() + CONTROL_RECOVERY_TIMEOUT;
-        loop {
-            if request_control_command(
-                &self.client,
-                &self.storage_key,
-                &command,
-                CONTROL_ACK_ATTEMPT_TIMEOUT,
-            )
-            .await
-            .is_ok()
-            {
-                return Ok(true);
-            }
-            let entries = self.load_durable_entries().await?;
-            if let Some(outcome) = request.outcome(&entries, approved)? {
-                return Ok(outcome);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "timed out waiting for worker to apply HITL approval '{}'",
-                    tool_call_id
-                );
-            }
-            tokio::time::sleep(CONTROL_ACK_RETRY_DELAY).await;
-        }
     }
 
     /// Run a turn: append user message, activate worker, stream events until completion.
