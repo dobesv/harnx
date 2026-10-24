@@ -129,16 +129,33 @@ impl HarnxHandler {
             .await
             .map_err(map_error)
     }
-    /// Wait for an admitted task without owning its turn. The point read checks
-    /// context ownership even when called directly by an in-process client.
+    /// Compatibility entry point: wait until the task ends this response,
+    /// including InputRequired and AuthRequired (neither ends the invocation).
     pub async fn wait_terminal(
         &self,
         owner: &RequestIdentity,
         task_id: &str,
     ) -> Result<TaskRecord, A2AError> {
+        self.wait_response(owner, task_id, None).await
+    }
+
+    /// Wait without owning the turn. Authorization precedes every result.
+    ///
+    /// For an accepted reply, pass the challenged snapshot's `stream_seq` as
+    /// `after`. Interrupted snapshots must have a strictly newer cursor; true
+    /// terminal states always win, even below that cursor. Capture it before
+    /// recording/delivering the decision, not after publishing Working.
+    /// This cursor is task-local, not a KV revision or a runtime request sequence.
+    /// Marked waits require a coordinated task with a durable event cursor.
+    pub async fn wait_response(
+        &self,
+        owner: &RequestIdentity,
+        task_id: &str,
+        after: Option<u64>,
+    ) -> Result<TaskRecord, A2AError> {
         let record = self.task(owner, task_id).await?;
         // Dropping a waiter never owns or cancels the detached turn.
-        if record.task.status.state.is_terminal() {
+        if wait::reached_boundary(&record, after) {
             return Ok(record);
         }
         let storage = harnx_core::session_identity::session_key(
@@ -153,9 +170,9 @@ impl HarnxHandler {
             .map_err(map_error)?
             .is_some()
         {
-            return self.wait_shared_terminal(owner, task_id).await;
+            return self.wait_shared_boundary(owner, task_id, after).await;
         }
-        self.wait_legacy_terminal(owner, record).await
+        self.wait_legacy_boundary(owner, record, after).await
     }
 }
 
@@ -188,7 +205,7 @@ impl RequestHandler for HarnxHandler {
         let mut task = if immediate {
             record
         } else {
-            self.wait_terminal(&owner, &record.task.id).await?
+            self.wait_response(&owner, &record.task.id, None).await?
         }
         .task;
         history(&mut task, length)?;

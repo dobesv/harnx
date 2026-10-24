@@ -15,9 +15,18 @@ pub struct A2aEvent {
     pub response: StreamResponse,
 }
 
+/// Interrupted tasks end a response without ending the task's invocation.
+pub fn ends_response(state: &TaskState) -> bool {
+    state.is_terminal() || matches!(state, TaskState::InputRequired | TaskState::AuthRequired)
+}
+
 impl A2aEvent {
     pub fn is_terminal(&self) -> bool {
         matches!(&self.response, StreamResponse::StatusUpdate(event) if event.status.state.is_terminal())
+    }
+
+    pub fn ends_response(&self) -> bool {
+        matches!(&self.response, StreamResponse::StatusUpdate(event) if ends_response(&event.status.state))
     }
 }
 

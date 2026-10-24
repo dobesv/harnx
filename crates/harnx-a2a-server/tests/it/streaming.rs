@@ -495,3 +495,38 @@ async fn compat_message_stream_resubscribe_and_cancel_aliases() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_closes_after_input_required_and_interrupted_snapshot() -> Result<()> {
+    let http = Http::start().await?;
+    let mut frames = Frames::open(
+        &http,
+        "SendStreamingMessage",
+        json!({"message":message("input-required-stream", None)}),
+    )
+    .await?;
+    let first = frames.event().await?.context("snapshot")?;
+    let id = first["task"]["id"].as_str().context("task id")?;
+    crate::unary::inject_response_state(&http.h, id, a2a_lf::TaskState::InputRequired).await?;
+    let mut interrupted = false;
+    while let Some(event) = frames.event().await? {
+        assert!(!interrupted, "stream emitted an event after interruption");
+        if event["statusUpdate"].is_object() {
+            assert_eq!(
+                event["statusUpdate"]["status"]["state"],
+                "TASK_STATE_INPUT_REQUIRED"
+            );
+            interrupted = true;
+        }
+    }
+    assert!(interrupted);
+    let mut subscribed = Frames::open(&http, "SubscribeToTask", json!({"id": id})).await?;
+    let snapshot = subscribed.event().await?.context("interrupted snapshot")?;
+    assert_eq!(
+        snapshot["task"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
+    assert!(subscribed.event().await?.is_none());
+    assert!(!http.h.task(id).await?.task.status.state.is_terminal());
+    Ok(())
+}

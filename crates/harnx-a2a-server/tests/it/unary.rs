@@ -893,3 +893,238 @@ async fn unary_shutdown_settles_detached_turn() -> Result<()> {
     assert_eq!(rejected["error"]["message"], "request failed");
     Ok(())
 }
+
+// Until the publisher produces interruptions, exercise response boundaries with
+// the same authority/outbox envelope that a publisher commits. The mock model
+// stays blocked, so no terminal result or second prompt can mask the boundary.
+pub(super) async fn inject_response_state(
+    h: &Harness,
+    id: &str,
+    state: a2a_lf::TaskState,
+) -> Result<harnx_a2a_server::store::TaskRecord> {
+    use a2a_lf::{StreamResponse, TaskStatus, TaskStatusUpdateEvent};
+    use harnx_a2a_server::store::context::PendingEvent;
+    let (local_id, uuid) = harnx_a2a_server::store::parse_task_id(id)?;
+    let storage = harnx_core::session_identity::session_key(Some(&h.export.agent), local_id);
+    let current = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let current = h.store.read_context(&storage).await?.context("authority")?;
+            let active = current.document.state.active.as_ref().context("active")?;
+            if active.snapshot.task.artifacts.is_some() && active.publication.pending.is_none() {
+                return Ok::<_, anyhow::Error>(current);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let operation = uuid::Uuid::new_v4().to_string();
+    let write = h
+        .store
+        .prepare_context_update(&storage, &current.version()?, &operation, |context| {
+            let active = context.active.as_mut().unwrap();
+            active.snapshot.task.status = TaskStatus {
+                state,
+                message: None,
+                timestamp: Some(chrono::Utc::now()),
+            };
+            active.snapshot.stream_seq += 1;
+            active.publication.stream_seq = active.snapshot.stream_seq;
+            active.publication.pending = Some(PendingEvent {
+                committed_at: Some(chrono::Utc::now()),
+                commit_id: operation.clone(),
+                task_sequence: active.snapshot.stream_seq,
+                expected_subject_sequence: active.publication.subject_sequence,
+                response: StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: id.into(),
+                    context_id: local_id.into(),
+                    status: active.snapshot.task.status.clone(),
+                    metadata: None,
+                }),
+            });
+        })
+        .await?;
+    let committed = h.store.commit_context(&write).await?;
+    let pending = committed
+        .document
+        .state
+        .active
+        .as_ref()
+        .unwrap()
+        .publication
+        .pending
+        .as_ref()
+        .unwrap();
+    let ack = h
+        .jetstream
+        .send_publish(
+            format!("a2a.tasks.{storage}.{uuid}"),
+            async_nats::jetstream::message::PublishMessage::build()
+                .message_id(pending.commit_id.clone())
+                .expected_last_subject_sequence(pending.expected_subject_sequence)
+                .payload(serde_json::to_vec(pending)?.into()),
+        )
+        .await?
+        .await?;
+    let write = h
+        .store
+        .prepare_context_update(
+            &storage,
+            &committed.version()?,
+            &uuid::Uuid::new_v4().to_string(),
+            |context| {
+                let active = context.active.as_mut().unwrap();
+                active.publication.pending = None;
+                active.publication.subject_sequence = ack.sequence;
+                active.publication.confirmed_history.push(ack.sequence);
+            },
+        )
+        .await?;
+    let checkpointed = h.store.commit_context(&write).await?;
+    Ok(checkpointed.document.state.active.unwrap().snapshot)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unary_blocking_send_returns_input_required_without_terminal_result() -> Result<()> {
+    let http = Http::start().await?;
+    let session = http.h.session(None, &crate::support::alice()).await?;
+    let msg = message("input-required", Some(&json!(session.session_id())));
+    let send = http.rpc("SendMessage", json!({"message": msg}));
+    tokio::pin!(send);
+    tokio::select! {
+        result = &mut send => anyhow::bail!("blocking send returned early: {result:?}"),
+        result = tokio::time::timeout(DEADLINE, http.h.llm.requested.notified()) => { result?; },
+    }
+    let requests = http.h.llm.requests.lock().len();
+    let authority = http
+        .h
+        .store
+        .read_context(session.storage_key())
+        .await?
+        .context("authority")?;
+    let id = authority
+        .document
+        .state
+        .active
+        .context("admitted task")?
+        .snapshot
+        .task
+        .id;
+    let interrupted = inject_response_state(&http.h, &id, a2a_lf::TaskState::InputRequired).await?;
+    let response = tokio::time::timeout(DEADLINE, &mut send).await??;
+    assert_eq!(response["result"]["task"]["id"], id);
+    assert_eq!(
+        response["result"]["task"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
+    assert!(!interrupted.task.status.state.is_terminal());
+    assert_eq!(http.h.llm.requests.lock().len(), requests);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_boundary_after_skips_stale_input_required_and_observes_next() -> Result<()> {
+    use a2a_lf::TaskState;
+    let h = Harness::start(Script::Text).await?;
+    let session = h.session(None, &crate::support::alice()).await?;
+    let admitted = h
+        .send(
+            &session,
+            a2a_lf::Message::new(
+                a2a_lf::Role::User,
+                vec![a2a_lf::Part::text("boundary cursor")],
+            ),
+        )
+        .await?;
+    let id = &admitted.snapshot.task.id;
+    let q1 = inject_response_state(&h, id, TaskState::InputRequired).await?;
+    // Reply history/intent writes aren't a new response boundary.
+    let context = h
+        .store
+        .read_context(session.storage_key())
+        .await?
+        .context("authority")?;
+    let write = h
+        .store
+        .prepare_context_update(
+            session.storage_key(),
+            &context.version()?,
+            &uuid::Uuid::new_v4().to_string(),
+            |context| {
+                context
+                    .active
+                    .as_mut()
+                    .unwrap()
+                    .snapshot
+                    .task
+                    .history
+                    .get_or_insert_default()
+                    .push(a2a_lf::Message::new(
+                        a2a_lf::Role::User,
+                        vec![a2a_lf::Part::text("y")],
+                    ));
+            },
+        )
+        .await?;
+    let updated = h
+        .store
+        .commit_context(&write)
+        .await?
+        .document
+        .state
+        .active
+        .unwrap()
+        .snapshot;
+    assert!(updated.revision > q1.revision);
+    assert_eq!(updated.stream_seq, q1.stream_seq);
+    let backend = Arc::new(Backend::new(
+        h.runner.clone(),
+        h.store.clone(),
+        BackendConfig {
+            config: h.config.clone(),
+            route: SessionActivationRoute::ClusterShared,
+            abort: harnx_core::abort::create_abort_signal(),
+        },
+    ));
+    let handler = HarnxHandler::new(
+        h.export.clone(),
+        Default::default(),
+        backend,
+        InputLimits::default(),
+    );
+    let owner = crate::support::alice().into();
+    assert_eq!(
+        handler.wait_response(&owner, id, None).await?.stream_seq,
+        q1.stream_seq
+    );
+    let waiting = handler.wait_response(&owner, id, Some(q1.stream_seq));
+    tokio::pin!(waiting);
+    tokio::select! {
+        result = &mut waiting => anyhow::bail!("returned stale challenge: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {},
+    }
+    inject_response_state(&h, id, TaskState::Working).await?;
+    let q2 = inject_response_state(&h, id, TaskState::AuthRequired).await?;
+    let observed = tokio::time::timeout(DEADLINE, &mut waiting).await??;
+    assert_eq!(observed.task.status.state, TaskState::AuthRequired);
+    assert_eq!(observed.stream_seq, q2.stream_seq);
+    // Next boundary can already be durable before waiter subscribes.
+    assert_eq!(
+        handler
+            .wait_response(&owner, id, Some(q1.stream_seq))
+            .await?
+            .stream_seq,
+        q2.stream_seq
+    );
+    inject_response_state(&h, id, TaskState::Completed).await?;
+    assert_eq!(
+        handler
+            .wait_response(&owner, id, Some(u64::MAX))
+            .await?
+            .task
+            .status
+            .state,
+        TaskState::Completed
+    );
+    assert_eq!(h.llm.requests.lock().len(), 1);
+    Ok(())
+}

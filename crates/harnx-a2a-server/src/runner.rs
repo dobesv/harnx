@@ -32,8 +32,8 @@ use crate::{
         TaskVersion,
     },
 };
-pub use event_map::A2aEvent;
 use event_map::{artifact, status, A2aEventSink, Output, FAILED_MESSAGE};
+pub use event_map::{ends_response, A2aEvent};
 mod admission;
 pub(crate) use admission::AllocatedAdmission;
 mod authority;

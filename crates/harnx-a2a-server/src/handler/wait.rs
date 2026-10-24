@@ -1,5 +1,12 @@
 //! Local done is a wake hint, not authority after remote takeover.
 use super::*;
+use crate::runner::ends_response;
+
+pub(super) fn reached_boundary(record: &TaskRecord, after: Option<u64>) -> bool {
+    record.task.status.state.is_terminal()
+        || (ends_response(&record.task.status.state)
+            && after.is_none_or(|sequence| record.stream_seq > sequence))
+}
 
 impl HarnxHandler {
     pub(super) async fn wait_local_completion(
@@ -7,6 +14,7 @@ impl HarnxHandler {
         owner: &RequestIdentity,
         record: &TaskRecord,
         done: &mut tokio::sync::watch::Receiver<bool>,
+        after: Option<u64>,
     ) -> Result<Option<TaskRecord>, A2AError> {
         let storage = harnx_core::session_identity::session_key(
             Some(&self.export.agent),
@@ -22,7 +30,7 @@ impl HarnxHandler {
         // can't leave this waiter on a former owner's never-finished local watch.
         loop {
             let latest = self.task(owner, &record.task.id).await?;
-            if latest.task.status.state.is_terminal() {
+            if reached_boundary(&latest, after) {
                 return Ok(Some(latest));
             }
             tokio::select! {
@@ -36,10 +44,11 @@ impl HarnxHandler {
 }
 
 impl HarnxHandler {
-    pub(super) async fn wait_shared_terminal(
+    pub(super) async fn wait_shared_boundary(
         &self,
         owner: &RequestIdentity,
         task_id: &str,
+        after: Option<u64>,
     ) -> Result<TaskRecord, A2AError> {
         // Recovery is a preflight, never the snapshot used for handoff. A stopped
         // local writer with unresolved KV state still needs foreground settlement.
@@ -51,15 +60,20 @@ impl HarnxHandler {
             .stream_snapshot(&self.export, owner, task_id)
             .await
             .map_err(map_error)?;
-        if snapshot.task.status.state.is_terminal() {
+        if reached_boundary(&snapshot, after) {
             return Ok(snapshot);
         }
         let mut events = events.ok_or_else(|| A2AError::internal("task reader missing"))?;
-        let mut done = self
-            .backend
-            .runner
-            .completion(&self.export, &snapshot)
-            .await;
+        // At/below the reply cursor, completion belongs to the previous segment.
+        // Don't retain it: it can fire after the next segment has become Working.
+        let mut done = if after.is_some_and(|sequence| snapshot.stream_seq <= sequence) {
+            None
+        } else {
+            self.backend
+                .runner
+                .completion(&self.export, &snapshot)
+                .await
+        };
         if done.is_some() {
             tracing::info!(%task_id, "waiting on local task completion");
         } else {
@@ -69,14 +83,17 @@ impl HarnxHandler {
             tokio::select! {
                 event = events.recv() => {
                     let event = event.map_err(|_| A2AError::internal("task stream interrupted; reconnect"))?;
-                    if event.is_terminal() { return self.task(owner, task_id).await; }
+                    if event.ends_response() {
+                        let record = self.task(owner, task_id).await?;
+                        if reached_boundary(&record, after) { return Ok(record); }
+                    }
                 }
                 _ = wait_done(&mut done) => {
                     // A local writer can finish with unresolved persistence. Keep
                     // the old bounded reconcile/error behavior, not a hung reader.
                     let record = self.reconcile(owner, self.task(owner, task_id).await?).await?;
-                    if record.task.status.state.is_terminal() { return Ok(record); }
-                    return Err(A2AError::internal("task stopped without terminal persistence"));
+                    if reached_boundary(&record, after) { return Ok(record); }
+                    return Err(A2AError::internal("task stopped without response-boundary persistence"));
                 }
             }
         }
@@ -92,32 +109,38 @@ async fn wait_done(done: &mut Option<tokio::sync::watch::Receiver<bool>>) {
 }
 
 impl HarnxHandler {
-    pub(super) async fn wait_legacy_terminal(
+    pub(super) async fn wait_legacy_boundary(
         &self,
         owner: &RequestIdentity,
         mut record: TaskRecord,
+        after: Option<u64>,
     ) -> Result<TaskRecord, A2AError> {
+        if after.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "response cursor requires a coordinated task",
+            ));
+        }
         if let Some(mut done) = self.backend.runner.completion(&self.export, &record).await {
             tracing::info!(task_id = %record.task.id, "waiting on local task completion");
             // A dropped supervisor must fall through to orphan reconciliation.
             if let Some(terminal) = self
-                .wait_local_completion(owner, &record, &mut done)
+                .wait_local_completion(owner, &record, &mut done, after)
                 .await?
             {
                 return Ok(terminal);
             }
             record = self.task(owner, &record.task.id).await?;
-            if record.task.status.state.is_terminal() {
+            if reached_boundary(&record, after) {
                 return Ok(record);
             }
             // done means no local writer remains. A KV outage may have prevented
             // final persistence; fence it or fail instead of waiting indefinitely.
             record = self.reconcile(owner, record).await?;
-            return if record.task.status.state.is_terminal() {
+            return if reached_boundary(&record, after) {
                 Ok(record)
             } else {
                 Err(A2AError::internal(
-                    "task stopped without terminal persistence",
+                    "task stopped without response-boundary persistence",
                 ))
             };
         }
@@ -140,7 +163,7 @@ impl HarnxHandler {
         record = self
             .reconcile(owner, self.task(owner, &record.task.id).await?)
             .await?;
-        while !record.task.status.state.is_terminal() {
+        while !reached_boundary(&record, after) {
             changes
                 .next()
                 .await
