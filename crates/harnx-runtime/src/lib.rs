@@ -58,8 +58,9 @@ mod worker_identity;
 // Re-export session types for frontends
 pub use nats_session::{
     replay_default_view_to_sink, replay_entries_to_sink, replay_entries_to_sink_with_decls,
-    replay_transcript_view_to_sink, send_control_command, DurableTextEnqueue, NatsSession,
-    NatsSessionConfig, NatsTurnResult, RunTurnOptions, SessionLeaseWatchdog,
+    replay_transcript_view_to_sink, send_control_command, ApprovalRef, DurableTextEnqueue,
+    HitlDecisionReceipt, NatsSession, NatsSessionConfig, NatsTurnResult, PendingHitlApproval,
+    PromptProgress, RunTurnOptions, SessionLeaseWatchdog,
 };
 pub use nats_session_metadata::{SessionInitializer, SessionOverrides};
 pub use nats_worker::{ControlCommand, SessionActivationRoute};

@@ -16,7 +16,7 @@ use crate::nats_hook_provider::{
 };
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
-use crate::nats_session::{NatsSession, NatsSessionConfig};
+use crate::nats_session::{NatsSession, NatsSessionConfig, PendingHitlApproval};
 use crate::nats_session_metadata::{SessionMetadata, SessionMetadataStore};
 use crate::tool_context::{discover_nats_hook_provider_fresh, discover_nats_tool_provider_fresh};
 use crate::utils::AbortSignal;
@@ -68,14 +68,6 @@ impl<'a> RunAgentLoopArgs<'a> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PendingHitlApproval {
-    pub seq: u64,
-    pub tool_round_seq: u64,
-    pub tool_call_id: String,
-    pub summary: String,
-}
-
 /// Detect an unresolved `CompactRequest` in the session log.
 ///
 /// An unresolved request is one without a subsequent `CompactResult`
@@ -123,25 +115,27 @@ pub(crate) fn derive_pending_hitl_approvals(
                 tool_call_id,
                 summary,
                 ..
-            } if orphan
-                .calls
-                .iter()
-                .any(|call| call.id.as_deref() == Some(tool_call_id.as_str()))
-                && !round_entries.iter().any(|(decision_seq, decision)| {
-                    decision_seq > request_seq
-                        && matches!(
-                            decision,
-                            SessionLogEntry::HitlApprovalDecision {
-                                tool_call_id: decided_id,
-                                ..
-                            } if decided_id == tool_call_id
-                        )
-                }) =>
+            } if !round_entries.iter().any(|(decision_seq, decision)| {
+                decision_seq > request_seq
+                    && matches!(
+                        decision,
+                        SessionLogEntry::HitlApprovalDecision {
+                            tool_call_id: decided_id,
+                            ..
+                        } if decided_id == tool_call_id
+                    )
+            }) =>
             {
+                let call = orphan
+                    .calls
+                    .iter()
+                    .find(|call| call.id.as_deref() == Some(tool_call_id.as_str()))?;
                 Some(PendingHitlApproval {
-                    seq: *request_seq,
+                    request_seq: *request_seq,
                     tool_round_seq: orphan.seq,
                     tool_call_id: tool_call_id.clone(),
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
                     summary: summary.clone(),
                 })
             }

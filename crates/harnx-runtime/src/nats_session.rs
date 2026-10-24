@@ -60,6 +60,7 @@ mod compaction_request;
 mod compaction_request_tests;
 mod completion;
 mod hitl;
+pub use hitl::{ApprovalRef, HitlDecisionReceipt, PendingHitlApproval, PromptProgress};
 pub mod interrupt;
 mod prompt_append;
 pub use compaction_request::{request_compaction_session, CompactSubmit, CompactionRequest};
@@ -1159,7 +1160,7 @@ impl NatsSession {
         let request = hitl::ApprovalRequest {
             tool_call_id,
             tool_round_seq: pending.tool_round_seq,
-            request_seq: pending.seq,
+            request_seq: pending.request_seq,
         };
         let Some(_) = self.activate_pending_turn().await? else {
             let entries = self.load_durable_entries().await?;

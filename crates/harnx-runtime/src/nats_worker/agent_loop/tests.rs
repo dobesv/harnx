@@ -1,3 +1,6 @@
+#[path = "hitl_progress_tests.rs"]
+mod hitl_progress;
+
 use super::{
     agent_resolved_hooks, derive_hitl_tool_round_continuation, derive_pending_compaction,
     derive_pending_hitl_approvals, dispatch_session_start, find_orphan_tool_calls, SessionOrigin,
@@ -263,7 +266,7 @@ fn reused_tool_call_id_requires_fresh_approval_in_current_tool_round() {
 
     let pending = derive_pending_hitl_approvals(&entries).expect("derive pending approval");
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].seq, 6);
+    assert_eq!(pending[0].request_seq, 6);
     assert_eq!(pending[0].summary, "Approve current call");
 
     let continuation = derive_hitl_tool_round_continuation(&entries)

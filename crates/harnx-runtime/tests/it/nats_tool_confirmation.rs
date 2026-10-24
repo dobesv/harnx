@@ -610,6 +610,149 @@ async fn durable_hitl_request_ends_activation_without_turn_end() -> Result<()> {
     Ok(())
 }
 
+/// Observe real worker deferral, then deterministic persisted continuation states.
+/// No decision activation races the decided-but-still-running observation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_prompt_hitl_progress_tracks_exact_invocation_and_reused_call_id() -> Result<()> {
+    use harnx_runtime::{nats_session::fixed_admission::FixedAdmissionOutcome, PromptProgress};
+
+    let harness = ConfirmationHarness::start()
+        .await?
+        .context("nats-server required")?;
+    let session = harness.source.clone().with_external_admission();
+    let ticket = session
+        .prepare_fixed_admission(
+            "hitl-progress".into(),
+            "hitl-progress-prompt".into(),
+            "hitl-progress-closed".into(),
+        )
+        .await?;
+    assert!(session.fixed_prompt_progress(&ticket).await.is_err());
+    let FixedAdmissionOutcome::Admitted { prompt_sequence } = session
+        .append_fixed_prompt(&ticket, MessageContent::Text("start handoff".into()))
+        .await?
+    else {
+        anyhow::bail!("expected admitted prompt");
+    };
+    assert!(matches!(
+        session.fixed_prompt_progress(&ticket).await?,
+        PromptProgress::Running {
+            last_decision: None
+        }
+    ));
+    session
+        .follow_admitted_prompt(
+            session
+                .fixed_prompt_handle(&ticket)
+                .await?
+                .context("fixed prompt handle")?,
+            Arc::new(NullSink),
+            None,
+            None,
+            Default::default(),
+        )
+        .await?;
+    let PromptProgress::InputRequired(first) = session.fixed_prompt_progress(&ticket).await? else {
+        anyhow::bail!("expected worker's durable approval request");
+    };
+    assert_eq!(first.tool_call_id, "hook-approval-handoff");
+    assert_eq!(first.tool_name, "target_session_handoff");
+    assert_eq!(first.arguments["session_id"], TARGET_SESSION_ID);
+    assert_eq!(first.summary, "Approve the handoff?");
+    assert!(first.tool_round_seq > prompt_sequence);
+    let log = NatsSessionLog::new_with_replicas(harness.jetstream.clone(), source_key(), 1);
+    let decision_seq = log
+        .append_event_async(&SessionLogEntry::HitlApprovalDecision {
+            tool_call_id: first.tool_call_id.clone(),
+            approved: true,
+            note: Some("audit only".into()),
+            fence_token: 1,
+        })
+        .await?;
+    let PromptProgress::Running {
+        last_decision: Some(receipt),
+    } = session.fixed_prompt_progress(&ticket).await?
+    else {
+        anyhow::bail!("decided invocation isn't terminal");
+    };
+    assert_eq!(receipt.request, first.approval_ref(ticket.invocation_id()));
+    assert_eq!(receipt.decision_seq, decision_seq);
+    assert!(receipt.approved);
+    assert_eq!(receipt.note.as_deref(), Some("audit only"));
+
+    log.append_event_async(&SessionLogEntry::ToolResults {
+        results: Vec::new(),
+        timestamp: None,
+    })
+    .await?;
+    let round = SessionLogEntry::ToolCalls {
+        text: String::new(),
+        thought: None,
+        calls: vec![ToolCall::new(
+            "next_tool".into(),
+            json!({"fresh": true}),
+            Some(first.tool_call_id.clone()),
+            None,
+        )],
+        timestamp: None,
+        fence_token: Some(1),
+    };
+    let round_seq = log.append_event_async(&round).await?;
+    let request = SessionLogEntry::HitlApprovalRequested {
+        tool_call_id: first.tool_call_id.clone(),
+        summary: "Next approval".into(),
+        fence_token: 1,
+    };
+    let request_seq = log.append_event_async(&request).await?;
+    let PromptProgress::InputRequired(next) = session.fixed_prompt_progress(&ticket).await? else {
+        anyhow::bail!("expected next request, not previous decision");
+    };
+    assert_eq!(next.tool_round_seq, round_seq);
+    assert_eq!(next.request_seq, request_seq);
+    assert_eq!(next.tool_name, "next_tool");
+    assert_eq!(next.arguments, json!({"fresh": true}));
+    assert_ne!(next.approval_ref(ticket.invocation_id()), receipt.request);
+    log.append_event_async(&SessionLogEntry::TurnEnd {
+        through_seq: prompt_sequence,
+        fence_token: 1,
+        timestamp: None,
+        usage: None,
+    })
+    .await?;
+    let PromptProgress::Terminal(result) = session.fixed_prompt_progress(&ticket).await? else {
+        anyhow::bail!("terminal must win even with unresolved request");
+    };
+    assert_eq!(result.user_msg_seq, prompt_sequence);
+    assert_eq!(result.user_msg_id, ticket.prompt_id());
+    assert!(!result.was_cancelled);
+
+    let next_ticket = session
+        .prepare_fixed_admission(
+            "next-hitl-invocation".into(),
+            "next-hitl-prompt".into(),
+            "next-hitl-closed".into(),
+        )
+        .await?;
+    session
+        .append_fixed_prompt(&next_ticket, MessageContent::Text("next invocation".into()))
+        .await?;
+    let later_round_seq = log.append_event_async(&round).await?;
+    log.append_event_async(&request).await?;
+    assert!(matches!(
+        session.fixed_prompt_progress(&ticket).await?,
+        PromptProgress::Terminal(_)
+    ));
+    let PromptProgress::InputRequired(later) = session.fixed_prompt_progress(&next_ticket).await?
+    else {
+        anyhow::bail!("next invocation must own its approval");
+    };
+    assert_eq!(later.tool_round_seq, later_round_seq);
+    assert_ne!(
+        later.approval_ref(next_ticket.invocation_id()),
+        next.approval_ref(ticket.invocation_id())
+    );
+    Ok(())
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_approval_does_not_authorize_reused_tool_call_id() -> Result<()> {
     let Some(harness) =

@@ -59,6 +59,33 @@ Session GC must retire frontend authority with its log and must not reuse the sa
 storage identity. Partial retention that removes admission evidence requires an
 explicit migration/settlement policy, not recovery replay.
 
+## Observe approval progress
+
+`NatsSession::fixed_prompt_progress(&ticket)` reads one retained log snapshot and
+validates the saved admission against it. It requires an admitted ticket; pending,
+closed, fenced, or mismatched tickets return an error. It doesn't append or activate
+work. `PromptProgress` distinguishes:
+
+- `Running { last_decision }`: no terminal or pending approval. The optional
+  `HitlDecisionReceipt` records the exact request, decision sequence, answer, and note.
+- `InputRequired(PendingHitlApproval)`: the invocation is suspended for approval.
+- `Terminal(NatsTurnResult)`: durable completion, cancellation, or worker failure.
+
+These types and `ApprovalRef` are exported from `harnx_runtime` and
+`harnx_runtime::nats_session`. Build a durable reply target with
+`pending.approval_ref(ticket.invocation_id())`. `PendingHitlApproval` and
+`ApprovalRef` support JSON serialization and equality comparisons.
+
+Scoping starts at the ticket's immutable root prompt and ends at its first raw
+terminal proof. Fixed admission prevents a successor invocation before that proof.
+Both the request and its `ToolCalls` round must be after the root prompt. Checking
+only the request sequence could attach a late request from an older round. Raw
+terminal proof wins over any remaining approval and over approvals in later
+invocations, even after transcript edits or rewind. Pending requests and decision
+receipts respect effective transcript mutations and are joined within their own
+round, so a reused provider tool call ID doesn't inherit an older decision.
+Tool name and arguments come from persisted `ToolCalls`, not unpersisted hook edits.
+
 ## Deployment and tests
 
 `AdmissionClosed` is a new durable transcript entry. Older readers reject it.

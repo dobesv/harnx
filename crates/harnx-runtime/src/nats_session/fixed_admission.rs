@@ -75,6 +75,17 @@ impl NatsSession {
         expected_content: Option<&MessageContent>,
     ) -> Result<FixedAdmissionOutcome> {
         self.check_fixed_ticket(ticket)?;
+        let entries = self.fixed_log().load_events_latest_required_async().await?;
+        self.resolve_fixed_admission_from_entries(ticket, expected_content, &entries)
+            .await
+    }
+
+    async fn resolve_fixed_admission_from_entries(
+        &self,
+        ticket: &FixedAdmissionTicket,
+        expected_content: Option<&MessageContent>,
+        entries: &[(u64, SessionLogEntry)],
+    ) -> Result<FixedAdmissionOutcome> {
         let saved = self
             .metadata_store
             .admission(&self.storage_key, ticket.invocation_id())
@@ -91,8 +102,7 @@ impl NatsSession {
                 );
             }
         }
-        let entries = self.fixed_log().load_events_latest_required_async().await?;
-        let outcome = ticket.outcome(&entries)?;
+        let outcome = ticket.outcome(entries)?;
         if let FixedAdmissionOutcome::Admitted { prompt_sequence } = outcome {
             let saved = match saved {
                 Some(saved) => saved,
@@ -256,18 +266,43 @@ impl NatsSession {
 }
 
 impl NatsSession {
+    /// Observe an admitted invocation from one coherent transcript snapshot.
+    /// Terminal proof wins over approvals, including requests from later invocations.
+    /// Returns an error if the ticket isn't admitted or its saved identity differs.
+    pub async fn fixed_prompt_progress(
+        &self,
+        ticket: &FixedAdmissionTicket,
+    ) -> Result<super::PromptProgress> {
+        self.check_fixed_ticket(ticket)?;
+        let entries = self.fixed_log().load_events_latest_required_async().await?;
+        let outcome = self
+            .resolve_fixed_admission_from_entries(ticket, None, &entries)
+            .await?;
+        let FixedAdmissionOutcome::Admitted { prompt_sequence } = outcome else {
+            anyhow::bail!("fixed prompt is not admitted: {outcome:?}");
+        };
+        Self::fixed_prompt_progress_from_entries(
+            ticket,
+            prompt_sequence,
+            &self.session_id,
+            &entries,
+        )
+    }
+
     /// Observe the original fixed invocation's durable completion without
     /// activation or append. Recovery must check this before deciding to stop it.
     pub async fn fixed_prompt_completion(
         &self,
         ticket: &FixedAdmissionTicket,
     ) -> Result<Option<super::NatsTurnResult>> {
-        let FixedAdmissionOutcome::Admitted { prompt_sequence } =
-            self.resolve_fixed_admission(ticket).await?
+        self.check_fixed_ticket(ticket)?;
+        let entries = self.fixed_log().load_events_latest_required_async().await?;
+        let FixedAdmissionOutcome::Admitted { prompt_sequence } = self
+            .resolve_fixed_admission_from_entries(ticket, None, &entries)
+            .await?
         else {
             return Ok(None);
         };
-        let entries = self.fixed_log().load_events_latest_required_async().await?;
         let Some(terminal) = super::invocation_terminal_seq(&entries, prompt_sequence) else {
             return Ok(None);
         };

@@ -186,7 +186,7 @@ fn try_append_with_retries(
             "HITL approval request: falling back to existing pending {} after exhausting retries",
             pending_id
         );
-        bump_attention_after_hitl_append(&state.backend, oldest.seq);
+        bump_attention_after_hitl_append(&state.backend, oldest.request_seq);
         notify_session_updated(&state.event_sink);
         return Ok(HitlOutcome::Fallback(pending_id));
     }
@@ -219,7 +219,7 @@ fn try_append_hitl_approval(
         log::warn!(
             "session already has pending HITL approval; retaining oldest request: tool_call_id={} seq={}",
             oldest.tool_call_id,
-            oldest.seq
+            oldest.request_seq
         );
         return Ok(AppendHitlResult::ExistingPending(
             oldest.tool_call_id.clone(),
