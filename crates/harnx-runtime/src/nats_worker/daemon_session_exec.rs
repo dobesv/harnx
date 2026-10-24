@@ -369,13 +369,13 @@ impl WorkerRuntime {
                     .await);
             }
         };
+        self.record_web_session_url(&activation.session_id, &metadata)
+            .await;
         let (execution_abort, abort_relay, shutdown_relay) =
             Self::spawn_execution_abort_relays(abort_signal, shutdown.clone());
-        let per_session = {
-            let mut base = self.config.read().clone();
-            base.maintenance_abort = Some(execution_abort.clone());
-            Arc::new(crate::config::ConfigLock::new(base))
-        };
+        let mut config = self.config.read().clone();
+        config.maintenance_abort = Some(execution_abort.clone());
+        let per_session = Arc::new(crate::config::ConfigLock::new(config));
         self.configure_tool_confirmation(
             &per_session,
             activation.tool_confirmation_subject.as_ref(),
@@ -392,8 +392,8 @@ impl WorkerRuntime {
             )
             .await,
         );
+        let backend = self.session_backend(&activation, event_sink.after_seq_handle());
         let after_seq_observer = event_sink.after_seq_handle();
-        let backend = self.session_backend(&activation, Arc::clone(&after_seq_observer));
         let startup = SessionRuntimeStartup {
             activation,
             activation_failure_key,

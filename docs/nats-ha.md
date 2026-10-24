@@ -411,6 +411,28 @@ overwrites them, so treat an inferred address as a hint: set the public URL
 when harnx-serve sits behind a proxy, or when clients reach it at an internal
 address.
 
+Workers also read `serve_public_url` / `HARNX_SERVE_PUBLIC_URL`. When set, a
+worker records `web_session_url` for each named-agent session it runs before its
+first turn starts, provided no address was recorded yet. This gives sessions
+started by handoff, sub-agent prompts, or A2A tasks a web link right away. When
+`serve_public_url` is unset on the worker, the worker records nothing and raises
+no error. Worker recording is best effort: storage failures or timeouts (2s) log
+a warning and allow the turn to run.
+
+The URL is constructed from the session's own agent name and bare session ID
+(never the parent session's ID). The agent name appears bare when running on
+`__local__` or when the worker's cluster matches `HARNX_NATS_SERVER`; otherwise
+it is formatted as `name@cluster`.
+
+Entries recorded by a worker carry `"source": "configured"` along with
+`"recorded_by": "worker"`, visible in `harnx_read_session_meta`. A worker never
+overwrites an existing value. Any value recorded by harnx-serve (whether inferred
+or configured) replaces a worker-recorded value and clears the marker. Explicit
+writes by an agent or person via `harnx_write_session_meta` also clear the marker
+and protect the property from being overwritten by Harnx. Because older versions
+of harnx-serve do not replace worker-recorded entries with inferred URLs, deploy
+harnx-serve and workers from the same release.
+
 ## Configuration
 
 Harnx looks for NATS cluster definitions in `nats_servers/<cluster_key>.yaml`. The filename (stem) is used as the cluster key.

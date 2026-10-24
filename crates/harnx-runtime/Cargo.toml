@@ -57,6 +57,7 @@ nu-ansi-term = { workspace = true }
 os_info = { workspace = true }
 parking_lot = { workspace = true }
 path-absolutize = { workspace = true }
+percent-encoding = { workspace = true }
 reqwest = { workspace = true }
 reqwest-eventsource = { workspace = true }
 rand = "0.10.0"

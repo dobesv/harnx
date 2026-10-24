@@ -50,6 +50,7 @@ mod subagent_toolset;
 mod tool_registry;
 pub mod tool_reservation;
 mod tool_supervisor;
+mod web_session_url;
 mod wind_up;
 
 #[cfg(test)]

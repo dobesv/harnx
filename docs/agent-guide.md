@@ -265,7 +265,7 @@ Each property holds a value and an `inherit` flag. A sub-agent session started f
 | `github_pull_request` | Pull request number in `github_owner_repo` | by default |
 | `external_task_url` | http(s) URL of the task in another tracker, such as Jira or Linear | by default |
 | `working_directory` | Directory the session works in | by default |
-| `web_session_url` | http(s) URL that opens the session in the Web UI. harnx-serve fills it in when it sends the session a prompt; see [Session properties](nats-ha.md#session-properties). | never |
+| `web_session_url` | http(s) URL that opens the session in the Web UI. harnx-serve or a worker fills it in when configured with `serve_public_url`; see [Session properties](nats-ha.md#session-properties). | never |
 | `labels` | List of labels | on request |
 
 Any other name that starts with a lowercase letter and uses only lowercase letters, digits, `_`, `-` and `.` is a custom property holding text, copied only on request. A session keeps at most 32 custom properties and 50 labels.

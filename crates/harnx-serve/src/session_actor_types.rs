@@ -35,11 +35,7 @@ impl ResolvedAgentTarget {
     }
 
     pub fn display_ref(&self) -> String {
-        if self.cluster == LOCAL_CLUSTER_KEY {
-            self.agent.clone()
-        } else {
-            format!("{}@{}", self.agent, self.cluster)
-        }
+        self.display_ref_with_default_cluster(None)
     }
 
     /// Return a display reference, omitting the cluster suffix when the agent
@@ -52,15 +48,7 @@ impl ResolvedAgentTarget {
     ///
     /// Local targets (`__local__`) are always shown bare, matching `display_ref()`.
     pub fn display_ref_with_default_cluster(&self, default_cluster: Option<&str>) -> String {
-        // Local cluster always shows bare, matching display_ref()
-        if self.cluster == LOCAL_CLUSTER_KEY {
-            return self.agent.clone();
-        }
-        match default_cluster {
-            Some(default) if self.cluster == default => self.agent.clone(),
-            Some(_) => format!("{}@{}", self.agent, self.cluster),
-            None => self.display_ref(),
-        }
+        harnx_runtime::web_url::agent_display_ref(&self.agent, &self.cluster, default_cluster)
     }
 }
 

@@ -52,6 +52,7 @@ pub mod tool_reservation_client;
 mod tool_selector;
 pub mod users;
 pub mod utils;
+pub mod web_url;
 mod worker_identity;
 
 // Re-export session types for frontends

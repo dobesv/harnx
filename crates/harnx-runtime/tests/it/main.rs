@@ -52,6 +52,7 @@ mod nats_worker_attention;
 mod nats_worker_handoff_hooks;
 mod nats_worker_handoffs;
 mod nats_worker_sigterm_e2e;
+mod nats_worker_web_session_url;
 mod package_loading;
 mod package_tool_naming_e2e;
 mod scope_discovery;
