@@ -81,6 +81,7 @@ pub use harnx_toolset::TOOL_PROTOCOL_VERSION;
 pub mod invocation_journal;
 mod recovery;
 mod reply_cache;
+mod reply_limits;
 use reply_cache::*;
 pub const TOOL_SCHEMA_VERSION: u32 = 1;
 
@@ -633,11 +634,11 @@ async fn process_tool_request(
     let key = cache_key(&request)?;
     let completion = match reserve_cache_entry(&context.reply_cache, &key).await {
         CacheReservation::Complete(saved) => {
-            return serve_cached(context, &request, reply_subject, saved).await;
+            return serve_cached(context, reply_subject, saved).await;
         }
         CacheReservation::Wait(reply) => {
             let saved = wait_for_cached_reply(reply).await?;
-            return serve_cached(context, &request, reply_subject, saved).await;
+            return serve_cached(context, reply_subject, saved).await;
         }
         CacheReservation::Full => {
             return publish_recoverable_reply(
@@ -661,7 +662,7 @@ async fn process_tool_request(
             }),
     );
     complete_cache_entry(&context.reply_cache, key, reply.clone(), completion).await;
-    serve_cached(context, &request, reply_subject, reply).await
+    serve_cached(context, reply_subject, reply).await
 }
 
 async fn validate_tool_request(
@@ -819,6 +820,12 @@ async fn publish_reply(
     reply: &ToolReply,
 ) -> Result<()> {
     let payload = serde_json::to_vec(reply).context("encode tool reply")?;
+    // ReplyTarget sends no headers, even when it asks for a delivery receipt.
+    // Do not make an unjournaled replacement if limits changed after commit.
+    anyhow::ensure!(
+        payload.len() <= client.server_info().max_payload,
+        "durable tool reply exceeds current broker payload limit"
+    );
     subject
         .send(client, payload)
         .await

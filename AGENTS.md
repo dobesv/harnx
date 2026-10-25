@@ -232,6 +232,21 @@ args:
 
 Use `--no-sandbox` when the test scope is bash behavior, not sandbox isolation. Hosts that block unprivileged user namespaces (some containers) fail `harnx-sandbox-exec` with exit 127 before the command runs. Precedent: `proxy_auth_hook_injects_env_vars_into_bash_exec` in `crates/harnx/tests/it/tmux_e2e.rs`; `write_with_wait_tool` in `crates/harnx/src/test_utils/interrupt.rs` bridges the time server the same way.
 
+### MCP bridge result limits
+
+Bridged MCP tool results are capped at 32 KiB serialized JSON by default
+(`--max-result-bytes` / `HARNX_MCP_MAX_RESULT_BYTES`, minimum 1024). Oversized parts
+offload to NATS attachments with original MIME and bytes; oversized aggregates fall back
+to `application/json`, preserving success status for collective fitting parts if representable,
+or returning an explicit error for unrepresentable schemas/metadata. Calls without trusted
+session identity or NATS storage (e.g. direct CLI) return bounded recoverable errors
+without retaining originals. Native tool results above 32 KiB pass unchanged when within
+server storage/wire limits (broker `max_payload` and journal KV row budget); the 32 KiB
+presentation cap applies only to bridged results. See
+`crates/harnx-mcp-bridge/README.md#result-limits-and-original-attachments` and
+`docs/nats-ha.md#oversized-terminal-tool-replies` for per-result caps, attachment paging,
+and output-only terminal guard.
+
 ### Session transcript and PreToolUse hook mutation
 
 ### Hook command strings must use `shell_words::join`
@@ -299,6 +314,36 @@ follow this pattern instead of `#[tokio::main]`.
 Tests that reproduce the Windows stack limit on Linux use `pre_exec` to set
 `RLIMIT_STACK` to 1 MiB (`crates/harnx/tests/it/tool_cli.rs`, Linux-only). Those
 tests verify the same bootstrap path that Windows executes unchanged.
+
+### Error classification through typed causes, not strings
+
+When classifying broker/JetStream errors (such as size limits), use typed downcasts
+against async-nats 0.50 error causes rather than string matching. String matching on
+error messages creates false positives: permission-denied or connection errors may
+contain words like "size" or "exceeded" without actually being size limits.
+
+Pattern (`is_size_error` in `crates/harnx-toolset-server/src/reply_limits.rs`):
+```rust
+error.chain().any(|cause| {
+    cause
+        .downcast_ref::<jetstream::Error>()
+        .is_some_and(|e| e.kind() == jetstream::ErrorCode::STREAM_MESSAGE_EXCEEDS_MAXIMUM)
+        || cause
+            .downcast_ref::<jetstream::context::PublishError>()
+            .is_some_and(|e| {
+                e.kind() == jetstream::context::PublishErrorKind::MaxPayloadExceeded
+            })
+        || cause
+            .downcast_ref::<async_nats::PublishError>()
+            .is_some_and(|e| {
+                e.kind() == async_nats::client::PublishErrorKind::MaxPayloadExceeded
+            })
+})
+```
+
+Test coverage at `reply_limits.rs:tests::size_words_are_not_a_size_error` explicitly verifies
+negative cases. Same pattern applies to any error-classification logic that needs to
+distinguish genuine protocol conditions from incidental message content.
 
 ### Telling a flake from a regression
 

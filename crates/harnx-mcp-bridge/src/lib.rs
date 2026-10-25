@@ -8,7 +8,10 @@ use async_trait::async_trait;
 use clap::Parser;
 use harnx_core::child_process::ChildProcessManager;
 use harnx_core::instance::HARNX_SERVER_SCOPE;
-use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{ToolInvocation, ToolInvokeError, ToolSpec, Toolset};
+
+pub mod result_limits;
+use result_limits::ResultLimits;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, Implementation, InitializeRequestParams, Tool,
@@ -80,6 +83,10 @@ pub struct Args {
     /// Must be a JSON object (e.g., `{"path": "/tmp"}`). Defaults to `{}`.
     #[arg(long = "tool-args", requires = "call_tool")]
     pub tool_args: Option<String>,
+
+    /// Maximum compact serialized JSON bytes per tool result (not per round).
+    #[arg(long, env = "HARNX_MCP_MAX_RESULT_BYTES", default_value = "32768", value_parser = result_limits::parse_max_result_bytes)]
+    pub max_result_bytes: usize,
 }
 
 impl Args {
@@ -109,6 +116,7 @@ pub struct BridgeToolset {
     // Keep the stable spawning thread alive until after its child is retired.
     process_manager: ChildProcessManager,
     stderr_tail: StderrTail,
+    result_limits: ResultLimits,
 }
 
 /// Render what a wrapped server advertises, for `--list-tools`.
@@ -438,6 +446,7 @@ impl BridgeToolset {
             watch_service(service, server_name.clone(), Arc::clone(&stderr_tail));
 
         Ok(Self {
+            result_limits: ResultLimits::default(),
             server_name,
             cached_tools,
             peer,
@@ -520,6 +529,42 @@ impl Toolset for BridgeToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
+        let result = self.dispatch(tool, args, cancel).await?;
+        self.result_limits.normalize(result, None).await
+    }
+
+    async fn invoke_with_context(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Value, ToolInvokeError> {
+        let session = invocation
+            .context
+            .invoking_session
+            .map(|session| harnx_core::cid_url::SessionRef::new(session.agent, session.session_id))
+            .transpose()
+            .map_err(|error| {
+                ToolInvokeError::Recoverable(format!("invalid caller session: {error}"))
+            })?;
+        let result = self
+            .dispatch(&invocation.tool, invocation.args, invocation.cancel)
+            .await?;
+        self.result_limits.normalize(result, session.as_ref()).await
+    }
+}
+
+impl BridgeToolset {
+    /// Configure result limits and optional existing serving storage connection.
+    pub fn with_result_limits(mut self, limits: ResultLimits) -> Self {
+        self.result_limits = limits;
+        self
+    }
+
+    async fn dispatch(
+        &self,
+        tool: &str,
+        args: Value,
+        cancel: CancellationToken,
+    ) -> Result<Value, ToolInvokeError> {
         let arguments = match args {
             Value::Object(arguments) => Some(arguments),
             Value::Null => None,
@@ -549,9 +594,6 @@ impl Toolset for BridgeToolset {
                 err => ToolInvokeError::Recoverable(err.to_string()),
             })
     }
-}
-
-impl BridgeToolset {
     async fn invoke_cancellable(
         &self,
         params: CallToolRequestParams,

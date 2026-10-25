@@ -50,8 +50,8 @@ Tool arguments passed to `--tool-args` must be a valid JSON object (`{...}`):
 
 ## Output and Exit Status
 
-- **Success**: Emits the full MCP `CallToolResult` JSON object to stdout and exits with code `0`.
-- **Tool Error (`isError: true`)**: Emits the full MCP `CallToolResult` JSON object to stdout, logs `error: tool '<name>' reported isError: true` to stderr, and exits with code `1`. Complete output structures (text, images, embedded resources, structured content, and metadata) are preserved.
+- **Success**: Emits the bounded MCP `CallToolResult` as compact JSON to stdout and exits with code `0`. Results within the limit retain all content and fields unchanged.
+- **Tool Error (`isError: true`)**: Emits the bounded result to stdout, logs `error: tool '<name>' reported isError: true` to stderr, and exits with code `1`. Size errors also use this status; see result limits below.
 - **Incomplete Result**: If a tool returns a `resultType` other than `"complete"` (such as `"partial"`), the bridge exits with code `1`.
 - **Protocol & Transport Errors**: Initialization failures, protocol violations, unknown tool names, and transport disconnects print diagnostics to stderr and exit with code `1`. No fabricated tool result is emitted to stdout.
 
@@ -70,3 +70,66 @@ The repeatable `--enable-tool <GLOB>` option applies across all modes:
   ```
 - **Session Identity**: Tools requiring caller session identity (such as attachment creation tools) fail clearly when called via stdio bridge, because standalone stdio invocations carry no session identity context.
 - **Process Lifecycle**: The bridge uses `ChildProcessManager` to manage child processes. On completion or error, the bridge explicitly stops and reaps the child process. `kill_on_drop` provides fallback protection against process leaks.
+
+## Result Limits and Original Attachments
+
+Every result is limited to **32,768 bytes** of compact serialized `CallToolResult`
+JSON by default. This is a per-result limit, not a limit shared across calls in a
+round. JSON escaping, all content parts, annotations, `structuredContent`, `_meta`
+and envelope fields count. Direct CLI stdout adds a trailing newline outside the
+JSON object.
+
+Set `HARNX_MCP_MAX_RESULT_BYTES` or pass `--max-result-bytes`; the CLI option wins
+over the environment. Values below 1,024 bytes are rejected before child startup.
+For example:
+
+```sh
+harnx-mcp-bridge --name external --max-result-bytes 65536 -- external-mcp-server
+HARNX_MCP_MAX_RESULT_BYTES=65536 harnx-mcp-bridge --call-tool list_items -- external-mcp-server
+```
+
+Fitting results pass through unchanged. With a trusted invoking session and the
+existing NATS serving connection, oversized parts are handled in order:
+
+- Text is stored as exact UTF-8 bytes before producing a middle-truncated preview,
+  its `cid:media:` URL and instructions to narrow the request or page the original.
+- Images, audio and embedded binary resources are decoded and stored without
+  cutting base64. Their replacements are MCP `resource_link` blocks with `uri`,
+  `name`, original `mimeType` and decoded byte `size`.
+- Unaffected siblings and representable annotations, metadata, structured content
+  and original `isError` status remain unchanged. Embedded resources retain their
+  original MIME, including parameters. Plain MCP text defaults to `text/plain`.
+
+Attachment CIDs hash the full data URI, including MIME and base64 data, so equal
+bytes with different MIME types don't overwrite each other's metadata. Images
+use the same data-URI hash convention as worker attachment caches. Storage uses
+`harnx_attachments` with the invoking session as owner and existing session
+retention/deletion rules. No connection is opened per invocation.
+
+If many individually fitting parts exceed the aggregate limit, the full original
+result is stored as `application/json` and replaced by an explicit aggregate
+reference, keeping representable top-level fields and error status. Oversized
+schema-sensitive fields or metadata that cannot be represented get an explicit
+small `isError: true` result with the original JSON reference, not an invented
+`structuredContent` schema. Malformed binary data also uses this JSON fallback.
+The final result is reserialized to enforce the limit after all substitutions.
+Images inside an aggregate JSON attachment remain recoverable in that JSON but
+aren't surfaced directly to the model as images. Normal per-part image links are
+hydrated into the worker cache before the next inference, including in the same
+turn and on replay. This doesn't fetch arbitrary network resource links.
+
+The bridge cap bounds each result, not the whole provider context or attachment
+contents later requested by the model. Many fitting results still add up. The
+shared server also bounds terminal replies against journal and broker limits;
+see [oversized terminal tool replies](../../docs/nats-ha.md#oversized-terminal-tool-replies).
+That guard doesn't impose the bridge's presentation cap on native tools.
+
+Use `attachment_read` with `byte_offset` and `byte_limit` to read large text/JSON
+originals in pages; line selectors also work when lines are reasonably sized.
+Attachment reads currently download the whole stored object before paging.
+
+Direct `--call-tool` and calls without trusted session identity cannot retain
+oversized originals. They return bounded errors saying the original wasn't
+retained and side effects may already have occurred. Direct CLI exits nonzero.
+Do not retry side-effecting tools blindly. Real storage failures remain fatal
+infrastructure errors rather than being reported as successful truncation.

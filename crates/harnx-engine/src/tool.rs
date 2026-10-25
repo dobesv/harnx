@@ -579,7 +579,7 @@ async fn complete_successful_tool_call(
     let images = if lossless {
         vec![]
     } else {
-        crate::media::extract_image_parts(&value)
+        crate::media::prepare_tool_result_images(&mut value)
     };
     if !images.is_empty() {
         crate::media::redact_image_data(&mut value);
@@ -614,7 +614,7 @@ pub async fn replay_tool_call(
         };
         work_boundary(ctx, call, abort, WorkBoundary::Accept).await?;
         let (mut value, observation) = output.into_parts();
-        let images = crate::media::extract_image_parts(&value);
+        let images = crate::media::prepare_tool_result_images(&mut value);
         if !images.is_empty() {
             crate::media::redact_image_data(&mut value);
         }
@@ -894,6 +894,8 @@ async fn dispatch_tool_call(
 
 #[cfg(test)]
 mod tests {
+    mod malformed_image;
+
     use super::*;
     use anyhow::anyhow;
     use harnx_core::abort::create_abort_signal;
