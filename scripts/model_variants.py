@@ -42,6 +42,10 @@ OPENAI_EFFORT_VARIANTS = {
     "gpt-6.1-sol": ("high", "max"),
 }
 OPENAI_NO_SAMPLING_PATCH = "del(.body.temperature) | del(.body.top_p)"
+OPENAI_SUMMARY_PATCH = '.body.reasoning = {"summary":"auto"}'
+# Responses models that don't reason.
+OPENAI_NON_REASONING_PREFIXES = ("gpt-4.1", "gpt-audio")
+OPENAI_NON_REASONING_SUFFIX = "-codex-spark"
 
 VARIANT_SUFFIXES = ("thinking", "high", *ADAPTIVE_EFFORT_VARIANTS)
 CLAUDE_VARIANT_SUFFIXES = ("thinking", *ADAPTIVE_EFFORT_VARIANTS)
@@ -174,9 +178,30 @@ def apply_base_thinking(model: dict[str, Any], provider: str) -> None:
         model["require_max_tokens"] = True
 
 
+def openai_reasons(model: dict[str, Any]) -> bool:
+    """Whether an OpenAI model on the Responses API can return reasoning summaries.
+
+    Keep in step with `openai_model_without_reasoning` in
+    crates/harnx-client/tests/it/models_yaml_patches.rs, which fails the
+    weekly refresh for any model it counts that lacks the patch.
+    """
+    name = model["name"]
+    return (
+        model.get("endpoint") == "responses"
+        and not name.startswith(OPENAI_NON_REASONING_PREFIXES)
+        and not name.endswith(OPENAI_NON_REASONING_SUFFIX)
+    )
+
+
 def apply_openai_base_patches(model: dict[str, Any], provider: str) -> None:
-    """Apply request rules for OpenAI base models with fixed reasoning."""
-    if provider == "openai" and model["name"] in (
+    """Ask OpenAI reasoning models for reasoning summaries, keeping curated patches.
+
+    The listed models have fixed reasoning and also drop sampling parameters.
+    Models the registry adds have no curated patch to carry over.
+    """
+    if provider != "openai":
+        return
+    if model["name"] in (
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -185,9 +210,9 @@ def apply_openai_base_patches(model: dict[str, Any], provider: str) -> None:
         "gpt-6.1-sol",
         "gpt-6-luna",
     ):
-        model["patches"] = [
-            f'{OPENAI_NO_SAMPLING_PATCH} | .body.reasoning = {{"summary":"auto"}}'
-        ]
+        model["patches"] = [f"{OPENAI_NO_SAMPLING_PATCH} | {OPENAI_SUMMARY_PATCH}"]
+    elif "patches" not in model and openai_reasons(model):
+        model["patches"] = [OPENAI_SUMMARY_PATCH]
 
 
 def gemini_version(name: str) -> tuple[int, int] | None:
