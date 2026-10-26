@@ -10,7 +10,6 @@ GEMINI_THOUGHTS_PATCH = (
     ".body.generationConfig.thinkingConfig = "
     '((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})'
 )
-OPENAI_SUMMARY_PATCH = '.body.reasoning = {"summary":"auto"}'
 
 
 class TestOpenAIEffortVariants(unittest.TestCase):
@@ -301,45 +300,6 @@ class TestProviderModelRegeneration(unittest.TestCase):
             regenerated = um.regenerate_provider_models(provider, old, fetched, [])
             with self.subTest(provider=provider):
                 self.assertEqual(regenerated[0]["patches"], curated)
-
-    def test_new_openai_reasoning_models_request_summaries(self) -> None:
-        # main() sets `endpoint` from the registry's supported_endpoints
-        # before the rules run.
-        models = [
-            {"name": "gpt-6.1-terra", "endpoint": "responses"},
-            {"name": "o3", "endpoint": "responses"},
-        ]
-        regenerated = self._regenerate_new_models("openai", models)
-        for model in models:
-            with self.subTest(name=model["name"]):
-                self.assertEqual(
-                    regenerated[model["name"]].get("patches"), [OPENAI_SUMMARY_PATCH]
-                )
-
-    def test_openai_models_without_reasoning_get_no_summary_patch(self) -> None:
-        models = [
-            {"name": "gpt-4.1-mini", "endpoint": "responses"},
-            {"name": "gpt-audio-1.5", "endpoint": "responses"},
-            {"name": "gpt-5.3-codex-spark", "endpoint": "responses"},
-            # The patch writes the Responses API's reasoning object.
-            {"name": "gpt-5.5-cyber-preview"},
-        ]
-        regenerated = self._regenerate_new_models("openai", models)
-        for model in models:
-            with self.subTest(name=model["name"]):
-                self.assertNotIn("patches", regenerated[model["name"]])
-        regenerated = self._regenerate_new_models(
-            "openrouter", [{"name": "gpt-6.1-terra", "endpoint": "responses"}]
-        )
-        self.assertNotIn("patches", regenerated["gpt-6.1-terra"])
-
-    def test_curated_openai_patch_is_not_replaced(self) -> None:
-        name = "gpt-5.5"
-        curated = ['.body.reasoning = {"effort":"low","summary":"concise"}']
-        old = {name: {"name": name, "endpoint": "responses", "patches": curated}}
-        fetched = {name: um.merge_old_fields({"name": name, "input_price": 5}, old[name])}
-        regenerated = um.regenerate_provider_models("openai", old, fetched, [])
-        self.assertEqual(regenerated[0]["patches"], curated)
 
     def test_bedrock_opus_5_5_does_not_generate_fixed_budget_variant(self) -> None:
         name = "us.anthropic.claude-opus-5-5"

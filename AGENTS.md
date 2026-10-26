@@ -486,15 +486,19 @@ are never supplied upstream, and must stay in that list or a refresh resets
 them. Any new field of that kind belongs there too.
 
 A model the registry adds starts with no `patches`, because only an existing
-entry has any to carry over. The rules in `scripts/model_variants.py` give
-new models the patches harnx needs, such as `includeThoughts` for Gemini
-thinking models and `reasoning.summary` for OpenAI reasoning models on the
-Responses API. The workflow runs the shipped-patch guard
-(`crates/harnx-client/tests/it/models_yaml_patches.rs`) before it opens its
-auto-merge pull request, so a model the rules miss fails the job instead (the
-Gemini and OpenAI checks report `<model> is missing its catalog patch`) and no
-pull request appears. Extend the rule rather than patching the catalog by
-hand, which only lasts until the registry adds the next such model.
+entry has any to carry over. The refresh gives new models the patches harnx
+needs: `scripts/model_variants.py` adds `includeThoughts` to Gemini thinking
+models, and `scripts/update_models.py` asks OpenAI Responses models the
+registry marks `supports_reasoning` for `reasoning.summary`. The workflow runs
+the shipped-patch guard (`crates/harnx-client/tests/it/models_yaml_patches.rs`)
+before it opens its auto-merge pull request, so a model the rules miss fails
+the job instead (the Gemini and OpenAI checks report `<model> is missing its
+catalog patch`) and no pull request appears. For Gemini, extend the rule
+rather than patching the catalog by hand, which only lasts until the registry
+adds the next such model. An OpenAI failure means a Responses model has no
+reasoning patch, usually because the registry doesn't mark it
+`supports_reasoning`: give it a curated patch if it reasons, or add it to the
+guard's `openai_model_without_reasoning` if it doesn't.
 
 LiteLLM records a capability only where it holds, so an omission is silence
 rather than a denial. `CURATED_CAPABILITY_FLAGS` lets a curated `true` survive
