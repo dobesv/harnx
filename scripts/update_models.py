@@ -17,6 +17,7 @@ from model_variants import (
     BASE_EFFORT,
     BEDROCK_THINKING_PATCH,
     OPENAI_NO_SAMPLING_PATCH,
+    OPENAI_SUMMARY_PATCH,
     apply_base_model_rules,
     apply_base_thinking,
     apply_openai_base_patches,
@@ -337,6 +338,25 @@ def apply_openai_endpoint_default(
     supported = payload.get("supported_endpoints")
     if isinstance(supported, list) and "/v1/responses" in supported:
         model["endpoint"] = "responses"
+
+
+def apply_openai_reasoning_summary(
+    model: dict[str, Any], provider: str, payload: dict[str, Any]
+) -> None:
+    """Ask OpenAI models the registry marks `supports_reasoning` for reasoning
+    summaries.
+
+    Runs after `apply_openai_endpoint_default`, because the patch writes the
+    Responses API's `reasoning` object. A curated patch carried over from
+    models.yaml wins. A model without the flag gets nothing, since the registry
+    omits a capability rather than denying it; the shipped-patch guard in
+    crates/harnx-client/tests/it/models_yaml_patches.rs then fails the refresh
+    unless it lists the model as non-reasoning.
+    """
+    if provider != "openai" or model.get("endpoint") != "responses":
+        return
+    if payload.get("supports_reasoning") is True:
+        model.setdefault("patches", [OPENAI_SUMMARY_PATCH])
 
 
 def ordered_model(model: dict[str, Any]) -> OrderedDict[str, Any]:
@@ -859,6 +879,7 @@ def main() -> int:
         old_model = old_by_provider.get(provider, {}).get(model_name)
         model = merge_old_fields(model, old_model)
         apply_openai_endpoint_default(model, provider, payload)
+        apply_openai_reasoning_summary(model, provider, payload)
         new_provider_models[provider][model_name] = model
 
     drop_bedrock_in_region_duplicates(new_provider_models["bedrock"])
