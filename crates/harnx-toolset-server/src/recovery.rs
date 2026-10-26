@@ -39,7 +39,7 @@ impl InvocationRecovery {
 
     pub async fn completed_reply(&self) -> Result<Option<ToolReply>, ToolInvokeError> {
         self.journal
-            .completed_reply(&self.request)
+            .completed_reply_for_delivery(&self.request)
             .await
             .map_err(invoke_error)
     }

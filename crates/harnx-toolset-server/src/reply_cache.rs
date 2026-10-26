@@ -125,11 +125,10 @@ fn digest(bytes: &[u8]) -> String {
 
 pub(super) async fn serve_cached(
     context: &ToolRequestContext,
-    request: &ToolRequest,
     subject: harnx_nats_common::rpc::ReplyTarget,
     saved: CachedReply,
 ) -> Result<()> {
-    let mut reply = (*saved).clone();
-    finalize_execution_context(context, request, &mut reply);
-    publish_reply(&context.client, subject, &reply).await
+    // Attestation and size normalization happened before the journal CAS.
+    // Re-stamping provenance here would change the durable reply's bytes.
+    publish_reply(&context.client, subject, &saved).await
 }

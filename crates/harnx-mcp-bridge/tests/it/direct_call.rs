@@ -449,3 +449,73 @@ async fn existing_list_mode_keeps_human_output_filters_and_child_cleanup() -> Re
     assert_eq!(fixture.requests()?.len(), 3);
     Ok(())
 }
+
+#[tokio::test]
+async fn oversized_contextless_result_is_bounded_error_and_nonzero() -> Result<()> {
+    let fixture = Fixture::new(
+        json!({"call_result": {"content": [{"type": "text", "text": "large".repeat(10000)}]}}),
+    )?;
+    let output = fixture.run(&["--call-tool", "mixed_tool"]).await?;
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout)?;
+    assert!(serde_json::to_vec(&result)?.len() <= 32768);
+    assert_eq!(result["isError"], true);
+    let message = result["content"][0]["text"].as_str().unwrap();
+    assert!(message.contains("original was not retained"));
+    assert!(message.contains("side effects may already have occurred"));
+    assert!(!message.contains("cid:"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn result_limit_env_cli_precedence_and_validation() -> Result<()> {
+    let expected = json!({"content": [{"type": "text", "text": "x".repeat(2000)}]});
+    let fixture = Fixture::new(json!({"call_result": expected}))?;
+    let output = fixture
+        .command(&["--call-tool", "mixed_tool"], false)
+        .env("HARNX_MCP_MAX_RESULT_BYTES", "1024")
+        .output()
+        .await?;
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout)?;
+    assert!(serde_json::to_vec(&result)?.len() <= 1024);
+    assert_eq!(result["isError"], true);
+    let output = fixture
+        .command(
+            &["--max-result-bytes", "4096", "--call-tool", "mixed_tool"],
+            false,
+        )
+        .env("HARNX_MCP_MAX_RESULT_BYTES", "1024")
+        .output()
+        .await?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(serde_json::from_slice::<Value>(&output.stdout)?, expected);
+    for invalid in ["0", "1023", "invalid"] {
+        let fixture = Fixture::new(json!({}))?;
+        let output = fixture
+            .command(&["--call-tool", "mixed_tool"], false)
+            .env("HARNX_MCP_MAX_RESULT_BYTES", invalid)
+            .output()
+            .await?;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!fixture.spawn_log.exists());
+    }
+    Fixture::new(json!({}))?
+        .rejected_before_spawn(
+            &["--max-result-bytes", "1", "--call-tool", "mixed_tool"],
+            "must be at least 1024",
+        )
+        .await?;
+    // A valid CLI value also overrides an invalid inherited environment value.
+    let output = fixture
+        .command(
+            &["--max-result-bytes", "4096", "--call-tool", "mixed_tool"],
+            false,
+        )
+        .env("HARNX_MCP_MAX_RESULT_BYTES", "invalid")
+        .output()
+        .await?;
+    assert!(output.status.success(), "{output:?}");
+    Ok(())
+}

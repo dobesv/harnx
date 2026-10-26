@@ -103,7 +103,7 @@ async fn record_outcome(
     };
     context
         .journal
-        .complete(request, reply)
+        .complete_for_delivery(request, reply)
         .await
         .map_err(recovery::invoke_error)
 }

@@ -15,6 +15,7 @@ use async_nats::jetstream::{self, kv};
 use harnx_toolset::{ToolReply, ToolRequest};
 use serde::{Deserialize, Serialize};
 
+mod completion;
 mod leader_reads;
 mod replies;
 pub use replies::{JournalCheckpointStore, JournalPartialResultStore};

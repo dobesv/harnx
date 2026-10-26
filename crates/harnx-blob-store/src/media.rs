@@ -23,6 +23,51 @@ pub async fn put_media(
     bytes: &[u8],
     mime_type: &str,
 ) -> Result<()> {
+    put_media_chunked(
+        store,
+        MediaBlob {
+            url,
+            bytes,
+            mime_type,
+        },
+        None,
+    )
+    .await
+}
+
+/// A media object's identity, exact bytes and stored content type.
+#[derive(Clone, Copy)]
+pub struct MediaBlob<'a> {
+    pub url: &'a CidUrl,
+    pub bytes: &'a [u8],
+    pub mime_type: &'a str,
+}
+
+/// Put a blob with chunks no larger than `max_chunk_bytes`. Use the connected
+/// broker's payload ceiling when it is smaller than the client's 128 KiB default.
+/// Object metadata still has to fit in a single message; failures propagate.
+pub async fn put_media_with_chunk_limit(
+    store: &object_store::ObjectStore,
+    blob: MediaBlob<'_>,
+    max_chunk_bytes: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        max_chunk_bytes > 0,
+        "attachment chunk limit must be positive"
+    );
+    put_media_chunked(store, blob, Some(max_chunk_bytes.min(128 * 1024))).await
+}
+
+async fn put_media_chunked(
+    store: &object_store::ObjectStore,
+    blob: MediaBlob<'_>,
+    chunk_size: Option<usize>,
+) -> Result<()> {
+    let MediaBlob {
+        url,
+        bytes,
+        mime_type,
+    } = blob;
     let key = url.kv_key();
     if store.info(&key).await.is_ok() {
         return Ok(()); // Already exists, skip duplicate put
@@ -33,6 +78,7 @@ pub async fn put_media(
         name: key.clone(),
         description: Some(format!("Attachment {}", url)),
         metadata,
+        chunk_size,
         ..Default::default()
     };
     let mut cursor = std::io::Cursor::new(bytes);

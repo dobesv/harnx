@@ -393,3 +393,77 @@ async fn missing_authoritative_and_local_attachment_is_rejected() -> Result<()> 
     assert!(error.to_string().contains("download attachment"));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydration_rejects_invalid_cids_and_remote_bytes_or_mime_without_caching() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let store = harnx_blob_store::media::ensure_attachments_bucket(&js, 1).await?;
+    let session = SessionRef::new(None, "img123".into())?;
+    let cid = cid_for_data_url_with_session(&session, "data:image/png;base64,aGVsbG8=");
+    let url = CidUrl::parse(&cid)?;
+    for (bytes, mime) in [
+        (b"wrong bytes".as_slice(), "image/png"),
+        (b"hello".as_slice(), "image/jpeg"),
+    ] {
+        let cache = tempfile::tempdir()?;
+        store.delete(url.kv_key()).await.ok();
+        // Deliberately violate the key's full-data-URI digest, as a corrupt store would.
+        let metadata = async_nats::jetstream::object_store::ObjectMetadata {
+            name: url.kv_key(),
+            metadata: [("content_type".into(), mime.into())].into_iter().collect(),
+            ..Default::default()
+        };
+        store
+            .put(metadata, &mut std::io::Cursor::new(bytes))
+            .await?;
+        let error = hydrate_attachment_refs(
+            location(&js, &session),
+            cache.path(),
+            std::slice::from_ref(&cid),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("attachment digest mismatch"));
+        assert_eq!(std::fs::read_dir(cache.path())?.count(), 0);
+    }
+    let cache = tempfile::tempdir()?;
+    let error = hydrate_attachment_refs(
+        location(&js, &session),
+        cache.path(),
+        &["cid:media:_temp/img123/not-a-hash".into()],
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("parse attachment URL"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydration_rejects_corrupt_cached_bytes_and_mime() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let session = SessionRef::new(None, "img123".into())?;
+    for corrupt_mime in [false, true] {
+        let cache = tempfile::tempdir()?;
+        let local = store_attachment_bytes_async(cache.path(), b"hello", "image/png").await?;
+        let hash = local.strip_prefix("cid:").unwrap();
+        if corrupt_mime {
+            std::fs::write(cache.path().join(format!("{hash}.mime")), "image/jpeg")?;
+        } else {
+            std::fs::write(cache.path().join(format!("{hash}.png")), b"corrupt")?;
+        }
+        let cid = canonical_cid(&session, &local);
+        let error = hydrate_attachment_refs(location(&js, &session), cache.path(), &[cid])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("attachment digest mismatch"));
+    }
+    Ok(())
+}

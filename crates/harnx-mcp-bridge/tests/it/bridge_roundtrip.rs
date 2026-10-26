@@ -21,10 +21,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-const TOKEN: &str = "mcp-bridge-roundtrip-token";
+pub(super) const TOKEN: &str = "mcp-bridge-roundtrip-token";
 
-struct NatsServerHandle {
-    url: String,
+pub(super) struct NatsServerHandle {
+    pub(super) url: String,
     _store_dir: TempDir,
     _ports_dir: TempDir,
     child: Child,
@@ -47,7 +47,13 @@ fn nats_server_binary() -> Option<PathBuf> {
     which::which("nats-server").ok()
 }
 
-async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
+pub(super) async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
+    spawn_nats_server_with_payload_limit(None).await
+}
+
+pub(super) async fn spawn_nats_server_with_payload_limit(
+    max_payload: Option<usize>,
+) -> Result<Option<NatsServerHandle>> {
     let Some(binary) = nats_server_binary() else {
         eprintln!("skipping NATS integration test: nats-server binary not found");
         return Ok(None);
@@ -55,7 +61,7 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
 
     let mut last_error = None;
     for _ in 0..5 {
-        match try_spawn_nats_server(&binary).await {
+        match try_spawn_nats_server(&binary, max_payload).await {
             Ok(server) => return Ok(Some(server)),
             Err(error) => last_error = Some(error),
         }
@@ -63,10 +69,19 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to spawn nats-server")))
 }
 
-async fn try_spawn_nats_server(binary: &Path) -> Result<NatsServerHandle> {
+async fn try_spawn_nats_server(
+    binary: &Path,
+    max_payload: Option<usize>,
+) -> Result<NatsServerHandle> {
     let store_dir = tempfile::tempdir().context("create NATS test store")?;
     let ports_dir = tempfile::tempdir().context("create NATS ports dir")?;
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    if let Some(max_payload) = max_payload {
+        let config = ports_dir.path().join("server.conf");
+        std::fs::write(&config, format!("max_payload: {max_payload}\n"))?;
+        command.arg("-c").arg(config);
+    }
+    let mut child = command
         .arg("-js")
         .arg("-sd")
         .arg(store_dir.path())
@@ -167,7 +182,7 @@ fn mock_mcp_binary() -> Result<PathBuf> {
     )
 }
 
-async fn wait_for_registration(
+pub(super) async fn wait_for_registration(
     client: &async_nats::Client,
     instance_id: &ServerScope,
     identity_token: &str,
@@ -190,7 +205,7 @@ async fn wait_for_registration(
     }
 }
 
-fn tool_request(call_id: &str, tool: &str) -> ToolRequest {
+pub(super) fn tool_request(call_id: &str, tool: &str) -> ToolRequest {
     ToolRequest {
         run_context: None,
         replay: None,

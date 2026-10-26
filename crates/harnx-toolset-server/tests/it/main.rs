@@ -18,4 +18,5 @@ mod partial_result;
 mod progress;
 mod replay;
 mod reply_projection;
+mod result_limits;
 mod stale_replica;

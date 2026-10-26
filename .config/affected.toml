@@ -88,6 +88,11 @@ test = ["harnx"]
 on-affected = ["harnx-fs-tools", "harnx-claude-compatible-hook-server"]
 test = ["harnx-runtime"]
 
+# Runtime attachment/result round tests launch the MCP bridge by path.
+[[test-edge]]
+on-affected = ["harnx-mcp-bridge"]
+test = ["harnx-runtime"]
+
 # Tool reservation client integration tests launch the attachment server.
 [[test-edge]]
 on-affected = ["harnx-attachment-tools"]
@@ -127,7 +132,7 @@ test = ["harnx-runtime"]
 # Bridge direct-call fixtures run the SDK-backed mock MCP binary by path.
 [[test-edge]]
 on-affected = ["harnx-test-bins"]
-test = ["harnx-mcp-bridge"]
+test = ["harnx-mcp-bridge", "harnx-runtime"]
 
 # Serve control-plane and SIGTERM tests reuse the runtime's NATS server fixture.
 [[test-path]]

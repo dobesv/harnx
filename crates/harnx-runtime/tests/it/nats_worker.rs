@@ -6,6 +6,8 @@
 mod activation_error_disposition;
 #[path = "nats_worker/activation_failure_budget.rs"]
 mod activation_failure_budget;
+#[path = "nats_worker/bounded_results.rs"]
+mod bounded_results;
 #[path = "nats_worker/cancellation.rs"]
 mod cancellation;
 use crate::common;
@@ -14,6 +16,10 @@ mod failed_assistant_recovery;
 #[path = "nats_worker/manual_compaction.rs"]
 mod manual_compaction;
 use crate::generation;
+#[path = "nats_worker/image_attachments.rs"]
+mod image_attachments;
+#[path = "nats_worker/result_fixture.rs"]
+mod result_fixture;
 use harnx_runtime::nats_session_log::NatsSessionLog;
 #[path = "nats_worker/multi_round_resume.rs"]
 mod multi_round_resume;

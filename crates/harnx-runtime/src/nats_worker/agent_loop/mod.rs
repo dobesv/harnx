@@ -492,7 +492,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
             instance_id: args.instance_id,
             abort_signal: args.abort_signal.clone(),
             token_budget: args.token_budget,
-            call_fn: args.call_fn,
+            call_fn: Some(attachment_sync.model_call(args.call_fn)),
             on_tool_round: args.on_tool_round,
             on_hitl_approval_required,
             prepare_handoff_fn,

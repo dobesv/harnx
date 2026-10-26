@@ -1,5 +1,5 @@
 use anyhow::Context;
-use harnx_mcp_bridge::{report_tools_filtered, Args, BridgeToolset};
+use harnx_mcp_bridge::{report_tools_filtered, result_limits::ResultLimits, Args, BridgeToolset};
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
 use harnx_toolset_server::{
     compile_enable_globs, serve_with_config, FilteredToolset, ServeConfig, ServeLifecycle,
@@ -72,12 +72,6 @@ async fn run() -> anyhow::Result<ExitCode> {
     // after it, and Kubernetes terminates pods with SIGTERM.
     let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
 
-    // Apply filter to bridge toolset if specified
-    let toolset: Arc<dyn harnx_toolset::Toolset> = match &filter_set {
-        Some(set) => Arc::new(FilteredToolset::new(bridge, set.clone())),
-        None => Arc::new(bridge),
-    };
-
     // Keep the connect attempt inside the same race as the signal above:
     // a slow/unreachable NATS cluster (bad DNS, stalled TLS handshake) must
     // not block the bridge from noticing the wrapped child has already died.
@@ -88,6 +82,17 @@ async fn run() -> anyhow::Result<ExitCode> {
             client,
             replicas: endpoint.resolved_replicas(),
         };
+        let limits = ResultLimits::new(args.max_result_bytes)?.with_storage(
+            async_nats::jetstream::new(connection.client.clone()),
+            connection.replicas,
+        );
+        let bridge = bridge.with_result_limits(limits);
+        // Apply filter to bridge toolset if specified
+        let toolset: Arc<dyn harnx_toolset::Toolset> = match &filter_set {
+            Some(set) => Arc::new(FilteredToolset::new(bridge, set.clone())),
+            None => Arc::new(bridge),
+        };
+
         serve_with_config(
             toolset,
             ServeConfig {
@@ -132,13 +137,14 @@ async fn call_tool_direct(tool_name: &str, args: &Args) -> anyhow::Result<ExitCo
     let name = args.name.as_deref().unwrap_or("mcp-diagnostic");
     let mut bridge = BridgeToolset::new(name, args.child.clone())
         .await
-        .context("failed to connect to MCP child server")?;
+        .context("failed to connect to MCP child server")?
+        .with_result_limits(ResultLimits::new(args.max_result_bytes)?);
     // Always reap after discovery, including unknown tools and protocol failures.
     let result = invoke_direct(&bridge, tool_name, tool_args).await;
     let cleanup = bridge.shutdown().await;
     match (result, cleanup) {
         (Ok(result), Ok(())) => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!("{}", serde_json::to_string(&result)?);
             anyhow::ensure!(
                 result.get("isError").and_then(serde_json::Value::as_bool) != Some(true),
                 "tool '{tool_name}' reported isError: true"
@@ -154,7 +160,7 @@ async fn call_tool_direct(tool_name: &str, args: &Args) -> anyhow::Result<ExitCo
         }
         (Ok(result), Err(error)) => {
             // Cleanup failure must not discard an otherwise complete tool payload.
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!("{}", serde_json::to_string(&result)?);
             Err(error.context("failed to clean up MCP child"))
         }
         (Err(error), Err(cleanup)) => {

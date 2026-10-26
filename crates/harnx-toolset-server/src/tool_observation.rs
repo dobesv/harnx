@@ -7,36 +7,52 @@ pub(super) struct RequestAttestation {
     pub(super) capabilities: std::collections::BTreeSet<String>,
 }
 
-pub(super) fn finalize_execution_context(
-    context: &ToolRequestContext,
-    request: &ToolRequest,
+pub(crate) fn finalize_journal_reply(
+    record: &invocation_journal::RecordedInvocation,
     reply: &mut ToolReply,
-) {
-    finalize_execution_context_for_attestation(
-        context,
-        &RequestAttestation {
-            call_id: request.call_id.clone(),
-            tool: request.tool.clone(),
-            capabilities: request.capabilities.clone(),
-        },
-        reply,
-    );
-}
-
-pub(super) fn finalize_execution_context_for_attestation(
-    context: &ToolRequestContext,
-    request: &RequestAttestation,
-    reply: &mut ToolReply,
+    already_recorded: bool,
 ) {
     let Ok(result) = &mut reply.result else {
         return;
     };
-    finalize_execution_context_value(
-        context.server_scope.as_str(),
-        &context.server_identity,
-        request,
-        result,
-    );
+    let request = RequestAttestation {
+        call_id: record.request.call_id.clone(),
+        tool: record.request.tool.clone(),
+        capabilities: record.request.capabilities.clone(),
+    };
+    if already_recorded && has_journal_attestation(record, result) {
+        return;
+    }
+    finalize_execution_context_value(&record.server_scope, &record.server, &request, result);
+}
+
+fn has_journal_attestation(
+    record: &invocation_journal::RecordedInvocation,
+    result: &Value,
+) -> bool {
+    let Some(raw) = result
+        .get("_meta")
+        .and_then(|meta| meta.get(EXECUTION_CONTEXT_NAMESPACE))
+    else {
+        return true;
+    };
+    if !record
+        .request
+        .capabilities
+        .contains(EXECUTION_CONTEXT_NAMESPACE)
+    {
+        return false;
+    }
+    let Ok(observation) = serde_json::from_value::<ExecutionContextObservation>(raw.clone()) else {
+        return false;
+    };
+    observation.validate().is_ok()
+        && observation.provenance.is_some_and(|provenance| {
+            provenance.server_scope == record.server_scope
+                && provenance.server_identity == record.server
+                && provenance.tool_name == record.request.tool
+                && provenance.call_id == record.request.call_id
+        })
 }
 
 pub(super) fn finalize_execution_context_value(

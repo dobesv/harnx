@@ -49,6 +49,61 @@ async fn media_put_get_round_trip() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn media_chunk_limit_validates_clamps_and_preserves_existing_blob() -> Result<()> {
+    use harnx_blob_store::media::{put_media_with_chunk_limit, MediaBlob};
+
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    let store = ensure_attachments_bucket(&jetstream, 1).await?;
+    let session = SessionRef::new(Some("pantheon/atlas".into()), "chunks1".into())?;
+    let bytes = [0, 1, 254, 255].repeat(80_000);
+    let mime_type = "audio/wav; codecs=pcm";
+    for (hash, limit) in [(HASH_A, 16 * 1024), (HASH_B, 512 * 1024)] {
+        let url = media_cid_url(&session, hash);
+        let blob = MediaBlob {
+            url: &url,
+            bytes: &bytes,
+            mime_type,
+        };
+        let error = put_media_with_chunk_limit(&store, blob, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "attachment chunk limit must be positive");
+        assert!(get_media(&store, &url).await?.is_none());
+        put_media_with_chunk_limit(&store, blob, limit).await?;
+        let info = store.info(url.kv_key()).await?;
+        let chunk_size = limit.min(128 * 1024);
+        assert_eq!(
+            info.options.as_ref().unwrap().max_chunk_size,
+            Some(chunk_size)
+        );
+        assert_eq!(info.chunks, bytes.len().div_ceil(chunk_size));
+        assert_eq!(
+            get_media(&store, &url).await?,
+            Some((bytes.clone(), mime_type.into()))
+        );
+        put_media_with_chunk_limit(
+            &store,
+            MediaBlob {
+                url: &url,
+                bytes: b"not the original",
+                mime_type: "text/plain",
+            },
+            1,
+        )
+        .await?;
+        assert_eq!(store.info(url.kv_key()).await?, info);
+        assert_eq!(
+            get_media(&store, &url).await?,
+            Some((bytes.clone(), mime_type.into()))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn resolve_media_returns_bytes_and_cache_metadata() -> Result<()> {
     harnx_core::require_nextest();
     let Some((_server, jetstream)) = isolated_jetstream().await? else {

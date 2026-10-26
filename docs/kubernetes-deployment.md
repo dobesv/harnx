@@ -646,6 +646,23 @@ For filesystem and shell execution in Kubernetes, deploy `harnx-k8s-sandbox-tool
 
 To use external Model Context Protocol (MCP) servers that communicate over stdio, run `harnx-mcp-bridge` in a container that installs the external MCP tool. `harnx-mcp-bridge` wraps the stdio process and exposes it as a native tool server on NATS within `HARNX_SERVER_SCOPE`.
 
+Set the bridge container's `HARNX_MCP_MAX_RESULT_BYTES` to change the default
+32,768-byte compact JSON cap per tool result. A `--max-result-bytes` argument
+before `--` overrides that environment variable; the minimum is 1,024 bytes:
+
+```yaml
+env:
+  - name: HARNX_MCP_MAX_RESULT_BYTES
+    value: "32768"
+```
+
+Oversized originals use the existing session-owned `harnx_attachments` object
+store when trusted caller identity is available. Keep that store available and
+size its retention for original outputs, not only previews. Contextless calls
+cannot retain oversized originals and return explicit errors. See
+[bridge result limits](../crates/harnx-mcp-bridge/README.md#result-limits-and-original-attachments)
+and [journal/broker limits](nats-ha.md#oversized-terminal-tool-replies).
+
 ---
 
 ## Startup Diagnostics

@@ -16,13 +16,27 @@ const ATTACHMENT_READ_DESCRIPTION: &str = "Read an attachment or plan by its cid
 Returns image content as image blocks, text and rendered plans as truncated
 text with line numbers, and errors for non-displayable binary content.
 
-Truncation parameters follow the same semantics as fs.read:
+Two paging modes are available - line-based (default) or byte-based:
+
+**Line-based paging** (default):
 - head_lines: return only the first N lines
 - tail_lines: return only the last N lines (combined with head_lines shows both ends)
 - offset: start reading at this line (1-indexed)
 - limit: maximum number of lines
 - max_output_bytes: maximum output size in bytes
 - grep: filter lines by regex pattern before truncation
+
+**Byte-based paging** (alternative to line selectors):
+- byte_offset: zero-based byte position to start reading
+- byte_limit: maximum number of bytes to return
+
+Cannot combine line selectors with byte selectors.
+
+Note: Whole object is downloaded into memory before paging is applied.
+Streaming is not supported; large attachments consume memory proportional
+to their size. For text larger than 5 MiB, use byte_offset/byte_limit to
+read in bounded pages. Binary content that is not a supported image type
+will return an error.
 ";
 
 const ATTACHMENT_CREATE_DESCRIPTION: &str = "Create a text attachment in the NATS object store.
@@ -84,36 +98,7 @@ impl Toolset for AttachmentToolset {
             ToolSpec {
                 name: "attachment_read".to_string(),
                 description: ATTACHMENT_READ_DESCRIPTION.to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The cid: URL to read"
-                        },
-                        "offset": { "type": "integer", "minimum": 1,
-                            "description": "Start reading at this line number (1-indexed)" },
-                        "limit": { "type": "integer",
-                            "description": "Maximum number of lines to return from offset" },
-                        "head_lines": {
-                            "type": "integer",
-                            "description": "Return only the first N lines"
-                        },
-                        "tail_lines": {
-                            "type": "integer",
-                            "description": "Return only the last N lines"
-                        },
-                        "max_output_bytes": {
-                            "type": "integer",
-                            "description": "Maximum output bytes"
-                        },
-                        "grep": {
-                            "type": "string",
-                            "description": "Filter lines by regex pattern"
-                        }
-                    },
-                    "required": ["url"]
-                }),
+                input_schema: attachment_read_schema(),
                 cancellation_guarantee: harnx_toolset::CancellationGuarantee::HardOnDrop,
                 idempotent_hint: true,
                 read_only_hint: true,
@@ -124,20 +109,7 @@ impl Toolset for AttachmentToolset {
             ToolSpec {
                 name: "attachment_create".to_string(),
                 description: ATTACHMENT_CREATE_DESCRIPTION.to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "The text content to store"
-                        },
-                        "mime_type": {
-                            "type": "string",
-                            "description": "MIME type (text/*, application/json, etc.)"
-                        }
-                    },
-                    "required": ["content", "mime_type"]
-                }),
+                input_schema: attachment_create_schema(),
                 cancellation_guarantee: harnx_toolset::CancellationGuarantee::HardOnDrop,
                 idempotent_hint: false,
                 read_only_hint: false,
@@ -225,23 +197,113 @@ async fn invoke_with_context_tool(
     }
 }
 
+fn attachment_read_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The cid: URL to read"
+            },
+            "offset": { "type": "integer", "minimum": 1,
+                "description": "Start reading at this line number (1-indexed)" },
+            "limit": { "type": "integer",
+                "description": "Maximum number of lines to return from offset" },
+            "head_lines": {
+                "type": "integer",
+                "description": "Return only the first N lines"
+            },
+            "tail_lines": {
+                "type": "integer",
+                "description": "Return only the last N lines"
+            },
+            "max_output_bytes": {
+                "type": "integer",
+                "description": "Maximum output bytes"
+            },
+            "grep": {
+                "type": "string",
+                "description": "Filter lines by regex pattern"
+            },
+            "byte_offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Zero-based byte offset to start reading. Cannot combine with line selectors. Must be at a valid UTF-8 character boundary."
+            },
+            "byte_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum bytes to return from byte_offset. Defaults to 64 KiB when byte_offset is provided without byte_limit."
+            }
+        },
+        "required": ["url"]
+    })
+}
+
+fn attachment_create_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The text content to store"
+            },
+            "mime_type": {
+                "type": "string",
+                "description": "MIME type (text/*, application/json, etc.)"
+            }
+        },
+        "required": ["content", "mime_type"]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn exposes_tool_specs() {
         let toolset = AttachmentToolset::new();
-        assert_eq!(toolset.name(), "attachments");
-        assert_eq!(toolset.default_mcp_http_port(), 3007);
-
+        assert_eq!(
+            (toolset.name(), toolset.default_mcp_http_port()),
+            ("attachments", 3007)
+        );
         let tools = toolset.tools();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].name, "attachment_read");
-        assert!(tools[0].input_schema["properties"].get("offset").is_some());
-        assert!(tools[0].input_schema["properties"].get("limit").is_some());
-        assert!(tools[0].idempotent_hint);
-        assert!(tools[0].read_only_hint);
-        assert_eq!(tools[1].name, "attachment_create");
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, ["attachment_read", "attachment_create"]);
+        for (tool, read_only) in tools.iter().zip([true, false]) {
+            assert_eq!(
+                (tool.idempotent_hint, tool.read_only_hint),
+                (read_only, read_only)
+            );
+        }
+    }
+
+    #[test]
+    fn read_schema_registers_byte_and_line_selectors() {
+        let tools = AttachmentToolset::new().tools();
+        let schema = &tools[0].input_schema;
+        assert_eq!(schema["required"], json!(["url"]));
+        for (name, kind, minimum) in [
+            ("url", "string", None),
+            ("offset", "integer", Some(1)),
+            ("limit", "integer", None),
+            ("head_lines", "integer", None),
+            ("tail_lines", "integer", None),
+            ("max_output_bytes", "integer", None),
+            ("grep", "string", None),
+            ("byte_offset", "integer", Some(0)),
+            ("byte_limit", "integer", Some(1)),
+        ] {
+            let property = &schema["properties"][name];
+            assert_eq!(property["type"], kind, "{name}");
+            assert_eq!(property["minimum"].as_u64(), minimum, "{name}");
+            assert!(!property["description"].as_str().unwrap().is_empty());
+        }
+        assert!(schema["properties"]["byte_limit"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("64 KiB"));
     }
 }

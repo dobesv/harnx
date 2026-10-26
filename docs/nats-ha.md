@@ -146,11 +146,34 @@ count (`None` means 1, no HA):
 Set `replicas` to 3 to match a 3-node cluster; a mismatch between the two leaves
 resources unable to tolerate a node loss.
 
-For NATS sessions, a local `cid:` file is only a cache entry. New local or
-inline payloads are uploaded before their `cid:` is appended to the transcript;
-a worker can backfill a legacy local-only blob, but fails the turn if the blob
-exists in neither place. HTTP(S) attachment URLs remain external references and
-are intentionally not copied into the object store.
+For NATS sessions, a local `cid:` file is only a cache entry. Inline user
+payloads are uploaded before their `cid:` is appended to the transcript. Locally
+created tool images are uploaded before the durable turn boundary. A worker can
+backfill a legacy local-only blob, but fails the turn if the blob exists in
+neither place. HTTP(S) attachment URLs remain external references and are
+intentionally not copied into the object store.
+
+Bridge-offloaded image `resource_link` parts use canonical `cid:media:` URLs.
+Workers hydrate missing image blobs before each agent model call, including the next
+call in the same turn, and when replaying a session on another worker. Cached
+and downloaded blobs are checked against the SHA-256 of the full data URI,
+including the exact stored MIME type. Malformed media image URLs, missing blobs,
+and digest mismatches fail explicitly instead of sending an unavailable-image
+placeholder. Valid cached blobs don't need another download. Arbitrary network
+resource links stay in tool text; they aren't fetched as images.
+
+**Internal `cid:media:` capability model.** The storage path `media/<owner>/<hash>`
+uses `<owner>` (`session_key(agent, sid)`) for lifecycle management — session
+deletion garbage-collects attachments under that prefix. Workers do not restrict
+hydration to the current session. Legitimate parent-to-child attachment handoff
+relies on cross-session reads. Because worker hydration lacks an internal session
+equality check, a tool-returned CID referencing another session also hydrates.
+The hash provides content integrity, not secret-key authorization: a known
+session ID plus known content bits constructs a valid CID. HTTP API access
+(`/v1/cid/*`) remains governed by `AccessRules` ACLs; internal cluster hydration
+has no HTTP boundary. Deployments requiring isolation from untrusted MCP output
+must use separate storage or delegated-read grants beyond the current
+implementation.
 
 **A bucket that has never existed before is created, not reconciled**, so
 `replicas` above what the cluster can actually provide (e.g. a production
@@ -1422,6 +1445,31 @@ the worker lease make repeated activation safe while preserving exactly one
 user row. Each targeted recovery attempt has a distinct JetStream message ID,
 so an activation already acknowledged by a worker that later stalled cannot
 suppress the replacement worker's wakeup during the duplicate window.
+
+### Oversized terminal tool replies
+
+The shared NATS tool server checks native and bridged terminal replies against
+both the connected broker's `max_payload` and the journal stream's independent
+message-size limit. The budget includes the complete invocation row, CAS headers,
+and final reply metadata. This is a per-record/message limit, not a whole-session
+limit. Native results that fit aren't subject to the MCP bridge's 32 KiB
+presentation cap.
+
+An oversized terminal reply is stored as an `application/json` attachment under
+the trusted invoking session, then replaced by an explicit recoverable size error
+with its `cid:media:` reference. Without trusted ownership, the error says the
+original wasn't retained. Read retained output with `attachment_read` byte paging;
+don't blindly retry side-effecting tools. The first bounded completion committed
+by journal CAS is delivered unchanged and reused on replay, without rerunning the
+tool or hydrating the large original into the reply. Fatal and interrupted
+outcomes keep their categories. Attachment outages and other non-size storage or
+transport failures aren't converted into recoverable size errors.
+
+This guard bounds outputs only. It doesn't add input or checkpoint admission
+limits. If those fields already fill a journal row so even a small terminal error
+can't be persisted, completion still fails fatally. A broker limit lowered below
+an already committed reply also remains a delivery failure; the server doesn't
+replace an authoritative stored completion with an unjournaled response.
 
 ## Manual Compaction
 

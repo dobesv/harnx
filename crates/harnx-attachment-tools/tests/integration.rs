@@ -13,6 +13,10 @@ use harnx_toolset::{SessionRef as ToolSessionRef, ToolInvocation, ToolInvocation
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+#[path = "integration/paging_fixture.rs"]
+mod paging_fixture;
+use paging_fixture::{assert_page, metadata, StoredAttachment};
+
 const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const HASH_B: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
@@ -362,4 +366,217 @@ async fn attachment_read_not_found() {
         .await;
 
     assert_error_contains(&result, "attachment not found");
+}
+#[tokio::test]
+async fn attachment_read_byte_paging_basic() {
+    let Some(stored) =
+        StoredAttachment::start(b"Hello, World! This is a test.", "text/plain").await
+    else {
+        return;
+    };
+    assert_page(&stored.page(0, 5).await, "Hello", Some(5));
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_middle_of_content() {
+    let Some(stored) =
+        StoredAttachment::start(b"Hello, World! This is a test.", "text/plain").await
+    else {
+        return;
+    };
+    assert_page(&stored.page(7, 6).await, "World!", Some(13));
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_with_multibyte_utf8() {
+    let Some(stored) = StoredAttachment::start("日本語テスト".as_bytes(), "text/plain").await
+    else {
+        return;
+    };
+    assert_page(&stored.page(0, 3).await, "日", Some(3));
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_rejects_conflicting_selectors() {
+    let Some(stored) = StoredAttachment::start(b"Hello", "text/plain").await else {
+        return;
+    };
+    for selector in ["offset", "limit", "head_lines", "tail_lines", "grep"] {
+        let mut args = json!({ "byte_offset": 0 });
+        args[selector] = if selector == "grep" {
+            json!("Hello")
+        } else {
+            json!(1)
+        };
+        let result = stored.read(args).await;
+        for expected in ["cannot combine", "line selectors", "byte selectors"] {
+            assert_error_contains(&result, expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_returns_next_offset() {
+    let Some(stored) = StoredAttachment::start(b"Hello, World!", "text/plain").await else {
+        return;
+    };
+    assert_page(&stored.page(0, 5).await, "Hello", Some(5));
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_end_of_content() {
+    let Some(stored) = StoredAttachment::start(b"Hi", "text/plain").await else {
+        return;
+    };
+    assert_page(&stored.page(10, 5).await, "", None);
+}
+
+#[tokio::test]
+async fn attachment_read_mime_with_charset_parameter() {
+    let Some(stored) =
+        StoredAttachment::start(b"Hello with charset", "text/plain; charset=utf-8").await
+    else {
+        return;
+    };
+    assert_page(&stored.page(0, 5).await, "Hello", Some(5));
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_reconstructs_multibyte_across_pages() {
+    let original = "日本語";
+    let Some(stored) = StoredAttachment::start(original.as_bytes(), "text/plain").await else {
+        return;
+    };
+    assert_eq!(stored.reconstruct(2).await, original);
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_tiny_limit_returns_complete_character() {
+    let Some(stored) = StoredAttachment::start("日本語".as_bytes(), "text/plain").await else {
+        return;
+    };
+    assert_page(&stored.page(0, 1).await, "日", Some(3));
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_invalid_offset_error() {
+    let Some(stored) = StoredAttachment::start("日本語".as_bytes(), "text/plain").await else {
+        return;
+    };
+    let result = stored.page(1, 5).await;
+    assert_error_contains(&result, "not at a valid UTF-8 character boundary");
+    assert_error_contains(&result, "next valid offset is 3");
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_giant_single_line_json() {
+    let items: Vec<u32> = (1..=1000).collect();
+    let original = serde_json::to_string(&items).expect("serialize JSON");
+    assert!(!original.contains('\n'));
+    let Some(stored) = StoredAttachment::start(original.as_bytes(), "application/json").await
+    else {
+        return;
+    };
+    let reconstructed = stored.reconstruct(100).await;
+    assert_eq!(reconstructed, original);
+    assert_eq!(
+        serde_json::from_str::<Vec<u32>>(&reconstructed).unwrap(),
+        items
+    );
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_uses_default_limit() {
+    let original = "x".repeat(100_000);
+    let Some(stored) = StoredAttachment::start(original.as_bytes(), "text/plain").await else {
+        return;
+    };
+    let result = stored.read(json!({ "byte_offset": 0 })).await;
+    assert_page(&result, &original[..65_536], Some(65_536));
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_above_5_mib() {
+    let original = "ABCDEFGHIJ".repeat(6 * 1024 * 1024 / 10);
+    assert!(original.len() > 5 * 1024 * 1024);
+    let Some(stored) = StoredAttachment::start(original.as_bytes(), "text/plain").await else {
+        return;
+    };
+    for offset in [0, 3 * 1024 * 1024, original.len() - 500] {
+        let end = (offset + 1000).min(original.len());
+        let next = (end < original.len()).then_some(end);
+        assert_page(
+            &stored.page(offset, 1000).await,
+            &original[offset..end],
+            next,
+        );
+    }
+}
+
+#[tokio::test]
+async fn attachment_read_byte_paging_4byte_emoji() {
+    let original = "Hello 😀 World";
+    let Some(stored) = StoredAttachment::start(original.as_bytes(), "text/plain").await else {
+        return;
+    };
+    assert_eq!(stored.reconstruct(3).await, original);
+}
+
+#[tokio::test]
+async fn attachment_read_malformed_utf8_with_tiny_limit_returns_error() {
+    let Some(stored) = StoredAttachment::start(&[0xE0, 0x80, 0x00], "text/plain").await else {
+        return;
+    };
+    for limit in [1, 2, 3] {
+        assert_error_contains(&stored.page(0, limit).await, "invalid UTF-8");
+    }
+}
+
+#[tokio::test]
+async fn attachment_read_yaml_mime_types_and_parameters() {
+    for mime in [
+        "application/x-yaml",
+        "application/x-yaml; charset=utf-8",
+        "application/yaml; charset=utf-8",
+        "Application/X-Yaml; charset=UTF-8",
+    ] {
+        assert_yaml_reads(mime).await;
+    }
+}
+
+async fn assert_yaml_reads(mime: &str) {
+    let original = "name: 日本語\ncount: 2";
+    let Some(stored) = StoredAttachment::start(original.as_bytes(), mime).await else {
+        return;
+    };
+    assert_eq!(stored.reconstruct(2).await, original, "{mime}");
+    let lines = stored
+        .read(json!({ "head_lines": 1, "tail_lines": 0 }))
+        .await;
+    assert_eq!(lines["isError"], false, "{mime}: {lines}");
+    assert!(first_text(&lines).starts_with("name: 日本語"));
+    assert!(!first_text(&lines).contains("count: 2"));
+}
+
+#[tokio::test]
+async fn attachment_read_byte_limits_are_positive_and_overflow_safe() {
+    let Some(stored) = StoredAttachment::start(b"Hello", "text/plain").await else {
+        return;
+    };
+    assert_error_contains(
+        &stored.page(0, 0).await,
+        "byte_limit must be greater than zero",
+    );
+    assert_page(&stored.page(1, usize::MAX).await, "ello", None);
+    assert_page(&stored.page(usize::MAX, usize::MAX).await, "", None);
+}
+
+#[tokio::test]
+async fn attachment_read_empty_byte_page_marks_end() {
+    let Some(stored) = StoredAttachment::start(b"", "text/plain").await else {
+        return;
+    };
+    let result = stored.read(json!({ "byte_limit": 1 })).await;
+    assert_page(&result, "", None);
+    assert!(metadata(&result).contains("offset 0 to 0/0"));
 }

@@ -2,20 +2,27 @@
 use super::*;
 
 impl InvocationJournal {
-    /// The first reply projected into the journal row wins by revision CAS, so
-    /// a handler that finishes after the call was already answered gets the
-    /// durable reply back instead of overwriting it.
-    pub async fn complete(&self, request: &ToolRequest, reply: ToolReply) -> Result<ToolReply> {
-        self.validate_replay(request).await?;
-        ensure!(reply.call_id == request.call_id, "reply call ID mismatch");
-        self.first_value(key(request), reply, |record| &mut record.reply)
-            .await
+    pub async fn completed_reply(&self, request: &ToolRequest) -> Result<Option<ToolReply>> {
+        Ok(self
+            .completed_record(request)
+            .await?
+            .and_then(|record| record.reply))
     }
 
-    pub async fn completed_reply(&self, request: &ToolRequest) -> Result<Option<ToolReply>> {
+    pub(crate) async fn completed_reply_for_delivery(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Option<ToolReply>> {
+        Ok(self
+            .completed_record(request)
+            .await?
+            .and_then(|record| completion::recorded_reply(record, true)))
+    }
+
+    async fn completed_record(&self, request: &ToolRequest) -> Result<Option<RecordedInvocation>> {
         self.validate_replay(request).await?;
         self.check_session_retained(request).await?;
-        Ok(self.get(request).await?.and_then(|record| record.reply))
+        self.get(request).await
     }
 }
 

@@ -11,7 +11,7 @@ use harnx_blob_store::media::{
     ensure_attachments_bucket, get_media, optional_attachments_bucket, put_media,
 };
 use harnx_core::attachments::{
-    cid_for_data_url_with_session, collect_cid_refs, read_attachment_async,
+    cid_for_data_url, cid_for_data_url_with_session, collect_cid_refs, read_attachment_async,
     store_attachment_bytes_async, CID_PREFIX,
 };
 use harnx_core::cid_url::{CidUrl, SessionRef};
@@ -80,6 +80,30 @@ impl SessionAttachmentSync {
             config,
             replicas,
             session,
+        })
+    }
+
+    /// Tools can create remote attachments after activation. Hydrate on every
+    /// model boundary, before request construction can expand refs from disk.
+    pub(crate) fn model_call(
+        &self,
+        call: Option<crate::agent_loop::AgentCallFn>,
+    ) -> crate::agent_loop::AgentCallFn {
+        let jetstream = self.jetstream.clone();
+        let replicas = self.replicas;
+        let session = self.session.clone();
+        std::sync::Arc::new(move |input, config, abort| {
+            let jetstream = jetstream.clone();
+            let session = session.clone();
+            let call = call.clone();
+            Box::pin(async move {
+                hydrate_session_attachments(&jetstream, config, replicas, session).await?;
+                if let Some(call) = call {
+                    call(input, config, abort).await
+                } else {
+                    crate::client::retry::call_with_retry_and_fallback(input, config, abort).await
+                }
+            })
         })
     }
 
@@ -306,15 +330,27 @@ async fn hydrate_attachment_ref(hydration: &AttachmentHydration<'_>, cid: &str) 
     let cid_url = parse_media_url(cid)?;
     let local_cid = local_cid(&cid_url)?;
     if let Ok((bytes, mime_type)) = read_attachment_async(hydration.dir, &local_cid).await {
+        validate_attachment_digest(&local_cid, &bytes, &mime_type)?;
         return put_media(hydration.store, &cid_url, &bytes, &mime_type).await;
     }
 
     let (bytes, mime_type) = get_media(hydration.store, &cid_url)
         .await?
         .with_context(|| format!("download attachment '{cid}'"))?;
-    let stored_cid = store_attachment_bytes_async(hydration.dir, &bytes, &mime_type).await?;
-    if stored_cid != local_cid {
-        bail!("attachment digest mismatch: expected {local_cid}, got {stored_cid}");
+    // Validate before writing, so corrupt remote data never enters the cache.
+    validate_attachment_digest(&local_cid, &bytes, &mime_type)?;
+    store_attachment_bytes_async(hydration.dir, &bytes, &mime_type).await?;
+    Ok(())
+}
+
+fn validate_attachment_digest(expected: &str, bytes: &[u8], mime_type: &str) -> Result<()> {
+    let data_url = format!(
+        "data:{mime_type};base64,{}",
+        harnx_core::crypto::base64_encode(bytes)
+    );
+    let actual = cid_for_data_url(&data_url);
+    if actual != expected {
+        bail!("attachment digest mismatch: expected {expected}, got {actual}");
     }
     Ok(())
 }
@@ -361,8 +397,8 @@ pub async fn delete_session_attachments(
 
 /// Hydrate the attachment references currently present in a loaded session.
 ///
-/// This is used during session preparation to download any referenced attachments
-/// that are missing from the local cache.
+/// Used at activation and before each agent model call. The latter covers
+/// attachments offloaded by tools after activation's initial hydration.
 async fn hydrate_session_attachments(
     jetstream: &jetstream::Context,
     config: &crate::config::GlobalConfig,
