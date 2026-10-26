@@ -488,12 +488,13 @@ them. Any new field of that kind belongs there too.
 A model the registry adds starts with no `patches`, because only an existing
 entry has any to carry over. The rules in `scripts/model_variants.py` give
 new models the patches harnx needs, such as `includeThoughts` for Gemini
-thinking models. The workflow runs the shipped-patch guard
+thinking models and `reasoning.summary` for OpenAI reasoning models on the
+Responses API. The workflow runs the shipped-patch guard
 (`crates/harnx-client/tests/it/models_yaml_patches.rs`) before it opens its
-auto-merge pull request, so a model the rules miss fails the job instead (for
-Gemini, `thinking model <id> is missing its catalog patch`) and no pull
-request appears. Extend the rule rather than patching the catalog by hand,
-which only lasts until the registry adds the next such model.
+auto-merge pull request, so a model the rules miss fails the job instead (the
+Gemini and OpenAI checks report `<model> is missing its catalog patch`) and no
+pull request appears. Extend the rule rather than patching the catalog by
+hand, which only lasts until the registry adds the next such model.
 
 LiteLLM records a capability only where it holds, so an omission is silence
 rather than a denial. `CURATED_CAPABILITY_FLAGS` lets a curated `true` survive
