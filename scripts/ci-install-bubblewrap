@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+#
+# Installs bubblewrap on a GitHub-hosted Ubuntu runner and makes sure the test
+# sandbox (scripts/nextest-sandbox) starts there, including inside itself, as
+# the runner's own tests start it. Further arguments name more apt packages to
+# install.
+#
+# Where the sandbox can't start, this lifts AppArmor's user namespace
+# restrictions for the whole machine. That is only acceptable on a runner
+# that is thrown away after the job; see AGENTS.md, "Test sandbox".
+
+set -euo pipefail
+
+if [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then
+    echo "ci-install-bubblewrap: this lifts AppArmor's user namespace restrictions for the whole machine, so it runs only on GitHub-hosted runners" >&2
+    exit 2
+fi
+
+sudo apt-get update -q
+sudo apt-get install -y -q bubblewrap "$@"
+
+runner=$(dirname "$0")/nextest-sandbox
+nested_sandbox() {
+    NEXTEST=1 NEXTEST_ATTEMPT_ID=ci "$runner" "$runner" true
+}
+
+if ! nested_sandbox 2>/dev/null; then
+    # Ubuntu restricts unprivileged user namespaces through AppArmor; this
+    # lifts that for programs without a profile of their own.
+    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    # Ubuntu 26.04 also gives bwrap a profile of its own. It lets bwrap set up
+    # its sandbox but takes every capability away from what runs in it, so a
+    # sandbox can't start inside the sandbox, whatever the sysctl says.
+    # Unloaded, it leaves bwrap to the sysctl alone.
+    if [ -e /etc/apparmor.d/bwrap-userns-restrict ]; then
+        sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict
+    fi
+fi
+# Run again with its errors shown, so a sandbox that still can't start fails
+# here rather than in every test.
+nested_sandbox

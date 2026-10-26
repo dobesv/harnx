@@ -6,6 +6,11 @@ import unittest
 
 import update_models as um
 
+GEMINI_THOUGHTS_PATCH = (
+    ".body.generationConfig.thinkingConfig = "
+    '((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})'
+)
+
 
 class TestOpenAIEffortVariants(unittest.TestCase):
     def _base(self, name: str = "gpt-5.6-sol") -> dict:
@@ -242,7 +247,59 @@ class TestProviderModelRegeneration(unittest.TestCase):
                 for model in um.regenerate_provider_models(provider, old, {base_name: {"name": base_name}}, [])
             }
             self.assertEqual(regenerated[alias_name], old[alias_name])
-            self.assertNotIn("patches", regenerated[base_name])
+            self.assertEqual(regenerated[base_name].get("patches"), [GEMINI_THOUGHTS_PATCH])
+
+    def _regenerate_new_models(self, provider: str, models: list[dict]) -> dict[str, dict]:
+        fetched = {model["name"]: model for model in models}
+        return {
+            model["name"]: model
+            for model in um.regenerate_provider_models(provider, {}, fetched, [])
+        }
+
+    def test_new_gemini_thinking_models_request_thoughts(self) -> None:
+        # A model the registry adds has no curated patch to carry over.
+        models = [
+            {"name": "gemini-4-argon", "supports_tool_use": True},
+            {"name": "gemini-4-argon-cyber-permissive"},
+            {"name": "gemini-2.5-flash"},
+            {"name": "argon-latest", "real_name": "gemini-4-argon"},
+        ]
+        for provider in ("gemini", "vertexai"):
+            regenerated = self._regenerate_new_models(provider, models)
+            for model in models:
+                with self.subTest(provider=provider, name=model["name"]):
+                    self.assertEqual(
+                        regenerated[model["name"]].get("patches"), [GEMINI_THOUGHTS_PATCH]
+                    )
+
+    def test_gemini_models_that_do_not_think_get_no_patch(self) -> None:
+        models = [
+            {"name": "gemini-1.5-pro"},
+            {"name": "gemini-2.0-flash"},
+            {"name": "gemini-2.5-flash-image"},
+            {"name": "gemini-2.5-flash-preview-tts"},
+            {"name": "gemini-2.5-flash-native-audio-latest"},
+            {"name": "gemini-omni-1.1-flash"},
+            {"name": "gemini-3.5-embedding", "type": "embedding"},
+        ]
+        for provider in ("gemini", "vertexai"):
+            regenerated = self._regenerate_new_models(provider, models)
+            for model in models:
+                with self.subTest(provider=provider, name=model["name"]):
+                    self.assertNotIn("patches", regenerated[model["name"]])
+        # Other providers serve Gemini through APIs without generationConfig.
+        regenerated = self._regenerate_new_models("github", [{"name": "gemini-4-argon"}])
+        self.assertNotIn("patches", regenerated["gemini-4-argon"])
+
+    def test_curated_gemini_patch_is_not_replaced(self) -> None:
+        name = "gemini-3.5-flash"
+        curated = ['.body.generationConfig.thinkingConfig = {"thinkingBudget":0}']
+        for provider in ("gemini", "vertexai"):
+            old = {name: {"name": name, "patches": curated}}
+            fetched = {name: um.merge_old_fields({"name": name, "input_price": 1}, old[name])}
+            regenerated = um.regenerate_provider_models(provider, old, fetched, [])
+            with self.subTest(provider=provider):
+                self.assertEqual(regenerated[0]["patches"], curated)
 
     def test_bedrock_opus_5_5_does_not_generate_fixed_budget_variant(self) -> None:
         name = "us.anthropic.claude-opus-5-5"
