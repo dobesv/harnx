@@ -19,6 +19,12 @@ BEDROCK_SUMMARIZED_THINKING_PATCH = (
     ".body.additionalModelRequestFields = "
     '{"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}'
 )
+GEMINI_THOUGHTS_PATCH = (
+    ".body.generationConfig.thinkingConfig = "
+    '((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})'
+)
+# Gemini 2.5 and later think, except these models.
+GEMINI_NON_THINKING_MARKERS = ("-image", "-tts", "-native-audio")
 
 # Opus 4.7+ and Opus 5.5 only accept adaptive thinking plus the effort
 # parameter. Opus 5.5 defaults to medium; other adaptive models use high.
@@ -184,17 +190,56 @@ def apply_openai_base_patches(model: dict[str, Any], provider: str) -> None:
         ]
 
 
-def apply_base_model_rules(model: dict[str, Any], provider: str) -> None:
-    """Apply provider rules to one suffix-less base model in place."""
-    apply_base_thinking(model, provider)
-    apply_openai_base_patches(model, provider)
+def gemini_version(name: str) -> tuple[int, int] | None:
+    """`(major, minor)` of a `gemini-<major>[.<minor>]-...` model name."""
+    if not name.startswith("gemini-"):
+        return None
+    numbers = name.removeprefix("gemini-").split("-")[0].split(".")
+    major, minor = numbers[0], (numbers[1] if len(numbers) > 1 else "0")
+    if not all(part.isascii() and part.isdigit() for part in (major, minor)):
+        return None
+    return int(major), int(minor)
+
+
+def gemini_thinks(model: dict[str, Any]) -> bool:
+    """Whether a Gemini chat model can return thought summaries.
+
+    Keep in step with `gemini_thinking_capable` in
+    crates/harnx-client/tests/it/models_yaml_patches.rs, which fails the
+    weekly refresh for any model it counts that lacks the patch.
+    """
+    name = model.get("real_name", model["name"])
+    version = gemini_version(name)
+    return (
+        model.get("type", "chat") == "chat"
+        and version is not None
+        and version >= (2, 5)
+        and not any(marker in name for marker in GEMINI_NON_THINKING_MARKERS)
+    )
+
+
+def apply_gemini_thoughts(model: dict[str, Any], provider: str) -> None:
+    """Ask Gemini thinking models for thought summaries, keeping curated patches.
+
+    Models the registry adds have no curated patch to carry over.
+    """
+    if provider not in ("gemini", "vertexai"):
+        return
     if provider == "gemini" and model["name"] == "gemini-3.8-flash":
         model["patches"] = [
             ".body.generationConfig = ((.body.generationConfig // {}) | "
             "del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | "
-            ".body.generationConfig.thinkingConfig = "
-            '((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})'
+            + GEMINI_THOUGHTS_PATCH
         ]
+    elif "patches" not in model and gemini_thinks(model):
+        model["patches"] = [GEMINI_THOUGHTS_PATCH]
+
+
+def apply_base_model_rules(model: dict[str, Any], provider: str) -> None:
+    """Apply provider rules to one suffix-less base model in place."""
+    apply_base_thinking(model, provider)
+    apply_openai_base_patches(model, provider)
+    apply_gemini_thoughts(model, provider)
 
 
 def _claude_thinking_variants(

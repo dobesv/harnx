@@ -179,9 +179,14 @@ bubblewrap needs unprivileged user namespaces. Ubuntu 24.04 restricts them
 through AppArmor by default. An AppArmor profile that allows `userns` for
 `/usr/bin/bwrap` lifts that for bubblewrap alone;
 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts it for
-every program on the host, which CI does only on its throwaway runners.
-Either is the machine owner's decision, so an agent asks rather than changing
-it. Containers block the namespaces too; set `HARNX_TEST_SANDBOX=light`
+every program on the host. Either is the machine owner's decision, so an agent
+asks rather than changing it. Ubuntu 26.04 ships such a profile,
+`bwrap-userns-restrict`, enabled. It lets the sandbox start but takes every
+capability away from what runs in it, so nothing in the sandbox can start a
+sandbox of its own, as the runner's tests in `nextest_sandbox.rs` do, whatever
+the sysctl says. CI lifts both on its throwaway runners:
+`scripts/ci-install-bubblewrap` sets the sysctl and unloads that profile.
+Containers block the namespaces too; set `HARNX_TEST_SANDBOX=light`
 there, or `off` to run unsandboxed. Without bubblewrap, every test fails with an
 install hint. Where an AppArmor restriction, a sysctl or a seccomp filter
 blocks the namespaces, every test fails with a message pointing here.
@@ -479,6 +484,16 @@ so read it rather than skimming the diff. Fields in `HARNX_ONLY_FIELDS`, such
 as `patches` and `require_max_tokens`, describe harnx's own request handling,
 are never supplied upstream, and must stay in that list or a refresh resets
 them. Any new field of that kind belongs there too.
+
+A model the registry adds starts with no `patches`, because only an existing
+entry has any to carry over. The rules in `scripts/model_variants.py` give
+new models the patches harnx needs, such as `includeThoughts` for Gemini
+thinking models. The workflow runs the shipped-patch guard
+(`crates/harnx-client/tests/it/models_yaml_patches.rs`) before it opens its
+auto-merge pull request, so a model the rules miss fails the job instead (for
+Gemini, `thinking model <id> is missing its catalog patch`) and no pull
+request appears. Extend the rule rather than patching the catalog by hand,
+which only lasts until the registry adds the next such model.
 
 LiteLLM records a capability only where it holds, so an omission is silence
 rather than a denial. `CURATED_CAPABILITY_FLAGS` lets a curated `true` survive
