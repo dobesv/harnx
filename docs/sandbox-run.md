@@ -70,6 +70,9 @@ set -euo pipefail
 # Save this file as "node", then symlink or copy it to yarn, npm, npx, and pnpm.
 # It detects which real tool to run from its own basename, so one script covers all five.
 # Common Node caches are already in harnx-sandbox-run's default whitelist.
+# Note that environment variables are not propagated by default, you have to either add
+# them to the command line below or set HARNX_BASH_ENV_PASSTHROUGH to a comma-separated
+# list of environment variable names
 # Exception: ~/.npm is read+write but NOT exec by default, so `npx <pkg>@<ver>`
 # cannot run its cached bin. We add --allow-rwx ~/.npm below to allow it.
 # Project roots are auto-detected by harnx-sandbox-run's pseudo-vars and silently skipped when absent.
