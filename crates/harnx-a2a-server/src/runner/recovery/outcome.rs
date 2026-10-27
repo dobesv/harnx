@@ -48,11 +48,50 @@ fn completed_outcome(
 ) -> RecoveryOutcome {
     let seq = result.user_msg_seq;
     if result.was_cancelled {
-        return interrupted_outcome(canceled, AdmissionPhase::Admitted, Some(seq));
+        // Runtime deadlines cancel without an A2A CancelIntent. Ordinary owner
+        // loss still fails, even though its scoped stop also writes Cancel.
+        return interrupted_outcome(
+            canceled || crate::runner::deadline_cancelled(&result),
+            AdmissionPhase::Admitted,
+            Some(seq),
+        );
     }
     let (state, text) =
         crate::runner::limits::bounded_outcome(turn_outcome(result, ""), output_limit);
     (state, text, AdmissionPhase::Admitted, Some(seq))
+}
+
+struct RecoveryContext<'a> {
+    session: &'a NatsSession,
+    ticket: &'a FixedAdmissionTicket,
+    output_limit: usize,
+}
+
+async fn handle_admitted_closure(
+    cx: &RecoveryContext<'_>,
+    prompt_sequence: u64,
+    canceled: bool,
+) -> Result<RecoveryOutcome> {
+    if !canceled {
+        match cx.session.fixed_prompt_progress(cx.ticket).await? {
+            harnx_runtime::PromptProgress::Terminal(result) => {
+                return Ok(completed_outcome(result, false, cx.output_limit));
+            }
+            harnx_runtime::PromptProgress::Running {
+                last_decision: None,
+            } => {}
+            _ => anyhow::bail!("HITL continuation requires progress recovery"),
+        }
+    }
+    cx.session
+        .interrupt_prompt(prompt_sequence, "A2A admission owner lost")
+        .await?;
+    let result = cx
+        .session
+        .fixed_prompt_completion(cx.ticket)
+        .await?
+        .context("scoped stop unconfirmed")?;
+    Ok(completed_outcome(result, canceled, cx.output_limit))
 }
 
 pub(super) async fn recovery_outcome(
@@ -61,20 +100,17 @@ pub(super) async fn recovery_outcome(
     canceled: bool,
     output_limit: usize,
 ) -> Result<RecoveryOutcome> {
-    // The log orders TurnEnd against the exact fenced Cancel append.
     if let Some(result) = session.fixed_prompt_completion(ticket).await? {
         return Ok(completed_outcome(result, canceled, output_limit));
     }
+    let cx = RecoveryContext {
+        session,
+        ticket,
+        output_limit,
+    };
     match session.close_fixed_admission(ticket).await? {
         FixedAdmissionOutcome::Admitted { prompt_sequence } => {
-            session
-                .interrupt_prompt(prompt_sequence, "A2A admission owner lost")
-                .await?;
-            let result = session
-                .fixed_prompt_completion(ticket)
-                .await?
-                .context("scoped stop unconfirmed")?;
-            Ok(completed_outcome(result, canceled, output_limit))
+            handle_admitted_closure(&cx, prompt_sequence, canceled).await
         }
         FixedAdmissionOutcome::Closed { .. } | FixedAdmissionOutcome::Fenced { .. } => {
             Ok(interrupted_outcome(canceled, AdmissionPhase::Closed, None))

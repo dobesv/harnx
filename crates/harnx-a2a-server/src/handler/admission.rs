@@ -1,5 +1,6 @@
 //! Ordered checks; local gates reduce contention, shared state decides admission.
 mod first_message;
+mod reply;
 use super::{
     errors::{map_error, not_found, permission_denied},
     task_view::validate_history,
@@ -14,6 +15,7 @@ use crate::{
     },
 };
 use a2a_lf::{A2AError, Message, Role, SendMessageRequest};
+use harnx_runtime::NatsSession;
 
 struct MessageAdmission {
     context: Option<String>,
@@ -62,6 +64,37 @@ impl MessageAdmission {
 }
 
 impl HarnxHandler {
+    async fn admit_existing(
+        &self,
+        owner: &RequestIdentity,
+        request: &MessageAdmission,
+    ) -> Result<Option<Admission>, A2AError> {
+        if let Some(reply) = self.admit_reply(owner, request).await? {
+            return Ok(Some(reply));
+        }
+        if let Some(record) = self.dedupe(owner, request).await? {
+            return Ok(Some(Admission::retry(self.reconcile(owner, record).await?)));
+        }
+        Ok(None)
+    }
+
+    async fn admit_existing_context_message(
+        &self,
+        owner: &RequestIdentity,
+        target: Option<TaskRecord>,
+        request: MessageAdmission,
+    ) -> Result<Admission, A2AError> {
+        let busy = self
+            .reconcile_context(owner, request.context.as_deref())
+            .await?;
+        self.reject_terminal_target(owner, target).await?;
+        self.check_running()?;
+        if busy {
+            return Err(map_error(RunnerError::Busy.into()));
+        }
+        self.admit_new_message(owner, request).await
+    }
+
     pub(super) async fn admit(
         &self,
         owner: RequestIdentity,
@@ -74,8 +107,8 @@ impl HarnxHandler {
         let _guard = gate.lock().await;
         let target = self.authorize_target(&owner, &request).await?;
         request.fingerprint = message_fingerprint(&request.message.parts);
-        if let Some(record) = self.dedupe(&owner, &request).await? {
-            return Ok(Admission::retry(self.reconcile(&owner, record).await?));
+        if let Some(admission) = self.admit_existing(&owner, &request).await? {
+            return Ok(admission);
         }
         #[cfg(feature = "fault-injection")]
         self.backend
@@ -88,15 +121,8 @@ impl HarnxHandler {
         if request.context.is_none() {
             return self.admit_first_message(&owner, request).await;
         }
-        let busy = self
-            .reconcile_context(&owner, request.context.as_deref())
-            .await?;
-        self.reject_terminal_target(&owner, target).await?;
-        self.check_running()?;
-        if busy {
-            return Err(map_error(RunnerError::Busy.into()));
-        }
-        self.admit_new_message(&owner, request).await
+        self.admit_existing_context_message(&owner, target, request)
+            .await
     }
 
     async fn check_input_budget(&self, message: &Message) -> Result<(), A2AError> {
@@ -294,6 +320,42 @@ impl HarnxHandler {
         Ok(())
     }
 
+    async fn start_turn_session(
+        &self,
+        owner: &RequestIdentity,
+        context: Option<&str>,
+        message: &Message,
+    ) -> Result<(NatsSession, harnx_core::input::Input), A2AError> {
+        let input =
+            message_to_input(message, self.limits).map_err(|error| map_error(error.into()))?;
+        let session = self.session(owner, context).await?;
+        Ok((session, input))
+    }
+
+    async fn recover_busy_turn(
+        &self,
+        owner: &RequestIdentity,
+        session: &NatsSession,
+        identity: MessageIdentity<'_>,
+    ) -> Result<Option<Admission>, A2AError> {
+        let access = ContextAccess {
+            export: &self.export,
+            owner,
+            local_id: session.session_id(),
+        };
+        let Some(record) = self
+            .backend
+            .store
+            .dedupe_task(access, identity)
+            .await
+            .map_err(map_error)?
+        else {
+            return Ok(None);
+        };
+        let reconciled = self.reconcile(owner, record).await?;
+        Ok(Some(Admission::retry(reconciled)))
+    }
+
     async fn admit_new_message(
         &self,
         owner: &RequestIdentity,
@@ -303,10 +365,9 @@ impl HarnxHandler {
             context, message, ..
         } = request;
         // Only new admissions validate parts. Invalid input must not allocate a session.
-        let input =
-            message_to_input(&message, self.limits).map_err(|error| map_error(error.into()))?;
-        // Orphan fencing mutates the abort flag. Resume a fresh handle after it settles.
-        let session = self.session(owner, context.as_deref()).await?;
+        let (session, input) = self
+            .start_turn_session(owner, context.as_deref(), &message)
+            .await?;
         let identity = message.message_id.clone();
         let fingerprint = message_fingerprint(&message.parts);
         let started = self
@@ -325,24 +386,12 @@ impl HarnxHandler {
         let started = match started {
             Ok(started) => started,
             Err(error) if error.downcast_ref::<RunnerError>() == Some(&RunnerError::Busy) => {
-                if let Some(record) = self
-                    .backend
-                    .store
-                    .dedupe_task(
-                        ContextAccess {
-                            export: &self.export,
-                            owner,
-                            local_id: session.session_id(),
-                        },
-                        MessageIdentity {
-                            message_id: &identity,
-                            fingerprint: &fingerprint,
-                        },
-                    )
-                    .await
-                    .map_err(map_error)?
-                {
-                    return Ok(Admission::retry(self.reconcile(owner, record).await?));
+                let msg_id = MessageIdentity {
+                    message_id: &identity,
+                    fingerprint: &fingerprint,
+                };
+                if let Some(admission) = self.recover_busy_turn(owner, &session, msg_id).await? {
+                    return Ok(admission);
                 }
                 return Err(map_error(error));
             }
@@ -351,6 +400,9 @@ impl HarnxHandler {
         Ok(Admission {
             snapshot: started.snapshot,
             deduped: started.deduped,
+            response_after: None,
+            direct: false,
+            events: None,
         })
     }
 

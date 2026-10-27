@@ -144,6 +144,11 @@ test = ["harnx-serve"]
 on-affected = ["harnx-claude-compatible-hook-server"]
 test = ["harnx-a2a-server"]
 
+# Same-round A2A approval tests execute the managed native time tool.
+[[test-edge]]
+on-affected = ["harnx-time-tools"]
+test = ["harnx-a2a-server"]
+
 # A2A e2e tests launch the server executable and CLI session deletion.
 [[test-edge]]
 on-affected = ["harnx-a2a-server", "harnx"]

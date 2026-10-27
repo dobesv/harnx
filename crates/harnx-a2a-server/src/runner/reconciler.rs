@@ -4,6 +4,12 @@ use super::*;
 use crate::store::{
     context::ContextSnapshot, registry::RecoveryRegistration, FirstMessageReservation,
 };
+use harnx_runtime::nats_lease::NatsSessionLease;
+
+struct RegisteredRecovery {
+    target: RecoveryTarget,
+    lease: Option<Arc<NatsSessionLease>>,
+}
 
 enum RecoveryTarget {
     Active,
@@ -11,78 +17,143 @@ enum RecoveryTarget {
 }
 
 impl Runner {
-    pub(super) async fn reconcile_registration(
+    async fn check_registration_eligible(
         &self,
+        export: &Export,
+        entry: &RecoveryRegistration,
+    ) -> Result<Option<RecoveryTarget>> {
+        entry.validate_export(export)?;
+        if self.store.prune_unused_registration(entry).await? {
+            return Ok(None);
+        }
+        self.recovery_target(export, entry).await
+    }
+
+    async fn prepare_registered_recovery(
+        &self,
+        export: &Export,
+        entry: &RecoveryRegistration,
+    ) -> Result<Option<RegisteredRecovery>> {
+        let Some(target) = self.check_registration_eligible(export, entry).await? else {
+            return Ok(None);
+        };
+        // First-message initialization needs its lease before any session create.
+        // Active sessions can be inspected without claiming a parked approval.
+        let lease = if matches!(&target, RecoveryTarget::First(_)) {
+            let Some(lease) = self.candidate_lease(&entry.allocation.storage_key).await? else {
+                return Ok(None);
+            };
+            Some(lease)
+        } else {
+            None
+        };
+        Ok(Some(RegisteredRecovery { target, lease }))
+    }
+
+    async fn recover_registered_first(
+        &self,
+        session: &NatsSession,
+        first: &FirstMessageReservation,
+        lease: Option<Arc<NatsSessionLease>>,
+    ) -> Result<()> {
+        self.recover_first_reservation(
+            session,
+            first,
+            lease.context("first recovery lease missing")?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn recover_registered_active(
+        self: &Arc<Self>,
+        export: &Export,
+        session: NatsSession,
+        storage: &str,
+    ) -> Result<()> {
+        if self.unchanged_parked(&session).await? {
+            #[cfg(feature = "fault-injection")]
+            self.hooks
+                .checkpoint(crate::fault_injection::Boundary::HitlParkedInspected)
+                .await;
+            return Ok(());
+        }
+        let Some(lease) = self.candidate_lease(storage).await? else {
+            return Ok(());
+        };
+        let authority = self.claim_context(&session, lease).await?;
+        if authority.context.document.state.active.is_some() {
+            self.recover_registered_task(export, session, authority)
+                .await
+        } else {
+            authority.release(&self.store, storage).await
+        }
+    }
+
+    pub(super) async fn reconcile_registration(
+        self: &Arc<Self>,
         export: &Export,
         entry: &RecoveryRegistration,
         settings: &SupervisionConfig,
     ) -> Result<()> {
-        entry.validate_export(export)?;
-        let storage = &entry.allocation.storage_key;
-        if self.store.prune_unused_registration(entry).await? {
-            return Ok(());
-        }
-        let Some(target) = self.recovery_target(export, entry).await? else {
+        let Some(recovery) = self.prepare_registered_recovery(export, entry).await? else {
             return Ok(());
         };
-        let Some(lease) = self.candidate_lease(storage).await? else {
-            return Ok(());
-        };
+        let RegisteredRecovery { target, lease } = recovery;
+        let is_first = matches!(&target, RecoveryTarget::First(_));
         let owner = entry
             .owner
             .clone()
             .map(Principal::User)
             .unwrap_or(Principal::Anonymous);
-        let request = super::stored_session::StoredSessionRequest {
-            export,
-            owner: &owner,
-            global_config: &settings.config,
-            activation_route: settings.route.clone(),
-            abort: settings.abort.clone(),
-            allow_create: matches!(&target, RecoveryTarget::First(_)),
-        };
-        // Recovery uses immutable owner/export facts, not a fabricated request
-        // identity. Revocation must deny new requests without preventing stop.
-        let session = self.stored_session(request, &entry.allocation).await?;
-        if let RecoveryTarget::First(first) = target {
-            self.recover_first_reservation(&session, &first, lease)
-                .await?;
-        } else {
-            let mut authority = self.claim_context(&session, lease).await?;
-            if authority.context.document.state.active.is_some() {
-                self.recover_admission(&session, &mut authority).await?;
+        let session = self
+            .stored_session(
+                super::stored_session::StoredSessionRequest {
+                    export,
+                    owner: &owner,
+                    global_config: &settings.config,
+                    activation_route: settings.route.clone(),
+                    abort: settings.abort.clone(),
+                    allow_create: is_first,
+                },
+                &entry.allocation,
+            )
+            .await?;
+        let storage = &entry.allocation.storage_key;
+        match target {
+            RecoveryTarget::First(first) => {
+                self.recover_registered_first(&session, &first, lease).await
             }
-            authority.release(&self.store, storage).await?;
+            RecoveryTarget::Active => {
+                self.recover_registered_active(export, session, storage)
+                    .await
+            }
         }
-        Ok(())
     }
 
-    async fn recovery_target(
+    async fn check_context_recovery_target(
         &self,
         export: &Export,
+        storage_key: &str,
+    ) -> Result<Option<Option<RecoveryTarget>>> {
+        let Some(context) = self.store.read_context(storage_key).await? else {
+            return Ok(None);
+        };
+        crate::diagnostics::pending(&context);
+        self.store.cleanup_context_events(storage_key).await?;
+        let Some(active) = &context.document.state.active else {
+            return Ok(None);
+        };
+        if active.ready_to_retire() || self.service_local_owner(export, &context).await? {
+            return Ok(Some(None));
+        }
+        Ok(Some(Some(RecoveryTarget::Active)))
+    }
+
+    async fn check_first_recovery_target(
+        &self,
         entry: &RecoveryRegistration,
     ) -> Result<Option<RecoveryTarget>> {
-        if let Some(context) = self
-            .store
-            .read_context(&entry.allocation.storage_key)
-            .await?
-        {
-            crate::diagnostics::pending(&context);
-            self.store
-                .cleanup_context_events(&entry.allocation.storage_key)
-                .await?;
-            if let Some(active) = &context.document.state.active {
-                if active.ready_to_retire() {
-                    return Ok(None);
-                }
-                if self.service_local_owner(export, &context).await? {
-                    return Ok(None);
-                }
-                return Ok(Some(RecoveryTarget::Active));
-            }
-        }
-        // Claim can land before task allocation. Existing empty authority isn't
-        // proof that the retained first reservation finished (or never existed).
         let first = self.registered_first(entry).await?;
         if self
             .store
@@ -98,6 +169,19 @@ impl Runner {
         Ok(first.map(|first| RecoveryTarget::First(Box::new(first))))
     }
 
+    async fn recovery_target(
+        &self,
+        export: &Export,
+        entry: &RecoveryRegistration,
+    ) -> Result<Option<RecoveryTarget>> {
+        if let Some(target) = self
+            .check_context_recovery_target(export, &entry.allocation.storage_key)
+            .await?
+        {
+            return Ok(target);
+        }
+        self.check_first_recovery_target(entry).await
+    }
     async fn registered_first(
         &self,
         entry: &RecoveryRegistration,

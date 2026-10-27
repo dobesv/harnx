@@ -86,15 +86,9 @@ impl Publisher {
             .active
             .as_ref()
             .is_some_and(|active| active.cancel.is_some());
-        let (state, text) = match completed {
-            Some(result) if !result.was_cancelled => super::turn_outcome(result, &self.output.text),
-            _ if canceled => (TaskState::Canceled, None),
-            _ => (TaskState::Failed, Some(FAILED_MESSAGE.into())),
-        };
-        let (state, text) = super::limits::bounded_outcome(
-            (state, text),
-            super::limits::task_output_limit(&self.store, &self.authority.context).await?,
-        );
+        let outcome = resolve_failure_outcome(completed, canceled, &self.output.text);
+        let limit = super::limits::task_output_limit(&self.store, &self.authority.context).await?;
+        let (state, text) = super::limits::bounded_outcome(outcome, limit);
         if state == TaskState::Completed {
             self.output.text = text.clone().unwrap_or_default();
         }
@@ -115,5 +109,19 @@ impl Publisher {
 async fn retry_delay(attempt: usize) {
     if attempt + 1 < TERMINAL_PERSIST_ATTEMPTS {
         tokio::time::sleep(TERMINAL_RETRY_DELAY * (1 << attempt)).await;
+    }
+}
+
+fn resolve_failure_outcome(
+    completed: Option<harnx_runtime::NatsTurnResult>,
+    canceled: bool,
+    output_text: &str,
+) -> (TaskState, Option<String>) {
+    match completed {
+        Some(result) if !result.was_cancelled || super::deadline_cancelled(&result) => {
+            super::turn_outcome(result, output_text)
+        }
+        _ if canceled => (TaskState::Canceled, None),
+        _ => (TaskState::Failed, Some(FAILED_MESSAGE.into())),
     }
 }

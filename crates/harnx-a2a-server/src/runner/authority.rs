@@ -1,12 +1,14 @@
 //! Every activated task mutation CASes its owning context document.
 use super::*;
 use crate::store::{
-    context::{ActiveTask, AdmissionPhase, AdmissionState, ContextSnapshot, RetainedMessage},
+    context::{ActiveTask, ContextSnapshot},
     MessageIdentity, TaskAllocation,
 };
 use harnx_runtime::{
     nats_lease::NatsSessionLease, nats_session::fixed_admission::FixedAdmissionTicket,
 };
+
+mod allocation;
 
 pub(super) struct TaskReservation<'a> {
     pub allocation: &'a TaskAllocation,
@@ -20,8 +22,14 @@ pub(super) struct OwnedTask {
 }
 impl OwnedTask {
     pub fn ticket(&self, storage: &str) -> Result<FixedAdmissionTicket> {
-        let admission = &self
-            .context
+        Self::ticket_from_context(&self.context, storage)
+    }
+
+    pub fn ticket_from_context(
+        context: &ContextSnapshot,
+        storage: &str,
+    ) -> Result<FixedAdmissionTicket> {
+        let admission = &context
             .document
             .state
             .active
@@ -39,67 +47,83 @@ impl OwnedTask {
             admission.fixed_predecessor,
         )
     }
+    async fn read_and_validate_version(
+        &self,
+        store: &A2aStore,
+        storage: &str,
+        expected: &crate::store::context::ContextVersion,
+    ) -> Result<crate::store::context::ContextVersion> {
+        anyhow::ensure!(
+            self.lease.revalidate_ownership().await?,
+            "A2A scoped lease lost"
+        );
+        let current = store
+            .read_context(storage)
+            .await?
+            .context("owned context missing")?;
+        let version = current.version()?;
+        anyhow::ensure!(
+            version.owner == expected.owner && version.task_id == expected.task_id,
+            crate::store::context::AuthorityError::StaleOwner
+        );
+        Ok(version)
+    }
+
+    async fn commit_update_write(
+        &mut self,
+        store: &A2aStore,
+        write: &crate::store::context::ContextWrite,
+    ) -> Result<Option<TaskRecord>> {
+        match store.commit_context(write).await {
+            Ok(context) => {
+                self.context = context;
+                let active = self
+                    .context
+                    .document
+                    .state
+                    .active
+                    .as_ref()
+                    .context("active task missing after CAS")?;
+                Ok(Some(active.snapshot.clone()))
+            }
+            Err(e) if is_authority_conflict(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn try_update_attempt(
+        &mut self,
+        store: &A2aStore,
+        storage: &str,
+        mutate: &mut impl FnMut(&mut ActiveTask),
+    ) -> Result<Option<TaskRecord>> {
+        let expected = self.context.version()?;
+        let version = self
+            .read_and_validate_version(store, storage, &expected)
+            .await?;
+        let op_id = uuid::Uuid::new_v4().to_string();
+        let prepared = store
+            .prepare_context_update(storage, &version, &op_id, |state| {
+                mutate(state.active.as_mut().expect("owned task"))
+            })
+            .await;
+        let write = match prepared {
+            Ok(write) => write,
+            Err(e) if is_authority_conflict(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        self.commit_update_write(store, &write).await
+    }
+
     pub async fn update(
         &mut self,
         store: &A2aStore,
         storage: &str,
         mut mutate: impl FnMut(&mut ActiveTask),
     ) -> Result<TaskRecord> {
-        let expected = self.context.version()?;
         for _ in 0..8 {
-            anyhow::ensure!(
-                self.lease.revalidate_ownership().await?,
-                "A2A scoped lease lost"
-            );
-            let current = store
-                .read_context(storage)
-                .await?
-                .context("owned context missing")?;
-            let version = current.version()?;
-            anyhow::ensure!(
-                version.owner == expected.owner && version.task_id == expected.task_id,
-                crate::store::context::AuthorityError::StaleOwner
-            );
-            // Only pure document mutation retries. Runtime effects keep their
-            // original ticket; a newer receipt never authorizes replay.
-            let prepared = store
-                .prepare_context_update(
-                    storage,
-                    &version,
-                    &uuid::Uuid::new_v4().to_string(),
-                    |state| mutate(state.active.as_mut().expect("owned task")),
-                )
-                .await;
-            let write = match prepared {
-                Ok(write) => write,
-                Err(error)
-                    if error.downcast_ref::<crate::store::context::AuthorityError>()
-                        == Some(&crate::store::context::AuthorityError::Conflict) =>
-                {
-                    continue
-                }
-                Err(error) => return Err(error),
-            };
-            match store.commit_context(&write).await {
-                Ok(context) => {
-                    self.context = context;
-                    return Ok(self
-                        .context
-                        .document
-                        .state
-                        .active
-                        .as_ref()
-                        .context("active task missing after CAS")?
-                        .snapshot
-                        .clone());
-                }
-                Err(error)
-                    if error.downcast_ref::<crate::store::context::AuthorityError>()
-                        == Some(&crate::store::context::AuthorityError::Conflict) =>
-                {
-                    continue
-                }
-                Err(error) => return Err(error),
+            if let Some(record) = self.try_update_attempt(store, storage, &mut mutate).await? {
+                return Ok(record);
             }
         }
         anyhow::bail!(crate::store::context::AuthorityError::Conflict)
@@ -110,48 +134,7 @@ impl OwnedTask {
         session: &NatsSession,
         reservation: TaskReservation<'_>,
     ) -> Result<TaskRecord> {
-        let TaskReservation {
-            allocation,
-            message,
-            predecessor,
-        } = reservation;
-        let fingerprint = crate::store::message_fingerprint(&message.parts);
-        let active = ActiveTask {
-            snapshot: TaskRecord {
-                version: 1,
-                task: Task {
-                    id: allocation.task_id.clone(),
-                    context_id: allocation.local_id.clone(),
-                    status: status(TaskState::Submitted, None),
-                    artifacts: None,
-                    history: Some(vec![message.clone()]),
-                    metadata: None,
-                },
-                user_msg_id: allocation.prompt_id.clone(),
-                user_msg_seq: 0,
-                execution_id: allocation.invocation_id.clone(),
-                revision: 1,
-                stream_seq: 0,
-                created_at: allocation.created_at,
-                updated_at: allocation.created_at,
-            },
-            message: RetainedMessage {
-                message_id: message.message_id,
-                fingerprint,
-            },
-            admission: AdmissionState {
-                invocation_id: allocation.invocation_id.clone(),
-                prompt_id: allocation.prompt_id.clone(),
-                closure_id: Some(allocation.closure_id.clone()),
-                fixed_predecessor: predecessor,
-                phase: AdmissionPhase::Reserved,
-                prompt_sequence: None,
-            },
-            cancel: None,
-            publication: Default::default(),
-            projections: Default::default(),
-            stop_confirmed: false,
-        };
+        let active = reservation.into_active();
         let write = store
             .prepare_context_update(
                 session.storage_key(),
@@ -194,13 +177,16 @@ impl OwnedTask {
             .archive_context_terminal(session.storage_key(), &active.snapshot.task.id)
             .await?;
         store
-            .put_message_dedupe(
+            .put_dedupe_mapping(
+                crate::store::DedupeMappingKind::Message,
                 session.storage_key(),
-                MessageIdentity {
-                    message_id: &active.message.message_id,
-                    fingerprint: &active.message.fingerprint,
-                },
-                &active.snapshot.task.id,
+                crate::store::DedupeMappingTarget::new(
+                    MessageIdentity {
+                        message_id: &active.message.message_id,
+                        fingerprint: &active.message.fingerprint,
+                    },
+                    &active.snapshot.task.id,
+                ),
             )
             .await?;
         self.flush_pending(store, session.storage_key()).await?;
@@ -236,4 +222,9 @@ pub(super) fn stage_terminal(active: &mut ActiveTask) {
     });
     let id = format!("{}:terminal", active.snapshot.task.id);
     super::outbox::stage_event(active, event, &id);
+}
+
+fn is_authority_conflict(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<crate::store::context::AuthorityError>()
+        == Some(&crate::store::context::AuthorityError::Conflict)
 }

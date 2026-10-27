@@ -27,6 +27,13 @@ pub enum Boundary {
     SnapshotCaptured,
     ReaderCreated,
     TerminalOutboxCommitted,
+    HitlOutboxCommitted,
+    HitlReplyBound,
+    HitlReplyIntentCommitted,
+    HitlRequestObserved,
+    HitlDecisionCommitted,
+    HitlParkedInspected,
+    HitlRecoveryDeferred,
 }
 impl Boundary {
     fn index(self) -> usize {
@@ -51,13 +58,21 @@ impl Default for Point {
 
 #[derive(Default)]
 pub struct FaultHooks {
-    points: [Point; 19],
+    points: [Point; Boundary::HitlRecoveryDeferred as usize + 1],
     context_ack_loss: AtomicBool,
     first_ack_loss: AtomicBool,
     terminal_ack_loss: AtomicBool,
     event_ack_loss: AtomicBool,
+    event_publish_failure: AtomicBool,
 }
 impl FaultHooks {
+    pub fn fail_next_event_publish(&self) {
+        self.event_publish_failure.store(true, Ordering::SeqCst);
+    }
+    pub(crate) fn take_event_publish_failure(&self) -> bool {
+        self.event_publish_failure.swap(false, Ordering::SeqCst)
+    }
+
     pub fn lose_next_event_ack(&self) {
         self.event_ack_loss.store(true, Ordering::SeqCst);
     }

@@ -9,11 +9,10 @@ pub(super) fn rules() -> Arc<AccessRules> {
     ).unwrap())
 }
 pub(super) fn identity(user: &str, groups: &[&str], roles: &[&str]) -> RequestIdentity {
-    RequestIdentity {
-        principal: Principal::User(user.into()),
-        groups: groups.iter().map(|s| (*s).into()).collect(),
-        roles: roles.iter().map(|s| (*s).into()).collect(),
-    }
+    let mut identity = RequestIdentity::from(Principal::User(user.into()));
+    identity.groups = groups.iter().map(|s| (*s).into()).collect();
+    identity.roles = roles.iter().map(|s| (*s).into()).collect();
+    identity
 }
 pub(super) fn member(user: &str) -> RequestIdentity {
     identity(user, &["acl-team"], &[])

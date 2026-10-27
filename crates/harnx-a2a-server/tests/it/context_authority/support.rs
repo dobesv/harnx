@@ -127,6 +127,7 @@ pub(crate) fn active_task() -> ActiveTask {
         publication: Default::default(),
         projections: Default::default(),
         stop_confirmed: false,
+        hitl_checkpoint: None,
     }
 }
 

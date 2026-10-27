@@ -1,5 +1,8 @@
 //! Coalesced execution output becomes one CAS-owned event at a time.
 use super::*;
+use a2a_lf::TaskStatus;
+
+mod follow;
 
 pub(super) struct Publisher {
     pub(super) store: Arc<A2aStore>,
@@ -12,6 +15,9 @@ pub(super) struct Publisher {
     pub(super) admission_guard: Option<OwnedMutexGuard<Option<Arc<RunnerHandle>>>>,
     pub(super) authority: OwnedTask,
     pub(super) stop_observed: bool,
+    pub(super) suspending: bool,
+    pub(super) resumed: bool,
+    pub(super) replace_output: bool,
     #[cfg(feature = "fault-injection")]
     pub(super) hooks: Arc<crate::fault_injection::FaultHooks>,
 }
@@ -43,6 +49,9 @@ impl Publisher {
             admission_guard: Some(admission_guard),
             authority,
             stop_observed: false,
+            suspending: false,
+            resumed: false,
+            replace_output: false,
             #[cfg(feature = "fault-injection")]
             hooks: Default::default(),
         }
@@ -80,30 +89,7 @@ impl Publisher {
         }
         let record = self.record();
         let status = status(state, text);
-        let history = status
-            .message
-            .as_ref()
-            .filter(|_| status.state == TaskState::Completed)
-            .map(|message| {
-                let mut history = record.task.history.clone().unwrap_or_default();
-                history.push(message.clone());
-                history
-            });
-        let changes = TaskChanges {
-            status: Some(status.clone()),
-            history,
-            artifacts: if self.output.sent || !self.output.text.is_empty() {
-                Some(vec![artifact(self.output.text.clone())])
-            } else {
-                record.task.artifacts.clone()
-            },
-        };
-        let response = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-            task_id: record.task.id.clone(),
-            context_id: record.task.context_id.clone(),
-            status,
-            metadata: None,
-        });
+        let (changes, response) = build_status_payload(record, &self.output, status);
         self.send(response, changes).await?;
         if self.record().task.status.state.is_terminal() {
             self.authority
@@ -112,11 +98,10 @@ impl Publisher {
         }
         Ok(())
     }
-
     pub(super) async fn flush_artifact(&mut self, last: bool, replace: bool) -> Result<()> {
-        let Some(update) = self
-            .output
-            .artifact_update(&self.record().task, last, replace)
+        let Some(update) =
+            self.output
+                .artifact_update(&self.record().task, last, replace || self.replace_output)
         else {
             return Ok(());
         };
@@ -130,6 +115,7 @@ impl Publisher {
         )
         .await?;
         self.output.committed();
+        self.replace_output = false;
         Ok(())
     }
     pub(super) async fn execute(&mut self, request: ExecutionRequest<'_>) -> Result<()> {
@@ -139,76 +125,27 @@ impl Publisher {
             cancel_rx,
             admitted_tx,
         } = request;
-        self.set_status(TaskState::Working, None).await?;
-        let route = session
-            .tool_confirmation_route(denial_confirmation_handler())
-            .await?;
+        if self.resumed {
+            self.drain_outbox().await?;
+            self.publish_snapshot();
+        } else {
+            self.set_status(TaskState::Working, None).await?;
+        }
         let session = session.clone().with_external_admission().with_admission_id(
             self.authority
                 .ticket(&self.storage_key)?
                 .invocation_id()
                 .into(),
         );
-        let result = self
-            .follow_turn(
-                &session,
-                &route,
-                AdmittedTurn {
-                    input,
-                    cancel_rx,
-                    admitted_tx,
-                },
-            )
-            .await;
-        route.close().await;
-        result
-    }
-
-    async fn follow_turn(
-        &mut self,
-        session: &NatsSession,
-        route: &harnx_runtime::nats_tool_confirmation::ToolConfirmationRoute,
-        turn: AdmittedTurn,
-    ) -> Result<()> {
-        let AdmittedTurn {
-            input,
-            cancel_rx,
-            admitted_tx,
-        } = turn;
-        let appended = self.admit_fixed_prompt(session, &input).await?;
-        // Cancellation must not land before the admitted user message.
-        self.admission_guard.take();
-        let snapshot = self.live.lock().snapshot().expect("admitted snapshot");
-        let _ = admitted_tx.send(Ok(snapshot));
-        let limit = super::limits::task_output_limit(&self.store, &self.authority.context).await?;
-        let inbox = Arc::new(super::inbox::TextInbox::new(limit));
-        #[cfg(feature = "fault-injection")]
-        self.hooks
-            .checkpoint(crate::fault_injection::Boundary::Activation)
-            .await;
-        let follow = session.follow_admitted_prompt(
-            appended,
-            Arc::new(A2aEventSink(inbox.clone())),
-            Some(cancel_rx),
-            Some(route.subject()),
-            RunTurnOptions::default(),
-        );
-        tokio::pin!(follow);
-        let mut cancellation = tokio::time::interval(Duration::from_millis(250));
-        let mut coalescer = super::coalescing::ArtifactCoalescer::new(inbox.clone(), limit);
-        let result = loop {
-            tokio::select! {
-                result = &mut follow => break result?,
-                ready = coalescer.ready(&mut self.output) => {
-                    ready?;
-                    self.flush_artifact(false, false).await?;
-                }
-                _ = cancellation.tick() => self.observe_cancel(session).await?,
-            }
-        };
-        self.output.accept(inbox.take()?, limit)?;
-        self.confirm_stop(session).await?;
-        self.complete_turn(result).await
+        self.follow_turn(
+            &session,
+            AdmittedTurn {
+                input,
+                cancel_rx,
+                admitted_tx,
+            },
+        )
+        .await
     }
 
     async fn complete_turn(&mut self, result: harnx_runtime::NatsTurnResult) -> Result<()> {
@@ -223,4 +160,37 @@ impl Publisher {
         self.flush_artifact(true, replace).await?;
         self.set_status(state, text.as_deref()).await
     }
+}
+
+fn build_status_payload(
+    record: &TaskRecord,
+    output: &Output,
+    status: TaskStatus,
+) -> (TaskChanges, StreamResponse) {
+    let history = status
+        .message
+        .as_ref()
+        .filter(|_| status.state == TaskState::Completed)
+        .map(|message| {
+            let mut history = record.task.history.clone().unwrap_or_default();
+            history.push(message.clone());
+            history
+        });
+    let artifacts = if output.sent || !output.text.is_empty() {
+        Some(vec![artifact(output.text.clone())])
+    } else {
+        record.task.artifacts.clone()
+    };
+    let changes = TaskChanges {
+        status: Some(status.clone()),
+        history,
+        artifacts,
+    };
+    let response = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        task_id: record.task.id.clone(),
+        context_id: record.task.context_id.clone(),
+        status,
+        metadata: None,
+    });
+    (changes, response)
 }

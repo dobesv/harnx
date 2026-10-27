@@ -267,3 +267,5 @@ async fn registry_recovers_claimed_context_before_task_allocation_without_replay
     t.b.backend.abort.set_ctrlc();
     Ok(())
 }
+
+mod hitl;

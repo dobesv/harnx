@@ -31,6 +31,7 @@ pub(crate) use binding::validate_stored_owner;
 pub use binding::{validate_binding, A2aBinding, A2A_BINDING_NAMESPACE, A2A_BINDING_VERSION};
 pub use dedupe::{
     create_dedupe_lru, message_fingerprint, message_id_hash, DedupeEntry, DedupeKey, DedupeLru,
+    DedupeMappingKind, DedupeMappingTarget,
 };
 pub use ids::{assert_local_id_no_dot, format_task_id, new_task_id, parse_task_id};
 pub use index::{to_index_state, IndexState, DANGLING_TASK_GRACE_PERIOD};
@@ -68,10 +69,19 @@ pub struct TaskAccess<'a> {
     pub task_id: &'a str,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MessageIdentity<'a> {
     pub message_id: &'a str,
     pub fingerprint: &'a str,
+}
+
+impl<'a> MessageIdentity<'a> {
+    pub fn new(message_id: &'a str, fingerprint: &'a str) -> Self {
+        Self {
+            message_id,
+            fingerprint,
+        }
+    }
 }
 
 /// A2A task store operations.

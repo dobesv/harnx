@@ -11,6 +11,10 @@ use harnx_runtime::nats_session_log::NatsSessionLog;
 #[path = "nats_tool_confirmation/fencing.rs"]
 mod fencing;
 use crate::generation;
+#[path = "nats_tool_confirmation/fixed_progress_support.rs"]
+mod fixed_progress_support;
+#[path = "nats_tool_confirmation/follow_boundary.rs"]
+mod follow_boundary;
 #[path = "nats_tool_confirmation/multi_client.rs"]
 mod multi_client;
 
@@ -610,6 +614,12 @@ async fn durable_hitl_request_ends_activation_without_turn_end() -> Result<()> {
     Ok(())
 }
 
+/// Observe real worker deferral, then deterministic persisted continuation states.
+/// No decision activation races the decided-but-still-running observation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_prompt_hitl_progress_tracks_exact_invocation_and_reused_call_id() -> Result<()> {
+    fixed_progress_support::verify_fixed_prompt_hitl_progress_and_reused_call_id().await
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_approval_does_not_authorize_reused_tool_call_id() -> Result<()> {
     let Some(harness) =
@@ -1280,5 +1290,78 @@ async fn seed_pending_hitl_round(harness: &ConfirmationHarness) -> Result<()> {
         .await?;
 
     lease.release().await?;
+    Ok(())
+}
+
+async fn setup_fixed_hitl_pending(
+    session: &NatsSession,
+    ticket: &harnx_runtime::nats_session::fixed_admission::FixedAdmissionTicket,
+) -> Result<harnx_runtime::PendingHitlApproval> {
+    use harnx_runtime::PromptProgress;
+    session
+        .append_fixed_prompt(ticket, MessageContent::Text("start handoff".into()))
+        .await?;
+    let handle = session
+        .fixed_prompt_handle(ticket)
+        .await?
+        .context("fixed handle")?;
+    session
+        .follow_admitted_prompt(handle, Arc::new(NullSink), None, None, Default::default())
+        .await?;
+    let PromptProgress::InputRequired(pending) = session.fixed_prompt_progress(ticket).await?
+    else {
+        anyhow::bail!("expected fixed invocation pending approval");
+    };
+    Ok(pending)
+}
+
+fn assert_fixed_prompt_decision_entries(
+    entries: &[(u64, SessionLogEntry)],
+    reference: &harnx_runtime::ApprovalRef,
+) {
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(_, entry)| matches!(entry, SessionLogEntry::HitlApprovalDecision { .. }))
+            .count(),
+        1
+    );
+    assert!(entries.iter().any(|(_, entry)| matches!(entry, SessionLogEntry::HitlApprovalDecision { tool_call_id, approved: false, note: Some(note), .. } if tool_call_id == &reference.tool_call_id && note == "exact rejection reason")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_prompt_hitl_decision_for_applies_exact_request() -> Result<()> {
+    use harnx_runtime::HitlDecisionOutcome;
+    let harness = ConfirmationHarness::start()
+        .await?
+        .context("nats-server required")?;
+    let session = harness.source.clone().with_external_admission();
+    let ticket = session
+        .prepare_fixed_admission(
+            "exact-hitl".into(),
+            "exact-hitl-prompt".into(),
+            "exact-hitl-closed".into(),
+        )
+        .await?;
+    let pending = setup_fixed_hitl_pending(&session, &ticket).await?;
+    let reference = pending.approval_ref(ticket.invocation_id());
+    assert_eq!(
+        session
+            .decide_hitl_approval_for(&reference, false, Some("exact rejection reason".into()))
+            .await?,
+        HitlDecisionOutcome::Applied
+    );
+    let entries = wait_for_source_entry(&harness.jetstream, |entry| {
+        matches!(entry, SessionLogEntry::TurnEnd { .. })
+    })
+    .await?;
+    assert_fixed_prompt_decision_entries(&entries, &reference);
+    assert_eq!(
+        session
+            .decide_hitl_approval_for(&reference, false, None)
+            .await?,
+        HitlDecisionOutcome::Stale,
+        "terminal invocation cannot be reactivated by an exact retry"
+    );
     Ok(())
 }

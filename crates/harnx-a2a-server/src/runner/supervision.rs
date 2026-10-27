@@ -56,7 +56,7 @@ impl Runner {
 }
 
 impl SupervisionConfig {
-    async fn sweep(&self, runner: &Runner, cursor: &mut u64) -> Result<()> {
+    async fn sweep(&self, runner: &Arc<Runner>, cursor: &mut u64) -> Result<()> {
         for _ in 0..SWEEP_BATCH {
             if self.abort.aborted() || runner.shutting_down.load(Ordering::SeqCst) {
                 break;

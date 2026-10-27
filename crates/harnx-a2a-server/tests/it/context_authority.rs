@@ -6,6 +6,7 @@ use harnx_runtime::nats_lease::{NatsLeaseConfig, NatsSessionLease};
 mod acknowledgements;
 #[cfg(feature = "fault-injection")]
 mod fixed_admission;
+mod hitl;
 #[cfg(feature = "fault-injection")]
 mod leader;
 mod projections;

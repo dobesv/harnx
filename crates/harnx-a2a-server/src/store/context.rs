@@ -8,10 +8,13 @@ use harnx_nats_common::leader_reads;
 use harnx_runtime::nats_lease::NatsSessionLease;
 
 mod cancellation;
+pub mod hitl;
+mod hitl_writes;
 mod projections;
 mod schema;
 pub(crate) mod terminal_event;
 mod writes;
+pub use hitl_writes::{HitlAdvanceParams, HitlReplyIntent, HitlWaitingParams};
 pub use schema::*;
 
 pub fn context_authority_key(storage_key: &str) -> String {
@@ -56,6 +59,22 @@ pub struct ContextVersion {
     pub revision: u64,
 }
 
+/// Target and immutable predecessor for an owner-checked context mutation.
+pub struct ContextMutation<'a> {
+    pub storage_key: &'a str,
+    pub expected: &'a ContextVersion,
+    pub operation_id: &'a str,
+}
+
+impl<'a> ContextMutation<'a> {
+    pub fn new(storage_key: &'a str, expected: &'a ContextVersion, operation_id: &'a str) -> Self {
+        Self {
+            storage_key,
+            expected,
+            operation_id,
+        }
+    }
+}
 /// Immutable operation identity and predecessor. Retain this exact ticket until
 /// its acknowledgement is resolved; don't prepare a replacement on uncertainty.
 #[derive(Debug, Clone)]

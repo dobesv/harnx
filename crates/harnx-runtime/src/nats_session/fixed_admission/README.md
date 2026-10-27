@@ -3,7 +3,7 @@
 Coordinated frontends use `NatsSession::prepare_fixed_admission`,
 `append_fixed_prompt`, `resolve_fixed_admission` and `close_fixed_admission`.
 Ordinary runtime admission keeps its existing steering and worker lease behavior.
-The A2A runner uses these APIs after its owner-checked context CAS. Shared first-message reservations and foreground recovery preserve the ticket; background supervision restores the same ticket. Remote event readers are separate work.
+The A2A runner uses these APIs after its owner-checked context CAS. Shared first-message reservations and foreground recovery preserve the ticket; background supervision restores the same ticket. A parked `InputRequired` task can have no A2A owner while its runtime admission remains busy. Resuming an accepted HITL continuation never allocates a replacement ticket or prompt.
 
 ## Persist before append
 
@@ -39,7 +39,11 @@ change the original admission. An unavailable broker is an error, not proof of c
   recovery calls close, never append.
 - `Admitted { prompt_sequence }`: prompt won. `fixed_prompt_handle` returns the
   same invocation/prompt for observation through `follow_admitted_prompt`.
-  Recovery must inspect durable completion or interrupt this exact invocation.
+  Recovery must inspect durable completion and approval progress before interrupting
+  this exact invocation. A durable pending HITL request parks it; an accepted exact
+  reply or committed decision may reactivate its existing continuation and attach
+  `follow_admitted_prompt_until_boundary` under this same ticket. That isn't prompt
+  replay. Without HITL evidence the ordinary orphan interruption policy is unchanged.
   **Admitted does not mean stopped.** Don't mark a stop checkpoint merely because
   close returned Admitted, and don't automatically activate interrupted work.
 - `Closed { closure_sequence }`: closure won. No executable prompt exists.
@@ -58,6 +62,130 @@ use open-existing-only handles; they cannot recreate a GC-deleted transcript.
 Session GC must retire frontend authority with its log and must not reuse the same
 storage identity. Partial retention that removes admission evidence requires an
 explicit migration/settlement policy, not recovery replay.
+
+## Observe approval progress
+
+`NatsSession::fixed_prompt_progress(&ticket)` reads one retained log snapshot and
+validates the saved admission against it. It requires an admitted ticket; pending,
+closed, fenced, or mismatched tickets return an error. It doesn't append or activate
+work. `PromptProgress` distinguishes:
+
+- `Running { last_decision }`: no terminal or pending approval. The optional
+  `HitlDecisionReceipt` records the exact request, decision sequence, answer, and note.
+- `InputRequired(PendingHitlApproval)`: the invocation is suspended for approval.
+- `Terminal(NatsTurnResult)`: durable completion, cancellation, or worker failure.
+
+These types and `ApprovalRef` are exported from `harnx_runtime` and
+`harnx_runtime::nats_session`. Build a durable reply target with
+`pending.approval_ref(ticket.invocation_id())`. `PendingHitlApproval` and
+`ApprovalRef` support JSON serialization and equality comparisons.
+
+Scoping starts at the ticket's immutable root prompt and ends at its first raw
+terminal proof. Fixed admission prevents a successor invocation before that proof.
+Both the request and its `ToolCalls` round must be after the root prompt. Checking
+only the request sequence could attach a late request from an older round. Raw
+terminal proof wins over any remaining approval and over approvals in later
+invocations, even after transcript edits or rewind. Pending requests and decision
+receipts respect effective transcript mutations and are joined within their own
+round, so a reused provider tool call ID doesn't inherit an older decision.
+Tool name and arguments come from persisted `ToolCalls`, not unpersisted hook edits.
+
+## Follow one approval segment
+
+`NatsSession::follow_admitted_prompt_until_boundary` takes an existing
+`AppendedPrompt`, the caller's `Arc<dyn AgentEventSink>`, and `FollowBoundaryOptions`
+(which carries `after_request_seq`, `run`, and optional `pending_cancel`). It returns public
+`FollowBoundary::InputRequired(PendingHitlApproval)` or
+`FollowBoundary::Terminal(NatsTurnResult)`. Both boundary types are exported from
+`harnx_runtime` and `harnx_runtime::nats_session`. No confirmation subject is
+accepted: activation always passes `None`, so the worker defers tool approval.
+
+For a new A2A segment, append the fixed prompt once, obtain its handle with
+`fixed_prompt_handle(&ticket)`, and follow with `FollowBoundaryOptions::default()`.
+On `InputRequired`, save the approval reference and publish the challenge. Don't
+close admission, interrupt the invocation, or treat suspension as a completed turn.
+
+After delivering a decision for Q1, reconstruct the handle from the **same ticket**
+and call the same follow method with:
+
+```rust
+FollowBoundaryOptions {
+    after_request_seq: Some(q1.request_seq),
+    run: original_run_options,
+}
+```
+
+`after_request_seq` is a checkpoint watermark, not an event-log offset. Decisions
+are excluded by durable request derivation, so a decided Q1 can't reappear. A
+still-undecided request at or before the watermark is returned again rather than
+silently skipped. A next approval already written before attachment is returned
+from history. Terminal proof always wins, even below the watermark. Don't use this
+field as permission to target a newer request with an older reply.
+
+Attachment subscribes before reading history. Typed follow then refreshes durable
+facts before activation, including when reusing an admission-time subscription.
+An already-pending approval or terminal result needs no activation. Otherwise it
+activates the original prompt and follows until a durable boundary. It reuses the
+legacy event loop, generation/cancel fencing, logical-sequence decoration, and
+final buffered-event drain. `follow_admitted_prompt` retains its existing return
+value and compatibility behavior.
+
+Text arrives at the supplied sink as `AgentEvent::Model(ModelEvent::MessageChunk)`
+throughout each live segment, including a resumed segment. Reuse the publisher's
+sink/inbox and preserve accumulated artifact text between segments. Like the
+legacy follower, this API doesn't replay historical text or make advisory chunks
+durable. A publisher attaching after output was already emitted must recover
+persisted `ToolCalls.text`/assistant messages and reconcile its artifact; terminal
+`NatsTurnResult.response` contains the final assistant response, not all prior
+segment text. The approval watermark doesn't deduplicate artifact output.
+
+A typed `Terminal` requires a durable terminal entry or confirmed cancel receipt.
+Log failures, a closed event stream without a boundary, or an orphaned worker
+without terminal proof return an error, not a synthetic successful completion.
+The existing `RunTurnOptions` are carried in `FollowBoundaryOptions.run`; following
+never admits a new prompt or creates a fresh run/deadline.
+
+## Decide an exact approval
+
+Call `NatsSession::decide_hitl_approval_for(&reference, approved, note)` with the
+saved `ApprovalRef`, not a fresh reference selected during retry. It returns public
+`HitlDecisionOutcome` (exported alongside the progress types):
+
+- `Applied`: the request was pending when inspected, an activation was published
+  for its original invocation, and a matching durable decision was then observed.
+  This includes recovery after a lost acknowledgement and a concurrent same-answer
+  decision. It proves the answer, not which caller wrote it.
+- `AlreadyApplied { approved, note }`: the same answer was already durable, the
+  request hasn't been superseded, and the invocation is non-terminal. Activation
+  is published again before returning. The original note is returned; retry notes
+  don't replace it. Idempotency compares the boolean answer, not the note.
+- `Conflicting`: this exact request has the opposite durable answer. A conflict
+  found at entry doesn't activate work. A conflict found after a delivery race
+  can follow an activation already published for that original invocation.
+- `Stale`: invocation identity doesn't match, the request was removed or replaced,
+  a different approval is current, or the invocation is already terminal. A stale
+  reference found at entry neither activates nor sends a decision. If replacement
+  happens during delivery, the earlier activation is still pinned to the original
+  prompt; no retry retargets the replacement request.
+
+Terminal proof and a newer pending request win over historical decisions at API
+entry. After an attempt starts, a matching commit for that exact request can still
+return `Applied` even if the worker has since finished or reached the next gate.
+Recovery should query `fixed_prompt_progress` after every outcome before projecting
+current state. Broker, log, activation, and unresolved delivery failures return an
+error rather than inventing an outcome. Activation publishes existing work; it
+neither appends a prompt nor guarantees a worker has already resumed.
+
+The tool-ID-only `decide_hitl_approval` API remains for web callers. It selects the
+current generation once and uses the fenced path, but keeps its historical boolean
+idempotency after completion. Its already-decided live path now reactivates work.
+
+Workers check optional `ControlCommand::HitlApprovalDecision.request_seq` against
+the current request and use the same snapshot's stream tail for the lease-fenced
+CAS append. A replaced generation or intervening write can't inherit the decision.
+Missing `request_seq` retains legacy tool-ID routing; old receivers ignore the new
+field. Wire compatibility does **not** add fencing to old workers. Upgrade workers
+before enabling exact-reference decisions in coordinated frontends.
 
 ## Deployment and tests
 

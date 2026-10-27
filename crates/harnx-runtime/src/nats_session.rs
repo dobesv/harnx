@@ -34,8 +34,6 @@
 
 use anyhow::{Context, Result};
 use async_nats::jetstream;
-use futures_util::StreamExt;
-use harnx_core::abort::wait_abort_signal;
 use harnx_core::event::{AgentEvent, AgentEventSink, ModelEvent, SessionEvent, UserEvent};
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::session::SessionLogEntry;
@@ -51,15 +49,20 @@ use crate::nats_session_log::NatsSessionLog;
 use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
 use crate::nats_worker::{
     publish_control_command, publish_session_activate, publish_targeted_session_activate,
-    request_control_command, ControlCommand, LocalWorkerTarget, SessionActivate,
-    SessionActivationRoute,
+    ControlCommand, LocalWorkerTarget, SessionActivate, SessionActivationRoute,
 };
 use crate::utils::AbortSignal;
 mod compaction_request;
 #[cfg(test)]
 mod compaction_request_tests;
 mod completion;
+mod follow;
+pub use follow::{FollowBoundary, FollowBoundaryOptions};
 mod hitl;
+mod hitl_decision;
+pub use hitl::{
+    ApprovalRef, HitlDecisionOutcome, HitlDecisionReceipt, PendingHitlApproval, PromptProgress,
+};
 pub mod interrupt;
 mod prompt_append;
 pub use compaction_request::{request_compaction_session, CompactSubmit, CompactionRequest};
@@ -1139,70 +1142,6 @@ impl NatsSession {
         Ok(Some(user_msg_seq))
     }
 
-    /// Route a tool-approval decision to the lease holder and wait until its
-    /// fenced durable decision entry has been applied. Matching decisions are
-    /// idempotent, including when the worker's acknowledgement was lost.
-    pub async fn decide_hitl_approval(
-        &self,
-        tool_call_id: &str,
-        approved: bool,
-        note: Option<String>,
-    ) -> Result<bool> {
-        let entries = self.load_durable_entries().await?;
-        let pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?;
-        let Some(pending) = pending
-            .iter()
-            .find(|item| item.tool_call_id == tool_call_id)
-        else {
-            return hitl::already_decided(&entries, tool_call_id, approved);
-        };
-        let request = hitl::ApprovalRequest {
-            tool_call_id,
-            tool_round_seq: pending.tool_round_seq,
-            request_seq: pending.seq,
-        };
-        let Some(_) = self.activate_pending_turn().await? else {
-            let entries = self.load_durable_entries().await?;
-            if let Some(outcome) = request.outcome(&entries, approved)? {
-                return Ok(outcome);
-            }
-            anyhow::bail!(
-                "pending HITL approval '{}' has no activatable durable turn",
-                tool_call_id
-            );
-        };
-        let command = ControlCommand::HitlApprovalDecision {
-            tool_call_id: tool_call_id.to_string(),
-            approved,
-            note,
-        };
-        let deadline = tokio::time::Instant::now() + CONTROL_RECOVERY_TIMEOUT;
-        loop {
-            if request_control_command(
-                &self.client,
-                &self.storage_key,
-                &command,
-                CONTROL_ACK_ATTEMPT_TIMEOUT,
-            )
-            .await
-            .is_ok()
-            {
-                return Ok(true);
-            }
-            let entries = self.load_durable_entries().await?;
-            if let Some(outcome) = request.outcome(&entries, approved)? {
-                return Ok(outcome);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "timed out waiting for worker to apply HITL approval '{}'",
-                    tool_call_id
-                );
-            }
-            tokio::time::sleep(CONTROL_ACK_RETRY_DELAY).await;
-        }
-    }
-
     /// Run a turn: append user message, activate worker, stream events until completion.
     ///
     /// This is the main entry point for all frontends (CLI and TUI).
@@ -1460,363 +1399,17 @@ impl NatsSession {
         tool_confirmation_subject: Option<&str>,
         options: RunTurnOptions,
     ) -> Result<NatsTurnResult> {
-        let user_msg_seq = appended.user_msg_seq;
-        let mut stopped_result = NatsTurnResult {
-            response: None,
-            session_id: self.session_id.clone(),
-            was_cancelled: true,
-            error: None,
-            user_msg_seq: appended.user_msg_seq,
-            user_msg_id: appended.user_msg_id.clone(),
-        };
-        let live = appended.live.clone();
-        // Stop observation remains pollable during attachment, activation and
-        // final transcript reads. None of them is a prerequisite for acceptance.
-        let result = tokio::select! {
-            biased;
-            cancel_seq = self.wait_for_prompt_interrupt(user_msg_seq) => {
-                let (cancel_seq, timeout) = cancel_seq?;
-                stopped_result.error = timeout;
-                if let Some(live) = &live { live.accept_interrupt(cancel_seq); }
-                return Ok(stopped_result);
-            }
-            result = Box::pin(self.follow_prompt_inner(appended, event_sink, pending_cancel, tool_confirmation_subject, options)) => result,
-        };
-        if result.as_ref().is_ok_and(|result| result.was_cancelled) {
-            return result;
-        }
-        // Completion and the interrupt watch can become ready together. The
-        // log settles it: a `Cancel` that terminated this turn wins.
-        if let Some((cancel_seq, timeout)) = self.prompt_interrupt_receipt(user_msg_seq).await? {
-            stopped_result.error = timeout;
-            if let Some(live) = &live {
-                live.accept_interrupt(cancel_seq);
-            }
-            return Ok(stopped_result);
-        }
-        result
-    }
-
-    async fn follow_prompt_inner(
-        &self,
-        appended: AppendedPrompt,
-        event_sink: Arc<dyn AgentEventSink>,
-        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
-        tool_confirmation_subject: Option<&str>,
-        options: RunTurnOptions,
-    ) -> Result<NatsTurnResult> {
-        let user_msg_id = appended.user_msg_id;
-        let user_msg_seq = appended.user_msg_seq;
-
-        // Step 2: Attach to session event stream (subscribe-first, then history).
-        let retained = match appended.events {
-            Some(events) => events.lock().await.take(),
-            None => None,
-        };
-        let mut event_stream = match retained {
-            Some(events) => events,
-            None => SessionEventStream::attach(
-                self.jetstream.clone(),
-                self.client.clone(),
-                &self.storage_key,
-            )
-            .await
-            .context("failed to attach to session event stream")?,
-        };
-
-        if let Some(live) = appended.live {
-            event_stream.use_live_state(live).await?;
-        } else {
-            event_stream.refresh_generation().await?;
-        }
-        let live = event_stream.live_state().clone();
-
-        // Render history to event sink (for resume/attach scenarios)
-        let history = event_stream.history();
-        // Apply mutations so retracted/edited entries are excluded from history render.
-        let _effective_history =
-            match harnx_core::session_reconstruct::apply_log_mutations_nats(history) {
-                Ok(history) => history,
-                Err(err) => {
-                    log::warn!(
-                        "failed to apply NATS log mutations while rendering session history: {err}"
-                    );
-                    history.to_vec()
-                }
-            };
-        // Front-ends render resumed history through their explicit transcript
-        // loading path. Replaying it on every newly-created per-turn session
-        // duplicates all prior messages in interactive and continued sessions.
-
-        // Step 3: Publish the live frontend route with the activation. Route
-        // construction subscribes and flushes before this method is called, so
-        // a fast worker cannot send an approval request before it is ready.
-        self.publish_activation(
-            user_msg_seq,
-            tool_confirmation_subject,
-            options.token_budget,
-        )
-        .await?;
-
-        // Step 4: Stream events and handle control until turn completion.
-        let mut event_stream = event_stream;
-        let mut final_response: Option<String> = None;
-        let mut turn_error: Option<String> = None;
-        let mut turn_complete = false;
-        // Cached effective log for emitting LogSeqAssigned on live advisory
-        // events. Refreshed on throttled durable reloads so we avoid O(N^2)
-        // full-log load per streaming token.
-        let mut cached_effective: Option<Vec<(u64, SessionLogEntry)>> = None;
-        let mut pending_advisories = VecDeque::new();
-        let mut emitted_logical_seqs = HashSet::new();
-        let mut completion_updates = Box::pin(completion::updates(
-            self.jetstream.clone(),
-            self.storage_key.clone(),
-            event_stream.history().to_vec(),
-            options.orphan_timeout,
-            self.lease_acquisition_timeout,
-        ));
-        let mut completion_error = None;
-        let mut emitted_subagent_completions = HashSet::new();
-        // Wrap channel in Option for select! handling.
-        let mut pending_cancel_rx = pending_cancel;
-        let mut was_cancelled = false;
-        let mut saw_terminal_model_error = false;
-
-        // Main event loop with abort signal handling
-        let abort_signal_clone = self.abort_signal.clone();
-        loop {
-            tokio::select! {
-                // Check for cancellation via wait_abort_signal
-                _ = wait_abort_signal(&abort_signal_clone) => {
-                    was_cancelled = true;
-                    log::info!("nats session: abort signal received, publishing cancel");
-                    if let Some(cancel_seq) = self.interrupt_prompt(user_msg_seq, "client cancel").await?.cancel_seq() {
-                        live.accept_interrupt(cancel_seq);
-                    }
-                    break;
-                }
-
-                // Handle pending cancel requests. Publish synchronously so run_turn
-                // cannot tear down before the command reaches the NATS connection.
-                Some(()) = async {
-                    match &mut pending_cancel_rx {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    was_cancelled = true;
-                    log::info!("nats session: pending cancel received, publishing cancel");
-                    if let Some(cancel_seq) = self.interrupt_prompt(user_msg_seq, "client cancel").await?.cancel_seq() {
-                        live.accept_interrupt(cancel_seq);
-                    }
-                    break;
-                }
-
-                // Poll durable completion independently so a client that misses
-                // the live Turn::Ended advisory still observes the authoritative
-                // TurnEnd marker promptly.
-                Some(update) = completion_updates.next() => {
-                    match update {
-                        Ok(completion::DurableUpdate { entries, orphaned }) => {
-                        event_stream.refresh_generation().await?;
-                        // Refresh cached effective log for live LogSeqAssigned.
-                        let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).ok();
-                        let completion_visible = Self::is_turn_completion_visible(
-                            &entries,
-                            effective.as_deref(),
-                            user_msg_seq);
-                        if let Some(effective) = effective {
-                            cached_effective = Some(effective);
-                            emit_all_logical_seqs_for_window(
-                                cached_effective.as_deref(),
-                                &event_sink,
-                                &mut emitted_logical_seqs,
-                            );
-                            flush_pending_advisories(
-                                &mut pending_advisories,
-                                cached_effective.as_deref(),
-                                &event_sink,
-                                &mut emitted_logical_seqs,
-                                AdvisoryFlush::Live,
-                                &live,
-                                event_stream.last_applied_seq(),
-                            );
-                        }
-                        completion::reconcile_subagent_progress(
-                            cached_effective.as_deref().unwrap_or(&entries),
-                            user_msg_seq,
-                            &event_sink,
-                            &mut emitted_subagent_completions,
-                        );
-                        if completion_visible {
-                            (final_response, turn_error) =
-                                Self::extract_turn_outcome(&entries, user_msg_seq);
-                            turn_complete = true;
-                            break;
-                        }
-                        if let Some(reason) = orphaned {
-                            // Workers predating durable TurnEnd release their
-                            // lease after persisting the assistant row. Treat
-                            // that confirmed release as their durable-compatible
-                            // boundary; a missing worker with no answer remains
-                            // an orphaned-turn failure.
-                            (final_response, turn_error) =
-                                Self::extract_turn_outcome(&entries, user_msg_seq);
-                            if final_response.is_none() {
-                                turn_error = Some(reason);
-                            }
-                            turn_complete = true;
-                            break;
-                        }
-                        }
-                        Err(error) => {
-                            completion_error = Some(error);
-                            break;
-                        }
-                    }
-                }
-
-                // Receive advisory events
-                maybe_envelope = event_stream.next() => {
-                    match maybe_envelope {
-                        Some(envelope) => {
-                            // Check if this advisory should be rendered (dedup rule)
-                            if event_stream.should_render(&envelope) {
-                                // Only parent-scope terminal events complete this
-                                // turn. Sub-agent events remain wrapped
-                                // in AgentEvent::SubAgent and therefore do not set
-                                // either compatibility flag.
-                                saw_terminal_model_error |= matches!(
-                                    envelope.event,
-                                    AgentEvent::Model(ModelEvent::Error(_))
-                                );
-                                pending_advisories.push_back(envelope.clone());
-                                flush_pending_advisories(
-                                    &mut pending_advisories,
-                                    cached_effective.as_deref(),
-                                    &event_sink,
-                                    &mut emitted_logical_seqs,
-                                    AdvisoryFlush::Live,
-                                    &live,
-                                    event_stream.last_applied_seq(),
-                                );
-                            }
-                        }
-                        None => {
-                            // Subscription closed, check final state
-                            log::info!("nats session: event stream closed");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if was_cancelled {
-            // Receipt is the completion boundary. No final log/status read may
-            // delay acceptance or return a later generation's response.
-            return Ok(NatsTurnResult {
-                response: None,
-                session_id: self.session_id.clone(),
-                was_cancelled: true,
-                error: None,
-                user_msg_seq,
-                user_msg_id,
-            });
-        }
-        event_stream.refresh_generation().await?;
-
-        // Re-load durable log to get final state if we haven't already.
-        //
-        // The error is held rather than propagated with `?`: returning here would
-        // skip the final flush below and lose advisories that had already been
-        // received, which is the whole point of that flush. They get emitted
-        // undecorated (no reload means no window), then the error is returned.
-        let mut final_reload_error = completion_error;
-        if !turn_complete && final_reload_error.is_none() {
-            match completion::bounded_refresh(self.load_durable_entries()).await {
-                Ok(entries) => {
-                    (final_response, turn_error) =
-                        Self::extract_turn_outcome(&entries, user_msg_seq);
-                    if let Ok(effective) =
-                        harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)
-                    {
-                        cached_effective = Some(effective);
-                        // Paired with the cache refresh everywhere else. If the
-                        // loop exited before any reload succeeded — a closed
-                        // subscription, or a cancel before the first completion
-                        // tick — this is the first reconstruction, and without it
-                        // live Message and ToolCalls rows never get their
-                        // LogSeqAssigned.
-                        emit_all_logical_seqs_for_window(
-                            cached_effective.as_deref(),
-                            &event_sink,
-                            &mut emitted_logical_seqs,
-                        );
-                    }
-                }
-                Err(error) => final_reload_error = Some(error),
-            }
-        }
-
-        // The final durable reload can outlive a stop accepted by another client.
-        event_stream.refresh_generation().await?;
-
-        // Admission may start the worker before this follower is polled. Drain
-        // its retained subscription before a durable completion check can hide
-        // response events already queued by that worker.
-        while let Some(envelope) = event_stream.try_next() {
-            if event_stream.should_render(&envelope) {
-                saw_terminal_model_error |=
-                    matches!(envelope.event, AgentEvent::Model(ModelEvent::Error(_)));
-                pending_advisories.push_back(envelope);
-            }
-        }
-
-        // Render what the worker already published before reporting the turn's
-        // terminal state.
-        //
-        // Notices — retry warnings, "exhausted retries", fallback transitions —
-        // are ephemeral advisories, published from a detached task. The terminal
-        // error is a durable log entry, found by polling. The two have no ordering
-        // relationship, so breaking out of the loop the moment the log reads
-        // complete abandoned advisories that were already in flight: they arrived
-        // after the error, or were dropped with `pending_advisories` and never
-        // shown at all. Losing the last "exhausted retries" line is the visible
-        // case — it's the only explanation a user gets for a fallback.
-        //
-        // No waiting on the subscription: an earlier version of this spent up to
-        // 250ms hoping in-flight advisories would land. Flushing what has already
-        // been received costs nothing and never delays a completed turn.
-        flush_pending_advisories(
-            &mut pending_advisories,
-            cached_effective.as_deref(),
-            &event_sink,
-            &mut emitted_logical_seqs,
-            AdvisoryFlush::Final,
-            &live,
-            event_stream.last_applied_seq(),
-        );
-
-        if let Some(error) = final_reload_error {
-            return Err(error);
-        }
-
-        if !saw_terminal_model_error {
-            if let Some(error) = &turn_error {
-                render_error_entry(error, &event_sink);
-            }
-        }
-
-        Ok(NatsTurnResult {
-            response: final_response,
-            session_id: self.session_id.clone(),
-            was_cancelled: was_cancelled || self.abort_signal.aborted(),
-            error: turn_error,
-            user_msg_seq,
-            user_msg_id,
-        })
+        Ok(self
+            .follow_prompt(follow::FollowPromptOptions {
+                appended,
+                event_sink,
+                pending_cancel,
+                tool_confirmation_subject,
+                options,
+                boundary_options: None,
+            })
+            .await?
+            .result)
     }
 
     /// Retract (delete) a queued user message by appending an EditEntries delete.
@@ -2290,7 +1883,7 @@ fn render_tool_calls_entry(
     decl_map: &HashMap<String, ToolDeclaration>,
     sink: &Arc<dyn AgentEventSink>,
 ) {
-    use harnx_core::event::{ContentBlock, ModelEvent, ToolEvent, ToolKind};
+    use harnx_core::event::{ContentBlock, ToolEvent, ToolKind};
 
     for call in calls {
         let raw_fallback = match &call.arguments {

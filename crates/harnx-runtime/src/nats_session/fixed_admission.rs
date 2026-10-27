@@ -23,6 +23,48 @@ pub(crate) fn admission_closed(
     })
 }
 
+struct AdmittedVerification<'a> {
+    prompt_sequence: u64,
+    entries: &'a [(u64, SessionLogEntry)],
+    saved: Option<InvocationAdmission>,
+}
+
+fn validate_admission_ticket_and_content(
+    saved: &InvocationAdmission,
+    ticket: &FixedAdmissionTicket,
+    expected_content: Option<&MessageContent>,
+) -> Result<()> {
+    ensure!(
+        saved.fixed_ticket.as_ref() == Some(ticket),
+        "fixed admission ticket mismatch"
+    );
+    if let Some(content) = expected_content {
+        ensure!(
+            saved.prompt_content.as_ref() == Some(content),
+            "fixed prompt content mismatch"
+        );
+    }
+    Ok(())
+}
+
+fn verify_admitted_entry(
+    saved: &InvocationAdmission,
+    prompt_sequence: u64,
+    entries: &[(u64, SessionLogEntry)],
+) -> Result<()> {
+    let entry = &entries
+        .iter()
+        .find(|(seq, _)| *seq == prompt_sequence)
+        .context("fixed prompt missing from transcript")?
+        .1;
+    ensure!(
+        matches!(entry, SessionLogEntry::Message { content, .. }
+        if Some(content) == saved.prompt_content.as_ref()),
+        "fixed prompt content mismatch"
+    );
+    Ok(())
+}
+
 impl NatsSession {
     fn fixed_log(&self) -> NatsSessionLog {
         NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone())
@@ -75,53 +117,74 @@ impl NatsSession {
         expected_content: Option<&MessageContent>,
     ) -> Result<FixedAdmissionOutcome> {
         self.check_fixed_ticket(ticket)?;
+        let entries = self.fixed_log().load_events_latest_required_async().await?;
+        self.resolve_fixed_admission_from_entries(ticket, expected_content, &entries)
+            .await
+    }
+
+    async fn check_saved_admission(
+        &self,
+        ticket: &FixedAdmissionTicket,
+        expected_content: Option<&MessageContent>,
+    ) -> Result<Option<InvocationAdmission>> {
         let saved = self
             .metadata_store
             .admission(&self.storage_key, ticket.invocation_id())
             .await?;
         if let Some(saved) = &saved {
-            ensure!(
-                saved.fixed_ticket.as_ref() == Some(ticket),
-                "fixed admission ticket mismatch"
-            );
-            if let Some(content) = expected_content {
-                ensure!(
-                    saved.prompt_content.as_ref() == Some(content),
-                    "fixed prompt content mismatch"
-                );
-            }
+            validate_admission_ticket_and_content(saved, ticket, expected_content)?;
         }
-        let entries = self.fixed_log().load_events_latest_required_async().await?;
-        let outcome = ticket.outcome(&entries)?;
+        Ok(saved)
+    }
+
+    async fn ensure_saved_admission(
+        &self,
+        ticket: &FixedAdmissionTicket,
+        saved: Option<InvocationAdmission>,
+    ) -> Result<InvocationAdmission> {
+        match saved {
+            Some(saved) => Ok(saved),
+            None => self
+                .metadata_store
+                .admission(&self.storage_key, ticket.invocation_id())
+                .await?
+                .context("fixed prompt missing admission"),
+        }
+    }
+
+    async fn confirm_admitted_fixed_prompt(
+        &self,
+        ticket: &FixedAdmissionTicket,
+        expected_content: Option<&MessageContent>,
+        verification: AdmittedVerification<'_>,
+    ) -> Result<()> {
+        let saved = self
+            .ensure_saved_admission(ticket, verification.saved)
+            .await?;
+        validate_admission_ticket_and_content(&saved, ticket, expected_content)?;
+        verify_admitted_entry(&saved, verification.prompt_sequence, verification.entries)?;
+        Ok(())
+    }
+
+    async fn resolve_fixed_admission_from_entries(
+        &self,
+        ticket: &FixedAdmissionTicket,
+        expected_content: Option<&MessageContent>,
+        entries: &[(u64, SessionLogEntry)],
+    ) -> Result<FixedAdmissionOutcome> {
+        let saved = self.check_saved_admission(ticket, expected_content).await?;
+        let outcome = ticket.outcome(entries)?;
         if let FixedAdmissionOutcome::Admitted { prompt_sequence } = outcome {
-            let saved = match saved {
-                Some(saved) => saved,
-                None => self
-                    .metadata_store
-                    .admission(&self.storage_key, ticket.invocation_id())
-                    .await?
-                    .context("fixed prompt missing admission")?,
-            };
-            ensure!(
-                saved.fixed_ticket.as_ref() == Some(ticket),
-                "fixed admission ticket mismatch"
-            );
-            if let Some(content) = expected_content {
-                ensure!(
-                    saved.prompt_content.as_ref() == Some(content),
-                    "fixed prompt content mismatch"
-                );
-            }
-            let entry = &entries
-                .iter()
-                .find(|(seq, _)| *seq == prompt_sequence)
-                .context("fixed prompt missing from transcript")?
-                .1;
-            ensure!(
-                matches!(entry, SessionLogEntry::Message { content, .. }
-                if Some(content) == saved.prompt_content.as_ref()),
-                "fixed prompt content mismatch"
-            );
+            self.confirm_admitted_fixed_prompt(
+                ticket,
+                expected_content,
+                AdmittedVerification {
+                    prompt_sequence,
+                    entries,
+                    saved,
+                },
+            )
+            .await?;
         }
         Ok(outcome)
     }
@@ -256,18 +319,43 @@ impl NatsSession {
 }
 
 impl NatsSession {
+    /// Observe an admitted invocation from one coherent transcript snapshot.
+    /// Terminal proof wins over approvals, including requests from later invocations.
+    /// Returns an error if the ticket isn't admitted or its saved identity differs.
+    pub async fn fixed_prompt_progress(
+        &self,
+        ticket: &FixedAdmissionTicket,
+    ) -> Result<super::PromptProgress> {
+        self.check_fixed_ticket(ticket)?;
+        let entries = self.fixed_log().load_events_latest_required_async().await?;
+        let outcome = self
+            .resolve_fixed_admission_from_entries(ticket, None, &entries)
+            .await?;
+        let FixedAdmissionOutcome::Admitted { prompt_sequence } = outcome else {
+            anyhow::bail!("fixed prompt is not admitted: {outcome:?}");
+        };
+        Self::fixed_prompt_progress_from_entries(
+            ticket,
+            prompt_sequence,
+            &self.session_id,
+            &entries,
+        )
+    }
+
     /// Observe the original fixed invocation's durable completion without
     /// activation or append. Recovery must check this before deciding to stop it.
     pub async fn fixed_prompt_completion(
         &self,
         ticket: &FixedAdmissionTicket,
     ) -> Result<Option<super::NatsTurnResult>> {
-        let FixedAdmissionOutcome::Admitted { prompt_sequence } =
-            self.resolve_fixed_admission(ticket).await?
+        self.check_fixed_ticket(ticket)?;
+        let entries = self.fixed_log().load_events_latest_required_async().await?;
+        let FixedAdmissionOutcome::Admitted { prompt_sequence } = self
+            .resolve_fixed_admission_from_entries(ticket, None, &entries)
+            .await?
         else {
             return Ok(None);
         };
-        let entries = self.fixed_log().load_events_latest_required_async().await?;
         let Some(terminal) = super::invocation_terminal_seq(&entries, prompt_sequence) else {
             return Ok(None);
         };
