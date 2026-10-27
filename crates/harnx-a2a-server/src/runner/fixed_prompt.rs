@@ -50,13 +50,16 @@ impl Publisher {
             .as_ref()
             .context("admitted task missing")?;
         self.store
-            .put_message_dedupe(
+            .put_dedupe_mapping(
+                crate::store::DedupeMappingKind::Message,
                 &self.storage_key,
-                crate::store::MessageIdentity {
-                    message_id: &active.message.message_id,
-                    fingerprint: &active.message.fingerprint,
-                },
-                &active.snapshot.task.id,
+                crate::store::DedupeMappingTarget::new(
+                    crate::store::MessageIdentity {
+                        message_id: &active.message.message_id,
+                        fingerprint: &active.message.fingerprint,
+                    },
+                    &active.snapshot.task.id,
+                ),
             )
             .await?;
         #[cfg(feature = "fault-injection")]

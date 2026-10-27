@@ -1,5 +1,8 @@
 //! Stream sequence filtering sits below the upstream ProtoJSON/JSON-RPC SSE codec.
-use crate::{runner::A2aEvent, store::TaskRecord};
+use crate::{
+    runner::{ends_response, A2aEvent},
+    store::TaskRecord,
+};
 use a2a_lf::{A2AError, StreamResponse};
 use axum::{extract::Request, middleware::Next, response::Response};
 use futures::{stream, stream::BoxStream, StreamExt};
@@ -9,11 +12,11 @@ pub(crate) fn task_stream(
     snapshot: TaskRecord,
     events: Option<broadcast::Receiver<A2aEvent>>,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-    let terminal = snapshot.task.status.state.is_terminal();
+    let boundary = ends_response(&snapshot.task.status.state);
     let sequence = snapshot.stream_seq;
     let first = stream::once(async move { Ok(StreamResponse::Task(snapshot.task)) });
     let updates = stream::unfold(
-        (events, sequence, terminal),
+        (events, sequence, boundary),
         |(events, mut sequence, done)| async move {
             if done {
                 return None;
@@ -24,8 +27,8 @@ pub(crate) fn task_stream(
                     Ok(event) if event.sequence <= sequence => continue,
                     Ok(event) => {
                         sequence = event.sequence;
-                        let terminal = event.is_terminal();
-                        return Some((Ok(event.response), (Some(events), sequence, terminal)));
+                        let boundary = event.ends_response();
+                        return Some((Ok(event.response), (Some(events), sequence, boundary)));
                     }
                     // A bounded receiver cannot recover its lost deltas. Disconnect
                     // only this client; it can reconnect using a fresh snapshot.
@@ -147,5 +150,49 @@ mod tests {
             StreamResponse::Task(_)
         ));
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupted_events_and_snapshots_close_without_becoming_terminal() {
+        for state in [TaskState::InputRequired, TaskState::AuthRequired] {
+            assert!(!state.is_terminal());
+            let (tx, rx) = broadcast::channel(4);
+            let boundary = event(6, state.clone());
+            assert!(boundary.ends_response());
+            assert!(!boundary.is_terminal());
+            tx.send(boundary).unwrap();
+            tx.send(event(7, TaskState::Working)).unwrap();
+            let mut stream = task_stream(snapshot(TaskState::Working), Some(rx));
+            stream.next().await.unwrap().unwrap();
+            assert!(
+                matches!(stream.next().await.unwrap().unwrap(), StreamResponse::StatusUpdate(update) if update.status.state == state)
+            );
+            assert!(stream.next().await.is_none());
+
+            let mut stream = task_stream(snapshot(state), Some(tx.subscribe()));
+            stream.next().await.unwrap().unwrap();
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[test]
+    fn response_boundary_classifies_all_task_states() {
+        for state in [
+            TaskState::Submitted,
+            TaskState::Working,
+            TaskState::Unspecified,
+        ] {
+            assert!(!ends_response(&state));
+        }
+        for state in [
+            TaskState::Completed,
+            TaskState::Canceled,
+            TaskState::Failed,
+            TaskState::Rejected,
+            TaskState::InputRequired,
+            TaskState::AuthRequired,
+        ] {
+            assert!(ends_response(&state));
+        }
     }
 }

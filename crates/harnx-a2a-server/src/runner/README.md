@@ -34,6 +34,80 @@ replace a recovered task. Active task mutations use `OwnedTask::update`, which
 checks the lease and CASes the same context document's owner/task/revision.
 Legacy task CRUD is refused on activated contexts.
 
+## HITL publisher segments
+
+A2A uses durable deferred approval, with no live confirmation route or automatic
+denial. `follow_admitted_prompt_until_boundary` always uses a `None` confirmation
+subject. An `InputRequired` boundary drains runtime text, reconciles persisted
+assistant output, flushes the answer artifact, then atomically stages the plain
+challenge, `HitlCheckpoint { phase: Waiting, ... }` and status event through one
+`OwnedTask::update`. Its event ID is `{task_id}:hitl:{request_seq}:input-required`.
+After publication/checkpoint, the detached supervisor CAS-releases the context
+owner, releases the scoped lease and removes only its own fenced local handle.
+The task, original message, fixed admission ticket and invocation stay active.
+Suspension never confirms stop, completes the turn or fails the invocation.
+
+Suspension publication retries three times using the same pending envelope. A
+transient transport error doesn't become a failed turn. If publication remains
+uncertain, the outbox and owner remain durable, lease renewal stops when the
+segment drops, and a successor can retry after lease expiry. The supervisor also
+checks durable HITL when a coalescer write fails before it observes the boundary.
+Ordinary terminal execution still uses `confirm_stop` and `complete_turn`.
+
+### Resume entry points
+
+Reply admission and parked-task recovery are separate from this publisher API.
+They must retain the exact original `ApprovalRef`; don't use a new prompt or call
+`start_turn` to continue it.
+
+For a caller already holding `OwnedTask` in a runner module:
+
+1. Deliver the saved decision with `session.decide_hitl_approval_for(&request,
+   approved, note)`. Query `fixed_prompt_progress(ticket)` after the outcome;
+   stale/conflicting decisions must not target a newer request.
+2. Drain the old outbox, persist reply dedupe if applicable, then use
+   `advance_hitl_to_following(storage, version, params)`. Refresh the
+   owned context after this helper's CAS. It stages the `Working` event.
+3. Call `runner.resume_owned_hitl(export, session, authority).await`. It consumes
+   ownership and spawns a detached publisher. The publisher drains `Working`
+   before sending its admitted snapshot, so streaming can start from that result.
+   No new user message, ticket, run or deadline is created.
+
+For trusted in-process callers that released ownership after step 2, public
+`runner.resume_hitl_turn(export, request_identity, session).await` authorizes the
+stored session, acquires the scoped lease and claims the existing context. It
+requires `AdmissionPhase::Admitted`, status `Working`, and checkpoint `Following`.
+It isn't a reply parser or HTTP admission route. Both entries return
+`StartTurnResult` for the original task. Capture the challenged `stream_seq`
+**before** accepting a reply and use `wait_response(..., Some(q1_stream_seq))`.
+
+`Publisher::resume` restores the stored `answer` artifact and its text. It obtains
+`fixed_prompt_handle` for the same ticket and follows with
+`after_request_seq: Some(checkpoint.request.request_seq)`. At each boundary it
+reconstructs effective `ToolCalls.text` and assistant messages between the original
+prompt and the request/first raw terminal. This catches output written before
+attachment. Reconciliation happens after the sink drains, not before subscription,
+so history and live chunks aren't counted twice. A replacement artifact repairs
+missed text; resumed completion retains earlier segment text rather than replacing
+it with only the last assistant response.
+
+### Frozen run deadline while parked
+
+A2A approvals follow existing Web/TUI precedent: there is no approval-specific
+timeout or automatic rejection. The existing frozen invocation execution deadline
+(`run_limits.timeout_secs`, default 24h from invocation admission) keeps counting
+while parked `INPUT_REQUIRED`. Worker
+`daemon_session_exec::start_invocation_deadline` deliberately detaches its timer
+across approval pauses. Wall-clock time continues while parked. On expiry, the
+runtime cancels the invocation (the task becomes `TASK_STATE_CANCELED`, not a
+rejection), and late replies cannot revive it. The approval window is whatever
+remains of the original invocation budget. Reactivation reloads the immutable
+invocation limits; approval does **not** pause, reset, or extend the deadline.
+
+Reply admission and owner-loss recovery use the same continuation APIs. Upgrade
+all A2A replicas together: old replicas treat parked tasks as ordinary orphans and
+can interrupt them. The frozen runtime deadline above still applies after restart.
+
 ## Request memberships and stored owners
 
 Request-facing admission, reads, cancellation, streams and waiters carry the full
@@ -60,10 +134,34 @@ stale owners, role-admin follow-ups and independent replica retries.
 
 Foreground retries/Get/New Send and background supervision may acquire the expired owner's scoped lease and
 CAS-take over. Recovery restores the original ticket, checks durable completion,
-then closes its fixed predecessor or interrupts the exact admitted prompt. It never
-calls append/activation to repair an absent prompt. A first-message crash before
-allocation reconstructs a non-executable task from the reservation, then closes it;
-that isn't prompt replay. Runtime completion inspection doesn't activate work.
+then classifies runtime progress before owner-loss interruption, including tasks
+still stored as `Working`. Without HITL evidence it closes the fixed predecessor or
+interrupts the exact admitted prompt. It never appends or activates an absent
+prompt. A first-message crash before allocation reconstructs a non-executable task
+from the reservation, then closes it; that isn't prompt replay.
+
+`recovery/hitl.rs` handles existing HITL continuations:
+
+- An undecided request reconstructs the challenge and stable status outbox, drains
+  publication, and releases ownership without stop or terminal proof.
+- An accepted reply repairs durable dedupe first. Only its exact pending reference
+  can receive its decision. The full note is parsed from saved task history, never
+  from the bounded inline receipt. Missing or inconsistent history leaves intent
+  unresolved for a later sweep.
+- A durable decision stages `Following`/`Working` and attaches the typed follower
+  from `fixed_prompt_handle(original_ticket)`. Its normal activation is pinned to
+  the original prompt. No new admission, message, run or deadline is created.
+- A newer pending request replaces the old checkpoint only after accepted reply
+  dedupe is durable. The old answer never targets that request.
+- Terminal proof and cancellation retain the existing settlement/stop ordering.
+  Recovered terminal artifacts include durable text from earlier HITL segments.
+
+Each sweep reloads runtime progress for a released unchanged `Waiting` task before
+acquiring a lease. It doesn't repeatedly claim or rewrite that parked task, but
+still notices decisions made by another frontend. Uncertain outbox publication
+retains its exact envelope and owner for lease-expiry takeover. Other inconsistent
+facts release unused ownership without failing the invocation and retry later.
+Foreground orphan repair uses the same progress classification.
 
 Only confirmed closure/interruption/completion permits terminal settlement. Broker
 uncertainty leaves the same identity unresolved and returns an error. Completion
@@ -173,3 +271,65 @@ deployment/load verification remains end-to-end work.
 ```sh
 PROTOC=/usr/bin/protoc HARNX_TEST_SANDBOX=light cargo nextest run -p harnx-a2a-server --features fault-injection -E 'test(multi_replica)' --stress-count=20
 ```
+
+## Reply admission and delivery
+
+`handler/admission/reply.rs` resolves active `InputRequired` / `DecisionIntent`
+tasks before busy rejection, including `contextId`-only Jira replies. Authorization
+and task/context binding still run first. Durable reply mappings (or an inline
+receipt whose mapping isn't written yet) precede grammar and terminal checks.
+Unrecognized text or any non-text part returns an ephemeral challenge snapshot;
+it doesn't claim ownership, append history, admit a prompt, or stage an event.
+
+`Runner::reply_hitl(TurnRequest, ApprovalRef)` is crate-private. The handler captures
+the exact checkpoint reference and Q1 `stream_seq` before attempting ownership.
+The runner claims the scoped lease/context and retries pure intent CAS writes
+against that same reference. A changed generation or another accepted message
+returns conflict, never a decision against the new request.
+
+Intent and the full user message enter task history in one CAS. Only the inline
+receipt note is truncated to 4096 bytes. Delivery parses the saved history message
+to recover the full plain-text note, writes reply dedupe before runtime effects,
+and calls `decide_hitl_approval_for` with the saved reference. History is task
+history only, not a new session prompt. Approval notes remain audit-only; rejection
+notes become the blocked-tool reason under the runtime's existing semantics.
+
+After every decision outcome, query `fixed_prompt_progress` on the original ticket.
+The invocation may already be terminal or awaiting Q2. Applied decisions stage and
+publish Working/Following, then pass the same `OwnedTask` into
+`resume_owned_hitl`. Stale/conflicting outcomes with advanced runtime progress
+attach that same follower to project progress without answering Q2. An unchanged
+pending request stays parked for retry rather than inventing decision success.
+
+Unary replies wait after the original Q1 `stream_seq`, not the later Working
+cursor. Streaming starts with the resumed Working snapshot and its segment event
+receiver, so even an already-durable next boundary follows Working. Duplicate
+replies can finish an unresolved intent, or return the associated current/archive
+task after retirement, without appending history twice.
+
+`Runner::cancel_hitl_task` handles foreground cancellation of parked work: persist
+cancel intent, claim the released scoped lease, repair any accepted reply mapping,
+and use existing fixed-ticket interruption/terminal settlement. Foreground task
+reads don't treat HITL checkpoints as ordinary orphan evidence. Background sweeps
+reinspect parked tasks and recover accepted intent or cross-frontend decisions
+through the progress classification above.
+
+## Approval regression matrix
+
+Tests under `tests/it/` use real admission, JetStream and a worker, not only seeded
+context documents. `support.rs::Script::SameRoundTools` emits two native time-tool
+calls in one model completion and uses a real `PreToolUse` hook to defer them.
+
+- `unary/hitl.rs` covers approval, model-visible full rejection reasons, context-only
+  replies, unrecognized messages, parked cancellation and same-round approval identity.
+- `streaming.rs::streaming_hitl_same_round_closes_each_gate_then_completes` checks
+  initial and resumed SSE boundaries, Working snapshots and accumulated output.
+- `multi_replica/hitl.rs` races replies across independent runners/stores. It holds
+  a Q1-bound loser until Q2 is parked, then checks duplicates remain idempotent and
+  conflicting losers cannot answer Q2.
+- `multi_replica/supervision/recovery/hitl.rs` covers accepted-intent recovery,
+  external runtime/web decisions and read-only parked sweeps. `e2e/supervision.rs`
+  kills and restarts the actual A2A server fleet while a task is parked.
+
+The client contract is documented in
+[Interactive tool approval](../../README.md#interactive-tool-approval).

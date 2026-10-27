@@ -1,10 +1,14 @@
+use crate::unary::hitl::reply;
 use crate::{
     support::DEADLINE,
     unary::{message, Http, HttpRpcCall},
 };
 use anyhow::{Context, Result};
+use harnx_a2a_server::store::TaskRecord;
 use harnx_a2a_server::store::TaskSeed;
 use serde_json::{json, Value};
+
+mod same_round;
 
 // Read frames across arbitrary HTTP chunk boundaries, including comment frames.
 pub(super) struct Frames {
@@ -145,16 +149,8 @@ pub(super) async fn finish(frames: &mut Frames, answer: &mut String) -> Result<(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn streaming_send_snapshot_artifacts_terminal_close_and_dedupe() -> Result<()> {
-    let http = Http::start().await?;
-    let request = json!({"message":message("stream", None)});
-    let mut frames = Frames::open(&http, "SendStreamingMessage", request.clone()).await?;
-    let first = frames.event().await?.context("missing snapshot")?;
-    assert_eq!(first["task"]["status"]["state"], "TASK_STATE_WORKING");
-    let id = first["task"]["id"].clone();
-    let mut answer = snapshot_text(&first["task"]);
-    let artifact = until_artifact(&mut frames, &mut answer).await?;
+async fn assert_initial_stream_artifact(frames: &mut Frames, answer: &mut String) -> Result<()> {
+    let artifact = until_artifact(frames, answer).await?;
     assert_ne!(artifact["artifactUpdate"]["append"], true);
     let fixture: Value = serde_json::from_str(
         include_str!("../fixtures/sse_stream.txt")
@@ -168,21 +164,86 @@ async fn streaming_send_snapshot_artifacts_terminal_close_and_dedupe() -> Result
         fixture["result"]["artifactUpdate"]["artifact"]["parts"]
     );
     assert_eq!(answer, "Hello ");
-    let mut retry = Frames::open(&http, "SendStreamingMessage", request.clone()).await?;
+    Ok(())
+}
+
+async fn assert_retry_stream_and_finish(
+    http: &Http,
+    request: &Value,
+    target: (&mut Frames, &mut String),
+    id: &Value,
+) -> Result<()> {
+    let (frames, answer) = target;
+    let mut retry = Frames::open(http, "SendStreamingMessage", request.clone()).await?;
     let retry_snapshot = retry.event().await?.unwrap();
-    assert_eq!(retry_snapshot["task"]["id"], id);
+    assert_eq!(&retry_snapshot["task"]["id"], id);
     let mut retry_answer = snapshot_text(&retry_snapshot["task"]);
     assert_eq!(retry_answer, "Hello ");
     http.h.llm.release.notify_one();
-    finish(&mut frames, &mut answer).await?;
-    finish(&mut retry, &mut retry_answer).await?;
-    let mut terminal_retry = Frames::open(&http, "SendStreamingMessage", request).await?;
+    finish(frames, answer).await?;
+    finish(&mut retry, &mut retry_answer).await
+}
+
+async fn assert_terminal_stream_retry(http: &Http, request: Value, id: &Value) -> Result<()> {
+    let mut terminal_retry = Frames::open(http, "SendStreamingMessage", request).await?;
     let terminal = terminal_retry.event().await?.unwrap();
-    assert_eq!(terminal["task"]["id"], id);
+    assert_eq!(&terminal["task"]["id"], id);
     assert_eq!(terminal["task"]["status"]["state"], "TASK_STATE_COMPLETED");
     assert_eq!(snapshot_text(&terminal["task"]), "Hello world");
     assert!(terminal_retry.event().await?.is_none());
     assert_eq!(http.h.llm.requests.lock().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_send_snapshot_artifacts_terminal_close_and_dedupe() -> Result<()> {
+    let http = Http::start().await?;
+    let request = json!({"message": message("stream", None)});
+    let mut frames = Frames::open(&http, "SendStreamingMessage", request.clone()).await?;
+    let first = frames.event().await?.context("missing snapshot")?;
+    assert_eq!(first["task"]["status"]["state"], "TASK_STATE_WORKING");
+    let id = first["task"]["id"].clone();
+    let mut answer = snapshot_text(&first["task"]);
+    assert_initial_stream_artifact(&mut frames, &mut answer).await?;
+    assert_retry_stream_and_finish(&http, &request, (&mut frames, &mut answer), &id).await?;
+    assert_terminal_stream_retry(&http, request, &id).await?;
+    Ok(())
+}
+
+async fn assert_unauthorized_subscribe(http: &Http, id: &Value) -> Result<()> {
+    let foreign = http
+        .rpc_call(HttpRpcCall::new(
+            &http.url,
+            "bob",
+            "SubscribeToTask",
+            json!({"id": id}),
+        ))
+        .await?;
+    assert_eq!(foreign["error"]["code"], -32001);
+    let cross_export = http
+        .rpc_call(HttpRpcCall::new(
+            &http.url.replace("runner", "other"),
+            "alice",
+            "SubscribeToTask",
+            json!({"id": id}),
+        ))
+        .await?;
+    assert_eq!(cross_export["error"]["code"], -32001);
+    Ok(())
+}
+
+async fn resubscribe_and_finish(http: &Http, id: &Value) -> Result<()> {
+    let mut resumed = Frames::open(http, "SubscribeToTask", json!({"id": id})).await?;
+    let snapshot = resumed.event().await?.unwrap();
+    assert_eq!(&snapshot["task"]["id"], id);
+    let mut answer = snapshot_text(&snapshot["task"]);
+    assert_eq!(answer, "Hello ");
+    http.h.llm.release.notify_one();
+    finish(&mut resumed, &mut answer).await?;
+    let completed = http.completed(id).await?;
+    assert_eq!(answer, snapshot_text(&completed["result"]));
+    let terminal = http.rpc("SubscribeToTask", json!({"id": id})).await?;
+    assert_eq!(terminal["error"]["code"], -32004);
     Ok(())
 }
 
@@ -192,7 +253,7 @@ async fn streaming_disconnect_resubscribe_no_duplicate_chunks_and_ownership() ->
     let mut frames = Frames::open(
         &http,
         "SendStreamingMessage",
-        json!({"message":message("disconnect", None)}),
+        json!({"message": message("disconnect", None)}),
     )
     .await?;
     let snapshot = frames.event().await?.unwrap();
@@ -200,35 +261,8 @@ async fn streaming_disconnect_resubscribe_no_duplicate_chunks_and_ownership() ->
     let mut answer = snapshot_text(&snapshot["task"]);
     until_artifact(&mut frames, &mut answer).await?;
     drop(frames);
-    let foreign = http
-        .rpc_call(HttpRpcCall::new(
-            &http.url,
-            "bob",
-            "SubscribeToTask",
-            json!({"id":id}),
-        ))
-        .await?;
-    assert_eq!(foreign["error"]["code"], -32001);
-    let cross_export = http
-        .rpc_call(HttpRpcCall::new(
-            &http.url.replace("runner", "other"),
-            "alice",
-            "SubscribeToTask",
-            json!({"id":id}),
-        ))
-        .await?;
-    assert_eq!(cross_export["error"]["code"], -32001);
-    let mut resumed = Frames::open(&http, "SubscribeToTask", json!({"id":id})).await?;
-    let snapshot = resumed.event().await?.unwrap();
-    assert_eq!(snapshot["task"]["id"], id);
-    answer = snapshot_text(&snapshot["task"]);
-    assert_eq!(answer, "Hello ");
-    http.h.llm.release.notify_one();
-    finish(&mut resumed, &mut answer).await?;
-    let completed = http.completed(&id).await?;
-    assert_eq!(answer, snapshot_text(&completed["result"]));
-    let terminal = http.rpc("SubscribeToTask", json!({"id":id})).await?;
-    assert_eq!(terminal["error"]["code"], -32004);
+    assert_unauthorized_subscribe(&http, &id).await?;
+    resubscribe_and_finish(&http, &id).await?;
     Ok(())
 }
 
@@ -297,10 +331,10 @@ async fn streaming_disconnect_without_subscribers_finishes_task() -> Result<()> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn streaming_subscribe_authorizes_before_orphan_reconciliation() -> Result<()> {
-    let http = Http::start().await?;
-    let session = http.h.session(None, &crate::support::alice()).await?;
+async fn create_streaming_orphan_record(
+    http: &Http,
+    session: &harnx_runtime::NatsSession,
+) -> Result<TaskRecord> {
     let task = a2a_lf::Task {
         id: harnx_a2a_server::store::new_task_id(session.session_id()),
         context_id: session.session_id().into(),
@@ -313,8 +347,7 @@ async fn streaming_subscribe_authorizes_before_orphan_reconciliation() -> Result
         artifacts: None,
         metadata: None,
     };
-    let record = http
-        .h
+    http.h
         .store
         .create_task(
             session.storage_key(),
@@ -325,35 +358,51 @@ async fn streaming_subscribe_authorizes_before_orphan_reconciliation() -> Result
                 execution_id: String::new(),
             },
         )
-        .await?;
-    let id = &record.task.id;
+        .await
+}
+
+async fn assert_orphan_subscribe_auth(http: &Http, id: &str, expected_revision: u64) -> Result<()> {
     let foreign = http
         .rpc_call(HttpRpcCall::new(
             &http.url,
             "bob",
             "SubscribeToTask",
-            json!({"id":id}),
+            json!({"id": id}),
         ))
         .await?;
     assert_eq!(foreign["error"]["code"], -32001);
-    assert_eq!(http.h.task(id).await?.revision, record.revision);
-    let orphan = http.rpc("SubscribeToTask", json!({"id":id})).await?;
+    assert_eq!(http.h.task(id).await?.revision, expected_revision);
+    let orphan = http.rpc("SubscribeToTask", json!({"id": id})).await?;
     assert_eq!(orphan["error"]["code"], -32004);
     assert_eq!(
         http.h.task(id).await?.task.status.state,
         a2a_lf::TaskState::Failed
     );
+    Ok(())
+}
+
+async fn assert_stream_send_after_orphan(http: &Http, session_id: &str) -> Result<()> {
     let mut frames = Frames::open(
-        &http,
+        http,
         "SendStreamingMessage",
-        json!({"message":message("after-orphan", Some(&json!(session.session_id())))}),
+        json!({"message": message("after-orphan", Some(&json!(session_id)))}),
     )
     .await?;
     frames.event().await?.unwrap();
     let mut answer = String::new();
     until_artifact(&mut frames, &mut answer).await?;
     http.h.llm.release.notify_one();
-    finish(&mut frames, &mut answer).await?;
+    finish(&mut frames, &mut answer).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_subscribe_authorizes_before_orphan_reconciliation() -> Result<()> {
+    let http = Http::start().await?;
+    let session = http.h.session(None, &crate::support::alice()).await?;
+    let record = create_streaming_orphan_record(&http, &session).await?;
+    let id = &record.task.id;
+    assert_orphan_subscribe_auth(&http, id, record.revision).await?;
+    assert_stream_send_after_orphan(&http, session.session_id()).await?;
     Ok(())
 }
 
@@ -390,23 +439,11 @@ async fn streaming_failed_turn_emits_terminal_status_and_closes() -> Result<()> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn streaming_send_reuses_admission_checks_and_cancel_closes() -> Result<()> {
-    let http = Http::start().await?;
-    let mut frames = Frames::open(
-        &http,
-        "SendStreamingMessage",
-        json!({"message":message("checks", None)}),
-    )
-    .await?;
-    let snapshot = frames.event().await?.unwrap();
-    let task = &snapshot["task"];
-    let mut answer = String::new();
-    until_artifact(&mut frames, &mut answer).await?;
+async fn assert_invalid_streaming_admissions(http: &Http, task: &Value) -> Result<()> {
     let mut mismatch = message("mismatch", Some(&json!("wrong")));
     mismatch["taskId"] = task["id"].clone();
     let mut changed = message("checks", Some(&task["contextId"]));
-    changed["parts"] = json!([{"text":"changed"}]);
+    changed["parts"] = json!([{"text": "changed"}]);
     for (request, expected) in [
         (message("unknown", Some(&json!("unknown"))), -32001),
         (mismatch, -32602),
@@ -414,7 +451,7 @@ async fn streaming_send_reuses_admission_checks_and_cancel_closes() -> Result<()
         (message("busy", Some(&task["contextId"])), -32000),
     ] {
         let error = http
-            .rpc("SendStreamingMessage", json!({"message":request}))
+            .rpc("SendStreamingMessage", json!({"message": request}))
             .await?;
         assert_eq!(error["error"]["code"], expected, "{error}");
     }
@@ -423,16 +460,24 @@ async fn streaming_send_reuses_admission_checks_and_cancel_closes() -> Result<()
             &http.url,
             "bob",
             "SendStreamingMessage",
-            json!({"message":message("checks", Some(&task["contextId"]))}),
+            json!({"message": message("checks", Some(&task["contextId"]))}),
         ))
         .await?;
     assert_eq!(foreign["error"]["code"], -32001);
+    Ok(())
+}
+
+async fn assert_streaming_retry_and_cancel(
+    http: &Http,
+    task: &Value,
+    mut frames: Frames,
+) -> Result<()> {
     let mut retry = message("checks", Some(&task["contextId"]));
     retry["taskId"] = task["id"].clone();
-    let mut retried = Frames::open(&http, "SendStreamingMessage", json!({"message":retry})).await?;
+    let mut retried = Frames::open(http, "SendStreamingMessage", json!({"message": retry})).await?;
     assert_eq!(retried.event().await?.unwrap()["task"]["id"], task["id"]);
     drop(retried);
-    let cancel = http.rpc("CancelTask", json!({"id":task["id"]})).await?;
+    let cancel = http.rpc("CancelTask", json!({"id": task["id"]})).await?;
     assert_eq!(cancel["result"]["status"]["state"], "TASK_STATE_CANCELED");
     let mut terminal = false;
     while let Some(event) = frames.event().await? {
@@ -451,36 +496,58 @@ async fn streaming_send_reuses_admission_checks_and_cancel_closes() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn compat_message_stream_resubscribe_and_cancel_aliases() -> Result<()> {
+async fn streaming_send_reuses_admission_checks_and_cancel_closes() -> Result<()> {
     let http = Http::start().await?;
+    let mut frames = Frames::open(
+        &http,
+        "SendStreamingMessage",
+        json!({"message": message("checks", None)}),
+    )
+    .await?;
+    let snapshot = frames.event().await?.unwrap();
+    let task = &snapshot["task"];
+    let mut answer = String::new();
+    until_artifact(&mut frames, &mut answer).await?;
+    assert_invalid_streaming_admissions(&http, task).await?;
+    assert_streaming_retry_and_cancel(&http, task, frames).await?;
+    Ok(())
+}
+
+async fn assert_resubscribe_alias(http: &Http, id: &Value) -> Result<()> {
+    let mut subscription =
+        Frames::open_version(http, "tasks/resubscribe", json!({"id": id}), Some("0.3")).await?;
+    assert_eq!(&subscription.event().await?.unwrap()["task"]["id"], id);
+    Ok(())
+}
+
+async fn assert_compat_stream_and_resubscribe(http: &Http) -> Result<()> {
     let mut msg = message("compat-stream", None);
     msg["role"] = json!("user");
-    // Missing A2A-Version is intentional; all other stream tests stay explicit.
     let mut frames =
-        Frames::open_version(&http, "message/stream", json!({"message":msg}), None).await?;
+        Frames::open_version(http, "message/stream", json!({"message": msg}), None).await?;
     let first = frames.event().await?.context("missing alias snapshot")?;
     assert_eq!(first["task"]["status"]["state"], "TASK_STATE_WORKING");
     assert_eq!(first["task"]["history"][0]["role"], "ROLE_USER");
     let id = first["task"]["id"].clone();
     let mut answer = snapshot_text(&first["task"]);
     until_artifact(&mut frames, &mut answer).await?;
-    let mut subscription =
-        Frames::open_version(&http, "tasks/resubscribe", json!({"id":id}), Some("0.3")).await?;
-    assert_eq!(subscription.event().await?.unwrap()["task"]["id"], id);
-    drop(subscription);
+    assert_resubscribe_alias(http, &id).await?;
     http.h.llm.release.notify_one();
     finish(&mut frames, &mut answer).await?;
-    let get = http.rpc("tasks/get", json!({"id":id})).await?;
+    let get = http.rpc("tasks/get", json!({"id": id})).await?;
     assert_eq!(get["result"]["status"]["state"], "TASK_STATE_COMPLETED");
+    Ok(())
+}
 
+async fn assert_compat_stream_cancel(http: &Http) -> Result<()> {
     let mut frames = Frames::open(
-        &http,
+        http,
         "message/stream",
-        json!({"message":message("compat-cancel",None)}),
+        json!({"message": message("compat-cancel", None)}),
     )
     .await?;
     let id = frames.event().await?.unwrap()["task"]["id"].clone();
-    let canceled = http.rpc("tasks/cancel", json!({"id":id})).await?;
+    let canceled = http.rpc("tasks/cancel", json!({"id": id})).await?;
     assert_eq!(
         canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "{canceled}"
@@ -494,4 +561,178 @@ async fn compat_message_stream_resubscribe_and_cancel_aliases() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compat_message_stream_resubscribe_and_cancel_aliases() -> Result<()> {
+    let http = Http::start().await?;
+    assert_compat_stream_and_resubscribe(&http).await?;
+    assert_compat_stream_cancel(&http).await?;
+    Ok(())
+}
+
+async fn drain_interrupted_stream_events(frames: &mut Frames) -> Result<()> {
+    let mut interrupted = false;
+    while let Some(event) = frames.event().await? {
+        assert!(!interrupted, "stream emitted an event after interruption");
+        if event["statusUpdate"].is_object() {
+            assert_eq!(
+                event["statusUpdate"]["status"]["state"],
+                "TASK_STATE_INPUT_REQUIRED"
+            );
+            interrupted = true;
+        }
+    }
+    assert!(interrupted);
+    Ok(())
+}
+
+async fn assert_interrupted_resubscribe(http: &Http, id: &str) -> Result<()> {
+    let mut subscribed = Frames::open(http, "SubscribeToTask", json!({"id": id})).await?;
+    let snapshot = subscribed.event().await?.context("interrupted snapshot")?;
+    assert_eq!(
+        snapshot["task"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
+    assert!(subscribed.event().await?.is_none());
+    assert!(!http.h.task(id).await?.task.status.state.is_terminal());
+    Ok(())
+}
+
+async fn open_stream_and_get_task_id(http: &Http) -> Result<(Frames, String)> {
+    let mut frames = Frames::open(
+        http,
+        "SendStreamingMessage",
+        json!({"message": message("input-required-stream", None)}),
+    )
+    .await?;
+    let first = frames.event().await?.context("snapshot")?;
+    let id = first["task"]["id"].as_str().context("task id")?.to_owned();
+    Ok((frames, id))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_closes_after_input_required_and_interrupted_snapshot() -> Result<()> {
+    let http = Http::start().await?;
+    let (mut frames, id) = open_stream_and_get_task_id(&http).await?;
+    crate::unary::inject_response_state(&http.h, &id, a2a_lf::TaskState::InputRequired).await?;
+    drain_interrupted_stream_events(&mut frames).await?;
+    assert_interrupted_resubscribe(&http, &id).await?;
+    Ok(())
+}
+
+async fn drive_single_hitl_gate_stream(
+    http: &Http,
+    task: &Value,
+    index: usize,
+    expected: &str,
+) -> Result<()> {
+    let mut frames = Frames::open(
+        http,
+        "SendStreamingMessage",
+        json!({"message": reply(&format!("stream-no-{index}"), task, "n no handoff", false)}),
+    )
+    .await?;
+    let first = frames.event().await?.context("resumed snapshot")?;
+    assert_eq!(first["task"]["id"], task["id"]);
+    assert_eq!(
+        first["task"]["status"]["state"], "TASK_STATE_WORKING",
+        "{first}"
+    );
+    let mut states = Vec::new();
+    while let Some(event) = frames.event().await? {
+        if let Some(state) = event["statusUpdate"]["status"]["state"].as_str() {
+            states.push(state.to_owned());
+        }
+    }
+    assert_eq!(states, vec![expected]);
+    Ok(())
+}
+
+async fn assert_terminal_gate_retry(http: &Http, task: &Value) -> Result<()> {
+    let mut unknown = Frames::open(
+        http,
+        "SendStreamingMessage",
+        json!({"message": reply("stream-no-1", task, "n no handoff", true)}),
+    )
+    .await?;
+    assert_eq!(
+        unknown.event().await?.unwrap()["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+    assert!(unknown.event().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_hitl_reply_starts_working_then_next_challenge_and_terminal() -> Result<()> {
+    use crate::{
+        support::{Harness, Script},
+        unary::hitl::challenge,
+    };
+    let http = Http::from_harness(Harness::start(Script::SerialTool).await?).await?;
+    let task = challenge(&http).await?;
+    for (index, expected) in [
+        (1, "TASK_STATE_INPUT_REQUIRED"),
+        (2, "TASK_STATE_COMPLETED"),
+    ] {
+        drive_single_hitl_gate_stream(&http, &task, index, expected).await?;
+    }
+    assert_eq!(http.h.llm.requests.lock().len(), 3);
+    assert_terminal_gate_retry(&http, &task).await?;
+    Ok(())
+}
+
+async fn assert_stored_challenge_intact(http: &Http, task_id: &str) -> Result<()> {
+    let stored = http.h.task(task_id).await?;
+    assert!(!serde_json::to_string(&stored)?.contains("Reply not recognized"));
+    assert_eq!(http.h.llm.requests.lock().len(), 1);
+    Ok(())
+}
+
+async fn assert_ephemeral_challenge_stream(frames: &mut Frames) -> Result<()> {
+    let snapshot = frames.event().await?.context("challenge")?;
+    assert_eq!(
+        snapshot["task"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
+    assert!(snapshot["task"]["status"]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("Reply not recognized"));
+    assert!(frames.event().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_hitl_unrecognized_reply_returns_ephemeral_challenge_and_closes() -> Result<()> {
+    use crate::{
+        support::{Harness, Script},
+        unary::hitl::challenge,
+    };
+    let http = Http::from_harness(Harness::start(Script::Tool).await?).await?;
+    let task = challenge(&http).await?;
+    let mut frames = Frames::open(
+        &http,
+        "SendStreamingMessage",
+        json!({"message": reply("stream-unknown", &task, "what?", true)}),
+    )
+    .await?;
+    assert_ephemeral_challenge_stream(&mut frames).await?;
+    assert_stored_challenge_intact(&http, task["id"].as_str().unwrap()).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_hitl_same_round_closes_each_gate_then_completes() -> Result<()> {
+    use crate::support::{Harness, Script};
+    let http = Http::from_harness(Harness::start(Script::SameRoundTools).await?).await?;
+    let task = same_round::assert_initial_gate(&http).await?;
+    for (index, expected) in ["TASK_STATE_INPUT_REQUIRED", "TASK_STATE_COMPLETED"]
+        .into_iter()
+        .enumerate()
+    {
+        same_round::assert_reply_gate(&http, &task, index, expected).await?;
+    }
+    same_round::assert_cumulative_output(&http, &task).await
 }

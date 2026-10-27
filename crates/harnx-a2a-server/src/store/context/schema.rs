@@ -1,7 +1,9 @@
 //! One CAS document owns the active snapshot and all work identities.
 use super::super::{parse_task_id, TaskRecord};
+use super::hitl;
 use a2a_lf::StreamResponse;
 use anyhow::{ensure, Result};
+pub use hitl::{HitlCheckpoint, HitlPhase, ReplyReceipt, ReplyReceiptParams, NOTE_BYTE_LIMIT};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +43,10 @@ pub struct ActiveTask {
     /// Set only after a durable scoped stop or non-executable closure, not HTTP disconnect.
     #[serde(default)]
     pub stop_confirmed: bool,
+    /// HITL checkpoint for suspended InputRequired tasks. Kept after resuming
+    /// so a recovered follower isn't mistaken for an ordinary orphan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hitl_checkpoint: Option<HitlCheckpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +122,41 @@ pub struct OperationReceipt {
 }
 
 impl ActiveTask {
+    /// Stage exactly one event with the snapshot's next durable cursor. Publication
+    /// and its checkpoint remain the caller's responsibility after the context CAS.
+    pub fn stage_event(&mut self, response: StreamResponse, commit_id: &str) -> Result<()> {
+        ensure!(
+            self.publication.pending.is_none(),
+            "unresolved event outbox"
+        );
+        ensure!(!commit_id.is_empty(), "missing event commit id");
+        let sequence = self
+            .snapshot
+            .stream_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("task stream sequence overflow"))?;
+        self.snapshot.stream_seq = sequence;
+        self.publication.stream_seq = sequence;
+        self.publication.pending = Some(PendingEvent {
+            committed_at: Some(chrono::Utc::now()),
+            commit_id: commit_id.into(),
+            task_sequence: sequence,
+            expected_subject_sequence: self.publication.subject_sequence,
+            response,
+        });
+        Ok(())
+    }
+
     pub(crate) fn ready_to_retire(&self) -> bool {
+        // Parked InputRequired tasks are never retirable
+        if self.hitl_checkpoint.is_some()
+            && matches!(
+                self.snapshot.task.status.state,
+                a2a_lf::TaskState::InputRequired
+            )
+        {
+            return false;
+        }
         self.snapshot.task.status.state.is_terminal()
             && self.stop_confirmed
             && self.projections.archive
@@ -125,7 +165,23 @@ impl ActiveTask {
             && self.publication.pending.is_none()
     }
 
+    #[allow(dead_code)]
+    /// Check if this task has an active HITL checkpoint (parked or paused).
+    pub(crate) fn has_hitl_evidence(&self) -> bool {
+        self.hitl_checkpoint.is_some()
+    }
+
     pub(super) fn validate(&self, local_id: &str) -> Result<()> {
+        self.validate_identities(local_id)?;
+        self.validate_cancel_intent()?;
+        self.validate_publication()?;
+        if let Some(checkpoint) = &self.hitl_checkpoint {
+            checkpoint.validate(&self.admission.invocation_id)?;
+        }
+        Ok(())
+    }
+
+    fn validate_identities(&self, local_id: &str) -> Result<()> {
         ensure!(
             self.snapshot.version == 1,
             "unsupported task record version"
@@ -143,6 +199,10 @@ impl ActiveTask {
             !self.admission.invocation_id.is_empty() && !self.admission.prompt_id.is_empty(),
             "missing admission identity"
         );
+        Ok(())
+    }
+
+    fn validate_cancel_intent(&self) -> Result<()> {
         if let Some(cancel) = &self.cancel {
             ensure!(
                 cancel.task_id == self.snapshot.task.id
@@ -151,6 +211,10 @@ impl ActiveTask {
                 "cancel intent identity mismatch"
             );
         }
+        Ok(())
+    }
+
+    fn validate_publication(&self) -> Result<()> {
         self.publication.validate()?;
         ensure!(
             self.snapshot.stream_seq == self.publication.stream_seq,

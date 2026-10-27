@@ -92,6 +92,65 @@ history cleanup retains subject predecessors. See `../../../../../docs/a2a-opera
 Single-document payloads are checked against stream/server limits before publication;
 missing server limit metadata falls back to 1 MiB, matching runtime conventions.
 
+## HITL checkpoint and accepted replies
+
+`ActiveTask.hitl_checkpoint` defaults to `None` for old documents. Its exact
+`ApprovalRef` binds invocation, tool round, request sequence and tool call ID.
+`Waiting` projects `InputRequired`; `DecisionIntent` retains an accepted reply;
+`Following` stays present when execution returns to `Working`. Owner release may
+park active `InputRequired` work with `owner = None`. That isn't a stop proof and
+never permits retirement. The original message, ticket and admission stay intact.
+Publisher, reply admission and recovery share this lifecycle. Recovery reinspects
+runtime progress without claiming an unchanged parked task; a durable decision
+resumes only the original fixed ticket. This includes decisions made through the
+runtime/web API without an A2A reply receipt. Missing A2A ownership alone is never
+proof that a parked invocation stopped. Old replicas must not recover parked tasks.
+See [Interactive tool approval](../../../README.md#interactive-tool-approval)
+for the client reply and rollout contract.
+
+Helpers in `hitl_writes.rs` use `prepare_context_update_checked`, the fallible
+variant of the existing exact-owner/task/revision CAS. Missing checkpoints,
+request mismatches (including `receipt.request`), and invalid phases return errors
+before a write ticket is created. They don't commit no-op revisions or panic.
+`record_hitl_reply_intent` returns `Ok(true)` only after the intent commits;
+rejected or duplicate intent returns an error, not `Ok(false)`. Retry handling
+must inspect dedupe and the saved receipt instead of accepting a new decision.
+
+Call sequence for an owned task:
+
+1. Drain pending output through `OwnedTask::flush_pending`.
+2. `set_hitl_checkpoint_waiting(storage, version, params)` commits the checkpoint, challenge snapshot and status event.
+   It derives the event from the snapshot; there is no caller-supplied event.
+3. Flush the outbox, then CAS-release the context owner and release the scoped lease.
+4. On reply, claim lease + context. Capture the challenged snapshot's `stream_seq`
+   before `record_hitl_reply_intent(storage, version, intent)`.
+5. `put_dedupe_mapping(DedupeMappingKind::Reply, storage, target)` durably projects
+   the accepted message ID. Deliver that receipt's exact request to runtime.
+6. After Applied/AlreadyApplied, drain any pending event, then call
+   `advance_hitl_to_following(storage, version, params)`. This stages
+   `Working`; flush before opening the resumed stream. Stale/Conflicting outcomes
+   cannot resume through this helper; query runtime progress instead. Recovery of
+   an externally applied decision may advance Waiting without an inline reply.
+7. A next request may replace a Following checkpoint. Only terminal tasks may
+   call `clear_hitl_checkpoint(storage, version)`.
+
+Refresh `ContextVersion` after each CAS. Helpers stage only, never publish or
+clear envelopes. `OwnedTask::flush_pending` reloads same-owner authority before
+publishing, so helper commits don't require another outbox implementation.
+Both paths use `ActiveTask::stage_event`: reject unresolved outbox, increment
+snapshot/publication `stream_seq` once, freeze that cursor in `PendingEvent`.
+Intent-only writes don't advance it. Status event IDs include task ID and request
+sequence, preventing cross-task JetStream dedupe collisions.
+
+Inline receipt notes are UTF-8-safe bounded to 4 KiB, including receipts built
+without the constructor. Generic authority writes reject oversized notes and
+mismatched receipt refs. Accepted intent is immutable within its request (only
+outcome may change). Central transition validation refuses checkpoint replacement,
+clearing or retirement until a leader read proves the exact reply mapping durable.
+Reply mappings use create-only CAS in `sessions/{storage_key}/a2a/reply/{message_hash}`;
+conflicting task IDs or fingerprints never overwrite them. Mappings remain after
+retirement and are readable by a fresh store instance.
+
 ## Verification
 
 `tests/it/context_authority*` uses two independent stores and real isolated JetStream.

@@ -18,6 +18,8 @@ use harnx_runtime::nats_session_metadata::{
 };
 use serde_json::json;
 
+mod dedupe_support;
+
 pub(super) async fn start_store() -> Result<(Broker, SessionMetadataStore)> {
     harnx_core::require_nextest();
     let (broker, _, client) = Broker::start().await?;
@@ -380,13 +382,16 @@ async fn assert_agent_dedupe_isolation(
     task: &Task,
 ) -> Result<()> {
     store
-        .put_message_dedupe(
+        .put_dedupe_mapping(
+            harnx_a2a_server::store::DedupeMappingKind::Message,
             &agents.a.key,
-            MessageIdentity {
-                message_id: "message",
-                fingerprint: "a",
-            },
-            &task.id,
+            harnx_a2a_server::store::DedupeMappingTarget::new(
+                MessageIdentity {
+                    message_id: "message",
+                    fingerprint: "a",
+                },
+                &task.id,
+            ),
         )
         .await?;
     assert!(store
@@ -394,18 +399,25 @@ async fn assert_agent_dedupe_isolation(
         .await?
         .is_none());
     store
-        .put_message_dedupe(
+        .put_dedupe_mapping(
+            harnx_a2a_server::store::DedupeMappingKind::Message,
             &agents.b.key,
-            MessageIdentity {
-                message_id: "message",
-                fingerprint: "b",
-            },
-            &task.id,
+            harnx_a2a_server::store::DedupeMappingTarget::new(
+                MessageIdentity {
+                    message_id: "message",
+                    fingerprint: "b",
+                },
+                &task.id,
+            ),
         )
         .await?;
     for (key, fingerprint) in [(&agents.a.key, "a"), (&agents.b.key, "b")] {
         assert_eq!(
-            store.get_message_dedupe(key, "message").await?.unwrap().1,
+            store
+                .get_message_dedupe(key, "message")
+                .await?
+                .unwrap()
+                .fingerprint,
             fingerprint
         );
     }
@@ -451,13 +463,16 @@ async fn seed_gc_records(store: &A2aStore, agents: &AgentPair, task: &Task) -> R
     }
     for agent in [&agents.a, &agents.b] {
         store
-            .put_message_dedupe(
+            .put_dedupe_mapping(
+                harnx_a2a_server::store::DedupeMappingKind::Message,
                 &agent.key,
-                MessageIdentity {
-                    message_id: "message",
-                    fingerprint: "fingerprint",
-                },
-                &task.id,
+                harnx_a2a_server::store::DedupeMappingTarget::new(
+                    MessageIdentity {
+                        message_id: "message",
+                        fingerprint: "fingerprint",
+                    },
+                    &task.id,
+                ),
             )
             .await?;
     }
@@ -508,7 +523,7 @@ async fn assert_gc_survivor(store: &A2aStore, agent: &BoundAgent, task: &Task) -
             .get_message_dedupe(&agent.key, "message")
             .await?
             .unwrap()
-            .1,
+            .fingerprint,
         "fingerprint"
     );
     assert_eq!(
@@ -546,13 +561,16 @@ async fn store_dedupe_hit_after_terminal_returns_existing_task() -> Result<()> {
     let message = &record.task.history.as_ref().unwrap()[0];
     let fingerprint = message_fingerprint(&message.parts);
     store
-        .put_message_dedupe(
+        .put_dedupe_mapping(
+            harnx_a2a_server::store::DedupeMappingKind::Message,
             &key,
-            MessageIdentity {
-                message_id: &message.message_id,
-                fingerprint: &fingerprint,
-            },
-            &record.task.id,
+            harnx_a2a_server::store::DedupeMappingTarget::new(
+                MessageIdentity {
+                    message_id: &message.message_id,
+                    fingerprint: &fingerprint,
+                },
+                &record.task.id,
+            ),
         )
         .await?;
     let terminal = store
@@ -606,62 +624,123 @@ async fn store_dedupe_fingerprint_mismatch_is_distinct_error() -> Result<()> {
     let record = create(&store, &key, snapshot("abc123")).await?;
     let original = message_fingerprint(&[Part::text("original")]);
     let changed = message_fingerprint(&[Part::text("changed")]);
-    assert!(store
-        .dedupe_task(
-            ContextAccess {
-                export: &export,
-                owner: &alice().into(),
-                local_id: "abc123"
-            },
-            MessageIdentity {
-                message_id: "new",
-                fingerprint: &original
-            }
-        )
-        .await?
-        .is_none());
+    let case = dedupe_support::DedupeCase {
+        store: &store,
+        export: &export,
+        key: &key,
+        task_id: &record.task.id,
+    };
+    case.assert_new_id_misses(&original).await?;
+    case.record_original(&original).await?;
+    case.assert_mismatch_is_distinct(&changed).await?;
+    case.assert_mapping_not_overwritten((&original, &changed))
+        .await?;
+    Ok(())
+}
+
+struct BoundKeys {
+    key_a: String,
+    key_b: String,
+    other_context: String,
+}
+
+async fn bind_prefix_keys(
+    metadata: &SessionMetadataStore,
+    store: &A2aStore,
+    a: &Export,
+    b: &Export,
+) -> Result<BoundKeys> {
+    let key_a = bind(metadata, store, a, "abc123").await?;
+    let key_b = bind(metadata, store, b, "abc123").await?;
+    let other_context = bind(metadata, store, a, "abc1234").await?;
+    Ok(BoundKeys {
+        key_a,
+        key_b,
+        other_context,
+    })
+}
+
+struct PrefixSeedTasks {
+    task_a: TaskRecord,
+    task_a2: TaskRecord,
+}
+
+async fn seed_prefix_tasks(
+    store: &A2aStore,
+    key_a: &str,
+    key_b: &str,
+    other_context: &str,
+) -> Result<PrefixSeedTasks> {
+    let task_a = create(store, key_a, snapshot("abc123")).await?;
+    let task_a2 = create(store, key_a, snapshot("abc123")).await?;
+    create(store, key_b, snapshot("abc123")).await?;
+    create(store, other_context, snapshot("abc1234")).await?;
     store
-        .put_message_dedupe(
-            &key,
-            MessageIdentity {
-                message_id: "message",
-                fingerprint: &original,
-            },
-            &record.task.id,
+        .put_dedupe_mapping(
+            harnx_a2a_server::store::DedupeMappingKind::Message,
+            key_a,
+            harnx_a2a_server::store::DedupeMappingTarget::new(
+                MessageIdentity {
+                    message_id: "message",
+                    fingerprint: "fingerprint",
+                },
+                &task_a.task.id,
+            ),
         )
         .await?;
-    let error = store
-        .dedupe_task(
-            ContextAccess {
-                export: &export,
-                owner: &alice().into(),
-                local_id: "abc123",
-            },
-            MessageIdentity {
-                message_id: "message",
-                fingerprint: &changed,
-            },
-        )
-        .await
-        .unwrap_err();
+    Ok(PrefixSeedTasks { task_a, task_a2 })
+}
+
+async fn delete_task_record(
+    metadata: &SessionMetadataStore,
+    store: &A2aStore,
+    key_a: &str,
+) -> Result<()> {
+    let deleted = create(store, key_a, snapshot("abc123")).await?;
+    metadata
+        .kv_store()
+        .delete(a2a_task_key(key_a, parse_task_id(&deleted.task.id)?.1))
+        .await?;
+    Ok(())
+}
+
+struct StoreListingTargets<'a> {
+    store: &'a A2aStore,
+    metadata: &'a SessionMetadataStore,
+    a: &'a Export,
+    b: &'a Export,
+}
+
+async fn assert_prefix_listings(
+    targets: StoreListingTargets<'_>,
+    key_a: &str,
+    mut expected: Vec<String>,
+) -> Result<()> {
+    expected.sort();
+    let actual = list_tasks(targets.store, targets.a, &alice(), "abc123")
+        .await?
+        .unwrap();
     assert_eq!(
-        error.downcast_ref::<StoreError>(),
-        Some(&StoreError::FingerprintMismatch)
+        actual
+            .into_iter()
+            .map(|record| record.task.id)
+            .collect::<Vec<_>>(),
+        expected
     );
-    assert!(store
-        .put_message_dedupe(
-            &key,
-            MessageIdentity {
-                message_id: "message",
-                fingerprint: &changed
-            },
-            &record.task.id
-        )
-        .await
-        .is_err());
+    assert_eq!(targets.metadata.list_a2a_tasks(key_a).await?.len(), 2);
     assert_eq!(
-        store.get_message_dedupe(&key, "message").await?.unwrap().1,
-        original
+        list_tasks(targets.store, targets.b, &alice(), "abc123")
+            .await?
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        list_tasks(targets.store, targets.a, &alice(), "abc1234")
+            .await?
+            .unwrap()
+            .len(),
+        1
     );
     Ok(())
 }
@@ -672,58 +751,25 @@ async fn store_list_prefix_is_scoped_to_session() -> Result<()> {
     let store = A2aStore::new(metadata.clone());
     let a = export("pkg/agent");
     let b = export("pkg/other");
-    let key_a = bind(&metadata, &store, &a, "abc123").await?;
-    let key_b = bind(&metadata, &store, &b, "abc123").await?;
-    let other_context = bind(&metadata, &store, &a, "abc1234").await?;
+    let keys = bind_prefix_keys(&metadata, &store, &a, &b).await?;
     assert!(list_tasks(&store, &a, &alice(), "abc123")
         .await?
         .unwrap()
         .is_empty());
-    let task_a = create(&store, &key_a, snapshot("abc123")).await?;
-    let task_a2 = create(&store, &key_a, snapshot("abc123")).await?;
-    create(&store, &key_b, snapshot("abc123")).await?;
-    create(&store, &other_context, snapshot("abc1234")).await?;
-    store
-        .put_message_dedupe(
-            &key_a,
-            MessageIdentity {
-                message_id: "message",
-                fingerprint: "fingerprint",
-            },
-            &task_a.task.id,
-        )
-        .await?;
+    let seeded = seed_prefix_tasks(&store, &keys.key_a, &keys.key_b, &keys.other_context).await?;
     // Deleted records must not appear in prefix listings.
-    let deleted = create(&store, &key_a, snapshot("abc123")).await?;
-    metadata
-        .kv_store()
-        .delete(a2a_task_key(&key_a, parse_task_id(&deleted.task.id)?.1))
-        .await?;
-    let mut expected = vec![task_a.task.id, task_a2.task.id];
-    expected.sort();
-    let actual = list_tasks(&store, &a, &alice(), "abc123").await?.unwrap();
-    assert_eq!(
-        actual
-            .into_iter()
-            .map(|record| record.task.id)
-            .collect::<Vec<_>>(),
-        expected
-    );
-    assert_eq!(metadata.list_a2a_tasks(&key_a).await?.len(), 2);
-    assert_eq!(
-        list_tasks(&store, &b, &alice(), "abc123")
-            .await?
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        list_tasks(&store, &a, &alice(), "abc1234")
-            .await?
-            .unwrap()
-            .len(),
-        1
-    );
+    delete_task_record(&metadata, &store, &keys.key_a).await?;
+    assert_prefix_listings(
+        StoreListingTargets {
+            store: &store,
+            metadata: &metadata,
+            a: &a,
+            b: &b,
+        },
+        &keys.key_a,
+        vec![seeded.task_a.task.id, seeded.task_a2.task.id],
+    )
+    .await?;
     Ok(())
 }
 

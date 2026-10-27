@@ -1,29 +1,19 @@
 //! One committed envelope at a time; publication precedes cursor checkpoint.
 use super::*;
-use crate::store::context::{ActiveTask, PendingEvent};
+use crate::store::context::ActiveTask;
 
 pub(super) fn stage_event(active: &mut ActiveTask, response: StreamResponse, commit_id: &str) {
-    assert!(
-        active.publication.pending.is_none(),
-        "unresolved event outbox"
-    );
-    active.snapshot.stream_seq += 1;
-    active.publication.stream_seq = active.snapshot.stream_seq;
-    active.publication.pending = Some(PendingEvent {
-        committed_at: Some(chrono::Utc::now()),
-        commit_id: commit_id.into(),
-        task_sequence: active.snapshot.stream_seq,
-        expected_subject_sequence: active.publication.subject_sequence,
-        response,
-    });
+    active
+        .stage_event(response, commit_id)
+        .expect("event staging");
 }
 
 impl OwnedTask {
-    pub(super) async fn flush_pending(
+    async fn sync_context_for_flush(
         &mut self,
         store: &A2aStore,
         storage: &str,
-    ) -> Result<Option<A2aEvent>> {
+    ) -> Result<Option<crate::store::context::PendingEvent>> {
         let current = store
             .read_context(storage)
             .await?
@@ -47,33 +37,23 @@ impl OwnedTask {
         };
         #[cfg(feature = "fault-injection")]
         fault_committed(store, active).await;
+        Ok(Some(pending))
+    }
+
+    pub(super) async fn flush_pending(
+        &mut self,
+        store: &A2aStore,
+        storage: &str,
+    ) -> Result<Option<A2aEvent>> {
+        let Some(pending) = self.sync_context_for_flush(store, storage).await? else {
+            return Ok(None);
+        };
         store.cleanup_context_events(storage).await?;
         let sequence =
             crate::store::context::terminal_event::publish_pending(store, &self.context, storage)
                 .await?;
         self.update(store, storage, |active| {
-            // External cancellation may race the ack, but cannot replace this envelope.
-            if active.publication.pending.is_none() {
-                // A lost checkpoint ack can be superseded by cancellation. The
-                // exact subject checkpoint proves this envelope was already cleared.
-                assert_eq!(active.publication.subject_sequence, sequence);
-                return;
-            }
-            assert_eq!(
-                active.publication.pending.as_ref().map(|p| &p.commit_id),
-                Some(&pending.commit_id)
-            );
-            active.publication.pending = None;
-            active.publication.subject_sequence = sequence;
-            active.publication.confirmed_history.push(sequence);
-            if active.publication.confirmed_history.len()
-                > harnx_runtime::a2a_events::CHECKPOINT_HISTORY
-            {
-                active.publication.confirmed_history.remove(0);
-            }
-            if active.snapshot.task.status.state.is_terminal() {
-                active.projections.final_event = true;
-            }
+            clear_published_pending(active, &pending.commit_id, sequence);
         })
         .await?;
         #[cfg(feature = "fault-injection")]
@@ -88,11 +68,38 @@ impl OwnedTask {
     }
 }
 
+fn clear_published_pending(active: &mut ActiveTask, pending_commit_id: &str, sequence: u64) {
+    if active.publication.pending.is_none() {
+        assert_eq!(active.publication.subject_sequence, sequence);
+        return;
+    }
+    assert_eq!(
+        active
+            .publication
+            .pending
+            .as_ref()
+            .map(|p| p.commit_id.as_str()),
+        Some(pending_commit_id)
+    );
+    active.publication.pending = None;
+    active.publication.subject_sequence = sequence;
+    active.publication.confirmed_history.push(sequence);
+    if active.publication.confirmed_history.len() > harnx_runtime::a2a_events::CHECKPOINT_HISTORY {
+        active.publication.confirmed_history.remove(0);
+    }
+    if active.snapshot.task.status.state.is_terminal() {
+        active.projections.final_event = true;
+    }
+}
+
 #[cfg(feature = "fault-injection")]
 async fn fault_committed(store: &A2aStore, active: &ActiveTask) {
     use crate::fault_injection::Boundary;
     let hooks = store.context_fault_hooks();
     hooks.checkpoint(Boundary::OutboxCommitted).await;
+    if active.snapshot.task.status.state == TaskState::InputRequired {
+        hooks.checkpoint(Boundary::HitlOutboxCommitted).await;
+    }
     if active.snapshot.task.status.state.is_terminal() {
         hooks.checkpoint(Boundary::TerminalOutboxCommitted).await;
     }

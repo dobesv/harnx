@@ -1,5 +1,8 @@
 //! Control plane for cancel over NATS.
 
+mod hitl;
+use hitl::HitlDecisionParams;
+
 use super::backend::NatsSessionLogBackend;
 use super::daemon::should_append_control_log_entry;
 use crate::nats_lease::NatsSessionLease;
@@ -34,6 +37,9 @@ pub enum ControlCommand {
         tool_call_id: String,
         approved: bool,
         note: Option<String>,
+        /// Expected approval generation. None retains tool-ID-only legacy routing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_seq: Option<u64>,
     },
     /// Latency hint that a `CompactRequest` entry was appended to this session's log.
     /// The log is authoritative; the worker detects and runs compaction at a safe boundary.
@@ -105,9 +111,10 @@ impl SessionControlHandler {
                 tool_call_id,
                 approved,
                 note,
+                request_seq,
             } => {
-                self.apply_hitl_decision(tool_call_id, approved, note, reply)
-                    .await
+                let params = HitlDecisionParams::new(tool_call_id, approved, note, request_seq);
+                self.apply_hitl_decision(params, reply).await
             }
             ControlCommand::Compact { .. } => {
                 // Compact is a hint only; worker detects pending requests via session watcher.
@@ -144,87 +151,6 @@ impl SessionControlHandler {
         self.abort_signal.set_ctrlc();
     }
 
-    async fn apply_hitl_decision(
-        &self,
-        tool_call_id: String,
-        approved: bool,
-        note: Option<String>,
-        reply: Option<async_nats::Subject>,
-    ) {
-        if !should_append_control_log_entry(&self.lease) {
-            return;
-        }
-        let entries = match self.backend.load_events_latest_async().await {
-            Ok(entries) => entries,
-            Err(error) => {
-                log::warn!("failed to load pending HITL approvals: {error:#}");
-                return;
-            }
-        };
-        let pending = match super::agent_loop::derive_pending_hitl_approvals(&entries) {
-            Ok(pending) => pending,
-            Err(error) => {
-                log::warn!("failed to derive pending HITL approvals: {error:#}");
-                return;
-            }
-        };
-        if !pending
-            .iter()
-            .any(|approval| approval.tool_call_id == tool_call_id)
-        {
-            return;
-        }
-        if !self.lease.is_held() {
-            return;
-        }
-        let entry = harnx_core::session::SessionLogEntry::HitlApprovalDecision {
-            tool_call_id: tool_call_id.clone(),
-            approved,
-            note: note.clone(),
-            fence_token: self.lease.fence_token(),
-        };
-        let expected_last_sequence = entries.last().map_or(0, |(seq, _)| *seq);
-        let sink = super::backend::FencedSessionLogSink::new(
-            self.backend.clone(),
-            Arc::clone(&self.lease),
-        );
-        match sink
-            .append_hitl_event_cas(&entry, expected_last_sequence)
-            .await
-        {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                match self.backend.load_events_latest_async().await {
-                    Ok(reloaded) => {
-                        if let Err(error) =
-                            super::agent_loop::derive_pending_hitl_approvals(&reloaded)
-                        {
-                            log::warn!(
-                                "failed to re-derive HITL approvals after decision CAS loss: {error:#}"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        log::warn!(
-                            "failed to reload HITL approvals after decision CAS loss: {error:#}"
-                        );
-                    }
-                }
-                return;
-            }
-            Err(error) => {
-                log::warn!("failed to append HITL approval decision: {error:#}");
-                return;
-            }
-        }
-        self.publish_updated().await;
-        let _ = self.hitl_decision_tx.send(AppliedHitlDecision {
-            tool_call_id,
-            approved,
-            note,
-        });
-        self.acknowledge(reply).await;
-    }
     async fn publish_updated(&self) {
         let event_sink = crate::nats_event_sink::NatsEventSink::new(
             self.client.clone(),
@@ -349,3 +275,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "control_hitl_tests.rs"]
+mod hitl_tests;

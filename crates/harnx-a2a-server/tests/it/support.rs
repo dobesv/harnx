@@ -1,16 +1,7 @@
 //! Real worker + isolated JetStream + scripted OpenAI-compatible streaming LLM.
 //! Follows MCP's Readiness harness; barriers replace timing guesses in turns.
 use anyhow::{bail, Context, Result};
-use axum::{
-    extract::State,
-    response::{
-        sse::{Event, Sse},
-        IntoResponse,
-    },
-    routing::post,
-    Json, Router,
-};
-use futures::stream;
+use axum::{routing::post, Router};
 use harnx_a2a_server::runner::{SessionRequest, TurnRequest};
 use harnx_a2a_server::{
     exports::{AgentCardMeta, Export},
@@ -25,9 +16,8 @@ use harnx_runtime::{
     nats_worker::{run_worker_daemon, WorkerDaemonConfig},
     NatsSession, SessionActivationRoute,
 };
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
-    convert::Infallible,
     ffi::OsString,
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -36,6 +26,10 @@ use std::{
 };
 use tokio::sync::Notify;
 use tokio_util::task::AbortOnDropHandle;
+
+#[path = "support/completion.rs"]
+mod completion;
+use completion::completion;
 
 pub const DEADLINE: Duration = Duration::from_secs(120);
 pub fn alice() -> Principal {
@@ -88,9 +82,7 @@ impl Broker {
         Ok(())
     }
     #[cfg(all(unix, feature = "fault-injection"))]
-    pub(super) async fn restart(&mut self) -> Result<()> {
-        let (url, _) = self.wait_for_client().await?;
-        let port = url.rsplit(':').next().context("broker port")?;
+    fn respawn_on_port(&mut self, port: &str) -> Result<()> {
         self.child.kill()?;
         self.child.wait()?;
         self.child = Command::new(
@@ -103,6 +95,14 @@ impl Broker {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "fault-injection"))]
+    pub(super) async fn restart(&mut self) -> Result<()> {
+        let (url, _) = self.wait_for_client().await?;
+        let port = url.rsplit(':').next().context("broker port")?;
+        self.respawn_on_port(port)?;
         tokio::time::timeout(DEADLINE, self.wait_for_client()).await??;
         Ok(())
     }
@@ -155,19 +155,27 @@ impl Broker {
             if let Some(status) = self.child.try_wait()? {
                 bail!("broker stopped: {status}");
             }
-            for entry in std::fs::read_dir(self._dir.path())? {
-                let Some(url) = broker_ports_url(&entry?.path())? else {
-                    continue;
-                };
-                if let Ok(client) = async_nats::connect(&url).await {
-                    return Ok((url, client));
-                }
+            if let Some(pair) = try_connect_broker_ports(self._dir.path()).await? {
+                return Ok(pair);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
 
+async fn try_connect_broker_ports(
+    dir: &std::path::Path,
+) -> Result<Option<(String, async_nats::Client)>> {
+    for entry in std::fs::read_dir(dir)? {
+        let Some(url) = broker_ports_url(&entry?.path())? else {
+            continue;
+        };
+        if let Ok(client) = async_nats::connect(&url).await {
+            return Ok(Some((url, client)));
+        }
+    }
+    Ok(None)
+}
 fn broker_ports_url(path: &std::path::Path) -> Result<Option<String>> {
     if !path.extension().is_some_and(|e| e == "ports") {
         return Ok(None);
@@ -182,6 +190,8 @@ fn broker_ports_url(path: &std::path::Path) -> Result<Option<String>> {
 pub enum Script {
     Text,
     Tool,
+    SerialTool,
+    SameRoundTools,
     CountedTool,
     Fail,
     Many,
@@ -195,110 +205,6 @@ pub struct Llm {
     pub release: Notify,
     pub requested: Notify,
     script: Script,
-}
-
-fn chunk(delta: Value, finish: Value) -> String {
-    json!({"id":"runner-completion", "object":"chat.completion.chunk", "created":0,
-        "model":"test", "choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
-    .to_string()
-}
-async fn completion(
-    State(llm): State<Arc<Llm>>,
-    Json(body): Json<Value>,
-) -> axum::response::Response {
-    let first = {
-        let mut requests = llm.requests.lock();
-        let first = requests.is_empty();
-        requests.push(body.clone());
-        first
-    };
-    llm.requested.notify_one();
-    if llm.script == Script::Fail {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"secret-token /srv/private https://private.invalid", "type":"invalid_request_error"}}))).into_response();
-    }
-    assert_eq!(body["stream"], true, "worker must call streaming LLM");
-    let many = matches!(llm.script, Script::Many | Script::Large | Script::Boundary);
-    let counted_tool = llm.script == Script::CountedTool
-        && body["messages"]
-            .as_array()
-            .and_then(|m| m.last())
-            .map(|m| m["role"].as_str())
-            != Some(Some("tool"));
-    let frames = if llm.script == Script::Overflow {
-        vec![
-            chunk(json!({"content":"x".repeat(224 * 1024 + 1)}), Value::Null),
-            chunk(json!({}), json!("stop")),
-            "[DONE]".into(),
-        ]
-    } else if many {
-        let text = "x".repeat(match llm.script {
-            Script::Large => 1024,
-            Script::Boundary => 3324,
-            _ => 1,
-        });
-        let mut frames = vec![
-            chunk(json!({"content":text}), Value::Null);
-            harnx_a2a_server::runner::EVENT_CAPACITY + 5
-        ];
-        if llm.script == Script::Boundary {
-            frames[68] = chunk(json!({"content":"x".repeat(3344)}), Value::Null);
-        }
-        frames.push(chunk(json!({}), json!("stop")));
-        frames.push("[DONE]".into());
-        frames
-    } else if counted_tool {
-        let counter = Config::config_dir().join("executions");
-        let command = format!(
-            "printf 'execution\\n' >> {}",
-            shell_words::quote(counter.to_str().expect("counter path"))
-        );
-        vec![
-            chunk(
-                json!({"tool_calls":[{"index":0,"id":"counted-call","type":"function",
-                "function":{"name":"bash_exec","arguments":json!({"command":command}).to_string()}}]}),
-                Value::Null,
-            ),
-            chunk(json!({}), json!("tool_calls")),
-            "[DONE]".into(),
-        ]
-    } else if llm.script == Script::Tool && first {
-        vec![
-            chunk(
-                json!({"tool_calls":[{"index":0,"id":"runner-handoff", "type":"function",
-            "function":{"name":"target_session_handoff", "arguments":"{\"prompt\":\"must not run\",\"session_id\":\"denied-target\"}"}}]}),
-                Value::Null,
-            ),
-            chunk(json!({}), json!("tool_calls")),
-            "[DONE]".into(),
-        ]
-    } else {
-        vec![
-            chunk(
-                json!({"reasoning_content":"private reasoning", "content":"Hello "}),
-                Value::Null,
-            ),
-            chunk(json!({"content":"world"}), Value::Null),
-            chunk(json!({}), json!("stop")),
-            "[DONE]".into(),
-        ]
-    };
-    // Text turns stop after their first real SSE token until the test observes
-    // an A2A artifact. This proves mid-stream behavior, without sleep-based races.
-    let held = llm.script == Script::Text || (llm.script == Script::CountedTool && !counted_tool);
-    Sse::new(stream::unfold(
-        (0, frames, llm),
-        move |(index, frames, llm)| async move {
-            if index >= frames.len() {
-                return None;
-            }
-            if (held && index == 1) || (many && index > 0 && index <= frames.len() - 2) {
-                llm.release.notified().await;
-            }
-            let event = Event::default().data(frames[index].clone());
-            Some((Ok::<_, Infallible>(event), (index + 1, frames, llm)))
-        },
-    ))
-    .into_response()
 }
 
 #[derive(Clone, Default)]
@@ -381,31 +287,40 @@ fn isolated_environment(root: &tempfile::TempDir, url: &str) -> Result<Vec<EnvGu
     Ok(env)
 }
 
-fn fixture_config(
+fn init_fixture_dirs(dir: &std::path::Path) -> Result<()> {
+    for subdir in ["agents", "clients", "nats_servers"] {
+        std::fs::create_dir_all(dir.join(subdir))?;
+    }
+    Ok(())
+}
+
+fn write_counted_tool_config(dir: &std::path::Path) -> Result<()> {
+    let command = binary("harnx-bash-tools")?;
+    std::fs::create_dir_all(dir.join("tool_servers"))?;
+    std::fs::write(
+        dir.join("tool_servers/bash.yaml"),
+        format!(
+            "command: {:?}\nargs: [--name, bash, --no-sandbox, --allow-write, {:?}]\n",
+            command.to_str().context("bash tool path")?,
+            dir.to_str().context("config path")?
+        ),
+    )?;
+    Ok(())
+}
+
+fn write_fixture_support_configs(
     dir: &std::path::Path,
     script: Script,
     url: &str,
     address: std::net::SocketAddr,
-) -> Result<GlobalConfig> {
-    for subdir in ["agents", "clients", "nats_servers"] {
-        std::fs::create_dir_all(dir.join(subdir))?;
-    }
+) -> Result<()> {
+    init_fixture_dirs(dir)?;
     let mut config_yaml = "model: mock:test\nstream: true\nsave: false\n".to_owned();
     if matches!(script, Script::Large | Script::Boundary | Script::Overflow) {
-        // The synthetic load repeats text on purpose; don't test the repeat guard.
         config_yaml.push_str("loop_detection:\n  output: false\n");
     }
     if script == Script::CountedTool {
-        let command = binary("harnx-bash-tools")?;
-        std::fs::create_dir_all(dir.join("tool_servers"))?;
-        std::fs::write(
-            dir.join("tool_servers/bash.yaml"),
-            format!(
-                "command: {:?}\nargs: [--name, bash, --no-sandbox, --allow-write, {:?}]\n",
-                command.to_str().context("bash tool path")?,
-                dir.to_str().context("config path")?
-            ),
-        )?;
+        write_counted_tool_config(dir)?;
     }
     std::fs::write(dir.join("config.yaml"), config_yaml)?;
     std::fs::write(
@@ -413,15 +328,54 @@ fn fixture_config(
         format!("url: {url:?}\n"),
     )?;
     std::fs::write(dir.join("clients/mock.yaml"), format!("type: openai-compatible\nname: mock\napi_base: http://{address}/v1\napi_key: test-key\nmodels:\n  - name: test\n    max_input_tokens: 32000\n    max_output_tokens: 1024\n"))?;
-    let agent = if script == Script::CountedTool {
-        "---\nmodel: mock:test\nuse_tools: [bash_exec]\n---\nTest counted tool agent\n".into()
-    } else if script == Script::Tool {
-        let binary = binary("harnx-claude-compatible-hook-server")?;
-        let command = shell_words::join([binary.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^target_session_handoff$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve handoff?\"}}"]);
-        format!("---\nmodel: mock:test\nuse_tools:\n- target_session_handoff\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest runner agent\n")
-    } else {
-        "---\nmodel: mock:test\n---\nTest runner agent\n".into()
-    };
+    Ok(())
+}
+
+fn write_same_round_tools_agent(dir: &std::path::Path) -> Result<String> {
+    std::fs::create_dir_all(dir.join("tool_servers"))?;
+    std::fs::write(
+        dir.join("tool_servers/time.yaml"),
+        format!(
+            "command: {:?}\n",
+            binary("harnx-time-tools")?
+                .to_str()
+                .context("time tool path")?
+        ),
+    )?;
+    let hook = binary("harnx-claude-compatible-hook-server")?;
+    let command = shell_words::join([hook.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^time_get_current_time$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve time lookup?\"}}"]);
+    Ok(format!("---\nmodel: mock:test\nuse_tools: [time_get_current_time]\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest same-round approvals\n"))
+}
+
+fn write_tool_handoff_agent() -> Result<String> {
+    let binary = binary("harnx-claude-compatible-hook-server")?;
+    let command = shell_words::join([binary.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^target_session_handoff$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve handoff?\"}}"]);
+    Ok(format!("---\nmodel: mock:test\nuse_tools:\n- target_session_handoff\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest runner agent\n"))
+}
+
+fn fixture_agent_content(script: Script, dir: &std::path::Path) -> Result<String> {
+    if script == Script::CountedTool {
+        return Ok(
+            "---\nmodel: mock:test\nuse_tools: [bash_exec]\n---\nTest counted tool agent\n".into(),
+        );
+    }
+    if script == Script::SameRoundTools {
+        return write_same_round_tools_agent(dir);
+    }
+    if matches!(script, Script::Tool | Script::SerialTool) {
+        return write_tool_handoff_agent();
+    }
+    Ok("---\nmodel: mock:test\n---\nTest runner agent\n".into())
+}
+
+fn fixture_config(
+    dir: &std::path::Path,
+    script: Script,
+    url: &str,
+    address: std::net::SocketAddr,
+) -> Result<GlobalConfig> {
+    write_fixture_support_configs(dir, script, url, address)?;
+    let agent = fixture_agent_content(script, dir)?;
     std::fs::write(dir.join("agents/runner.md"), agent)?;
     std::fs::write(
         dir.join("agents/target.md"),
@@ -486,6 +440,83 @@ impl Drop for Harness {
         self.http.abort();
     }
 }
+struct BrokerLlmBootstrap {
+    broker: Broker,
+    url: String,
+    client: async_nats::Client,
+    llm: Arc<Llm>,
+    address: std::net::SocketAddr,
+    http: AbortOnDropHandle<()>,
+}
+
+async fn bootstrap_broker_and_llm(
+    script: Script,
+    broker_config: Option<&str>,
+) -> Result<BrokerLlmBootstrap> {
+    let (broker, url, client) = match broker_config {
+        Some(config) => Broker::start_with_config(config).await?,
+        None => Broker::start().await?,
+    };
+    let (llm, address, http) = start_llm(script).await?;
+    Ok(BrokerLlmBootstrap {
+        broker,
+        url,
+        client,
+        llm,
+        address,
+        http,
+    })
+}
+
+struct DefaultBrokerSetup {
+    config: GlobalConfig,
+    client: async_nats::Client,
+}
+
+async fn configure_broker_client(
+    root: &std::path::Path,
+    url: &str,
+    broker_config: Option<&str>,
+    defaults: DefaultBrokerSetup,
+) -> Result<(GlobalConfig, async_nats::Client)> {
+    if broker_config.is_none() {
+        return Ok((defaults.config, defaults.client));
+    }
+    let endpoint = url.replacen(
+        "nats://",
+        "nats://a2a_backend:a2a_backend_test_password@",
+        1,
+    );
+    std::fs::write(
+        root.join("config/nats_servers/runner.yaml"),
+        format!("url: {endpoint:?}\n"),
+    )?;
+    let config = Arc::new(ConfigLock::new(Config::load_from_file(
+        &root.join("config/config.yaml"),
+    )?));
+    let client = async_nats::ConnectOptions::new()
+        .user_and_password("a2a_backend".into(), "a2a_backend_test_password".into())
+        .connect(url)
+        .await?;
+    Ok((config, client))
+}
+
+struct FixtureRootEnv {
+    root: tempfile::TempDir,
+    env: Vec<EnvGuard>,
+    config: GlobalConfig,
+}
+
+fn setup_fixture_environment(
+    script: Script,
+    worker_url: &str,
+    address: std::net::SocketAddr,
+) -> Result<FixtureRootEnv> {
+    let root = tempfile::tempdir()?;
+    let env = isolated_environment(&root, worker_url)?;
+    let config = fixture_config(&root.path().join("config"), script, worker_url, address)?;
+    Ok(FixtureRootEnv { root, env, config })
+}
 impl Harness {
     pub async fn start(script: Script) -> Result<Self> {
         Self::start_with_access_rules(script, None).await
@@ -503,42 +534,25 @@ impl Harness {
     ) -> Result<Self> {
         harnx_core::require_nextest();
         let logs = test_logs();
-        let (broker, url, client) = match broker_config {
-            Some(config) => Broker::start_with_config(config).await?,
-            None => Broker::start().await?,
-        };
-        let (llm, address, http) = start_llm(script).await?;
-        let root = tempfile::tempdir()?;
-        let endpoint = |user: &str, password: &str| {
-            url.replacen("nats://", &format!("nats://{user}:{password}@"), 1)
-        };
+        let boot = bootstrap_broker_and_llm(script, broker_config).await?;
         let worker_url = if broker_config.is_some() {
-            endpoint("worker", "worker_test_password")
+            boot.url
+                .replacen("nats://", "nats://worker:worker_test_password@", 1)
         } else {
-            url.clone()
+            boot.url.clone()
         };
-        let env = isolated_environment(&root, &worker_url)?;
-        let config = fixture_config(&root.path().join("config"), script, &worker_url, address)?;
-        let worker = start_worker(&config).await?;
-        let (config, client) = if broker_config.is_some() {
-            std::fs::write(
-                root.path().join("config/nats_servers/runner.yaml"),
-                format!(
-                    "url: {:?}\n",
-                    endpoint("a2a_backend", "a2a_backend_test_password")
-                ),
-            )?;
-            let config = Arc::new(ConfigLock::new(Config::load_from_file(
-                &root.path().join("config/config.yaml"),
-            )?));
-            let client = async_nats::ConnectOptions::new()
-                .user_and_password("a2a_backend".into(), "a2a_backend_test_password".into())
-                .connect(&url)
-                .await?;
-            (config, client)
-        } else {
-            (config, client)
-        };
+        let fixture_env = setup_fixture_environment(script, &worker_url, boot.address)?;
+        let worker = start_worker(&fixture_env.config).await?;
+        let (config, client) = configure_broker_client(
+            fixture_env.root.path(),
+            &boot.url,
+            broker_config,
+            DefaultBrokerSetup {
+                config: fixture_env.config,
+                client: boot.client,
+            },
+        )
+        .await?;
         let jetstream = async_nats::jetstream::new(client);
         let metadata = SessionMetadataStore::ensure(&jetstream, 1).await?;
         let store = Arc::new(A2aStore::new_with_access_rules(metadata.clone(), rules));
@@ -551,13 +565,13 @@ impl Harness {
             metadata,
             config,
             export,
-            llm,
+            llm: boot.llm,
             jetstream,
             worker,
-            http,
-            _broker: broker,
-            _root: root,
-            _env: env,
+            http: boot.http,
+            _broker: boot.broker,
+            _root: fixture_env.root,
+            _env: fixture_env.env,
         })
     }
     pub fn config_dir(&self) -> PathBuf {
@@ -617,6 +631,28 @@ pub fn binary(name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+async fn process_index_entry(
+    store: &A2aStore,
+    key: &str,
+    local_id: &str,
+    entry: &harnx_runtime::nats_session_metadata::TaskIndexEntry,
+) -> Result<Option<TaskRecord>> {
+    let Some(record) = store.get_task(key, &entry.task_id).await? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        record.version == 1 && record.task.context_id == local_id,
+        "invalid task record"
+    );
+    let state_mismatch =
+        harnx_a2a_server::store::to_index_state(record.task.status.state.clone()) != entry.state;
+    let time_mismatch = record.task.status.timestamp != entry.status_timestamp;
+    if state_mismatch || time_mismatch {
+        store.repair_index_best_effort(key, &record).await;
+    }
+    Ok(Some(record))
+}
+
 pub async fn list_all_tasks_for_test(
     store: &A2aStore,
     export: &Export,
@@ -632,18 +668,8 @@ pub async fn list_all_tasks_for_test(
 
     let (index, _) = store.get_or_migrate_index(&key, Some(local_id)).await?;
     let mut records = Vec::new();
-    for entry in index.entries {
-        if let Some(record) = store.get_task(&key, &entry.task_id).await? {
-            anyhow::ensure!(
-                record.version == 1 && record.task.context_id == local_id,
-                "invalid task record"
-            );
-            if harnx_a2a_server::store::to_index_state(record.task.status.state.clone())
-                != entry.state
-                || record.task.status.timestamp != entry.status_timestamp
-            {
-                store.repair_index_best_effort(&key, &record).await;
-            }
+    for entry in &index.entries {
+        if let Some(record) = process_index_entry(store, &key, local_id, entry).await? {
             records.push(record);
         }
     }

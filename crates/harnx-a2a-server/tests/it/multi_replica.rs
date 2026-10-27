@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tower::ServiceExt;
 mod admission;
 mod auth;
+mod hitl;
+mod hitl_state;
 mod operations;
 mod streaming;
 mod supervision;
@@ -93,7 +95,10 @@ struct TwoBackends {
 }
 impl TwoBackends {
     async fn start() -> Result<Self> {
-        let h = Harness::start(Script::Text).await?;
+        Self::start_script(Script::Text).await
+    }
+    async fn start_script(script: Script) -> Result<Self> {
+        let h = Harness::start(script).await?;
         let a = Replica::new(&h, h.store.clone(), h.runner.clone())?;
         let store_b = Arc::new(A2aStore::new(h.metadata.clone()));
         let b = Replica::new(&h, store_b.clone(), Runner::new(store_b))?;
@@ -116,6 +121,7 @@ impl TwoBackends {
             .await
     }
 }
+// Runtime timing notices use User role but aren't admitted client prompts.
 async fn prompts(log: &NatsSessionLog) -> Result<Vec<(u64, String)>> {
     Ok(log
         .load_events_async()
@@ -125,8 +131,11 @@ async fn prompts(log: &NatsSessionLog) -> Result<Vec<(u64, String)>> {
             SessionLogEntry::Message {
                 role: MessageRole::User,
                 id: Some(id),
+                content,
                 ..
-            } => Some((seq, id)),
+            } if !harnx_core::timing_identity::is_timing_notice(&content.to_text()) => {
+                Some((seq, id))
+            }
             _ => None,
         })
         .collect())

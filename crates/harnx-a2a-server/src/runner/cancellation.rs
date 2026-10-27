@@ -8,6 +8,8 @@
 //! replay.
 use super::*;
 
+mod parked;
+
 impl Runner {
     /// Requests task cancellation, records immutable intent, and awaits terminal state.
     ///

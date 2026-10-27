@@ -30,12 +30,29 @@ use task_view::{history, validate_history};
 struct Admission {
     snapshot: TaskRecord,
     deduped: bool,
+    response_after: Option<u64>,
+    direct: bool,
+    events: Option<tokio::sync::broadcast::Receiver<crate::runner::A2aEvent>>,
 }
 impl Admission {
+    fn reply_snapshot(snapshot: TaskRecord) -> Self {
+        let direct = crate::runner::ends_response(&snapshot.task.status.state);
+        Self {
+            snapshot,
+            deduped: false,
+            response_after: None,
+            direct,
+            events: None,
+        }
+    }
+
     fn retry(snapshot: TaskRecord) -> Self {
         Self {
             snapshot,
             deduped: true,
+            response_after: None,
+            direct: false,
+            events: None,
         }
     }
 }
@@ -115,6 +132,13 @@ impl HarnxHandler {
         if record.task.status.state.is_terminal() {
             return Ok(record);
         }
+        // Parked approvals need no foreground claim; Working continuations still
+        // need the shared orphan recovery path when their owner disappears.
+        if record.task.status.state == TaskState::InputRequired
+            && self.hitl_task(owner, &record).await?
+        {
+            return self.task(owner, &record.task.id).await;
+        }
         let session = self.session(owner, Some(&record.task.context_id)).await?;
         self.backend
             .runner
@@ -129,16 +153,55 @@ impl HarnxHandler {
             .await
             .map_err(map_error)
     }
-    /// Wait for an admitted task without owning its turn. The point read checks
-    /// context ownership even when called directly by an in-process client.
+    async fn hitl_task(
+        &self,
+        owner: &RequestIdentity,
+        record: &TaskRecord,
+    ) -> Result<bool, A2AError> {
+        let storage = self
+            .backend
+            .store
+            .resolve_context(&self.export, owner, &record.task.context_id)
+            .await
+            .map_err(map_error)?
+            .ok_or_else(not_found)?;
+        Ok(self
+            .backend
+            .store
+            .read_context(&storage)
+            .await
+            .map_err(map_error)?
+            .and_then(|c| c.document.state.active)
+            .is_some_and(|a| a.snapshot.task.id == record.task.id && a.hitl_checkpoint.is_some()))
+    }
+
+    /// Compatibility entry point: wait until the task ends this response,
+    /// including InputRequired and AuthRequired (neither ends the invocation).
     pub async fn wait_terminal(
         &self,
         owner: &RequestIdentity,
         task_id: &str,
     ) -> Result<TaskRecord, A2AError> {
+        self.wait_response(owner, task_id, None).await
+    }
+
+    /// Wait without owning the turn. Authorization precedes every result.
+    ///
+    /// For an accepted reply, pass the challenged snapshot's `stream_seq` as
+    /// `after`. Interrupted snapshots must have a strictly newer cursor; true
+    /// terminal states always win, even below that cursor. Capture it before
+    /// recording/delivering the decision, not after publishing Working.
+    /// This cursor is task-local, not a KV revision or a runtime request sequence.
+    /// Marked waits require a coordinated task with a durable event cursor.
+    pub async fn wait_response(
+        &self,
+        owner: &RequestIdentity,
+        task_id: &str,
+        after: Option<u64>,
+    ) -> Result<TaskRecord, A2AError> {
         let record = self.task(owner, task_id).await?;
         // Dropping a waiter never owns or cancels the detached turn.
-        if record.task.status.state.is_terminal() {
+        if wait::reached_boundary(&record, after) {
             return Ok(record);
         }
         let storage = harnx_core::session_identity::session_key(
@@ -153,9 +216,105 @@ impl HarnxHandler {
             .map_err(map_error)?
             .is_some()
         {
-            return self.wait_shared_terminal(owner, task_id).await;
+            return self.wait_shared_boundary(owner, task_id, after).await;
         }
-        self.wait_legacy_terminal(owner, record).await
+        self.wait_legacy_boundary(owner, record, after).await
+    }
+
+    async fn resolve_send_task(
+        &self,
+        owner: &RequestIdentity,
+        admission: Admission,
+        immediate: bool,
+    ) -> Result<Task, A2AError> {
+        let record = if admission.deduped && !immediate {
+            self.reconcile(owner, admission.snapshot).await?
+        } else {
+            admission.snapshot
+        };
+        if immediate || admission.direct {
+            Ok(record.task)
+        } else {
+            let waited = self
+                .wait_response(owner, &record.task.id, admission.response_after)
+                .await?;
+            Ok(waited.task)
+        }
+    }
+
+    async fn cancel_hitl_if_active(
+        &self,
+        owner: &RequestIdentity,
+        task_id: &str,
+        initial: &TaskRecord,
+    ) -> Result<Option<Task>, A2AError> {
+        if initial.task.status.state.is_terminal() {
+            return Ok(None);
+        }
+        if !self.hitl_task(owner, initial).await? {
+            return Ok(None);
+        }
+        let session = self.session(owner, Some(&initial.task.context_id)).await?;
+        let task = self
+            .backend
+            .runner
+            .cancel_hitl_task(
+                TaskAccess {
+                    export: &self.export,
+                    owner,
+                    task_id,
+                },
+                &session,
+            )
+            .await
+            .map_err(map_error)?
+            .task;
+        Ok(Some(task))
+    }
+
+    async fn cancel_standard_task(
+        &self,
+        owner: &RequestIdentity,
+        task_id: &str,
+        initial: TaskRecord,
+    ) -> Result<Task, A2AError> {
+        let initially_terminal = initial.task.status.state.is_terminal();
+        let record = self.reconcile(owner, initial).await?;
+        // The worker can complete mid-reconcile: we read a Working snapshot but the reconcile
+        // sees Completed. Return the completed task instead of task_not_cancelable.
+        // Verified by nats_http_cancel_returns_completed_when_completion_wins_after_snapshot.
+        if !initially_terminal && record.task.status.state == TaskState::Completed {
+            return Ok(record.task);
+        }
+        if record.task.status.state.is_terminal() {
+            return Err(A2AError::task_not_cancelable(&record.task.id));
+        }
+        Ok(self
+            .backend
+            .runner
+            .cancel_task(&self.export, owner, task_id)
+            .await
+            .map_err(map_error)?
+            .task)
+    }
+
+    async fn open_reconciled_stream(
+        &self,
+        owner: &RequestIdentity,
+        snapshot: TaskRecord,
+    ) -> Result<
+        (
+            TaskRecord,
+            Option<tokio::sync::broadcast::Receiver<crate::runner::A2aEvent>>,
+        ),
+        A2AError,
+    > {
+        let record = self.reconcile(owner, snapshot).await?;
+        self.backend
+            .runner
+            .stream_snapshot(&self.export, owner, &record.task.id)
+            .await
+            .map_err(map_error)
     }
 }
 
@@ -177,20 +336,7 @@ impl RequestHandler for HarnxHandler {
         let owner = self.owner(params)?;
         let immediate = return_immediately(req.configuration.as_ref());
         let (admission, length) = self.admit_request(owner.clone(), req).await?;
-        let record = admission.snapshot;
-        // Retries keep their task ID and chosen return mode. Reconcile an
-        // orphan before a blocking wait, without applying new-turn rejection.
-        let record = if admission.deduped && !immediate {
-            self.reconcile(&owner, record).await?
-        } else {
-            record
-        };
-        let mut task = if immediate {
-            record
-        } else {
-            self.wait_terminal(&owner, &record.task.id).await?
-        }
-        .task;
+        let mut task = self.resolve_send_task(&owner, admission, immediate).await?;
         history(&mut task, length)?;
         Ok(SendMessageResponse::Task(task))
     }
@@ -214,28 +360,17 @@ impl RequestHandler for HarnxHandler {
     ) -> Result<Task, A2AError> {
         let owner = self.owner(params)?;
         let initial = self.task(&owner, &req.id).await?;
-        let initially_terminal = initial.task.status.state.is_terminal();
         #[cfg(test)]
         if let Some(gate) = &self.cancel_snapshot_gate {
             gate.after_snapshot(initial.task.status.state.clone()).await;
         }
-        let record = self.reconcile(&owner, initial).await?;
-        // The worker can complete mid-reconcile: we read a Working snapshot but the reconcile
-        // sees Completed. Return the completed task instead of task_not_cancelable.
-        // Verified by nats_http_cancel_returns_completed_when_completion_wins_after_snapshot.
-        if !initially_terminal && record.task.status.state == TaskState::Completed {
-            return Ok(record.task);
+        if let Some(task) = self
+            .cancel_hitl_if_active(&owner, &req.id, &initial)
+            .await?
+        {
+            return Ok(task);
         }
-        if record.task.status.state.is_terminal() {
-            return Err(A2AError::task_not_cancelable(&record.task.id));
-        }
-        Ok(self
-            .backend
-            .runner
-            .cancel_task(&self.export, &owner, &req.id)
-            .await
-            .map_err(map_error)?
-            .task)
+        self.cancel_standard_task(&owner, &req.id, initial).await
     }
     async fn list_tasks(
         &self,
@@ -274,13 +409,12 @@ impl RequestHandler for HarnxHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let owner = self.owner(params)?;
         let (admission, length) = self.admit_request(owner.clone(), req).await?;
-        let record = self.reconcile(&owner, admission.snapshot).await?;
-        let (mut snapshot, events) = self
-            .backend
-            .runner
-            .stream_snapshot(&self.export, &owner, &record.task.id)
-            .await
-            .map_err(map_error)?;
+        let (mut snapshot, events) = if admission.direct || admission.events.is_some() {
+            (admission.snapshot, admission.events)
+        } else {
+            self.open_reconciled_stream(&owner, admission.snapshot)
+                .await?
+        };
         history(&mut snapshot.task, length)?;
         Ok(crate::sse::task_stream(snapshot, events))
     }

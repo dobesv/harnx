@@ -15,9 +15,20 @@ pub struct A2aEvent {
     pub response: StreamResponse,
 }
 
+/// Interrupted tasks end a response without ending the task's invocation.
+/// `InputRequired` and `AuthRequired` suspend the same admission; the task
+/// continues after a reply or continuation. Terminal states end both.
+pub fn ends_response(state: &TaskState) -> bool {
+    state.is_terminal() || matches!(state, TaskState::InputRequired | TaskState::AuthRequired)
+}
+
 impl A2aEvent {
     pub fn is_terminal(&self) -> bool {
         matches!(&self.response, StreamResponse::StatusUpdate(event) if event.status.state.is_terminal())
+    }
+
+    pub fn ends_response(&self) -> bool {
+        matches!(&self.response, StreamResponse::StatusUpdate(event) if ends_response(&event.status.state))
     }
 }
 
@@ -48,7 +59,7 @@ impl Output {
         last: bool,
         replace: bool,
     ) -> Option<TaskArtifactUpdateEvent> {
-        if !last && self.pending.is_empty() {
+        if !self.needs_artifact_update(last, replace) {
             return None;
         }
         Some(TaskArtifactUpdateEvent {
@@ -63,6 +74,13 @@ impl Output {
             last_chunk: Some(last),
             metadata: None,
         })
+    }
+
+    fn needs_artifact_update(&self, last: bool, replace: bool) -> bool {
+        if last || replace {
+            return true;
+        }
+        !self.pending.is_empty()
     }
 
     pub fn committed(&mut self) {

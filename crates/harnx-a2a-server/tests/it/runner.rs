@@ -8,7 +8,6 @@ use harnx_a2a_server::{
 };
 use harnx_core::{session::SessionLogEntry, session_identity::session_key};
 use harnx_runtime::{nats_session_log::NatsSessionLog, nats_session_metadata::session_properties};
-use serde_json::json;
 use tokio::sync::broadcast;
 
 fn prompt() -> Message {
@@ -221,40 +220,6 @@ async fn runner_cancel_mid_stream_is_canceled() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runner_confirmation_tool_is_denied_and_turn_terminates() -> Result<()> {
-    let h = Harness::start(Script::Tool).await?;
-    let session = h.session(None, &alice()).await?;
-    let mut started = h.send(&session, prompt()).await?;
-    terminal(&mut started.events).await?;
-    let task = h.task(&started.snapshot.task.id).await?;
-    assert_eq!(task.task.status.state, TaskState::Completed);
-    let entries = NatsSessionLog::new_with_replicas(h.jetstream.clone(), session.storage_key(), 1)
-        .load_events_async()
-        .await?;
-    // Routed confirmation uses a per-turn callback, not durable HITL entries.
-    // Its info log proves the ask reached our deny handler (rather than a hook
-    // startup failure or a deny decision made by the hook itself).
-    assert!(h.logs.text().contains("INFO harnx_a2a_server::runner: A2A tool confirmation denied tool=target_session_handoff tool_call_id=Some(\"runner-handoff\")"), "{}", h.logs.text());
-    assert!(entries.iter().any(|(_, entry)| matches!(entry, SessionLogEntry::ToolResults { results, .. }
-        if results.iter().any(|result| result.name == "target_session_handoff" && result.output["blocked_by_hook"] == json!(true)))));
-    assert!(!entries
-        .iter()
-        .any(|(_, entry)| matches!(entry, SessionLogEntry::HandoffCommitted { .. })));
-    let requests = h.llm.requests.lock();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1]["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|message| message["role"] == "tool"
-            && message["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("blocked_by_hook")));
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runner_jira_assignment_data_reaches_recorded_llm_request() -> Result<()> {
     let h = Harness::start(Script::Text).await?;
     let session = h.session(None, &alice()).await?;
@@ -286,6 +251,8 @@ async fn runner_jira_assignment_data_reaches_recorded_llm_request() -> Result<()
     terminal(&mut started.events).await?;
     Ok(())
 }
+
+mod hitl;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runner_busy_context_rejects_second_start_and_stale_cancel() -> Result<()> {

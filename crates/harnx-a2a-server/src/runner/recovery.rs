@@ -1,11 +1,15 @@
-//! Shared foreground/background settlement. Never activates or appends a missing
-//! prompt; only durable completion, closure or exact scoped stop permits release.
-use super::authority::{stage_terminal, OwnedTask, TaskReservation};
+//! Shared terminal settlement. HITL recovery can follow an existing continuation,
+//! but never appends a missing prompt or changes its fixed ticket.
+use super::authority::{OwnedTask, TaskReservation};
 use super::*;
 use crate::store::context::AdmissionPhase;
+
+mod admission;
 mod artifact;
+mod hitl;
+mod hitl_progress;
+mod hitl_state;
 mod outcome;
-use outcome::{recovery_outcome, recovery_status};
 
 impl Runner {
     pub(super) async fn recover_admission(
@@ -13,58 +17,25 @@ impl Runner {
         session: &NatsSession,
         authority: &mut OwnedTask,
     ) -> Result<()> {
-        authority
-            .flush_pending(&self.store, session.storage_key())
-            .await?;
-        let active = authority
-            .context
-            .document
-            .state
-            .active
-            .as_ref()
-            .context("missing recovery task")?;
-        if active.snapshot.task.status.state.is_terminal() {
-            return authority.project_terminal(&self.store, session).await;
-        }
-        let ticket = authority.ticket(session.storage_key())?;
-        let (state, text, phase, prompt) = recovery_outcome(
-            session,
-            &ticket,
-            active.cancel.is_some(),
-            super::limits::task_output_limit(&self.store, &authority.context).await?,
-        )
-        .await?;
-        if let Some(text) = text.as_deref().filter(|_| state == TaskState::Completed) {
-            artifact::recover_artifact(authority, &self.store, session, text).await?;
-        }
-        authority
-            .update(&self.store, session.storage_key(), |active| {
-                active.snapshot.task.status =
-                    recovery_status(state.clone(), text.as_deref(), active.cancel.is_some());
-                if state == TaskState::Completed {
-                    active.snapshot.task.artifacts = text.clone().map(|text| vec![artifact(text)]);
-                    if let Some(message) = active.snapshot.task.status.message.clone() {
-                        active
-                            .snapshot
-                            .task
-                            .history
-                            .get_or_insert_with(Vec::new)
-                            .push(message);
-                    }
-                }
-                active.admission.phase = phase.clone();
-                active.admission.prompt_sequence = prompt;
-                if let Some(prompt) = prompt {
-                    active.snapshot.user_msg_seq = prompt;
-                }
-                active.stop_confirmed = true;
-                stage_terminal(active);
-            })
-            .await?;
-        authority.project_terminal(&self.store, session).await
+        admission::recover_admission(self, session, authority).await
     }
-    pub(super) async fn reconcile_coordinated(
+
+    async fn read_unowned_coordinated_task(
         &self,
+        export: &Export,
+        session: &NatsSession,
+        task_id: &str,
+    ) -> Result<TaskRecord> {
+        let record = self
+            .store
+            .get_task(session.storage_key(), task_id)
+            .await?
+            .context("active task missing")?;
+        Ok(self.live_record(export, record).await)
+    }
+
+    pub(super) async fn reconcile_coordinated(
+        self: &Arc<Self>,
         export: &Export,
         session: &NatsSession,
         record: TaskRecord,
@@ -73,36 +44,27 @@ impl Runner {
             return Ok(record);
         }
         let Some(lease) = self.candidate_lease(session.storage_key()).await? else {
-            // Absence of a local handle is never absence of an owner.
-            let record = self
-                .store
-                .get_task(session.storage_key(), &record.task.id)
-                .await?
-                .context("active task missing")?;
-            return Ok(self.live_record(export, record).await);
+            return self
+                .read_unowned_coordinated_task(export, session, &record.task.id)
+                .await;
         };
-        let mut authority = self.claim_context(session, lease).await?;
-        self.recover_admission(session, &mut authority).await?;
-        let record = self
-            .store
+        let authority = self.claim_context(session, lease).await?;
+        // Keep the continuation launch future off blocking waiters' stack frames.
+        Box::pin(self.recover_registered_task(export, session.clone(), authority)).await?;
+        self.store
             .get_task(session.storage_key(), &record.task.id)
             .await?
-            .context("recovered task missing")?;
-        authority
-            .release(&self.store, session.storage_key())
-            .await?;
-        Ok(record)
+            .context("recovered task missing")
     }
 }
 
 impl Runner {
-    pub(crate) async fn recover_first_reservation(
+    async fn ensure_first_reservation_allocated(
         &self,
         session: &NatsSession,
+        authority: &mut OwnedTask,
         reservation: &crate::store::FirstMessageReservation,
-        lease: Arc<harnx_runtime::nats_lease::NatsSessionLease>,
-    ) -> Result<TaskRecord> {
-        let mut authority = self.claim_context(session, lease).await?;
+    ) -> Result<()> {
         match &authority.context.document.state.active {
             None => {
                 authority
@@ -116,12 +78,27 @@ impl Runner {
                         },
                     )
                     .await?;
+                Ok(())
             }
-            Some(active) => anyhow::ensure!(
-                active.snapshot.task.id == reservation.allocation.task_id,
-                "reserved first task disappeared before recovery"
-            ),
+            Some(active) => {
+                anyhow::ensure!(
+                    active.snapshot.task.id == reservation.allocation.task_id,
+                    "reserved first task disappeared before recovery"
+                );
+                Ok(())
+            }
         }
+    }
+
+    pub(crate) async fn recover_first_reservation(
+        &self,
+        session: &NatsSession,
+        reservation: &crate::store::FirstMessageReservation,
+        lease: Arc<harnx_runtime::nats_lease::NatsSessionLease>,
+    ) -> Result<TaskRecord> {
+        let mut authority = self.claim_context(session, lease).await?;
+        self.ensure_first_reservation_allocated(session, &mut authority, reservation)
+            .await?;
         self.recover_admission(session, &mut authority).await?;
         let record = self
             .store
@@ -136,6 +113,37 @@ impl Runner {
 }
 
 impl Runner {
+    async fn fail_abandoned_legacy_orphan(
+        &self,
+        session: &NatsSession,
+        task_id: &str,
+        revision: u64,
+    ) -> Result<TaskRecord> {
+        #[cfg(feature = "fault-injection")]
+        self.hooks
+            .checkpoint(crate::fault_injection::Boundary::OrphanCancel)
+            .await;
+        if let Err(error) = session.cancel_pending_turn().await {
+            warn!(%task_id, %error, "orphan remote cancellation failed");
+        }
+        self.store
+            .update_task(
+                TaskVersion {
+                    storage_key: session.storage_key(),
+                    task_id,
+                    revision,
+                },
+                TaskChanges {
+                    status: Some(status(
+                        TaskState::Failed,
+                        Some("interrupted by server restart"),
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await
+    }
+
     pub(super) async fn reconcile_legacy_orphan(
         &self,
         access: TaskAccess<'_>,
@@ -165,38 +173,26 @@ impl Runner {
         if record.task.status.state.is_terminal() {
             return Ok(record);
         }
-        if let Some(handle) = active.as_ref().filter(|handle| !*handle.done.borrow()) {
-            if handle.task_id == task_id {
-                return Ok(record);
-            }
-            // Never send a session-wide cancel at a newer live task.
-            return Err(RunnerError::Busy.into());
+        if let Some(result) = check_live_handle(&active, task_id, &record) {
+            return result;
         }
         // A completed supervisor with nonterminal KV state failed persistence.
         // Treat it as abandoned, rather than waiting for a writer that has stopped.
         *active = None;
-        #[cfg(feature = "fault-injection")]
-        self.hooks
-            .checkpoint(crate::fault_injection::Boundary::OrphanCancel)
-            .await;
-        if let Err(error) = session.cancel_pending_turn().await {
-            warn!(%task_id, %error, "orphan remote cancellation failed");
-        }
-        self.store
-            .update_task(
-                TaskVersion {
-                    storage_key: session.storage_key(),
-                    task_id,
-                    revision: record.revision,
-                },
-                TaskChanges {
-                    status: Some(status(
-                        TaskState::Failed,
-                        Some("interrupted by server restart"),
-                    )),
-                    ..Default::default()
-                },
-            )
+        self.fail_abandoned_legacy_orphan(session, task_id, record.revision)
             .await
+    }
+}
+
+fn check_live_handle(
+    active: &Option<Arc<RunnerHandle>>,
+    task_id: &str,
+    record: &TaskRecord,
+) -> Option<Result<TaskRecord>> {
+    let handle = active.as_ref().filter(|handle| !*handle.done.borrow())?;
+    if handle.task_id == task_id {
+        Some(Ok(record.clone()))
+    } else {
+        Some(Err(RunnerError::Busy.into()))
     }
 }

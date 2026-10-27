@@ -15,37 +15,15 @@ struct FirstCandidate {
 }
 
 impl HarnxHandler {
-    pub(super) async fn admit_first_message(
+    async fn start_reserved_first_turn(
         &self,
         owner: &RequestIdentity,
-        request: MessageAdmission,
+        candidate: FirstCandidate,
+        input: harnx_core::input::Input,
     ) -> Result<Admission, A2AError> {
-        let input = message_to_input(&request.message, self.limits)
-            .map_err(|error| map_error(error.into()))?;
         let FirstCandidate {
-            reservation,
-            lease,
-            own,
-        } = self.reserve_first_candidate(request).await?;
-        if !own {
-            lease.release().await.map_err(map_error)?;
-            return self
-                .follow_first_reservation(owner, &reservation)
-                .await
-                .map(Admission::retry);
-        }
-        #[cfg(feature = "fault-injection")]
-        self.backend
-            .runner
-            .fault_hooks()
-            .checkpoint(crate::fault_injection::Boundary::FirstReservation)
-            .await;
-        if !lease.revalidate_ownership().await.map_err(map_error)? {
-            return self
-                .follow_first_reservation(owner, &reservation)
-                .await
-                .map(Admission::retry);
-        }
+            reservation, lease, ..
+        } = candidate;
         let session = self
             .initialize_reserved_session(owner, &reservation)
             .await?;
@@ -63,11 +41,11 @@ impl HarnxHandler {
                     export: &self.export,
                     owner,
                     session,
-                    message: reservation.message.clone(),
+                    message: reservation.message,
                 },
                 input,
                 crate::runner::AllocatedAdmission {
-                    allocation: reservation.allocation.clone(),
+                    allocation: reservation.allocation,
                     lease,
                     fixed_predecessor: Some(0),
                 },
@@ -77,7 +55,46 @@ impl HarnxHandler {
         Ok(Admission {
             snapshot: started.snapshot,
             deduped: false,
+            response_after: None,
+            direct: false,
+            events: None,
         })
+    }
+
+    pub(super) async fn admit_first_message(
+        &self,
+        owner: &RequestIdentity,
+        request: MessageAdmission,
+    ) -> Result<Admission, A2AError> {
+        let input = message_to_input(&request.message, self.limits)
+            .map_err(|error| map_error(error.into()))?;
+        let candidate = self.reserve_first_candidate(request).await?;
+        if !candidate.own {
+            candidate.lease.release().await.map_err(map_error)?;
+            return self
+                .follow_first_reservation(owner, &candidate.reservation)
+                .await
+                .map(Admission::retry);
+        }
+        #[cfg(feature = "fault-injection")]
+        self.backend
+            .runner
+            .fault_hooks()
+            .checkpoint(crate::fault_injection::Boundary::FirstReservation)
+            .await;
+        if !candidate
+            .lease
+            .revalidate_ownership()
+            .await
+            .map_err(map_error)?
+        {
+            return self
+                .follow_first_reservation(owner, &candidate.reservation)
+                .await
+                .map(Admission::retry);
+        }
+        self.start_reserved_first_turn(owner, candidate, input)
+            .await
     }
     pub(super) async fn follow_first_reservation(
         &self,
