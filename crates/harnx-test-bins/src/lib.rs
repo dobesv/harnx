@@ -11,7 +11,7 @@ use tempfile::TempDir;
 pub struct NatsServerHandle {
     /// Client URL for the server.
     pub url: String,
-    _store_dir: TempDir,
+    store_dir: Option<TempDir>,
     _ports_dir: TempDir,
     child: Child,
 }
@@ -20,6 +20,24 @@ impl NatsServerHandle {
     /// Client URL for the server.
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Kill the server. Call [`Self::wait`] to reap it before continuing a test.
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    /// Wait for the server to exit, normally after calling [`Self::kill`].
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+
+    /// Transfer the store directory guard to the caller, at most once.
+    ///
+    /// Dropping it while the server runs deletes JetStream's store from under
+    /// it, so callers that need the server afterwards should hold it longer.
+    pub fn take_store_dir(&mut self) -> Option<TempDir> {
+        self.store_dir.take()
     }
 }
 
@@ -92,7 +110,7 @@ async fn try_spawn_nats_server(binary: &Path) -> Result<NatsServerHandle> {
 
     Ok(NatsServerHandle {
         url,
-        _store_dir: store_dir,
+        store_dir: Some(store_dir),
         _ports_dir: ports_dir,
         child,
     })
@@ -111,11 +129,14 @@ fn nats_server_binary() -> Option<PathBuf> {
 async fn wait_for_nats_ready(url: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        match tokio::time::timeout(Duration::from_secs(1), async_nats::connect(url)).await {
-            Ok(Ok(client)) => {
-                client.flush().await.context("flush NATS test connection")?;
-                return Ok(());
-            }
+        let probe = async {
+            let client = async_nats::connect(url)
+                .await
+                .context("connect to NATS test server")?;
+            client.flush().await.context("flush NATS test connection")
+        };
+        match tokio::time::timeout(Duration::from_secs(1), probe).await {
+            Ok(Ok(())) => return Ok(()),
             Ok(Err(error)) if Instant::now() >= deadline => {
                 return Err(error).context("NATS test server did not become ready");
             }
