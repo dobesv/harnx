@@ -861,7 +861,7 @@ export const sendFailHandlers = [
       return new HttpResponse(null, { status: 500, statusText: 'Internal Server Error' });
     }
 
-    return new HttpResponse(createAgUiStream({ session: 'session-1', body }), {
+    return new HttpResponse(createAgUiStream({ session: String(params.session), body }), {
       headers: {
         'Content-Type': 'text/event-stream'
       }

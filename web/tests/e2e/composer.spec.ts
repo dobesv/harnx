@@ -49,11 +49,16 @@ test('queued prompts remain visible and the composer accepts another message', a
   await input.fill('first queued message');
   await page.locator('.aui-composer-send').click();
   await expect(page.locator('.aui-queued-message')).toContainText('first queued message');
+  const announcements = page.getByRole('log', { name: 'Queued messages' });
+  await expect(announcements).toHaveAttribute('aria-live', 'polite');
+  await expect(announcements).toHaveAttribute('aria-relevant', 'additions');
+  await expect(announcements).toHaveText('Message accepted and queued.');
   await expect(input).toBeEnabled();
 
   await input.fill('second queued message');
   await page.locator('.aui-composer-send').click();
   await expect(page.locator('.aui-queued-message')).toHaveCount(2);
+  await expect(announcements.locator('div')).toHaveCount(2);
   await expect(input).toBeEnabled();
 
   await page.evaluate(() => (window as any).__msw.flushQueuedPrompts());

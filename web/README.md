@@ -75,6 +75,10 @@ adding one there would cause a promptless session refresh to resend it as a new
 turn. `pendingPrompts.ts` retires each queued row by ID when hydration completes.
 If an older server omits `message_id`, the accepted row stays visible until a
 page reload because the client cannot safely identify its transcript counterpart.
+If another client deletes or rewinds an acknowledged row before this tab hydrates
+it, its queued placeholder can also remain until reload. Retiring that placeholder
+safely requires an authoritative deletion signal; a timeout could hide a prompt
+that is still queued behind a long-running turn.
 
 ## Build and CI
 

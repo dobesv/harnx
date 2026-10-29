@@ -824,6 +824,9 @@ const MyThread = ({
   return (
     <ThreadPrimitive.Root className={`aui-thread ${isEmpty && reconciled.prompts.length === 0 ? 'aui-thread-empty' : ''}`}>
       <RunStateMonitor onRunFinish={onRunFinish} />
+      <div role="log" aria-label="Queued messages" aria-live="polite" aria-relevant="additions" className="aui-visually-hidden">
+        {reconciled.prompts.map((prompt) => <div key={prompt.id}>Message accepted and queued.</div>)}
+      </div>
 
       {(!isEmpty || reconciled.prompts.length > 0) && (
         <ThreadPrimitive.Viewport className="aui-thread-viewport">
