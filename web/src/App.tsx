@@ -246,13 +246,19 @@ function handleSendFailure({
   focusAndResize();
 }
 
-async function clearAcceptedPrompt(
+async function clearAcceptedPrompt({
+  resetComposerInput,
+  setErrorText,
+  setIsSending,
+  attachments,
+  setBlockedAttachmentIds,
+}: {
   resetComposerInput: () => Promise<void>,
   setErrorText: (text: string | null) => void,
   setIsSending: (sending: boolean) => void,
   attachments: readonly Attachment[],
   setBlockedAttachmentIds: (ids: Set<string>) => void,
-): Promise<void> {
+}): Promise<void> {
   try {
     await resetComposerInput();
   } catch (error) {
@@ -439,7 +445,7 @@ export const MyComposer = ({
         // locally until its server-authored row is hydrated, then let the user
         // compose another message without waiting for that run to finish.
         recordAcceptedPrompt(result, text, savedAttachments, onPromptQueued);
-        await clearAcceptedPrompt(resetComposerInput, setErrorText, setIsSending, savedAttachments, setBlockedAttachmentIds);
+        await clearAcceptedPrompt({ resetComposerInput, setErrorText, setIsSending, attachments: savedAttachments, setBlockedAttachmentIds });
       };
 
       doSend().catch(err => {
