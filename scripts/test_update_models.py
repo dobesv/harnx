@@ -25,6 +25,7 @@ from update_models_openai_tests import (
     TestOpenAIReasoningSummaryDefault,
 )
 from update_models_variant_tests import (
+    TestDirectProviderRules,
     TestOpenAIEffortVariants,
     TestProviderModelRegeneration,
 )

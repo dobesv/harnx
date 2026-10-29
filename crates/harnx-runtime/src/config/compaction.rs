@@ -516,6 +516,7 @@ compaction_tool_output_max_chars: 50\n\
                 text: "checking".into(),
                 thought: None,
                 sequence: false,
+                rounds: Vec::new(),
                 tool_results: vec![ToolResult {
                     call: ToolCall::new("read".into(), json!({}), Some(id.into()), None),
                     output: json!({"text": "word ".repeat(words)}),
@@ -853,6 +854,7 @@ compaction_tool_output_max_chars: 50\n\
                     text: "let me check".into(),
                     thought: None,
                     sequence: false,
+                    rounds: Vec::new(),
                     tool_results: vec![ToolResult {
                         call: ToolCall::new(
                             "bash".into(),

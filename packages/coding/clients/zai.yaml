@@ -1,0 +1,8 @@
+type: openai-compatible
+api_base: https://api.z.ai/api/paas/v4
+model_catalog: zai
+
+# Optional direct GLM route. Set ZAI_API_KEY in ~/.local/share/harnx/.env.
+# For a GLM Coding Plan key, override api_base with:
+# https://api.z.ai/api/coding/paas/v4
+# See pantheon/MODELS.md for the opt-in agent patch.

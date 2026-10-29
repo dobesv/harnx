@@ -4,7 +4,7 @@ model: codex:gpt-6-astra:max
 model_fallbacks:
 - openai:gpt-6-astra:max
 - claude:claude-fable-5-1:max
-- gemini:gemini-3.8-flash
+- gemini:gemini-4-argon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-dev
 use_tools:

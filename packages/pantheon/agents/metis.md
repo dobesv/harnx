@@ -1,10 +1,10 @@
 ---
 role: subagent
-model: bedrock:zai.glm-5
+model: bedrock:us.zai.glm-5.3
 model_fallbacks:
 - gemini:gemini-3.8-flash
-- codex:gpt-5.6-terra
-- openai:gpt-5.6-terra
+- codex:gpt-6.1-sol
+- openai:gpt-6.1-sol
 - claude:claude-sonnet-5-5
 compaction_agent: compact-planner
 use_tools:

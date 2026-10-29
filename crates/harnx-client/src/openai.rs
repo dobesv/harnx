@@ -1,10 +1,7 @@
 use crate::*;
 
 use harnx_core::{
-    message::MessageContentPart,
     model::{normalize_cache_usage, RawCacheUsage},
-    text::strip_think_tag,
-    tool::ToolResult,
 };
 
 use anyhow::{bail, Context, Result};
@@ -14,36 +11,6 @@ use serde_json::{json, Value};
 
 const API_BASE: &str = "https://api.openai.com/v1";
 
-
-fn openai_collect_tool_result_images(tool_results: &[ToolResult]) -> Vec<Value> {
-    tool_results
-        .iter()
-        .flat_map(|tool_result| tool_result.content.iter())
-        .filter_map(|part| match part {
-            MessageContentPart::ImageUrl { image_url } => Some(json!({
-                "type": "image_url",
-                "image_url": { "url": image_url.url },
-            })),
-            MessageContentPart::Text { .. } => None,
-        })
-        .collect()
-}
-
-fn openai_tool_message_content(tool_result: &ToolResult) -> String {
-    let output = tool_result.output.to_string();
-    if tool_result
-        .content
-        .iter()
-        .any(|part| matches!(part, MessageContentPart::ImageUrl { .. }))
-    {
-        format!(
-            "{output}\n[Tool {} returned image(s): see next message]",
-            tool_result.call.name
-        )
-    } else {
-        output
-    }
-}
 
 impl OpenAIClient {
     config_get_fn!(api_key, get_api_key);
@@ -287,7 +254,11 @@ pub(crate) fn openai_handle_stream_event(
     if let Some(_err) = data["error"].as_object() {
         return crate::catch_stream_error(data);
     }
-    openai_handle_text_delta(state, handler, data)?;
+    if tool_replay::requires_reasoning_replay(model) {
+        tool_replay::streamed_text(handler, data)?;
+    } else {
+        openai_handle_text_delta(state, handler, data)?;
+    }
     openai_handle_tool_call_delta(state, handler, data)?;
     openai_handle_final_usage(handler, data, model);
     Ok(())
@@ -347,151 +318,14 @@ struct EmbeddingsResBodyEmbedding {
     embedding: Vec<f32>,
 }
 
-pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Value {
-    let ChatCompletionsData {
-        messages,
-        temperature,
-        top_p,
-        functions,
-        stream,
-        attachments_dir: _,  // OpenAI uses the runtime base64 pre-pass
-    } = data;
+mod chat_request;
+pub use chat_request::openai_build_chat_completions_body;
 
-    let messages_len = messages.len();
-    let messages: Vec<Value> = messages
-        .into_iter()
-        .enumerate()
-        .flat_map(|(i, message)| {
-            let Message { role, content, .. } = message;
-            match content {
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results,
-                    text: _,
-                    thought: _,
-                    sequence,
-                }) => {
-                    let trailing_image_parts = openai_collect_tool_result_images(&tool_results);
-                    if !sequence {
-                        let tool_calls: Vec<_> = tool_results
-                            .iter()
-                            .map(|tool_result| {
-                                json!({
-                                    "id": tool_result.call.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_result.call.name,
-                                        "arguments": tool_result.call.arguments.to_string(),
-                                    },
-                                })
-                            })
-                            .collect();
-                        let mut messages = vec![
-                            json!({ "role": MessageRole::Assistant, "tool_calls": tool_calls }),
-                        ];
-                        for tool_result in &tool_results {
-                            messages.push(json!({
-                                "role": "tool",
-                                "content": openai_tool_message_content(tool_result),
-                                "tool_call_id": tool_result.call.id,
-                            }));
-                        }
-                        if !trailing_image_parts.is_empty() {
-                            messages.push(json!({
-                                "role": MessageRole::User,
-                                "content": trailing_image_parts,
-                            }));
-                        }
-                        messages
-                    } else {
-                        let mut messages: Vec<_> = tool_results
-                            .into_iter()
-                            .flat_map(|tool_result| {
-                                vec![
-                                    json!({
-                                        "role": MessageRole::Assistant,
-                                        "tool_calls": [
-                                            {
-                                                "id": tool_result.call.id,
-                                                "type": "function",
-                                                "function": {
-                                                    "name": tool_result.call.name,
-                                                    "arguments": tool_result.call.arguments.to_string(),
-                                                },
-                                            }
-                                        ]
-                                    }),
-                                    json!({
-                                        "role": "tool",
-                                        "content": openai_tool_message_content(&tool_result),
-                                        "tool_call_id": tool_result.call.id,
-                                    })
-                                ]
-                            })
-                            .collect();
-                        if !trailing_image_parts.is_empty() {
-                            messages.push(json!({
-                                "role": MessageRole::User,
-                                "content": trailing_image_parts,
-                            }));
-                        }
-                        messages
-                    }
-                }
-                MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
-                    vec![json!({ "role": role, "content": strip_think_tag(&text) }
-                    )]
-                }
-                _ => vec![json!({ "role": role, "content": content })],
-            }
-        })
-        .collect();
+mod tool_replay;
 
-    let mut body = json!({
-        "model": &model.real_name(),
-        "messages": messages,
-    });
-
-    if let Some(v) = model.max_tokens_param() {
-        // Check if patches specify max_tokens: null (should use max_completion_tokens instead)
-        let patches_have_null_max_tokens = model
-            .patches()
-            .map(|p| {
-                p.iter().any(|expr| {
-                    // jq patches use field-path syntax: `.body.max_tokens = null`
-                    // (not quoted JSON key form like `"max_tokens"`)
-                    expr.contains(".max_tokens") && expr.contains("null")
-                })
-            })
-            .unwrap_or(false);
-        if patches_have_null_max_tokens {
-            body["max_completion_tokens"] = v.into();
-        } else {
-            body["max_tokens"] = v.into();
-        }
-    }
-    if let Some(v) = temperature {
-        body["temperature"] = v.into();
-    }
-    if let Some(v) = top_p {
-        body["top_p"] = v.into();
-    }
-    if stream {
-        body["stream"] = true.into();
-        body["stream_options"] = json!({"include_usage": true});
-    }
-    if let Some(functions) = functions {
-        body["tools"] = functions
-            .iter()
-            .map(|v| {
-                json!({
-                    "type": "function",
-                    "function": v,
-                })
-            })
-            .collect();
-    }
-    body
-}
+#[cfg(test)]
+#[path = "openai/reasoning_replay_tests.rs"]
+mod reasoning_replay_tests;
 
 pub fn openai_build_embeddings_body(data: &EmbeddingsData, model: &Model) -> Value {
     json!({
@@ -544,8 +378,7 @@ pub fn openai_extract_chat_completions(
     let reasoning = data["choices"][0]["message"]["reasoning_content"]
         .as_str()
         .or_else(|| data["choices"][0]["message"]["reasoning"].as_str())
-        .unwrap_or_default()
-        .trim();
+        .unwrap_or_default();
 
     let mut tool_calls = vec![];
     if let Some(calls) = data["choices"][0]["message"]["tool_calls"].as_array() {
@@ -571,11 +404,7 @@ pub fn openai_extract_chat_completions(
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
-    let text = if !reasoning.is_empty() {
-        format!("<think>\n{reasoning}\n</think>\n\n{text}")
-    } else {
-        text.to_string()
-    };
+    let (text, thought) = tool_replay::split_output_reasoning(text, reasoning, model);
     let usage = data
         .get("usage")
         .filter(|value| value.is_object())
@@ -583,7 +412,7 @@ pub fn openai_extract_chat_completions(
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
-        thought: None,
+        thought,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: usage.as_ref().map(|usage| usage.input_tokens),
         output_tokens: usage.as_ref().map(|usage| usage.output_tokens),

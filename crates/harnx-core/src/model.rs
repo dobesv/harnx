@@ -621,7 +621,8 @@ pub struct ModelsOverride {
     pub list: Vec<ProviderModels>,
 }
 
-fn request_image_count(content: &MessageContent) -> usize {
+/// Count images in a message, including images returned by tools.
+pub fn request_image_count(content: &MessageContent) -> usize {
     let count = |parts: &[MessageContentPart]| {
         parts
             .iter()

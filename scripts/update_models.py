@@ -279,6 +279,12 @@ PROVIDER_COMMENTS = {
         "#  - https://open.bigmodel.cn/pricing",
         "#  - https://open.bigmodel.cn/dev/api#glm-4",
     ],
+    "zai": [
+        "# International Z.AI API; curated separately from the China catalog.",
+        "# Links:",
+        "#  - https://docs.z.ai/guides/llm/glm-5.3",
+        "#  - https://docs.z.ai/guides/overview/pricing",
+    ],
     "minimax": [
         "# Links:",
         "# - https://platform.minimaxi.com/docs/guides/pricing-paygo",

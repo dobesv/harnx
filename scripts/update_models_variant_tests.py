@@ -12,6 +12,30 @@ GEMINI_THOUGHTS_PATCH = (
 )
 
 
+class TestDirectProviderRules(unittest.TestCase):
+    def test_curated_zai_provider_can_be_preserved_and_rendered(self) -> None:
+        old = {"glm-5.3": {"name": "glm-5.3", "max_input_tokens": 868928}}
+        models = um.regenerate_provider_models("zai", old, None, [])
+        block = um.render_provider_block("zai", models)
+        self.assertIn("provider: zai", block)
+        self.assertIn("name: glm-5.3", block)
+        self.assertIn("https://docs.z.ai/", block)
+
+    def test_refreshed_direct_models_retain_supported_reasoning(self) -> None:
+        for provider, name, effort in (("zai", "glm-5.3", "high"), ("minimax", "MiniMax-M3.1-Flash", "low")):
+            with self.subTest(provider=provider):
+                old = {name: {"name": name, "patches": ["stale"]}}
+                refreshed = {name: {"name": name, "max_input_tokens": 1000000}}
+                models = um.regenerate_provider_models(provider, old, refreshed, [])
+                patch = models[0]["patches"][0]
+                self.assertIn(f'.body.reasoning_effort = "{effort}"', patch)
+                self.assertNotIn('"disabled"', patch)
+                if provider == "minimax":
+                    self.assertIn(".body.max_completion_tokens", patch)
+                    self.assertIn("del(.body.max_tokens)", patch)
+                    self.assertEqual((models[0]["max_input_tokens"], models[0]["max_output_tokens"]), (868928, 131072))
+
+
 class TestOpenAIEffortVariants(unittest.TestCase):
     def _base(self, name: str = "gpt-5.6-sol") -> dict:
         return {
@@ -55,6 +79,7 @@ class TestOpenAIEffortVariants(unittest.TestCase):
             "gpt-6-astra",
             "gpt-6-sol",
             "gpt-6.1-sol",
+            "gpt-6.1-terra",
             "gpt-6-luna",
         ):
             with self.subTest(name=name):
@@ -170,6 +195,7 @@ class TestProviderModelRegeneration(unittest.TestCase):
             "us.anthropic.claude-opus-5:thinking",
             "us.anthropic.claude-sonnet-5:thinking",
             "us.anthropic.claude-sonnet-5-5:thinking",
+            "us.anthropic.claude-haiku-5-5:thinking",
         })
         self.assertGreater(older_thinking, 0)
 
@@ -259,7 +285,6 @@ class TestProviderModelRegeneration(unittest.TestCase):
     def test_new_gemini_thinking_models_request_thoughts(self) -> None:
         # A model the registry adds has no curated patch to carry over.
         models = [
-            {"name": "gemini-4-argon", "supports_tool_use": True},
             {"name": "gemini-4-argon-cyber-permissive"},
             {"name": "gemini-2.5-flash"},
             {"name": "argon-latest", "real_name": "gemini-4-argon"},
@@ -271,6 +296,34 @@ class TestProviderModelRegeneration(unittest.TestCase):
                     self.assertEqual(
                         regenerated[model["name"]].get("patches"), [GEMINI_THOUGHTS_PATCH]
                     )
+
+    def test_argon_refresh_preserves_single_request_context_and_output_limits(self) -> None:
+        name = "gemini-4-argon"
+        fetched = {
+            name: {
+                "name": name, "max_input_tokens": 1048576,
+                "max_output_tokens": 1048576, "input_price": 2, "output_price": 10,
+            }
+        }
+        old = {name: {"name": name, "patches": ["stale"]}}
+        models = um.regenerate_provider_models("gemini", old, fetched, [])
+        model = models[0]
+        self.assertEqual(model["max_input_tokens"], 983040)
+        self.assertEqual(model["max_output_tokens"], 65536)
+        self.assertTrue(model["require_max_tokens"])
+        self.assertEqual(model["input_price"], 2)
+        self.assertIn("includeThoughts", model["patches"][0])
+        self.assertNotIn("stale", model["patches"][0])
+
+    def test_glm_5_3_effort_patch_survives_refresh(self) -> None:
+        name = "us.zai.glm-5.3"
+        _, providers = um.load_existing_data()
+        old = {name: providers["bedrock"][name]}
+        refreshed = um.regenerate_provider_models(
+            "bedrock", old, {name: {"name": name, "max_input_tokens": 1000000}}, []
+        )[0]
+        self.assertEqual(refreshed["patches"], old[name]["patches"])
+        self.assertIn('"reasoning_effort":"high"', refreshed["patches"][0])
 
     def test_gemini_models_that_do_not_think_get_no_patch(self) -> None:
         models = [
@@ -305,30 +358,33 @@ class TestProviderModelRegeneration(unittest.TestCase):
         name = "us.anthropic.claude-opus-5-5"
         self.assertEqual(um.thinking_variants({"name": name}, "bedrock"), [])
 
-    def test_bedrock_sonnet_5_5_adaptive_correction_survives_regeneration(self) -> None:
+    def test_bedrock_adaptive_corrections_survive_regeneration(self) -> None:
         _, providers = um.load_existing_data()
-        name = "us.anthropic.claude-sonnet-5-5"
-        alias = f"{name}:thinking"
-        old = {key: providers["bedrock"][key] for key in (name, alias)}
-        fetched = {name: dict(old[name], input_price=3)}
-        regenerated = {
-            model["name"]: model
-            for model in um.regenerate_provider_models("bedrock", old, fetched, [])
-        }
-        variant = regenerated[alias]
-        self.assertEqual(variant["patches"], old[alias]["patches"])
-        self.assertEqual(variant["real_name"], name)
-        self.assertEqual(variant["max_output_tokens"], 24000)
-        self.assertTrue(variant["require_max_tokens"])
-        self.assertEqual(variant["input_price"], 3)
-        patch = variant["patches"][0]
-        self.assertIn('"type":"adaptive","display":"summarized"', patch)
-        self.assertIn('"output_config":{"effort":"high"}', patch)
-        self.assertNotIn("budget_tokens", patch)
-        self.assertNotIn("patches", regenerated[name])
-        self.assertEqual(regenerated[name]["max_output_tokens"], 128000)
+        for name, effort in (
+            ("us.anthropic.claude-sonnet-5-5", "high"),
+            ("us.anthropic.claude-haiku-5-5", "medium"),
+        ):
+            alias = f"{name}:thinking"
+            old = {key: providers["bedrock"][key] for key in (name, alias)}
+            fetched = {name: dict(old[name], input_price=3)}
+            regenerated = {
+                model["name"]: model
+                for model in um.regenerate_provider_models("bedrock", old, fetched, [])
+            }
+            variant = regenerated[alias]
+            self.assertEqual(variant["patches"], old[alias]["patches"])
+            self.assertEqual(variant["real_name"], name)
+            self.assertEqual(variant["max_output_tokens"], 24000)
+            self.assertTrue(variant["require_max_tokens"])
+            self.assertEqual(variant["input_price"], 3)
+            patch = variant["patches"][0]
+            self.assertIn('"type":"adaptive","display":"summarized"', patch)
+            self.assertIn(f'"output_config":{{"effort":"{effort}"}}', patch)
+            self.assertNotIn("budget_tokens", patch)
+            self.assertNotIn("patches", regenerated[name])
+            self.assertEqual(regenerated[name]["max_output_tokens"], 128000)
 
-        # Only the probed model changes; don't migrate older aliases here.
+        # Older aliases retain their fixed-budget configuration.
         older = um.thinking_variants({"name": "us.anthropic.claude-sonnet-4-6"}, "bedrock")[0]
         self.assertIn('"type":"enabled","budget_tokens":16000', older["patches"][0])
 
@@ -362,6 +418,36 @@ class TestProviderModelRegeneration(unittest.TestCase):
         for model in models:
             self.assertIn("drop_block", model["patches"][0])
             self.assertIn("thinking-binding-controls-2026-08-01", model["patches"][0])
+
+    def test_haiku_5_5_refresh_replaces_fixed_budget_with_adaptive_thinking(self) -> None:
+        for provider, name in (
+            ("claude", "claude-haiku-5-5"),
+            ("vertexai", "claude-haiku-5-5"),
+            ("vertexai", "claude-haiku-5-5@default"),
+        ):
+            alias = f"{name}:thinking"
+            base = {
+                "name": name, "max_input_tokens": 1000000,
+                "max_output_tokens": 128000, "input_price": 0.1,
+            }
+            old = {alias: {"name": alias, "patches": [
+                '.body.thinking = {"type":"enabled","budget_tokens":16000}'
+            ]}}
+            models = um.regenerate_provider_models(provider, old, {name: base}, [])
+            by_name = {model["name"]: model for model in models}
+            with self.subTest(provider=provider, name=name):
+                self.assertEqual(set(by_name), {name, alias})
+                self.assertEqual(by_name[name]["max_output_tokens"], 128000)
+                self.assertEqual(by_name[alias]["max_output_tokens"], 24000)
+                self.assertEqual(by_name[alias]["real_name"], name)
+                for model in models:
+                    self.assertTrue(model["require_max_tokens"])
+                    self.assertEqual(model["max_input_tokens"], 1000000)
+                    patch = model["patches"][0]
+                    self.assertIn('"type":"adaptive"', patch)
+                    self.assertIn('"effort":"medium"', patch)
+                    self.assertNotIn("budget_tokens", patch)
+                    self.assertEqual("drop_block" in patch, provider == "claude")
 
     def test_openai_aliases_refresh_while_unowned_max_alias_survives(self) -> None:
         old_models = {

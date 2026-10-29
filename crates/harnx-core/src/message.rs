@@ -203,6 +203,17 @@ pub struct MessageContentToolCalls {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought: Option<String>,
     pub sequence: bool,
+    /// Generation boundaries for merged non-session tool rounds. Aggregate
+    /// text/thought remain available to older readers and rendering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rounds: Vec<ToolCallRound>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ToolCallRound {
+    pub tool_count: usize,
+    pub text: String,
+    pub thought: Option<String>,
 }
 
 impl MessageContentToolCalls {
@@ -212,10 +223,25 @@ impl MessageContentToolCalls {
             text,
             thought,
             sequence: false,
+            rounds: Vec::new(),
         }
     }
 
     pub fn merge(&mut self, tool_results: Vec<ToolResult>, text: String, thought: Option<String>) {
+        if self.rounds.is_empty() && !self.sequence {
+            self.rounds.push(ToolCallRound {
+                tool_count: self.tool_results.len(),
+                text: self.text.clone(),
+                thought: self.thought.clone(),
+            });
+        }
+        if !self.rounds.is_empty() {
+            self.rounds.push(ToolCallRound {
+                tool_count: tool_results.len(),
+                text: text.clone(),
+                thought: thought.clone(),
+            });
+        }
         self.tool_results.extend(tool_results);
         if !text.is_empty() {
             if !self.text.is_empty() {

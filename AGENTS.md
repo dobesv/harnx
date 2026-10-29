@@ -656,11 +656,13 @@ the two differ in more than wire format:
 
 - `type: bedrock` speaks Converse and signs with the AWS credential chain, so
   it is the one that works with rotating credentials such as IRSA in
-  Kubernetes. It is the only path that replays reasoning.
+  Kubernetes. It replays compatible signed reasoning blocks.
 - `type: openai-compatible` against `bedrock-runtime.../openai/v1`
   authenticates with a `BEDROCK_API_KEY` bearer token and cannot use the
-  credential chain. `openai.rs` discards the stored thought when building a
-  request, so nothing is replayed. Both shipped packages ship this variant.
+  credential chain. GLM 5.3 replays plaintext `reasoning_content` through the
+  model-specific rule in `openai/tool_replay.rs`; other models retain their
+  previous history shape. This does not replay Converse signatures. Both
+  shipped packages ship this client variant.
 
 On the Converse path the replay is gated on having captured a signature, and
 that gate is what keeps a hostile model safe rather than any per-model
@@ -877,11 +879,13 @@ escalates:
   the same way. `run_chat_completion_streaming` must never return a stopped
   stream as a partial reply, as it does after other stream errors.
 - Clients that read an OpenAI chat-completions stream, such as
-  `openai-compatible` and `llama-server`, send reasoning through the answer
+  `openai-compatible` and `llama-server`, usually send reasoning through the answer
   channel inside `<think>` tags (`openai_transition_reasoning` in
   `crates/harnx-client/src/openai.rs`), so it shares the answer's detector. A
   reasoning loop on those providers is still caught, but it is reported as
   `answer`, both in the retry note's wording and as the stop's `source`.
+  GLM 5.3 and MiniMax M3.1 Flash use `handler.thought` instead, preserving raw
+  reasoning for tool continuation and using the separate thinking detector.
 - The retry layer (`harnx_engine::retry`) retries that model once,
   immediately, with `Input.transient_note`, a user message added to requests
   but never persisted, then tries the next fallback with the note and without
@@ -1914,7 +1918,7 @@ The request estimator (`Model::estimate_request_tokens`) covers messages, tool d
 
 ### Context overflow recovery
 
-When a provider rejects a request with a context-overflow error (HTTP 400/413 with recognized error phrases), the shared agent loop forces compaction and retries once (`agent_loop/overflow.rs`). Threshold is ignored — this runs even when `compress_threshold: 0`.
+When a provider rejects a request with a context-overflow error (HTTP 400/413 with recognized error phrases), the retry layer first tries configured fallbacks without a model cooldown for request incompatibility. If none succeeds and overflow is retained, `retry/failure.rs` restores the overflowing model on `Input` so the shared agent loop can force compaction and retry the chain once (`agent_loop/overflow.rs`). Threshold is ignored — this runs even when `compress_threshold: 0`. Missing credentials and incompatible fallbacks preserve that overflow; malformed requests and exhausted transport/server failures keep their own errors.
 
 `LlmError::is_context_overflow` (`harnx-core/src/error.rs`) matches provider-specific phrases for OpenAI, Anthropic, Gemini, and Bedrock. Adding a new provider requires extending this classifier and the streaming parser's error mapping.
 

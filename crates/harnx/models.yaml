@@ -891,7 +891,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.reasoning = {"summary":"auto"}
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-audio
       max_input_tokens: 128000
@@ -1199,6 +1199,17 @@
       supports_tool_use: true
       patches:
       - .body.generationConfig = ((.body.generationConfig // {}) | del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
+    - name: gemini-4-argon
+      max_input_tokens: 983040
+      max_output_tokens: 65536
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.1
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.generationConfig = ((.body.generationConfig // {}) | del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true}) | .body.generationConfig.maxOutputTokens = ([.body.generationConfig.maxOutputTokens // 65536, (if (.url | endswith(":generateContent")) then 32768 else 65536 end)] | min)
     - name: gemma-3-27b-it
       max_input_tokens: 131072
       max_output_tokens: 8192
@@ -1386,6 +1397,8 @@
       cache_write_price: 0.125
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-haiku-5-5:thinking
       real_name: claude-haiku-5-5
       max_input_tokens: 1000000
@@ -1398,7 +1411,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-mythos-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3213,6 +3226,8 @@
       cache_write_price: 0.125
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
     - name: claude-haiku-5-5:thinking
       real_name: claude-haiku-5-5
       max_input_tokens: 1000000
@@ -3225,7 +3240,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
     - name: claude-haiku-5-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3236,6 +3251,8 @@
       cache_write_price: 0.125
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
     - name: claude-haiku-5-5@default:thinking
       real_name: claude-haiku-5-5@default
       max_input_tokens: 1000000
@@ -3248,7 +3265,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
     - name: claude-opus-4
       max_input_tokens: 200000
       max_output_tokens: 32000
@@ -5204,7 +5221,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"medium"}}
     - name: us.anthropic.claude-mythos-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5759,6 +5776,8 @@
       cache_write_price: 2.31
       supports_vision: false
       supports_tool_use: true
+      patches:
+      - if (.body | has("inferenceConfig")) then .body.additionalModelRequestFields = ((.body.additionalModelRequestFields // {}) + {"reasoning_effort":"high"}) else .body.reasoning_effort = "high" end
     - name: writer.palmyra-vision-7b
       max_input_tokens: 4096
       max_output_tokens: 4096
@@ -6572,6 +6591,17 @@
 # - https://platform.minimaxi.com/document/ChatCompletion%20v2
 - provider: minimax
   models:
+    - name: MiniMax-M3.1-Flash
+      max_input_tokens: 868928
+      max_output_tokens: 131072
+      require_max_tokens: true
+      input_price: 0.15
+      output_price: 0.6
+      cache_read_price: 0.015
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.reasoning_effort = "low" | .body.max_completion_tokens = (.body.max_completion_tokens // .body.max_tokens) | del(.body.max_tokens)
     - name: MiniMax-M2
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -11821,3 +11851,18 @@
       max_input_tokens: 32000
       input_price: 0.12
       type: embedding
+
+# International Z.AI API; distinct from the legacy China zhipuai catalog.
+# https://docs.z.ai/guides/llm/glm-5.3
+- provider: zai
+  models:
+    - name: glm-5.3
+      max_input_tokens: 868928
+      max_output_tokens: 131072
+      require_max_tokens: true
+      input_price: 1.4
+      output_price: 4.4
+      cache_read_price: 0.26
+      supports_tool_use: true
+      patches:
+      - .body.thinking = {"type":"enabled"} | .body.reasoning_effort = "high"

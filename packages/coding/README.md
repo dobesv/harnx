@@ -9,7 +9,7 @@ multi-agent orchestration overhead.
 | Agent | Model | Role |
 |-------|-------|------|
 | `coder` | claude-sonnet-5-5 | Main coding assistant |
-| `compact-coder` | gemini-3.5-flash-lite | Context compaction for long sessions |
+| `compact-coder` | gpt-6-luna | Context compaction for long sessions |
 
 ## Quick start
 
@@ -19,7 +19,7 @@ Install from GHCR (replace `v0.1.0` with the current release):
 harnx-pkg add ghcr.io/dobesv/harnx-packages/coding v0.4.16
 ```
 
-Use harnx 0.34.0 or a development build containing the package model updates.
+Use a harnx build containing the model and client updates accompanying this package refresh.
 Configure any one of Gemini, Claude, Codex, OpenAI API, or Bedrock; both agents
 have fallbacks for every provider. For a ChatGPT subscription, run `codex login`.
 For API-key access, set the applicable key in `~/.local/share/harnx/.env`:
@@ -44,19 +44,21 @@ OpenAI API model:
 
 | Agent | Ordered model chain |
 |-------|---------------------|
-| `coder` | Sonnet 5 → Codex Terra → OpenAI Terra → Gemini 3.8 Flash → Bedrock GLM 5 |
-| `compact-coder` | Gemini 3.5 Flash-Lite → Codex Luna → OpenAI Luna → Sonnet 5 → Bedrock GLM 4.7 Flash |
+| `coder` | Sonnet 5.5 → Codex Sol 6.1 → OpenAI Sol 6.1 → Gemini 3.8 Flash → Bedrock GLM 5.3 |
+| `compact-coder` | Codex Luna → OpenAI Luna → Gemini 3.5 Flash-Lite → Haiku 5.5 → Bedrock Luna |
 
-Terra balances everyday coding cost and quality; Luna and Flash-Lite keep
-compaction inexpensive. Sonnet 5 is the Claude compaction fallback because its
-1M context window can summarize long coding sessions. Opus overrides use 5.5.
+Sol 6.1 preserves coding quality when Sonnet is unavailable; Luna and Flash-Lite
+keep compaction inexpensive. Haiku 5.5 supplies a lower-cost Claude compaction
+fallback with a 1M context window. Opus overrides use 5.5.
 
-The five `clients/*.yaml` files inherit model metadata from harnx's shared
+The `clients/*.yaml` files inherit model metadata from harnx's shared
 catalog. The Bedrock client uses the OpenAI-compatible endpoint in `us-east-1`
 and an API key, not the AWS SigV4 credential chain. Region, model entitlement,
 context limits, and subscription quotas still apply. Fallback handles missing
-credentials, authentication errors, and exhausted retries; request errors such
-as HTTP 400/404 stop the turn.
+credentials, authentication errors, exhausted retries, specific model availability
+errors, and incompatible input. Generic malformed HTTP 400/404 requests still
+stop the turn. Optional direct Z.AI routing uses `ZAI_API_KEY` and the
+[example package patch](zai.patch.example.yaml), retaining the Bedrock fallback.
 
 For the dated selection rationale and provider sources, see the
 [Pantheon model policy](https://github.com/dobesv/harnx/blob/main/packages/pantheon/MODELS.md).
@@ -80,7 +82,7 @@ update), use a patch file placed next to the installed package directory:
 
 ```yaml
 agents:
-  - 'if .name == "coder" then .model = "codex:gpt-5.6-terra" end'
+  - 'if .name == "coder" then .model = "codex:gpt-6.1-sol" end'
   - 'if .name == "compact-coder" then .model = "gemini:gemini-3.5-flash-lite" end'
 ```
 

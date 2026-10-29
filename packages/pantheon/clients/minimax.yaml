@@ -1,0 +1,6 @@
+type: openai-compatible
+api_base: https://api.minimax.io/v1
+model_catalog: minimax
+
+# Hestia's optional MiniMax fallback. Set MINIMAX_API_KEY in
+# ~/.local/share/harnx/.env. The shared catalog selects low reasoning effort.

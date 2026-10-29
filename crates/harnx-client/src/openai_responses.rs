@@ -693,7 +693,7 @@ fn responses_completed(state: &mut ResponsesStreamState, handler: &mut SseHandle
     });
 }
 
-fn responses_stream_error(data: &Value) -> Result<()> {
+pub(crate) fn responses_stream_error(data: &Value) -> Result<()> {
     if let Some(err_obj) = data.get("error").or_else(|| {
         data.get("response")
             .and_then(|response| response.get("error"))

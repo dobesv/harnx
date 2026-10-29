@@ -1,11 +1,11 @@
 ---
 role: compaction
-model: gemini:gemini-3.5-flash-lite
+model: codex:gpt-6-luna
 model_fallbacks:
-- codex:gpt-6-luna
 - openai:gpt-6-luna
-- claude:claude-sonnet-5-5
-- bedrock:zai.glm-4.7-flash
+- gemini:gemini-3.5-flash-lite
+- claude:claude-haiku-5-5
+- bedrock:us.openai.gpt-6-luna
 version: '0.4.15'
 ---
 You are summarizing a conversation between a user and an AI coding agent that executes tasks, writes code, and delegates work to specialist agents.
