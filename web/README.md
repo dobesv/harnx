@@ -64,9 +64,17 @@ The proxy is configured to be **SSE-safe**. It disables buffering for `text/even
   - Model switching.
   - NATS single-owner-route fanout redesign for multi-client tool approvals.
 
-### Known Cosmetic Issues
-
-- **C5**: There is no optimistic rendering for out-of-band user messages. When sending to an existing session, the composer disables and shows a spinner until the backend hydrates the message into the transcript.
+When a message is accepted for an existing session while the agent is busy, the
+client shows it as queued and keeps the composer available. The queued row is
+replaced by the server-authored transcript row when the session update arrives.
+The `session/prompt` RPC can return `enqueued` before the subscriber hydrates
+the durable user row. The response includes that row's `message_id` so the
+client can replace the exact queued row, even when another tab sends the same
+text. Queued rows are displayed outside assistant-ui's message runtime:
+adding one there would cause a promptless session refresh to resend it as a new
+turn. `pendingPrompts.ts` retires each queued row by ID when hydration completes.
+If an older server omits `message_id`, the accepted row stays visible until a
+page reload because the client cannot safely identify its transcript counterpart.
 
 ## Build and CI
 

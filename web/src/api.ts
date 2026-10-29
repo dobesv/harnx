@@ -193,7 +193,26 @@ export async function sendPrompt(
 
   if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
 
-  return json?.result as PromptResult;
+  return normalizePromptResult(json?.result);
+}
+
+function normalizePromptResult(result: PromptResult | undefined): PromptResult {
+  switch (result?.status) {
+    case 'accepted':
+    case 'enqueued':
+      // A server from before message_id was added can still have accepted the
+      // prompt. Preserve that success so the composer can show a local queued row.
+      return { ...result, message_id: usablePromptMessageId(result.message_id) };
+    default:
+      throw new Error('RPC call returned no prompt acknowledgement');
+  }
+}
+
+function usablePromptMessageId(value: unknown): string | null {
+  // Correlation metadata cannot undo acceptance. An unusable ID gets the same
+  // visible fallback as legacy metadata, never a send failure inviting replay.
+  if (typeof value !== 'string') return null;
+  return value.trim().length > 0 ? value : null;
 }
 
 export async function submitHitlDecision(

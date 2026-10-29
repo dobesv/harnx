@@ -37,6 +37,8 @@ import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './composer/Age
 import { ConnectionBanner } from './ConnectionBanner';
 import { useConnectionStatus, useRetryCountdownSeconds } from './useConnectionStatus';
 import { isAbortError } from './httpClient';
+import { createPendingPrompt, pendingUserMessageIds, reconcilePendingPrompts, type PendingPrompt, type PendingPromptsState } from './pendingPrompts';
+import { usePendingSessionPrompts } from './usePendingSessionPrompts';
 import { SessionCard, compareSessionsUnreadFirst } from './SessionCard';
 import { SessionLoadMore } from './SessionLoadMore';
 import './chat.css';
@@ -244,6 +246,33 @@ function handleSendFailure({
   focusAndResize();
 }
 
+async function clearAcceptedPrompt(
+  resetComposerInput: () => Promise<void>,
+  setErrorText: (text: string | null) => void,
+  setIsSending: (sending: boolean) => void,
+  attachments: readonly Attachment[],
+  setBlockedAttachmentIds: (ids: Set<string>) => void,
+): Promise<void> {
+  try {
+    await resetComposerInput();
+  } catch (error) {
+    console.error('Prompt queued, but composer cleanup failed', error);
+    setBlockedAttachmentIds(new Set(attachments.map((attachment) => attachment.id)));
+    setErrorText('Message queued, but the composer could not be cleared. Remove any remaining attachments before sending again.');
+  } finally {
+    setIsSending(false);
+  }
+}
+
+function recordAcceptedPrompt(
+  result: { message_id?: string | null } | undefined,
+  text: string,
+  attachments: readonly Attachment[],
+  onPromptQueued: (prompt: PendingPrompt) => void,
+): void {
+  onPromptQueued(createPendingPrompt(text, attachments, result?.message_id ?? null));
+}
+
 function useComposerMarkRead({
   agentName,
   sessionId,
@@ -306,6 +335,7 @@ export const MyComposer = ({
   onSwitchSession,
   switchAgentHref,
   switchSessionHref,
+  onPromptQueued = () => {},
 }: {
   agentName: string;
   sessionId: string;
@@ -317,6 +347,7 @@ export const MyComposer = ({
   onSwitchSession: () => void;
   switchAgentHref: string;
   switchSessionHref: string;
+  onPromptQueued?: (prompt: PendingPrompt) => void;
 }) => {
   const { setErrorText } = useContext(PendingContext);
   const { phase } = useContext(CancellationContext);
@@ -324,16 +355,10 @@ export const MyComposer = ({
   const composerRuntime = useAui().composer;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [isSending, setIsSending] = useState(false);
-  const userMessageCount = useAuiState(s => s.thread.messages.filter(m => m.role === 'user').length);
-  const prevUserMessageCount = useRef(userMessageCount);
+  const [blockedAttachmentIds, setBlockedAttachmentIds] = useState<Set<string>>(() => new Set());
+  const composerAttachments = useAuiState(s => s.composer?.attachments);
 
   const triggerMarkRead = useComposerMarkRead({ agentName, sessionId, isUnread, onMarkRead });
-
-  useEffect(() => {
-    if (isSending && userMessageCount > prevUserMessageCount.current) {
-      setIsSending(false);
-    }
-  }, [isSending, userMessageCount]);
 
   const resizeTextarea = useCallback((el: HTMLTextAreaElement | null) => {
     if (!el) return;
@@ -367,13 +392,13 @@ export const MyComposer = ({
     });
   }, []);
 
-  const resetComposerInput = useCallback(() => {
+  const resetComposerInput = useCallback(async () => {
     composerRuntime.setText('');
-    void composerRuntime.clearAttachments();
+    await composerRuntime.clearAttachments();
     collapseTextarea();
   }, [composerRuntime, collapseTextarea]);
 
-  const submissionDisabled = isSending || interrupting;
+  const submissionDisabled = isSending || interrupting || !!composerAttachments?.some(att => blockedAttachmentIds.has(att.id));
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (submissionDisabled) return;
@@ -400,7 +425,6 @@ export const MyComposer = ({
       // Attaches to the existing stream via RuntimeSessionSubscriber.startRun({parentId}),
       // which hydrates the server-authored user row without re-execution.
       setIsSending(true);
-      prevUserMessageCount.current = userMessageCount;
       const savedAttachments = state.attachments;
 
       // assistant-ui (0.15.18) only uploads attachments inside composerRuntime.send().
@@ -409,15 +433,13 @@ export const MyComposer = ({
       // avoids composerRuntime.send(), we must upload fresh attachments ourselves.
       // Attachments retained from a previous send already have CIDs in .content.
       const doSend = async () => {
-        const attachmentRefs = savedAttachments.length === 0
-          ? []
-          : await resolveOutofBandAttachmentRefs(savedAttachments, agentName, sessionId);
-        await sendPrompt(agentName, sessionId, { text, attachmentRefs });
-        // Clear only once the prompt is queued (#1945). Keeping the draft in the
-        // disabled composer until now means the message and attachments stay
-        // visible during upload + RPC instead of vanishing on click; the spinner
-        // covers the brief gap until RuntimeSessionSubscriber hydrates the row.
-        resetComposerInput();
+        const attachmentRefs = await resolveOutofBandAttachmentRefs(savedAttachments, agentName, sessionId);
+        const result = await sendPrompt(agentName, sessionId, { text, attachmentRefs });
+        // The server may queue this behind a long run. Show the accepted prompt
+        // locally until its server-authored row is hydrated, then let the user
+        // compose another message without waiting for that run to finish.
+        recordAcceptedPrompt(result, text, savedAttachments, onPromptQueued);
+        await clearAcceptedPrompt(resetComposerInput, setErrorText, setIsSending, savedAttachments, setBlockedAttachmentIds);
       };
 
       doSend().catch(err => {
@@ -757,6 +779,8 @@ const MyThread = ({
   onSwitchSession,
   switchAgentHref,
   switchSessionHref,
+  pendingState,
+  updatePendingState,
 }: {
   agentName: string;
   sessionId: string;
@@ -769,16 +793,42 @@ const MyThread = ({
   onSwitchSession: () => void;
   switchAgentHref: string;
   switchSessionHref: string;
+  pendingState: PendingPromptsState;
+  updatePendingState: (update: (current: PendingPromptsState) => PendingPromptsState) => void;
 }) => {
-  const isEmpty = useAuiState(s => s.thread.messages.length === 0);
+  const threadMessages = useAuiState(s => s.thread.messages);
+  const isEmpty = threadMessages.length === 0;
+  const userMessageIds = useMemo(
+    () => pendingUserMessageIds(pendingState, threadMessages),
+    [pendingState, threadMessages],
+  );
+  const reconciled = useMemo(
+    () => reconcilePendingPrompts(pendingState, userMessageIds),
+    [pendingState, userMessageIds],
+  );
+  useEffect(() => {
+    // The transcript is external runtime state; retire acknowledged rows when it advances.
+    // eslint-disable-next-line react/set-state-in-effect
+    updatePendingState((current) => reconcilePendingPrompts(current, userMessageIds));
+  }, [pendingState, userMessageIds, updatePendingState]);
+  const onPromptQueued = useCallback((prompt: PendingPrompt) => {
+    updatePendingState((current) => ({ prompts: [...current.prompts, prompt] }));
+  }, [updatePendingState]);
 
   return (
-    <ThreadPrimitive.Root className={`aui-thread ${isEmpty ? 'aui-thread-empty' : ''}`}>
+    <ThreadPrimitive.Root className={`aui-thread ${isEmpty && reconciled.prompts.length === 0 ? 'aui-thread-empty' : ''}`}>
       <RunStateMonitor onRunFinish={onRunFinish} />
 
-      {!isEmpty && (
+      {(!isEmpty || reconciled.prompts.length > 0) && (
         <ThreadPrimitive.Viewport className="aui-thread-viewport">
           <ThreadPrimitive.Messages components={{ Message: MyMessage }} />
+          {reconciled.prompts.map((prompt) => (
+            <div key={prompt.id} className="aui-message aui-user-message aui-queued-message">
+              <div className="aui-message-content">{prompt.text}</div>
+              {prompt.attachmentNames.map((name, index) => <div key={index}>{name}</div>)}
+              <span className="aui-queued-label">Queued</span>
+            </div>
+          ))}
         </ThreadPrimitive.Viewport>
       )}
 
@@ -798,6 +848,7 @@ const MyThread = ({
             onSwitchSession={onSwitchSession}
             switchAgentHref={switchAgentHref}
             switchSessionHref={switchSessionHref}
+            onPromptQueued={onPromptQueued}
           />
         </div>
       </div>
@@ -996,6 +1047,7 @@ export default function App() {
     ? sessions.find((s) => s.session_id === selectedSessionId)
     : undefined;
   const isCurrentSessionUnread = Boolean(currentSession?.unread);
+  const pendingPrompts = usePendingSessionPrompts(selectedAgent, selectedSessionId);
 
   const handleCurrentMarkRead = useCallback(() => {
     if (selectedSessionId) {
@@ -1061,6 +1113,7 @@ export default function App() {
                   onSwitchSession={clearSession}
                   switchAgentHref="/"
                   switchSessionHref={`/agents/${encodeURIComponent(selectedAgent)}`}
+                  {...pendingPrompts}
                 />
               </ChatProvider>
             </div>

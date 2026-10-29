@@ -190,7 +190,7 @@ async fn same_session_handoff_queues_without_self_await() {
     let handle = registry.get_or_spawn(key("loop-agent", "same-session"));
     let mut events = subscribe(&handle).await.events;
     let first_run = match prompt(&handle, "start").await {
-        PromptResult::Accepted { run_id } => run_id,
+        PromptResult::Accepted { run_id, .. } => run_id,
         other => panic!("expected accepted prompt, got {other:?}"),
     };
 

@@ -105,9 +105,10 @@ test.describe('Gallery', () => {
     await page.locator('.aui-composer-input').fill('Start a slow task');
     await page.locator('.aui-composer-send').click();
 
-    // Clicking Send while a run is active now disables the composer and shows a spinner.
-    await expect(page.locator('.aui-composer-input')).toBeDisabled({ timeout: 30000 });
-    await expect(page.locator('.aui-spinner').last()).toBeVisible({ timeout: 30000 });
+    // The accepted prompt leaves the composer available while the run continues.
+    await expect(page.locator('.aui-composer-input')).toBeEnabled({ timeout: 30000 });
+    await expect(page.locator('.aui-user-message')).toContainText('Start a slow task');
+    await expect(page.locator('.aui-queued-message')).toBeInViewport();
 
     await expect(page.locator('text=Working on it')).toBeVisible();
 

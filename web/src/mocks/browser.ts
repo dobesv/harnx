@@ -1,5 +1,5 @@
 import { setupWorker } from 'msw/browser';
-import { handlers, scenarios } from './handlers';
+import { flushQueuedPrompts, handlers, scenarios } from './handlers';
 
 // Check if a scenario is requested via URL
 const urlParams = new URLSearchParams(window.location.search);
@@ -11,5 +11,5 @@ const initialHandlers = scenarioName && (scenarios as any)[scenarioName]
 export const worker = setupWorker(...initialHandlers);
 
 if (typeof window !== 'undefined') {
-  (window as any).__msw = { worker, scenarios };
+  (window as any).__msw = { worker, scenarios, flushQueuedPrompts };
 }

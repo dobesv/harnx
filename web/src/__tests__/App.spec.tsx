@@ -4,7 +4,7 @@ class MockEventSource {
 }
 (globalThis as any).EventSource = MockEventSource;
 
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import {
   BatchInterruptUI,
@@ -456,13 +456,13 @@ describe('MyComposer', () => {
   it('routes existing session submit via sendPrompt (no second run)', async () => {
     // This guards the "no duplicate turn" invariant: an out-of-band send must NOT trigger the streaming runAgent path.
     // The server-side pending_user_prompt behavior is already covered by Rust tests (ag_ui_tests.rs).
-    vi.mocked(sendPrompt).mockResolvedValueOnce({ status: 'enqueued', run_id: '1' });
+    vi.mocked(sendPrompt).mockResolvedValueOnce({ status: 'enqueued', run_id: '1', message_id: 'server-1' });
     renderComposer(false);
     const form = document.querySelector('form');
     fireEvent.submit(form!);
 
     expect(composerRuntime.send).not.toHaveBeenCalled();
-    expect(sendPrompt).toHaveBeenCalledWith('foo', 'bar', { text: 'hello', attachmentRefs: [] });
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('foo', 'bar', { text: 'hello', attachmentRefs: [] }));
   });
 
   it('routes message #2 via sendPrompt after fresh session flag is cleared', async () => {
@@ -493,22 +493,24 @@ describe('MyComposer', () => {
 
     fireEvent.submit(form!);
     expect(composerRuntime.send).not.toHaveBeenCalled();
-    expect(sendPrompt).toHaveBeenCalled();
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalled());
   });
 
-  it('shows busy state on submit, blocks second submit, and clears when message lands', async () => {
+  it('blocks another submit only until the queued prompt is acknowledged', async () => {
     let resolveSendPrompt: (value: any) => void;
     vi.mocked(sendPrompt).mockReturnValue(new Promise(resolve => {
       resolveSendPrompt = resolve;
     }));
 
-    let userMessages = 0;
-    vi.mocked(aui.useAuiState).mockImplementation((selector: any) => {
-      const state = { thread: { isRunning: false, messages: Array(userMessages).fill({ role: 'user' }) } };
-      return selector(state);
-    });
-
-    const { rerender } = renderComposer(false);
+    const onPromptQueued = vi.fn();
+    render(
+      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+        <MyComposer agentName="foo" sessionId="bar" isFreshSession={false}
+          markSessionNotFresh={markSessionNotFresh} onSwitchAgent={() => {}}
+          onSwitchSession={() => {}} switchAgentHref="" switchSessionHref=""
+          onPromptQueued={onPromptQueued} />
+      </ChatProvider>,
+    );
     const form = document.querySelector('form');
     
     // First submit
@@ -524,12 +526,12 @@ describe('MyComposer', () => {
     
     // Try second submit
     fireEvent.submit(form!);
-    expect(sendPrompt).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1));
     expect(composerRuntime.setText).not.toHaveBeenCalled();
     expect(composerRuntime.clearAttachments).not.toHaveBeenCalled();
     
     // Resolve RPC
-    resolveSendPrompt!({ status: 'enqueued', run_id: '1' });
+    await act(async () => resolveSendPrompt!({ status: 'enqueued', run_id: '1', message_id: 'server-1' }));
 
     // Composer IS cleared after sendPrompt resolves
     await waitFor(() => {
@@ -537,47 +539,71 @@ describe('MyComposer', () => {
     });
     expect(composerRuntime.clearAttachments).toHaveBeenCalled();
     
-    // Still sending because user message count hasn't increased
-    rerender(
-      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
-        <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
-          <MyComposer 
-            agentName="foo" 
-            sessionId="bar" 
-            isFreshSession={false} 
-            markSessionNotFresh={markSessionNotFresh}
-            switchAgentHref="" 
-            switchSessionHref="" 
-            onSwitchAgent={() => {}} 
-            onSwitchSession={() => {}} 
-          />
-        </PendingContext.Provider>
-      </ChatProvider>
-    );
-    expect(screen.getByRole('textbox')).toBeDisabled();
-
-    // Simulate message landing in transcript
-    userMessages = 1;
-    rerender(
-      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
-        <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
-          <MyComposer 
-            agentName="foo" 
-            sessionId="bar" 
-            isFreshSession={false} 
-            markSessionNotFresh={markSessionNotFresh}
-            switchAgentHref="" 
-            switchSessionHref="" 
-            onSwitchAgent={() => {}} 
-            onSwitchSession={() => {}} 
-          />
-        </PendingContext.Provider>
-      </ChatProvider>
-    );
-
-    // No longer sending
-    expect(screen.getByRole('textbox')).not.toBeDisabled();
+    await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+    expect(onPromptQueued).toHaveBeenCalledWith(expect.objectContaining({
+      text: 'hello', attachmentNames: [],
+    }));
     expect(document.querySelector('.aui-spinner')).not.toBeInTheDocument();
+
+    fireEvent.submit(form!);
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(2));
+  });
+
+  it('shows accepted prompts from a legacy response without a message ID', async () => {
+    vi.mocked(sendPrompt).mockResolvedValueOnce({ status: 'enqueued', run_id: '1', message_id: null });
+    const onPromptQueued = vi.fn();
+    render(
+      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+        <MyComposer agentName="foo" sessionId="bar" isFreshSession={false}
+          markSessionNotFresh={markSessionNotFresh} onSwitchAgent={() => {}}
+          onSwitchSession={() => {}} switchAgentHref="" switchSessionHref=""
+          onPromptQueued={onPromptQueued} />
+      </ChatProvider>,
+    );
+    fireEvent.submit(document.querySelector('form')!);
+    await waitFor(() => expect(onPromptQueued).toHaveBeenCalledWith(expect.objectContaining({
+      text: 'hello', messageId: null,
+    })));
+    await waitFor(() => expect(screen.getByRole('textbox')).toBeEnabled());
+  });
+
+  it('keeps an accepted prompt queued when local composer cleanup fails', async () => {
+    vi.mocked(sendPrompt).mockResolvedValueOnce({ status: 'enqueued', run_id: '1', message_id: 'server-1' });
+    vi.mocked(uploadAttachment).mockResolvedValueOnce(['cid:file.png']);
+    composerRuntime.clearAttachments.mockRejectedValueOnce(new Error('clear failed'));
+    let composerAttachments = [{ id: 'retained-file', name: 'file.png', file: new File(['data'], 'file.png') }];
+    composerRuntime.getState = () => ({ text: 'hello', attachments: composerAttachments });
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) => selector({
+      thread: { isRunning: false, messages: [] },
+      composer: { attachments: composerAttachments },
+    }));
+    const onPromptQueued = vi.fn();
+    const composer = () => (
+      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+        <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
+          <MyComposer agentName="foo" sessionId="bar" isFreshSession={false}
+            markSessionNotFresh={markSessionNotFresh} onSwitchAgent={() => {}}
+            onSwitchSession={() => {}} switchAgentHref="" switchSessionHref=""
+            onPromptQueued={onPromptQueued} />
+        </PendingContext.Provider>
+      </ChatProvider>
+    );
+    const { rerender } = render(composer());
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      fireEvent.submit(document.querySelector('form')!);
+      await waitFor(() => expect(onPromptQueued).toHaveBeenCalledWith(expect.objectContaining({ text: 'hello' })));
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled());
+      expect(setErrorText).toHaveBeenCalledWith(expect.stringContaining('Message queued'));
+      fireEvent.submit(document.querySelector('form')!);
+      expect(sendPrompt).toHaveBeenCalledTimes(1);
+
+      composerAttachments = [];
+      rerender(composer());
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   const submitWithSendPromptError = async (error: unknown) => {
@@ -665,7 +691,7 @@ describe('MyComposer', () => {
   });
 
   it('uploads attachments on existing-session submit', async () => {
-    vi.mocked(sendPrompt).mockResolvedValueOnce({ status: 'enqueued', run_id: '1' });
+    vi.mocked(sendPrompt).mockResolvedValueOnce({ status: 'enqueued', run_id: '1', message_id: 'server-1' });
     vi.mocked(uploadAttachment).mockResolvedValueOnce(['cid:file1']);
     
     const file = new File([''], 'test.png');

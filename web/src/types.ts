@@ -57,6 +57,7 @@ export interface CancelResult {
 export interface PromptResult {
   status: 'accepted' | 'enqueued';
   run_id: string;
+  message_id: string | null;
 }
 
 export interface SessionInfo {

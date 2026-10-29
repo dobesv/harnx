@@ -33,10 +33,10 @@ export function additionalSnapshot(session: string): any[] {
   return snapshots.get(session) ?? [];
 }
 
-export function persistExchange(session: string, userText: string, reply: string) {
+export function persistExchange(session: string, userText: string, reply: string, userMessageId = `mock-user-${messageId++}`) {
   const persisted = additionalSnapshot(session);
   persisted.push(
-    { id: `mock-user-${messageId++}`, role: 'user', content: userText },
+    { id: userMessageId, role: 'user', content: userText },
     { id: `mock-assistant-${messageId++}`, role: 'assistant', content: reply },
   );
   snapshots.set(session, persisted);

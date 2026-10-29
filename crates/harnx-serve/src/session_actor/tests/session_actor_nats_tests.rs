@@ -334,10 +334,17 @@ async fn serve_replays_prompt_queued_during_active_run() {
     mock.first_request
         .await
         .expect("first mock request notifier dropped");
-    assert!(matches!(
-        prompt(&handle, "queued follow-up").await,
-        PromptResult::Enqueued { .. }
-    ));
+    let queued_id = match prompt(&handle, "queued follow-up").await {
+        PromptResult::Enqueued {
+            message_id: Some(id),
+            ..
+        } => id,
+        other => panic!("expected an enqueued prompt with a durable message ID, got {other:?}"),
+    };
+    assert!(subscribe(&handle).await.snapshot.iter().any(|message| {
+        matches!(message, AgUiMessage::User { id, content, .. }
+            if id.to_string() == queued_id && content == "queued follow-up")
+    }));
     assert!(
         tokio::time::timeout(Duration::from_millis(250), &mut mock.second_request)
             .await

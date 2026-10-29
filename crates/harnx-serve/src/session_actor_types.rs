@@ -256,9 +256,17 @@ pub struct SubscribeResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptResult {
-    Accepted { run_id: String },
-    Enqueued { run_id: String },
-    Rejected { reason: String },
+    Accepted {
+        run_id: String,
+        message_id: Option<String>,
+    },
+    Enqueued {
+        run_id: String,
+        message_id: Option<String>,
+    },
+    Rejected {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

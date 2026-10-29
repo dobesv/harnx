@@ -594,6 +594,10 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
   });
 }
 
+function latestUserMessageId(session: string): string | null {
+  return (snapshots.get(session) ?? []).filter((message) => message.role === 'user').at(-1)?.id ?? null;
+}
+
 export const happyPathHandlers = [
   http.get('/v1/agents', ({ request }) => {
     const url = new URL(request.url);
@@ -795,7 +799,7 @@ export const happyPathHandlers = [
         } else {
           persistExchange(session, text, `Mock streamed reply to: ${text || 'empty prompt'}`);
         }
-        return HttpResponse.json({ jsonrpc: '2.0', result: { status: 'accepted', run_id: 'mock-run-123' }, id: body.id });
+        return HttpResponse.json({ jsonrpc: '2.0', result: { status: 'accepted', run_id: 'mock-run-123', message_id: latestUserMessageId(session) }, id: body.id });
       }
       return HttpResponse.json({
         jsonrpc: '2.0',
@@ -834,7 +838,7 @@ export const sessionsFailHandlers = [
 ];
 
 export const sendFailHandlers = [
-  http.post('/v1/agents/:agent/sessions/:session', async ({ request }) => {
+  http.post('/v1/agents/:agent/sessions/:session', async ({ request, params }) => {
     if (await isRpcRequest(request)) {
       const body = await request.clone().json() as any;
       if (body.method === 'session/prompt') {
@@ -853,7 +857,7 @@ export const sendFailHandlers = [
 
     const body = await request.clone().json() as any;
     const messages = Array.isArray(body?.messages) ? body.messages : [];
-    if (messages.length > 0) {
+    if (!isPromptlessRun(messages, buildSnapshot(String(params.session)))) {
       return new HttpResponse(null, { status: 500, statusText: 'Internal Server Error' });
     }
 
@@ -894,8 +898,39 @@ export const sessionsTransient502Handlers = [
   ...happyPathHandlers
 ];
 
+// Exercise the gap between a successful session/prompt RPC and the later
+// server-authored transcript row when an active run queues follow-up prompts.
+const queuedPrompts: Array<{ session: string; text: string; messageId: string }> = [];
+
+export function flushQueuedPrompts(): void {
+  for (const { session, text, messageId } of queuedPrompts.splice(0)) {
+    persistExchange(session, text, `Mock streamed reply to: ${text}`, messageId);
+  }
+}
+
+export const queuedPromptHandlers = [
+  http.post('/v1/agents/:agent/sessions/:session', async ({ request, params }) => {
+    if (!await isRpcRequest(request)) return;
+    const body = await request.clone().json() as {
+      method?: string;
+      params?: { text?: string };
+      id?: string | number | null;
+    };
+    if (body.method !== 'session/prompt') return;
+    const text = body.params?.text || '';
+    const session = String(params.session);
+    const messageId = crypto.randomUUID();
+    queuedPrompts.push({ session, text, messageId });
+    return HttpResponse.json({
+      jsonrpc: '2.0', result: { status: 'enqueued', run_id: 'mock-running', message_id: messageId }, id: body.id,
+    });
+  }),
+  ...happyPathHandlers,
+];
+
 export const scenarios = {
   happy: happyPathHandlers,
+  queued: queuedPromptHandlers,
   agentsFail: agentsFailHandlers,
   agentsTransient502: agentsTransient502Handlers,
   sessionsFail: sessionsFailHandlers,

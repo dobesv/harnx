@@ -585,10 +585,15 @@ impl SessionActor {
                 }
             }
         }
+        let message_id = options
+            .admitted
+            .as_ref()
+            .map(|admitted| crate::ag_ui_sync::wire_message_id(admitted.user_msg_id()).to_string());
         let Some(active_run) = &self.active_run else {
             let run_id = self.start_run(text, options, reap_sleep).await;
             return PromptResult::Accepted {
                 run_id: run_id.to_string(),
+                message_id,
             };
         };
 
@@ -604,6 +609,7 @@ impl SessionActor {
         }
         PromptResult::Enqueued {
             run_id: run_id.to_string(),
+            message_id,
         }
     }
 
@@ -1281,7 +1287,7 @@ mod tests {
 
         let result = prompt(&handle, "hello actor").await;
         let run_id = match result {
-            PromptResult::Accepted { run_id } => run_id,
+            PromptResult::Accepted { run_id, .. } => run_id,
             other => panic!("expected Accepted, got {other:?}"),
         };
 
@@ -1334,7 +1340,7 @@ mod tests {
 
         let accepted = prompt(&handle, "emit text").await;
         let run_id = match accepted {
-            PromptResult::Accepted { run_id } => run_id,
+            PromptResult::Accepted { run_id, .. } => run_id,
             other => panic!("expected Accepted, got {other:?}"),
         };
 
@@ -1694,7 +1700,7 @@ mod tests {
 
         let result = prompt(&handle, "hello actor").await;
         let run_id = match result {
-            PromptResult::Accepted { run_id } => run_id,
+            PromptResult::Accepted { run_id, .. } => run_id,
             other => panic!("expected Accepted, got {other:?}"),
         };
 
@@ -1858,7 +1864,7 @@ mod tests {
         let mut sub = subscribe(&handle).await.events;
 
         let run_id = match prompt(&handle, "error after text").await {
-            PromptResult::Accepted { run_id } => run_id,
+            PromptResult::Accepted { run_id, .. } => run_id,
             other => panic!("expected Accepted, got {other:?}"),
         };
 
@@ -1931,7 +1937,7 @@ mod tests {
 
         let result = prompt(&handle, "state prompt").await;
         let run_id = match result {
-            PromptResult::Accepted { run_id } => run_id,
+            PromptResult::Accepted { run_id, .. } => run_id,
             other => panic!("expected Accepted, got {other:?}"),
         };
         gate_ready.notified().await;
@@ -2081,7 +2087,7 @@ mod tests {
         // Prompt the source agent
         let result = prompt(&source_handle, "start handoff").await;
         let source_run_id = match result {
-            PromptResult::Accepted { run_id } => run_id,
+            PromptResult::Accepted { run_id, .. } => run_id,
             other => panic!("expected Accepted, got {other:?}"),
         };
 

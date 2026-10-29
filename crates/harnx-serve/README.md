@@ -270,7 +270,7 @@ Same canonical session URL, negotiated into programmatic control.
   ```json
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello" } }
   ```
-  **Result:** `{ "status": "accepted", "run_id": "..." }` (idle) or `{ "status": "enqueued", "run_id": "..." }` (running).
+  **Result:** `{ "status": "accepted", "run_id": "...", "message_id": "..." }` (idle) or `{ "status": "enqueued", "run_id": "...", "message_id": "..." }` (running). `message_id` is the AG-UI wire ID of the durable user row, so clients can reconcile an acknowledged prompt with a later transcript snapshot. It is `null` only for test executors without durable admission.
 
   Optional `timeout_secs` parameter limits run duration. Positive values can only
   shorten the target agent's configured run limits policy; they cannot extend
