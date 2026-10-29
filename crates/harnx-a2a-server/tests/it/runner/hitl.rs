@@ -12,6 +12,7 @@ mod assertions;
 #[cfg(feature = "fault-injection")]
 mod external;
 mod fixtures;
+mod reply_note;
 
 use super::*;
 use assertions::*;

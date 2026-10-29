@@ -346,6 +346,17 @@ the original continuation. **Upgrade all A2A replicas together**: old replicas
 can mistake parked tasks for interrupted work. Upgrade runtime workers before
 enabling exact-reference decisions; old workers don't enforce request fencing.
 
+**Rollback procedure**: Old server replicas (before interactive tool approval)
+treat unowned parked tasks as ordinary orphans and mark them `TASK_STATE_FAILED`
+with "interrupted by server restart" on startup or foreground access. Before
+rolling back to an older server version, drain parked approvals: answer or cancel
+every task in `TASK_STATE_INPUT_REQUIRED`, or accept that remaining parked tasks
+will be failed by older replicas. Find parked tasks by calling `ListTasks` per
+context with `status="TASK_STATE_INPUT_REQUIRED"` (or lenient `"input-required"`).
+Because `ListTasks` is paginated, follow `nextPageToken` as `pageToken` (with
+optional `pageSize`) until `nextPageToken` is empty. Cancel unhandled parked
+tasks with `CancelTask`. See [rolling back server versions](../../docs/a2a-operations.md#rolling-back-server-versions).
+
 There is no approval-specific timeout; approvals follow Web/TUI precedent.
 The existing frozen invocation execution deadline (`run_limits.timeout_secs`,
 24 hours by default from admission) keeps counting while parked `INPUT_REQUIRED`.

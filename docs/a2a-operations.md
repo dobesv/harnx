@@ -156,7 +156,7 @@ Enable `harnx-a2a-server --metrics-addr :8456` to export bounded-label diagnosti
 No session, task, principal or subject is a metric label. Structured recovery and
 reader-interruption logs contain those identities for incident correlation.
 
-## Upgrade without mixed writers
+## Upgrade and rollback without mixed writers
 
 1. Deploy runtime readers that understand `admission_closed` before enabling its
    writers. Old readers must not encounter that transcript variant.
@@ -178,6 +178,22 @@ Recovery is eventual and lease-TTL-based (default A2A lease 30 seconds, renewal
 ownership fence, not wall-clock expiry alone. Broker uncertainty extends recovery.
 Interrupted work is never automatically replayed. Already completed tool side
 effects are not rolled back.
+
+### Rolling back server versions
+
+Old server replicas (before interactive tool approval) cannot handle parked
+`INPUT_REQUIRED` tasks: they treat unowned tasks as ordinary orphans and fail
+them with "interrupted by server restart" on startup or foreground access.
+
+Before rolling back to a version without interactive tool approval:
+- Drain parked approvals: answer or cancel tasks in `TASK_STATE_INPUT_REQUIRED`.
+- Query active sessions via `ListTasks` with `status="TASK_STATE_INPUT_REQUIRED"`
+  (or `"input-required"`) per context. ListTasks is paginated: check `nextPageToken`
+  on each response and pass it as `pageToken` (with optional `pageSize`) until
+  `nextPageToken` is empty.
+- Use `CancelTask` to settle any remaining parked approvals that cannot be answered.
+- Any unresolved parked task will be marked `TASK_STATE_FAILED` once an older
+  replica claims or recovers it.
 
 ## Measured scope and capacity gaps
 

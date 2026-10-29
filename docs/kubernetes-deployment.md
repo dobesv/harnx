@@ -446,7 +446,7 @@ two-Deployment example unchanged into a larger fleet.
 1. Close public ingress and all other prompt submission paths using the site's
    maintenance controls. Let admitted turns reach durable completion or use
    existing cancellation controls and confirm the durable stop. Do not infer
-   task drain from closed HTTP connections. Follow [A2A operations](a2a-operations.md#upgrade-without-mixed-writers)
+   task drain from closed HTTP connections. Follow [A2A operations](a2a-operations.md#upgrade-and-rollback-without-mixed-writers)
    for A2A work. Record unresolved work; never extend its frozen deadline or
    replay tool side effects to make the release pass.
 2. Stop **all** inventoried frontends and workers, including external clients and
