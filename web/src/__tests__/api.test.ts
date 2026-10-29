@@ -256,13 +256,23 @@ describe('api.ts', () => {
 
 
   describe('sendPrompt', () => {
+    it.each([123, '', '   '])('preserves acceptance with unusable correlation metadata %j', async (message_id) => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ result: { status: 'accepted', run_id: 'r1', message_id } }),
+      });
+      expect(await sendPrompt('agent', 'session', { text: 'hello' })).toEqual({
+        status: 'accepted', run_id: 'r1', message_id: null,
+      });
+    });
+
     it('resolves on success and formats envelope correctly without attachments', async () => {
       fetchMock.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ result: { status: 'accepted', run_id: 'r1' } }),
+        json: async () => ({ result: { status: 'accepted', run_id: 'r1', message_id: 'server-user-1' } }),
       });
       const result = await sendPrompt('agent1', 'session1', { text: 'hello' });
-      expect(result).toEqual({ status: 'accepted', run_id: 'r1' });
+      expect(result).toEqual({ status: 'accepted', run_id: 'r1', message_id: 'server-user-1' });
       
       const callArgs = fetchMock.mock.calls[0];
       expect(callArgs[0]).toBe('/v1/agents/agent1/sessions/session1');
@@ -279,13 +289,13 @@ describe('api.ts', () => {
       });
     });
 
-    it('formats envelope correctly with attachments', async () => {
+    it('keeps a legacy acknowledgement successful when message_id is missing', async () => {
       fetchMock.mockResolvedValueOnce({
         ok: true,
         json: async () => ({ result: { status: 'enqueued', run_id: 'r2' } }),
       });
       const result = await sendPrompt('agent1', 'session1', { text: 'hello', attachmentRefs: ['cid:x', 'cid:y'] });
-      expect(result).toEqual({ status: 'enqueued', run_id: 'r2' });
+      expect(result).toEqual({ status: 'enqueued', run_id: 'r2', message_id: null });
       
       const callArgs = fetchMock.mock.calls[0];
       expect(JSON.parse(callArgs[1].body)).toEqual({

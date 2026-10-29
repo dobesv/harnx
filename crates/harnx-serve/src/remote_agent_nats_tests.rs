@@ -115,7 +115,7 @@ async fn accepted_run_id(
     context: &str,
 ) -> Result<String> {
     match prompt(handle, text).await {
-        crate::session_actor::PromptResult::Accepted { run_id } => Ok(run_id),
+        crate::session_actor::PromptResult::Accepted { run_id, .. } => Ok(run_id),
         other => anyhow::bail!("{context} was not accepted: {other:?}"),
     }
 }

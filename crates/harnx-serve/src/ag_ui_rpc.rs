@@ -386,8 +386,12 @@ async fn submit_prompt(
         }
     };
     let mut result_json = match result {
-        PromptResult::Accepted { run_id } => json!({ "status": "accepted", "run_id": run_id }),
-        PromptResult::Enqueued { run_id } => json!({ "status": "enqueued", "run_id": run_id }),
+        PromptResult::Accepted { run_id, message_id } => {
+            json!({ "status": "accepted", "run_id": run_id, "message_id": message_id })
+        }
+        PromptResult::Enqueued { run_id, message_id } => {
+            json!({ "status": "enqueued", "run_id": run_id, "message_id": message_id })
+        }
         PromptResult::Rejected { reason } => {
             return json_rpc_response(
                 StatusCode::CONFLICT,
@@ -1013,11 +1017,11 @@ mod tests {
             };
             assert_eq!(text, "continue with this request");
             assert_eq!(options, SessionPromptOptions::default());
-            reply
-                .send(PromptResult::Accepted {
-                    run_id: "combined-run".to_string(),
-                })
-                .expect("prompt acknowledgement");
+            let accepted = PromptResult::Accepted {
+                run_id: "combined-run".into(),
+                message_id: None,
+            };
+            reply.send(accepted).expect("prompt acknowledgement");
         });
 
         let response = handle_ag_ui_rpc_bytes(

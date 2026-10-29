@@ -684,6 +684,16 @@ body {
   border-radius: 16px 16px 4px 16px;
 }
 
+.aui-queued-message .aui-message-content {
+  white-space: pre-wrap;
+}
+
+.aui-queued-label {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  margin-top: 0.35rem;
+}
+
 .aui-assistant-message {
   align-self: flex-start;
   background: transparent;

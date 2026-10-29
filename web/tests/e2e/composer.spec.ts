@@ -41,6 +41,60 @@ test('composer active-session view', async ({ page }) => {
   expect(new URL(page.url()).pathname).toBe('/agents/coding%2Fcoder');
 });
 
+test('queued prompts remain visible and the composer accepts another message', async ({ page }) => {
+  await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=queued');
+  await expect(page.locator('.aui-assistant-message')).toContainText('Hello from mock session');
+
+  const input = page.locator('.aui-composer-input');
+  await input.fill('first queued message');
+  await page.locator('.aui-composer-send').click();
+  await expect(page.locator('.aui-queued-message')).toContainText('first queued message');
+  const announcements = page.getByRole('log', { name: 'Queued messages' });
+  await expect(announcements).toHaveAttribute('aria-live', 'polite');
+  await expect(announcements).toHaveAttribute('aria-relevant', 'additions');
+  await expect(announcements).toHaveText('Message accepted and queued.');
+  await expect(input).toBeEnabled();
+
+  await input.fill('second queued message');
+  await page.locator('.aui-composer-send').click();
+  await expect(page.locator('.aui-queued-message')).toHaveCount(2);
+  await expect(announcements.locator('div')).toHaveCount(2);
+  await expect(input).toBeEnabled();
+
+  await page.evaluate(() => (window as any).__msw.flushQueuedPrompts());
+  await expect(page.locator('.aui-queued-message')).toHaveCount(0, { timeout: 10000 });
+  await expect(page.locator('.aui-user-message').filter({ hasText: 'first queued message' })).toHaveCount(1);
+  await expect(page.locator('.aui-user-message').filter({ hasText: 'second queued message' })).toHaveCount(1);
+});
+
+test('a queued prompt scrolls into view when it extends the transcript', async ({ page }) => {
+  await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=queued');
+  await expect(page.locator('.aui-assistant-message')).toContainText('Hello from mock session');
+
+  const text = Array.from({ length: 35 }, (_, index) => `Queued line ${index + 1}`).join('\n');
+  await page.locator('.aui-composer-input').fill(text);
+  await page.locator('.aui-composer-send').click();
+  await expect(page.locator('.aui-queued-message')).toContainText('Queued line 35');
+  await expect(page.locator('.aui-queued-label')).toBeInViewport();
+});
+
+test('queued prompts survive switching away and back to the session', async ({ page }) => {
+  await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=queued');
+  await expect(page.locator('.aui-assistant-message')).toContainText('Hello from mock session');
+  await page.locator('.aui-composer-input').fill('message while away');
+  await page.locator('.aui-composer-send').click();
+  await expect(page.locator('.aui-queued-message')).toContainText('message while away');
+
+  await page.locator('button[aria-label^="Session:"]').click();
+  await page.getByRole('menuitem', { name: /switch session/i }).click();
+  await page.click('text=session-1');
+  await expect(page.locator('.aui-queued-message')).toContainText('message while away');
+
+  await page.evaluate(() => (window as any).__msw.flushQueuedPrompts());
+  await expect(page.locator('.aui-queued-message')).toHaveCount(0);
+  await expect(page.locator('.aui-user-message').filter({ hasText: 'message while away' })).toHaveCount(1);
+});
+
 test('composer keyboard navigation', async ({ page }) => {
   await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=happy');
   
