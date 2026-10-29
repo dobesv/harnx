@@ -8,7 +8,6 @@
 //! `harnx_core::session_identity::session_key` for the derivation.
 
 use super::daemon_runtime::WorkerRuntime;
-use crate::config::{nats_routing_from_env, NatsRouting};
 use crate::nats_session_metadata::{session_properties, SessionMetadata, WEB_SESSION_URL_PROPERTY};
 use crate::web_url::{agent_display_ref, normalize_public_url, session_url};
 use std::time::Duration;
@@ -21,7 +20,6 @@ struct UrlComponents<'a> {
     base: &'a str,
     name: &'a str,
     cluster: &'a str,
-    default_cluster: Option<&'a str>,
     session_id: &'a str,
 }
 
@@ -54,17 +52,10 @@ impl WorkerRuntime {
                 return;
             }
         }
-        // Read the frontend's display default without applying frontend routing.
-        // Workers must NOT call `apply_frontend_nats_routing()`.
-        let default_cluster = match nats_routing_from_env() {
-            NatsRouting::Cluster(name) => Some(name),
-            _ => None,
-        };
         let url = worker_session_url(UrlComponents {
             base: &base,
             name,
             cluster: &self.cluster,
-            default_cluster: default_cluster.as_deref(),
             session_id: &metadata.session_id,
         });
         // The route uses the bare ID above; metadata writes use the activation's hash.
@@ -86,11 +77,7 @@ impl WorkerRuntime {
 fn worker_session_url(components: UrlComponents<'_>) -> String {
     session_url(
         components.base,
-        &agent_display_ref(
-            components.name,
-            components.cluster,
-            components.default_cluster,
-        ),
+        &agent_display_ref(components.name, components.cluster, None),
         components.session_id,
     )
 }
@@ -101,20 +88,13 @@ mod tests {
     use crate::config::LOCAL_CLUSTER_KEY;
 
     #[test]
-    fn worker_urls_use_the_frontend_display_default() {
-        for (cluster, default, agent) in [
-            (LOCAL_CLUSTER_KEY, None, "metis"),
-            (LOCAL_CLUSTER_KEY, Some("prod"), "metis"),
-            ("prod", Some("prod"), "metis"),
-            ("prod", None, "metis%40prod"),
-            ("prod", Some("other"), "metis%40prod"),
-        ] {
+    fn worker_urls_qualify_nonlocal_agents() {
+        for (cluster, agent) in [(LOCAL_CLUSTER_KEY, "metis"), ("prod", "metis%40prod")] {
             assert_eq!(
                 worker_session_url(UrlComponents {
                     base: "https://example.test",
                     name: "metis",
                     cluster,
-                    default_cluster: default,
                     session_id: "bare-id",
                 }),
                 format!("https://example.test/agents/{agent}/sessions/bare-id")
@@ -129,7 +109,6 @@ mod tests {
                 base: "https://example.test/harnx",
                 name: "pantheon/atlas",
                 cluster: "prod",
-                default_cluster: None,
                 session_id: "session /雪",
             }),
             "https://example.test/harnx/agents/pantheon%2Fatlas%40prod/sessions/session%20%2F%E9%9B%AA"

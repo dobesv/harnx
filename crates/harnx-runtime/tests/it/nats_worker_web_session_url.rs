@@ -28,6 +28,7 @@ use worker::{EnvGuard, CI_SAFE_TIMEOUT};
 
 const BASE: &str = "https://example.test";
 const WORKER_ID: &str = "worker-web-session-url";
+const HANDOFF_URL: &str = "https://example.test/agents/beta%40local/sessions/child-id";
 
 struct Fixture {
     _server: NatsServerHandle,
@@ -254,7 +255,7 @@ async fn configured_url_is_visible_before_first_model_call() -> Result<()> {
     f.agent("metis", "test agent").await?;
     let (session, _daemon, mut rx) = setup_web_session_url_test(
         "bare-id",
-        worker_property("https://example.test/agents/metis/sessions/bare-id"),
+        worker_property("https://example.test/agents/metis%40local/sessions/bare-id"),
         &f,
     )
     .await?;
@@ -316,7 +317,7 @@ async fn worker_encodes_agent_like_serve_and_uses_bare_session_id() -> Result<()
         f.store.clone(),
         Some("pantheon/metis"),
         "encoded-id",
-        worker_property("https://example.test/agents/pantheon%2Fmetis/sessions/encoded-id"),
+        worker_property("https://example.test/agents/pantheon%2Fmetis%40local/sessions/encoded-id"),
     );
     let _daemon = f.daemon(call).await?;
     enqueue_and_observe(&session, &mut rx).await
@@ -419,7 +420,7 @@ async fn handoff_target_has_its_own_url_before_first_model_call() -> Result<()> 
                         &store,
                         Some("beta"),
                         "child-id",
-                        &worker_property("https://example.test/agents/beta/sessions/child-id"),
+                        &worker_property(HANDOFF_URL),
                     )
                     .await?;
                     tx.send(()).context("test waiting for target model")?;
