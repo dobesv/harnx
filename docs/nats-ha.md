@@ -444,8 +444,9 @@ a warning and allow the turn to run.
 
 The URL is constructed from the session's own agent name and bare session ID
 (never the parent session's ID). The agent name appears bare when running on
-`__local__` or when the worker's cluster matches `HARNX_NATS_SERVER`; otherwise
-it is formatted as `name@cluster`.
+`__local__`; otherwise it is formatted as `name@cluster`. Workers include the
+cluster even when it matches their own `HARNX_NATS_SERVER`, because the Web UI
+may use a different default cluster.
 
 Entries recorded by a worker carry `"source": "configured"` along with
 `"recorded_by": "worker"`, visible in `harnx_read_session_meta`. A worker never

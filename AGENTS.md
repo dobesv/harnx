@@ -1402,9 +1402,9 @@ The seam is `resolve_nats_server()` at `nats_split.rs:234`:
 `NatsRouting::Default` → reads env handoff; `NatsRouting::Cluster` → bails;
 `NatsRouting::FrontendLocal` → resolves auto-managed local broker.
 
-Workers may read `nats_routing_from_env()` for display purposes only (e.g.,
-deriving `web_session_url` display default). This returns `Cluster(name)` or
-`Default` without affecting routing resolution. Never call
+Workers must not use their own `HARNX_NATS_SERVER` as the Web UI's display
+default when recording `web_session_url`: the UI may use a different default.
+Qualify non-`__local__` agent names with their cluster. Never call
 `apply_frontend_nats_routing()` in a worker process.
 
 ### NATS/GC tests: CI coverage and isolation
