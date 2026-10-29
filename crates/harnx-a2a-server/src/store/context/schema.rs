@@ -165,12 +165,6 @@ impl ActiveTask {
             && self.publication.pending.is_none()
     }
 
-    #[allow(dead_code)]
-    /// Check if this task has an active HITL checkpoint (parked or paused).
-    pub(crate) fn has_hitl_evidence(&self) -> bool {
-        self.hitl_checkpoint.is_some()
-    }
-
     pub(super) fn validate(&self, local_id: &str) -> Result<()> {
         self.validate_identities(local_id)?;
         self.validate_cancel_intent()?;

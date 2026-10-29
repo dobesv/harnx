@@ -17,7 +17,10 @@ async fn redeliver_saved_decision_if_pending(
             checkpoint.phase == HitlPhase::DecisionIntent,
             "accepted HITL request is not DecisionIntent"
         );
-        let note = hitl_state::saved_reply_note(active, receipt)?;
+        let note = crate::runner::reply_note::saved_reply_note(
+            active.snapshot.task.history.as_deref(),
+            receipt,
+        )?;
         session
             .decide_hitl_approval_for(&receipt.request, receipt.approved, note)
             .await?;

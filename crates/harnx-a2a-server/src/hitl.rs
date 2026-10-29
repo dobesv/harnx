@@ -1,6 +1,4 @@
 //! Plain-text HITL approval challenges and replies.
-// These APIs are wired into the publisher and admission paths in Task 7/8.
-#![allow(dead_code)]
 
 use a2a_lf::{Part, PartContent};
 use harnx_runtime::PendingHitlApproval;

@@ -5,9 +5,8 @@ use harnx_runtime::{
 };
 
 use crate::{
-    hitl::{parse_reply, ReplyParse},
     runner::{authority::OwnedTask, event_map::status, Runner},
-    store::context::{ActiveTask, ContextSnapshot, HitlCheckpoint, HitlPhase, ReplyReceipt},
+    store::context::{ActiveTask, ContextSnapshot, HitlCheckpoint, HitlPhase},
 };
 
 pub(super) async fn check_unchanged_parked(runner: &Runner, session: &NatsSession) -> Result<bool> {
@@ -190,26 +189,4 @@ pub(super) fn stage_recovered_status(active: &mut ActiveTask, request_seq: u64, 
         }),
         &id,
     );
-}
-
-pub(super) fn saved_reply_note(
-    active: &ActiveTask,
-    receipt: &ReplyReceipt,
-) -> Result<Option<String>> {
-    let saved = active
-        .snapshot
-        .task
-        .history
-        .as_ref()
-        .and_then(|history| history.iter().find(|m| m.message_id == receipt.message_id))
-        .context("accepted reply history missing")?;
-    anyhow::ensure!(
-        crate::store::message_fingerprint(&saved.parts) == receipt.fingerprint,
-        "accepted reply history fingerprint mismatch"
-    );
-    match parse_reply(&saved.parts) {
-        ReplyParse::Approve(note) if receipt.approved => Ok(note),
-        ReplyParse::Reject(note) if !receipt.approved => Ok(note),
-        _ => anyhow::bail!("accepted reply history decision mismatch"),
-    }
 }

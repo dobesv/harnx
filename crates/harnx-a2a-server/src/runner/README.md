@@ -288,10 +288,13 @@ against that same reference. A changed generation or another accepted message
 returns conflict, never a decision against the new request.
 
 Intent and the full user message enter task history in one CAS. Only the inline
-receipt note is truncated to 4096 bytes. Delivery parses the saved history message
-to recover the full plain-text note, writes reply dedupe before runtime effects,
-and calls `decide_hitl_approval_for` with the saved reference. History is task
-history only, not a new session prompt. Approval notes remain audit-only; rejection
+receipt note is truncated to 4096 bytes. Immediate delivery and recovery use
+`reply_note::saved_reply_note` to recover the full plain-text note, checking its
+fingerprint and approve/reject alignment against the receipt. Missing or mismatched
+history leaves the exact intent unresolved for retry, without delivering a decision.
+Delivery writes reply dedupe before runtime effects and calls
+`decide_hitl_approval_for` with the saved reference. The reply stays in task history;
+it isn't a new session prompt. Approval notes remain audit-only; rejection
 notes become the blocked-tool reason under the runtime's existing semantics.
 
 After every decision outcome, query `fixed_prompt_progress` on the original ticket.

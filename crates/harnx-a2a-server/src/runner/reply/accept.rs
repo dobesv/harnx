@@ -4,8 +4,7 @@ use harnx_runtime::{HitlDecisionOutcome, PromptProgress};
 
 use super::{advance, intent, target::ReplyTarget};
 use crate::{
-    hitl::{parse_reply, ReplyParse},
-    runner::{authority::OwnedTask, Runner},
+    runner::{authority::OwnedTask, reply_note::saved_reply_note, Runner},
     store::context::{HitlAdvanceParams, ReplyReceipt},
 };
 
@@ -118,17 +117,7 @@ fn parse_accepted_receipt(authority: &OwnedTask) -> Result<(ReplyReceipt, Option
         .as_ref()
         .context("reply receipt missing")?
         .clone();
-    let saved = active
-        .snapshot
-        .task
-        .history
-        .as_ref()
-        .and_then(|history| history.iter().find(|m| m.message_id == receipt.message_id))
-        .context("accepted reply history missing")?;
-    let note = match parse_reply(&saved.parts) {
-        ReplyParse::Approve(note) | ReplyParse::Reject(note) => note,
-        ReplyParse::Unrecognized => anyhow::bail!("accepted reply is not plain text"),
-    };
+    let note = saved_reply_note(active.snapshot.task.history.as_deref(), &receipt)?;
     Ok((receipt, note))
 }
 

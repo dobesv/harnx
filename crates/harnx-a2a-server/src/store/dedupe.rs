@@ -32,17 +32,6 @@ pub struct DedupeKey {
     pub message_id: String,
 }
 
-/// Key for reply dedupe: uses separate storage from initial message dedupe.
-/// Reply mappings survive task retirement.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ReplyDedupeKey {
-    pub cluster: String,
-    pub export: String,
-    pub owner: Option<String>,
-    pub message_id: String,
-}
-
 /// Task and message fingerprint retained for dedupe mappings and LRU.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DedupeEntry {
@@ -289,7 +278,7 @@ impl A2aStore {
     }
 
     // ========================================================================
-    // Reply dedupe (Task 5)
+    // Durable reply dedupe
     // ========================================================================
 
     /// Check existing reply dedupe mapping. Returns DedupeEntry if found.
