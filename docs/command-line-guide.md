@@ -104,6 +104,20 @@ expiry interrupts the same way but keeps its own exit contract below.
 
 Non-interactive prompts (`harnx prompt` or `harnx -- <text>`) can set per-invocation controls using `--timeout-secs` and `--token-budget`. Worker-owned run deadlines also apply to TUI and Web UI admissions, with a finite 24-hour fallback when no positive policy is configured.
 
+### Thought and Answer Streaming Output
+
+On a TTY with highlight enabled, streamed thinking renders distinctly: a dim
+`Thinking` label line opens each thought block, and the thought text prints in
+dim italic gray without its `<think>`/`<thinking>` wrapper tags. Answer text
+streams through the markdown renderer as before. Tags split across streamed
+chunks are held back so they never appear on screen mid-stream.
+
+In non-TTY (piped) output and with `--no-highlight`, nothing changes: thinking
+stays embedded in the answer text with its literal `<think>…</think>` tags,
+byte-for-byte, so scripts that parse the raw output keep working.
+
+Bounding options:
+
 - `--timeout-secs <SECONDS>`: A positive value sets the admission allowance and a caller-side observer timer. Passing `0` or omitting the option leaves that observer timer off; the worker still uses target/global policy and the finite 24-hour fallback.
 - `--token-budget <TOKENS>`: Maximum budgeted tokens for the invocation. Passing `0` or omitting the option means unlimited tokens.
 

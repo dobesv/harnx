@@ -116,11 +116,19 @@ enum RelaxedAgUiMessage {
         tool_call_id: Option<String>,
         content: String,
     },
+    // AG-UI clients (assistant-ui react-ag-ui >= 0.0.63) echo the server's own
+    // THINKING_* events back as `role:"reasoning"` messages; the spec also has
+    // `activity`. The server only reads client messages for the trailing user
+    // prompt (pending_user_prompt), so any unrecognized role is accepted at
+    // parse time and dropped in `into_ag_ui` rather than failing the request
+    // with 400 "unknown variant" (#2488).
+    #[serde(other)]
+    Unknown,
 }
 
-impl From<RelaxedAgUiMessage> for AgUiMessage {
-    fn from(value: RelaxedAgUiMessage) -> Self {
-        match value {
+impl RelaxedAgUiMessage {
+    fn into_ag_ui(self) -> Option<AgUiMessage> {
+        Some(match self {
             RelaxedAgUiMessage::User { id, content } => AgUiMessage::User {
                 // Preserve UUIDs and translate arbitrary assistant-ui IDs to a
                 // deterministic UUID at the AG-UI wire boundary. Stable IDs let
@@ -164,7 +172,8 @@ impl From<RelaxedAgUiMessage> for AgUiMessage {
                     .unwrap_or_else(ToolCallId::random),
                 error: None,
             },
-        }
+            RelaxedAgUiMessage::Unknown => return None,
+        })
     }
 }
 
@@ -987,7 +996,7 @@ pub fn parse_run_input(body: &[u8]) -> Result<RunAgentInput<JsonValue, JsonValue
         serde_json::from_value::<Vec<RelaxedAgUiMessage>>(messages_value)
             .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI messages: {err}")))?
             .into_iter()
-            .map(AgUiMessage::from)
+            .filter_map(RelaxedAgUiMessage::into_ag_ui)
             .collect();
 
     let mut relaxed_value = value.clone();

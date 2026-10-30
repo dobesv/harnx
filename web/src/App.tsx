@@ -8,12 +8,9 @@ import {
   useAui,
   useAuiState,
 } from '@assistant-ui/react';
-import { MarkdownTextPrimitive } from '@assistant-ui/react-markdown';
-import { makeLightAsyncSyntaxHighlighter } from '@assistant-ui/react-syntax-highlighter';
-import remarkGfm from 'remark-gfm';
-
-const SyntaxHighlighter = makeLightAsyncSyntaxHighlighter({ useInlineStyles: false });
 import { ToolCallCard } from './ToolCallCard';
+import { ReasoningPartAdapter } from './components/ReasoningPartAdapter';
+import { MessageTextPart } from './components/MessageTextPart';
 import { useAgUiInterrupts } from '@assistant-ui/react-ag-ui';
 import { ChatProvider, attachmentToMessageParts } from './ChatProvider';
 import { PendingContext, type HydratedPendingApproval } from './PendingContext';
@@ -29,8 +26,6 @@ import { CompactionMarker } from './CompactionMarker';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import { AttachIcon, SendIcon, StopIcon } from './icons';
-import { MarkdownLink } from './markdownLink';
-import { markdownUrlTransform } from './markdownUrl';
 import { CidDocumentProvider } from './CidDocumentProvider';
 import { ArchivedHistoryProvider } from './ArchivedHistoryProvider';
 import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './composer/AgentSessionMenu';
@@ -59,21 +54,8 @@ function formatTokenCount(value: number | undefined) {
 
 export const MessageContent = () => (
   <MessagePrimitive.Content components={{
-    Text: () => (
-      <MarkdownTextPrimitive
-        remarkPlugins={[remarkGfm]}
-        urlTransform={markdownUrlTransform}
-        components={{
-          SyntaxHighlighter,
-          a: MarkdownLink,
-          table: ({ node: _node, ...props }: any) => (
-            <div className="overflow-x-auto">
-              <table {...props} />
-            </div>
-          )
-        }}
-      />
-    ),
+    Text: (props: any) => <MessageTextPart {...props} />,
+    Reasoning: (props: any) => <ReasoningPartAdapter {...props} />,
     tools: { Fallback: ToolCallCard }
   }} />
 );

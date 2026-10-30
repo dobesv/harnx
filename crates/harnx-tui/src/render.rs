@@ -235,8 +235,7 @@ impl Tui {
                 // unclosed `**bold` mid-stream simply renders as literal
                 // asterisks for the moment, then upgrades to bold once the
                 // closing `**` arrives in a later chunk.
-                let mut entry =
-                    crate::markdown_render::render_markdown(text, Style::default(), width, theme);
+                let mut entry = crate::assistant_render::render_assistant_text(text, width, theme);
                 if let Some(suffix) =
                     Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
@@ -268,15 +267,7 @@ impl Tui {
                 RenderedEntry::from_lines(lines, width)
             }
             TranscriptItem::ThoughtText(text) => {
-                let lines = Self::render_text_entry(
-                    "",
-                    &format!("<think>{text}</think>"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                    false,
-                );
-                RenderedEntry::from_lines(lines, width)
+                crate::assistant_render::render_thought_text(text, width)
             }
             TranscriptItem::ToolResultMarkdown {
                 text,

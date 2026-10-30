@@ -200,7 +200,9 @@ This rule keeps subscriber requests and JSON-RPC calls unambiguous even if both 
 **Endpoint:** `POST /v1/agents/:agent/sessions/:session`  
 **Header:** `Accept: text/event-stream`
 
-Provides AG-UI events for a run. The body's **last message** selects the mode:
+Provides AG-UI events for a run. Unknown message roles (including `reasoning` and
+`activity` echoed by AG-UI clients) are accepted and dropped before selecting a
+prompt. The body's **last supported message** selects the mode:
 
 - **Prompted run** (last message is a non-empty `user` message whose ID is not
   already present in the authoritative snapshot): a pure delta
@@ -429,7 +431,7 @@ SSE connections are decoupled from execution. Dropping an SSE connection (e.g., 
 ### Divergence from AG-UI Standards
 
 This implementation deliberately diverges from generic AG-UI/assistant-ui standards for optimization:
-- **Last-Message Inspection:** Decision to start a run is based on last message in SSE POST body.
+- **Last-Message Inspection:** Decision to start a run is based on the last supported message in the SSE POST body (unknown roles are dropped first).
 - **Two-Plane Control:** Uses JSON-RPC instead of standard RESTful run endpoints to support mid-run injection.
 - **Single Canonical URL:** Both planes share one session permalink and rely on content negotiation instead of sibling routes.
 - **Message-ID Replay Guard:** A trailing user row already present in the

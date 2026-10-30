@@ -20,6 +20,7 @@ use harnx_toolset::{
     is_subagent_launcher, TOOL_TIMER_MIN_ELAPSED_MS, TOOL_TIMER_NOTICE_INTERVAL_MS,
 };
 
+use crate::streaming_think_segmenter::{Segment, StreamingThinkSegmenter};
 use harnx_render::{MarkdownRender, RenderOptions};
 use harnx_runtime::utils::{dimmed_text, pretty_yaml_block, warning_text, IS_STDOUT_TERMINAL};
 
@@ -53,6 +54,7 @@ struct CliSinkState {
     buffer: String,
     last_ui_output_source: Option<AgentSource>,
     highlight: bool,
+    stdout_is_terminal: bool,
     render_options: RenderOptions,
     final_only: bool,
     subagents: CliSubagentReporter,
@@ -61,6 +63,12 @@ struct CliSinkState {
     tool_timers: ToolCallTimerReporter,
     /// In-flight tool update tracking for streamed progress notices.
     tool_updates: ToolUpdateReporter,
+    /// Streaming think-block segmenter for rendering thoughts distinctly.
+    think_segmenter: StreamingThinkSegmenter,
+    /// Whether a "Thinking" label was printed for the current thought block.
+    thinking_label_printed: bool,
+    thought_line_open: bool,
+    native_thought: bool,
 }
 
 const SUBAGENT_REPORT_INTERVAL_MS: u64 = 10_000;
@@ -309,11 +317,16 @@ impl CliAgentEventSink {
                 buffer: String::new(),
                 last_ui_output_source: None,
                 highlight,
+                stdout_is_terminal: *IS_STDOUT_TERMINAL,
                 render_options,
                 final_only,
                 subagents: CliSubagentReporter::default(),
                 tool_timers: ToolCallTimerReporter::default(),
                 tool_updates: ToolUpdateReporter::default(),
+                think_segmenter: StreamingThinkSegmenter::default(),
+                thinking_label_printed: false,
+                thought_line_open: false,
+                native_thought: false,
             })),
         }
     }
@@ -361,14 +374,71 @@ impl CliSinkState {
         self.last_ui_output_source = next_source.cloned();
     }
 
-    /// Dispatch a chunk of text to either the markdown or raw rendering
-    /// path based on the highlight flag snapshot + stdout terminal-ness.
-    fn handle_chunk_text(&mut self, text: &str) -> anyhow::Result<()> {
-        if self.highlight && *IS_STDOUT_TERMINAL {
-            self.handle_markdown_chunk(text)
+    /// Raw/non-TTY output bypasses parsing to preserve the scripting contract.
+    fn handle_chunk_text(&mut self, text: &str, is_thought: bool) -> anyhow::Result<()> {
+        if self.highlight && self.stdout_is_terminal {
+            self.handle_segmented_chunk(text, is_thought)
         } else {
             self.handle_raw_chunk(text)
         }
+    }
+
+    fn handle_segmented_chunk(&mut self, text: &str, is_thought: bool) -> anyhow::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if is_thought {
+            let pending = self.think_segmenter.flush();
+            self.print_segments(pending)?;
+            self.native_thought = true;
+            return self.handle_thought_segment(text);
+        }
+        if self.native_thought {
+            self.end_thought()?;
+            self.native_thought = false;
+        }
+        let segments = self.think_segmenter.segment(text);
+        self.print_segments(segments)
+    }
+
+    fn print_segments(&mut self, segments: Vec<Segment>) -> anyhow::Result<()> {
+        for segment in segments {
+            match segment {
+                Segment::Text(text) => self.handle_markdown_chunk(&text)?,
+                Segment::Thought(text) => self.handle_thought_segment(&text)?,
+                Segment::ThoughtEnd => self.end_thought()?,
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_thought_segment(&mut self, text: &str) -> anyhow::Result<()> {
+        if !self.thinking_label_printed {
+            // The markdown prefix has already been printed raw. Complete its
+            // rendering before the label so a later CR cannot overwrite it.
+            if !self.buffer.is_empty() {
+                self.handle_markdown_chunk("\n")?;
+            }
+            println!("{}", nu_ansi_term::Style::new().dimmed().paint("Thinking"));
+            self.thinking_label_printed = true;
+        }
+        print!(
+            "{}",
+            nu_ansi_term::Color::DarkGray.dimmed().italic().paint(text)
+        );
+        self.thought_line_open = !text.ends_with('\n');
+        stdout().flush()?;
+        Ok(())
+    }
+
+    fn end_thought(&mut self) -> anyhow::Result<()> {
+        if self.thought_line_open {
+            println!();
+            self.thought_line_open = false;
+            stdout().flush()?;
+        }
+        self.thinking_label_printed = false;
+        Ok(())
     }
 
     fn handle_raw_chunk(&mut self, text: &str) -> anyhow::Result<()> {
@@ -435,9 +505,10 @@ impl CliSinkState {
 
     /// Close a partial stdout line before writing a separate line to stderr.
     fn flush_pending_stdout_line(&mut self) -> anyhow::Result<()> {
-        if !self.buffer.is_empty() {
+        if !self.buffer.is_empty() || self.thought_line_open {
             println!();
             self.buffer.clear();
+            self.thought_line_open = false;
             stdout().flush()?;
         }
         Ok(())
@@ -446,7 +517,11 @@ impl CliSinkState {
     /// End-of-turn cleanup: flush any buffered partial line and reset state so
     /// the next turn starts fresh.
     fn cleanup(&mut self) -> anyhow::Result<()> {
+        let segments = self.think_segmenter.flush();
+        self.print_segments(segments)?;
+        self.end_thought()?;
         self.flush_pending_stdout_line()?;
+        self.native_thought = false;
         self.render = None;
         self.last_ui_output_source = None;
         Ok(())
@@ -513,7 +588,7 @@ impl CliSinkState {
         F: FnOnce(&mut MarkdownRender, &str) -> String,
         G: FnOnce(&str) -> String,
     {
-        if !(self.highlight && *IS_STDOUT_TERMINAL) {
+        if !(self.highlight && self.stdout_is_terminal) {
             return fallback(text);
         }
         if self.render.is_none() {
@@ -600,8 +675,11 @@ impl CliSinkState {
 
     fn print_model_event(&mut self, event: ModelEvent) {
         match event {
-            ModelEvent::MessageChunk { blocks } | ModelEvent::ThoughtChunk { blocks } => {
-                self.print_content_blocks(blocks);
+            ModelEvent::MessageChunk { blocks } => {
+                self.print_content_blocks(blocks, false);
+            }
+            ModelEvent::ThoughtChunk { blocks } => {
+                self.print_content_blocks(blocks, true);
             }
             ModelEvent::Final { output, usage } => {
                 if !output.is_empty() {
@@ -620,12 +698,12 @@ impl CliSinkState {
         }
     }
 
-    fn print_content_blocks(&mut self, blocks: Vec<ContentBlock>) {
+    fn print_content_blocks(&mut self, blocks: Vec<ContentBlock>, is_thought: bool) {
         for block in blocks {
             let ContentBlock::Text(text) = block else {
                 continue;
             };
-            if let Err(error) = self.handle_chunk_text(&text) {
+            if let Err(error) = self.handle_chunk_text(&text, is_thought) {
                 eprintln!("{}", warning_text(&format!("render failed: {error}")));
                 break;
             }
@@ -806,11 +884,16 @@ mod tests {
             buffer: String::new(),
             last_ui_output_source: None,
             highlight,
+            stdout_is_terminal: *IS_STDOUT_TERMINAL,
             render_options: RenderOptions::default(),
             final_only: false,
             subagents: CliSubagentReporter::default(),
             tool_timers: ToolCallTimerReporter::default(),
             tool_updates: ToolUpdateReporter::default(),
+            think_segmenter: StreamingThinkSegmenter::default(),
+            thinking_label_printed: false,
+            thought_line_open: false,
+            native_thought: false,
         }
     }
 
@@ -2077,11 +2160,16 @@ mod tests {
             buffer: String::new(),
             last_ui_output_source: None,
             highlight: false,
+            stdout_is_terminal: *IS_STDOUT_TERMINAL,
             render_options: RenderOptions::default(),
             final_only: true,
             subagents: CliSubagentReporter::default(),
             tool_timers: ToolCallTimerReporter::default(),
             tool_updates: ToolUpdateReporter::default(),
+            think_segmenter: StreamingThinkSegmenter::default(),
+            thinking_label_printed: false,
+            thought_line_open: false,
+            native_thought: false,
         };
 
         state.tool_call_started("call-1", "read_file");
@@ -2468,3 +2556,7 @@ mod tests {
         assert!(output.contains("Processing file"));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "cli_thought_tests.rs"]
+mod thought_tests;

@@ -6,6 +6,7 @@ mod compact;
 mod main_runtime;
 mod oneshot_nats;
 mod session_dump;
+mod streaming_think_segmenter;
 mod tool_cmd;
 
 /// Heap-usage guard installed as the process allocator: aborts with a backtrace
