@@ -4,6 +4,9 @@ use crate::test_utils::{MockClient, MockTurn, MockTurnBuilder};
 use harnx_core::error::LlmError;
 use harnx_core::message::{Message, MessageContent};
 
+#[path = "overflow_tests/fallback.rs"]
+mod fallback;
+
 fn config_with_old_history() -> GlobalConfig {
     let config = replay_test_config(&TempDir::new().unwrap());
     let mut guard = config.write();

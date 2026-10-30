@@ -1,0 +1,11 @@
+# Merge the agents entry into ~/.config/harnx/packages/coding.patch.yaml if it exists.
+# Otherwise, copy this file there. Preserve existing overrides and set ZAI_API_KEY.
+# Prefer direct GLM 5.3, keeping the existing Bedrock route immediately after it.
+# For a Coding Plan key, also enable this endpoint override:
+# clients:
+#   - 'if .name == "zai" then .api_base = "https://api.z.ai/api/coding/paas/v4" end'
+agents:
+  - |
+    ([.model] + (.model_fallbacks // [])) as $chain |
+    ($chain | map(if . == "bedrock:us.zai.glm-5.3" then "zai:glm-5.3", . else . end)) as $chain |
+    .model = $chain[0] | .model_fallbacks = $chain[1:]

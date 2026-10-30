@@ -10,6 +10,10 @@ use harnx_client::ClientConfig;
 use harnx_core::model::Model;
 use harnx_engine::retry::{CallFuture, TurnContext};
 
+#[cfg(test)]
+#[path = "retry/fallback_tests.rs"]
+mod fallback_tests;
+
 pub use harnx_core::retry_config::ModelCooldownMap;
 
 /// Token usage from a completion call.
@@ -212,7 +216,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    fn make_config() -> GlobalConfig {
+    pub(super) fn make_config() -> GlobalConfig {
         let config = Config {
             data: harnx_core::config_data::ConfigData {
                 stream: false,
@@ -227,7 +231,7 @@ mod tests {
         crate::config::input::from_str(config, "hello", None)
     }
 
-    fn provider_switch_context() -> TurnContext {
+    pub(super) fn provider_switch_context() -> TurnContext {
         let clients = ["claude", "gemini"]
             .into_iter()
             .map(|provider| {
@@ -256,7 +260,7 @@ mod tests {
 
     /// Claude with a Gemini fallback, each model tried `attempts` times
     /// with no delay between tries.
-    fn input_with_attempts(config: &GlobalConfig, attempts: u32) -> Input {
+    pub(super) fn input_with_attempts(config: &GlobalConfig, attempts: u32) -> Input {
         let front_matter = format!(
             "---\nretry:\n  attempts: {attempts}\n  initial_delay_ms: 0\n  max_delay_ms: 0\n---\ntest"
         );

@@ -4,7 +4,7 @@ model: codex:gpt-6-luna
 model_fallbacks:
 - openai:gpt-6-luna
 - gemini:gemini-3.8-flash
-- claude:claude-haiku-4-5
+- claude:claude-haiku-5-5
 - bedrock:minimax.minimax-m2.5
 compaction_agent: compact-dev
 use_tools:

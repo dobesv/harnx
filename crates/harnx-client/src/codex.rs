@@ -5,6 +5,8 @@ use anyhow::Result;
 
 const CODEX_API_BASE: &str = "https://chatgpt.com/backend-api/codex";
 
+mod collect;
+
 impl CodexClient {
     // Read from env (`CODEX_API_BASE` / `CODEX_AUTH_FILE`, per the client's
     // filename stem) first, then the config file. Both are optional, so callers
@@ -31,7 +33,7 @@ impl Client for CodexClient {
         let api_base = self.get_api_base().ok();
         let request_data = build_codex_request(api_base.as_deref(), &model, &creds, data)?;
         let builder = self.request_builder(client, request_data)?;
-        crate::openai::openai_chat_completions(builder, &model).await
+        collect::completion(builder, &model).await
     }
 
     async fn chat_completions_streaming_inner(
@@ -61,7 +63,7 @@ fn build_codex_request(
     config_api_base: Option<&str>,
     model: &Model,
     creds: &CodexCreds,
-    data: ChatCompletionsData,
+    mut data: ChatCompletionsData,
 ) -> Result<RequestData> {
     let api_base = config_api_base
         .unwrap_or(CODEX_API_BASE)
@@ -71,6 +73,9 @@ fn build_codex_request(
     // it could leak. HTTPS overrides (including local test servers) stay allowed.
     require_https_base(api_base)?;
     let url = format!("{api_base}/responses");
+    // The subscription backend requires streaming even when the caller wants a
+    // completed result (compaction, titles, or a user with streaming disabled).
+    data.stream = true;
     let mut body = crate::openai_responses::openai_build_responses_body(data, model);
     body["store"] = serde_json::json!(false);
     let needs_instr = body
@@ -183,6 +188,7 @@ mod tests {
             Some("codex_cli_rs")
         );
         assert_eq!(request_data.body["store"], serde_json::json!(false));
+        assert_eq!(request_data.body["stream"], serde_json::json!(true));
         assert!(request_data.body["instructions"]
             .as_str()
             .is_some_and(|instructions| !instructions.is_empty()));

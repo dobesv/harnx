@@ -121,11 +121,16 @@ impl GeminiClient {
         };
 
         // Build request body with pre-expanded attachments
+        let method = if data.stream {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        };
         let body = gemini_build_chat_completions_body(data, &self.model, expanded_attachments)?;
 
         // Build URL - determine streaming vs non-streaming
         let url = format!(
-            "{}/models/{}:generateContent",
+            "{}/models/{}:{method}",
             api_base.trim_end_matches('/'),
             self.model.real_name(),
         );
@@ -217,6 +222,48 @@ struct EmbeddingsResBodyEmbedding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn argon_requests_use_the_matching_rest_method_and_output_limit() {
+        let catalog = crate::client::ALL_PROVIDER_MODELS
+            .iter()
+            .find(|provider| provider.provider == "gemini")
+            .expect("Gemini catalog");
+        let model = Model::from_config("gemini", &catalog.models)
+            .into_iter()
+            .find(|model| model.name() == "gemini-4-argon")
+            .expect("Argon catalog entry");
+        let client = GeminiClient {
+            config: GeminiConfig {
+                name: "gemini-routing-test".into(),
+                api_key: Some("test-key".into()),
+                api_base: Some("https://example.invalid/v1beta".into()),
+                ..Default::default()
+            },
+            model,
+        };
+        let http = reqwest::Client::new();
+        for (stream, method, limit) in [
+            (false, "generateContent", 32768),
+            (true, "streamGenerateContent", 65536),
+        ] {
+            let data = ChatCompletionsData {
+                messages: vec![Message::new(MessageRole::User, MessageContent::Text("hi".into()))],
+                temperature: Some(0.7),
+                top_p: Some(0.9),
+                functions: None,
+                stream,
+                attachments_dir: None,
+            };
+            let request = client.prepare_and_build_request(&http, data).await
+                .expect("build Gemini request").build().unwrap();
+            assert_eq!(request.url().path(), format!("/v1beta/models/gemini-4-argon:{method}"));
+            let body: Value = serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            assert_eq!(body["generationConfig"]["maxOutputTokens"], limit);
+            assert_eq!(body["generationConfig"]["thinkingConfig"]["includeThoughts"], true);
+            assert!(body["generationConfig"].get("temperature").is_none());
+        }
+    }
 
     #[test]
     fn collect_cid_refs_includes_tool_result_images() {

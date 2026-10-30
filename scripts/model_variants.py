@@ -23,11 +23,22 @@ GEMINI_THOUGHTS_PATCH = (
     ".body.generationConfig.thinkingConfig = "
     '((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})'
 )
+GEMINI_SAMPLING_THOUGHTS_PATCH = (
+    ".body.generationConfig = ((.body.generationConfig // {}) | "
+    "del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | "
+    + GEMINI_THOUGHTS_PATCH
+)
+ARGON_REQUEST_PATCH = GEMINI_SAMPLING_THOUGHTS_PATCH + (
+    " | .body.generationConfig.maxOutputTokens = "
+    "([.body.generationConfig.maxOutputTokens // 65536, "
+    '(if (.url | endswith(":generateContent")) then 32768 else 65536 end)] | min)'
+)
 # Gemini 2.5 and later think, except these models.
 GEMINI_NON_THINKING_MARKERS = ("-image", "-tts", "-native-audio")
 
-# Opus 4.7+ and Opus 5.5 only accept adaptive thinking plus the effort
-# parameter. Opus 5.5 defaults to medium; other adaptive models use high.
+# Opus 4.7+, Opus 5.5, Fable 5.1 and Haiku 5.5 use adaptive thinking
+# instead of fixed token budgets. Opus 5.5 and Haiku 5.5 default to medium;
+# other adaptive models use high.
 ADAPTIVE_ONLY_OPUS_MIN_MINOR = 7
 BASE_EFFORT = "high"
 ADAPTIVE_EFFORT_VARIANTS = ("xhigh", "max")
@@ -72,7 +83,9 @@ def is_adaptive_only_opus(name: str) -> bool:
 
 
 def is_adaptive_only_claude(name: str) -> bool:
-    return is_adaptive_only_opus(name) or name.startswith("claude-fable-5-1")
+    return is_adaptive_only_opus(name) or name.startswith(
+        ("claude-fable-5-1", "claude-haiku-5-5")
+    )
 
 
 def claude_requires_max_tokens(name: str) -> bool:
@@ -118,7 +131,7 @@ def claude_adaptive_patch(effort: str) -> str:
 
 def adaptive_model_patch(name: str, effort: str, provider: str) -> str:
     patch = claude_adaptive_patch(effort)
-    if provider == "claude" and name.startswith("claude-fable-5-1"):
+    if provider in ("claude", "vertexai") and name.startswith(("claude-fable-5-1", "claude-haiku-5-5")):
         # Harnx can compact history and rebuild dynamic system prompts. Ask the
         # API to drop invalidated thinking rather than reject the next tool turn.
         patch = patch.replace(
@@ -168,7 +181,9 @@ def apply_base_thinking(model: dict[str, Any], provider: str) -> None:
     if is_generated_variant_name(provider, name):
         return
     if name.startswith("claude-") and is_adaptive_only_claude(name):
-        effort = "medium" if name.startswith("claude-opus-5-5") else BASE_EFFORT
+        effort = (
+            "medium" if name.startswith(("claude-opus-5-5", "claude-haiku-5-5")) else BASE_EFFORT
+        )
         model["patches"] = [adaptive_model_patch(name, effort, provider)]
         model["require_max_tokens"] = True
     if claude_requires_max_tokens(name):
@@ -184,6 +199,7 @@ def apply_openai_base_patches(model: dict[str, Any], provider: str) -> None:
         "gpt-6-astra",
         "gpt-6-sol",
         "gpt-6.1-sol",
+        "gpt-6.1-terra",
         "gpt-6-luna",
     ):
         model["patches"] = [f"{OPENAI_NO_SAMPLING_PATCH} | {OPENAI_SUMMARY_PATCH}"]
@@ -224,14 +240,35 @@ def apply_gemini_thoughts(model: dict[str, Any], provider: str) -> None:
     """
     if provider not in ("gemini", "vertexai"):
         return
-    if provider == "gemini" and model["name"] == "gemini-3.8-flash":
-        model["patches"] = [
-            ".body.generationConfig = ((.body.generationConfig // {}) | "
-            "del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | "
-            + GEMINI_THOUGHTS_PATCH
-        ]
+    if provider == "gemini" and model["name"] == "gemini-4-argon":
+        apply_argon_limits(model)
+    elif provider == "gemini" and model["name"] == "gemini-3.8-flash":
+        model["patches"] = [GEMINI_SAMPLING_THOUGHTS_PATCH]
     elif "patches" not in model and gemini_thinks(model):
         model["patches"] = [GEMINI_THOUGHTS_PATCH]
+
+
+def apply_argon_limits(model: dict[str, Any]) -> None:
+    """Replace owned Argon rules once, retaining unrelated curated patches."""
+    # Reserve streaming output inside Argon's unified 1,048,576-token window.
+    # https://ai.google.dev/gemini-api/docs/generate-content/long-decode
+    model.update(max_input_tokens=983040, max_output_tokens=65536, require_max_tokens=True)
+    owned = {GEMINI_THOUGHTS_PATCH, GEMINI_SAMPLING_THOUGHTS_PATCH, ARGON_REQUEST_PATCH}
+    curated = [patch for patch in model.get("patches", []) if patch not in owned]
+    model["patches"] = [*curated, ARGON_REQUEST_PATCH]
+
+
+def apply_bedrock_base_patches(model: dict[str, Any], provider: str) -> None:
+    """Set an explicit GLM effort in the shape used by the selected client."""
+    if provider == "bedrock" and model["name"] == "us.zai.glm-5.3":
+        # GLM 5.3 defaults to max. Use high for everyday engineering specialists.
+        # The package client uses Chat Completions; native Bedrock uses Converse.
+        model["patches"] = [
+            'if (.body | has("inferenceConfig")) then '
+            ".body.additionalModelRequestFields = "
+            '((.body.additionalModelRequestFields // {}) + {"reasoning_effort":"high"}) '
+            'else .body.reasoning_effort = "high" end'
+        ]
 
 
 def apply_base_model_rules(model: dict[str, Any], provider: str) -> None:
@@ -239,12 +276,37 @@ def apply_base_model_rules(model: dict[str, Any], provider: str) -> None:
     apply_base_thinking(model, provider)
     apply_openai_base_patches(model, provider)
     apply_gemini_thoughts(model, provider)
+    apply_bedrock_base_patches(model, provider)
+    if provider == "zai" and model["name"] == "glm-5.3":
+        model["patches"] = [
+            '.body.thinking = {"type":"enabled"} | .body.reasoning_effort = "high"'
+        ]
+    if provider == "minimax" and model["name"] == "MiniMax-M3.1-Flash":
+        # Always reasons; use low for the routine-maintenance fallback.
+        # https://platform.minimax.io/docs/api-reference/text-openai-api
+        model.update(max_input_tokens=868928, max_output_tokens=131072, require_max_tokens=True)
+        model["patches"] = [
+            f'{OPENAI_NO_SAMPLING_PATCH} | '
+            '.body.thinking = {"type":"adaptive"} | .body.reasoning_effort = "low" | '
+            '.body.max_completion_tokens = (.body.max_completion_tokens // .body.max_tokens) | '
+            'del(.body.max_tokens)'
+        ]
 
 
 def _claude_thinking_variants(
     base_model: dict[str, Any], provider: str
 ) -> list[dict[str, Any]]:
     name = base_model["name"]
+    if name.startswith("claude-haiku-5-5"):
+        # Keep the existing alias, but replace its rejected fixed token budget.
+        return [
+            _variant_from_base(
+                base_model,
+                "thinking",
+                adaptive_model_patch(name, "medium", provider),
+                max_output_tokens=24000,
+            )
+        ]
     if is_adaptive_only_claude(name):
         return [
             _variant_from_base(
@@ -263,17 +325,18 @@ def _claude_thinking_variants(
 
 
 def _bedrock_thinking_patch(name: str) -> str:
-    if name == "us.anthropic.claude-sonnet-5-5":
-        # Converse rejects enabled + budget_tokens for this probed alias.
-        # Use Sonnet 5.5's documented default, not a budget-to-effort mapping:
+    if name in ("us.anthropic.claude-sonnet-5-5", "us.anthropic.claude-haiku-5-5"):
+        # These models need adaptive thinking, not a fixed token budget.
+        # Use their documented defaults, not a budget-to-effort mapping:
         # https://platform.claude.com/docs/en/build-with-claude/effort
         # Delete sampling fields without discarding the builder's maxTokens.
+        effort = "medium" if name == "us.anthropic.claude-haiku-5-5" else "high"
         return (
             ".body.inferenceConfig = ((.body.inferenceConfig // {}) | "
             "del(.temperature) | del(.topP)) | "
             ".body.additionalModelRequestFields = "
             '{"thinking":{"type":"adaptive","display":"summarized"},'
-            '"output_config":{"effort":"high"}}'
+            f'"output_config":{{"effort":"{effort}"}}}}'
         )
     if name in (
         "us.anthropic.claude-fable-5",

@@ -159,8 +159,9 @@ pub fn prepare_completion_data(
     let functions = config.read().select_tools(input.agent());
     input.resolved_tools = functions.clone();
     let mut messages = build_messages(input, config)?;
+    compatibility::guard_images(model, &messages)?;
     patch_messages(&mut messages, model);
-    model.guard_max_input_tokens(&messages)?;
+    compatibility::guard_request_size(model, &messages, functions.as_deref().unwrap_or_default())?;
     let (temperature, top_p) = (input.agent().temperature(), input.agent().top_p());
 
     let attachments_dir = if client.expands_attachments_internally() {
@@ -185,6 +186,8 @@ pub fn prepare_completion_data(
         attachments_dir,
     })
 }
+
+mod compatibility;
 
 pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Message>> {
     let guard = config.read();

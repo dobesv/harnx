@@ -25,6 +25,7 @@ fn tool(fixture: ToolFixture<'_>) -> Message {
             text: "checking".into(),
             thought: None,
             sequence: false,
+            rounds: Vec::new(),
             tool_results: vec![ToolResult::new(
                 ToolCall::new(
                     fixture.name.into(),

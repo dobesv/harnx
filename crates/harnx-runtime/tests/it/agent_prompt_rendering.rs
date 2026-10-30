@@ -388,6 +388,51 @@ async fn shipped_agent_models_resolve_with_required_endpoint_metadata() {
     );
 }
 
+#[tokio::test]
+async fn optional_zai_patch_prefers_direct_glm_and_retains_bedrock() {
+    harnx_core::require_nextest();
+    let Some(root) = workspace_root() else {
+        return;
+    };
+    let (temp, _guard) = install_packages(&root);
+    for package in PACKAGES {
+        fs::copy(
+            root.join("packages")
+                .join(package)
+                .join("zai.patch.example.yaml"),
+            temp.path()
+                .join("packages")
+                .join(format!("{package}.patch.yaml")),
+        )
+        .unwrap();
+    }
+    let config = Config::load_from_file(&temp.path().join("config.yaml")).unwrap();
+    for (name, expected) in [
+        ("pantheon/athena", true),
+        ("pantheon/mnemosyne", true),
+        ("pantheon/atlas", true),
+        ("coding/coder", true),
+        ("coding/compact-coder", false),
+    ] {
+        let agent = load_with_qualified_name(&Config::agent_file(name), name).unwrap();
+        let ids: Vec<_> = agent
+            .model_id()
+            .into_iter()
+            .chain(agent.model_fallbacks().iter().map(String::as_str))
+            .collect();
+        let direct = ids.iter().position(|id| id.ends_with("/zai:glm-5.3"));
+        assert_eq!(direct.is_some(), expected, "{name}: {ids:?}");
+        if let Some(index) = direct {
+            assert!(
+                ids[index + 1].ends_with("/bedrock:us.zai.glm-5.3"),
+                "{name}: {ids:?}"
+            );
+        }
+        let (_, failures) = check_agent_models(&config, name).await;
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+}
+
 #[test]
 fn clio_prompt_checks_for_an_existing_pull_request_after_push() {
     harnx_core::require_nextest();

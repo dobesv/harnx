@@ -245,7 +245,10 @@ macro_rules! config_get_fn {
             std::env::var(&env_name)
                 .ok()
                 .or_else(|| self.config.$field_name.clone())
-                .ok_or_else(|| anyhow::anyhow!("Miss '{}'", stringify!($field_name)))
+                .ok_or_else(|| {
+                    anyhow::Error::new(harnx_core::error::ModelFallbackReason::Unavailable)
+                        .context(format!("Miss '{}'", stringify!($field_name)))
+                })
         }
     };
 }

@@ -4,7 +4,7 @@ model: claude:claude-opus-5-5
 model_fallbacks:
 - codex:gpt-6.1-sol
 - openai:gpt-6.1-sol
-- gemini:gemini-3.8-flash
+- gemini:gemini-4-argon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-dev
 use_tools:

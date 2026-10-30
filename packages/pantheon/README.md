@@ -22,9 +22,9 @@ results, and a multi-agent code review pipeline.
 | `hephaestus` | gpt-6.1-sol:high | Large refactors, migrations, deep implementation |
 | `iris` | gemini-3.8-flash | UI, frontend, visual engineering |
 | `apollo` | gemini-3.8-flash | Creative solutions, novel UX |
-| `athena` | zai.glm-5 | Complex multi-file features, agent of last resort |
+| `athena` | us.zai.glm-5.3 | Complex multi-file features, agent of last resort |
 | `hermes` | gpt-6-luna | Quick fixes, one-liners, config tweaks |
-| `hestia` | minimax.minimax-m2.5 | Maintenance, dependency updates, linting |
+| `hestia` | gpt-6-luna | Maintenance, dependency updates, linting |
 | `plato` | gpt-6-astra:max | Architecture, data modeling, complex algorithms |
 | `peitho` | gemini-3.8-flash | Documentation, READMEs, release notes |
 
@@ -37,7 +37,7 @@ results, and a multi-agent code review pipeline.
 | `librarian` | gemini-3.8-flash | External knowledge — web search, docs, GitHub |
 | `oracle` | gpt-6-astra:max | Architectural decisions and consultation |
 | `argus` | gemini-3.8-flash | Independent verification — PASS/FAIL with evidence |
-| `mnemosyne` | zai.glm-5 | Knowledge compounding — reconciles durable knowledge into the authoritative docs, instructions, comments and tests |
+| `mnemosyne` | us.zai.glm-5.3 | Knowledge compounding — reconciles durable knowledge into the authoritative docs, instructions, comments and tests |
 | `clio` | gemini-3.8-flash | Git operations — squash, rebase, push |
 
 ### Code Review Pipeline (Aristarchus)
@@ -52,7 +52,7 @@ results, and a multi-agent code review pipeline.
 
 `compact-dev`, `compact-researcher`, `compact-planner`, `compact-reviewer`,
 `compact-argus`, `compact-mnemosyne`, `compact-reliability`, `compact-deploy` —
-lightweight context-compression agents (gemini-3.5-flash-lite) used to keep
+lightweight context-compression agents (gpt-6-luna) used to keep
 long conversations within token limits.
 
 ---
@@ -65,8 +65,8 @@ Install from GHCR (replace `v0.1.0` with the current release):
 harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.4.16
 ```
 
-Use harnx 0.34.0 or a development build containing the package model updates.
-Configure any one of the five included clients; every agent, including compaction,
+Use a harnx build containing the model and client updates accompanying this package refresh.
+Configure any one of the five core clients; every agent, including compaction,
 has a fallback for each provider. For a ChatGPT subscription, run `codex login`.
 For API-key access, set the applicable key in `~/.local/share/harnx/.env`:
 
@@ -76,6 +76,11 @@ OPENAI_API_KEY=sk-...
 GEMINI_API_KEY=AIza...
 BEDROCK_API_KEY=...   # Amazon Bedrock API key
 ```
+
+Hestia also tries direct MiniMax M3.1 Flash after Luna when `MINIMAX_API_KEY`
+is configured. Optional direct Z.AI routing uses `ZAI_API_KEY` and the
+[example package patch](zai.patch.example.yaml); Bedrock remains in the chain.
+See the [model policy](MODELS.md) for setup and request compatibility behavior.
 
 Run Sisyphus:
 
@@ -141,7 +146,7 @@ Override per-agent or set all at once:
 ```yaml
 # ~/.config/harnx/packages/pantheon.patch.yaml
 agents:
-  - '.model = "codex:gpt-5.6-terra"'   # replace every agent's model
+  - '.model = "codex:gpt-6.1-sol"'   # replace every agent's model
 ```
 
 ### Using the Bedrock client

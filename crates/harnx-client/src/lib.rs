@@ -61,6 +61,8 @@ pub const OPENAI_COMPATIBLE_PROVIDERS: [(&str, &str); 18] = [
     ("voyageai", "https://api.voyageai.com/v1"),
 ];
 
+// These macro-declared provider modules aren't traversed by `cargo fmt`.
+// Run rustfmt directly on edited provider files and their child modules too.
 register_client!(
     (openai, "openai", OpenAIConfig, OpenAIClient),
     (

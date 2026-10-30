@@ -2,6 +2,25 @@
 
 use std::time::Duration;
 
+/// A positively identified reason to try another model without retrying this one.
+/// Kept as typed error context so the original provider diagnostics survive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFallbackReason {
+    Unavailable,
+    IncompatibleInput,
+}
+
+impl std::fmt::Display for ModelFallbackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unavailable => "Model unavailable",
+            Self::IncompatibleInput => "Model cannot accept this request",
+        })
+    }
+}
+
+impl std::error::Error for ModelFallbackReason {}
+
 /// Structured error from LLM API calls, carrying HTTP status and retry-after info.
 #[derive(Debug)]
 pub struct LlmError {

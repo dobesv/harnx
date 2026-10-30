@@ -543,12 +543,7 @@ fn assemble_tool_message(
 
     Message::new(
         MessageRole::Tool,
-        MessageContent::ToolCalls(MessageContentToolCalls {
-            tool_results,
-            text,
-            thought,
-            sequence: false,
-        }),
+        MessageContent::ToolCalls(MessageContentToolCalls::new(tool_results, text, thought)),
     )
 }
 

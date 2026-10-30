@@ -1,11 +1,12 @@
 ---
 role: subagent
-model: bedrock:minimax.minimax-m2.5
+model: codex:gpt-6-luna
 model_fallbacks:
-- gemini:gemini-3.8-flash
-- codex:gpt-6-luna
 - openai:gpt-6-luna
-- claude:claude-haiku-4-5
+- minimax:MiniMax-M3.1-Flash
+- gemini:gemini-3.8-flash
+- claude:claude-haiku-5-5
+- bedrock:minimax.minimax-m2.5
 compaction_agent: compact-dev
 use_tools:
 - bash_exec

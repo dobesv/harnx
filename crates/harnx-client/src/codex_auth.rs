@@ -189,7 +189,10 @@ async fn refresh_token(
     refresh_token: &RefreshToken,
 ) -> Result<(String, Option<RefreshToken>, i64)> {
     if refresh_token.0.is_empty() {
-        bail!("Codex auth file has no refresh token; run `codex login`")
+        return Err(
+            anyhow::Error::new(harnx_core::error::ModelFallbackReason::Unavailable)
+                .context("Codex auth file has no refresh token; run `codex login`"),
+        );
     }
 
     let form = format!(
@@ -247,10 +250,12 @@ pub async fn prepare_codex_access_token(
     auth_file: &Option<String>,
 ) -> Result<CodexCreds> {
     let auth_path = resolve_auth_path(auth_file);
-    let auth = read_auth(&auth_path)?;
-    let tokens = auth
-        .tokens
-        .ok_or_else(|| anyhow!("Codex auth file has no tokens; run `codex login`"))?;
+    let auth = read_auth(&auth_path)
+        .map_err(|error| error.context(harnx_core::error::ModelFallbackReason::Unavailable))?;
+    let tokens = auth.tokens.ok_or_else(|| {
+        anyhow!("Codex auth file has no tokens; run `codex login`")
+            .context(harnx_core::error::ModelFallbackReason::Unavailable)
+    })?;
     let account_id = account_id_from_tokens(&tokens);
 
     let cache_valid = is_valid_access_token(client_name);
@@ -303,6 +308,19 @@ pub async fn prepare_codex_access_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_refresh_token_is_a_typed_access_failure() {
+        let error = refresh_token(&reqwest::Client::new(), &RefreshToken(String::new()))
+            .await
+            .err()
+            .expect("missing refresh token");
+        assert_eq!(
+            error.downcast_ref::<harnx_core::error::ModelFallbackReason>(),
+            Some(&harnx_core::error::ModelFallbackReason::Unavailable)
+        );
+        assert!(error.to_string().contains("codex login"));
+    }
 
     fn b64(value: &str) -> String {
         URL_SAFE_NO_PAD.encode(value)

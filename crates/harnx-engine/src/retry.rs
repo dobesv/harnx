@@ -10,7 +10,7 @@ use anyhow::Result;
 use harnx_client::{retrieve_model, Client, ClientConfig};
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::api_types::CompletionTokenUsage;
-use harnx_core::error::LlmError;
+use harnx_core::error::{LlmError, ModelFallbackReason};
 use harnx_core::event::{AgentEvent, TurnEvent};
 use harnx_core::input::Input;
 use harnx_core::loop_guard::{find_repetitive_output, RepetitionStop};
@@ -22,6 +22,8 @@ use parking_lot::Mutex;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+
+mod failure;
 
 pub const DEFAULT_COOLDOWN_SECS: u64 = 60;
 
@@ -133,11 +135,14 @@ pub fn find_llm_error(err: &anyhow::Error) -> Option<&LlmError> {
     None
 }
 
-/// Returns true if the error is non-retryable AND not an auth error.
-/// These errors (400, 404) should not trigger fallback to next model.
+/// Malformed requests stop the chain; positively identified model availability
+/// and input compatibility errors can be handled by another model.
 pub fn is_non_retryable_non_auth(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<ModelFallbackReason>().is_some() {
+        return false;
+    }
     if let Some(llm_err) = find_llm_error(err) {
-        !llm_err.is_retryable() && !llm_err.is_auth_error()
+        !llm_err.is_retryable() && !llm_err.is_auth_error() && !llm_err.is_context_overflow()
     } else {
         false
     }
@@ -177,6 +182,10 @@ where
         .to_string();
     let mut model_ids: Vec<String> = vec![primary_model_id];
     model_ids.extend(input.agent().model_fallbacks().iter().cloned());
+    // A previously selected fallback can now be primary while still appearing
+    // in the configured chain. Request-specific failures must not call it twice.
+    let mut seen = std::collections::HashSet::new();
+    model_ids.retain(|id| seen.insert(id.clone()));
 
     // Eagerly validate all fallback model IDs so the user gets immediate
     // feedback about typos / missing models instead of a silent skip.
@@ -191,7 +200,7 @@ where
         }
     }
 
-    let mut last_error: Option<anyhow::Error> = None;
+    let mut failure = failure::LastFailure::default();
     // Tracks the last model we actually attempted (not just validated/skipped),
     // so we can emit `TurnEvent::ModelFallback` when switching to a new one.
     let mut prev_tried_model: Option<String> = None;
@@ -226,7 +235,7 @@ where
                         model_id, err
                     ));
                     ctx.model_cooldowns.lock().set_infinite_cooldown(model_id);
-                    last_error = Some(err);
+                    failure.remember(err, None);
                     continue;
                 }
             }
@@ -239,7 +248,7 @@ where
                         model_id, err
                     ));
                     ctx.model_cooldowns.lock().set_infinite_cooldown(model_id);
-                    last_error = Some(err);
+                    failure.remember(err, None);
                     continue;
                 }
             }
@@ -262,7 +271,7 @@ where
             Ok(result) => return Ok(result),
             Err(err) => {
                 if is_non_retryable_non_auth(&err) {
-                    // Non-retryable errors (400, 404) should not sideline the model
+                    // A malformed request should not sideline the model.
                     return Err(err);
                 }
 
@@ -274,15 +283,13 @@ where
                 // "exhausted retries" notice event and appear in the wrong
                 // order in the transcript.
                 tokio::task::yield_now().await;
-                last_error = Some(err);
+                failure.remember(err, Some(&selected_model));
             }
         }
         prev_tried_model = Some(model_id.clone());
     }
 
-    Err(last_error
-        .map(stop_if_repetitive)
-        .unwrap_or_else(|| anyhow::anyhow!("All models are on cooldown")))
+    Err(failure.finish(input, ctx))
 }
 
 /// Take a model out of the rest of this call after it failed. A model that
@@ -295,14 +302,31 @@ fn sideline_model(ctx: &TurnContext, err: &anyhow::Error, model_id: &str) {
         ));
         return;
     }
+    if request_incompatible(err) {
+        ctx.warn(&format!(
+            "Model '{model_id}' cannot accept this request (error: {err:#}). Trying next fallback."
+        ));
+        return;
+    }
     let cooldown = compute_cooldown(err, &ctx.clients, model_id);
     ctx.model_cooldowns.lock().set_cooldown(model_id, cooldown);
+    let reason =
+        if err.downcast_ref::<ModelFallbackReason>() == Some(&ModelFallbackReason::Unavailable) {
+            "is unavailable"
+        } else {
+            "exhausted retries"
+        };
     ctx.warn(&format!(
-        "Model '{}' exhausted retries (error: {:#}), cooldown {}s. Trying next fallback.",
+        "Model '{}' {reason} (error: {:#}), cooldown {}s. Trying next fallback.",
         model_id,
         err,
         cooldown.as_secs()
     ));
+}
+
+fn request_incompatible(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ModelFallbackReason>() == Some(&ModelFallbackReason::IncompatibleInput)
+        || find_llm_error(err).is_some_and(LlmError::is_context_overflow)
 }
 
 /// A call whose last model kept repeating ends the turn as a repetition
@@ -342,7 +366,7 @@ fn handle_attempt_error(
 ) -> AttemptOutcome {
     // Repeated even after the note: give up on this model at once and let
     // the fallback loop decide what comes next.
-    if find_repetitive_output(err).is_some() {
+    if stops_attempts(err) {
         return AttemptOutcome::BailImmediately;
     }
     if let Some(llm_err) = find_llm_error(err) {
@@ -374,6 +398,10 @@ fn handle_attempt_error(
     } else {
         untyped_error_outcome(err, retry_config, attempt, attempts)
     }
+}
+
+fn stops_attempts(err: &anyhow::Error) -> bool {
+    find_repetitive_output(err).is_some() || err.downcast_ref::<ModelFallbackReason>().is_some()
 }
 
 /// What to do after a failure that carries no `LlmError`. Untyped errors

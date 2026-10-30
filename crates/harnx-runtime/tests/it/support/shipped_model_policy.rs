@@ -76,22 +76,27 @@ pub async fn check_single_provider_fallbacks(config: &Config, agent: &AgentConfi
     let primary = retrieve_model(&config.clients, primary_id, ModelType::Chat)?;
     // Each configured provider must be independently sufficient, even when all
     // preceding clients reject their credentials. Also check Codex + API-key ordering.
-    for available in [
-        "gemini",
-        "claude",
-        "codex",
-        "openai",
-        "bedrock",
-        "codex+openai",
-    ] {
+    let mut providers: Vec<_> = agent
+        .model_id()
+        .into_iter()
+        .chain(agent.model_fallbacks().iter().map(String::as_str))
+        .map(|id| provider(id).to_owned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    providers.push("codex+openai".to_owned());
+    providers.sort_unstable();
+    for available in providers {
         let mut input = Input::new("hello".into(), ("hello".into(), vec![]), agent.clone());
         input.agent.set_resolved_model(primary.clone());
         let context = turn_context(config);
+        let selected = available.clone();
         let result = call_with_retry_and_fallback_custom(
             &mut input,
             &context,
             harnx_core::abort::create_abort_signal(),
             move |_, client, _| {
+                let available = selected.clone();
                 Box::pin(async move {
                     let id = client.model().id();
                     if available.split('+').any(|p| p == provider(&id)) {
@@ -112,7 +117,7 @@ pub async fn check_single_provider_fallbacks(config: &Config, agent: &AgentConfi
         let expected = if available == "codex+openai" {
             "codex"
         } else {
-            available
+            available.as_str()
         };
         ensure!(
             provider(&result.0) == expected,

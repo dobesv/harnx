@@ -2,10 +2,10 @@
 role: subagent
 model: gemini:gemini-3.8-flash
 model_fallbacks:
-- codex:gpt-5.6-terra
-- openai:gpt-5.6-terra
+- codex:gpt-6.1-sol
+- openai:gpt-6.1-sol
 - claude:claude-sonnet-5-5
-- bedrock:zai.glm-5
+- bedrock:us.zai.glm-5.3
 compaction_agent: compact-dev
 use_tools:
 - bash_exec
