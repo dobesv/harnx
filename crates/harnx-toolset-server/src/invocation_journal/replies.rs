@@ -19,7 +19,13 @@ impl InvocationJournal {
             .and_then(|record| completion::recorded_reply(record, true)))
     }
 
-    async fn completed_record(&self, request: &ToolRequest) -> Result<Option<RecordedInvocation>> {
+    /// Read the latest row after validating replay identity and session retention.
+    /// The row may still be awaiting a reply. Reply and partial result in a
+    /// returned row come from the same revision.
+    pub async fn completed_record(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Option<RecordedInvocation>> {
         self.validate_replay(request).await?;
         self.check_session_retained(request).await?;
         self.get(request).await
@@ -78,28 +84,16 @@ impl InvocationJournal {
         key: &str,
         value: &serde_json::Value,
     ) -> Result<bool> {
-        let entry = self
-            .entry(key)
+        Ok(self
+            .try_update_record(key, "persist tool invocation partial result", |record| {
+                if record.reply.is_some() || record.partial_result.as_ref() == Some(value) {
+                    return RecordUpdate::Unchanged(());
+                }
+                record.partial_result = Some(value.clone());
+                RecordUpdate::Changed(())
+            })
             .await?
-            .context("durable tool invocation missing")?;
-        ensure!(
-            entry.operation == kv::Operation::Put,
-            "tool invocation was deleted"
-        );
-        let mut record: RecordedInvocation = serde_json::from_slice(&entry.value)?;
-        if record.reply.is_some() || record.partial_result.as_ref() == Some(value) {
-            return Ok(true);
-        }
-        record.partial_result = Some(value.clone());
-        match self
-            .0
-            .update(key, serde_json::to_vec(&record)?.into(), entry.revision)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == kv::UpdateErrorKind::WrongLastRevision => Ok(false),
-            Err(error) => Err(error).context("persist tool invocation partial result"),
-        }
+            .is_some())
     }
 }
 

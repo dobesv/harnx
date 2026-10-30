@@ -23,6 +23,11 @@ impl ToolInvocationContext {
     /// `partial_result`. A successful call returns only its own result.
     ///
     /// Does nothing when the transport has no store for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the serialized value exceeds [`PARTIAL_RESULT_MAX_BYTES`]
+    /// or the store fails to persist it.
     pub async fn record_partial_result(&self, value: Value) -> anyhow::Result<()> {
         let Some(store) = &self.partial_result_store else {
             return Ok(());

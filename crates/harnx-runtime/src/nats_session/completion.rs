@@ -128,9 +128,12 @@ pub fn completed_subagent_progress(
             let Some(value) = result.output.get("sub_agent_progress") else {
                 continue;
             };
-            let Ok(progress) = serde_json::from_value::<SubAgentProgress>(value.clone()) else {
+            let Ok(mut progress) = serde_json::from_value::<SubAgentProgress>(value.clone()) else {
                 continue;
             };
+            if progress.tool_call_id.is_none() {
+                progress.tool_call_id = result.id.clone();
+            }
             if progress.status != SubAgentProgressStatus::Running {
                 completed.push(progress);
             }

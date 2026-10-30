@@ -146,7 +146,10 @@ async fn assert_child_result_recovery(compacted: bool) {
         .await
         .unwrap();
     assert!(tui.app.llm_busy);
-    assert_completed_child(tui, &progress);
+    // Recovery supplies the parent call ID omitted by the stored child snapshot.
+    let mut expected = progress;
+    expected.tool_call_id = Some("call".into());
+    assert_completed_child(tui, &expected);
 }
 
 fn assert_completed_child(tui: &Tui, progress: &harnx_core::event::SubAgentProgress) {

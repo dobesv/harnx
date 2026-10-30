@@ -3,7 +3,9 @@
 //! server hands it.
 use crate::common::{self, request_headers, TestHarness};
 use anyhow::{Context, Result};
-use harnx_toolset::{PartialResultStore, ToolErrorPayload, ToolReply, ToolRequest};
+use harnx_toolset::{
+    CheckpointStore, PartialResultStore, ToolErrorPayload, ToolReply, ToolRequest,
+};
 use harnx_toolset_server::invocation_journal::InvocationJournal;
 use serde_json::json;
 
@@ -110,5 +112,48 @@ async fn a_failing_tool_leaves_its_partial_result_on_the_call_row() -> Result<()
         .context("journal row")?;
     assert_eq!(row.partial_result, Some(json!({"job": "j-1"})));
     harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_checkpoint_and_partial_result_updates_preserve_both_fields() -> Result<()> {
+    let (_server, journal) = common::journal().await;
+    let request = common::request("sess-concurrent", "call-concurrent");
+    journal.record(&request, ("echo", "scope", "srv")).await?;
+
+    let handles = futures_util::future::try_join_all((0..8).map(|index| {
+        let checkpoint = journal.checkpoint_store(&request);
+        let partial = journal.partial_result_store(&request);
+        async move {
+            let (handle, ()) = tokio::try_join!(
+                checkpoint.checkpoint(json!({"job": index})),
+                partial.record_partial_result(json!({"step": index})),
+            )?;
+            Ok::<_, anyhow::Error>(handle)
+        }
+    }))
+    .await?;
+    let winner = &handles[0];
+    assert!(handles.iter().all(|handle| handle == winner));
+
+    let row = journal.get(&request).await?.context("call row")?;
+    assert_eq!(row.checkpoint.as_ref(), Some(winner));
+    let partial = row
+        .partial_result
+        .context("partial result survived CAS retries")?;
+    journal
+        .partial_result_store(&request)
+        .record_partial_result(partial.clone())
+        .await?;
+    assert_eq!(
+        journal
+            .checkpoint_store(&request)
+            .checkpoint(json!({"job": "later"}))
+            .await?,
+        *winner,
+    );
+    let unchanged = journal.get(&request).await?.context("unchanged call row")?;
+    assert_eq!(unchanged.partial_result, Some(partial));
+    assert_eq!(unchanged.checkpoint.as_ref(), Some(winner));
     Ok(())
 }

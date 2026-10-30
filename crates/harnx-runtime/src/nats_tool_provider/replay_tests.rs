@@ -5,6 +5,9 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[path = "replay_reply_race.rs"]
+mod reply_race;
+
 #[test]
 fn replay_route_preserves_logical_identity_across_process_scopes() -> anyhow::Result<()> {
     let record = serde_json::from_value(json!({
@@ -93,10 +96,10 @@ async fn resume_without_cancel_rolls_forward_saved_reply_then_replays_retryable_
     Ok(())
 }
 
-/// A failure the journal already holds rolls forward with the partial result
-/// its tool recorded, the same as a failure the caller saw live.
+/// A completion between replay's two reads must carry the partial result
+/// stored with the reply, not the older value from the initial lookup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_saved_failure_rolls_forward_with_its_partial_result() -> anyhow::Result<()> {
+async fn a_saved_failure_rolls_forward_with_its_reply_time_partial_result() -> anyhow::Result<()> {
     use harnx_toolset::PartialResultStore;
 
     let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
@@ -126,17 +129,14 @@ async fn a_saved_failure_rolls_forward_with_its_partial_result() -> anyhow::Resu
         .partial_result_store(&request)
         .record_partial_result(json!({"job": "j-1"}))
         .await?;
-    journal
-        .complete(
-            &request,
-            ToolReply {
-                call_id: "failed-original".into(),
-                result: Err(ToolErrorPayload::Recoverable("job failed".into())),
-                final_progress: None,
-            },
-        )
-        .await?;
+    let proxy = reply_race::complete_after_first_read(&client, journal, request).await?;
+    let proxy_js = async_nats::jetstream::with_prefix(client.clone(), "REPLAY_RACE");
+    let proxy_journal = InvocationJournal::ensure(&proxy_js, 1).await?;
     let provider = saved_reply_provider(client).await?;
+    provider
+        .journal
+        .set(proxy_journal)
+        .map_err(|_| anyhow!("provider journal was already initialized"))?;
 
     let failed = harnx_core::tool::ToolCall::new(
         "retired_echo".into(),
@@ -153,9 +153,10 @@ async fn a_saved_failure_rolls_forward_with_its_partial_result() -> anyhow::Resu
         .context("recovered failure")?;
     assert_eq!(
         result.value,
-        json!({"is_error": true, "error": "job failed", "partial_result": {"job": "j-1"}})
+        json!({"is_error": true, "error": "job failed", "partial_result": {"job": "j-2"}})
     );
 
+    proxy.abort();
     let _ = nats.kill();
     let _ = nats.wait();
     Ok(())

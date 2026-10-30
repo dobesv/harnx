@@ -76,7 +76,10 @@ impl NatsToolProvider {
             return Ok(None);
         };
         anyhow::ensure!(record.tool_name == call.name, "replayed tool name changed");
-        if let Some(reply) = journal.completed_reply(&record.request).await? {
+        let Some(mut record) = journal.completed_record(&record.request).await? else {
+            return Ok(None);
+        };
+        if let Some(reply) = record.reply.take() {
             return recovered_output(attach_partial_result(
                 decode_journaled_reply(&record, reply),
                 record.partial_result.as_ref(),
