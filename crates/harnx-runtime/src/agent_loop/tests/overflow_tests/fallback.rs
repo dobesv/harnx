@@ -13,8 +13,37 @@ async fn primary_overflow_then_auth_fallback_compacts_and_retries_primary() {
     let _mock = crate::client::TestStateGuard::new(Some(mock.clone())).await;
     let mut ctx = context(config.clone());
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let seen = calls.clone();
-    ctx.call_fn = Some(Arc::new(move |input, _, abort| {
+    ctx.call_fn = Some(overflow_then_auth(calls.clone()));
+    let mut input = crate::config::input::from_str(&config, "Current question", None);
+    input
+        .agent_mut()
+        .set_model(Model::new("claude", "claude-sonnet"));
+    input
+        .agent_mut()
+        .set_model_fallbacks(vec!["gemini:gemini-2.5-pro".into()]);
+    let sink = Arc::new(CollectingSink::default());
+    let result = harnx_core::sink::with_agent_event_sink(sink.clone(), run_agent_loop(&ctx, input))
+        .await
+        .unwrap();
+    assert!(matches!(result, LoopResult::Completed));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            "claude:claude-sonnet",
+            "gemini:gemini-2.5-pro",
+            "claude:claude-sonnet"
+        ]
+    );
+    assert_eq!(
+        mock.conversation_history().conversation_history.len(),
+        1,
+        "exactly one real compactor call"
+    );
+    assert_compaction_lifecycle(&sink);
+}
+
+fn overflow_then_auth(seen: Arc<std::sync::Mutex<Vec<String>>>) -> crate::agent_loop::AgentCallFn {
+    Arc::new(move |input, _, abort| {
         let seen = seen.clone();
         Box::pin(async move {
             let turn = turn_context();
@@ -45,33 +74,7 @@ async fn primary_overflow_then_auth_fallback_compacts_and_retries_primary() {
             })
             .await
         })
-    }));
-    let mut input = crate::config::input::from_str(&config, "Current question", None);
-    input
-        .agent_mut()
-        .set_model(Model::new("claude", "claude-sonnet"));
-    input
-        .agent_mut()
-        .set_model_fallbacks(vec!["gemini:gemini-2.5-pro".into()]);
-    let sink = Arc::new(CollectingSink::default());
-    let result = harnx_core::sink::with_agent_event_sink(sink.clone(), run_agent_loop(&ctx, input))
-        .await
-        .unwrap();
-    assert!(matches!(result, LoopResult::Completed));
-    assert_eq!(
-        *calls.lock().unwrap(),
-        [
-            "claude:claude-sonnet",
-            "gemini:gemini-2.5-pro",
-            "claude:claude-sonnet"
-        ]
-    );
-    assert_eq!(
-        mock.conversation_history().conversation_history.len(),
-        1,
-        "exactly one real compactor call"
-    );
-    assert_compaction_lifecycle(&sink);
+    })
 }
 
 fn turn_context() -> TurnContext {

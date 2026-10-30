@@ -3083,7 +3083,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"high"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1:max
       real_name: claude-fable-5-1
       max_input_tokens: 1000000
@@ -3096,7 +3096,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1:xhigh
       real_name: claude-fable-5-1
       max_input_tokens: 1000000
@@ -3109,7 +3109,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3121,7 +3121,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"high"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1@default:max
       real_name: claude-fable-5-1@default
       max_input_tokens: 1000000
@@ -3134,7 +3134,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1@default:xhigh
       real_name: claude-fable-5-1@default
       max_input_tokens: 1000000
@@ -3147,7 +3147,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3227,7 +3227,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-haiku-5-5:thinking
       real_name: claude-haiku-5-5
       max_input_tokens: 1000000
@@ -3240,7 +3240,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-haiku-5-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3252,7 +3252,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-haiku-5-5@default:thinking
       real_name: claude-haiku-5-5@default
       max_input_tokens: 1000000
@@ -3265,7 +3265,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-opus-4
       max_input_tokens: 200000
       max_output_tokens: 32000

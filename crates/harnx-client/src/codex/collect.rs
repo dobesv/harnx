@@ -21,6 +21,16 @@ pub(super) async fn completion(
                 kind => kind,
             };
             match kind {
+                "response.incomplete"
+                    if data["response"]["incomplete_details"]["reason"] == "content_filter" =>
+                {
+                    Err(harnx_core::error::LlmError {
+                        status: 400,
+                        message: "Codex response incomplete: content_filter".into(),
+                        retry_after: None,
+                    }
+                    .into())
+                }
                 "response.completed" | "response.incomplete" => {
                     terminal = Some(data["response"].clone());
                     Ok(true)

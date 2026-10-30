@@ -290,6 +290,48 @@ fn prefix_bound_claude_models_use_adaptive_thinking_and_an_output_limit() {
 }
 
 #[test]
+fn vertex_thinking_binding_controls_reach_the_http_request() {
+    use harnx_client::{Client, RequestData, VertexAIClient};
+
+    for name in [
+        "claude-haiku-5-5",
+        "claude-haiku-5-5:thinking",
+        "claude-haiku-5-5@default",
+        "claude-haiku-5-5@default:thinking",
+        "claude-fable-5-1",
+        "claude-fable-5-1@default:max",
+    ] {
+        let model = provider_models("vertexai")
+            .into_iter()
+            .find(|model| model.name() == name)
+            .unwrap();
+        let envelope = request_envelope(&model);
+        let client = VertexAIClient::from_config_for_test(Default::default(), model);
+        let mut data = RequestData::new(
+            "https://example.invalid/anthropic/models/test:streamRawPredict",
+            envelope["body"].clone(),
+        );
+        data.header("anthropic-beta", "files-api-2025-04-14");
+        let request = client
+            .request_builder(&reqwest::Client::new(), data)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers()["anthropic-beta"],
+            "files-api-2025-04-14,thinking-binding-controls-2026-08-01"
+        );
+        let body: Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "drop_block"
+        );
+        assert_eq!(body["max_tokens"], 4096);
+    }
+}
+
+#[test]
 fn opus_5_5_uses_adaptive_thinking_and_required_output_limit() {
     for provider_name in ["claude", "vertexai"] {
         let provider = ALL_PROVIDER_MODELS

@@ -23,6 +23,16 @@ GEMINI_THOUGHTS_PATCH = (
     ".body.generationConfig.thinkingConfig = "
     '((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})'
 )
+GEMINI_SAMPLING_THOUGHTS_PATCH = (
+    ".body.generationConfig = ((.body.generationConfig // {}) | "
+    "del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | "
+    + GEMINI_THOUGHTS_PATCH
+)
+ARGON_REQUEST_PATCH = GEMINI_SAMPLING_THOUGHTS_PATCH + (
+    " | .body.generationConfig.maxOutputTokens = "
+    "([.body.generationConfig.maxOutputTokens // 65536, "
+    '(if (.url | endswith(":generateContent")) then 32768 else 65536 end)] | min)'
+)
 # Gemini 2.5 and later think, except these models.
 GEMINI_NON_THINKING_MARKERS = ("-image", "-tts", "-native-audio")
 
@@ -121,7 +131,7 @@ def claude_adaptive_patch(effort: str) -> str:
 
 def adaptive_model_patch(name: str, effort: str, provider: str) -> str:
     patch = claude_adaptive_patch(effort)
-    if provider == "claude" and name.startswith(("claude-fable-5-1", "claude-haiku-5-5")):
+    if provider in ("claude", "vertexai") and name.startswith(("claude-fable-5-1", "claude-haiku-5-5")):
         # Harnx can compact history and rebuild dynamic system prompts. Ask the
         # API to drop invalidated thinking rather than reject the next tool turn.
         patch = patch.replace(
@@ -230,24 +240,22 @@ def apply_gemini_thoughts(model: dict[str, Any], provider: str) -> None:
     """
     if provider not in ("gemini", "vertexai"):
         return
-    if provider == "gemini" and model["name"] in ("gemini-3.8-flash", "gemini-4-argon"):
-        model["patches"] = [
-            ".body.generationConfig = ((.body.generationConfig // {}) | "
-            "del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | "
-            + GEMINI_THOUGHTS_PATCH
-        ]
+    if provider == "gemini" and model["name"] == "gemini-4-argon":
+        apply_argon_limits(model)
+    elif provider == "gemini" and model["name"] == "gemini-3.8-flash":
+        model["patches"] = [GEMINI_SAMPLING_THOUGHTS_PATCH]
     elif "patches" not in model and gemini_thinks(model):
         model["patches"] = [GEMINI_THOUGHTS_PATCH]
-    if provider == "gemini" and model["name"] == "gemini-4-argon":
-        # GenerateContent REST has no continuation loop in harnx. Reserve the
-        # streaming output ceiling inside Argon's unified 1,048,576-token window.
-        # https://ai.google.dev/gemini-api/docs/generate-content/long-decode
-        model.update(max_input_tokens=983040, max_output_tokens=65536, require_max_tokens=True)
-        model["patches"][0] += (
-            " | .body.generationConfig.maxOutputTokens = "
-            "([.body.generationConfig.maxOutputTokens // 65536, "
-            '(if (.url | endswith(":generateContent")) then 32768 else 65536 end)] | min)'
-        )
+
+
+def apply_argon_limits(model: dict[str, Any]) -> None:
+    """Replace owned Argon rules once, retaining unrelated curated patches."""
+    # Reserve streaming output inside Argon's unified 1,048,576-token window.
+    # https://ai.google.dev/gemini-api/docs/generate-content/long-decode
+    model.update(max_input_tokens=983040, max_output_tokens=65536, require_max_tokens=True)
+    owned = {GEMINI_THOUGHTS_PATCH, GEMINI_SAMPLING_THOUGHTS_PATCH, ARGON_REQUEST_PATCH}
+    curated = [patch for patch in model.get("patches", []) if patch not in owned]
+    model["patches"] = [*curated, ARGON_REQUEST_PATCH]
 
 
 def apply_bedrock_base_patches(model: dict[str, Any], provider: str) -> None:

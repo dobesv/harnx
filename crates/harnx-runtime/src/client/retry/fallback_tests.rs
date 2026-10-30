@@ -9,6 +9,8 @@ use harnx_core::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+const MISSING_CREDENTIALS: u16 = u16::MAX;
+
 fn failure(status: u16, message: &str) -> anyhow::Error {
     LlmError {
         status,
@@ -36,9 +38,12 @@ async fn promoted_fallback_is_attempted_once_on_request_specific_failure() {
         &mut input,
         &context,
         create_abort_signal(),
-        move |_, _, _| {
+        move |_, client, _| {
             seen.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { Err(failure(400, "context_length_exceeded")) })
+            Box::pin(async move {
+                assert_eq!(client.model().client_name(), "gemini");
+                Err(failure(400, "context_length_exceeded"))
+            })
         },
     )
     .await;
@@ -135,7 +140,6 @@ async fn image_request_reaches_vision_fallback_intact_without_cooldown() {
 
 #[tokio::test]
 async fn overflow_tries_larger_model_and_is_retained_for_compaction_on_exhaustion() {
-    const MISSING_CREDENTIALS: u16 = u16::MAX;
     for fallback_status in [200, 401, 400, 413, 503, 0, MISSING_CREDENTIALS] {
         let config = make_config();
         let mut input = input_with_attempts(&config, 3);
@@ -148,23 +152,11 @@ async fn overflow_tries_larger_model_and_is_retained_for_compaction_on_exhaustio
             create_abort_signal(),
             move |_, client, _| {
                 seen.fetch_add(1, Ordering::Relaxed);
-                Box::pin(async move {
-                    if client.model().client_name() == "claude" {
-                        return Err(failure(400, "context_length_exceeded"));
-                    }
-                    if fallback_status == 200 {
-                        Ok(("fits".into(), None, vec![], Default::default()))
-                    } else if fallback_status == 0 {
-                        Err(anyhow::anyhow!("Invalid provider event-stream"))
-                    } else if fallback_status == MISSING_CREDENTIALS {
-                        Err(anyhow::anyhow!("Miss 'api_key'")
-                            .context(ModelFallbackReason::Unavailable))
-                    } else if fallback_status == 413 {
-                        Err(failure(413, "input is too long"))
-                    } else {
-                        Err(failure(fallback_status, "invalid request or credentials"))
-                    }
-                })
+                if client.model().client_name() == "claude" {
+                    Box::pin(async { Err(failure(400, "context_length_exceeded")) })
+                } else {
+                    fallback_response(fallback_status)
+                }
             },
         )
         .await;
@@ -176,14 +168,38 @@ async fn overflow_tries_larger_model_and_is_retained_for_compaction_on_exhaustio
                 2
             }
         );
-        if fallback_status == 200 {
-            assert_eq!(result.unwrap().0, "fits");
-        } else if fallback_status == 0 {
+        assert_fallback_result(fallback_status, result.map(|output| output.0), &input);
+        assert!(!context
+            .model_cooldowns
+            .lock()
+            .is_on_cooldown("claude:claude-sonnet"));
+    }
+}
+
+fn fallback_response(status: u16) -> harnx_engine::retry::CallFuture<'static> {
+    Box::pin(async move {
+        match status {
+            200 => Ok(("fits".into(), None, vec![], Default::default())),
+            0 => Err(anyhow::anyhow!("Invalid provider event-stream")),
+            MISSING_CREDENTIALS => {
+                Err(anyhow::anyhow!("Miss 'api_key'").context(ModelFallbackReason::Unavailable))
+            }
+            413 => Err(failure(413, "input is too long")),
+            _ => Err(failure(status, "invalid request or credentials")),
+        }
+    })
+}
+
+fn assert_fallback_result(status: u16, result: anyhow::Result<String>, input: &Input) {
+    match status {
+        200 => assert_eq!(result.unwrap(), "fits"),
+        0 => {
             assert!(result
                 .unwrap_err()
                 .to_string()
                 .contains("Invalid provider event-stream"));
-        } else if matches!(fallback_status, 400 | 503) {
+        }
+        400 | 503 => {
             // A malformed fallback must remain visible. Compaction would not fix
             // its parameters and must not hide that actionable provider error.
             let error = result.unwrap_err();
@@ -191,7 +207,8 @@ async fn overflow_tries_larger_model_and_is_retained_for_compaction_on_exhaustio
                 .downcast_ref::<LlmError>()
                 .unwrap()
                 .is_context_overflow());
-        } else {
+        }
+        _ => {
             assert!(result
                 .unwrap_err()
                 .downcast_ref::<LlmError>()
@@ -203,9 +220,5 @@ async fn overflow_tries_larger_model_and_is_retained_for_compaction_on_exhaustio
                 "compaction must retry the model that overflowed"
             );
         }
-        assert!(!context
-            .model_cooldowns
-            .lock()
-            .is_on_cooldown("claude:claude-sonnet"));
     }
 }

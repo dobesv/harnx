@@ -10,3 +10,5 @@ Upgrade GLM 5 slots to Bedrock GLM 5.3 with explicit high reasoning effort, and 
 Prefer Luna for all compactors and Hestia, replace the compactors' 4K-output Bedrock GLM fallback with Luna, and add MiniMax M3.1 Flash as Hestia's direct fallback at low effort. Offer optional direct Z.AI routing while retaining Bedrock. Preserve MiniMax and GLM reasoning during tool continuation. Try another model on specific model availability errors or incompatible image/context input, without cooling down models solely for request incompatibility; malformed requests still stop the chain.
 
 Collect the Codex backend's required event stream for non-streaming callers so subscription-based compaction also works when streaming is disabled.
+
+Reject filtered Codex partial responses, retain custom Argon request patches during regeneration, and apply thinking binding controls on Vertex so compacted conversations can continue. Clarify how to merge optional provider settings with existing package overrides.

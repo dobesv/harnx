@@ -305,15 +305,21 @@ class TestProviderModelRegeneration(unittest.TestCase):
                 "max_output_tokens": 1048576, "input_price": 2, "output_price": 10,
             }
         }
-        old = {name: {"name": name, "patches": ["stale"]}}
+        curated = '.headers["x-custom"] = "preserved"'
+        old = {name: {"name": name, "patches": [curated, GEMINI_THOUGHTS_PATCH]}}
+        fetched[name] = um.merge_old_fields(fetched[name], old[name])
         models = um.regenerate_provider_models("gemini", old, fetched, [])
         model = models[0]
         self.assertEqual(model["max_input_tokens"], 983040)
         self.assertEqual(model["max_output_tokens"], 65536)
         self.assertTrue(model["require_max_tokens"])
         self.assertEqual(model["input_price"], 2)
-        self.assertIn("includeThoughts", model["patches"][0])
-        self.assertNotIn("stale", model["patches"][0])
+        self.assertEqual(model["patches"][0], curated)
+        self.assertIn("includeThoughts", model["patches"][1])
+        self.assertEqual(len(model["patches"]), 2)
+        fetched_again = {name: um.merge_old_fields({"name": name}, model)}
+        refreshed = um.regenerate_provider_models("gemini", {name: model}, fetched_again, [])[0]
+        self.assertEqual(refreshed["patches"], model["patches"])
 
     def test_glm_5_3_effort_patch_survives_refresh(self) -> None:
         name = "us.zai.glm-5.3"
@@ -414,10 +420,11 @@ class TestProviderModelRegeneration(unittest.TestCase):
     def test_fable_5_1_adds_binding_controls(self) -> None:
         name = "claude-fable-5-1"
         base = {"name": name, "max_output_tokens": 128000}
-        models = um.regenerate_provider_models("claude", {}, {name: base}, [])
-        for model in models:
-            self.assertIn("drop_block", model["patches"][0])
-            self.assertIn("thinking-binding-controls-2026-08-01", model["patches"][0])
+        for provider in ("claude", "vertexai"):
+            models = um.regenerate_provider_models(provider, {}, {name: base}, [])
+            for model in models:
+                self.assertIn("drop_block", model["patches"][0])
+                self.assertIn("thinking-binding-controls-2026-08-01", model["patches"][0])
 
     def test_haiku_5_5_refresh_replaces_fixed_budget_with_adaptive_thinking(self) -> None:
         for provider, name in (
@@ -447,7 +454,8 @@ class TestProviderModelRegeneration(unittest.TestCase):
                     self.assertIn('"type":"adaptive"', patch)
                     self.assertIn('"effort":"medium"', patch)
                     self.assertNotIn("budget_tokens", patch)
-                    self.assertEqual("drop_block" in patch, provider == "claude")
+                    self.assertIn("drop_block", patch)
+                    self.assertIn("thinking-binding-controls-2026-08-01", patch)
 
     def test_openai_aliases_refresh_while_unowned_max_alias_survives(self) -> None:
         old_models = {

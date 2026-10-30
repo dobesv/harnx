@@ -6,6 +6,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct EventCount(std::sync::atomic::AtomicUsize);
 
 #[tokio::test]
+async fn non_streaming_codex_rejects_filtered_partial_output() {
+    let builder = response(&[json!({"type": "response.incomplete", "response": {
+        "id": "resp_filtered", "status": "incomplete", "incomplete_details": {"reason": "content_filter"},
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial answer"}]}],
+        "usage": {"input_tokens": 10, "output_tokens": 20}
+    }})]).await;
+    let error = completion(builder, &Model::new("codex", "gpt-6-luna"))
+        .await
+        .unwrap_err();
+    let error = error.downcast_ref::<harnx_core::error::LlmError>().unwrap();
+    assert_eq!(error.status, 400);
+    assert!(!error.is_retryable());
+    assert!(error.message.contains("content_filter"));
+}
+
+#[tokio::test]
 async fn non_streaming_codex_retains_partial_output_and_usage_at_the_output_limit() {
     let builder = response(&[json!({"type": "response.incomplete", "response": {
         "id": "resp_partial", "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},

@@ -170,6 +170,8 @@ The Codex client buffers the terminal `response.completed` or `response.incomple
 normal Responses extractor to return text, reasoning, tool signatures, IDs and
 usage without emitting early chunk events. Preserve this path when changing
 compaction or title generation; forwarding `stream: false` returns HTTP 400.
+An incomplete response stopped by `content_filter` is an error; an output-token
+limit can still return its partial output and usage.
 
 MiniMax and GLM Chat Completions continuations replay the thought and text from
 the generation that issued each tool call. Merged non-session tool rounds retain
@@ -191,8 +193,10 @@ Astra, Sol 6.1 and Terra 6.1 need Responses for tool use. Terra 6.1 request
 patches also remove sampling parameters when reasoning is active. Gemini call
 IDs must survive parsing and appear on both the replayed call and its response.
 Fable 5.1 and Haiku 5.5 need adaptive thinking and an explicit output limit.
-Their direct Claude patches request summarized thinking and the binding-controls beta so the API drops thinking
+Their Claude and Vertex patches request summarized thinking and the binding-controls beta so the API drops thinking
 invalidated by dynamic prompts or compaction instead of rejecting the turn.
+Vertex accepts the same comma-separated `anthropic-beta` header; preserve other
+enabled betas when adding it (see [beta headers](https://platform.claude.com/docs/en/api/beta-headers)).
 Haiku defaults to medium effort; its existing `:thinking` alias also uses
 adaptive thinking because the former fixed-budget setting returns HTTP 400.
 See the [Haiku migration guide](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide). The
