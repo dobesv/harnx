@@ -29,14 +29,12 @@ export interface SubAgentNotesState {
   notes: SubAgentNote[];
   latestParentMessageId: string | null;
   parentByToolCall: Map<string, string>;
-  nextId: number;
 }
 
 export const INITIAL_SUB_AGENT_NOTES_STATE: SubAgentNotesState = {
   notes: [],
   latestParentMessageId: null,
   parentByToolCall: new Map(),
-  nextId: 0,
 };
 
 type EventRecord = Record<string, unknown>;
@@ -340,6 +338,24 @@ function progressCanReplace(
   return true;
 }
 
+function noteMatchesProgress(
+  note: SubAgentNote,
+  progress: SubAgentProgressValue,
+): boolean {
+  if (note.invocationId === progress.invocationId) return true;
+  return !note.invocationId && Boolean(progress.toolCallId) && note.toolCallId === progress.toolCallId;
+}
+
+function canReplaceNote(
+  existing: SubAgentNote,
+  progress: SubAgentProgressValue,
+): boolean {
+  return (
+    progressCanReplace(existing.status, progress.status) ||
+    (!existing.invocationId && progress.status === existing.status)
+  );
+}
+
 // A snapshot's assistant messages say exactly which one launched a call, so
 // they beat the latest started tool call, which is only a guess and is unset
 // right after a snapshot.
@@ -356,9 +372,9 @@ function applyProgress(
 ): SubAgentNotesState {
   const progress = subAgentProgress(value);
   if (!progress) return state;
-  const index = state.notes.findIndex((note) => note.invocationId === progress.invocationId);
+  const index = state.notes.findIndex((note) => noteMatchesProgress(note, progress));
   if (index >= 0) {
-    if (!progressCanReplace(state.notes[index].status, progress.status)) return state;
+    if (!canReplaceNote(state.notes[index], progress)) return state;
     return {
       ...state,
       notes: state.notes.map((note, noteIndex) => (
@@ -373,14 +389,18 @@ function applyProgress(
   return {
     ...state,
     notes: [...state.notes, noteFromProgress(progress, parentMessageId)],
-    nextId: state.nextId + 1,
   };
 }
 
-function completeNote(state: SubAgentNotesState, content: unknown): SubAgentNotesState {
+function completeNote(
+  state: SubAgentNotesState,
+  content: unknown,
+  fallbackToolCallId?: string,
+): SubAgentNotesState {
   const progress = resultProgress(content);
   if (progress) return applyProgress(state, {
     invocation_id: progress.invocationId,
+    tool_call_id: progress.toolCallId ?? fallbackToolCallId,
     agent: progress.agent,
     title: progress.title,
     session_id: progress.sessionId,
@@ -472,7 +492,7 @@ function completeFromToolResult(
   state: SubAgentNotesState,
   event: EventRecord,
 ): SubAgentNotesState {
-  return completeNote(state, event.content);
+  return completeNote(state, event.content, toolCallId(event));
 }
 
 function restoreSnapshot(
@@ -484,7 +504,6 @@ function restoreSnapshot(
     notes,
     latestParentMessageId: null,
     parentByToolCall,
-    nextId: notes.length,
   };
 }
 

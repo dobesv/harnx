@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 mod completion;
 mod leader_reads;
 mod replies;
+mod updates;
 pub use replies::{JournalCheckpointStore, JournalPartialResultStore};
+use updates::RecordUpdate;
 
 pub const BUCKET: &str = "harnx_tool_invocations";
 
@@ -269,29 +271,15 @@ impl InvocationJournal {
         value: &T,
         field: &impl Fn(&mut RecordedInvocation) -> &mut Option<T>,
     ) -> Result<Option<T>> {
-        let entry = self
-            .entry(key)
-            .await?
-            .context("durable tool invocation missing")?;
-        ensure!(
-            entry.operation == kv::Operation::Put,
-            "tool invocation was deleted"
-        );
-        let mut record: RecordedInvocation = serde_json::from_slice(&entry.value)?;
-        let slot = field(&mut record);
-        if let Some(existing) = slot {
-            return Ok(Some(existing.clone()));
-        }
-        *slot = Some(value.clone());
-        match self
-            .0
-            .update(key, serde_json::to_vec(&record)?.into(), entry.revision)
-            .await
-        {
-            Ok(_) => Ok(Some(value.clone())),
-            Err(error) if error.kind() == kv::UpdateErrorKind::WrongLastRevision => Ok(None),
-            Err(error) => Err(error).context("persist tool invocation state"),
-        }
+        self.try_update_record(key, "persist tool invocation state", |record| {
+            let slot = field(record);
+            if let Some(existing) = slot {
+                return RecordUpdate::Unchanged(existing.clone());
+            }
+            *slot = Some(value.clone());
+            RecordUpdate::Changed(value.clone())
+        })
+        .await
     }
 
     pub async fn purge_session(&self, session: &str) -> Result<()> {

@@ -47,6 +47,7 @@ const progress = (
   status: 'running' | 'done' | 'failed',
   elapsedMs: number,
   title?: string,
+  sessionId = 'child-session-0001',
 ) => ({
   type: 'CUSTOM',
   name: 'sub_agent_progress',
@@ -54,7 +55,7 @@ const progress = (
     invocation_id: invocationId,
     agent: 'researcher',
     ...(title === undefined ? {} : { title }),
-    session_id: 'child-session-0001',
+    session_id: sessionId,
     status,
     elapsed_ms: elapsedMs,
     usage: { input_tokens: 120, output_tokens: 45, cached_tokens: 30 },
@@ -352,6 +353,110 @@ describe('reduceSubAgentNotes', () => {
       parentMessageId: 'assistant-1',
       status: 'failed',
     })]);
+  });
+
+  // A failed sub-agent call whose row is restored from its partial result,
+  // without an invocation id.
+  const restoredFailedCallSnapshot = () => ({
+    type: 'MESSAGES_SNAPSHOT',
+    messages: [
+      { id: 'assistant-1', role: 'assistant', toolCalls: [{ id: 'call-1' }] },
+      {
+        role: 'tool',
+        toolCallId: 'call-1',
+        content: JSON.stringify({
+          is_error: true,
+          error: 'tool server unavailable',
+          partial_result: {
+            session_id: 'child-1',
+            sub_agent: { agent: 'researcher', session_id: 'child-1' },
+          },
+        }),
+      },
+    ],
+  });
+
+  it('updates a restored partial-result note in place when progress arrives with the same toolCallId', () => {
+    const state = apply(restoredFailedCallSnapshot());
+
+    expect(state.notes).toHaveLength(1);
+    expect(state.notes[0]).toEqual(expect.objectContaining({
+      id: 'snapshot:assistant-1:call-1',
+      invocationId: undefined,
+      toolCallId: 'call-1',
+      agent: 'researcher',
+      sessionId: 'child-1',
+      parentMessageId: 'assistant-1',
+      status: 'failed',
+    }));
+
+    const updated = reduceSubAgentNotes(state, {
+      type: 'CUSTOM',
+      name: 'sub_agent_progress',
+      value: {
+        invocation_id: 'inv-1',
+        tool_call_id: 'call-1',
+        agent: 'researcher',
+        title: 'Recovered sub-agent',
+        session_id: 'child-1',
+        status: 'failed',
+        elapsed_ms: 2500,
+        usage: { input_tokens: 150, output_tokens: 60, cached_tokens: 20 },
+        tool_call_count: 2,
+      },
+    });
+
+    expect(updated.notes).toHaveLength(1);
+    expect(updated.notes[0]).toEqual(expect.objectContaining({
+      id: 'snapshot:assistant-1:call-1',
+      invocationId: 'inv-1',
+      toolCallId: 'call-1',
+      agent: 'researcher',
+      title: 'Recovered sub-agent',
+      sessionId: 'child-1',
+      parentMessageId: 'assistant-1',
+      status: 'failed',
+      elapsedMs: 2500,
+      inputTokens: 150,
+      outputTokens: 60,
+      cachedTokens: 20,
+      toolCallCount: 2,
+    }));
+
+    const finalState = reduceSubAgentNotes(updated, progress('inv-1', 'done', 3500, undefined, 'child-1'));
+    expect(finalState.notes).toHaveLength(1);
+    expect(finalState.notes[0]).toEqual(expect.objectContaining({
+      id: 'snapshot:assistant-1:call-1',
+      invocationId: 'inv-1',
+      sessionId: 'child-1',
+      status: 'done',
+      elapsedMs: 3500,
+    }));
+  });
+
+  it('does not resurrect a restored failed row on late running progress with same toolCallId', () => {
+    const state = apply(restoredFailedCallSnapshot());
+
+    expect(state.notes).toHaveLength(1);
+    expect(state.notes[0].status).toBe('failed');
+
+    const updated = reduceSubAgentNotes(state, {
+      type: 'CUSTOM',
+      name: 'sub_agent_progress',
+      value: {
+        invocation_id: 'inv-1',
+        tool_call_id: 'call-1',
+        agent: 'researcher',
+        session_id: 'child-1',
+        status: 'running',
+        elapsed_ms: 1000,
+        usage: { input_tokens: 10, output_tokens: 5, cached_tokens: 0 },
+        tool_call_count: 1,
+      },
+    });
+
+    // The rejected progress leaves the restored row exactly as it was.
+    expect(updated.notes).toEqual(state.notes);
   });
 
   it('classifies CHILD_TERMINAL to fail a running note', () => {
