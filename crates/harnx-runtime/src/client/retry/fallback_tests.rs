@@ -47,7 +47,11 @@ async fn promoted_fallback_is_attempted_once_on_request_specific_failure() {
         },
     )
     .await;
-    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(error
+        .downcast_ref::<LlmError>()
+        .unwrap()
+        .is_context_overflow());
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 }
 
@@ -203,10 +207,9 @@ fn assert_fallback_result(status: u16, result: anyhow::Result<String>, input: &I
             // A malformed fallback must remain visible. Compaction would not fix
             // its parameters and must not hide that actionable provider error.
             let error = result.unwrap_err();
-            assert!(!error
-                .downcast_ref::<LlmError>()
-                .unwrap()
-                .is_context_overflow());
+            let error = error.downcast_ref::<LlmError>().unwrap();
+            assert!(!error.is_context_overflow());
+            assert_eq!(error.status, status);
         }
         _ => {
             assert!(result

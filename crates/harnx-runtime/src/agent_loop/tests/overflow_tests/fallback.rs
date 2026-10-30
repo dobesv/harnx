@@ -43,12 +43,14 @@ async fn primary_overflow_then_auth_fallback_compacts_and_retries_primary() {
 }
 
 fn overflow_then_auth(seen: Arc<std::sync::Mutex<Vec<String>>>) -> crate::agent_loop::AgentCallFn {
-    Arc::new(move |input, _, abort| {
+    Arc::new(move |input, config, abort| {
         let seen = seen.clone();
+        let config = config.clone();
         Box::pin(async move {
             let turn = turn_context();
-            call_with_retry_and_fallback_custom(input, &turn, abort, move |_, client, _| {
+            call_with_retry_and_fallback_custom(input, &turn, abort, move |input, client, _| {
                 let seen = seen.clone();
+                let config = config.clone();
                 Box::pin(async move {
                     let id = client.model().id();
                     let mut calls = seen.lock().unwrap();
@@ -69,6 +71,9 @@ fn overflow_then_auth(seen: Arc<std::sync::Mutex<Vec<String>>>) -> crate::agent_
                         }
                         .into());
                     }
+                    let request = texts(&crate::config::input::build_messages(input, &config)?);
+                    assert!(request.iter().any(|text| text.contains("Summary.")));
+                    assert!(!request.iter().any(|text| text.contains("archived context")));
                     Ok(("done".into(), None, vec![], Default::default()))
                 })
             })
