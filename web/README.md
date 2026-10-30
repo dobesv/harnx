@@ -58,6 +58,12 @@ The proxy is configured to be **SSE-safe**. It disables buffering for `text/even
   - Session switching.
   - Turn cancellation.
   - Tool approval and session handoff confirmations (approve/deny responses and reconnect replay).
+  - Thinking rendering: live reasoning (AG-UI THINKING_* events) and hydrated
+    `<think>`/`<thinking>` blocks from session history render as collapsible
+    "Thinking" `<details>` blocks (`web/src/components/ThinkingBlock.tsx`), open
+    while streaming, collapsed when done or on reload, never with literal tags.
+    Text segments of a tagged message render through `MessageTextPart.tsx`
+    using the same markdown setup as untagged messages.
 - **Out of Scope** (Deferred to `harnx-webui-parity` backlog):
   - General transcript message editing and history rewinding.
   - File attachments.

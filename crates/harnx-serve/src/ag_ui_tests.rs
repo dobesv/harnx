@@ -1014,6 +1014,87 @@ fn parse_run_input_accepts_valid_body() {
     assert_eq!(parsed.messages.len(), 1);
 }
 
+fn assert_unknown_ag_ui_role_is_filtered(message: Value) {
+    let body = serde_json::to_vec(&json!({
+        "messages": [
+            { "role": "assistant", "content": "previous answer" },
+            message,
+            { "role": "user", "id": "new-prompt", "content": "next question" }
+        ]
+    }))
+    .unwrap();
+
+    let relaxed: RelaxedRunAgentInput<JsonValue> =
+        serde_json::from_slice(&body).expect("request-body parser accepts unknown role");
+    assert_eq!(relaxed.messages.len(), 3);
+
+    let parsed = parse_run_input(&body).expect("run-input parser accepts unknown role");
+    assert_eq!(parsed.messages.len(), 2);
+    assert!(matches!(
+        &parsed.messages[0],
+        AgUiMessage::Assistant { content: Some(content), .. } if content == "previous answer"
+    ));
+    assert!(matches!(
+        &parsed.messages[1],
+        AgUiMessage::User { id, content, .. }
+            if id == &wire_message_id("new-prompt") && content == "next question"
+    ));
+}
+
+#[test]
+fn parse_run_input_filters_reasoning_role_with_encrypted_value() {
+    assert_unknown_ag_ui_role_is_filtered(json!({
+        "role": "reasoning",
+        "id": "reasoning-1",
+        "content": "previous reasoning",
+        "encryptedValue": "opaque-encrypted-value"
+    }));
+}
+
+#[test]
+fn parse_run_input_filters_activity_role() {
+    assert_unknown_ag_ui_role_is_filtered(json!({
+        "role": "activity",
+        "id": "activity-1",
+        "activityType": "progress",
+        "content": { "status": "complete" }
+    }));
+}
+
+#[test]
+fn parse_run_input_filters_arbitrary_unknown_role() {
+    assert_unknown_ag_ui_role_is_filtered(json!({
+        "role": "future-thing",
+        "id": "future-1",
+        "extra": [1, { "nested": true }]
+    }));
+}
+
+#[test]
+fn pending_user_prompt_uses_last_kept_message_after_filtering_reasoning() {
+    let mut body = json!({
+        "messages": [
+            { "role": "user", "id": "new-prompt", "content": "next question" },
+            { "role": "reasoning", "content": "trailing reasoning" }
+        ]
+    });
+    let parsed = parse_run_input(&serde_json::to_vec(&body).unwrap()).expect("trailing reasoning");
+    assert_eq!(parsed.messages.len(), 1);
+    assert_eq!(
+        pending_user_prompt(&parsed, &[]).as_deref(),
+        Some("next question")
+    );
+    assert_eq!(pending_user_prompt(&parsed, &parsed.messages), None);
+
+    body["messages"].as_array_mut().unwrap().insert(
+        1,
+        json!({ "role": "assistant", "content": "already answered" }),
+    );
+    let parsed = parse_run_input(&serde_json::to_vec(&body).unwrap()).expect("trailing assistant");
+    assert_eq!(parsed.messages.len(), 2);
+    assert_eq!(pending_user_prompt(&parsed, &[]), None);
+}
+
 #[test]
 fn ag_ui_sink_maps_only_sub_agent_turns_to_step_events() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
@@ -2048,6 +2129,54 @@ async fn ag_ui_run_uses_only_last_message_user_prompt() {
     );
     assert_eq!(events[1]["name"], "session_attach_boundary");
     assert_eq!(events[3]["delta"].as_str(), Some("assistant2"));
+}
+
+#[tokio::test]
+async fn ag_ui_run_accepts_reasoning_history_and_trailing_reasoning() {
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "You are plain.");
+    let config = sandbox.config();
+    let body = json!({
+        "messages": [
+            { "role": "assistant", "content": "previous answer" },
+            {
+                "role": "reasoning",
+                "id": "reasoning-1",
+                "content": "previous reasoning",
+                "encryptedValue": "opaque-encrypted-value"
+            },
+            { "role": "user", "content": "next question" },
+            { "role": "reasoning", "content": "trailing reasoning" }
+        ]
+    });
+    let call_fn: AgentCallFn = Arc::new(|input, _config, _abort| {
+        let text = input.text();
+        Box::pin(async move {
+            assert_eq!(text, "next question");
+            let usage = CompletionTokenUsage::new(Some(1), Some(1), Some(0));
+            Ok(("next answer".into(), None, vec![], usage))
+        })
+    });
+    let registry = ag_ui_test_registry(&config, Some(call_fn));
+    let response = ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        "reasoning-history-session",
+        &serde_json::to_vec(&body).unwrap(),
+        None,
+    )
+    .await
+    .expect("reasoning history must not cause HTTP 400");
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = read_sse_events_until(response, |events| {
+        events.iter().any(|event| event["type"] == "RUN_FINISHED")
+    })
+    .await;
+    assert!(events.iter().any(|event| {
+        event["type"] == "TEXT_MESSAGE_CONTENT" && event["delta"] == "next answer"
+    }));
+    assert!(!events.iter().any(|event| event["type"] == "RUN_ERROR"));
 }
 
 #[tokio::test]

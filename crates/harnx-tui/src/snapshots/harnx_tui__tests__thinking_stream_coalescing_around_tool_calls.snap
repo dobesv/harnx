@@ -4,12 +4,12 @@ expression: rendered
 ---
 Welcome to harnx [VERSION]  •  Type .help for commands, Tab to complete.
 > argus ▸ session-1
-<think>thinking before tool</think>
+Thinking
+thinking before tool
 → argus_session_prompt
 message: delegate
-<think>thinking after tool</think>
-
-
+Thinking
+thinking after tool
 
 
 

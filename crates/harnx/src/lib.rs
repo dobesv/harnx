@@ -3,6 +3,7 @@ pub mod cli;
 pub mod cli_event_sink;
 pub mod cli_replay_sink;
 
+mod streaming_think_segmenter;
 pub mod test_utils;
 
 pub use harnx_core::safety as mcp_safety;

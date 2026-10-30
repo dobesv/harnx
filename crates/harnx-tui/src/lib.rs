@@ -5,6 +5,7 @@
 
 pub mod agent_event_sink;
 mod agent_events;
+mod assistant_render;
 mod assistant_transcript;
 mod cancellation;
 mod event_isolation;

@@ -15,6 +15,8 @@ vi.mock('@assistant-ui/react', async (importOriginal) => {
     ...actual,
     useAuiState: vi.fn(),
     useAui: vi.fn(),
+    useMessagePartText: () => ({ text: 'mock text', status: { type: 'complete' } }),
+    useSmooth: (part: any) => ({ text: part?.text || '', status: part?.status || { type: 'complete' } }),
     MessagePrimitive: {
       Root: ({ className, children, ...props }: any) => (
         <div className={className} {...props}>

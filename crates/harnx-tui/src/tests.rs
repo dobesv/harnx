@@ -97,6 +97,7 @@ mod markdown_link_accessibility_tests;
 mod operator_tool_completion;
 mod shared_session_event_tests;
 mod subagent_session_tests;
+mod thought_rendering_tests;
 mod tool_live_updates_tests;
 mod turn_activity_tests;
 
@@ -1291,32 +1292,23 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
 
     tui.flush_pending_thought_for_test();
 
-    let system_entries: Vec<_> = tui
-        .app
-        .transcript
+    let system_entries: Vec<_> = rendered_lines(&tui)
         .iter()
-        .flat_map(|entry| render_entry_lines(entry, true, false, false))
-        .filter_map(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            if text.is_empty() || text.starts_with("Welcome to harnx") || text.starts_with('•') {
-                None
-            } else {
-                Some(text)
-            }
+        .map(line_to_plain)
+        .filter(|text| {
+            !text.is_empty() && !text.starts_with("Welcome to harnx") && !text.starts_with('•')
         })
         .collect();
 
     assert_eq!(
         system_entries,
         vec![
-            "<think>thinking before tool</think>",
+            "Thinking",
+            "thinking before tool",
             "→ argus_session_prompt",
             "message: delegate",
-            "<think>thinking after tool</think>",
+            "Thinking",
+            "thinking after tool",
         ]
     );
 }
@@ -1370,22 +1362,11 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
 
     tui.flush_pending_thought_for_test();
 
-    let system_entries: Vec<_> = tui
-        .app
-        .transcript
+    let system_entries: Vec<_> = rendered_lines(&tui)
         .iter()
-        .flat_map(|entry| render_entry_lines(entry, true, false, false))
-        .filter_map(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            if text.is_empty() || text.starts_with("Welcome to harnx") || text.starts_with('•') {
-                None
-            } else {
-                Some(text)
-            }
+        .map(line_to_plain)
+        .filter(|text| {
+            !text.is_empty() && !text.starts_with("Welcome to harnx") && !text.starts_with('•')
         })
         .collect();
 
@@ -1393,10 +1374,12 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         system_entries,
         vec![
             "> argus ▸ session-1",
-            "<think>thinking before tool</think>",
+            "Thinking",
+            "thinking before tool",
             "→ argus_session_prompt",
             "message: delegate",
-            "<think>thinking after tool</think>",
+            "Thinking",
+            "thinking after tool",
         ]
     );
 }
@@ -1620,24 +1603,16 @@ async fn structured_ui_output_variants_render_in_transcript() {
     .await
     .unwrap();
 
-    let system_entries: Vec<_> = tui
-        .app
-        .transcript
+    let system_entries: Vec<_> = rendered_lines(&tui)
         .iter()
-        .flat_map(|entry| render_entry_lines(entry, true, false, false))
-        .filter_map(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            (!text.is_empty()).then_some(text)
-        })
+        .map(line_to_plain)
+        .filter(|text| !text.is_empty())
         .collect();
 
     assert!(system_entries.contains(&"> argus ▸ session-1".to_string()));
     assert!(system_entries.contains(&"argus_session_prompt".to_string()));
-    assert!(system_entries.contains(&"<think>thinking hard</think>".to_string()));
+    assert!(system_entries.contains(&"Thinking".to_string()));
+    assert!(system_entries.contains(&"thinking hard".to_string()));
     assert!(!system_entries.iter().any(|s| s.starts_with("-> ")));
     assert!(system_entries.contains(&"Plan:".to_string()));
     assert!(system_entries.contains(&"  [in_progress] Refactor sub-agent formatting".to_string()));

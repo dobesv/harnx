@@ -1,0 +1,7 @@
+---
+source: crates/harnx-tui/src/tests/thought_rendering_tests.rs
+expression: plain
+---
+Thinking
+reasoning
+answer bold

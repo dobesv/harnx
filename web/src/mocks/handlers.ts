@@ -2,7 +2,6 @@ import { http, HttpResponse } from 'msw';
 import {
   additionalSnapshot,
   createSessionEventsStream,
-  finishExchange,
   isPromptlessRun,
   controlStates,
   addControlState,
@@ -13,6 +12,11 @@ import {
   persistExchange,
   
 } from './sessionUpdates';
+import {
+  emitThinkingRun,
+  emitStandardReply,
+  getSpecialSnapshot,
+} from './thinkingFixtures';
 
 const SUB_AGENT_SESSION_ID = 'child-session-0001';
 const activeSessions = new Set<string>();
@@ -93,6 +97,8 @@ const HANDOFF_TARGET_SNAPSHOT = [
 ];
 
 function buildSnapshot(session: string) {
+  const special = getSpecialSnapshot(session);
+  if (special) return special;
   if (session === 'handoff-target') return HANDOFF_TARGET_SNAPSHOT;
   if (session === SUB_AGENT_SESSION_ID) {
     return [
@@ -108,54 +114,6 @@ function buildSnapshot(session: string) {
         content: 'You are mock system prompt content that should be collapsed by default.'
       },
       ...additionalSnapshot(session)
-    ];
-  }
-  if (session === 'session-restored') {
-    return [
-      {
-        id: 'm-system',
-        role: 'system',
-        content: 'System prompt.'
-      },
-      {
-        id: 'user-1',
-        role: 'user',
-        content: 'Show me restored tool call'
-      },
-      {
-        id: 'assistant-1',
-        role: 'assistant',
-        content: '',
-        tool_calls: [
-          {
-            id: 'call_1',
-            type: 'function',
-            call_type: 'function',
-            function: {
-              name: 'bash_exec',
-              arguments: '{"command":"ls -la"}'
-            }
-          }
-        ],
-        toolCalls: [
-          {
-            id: 'call_1',
-            type: 'function',
-            call_type: 'function',
-            function: {
-              name: 'bash_exec',
-              arguments: '{"command":"ls -la"}'
-            }
-          }
-        ]
-      },
-      {
-        id: 'tool-result-1',
-        role: 'tool',
-        toolCallId: 'call_1',
-        toolName: 'bash_exec',
-        content: ''
-      }
     ];
   }
   if (session !== 'session-1') return additionalSnapshot(session);
@@ -543,44 +501,12 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
         return;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      controller.enqueue(encodeSseEvent({
-        type: 'CUSTOM',
-        threadId,
-        runId,
-        name: 'status',
-        value: { text: 'Mock stream in progress' }
-      }));
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      controller.enqueue(encodeSseEvent({
-        type: 'TEXT_MESSAGE_START',
-        messageId: 'assistant-1',
-        role: 'assistant'
-      }));
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      controller.enqueue(encodeSseEvent({
-        type: 'TEXT_MESSAGE_CONTENT',
-        messageId: 'assistant-1',
-        delta: `Mock streamed reply to: ${userText || 'empty prompt'}`
-      }));
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      controller.enqueue(encodeSseEvent({
-        type: 'TEXT_MESSAGE_END',
-        messageId: 'assistant-1'
-      }));
-      controller.enqueue(encodeSseEvent({
-        type: 'CUSTOM',
-        threadId,
-        runId,
-        name: 'status',
-        value: { text: 'Mock stream finished' }
-      }));
-      controller.enqueue(encodeSseEvent({
-        type: 'RUN_FINISHED',
-        threadId,
-        runId
-      }));
-      finishExchange(controller, session, userText);
+      if (userText === 'think then answer') {
+        await emitThinkingRun({ controller, threadId, runId, session, userText });
+        return;
+      }
+
+      await emitStandardReply({ controller, threadId, runId, session, userText });
     },
     cancel() {
       // The client (browser EventSource) disconnected — e.g. the test navigated
@@ -654,6 +580,15 @@ export const happyPathHandlers = [
         updated_at: '2024-01-01T12:00:00.000Z',
         unread: false,
       },
+      {
+        session_id: 'session-thinking-hydrated',
+        title: 'Hydrated Thinking',
+        repository: null,
+        branch: null,
+        updated_at: '2024-01-01T12:00:00.000Z',
+        unread: false,
+      },
+
     ];
 
     if (hasPagination) {

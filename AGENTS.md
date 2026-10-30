@@ -690,6 +690,33 @@ of failure, and a probe on one client type says nothing about the other.
 To verify reasoning summaries, streaming, and tool replay across providers,
 run the live probe script (`scripts/probe_reasoning_summaries.*`).
 
+### Think-tag rendering contract (issues #2437, #2488)
+
+Thinking text is persisted and streamed wrapped in literal `<think>\n…\n</think>`
+tags: session persistence (`harnx-runtime/src/config/session.rs` ~L860 and
+`harnx-serve/src/lib.rs` ~L1953 for tool-call turns), the streaming bracket
+helpers in `harnx-client` (`SseHandler::thought`, `claude_transition_reasoning`,
+`openai_transition_reasoning`), the non-streaming `format!`s in `claude.rs`,
+`openai.rs`, and `bedrock.rs`, and inline-thinking models emitting tags inside
+normal text. The tags are the wire format; frontends split them out for display
+rather than persistence changing what it writes.
+
+- Display splitting uses `harnx_core::text::THINK_TAG_PAIRS` (`<think>` and
+  `<thinking>`; case-sensitive, no nesting, no code-fence special-casing).
+  Consumers: the TUI (`assistant_render.rs`), the CLI
+  (`streaming_think_segmenter.rs`, which must run at the `cli_event_sink`
+  boundary because the sink's partial-line raw writes bypass `MarkdownRender`),
+  and the web port `web/src/lib/thinkBlocks.ts`. The TS port must stay
+  semantically identical to `split_think_blocks` — its vitest cases mirror the
+  Rust unit tests, including the single-newline trim at tag boundaries.
+- `strip_think_tag` (`harnx-core/src/text.rs`) is LLM-facing: it removes a
+  leading think block before replaying history to providers, and must stay
+  leading-only. `split_think_blocks` is display-facing (any position, ordered
+  segments). Keep the two contracts separate.
+- CLI raw/non-TTY output keeps literal tags byte-for-byte — scripts may parse it
+  (`raw_and_non_tty_output_remain_byte_identical` in `cli_thought_tests.rs`).
+  TTY output instead prints a dim `Thinking` label plus DarkGray DIM+ITALIC
+  text, the same styles the TUI uses in `assistant_render.rs`.
 
 ### Adding a Provider Client
 

@@ -686,4 +686,39 @@ describe('CompactionMarker action integration with ArchivedHistoryProvider', () 
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
   });
+
+  it('renders thinking blocks for assistant messages with think tags in archived history', async () => {
+    mockGetSessionHistory.mockResolvedValueOnce({
+      history_snapshot: [
+        {
+          role: 'assistant',
+          id: 'msg-with-think',
+          content: '<think>\nAnalyzed past logs\n</think>\n\nResult summary',
+        },
+      ],
+      next_cursor: null,
+      prev_cursor: null,
+      earlier_compaction: null,
+    });
+
+    render(
+      <ArchivedHistoryViewer
+        initialTarget={{
+          agent: 'test-agent',
+          session: 'test-session',
+          beforeCompaction: 15,
+        }}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Thinking')).toBeInTheDocument();
+    });
+
+    expect(screen.getByText('Analyzed past logs')).toBeInTheDocument();
+    expect(screen.getByText('Result summary')).toBeInTheDocument();
+    expect(screen.queryByText('<think>')).not.toBeInTheDocument();
+    expect(screen.queryByText('</think>')).not.toBeInTheDocument();
+  });
 });
