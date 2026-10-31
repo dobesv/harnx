@@ -367,6 +367,96 @@ async fn confirmation_enqueue_reuses_stable_submission_id() -> Result<()> {
     Ok(())
 }
 
+/// Caller-supplied submission ids must not collide with the reserved
+/// runtime-note and timing-notice id prefixes: a prompt admitted under one
+/// would be silently skipped by every executable-prompt check (issue #2493).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmation_enqueue_rejects_reserved_submission_ids() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = new_remote_session_id();
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(&session_id), 1);
+    let session = NatsSession::new(
+        resumed_session_config(session_id),
+        client,
+        jetstream,
+        harnx_runtime::utils::create_abort_signal(),
+    )
+    .await?;
+    let handler: Arc<ToolConfirmationHandler> = Arc::new(|_| Box::pin(async { true }));
+    let route = session.tool_confirmation_route(handler).await?;
+
+    let reserved_ids = [
+        harnx_core::runtime_note::new_runtime_note_message_id(),
+        format!(
+            "{}abc123",
+            harnx_core::timing_identity::TIMING_MESSAGE_ID_PREFIX
+        ),
+    ];
+    for submission_id in &reserved_ids {
+        let rejected = session
+            .clone()
+            .with_external_admission()
+            .enqueue_text_with_tool_confirmation_id("hidden prompt", &route, submission_id)
+            .await;
+        let Err(err) = rejected else {
+            panic!("reserved admission id must be rejected: {submission_id}");
+        };
+        assert_eq!(
+            err.to_string(),
+            format!("caller-supplied admission id is reserved: {submission_id}")
+        );
+    }
+    // A reserved id that already names a durable runtime-note row must still be
+    // rejected: the existing-row lookup must not let a caller claim runtime
+    // context as an admitted prompt.
+    let existing_note_id = harnx_core::runtime_note::new_runtime_note_message_id();
+    log.append_event_async(&SessionLogEntry::Message {
+        id: Some(existing_note_id.clone()),
+        role: MessageRole::User,
+        content: MessageContent::Text("runtime note text".to_string()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await?;
+    let rejected = session
+        .clone()
+        .with_external_admission()
+        .enqueue_text_with_tool_confirmation_id("hidden prompt", &route, &existing_note_id)
+        .await;
+    let Err(err) = rejected else {
+        panic!("reserved admission id must be rejected: {existing_note_id}");
+    };
+    assert_eq!(
+        err.to_string(),
+        format!("caller-supplied admission id is reserved: {existing_note_id}")
+    );
+    // Nothing was admitted or appended under either id.
+    let leaked = log
+        .load_events_async()
+        .await?
+        .into_iter()
+        .filter(|(_, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::Message {
+                    id: Some(id),
+                    role: MessageRole::User,
+                    ..
+                } if reserved_ids.iter().any(|reserved| reserved == id)
+            )
+        })
+        .count();
+    assert_eq!(leaked, 0);
+    Ok(())
+}
+
 /// Test retract-before-consume appends correct EditEntries and removes the message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retract_queued_user_message() -> Result<()> {

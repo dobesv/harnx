@@ -113,7 +113,7 @@ impl Harness {
             .into_iter()
             .map(|(seq, entry)| (seq as usize, entry))
             .collect::<Vec<_>>();
-        harnx_runtime::config::session::replay_log_entries_for_external(&entries, "race")
+        harnx_runtime::config::session::replay_log_entries_for_external(&entries, "race", false)
     }
 }
 

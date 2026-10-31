@@ -54,6 +54,13 @@ pub struct Input {
     /// selected rows archived by concurrent compaction without appending them
     /// again to the log. Identity is the stable message ID (seq for legacy rows).
     pub durable_user_messages: Vec<crate::message::Message>,
+    /// Durable user rows the mid-turn injection callback selected (already
+    /// logged and admitted). The loop's input preparation pushes these into
+    /// `session.messages` verbatim — ids and log seqs intact — instead of a
+    /// fresh ID-less folded text message, so a later compaction re-logs them
+    /// under their original identity instead of manufacturing unadmitted
+    /// ID-less user rows. Empty for text-only injection (local modes).
+    pub injected_user_messages: Vec<crate::message::Message>,
     /// History length before this round's input was persisted. Request building
     /// uses that prefix plus this Input, so request-only patches still reach the
     /// model without duplicating the durable user message. Runtime-local cursor,
@@ -107,6 +114,7 @@ impl Input {
             injected_user_text: None,
             skip_user_log_append: false,
             durable_user_messages: Vec::new(),
+            injected_user_messages: Vec::new(),
             session_input_start: None,
             preferred_assistant_message_id: None,
             timing_context: None,
@@ -193,6 +201,26 @@ impl Input {
     pub fn set_injected_user_text(&mut self, text: String) {
         self.session_input_start = None;
         self.injected_user_text = Some(text);
+        // A plain-text injection replaces any prior message-based injection:
+        // keeping stale messages would append them (with their durable
+        // identity) on top of the new text.
+        self.injected_user_messages.clear();
+    }
+
+    /// Set mid-turn injection from the durable user rows the callback
+    /// selected: the folded text the loop consumes plus the messages
+    /// themselves, so input preparation can preserve their admission
+    /// identity in session memory. Replaces any prior injection.
+    pub fn set_injected_user_messages(&mut self, messages: Vec<crate::message::Message>) {
+        self.session_input_start = None;
+        self.injected_user_text = Some(
+            messages
+                .iter()
+                .map(|message| message.content.to_text())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+        self.injected_user_messages = messages;
     }
 
     pub fn injected_user_text(&self) -> Option<&str> {
@@ -319,5 +347,39 @@ pub fn resolve_data_url(data_urls: &HashMap<String, String>, data_url: String) -
         data_url
     } else {
         data_url
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// set_injected_user_text replaces a prior message-based injection: stale
+    /// messages must not survive to be appended with their durable identity.
+    #[test]
+    fn set_injected_user_text_clears_injected_user_messages() {
+        let mut input = Input::new(
+            String::new(),
+            (String::new(), Vec::new()),
+            crate::agent_config::AgentConfig::default(),
+        );
+        let message = crate::message::Message::new(
+            crate::message::MessageRole::User,
+            crate::message::MessageContent::Text("queued".into()),
+        )
+        .with_id("admitted-1");
+        input.set_injected_user_messages(vec![message]);
+        assert_eq!(input.injected_user_messages.len(), 1);
+
+        input.set_injected_user_text("plain injection".to_string());
+        assert_eq!(
+            input.injected_user_text(),
+            Some("plain injection"),
+            "plain-text setter must keep the folded text"
+        );
+        assert!(
+            input.injected_user_messages.is_empty(),
+            "plain-text setter must clear stale injected messages"
+        );
     }
 }

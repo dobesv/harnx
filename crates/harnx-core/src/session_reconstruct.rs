@@ -382,11 +382,18 @@ pub fn reconstruct_state_effective(entries: &[(usize, SessionLogEntry)]) -> Reco
 pub fn reconstruct_state_with_seq(
     entries: &[(Option<usize>, SessionLogEntry)],
 ) -> ReconstructedState {
-    let tail_indices = entries_after_last_barrier_with_seq(entries);
+    let split = after_last(entries, |(_, entry)| is_terminal_barrier(entry));
     let mut replay = ReplayAccumulator::default();
-
-    for (idx, entry) in tail_indices {
-        replay.apply_entry_with_seq(idx, entry);
+    // Compaction re-logs kept user rows after the Compress marker under their
+    // original ids. A keep plan can retain an answered prompt without its
+    // assistant reply, so a copy would otherwise resurface in
+    // `next_turn_messages` as pending input for the next invocation and get
+    // silently re-executed (issue #2493). Seed the seen-id set with every
+    // pre-barrier user id, settled or not; replay then treats their copies
+    // as non-pending.
+    replay.seed_settled_user_ids(&entries[..split]);
+    for (idx, entry) in &entries[split..] {
+        replay.apply_entry_with_seq(*idx, entry);
     }
 
     replay.finish()
@@ -403,6 +410,10 @@ struct ReplayAccumulator {
     open_calls: Vec<OrphanToolCalls>,
     /// Set by Cancel: the interrupted turn's still-open calls and the Cancel identity.
     interrupted: Option<(u64, Option<String>, Vec<OrphanToolCalls>)>,
+    /// User message ids already replayed (or answered before the replay
+    /// window), so compaction copies of the same admission are skipped
+    /// instead of resurfacing as pending input.
+    seen_user_ids: std::collections::HashSet<String>,
 }
 
 impl ReplayAccumulator {
@@ -419,13 +430,22 @@ impl ReplayAccumulator {
                 log_seq.map_or(0, |s| u64::try_from(s).unwrap_or(0)),
                 cancellation_id.clone(),
             ),
-            SessionLogEntry::Message { role, content, .. } if role.is_user() => {
+            SessionLogEntry::Message {
+                id, role, content, ..
+            } if role.is_user() => {
                 // Timing notices are non-executable context: don't treat them as prompts.
                 // Use the shared classifier to ensure only valid timing notices are skipped.
-                let is_timing = crate::timing_identity::is_timing_notice(&content.to_text());
-                if !is_timing {
-                    self.on_user_message_with_seq(log_seq, entry)
+                if crate::timing_identity::is_timing_notice(&content.to_text()) {
+                    return;
                 }
+                // Runtime notes (sub-agent starts, cancels) are context too.
+                // Replay synthesized them from control events; a compaction
+                // re-log persists them as user rows, and they must not be
+                // executed or queued as pending input.
+                if crate::runtime_note::is_runtime_note_id(id.as_deref()) {
+                    return;
+                }
+                self.on_user_message_with_seq(log_seq, entry)
             }
             SessionLogEntry::Message { role, .. } if role.is_assistant() => {
                 self.on_assistant_message(entry)
@@ -557,6 +577,25 @@ impl ReplayAccumulator {
         self.on_user_message_with_seq(None, entry);
     }
 
+    /// Seed the seen-id set with every user message id before the replay
+    /// window, answered or not. Compaction can re-log any kept row after the
+    /// barrier under its original id, and a copy of a pre-barrier prompt must
+    /// not resurface as pending input. The copy's history text reaches the
+    /// model through `active_context_window`, which replays the post-Compress
+    /// window; this set only keeps the copy out of `next_turn_messages`.
+    fn seed_settled_user_ids(&mut self, entries: &[(Option<usize>, SessionLogEntry)]) {
+        for (_, entry) in entries {
+            if let SessionLogEntry::Message {
+                id: Some(id), role, ..
+            } = entry
+            {
+                if role.is_user() {
+                    self.seen_user_ids.insert(id.clone());
+                }
+            }
+        }
+    }
+
     fn on_user_message_with_seq(&mut self, log_seq: Option<usize>, entry: &SessionLogEntry) {
         let Some(mut message) = cloned_message(entry) else {
             return;
@@ -564,6 +603,15 @@ impl ReplayAccumulator {
         // Attach log_seq if provided
         if let Some(seq) = log_seq {
             message.log_seq = Some(seq);
+        }
+        // A repeated id is a compaction copy of a row already replayed (or
+        // settled before the window): the copy still replays as history via
+        // `active_context_window`, but it is not pending input for the next
+        // turn.
+        if let Some(id) = &message.id {
+            if !self.seen_user_ids.insert(id.clone()) {
+                return;
+            }
         }
 
         // A user message never clears `interrupted`: if the Cancel it
@@ -664,15 +712,6 @@ fn cloned_message(entry: &SessionLogEntry) -> Option<Message> {
 #[allow(dead_code)]
 fn entries_after_last_barrier(entries: &[SessionLogEntry]) -> &[SessionLogEntry] {
     &entries[after_last(entries, is_terminal_barrier)..]
-}
-
-fn entries_after_last_barrier_with_seq(
-    entries: &[(Option<usize>, SessionLogEntry)],
-) -> Vec<(Option<usize>, &SessionLogEntry)> {
-    entries[after_last(entries, |(_, entry)| is_terminal_barrier(entry))..]
-        .iter()
-        .map(|(seq, entry)| (*seq, entry))
-        .collect()
 }
 
 fn is_terminal_barrier(entry: &SessionLogEntry) -> bool {
@@ -1774,5 +1813,151 @@ mod timing_non_executable_tests {
 
         // pending_prompt_seq should return 2 (the fake timing prompt), not skip it
         assert_eq!(pending_prompt_seq(&entries), Some(2));
+    }
+}
+
+/// Issue #2493: compaction re-logs kept user rows after the Compress marker
+/// under their original ids. A keep plan can retain an answered prompt without
+/// its assistant reply; without id dedup, replay returned that stale copy in
+/// `next_turn_messages` and the next invocation silently re-executed it.
+#[cfg(test)]
+mod compaction_copy_dedup_tests {
+    use super::*;
+    use crate::message::MessageContent;
+    use crate::message::MessageRole;
+    use crate::session_reconstruct::TurnStatus;
+
+    fn user_with_id(id: &str, text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: Some(id.to_string()),
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn assistant(text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn turn_end(through_seq: u64) -> SessionLogEntry {
+        SessionLogEntry::TurnEnd {
+            through_seq,
+            fence_token: 0,
+            timestamp: None,
+            usage: None,
+        }
+    }
+
+    fn compress() -> SessionLogEntry {
+        SessionLogEntry::Compress {
+            prompt: "summary".to_string(),
+        }
+    }
+
+    fn calls() -> SessionLogEntry {
+        SessionLogEntry::ToolCalls {
+            text: "working".to_string(),
+            thought: None,
+            calls: vec![crate::tool::ToolCall {
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+                id: Some("c1".into()),
+                thought_signature: None,
+                reasoning_provenance: None,
+            }],
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn nats(entries: Vec<SessionLogEntry>) -> Vec<(u64, SessionLogEntry)> {
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, entry)| ((i + 1) as u64, entry))
+            .collect()
+    }
+
+    #[test]
+    fn compaction_copy_of_an_answered_prompt_is_not_pending_input() {
+        // A keep plan retained the answered "old" prompt but dropped its
+        // assistant reply; the copy sits past the barrier with the fresh prompt.
+        let entries = nats(vec![
+            user_with_id("old", "first task"),
+            assistant("first answer"),
+            turn_end(1),
+            compress(),
+            user_with_id("old", "first task"),
+            user_with_id("new", "second task"),
+        ]);
+
+        let state = reconstruct_state_from_nats(&entries);
+        assert_eq!(state.turn_status, TurnStatus::Idle);
+        let texts: Vec<String> = state
+            .next_turn_messages
+            .iter()
+            .map(|message| message.content.to_text())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["second task".to_string()],
+            "the stale copy must not be re-executed as pending input"
+        );
+    }
+
+    #[test]
+    fn compaction_copy_of_an_in_flight_prompt_is_not_requeued() {
+        // Mid-turn compaction re-logs the current prompt; on resume the copy
+        // must not appear next to the original as a second queued message.
+        let entries = nats(vec![
+            user_with_id("cur", "current task"),
+            calls(),
+            compress(),
+            user_with_id("cur", "current task"),
+        ]);
+
+        let state = reconstruct_state_from_nats(&entries);
+        assert!(matches!(
+            state.turn_status,
+            TurnStatus::InFlightResumable { .. }
+        ));
+        let resumable = state.resumable_ctx.expect("resumable context");
+        assert_eq!(
+            resumable
+                .last_user
+                .as_ref()
+                .map(|message| message.content.to_text()),
+            Some("current task".to_string())
+        );
+        assert!(
+            state.next_turn_messages.is_empty(),
+            "the prompt's compaction copy must not queue as fresh input"
+        );
+    }
+
+    #[test]
+    fn distinct_ids_stay_pending_together() {
+        // The dedup is per admission id, not per text: two prompts with
+        // different ids remain separate pending input.
+        let entries = nats(vec![
+            user_with_id("a", "same text"),
+            user_with_id("b", "same text"),
+        ]);
+
+        let state = reconstruct_state_from_nats(&entries);
+        let ids: Vec<&str> = state
+            .next_turn_messages
+            .iter()
+            .filter_map(|message| message.id.as_deref())
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
     }
 }

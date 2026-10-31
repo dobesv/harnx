@@ -500,7 +500,7 @@ pub fn load_session_from_entries(
                 .context("session log sequence does not fit into usize")
         })
         .collect::<Result<_>>()?;
-    crate::config::session::replay_log_entries_for_external(&raw_entries, name)
+    crate::config::session::replay_log_entries_for_external(&raw_entries, name, false)
 }
 
 pub fn load_session_from_entries_with_metadata(
@@ -536,20 +536,17 @@ fn load_session_from_entries_with_metadata_policy(
                 .context("session log sequence does not fit into usize")
         })
         .collect::<Result<_>>()?;
-    if preserve_pending {
-        crate::config::session::replay_nats_entries_into_session_preserving_pending(
-            &raw_entries,
-            name,
-            session,
-        )
-    } else {
-        crate::config::session::replay_nats_entries_into_session(&raw_entries, name, session)
-    }
+    crate::config::session::replay_nats_entries_into_session(
+        &raw_entries,
+        name,
+        session,
+        preserve_pending,
+    )
 }
 
 pub fn load_session_from_yaml(content: &str, name: &str) -> Result<harnx_core::session::Session> {
     let raw_entries = crate::config::session::collect_raw_log_entries(content, name)?;
-    crate::config::session::replay_log_entries_for_external(&raw_entries, name)
+    crate::config::session::replay_log_entries_for_external(&raw_entries, name, false)
 }
 
 pub fn subject_for_session(session_id: &str) -> String {

@@ -102,6 +102,48 @@ impl SessionTurn {
     }
 }
 
+/// Admission ids of executable user rows that still need a turn, deduplicated
+/// to each id's first effective occurrence. Compaction re-logs kept messages
+/// after the Compress marker under their original ids, so a copy of an
+/// already-validated prompt (from an older invocation, crash-before-TurnEnd)
+/// must not be re-checked — it was validated where the prompt actually asked
+/// for its turn. Bails when an id-less executable row is still pending: it
+/// has no admission identity to check (the fail-closed case of issue #2493).
+fn pending_prompt_admission_checks(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    effective: &[(u64, harnx_core::session::SessionLogEntry)],
+) -> Result<Vec<String>> {
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut checks = Vec::new();
+    for (seq, entry) in effective {
+        let Some(prompt) = super::agent_loop::executable_user_message_id(entry) else {
+            continue;
+        };
+        let Some(prompt) = prompt else {
+            // Id-less executable rows have no admission to check; their
+            // pending state decides whether that fails the turn. Carry the
+            // seq so an operator can find the row, like the mid-turn
+            // diagnostic does (issue #2493).
+            if crate::nats_session::requested_seq_status_with_effective(entries, effective, *seq)
+                == crate::nats_session::RequestedSeqStatus::Pending
+            {
+                anyhow::bail!("unmapped executable user row has no admission identity (seq={seq})");
+            }
+            continue;
+        };
+        if !seen_ids.insert(prompt) {
+            continue;
+        }
+        if crate::nats_session::requested_seq_status_with_effective(entries, effective, *seq)
+            != crate::nats_session::RequestedSeqStatus::Pending
+        {
+            continue;
+        }
+        checks.push(prompt.to_owned());
+    }
+    Ok(checks)
+}
+
 async fn remove_unterminated_failed_assistant(
     backend: &NatsSessionLogBackend,
     lease: &NatsSessionLease,
@@ -249,21 +291,11 @@ impl SessionTurn {
         invocation_id: &crate::nats_session_metadata::InvocationIdentity,
     ) -> Result<()> {
         let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)?;
-        for (seq, entry) in &effective {
-            let Some(prompt) = super::agent_loop::executable_user_message_id(entry) else {
-                continue;
-            };
-            if crate::nats_session::requested_seq_status_with_effective(entries, &effective, *seq)
-                != crate::nats_session::RequestedSeqStatus::Pending
-            {
-                continue;
-            }
-            let prompt =
-                prompt.context("unmapped executable user row has no admission identity")?;
+        for prompt in pending_prompt_admission_checks(entries, &effective)? {
             let bound = self
                 .worker
                 .session_metadata
-                .prompt_admission(&self.activation.session_id, prompt)
+                .prompt_admission(&self.activation.session_id, &prompt)
                 .await?
                 .context("unmapped executable user row has no durable admission")?;
             anyhow::ensure!(
@@ -1072,5 +1104,138 @@ mod compaction_deferral_tests {
             ],
             false,
         );
+    }
+}
+
+/// Issue #2493 regression tests for the admission-validation branches of
+/// `pending_prompt_admission_checks`: compaction-copy dedup, the id-less
+/// pending bail, and id-less answered rows passing through.
+#[cfg(test)]
+mod pending_input_admission_tests {
+    use super::*;
+    use harnx_core::message::{MessageContent, MessageRole};
+    use harnx_core::session::SessionLogEntry;
+
+    fn user(id: Option<&str>) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: id.map(str::to_string),
+            role: MessageRole::User,
+            content: MessageContent::Text("run this".to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn assistant() -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("done".to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn turn_end(through_seq: u64) -> SessionLogEntry {
+        SessionLogEntry::TurnEnd {
+            through_seq,
+            fence_token: 0,
+            timestamp: None,
+            usage: None,
+        }
+    }
+
+    fn compress() -> SessionLogEntry {
+        SessionLogEntry::Compress {
+            prompt: "summary".to_string(),
+        }
+    }
+
+    fn checks(entries: Vec<SessionLogEntry>) -> anyhow::Result<Vec<String>> {
+        let entries: Vec<(u64, SessionLogEntry)> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, entry)| ((i + 1) as u64, entry))
+            .collect();
+        let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
+        pending_prompt_admission_checks(&entries, &effective)
+    }
+
+    #[test]
+    fn compaction_copy_of_validated_prompt_is_skipped() {
+        // The keep plan retained "p1" without its reply; the copy sits past
+        // the barrier at a fresh pending sequence. Dedup must validate "p1"
+        // once, at its first occurrence, and not return the copy as a new
+        // check — otherwise the turn is refused ("cannot coalesce") or, with
+        // a stale admission, silently re-executed.
+        let result = checks(vec![
+            user(Some("p1")),
+            assistant(),
+            turn_end(1),
+            compress(),
+            user(Some("p1")),
+            user(Some("p2")),
+        ])
+        .expect("deduped copy must not fail validation");
+        assert_eq!(result, vec!["p2".to_string()]);
+    }
+
+    #[test]
+    fn pending_row_without_admission_identity_fails_closed() {
+        // The pre-fix shape of issue #2493: an executable user row with no
+        // admission id is still pending, so the turn must fail closed instead
+        // of executing it.
+        let err = checks(vec![user(None)]).expect_err("id-less pending row must bail");
+        assert_eq!(
+            err.to_string(),
+            "unmapped executable user row has no admission identity (seq=1)"
+        );
+    }
+
+    #[test]
+    fn id_less_answered_row_passes_through() {
+        // Historical id-less rows that already have their answer carry no
+        // pending work; they must not trip the id-less bail once covered.
+        let result = checks(vec![user(None), assistant(), turn_end(1), user(Some("p2"))])
+            .expect("answered id-less row must not fail validation");
+        assert_eq!(result, vec!["p2".to_string()]);
+    }
+
+    #[test]
+    fn distinct_pending_ids_are_all_checked() {
+        // Sanity against over-dedup: two different ids are two checks.
+        let result = checks(vec![user(Some("a")), user(Some("b"))])
+            .expect("distinct ids must not fail validation");
+        assert_eq!(result, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn duplicate_id_is_checked_once_even_when_first_copy_is_pending() {
+        // The first occurrence decides: if both the original and the copy are
+        // pending (crash before TurnEnd, compaction, then redelivery), the id
+        // is validated once at the original sequence.
+        let result = checks(vec![
+            user(Some("a")),
+            compress(),
+            user(Some("a")),
+            user(Some("b")),
+        ])
+        .expect("pending duplicate must not fail validation");
+        assert_eq!(result, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// The dedup must rely on `RequestedSeqStatus`, so a covered row is not
+    /// pending even without dedup — guards the helper against losing the
+    /// pending-status filter entirely.
+    #[test]
+    fn covered_prompt_is_not_a_pending_check() {
+        let result = checks(vec![
+            user(Some("p1")),
+            assistant(),
+            turn_end(1),
+            user(Some("p2")),
+        ])
+        .expect("covered prompt must not be a check");
+        assert_eq!(result, vec!["p2".to_string()]);
     }
 }

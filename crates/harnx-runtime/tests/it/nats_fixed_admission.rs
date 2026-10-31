@@ -332,6 +332,95 @@ async fn fixed_ticket_identity_and_content_cannot_be_replaced_or_sent_to_other_s
     Ok(())
 }
 
+/// Caller-supplied fixed prompt ids must not collide with the reserved
+/// runtime-note and timing-notice prefixes: a prompt admitted under one is
+/// silently skipped by every executable-prompt check. Both the prepare and
+/// the restored-ticket paths must refuse before any durable write.
+#[tokio::test]
+async fn reserved_prompt_id_prefixes_are_rejected_without_durable_effects() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        anyhow::bail!("nats-server required")
+    };
+    for (idx, reserved) in ["runtime-note-v1-forged", "timing-v1-forged"]
+        .into_iter()
+        .enumerate()
+    {
+        let session = open(server.url(), &format!("reserved-{idx}")).await?;
+        let log = log(server.url(), &session).await?;
+        assert_reserved_ticket_rejected(&session, "reserved-invocation", reserved).await?;
+        assert_restored_ticket_rejected(&session, "reserved-invocation", reserved).await?;
+        assert_no_reserved_admission(&session, &log, "reserved-invocation", reserved).await?;
+        // The invocation id reaches the transcript too: A2A republish flows
+        // it into `with_admission_id`, which appends the prompt under it, so a
+        // reserved prefix there must be refused the same way.
+        assert_reserved_ticket_rejected(&session, reserved, "normal-prompt").await?;
+        assert_restored_ticket_rejected(&session, reserved, "normal-prompt").await?;
+        assert_no_reserved_admission(&session, &log, reserved, "normal-prompt").await?;
+    }
+    Ok(())
+}
+
+async fn assert_reserved_ticket_rejected(
+    session: &NatsSession,
+    invocation: &str,
+    prompt: &str,
+) -> Result<()> {
+    assert!(session
+        .prepare_fixed_admission(invocation.into(), prompt.into(), "reserved-close".into())
+        .await
+        .is_err());
+    assert!(FixedAdmissionTicket::from_parts(
+        session.storage_key().into(),
+        invocation.into(),
+        prompt.into(),
+        "reserved-close".into(),
+        0,
+    )
+    .is_err());
+    Ok(())
+}
+
+async fn assert_restored_ticket_rejected(
+    session: &NatsSession,
+    invocation: &str,
+    prompt: &str,
+) -> Result<()> {
+    // A deserialized ticket bypasses from_parts; every durable entry
+    // point must still refuse it.
+    let forged: FixedAdmissionTicket = serde_json::from_str(&format!(
+        r#"{{"storage_key":{},"invocation_id":{},"prompt_id":{},"closure_id":"reserved-close","expected_predecessor":0}}"#,
+        serde_json::to_string(session.storage_key())?,
+        serde_json::to_string(invocation)?,
+        serde_json::to_string(prompt)?,
+    ))?;
+    assert!(session.append_fixed_prompt(&forged, text()).await.is_err());
+    assert!(session.close_fixed_admission(&forged).await.is_err());
+    assert!(session.resolve_fixed_admission(&forged).await.is_err());
+    Ok(())
+}
+
+async fn assert_no_reserved_admission(
+    session: &NatsSession,
+    log: &NatsSessionLog,
+    invocation: &str,
+    prompt: &str,
+) -> Result<()> {
+    // No log row, no admission reservation, no prompt binding.
+    assert!(log.load_events_latest_async().await?.is_empty());
+    assert!(session
+        .metadata_store()
+        .admission(session.storage_key(), invocation)
+        .await?
+        .is_none());
+    assert!(session
+        .metadata_store()
+        .prompt_admission(session.storage_key(), prompt)
+        .await?
+        .is_none());
+    Ok(())
+}
+
 mod edges;
 #[cfg(feature = "fault-injection")]
 mod faults;

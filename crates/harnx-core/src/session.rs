@@ -21,7 +21,7 @@ use std::collections::HashMap;
 ///
 /// # Protocol Compatibility
 /// New variants are transcript-protocol changes. Canonical NATS replay
-/// (`replay_nats_entries_into_session_with_policy`) rejects `Unknown`,
+/// (`replay_nats_entries_into_session`) rejects `Unknown`,
 /// so old workers cannot read transcripts containing new variants.
 /// Deploy readers before writers in multi-instance clusters.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

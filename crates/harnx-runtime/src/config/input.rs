@@ -1,3 +1,5 @@
+mod request_context;
+
 use super::*;
 
 use crate::client::{
@@ -199,42 +201,7 @@ pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Messag
         input.agent().build_messages(input)?
     };
     drop(guard);
-    // Append `input.tool_calls` only when there's no session. With a session,
-    // `append_session_tool_calls` + `append_session_tool_results` already pushed
-    // the same `(call, result)` pair into `session.messages`.
-    if !with_session {
-        if let Some(tool_calls) = &input.tool_calls {
-            messages.push(Message::new(
-                MessageRole::Assistant,
-                MessageContent::ToolCalls(tool_calls.clone()),
-            ))
-        }
-    }
-    if let Some(text) = &input.injected_user_text {
-        messages.push(Message::new(
-            MessageRole::User,
-            MessageContent::Text(text.clone()),
-        ))
-    }
-    if let Some(timing) = &input.timing_context {
-        let already_present = messages.iter().any(|message| {
-            message.role.is_user()
-                && harnx_core::timing_identity::TimingReceipt::from_notice_line(
-                    &message.content.to_text(),
-                )
-                .as_ref()
-                    == Some(&timing.receipt)
-        });
-        if !already_present {
-            messages.push(timing.message.clone());
-        }
-    }
-    if let Some(note) = &input.transient_note {
-        messages.push(Message::new(
-            MessageRole::User,
-            MessageContent::Text(note.clone()),
-        ))
-    }
+    request_context::append(input, &mut messages, with_session);
     Ok(messages)
 }
 

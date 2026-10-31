@@ -56,11 +56,7 @@ pub(crate) fn fold_new_user_messages_since(
         else {
             continue;
         };
-        if !role.is_user() {
-            continue;
-        }
-        // Skip timing notices — use shared classifier to ensure only valid notices skipped
-        if harnx_core::timing_identity::is_timing_notice(&content.to_text()) {
+        if !super::is_executable_user_message(id.as_deref(), &role, &content) {
             continue;
         }
         // Register identities before cursor filtering: compaction copies have
@@ -75,9 +71,15 @@ pub(crate) fn fold_new_user_messages_since(
             .with_log_timestamp(timestamp.unwrap_or_else(chrono::Utc::now));
         message.id = id;
         messages.push(message);
-        latest_seq = Some(seq);
+        latest_seq = Some(advance_cursor(latest_seq, seq));
     }
     (messages, latest_seq)
+}
+
+fn advance_cursor(cursor: Option<u64>, seq: u64) -> u64 {
+    // Edits resequence rows without changing conversation order. Track the max,
+    // not the last selected sequence, or an earlier-positioned row repeats.
+    cursor.map_or(seq, |seen| seen.max(seq))
 }
 
 #[cfg(test)]
@@ -272,5 +274,122 @@ mod timing_fold_tests {
             .contains("invalid timing format"));
         assert_eq!(messages[2].content.to_text(), "third");
         assert_eq!(latest_seq, Some(3));
+    }
+}
+
+#[cfg(test)]
+mod runtime_note_and_cursor_tests {
+    use super::*;
+    use harnx_core::message::{MessageContent, MessageRole};
+    use harnx_core::session::SessionLogEntry;
+
+    fn message_row(id: Option<&str>, text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: id.map(str::to_owned),
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    #[test]
+    fn fold_skips_runtime_notes_and_keeps_lookalikes_executable() {
+        let note_id = harnx_core::runtime_note::new_runtime_note_message_id();
+        let entries = vec![
+            (1, message_row(Some("real-1"), "first prompt")),
+            // Compaction re-log of a replayed sub-agent note: structured id.
+            (
+                2,
+                message_row(
+                    Some(&note_id),
+                    &format!(
+                        "{}Started sub-agent 'child' in session child-session.",
+                        harnx_core::runtime_note::RUNTIME_NOTE_PREFIX
+                    ),
+                ),
+            ),
+            // An ID-less lookalike is NOT classified by text: it stays
+            // executable input (fail-closed at admission verification).
+            (
+                3,
+                message_row(
+                    None,
+                    &format!(
+                        "{}The user interrupted this turn.",
+                        harnx_core::runtime_note::RUNTIME_NOTE_PREFIX
+                    ),
+                ),
+            ),
+            (4, message_row(Some("real-2"), "second prompt")),
+        ];
+
+        let (messages, latest_seq) = fold_new_user_messages_since(&entries, None);
+        let texts: Vec<String> = messages.iter().map(|m| m.content.to_text()).collect();
+        let interrupted = format!(
+            "{}The user interrupted this turn.",
+            harnx_core::runtime_note::RUNTIME_NOTE_PREFIX
+        );
+        assert_eq!(
+            texts,
+            vec![
+                "first prompt".to_string(),
+                interrupted,
+                "second prompt".to_string()
+            ]
+        );
+        assert_eq!(latest_seq, Some(4));
+    }
+
+    #[test]
+    fn authored_prompt_with_note_prefix_keeps_its_admission_identity() {
+        // A user prompt that merely starts with the runtime-note prefix is
+        // admitted with an id, so it must stay executable input.
+        let entries = vec![(
+            1,
+            message_row(
+                Some("admitted-lookalike"),
+                &format!(
+                    "{}lookalike prompt",
+                    harnx_core::runtime_note::RUNTIME_NOTE_PREFIX
+                ),
+            ),
+        )];
+
+        let (messages, latest_seq) = fold_new_user_messages_since(&entries, None);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id.as_deref(), Some("admitted-lookalike"));
+        assert_eq!(latest_seq, Some(1));
+    }
+
+    #[test]
+    fn fold_cursor_is_max_selected_seq_when_edits_resequence_rows() {
+        // An EditEntries replacement inherits the edit's physical sequence but
+        // stays at the original row's conversation position, so effective
+        // sequences are not monotonic across the selected set. The cursor must
+        // be the maximum selected sequence; the last selected row's sequence
+        // would leave the earlier-positioned row re-selected every round.
+        let edited = serde_yaml::to_string(&message_row(Some("edited"), "edited prompt")).unwrap();
+        let entries = vec![
+            (1, message_row(Some("edited"), "original prompt")),
+            (2, message_row(Some("later"), "later prompt")),
+            (
+                3,
+                SessionLogEntry::EditEntries {
+                    from: 1,
+                    to: 1,
+                    replacements: vec![edited],
+                },
+            ),
+        ];
+
+        let (messages, cursor) = fold_new_user_messages_since(&entries, None);
+        let texts: Vec<String> = messages.iter().map(|m| m.content.to_text()).collect();
+        assert_eq!(texts, vec!["edited prompt", "later prompt"]);
+        assert_eq!(cursor, Some(3), "cursor must be the max selected seq");
+
+        // The next round must not re-select the edited row at its higher seq.
+        let (again, _) = fold_new_user_messages_since(&entries, cursor);
+        assert!(again.is_empty());
     }
 }

@@ -105,6 +105,68 @@ fn prompt_key(storage: &str, id: &str) -> String {
     format!("sessions/{storage}/prompt_admissions/{key}")
 }
 
+/// Compaction re-logs kept rows under their original ids; replay treats the
+/// first occurrence as the operative prompt (a later copy is history).
+/// Admission must agree: the original occurrence carries the invocation
+/// binding, and a copy is skipped — otherwise a turn that covered the
+/// original (TurnEnd through_seq) leaves the admission looking non-terminal
+/// and the next prompt coalesces into the completed invocation.
+fn repeated_user_row_copies(effective: &[(u64, SessionLogEntry)]) -> Vec<bool> {
+    let mut earlier_ids = std::collections::HashSet::<&str>::new();
+    effective
+        .iter()
+        .map(|(_, entry)| match entry {
+            SessionLogEntry::Message {
+                id: Some(id), role, ..
+            } if role.is_user() => !earlier_ids.insert(id.as_str()),
+            _ => false,
+        })
+        .collect()
+}
+
+fn invocation_prompt_candidates(
+    effective: &[(u64, SessionLogEntry)],
+) -> impl Iterator<Item = (u64, &str)> {
+    let repeated = repeated_user_row_copies(effective);
+    effective
+        .iter()
+        .zip(repeated)
+        .rev()
+        .filter_map(|((seq, entry), is_copy)| {
+            if is_copy {
+                return None;
+            }
+            let prompt = match entry {
+                SessionLogEntry::Message {
+                    id: Some(prompt),
+                    role,
+                    ..
+                } if role.is_user() => prompt,
+                SessionLogEntry::CompactRequest { compaction_id, .. } => compaction_id,
+                _ => return None,
+            };
+            Some((*seq, prompt.as_str()))
+        })
+}
+
+fn raw_root_prompt_seq(
+    entries: &[(u64, SessionLogEntry)],
+    id: &str,
+    fixed: Option<&crate::nats_session::fixed_admission::FixedAdmissionTicket>,
+) -> Option<u64> {
+    entries.iter().find_map(|(seq, entry)| match entry {
+        SessionLogEntry::Message {
+            id: Some(prompt),
+            role,
+            ..
+        } if role.is_user() && (prompt == id || fixed.is_some_and(|t| t.prompt_id() == prompt)) => {
+            Some(*seq)
+        }
+        SessionLogEntry::CompactRequest { compaction_id, .. } if compaction_id == id => Some(*seq),
+        _ => None,
+    })
+}
+
 impl SessionMetadataStore {
     pub async fn admission(&self, storage: &str, id: &str) -> Result<Option<InvocationAdmission>> {
         let key = intent_key(storage, id);
@@ -155,25 +217,14 @@ impl SessionMetadataStore {
         entries: &[(u64, SessionLogEntry)],
     ) -> Result<Option<u64>> {
         let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)?;
-        for (seq, entry) in effective.iter().rev() {
-            let prompt = match entry {
-                SessionLogEntry::Message {
-                    id: Some(prompt),
-                    role,
-                    ..
-                } if role.is_user() => Some(prompt),
-                SessionLogEntry::CompactRequest { compaction_id, .. } => Some(compaction_id),
-                _ => None,
-            };
-            if let Some(prompt) = prompt {
-                if prompt == id
-                    || self
-                        .prompt_admission(storage, prompt)
-                        .await?
-                        .is_some_and(|admission| admission.invocation_id.as_str() == id)
-                {
-                    return Ok(Some(*seq));
-                }
+        for (seq, prompt) in invocation_prompt_candidates(&effective) {
+            if prompt == id
+                || self
+                    .prompt_admission(storage, prompt)
+                    .await?
+                    .is_some_and(|admission| admission.invocation_id.as_str() == id)
+            {
+                return Ok(Some(seq));
             }
         }
         // Removing or editing the root prompt does not remove its admission or
@@ -182,21 +233,7 @@ impl SessionMetadataStore {
             .admission(storage, id)
             .await?
             .and_then(|a| a.fixed_ticket);
-        Ok(entries.iter().find_map(|(seq, entry)| match entry {
-            SessionLogEntry::Message {
-                id: Some(prompt),
-                role,
-                ..
-            } if role.is_user()
-                && (prompt == id || fixed.as_ref().is_some_and(|t| t.prompt_id() == prompt)) =>
-            {
-                Some(*seq)
-            }
-            SessionLogEntry::CompactRequest { compaction_id, .. } if compaction_id == id => {
-                Some(*seq)
-            }
-            _ => None,
-        }))
+        Ok(raw_root_prompt_seq(entries, id, fixed.as_ref()))
     }
 
     /// Reserve one execution invocation. Its log terminal permits replacement.
@@ -352,5 +389,67 @@ impl SessionMetadataStore {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::message::{MessageContent, MessageRole};
+
+    fn user_row(seq: u64, id: Option<&str>) -> (u64, SessionLogEntry) {
+        (
+            seq,
+            SessionLogEntry::Message {
+                id: id.map(str::to_owned),
+                role: MessageRole::User,
+                content: MessageContent::Text("prompt".into()),
+                timestamp: None,
+                fence_token: None,
+            },
+        )
+    }
+
+    fn assistant_row(seq: u64, id: &str) -> (u64, SessionLogEntry) {
+        (
+            seq,
+            SessionLogEntry::Message {
+                id: Some(id.to_owned()),
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("reply".into()),
+                timestamp: None,
+                fence_token: None,
+            },
+        )
+    }
+
+    #[test]
+    fn only_repeated_user_ids_flag_compaction_copies() {
+        // The exact #2493 shape: an answered prompt, a terminal barrier, a
+        // compaction re-log of the answered prompt under the same id, then a
+        // fresh prompt. Only the re-logged copy is flagged.
+        let entries = vec![
+            user_row(1, Some("prompt-a")),
+            assistant_row(2, "reply"),
+            user_row(3, Some("prompt-a")),
+            user_row(4, Some("prompt-b")),
+        ];
+        assert_eq!(
+            repeated_user_row_copies(&entries),
+            vec![false, false, true, false]
+        );
+    }
+
+    #[test]
+    fn distinct_and_idless_user_rows_are_never_copies() {
+        let entries = vec![
+            user_row(1, Some("prompt-a")),
+            user_row(2, None),
+            user_row(3, Some("prompt-b")),
+        ];
+        assert_eq!(
+            repeated_user_row_copies(&entries),
+            vec![false, false, false]
+        );
     }
 }

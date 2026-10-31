@@ -186,7 +186,7 @@ fn assert_user_history(entries: &[(u64, SessionLogEntry)], prompts: &[&str]) -> 
         .map(|(seq, entry)| (*seq as usize, entry.clone()))
         .collect::<Vec<_>>();
     let restored =
-        harnx_runtime::config::session::replay_log_entries_for_external(&raw, SESSION_ID)?;
+        harnx_runtime::config::session::replay_log_entries_for_external(&raw, SESSION_ID, false)?;
     let actual = restored
         .messages
         .iter()

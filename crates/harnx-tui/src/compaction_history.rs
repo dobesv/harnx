@@ -73,7 +73,7 @@ fn transcript_items(
         .map(|(seq, entry)| Ok((usize::try_from(*seq)?, entry.clone())))
         .collect::<Result<Vec<_>>>()?;
     let session =
-        replay_nats_entries_into_session(&entries, "archived history", Session::default())?;
+        replay_nats_entries_into_session(&entries, "archived history", Session::default(), false)?;
     let mut items = crate::lifecycle::build_transcript_with_compaction_for_cluster(
         &[],
         &session.messages,

@@ -36,7 +36,7 @@ impl PromptLog {
     }
 
     fn messages(&self) -> Vec<Message> {
-        replay_log_entries_for_external(&self.entries(), "input-persistence")
+        replay_log_entries_for_external(&self.entries(), "input-persistence", false)
             .unwrap()
             .messages
     }

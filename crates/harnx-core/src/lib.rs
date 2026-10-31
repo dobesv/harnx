@@ -38,6 +38,7 @@ pub mod partial_result;
 pub mod path;
 pub mod provider_config;
 pub mod retry_config;
+pub mod runtime_note;
 pub mod safety;
 pub mod session;
 pub mod session_identity;

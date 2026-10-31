@@ -41,6 +41,11 @@ pub const TIMING_NOTE_PREFIX: &str = "[Runtime note] ⏱ ";
 /// Current timing identity schema version.
 pub const TIMING_SCHEMA_VERSION: &str = "v1";
 
+/// Prefix of the structured message id carried by durable timing notices.
+/// Reserved: callers may not admit prompts under this prefix, or the notices
+/// would be indistinguishable from executable prompts in the log.
+pub const TIMING_MESSAGE_ID_PREFIX: &str = "timing-v1-";
+
 /// Combined versioned header for timing notices.
 pub const TIMING_HEADER: &str = "[Runtime note] ⏱ v1 ";
 

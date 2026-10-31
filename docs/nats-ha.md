@@ -848,6 +848,35 @@ deadline. Admission reads go to the stream leader (see "Read a record that was
 just written" in the recovery table below), so a missing admission is not a
 replica that hasn't caught up yet.
 
+Admission also refuses caller-supplied message ids that use the reserved
+`runtime-note-v1-` and `timing-v1-` prefixes, on both the ordinary prompt path
+and fixed-ticket admission (`prepare_fixed_admission`, restored tickets, append
+and reservation). A prompt filed under a reserved prefix would be skipped by
+every executable-prompt check and never run. Internal compaction re-logs copy
+ids verbatim without passing through admission, so runtime notes and timing
+rows keep their reserved ids.
+
+A user row's identity is its stable message id, and compaction re-logs kept rows
+under that id at fresh sequences. The admission-side consumers — replay's
+pending-input reconstruction (`seed_settled_user_ids` in
+`session_reconstruct.rs`), the mid-turn fold (`fold_new_user_messages_since`),
+`pending_prompt_admission_checks`, and `invocation_prompt_seq`
+(`repeated_user_row_copies` in `nats_session_metadata/admission.rs`) — all key
+an id to its first effective occurrence and treat later copies as history. The
+sites must agree: if one picks a compaction copy as an invocation's prompt, the
+answered admission looks non-terminal and the next prompt coalesces into the
+completed invocation.
+
+Mid-turn injection follows the same rule. The worker's tool-round callback
+selects durable, admitted rows and input preparation pushes them into session
+memory verbatim (`Input.injected_user_messages`, ids and log seqs intact),
+never as fresh ID-less text: a later compaction re-log would persist ID-less
+user rows that no admission path can verify, failing with "injected user row
+has no admission identity" (issue #2493). Legacy ID-less rows written by that
+bug still fail closed; they are repaired by starting a clean turn, not by
+trusting the `[Runtime note]` text prefix, which user prompts may legitimately
+mimic.
+
 The ten-failure limit is counted in the `harnx_activation_failures` KV bucket
 (`activation_failure.rs`, one-hour TTL per key). If a worker can't read or
 update that bucket, it logs a warning and retries the activation with a

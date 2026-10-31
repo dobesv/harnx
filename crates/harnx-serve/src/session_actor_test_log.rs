@@ -46,7 +46,7 @@ pub fn load_test_session_messages(agent: &str, session: &str) -> Vec<harnx_core:
     let key = SessionKey::local(agent.to_string(), session.to_string());
     let entries = test_session_log(&key).entries();
     let raw = entries.into_iter().enumerate().collect::<Vec<_>>();
-    harnx_runtime::config::session::replay_log_entries_for_external(&raw, session)
+    harnx_runtime::config::session::replay_log_entries_for_external(&raw, session, false)
         .expect("replay test session log")
         .messages
 }

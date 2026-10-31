@@ -265,13 +265,6 @@ fn derive_hitl_tool_round_continuation(
         decisions,
     }))
 }
-fn fold_user_messages(messages: &[Message]) -> String {
-    messages
-        .iter()
-        .map(|message| message.content.to_text())
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
 
 #[allow(dead_code)]
 pub(crate) fn last_fed_user_log_seq(_input: &Input) -> Option<u64> {
@@ -294,33 +287,60 @@ pub(super) fn executable_user_message_id(entry: &SessionLogEntry) -> Option<Opti
     match entry {
         SessionLogEntry::Message {
             id, role, content, ..
-        } if role.is_user()
-            && !harnx_core::timing_identity::is_timing_notice(&content.to_text()) =>
-        {
-            Some(id.as_deref())
-        }
+        } if is_executable_user_message(id.as_deref(), role, content) => Some(id.as_deref()),
         _ => None,
     }
 }
 
-async fn verify_injected_prompt_admission(
+fn is_executable_user_message(
+    id: Option<&str>,
+    role: &harnx_core::message::MessageRole,
+    content: &harnx_core::message::MessageContent,
+) -> bool {
+    // Replayed runtime notes and valid timing notices are context, not prompts.
+    role.is_user()
+        && !harnx_core::timing_identity::is_timing_notice(&content.to_text())
+        && !harnx_core::runtime_note::is_runtime_note_id(id)
+}
+
+/// Verify that the durable user rows the fold selected for injection are all
+/// admitted to this execution. Verifying exactly the selected rows matters:
+/// scanning every effective row past the cursor would re-check historical
+/// compaction copies whose admissions belong to older invocations and fail
+/// with a competing-execution error even though the fold already deduplicated
+/// them out of the injection.
+async fn verify_injected_prompt_admissions(
     store: &SessionMetadataStore,
     session_id: &str,
-    entry: &SessionLogEntry,
+    messages: &[harnx_core::message::Message],
     invocation_id: &str,
 ) -> Result<()> {
-    let Some(id_opt) = executable_user_message_id(entry) else {
-        return Ok(());
-    };
-    let id = id_opt.context("injected user row has no admission identity")?;
-    let admission = store
-        .prompt_admission(session_id, id)
-        .await?
-        .context("injected user row has no durable admission")?;
-    anyhow::ensure!(
-        admission.invocation_id.as_str() == invocation_id,
-        "cannot inject a competing execution admission"
-    );
+    for message in messages {
+        // Include provenance in the failure so future incidents can be
+        // diagnosed from the log_seq alone (issue #2493 arrived with no
+        // session log attached).
+        let note_like = message
+            .content
+            .to_text()
+            .starts_with(harnx_core::runtime_note::RUNTIME_NOTE_PREFIX);
+        let id = message
+            .id
+            .as_deref()
+            .with_context(|| {
+                format!(
+                    "injected user row has no admission identity (log_seq={:?}, runtime-note-prefixed text={note_like})",
+                    message.log_seq
+                )
+            })?;
+        let admission = store
+            .prompt_admission(session_id, id)
+            .await?
+            .context("injected user row has no durable admission")?;
+        anyhow::ensure!(
+            admission.invocation_id.as_str() == invocation_id,
+            "cannot inject a competing execution admission"
+        );
+    }
     Ok(())
 }
 
@@ -349,23 +369,21 @@ pub(crate) fn build_mid_turn_injection_callback(
             if messages.is_empty() {
                 return Ok(());
             }
-            let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&tail)?;
             let store = backend
                 .metadata_store_opt()
                 .context("injection requires admission metadata")?;
-            let min_seq = current.unwrap_or(0);
-            for (seq, entry) in &effective {
-                if *seq > min_seq {
-                    verify_injected_prompt_admission(
-                        store,
-                        backend.session_id(),
-                        entry,
-                        &invocation_id,
-                    )
-                    .await?;
-                }
-            }
-            merged_input.set_injected_user_text(fold_user_messages(&messages));
+            // Verify exactly what the fold selected (deduplicated, past the
+            // cursor) rather than rescanning the whole tail: compaction copies
+            // of older admissions must not fail this turn once any new input
+            // unlocks the callback.
+            verify_injected_prompt_admissions(
+                store,
+                backend.session_id(),
+                &messages,
+                &invocation_id,
+            )
+            .await?;
+            merged_input.set_injected_user_messages(messages);
             if let Some(seq) = latest_seq {
                 cursor.store(seq, std::sync::atomic::Ordering::SeqCst);
             }
@@ -1643,6 +1661,11 @@ fn rerun_failure_output(
 
 #[cfg(test)]
 mod tests;
+
+/// NATS-backed tests for `build_mid_turn_injection_callback` (issue #2493).
+#[cfg(test)]
+#[path = "mid_turn_injection_tests.rs"]
+mod mid_turn_injection_tests;
 
 /// Tests for `build_hitl_approval_request_callback` attention bump.
 #[cfg(test)]
