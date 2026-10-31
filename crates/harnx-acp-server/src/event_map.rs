@@ -313,8 +313,8 @@ fn notice_event_to_update(event: NoticeEvent) -> Option<SessionUpdate> {
 
 /// Map subagent progress into an ACP ToolCallUpdate.
 ///
-/// The `invocation_id` field correlates to the parent tool call that started
-/// the subagent (resolved at emission time, not session ID). ACP has no native
+/// Use `tool_call_id` to correlate with the parent's transcript tool call, falling
+/// back to `invocation_id` for legacy and top-level events. ACP has no native
 /// usage field, so structured usage is placed in namespaced `_meta` under
 /// `harnx:usage`. Title incorporates the child session title plus compact usage.
 ///
@@ -323,7 +323,10 @@ fn notice_event_to_update(event: NoticeEvent) -> Option<SessionUpdate> {
 /// equating child `Done` with parent tool completion — the parent tool call
 /// remains InProgress until the subagent tool completes.
 fn subagent_progress_to_update(progress: &SubAgentProgress) -> SessionUpdate {
-    let id = progress.invocation_id.clone();
+    let id = progress
+        .tool_call_id
+        .clone()
+        .unwrap_or_else(|| progress.invocation_id.clone());
 
     // Build title: agent name + child title (if present) + compact usage
     let mut title_parts = vec![format!("@ {}", progress.agent)];

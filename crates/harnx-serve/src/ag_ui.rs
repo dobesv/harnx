@@ -616,8 +616,9 @@ impl AgUiSink {
     /// Project subagent progress into a unified tool_update event.
     ///
     /// This bridges the legacy SubAgentProgress path with the shared tool-call
-    /// rendering path introduced in Phase 6 (Issue #2096). The title incorporates
-    /// the child session title and compact usage, matching ACP projection.
+    /// rendering path introduced in Phase 6 (Issue #2096). Updates key on the
+    /// parent's `tool_call_id`, falling back to `invocation_id` for legacy events.
+    /// The title incorporates child session title and compact usage, matching ACP projection.
     fn emit_subagent_progress_update(&self, progress: &harnx_core::event::SubAgentProgress) {
         // Build title: agent name + child title (if present) + compact usage
         let mut title_parts = vec![format!("@ {}", progress.agent)];
@@ -646,9 +647,13 @@ impl AgUiSink {
             }
         };
 
-        // Emit tool_update for the invocation_id (correlates to parent tool call)
+        // Parent transcript id is what clients use to look up tool-call updates.
+        let tool_call_id = progress
+            .tool_call_id
+            .clone()
+            .unwrap_or_else(|| progress.invocation_id.clone());
         self.emit_tool_update(
-            progress.invocation_id.clone(),
+            tool_call_id,
             None, // markdown
             Some(status),
             Some(title),
@@ -815,7 +820,7 @@ impl AgUiSink {
             ),
             TurnEvent::SubAgentProgress(progress) => {
                 // Emit both the legacy sub_agent_progress custom event AND the projected
-                // tool_call_update so clients can transition incrementally. The projected
+                // tool_update so clients can transition incrementally. The projected
                 // update uses the shared tool-call rendering path with title+usage.
                 self.emit_custom(
                     "sub_agent_progress",

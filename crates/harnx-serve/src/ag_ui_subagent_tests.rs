@@ -100,7 +100,7 @@ fn subagent_progress_emits_both_legacy_and_tool_update() {
             usage: CompletionTokenUsage::new(Some(100), Some(50), Some(0)),
             tool_call_count: 3,
             title: Some("Analyzing code".into()),
-            tool_call_id: None,
+            tool_call_id: Some("parent-proj".into()),
         },
     )));
 
@@ -116,7 +116,7 @@ fn subagent_progress_emits_both_legacy_and_tool_update() {
         panic!("expected tool_update custom event");
     };
     assert_eq!(update.name, "tool_update");
-    assert_eq!(update.value["tool_call_id"], json!("inv-proj"));
+    assert_eq!(update.value["tool_call_id"], json!("parent-proj"));
     let title = update.value["title"]
         .as_str()
         .expect("title should be string");
@@ -159,6 +159,7 @@ fn subagent_progress_projected_with_zero_usage() {
     let Event::Custom(update) = rx.try_recv().expect("tool_update event") else {
         panic!("expected tool_update custom event");
     };
+    assert_eq!(update.value["tool_call_id"], json!("inv-zero"));
     let title = update.value["title"]
         .as_str()
         .expect("title should be string");
