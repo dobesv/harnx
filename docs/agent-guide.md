@@ -170,6 +170,45 @@ The `instructions` front-matter field, if set, overrides the body entirely. This
 
 Both the body and `instructions` support `{{variable}}` and `{{__builtin__}}` interpolation.
 
+### Compaction Prompt Design
+
+The `coding` and `pantheon` packages and `example-compaction-agent` ask for a
+continuation checkpoint: enough state to resume the work, with exact references
+and explicit progress. Their shared guidance keeps plan/task IDs and URLs,
+important changed files, decisions and rationale, verification evidence, and
+pending work. Specialist prompts add their own evidence and verdict requirements.
+Headings are adaptable; completeness of relevant state matters more than filling
+a fixed report template. Large logs are condensed to results and diagnostic
+excerpts, while constraints and unfinished work survive repeated compactions.
+
+This design draws on three primary sources reviewed for [issue #2495](https://github.com/dobesv/harnx/issues/2495):
+
+- [Anthropic's context engineering guidance](https://www.anthropic.com/research/effective-context-engineering-for-ai-agents)
+  recommends tuning compaction for recall first, preserving decisions and
+  unresolved work while removing redundant output.
+- [Pi's compaction prompts](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts)
+  distinguish initial summaries from updates and retain constraints, progress,
+  decisions, and next steps across updates.
+- [OpenCode's compaction prompts](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/compaction.ts)
+  preserve exact references and consequential workflow state, reconcile older
+  checkpoints with newer evidence, and separate summarization from task execution.
+
+Harnx supplies a sanitized, budgeted transcript as the compaction request's input
+(`config/compaction/request.rs` and `transcript.rs` in `harnx-runtime`); no
+`{conversation_history}` placeholder is needed in the agent prompt. Kept messages
+are excluded from that transcript. Tool results may already be shortened, so a
+prompt cannot recover missing details; it should identify consequential gaps
+instead of inventing them. The built-in fallback used without a configured
+`compaction_agent` is separate and still requests about 200 words.
+
+When evaluating prompt changes, use transcripts with an earlier summary, a
+partially completed plan, changed files, a failed check, and a later user
+correction. Check that the output retains exact references and their purpose,
+updates statuses without reviving resolved blockers, distinguishes proposed work
+from verified results, and identifies the next action. Include a mid-task cutoff
+and a second compaction to check continuity. Prompt-rendering tests validate
+loading and the request/reply instruction; they do not establish model recall.
+
 ## Tools
 
 The `use_tools` field controls which MCP tools the agent can access. Tools are specified as a YAML list (a comma-separated string is also accepted for backward compatibility). Glob patterns are supported via the `globset` crate, including `*` wildcards and `{a,b}` brace expansion.

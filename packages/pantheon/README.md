@@ -55,6 +55,9 @@ results, and a multi-agent code review pipeline.
 lightweight context-compression agents (gpt-6-luna) used to keep
 long conversations within token limits.
 
+See [compaction prompt design](../../docs/agent-guide.md#compaction-prompt-design)
+for retention priorities, research sources, and evaluation guidance.
+
 ---
 
 ## Quick start
