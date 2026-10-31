@@ -141,7 +141,7 @@ The `harnx_activation_naks_total` counter tracks activation deliveries that the 
 
 #### Bounded NATS Operations
 
-The `harnx_nats_operation_seconds` and `harnx_nats_operations_total` metrics track 12 bounded operations:
+The `harnx_nats_operation_seconds` and `harnx_nats_operations_total` metrics track 13 bounded operations:
 
 - `stream_lookup`: Fetch stream state (`get_stream`).
 - `stream_create`: Create session or notification stream (`create_stream`).
@@ -154,6 +154,7 @@ The `harnx_nats_operation_seconds` and `harnx_nats_operations_total` metrics tra
 - `lease_create`: Acquire session lease with TTL (`bucket.create_with_ttl`).
 - `lease_renew`: CAS update to renew session lease fence token (`publish_with_headers`).
 - `lease_release`: Delete lease key with revision fencing (`bucket.delete_expect_revision`).
+- `lease_reclaim`: Delete a lease held by a worker that is provably dead on this host, at the observed revision (`bucket.delete_expect_revision`). `outcome="ok"` counts successful reclaims; a lost CAS race (another writer moved first) records `outcome="error"` and is benign.
 - `activation_publish`: Publish `SessionActivate` message to work queue.
 
 The `outcome` label is classified as:

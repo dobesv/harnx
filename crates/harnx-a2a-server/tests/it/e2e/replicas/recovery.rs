@@ -20,23 +20,19 @@ async fn alternating_process_sigkill_background_recovery_restart_rejects_stale_w
     one_prompt(&pair.a.h, &context).await?;
     let (storage, write) = stale_ticket(&pair.a.h, &context).await?;
     let old_owner = write.document().owner.clone().context("old fence")?;
-    let leases = pair.a.h.jetstream.get_key_value("harnx_leases").await?;
     let worker_key = format!("sessions/{storage}/lock");
-    let before = harnx_nats_common::leader_reads::entry(&leases, &worker_key)
-        .await?
-        .context("worker lease")?;
     drop(routes);
 
-    kill_owner(&mut pair, &worker_key, before.revision).await?;
-    drop(owner_stream);
-    // No HTTP polling/reconciliation: B's production background sweep must settle.
-    let terminal = settled(&pair.b.h, &id).await?;
-    assert_eq!(terminal.task.status.state, a2a_lf::TaskState::Failed);
-    terminal_frames(&mut remote, "TASK_STATE_FAILED").await?;
-    assert!(
-        remote.comments > 0,
-        "real idle HTTP stream must send keep-alives before lease expiry"
-    );
+    let terminal = kill_owner_and_await_background_settle(
+        &mut pair,
+        owner_stream,
+        &mut remote,
+        RecoveryTarget {
+            worker_key: &worker_key,
+            task_id: &id,
+        },
+    )
+    .await?;
     let current = pair
         .b
         .h
@@ -67,6 +63,60 @@ async fn alternating_process_sigkill_background_recovery_restart_rejects_stale_w
     assert_eq!(retained.revision, terminal.revision);
     assert_eq!(retained.execution_id, terminal.execution_id);
     Ok(())
+}
+
+/// Kill the owning replica and wait for B's production background sweep to
+/// settle the orphaned task — there is no HTTP polling or reconciliation to
+/// do it. Where the runtime can prove the owner's pid is gone (a strong host
+/// identity; see `nats_lease::holder_reclaim_supported`) the sweep reclaims
+/// its dead-holder lease instead of waiting out the 30 s lease TTL; the
+/// timer starts before the SIGKILL so the budget covers the whole path.
+/// Elsewhere the sweep still waits the TTL, so the idle SSE stream must have
+/// kept the connection alive with keep-alive comments in the meantime.
+/// Returns the terminal task record B produced.
+struct RecoveryTarget<'a> {
+    worker_key: &'a str,
+    task_id: &'a Value,
+}
+
+async fn kill_owner_and_await_background_settle(
+    pair: &mut Pair,
+    owner_stream: Frames,
+    remote: &mut Frames,
+    target: RecoveryTarget<'_>,
+) -> Result<harnx_a2a_server::store::TaskRecord> {
+    let RecoveryTarget {
+        worker_key,
+        task_id,
+    } = target;
+    let leases = pair.a.h.jetstream.get_key_value("harnx_leases").await?;
+    let before = harnx_nats_common::leader_reads::entry(&leases, worker_key)
+        .await?
+        .context("worker lease")?;
+    let settle_started = std::time::Instant::now();
+    kill_owner(pair, worker_key, before.revision).await?;
+    drop(owner_stream);
+    let terminal = settled(&pair.b.h, task_id).await?;
+    assert_eq!(terminal.task.status.state, a2a_lf::TaskState::Failed);
+    terminal_frames(remote, "TASK_STATE_FAILED").await?;
+    if harnx_runtime::nats_lease::holder_reclaim_supported() {
+        // kill_owner also waits for the shared worker's next renewal (up to
+        // the 10 s renew interval) before returning, so the budget must
+        // cover that too. A reclaim regression instead waits the holder's
+        // full 30 s lease, far above this bound.
+        assert!(
+            settle_started.elapsed() < std::time::Duration::from_secs(20),
+            "background sweep settled {:?} after the owner's death, not by \
+             reclaiming its dead-holder lease",
+            settle_started.elapsed()
+        );
+    } else {
+        assert!(
+            remote.comments > 0,
+            "real idle HTTP stream must send keep-alives before lease expiry"
+        );
+    }
+    Ok(terminal)
 }
 
 async fn kill_owner(pair: &mut Pair, worker_key: &str, revision: u64) -> Result<()> {

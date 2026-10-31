@@ -1,3 +1,4 @@
+mod holder_liveness;
 mod scope;
 use crate::config::DEFAULT_BUCKET_REPLICAS;
 use crate::nats_metrics;
@@ -5,6 +6,7 @@ use crate::nats_session_metadata::SessionMetadataStore;
 use anyhow::{anyhow, bail, Context, Result};
 use async_nats::header::{NATS_EXPECTED_LAST_SUBJECT_SEQUENCE, NATS_MESSAGE_ID, NATS_MESSAGE_TTL};
 use async_nats::jetstream::{self, context::PublishErrorKind, kv, stream};
+pub use holder_liveness::holder_reclaim_supported;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::sync::{
@@ -32,6 +34,26 @@ pub struct LeaseRecord {
     pub worker_id: String,
     pub generation: u64,
     pub acquired_at: String,
+    /// Liveness identity of the process that took the lease: pid, host
+    /// identity and, on Linux, process start time. Lets a later worker on
+    /// the same host reclaim the lease once the holder is provably dead,
+    /// instead of waiting out the TTL. Absent in records written before this
+    /// existed — such holders are never treated as dead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<holder_liveness::HolderIdentity>,
+}
+
+/// Whether the holder recorded in `record` is provably dead on this host, so
+/// the lease it can no longer renew may be reclaimed. `false` on any
+/// uncertainty: missing identity (records from older binaries), a different
+/// host, or a liveness check that can't be trusted all keep the TTL as the
+/// only reclaim path.
+pub(crate) fn holder_is_stale(record: &LeaseRecord) -> bool {
+    use holder_liveness::HolderLiveness;
+    record
+        .holder
+        .as_ref()
+        .is_some_and(|holder| holder_liveness::holder_liveness(holder) == HolderLiveness::Dead)
 }
 
 #[derive(Debug, Clone)]
@@ -111,8 +133,9 @@ impl NatsSessionLease {
     }
 
     /// Acquire the lease and record which execution the holder took it for.
-    /// The binding is descriptive only: a held lease is never taken from its
-    /// owner, so a replacement waits for the TTL either way.
+    /// A live holder's lease is never taken. A replacement waits for the TTL
+    /// unless the holder is provably dead on this host, in which case the lease
+    /// is reclaimed immediately.
     pub async fn acquire_for_execution(
         params: NatsLeaseAcquireParams<'_>,
         execution_id: Option<String>,
@@ -139,8 +162,21 @@ impl NatsSessionLease {
         let mut record = LeaseRecord::new(worker_id.clone(), generation);
         record.execution_id = execution_id.clone();
         let acquired_at = time::Instant::now();
-        let Some(revision) = create_lease(&bucket, &key, &record, config.ttl).await? else {
-            return Ok(None);
+        let revision = match create_lease(&bucket, &key, &record, config.ttl).await? {
+            Some(revision) => revision,
+            None => {
+                // Another holder owns the key. When that holder provably died
+                // on this host — a SIGKILLed local worker, a crashed daemon —
+                // reclaim the stale lease now instead of waiting out its TTL.
+                // Anything less certain keeps the old back-off behaviour.
+                if !try_reclaim_stale_lease(&bucket, session_id, &key).await? {
+                    return Ok(None);
+                }
+                let Some(revision) = create_lease(&bucket, &key, &record, config.ttl).await? else {
+                    return Ok(None);
+                };
+                revision
+            }
         };
 
         let (status_tx, _status_rx) = watch::channel(true);
@@ -328,6 +364,7 @@ impl LeaseRecord {
             worker_id,
             generation,
             acquired_at: chrono::Utc::now().to_rfc3339(),
+            holder: Some(holder_liveness::current()),
         }
     }
 }
@@ -450,6 +487,101 @@ async fn create_lease(
         Ok(revision) => Ok(Some(revision)),
         Err(error) if is_create_conflict(&error) => Ok(None),
         Err(error) => Err(error).context("Failed to acquire NATS lease"),
+    }
+}
+
+/// Delete the lease at `key` when its holder is provably dead on this host.
+///
+/// Returns `Ok(true)` when a stale lease was removed at the revision this
+/// function observed; `Ok(false)` when the lease is still legitimately held,
+/// was already released or expired, or its record can't be decoded. The
+/// delete is a CAS on the observed revision, so a holder that renewed or a
+/// worker that reclaimed first makes this a no-op, and any uncertainty keeps
+/// the TTL as the only reclaim path.
+///
+/// A failure to *read* the entry propagates as an error instead of a silent
+/// `Ok(false)`, so a contended acquire surfaces a `ClaimError`-style delayed
+/// NAK rather than a quiet defer; that is bounded and self-healing, and
+/// indistinguishable from any other broker read failure.
+async fn try_reclaim_stale_lease(bucket: &kv::Store, session_id: &str, key: &str) -> Result<bool> {
+    let Some(entry) = harnx_metrics::time_nats_operation("lease_get", bucket.entry(key))
+        .await
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("Failed to read NATS lease for session '{session_id}'"))?
+    else {
+        return Ok(false);
+    };
+    if entry.operation != kv::Operation::Put {
+        return Ok(false);
+    }
+    let record: LeaseRecord = match serde_json::from_slice(&entry.value) {
+        Ok(record) => record,
+        Err(_) => return Ok(false),
+    };
+    let Some(holder) = record.holder.as_ref() else {
+        return Ok(false);
+    };
+    if holder_liveness::holder_liveness(holder) != holder_liveness::HolderLiveness::Dead {
+        return Ok(false);
+    }
+    delete_stale_lease_at_revision(
+        bucket,
+        session_id,
+        key,
+        ObservedLease {
+            revision: entry.revision,
+            record: &record,
+        },
+    )
+    .await
+}
+
+/// A lease entry as read before a reclaim attempt.
+struct ObservedLease<'a> {
+    revision: u64,
+    record: &'a LeaseRecord,
+}
+
+/// CAS-delete a stale lease at the revision it was observed at. `Ok(false)`
+/// means the delete lost the CAS: another writer moved first and this
+/// attempt gives up. Split from [`try_reclaim_stale_lease`] so the CAS
+/// outcome can be tested directly against a replaced lease.
+async fn delete_stale_lease_at_revision(
+    bucket: &kv::Store,
+    session_id: &str,
+    key: &str,
+    observed: ObservedLease<'_>,
+) -> Result<bool> {
+    let ObservedLease { revision, record } = observed;
+    let holder = record
+        .holder
+        .as_ref()
+        .expect("reclaim precondition: holder identity present");
+    match harnx_metrics::time_nats_operation(
+        "lease_reclaim",
+        bucket.delete_expect_revision(key, Some(revision)),
+    )
+    .await
+    {
+        Ok(()) => {
+            info!(
+                "reclaimed stale session lease from dead holder: session_id={session_id} holder_worker_id={} holder_pid={} holder_generation={}",
+                record.worker_id, holder.pid, record.generation
+            );
+            nats_metrics::lease_reclaimed();
+            Ok(true)
+        }
+        // The holder renewed or another worker reclaimed first: not ours.
+        Err(error) if error.kind() == kv::UpdateErrorKind::WrongLastRevision => {
+            debug!(
+                "stale lease reclaim lost the CAS for session '{session_id}'; \
+                 another writer moved first"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(anyhow::Error::from(error)).with_context(|| {
+            format!("Failed to reclaim stale NATS lease key '{key}' for session '{session_id}'")
+        }),
     }
 }
 
@@ -673,6 +805,197 @@ fn is_create_conflict(error: &kv::CreateError) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn lease_record_deserializes_legacy_json_without_holder() {
+        let json = r#"{"worker_id":"w1","generation":3,"acquired_at":"2024-01-01T00:00:00Z"}"#;
+        let record: LeaseRecord = serde_json::from_str(json).expect("legacy record decodes");
+        assert_eq!(record.worker_id, "w1");
+        // Records written before holder identity existed never authorize a
+        // reclaim.
+        assert!(record.holder.is_none());
+        assert!(!holder_is_stale(&record));
+    }
+
+    #[test]
+    fn lease_record_roundtrips_holder_identity() {
+        let record = LeaseRecord::new("w1".into(), 7);
+        assert!(record.holder.is_some());
+        let json = serde_json::to_string(&record).expect("encode record");
+        let decoded: LeaseRecord = serde_json::from_str(&json).expect("decode record");
+        assert_eq!(decoded, record);
+        // A record this process wrote names a holder that is alive.
+        assert!(!holder_is_stale(&decoded));
+    }
+
+    fn dead_holder_on_this_host() -> Option<holder_liveness::HolderIdentity> {
+        if !holder_reclaim_supported() {
+            // Without a strong host identity (macOS, Windows, restricted
+            // procfs) reclaim stays disabled entirely.
+            return None;
+        }
+        // Spawn and reap a child; its pid is gone from the process table, and
+        // the test sandbox shares one pid namespace between test and child.
+        let child = std::process::Command::new("sleep")
+            .arg("0")
+            .spawn()
+            .expect("spawn sleep for stale-holder test");
+        let pid = child.id();
+        let _ = child.wait_with_output();
+        Some(holder_liveness::HolderIdentity {
+            pid,
+            host: holder_liveness::current().host,
+            start_ticks: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn acquire_reclaims_lease_from_dead_holder() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let config = NatsLeaseConfig::default();
+        let bucket = ensure_lease_bucket(&js, &config).await?;
+
+        let Some(dead_holder) = dead_holder_on_this_host() else {
+            // Liveness is not provable on this platform or sandbox: reclaim
+            // must stay disabled there.
+            let _ = nats.kill();
+            let _ = nats.wait();
+            return Ok(());
+        };
+        let mut stale = LeaseRecord::new("dead-worker".into(), 1);
+        stale.holder = Some(dead_holder);
+        // The nextest sandbox proves liveness on Linux; on any other strong
+        // identity the precondition still holds, so assert it rather than
+        // silently testing nothing.
+        assert!(
+            holder_is_stale(&stale),
+            "identity should be provably dead on a strong host"
+        );
+        let reclaims_before = nats_metrics::snapshot().lease_reclaims;
+        let payload = serde_json::to_vec(&stale)?.into();
+        bucket
+            .create_with_ttl(&config.key_for_session("reclaim-dead"), payload, config.ttl)
+            .await?;
+
+        // The stale holder must not block acquisition; the acquire path CAS
+        // deletes the dead holder's lease and retries the create.
+        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+            jetstream: js.clone(),
+            session_id: "reclaim-dead",
+            worker_id: "new-worker".into(),
+            generation: 2,
+            config: config.clone(),
+            session_metadata: None,
+        })
+        .await?
+        .expect("lease acquired despite dead holder");
+        assert!(lease.is_held());
+        assert!(
+            nats_metrics::snapshot().lease_reclaims > reclaims_before,
+            "reclaim must be counted"
+        );
+        lease.stop_renewal_for_test().await;
+        drop(lease);
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reclaim_delete_loses_the_cas_to_a_replacement_lease() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let config = NatsLeaseConfig::default();
+        let bucket = ensure_lease_bucket(&js, &config).await?;
+
+        let Some(dead_holder) = dead_holder_on_this_host() else {
+            // Liveness is not provable on this platform or sandbox: reclaim
+            // stays disabled there.
+            let _ = nats.kill();
+            let _ = nats.wait();
+            return Ok(());
+        };
+        let key = config.key_for_session("reclaim-cas-lost");
+        let mut stale = LeaseRecord::new("dead-worker".into(), 1);
+        stale.holder = Some(dead_holder);
+        assert!(
+            holder_is_stale(&stale),
+            "identity should be provably dead on a strong host"
+        );
+        let observed = bucket
+            .create_with_ttl(&key, serde_json::to_vec(&stale)?.into(), config.ttl)
+            .await?;
+
+        // Another worker replaces the dead holder's lease after it was read:
+        // the reclaim delete is CAS'd on the observed revision and must lose
+        // to it, leaving the replacement untouched.
+        let live = LeaseRecord::new("live-worker".into(), 2);
+        bucket
+            .update(&key, serde_json::to_vec(&live)?.into(), observed)
+            .await
+            .context("replace the lease between read and reclaim")?;
+
+        let reclaimed = delete_stale_lease_at_revision(
+            &bucket,
+            "reclaim-cas-lost",
+            &key,
+            ObservedLease {
+                revision: observed,
+                record: &stale,
+            },
+        )
+        .await?;
+        assert!(!reclaimed, "a replaced lease must not be reclaimed");
+        let current = bucket
+            .entry(&key)
+            .await?
+            .expect("replacement lease remains");
+        let record: LeaseRecord = serde_json::from_slice(&current.value)?;
+        assert_eq!(record.worker_id, "live-worker");
+
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquire_defers_when_holder_is_alive() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let config = NatsLeaseConfig::default();
+        let bucket = ensure_lease_bucket(&js, &config).await?;
+
+        // This very process holds the lease, so it is as alive as it gets.
+        let live = LeaseRecord::new("live-worker".into(), 1);
+        let payload = serde_json::to_vec(&live)?.into();
+        bucket
+            .create_with_ttl(&config.key_for_session("reclaim-live"), payload, config.ttl)
+            .await?;
+
+        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+            jetstream: js.clone(),
+            session_id: "reclaim-live",
+            worker_id: "new-worker".into(),
+            generation: 2,
+            config: config.clone(),
+            session_metadata: None,
+        })
+        .await?;
+        assert!(
+            lease.is_none(),
+            "a live holder's lease must never be reclaimed"
+        );
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn release_waits_for_committed_renewal_revision() -> Result<()> {

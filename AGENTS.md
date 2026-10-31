@@ -1093,6 +1093,21 @@ retry and treat a conflict as a decision to re-read, never as a reason to append
 again. A `Cancel` is an ordinary log entry any holder of the session can write,
 including frontends that hold no lease. See `docs/nats-ha.md` under "Interruption".
 
+A lease record carries its holder's liveness identity: pid, a one-way hash of
+the host identity (machine id, boot id and pid namespace on Linux) and, on Linux,
+process start time. A worker that finds a session lease whose holder is provably
+dead on this host reclaims it right away (CAS delete at the observed revision, then
+a normal acquire) instead of busy-NAKing until the TTL expires — that is what
+keeps a one-shot `prompt` retry on the same session fast after `--timeout-secs`
+killed the previous worker. Proof means dead: the pid is gone, or exists but is
+a different process or a zombie. Anything else — missing identity fields
+(records from older binaries), a different host or pid namespace, a live pid,
+EPERM, or any platform that can't record a strong host identity (macOS and
+Windows never reclaim; Linux needs a readable boot id and pid namespace, and a
+machine id alone never suffices) — keeps the TTL as the only reclaim path.
+Never reclaim a live holder, and never let a frontend wait on a lease (see
+"Interrupt acceptance").
+
 ### Reading KV state that was just written
 
 async-nats creates every KV bucket with `allow_direct`, so `kv::Store::get`
