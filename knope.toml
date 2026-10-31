@@ -69,6 +69,13 @@ command = "git commit -m \"chore: prepare release\""
 [[workflows.steps]]
 type = "Release"
 
+# `--atomic` makes the branch and the release tags land together or not at
+# all. A plain push updates each ref separately, so when a merge reached
+# `main` while the release was building, the branch was rejected but the
+# tags went through: Release and Publish Agent Packages shipped a version
+# that `main` never recorded, and every later run failed with "tag already
+# exists". With `--atomic` that race fails the run with nothing pushed, and
+# running the workflow again releases from the new `main`.
 [[workflows.steps]]
 type = "Command"
-command = "git push --follow-tags"
+command = "git push --atomic --follow-tags"

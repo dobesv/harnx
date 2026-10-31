@@ -16,6 +16,13 @@
 #
 # Manual trigger: Actions → Prepare Release → Run workflow.
 # Optional: uncomment the `schedule` block to auto-release on a cadence.
+#
+# If knope fails with "tag already exists", an earlier run pushed its tags
+# without its release commit, so that version shipped but `main` never
+# recorded it. Don't delete the tags: Release and Publish Agent Packages have
+# already published from them. Cherry-pick the tagged commit onto `main`
+# through a pull request (`git cherry-pick harnx/v<version>`), then run this
+# workflow again to release the next version.
 
 name: Prepare Release
 

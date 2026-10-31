@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.17 (2026-10-27)
+
+### Features
+
+- Resume A2A tool approvals with plain-text replies on the same task, including context-only Jira replies. Persist exact-generation reply intent and dedupe, preserve rejection reasons for the model, and support cancellation while awaiting approval.
+- Browse archived session history with `harnx dump session --before-compaction`, using an exact compaction sequence or a quoted count such as `"2 back"`. Text dump markers now print commands to open each earlier window; JSON/YAML exports remain unchanged.
+- Reserve target child session ID during handoff tool execution and include it in the handoff tool result. The result now includes the target agent and child session ID in text (`Handing off to <agent>; target session: <id>.`) and in a structured `handoff: {agent, session_id}` marker without a user-only audience restriction. Parent model context and session dumps now include the target session ID, and web and TUI interfaces render a static navigable row linking to the child session. Issue #1834.
+- Add exact-request tool approval decisions with worker-side request generation fencing. Retrying an already-decided live approval now reactivates its original invocation without appending a prompt.
+- Add a typed runtime follower that returns pending tool approval separately from terminal completion while preserving live event streaming and the original invocation across approval segments.
+- Add an invocation-scoped runtime progress query that distinguishes pending tool approval from running and terminal prompts, with serializable approval references for coordinated frontends.
+- Add read-only `session/history` JSON-RPC and HTTP history pages for browsing archived conversation windows. Pages preserve complete tool rounds, include linked compaction summaries, and use session-scoped cursors without changing the agent's context.
+- Workers record web_session_url in session metadata for handoff, sub-agent, and A2A sessions when configured with serve_public_url (HARNX_SERVE_PUBLIC_URL). The URL is recorded before the first turn using the session's own agent and ID. harnx-serve remains authoritative and replaces worker-recorded entries. Issue #2459.
+
+### Fixes
+
+- unblock the weekly models.yaml refresh (#2479)
+- request reasoning summaries for new OpenAI models (#2480)
+- use LiteLLM's supports_reasoning for OpenAI summaries (#2481)
+- Add durable A2A HITL checkpoints and exact-request reply receipts, with monotonic status event cursors and reply dedupe mappings retained after task retirement.
+- Fix A2A recovery and failed publication handling so execution deadline expiry settles tasks as canceled, including tasks waiting for tool approval. Foreground task reads now recover ownerless working approval continuations instead of leaving them stranded.
+- Verify same-round A2A tool approvals and duplicate/conflicting replies across independent replicas. Document plain-text approval replies, parked-task recovery, rollout requirements and the existing invocation deadline.
+- Park A2A tool approval requests at INPUT_REQUIRED with a plain-text challenge instead of automatically denying them. Preserve the fixed invocation and accumulated answer across publisher segments, and keep suspension publication failures retryable without failing the turn.
+- Recover parked A2A tool approvals and accepted replies across backend restarts and replica changes. Recovery follows the original invocation, preserves full rejection notes and reply deduplication, and picks up decisions made by other frontends without admitting another prompt.
+- Return interrupted A2A tasks from blocking sends and close SSE responses at InputRequired or AuthRequired without treating the task as terminal. Add a task-local response cursor for waits after an approval reply.
+- Classify Bedrock streaming validation and access-denied exceptions as non-retryable errors instead of transient server failures. Preserve the parsed exception payload when no string message is supplied, including legacy base64 frames. Unknown stream exceptions keep their existing transient handling.
+- Keep tool-heavy turns running when best-effort preflight compaction fails. Report the compaction failure and try the next request with the original history, while still stopping for interruption or an expired deadline. Compaction after a provider context-window rejection remains required before retrying.
+- Add "Show earlier history" action to compaction markers in web, loading pre-compaction transcript windows through `session/history` with cursor paging and nested walk-back.
+- Show the latest compaction summary before kept and later messages across session history snapshots, the web interface, the TUI, the CLI session dump, ACP session loading, and TUI dump overlays. Add compaction metadata to session/get and live snapshots, and summary/range fields to compaction completion events. Keep archived messages in the TUI marker detail view without repeating them inline. Strip terminal control characters from replayed compaction notices in CLI dump.
+- Keep remote session followers connected after temporary compaction-history read failures, and preserve session control state when transcript projection fails.
+- Strip inline base64 data URLs and structured image/audio payloads from compaction transcripts and fit summarizer input to its model's estimated context budget. Reduce tool output and older messages first, preserve recent requests and replies when they fit, and use marked excerpts or counted omissions for oversized histories. Excerpt larger latest messages first so a large reply doesn't erase a short request. Avoid repeated full-transcript rendering while fitting large sessions.
+- Keep the latest user prompt and recent complete tool rounds after compaction when the final turn exceeds the keep-recent token budget, instead of dropping the entire turn. Preserve the final reply when it fits even if the preceding tool round is too large.
+- Update compaction prompts to preserve user requests and agent replies. Short requests and questions are quoted directly, while long exchanges retain key results, numbers, warnings, and recommendations with greatest weight on the latest turn.
+- Recover from provider context-window errors by compacting session history and retrying the failed request once, including the first request of a turn. Keep newly submitted input verbatim during recovery, preserve request-only patches, and report when a request still fails after compaction. Recognize context overflow in HTTP and streaming errors from Gemini, OpenAI-compatible providers, Anthropic, and Bedrock.
+- Clamp session compaction thresholds to 90% of the model input limit and lower the default threshold to 150,000 tokens.
+- Keep missing pod IP diagnostics consistent when sandbox activation times out during a Kubernetes lookup, without misreporting cancellations or API failures as pod IP timeouts.
+- Compress oversized context between completed tool rounds so long-running turns can continue without repeating user prompts or restoring archived tool results. Include system prompts, tool definitions and images in the preflight estimate. Keep live web and TUI transcripts streaming through compaction snapshots.
+- Browse earlier TUI history by selecting a compaction marker with Up and pressing Enter. Archived transcripts open fullscreen and read-only, with earlier compaction markers opening another level. Escape returns one level without changing the current session or its default transcript.
+
+#### Bound MCP bridge results to 32 KiB of serialized JSON by default, configurable
+
+with `--max-result-bytes` or `HARNX_MCP_MAX_RESULT_BYTES`. Preserve oversized
+parts as MIME-aware session attachments with previews or resource links, and
+hydrate attached images before the next model request. Add UTF-8 byte paging
+for large text/JSON originals. Bound native and bridged terminal replies before
+journal storage and NATS delivery without losing successful sibling calls;
+real infrastructure failures remain fatal. Fixes [#2431](https://github.com/dobesv/harnx/issues/2431).
+
 ## 0.34.16 (2026-10-16)
 
 ### Features

@@ -1,6 +1,15 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.16 (2026-10-27)
+
+### Fixes
+
+- unblock the weekly models.yaml refresh (#2479)
+- request reasoning summaries for new OpenAI models (#2480)
+- use LiteLLM's supports_reasoning for OpenAI summaries (#2481)
+- Update compaction prompts to preserve user requests and agent replies. Short requests and questions are quoted directly, while long exchanges retain key results, numbers, warnings, and recommendations with greatest weight on the latest turn.
+
 ## 0.4.15 (2026-10-16)
 
 ### Fixes
