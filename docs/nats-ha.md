@@ -966,10 +966,28 @@ processes to die.
   <seq> -j`) and the frontend's log lines, which carry its pid: `abort signal
   received`, `interrupt appended`, and `attached to session` for the attach
   that precedes the TUI's request.
-- If the owning worker is dead, the wind-up waits for its lease to expire (30 s
-  by default) and then runs on the next activation, which is NAKed with delay
-  until the lease is free. There is no lease-revocation shortcut, and the user
-  is not kept waiting for it either way.
+- If the owning worker is dead, the wind-up runs on the next activation once
+  its lease is free. A worker that finds a session lease held by a holder
+  recorded in the lease as living on this host and provably gone — the pid no
+  longer exists, or exists but is a different process or a zombie — deletes
+  that stale lease at its observed revision and acquires the session
+  immediately, instead of waiting out the lease TTL (30 s by default) on
+  NAKed redeliveries. "This host" means the same machine, the same boot and
+  the same pid namespace: the lease records a one-way hash of machine id,
+  boot id and pid-namespace inode, and reclaim needs a full match. A pod
+  restart under Kubernetes lands in a fresh pid namespace, so per-pod restarts
+  still wait the TTL; local mode and deployments that share one pid namespace
+  get the fast path. Everything short of that proof (records without holder
+  identity, a different host, a live pid, a check the platform can't run —
+  Linux only, since only it records a strong host identity) keeps the TTL as
+  the only reclaim path, so a live holder is never reclaimed. Operators see a
+  successful reclaim as
+  `harnx_nats_operations_total{op="lease_reclaim",outcome="ok"}` plus the
+  `reclaimed stale session lease from dead holder` info log. A lost CAS is
+  recorded as `outcome="error"` (the delete returned `WrongLastRevision`); the
+  `lease_reclaims` counter in the worker's metrics snapshot is internal and
+  not exported. The user is not kept waiting either way: frontends return on
+  the durable `Cancel`, never on the lease disappearing.
 - In local mode the worker and its tool servers die with the frontend
   (parent-death signal on Linux; macOS and Windows still leak processes). In HA
   mode workers are daemons and see the `Cancel` live through their watchers.
@@ -1634,6 +1652,10 @@ Workers emit structured logs for:
 Harnx tracks internal counters (exported to logs and future metrics endpoints):
 - `active_sessions_per_worker`: Current active loops.
 - `lease_acquisitions` / `lease_losses`: Lease churn.
+- `lease_reclaims`: Leases taken back from a holder provably dead on this host.
+  Internal only, not exported; the exported signal for a reclaim is
+  `harnx_nats_operations_total{op="lease_reclaim",outcome="ok"}` plus the
+  info log line; lost-CAS attempts have `outcome="error"`.
 - `fenced_writes_rejected`: Safety triggers.
 - `interrupt_errors_synthesized`: Data points on failover impact.
 

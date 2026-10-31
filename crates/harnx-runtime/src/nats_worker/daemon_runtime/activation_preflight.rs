@@ -230,6 +230,25 @@ impl WorkerRuntime {
         .await
         {
             Ok(Some(holder)) => {
+                if crate::nats_lease::holder_is_stale(&holder) {
+                    // The holder provably died on this host (a SIGKILLed local
+                    // worker, a crashed daemon). Skip the busy NAK so the
+                    // acquisition CAS reclaims the stale key instead of the
+                    // delivery waiting out the lease TTL; a live holder that
+                    // took over meanwhile wins that CAS and we defer then.
+                    log::info!(
+                        "stale lease holder is dead on this host; proceeding to reclaim: session_id={} holder_worker_id={} holder_pid={} holder_generation={}",
+                        activation.session_id,
+                        holder.worker_id,
+                        holder
+                            .holder
+                            .as_ref()
+                            .map(|identity| identity.pid)
+                            .unwrap_or_default(),
+                        holder.generation
+                    );
+                    return Ok(true);
+                }
                 log::debug!(
                     "deferring busy activation before session preflight: session_id={} holder_worker_id={} holder_generation={}",
                     activation.session_id,

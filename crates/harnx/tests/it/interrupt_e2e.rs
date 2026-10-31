@@ -156,8 +156,19 @@ fn one_shot_timeout_emits_contract_then_same_session_retry_succeeds() -> Result<
         "retry after timeout",
         &["--final-only", "--session", &session_id],
     )?;
+    // The nextest sandbox proves the fix only where the runtime can build a
+    // strong host identity (hashed machine/boot/pid-namespace) and reclaim
+    // the dead holder's lease immediately (see
+    // `nats_lease::holder_reclaim_supported`), so the retry must finish well
+    // inside the 30 s lease TTL. Platforms that keep the TTL-only reclaim
+    // (macOS, Windows) retain the old tolerant budget.
+    let retry_budget_secs = if harnx_runtime::nats_lease::holder_reclaim_supported() {
+        20
+    } else {
+        45
+    };
     let (retry_status, retry_stdout, retry_stderr) =
-        collect_child_output(&mut retry, Duration::from_secs(45))?;
+        collect_child_output(&mut retry, Duration::from_secs(retry_budget_secs))?;
     assert!(
         retry_status.success(),
         "same-session retry exited with {retry_status}; stderr: {retry_stderr:?}"
