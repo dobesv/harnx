@@ -6,7 +6,7 @@ model_fallbacks:
 - gemini:gemini-3.5-flash-lite
 - claude:claude-haiku-5-5
 - bedrock:us.openai.gpt-6-luna
-version: '0.4.15'
+version: '0.4.16'
 ---
 You are summarizing a conversation between a user and an AI deployment verification agent that assesses deployment readiness and produces Go/No-Go checklists for pull requests.
 
