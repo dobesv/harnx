@@ -372,3 +372,57 @@ fn session_hook_resolution_keeps_agent_override_of_global_hook() {
         "harnx-claude-compatible-hook-server --event SessionStart --timeout 30 -- echo agent"
     );
 }
+
+/// Issue #2493: runtime notes — replay-synthesized context re-logged by
+/// compaction — are not executable prompts, whether they carry a structured
+/// runtime-note id or only the note prefix on a legacy ID-less row. Admitted
+/// prompts that merely start with the prefix keep their id and stay executable.
+#[test]
+fn executable_user_message_id_skips_runtime_notes_only() {
+    use super::executable_user_message_id;
+    use harnx_core::message::MessageContent;
+    use harnx_core::runtime_note::RUNTIME_NOTE_PREFIX;
+
+    fn user_row(id: Option<&str>, text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: id.map(str::to_owned),
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    let note_id = harnx_core::runtime_note::new_runtime_note_message_id();
+    // Structured runtime-note row: not executable.
+    assert_eq!(
+        executable_user_message_id(&user_row(
+            Some(&note_id),
+            &format!("{RUNTIME_NOTE_PREFIX}Started sub-agent 'child'.")
+        )),
+        None
+    );
+    // An ID-less lookalike is NOT classified by text: it stays
+    // executable-but-unmapped, the signal that fails admission verification.
+    assert_eq!(
+        executable_user_message_id(&user_row(
+            None,
+            &format!("{RUNTIME_NOTE_PREFIX}The user interrupted this turn.")
+        )),
+        Some(None)
+    );
+    // An admitted lookalike keeps its identity and stays executable.
+    assert_eq!(
+        executable_user_message_id(&user_row(
+            Some("admitted-lookalike"),
+            &format!("{RUNTIME_NOTE_PREFIX}lookalike prompt")
+        )),
+        Some(Some("admitted-lookalike"))
+    );
+    // An ID-less non-internal row is executable-but-unmapped: Some(None), the
+    // signal that fails admission verification.
+    assert_eq!(
+        executable_user_message_id(&user_row(None, "unadmitted input")),
+        Some(None)
+    );
+}

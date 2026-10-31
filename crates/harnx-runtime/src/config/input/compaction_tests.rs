@@ -45,9 +45,13 @@ fn setup(entries: &[SessionLogEntry], prompt: &str) -> (GlobalConfig, Arc<Captur
     }
     let mut base = session::new(&config, "continuity", None).unwrap();
     base.agent_instructions = prompt.into();
-    let mut sess =
-        session::replay_nats_entries_into_session(&log.0.lock().unwrap(), "continuity", base)
-            .unwrap();
+    let mut sess = session::replay_nats_entries_into_session(
+        &log.0.lock().unwrap(),
+        "continuity",
+        base,
+        false,
+    )
+    .unwrap();
     sess.runtime = Some(Arc::new(log.clone() as Arc<dyn SessionAppendSink>));
     config.session = Some(sess);
     (Arc::new(ConfigLock::new(config)), log)
@@ -63,9 +67,13 @@ fn reload(config: &GlobalConfig, log: &CaptureLog) {
         base.runtime = previous.runtime.clone();
         base
     };
-    let loaded =
-        session::replay_nats_entries_into_session(&log.0.lock().unwrap(), "continuity", base)
-            .unwrap();
+    let loaded = session::replay_nats_entries_into_session(
+        &log.0.lock().unwrap(),
+        "continuity",
+        base,
+        false,
+    )
+    .unwrap();
     config.write().session = Some(loaded);
 }
 
@@ -691,4 +699,143 @@ fn compaction_reply_only_tail_serializes_for_claude_openai_and_gemini() {
         reload(&config, &log);
         assert_reply_only_request(&config, provider);
     }
+}
+
+/// Issue #2493: a mid-turn injected prompt pushed into session memory keeps
+/// its durable identity (id + log seq), so a later compaction re-logs it as a
+/// copy of the admitted prompt — not as an ID-less user row that admission
+/// checks would treat as a fresh unadmitted prompt.
+#[test]
+fn injected_durable_messages_survive_compaction_with_identity() {
+    let entries = vec![
+        entry(MessageRole::User, "seed"),
+        entry(MessageRole::Assistant, "answer"),
+    ];
+    let (config, log) = setup(&entries, "");
+    let mut session = config
+        .write()
+        .session
+        .take()
+        .expect("setup attaches a session");
+
+    // Mirror what `build_mid_turn_injection_callback` selects: the durable
+    // "late message" row, id and log seq intact.
+    let late = Message::new(
+        MessageRole::User,
+        MessageContent::Text("late message".into()),
+    )
+    .with_id("late-1")
+    .with_log_seq(3);
+    let mut input = from_str(&config, "seed", None);
+    input.skip_user_log_append = true;
+    input.set_injected_user_messages(vec![late]);
+
+    session::prepare_input(&mut session, &mut input).unwrap();
+    let pushed = session
+        .messages
+        .last()
+        .expect("injection pushed into memory");
+    assert_eq!(pushed.id.as_deref(), Some("late-1"));
+    assert_eq!(pushed.log_seq, Some(3));
+
+    let before = log.0.lock().unwrap().len();
+    session::compress_keeping_recent(&mut session, "summary".into(), 1);
+    let relogged = log.0.lock().unwrap()[before..].to_vec();
+    let late_rows: Vec<&SessionLogEntry> = relogged
+        .iter()
+        .filter(|(_, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::Message { role, content, .. }
+                    if *role == MessageRole::User && content.to_text() == "late message"
+            )
+        })
+        .map(|(_, entry)| entry)
+        .collect();
+    assert!(
+        !late_rows.is_empty(),
+        "compaction must re-log the kept injected prompt"
+    );
+    for entry in late_rows {
+        let SessionLogEntry::Message { id, .. } = entry else {
+            unreachable!("filtered to Message rows");
+        };
+        assert_eq!(
+            id.as_deref(),
+            Some("late-1"),
+            "compaction must preserve the injected prompt's admission identity"
+        );
+    }
+}
+
+/// Issue #2493: replay-synthesized runtime notes (sub-agent starts, cancels)
+/// carry a structured runtime-note id, so a compaction re-log persists them as
+/// non-executable context rows instead of ID-less user rows.
+#[test]
+fn replayed_runtime_notes_carry_non_executable_identity_through_compaction() {
+    assert_replayed_note_survives_compaction(SessionLogEntry::SubAgentStarted {
+        agent: "child".into(),
+        session_id: "child-session".into(),
+        invocation_id: None,
+        tool_call_id: None,
+        started_at: None,
+    });
+}
+
+/// Issue #2493: a replayed `Cancel` synthesizes the interrupt runtime note,
+/// which must carry the structured runtime-note id through a compaction
+/// re-log — otherwise the copy is an ID-less user row that admission checks
+/// treat as an unadmitted prompt.
+#[test]
+fn replayed_cancel_note_carries_non_executable_identity_through_compaction() {
+    assert_replayed_note_survives_compaction(SessionLogEntry::Cancel {
+        fence_token: 0,
+        cancellation_id: None,
+        requested_by: None,
+        timestamp: None,
+    });
+}
+
+fn assert_replayed_note_survives_compaction(note_event: SessionLogEntry) {
+    let entries = vec![entry(MessageRole::User, "seed"), note_event];
+    let (config, log) = setup(&entries, "");
+    let mut session = config
+        .write()
+        .session
+        .take()
+        .expect("setup attaches a session");
+
+    let note = session
+        .messages
+        .last()
+        .expect("replay synthesized the note");
+    assert!(
+        note.id
+            .as_deref()
+            .is_some_and(harnx_core::runtime_note::is_runtime_note_message_id),
+        "replayed runtime notes must carry a runtime-note id, got {:?}",
+        note.id
+    );
+
+    let before = log.0.lock().unwrap().len();
+    session::compress_keeping_recent(&mut session, "summary".into(), 1);
+    let relogged = log.0.lock().unwrap()[before..].to_vec();
+    let note_rows: Vec<&SessionLogEntry> = relogged
+        .iter()
+        .filter(|(_, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::Message { id, role, content, .. }
+                    if role.is_user()
+                        && harnx_core::runtime_note::is_runtime_note_id(id.as_deref())
+                        && content.to_text().starts_with(harnx_core::runtime_note::RUNTIME_NOTE_PREFIX)
+            )
+        })
+        .map(|(_, entry)| entry)
+        .collect();
+    assert_eq!(
+        note_rows.len(),
+        1,
+        "compaction must re-log the runtime note exactly once, got {relogged:?}"
+    );
 }

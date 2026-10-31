@@ -976,20 +976,23 @@ async fn denied_zero_execution_round_injects_queued_messages_once_after_blocked_
             2,
             "expected post-denial and next-seam model calls"
         );
-        let injected_text = "busy input\n\nconfirmation message";
+        // Mid-turn injection carries the durable queued rows to the model as
+        // themselves (issue #2493 keeps their admission identity), not as one
+        // folded blob, so each round shows each queued message exactly once.
+        let queued_texts = ["busy input", "confirmation message"];
         for (round, messages) in rounds.iter().enumerate() {
-            let injected_count = messages
-                .iter()
-                .filter(|message| {
-                    message.role.is_user() && message.content.to_text() == injected_text
-                })
-                .count();
-            assert_eq!(
-                injected_count,
-                1,
-                "queued messages must appear once in model round {}",
-                round + 1
-            );
+            for text in queued_texts {
+                let injected_count = messages
+                    .iter()
+                    .filter(|message| message.role.is_user() && message.content.to_text() == text)
+                    .count();
+                assert_eq!(
+                    injected_count,
+                    1,
+                    "queued message {text:?} must appear once in model round {}",
+                    round + 1
+                );
+            }
         }
         let blocked_index = rounds[0]
             .iter()
@@ -1005,10 +1008,8 @@ async fn denied_zero_execution_round_injects_queued_messages_once_after_blocked_
             .expect("synthetic blocked tool result");
         let injected_index = rounds[0]
             .iter()
-            .position(|message| {
-                message.role.is_user() && message.content.to_text() == injected_text
-            })
-            .expect("folded queued messages");
+            .position(|message| message.role.is_user() && message.content.to_text() == "busy input")
+            .expect("first queued message");
         assert!(
             blocked_index < injected_index,
             "agent must see blocked result before queued text"
@@ -1025,6 +1026,7 @@ async fn denied_zero_execution_round_injects_queued_messages_once_after_blocked_
     let replayed = harnx_runtime::config::session::replay_log_entries_for_external(
         &indexed,
         "denied-ordering",
+        false,
     )?;
     let replayed_labels = replayed
         .messages

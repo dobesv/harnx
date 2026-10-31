@@ -1,4 +1,19 @@
-use super::session_externalize::{externalize_content, record_externalized};
+mod replay;
+pub(crate) use replay::interrupted_tool_outputs;
+#[cfg(test)]
+pub(crate) use replay::load_from_log_for_test;
+#[cfg(test)]
+use replay::LOST_TOOL_RESPONSE_ERROR;
+use replay::PENDING_TOOL_RESPONSE_ERROR;
+pub use replay::{
+    is_pending_tool_result, replay_log_entries_for_external, replay_nats_entries_into_session,
+    INTERRUPTED_TOOL_RESPONSE_ERROR, RUNTIME_NOTE_PREFIX,
+};
+
+mod input_append;
+pub(crate) use input_append::prepare_input;
+use input_append::{append_session_message, begin_turn};
+
 pub(crate) use super::session_persistence::active_session_sink;
 #[cfg(test)]
 pub(crate) use super::session_persistence::attach_memory_log;
@@ -23,9 +38,8 @@ use harnx_core::{
     sink::emit_agent_event,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
-use serde::Deserialize;
 
 use crate::utils::session_name::{decode_timestamp_session_id, generate_session_id};
 
@@ -54,497 +68,11 @@ pub fn new(config: &Config, name: &str, working_dir: Option<&std::path::Path>) -
     Ok(session)
 }
 
-struct PendingToolCalls {
-    seq: usize,
-    text: String,
-    thought: Option<String>,
-    calls: Vec<crate::tool::ToolCall>,
-    timestamp: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// Marks a message replay synthesizes as informational context for the
-/// model, not a prompt the user typed. Public so callers replaying a
-/// session (tests included) can tell runtime notes apart from real
-/// user-authored history despite both carrying `MessageRole::User`.
-pub const RUNTIME_NOTE_PREFIX: &str = "[Runtime note] ";
-
-const LOST_TOOL_RESPONSE_ERROR: &str =
-    "tool response lost (session was interrupted before results were persisted)";
-const PENDING_TOOL_RESPONSE_ERROR: &str = "tool response pending (results not yet persisted)";
-/// Public only so integration tests can name the placeholder a wind-up
-/// writes instead of repeating its text; not part of the crate's API.
-#[doc(hidden)]
-pub const INTERRUPTED_TOOL_RESPONSE_ERROR: &str = "tool call interrupted by user";
-
-/// Synthesize placeholder results for tool calls cut off by a user
-/// interruption. The worker's wind-up persists these as the `ToolResults`
-/// entry that closes out the round the `Cancel` entry terminated, for every
-/// call the invocation journal has no real reply for.
-pub(crate) fn interrupted_tool_outputs(
-    calls: &[harnx_core::tool::ToolCall],
-    cancellation_id: Option<&str>,
-) -> Vec<harnx_core::session::ToolOutput> {
-    calls
-        .iter()
-        .map(|call| harnx_core::session::ToolOutput {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            output: serde_json::json!({
-                "error": INTERRUPTED_TOOL_RESPONSE_ERROR,
-                "cancellation_id": cancellation_id,
-            }),
-            markdown: None,
-            content: Vec::new(),
-            switch_agent: None,
-        })
-        .collect()
-}
-
 pub(crate) fn collect_raw_log_entries(
     content: &str,
     name: &str,
 ) -> Result<Vec<(usize, SessionLogEntry)>> {
-    serde_yaml::Deserializer::from_str(content)
-        .enumerate()
-        .map(|(seq, document)| {
-            let entry = SessionLogEntry::deserialize(document)
-                .with_context(|| format!("Invalid log entry #{seq} in session {name}"))?;
-            Ok((seq, entry))
-        })
-        .collect()
-}
-
-fn build_effective_log_entries(
-    raw_entries: &[(usize, SessionLogEntry)],
-    name: &str,
-) -> Vec<(usize, SessionLogEntry)> {
-    // Delegate to the canonical implementation in harnx-core
-    harnx_core::session_reconstruct::apply_log_mutations_with_name(raw_entries, name)
-}
-
-pub fn replay_log_entries_for_external(
-    raw_entries: &[(usize, SessionLogEntry)],
-    name: &str,
-) -> Result<Session> {
-    replay_log_entries_into_session(
-        raw_entries,
-        name,
-        Session::default(),
-        true,
-        TrailingToolCallPolicy::Interrupted,
-    )
-}
-
-/// Replay external log entries while preserving a trailing tool-call batch as
-/// pending. Read-only observers use this while a worker still holds the lease.
-pub fn replay_log_entries_for_external_preserving_pending(
-    raw_entries: &[(usize, SessionLogEntry)],
-    name: &str,
-) -> Result<Session> {
-    replay_log_entries_into_session(
-        raw_entries,
-        name,
-        Session::default(),
-        true,
-        TrailingToolCallPolicy::Pending,
-    )
-}
-
-/// Replay conversation-only NATS entries into state initialized from canonical
-/// session metadata. Header and title rows are protocol violations in this
-/// path: their state belongs in KV and must never be synthesized or repaired
-/// from transcript contents.
-pub fn replay_nats_entries_into_session(
-    raw_entries: &[(usize, SessionLogEntry)],
-    name: &str,
-    session: Session,
-) -> Result<Session> {
-    replay_nats_entries_into_session_with_policy(
-        raw_entries,
-        name,
-        session,
-        TrailingToolCallPolicy::Interrupted,
-    )
-}
-
-/// Replay a NATS transcript for a read-only observer while its worker lease is
-/// held. A trailing tool-call batch is still in flight in this case, so retain
-/// pending placeholders instead of fabricating interrupted results.
-pub fn replay_nats_entries_into_session_preserving_pending(
-    raw_entries: &[(usize, SessionLogEntry)],
-    name: &str,
-    session: Session,
-) -> Result<Session> {
-    replay_nats_entries_into_session_with_policy(
-        raw_entries,
-        name,
-        session,
-        TrailingToolCallPolicy::Pending,
-    )
-}
-
-fn replay_nats_entries_into_session_with_policy(
-    raw_entries: &[(usize, SessionLogEntry)],
-    name: &str,
-    session: Session,
-    trailing_tool_calls: TrailingToolCallPolicy,
-) -> Result<Session> {
-    // `apply_log_mutations_with_name` intentionally ignores unknown rows for
-    // tolerant local-file replay. Canonical NATS transcripts are a hard
-    // protocol boundary, so reject legacy Header/Title rows (which deserialize
-    // as `Unknown`) before mutation resolution can discard them.
-    anyhow::ensure!(
-        !raw_entries
-            .iter()
-            .any(|(_, entry)| matches!(entry, SessionLogEntry::Unknown)),
-        "unsupported or legacy entry found in canonical NATS transcript '{name}'"
-    );
-    replay_log_entries_into_session(raw_entries, name, session, false, trailing_tool_calls)
-}
-
-#[derive(Clone, Copy)]
-enum TrailingToolCallPolicy {
-    Interrupted,
-    Pending,
-}
-
-fn replay_log_entries_into_session(
-    raw_entries: &[(usize, SessionLogEntry)],
-    name: &str,
-    mut session: Session,
-    allow_embedded_metadata: bool,
-    trailing_tool_calls: TrailingToolCallPolicy,
-) -> Result<Session> {
-    let effective_entries = build_effective_log_entries(raw_entries, name);
-
-    // Pending ToolCalls entry awaiting a matching ToolResults entry. User
-    // messages and runtime notes may be appended while the tool is still running,
-    // so buffer them until the result arrives and replay the valid conversation
-    // order: assistant tool call -> tool result -> queued message.
-    let mut pending: Option<PendingToolCalls> = None;
-    let mut messages_queued_during_tool = Vec::new();
-    let mut completed_tool_call_ids = std::collections::HashSet::new();
-
-    for (seq, entry) in effective_entries {
-        match entry {
-            SessionLogEntry::Message {
-                id,
-                role,
-                content,
-                timestamp,
-                ..
-            } => {
-                if role == MessageRole::Tool {
-                    anyhow::bail!(
-                        "Invalid log entry in session {name}: Tool-role Message entries are                          no longer supported; use tool_calls/tool_results entries"
-
-                    );
-                }
-                if role == MessageRole::System && !session.agent_instructions.is_empty() {
-                    continue;
-                }
-                let mut message = Message::new(role, content).with_log_seq(seq);
-                if let Some(id) = id {
-                    message = message.with_id(id);
-                }
-                if let Some(timestamp) = timestamp {
-                    message = message.with_log_timestamp(timestamp);
-                }
-                if role.is_user() && pending.is_some() {
-                    messages_queued_during_tool.push(message);
-                    continue;
-                }
-                finish_orphaned_tool_round(
-                    &mut session,
-                    &mut pending,
-                    &mut messages_queued_during_tool,
-                    name,
-                )?;
-                session.messages.push(message);
-            }
-            SessionLogEntry::SubAgentStarted {
-                agent, session_id, ..
-            } => {
-                let note = Message::new(
-                    MessageRole::User,
-                    MessageContent::Text(format!(
-                        "{RUNTIME_NOTE_PREFIX}Started sub-agent '{agent}' in session {session_id}."
-                    )),
-                )
-                .with_log_seq(seq);
-                if pending.is_some() {
-                    messages_queued_during_tool.push(note);
-                } else {
-                    session.messages.push(note);
-                }
-            }
-            SessionLogEntry::ToolCalls {
-                text,
-                thought,
-                calls,
-                timestamp,
-                ..
-            } => {
-                finish_orphaned_tool_round(
-                    &mut session,
-                    &mut pending,
-                    &mut messages_queued_during_tool,
-                    name,
-                )?;
-                for call in &calls {
-                    if let Some(id) = &call.id {
-                        // Providers should issue unique IDs, but treating a
-                        // newly observed call as authoritative avoids hiding a
-                        // later result if an old ID is reused.
-                        completed_tool_call_ids.remove(id);
-                    }
-                }
-                pending = Some(PendingToolCalls {
-                    seq,
-                    text,
-                    thought,
-                    calls,
-                    timestamp,
-                });
-            }
-            SessionLogEntry::ToolResults { results, .. } => {
-                let Some(PendingToolCalls {
-                    seq,
-                    text,
-                    thought,
-                    calls,
-                    timestamp,
-                }) = pending.take()
-                else {
-                    let duplicate = !results.is_empty()
-                        && results.iter().all(|result| {
-                            result
-                                .id
-                                .as_ref()
-                                .is_some_and(|id| completed_tool_call_ids.contains(id))
-                        });
-                    if duplicate {
-                        log::debug!(
-                            "Ignored duplicate tool results at log entry {seq} in session {name}"
-                        );
-                        continue;
-                    }
-                    let warning = format!(
-                        "Ignored orphan tool results at log entry {seq} in session {name}; the corresponding tool call was missing or interrupted"
-                    );
-                    log::warn!("{warning}");
-                    session.replay_warnings.push(warning);
-                    continue;
-                };
-                completed_tool_call_ids.extend(calls.iter().filter_map(|call| call.id.clone()));
-                let mut message =
-                    assemble_tool_message(text, thought, calls, results).with_log_seq(seq);
-                if let Some(timestamp) = timestamp {
-                    message = message.with_log_timestamp(timestamp);
-                }
-                session.messages.push(message);
-                session.messages.append(&mut messages_queued_during_tool);
-            }
-            SessionLogEntry::DataUrls { urls } => {
-                session.data_urls.extend(urls);
-            }
-            SessionLogEntry::Compress { prompt } => {
-                finish_orphaned_tool_round(
-                    &mut session,
-                    &mut pending,
-                    &mut messages_queued_during_tool,
-                    name,
-                )?;
-                session.compressed_messages.append(&mut session.messages);
-                session.compaction_summary = Some(prompt);
-            }
-            SessionLogEntry::Clear => {
-                pending = None;
-                messages_queued_during_tool.clear();
-                completed_tool_call_ids.clear();
-                session.messages.clear();
-                session.compressed_messages.clear();
-                session.data_urls.clear();
-            }
-            // A failed turn is a transcript annotation, not conversation
-            // history — replaying it would feed the error back to the model.
-            SessionLogEntry::Error { .. } => {}
-            SessionLogEntry::TurnEnd { .. } => {}
-            SessionLogEntry::Cancel { .. } => {
-                let note = Message::new(
-                    MessageRole::User,
-                    MessageContent::Text(format!(
-                        "{RUNTIME_NOTE_PREFIX}The user interrupted this turn. Incomplete tool calls above were cancelled."
-                    )),
-                )
-                .with_log_seq(seq);
-                if pending.is_some() {
-                    messages_queued_during_tool.push(note);
-                } else {
-                    session.messages.push(note);
-                }
-            }
-            // Durable control state is hydrated separately from model messages.
-            // Ignoring it here preserves any pending tool-call/result adjacency.
-            SessionLogEntry::HandoffCommitted { .. }
-            | SessionLogEntry::HitlApprovalRequested { .. }
-            | SessionLogEntry::HitlApprovalDecision { .. } => {}
-            // Compaction request/result are non-mutating markers. They are
-            // processed by the worker, not during transcript replay.
-            SessionLogEntry::CompactRequest { .. }
-            | SessionLogEntry::CompactResult { .. }
-            | SessionLogEntry::AdmissionClosed { .. } => {}
-            SessionLogEntry::EditEntries { .. } | SessionLogEntry::Rewind { .. } => {}
-            SessionLogEntry::Unknown => anyhow::ensure!(
-                allow_embedded_metadata,
-                "unsupported or legacy entry found in canonical NATS transcript '{name}'"
-            ),
-        }
-    }
-
-    if let Some(pending) = pending.take() {
-        let message = match trailing_tool_calls {
-            TrailingToolCallPolicy::Interrupted => repair_orphan_tool_calls(pending, name)?,
-            TrailingToolCallPolicy::Pending => preserve_pending_tool_calls(pending),
-        };
-        session.messages.push(message);
-    }
-    session.messages.append(&mut messages_queued_during_tool);
-
-    Ok(session)
-}
-
-fn finish_orphaned_tool_round(
-    session: &mut Session,
-    pending: &mut Option<PendingToolCalls>,
-    messages_queued_during_tool: &mut Vec<Message>,
-    name: &str,
-) -> Result<()> {
-    if let Some(pending) = pending.take() {
-        session
-            .messages
-            .push(repair_orphan_tool_calls(pending, name)?);
-    }
-    session.messages.append(messages_queued_during_tool);
-    Ok(())
-}
-
-/// Test-only log parser — runs full load pipeline (including replay and
-/// orphan-ToolCalls repair) but skips model-catalog lookup that
-/// `super::load` performs, so it works against minimal `Config::default`
-/// used in unit tests.
-#[cfg(test)]
-pub(crate) fn load_from_log_for_test(content: &str) -> Session {
-    let raw_entries = collect_raw_log_entries(content, "test").expect("valid log entries");
-    let mut session =
-        replay_log_entries_for_external(&raw_entries, "test").expect("replay should succeed");
-    session.log_entry_count = raw_entries.len();
-    session
-}
-
-fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Message> {
-    Ok(assemble_synthetic_tool_message(
-        pending,
-        LOST_TOOL_RESPONSE_ERROR,
-    ))
-}
-
-fn preserve_pending_tool_calls(pending: PendingToolCalls) -> Message {
-    assemble_synthetic_tool_message(pending, PENDING_TOOL_RESPONSE_ERROR)
-}
-
-fn assemble_synthetic_tool_message(pending: PendingToolCalls, error: &str) -> Message {
-    let PendingToolCalls {
-        seq,
-        text,
-        thought,
-        calls,
-        timestamp,
-    } = pending;
-    let lost = harnx_core::session::ToolOutput {
-        id: None,
-        name: String::new(),
-        output: serde_json::json!({ "error": error }),
-        markdown: None,
-        content: Vec::new(),
-        switch_agent: None,
-    };
-    // Fabricate one lost-response per call, matched by id/position.
-    let results: Vec<_> = calls
-        .iter()
-        .map(|c| harnx_core::session::ToolOutput {
-            id: c.id.clone(),
-            name: c.name.clone(),
-            ..lost.clone()
-        })
-        .collect();
-    let mut message = assemble_tool_message(text, thought, calls, results)
-        .with_id(persisted_message_id())
-        .with_log_seq(seq);
-    if let Some(timestamp) = timestamp {
-        message = message.with_log_timestamp(timestamp);
-    }
-    message
-}
-
-/// Whether a reconstructed tool result is only the placeholder for a call
-/// that an active lease holder has not finished yet.
-pub fn is_pending_tool_result(result: &crate::tool::ToolResult) -> bool {
-    result.output.as_object().is_some_and(|output| {
-        output.len() == 1
-            && output.get("error").and_then(serde_json::Value::as_str)
-                == Some(PENDING_TOOL_RESPONSE_ERROR)
-    })
-}
-
-fn assemble_tool_message(
-    text: String,
-    thought: Option<String>,
-    calls: Vec<crate::tool::ToolCall>,
-    results: Vec<harnx_core::session::ToolOutput>,
-) -> Message {
-    use crate::client::MessageContentToolCalls;
-    use crate::tool::ToolResult;
-
-    // Match each call to its result by id (falling back to position).
-    let mut by_id: std::collections::HashMap<String, harnx_core::session::ToolOutput> = results
-        .iter()
-        .filter_map(|r| r.id.clone().map(|id| (id, r.clone())))
-        .collect();
-    let mut positional = results.into_iter().filter(|r| r.id.is_none());
-
-    let tool_results: Vec<ToolResult> = calls
-        .into_iter()
-        .map(|call| {
-            let output = match call
-                .id
-                .as_ref()
-                .and_then(|id| by_id.remove(id))
-                .or_else(|| positional.next())
-            {
-                Some(out) => ToolResult {
-                    call,
-                    output: out.output,
-                    markdown: out.markdown,
-                    content: out.content,
-                    switch_agent: out.switch_agent,
-                    execution_context: None,
-                },
-                None => ToolResult::new(
-                    call,
-                    serde_json::json!({
-                        "error": LOST_TOOL_RESPONSE_ERROR
-                    }),
-                ),
-            };
-            output
-        })
-        .collect();
-
-    Message::new(
-        MessageRole::Tool,
-        MessageContent::ToolCalls(MessageContentToolCalls::new(tool_results, text, thought)),
-    )
+    replay::LogSource { content, name }.entries()
 }
 
 pub fn render(session: &Session) -> Result<String> {
@@ -974,155 +502,6 @@ fn is_tool_continuation(input: &Input) -> bool {
     input.tool_calls.is_some()
 }
 
-/// Persist input before model work. Cancellation may reject every output from
-/// this round, but cannot undo its input. NATS inputs retain their admission's
-/// `skip_user_log_append`; they are already generation-owned durable history.
-pub(crate) fn prepare_input(session: &mut Session, input: &mut Input) -> Result<()> {
-    if input.session_input_start.is_some() {
-        return Ok(());
-    }
-    if input.continue_output().is_some() || input.regenerate() {
-        return Ok(());
-    }
-    let history_len = session.messages.len();
-    let mut unpatched = input.clone();
-    unpatched.clear_patch();
-    let all_appended = begin_turn(session, &unpatched, "")?;
-    session.dirty |= !all_appended;
-    require_authoritative_appends(session, all_appended, "user input")?;
-    input.session_input_start = Some(history_len);
-    session.update_tokens();
-    Ok(())
-}
-
-fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<bool> {
-    if input.session_input_start.is_some() {
-        return Ok(true);
-    }
-    let mut all_appended = true;
-    let is_continuation = is_tool_continuation(input);
-
-    if session.messages.is_empty() && !is_continuation {
-        all_appended &= append_initial_agent_messages(session, input)?;
-    } else if !is_continuation && !input.skip_user_log_append {
-        // `skip_user_log_append` is set by the NATS HA worker: the user
-        // message is already durably logged by the client and present in the
-        // loaded `session.messages`, so re-appending it would duplicate it and
-        // reorder the assistant barrier past concurrent arrivals.
-        all_appended &= append_user_turn_message(session, input);
-    }
-
-    all_appended &= append_input_data_urls(session, input);
-    all_appended &= append_injected_user_text(session, input);
-    Ok(all_appended)
-}
-
-fn append_initial_agent_messages(session: &mut Session, input: &Input) -> Result<bool> {
-    let agent_messages = input.agent().build_messages(input)?;
-    let mut all_appended = true;
-    let mut cid_urls = std::collections::HashMap::new();
-
-    for mut msg in agent_messages {
-        if msg.role == MessageRole::System {
-            continue;
-        }
-        // `externalize_content` only writes files + rewrites `content` in
-        // memory (takes `&Session`, cannot append), so `seq` stays correct.
-        let seq = session.next_seq();
-        cid_urls.extend(externalize_content(session, &mut msg.content));
-        all_appended &= append_session_message(session, msg.role, msg.content.clone());
-        session.messages.push(msg.with_log_seq(seq));
-    }
-
-    // Seq-less metadata record for the cids written above; appended after
-    // the messages so message log_seqs are unaffected.
-    all_appended &= record_externalized(session, cid_urls);
-    Ok(all_appended)
-}
-
-fn append_user_turn_message(session: &mut Session, input: &Input) -> bool {
-    // `seq` is the message's log-document index. `externalize_content` only
-    // writes attachment files + rewrites `content` in memory (it takes
-    // `&Session`, so it cannot append), so nothing must be appended between
-    // here and the Message append below or `seq` would be off by one. The
-    // cid DataUrls entry is a seq-less metadata record appended *after* the
-    // message.
-    let seq = session.next_seq();
-    let mut content = input.message_content();
-    let cid_urls = externalize_content(session, &mut content);
-    let user_msg = Message::new(MessageRole::User, content).with_log_seq(seq);
-    let mut all_appended = append_session_message(session, user_msg.role, user_msg.content.clone());
-    session.messages.push(user_msg);
-    emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
-    all_appended &= record_externalized(session, cid_urls);
-    all_appended
-}
-
-fn append_input_data_urls(session: &mut Session, input: &Input) -> bool {
-    let new_data_urls = input.data_urls();
-    let mut all_appended = true;
-    if !new_data_urls.is_empty() {
-        all_appended &= append_event(
-            session,
-            &SessionLogEntry::DataUrls {
-                urls: new_data_urls.clone(),
-            },
-        );
-    }
-    session.data_urls.extend(new_data_urls);
-    all_appended
-}
-
-fn append_injected_user_text(session: &mut Session, input: &Input) -> bool {
-    let Some(injected) = input.injected_user_text() else {
-        return true;
-    };
-
-    // `skip_user_log_append` marks an input whose user text was folded out of
-    // the durable log, so the log already holds this message and re-appending
-    // it is not just a duplicate row: the worker's mid-round fold would read
-    // the fresh copy as another unanswered message and inject it again, once
-    // more per remaining tool round. The in-memory push still has to happen —
-    // `session.messages` is loaded once per turn and is what carries the
-    // injected message into the following rounds' wire requests.
-    if input.skip_user_log_append {
-        session.messages.push(Message::new(
-            MessageRole::User,
-            MessageContent::Text(injected.to_string()),
-        ));
-        return true;
-    }
-
-    let seq = session.next_seq();
-    let injected_msg = Message::new(
-        MessageRole::User,
-        MessageContent::Text(injected.to_string()),
-    )
-    .with_log_seq(seq);
-    let all_appended =
-        append_session_message(session, injected_msg.role, injected_msg.content.clone());
-    session.messages.push(injected_msg);
-    emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
-    all_appended
-}
-
-fn append_session_message(
-    session: &mut Session,
-    role: MessageRole,
-    content: MessageContent,
-) -> bool {
-    append_event(
-        session,
-        &SessionLogEntry::Message {
-            id: Some(persisted_message_id()),
-            role,
-            content,
-            timestamp: Some(Utc::now()),
-            fence_token: None,
-        },
-    )
-}
-
 pub fn append_message(session: &mut Session, role: MessageRole, content: MessageContent) -> bool {
     append_session_message(session, role, content)
 }
@@ -1131,6 +510,9 @@ fn clear_messages_in_memory(session: &mut Session) {
     session.messages.clear();
     session.compressed_messages.clear();
     session.data_urls.clear();
+    // The compaction summary describes archived rows that no longer exist;
+    // keep it around and build_messages would inject stale context.
+    session.compaction_summary = None;
     session.completion_usage = CompletionTokenUsage::default();
     session.update_tokens();
 }
@@ -1302,6 +684,7 @@ mod continuation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
 
     struct FailingAuthoritativeSink;
 
@@ -1399,9 +782,13 @@ mod tests {
         .expect("legacy YAML remains syntactically readable");
         assert!(matches!(raw_entries[0].1, SessionLogEntry::Unknown));
 
-        let error =
-            replay_nats_entries_into_session(&raw_entries, "legacy-session", Session::default())
-                .expect_err("canonical NATS replay must reject embedded legacy metadata");
+        let error = replay_nats_entries_into_session(
+            &raw_entries,
+            "legacy-session",
+            Session::default(),
+            false,
+        )
+        .expect_err("canonical NATS replay must reject embedded legacy metadata");
 
         assert!(error.to_string().contains("unsupported or legacy entry"));
     }
@@ -1433,13 +820,11 @@ mod tests {
             ),
         ];
 
-        // Replay entries into a default session - use TrailingToolCallPolicy::Interrupted
-        let session = super::replay_log_entries_into_session(
+        let session = super::replay_nats_entries_into_session(
             &entries,
             "test-session",
             Session::default(),
             false,
-            super::TrailingToolCallPolicy::Interrupted,
         )
         .expect("replay should succeed");
 
@@ -1492,6 +877,7 @@ fence_token: 7
             &raw_entries,
             "pre-schema-session",
             Session::default(),
+            false,
         )
         .expect("canonical replay should accept pre-schema variants");
 
@@ -2091,7 +1477,7 @@ content: work complete
             },
         ));
 
-        let loaded = replay_log_entries_for_external(&entries, "completed-parent").unwrap();
+        let loaded = replay_log_entries_for_external(&entries, "completed-parent", false).unwrap();
 
         assert_sub_agent_start_replay(
             &loaded,
@@ -2104,7 +1490,8 @@ content: work complete
     fn external_replay_queues_sub_agent_start_note_after_interrupted_tool_result() {
         let entries = sub_agent_start_entries("child-interrupted");
 
-        let loaded = replay_log_entries_for_external(&entries, "interrupted-parent").unwrap();
+        let loaded =
+            replay_log_entries_for_external(&entries, "interrupted-parent", false).unwrap();
 
         assert_sub_agent_start_replay(
             &loaded,
@@ -2183,7 +1570,7 @@ invocation_id: invocation-direct
             ),
         ];
 
-        let loaded = replay_log_entries_for_external(&entries, "interrupted").unwrap();
+        let loaded = replay_log_entries_for_external(&entries, "interrupted", false).unwrap();
 
         let note_index = loaded
             .messages
@@ -2297,12 +1684,9 @@ content: queued correction
 "#;
         let raw = collect_raw_log_entries(content, "leased-session").unwrap();
 
-        let loaded = replay_nats_entries_into_session_preserving_pending(
-            &raw,
-            "leased-session",
-            Session::default(),
-        )
-        .unwrap();
+        let loaded =
+            replay_nats_entries_into_session(&raw, "leased-session", Session::default(), true)
+                .unwrap();
 
         assert_eq!(
             loaded
@@ -3006,6 +2390,37 @@ replacements:
             .all(|message| message.role != MessageRole::System));
         assert_eq!(session.messages[0].content.to_text(), "recent u");
         assert_eq!(session.messages[1].content.to_text(), "recent a");
+    }
+
+    #[test]
+    fn clearing_session_drops_compaction_summary() {
+        // Live `/empty`: the summary describes archived rows that are gone.
+        let mut session = test_session();
+        session.compaction_summary = Some("stale summary".to_string());
+        session.messages = vec![Message::new(
+            MessageRole::User,
+            MessageContent::Text("live question".to_string()),
+        )];
+        clear_messages_in_memory(&mut session);
+        assert!(session.messages.is_empty());
+        assert!(session.compaction_summary.is_none());
+
+        // Replay of a persisted clear must do the same, or a reloaded session
+        // would inject the stale summary into its next model request.
+        let content = r#"---
+type: message
+role: user
+content: old question
+---
+type: compress
+prompt: summary of earlier conversation
+---
+type: clear
+"#;
+        let session = super::load_from_log_for_test(content);
+        assert!(session.messages.is_empty());
+        assert!(session.compressed_messages.is_empty());
+        assert!(session.compaction_summary.is_none());
     }
 
     #[test]

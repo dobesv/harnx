@@ -21,7 +21,7 @@ pub(super) fn replay(entries: &[(u64, SessionLogEntry)]) -> Session {
         .iter()
         .map(|(seq, entry)| (usize::try_from(*seq).unwrap(), entry.clone()))
         .collect::<Vec<_>>();
-    replay_nats_entries_into_session(&entries, "d2-fixture", Session::default())
+    replay_nats_entries_into_session(&entries, "d2-fixture", Session::default(), false)
         .expect("normal NATS session replay")
 }
 

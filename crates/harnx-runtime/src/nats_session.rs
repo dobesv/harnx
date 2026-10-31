@@ -774,6 +774,19 @@ impl NatsSession {
         self
     }
 
+    /// Caller-supplied message ids must not use the reserved runtime-note and
+    /// timing-notice prefixes. Checked before any existing-row lookup: a
+    /// reserved id can legitimately name a durable runtime-note row, and
+    /// returning that row would let a caller claim runtime context as its own
+    /// admitted prompt (issue #2493).
+    fn ensure_unreserved_admission_id(user_msg_id: &str) -> Result<()> {
+        anyhow::ensure!(
+            !harnx_core::runtime_note::is_reserved_message_id(user_msg_id),
+            "caller-supplied admission id is reserved: {user_msg_id}"
+        );
+        Ok(())
+    }
+
     async fn admit_prompt(
         &self,
         user_msg_id: &str,
@@ -781,6 +794,12 @@ impl NatsSession {
         content: Option<&MessageContent>,
     ) -> Result<String> {
         use crate::nats_session_metadata::{AdmissionAuthority, InvocationAdmission};
+        // Reserved structured ids (runtime notes, timing notices) mark
+        // non-executable rows in the session log. A prompt admitted under one
+        // would be silently skipped by every executable-prompt check, so
+        // reject them here. Compaction re-logs kept rows verbatim through the
+        // session log, not through admission, so copies keep their ids.
+        Self::ensure_unreserved_admission_id(user_msg_id)?;
         if let Some(saved) = self
             .metadata_store
             .prompt_admission(&self.storage_key, user_msg_id)
@@ -866,6 +885,9 @@ impl NatsSession {
         user_msg_id: String,
     ) -> Result<AppendedPrompt> {
         self.check_parent_work("child-prompt-admission").await?;
+        // Reserved ids are rejected before the existing-row lookup so a
+        // submission cannot claim a durable runtime-note row as its prompt.
+        Self::ensure_unreserved_admission_id(&user_msg_id)?;
         if let Some(prompt) = self.existing_prompt_with_message_id(&user_msg_id).await? {
             return Ok(prompt);
         }

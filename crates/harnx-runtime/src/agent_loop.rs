@@ -965,6 +965,14 @@ fn begin_agent_loop(ctx: &AgentLoopContext, mut input: Input) -> Input {
     input
 }
 
+fn clear_persisted_round_context(input: &mut Input) {
+    // Input was persisted before the model call. Clear one-shot context before
+    // on_tool_round supplies the next pending user message.
+    input.injected_user_text = None;
+    input.injected_user_messages.clear();
+    input.timing_context = None;
+}
+
 #[tracing::instrument(
     name = "agent_turn",
     skip_all,
@@ -1029,10 +1037,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
         };
 
         ctx.check_generation("completion-reducer")?;
-        // Input was persisted before the model call. Clear this one-shot field
-        // before on_tool_round can supply the next pending user message.
-        input.injected_user_text = None;
-        input.timing_context = None;
+        clear_persisted_round_context(&mut input);
 
         emit_text_turn_status(ctx, &usage, tool_results.is_empty(), emitted_text_turns);
 

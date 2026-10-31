@@ -1,4 +1,5 @@
 use anyhow::{ensure, Result};
+use harnx_core::runtime_note::is_reserved_message_id;
 use harnx_core::session::SessionLogEntry;
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +81,20 @@ impl FixedAdmissionTicket {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
             "fixed invocation identity must be a KV-safe segment"
+        );
+        // Every entry point (prepare, restore, append, close, reserve) funnels
+        // through validate. A prompt admitted under a reserved prefix would
+        // be silently skipped by every executable-prompt check.
+        ensure!(
+            !is_reserved_message_id(&self.prompt_id),
+            "fixed prompt id uses a reserved message-id prefix"
+        );
+        // The invocation id also reaches the transcript: A2A republish flows
+        // it into `with_admission_id`, which appends the prompt under it, so a
+        // reserved prefix would make the worker skip the row it admitted.
+        ensure!(
+            !is_reserved_message_id(&self.invocation_id),
+            "fixed invocation id uses a reserved message-id prefix"
         );
         ensure!(
             self.expected_predecessor < u64::MAX,

@@ -1023,7 +1023,7 @@ async fn prompt_config_for_agent_session_from_global(
                 if !entries.is_empty() {
                     let raw = entries.into_iter().enumerate().collect::<Vec<_>>();
                     let mut replayed =
-                        config::session::replay_log_entries_for_external(&raw, &key.session)
+                        config::session::replay_log_entries_for_external(&raw, &key.session, false)
                             .expect("replay test session log");
                     replayed.model = session.model.clone();
                     replayed.model_id = session.model_id.clone();

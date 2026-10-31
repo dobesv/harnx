@@ -488,14 +488,11 @@ fn transcript_state_from_entries(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut session = if preserve_pending {
-        super::session::replay_log_entries_for_external_preserving_pending(
-            &raw_entries,
-            session_id,
-        )?
-    } else {
-        super::session::replay_log_entries_for_external(&raw_entries, session_id)?
-    };
+    let mut session = super::session::replay_log_entries_for_external(
+        &raw_entries,
+        session_id,
+        preserve_pending,
+    )?;
 
     renumber_remote_messages_for_window(
         &mut session.compressed_messages,

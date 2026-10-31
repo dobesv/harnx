@@ -301,7 +301,8 @@ fn pending_notice(run: &TimingRun, now: DateTime<Utc>) -> Option<PendingNotice> 
     // Stable across preparation retries; the pending entry also retains its
     // original timestamp/prose so the existing fenced writer can recognise it.
     let id = format!(
-        "timing-v1-{}",
+        "{}{}",
+        harnx_core::timing_identity::TIMING_MESSAGE_ID_PREFIX,
         harnx_core::crypto::sha256(&receipt.to_json())
     );
     Some(PendingNotice {

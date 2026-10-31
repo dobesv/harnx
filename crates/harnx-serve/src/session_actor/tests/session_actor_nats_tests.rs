@@ -589,7 +589,7 @@ async fn assert_cancel_reached_worker(config: &harnx_runtime::config::Config, se
         .map(|(seq, entry)| (seq as usize, entry))
         .collect::<Vec<_>>();
     let restored =
-        harnx_runtime::config::session::replay_log_entries_for_external(&raw, session_id)
+        harnx_runtime::config::session::replay_log_entries_for_external(&raw, session_id, false)
             .expect("replay cancelled serve session");
     let user_texts = restored
         .messages

@@ -80,11 +80,16 @@ pub fn prompt_interrupted_at(entries: &[(u64, SessionLogEntry)], user_msg_seq: u
 }
 
 fn is_queued_user_message(entry: &SessionLogEntry) -> bool {
-    // Timing notices are non-executable context, not queued user prompts.
-    // Use shared classifier to ensure only valid timing notices are skipped.
-    if let SessionLogEntry::Message { role, content, .. } = entry {
+    // Timing notices and runtime notes are non-executable context, not queued
+    // user prompts. Both use structured classifiers; reserved-prefix
+    // lookalikes stay executable.
+    if let SessionLogEntry::Message {
+        id, role, content, ..
+    } = entry
+    {
         if role.is_user() {
-            return !crate::timing_identity::is_timing_notice(&content.to_text());
+            return !crate::timing_identity::is_timing_notice(&content.to_text())
+                && !crate::runtime_note::is_runtime_note_id(id.as_deref());
         }
     }
     false
@@ -112,6 +117,10 @@ pub fn latest_prompt_seq(entries: &[(u64, SessionLogEntry)]) -> Option<u64> {
         };
         // Skip timing notices — use shared classifier to ensure only valid notices skipped
         if crate::timing_identity::is_timing_notice(&content.to_text()) {
+            continue;
+        }
+        // Runtime notes are context, not prompts: they never hold pending work.
+        if crate::runtime_note::is_runtime_note_id(id.as_deref()) {
             continue;
         }
         let is_copy = id.as_deref().is_some_and(|id| !seen_ids.insert(id));
@@ -591,5 +600,82 @@ mod tests {
             assert_eq!(pending_prompt_seq(&log), None);
         }
         assert_eq!(pending_prompt_seq(&[]), None);
+    }
+
+    /// Runtime notes — replay-synthesized sub-agent/cancel context and their
+    /// compaction re-logs — are never pending prompts. Classification is by
+    /// structured id only: an ID-less row that merely looks like a note stays
+    /// executable, failing closed at admission verification.
+    #[test]
+    fn runtime_notes_are_not_pending_prompts() {
+        fn note_row(id: Option<&str>) -> SessionLogEntry {
+            SessionLogEntry::Message {
+                id: id.map(str::to_owned),
+                role: MessageRole::User,
+                content: MessageContent::Text(format!(
+                    "{}The user interrupted this turn.",
+                    crate::runtime_note::RUNTIME_NOTE_PREFIX
+                )),
+                timestamp: None,
+                fence_token: None,
+            }
+        }
+        let structured = crate::runtime_note::new_runtime_note_message_id();
+
+        // The newest row is a runtime note: nothing is pending.
+        let log = numbered(vec![note_row(Some(&structured))]);
+        assert_eq!(pending_prompt_seq(&log), None);
+
+        // An ID-less lookalike is not classified by text: it stays a prompt.
+        let log = numbered(vec![note_row(None)]);
+        assert_eq!(pending_prompt_seq(&log), Some(1));
+
+        // The note is also ignored when it trails a real prompt: the real
+        // prompt keeps its pending status.
+        let log = numbered(vec![user(), note_row(Some(&structured))]);
+        assert_eq!(pending_prompt_seq(&log), Some(1));
+    }
+
+    /// A durable runtime-note row must not be queued as the next turn's input.
+    #[test]
+    fn runtime_notes_are_not_next_turn_messages() {
+        fn note_row(id: Option<&str>) -> SessionLogEntry {
+            SessionLogEntry::Message {
+                id: id.map(str::to_owned),
+                role: MessageRole::User,
+                content: MessageContent::Text(format!(
+                    "{}Started sub-agent 'child' in session child-session.",
+                    crate::runtime_note::RUNTIME_NOTE_PREFIX
+                )),
+                timestamp: None,
+                fence_token: None,
+            }
+        }
+        let structured = crate::runtime_note::new_runtime_note_message_id();
+
+        let log = numbered(vec![note_row(Some(&structured))]);
+        let state = reconstruct_state_from_nats(&log);
+        assert!(
+            state.next_turn_messages.is_empty(),
+            "runtime notes must not be executed as prompts"
+        );
+
+        // An admitted prompt starting with the same prefix stays executable:
+        // its id is an admission id, not a runtime-note id.
+        let lookalike = SessionLogEntry::Message {
+            id: Some("admitted-lookalike".into()),
+            role: MessageRole::User,
+            content: MessageContent::Text(format!(
+                "{}lookalike prompt",
+                crate::runtime_note::RUNTIME_NOTE_PREFIX
+            )),
+            timestamp: None,
+            fence_token: None,
+        };
+        let log = numbered(vec![lookalike]);
+        assert_eq!(
+            reconstruct_state_from_nats(&log).next_turn_messages.len(),
+            1
+        );
     }
 }

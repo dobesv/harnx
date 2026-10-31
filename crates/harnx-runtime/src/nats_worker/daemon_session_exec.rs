@@ -72,13 +72,6 @@ pub(super) fn is_activation_refusal(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<ActivationRefusal>().is_some())
 }
 
-fn is_executable_user_prompt(
-    role: &harnx_core::message::MessageRole,
-    content: &harnx_core::message::MessageContent,
-) -> bool {
-    role.is_user() && !harnx_core::timing_identity::is_timing_notice(&content.to_text())
-}
-
 /// The id of the latest prompt or compaction request at or before `requested`.
 fn latest_prompt_id(
     entries: &[(u64, harnx_core::session::SessionLogEntry)],
@@ -90,12 +83,9 @@ fn latest_prompt_id(
             return None;
         }
         match entry {
-            SessionLogEntry::Message {
-                id: Some(id),
-                role,
-                content,
-                ..
-            } if is_executable_user_prompt(role, content) => Some(id.clone()),
+            SessionLogEntry::Message { .. } => super::agent_loop::executable_user_message_id(entry)
+                .flatten()
+                .map(str::to_owned),
             SessionLogEntry::CompactRequest { compaction_id, .. } => Some(compaction_id.clone()),
             _ => None,
         }
