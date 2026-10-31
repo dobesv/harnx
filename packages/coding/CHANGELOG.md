@@ -1,6 +1,33 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.4.17 (2026-10-31)
+
+### Features
+
+- refresh models and harden provider fallback (#2496)
+
+#### Refresh agent fallbacks with GPT-6.1 Sol for coding and judgment, GPT-6.1 Terra for writing, visual work and research, and Claude Haiku 5.5 for small tasks and compaction. Preserve compatible Terra request settings and Haiku adaptive thinking through catalog refreshes.
+
+Upgrade GLM 5 slots to Bedrock GLM 5.3 with explicit high reasoning effort, and reasoning-heavy Gemini fallbacks to Gemini 4 Argon. Atlas tries Argon after both Sol routes. Route native Gemini streaming requests correctly and keep Argon within the supported per-request output and unified context limits.
+
+Prefer Luna for all compactors and Hestia, replace the compactors' 4K-output Bedrock GLM fallback with Luna, and add MiniMax M3.1 Flash as Hestia's direct fallback at low effort. Offer optional direct Z.AI routing while retaining Bedrock. Preserve MiniMax and GLM reasoning during tool continuation. Try another model on specific model availability errors or incompatible image/context input, without cooling down models solely for request incompatibility; malformed requests still stop the chain.
+
+Collect the Codex backend's required event stream for non-streaming callers so subscription-based compaction also works when streaming is disabled.
+
+Reject filtered Codex partial responses, retain custom Argon request patches during regeneration, and apply thinking binding controls on Vertex so compacted conversations can continue. Clarify how to merge optional provider settings with existing package overrides.
+
+### Fixes
+
+- unblock the weekly models.yaml refresh (#2479)
+- request reasoning summaries for new OpenAI models (#2480)
+- use LiteLLM's supports_reasoning for OpenAI summaries (#2481)
+- qualify worker Web UI session links by cluster (#2487)
+- keep queued prompts visible during active runs (#2489)
+- preserve continuation state in compaction prompts (#2534)
+- record v0.34.17 on main and push release refs atomically (#2535)
+- Improve packaged and example compaction prompts to retain plan references, task progress, important changed files, decisions, and pending work across repeated summaries.
+
 ## 0.4.16 (2026-10-27)
 
 ### Fixes

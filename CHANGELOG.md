@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.18 (2026-10-31)
+
+### Features
+
+- refresh models and harden provider fallback (#2496)
+- Accept AG-UI messages with non-standard roles such as `reasoning`. The server now ignores unknown roles instead of rejecting them with a 400 error. TUI, CLI `prompt` on a TTY, and Web UI now render thinking content in a distinct style instead of showing literal `<think>` tags. Web UI shows live reasoning in a collapsible Thinking block.
+
+### Fixes
+
+- unblock the weekly models.yaml refresh (#2479)
+- request reasoning summaries for new OpenAI models (#2480)
+- use LiteLLM's supports_reasoning for OpenAI summaries (#2481)
+- qualify worker Web UI session links by cluster (#2487)
+- keep queued prompts visible during active runs (#2489)
+- preserve continuation state in compaction prompts (#2534)
+- record v0.34.17 on main and push release refs atomically (#2535)
+- Validate saved A2A approval replies consistently during immediate delivery and recovery. Mismatched history leaves the accepted intent unresolved instead of delivering a decision.
+- Improve packaged and example compaction prompts to retain plan references, task progress, important changed files, decisions, and pending work across repeated summaries.
+- Record the lease holder's process identity (pid, a one-way hash of the host identity, and on Linux process start time) in session lease records, and let a worker on Linux reclaim the lease immediately when that holder is provably dead on the same host, instead of waiting out the lease TTL. This removes the roughly 30-second stall when re-running a session after a one-shot `harnx prompt` exited on `--timeout-secs` and killed its local worker. Any uncertainty — old records without the identity, a different host or pid namespace, a live pid, or a platform that can't record a strong host identity — keeps the previous TTL-only behavior.
+- Web UI tool-call cards and ACP clients now show sub-agent progress (title, status, and token usage) on the parent's tool call.
+- Show queued Web UI messages immediately and allow another message while the agent session is busy.
+- Include the cluster in worker-recorded Web UI links so they reach the correct agent when the worker and Web UI use different default clusters.
+
+#### Fixed running tasks failing with "injected user row has no admission identity" when a mid-turn compaction re-logged injected prompts or runtime notes.
+
+Messages queued during a running task now keep their admission identity when carried into the model's context, and replayed runtime notes (sub-agent starts and interrupt notices) are marked as non-executable context, so compacting the session mid-turn can no longer turn them into prompts the worker refuses to run. Admission verification now checks exactly the messages queued for injection instead of re-scanning history, which also stops old compaction copies from being mistaken for competing input, and the injection cursor no longer re-delivers messages after an edit re-sequences the log. Prompt admission now rejects caller-supplied message ids that use the reserved `runtime-note-v1-` and `timing-v1-` prefixes on every admission path — ordinary prompts, tool confirmations and fixed-ticket admission — so a client prompt can never be filed as runtime context. Fixed-admission invocation ids are checked against the same reserved prefixes, because A2A republish appends the prompt under that id; and a reserved id that already names a durable runtime-note row is rejected instead of being returned as an existing prompt.
+
+Clearing a session (`/empty` on a live session, or replaying a `clear` entry) now also drops the stored compaction summary, so the next model request no longer includes a summary of conversation history that no longer exists.
+
+**Recovery for sessions already hit by the old bug:** a session containing a broken ID-less row still fails that activation, but is not wedged. The failed activation durably records an `Error` entry (unless the process lost its lease mid-failure), which terminates the turn that the broken row was pending for. Submitting a new prompt then starts a clean turn and the session works again. Only if no terminator was written at all (lease loss, append failure, hard process death) do you need to cancel the stuck turn or rewind the session before continuing. There is no automatic text-based repair: prefix lookalikes are deliberately kept executable.
+
+#### Refresh agent fallbacks with GPT-6.1 Sol for coding and judgment, GPT-6.1 Terra for writing, visual work and research, and Claude Haiku 5.5 for small tasks and compaction. Preserve compatible Terra request settings and Haiku adaptive thinking through catalog refreshes.
+
+Upgrade GLM 5 slots to Bedrock GLM 5.3 with explicit high reasoning effort, and reasoning-heavy Gemini fallbacks to Gemini 4 Argon. Atlas tries Argon after both Sol routes. Route native Gemini streaming requests correctly and keep Argon within the supported per-request output and unified context limits.
+
+Prefer Luna for all compactors and Hestia, replace the compactors' 4K-output Bedrock GLM fallback with Luna, and add MiniMax M3.1 Flash as Hestia's direct fallback at low effort. Offer optional direct Z.AI routing while retaining Bedrock. Preserve MiniMax and GLM reasoning during tool continuation. Try another model on specific model availability errors or incompatible image/context input, without cooling down models solely for request incompatibility; malformed requests still stop the chain.
+
+Collect the Codex backend's required event stream for non-streaming callers so subscription-based compaction also works when streaming is disabled.
+
+Reject filtered Codex partial responses, retain custom Argon request patches during regeneration, and apply thinking binding controls on Vertex so compacted conversations can continue. Clarify how to merge optional provider settings with existing package overrides.
+
+#### Recovered failed tool calls now use the partial result stored with the journaled reply, even if it changed during replay. Recovered sub-agent progress includes the parent's tool call ID so clients can match it to the original call.
+
+The Web UI no longer shows a second row for a failed sub-agent call when progress arrives after the row was restored from the call's partial result.
+
 ## 0.34.17 (2026-10-27)
 
 ### Features
