@@ -877,6 +877,30 @@ describe('ToolCallCard', () => {
       expect(screen.getByText(/c\.rs/)).toBeInTheDocument();
       expect(screen.getByText(/\+2 more/)).toBeInTheDocument();
     });
+
+    it('displays projected sub-agent progress title on parent transcript tool call id', () => {
+      const parentTranscriptToolCallId = 'parent_tool_call_789';
+      renderLiveUpdateTestCard(
+        parentTranscriptToolCallId,
+        {
+          title: '@ researcher — Analyzing data — (1200→345)',
+          status: 'InProgress',
+          usage: { input_tokens: 1200, output_tokens: 345, cached_tokens: 67 },
+        },
+        {
+          props: {
+            toolName: 'pantheon/researcher_session_prompt',
+            args: { message: 'Analyze dataset' },
+          },
+        },
+      );
+      expect(
+        screen.getByText('@ researcher — Analyzing data — (1200→345)'),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText('pantheon/researcher_session_prompt'),
+      ).not.toBeInTheDocument();
+    });
   });
 
   describe('static handoff row', () => {

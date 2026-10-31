@@ -5,3 +5,4 @@
 mod event_map_tests;
 mod integration_tests;
 mod nats_integration;
+mod subagent_progress_map_tests;

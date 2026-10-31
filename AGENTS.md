@@ -1742,14 +1742,17 @@ publisher flushes before awaiting the reply.
 `TurnEvent::SubAgentProgress` projects into `ToolCallUpdate` for ACP and Web clients, bridging
 the legacy poll-based reporter with the shared tool-call rendering path. Key invariants:
 
-1. **Correlation key** — `SubAgentProgress.invocation_id` maps to the parent tool call's
-   `tool_call_id`, not the child session. A child session can be prompted more than once,
-   so `invocation_id` is the stable correlation key.
+1. **Correlation key** — Use `SubAgentProgress.tool_call_id` when present to key updates
+   to the parent's transcript tool call. Fall back to `invocation_id` when absent for legacy
+   and top-level events; never key on the child session.
 
 2. **ACP status mapping** — `SubAgentProgressStatus` has six variants; ACP `ToolCallStatus`
    has four. Rich internal states (`Cancelling`, `Unconfirmed`) and child `Done` all map to
    `InProgress`. The parent tool call remains in progress until `ToolEvent::Completed` arrives.
-   Only `Cancelled` and `Failed` map to `Failed`.
+   Only `Cancelled` and `Failed` map to `Failed`. ACP sink suppresses status on later progress
+   patches for calls already completed or failed, while retaining title and usage updates. The guard
+   lives in `AcpEventSink::emit`; AG-UI has no terminal guard because web cards rely on `props.status`
+   and ignore projected status.
 
 3. **Title format** — Projected title includes agent name, child title (if present), and compact
    usage: `@ {agent} — {child_title} — ({in}→{out})`. Zero usage omits the arrow suffix.
