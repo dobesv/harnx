@@ -11,6 +11,9 @@ multi-agent orchestration overhead.
 | `coder` | claude-sonnet-5-5 | Main coding assistant |
 | `compact-coder` | gpt-6-luna | Context compaction for long sessions |
 
+See [compaction prompt design](../../docs/agent-guide.md#compaction-prompt-design)
+for retention priorities, research sources, and evaluation guidance.
+
 ## Quick start
 
 Install from GHCR (replace `v0.1.0` with the current release):

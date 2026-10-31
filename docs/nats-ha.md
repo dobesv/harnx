@@ -1528,6 +1528,9 @@ rendering" for the shared view contract and fixture path.
 
 The model receives the stored `compaction_summary` before the retained suffix—never archived messages resurrected from `compressed_messages`. The summary is a transient runtime note, not a durable log entry. Subsequent compactions include the prior summary in the summarizer transcript, preserving completed work across multiple rounds. The worker's cursor folding deduplicates re-logged suffix entries by stable message ID, preventing completed prompts from being scheduled as fresh input.
 
+For summarizer retention priorities, research, and evaluation guidance, see
+[Compaction Prompt Design](agent-guide.md#compaction-prompt-design) in the Agent Guide.
+
 ### Triggering Manual Compaction
 
 - **CLI**:
