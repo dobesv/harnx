@@ -207,6 +207,7 @@ impl tokio_stream::Stream for GuardedEventStream {
 pub enum AgUiError {
     BadRequest(String),
     NotFound(String),
+    Conflict(String),
     Internal(String),
 }
 
@@ -215,6 +216,7 @@ impl AgUiError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -223,7 +225,10 @@ impl AgUiError {
 impl std::fmt::Display for AgUiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BadRequest(msg) | Self::NotFound(msg) | Self::Internal(msg) => f.write_str(msg),
+            Self::BadRequest(msg)
+            | Self::NotFound(msg)
+            | Self::Conflict(msg)
+            | Self::Internal(msg) => f.write_str(msg),
         }
     }
 }
@@ -1409,13 +1414,20 @@ pub(crate) async fn ag_ui_run_for_target(
     let requested_prompt = (!is_resume)
         .then(|| pending_user_prompt(&run_input, &subscription.snapshot))
         .flatten();
-    let thread_id = derive_thread_id(session);
-    let thread_id_text = thread_id.to_string();
-
     if let Some(text) = requested_prompt.as_deref() {
-        let _ = prompt(&handle, text, prompt_options).await;
+        if let PromptResult::Rejected { reason } = prompt(&handle, text, prompt_options).await {
+            log::warn!(
+                "AG-UI prompt rejected for agent {} session {}: {}",
+                target.agent(),
+                session,
+                reason
+            );
+            return Err(AgUiError::Conflict(reason));
+        }
     }
 
+    let thread_id = derive_thread_id(session);
+    let thread_id_text = thread_id.to_string();
     let stream = if let Some(stream) = crate::ag_ui_remote_follow::resolve_event_stream(
         crate::ag_ui_remote_follow::EventStreamParams {
             config: base_config,

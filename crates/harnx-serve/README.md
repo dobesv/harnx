@@ -6,6 +6,10 @@
 
 The server allows external clients (such as IDE plugins or web interfaces) to interact with `harnx` agents over HTTP. It supports agent execution, session management, and MCP tool orchestration.
 
+## AG-UI Runs
+
+When a prompted AG-UI run is rejected by its session, the request fails with HTTP 409 and the rejection reason before any stream opens.
+
 ## Remote Agents
 
 harnx-serve supports remote `agent@cluster` agents via the same mechanism as CLI/TUI. Agent resolution uses `AgentRef::parse` and `Config::use_agent`, which validates the cluster via `nats_servers/<cluster>.yaml` and records `remote_agent` state.

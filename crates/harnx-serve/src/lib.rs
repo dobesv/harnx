@@ -2594,6 +2594,11 @@ mod tests {
             status_from_error(&not_acceptable_err),
             Some(StatusCode::NOT_ACCEPTABLE)
         );
+
+        let conflict = ag_ui_error_to_anyhow(AgUiError::Conflict("test rejection".into()));
+        assert_eq!(status_from_error(&conflict), Some(StatusCode::CONFLICT));
+        let conflict_response = response_json(ret_err(&conflict)).await;
+        assert_eq!(conflict_response["error"]["message"], "test rejection");
     }
 
     #[tokio::test]
