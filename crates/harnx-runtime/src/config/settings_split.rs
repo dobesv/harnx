@@ -4,6 +4,46 @@ use crate::client::ModelType;
 use crate::nats_session_metadata::SessionOverrideUpdate;
 use anyhow::{anyhow, bail, Context, Result};
 
+/// A tool-selector setting's `.set` behavior, bundled so
+/// [`Config::update_tool_selectors`] stays within CodeScene's argument
+/// threshold: how a raw value parses (with the setting's own meaning for
+/// `null`), which session override to persist, and how the parsed value
+/// lands in memory.
+struct ToolSelectorSetting {
+    parse: fn(&str) -> Option<Vec<String>>,
+    persist: fn(Option<Vec<String>>) -> SessionOverrideUpdate,
+    apply: fn(&mut Config, Option<Vec<String>>) -> Result<()>,
+}
+
+/// `use_tools` as a `.set` target: `null` clears the override, so the
+/// agent's selectors apply again; with no session or agent the value falls
+/// back to the global default.
+const USE_TOOLS: ToolSelectorSetting = ToolSelectorSetting {
+    parse: |value| (value != "null").then(|| Config::split_selectors(value)),
+    persist: SessionOverrideUpdate::UseTools,
+    apply: |config, value| {
+        config.set_use_tools(value);
+        Ok(())
+    },
+};
+
+/// `bash_tools` as a `.set` target. Unlike `use_tools`, `null` is an
+/// explicit clear, not an unset override: the clear persists as an empty
+/// selector list so worker reconstruction re-applies it instead of falling
+/// back to the agent file's `bash_tools`. `SessionOverrides` uses `Option`,
+/// where `None` means "no override" (and serializes as absent).
+const BASH_TOOLS: ToolSelectorSetting = ToolSelectorSetting {
+    parse: |value| {
+        Some(if value == "null" {
+            Vec::new()
+        } else {
+            Config::split_selectors(value)
+        })
+    },
+    persist: SessionOverrideUpdate::BashTools,
+    apply: Config::set_bash_tools,
+};
+
 impl Config {
     pub fn update(config: &GlobalConfig, data: &str) -> Result<()> {
         // `title` takes a free-form, possibly multi-word value: everything
@@ -157,54 +197,28 @@ impl Config {
     }
 
     /// Shared `.set` handling for tool-selector settings: parse the value
-    /// with the caller's `null` mapping, persist the session override, then
-    /// apply it in memory. `use_tools` and `bash_tools` differ only in what
-    /// `null` means and in which setter the value lands in.
+    /// with the setting's `null` mapping, persist the session override, then
+    /// apply it in memory. The per-setting behavior lives in
+    /// [`ToolSelectorSetting`], which keeps this within CodeScene's
+    /// argument threshold.
     fn update_tool_selectors(
         config: &GlobalConfig,
         value: &str,
-        parse: impl Fn(&str) -> Option<Vec<String>>,
-        update: impl Fn(Option<Vec<String>>) -> SessionOverrideUpdate,
-        apply: impl FnOnce(&mut Config, Option<Vec<String>>) -> Result<()>,
+        setting: ToolSelectorSetting,
     ) -> Result<()> {
-        let value = parse(value);
-        Self::persist_override(config, update(value.clone()))?;
-        apply(&mut config.write(), value)
+        let value = (setting.parse)(value);
+        Self::persist_override(config, (setting.persist)(value.clone()))?;
+        (setting.apply)(&mut config.write(), value)
     }
 
     fn update_use_tools(config: &GlobalConfig, value: &str) -> Result<()> {
-        Self::update_tool_selectors(
-            config,
-            value,
-            // `null` clears the override, so the agent's selectors apply again.
-            |value| (value != "null").then(|| Self::split_selectors(value)),
-            SessionOverrideUpdate::UseTools,
-            |config, value| {
-                config.set_use_tools(value);
-                Ok(())
-            },
-        )
+        Self::update_tool_selectors(config, value, USE_TOOLS)
     }
 
     /// Unlike `use_tools`, `.set bash_tools null` is an explicit clear, not an
-    /// unset override: the clear persists as an empty selector list so worker
-    /// reconstruction re-applies it instead of falling back to the agent
-    /// file's `bash_tools`. `SessionOverrides` uses `Option`, where `None`
-    /// means "no override" (and serializes as absent).
+    /// unset override: see [`BASH_TOOLS`].
     fn update_bash_tools(config: &GlobalConfig, value: &str) -> Result<()> {
-        Self::update_tool_selectors(
-            config,
-            value,
-            |value| {
-                Some(if value == "null" {
-                    Vec::new()
-                } else {
-                    Self::split_selectors(value)
-                })
-            },
-            SessionOverrideUpdate::BashTools,
-            Config::set_bash_tools,
-        )
+        Self::update_tool_selectors(config, value, BASH_TOOLS)
     }
 
     fn update_model_fallbacks(config: &GlobalConfig, value: &str) -> Result<()> {
@@ -526,9 +540,9 @@ mod bash_tools_command_tests {
         assert_eq!(session.bash_tools(), Some(Vec::new()));
     }
 
-    /// A config with an explicit agent (its own `bash_tools`), an active
-    /// session, and declarations the selectors can resolve against.
-    fn config_with_agent_session_and_tools() -> Config {
+    /// A config with an explicit agent (its own `bash_tools`, if any), an
+    /// active session, and declarations the selectors can resolve against.
+    fn config_with_agent_session_and_tools(agent_bash_tools: Option<Vec<String>>) -> Config {
         let declaration = |name: &str, description: &str| ToolDeclaration {
             name: name.to_string(),
             description: description.to_string(),
@@ -549,7 +563,7 @@ mod bash_tools_command_tests {
             ..Config::default()
         };
         let mut agent = crate::config::Agent::default();
-        agent.set_bash_tools(Some(vec!["grep_search".to_string()]));
+        agent.set_bash_tools(agent_bash_tools);
         config.use_agent_obj(agent).unwrap();
         let mut session = crate::config::session::new(&config, "bash-tools-a", None).unwrap();
         crate::config::session::attach_memory_log(&mut session);
@@ -559,7 +573,9 @@ mod bash_tools_command_tests {
 
     #[test]
     fn set_bash_tools_stays_scoped_to_the_active_session() {
-        let config = Arc::new(ConfigLock::new(config_with_agent_session_and_tools()));
+        let config = Arc::new(ConfigLock::new(config_with_agent_session_and_tools(Some(
+            vec!["grep_search".to_string()],
+        ))));
 
         // While session A is active, the override steers tool selection even
         // though `extract_agent` prefers the explicit agent: tool selection
@@ -592,6 +608,35 @@ mod bash_tools_command_tests {
             Some(vec!["grep_search".to_string()])
         );
         assert_eq!(guard.bash_tool_names(&agent), vec!["grep_search"]);
+    }
+
+    #[test]
+    fn session_bash_tools_reach_the_model_request_input_path() {
+        // The model's tool declarations come from `prepare_completion_data`
+        // as `select_tools(input.agent())`, with the input agent resolved by
+        // `input::from_str` when the caller passes no explicit agent. The
+        // base agent declares no `bash_tools` of its own, so a `bash`
+        // declaration can only appear if the session's override rides along
+        // on the input agent — resolving the base agent instead would leave
+        // the model without script mode.
+        let config = Arc::new(ConfigLock::new(config_with_agent_session_and_tools(None)));
+
+        Config::update(&config, "bash_tools fs_*").unwrap();
+
+        let input = crate::config::input::from_str(&config, "run a script", None);
+        let functions = config.read().select_tools(input.agent());
+        let functions = functions.expect("tool declarations for the model request");
+        assert!(
+            functions
+                .iter()
+                .any(|declaration| declaration.name == "bash"),
+            "the model request must carry the session-backed bash declaration"
+        );
+        assert_eq!(
+            config.read().bash_tool_names(input.agent()),
+            vec!["fs_read".to_string()],
+            "the bash declaration is built from the session's selectors"
+        );
     }
 
     #[test]
