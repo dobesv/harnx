@@ -258,23 +258,18 @@ impl Config {
     /// active session or agent there is nowhere to store the value; surface
     /// that instead of silently dropping it.
     ///
-    /// The value must reach the same agent [`Config::extract_agent`] resolves:
-    /// when an explicit agent is active it wins tool selection, so writing
-    /// only the session (like `set_use_tools`) would make `.set bash_tools`
-    /// report success while the model keeps the old inner tool set. The
-    /// session copy keeps the per-session record in sync for session-derived
-    /// views (export, resume without the agent).
+    /// The value stays scoped to the active session: writing the explicit
+    /// agent too would leak an override into every other session that keeps
+    /// the agent (the TUI session picker switches sessions without reloading
+    /// it). Tool selection still sees the override immediately through
+    /// `Config::effective_bash_tools`, which overlays the session's record on
+    /// the active agent.
     pub fn set_bash_tools(&mut self, value: Option<Vec<String>>) -> Result<()> {
-        let mut applied = false;
         if let Some(session) = self.session.as_mut() {
-            session.set_bash_tools(value.clone());
-            applied = true;
-        }
-        if let Some(agent) = self.agent.as_mut() {
+            session.set_bash_tools(value);
+        } else if let Some(agent) = self.agent.as_mut() {
             agent.set_bash_tools(value);
-            applied = true;
-        }
-        if !applied {
+        } else {
             bail!("no active session or agent to apply bash_tools to");
         }
         Ok(())
@@ -479,30 +474,71 @@ mod bash_tools_command_tests {
         assert_eq!(session.bash_tools(), Some(Vec::new()));
     }
 
-    #[test]
-    fn set_bash_tools_reaches_explicit_agent_and_session() {
-        let mut config = Config::default();
+    /// A config with an explicit agent (its own `bash_tools`), an active
+    /// session, and declarations the selectors can resolve against.
+    fn config_with_agent_session_and_tools() -> Config {
+        let declaration = |name: &str, description: &str| ToolDeclaration {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters: Default::default(),
+            mcp_tool_name: None,
+            mcp_server_name: None,
+            call_template: None,
+            result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
+            kind: None,
+        };
+        let mut config = Config {
+            tools: Tools::init_from_mcp(Some(vec![
+                declaration("fs_read", "read"),
+                declaration("grep_search", "grep"),
+            ])),
+            ..Config::default()
+        };
         let mut agent = crate::config::Agent::default();
-        agent.set_bash_tools(Some(vec!["old_*".to_string()]));
+        agent.set_bash_tools(Some(vec!["grep_search".to_string()]));
         config.use_agent_obj(agent).unwrap();
-        let mut session = crate::config::session::new(&config, "bash-tools-agent", None).unwrap();
+        let mut session = crate::config::session::new(&config, "bash-tools-a", None).unwrap();
         crate::config::session::attach_memory_log(&mut session);
         config.session = Some(session);
-        let config = Arc::new(ConfigLock::new(config));
+        config
+    }
 
+    #[test]
+    fn set_bash_tools_stays_scoped_to_the_active_session() {
+        let config = Arc::new(ConfigLock::new(config_with_agent_session_and_tools()));
+
+        // While session A is active, the override steers tool selection even
+        // though `extract_agent` prefers the explicit agent: selection
+        // overlays the session's record on the active agent.
         Config::update(&config, "bash_tools fs_*").unwrap();
+        {
+            let guard = config.read();
+            assert_eq!(
+                guard.session.as_ref().unwrap().bash_tools(),
+                Some(vec!["fs_*".to_string()])
+            );
+            let agent = guard.extract_agent();
+            assert_eq!(guard.bash_tool_names(&agent), vec!["fs_read"]);
+        }
 
+        // The explicit agent keeps its own selectors, so switching sessions
+        // (the TUI picker path: `use_session` keeps the agent) does not carry
+        // session A's override into session B — B snapshots the agent.
+        config.write().use_session(Some("bash-tools-b")).unwrap();
         let guard = config.read();
-        // `extract_agent` prefers the explicit agent, so the new selectors must
-        // land there or tool selection keeps the old inner set.
+        let agent = guard.extract_agent();
         assert_eq!(
-            guard.extract_agent().bash_tools(),
-            Some(vec!["fs_*".to_string()])
+            agent.bash_tools(),
+            Some(vec!["grep_search".to_string()]),
+            "the override must not overwrite the explicit agent"
         );
         assert_eq!(
             guard.session.as_ref().unwrap().bash_tools(),
-            Some(vec!["fs_*".to_string()])
+            Some(vec!["grep_search".to_string()])
         );
+        assert_eq!(guard.bash_tool_names(&agent), vec!["grep_search"]);
     }
 
     #[test]

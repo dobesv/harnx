@@ -269,7 +269,7 @@ When `bash_tools` is configured and resolves to a non-empty set of tools, Harnx 
 - **Excluded tools**: Control-flow tools (`switch_agent`, `*_session_handoff`, `ask_user`) and `bash` itself cannot be placed inside `bash_tools`; they remain at the direct conversation boundary.
 - **Reserved name**: While `bash_tools` resolves to tools, the name `bash` belongs to script mode. An external tool named `bash` is not exposed to the model, and a `bash` call fails closed instead of routing to it.
 - **No glob shadowing**: `use_tools` wildcard globs like `*` or `bash*` never match or synthesize the script-mode `bash` tool.
-- **Session override**: `.set bash_tools <selectors>` updates the active session and agent; `.set bash_tools null` disables script mode for the session. Unlike `use_tools`, the clear persists as an empty selector list rather than an unset override, so a restarted worker keeps script mode off instead of falling back to the agent file's `bash_tools`.
+- **Session override**: `.set bash_tools <selectors>` updates the active session's record; tool selection overlays that record on the active agent, so the change takes effect immediately but stays scoped to the session — switching sessions (the TUI picker keeps the agent) does not carry the override into other sessions. `.set bash_tools null` disables script mode for the session; unlike `use_tools`, the clear persists as an empty selector list rather than an unset override, so a restarted worker keeps script mode off instead of falling back to the agent file's `bash_tools`.
 - **Preview status**: Script execution is under development. In this release, calling the synthesized `bash` tool returns a recoverable error saying script mode is not available yet.
 
 ```yaml
