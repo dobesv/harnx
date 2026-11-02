@@ -31,6 +31,7 @@ pub(crate) mod session_timing;
 mod session_tool_results;
 mod settings_split;
 mod tool_selection;
+pub(crate) use tool_selection::is_bash_inner_tool_allowed;
 mod tool_servers_split;
 
 pub(crate) use self::bash_declaration::BASH_TOOL_NAME;

@@ -213,7 +213,51 @@ pub struct ToolEvalContext {
     pub prepare_handoff_fn: Option<Arc<PrepareHandoffFn>>,
 }
 
+/// Required replacements when forking a context for script-originated calls.
+/// All emitters are supplied explicitly so inner calls don't inherit UI rows.
+pub struct InnerToolEvalOptions {
+    /// Base providers, excluding the script provider to prevent recursive dispatch.
+    /// The caller still enforces the inner tool-name allowlist before evaluation.
+    pub providers: Vec<Arc<dyn ToolProvider>>,
+    /// Parent invocation's `ToolCallOrigin::tool_round`, supplied at call time.
+    pub tool_round: Option<u64>,
+    /// Collect the admitted call and its parsed arguments.
+    pub emit_tool_call_fn: Arc<ToolCallEmitFn>,
+    /// Collect the completed call and its output, including recoverable errors.
+    pub emit_tool_result_fn: Arc<ToolCallEmitFn>,
+    /// Collect a blocked call without emitting a child UI row.
+    pub emit_tool_blocked_fn: Arc<ToolCallEmitFn>,
+    /// Route per-call progress into the parent call's aggregator.
+    pub emit_tool_update_fn: Arc<ToolUpdateEmitFn>,
+}
+
 impl ToolEvalContext {
+    /// Fork admission state without inheriting operator consent or UI emitters.
+    /// Hooks and work-boundary checks are shared; metadata is cloned. The outer
+    /// context is unchanged. The supplied round replaces even a stale outer round.
+    ///
+    /// Cancellation isn't stored in `ToolEvalContext`: pass the parent's existing
+    /// `AbortSignal` to [`eval_inner_tool_call`] when evaluating the fork.
+    pub fn fork_for_inner_calls(&self, options: InnerToolEvalOptions) -> Self {
+        Self {
+            work_boundary: self.work_boundary.clone(),
+            instance_id: self.instance_id.clone(),
+            tool_round: options.tool_round,
+            render: self.render.clone(),
+            providers: options.providers,
+            allowed_tool_names: self.allowed_tool_names.clone(),
+            current_agent_package: self.current_agent_package.clone(),
+            handoff_targets: self.handoff_targets.clone(),
+            emit_tool_call_fn: options.emit_tool_call_fn,
+            emit_tool_result_fn: options.emit_tool_result_fn,
+            emit_tool_blocked_fn: options.emit_tool_blocked_fn,
+            emit_tool_update_fn: options.emit_tool_update_fn,
+            confirm_tool_use_fn: Arc::new(|_, _, _| ToolUseConfirmation::Defer),
+            dispatch_hook_fn: Arc::clone(&self.dispatch_hook_fn),
+            prepare_handoff_fn: self.prepare_handoff_fn.clone(),
+        }
+    }
+
     /// What a dispatch of the call `tool_call_id` tells its provider about the
     /// transcript call it answers.
     fn origin<'a>(&self, tool_call_id: &'a str) -> ToolCallOrigin<'a> {
@@ -308,6 +352,39 @@ pub async fn eval_operator_tool_call(
     anyhow::ensure!(
         results.len() == 1,
         "operator tool evaluation returned no result"
+    );
+    Ok(results.remove(0))
+}
+
+/// Evaluate one script-originated call through the normal admission pipeline.
+/// Unlike [`eval_operator_tool_call`], this leaves the context's confirmation
+/// callback unchanged. A deferred confirmation returns [`ToolApprovalRequiredError`];
+/// fatal errors propagate, while blocks and recoverable failures return tool results.
+/// Null outputs and inline media are preserved, including any hook mutations.
+///
+/// The caller must enforce its inner-tool allowlist before calling this function.
+/// Lifecycle and progress events use the context's callbacks, so callers can
+/// collect a trace without emitting child UI rows. This does not persist a round;
+/// providers receive `ctx.tool_round` and the call's ID (assigned here if missing).
+/// The context is borrowed immutably and can be shared by concurrent callers.
+pub async fn eval_inner_tool_call(
+    ctx: &ToolEvalContext,
+    call: ToolCall,
+    abort_signal: &AbortSignal,
+) -> Result<ToolResult> {
+    let mut results = Box::pin(eval_tool_calls_inner(
+        ToolEvaluation {
+            ctx,
+            abort_signal,
+            authorization: None,
+            lossless: true,
+        },
+        vec![call],
+    ))
+    .await?;
+    anyhow::ensure!(
+        results.len() == 1,
+        "inner tool evaluation returned no result"
     );
     Ok(results.remove(0))
 }
@@ -894,6 +971,8 @@ async fn dispatch_tool_call(
 
 #[cfg(test)]
 mod tests {
+    mod inner_call;
+    mod inner_context;
     mod malformed_image;
 
     use super::*;
