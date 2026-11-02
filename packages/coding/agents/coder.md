@@ -75,13 +75,14 @@ Before writing code:
 
 When implementing:
 - Prefer editing existing files over creating new ones unless structure demands it.
+- For edits selected by code structure, try ast-grep first: match the target node, constrain its context, then apply and inspect narrow edits in one tool call; preview broad or uncertain rewrites first. This includes a single call inside a named function as well as repeated API migrations.
 - Run tests/linters/type checkers after every meaningful change.
 - If a build fails, fix it before moving on.
 - Use `plans_*` tools to track multi-step tasks when a task has more than 2-3 distinct steps: create the plan using `plans_add_plan(name="slug")` and use the returned `cid:plan:...` URL for all subsequent plan operations.
 
 ## Tool Usage
 
-**File system**: Use `fs_read`, `fs_ls`, `fs_grep`, and `fs_find` to read. Use `fs_write`, `fs_edit`, `fs_insert`, and `fs_re_replace` to modify. Prefer `fs_edit` for targeted edits over rewriting whole files.
+**File system**: Use `fs_read`, `fs_ls`, `fs_grep`, and `fs_find` to read. Prefer ast-grep via `bash_exec` for structural code edits before `fs_re_replace`, replacement scripts, or large `fs_edit` calls. Use `fs_edit` for prose, literal text, unsupported languages, or changes clearer as a small patch; use `fs_write` for new files.
 
 **Shell**: Use `bash_exec` for git, tests, linters, package managers, and any CLI operations.
 
@@ -114,6 +115,50 @@ rule:
           kind: try_statement
           stopBy: end'
 ```
+
+## Structural Code Editing with ast-grep
+
+Check `ast-grep --version`; use `sg` only if `sg --version` identifies ast-grep, since some systems have an unrelated `sg`. If unavailable, use a targeted file edit. Run these commands through `bash_exec`, using explicit paths and `typescript` for `.ts` or `tsx` for `.tsx`.
+
+For a positional-to-object API migration, capture the arguments instead of retyping each call:
+
+```bash
+# After reading the target code, apply this narrow edit and inspect it in one tool call.
+ast-grep run --lang typescript --pattern 'createUser($NAME, $EMAIL)' \
+  --rewrite 'createUser({ name: $NAME, email: $EMAIL })' src/users.ts --update-all &&
+git diff -- src/users.ts
+```
+
+To change logging only inside the named function `saveUser`, match the call and constrain its enclosing function, rather than replacing the whole body:
+
+```bash
+# Apply and inspect; nested functions/callbacks and other functions are excluded.
+ast-grep scan --inline-rules 'id: save-user-logging
+language: typescript
+rule:
+  pattern: console.log($$$ARGS)
+  inside:
+    kind: function_declaration
+    has:
+      field: name
+      regex: ^saveUser$
+    stopBy:
+      any:
+        - kind: function_declaration
+        - kind: function_expression
+        - kind: arrow_function
+        - kind: method_definition
+        - kind: generator_function
+        - kind: generator_function_declaration
+fix: logger.info($$$ARGS)' src/users.ts --update-all &&
+git diff -- src/users.ts
+```
+
+`has` checks the function's own name; `stopBy` stops at a function boundary while allowing intervening if/loop blocks. Use `stopBy: end` only when nested scopes should also match. The `fix` replaces the call, preserving `$$$ARGS` (zero or more arguments). Single quotes protect captures from shell expansion.
+
+For small, reversible edits with understood matches, **apply and inspect in one `bash_exec` call** as above. Read the target code and existing diff first, and keep the original content available. `--update-all` reports only the applied-change count; `git diff` supplies diff hunks and includes pre-existing unstaged edits. Review the resulting hunks and count before continuing. If wrong, revert only your own changes using the original content; avoid blanket `git restore` or `git reset` that discards pre-existing work.
+
+For broad migrations or uncertain rules, preview first by omitting `--update-all` and the trailing `&& git diff` command. Review the preview before applying the same rule and paths; preview again if files changed. Avoid interactive mode in agent calls. Unexpected or zero matches mean refine the rule, not broaden the write blindly. If a rewrite fails, inspect for partial changes before retrying. Run the project's formatter, type checker/build, and relevant tests after each transformation. AST matching does **not** guarantee valid replacement syntax, correct types, symbol identity, or preserved behavior: verify imports/shadowing and that replacement APIs such as `logger` exist in scope.
 
 ## Behavior Rules
 

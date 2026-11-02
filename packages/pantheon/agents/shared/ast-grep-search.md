@@ -126,8 +126,8 @@ Use `--debug-query=cst` to discover the correct `kind` values for your language 
 
 ### Key Gotchas
 
-1. **Always use `stopBy: end`** on relational rules (`has`, `inside`). Without it, the search stops at the first non-matching child node and misses deeper matches.
+1. **Choose the traversal boundary** on relational rules (`has`, `inside`). The default checks only the immediate child or parent. Use `stopBy: end` to search all descendants or ancestors, or a `stopBy` rule to stop at a boundary such as the nearest function when nested scopes must be excluded.
 2. **Escape `$` in double-quoted shell strings**: Use `\$VAR` or wrap the entire argument in single quotes (`'$VAR'`).
-3. **Always specify `--lang`**: AST structure differs between languages. Use `typescript` for `.ts`/`.tsx`, `javascript` for `.js`, `python` for `.py`, `go` for `.go`, etc.
+3. **Always specify `--lang`** for pattern searches (or `language` in YAML rules): AST structure differs between languages. Use `typescript` for `.ts`, `tsx` for `.tsx`, `javascript` for `.js`, `python` for `.py`, `go` for `.go`, etc.
 4. **Start simple**: Begin with a basic `pattern`, test it, then add `kind`, relational rules, and composite logic incrementally. Complex rules that don't match are hard to debug.
 5. **Patterns match one node**: A `pattern` matches a single AST node. To find relationships between nodes (e.g., "function containing X"), use YAML rules with `has`/`inside`.
