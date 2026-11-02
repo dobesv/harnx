@@ -13,6 +13,11 @@ use crate::{
 mod discovery;
 mod render;
 pub(crate) use discovery::unknown_command_message;
+// Shared MCP domain-error classification (PR3 round-2 review R6): the runtime
+// executor uses the same detector and text extractor the command layer
+// falls back to, so later error blocks can't be dropped in one layer and
+// kept in the other.
+pub use render::{error_text, is_mcp_error};
 
 /// The declaration subset needed for parsing and discovery. Names stay identical
 /// to direct tool names; only property names become kebab-case flags.

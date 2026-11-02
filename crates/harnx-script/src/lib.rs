@@ -7,6 +7,7 @@
 mod bashkit_backend;
 pub mod cli_map;
 pub mod commands;
+pub mod fs_attachments;
 pub mod help;
 mod schema;
 

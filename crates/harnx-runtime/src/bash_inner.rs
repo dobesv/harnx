@@ -17,9 +17,12 @@
 //! [`ToolEvalContext`] once with the parent `tool_round` (taken from the outer
 //! `ToolCallOrigin` at call time), captures the agent event sink once, and
 //! wraps every inner eval in [`with_agent_event_sink`] so events emitted from
-//! BashKit-spawned tasks reach the right session. Inner calls are not
-//! durably recorded; their trace lives only in the `bash` ToolOutput
-//! (plan decision, PR2 architecture).
+//! BashKit-spawned tasks reach the right session. Inner calls get no
+//! session-log rows of their own; the transcript records only the outer
+//! `bash` call and the inner trace lives in its ToolOutput (plan decision,
+//! PR2 architecture). The NATS invocation journal still records each inner
+//! request in full for retry and recovery — "no durable inner calls" refers
+//! to the session log, not to the journal (PR3 round-2 review R9).
 //!
 //! Progress aggregation lives in [`InnerProgressAggregator`]: it implements
 //! [`InnerCallObserver`] and turns child lifecycle into the outer `bash`
@@ -40,9 +43,14 @@ use harnx_engine::tool::{
     eval_inner_tool_call, EvaluatedInnerCall, InnerToolCallStatus, InnerToolEvalOptions,
     ToolApprovalRequiredError, ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn, WorkBoundary,
 };
+// MCP domain-error classification shared with the command layer (PR3
+// round-2 review R6): `error_text` joins every content block, so later error
+// blocks aren't dropped the way the old first-block-only copy did.
+use harnx_script::commands::{error_text, is_mcp_error};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 
+pub(crate) mod media;
 mod script_adapter;
 pub use script_adapter::ScriptInnerExecutor;
 
@@ -110,7 +118,7 @@ impl PayloadLimit {
             return Err(CallRejection {
                 bytes: request_bytes as u64,
                 reason: format!(
-                    "tool '{tool}' request is {request_bytes} bytes, above the broker's {} byte maximum payload",
+                    "tool '{tool}' request is {request_bytes} bytes, above the {} byte per-request limit (broker max_payload minus the journal envelope margin)",
                     self.max_bytes
                 ),
             });
@@ -280,6 +288,7 @@ impl InnerCallExecutor {
 
         InnerCallRun {
             ctx,
+            media: None,
             sink: current_agent_event_sink(),
             allowed: Arc::clone(&self.allowed),
             max_calls: self.max_calls,
@@ -401,6 +410,7 @@ impl InnerTraceStatus {
 /// can be shared across the tasks BashKit spawns for `&`/`wait` pipelines.
 pub struct InnerCallRun {
     ctx: ToolEvalContext,
+    media: Option<media::InnerMedia>,
     sink: Option<Arc<dyn AgentEventSink>>,
     allowed: Arc<BTreeSet<String>>,
     max_calls: usize,
@@ -521,6 +531,9 @@ impl InnerCallRun {
             None => eval_inner_tool_call(&self.ctx, call, abort_signal).await,
         };
 
+        // Keep the concurrency permit and cancellation guard until durable
+        // media writes finish, so a completed command can read its path at once.
+        let evaluated = self.prepare_media(evaluated).await;
         let (outcome, status, bytes) = classify_evaluation(tool, evaluated);
 
         // Normal completion: disarm the guard, then record the final row.
@@ -624,10 +637,15 @@ impl InnerCallRun {
         // The retained window keeps only the newest entries, so the first
         // failure of the run can age out of the trace entirely (PR3 review
         // F13). Remember it separately; `failed_call` reports it even when
-        // its row is gone.
+        // its row is gone. Concurrent failures can complete out of order,
+        // so keep the one with the lowest `start_seq`, not the first to
+        // finish recording (PR3 round-2 review R10).
         if !matches!(status, InnerTraceStatus::Ok | InnerTraceStatus::Cancelled) {
             let mut first_failed = self.first_failed.lock().expect("first failure lock");
-            if first_failed.is_none() {
+            let replace = first_failed
+                .as_ref()
+                .is_none_or(|existing| entry.start_seq < existing.start_seq);
+            if replace {
                 *first_failed = Some(entry.clone());
             }
         }
@@ -849,41 +867,6 @@ fn value_shape(value: &Value) -> String {
     }
 }
 
-/// MCP domain error: a successful transport whose tool reported failure
-/// through `content` blocks plus `isError: true` (the equivalent of HTTP 200
-/// with an error body). Mirrors `harnx_script::commands::render::is_mcp_error`,
-/// which is `pub(super)` and unreachable from this crate (PR3 review F27).
-/// A raw `isError: true` key without MCP content blocks is a tool's own
-/// JSON, not a domain error.
-fn is_mcp_domain_error(output: &Value) -> bool {
-    output.get("content").is_some_and(Value::is_array)
-        && output.get("isError").and_then(Value::as_bool) == Some(true)
-}
-
-/// Human-readable message for an MCP domain error: the first text content
-/// block, then the `error` field, then a generic default. Mirrors
-/// `harnx_script::commands::render::error_text`.
-fn mcp_domain_error_text(output: &Value) -> String {
-    let text = output
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|blocks| {
-            blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .map(str::trim)
-                .find(|text| !text.is_empty())
-        });
-    if let Some(text) = text {
-        return text.to_string();
-    }
-    output
-        .get("error")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| "tool reported an error".to_string())
-}
-
 fn suggest_tool_name<'a>(name: &str, allowed: &'a BTreeSet<String>) -> Option<&'a str> {
     let name_chars: Vec<char> = name.chars().collect();
     allowed
@@ -984,12 +967,12 @@ fn classify_output(
                 InnerTraceStatus::ToolError,
             )
         }
-        InnerToolCallStatus::Ok if is_mcp_domain_error(&result.output) => {
+        InnerToolCallStatus::Ok if is_mcp_error(&result.output) => {
             // Successful transport, but MCP reported failure. Keep the trace
             // and failed_call consistent with the command layer.
             (
                 InnerOutcome::ToolError {
-                    message: mcp_domain_error_text(&result.output),
+                    message: error_text(&result.output),
                     partial_result: None,
                 },
                 InnerTraceStatus::ToolError,
@@ -1039,7 +1022,7 @@ mod tests {
     use harnx_core::tool::{ToolCallOrigin, ToolError, ToolProgress, ToolProviderOutput};
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     type HookEvents = Arc<Mutex<Vec<HookEvent>>>;
 
@@ -1180,6 +1163,9 @@ mod tests {
             message: &'static str,
             partial: Option<Value>,
         },
+        /// Fails recoverably after a delay, for tests that need failures
+        /// completing out of start order.
+        DelayedRecoverable(Duration, &'static str),
         NoticeThenOk(String, Value),
         /// Terminal provider failure: maps to `InnerOutcome::Fatal` (C14).
         Fatal(&'static str),
@@ -1214,6 +1200,10 @@ mod tests {
                         anyhow::anyhow!(*message),
                         partial.clone().unwrap_or(Value::Null),
                     )))
+                }
+                Behavior::DelayedRecoverable(delay, message) => {
+                    tokio::time::sleep(*delay).await;
+                    Err(ToolError::Recoverable(anyhow::anyhow!(*message)))
                 }
                 Behavior::NoticeThenOk(notice, value) => {
                     harnx_core::sink::emit_agent_event(AgentEvent::Notice(NoticeEvent::Info(
@@ -2053,27 +2043,33 @@ mod tests {
         assert_eq!(run.trace()[0].status, InnerTraceStatus::ToolError);
     }
 
+    /// PR3 round-2 review R6: the MCP domain-error helpers are exported from
+    /// harnx-script and shared with the command layer. Later error blocks
+    /// must all reach the message — the old runtime copy kept only the first.
     #[test]
     fn mcp_domain_error_helpers() {
         let error = json!({
-            "content": [{"type": "text", "text": "boom"}],
+            "content": [
+                {"type": "text", "text": "boom"},
+                {"type": "text", "text": "and this too"},
+            ],
             "isError": true,
         });
-        assert!(is_mcp_domain_error(&error));
-        assert_eq!(mcp_domain_error_text(&error), "boom");
+        assert!(is_mcp_error(&error));
+        assert_eq!(error_text(&error), "boom\nand this too");
 
         // Same shape, missing isError: a successful call.
-        assert!(!is_mcp_domain_error(&json!({
+        assert!(!is_mcp_error(&json!({
             "content": [{"type": "text", "text": "boom"}],
         })));
         // A tool whose raw JSON happens to carry `isError: true` without
         // MCP content blocks must not be mistaken for a domain error.
-        assert!(!is_mcp_domain_error(&json!({"isError": true})));
+        assert!(!is_mcp_error(&json!({"isError": true})));
         // No text content: fall back to the error field, then a default.
         let textless = json!({"content": [], "isError": true, "error": "from error field"});
-        assert_eq!(mcp_domain_error_text(&textless), "from error field");
+        assert_eq!(error_text(&textless), "from error field");
         let bare = json!({"content": [], "isError": true});
-        assert_eq!(mcp_domain_error_text(&bare), "tool reported an error");
+        assert_eq!(error_text(&bare), "tool reported an error");
     }
 
     // ================================================================
@@ -2509,6 +2505,70 @@ mod tests {
             .expect("first failure survives retention");
         assert_eq!(first.name, "tool_b");
         assert_eq!(first.status, InnerTraceStatus::Rejected);
+    }
+
+    /// PR3 round-2 review R10: concurrent failures complete out of order, but
+    /// `first_failed` must report the call that started first, not the one
+    /// that happened to finish recording first.
+    #[tokio::test]
+    async fn first_failure_is_the_lowest_start_seq_under_concurrent_failures() {
+        let slow_provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: Some(HashSet::from(["slow_fail"])),
+            progress_title: None,
+            behavior: Behavior::DelayedRecoverable(Duration::from_millis(80), "slow failure"),
+        });
+        let fast_provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: Some(HashSet::from(["fast_fail"])),
+            progress_title: None,
+            behavior: Behavior::DelayedRecoverable(Duration::from_millis(5), "fast failure"),
+        });
+        let providers: Vec<Arc<dyn ToolProvider>> =
+            vec![slow_provider.clone(), fast_provider.clone()];
+        let (ctx, _hooks) = outer_context(providers.clone(), HookControl::Continue);
+        let executor = executor_with(&["slow_fail", "fast_fail"], providers, (8, 100));
+        let run = Arc::new(executor.begin_run(&ctx, PARENT_ROUND, None));
+        let abort = create_abort_signal();
+
+        // Start the slow failure first so it owns the lower `start_seq`.
+        // Wait until it is actually dispatched (its provider logged the call)
+        // before starting the fast one, so the start order is deterministic;
+        // the fast failure still finishes and records first.
+        let slow_provider_log = slow_provider.log.clone();
+        let slow = {
+            let run = run.clone();
+            let abort = abort.clone();
+            tokio::spawn(async move { run.call("slow_fail", json!({}), &abort).await })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slow_provider_log.count() == 0 {
+            assert!(Instant::now() < deadline, "slow failure never dispatched");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let fast = {
+            let run = run.clone();
+            let abort = abort.clone();
+            tokio::spawn(async move { run.call("fast_fail", json!({}), &abort).await })
+        };
+        assert!(matches!(
+            slow.await.expect("slow call task"),
+            InnerOutcome::ToolError { .. }
+        ));
+        assert!(matches!(
+            fast.await.expect("fast call task"),
+            InnerOutcome::ToolError { .. }
+        ));
+
+        let first = run.first_failed().expect("a failure was recorded");
+        assert_eq!(first.name, "slow_fail");
+        assert_eq!(first.start_seq, 0);
+        // The fast failure finished first, so completion order alone would
+        // have reported it; the recorded winner is the lower start order.
+        assert!(run
+            .trace()
+            .iter()
+            .any(|entry| entry.name == "fast_fail" && entry.start_seq == 1));
     }
 
     #[tokio::test]

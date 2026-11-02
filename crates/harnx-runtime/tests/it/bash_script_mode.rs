@@ -355,3 +355,106 @@ async fn inactive_script_mode_leaves_bash_replay_to_other_providers() -> Result<
     );
     Ok(())
 }
+
+/// PR3 round-2 review R4: the fall-through above must actually reach NATS
+/// journal recovery. Seeds the journal the way a completed tool-server-native
+/// `bash` call leaves it — one row under (session, round, tool-call id) with
+/// its final reply — and asserts replay hands back the saved reply instead
+/// of a synthetic interruption.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<()> {
+    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(TOKEN.to_string()),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let _env = EnvGuard::install(&[
+        (HARNX_NATS_URL_ENV, server.url()),
+        (HARNX_NATS_TOKEN_ENV, TOKEN),
+    ]);
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(server.url())
+        .await?;
+
+    // Seed the invocation journal exactly like a finished external call.
+    let request = harnx_toolset::ToolRequest {
+        run_context: None,
+        replay: None,
+        call_id: "wire-1".to_string(),
+        operation_id: "wire-1".to_string(),
+        tool: "bash".to_string(),
+        args: json!({"command": "true"}),
+        parent_session_id: Some("session-1".to_string()),
+        parent_agent: None,
+        parent_local_session_id: None,
+        tool_call_id: Some("bash-1".to_string()),
+        capabilities: Default::default(),
+        tool_round: Some(1),
+    };
+    let journal = harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
+        &async_nats::jetstream::new(client.clone()),
+        1,
+    )
+    .await?;
+    journal
+        .record(&request, ("bash", "external-scope", "external-server"))
+        .await?;
+    journal
+        .complete(
+            &request,
+            harnx_toolset::ToolReply {
+                call_id: "wire-1".to_string(),
+                result: Ok(json!({"native": true})),
+                final_progress: None,
+            },
+        )
+        .await?;
+
+    // No tool servers: script mode stays inactive, so the bare `bash` name
+    // belongs to the journaled external tool.
+    let config = script_mode_config();
+    assert!(
+        !config.read().bash_tools_active(),
+        "no registered declarations means script mode is inactive"
+    );
+    let slot = Arc::new(BashEvalContextSlot::default());
+    let instance_id = ServerScope::new();
+    let mut params = BuildToolEvalContextParams::new(&config, &instance_id);
+    params.bash_context_slot = Some(slot.clone());
+    let ctx = Arc::new(harnx_runtime::tool::build_tool_eval_context(params).await);
+    slot.set(&ctx);
+    let call = ToolCall::new(
+        "bash".to_string(),
+        json!({"script": "true"}),
+        Some("bash-1".to_string()),
+        None,
+    );
+    let abort = create_abort_signal();
+    let replay = harnx_engine::tool::replay_tool_call(
+        &ctx,
+        harnx_core::tool::ToolReplay {
+            session_id: "session-1",
+            tool_round: 1,
+            call: &call,
+            worker_id: Some("worker-2"),
+            fence_token: None,
+            authorization: None,
+        },
+        &abort,
+    )
+    .await
+    .expect("replay evaluates");
+    let result =
+        replay.expect("inactive script mode must let the journal answer for the external bash");
+    assert_eq!(
+        result.output,
+        json!({"native": true}),
+        "the external tool's saved reply must be recovered, not a synthetic interruption: {}",
+        result.output
+    );
+    Ok(())
+}

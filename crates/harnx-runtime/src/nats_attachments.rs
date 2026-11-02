@@ -160,7 +160,7 @@ pub async fn get_session_attachment(
     get_media(&store, &cid_url).await
 }
 
-fn parse_data_url(data_url: &str) -> Result<(String, Vec<u8>)> {
+pub(crate) fn parse_data_url(data_url: &str) -> Result<(String, Vec<u8>)> {
     let rest = data_url
         .strip_prefix("data:")
         .context("attachment must be a data: URI")?;
@@ -172,19 +172,19 @@ fn parse_data_url(data_url: &str) -> Result<(String, Vec<u8>)> {
     Ok((mime_type.to_string(), bytes))
 }
 
-struct ExternalizedAttachment {
-    cid: String,
-    mime_type: String,
-    size: usize,
+pub(crate) struct ExternalizedAttachment {
+    pub(crate) cid: String,
+    pub(crate) mime_type: String,
+    pub(crate) size: usize,
 }
 
 impl ExternalizedAttachment {
-    fn marker(&self) -> String {
+    pub(crate) fn marker(&self) -> String {
         crate::config::attachment_marker(&self.cid, &self.mime_type, self.size)
     }
 }
 
-async fn externalize_data_url(
+pub(crate) async fn externalize_data_url(
     store: &object_store::ObjectStore,
     session: &SessionRef,
     data_url: &str,

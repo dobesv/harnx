@@ -1,0 +1,189 @@
+use std::collections::{HashMap, HashSet};
+
+use super::*;
+use crate::bash_provider::{BashEvalContextSlot, BashProvider};
+use base64::Engine;
+use harnx_blob_store::{
+    media::{ensure_attachments_bucket, get_media, put_media},
+    media_cid_url,
+};
+use harnx_core::{
+    abort::create_abort_signal,
+    cid_url::SessionRef,
+    hooks::{HookOutcome, HookResult, HookResultControl},
+    instance::ServerScope,
+    tool::{ToolError, ToolProvider},
+};
+use harnx_engine::tool::ToolEvalContext;
+use serde_json::{json, Value};
+
+const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const PNG_BASE64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
+
+fn provider(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> (BashProvider, Arc<ToolEvalContext>) {
+    let slot = BashEvalContextSlot::new();
+    let provider = BashProvider::new(crate::bash_provider::BashProviderConfig {
+        active: true,
+        inner_declarations: vec![],
+        base_providers: vec![],
+        slot: Some(slot.clone()),
+        payload_limit: None,
+    })
+    .with_attachment_fetcher(fetcher);
+    let ctx = Arc::new(ToolEvalContext {
+        work_boundary: None,
+        instance_id: ServerScope::new(),
+        tool_round: Some(1),
+        render: None,
+        providers: vec![],
+        allowed_tool_names: HashSet::new(),
+        current_agent_package: None,
+        handoff_targets: HashMap::new(),
+        emit_tool_call_fn: Arc::new(|_, _| {}),
+        emit_tool_result_fn: Arc::new(|_, _| {}),
+        emit_tool_blocked_fn: Arc::new(|_, _| {}),
+        emit_tool_update_fn: Arc::new(|_, _| {}),
+        confirm_tool_use_fn: Arc::new(|_, _, _| panic!("no tool calls expected")),
+        dispatch_hook_fn: Arc::new(|_| {
+            Box::pin(async {
+                HookOutcome {
+                    control: HookResultControl::Continue,
+                    result: HookResult::default(),
+                }
+            })
+        }),
+        prepare_handoff_fn: None,
+    });
+    slot.set(&ctx);
+    (provider, ctx)
+}
+
+async fn run(provider: &BashProvider, script: String) -> Value {
+    match provider
+        .call_tool("bash", json!({"script": script}), &create_abort_signal())
+        .await
+    {
+        Ok(result) => result.value,
+        Err(ToolError::Recoverable(error)) => harnx_core::partial_result::partial_result_of(&error)
+            .unwrap_or_else(|| panic!("missing partial output: {error:#}"))
+            .clone(),
+        Err(ToolError::Fatal(error)) => panic!("unexpected fatal provider error: {error:#}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nats_attachment_mount_reads_binary_is_readonly_and_resets_cache_per_run(
+) -> anyhow::Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let store = ensure_attachments_bucket(&js, 1).await?;
+    // Cross-session explicit references work just as attachment_read does. The
+    // percent-encoded namespaced agent remains encoded in the VFS path.
+    let url = media_cid_url(
+        &SessionRef::new(Some("pantheon/atlas".into()), "shared1".into())?,
+        HASH,
+    );
+    let png = base64::engine::general_purpose::STANDARD.decode(PNG_BASE64)?;
+    put_media(&store, &url, &png, "image/png").await?;
+    let (provider, _ctx) = provider(Some(fetcher(js)));
+    let path = harnx_script::fs_attachments::attachment_path(&url.to_string())?;
+    let result = run(
+        &provider,
+        format!(
+            "ls /attachments; base64 -w0 '{}' | wc -c; base64 -w0 '{}'; echo",
+            path.display(),
+            path.display()
+        ),
+    )
+    .await;
+    assert_eq!(result["exit_code"], 0, "{result}");
+    assert_eq!(
+        result["stdout"],
+        format!("{}\n{PNG_BASE64}\n", PNG_BASE64.len())
+    );
+    let result = run(&provider, format!("echo bad > '{}'", path.display())).await;
+    assert_eq!(result["exit_code"], 1);
+    assert!(
+        result["stderr"].as_str().unwrap().contains("read-only"),
+        "{result}"
+    );
+    assert_eq!(get_media(&store, &url).await?.unwrap().0, png);
+    store.delete(url.kv_key()).await?;
+    let result = run(&provider, format!("cat '{}'", path.display())).await;
+    assert_ne!(result["exit_code"], 0);
+    assert!(
+        result["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("attachment not found"),
+        "{result}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nats_fetcher_validates_cids_preserves_missing_errors_and_bounds_blob_download(
+) -> anyhow::Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let fetcher = fetcher(js.clone());
+    for cid in [
+        "cid:media:agent/session/not-a-hash",
+        "cid:plan:agent/session/plan",
+        "cid:media:agent/../aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        assert_eq!(
+            fetcher.fetch(cid, 100).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    let url = media_cid_url(
+        &SessionRef::new(Some("agent".into()), "attach1".into())?,
+        HASH,
+    );
+    assert_eq!(
+        fetcher.fetch(&url.to_string(), 3).await.unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(
+        optional_attachments_bucket(&js).await?.is_none(),
+        "reads must not provision storage"
+    );
+    let store = ensure_attachments_bucket(&js, 1).await?;
+    put_media(&store, &url, &[0, 255, 1], "application/octet-stream").await?;
+    assert!(fetcher
+        .fetch(&url.to_string(), 2)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("blob too large: 3 bytes exceeds limit of 2 bytes"));
+    assert_eq!(fetcher.fetch(&url.to_string(), 3).await?, [0, 255, 1]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mount_is_empty_and_fails_clearly_without_a_broker() {
+    let (provider, _ctx) = provider(None);
+    let result = run(&provider, "ls /attachments".into()).await;
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["stdout"], "");
+    let result = run(
+        &provider,
+        format!("cat /attachments/cid:media:agent/attach1/{HASH}"),
+    )
+    .await;
+    assert!(
+        result["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("attachment storage unavailable"),
+        "{result}"
+    );
+}

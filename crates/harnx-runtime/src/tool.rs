@@ -572,6 +572,10 @@ fn build_tool_providers(
     let payload_limit = nats_provider
         .as_ref()
         .map(|nats| nats.script_payload_limit());
+    let attachment_fetcher = nats_provider
+        .as_ref()
+        .map(|nats| nats.script_attachment_fetcher());
+    let media_store = nats_provider.as_ref().map(|nats| nats.script_media_store());
     if let Some(nats) = nats_provider {
         base_providers.push(nats as Arc<dyn ToolProvider>);
     }
@@ -591,15 +595,17 @@ fn build_tool_providers(
     // so recursive `bash` dispatch is impossible.
     let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
     let active = config.read().bash_tools_active();
-    providers.push(Arc::new(crate::bash_provider::BashProvider::new(
-        crate::bash_provider::BashProviderConfig {
+    providers.push(Arc::new(
+        crate::bash_provider::BashProvider::new(crate::bash_provider::BashProviderConfig {
             active,
             inner_declarations: config.read().bash_inner_tool_declarations(),
             base_providers: base_providers.clone(),
             slot: bash_context_slot,
             payload_limit,
-        },
-    )) as Arc<dyn ToolProvider>);
+        })
+        .with_attachment_fetcher(attachment_fetcher)
+        .with_media_store(media_store),
+    ) as Arc<dyn ToolProvider>);
     providers.extend(base_providers);
     providers
 }

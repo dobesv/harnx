@@ -100,6 +100,18 @@ pub async fn get_media(
     get_media_with_limit(store, url, None).await
 }
 
+/// Read at most `max_bytes` of a media object. Check metadata before download and
+/// bound the stream too, so a stale or dishonest size cannot cause an unbounded
+/// allocation. Oversized objects fail without returning a truncated payload.
+pub async fn get_media_bounded(
+    store: &object_store::ObjectStore,
+    url: &CidUrl,
+    max_bytes: u64,
+) -> Result<Option<(Vec<u8>, String)>> {
+    let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    get_media_with_limit(store, url, Some(max_bytes)).await
+}
+
 pub(crate) async fn get_media_with_limit(
     store: &object_store::ObjectStore,
     url: &CidUrl,
