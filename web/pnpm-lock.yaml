@@ -188,8 +188,8 @@ importers:
         specifier: 0.14.24
         version: 0.14.24(@assistant-ui/react@0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       '@assistant-ui/react-syntax-highlighter':
-        specifier: 0.14.6
-        version: 0.14.6(@assistant-ui/react-markdown@0.14.24(@assistant-ui/react@0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@assistant-ui/react@0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-syntax-highlighter@15.5.13)(@types/react@19.3.0)(react-syntax-highlighter@16.1.2(react@19.3.1))(react@19.3.1)
+        specifier: 0.14.7
+        version: 0.14.7(@assistant-ui/react-markdown@0.14.24(@assistant-ui/react@0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@assistant-ui/react@0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-syntax-highlighter@15.5.13)(@types/react@19.3.0)(react-syntax-highlighter@16.1.2(react@19.3.1))(react@19.3.1)
       '@radix-ui/react-dropdown-menu':
         specifier: 2.1.24
         version: 2.1.24(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
@@ -334,8 +334,8 @@ packages:
       '@types/react':
         optional: true
 
-  '@assistant-ui/react-syntax-highlighter@0.14.6':
-    resolution: {integrity: sha512-ZzSmBCbzAt/IcCzb45TY6VXTHXoY1/T9hD1jsqF9CCzxuhpbcgjWj6ajEcbJ+cylorfxDoAKE6EABp00Q+izmg==}
+  '@assistant-ui/react-syntax-highlighter@0.14.7':
+    resolution: {integrity: sha512-EWTWSBdBfhy0xUsdbvhL8fwPq7MqEZaWSBLLKVE0Aw5jlyPEbj7cIrEsWA27KfbhhBeyOmYVXJbGyChk5LjeqA==}
     peerDependencies:
       '@assistant-ui/react': ^0.15.0
       '@assistant-ui/react-markdown': ^0.14.8
@@ -3134,7 +3134,7 @@ snapshots:
       - react-dom
       - supports-color
 
-  '@assistant-ui/react-syntax-highlighter@0.14.6(@assistant-ui/react-markdown@0.14.24(@assistant-ui/react@0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@assistant-ui/react@0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-syntax-highlighter@15.5.13)(@types/react@19.3.0)(react-syntax-highlighter@16.1.2(react@19.3.1))(react@19.3.1)':
+  '@assistant-ui/react-syntax-highlighter@0.14.7(@assistant-ui/react-markdown@0.14.24(@assistant-ui/react@0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@assistant-ui/react@0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-syntax-highlighter@15.5.13)(@types/react@19.3.0)(react-syntax-highlighter@16.1.2(react@19.3.1))(react@19.3.1)':
     dependencies:
       '@assistant-ui/react': 0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       '@assistant-ui/react-markdown': 0.14.24(@assistant-ui/react@0.15.32(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
