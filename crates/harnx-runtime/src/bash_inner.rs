@@ -379,40 +379,8 @@ impl InnerCallRun {
             args_summary: summarize_args(&args),
         };
 
-        // Control tools stay at the model boundary even if a malformed
-        // allowlist contains them. The forked context still shares
-        // `prepare_handoff_fn` and the handoff dispatch path, so this check
-        // is what actually keeps handoffs out of scripts.
-        if !crate::config::is_bash_inner_tool_allowed(tool) {
-            let reason =
-                format!("tool '{tool}' cannot be called from a bash script (control tool)");
-            return self.reject(start, 0, reason);
-        }
-        if !self.allowed.contains(tool) {
-            let reason = match suggest_tool_name(tool, &self.allowed) {
-                Some(suggestion) => {
-                    format!("tool '{tool}' is not in bash_tools; did you mean '{suggestion}'?")
-                }
-                None => format!("tool '{tool}' is not in bash_tools"),
-            };
-            return self.reject(start, 0, reason);
-        }
-        if let Some(limit) = &self.payload_limit {
-            let request_bytes = (limit.request_size)(tool, &args);
-            if request_bytes > limit.max_bytes {
-                let reason = format!(
-                    "tool '{tool}' request is {request_bytes} bytes, above the broker's {} byte maximum payload",
-                    limit.max_bytes
-                );
-                return self.reject(start, request_bytes as u64, reason);
-            }
-        }
-        if !self.reserve_budget() {
-            let reason = format!(
-                "bash script exceeded its limit of {} inner calls",
-                self.max_calls
-            );
-            return self.reject(start, 0, reason);
+        if let Err(rejection) = self.preflight(tool, &args) {
+            return self.reject(start, rejection.bytes, rejection.reason);
         }
 
         let _permit = self
@@ -434,80 +402,63 @@ impl InnerCallRun {
             None => eval_inner_tool_call(&self.ctx, call, abort_signal).await,
         };
 
-        let (outcome, status, bytes) = match evaluated {
-            Ok(result) => {
-                let bytes = serialized_size(&result.output);
-                if result
-                    .output
-                    .get("blocked_by_hook")
-                    .and_then(Value::as_bool)
-                    == Some(true)
-                {
-                    let reason = result
-                        .output
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("blocked by hook")
-                        .to_string();
-                    (
-                        InnerOutcome::Blocked { reason },
-                        InnerTraceStatus::Blocked,
-                        bytes,
-                    )
-                } else if result.output.get("is_error").and_then(Value::as_bool) == Some(true) {
-                    let message = result
-                        .output
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool error")
-                        .to_string();
-                    let partial_result = result.output.get("partial_result").cloned();
-                    (
-                        InnerOutcome::ToolError {
-                            message,
-                            partial_result,
-                        },
-                        InnerTraceStatus::ToolError,
-                        bytes,
-                    )
-                } else {
-                    (
-                        InnerOutcome::Ok {
-                            result: Box::new(result),
-                        },
-                        InnerTraceStatus::Ok,
-                        bytes,
-                    )
-                }
-            }
-            Err(error) => {
-                if let Some(approval) = error.downcast_ref::<ToolApprovalRequiredError>() {
-                    let reason = approval
-                        .deferred_calls()
-                        .first()
-                        .and_then(|deferred| deferred.reason.clone());
-                    (
-                        InnerOutcome::ApprovalRequired {
-                            tool: tool.to_string(),
-                            reason,
-                        },
-                        InnerTraceStatus::ApprovalRequired,
-                        0,
-                    )
-                } else {
-                    (
-                        InnerOutcome::Fatal {
-                            message: format!("{error:#}"),
-                        },
-                        InnerTraceStatus::Fatal,
-                        0,
-                    )
-                }
-            }
-        };
+        let (outcome, status, bytes) = classify_evaluation(tool, evaluated);
 
         self.record_trace(start, status, bytes);
         outcome
+    }
+
+    fn preflight(&self, tool: &str, args: &Value) -> Result<(), CallRejection> {
+        if let Some(reason) = self.tool_rejection_reason(tool) {
+            return Err(CallRejection { bytes: 0, reason });
+        }
+        self.check_payload_size(tool, args)?;
+        if !self.reserve_budget() {
+            return Err(CallRejection {
+                bytes: 0,
+                reason: format!(
+                    "bash script exceeded its limit of {} inner calls",
+                    self.max_calls
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn tool_rejection_reason(&self, tool: &str) -> Option<String> {
+        // Control tools stay at the model boundary even if a malformed
+        // allowlist contains them. The fork still shares the handoff callback.
+        if !crate::config::is_bash_inner_tool_allowed(tool) {
+            return Some(format!(
+                "tool '{tool}' cannot be called from a bash script (control tool)"
+            ));
+        }
+        if self.allowed.contains(tool) {
+            return None;
+        }
+        Some(match suggest_tool_name(tool, &self.allowed) {
+            Some(suggestion) => {
+                format!("tool '{tool}' is not in bash_tools; did you mean '{suggestion}'?")
+            }
+            None => format!("tool '{tool}' is not in bash_tools"),
+        })
+    }
+
+    fn check_payload_size(&self, tool: &str, args: &Value) -> Result<(), CallRejection> {
+        let Some(limit) = &self.payload_limit else {
+            return Ok(());
+        };
+        let request_bytes = (limit.request_size)(tool, args);
+        if request_bytes > limit.max_bytes {
+            return Err(CallRejection {
+                bytes: request_bytes as u64,
+                reason: format!(
+                    "tool '{tool}' request is {request_bytes} bytes, above the broker's {} byte maximum payload",
+                    limit.max_bytes
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Count the call against the budget without overshooting under races.
@@ -747,6 +698,89 @@ fn edit_distance(a: &[char], b: &str) -> usize {
     previous[b_chars.len()]
 }
 
+struct CallRejection {
+    bytes: u64,
+    reason: String,
+}
+
+fn classify_evaluation(
+    tool: &str,
+    evaluated: anyhow::Result<ToolResult>,
+) -> (InnerOutcome, InnerTraceStatus, u64) {
+    match evaluated {
+        Ok(result) => {
+            let bytes = serialized_size(&result.output);
+            let (outcome, status) = classify_output(result);
+            (outcome, status, bytes)
+        }
+        Err(error) => {
+            let (outcome, status) = classify_error(tool, error);
+            (outcome, status, 0)
+        }
+    }
+}
+
+fn classify_output(result: ToolResult) -> (InnerOutcome, InnerTraceStatus) {
+    if result
+        .output
+        .get("blocked_by_hook")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        let reason = result
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("blocked by hook")
+            .to_string();
+        return (InnerOutcome::Blocked { reason }, InnerTraceStatus::Blocked);
+    }
+    if result.output.get("is_error").and_then(Value::as_bool) == Some(true) {
+        let message = result
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("tool error")
+            .to_string();
+        let partial_result = result.output.get("partial_result").cloned();
+        return (
+            InnerOutcome::ToolError {
+                message,
+                partial_result,
+            },
+            InnerTraceStatus::ToolError,
+        );
+    }
+    (
+        InnerOutcome::Ok {
+            result: Box::new(result),
+        },
+        InnerTraceStatus::Ok,
+    )
+}
+
+fn classify_error(tool: &str, error: anyhow::Error) -> (InnerOutcome, InnerTraceStatus) {
+    if let Some(approval) = error.downcast_ref::<ToolApprovalRequiredError>() {
+        let reason = approval
+            .deferred_calls()
+            .first()
+            .and_then(|deferred| deferred.reason.clone());
+        return (
+            InnerOutcome::ApprovalRequired {
+                tool: tool.to_string(),
+                reason,
+            },
+            InnerTraceStatus::ApprovalRequired,
+        );
+    }
+    (
+        InnerOutcome::Fatal {
+            message: format!("{error:#}"),
+        },
+        InnerTraceStatus::Fatal,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,8 +882,21 @@ mod tests {
         max_concurrent: AtomicUsize,
     }
 
+    struct InFlightDispatch<'a>(&'a DispatchLog);
+
+    impl Drop for InFlightDispatch<'_> {
+        fn drop(&mut self) {
+            self.0.concurrent.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     impl DispatchLog {
-        fn record(&self, tool: &str, args: &Value, call_id: Option<&str>, tool_round: Option<u64>) {
+        fn record(
+            &self,
+            tool: &str,
+            args: &Value,
+            origin: ToolCallOrigin<'_>,
+        ) -> InFlightDispatch<'_> {
             let now_concurrent = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_concurrent
                 .fetch_max(now_concurrent, Ordering::SeqCst);
@@ -859,10 +906,10 @@ mod tests {
                 .push(RecordedDispatch {
                     tool: tool.to_string(),
                     args: args.clone(),
-                    call_id: call_id.map(str::to_string),
-                    tool_round,
+                    call_id: origin.tool_call_id.map(str::to_string),
+                    tool_round: origin.tool_round,
                 });
-            self.concurrent.fetch_sub(1, Ordering::SeqCst);
+            InFlightDispatch(self)
         }
 
         fn count(&self) -> usize {
@@ -940,12 +987,7 @@ mod tests {
             _abort: &AbortSignal,
             progress: Arc<dyn ToolProgress>,
         ) -> Result<ToolProviderOutput, ToolError> {
-            self.log.record(
-                tool_name,
-                &arguments,
-                origin.tool_call_id,
-                origin.tool_round,
-            );
+            let _in_flight = self.log.record(tool_name, &arguments, origin);
             if let Some(title) = &self.progress_title {
                 progress.update(ToolUpdatePatch {
                     title: Some(title.clone()),
@@ -1088,12 +1130,12 @@ mod tests {
 
         let trace = run.trace();
         assert_eq!(trace.len(), 2);
-        assert_eq!(trace[0].name, "slow_tool");
-        assert_eq!(trace[0].start_seq, 0);
-        assert_eq!(trace[1].name, "fast_tool");
-        assert_eq!(trace[1].start_seq, 1);
-        assert_eq!(trace[0].status, InnerTraceStatus::Ok);
-        assert_eq!(trace[1].status, InnerTraceStatus::Ok);
+        for (entry, (name, seq)) in trace.iter().zip([("slow_tool", 0), ("fast_tool", 1)]) {
+            assert_eq!(
+                (entry.name.as_str(), entry.start_seq, entry.status),
+                (name, seq, InnerTraceStatus::Ok)
+            );
+        }
     }
 
     #[tokio::test]
@@ -1243,14 +1285,9 @@ mod tests {
             let abort = create_abort_signal();
             tokio::spawn(async move { run.call("tool_b", json!({}), &abort).await })
         };
-        assert!(matches!(
-            task_a.await.expect("call a"),
-            InnerOutcome::Ok { .. }
-        ));
-        assert!(matches!(
-            task_b.await.expect("call b"),
-            InnerOutcome::Ok { .. }
-        ));
+        for (name, task) in [("call a", task_a), ("call b", task_b)] {
+            assert!(matches!(task.await.expect(name), InnerOutcome::Ok { .. }));
+        }
 
         assert_eq!(
             sink_a.events.lock().expect("sink lock").clone(),
@@ -1492,6 +1529,12 @@ mod tests {
         assert_eq!(run.trace()[0].bytes, 4);
     }
 
+    fn assert_dispatch_origin(call: &RecordedDispatch, id: &str) {
+        assert_eq!((call.tool.as_str(), &call.args), ("tool_a", &json!({})));
+        assert_eq!(call.call_id.as_deref(), Some(id));
+        assert_eq!(call.tool_round, PARENT_ROUND);
+    }
+
     #[tokio::test]
     async fn child_call_ids_are_unique_and_parent_round_propagates() {
         let log = Arc::new(DispatchLog::default());
@@ -1523,12 +1566,9 @@ mod tests {
 
         let calls = log.calls.lock().expect("dispatch log lock");
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].tool, "tool_a");
-        assert_eq!(calls[0].args, json!({}));
-        assert_eq!(calls[0].call_id.as_deref(), Some(first_id.as_str()));
-        assert_eq!(calls[1].call_id.as_deref(), Some(second_id.as_str()));
-        assert_eq!(calls[0].tool_round, PARENT_ROUND);
-        assert_eq!(calls[1].tool_round, PARENT_ROUND);
+        for (call, id) in calls.iter().zip([&first_id, &second_id]) {
+            assert_dispatch_origin(call, id);
+        }
         drop(calls);
 
         let trace = run.trace();
@@ -1662,14 +1702,14 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        assert_eq!(suggest_tool_name("fs_readd", &allowed), Some("fs_read"));
-        assert_eq!(
-            suggest_tool_name("grep_sarch", &allowed),
-            Some("grep_search")
-        );
-        // Distance 3: no suggestion.
-        assert_eq!(suggest_tool_name("fs_redddd", &allowed), None);
-        assert_eq!(suggest_tool_name("zzz", &allowed), None);
+        for (name, expected) in [
+            ("fs_readd", Some("fs_read")),
+            ("grep_sarch", Some("grep_search")),
+            ("fs_redddd", None), // Distance 3: no suggestion.
+            ("zzz", None),
+        ] {
+            assert_eq!(suggest_tool_name(name, &allowed), expected, "{name}");
+        }
     }
 
     #[test]
@@ -1749,29 +1789,23 @@ mod tests {
         ));
 
         let patches = progress.patches.lock().expect("patch log lock").clone();
-        assert_eq!(patches.len(), 4);
-        assert_eq!(
-            patches[0].title.as_deref(),
-            Some("bash: fs_read (0 done, 1 running)")
-        );
-        assert!(patches[0].markdown.is_none(), "no trace line yet");
-        assert_eq!(
-            patches[1].title.as_deref(),
-            Some("bash: fs_read, fs_write (0 done, 2 running)")
-        );
-        assert_eq!(
-            patches[2].title.as_deref(),
-            Some("bash: fs_write (1 done, 1 running)")
-        );
-        assert_eq!(patches[2].markdown.as_deref(), Some("fs_read ok 42B 7ms"));
-        assert_eq!(
-            patches[3].title.as_deref(),
-            Some("bash: (2 done, 0 running)")
-        );
-        assert_eq!(
-            patches[3].markdown.as_deref(),
-            Some("fs_read ok 42B 7ms\nfs_write tool_error 42B 7ms {\"pattern\":\"x\"}")
-        );
+        let expected = [
+            ("bash: fs_read (0 done, 1 running)", None),
+            ("bash: fs_read, fs_write (0 done, 2 running)", None),
+            (
+                "bash: fs_write (1 done, 1 running)",
+                Some("fs_read ok 42B 7ms"),
+            ),
+            (
+                "bash: (2 done, 0 running)",
+                Some("fs_read ok 42B 7ms\nfs_write tool_error 42B 7ms {\"pattern\":\"x\"}"),
+            ),
+        ];
+        assert_eq!(patches.len(), expected.len());
+        for (index, (patch, (title, markdown))) in patches.iter().zip(expected).enumerate() {
+            assert_eq!(patch.title.as_deref(), Some(title), "patch {index}");
+            assert_eq!(patch.markdown.as_deref(), markdown, "patch {index}");
+        }
     }
 
     #[test]

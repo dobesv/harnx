@@ -98,32 +98,36 @@ fn context(hooks: Arc<NatsHookProvider>, session: &str) -> ToolEvalContext {
     }
 }
 
+fn post_hooks(release: Arc<Barrier>) -> Arc<NatsHookProvider> {
+    Arc::new(NatsHookProvider::from_dispatcher(
+        ServerScope::new(),
+        ["PostToolUse", "PostToolUseFailure"]
+            .into_iter()
+            .map(|event| DiscoveredHook {
+                server: "post-hook".into(),
+                display_label: None,
+                spec: HookSpec {
+                    event: event.into(),
+                    matcher: Some(".*".into()),
+                    priority: 0,
+                    timeout_secs: None,
+                    fail_policy: FailPolicy::Closed,
+                },
+            })
+            .collect(),
+        Arc::new(PostHookDispatcher {
+            release: Arc::clone(&release),
+        }),
+    ))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_inner_eval_post_hook_notices_keep_sessions_isolated() {
     tokio::time::timeout(Duration::from_secs(5), async {
         // No process-global sink: only begin_run's scope supplies each session's sink.
         assert!(current_agent_event_sink().is_none());
         let release = Arc::new(Barrier::new(5));
-        let hooks = Arc::new(NatsHookProvider::from_dispatcher(
-            ServerScope::new(),
-            ["PostToolUse", "PostToolUseFailure"]
-                .into_iter()
-                .map(|event| DiscoveredHook {
-                    server: "post-hook".into(),
-                    display_label: None,
-                    spec: HookSpec {
-                        event: event.into(),
-                        matcher: Some(".*".into()),
-                        priority: 0,
-                        timeout_secs: None,
-                        fail_policy: FailPolicy::Closed,
-                    },
-                })
-                .collect(),
-            Arc::new(PostHookDispatcher {
-                release: Arc::clone(&release),
-            }),
-        ));
+        let hooks = post_hooks(Arc::clone(&release));
         let executor = InnerCallExecutor::new(InnerCallExecutorConfig::new(
             vec!["succeed".into(), "fail".into()],
             vec![Arc::new(SuccessOrFailure)],

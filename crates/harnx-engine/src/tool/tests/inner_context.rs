@@ -14,8 +14,7 @@ fn silent_options(
     }
 }
 
-#[test]
-fn fork_preserves_outer_context_and_shares_admission_dependencies() {
+fn context_with_metadata() -> ToolEvalContext {
     let mut outer = test_context(
         vec![
             Arc::new(MockToolProvider::panic("base_tool")),
@@ -38,6 +37,62 @@ fn fork_preserves_outer_context_and_shares_admission_dependencies() {
     outer.prepare_handoff_fn = Some(Arc::new(|_, _, _| {
         Box::pin(async { panic!("forking must not prepare a handoff") })
     }));
+    outer
+}
+
+fn assert_inner_dependencies(inner: &ToolEvalContext, outer: &ToolEvalContext) {
+    assert_eq!(inner.instance_id, outer.instance_id);
+    assert_eq!(inner.providers.len(), 1);
+    assert!(Arc::ptr_eq(&inner.providers[0], &outer.providers[0]));
+    for (name, shared) in [
+        (
+            "hooks",
+            Arc::ptr_eq(&inner.dispatch_hook_fn, &outer.dispatch_hook_fn),
+        ),
+        (
+            "work boundary",
+            Arc::ptr_eq(
+                inner.work_boundary.as_ref().unwrap(),
+                outer.work_boundary.as_ref().unwrap(),
+            ),
+        ),
+        (
+            "handoff",
+            Arc::ptr_eq(
+                inner.prepare_handoff_fn.as_ref().unwrap(),
+                outer.prepare_handoff_fn.as_ref().unwrap(),
+            ),
+        ),
+        (
+            "render declarations",
+            Arc::ptr_eq(
+                &inner.render.as_ref().unwrap().decl_map,
+                &outer.render.as_ref().unwrap().decl_map,
+            ),
+        ),
+    ] {
+        assert!(shared, "fork must share {name}");
+    }
+}
+
+fn assert_copied_metadata(inner: &ToolEvalContext, outer: &ToolEvalContext) {
+    assert_eq!(inner.allowed_tool_names, outer.allowed_tool_names);
+    assert_eq!(inner.handoff_targets, outer.handoff_targets);
+    assert_eq!(inner.current_agent_package, outer.current_agent_package);
+}
+
+fn assert_outer_metadata(outer: &ToolEvalContext) {
+    assert_eq!(
+        (outer.tool_round, outer.current_agent_package.as_deref()),
+        (Some(1), Some("pantheon"))
+    );
+    assert!(outer.allowed_tool_names.contains("atlas_session_handoff"));
+    assert_eq!(outer.handoff_targets["atlas"], "pantheon/atlas");
+}
+
+#[test]
+fn fork_preserves_outer_context_and_shares_admission_dependencies() {
+    let outer = context_with_metadata();
     let original_providers = outer.providers.clone();
     let original_confirm = Arc::clone(&outer.confirm_tool_use_fn);
     let original_emitters = (
@@ -53,28 +108,8 @@ fn fork_preserves_outer_context_and_shares_admission_dependencies() {
             parent_round,
         ));
         assert_eq!(inner.tool_round, parent_round);
-        assert_eq!(inner.instance_id, outer.instance_id);
-        assert_eq!(inner.providers.len(), 1);
-        assert!(Arc::ptr_eq(&inner.providers[0], &original_providers[0]));
-        assert!(Arc::ptr_eq(
-            &inner.dispatch_hook_fn,
-            &outer.dispatch_hook_fn
-        ));
-        assert!(Arc::ptr_eq(
-            inner.work_boundary.as_ref().unwrap(),
-            outer.work_boundary.as_ref().unwrap(),
-        ));
-        assert!(Arc::ptr_eq(
-            inner.prepare_handoff_fn.as_ref().unwrap(),
-            outer.prepare_handoff_fn.as_ref().unwrap(),
-        ));
-        assert!(Arc::ptr_eq(
-            &inner.render.as_ref().unwrap().decl_map,
-            &outer.render.as_ref().unwrap().decl_map,
-        ));
-        assert_eq!(inner.allowed_tool_names, outer.allowed_tool_names);
-        assert_eq!(inner.handoff_targets, outer.handoff_targets);
-        assert_eq!(inner.current_agent_package, outer.current_agent_package);
+        assert_inner_dependencies(&inner, &outer);
+        assert_copied_metadata(&inner, &outer);
         let call = test_call("base_tool");
         assert_eq!(
             (inner.confirm_tool_use_fn)(&call, &json!({}), None),
@@ -85,32 +120,36 @@ fn fork_preserves_outer_context_and_shares_admission_dependencies() {
         inner.current_agent_package = None;
     }
 
-    assert_eq!(outer.tool_round, Some(1));
+    assert_outer_metadata(&outer);
     assert_eq!(outer.providers.len(), 2);
     for (current, original) in outer.providers.iter().zip(original_providers) {
         assert!(Arc::ptr_eq(current, &original));
     }
-    assert_eq!(outer.current_agent_package.as_deref(), Some("pantheon"));
-    assert!(outer.allowed_tool_names.contains("atlas_session_handoff"));
-    assert_eq!(outer.handoff_targets["atlas"], "pantheon/atlas");
     assert!(Arc::ptr_eq(&outer.confirm_tool_use_fn, &original_confirm));
     assert_eq!(
         (outer.confirm_tool_use_fn)(&test_call("base_tool"), &json!({}), None),
         ToolUseConfirmation::Approve,
     );
-    assert!(Arc::ptr_eq(&outer.emit_tool_call_fn, &original_emitters.0));
-    assert!(Arc::ptr_eq(
-        &outer.emit_tool_result_fn,
-        &original_emitters.1
-    ));
-    assert!(Arc::ptr_eq(
-        &outer.emit_tool_blocked_fn,
-        &original_emitters.2
-    ));
-    assert!(Arc::ptr_eq(
-        &outer.emit_tool_update_fn,
-        &original_emitters.3
-    ));
+    for (name, unchanged) in [
+        (
+            "Started",
+            Arc::ptr_eq(&outer.emit_tool_call_fn, &original_emitters.0),
+        ),
+        (
+            "Completed",
+            Arc::ptr_eq(&outer.emit_tool_result_fn, &original_emitters.1),
+        ),
+        (
+            "Blocked",
+            Arc::ptr_eq(&outer.emit_tool_blocked_fn, &original_emitters.2),
+        ),
+        (
+            "progress",
+            Arc::ptr_eq(&outer.emit_tool_update_fn, &original_emitters.3),
+        ),
+    ] {
+        assert!(unchanged, "fork replaced outer {name} callback");
+    }
 }
 
 #[tokio::test]

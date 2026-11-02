@@ -23,6 +23,57 @@ fn recording_context(
     (ctx, events)
 }
 
+fn assert_hook_identity(call: &ToolCall, pre_id: &str, post_id: &str) {
+    assert!(!pre_id.is_empty());
+    assert_eq!(post_id, pre_id);
+    assert_eq!(call.id.as_deref(), Some(pre_id));
+}
+
+fn assert_hook_inputs(pre: (&str, &Value), post: (&str, &Value)) {
+    assert_eq!(pre.0, "tool_a");
+    assert_eq!(pre.1, &json!({}));
+    assert_eq!(post, pre);
+}
+
+fn assert_success_hooks(hooks: &[HookEvent], result: &ToolResult, output: &Value) {
+    let [HookEvent::PreToolUse {
+        tool_name: pre_name,
+        tool_input: pre_input,
+        tool_use_id: pre_id,
+    }, HookEvent::PostToolUse {
+        tool_name: post_name,
+        tool_input: post_input,
+        tool_use_id: post_id,
+        tool_response,
+    }] = hooks
+    else {
+        panic!("expected exactly one pre and one post hook: {hooks:?}");
+    };
+    assert_hook_inputs((pre_name, pre_input), (post_name, post_input));
+    assert_hook_identity(&result.call, pre_id, post_id);
+    assert_eq!(tool_response, output);
+}
+
+fn assert_deferred_approval(approval: &ToolApprovalRequiredError) {
+    assert_eq!(approval.tool_calls().len(), 1);
+    assert_eq!(approval.tool_calls()[0].id.as_deref(), Some("inner-call"));
+    let [deferred] = approval.deferred_calls() else {
+        panic!("expected exactly one deferred call");
+    };
+    assert_eq!(
+        (
+            deferred.call.id.as_deref(),
+            &deferred.arguments,
+            deferred.reason.as_deref()
+        ),
+        (
+            Some("inner-call"),
+            &json!({"injected": true}),
+            Some("approval needed")
+        )
+    );
+}
+
 #[tokio::test]
 async fn preserves_outputs_and_runs_pre_and_post_hooks_once() {
     for output in [
@@ -49,28 +100,7 @@ async fn preserves_outputs_and_runs_pre_and_post_hooks_once() {
             result.content.is_empty(),
             "lossless calls leave media inline"
         );
-        let hooks = hooks.lock().unwrap();
-        let [HookEvent::PreToolUse {
-            tool_name: pre_name,
-            tool_input: pre_input,
-            tool_use_id: pre_id,
-        }, HookEvent::PostToolUse {
-            tool_name: post_name,
-            tool_input: post_input,
-            tool_use_id: post_id,
-            tool_response,
-        }] = hooks.as_slice()
-        else {
-            panic!("expected exactly one pre and one post hook: {hooks:?}");
-        };
-        assert_eq!(pre_name, "tool_a");
-        assert_eq!(post_name, pre_name);
-        assert_eq!(pre_input, &json!({}));
-        assert_eq!(post_input, pre_input);
-        assert!(!pre_id.is_empty());
-        assert_eq!(post_id, pre_id);
-        assert_eq!(result.call.id.as_deref(), Some(pre_id.as_str()));
-        assert_eq!(tool_response, &output);
+        assert_success_hooks(&hooks.lock().unwrap(), &result, &output);
     }
 }
 
@@ -92,8 +122,10 @@ async fn defer_returns_typed_approval_error_without_dispatch_or_post_hooks() {
     let captured = Arc::clone(&confirmations);
     ctx.confirm_tool_use_fn = Arc::new(move |call, arguments, reason| {
         captured.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(call.name, "tool_a");
-        assert_eq!(call.id.as_deref(), Some("inner-call"));
+        assert_eq!(
+            (call.name.as_str(), call.id.as_deref()),
+            ("tool_a", Some("inner-call"))
+        );
         assert_eq!(arguments, &json!({"injected": true}));
         assert_eq!(reason, Some("approval needed"));
         ToolUseConfirmation::Defer
@@ -105,13 +137,7 @@ async fn defer_returns_typed_approval_error_without_dispatch_or_post_hooks() {
         .unwrap_err();
 
     let approval = error.downcast_ref::<ToolApprovalRequiredError>().unwrap();
-    assert_eq!(approval.tool_calls().len(), 1);
-    assert_eq!(approval.tool_calls()[0].id.as_deref(), Some("inner-call"));
-    assert_eq!(approval.deferred_calls().len(), 1);
-    let deferred = &approval.deferred_calls()[0];
-    assert_eq!(deferred.call.id.as_deref(), Some("inner-call"));
-    assert_eq!(deferred.arguments, json!({"injected": true}));
-    assert_eq!(deferred.reason.as_deref(), Some("approval needed"));
+    assert_deferred_approval(approval);
     assert_eq!(confirmations.load(Ordering::SeqCst), 1);
     assert!(Arc::ptr_eq(&ctx.confirm_tool_use_fn, &original_confirm));
     assert!(matches!(
@@ -225,20 +251,21 @@ async fn provider_error_keeps_partial_result_and_runs_failure_hook_once() {
             "partial_result": {"session_id": "child-1"},
         })
     );
-    let hooks = hooks.lock().unwrap();
+    assert_failure_hooks(&hooks.lock().unwrap(), &result.call);
+}
+
+fn assert_failure_hooks(hooks: &[HookEvent], call: &ToolCall) {
     let [HookEvent::PreToolUse { tool_use_id, .. }, HookEvent::PostToolUseFailure {
         tool_name,
         tool_input,
         tool_use_id: failure_id,
         error,
-    }] = hooks.as_slice()
+    }] = hooks
     else {
         panic!("expected one pre and one failure hook: {hooks:?}");
     };
-    assert_eq!(tool_name, "tool_a");
-    assert_eq!(tool_input, &json!({}));
-    assert_eq!(failure_id, tool_use_id);
-    assert_eq!(result.call.id.as_deref(), Some(tool_use_id.as_str()));
+    assert_eq!((tool_name.as_str(), tool_input), ("tool_a", &json!({})));
+    assert_hook_identity(call, tool_use_id, failure_id);
     assert_eq!(error, "child failed");
 }
 
@@ -329,12 +356,7 @@ async fn work_boundary_errors_propagate_without_provider_dispatch() {
     }
 }
 
-#[tokio::test]
-async fn concurrent_calls_share_context_and_route_progress_by_id() {
-    let provider = Arc::new(UpdatingToolProvider::default());
-    let origins = Arc::clone(&provider.origins);
-    let (mut ctx, hooks) = recording_context(vec![provider], continue_hook_outcome());
-    ctx.tool_round = Some(12);
+fn synchronize_dispatch(ctx: &mut ToolEvalContext) {
     // Neither evaluation can finish before both reach provider dispatch.
     let dispatch_barrier = Arc::new(tokio::sync::Barrier::new(2));
     ctx.work_boundary = Some(Arc::new(move |boundary, _| {
@@ -346,6 +368,36 @@ async fn concurrent_calls_share_context_and_route_progress_by_id() {
             Ok(())
         })
     }));
+}
+
+fn assert_call_hook_counts(hooks: &[HookEvent], id: &str) {
+    assert_eq!(
+        hooks
+            .iter()
+            .filter(|event| matches!(event,
+                HookEvent::PreToolUse { tool_use_id, .. } if tool_use_id == id
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        hooks
+            .iter()
+            .filter(|event| matches!(event,
+                HookEvent::PostToolUse { tool_use_id, .. } if tool_use_id == id
+            ))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_calls_share_context_and_route_progress_by_id() {
+    let provider = Arc::new(UpdatingToolProvider::default());
+    let origins = Arc::clone(&provider.origins);
+    let (mut ctx, hooks) = recording_context(vec![provider], continue_hook_outcome());
+    ctx.tool_round = Some(12);
+    synchronize_dispatch(&mut ctx);
     let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = Arc::clone(&updates);
     ctx.emit_tool_update_fn = Arc::new(move |id, patch| {
@@ -372,33 +424,17 @@ async fn concurrent_calls_share_context_and_route_progress_by_id() {
         .collect();
     assert_ne!(results[0].call.id, results[1].call.id);
     assert_eq!(ctx.tool_round, Some(12));
-    assert_eq!(origins.lock().unwrap().len(), 2);
-    assert_eq!(hooks.lock().unwrap().len(), 4);
+    assert_eq!(
+        (origins.lock().unwrap().len(), hooks.lock().unwrap().len()),
+        (2, 4)
+    );
     for result in results {
         let id = result.call.id.unwrap();
         assert!(origins
             .lock()
             .unwrap()
             .contains(&(Some(id.clone()), Some(12))));
-        let hooks = hooks.lock().unwrap();
-        assert_eq!(
-            hooks
-                .iter()
-                .filter(|event| matches!(event,
-                    HookEvent::PreToolUse { tool_use_id, .. } if tool_use_id == &id
-                ))
-                .count(),
-            1
-        );
-        assert_eq!(
-            hooks
-                .iter()
-                .filter(|event| matches!(event,
-                    HookEvent::PostToolUse { tool_use_id, .. } if tool_use_id == &id
-                ))
-                .count(),
-            1
-        );
+        assert_call_hook_counts(&hooks.lock().unwrap(), &id);
         let updates = updates.lock().unwrap();
         let last = updates.iter().rfind(|(call_id, _)| call_id == &id).unwrap();
         assert_eq!(last.1.title.as_deref(), Some("second"));
