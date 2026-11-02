@@ -130,6 +130,36 @@ fn bash_tools_without_use_tools_exposes_only_bash() {
 }
 
 #[test]
+fn session_bash_tools_do_not_bleed_into_the_compaction_summarizer() {
+    // Session-only config: `extract_agent` resolves to the unnamed `%%`
+    // agent — exactly the name the default compaction summarizer gets from
+    // `AgentConfig::from_prompt(DEFAULT_COMPACT_SYSTEM_PROMPT)`. The session
+    // override must follow the explicit tool-selection resolution
+    // (`tool_selection_agent`), never that name collision.
+    let mut config = config_with_tools();
+    let mut session = Session::default();
+    session.set_bash_tools(Some(vec!["fs_*".to_string()]));
+    config.session = Some(session);
+
+    let summarizer =
+        AgentConfig::from_prompt(crate::config::compaction::DEFAULT_COMPACT_SYSTEM_PROMPT);
+    assert_eq!(
+        summarizer.name(),
+        config.extract_agent().name(),
+        "both resolve to `%%`; documents why a name compare cannot identify the active agent"
+    );
+    assert!(config.select_tools(&summarizer).is_none());
+    assert_eq!(config.bash_tool_names(&summarizer), Vec::<String>::new());
+
+    // The active agent still gets script mode from the session's record.
+    assert!(config.bash_tools_active());
+    assert_eq!(
+        config.bash_tool_names(&config.tool_selection_agent()),
+        vec!["fs_read".to_string(), "fs_write".to_string()]
+    );
+}
+
+#[test]
 fn bash_inner_set_excludes_control_tools() {
     let config = Config {
         tools: Tools::init_from_mcp(Some(vec![

@@ -12,10 +12,8 @@ impl Config {
             .use_tools()
             .map(|use_tools| self.select_tools_for_package(&use_tools, package))
             .unwrap_or_default();
-        let bash_inner = self.select_bash_inner_tools(
-            self.effective_bash_tools(agent).as_deref().unwrap_or(&[]),
-            package,
-        );
+        let bash_inner =
+            self.select_bash_inner_tools(agent.bash_tools().as_deref().unwrap_or(&[]), package);
         if !bash_inner.is_empty() {
             // While script mode is active the name `bash` is reserved: the
             // model gets the synthesized declaration, and an external tool of
@@ -28,53 +26,56 @@ impl Config {
         (!functions.is_empty()).then_some(functions)
     }
 
-    /// The `bash_tools` selectors tool selection resolves for `agent`.
+    /// The agent tool selection resolves for the active session:
+    /// [`Config::extract_agent`] with the active session's `bash_tools`
+    /// record overlaid on it.
     ///
-    /// For the active agent, the active session's record wins over the
-    /// explicit agent's: `.set bash_tools` stays scoped to the session
-    /// instead of overwriting the agent (which the TUI session picker keeps
-    /// across a switch, so a write there would leak session A's selectors
-    /// into session B). The session copies the agent's value when it is
-    /// created, so without an override both agree. Agents other than the
-    /// active one (e.g. a compaction summarizer) keep their own
-    /// `bash_tools`, so a session override never bleeds into their tool
-    /// selection.
-    fn effective_bash_tools(&self, agent: &AgentConfig) -> Option<Vec<String>> {
-        if agent.name() == self.extract_agent().name() {
-            if let Some(bash_tools) = self
-                .session
-                .as_ref()
-                .and_then(|session| session.bash_tools())
-            {
-                return Some(bash_tools);
-            }
+    /// Applying the overlay here — when the config resolves its own active
+    /// agent, before `Input` construction — is the explicit signal that
+    /// separates the active agent from any other agent `select_tools` is
+    /// asked about. Name comparisons cannot do that: an unnamed session and
+    /// the default compaction summarizer both resolve to `%%`, which made
+    /// the summarizer pick up the session's selectors and synthesize a
+    /// `bash` declaration for the compaction model. Separately-built inputs
+    /// (like the summarizer in `compaction::fetch_summary`) never pass
+    /// through here, so they keep their own `bash_tools`.
+    ///
+    /// `session::new` and other snapshot paths keep using `extract_agent`
+    /// directly, so switching sessions cannot carry one session's override
+    /// into the next session's snapshot.
+    pub fn tool_selection_agent(&self) -> crate::config::Agent {
+        let mut agent = self.extract_agent();
+        if let Some(bash_tools) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.bash_tools())
+        {
+            agent.set_bash_tools(Some(bash_tools));
         }
-        agent.bash_tools()
+        agent
     }
 
     /// Whether the active agent's `bash_tools` (the session's record over the
-    /// agent's own, as resolved by `effective_bash_tools`) resolves to a
+    /// agent's own, as resolved by `tool_selection_agent`) resolves to a
     /// non-empty inner set, meaning the `bash` tool name is reserved for
     /// script mode.
     pub fn bash_tools_active(&self) -> bool {
-        let agent = self.extract_agent();
+        let agent = self.tool_selection_agent();
         !self.bash_tool_names(&agent).is_empty()
     }
 
     /// The inner tool set script mode exposes as shell commands, resolved from
-    /// the agent's `bash_tools` selectors. Independent of `use_tools`: a tool
-    /// can be bash-only. Empty when `bash_tools` is unset, empty, matches
+    /// the given agent's `bash_tools` selectors. Independent of `use_tools`: a
+    /// tool can be bash-only. Empty when `bash_tools` is unset, empty, matches
     /// nothing, or tool use is disabled. Sorted by name for stable
-    /// declaration descriptions and provider wiring.
+    /// declaration descriptions and provider wiring. The active session's
+    /// override reaches this through [`Config::tool_selection_agent`].
     pub fn bash_tool_names(&self, agent: &AgentConfig) -> Vec<String> {
         let package = harnx_core::package_namespace::pkg_from_qualified(agent.name());
-        self.select_bash_inner_tools(
-            self.effective_bash_tools(agent).as_deref().unwrap_or(&[]),
-            package,
-        )
-        .into_iter()
-        .map(|declaration| declaration.name)
-        .collect()
+        self.select_bash_inner_tools(agent.bash_tools().as_deref().unwrap_or(&[]), package)
+            .into_iter()
+            .map(|declaration| declaration.name)
+            .collect()
     }
 
     /// Resolve `bash_tools` selectors against the available declarations using
