@@ -126,6 +126,12 @@ pub struct AgentConfig {
         deserialize_with = "deserialize_use_tools"
     )]
     use_tools: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_use_tools"
+    )]
+    bash_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "String::is_empty")]
     description: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -195,6 +201,7 @@ impl AgentConfig {
             temperature: frontmatter.temperature,
             top_p: frontmatter.top_p,
             use_tools: frontmatter.use_tools,
+            bash_tools: frontmatter.bash_tools,
             description: frontmatter.description,
             version: frontmatter.version,
             variables: frontmatter.variables,
@@ -366,6 +373,10 @@ impl AgentConfig {
         self.use_tools.clone()
     }
 
+    pub fn bash_tools(&self) -> Option<Vec<String>> {
+        self.bash_tools.clone()
+    }
+
     pub fn hooks(&self) -> Option<&HooksConfig> {
         self.hooks.as_ref()
     }
@@ -424,6 +435,10 @@ impl AgentConfig {
 
     pub fn set_use_tools(&mut self, value: Option<Vec<String>>) {
         self.use_tools = value;
+    }
+
+    pub fn set_bash_tools(&mut self, value: Option<Vec<String>>) {
+        self.bash_tools = value;
     }
 
     pub fn set_tools(&mut self, tools: Tools) {
@@ -576,6 +591,12 @@ struct AgentFrontMatter {
         deserialize_with = "deserialize_use_tools"
     )]
     use_tools: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_use_tools"
+    )]
+    bash_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "String::is_empty")]
     description: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -618,6 +639,7 @@ impl AgentFrontMatter {
             temperature: config.temperature,
             top_p: config.top_p,
             use_tools: config.use_tools.clone(),
+            bash_tools: config.bash_tools.clone(),
             description: config.description.clone(),
             version: config.version.clone(),
             variables: config.variables.clone(),
@@ -646,6 +668,7 @@ impl AgentFrontMatter {
 
     fn content_is_empty(&self) -> bool {
         self.use_tools.is_none()
+            && self.bash_tools.is_none()
             && self.description.is_empty()
             && self.version.is_empty()
             && self.variables.is_empty()
@@ -699,6 +722,30 @@ fn serialize_frontmatter(frontmatter: &AgentFrontMatter) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_tools_parse_from_frontmatter_string_and_list() {
+        let string_form =
+            AgentConfig::from_markdown("string-tools", "---\nbash_tools: \"fs_*,grep_*\"\n---\n")
+                .unwrap();
+        let expected = Some(vec!["fs_*".to_string(), "grep_*".to_string()]);
+        assert_eq!(string_form.bash_tools(), expected);
+
+        let list_form = AgentConfig::from_markdown(
+            "list-tools",
+            "---\nbash_tools:\n  - fs_*\n  - grep_*\n---\n",
+        )
+        .unwrap();
+        assert_eq!(list_form.bash_tools(), expected);
+
+        let absent =
+            AgentConfig::from_markdown("plain", "---\nmodel: openai:gpt-4o\n---\nhi\n").unwrap();
+        assert_eq!(absent.bash_tools(), None);
+
+        let exported = string_form.export().unwrap();
+        let reparsed = AgentConfig::from_markdown("string-tools", &exported).unwrap();
+        assert_eq!(reparsed.bash_tools(), expected);
+    }
 
     #[test]
     fn collect_agent_variables_empty_is_none() {

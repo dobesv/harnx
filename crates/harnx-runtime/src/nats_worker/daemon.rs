@@ -194,6 +194,9 @@ fn apply_tool_overrides(
     if let Some(use_tools) = &overrides.use_tools {
         config.set_use_tools(Some(use_tools.clone()));
     }
+    if let Some(bash_tools) = &overrides.bash_tools {
+        config.set_bash_tools(Some(bash_tools.clone()))?;
+    }
     if !overrides.model_fallbacks.is_empty() {
         config.set_model_fallbacks(overrides.model_fallbacks.clone());
     }
@@ -883,6 +886,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn bash_tools_session_override_replaces_agent_value() {
+        let mut config = Config::default();
+        let mut agent = crate::config::Agent::default();
+        agent.set_bash_tools(Some(vec!["old_*".to_string()]));
+        config.use_agent_obj(agent).unwrap();
+
+        super::apply_tool_overrides(
+            &mut config,
+            &crate::nats_session_metadata::SessionOverrides {
+                bash_tools: Some(vec!["new_*".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.extract_agent().bash_tools(),
+            Some(vec!["new_*".to_string()])
+        );
+    }
 
     #[tokio::test]
     async fn remote_session_cleanup_spawns_only_for_positive_retention() {

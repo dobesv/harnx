@@ -173,7 +173,14 @@ async fn assert_nats_eval_batch(instance_id: &ServerScope) -> Result<()> {
             .with_agent_use_tools(Some("*")),
     )
     .await;
-    assert_eq!(context.providers[0].name(), "nats");
+    // The reserved script-mode `bash` stub leads the provider list but claims
+    // nothing without bash_tools; NATS is still the first dispatch provider
+    // for actual tools.
+    assert_eq!(context.providers[0].name(), "reserved-bash");
+    assert!(context
+        .providers
+        .iter()
+        .any(|provider| provider.name() == "nats"));
     let results = harnx_runtime::tool::eval_tool_calls(
         &context,
         vec![ToolCall::new(

@@ -12,6 +12,14 @@ fn metadata() -> SessionMetadata {
 }
 
 #[test]
+fn old_session_overrides_without_bash_tools_deserialize() {
+    let overrides: SessionOverrides =
+        serde_json::from_value(serde_json::json!({"use_tools": ["fs_read"]})).unwrap();
+    assert_eq!(overrides.use_tools, Some(vec!["fs_read".to_string()]));
+    assert_eq!(overrides.bash_tools, None);
+}
+
+#[test]
 fn canonical_keys_reserve_future_read_cursor_namespace() {
     assert_eq!(metadata_key("s1"), "sessions/s1/meta");
     assert_eq!(activity_key("s1"), "sessions/s1/activity");

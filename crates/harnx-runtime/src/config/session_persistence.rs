@@ -283,6 +283,7 @@ pub fn session_overrides(session: &Session) -> Result<SessionOverrides> {
         temperature: session.temperature(),
         top_p: session.top_p(),
         use_tools: session.use_tools(),
+        bash_tools: session.bash_tools(),
         model_fallbacks: session.model_fallbacks.clone(),
         compress_threshold: session.compress_threshold,
         compaction_agent: session.compaction_agent.clone(),

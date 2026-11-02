@@ -35,6 +35,7 @@ impl Config {
                 Config::set_top_p,
             ),
             "use_tools" => Self::update_use_tools(config, value),
+            "bash_tools" => Self::update_bash_tools(config, value),
             "model_fallbacks" => Self::update_model_fallbacks(config, value),
             "compaction_agent" => Self::update_optional(
                 config,
@@ -161,6 +162,24 @@ impl Config {
         Ok(())
     }
 
+    fn update_bash_tools(config: &GlobalConfig, value: &str) -> Result<()> {
+        let value = if value == "null" {
+            None
+        } else {
+            Some(
+                harnx_core::agent_config::split_tool_selectors(value)
+                    .into_iter()
+                    .map(str::trim)
+                    .filter(|selector| !selector.is_empty())
+                    .map(String::from)
+                    .collect(),
+            )
+        };
+        Self::persist_override(config, SessionOverrideUpdate::BashTools(value.clone()))?;
+        config.write().set_bash_tools(value)?;
+        Ok(())
+    }
+
     fn update_model_fallbacks(config: &GlobalConfig, value: &str) -> Result<()> {
         let value = if value == "null" {
             vec![]
@@ -234,6 +253,20 @@ impl Config {
         } else {
             self.use_tools = value;
         }
+    }
+
+    /// `bash_tools` has no global default (unlike `use_tools`), so without an
+    /// active session or agent there is nowhere to store the value; surface
+    /// that instead of silently dropping it.
+    pub fn set_bash_tools(&mut self, value: Option<Vec<String>>) -> Result<()> {
+        if let Some(session) = self.session.as_mut() {
+            session.set_bash_tools(value);
+        } else if let Some(agent) = self.agent.as_mut() {
+            agent.set_bash_tools(value);
+        } else {
+            bail!("no active session or agent to apply bash_tools to");
+        }
+        Ok(())
     }
 
     pub fn set_model_fallbacks(&mut self, value: Vec<String>) {
@@ -394,5 +427,55 @@ mod title_command_tests {
         let tmp = TempDir::new().unwrap();
         let config = config_with_session(tmp.path());
         assert!(Config::update(&config, "title   ").is_err());
+    }
+}
+
+#[cfg(test)]
+mod bash_tools_command_tests {
+    use super::super::*;
+    use crate::config::ConfigLock;
+    use std::sync::Arc;
+
+    fn config_with_session() -> GlobalConfig {
+        let mut config = Config::default();
+        let mut session = crate::config::session::new(&config, "bash-tools-test", None).unwrap();
+        crate::config::session::attach_memory_log(&mut session);
+        config.session = Some(session);
+        Arc::new(ConfigLock::new(config))
+    }
+
+    #[test]
+    fn set_bash_tools_updates_session_and_clears_with_null() {
+        let config = config_with_session();
+
+        Config::update(&config, "bash_tools fs_*,grep_search").unwrap();
+
+        let guard = config.read();
+        let session = guard.session.as_ref().unwrap();
+        assert_eq!(
+            session.bash_tools(),
+            Some(vec!["fs_*".to_string(), "grep_search".to_string()])
+        );
+        drop(guard);
+
+        Config::update(&config, "bash_tools null").unwrap();
+
+        let guard = config.read();
+        let session = guard.session.as_ref().unwrap();
+        assert_eq!(session.bash_tools(), None);
+    }
+
+    #[test]
+    fn set_bash_tools_errors_without_session_or_agent() {
+        // No session, no agent: there is nowhere to store the value, so the
+        // command must fail instead of silently doing nothing.
+        let config = Arc::new(ConfigLock::new(Config::default()));
+
+        let error = Config::update(&config, "bash_tools fs_*").unwrap_err();
+
+        assert!(
+            error.to_string().contains("no active session or agent"),
+            "unexpected error: {error}"
+        );
     }
 }

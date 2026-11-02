@@ -106,6 +106,9 @@ pub fn render(session: &Session) -> Result<String> {
     if let Some(use_tools) = session.use_tools() {
         items.push(("use_tools", use_tools.join(",")));
     }
+    if let Some(bash_tools) = session.bash_tools() {
+        items.push(("bash_tools", bash_tools.join(",")));
+    }
 
     if !session.model_fallbacks.is_empty() {
         items.push(("model_fallbacks", session.model_fallbacks.join(",")));

@@ -76,6 +76,7 @@ impl Config {
                     "temperature",
                     "top_p",
                     "use_tools",
+                    "bash_tools",
                     "compress_threshold",
                     "compaction_agent",
                     "model_fallbacks",
@@ -135,7 +136,7 @@ impl Config {
             "stream" => complete_bool(self.stream),
             "save" => complete_bool(self.save),
             "tool_use" => complete_bool(self.tool_use),
-            "use_tools" => self.complete_use_tools_arg(setting.value_prefix),
+            "use_tools" | "bash_tools" => self.complete_use_tools_arg(setting.value_prefix),
             "rag_reranker_model" => list_models(&self.clients, ModelType::Reranker)
                 .iter()
                 .map(|v| v.id())
@@ -277,6 +278,18 @@ mod tests {
         assert!(config
             .command_complete(".set", &["stream", "not-a-boolean"], vec![])
             .is_empty());
+    }
+
+    #[test]
+    fn bash_tools_set_completion_matches_use_tools() {
+        let config = Config::default();
+        let first_arg = config.command_complete(".set", &["bash"], vec![]);
+        assert!(first_arg.contains(&("bash_tools ".to_string(), None)));
+
+        assert_eq!(
+            config.command_complete(".set", &["bash_tools", ""], vec![]),
+            config.command_complete(".set", &["use_tools", ""], vec![]),
+        );
     }
 
     /// Test that remote session completion gracefully degrades on unreachable cluster.

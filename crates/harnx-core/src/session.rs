@@ -339,6 +339,12 @@ pub struct Session {
         deserialize_with = "crate::agent_config::deserialize_use_tools"
     )]
     pub use_tools: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::agent_config::deserialize_use_tools"
+    )]
+    pub bash_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compress_threshold: Option<usize>,
 
@@ -497,6 +503,14 @@ impl Session {
                     .collect(),
             );
         }
+        if let Some(bash_tools) = self.bash_tools() {
+            data["bash_tools"] = serde_json::Value::Array(
+                bash_tools
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
         if !self.model_fallbacks.is_empty() {
             data["model_fallbacks"] = serde_json::Value::Array(
                 self.model_fallbacks
@@ -541,6 +555,7 @@ impl Session {
         self.temperature = agent.temperature();
         self.top_p = agent.top_p();
         self.use_tools = agent.use_tools();
+        self.bash_tools = agent.bash_tools();
         self.model_fallbacks = agent.model_fallbacks().to_vec();
         self.compaction_agent = agent.compaction_agent().map(str::to_string);
         self.model = agent.model().clone();
@@ -706,6 +721,7 @@ impl Session {
         config.set_temperature(self.temperature);
         config.set_top_p(self.top_p);
         config.set_use_tools(self.use_tools.clone());
+        config.set_bash_tools(self.bash_tools.clone());
         config.set_model_fallbacks(self.model_fallbacks.clone());
         config.set_compaction_agent(self.compaction_agent.clone());
         config.set_shared_variables(self.agent_variables.clone());
@@ -726,6 +742,10 @@ impl Session {
 
     pub fn use_tools(&self) -> Option<Vec<String>> {
         self.use_tools.clone()
+    }
+
+    pub fn bash_tools(&self) -> Option<Vec<String>> {
+        self.bash_tools.clone()
     }
 
     pub fn set_model(&mut self, model: Model) {
@@ -754,6 +774,13 @@ impl Session {
     pub fn set_use_tools(&mut self, value: Option<Vec<String>>) {
         if self.use_tools != value {
             self.use_tools = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_bash_tools(&mut self, value: Option<Vec<String>>) {
+        if self.bash_tools != value {
+            self.bash_tools = value;
             self.dirty = true;
         }
     }
