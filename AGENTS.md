@@ -85,6 +85,11 @@ On Linux, every test runs inside bubblewrap 0.5.0 or later, which needs
 unprivileged user namespaces: install it first (`sudo apt install bubblewrap`)
 and see "Test sandbox".
 
+If the workspace build fails with `Permission denied (os error 13)` from
+`protoc-bin-vendored-linux-x86_64`, the cargo registry is on a noexec mount, so
+`a2a-pb`'s vendored protoc binary can't run. Prefix cargo commands with
+`PROTOC=/usr/bin/protoc` to use the system protoc instead.
+
 **Scope the test run to the affected packages.** `cargo xtask affected` diffs
 the working tree, uncommitted and untracked files included, against its merge
 base with `origin/HEAD` (or `--base <rev>`) and prints `-p` arguments for every
@@ -542,6 +547,8 @@ Native toolset servers are named `harnx-<noun>-tools` (e.g. `harnx-fs-tools`, `h
 | attachments | 3007 |
 
 When launching behind `harnx-mcp-bridge` for stdio MCP compatibility, pass `--mcp-stdio` — without it, the server waits for NATS and the bridge handshake times out.
+
+Toolsets that need the hosting NATS connection at construction time (like `harnx-fs-tools`' attachment resolver) use `run_toolset_main_with_factory` instead: the factory runs after transport selection and receives a clone of the hosting client in NATS mode, `None` in MCP stdio/HTTP modes. Handle `None` with a recoverable error from the affected tool rather than connecting yourself, and keep NATS clients out of the `Toolset` trait and invocation context. Don't copy `harnx-attachment-tools`' per-invocation `connect_nats` — it predates the factory; reuse the hosting connection. MCP HTTP servers that need request bodies above rmcp's 4 MiB default set `McpHttpOptions::max_request_body_bytes` via `run_toolset_main_with_factory_and_http_options`; only the fs sandbox transport (`--sandbox-transport`) raises it, and other servers keep the default.
 
 Binaries with `-mcp-` in the name are genuine MCP infrastructure (`harnx-mcp-bridge`, `harnx-mcp-remote`, `harnx-mcp-server`) or test fixtures (`harnx-mock-mcp`), not native toolsets.
 

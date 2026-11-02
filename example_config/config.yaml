@@ -42,6 +42,7 @@ toolsets:
     - fs_find
   fs_write_tools:
     - fs_write
+    - fs_write_attachment
     - fs_edit
     - fs_insert
     - fs_re_replace

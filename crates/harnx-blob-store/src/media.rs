@@ -97,9 +97,17 @@ pub async fn get_media(
     store: &object_store::ObjectStore,
     url: &CidUrl,
 ) -> Result<Option<(Vec<u8>, String)>> {
+    get_media_with_limit(store, url, None).await
+}
+
+pub(crate) async fn get_media_with_limit(
+    store: &object_store::ObjectStore,
+    url: &CidUrl,
+    max_bytes: Option<usize>,
+) -> Result<Option<(Vec<u8>, String)>> {
     let key = url.kv_key();
 
-    let mut object = match store.get(&key).await {
+    let object = match store.get(&key).await {
         Ok(object) => object,
         Err(error) if error.kind() == object_store::GetErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -108,18 +116,35 @@ pub async fn get_media(
         }
     };
 
+    // ObjectStore::get only fetches metadata; chunk download starts on the first read.
+    crate::limits::check_size(object.info().size, max_bytes)?;
     let mime_type = object
         .info()
         .metadata
         .get(CONTENT_TYPE_METADATA_KEY)
         .cloned()
         .unwrap_or_else(|| "application/octet-stream".to_string());
+    let bytes = read_media_bytes(object, &key, max_bytes).await?;
+    Ok(Some((bytes, mime_type)))
+}
+
+async fn read_media_bytes(
+    object: object_store::Object,
+    key: &str,
+    max_bytes: Option<usize>,
+) -> Result<Vec<u8>> {
+    let read_limit = max_bytes
+        .map(|max| (max as u64).saturating_add(1))
+        .unwrap_or(u64::MAX);
     let mut bytes = Vec::new();
     object
+        .take(read_limit)
         .read_to_end(&mut bytes)
         .await
         .with_context(|| format!("read media blob '{}'", key))?;
-    Ok(Some((bytes, mime_type)))
+    // Metadata can understate the size. Never trust it as the only bound.
+    crate::limits::check_size(bytes.len(), max_bytes)?;
+    Ok(bytes)
 }
 
 fn object_store_stream_name() -> String {

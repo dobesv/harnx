@@ -20,8 +20,12 @@ use invocation::{
 mod mcp;
 #[cfg(test)]
 use mcp::call_tool_result_from_value;
-use mcp::McpToolsetAdapter;
 mod lifecycle;
+mod runner;
+pub use runner::{
+    run_toolset_main, run_toolset_main_with_factory,
+    run_toolset_main_with_factory_and_http_options, run_toolset_mcp_http, McpHttpOptions,
+};
 mod name;
 mod progress;
 mod registration_identity;
@@ -64,9 +68,7 @@ use rmcp::model::{
     ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
-use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{ServerHandler, ServiceExt};
+use rmcp::ServerHandler;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -881,251 +883,6 @@ async fn publish_registration(
         .await
         .map_err(anyhow::Error::from)
         .with_context(|| format!("publish tool registration '{key}'"))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum McpMode {
-    Stdio,
-    Http,
-}
-
-pub(crate) fn resolve_mcp_mode(
-    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
-) -> Result<Option<McpMode>> {
-    let mut mcp_stdio = false;
-    let mut mcp_http = false;
-    for arg in args {
-        let arg = arg.as_ref();
-        if arg == "--mcp-stdio" {
-            mcp_stdio = true;
-        } else if arg == "--mcp-http" {
-            mcp_http = true;
-        }
-    }
-    if mcp_stdio && mcp_http {
-        anyhow::bail!("choose one of --mcp-stdio or --mcp-http, not both");
-    }
-    if mcp_stdio {
-        Ok(Some(McpMode::Stdio))
-    } else if mcp_http {
-        Ok(Some(McpMode::Http))
-    } else {
-        Ok(None)
-    }
-}
-
-fn mcp_http_arg_value(args: &[String], flag: &str) -> Result<Option<String>> {
-    let assignment = format!("{flag}=");
-    for (index, arg) in args.iter().enumerate() {
-        if arg == flag {
-            let value = args
-                .get(index + 1)
-                .with_context(|| format!("missing value for {flag}"))?;
-            return Ok(Some(value.clone()));
-        }
-        if let Some(value) = arg.strip_prefix(&assignment) {
-            return Ok(Some(value.to_string()));
-        }
-    }
-    Ok(None)
-}
-
-/// Serve a toolset over MCP Streamable HTTP at `/mcp`.
-pub async fn run_toolset_mcp_http(
-    toolset: Arc<dyn Toolset>,
-    host: String,
-    port: u16,
-    readiness: Option<Readiness>,
-) -> Result<()> {
-    let ct = CancellationToken::new();
-    let adapter = McpToolsetAdapter { toolset };
-    let config = StreamableHttpServerConfig::default()
-        .with_legacy_session_mode(false)
-        .with_json_response(true)
-        .with_cancellation_token(ct.child_token())
-        .disable_allowed_hosts();
-    let service = StreamableHttpService::new(
-        move || Ok(adapter.clone()),
-        Arc::new(NeverSessionManager::default()),
-        config,
-    );
-    let app = axum::Router::new()
-        .nest_service("/mcp", service)
-        .layer(axum::middleware::from_fn(
-            harnx_metrics::http_metrics_middleware,
-        ));
-    let listener = tokio::net::TcpListener::bind((host.as_str(), port))
-        .await
-        .with_context(|| format!("failed to bind {host}:{port}"))?;
-    if let Some(readiness) = readiness.as_ref() {
-        readiness.ready();
-    }
-
-    let shutdown_ct = ct.clone();
-    tokio::spawn(async move {
-        harnx_nats_common::shutdown::shutdown_signal().await;
-        if let Some(readiness) = readiness.as_ref() {
-            readiness.not_ready();
-        }
-        shutdown_ct.cancel();
-    });
-
-    log::info!("serving MCP HTTP at http://{host}:{port}/mcp");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { ct.cancelled().await })
-        .await
-        .context("run MCP HTTP server")
-}
-
-fn print_toolset_help() {
-    eprintln!("Options:");
-    eprintln!("  --mcp-stdio               Use MCP stdio transport instead of NATS");
-    eprintln!("  --mcp-http                Use MCP Streamable HTTP transport instead of NATS");
-    eprintln!("  --host <HOST>             MCP HTTP bind host (default: 0.0.0.0)");
-    eprintln!("  --port <PORT>             MCP HTTP bind port (toolset-specific default)");
-    eprintln!("  --name <NAME>             Override the registered toolset name");
-    eprintln!("  --enable-tool <glob>      Enable only tools matching the glob pattern.");
-    eprintln!("                            Repeatable. If set, only enabled tools are");
-    eprintln!("                            registered and invocable on this server.");
-    eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
-    eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
-    eprintln!("                            Also honors HARNX_METRICS_ADDR env.");
-    eprintln!("  --healthz-addr <ADDR>     Serve readiness checks at http://ADDR/healthz.");
-    eprintln!("                            Blank host binds 0.0.0.0, e.g. :8457. Unset disables.");
-    eprintln!("                            Also honors HARNX_HEALTHZ_ADDR env.");
-    eprintln!("  --help, -h                Show this help message");
-}
-
-fn wrap_toolset_if_filtered(
-    toolset: Arc<dyn Toolset>,
-    filter_set: Option<globset::GlobSet>,
-) -> (Arc<dyn Toolset>, Option<Arc<globset::GlobSet>>) {
-    match filter_set {
-        Some(set) => {
-            let filter = Arc::new(set.clone());
-            (
-                Arc::new(FilteredToolset::new(ArcToolsetWrapper(toolset), set)),
-                Some(filter),
-            )
-        }
-        None => (toolset, None),
-    }
-}
-
-/// Run a toolset in MCP stdio or HTTP mode when selected, otherwise NATS mode.
-///
-/// In NATS mode, wires SIGTERM/Ctrl+C to a graceful stop so a pod killed by
-/// Kubernetes gets a chance to remove its own registration instead of
-/// leaving it for the TTL.
-///
-/// **Strict front-parser binaries:** `harnx-{bash,fs,grep,exa,fetch,time,attachment}-tools`
-/// have their own argument parsers that reject unknown flags BEFORE delegating here.
-/// (`harnx-plans-tools` has no front parser; `harnx-mcp-bridge` and `harnx-k8s-sandbox-tools`
-/// use clap.) When adding any new cross-cutting CLI flag to this shared entry point,
-/// update EACH strict front parser to recognize and skip both `--flag VALUE` (separate)
-/// and `--flag=VALUE` (equals) forms. Use EXACT match (`arg == "--flag"` or
-/// `arg.strip_prefix("--flag=")`), not `starts_with("--flag")`, to reject near-prefix
-/// typos like `--flag-typo`.
-async fn run_mcp_service(
-    toolset: Arc<dyn Toolset>,
-    readiness: Option<Readiness>,
-    filter_set: Option<globset::GlobSet>,
-) -> Result<()> {
-    let (toolset, filter) = wrap_toolset_if_filtered(toolset, filter_set);
-    match resolve_mcp_mode(std::env::args_os())? {
-        Some(McpMode::Stdio) => {
-            let service = McpToolsetAdapter { toolset }
-                .serve(rmcp::transport::stdio())
-                .await
-                .context("start MCP stdio server")?;
-            if let Some(readiness) = readiness.as_ref() {
-                readiness.ready();
-            }
-            let outcome = service.waiting().await.context("run MCP stdio server");
-            if let Some(readiness) = readiness.as_ref() {
-                readiness.not_ready();
-            }
-            outcome?;
-            return Ok(());
-        }
-        Some(McpMode::Http) => {
-            // Front parsers only validate/consume-and-skip these flags; the shared runner
-            // re-reads env::args to resolve host/port.
-            let args = std::env::args().collect::<Vec<_>>();
-            let host =
-                mcp_http_arg_value(&args, "--host")?.unwrap_or_else(|| "0.0.0.0".to_string());
-            let port = match mcp_http_arg_value(&args, "--port")? {
-                Some(port) => port
-                    .parse::<u16>()
-                    .with_context(|| format!("invalid --port value '{port}'"))?,
-                None => toolset.default_mcp_http_port(),
-            };
-            return run_toolset_mcp_http(toolset, host, port, readiness).await;
-        }
-        None => {}
-    }
-
-    let scope =
-        harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::McpStdio)?;
-    log::info!("serving under scope '{}'", scope.as_str());
-    let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
-    let client = endpoint.connect().await?;
-    let connection = NatsConnection {
-        client,
-        replicas: endpoint.resolved_replicas(),
-    };
-    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
-    serve_configured(
-        toolset,
-        ServeSettings {
-            instance_id: scope,
-            connection,
-            lifecycle: ServeLifecycle::new(shutdown, readiness),
-            identity: RegistrationIdentity::from_env(),
-            started: None,
-            filter,
-        },
-    )
-    .await
-}
-
-pub async fn run_toolset_main<T>(toolset: T) -> Result<()>
-where
-    T: Toolset + 'static,
-{
-    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
-
-    let args = std::env::args_os().collect::<Vec<_>>();
-    let name = toolset_name_from_args(&args)?;
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print_toolset_help();
-        return Ok(());
-    }
-
-    let enable_tools = enable_tools_from_args(&args)?;
-    let filter_set = compile_enable_globs(&enable_tools)?;
-    let toolset: Arc<dyn Toolset> = match name {
-        Some(name) => Arc::new(NamedToolset::new(toolset, name)?),
-        None => Arc::new(toolset),
-    };
-
-    let metrics_addr = harnx_metrics::metrics_addr_from_args(
-        std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()),
-    )
-    .or_else(|| std::env::var("HARNX_METRICS_ADDR").ok());
-    harnx_metrics::init(&harnx_metrics::MetricsFlags { metrics_addr })?;
-
-    let healthz_addr = harnx_healthz::healthz_addr_from_args(std::env::args())
-        .or_else(|| std::env::var("HARNX_HEALTHZ_ADDR").ok());
-    let readiness = harnx_healthz::init(&harnx_healthz::HealthzFlags { healthz_addr }).await?;
-
-    let service_name = format!("harnx-{}-server", toolset.name());
-    let telemetry = harnx_telemetry::init_telemetry(&service_name)?;
-
-    let result = run_mcp_service(toolset, readiness, filter_set).await;
-
-    telemetry.shutdown().await;
-    result
 }
 
 #[cfg(test)]

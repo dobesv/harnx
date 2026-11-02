@@ -22,6 +22,7 @@ use_tools:
 - fs_grep
 - fs_find
 - fs_write
+- fs_write_attachment
 - fs_edit
 - fs_insert
 - fs_re_replace

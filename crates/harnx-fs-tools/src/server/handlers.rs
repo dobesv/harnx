@@ -24,7 +24,7 @@ impl FsServer {
     pub(crate) fn progress_location_for_args(&self, tool: &str, args: &Value) -> Option<PathBuf> {
         match tool {
             "read" | "ls" => validate_path(args.get("path")?.as_str()?, &self.allowlist).ok(),
-            "write" | "edit" | "insert" | "re_replace" => {
+            "write" | "write_attachment" | "write_bytes" | "edit" | "insert" | "re_replace" => {
                 validate_write_path(args.get("path")?.as_str()?, &self.allowlist).ok()
             }
             "grep" | "find" => match args.get("path").and_then(Value::as_str) {
@@ -41,6 +41,8 @@ impl FsServer {
     pub fn new(allowlist: ResolvedAllowlist) -> Self {
         Self {
             allowlist: Arc::new(allowlist),
+            attachment_resolver: None,
+            sandbox_transport: false,
             history: Arc::new(HistoryManager::new()),
             repo_locks: Arc::new(Mutex::new(HashMap::new())),
             file_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -53,7 +55,7 @@ impl FsServer {
             .unwrap_or_else(|| path.to_path_buf())
     }
 
-    fn repo_lock_for_path(&self, path: &Path) -> Arc<RwLock<()>> {
+    pub(super) fn repo_lock_for_path(&self, path: &Path) -> Arc<RwLock<()>> {
         let key = Self::repo_lock_key_for_path(path);
         let mut locks = self
             .repo_locks
@@ -70,7 +72,7 @@ impl FsServer {
         lock
     }
 
-    fn lock_for_path(&self, path: &Path) -> Arc<AsyncMutex<()>> {
+    pub(super) fn lock_for_path(&self, path: &Path) -> Arc<AsyncMutex<()>> {
         let mut locks = self
             .file_locks
             .lock()
@@ -139,7 +141,7 @@ impl FsServer {
         )
     }
 
-    fn mutation_success(message: String, diff: Option<String>) -> CallToolResult {
+    pub(super) fn mutation_success(message: String, diff: Option<String>) -> CallToolResult {
         let mut contents = vec![ContentBlock::text(message)];
         if let Some(diff_content) = diff.filter(|diff| !diff.is_empty()) {
             contents.push(ContentBlock::text(diff_content));
@@ -499,53 +501,6 @@ impl FsServer {
             bytes.len(),
             notices,
         )
-    }
-
-    pub(crate) async fn write_file_impl(
-        &self,
-        params: WriteFileParams,
-    ) -> Result<CallToolResult, ErrorData> {
-        let path = validate_write_path(&params.path, &self.allowlist).map_err(invalid_params)?;
-        let repo_lock = self.repo_lock_for_path(&path);
-        let _repo_guard = repo_lock.read().await;
-        let file_lock = self.lock_for_path(&path);
-        let _file_guard = file_lock.lock().await;
-
-        if params.content.len() > WRITE_MAX_BYTES {
-            return tool_error(format!(
-                "Content too large ({}, max {})",
-                format_size(params.content.len()),
-                format_size(WRITE_MAX_BYTES)
-            ));
-        }
-
-        let before_snap = self.snapshot_before(&path, "before write_file").await;
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                internal_error(format!(
-                    "failed to create directories for '{}': {err}",
-                    params.path
-                ))
-            })?;
-        }
-
-        std::fs::write(&path, &params.content)
-            .map_err(|err| internal_error(format!("failed to write '{}': {err}", params.path)))?;
-
-        let diff = self
-            .snapshot_after_diff(&path, before_snap, "after write_file")
-            .await;
-
-        Ok(Self::mutation_success(
-            format!(
-                "Wrote {} ({} lines) to {}",
-                format_size(params.content.len()),
-                params.content.lines().count(),
-                params.path
-            ),
-            diff,
-        ))
     }
 
     pub(crate) async fn insert_impl(

@@ -363,3 +363,6 @@ async fn missing_binding_uses_effective_sandbox_toolset_name() -> Result<()> {
         .contains("call review_sandbox_connect or provide sandbox_id"));
     Ok(())
 }
+
+#[path = "proxy/attachment_write.rs"]
+mod attachment_write;

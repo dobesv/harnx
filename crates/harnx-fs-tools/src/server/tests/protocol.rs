@@ -128,6 +128,7 @@ async fn test_fs_server_list_tools() {
         vec![
             "read",
             "write",
+            "write_attachment",
             "edit",
             "insert",
             "re_replace",

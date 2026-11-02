@@ -14,6 +14,7 @@ use_tools:
 - bash_wait
 - bash_terminate
 - fs_write
+- fs_write_attachment
 - fs_edit
 - fs_insert
 - fs_re_replace

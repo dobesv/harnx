@@ -55,6 +55,7 @@ fn proxy_tool_surface_includes_bash_and_filesystem_tools() {
         [
             "fs_read",
             "fs_write",
+            "fs_write_attachment",
             "fs_edit",
             "fs_insert",
             "fs_re_replace",
@@ -108,4 +109,28 @@ fn all_lifecycle_tools_declare_correct_kind() {
         Some(ToolProgressKind::Delete),
         "'release' should have Delete kind"
     );
+}
+
+#[test]
+fn attachment_write_proxy_schema_keeps_public_args_and_hides_private_transport() {
+    let specs = harnx_fs_tools::builtin_tool_specs()
+        .into_iter()
+        .map(proxy_spec)
+        .collect::<Vec<_>>();
+    assert!(!specs.iter().any(|spec| spec.name == "write_bytes"));
+    let spec = specs
+        .iter()
+        .find(|spec| spec.name == "write_attachment")
+        .unwrap();
+    assert_eq!(spec.kind(), Some(ToolProgressKind::Edit));
+    assert!(!spec.read_only_hint);
+    assert_eq!(spec.timeout_secs, Some(0));
+    assert_eq!(spec.input_schema["required"], json!(["path", "url"]));
+    assert_eq!(spec.input_schema["additionalProperties"], false);
+    let properties = spec.input_schema["properties"].as_object().unwrap();
+    assert_eq!(properties.len(), 3);
+    for name in ["path", "url", "sandbox_id"] {
+        assert_eq!(properties[name]["type"], "string");
+    }
+    assert!(!properties.contains_key("data_base64"));
 }

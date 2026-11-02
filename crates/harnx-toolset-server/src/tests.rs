@@ -1,66 +1,8 @@
+use crate::mcp::McpToolsetAdapter;
 use opentelemetry::trace::{SpanId, SpanKind, TraceId};
 use rmcp::model::RequestParamsMeta;
 
 use super::*;
-
-#[test]
-fn mcp_http_args_accept_separate_and_equals_values() {
-    let separate = vec![
-        "server".to_string(),
-        "--host".to_string(),
-        "127.0.0.1".to_string(),
-        "--port".to_string(),
-        "3999".to_string(),
-    ];
-    assert_eq!(
-        mcp_http_arg_value(&separate, "--host").unwrap(),
-        Some("127.0.0.1".to_string())
-    );
-    assert_eq!(
-        mcp_http_arg_value(&separate, "--port").unwrap(),
-        Some("3999".to_string())
-    );
-
-    let equals = vec![
-        "server".to_string(),
-        "--host=0.0.0.0".to_string(),
-        "--port=3001".to_string(),
-    ];
-    assert_eq!(
-        mcp_http_arg_value(&equals, "--host").unwrap(),
-        Some("0.0.0.0".to_string())
-    );
-    assert_eq!(
-        mcp_http_arg_value(&equals, "--port").unwrap(),
-        Some("3001".to_string())
-    );
-}
-
-#[test]
-fn resolve_mcp_mode_mutual_exclusion() {
-    let err = resolve_mcp_mode(["server", "--mcp-stdio", "--mcp-http"]).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "choose one of --mcp-stdio or --mcp-http, not both"
-    );
-
-    assert_eq!(
-        resolve_mcp_mode(["server", "--mcp-stdio"]).unwrap(),
-        Some(McpMode::Stdio)
-    );
-    assert_eq!(
-        resolve_mcp_mode(["server", "--mcp-http"]).unwrap(),
-        Some(McpMode::Http)
-    );
-    assert_eq!(resolve_mcp_mode(["server"]).unwrap(), None);
-}
-
-#[test]
-fn mcp_http_arg_requires_separate_value() {
-    let args = vec!["server".to_string(), "--port".to_string()];
-    let error = mcp_http_arg_value(&args, "--port").unwrap_err();
-    assert_eq!(error.to_string(), "missing value for --port");
-}
 
 #[test]
 fn parent_session_argument_only_uses_transport_context() {

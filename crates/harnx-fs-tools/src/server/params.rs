@@ -26,6 +26,26 @@ pub struct WriteFileParams {
     pub content: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub struct WriteAttachmentParams {
+    /// Absolute path to the file to write or create.
+    pub path: String,
+    /// The cid:media: or cid:plan: URL to copy.
+    pub url: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub struct WriteBytesParams {
+    /// Absolute path to the file to write or create.
+    pub path: String,
+    /// Standard padded base64 of the exact file bytes (at most 100 MiB decoded).
+    pub data_base64: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct EditFileParams {
     pub path: String,

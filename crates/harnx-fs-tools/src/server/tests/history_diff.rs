@@ -73,3 +73,78 @@ async fn edit_file_emits_unaudienced_diff_content() {
     assert!(audience(&result.content[0]).is_none(), "summary audience");
     assert!(audience(&result.content[1]).is_none(), "diff audience");
 }
+
+#[tokio::test]
+async fn write_bytes_emits_unchanged_text_diff() {
+    let dir = TestDir::new();
+    if !seed_committed_file(dir.path(), "tracked.txt", "old value\n") {
+        return;
+    }
+    let path = dir.path().join("tracked.txt");
+
+    let result = make_server(dir.path())
+        .write_bytes_impl(&path_string(&path), b"new value\n")
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(
+        text_content(&result),
+        format!("Wrote 10B (1 lines) to {}", path.display())
+    );
+    assert_eq!(result.content.len(), 2);
+    let diff = &result.content[1].as_text().unwrap().text;
+    assert!(diff.starts_with("commit "));
+    assert!(diff.contains("```diff\n"));
+    assert!(diff.contains("-old value"));
+    assert!(diff.contains("+new value"));
+    assert!(audience(&result.content[1]).is_none());
+}
+
+#[tokio::test]
+async fn write_bytes_snapshots_binary_without_rendering_payload() {
+    let dir = TestDir::new();
+    if !seed_committed_file(dir.path(), "tracked.png", "original\n") {
+        return;
+    }
+    let path = dir.path().join("tracked.png");
+    let server = make_server(dir.path());
+
+    // Exercise both git's text-like and NUL-detected binary cases.
+    for bytes in [b"\x89PNG\r\n\x1a\n\xff\xff".as_slice(), b"\x89PNG\x00\xff"] {
+        let previous = std::fs::read(&path).unwrap();
+        let result = server
+            .write_bytes_impl(&path_string(&path), bytes)
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        write_ops::assert_binary_output_is_safe(&result);
+        assert_eq!(result.content.len(), 2);
+        let summary = &result.content[1].as_text().unwrap().text;
+        assert!(summary.contains("Binary file changed (diff omitted)."));
+        assert!(audience(&result.content[1]).is_none());
+        let commit = summary
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("commit ")
+            .unwrap();
+        assert_eq!(snapshot_bytes(dir.path(), commit, "tracked.png"), bytes);
+        assert_eq!(
+            snapshot_bytes(dir.path(), &format!("{commit}^"), "tracked.png"),
+            previous
+        );
+    }
+}
+
+fn snapshot_bytes(dir: &Path, commit: &str, path: &str) -> Vec<u8> {
+    let output = std::process::Command::new("git")
+        .args(["show", &format!("{commit}:{path}")])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "snapshot blob should be readable");
+    output.stdout
+}

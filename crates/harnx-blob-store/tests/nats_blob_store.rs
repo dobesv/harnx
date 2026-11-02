@@ -7,7 +7,7 @@ use harnx_blob_store::{
         create_document, serialize_note, serialize_plan, serialize_task, NoteDocument,
         NoteFrontMatter, PlanDocument, PlanFrontMatter, TaskDocument, TaskFrontMatter,
     },
-    resolve, touch_activity, ResolvedBlob,
+    resolve, resolve_bounded, touch_activity, BlobTooLarge, ResolvedBlob,
 };
 use harnx_core::cid_url::{CidUrl, PlanItem, SessionRef};
 
@@ -141,6 +141,195 @@ async fn resolve_missing_media_returns_error() -> Result<()> {
 
     let error = resolve(&jetstream, &url).await.unwrap_err();
     assert!(error.to_string().contains("attachment not found"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_bounded_media_preserves_bytes_and_cache_metadata() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    let store = ensure_attachments_bucket(&jetstream, 1).await?;
+    let session = SessionRef::new(Some("pantheon/atlas".into()), "bound1".into())?;
+    let url = media_cid_url(&session, HASH_A);
+    let bytes = [0, 255, 128, 13, 10].repeat(30_000);
+    put_media(&store, &url, &bytes, "image/png").await?;
+
+    let bounded = resolve_bounded(&jetstream, &url, bytes.len()).await?;
+    let activity = jetstream.get_key_value("harnx_sessions").await?;
+    assert!(activity
+        .get(format!("sessions/{}/activity", session.owner()))
+        .await?
+        .is_some());
+    assert_eq!(bounded, resolve(&jetstream, &url).await?);
+    for max_bytes in [bytes.len() + 1, usize::MAX] {
+        assert_eq!(resolve_bounded(&jetstream, &url, max_bytes).await?, bounded);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_bounded_empty_media_accepts_zero_limit() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    let store = ensure_attachments_bucket(&jetstream, 1).await?;
+    let session = SessionRef::new(None, "bound2".into())?;
+    let url = media_cid_url(&session, HASH_A);
+    put_media(&store, &url, b"", "application/octet-stream").await?;
+
+    assert_eq!(
+        resolve_bounded(&jetstream, &url, 0).await?,
+        resolve(&jetstream, &url).await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_bounded_media_rejects_oversize_before_reading() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    let store = ensure_attachments_bucket(&jetstream, 1).await?;
+    let session = SessionRef::new(None, "bound3".into())?;
+    let url = media_cid_url(&session, HASH_A);
+    let bytes = [255; 1024];
+    put_media(&store, &url, &bytes, "application/octet-stream").await?;
+    // Any read of this single-chunk object fails digest validation.
+    rewrite_last_media_info(&jetstream, &url, |info| {
+        info.digest = Some("SHA-256=invalid".into());
+    })
+    .await?;
+
+    for max_bytes in [0, bytes.len() - 1] {
+        let error = resolve_bounded(&jetstream, &url, max_bytes)
+            .await
+            .unwrap_err();
+        assert_too_large(&error, bytes.len(), max_bytes);
+    }
+    let error = resolve(&jetstream, &url).await.unwrap_err();
+    assert!(format!("{error:#}").contains("wrong digest"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_bounded_media_stops_when_metadata_understates_size() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    let store = ensure_attachments_bucket(&jetstream, 1).await?;
+    let session = SessionRef::new(None, "bound4".into())?;
+    let url = media_cid_url(&session, HASH_A);
+    put_media(&store, &url, &vec![255; 512 * 1024], "image/png").await?;
+    rewrite_last_media_info(&jetstream, &url, |info| {
+        info.size = 0;
+        // Reading through the final chunk would fail instead of returning BlobTooLarge.
+        info.digest = Some("SHA-256=invalid".into());
+    })
+    .await?;
+
+    for max_bytes in [0, 16, 128 * 1024] {
+        let error = resolve_bounded(&jetstream, &url, max_bytes)
+            .await
+            .unwrap_err();
+        assert_too_large(&error, max_bytes + 1, max_bytes);
+    }
+    Ok(())
+}
+
+async fn rewrite_last_media_info(
+    jetstream: &async_nats::jetstream::Context,
+    url: &CidUrl,
+    rewrite: impl FnOnce(&mut async_nats::jetstream::object_store::ObjectInfo),
+) -> Result<()> {
+    let stream = jetstream.get_stream("OBJ_harnx_attachments").await?;
+    let message = stream
+        .get_raw_message(stream.cached_info().state.last_sequence)
+        .await?;
+    let mut info: async_nats::jetstream::object_store::ObjectInfo =
+        serde_json::from_slice(&message.payload)?;
+    assert_eq!(info.name, url.kv_key());
+    rewrite(&mut info);
+    jetstream
+        .publish(message.subject, serde_json::to_vec(&info)?.into())
+        .await?
+        .await?;
+    Ok(())
+}
+
+fn assert_too_large(error: &anyhow::Error, size_bytes: usize, max_bytes: usize) {
+    assert_eq!(
+        error.downcast_ref::<BlobTooLarge>(),
+        Some(&BlobTooLarge {
+            size_bytes,
+            max_bytes,
+        })
+    );
+    assert_eq!(
+        error.to_string(),
+        format!("blob too large: {size_bytes} bytes exceeds limit of {max_bytes} bytes")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_bounded_missing_media_returns_not_found() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    let session = SessionRef::new(None, "bound5".into())?;
+    let url = media_cid_url(&session, HASH_A);
+    assert_bounded_not_found(&jetstream, &url).await?;
+    let store = ensure_attachments_bucket(&jetstream, 1).await?;
+    assert_bounded_not_found(&jetstream, &url).await?;
+    put_media(&store, &url, b"deleted", "text/plain").await?;
+    store.delete(url.kv_key()).await?;
+    assert_bounded_not_found(&jetstream, &url).await?;
+    Ok(())
+}
+
+async fn assert_bounded_not_found(
+    jetstream: &async_nats::jetstream::Context,
+    url: &CidUrl,
+) -> Result<()> {
+    let error = resolve_bounded(jetstream, url, 0).await.unwrap_err();
+    assert!(error.to_string().contains("attachment not found"));
+    assert!(error.downcast_ref::<BlobTooLarge>().is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_bounded_plan_checks_rendered_markdown_size() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    let fixture = seed_rendered_plan(&jetstream).await?;
+    let store = ensure_plans_bucket(&jetstream, 1).await?;
+    let mut note = note_document(&fixture.note);
+    note.body = "Résumé 🦀".into();
+    store
+        .put(fixture.note.kv_key(), serialize_note(&note)?.into())
+        .await?;
+    for url in [&fixture.plan, &fixture.task, &fixture.note] {
+        let expected = resolve(&jetstream, url).await?;
+        let size = expected.bytes.len();
+        assert_eq!(resolve_bounded(&jetstream, url, size).await?, expected);
+        assert_eq!(
+            resolve_bounded(&jetstream, url, usize::MAX).await?,
+            expected
+        );
+        for max_bytes in [0, size - 1] {
+            let error = resolve_bounded(&jetstream, url, max_bytes)
+                .await
+                .unwrap_err();
+            assert_too_large(&error, size, max_bytes);
+        }
+    }
     Ok(())
 }
 
