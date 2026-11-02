@@ -793,6 +793,17 @@
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max","summary":"auto"}
       endpoint: responses
+    - name: gpt-6-astra-law
+      max_input_tokens: 922000
+      max_output_tokens: 128000
+      input_price: 10
+      output_price: 50
+      cache_read_price: 1
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
+      endpoint: responses
     - name: gpt-6-luna
       max_input_tokens: 922000
       max_output_tokens: 128000
@@ -805,6 +816,15 @@
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"summary":"auto"}
       endpoint: responses
+    - name: gpt-6-rosalind
+      max_input_tokens: 922000
+      max_output_tokens: 128000
+      input_price: 15
+      output_price: 75
+      cache_read_price: 1.5
+      cache_write_price: 18.75
+      supports_vision: true
+      supports_tool_use: true
     - name: gpt-6-sol
       max_input_tokens: 922000
       max_output_tokens: 128000
@@ -6591,17 +6611,6 @@
 # - https://platform.minimaxi.com/document/ChatCompletion%20v2
 - provider: minimax
   models:
-    - name: MiniMax-M3.1-Flash
-      max_input_tokens: 868928
-      max_output_tokens: 131072
-      require_max_tokens: true
-      input_price: 0.15
-      output_price: 0.6
-      cache_read_price: 0.015
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.reasoning_effort = "low" | .body.max_completion_tokens = (.body.max_completion_tokens // .body.max_tokens) | del(.body.max_tokens)
     - name: MiniMax-M2
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -6650,6 +6659,17 @@
       cache_read_price: 0.06
       supports_vision: true
       supports_tool_use: true
+    - name: MiniMax-M3.1-Flash
+      max_input_tokens: 868928
+      max_output_tokens: 131072
+      require_max_tokens: true
+      input_price: 0.15
+      output_price: 0.6
+      cache_read_price: 0.015
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.reasoning_effort = "low" | .body.max_completion_tokens = (.body.max_completion_tokens // .body.max_tokens) | del(.body.max_tokens)
     - name: minimax-m2.1
       max_input_tokens: 204800
       input_price: 0.294
@@ -11852,8 +11872,10 @@
       input_price: 0.12
       type: embedding
 
-# International Z.AI API; distinct from the legacy China zhipuai catalog.
-# https://docs.z.ai/guides/llm/glm-5.3
+# International Z.AI API; curated separately from the China catalog.
+# Links:
+#  - https://docs.z.ai/guides/llm/glm-5.3
+#  - https://docs.z.ai/guides/overview/pricing
 - provider: zai
   models:
     - name: glm-5.3
