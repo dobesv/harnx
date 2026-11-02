@@ -112,7 +112,9 @@ pub fn stream(input: &Input, config: &GlobalConfig) -> bool {
 }
 
 pub fn set_regenerate(input: &mut Input, config: &GlobalConfig) {
-    let agent = config.read().extract_agent();
+    // Refresh from the tool-selection resolution so a regenerated turn keeps
+    // the active session's `bash_tools` override.
+    let agent = config.read().tool_selection_agent();
     if agent.name() == input.agent().name() {
         input.agent = agent.into_config();
     }
@@ -237,7 +239,11 @@ fn resolve_agent(config: &Config, agent: Option<Agent>) -> (Agent, bool, bool) {
     match agent {
         Some(v) => (v, false, false),
         None => (
-            config.extract_agent(),
+            // The session's `bash_tools` override must ride along on the
+            // input agent so tool selection (`select_tools(input.agent())`)
+            // sees it; separately-built inputs (compaction summarizer) keep
+            // their own selectors.
+            config.tool_selection_agent(),
             config.session.is_some(),
             config.agent.is_some(),
         ),

@@ -76,6 +76,7 @@ impl Config {
                     "temperature",
                     "top_p",
                     "use_tools",
+                    "bash_tools",
                     "compress_threshold",
                     "compaction_agent",
                     "model_fallbacks",
@@ -97,6 +98,20 @@ impl Config {
             _ => fixed_subcommands(cmd)
                 .map(|subcommands| map_completion_values(subcommands.to_vec()))
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Whether a `bash_tools` completion candidate can resolve to at least
+    /// one inner-admissible tool. Toolset members are exact names and only
+    /// count when they match an available declaration (mirroring
+    /// `collect_selected_tool_names`), so a toolset whose resolvable members
+    /// are all excluded stays out of the candidate list.
+    fn bash_tools_candidate_admits(&self, name: &str, declarations: &HashSet<String>) -> bool {
+        match self.toolsets.get(name) {
+            Some(members) => members.iter().any(|member| {
+                declarations.contains(member) && tool_selection::is_bash_inner_tool_allowed(member)
+            }),
+            None => tool_selection::is_bash_inner_tool_allowed(name),
         }
     }
 
@@ -136,6 +151,31 @@ impl Config {
             "save" => complete_bool(self.save),
             "tool_use" => complete_bool(self.tool_use),
             "use_tools" => self.complete_use_tools_arg(setting.value_prefix),
+            // A candidate is useful only if it can resolve to at least one
+            // tool script mode actually admits (`is_bash_inner_tool_allowed`).
+            // Plain names pass the boundary check; toolsets pass when at least
+            // one member that matches an available declaration does — a
+            // toolset holding only excluded names (e.g. `*_session_handoff`)
+            // would otherwise complete but resolve to an empty inner set,
+            // silently leaving script mode off. `use_tools` keeps the full
+            // candidate set.
+            "bash_tools" => {
+                let declarations: HashSet<String> = self
+                    .tool_declarations_for_use_tools(Some("*"), self.active_package().as_deref())
+                    .0
+                    .iter()
+                    .map(|declaration| declaration.name.clone())
+                    .collect();
+                self.complete_use_tools_arg(setting.value_prefix)
+                    .into_iter()
+                    .filter(|candidate| {
+                        let name = candidate
+                            .rsplit_once(',')
+                            .map_or(candidate.as_str(), |(_, last)| last);
+                        self.bash_tools_candidate_admits(name, &declarations)
+                    })
+                    .collect()
+            }
             "rag_reranker_model" => list_models(&self.clients, ModelType::Reranker)
                 .iter()
                 .map(|v| v.id())
@@ -235,6 +275,21 @@ fn complete_bool(value: bool) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn tool(name: &str) -> ToolDeclaration {
+        ToolDeclaration {
+            name: name.to_string(),
+            description: format!("tool {name}"),
+            parameters: Default::default(),
+            mcp_tool_name: None,
+            mcp_server_name: None,
+            call_template: None,
+            result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
+            kind: None,
+        }
+    }
+
     #[test]
     fn session_completion_uses_default_cluster_for_bare_agent() {
         let default_config = Config::default();
@@ -277,6 +332,78 @@ mod tests {
         assert!(config
             .command_complete(".set", &["stream", "not-a-boolean"], vec![])
             .is_empty());
+    }
+
+    #[test]
+    fn bash_tools_set_completion_lists_setting_and_filters_inner_forbidden_names() {
+        // Injected MCP declarations keep the candidate set deterministic;
+        // handoff candidates from agent files vary by host.
+        let mut config = Config {
+            tools: Tools::init_from_mcp(Some(vec![
+                tool("fs_read"),
+                tool("atlas_session_handoff"),
+                tool("switch_agent"),
+                tool("ask_user"),
+                tool("bash"),
+            ])),
+            ..Config::default()
+        };
+        // `handoffs` resolves only to excluded names, `mixed` also has an
+        // unresolved member that must not count either way, and `docs` has
+        // an admissible member.
+        config.toolsets.insert(
+            "handoffs".to_string(),
+            vec!["atlas_session_handoff".to_string()],
+        );
+        config.toolsets.insert(
+            "mixed".to_string(),
+            vec!["atlas_session_handoff".to_string(), "fs_read".to_string()],
+        );
+        config.toolsets.insert(
+            "docs".to_string(),
+            vec!["fs_read".to_string(), "no_such_tool".to_string()],
+        );
+
+        let first_arg = config.command_complete(".set", &["bash"], vec![]);
+        assert!(first_arg.contains(&("bash_tools ".to_string(), None)));
+
+        let use_tools = config.command_complete(".set", &["use_tools", ""], vec![]);
+        let bash_tools = config.command_complete(".set", &["bash_tools", ""], vec![]);
+
+        // use_tools completion is unchanged: control tools and every toolset
+        // stay offerable (builtins precede toolsets in the candidate order).
+        assert_eq!(
+            use_tools,
+            vec![
+                ("*".to_string(), None),
+                ("fs_read".to_string(), None),
+                ("atlas_session_handoff".to_string(), None),
+                ("switch_agent".to_string(), None),
+                ("ask_user".to_string(), None),
+                ("bash".to_string(), None),
+                ("harnx_agent_session_history_read".to_string(), None),
+                ("harnx_read_session_meta".to_string(), None),
+                ("harnx_write_session_meta".to_string(), None),
+                ("handoffs".to_string(), None),
+                ("mixed".to_string(), None),
+                ("docs".to_string(), None),
+            ]
+        );
+        // bash_tools offers only candidates that resolve to at least one
+        // inner-admissible tool: `handoffs` drops out, `mixed` and `docs`
+        // survive on their admissible members.
+        assert_eq!(
+            bash_tools,
+            vec![
+                ("*".to_string(), None),
+                ("fs_read".to_string(), None),
+                ("harnx_agent_session_history_read".to_string(), None),
+                ("harnx_read_session_meta".to_string(), None),
+                ("harnx_write_session_meta".to_string(), None),
+                ("mixed".to_string(), None),
+                ("docs".to_string(), None),
+            ]
+        );
     }
 
     /// Test that remote session completion gracefully degrades on unreachable cluster.

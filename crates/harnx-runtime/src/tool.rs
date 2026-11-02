@@ -554,6 +554,12 @@ fn build_tool_providers(
     nats_provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
 ) -> Vec<Arc<dyn ToolProvider>> {
     let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
+    // The reserved `bash` stub must come before the NATS provider so it wins
+    // `has_tool("bash")` against raw-name aliases registered from tool
+    // servers (script mode, #2537).
+    providers.push(Arc::new(crate::bash_provider::ReservedBashProvider::new(
+        config.read().bash_tools_active(),
+    )) as Arc<dyn ToolProvider>);
     // NATS is the runtime provider for configured sub-agent and tool-server tools.
     if let Some(nats) = nats_provider {
         providers.push(nats as Arc<dyn ToolProvider>);
@@ -820,6 +826,37 @@ mod tests {
                 .expect("runtime callback"),
             &prepare,
         ));
+    }
+
+    /// The reserved `bash` provider must sit first so it wins
+    /// `has_tool("bash")` against NATS raw-name aliases, and must only claim
+    /// the name while the active agent's `bash_tools` resolves to tools
+    /// (script mode, #2537).
+    #[test]
+    fn reserved_bash_provider_leads_and_tracks_bash_tools() {
+        let tools = harnx_core::tool::Tools::init_from_mcp(Some(vec![make_decl_with_templates(
+            "fs_read", None, None,
+        )]));
+        let mut agent_config = harnx_core::agent_config::AgentConfig::from_prompt("test");
+        agent_config.set_bash_tools(Some(vec!["fs_*".to_string()]));
+        let config = Config {
+            tools,
+            agent: Some(crate::config::agent::Agent::new(agent_config)),
+            ..Config::default()
+        };
+        let config = Arc::new(ConfigLock::new(config));
+
+        let providers = build_tool_providers(&config, None);
+        assert_eq!(providers[0].name(), "reserved-bash");
+        assert!(providers[0].has_tool("bash"));
+
+        let bare = Arc::new(ConfigLock::new(Config::default()));
+        let providers = build_tool_providers(&bare, None);
+        assert_eq!(providers[0].name(), "reserved-bash");
+        assert!(
+            !providers[0].has_tool("bash"),
+            "inert when bash_tools resolves to nothing"
+        );
     }
 
     #[tokio::test]

@@ -69,6 +69,7 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 | `temperature` | `float` | global default | Controls randomness (0 = deterministic, 1 = creative). Inherited from global config when `model` is omitted. |
 | `top_p` | `float` | global default | Nucleus sampling parameter. Alternative to temperature. Inherited from global config when `model` is omitted. |
 | `use_tools` | `list` | none | YAML list of tool specifiers. Also accepts a comma-separated string for backward compatibility. See [Tools](#tools). |
+| `bash_tools` | `list` | none | Tool specifiers exposed to script mode via a synthesized `bash` tool (preview; script execution arrives in a later release). See [Script Mode Tools](#script-mode-tools-bash_tools). |
 | `description` | `string` | `""` | Short description shown in agent listings. |
 | `version` | `string` | `""` | Version identifier for the agent. |
 | `variables` | `list` | `[]` | Variables prompted on first use. See [Variables](#variables). |
@@ -256,6 +257,26 @@ use_tools:
 ```
 
 When tools are enabled, their declarations are injected into the system prompt as a numbered list appended after the prompt body.
+
+### Script Mode Tools (`bash_tools`)
+
+The `bash_tools` field enables script mode (in preview). Instead of invoking individual MCP tools across separate round trips, an agent can run multi-step scripts that chain tools and filter output locally.
+
+When `bash_tools` is configured and resolves to a non-empty set of tools, Harnx synthesizes a single `bash` tool declaration for the model. Its parameters mirror `bash_exec` (`script` instead of `command`, plus `timeout_secs`, `head_lines`, `tail_lines`, `max_output_bytes`; no `working_dir` or `env`), and its description lists the inner tools available inside the script.
+
+- **Selector syntax**: Uses the same list, comma-separated string, glob, brace expansion, and toolset syntax as `use_tools`.
+- **Independent tool sets**: `bash_tools` is independent of `use_tools`. A tool can be exposed directly in `use_tools`, inside `bash_tools`, or in both.
+- **Excluded tools**: Control-flow tools (`switch_agent`, `*_session_handoff`, `ask_user`) and `bash` itself cannot be placed inside `bash_tools`; they remain at the direct conversation boundary.
+- **Reserved name**: While `bash_tools` resolves to tools, the name `bash` belongs to script mode. An external tool named `bash` is not exposed to the model, and a `bash` call fails closed instead of routing to it.
+- **No glob shadowing**: `use_tools` wildcard globs like `*` or `bash*` never match or synthesize the script-mode `bash` tool.
+- **Session override**: `.set bash_tools <selectors>` updates the active session's record; tool selection overlays that record on the active agent, so the change takes effect immediately but stays scoped to the session — switching sessions (the TUI picker keeps the agent) does not carry the override into other sessions. `.set bash_tools null` disables script mode for the session; unlike `use_tools`, the clear persists as an empty selector list rather than an unset override, so a restarted worker keeps script mode off instead of falling back to the agent file's `bash_tools`.
+- **Preview status**: Script execution is under development. In this release, calling the synthesized `bash` tool returns a recoverable error saying script mode is not available yet.
+
+```yaml
+# Expose fs tools to script mode
+bash_tools:
+  - fs_*
+```
 
 ### Attachment Tools
 

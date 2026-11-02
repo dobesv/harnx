@@ -53,6 +53,8 @@ pub struct SessionOverrides {
     pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bash_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_fallbacks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +92,7 @@ pub enum SessionOverrideUpdate {
     CompressThreshold(Option<usize>),
     CompactionAgent(Option<String>),
     MaxOutputTokens(Option<isize>),
+    BashTools(Option<Vec<String>>),
 }
 
 impl SessionOverrideUpdate {
@@ -99,6 +102,7 @@ impl SessionOverrideUpdate {
             Self::Temperature(value) => overrides.temperature = *value,
             Self::TopP(value) => overrides.top_p = *value,
             Self::UseTools(value) => overrides.use_tools = value.clone(),
+            Self::BashTools(value) => overrides.bash_tools = value.clone(),
             Self::ModelFallbacks(value) => overrides.model_fallbacks = value.clone(),
             Self::CompressThreshold(value) => overrides.compress_threshold = *value,
             Self::CompactionAgent(value) => overrides.compaction_agent = value.clone(),
@@ -240,6 +244,7 @@ impl SessionMetadata {
             temperature: self.overrides.temperature,
             top_p: self.overrides.top_p,
             use_tools: self.overrides.use_tools.clone(),
+            bash_tools: self.overrides.bash_tools.clone(),
             compress_threshold: self.overrides.compress_threshold,
             model_fallbacks: self.overrides.model_fallbacks.clone(),
             compaction_agent: self.overrides.compaction_agent.clone(),
