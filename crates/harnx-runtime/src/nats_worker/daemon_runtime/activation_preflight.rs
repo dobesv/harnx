@@ -142,7 +142,10 @@ impl WorkerRuntime {
             self.jetstream.clone(),
             &activation.session_id,
             self.lease.replicas,
-        );
+        )
+        // Wind-up writes journal replies the interrupted turn never appended,
+        // so its `ToolResults` entry needs the size bound's owner too.
+        .with_metadata_store(Some(self.session_metadata.clone()));
         let entries = backend.load_events_latest_async().await?;
         let state = harnx_core::session_reconstruct::reconstruct_state_from_nats(&entries);
         match state.turn_status {

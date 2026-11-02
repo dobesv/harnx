@@ -100,11 +100,11 @@ pub(crate) fn externalize_tool_result_content(
 pub(crate) fn record_externalized(
     session: &mut Session,
     cid_urls: HashMap<String, String>,
-) -> bool {
+) -> super::session_persistence::AppendStatus {
     if cid_urls.is_empty() {
-        return true;
+        return super::session_persistence::AppendStatus::complete();
     }
-    let appended = crate::config::session::append_event(
+    let appended = super::session_persistence::append_event_status(
         session,
         &SessionLogEntry::DataUrls {
             urls: cid_urls.clone(),

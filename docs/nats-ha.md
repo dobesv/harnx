@@ -812,8 +812,9 @@ replacement worker may resume:
 - **Terminal NAK with Term** (`AckKind::Term`): the activation cannot succeed.
   Malformed payloads are terminated without a session-log write. A refusal
   (see below) and the tenth failure before a turn starts are terminated only
-  after persisting `SessionLogEntry::Error`. An activation past the delivery
-  limit is terminated without one.
+  after persisting `SessionLogEntry::Error`. A typed broker/stream size rejection
+  is terminated on its first failure, with an `Error` entry when that entry can
+  be appended. An activation past the delivery limit is terminated without one.
 - **Non-terminal NAK** (`AckKind::Nak(None)`): failover path. The replacement
   worker resumes from the journal. Used for lease loss and shutdown.
 - **Busy NAK** (`AckKind::Nak(10–12s)`): in-memory fast-path for
@@ -824,7 +825,13 @@ replacement worker may resume:
   before a turn starts, claim errors and rejected settlements. Retries with
   increasing delay up to 2s maximum.
 
-Every failure between claiming the lease and starting the turn counts toward a
+A typed size rejection skips the failure budget, both before and during a turn:
+redelivering the same oversized entry cannot make it fit. The worker tries to
+record the failure, then terminates only that delivery even if the diagnostic
+`Error` entry also exceeds the size limit. Later user messages still start new
+activations; termination does not disable the session.
+
+Other failures between claiming the lease and starting the turn count toward a
 budget of ten, including loading the session's metadata, freezing its run
 limits, recovering a child result that completed before its deadline and
 arming the invocation's deadline. A refusal is a failure no redelivery can
@@ -1518,6 +1525,22 @@ limits. If those fields already fill a journal row so even a small terminal erro
 can't be persisted, completion still fails fatally. A broker limit lowered below
 an already committed reply also remains a delivery failure; the server doesn't
 replace an authoritative stored completion with an unjournaled response.
+
+The worker applies the same budget a second time at its own boundary. The whole
+`ToolResults` round is one YAML session-log entry, and block-scalar indentation plus the
+sum of many parallel results can exceed the broker's `max_payload` even when every reply
+passed the tool server's JSON check (#2555). Before appending,
+`NatsSessionLogBackend::bounded_entry` measures the serialized entry against the broker
+ceiling and degrades the biggest outputs first into the same recoverable size error, with
+the original retained as a `cid:media:` attachment
+(`crates/harnx-runtime/src/nats_worker/tool_result_budget.rs`). The bound covers every
+worker append path, including orphan repair, so a session already stuck with a journaled
+oversized reply recovers on its next message. If attachment retention fails, the worker
+degrades without retention and warns rather than fail the append — failing there would
+re-wedge the session exactly as before the fix. A round of many small results that
+overflows only by count keeps its outputs: a size error is bigger than the result it
+replaces, so nothing is degraded and the typed rejection terminates the activation
+instead.
 
 ## Manual Compaction
 

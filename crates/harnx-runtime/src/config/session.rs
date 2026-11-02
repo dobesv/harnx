@@ -21,7 +21,9 @@ pub use super::session_persistence::{
     append_event, persist_active_session_override, persist_session_overrides, record_title,
     session_overrides, SessionAppendSink, TitleRecord,
 };
-use super::session_persistence::{append_event_seq, require_authoritative_appends};
+use super::session_persistence::{
+    append_event_seq, append_event_status, require_authoritative_appends, AppendStatus,
+};
 pub use super::session_tool_results::add_tool_results;
 pub(crate) use super::session_tool_results::{prepare_tool_results, prepare_tool_results_in_place};
 use super::*;
@@ -266,7 +268,9 @@ impl CompactionLog {
 
     fn append_one(&self, entry: &SessionLogEntry, log_entry_count: &mut usize) -> bool {
         let seq =
-            super::session_persistence::append_through(self.sink.as_ref(), &self.session_id, entry);
+            super::session_persistence::append_through(self.sink.as_ref(), &self.session_id, entry)
+                .ok()
+                .flatten();
         if let Some(seq) = seq {
             *log_entry_count = seq as usize;
         }
@@ -396,7 +400,7 @@ pub fn add_assistant_text(
             .with_id(message_id.clone())
             .with_log_seq(seq)
             .with_log_timestamp(timestamp);
-        all_appended &= append_event(
+        all_appended &= append_event_status(
             session,
             &SessionLogEntry::Message {
                 id: Some(message_id),
@@ -408,7 +412,7 @@ pub fn add_assistant_text(
         );
         session.messages.push(assistant_msg);
         emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
-        session.dirty = !all_appended;
+        session.dirty = !all_appended.is_complete();
         require_authoritative_appends(session, all_appended, "assistant response")?;
     }
     session.update_tokens();
@@ -451,7 +455,8 @@ pub fn add_tool_calls(
             fence_token: None,
         },
     );
-    all_appended &= round.is_some();
+    let round_seq = round.as_ref().ok().copied().flatten();
+    all_appended &= AppendStatus::from_result(round);
     emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned {
         seq: tool_calls_seq,
     }));
@@ -481,10 +486,10 @@ pub fn add_tool_calls(
             .with_id(tool_message_id)
             .with_log_seq(tool_calls_seq),
     );
-    session.dirty = !all_appended;
+    session.dirty = !all_appended.is_complete();
     require_authoritative_appends(session, all_appended, "tool calls")?;
     session.update_tokens();
-    Ok(round)
+    Ok(round_seq)
 }
 
 /// Returns `true` when `input` is a genuine tool-call continuation of

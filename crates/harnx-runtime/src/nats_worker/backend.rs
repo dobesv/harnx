@@ -1,5 +1,6 @@
 //! NATS session log backend for the async worker.
 
+use super::tool_result_budget;
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
 use anyhow::{Context, Result};
@@ -521,6 +522,52 @@ impl NatsSessionLogBackend {
         self.metadata_store.as_ref()
     }
 
+    /// The owner that oversized `ToolResults` outputs are retained for while
+    /// bounding an entry against the broker's payload ceiling. Derived from
+    /// the session's canonical metadata; `None` degrades without retention.
+    async fn attachment_owner(&self) -> Option<harnx_core::cid_url::SessionRef> {
+        let store = self.metadata_store.as_ref().cloned()?;
+        let record = match store.get(&self.session_id).await {
+            Ok(record) => record?,
+            Err(error) => {
+                warn!(
+                    "failed to read tool result attachment owner: session_id={} error={error:#}",
+                    self.session_id
+                );
+                return None;
+            }
+        };
+        let metadata = &record.metadata;
+        harnx_core::cid_url::SessionRef::new(
+            metadata.agent.name().map(str::to_string),
+            metadata.session_id.clone(),
+        )
+        .ok()
+    }
+
+    /// Bound an entry against the broker's payload ceiling before it is
+    /// serialized and published (#2555). An oversized `ToolResults` round
+    /// degrades its biggest outputs into recoverable size errors that retain
+    /// the originals as `cid:media:` attachments; everything else passes
+    /// through so a rejection keeps its typed broker cause.
+    async fn bounded_entry<'a>(
+        &self,
+        entry: &'a harnx_core::session::SessionLogEntry,
+    ) -> Result<std::borrow::Cow<'a, harnx_core::session::SessionLogEntry>> {
+        // The owner lookup is a KV read, so only pay it once an entry really
+        // has to be degraded; fitting entries never need an owner.
+        if tool_result_budget::entry_fits(&self.jetstream, entry)? {
+            // ToolResults serialize here for measurement and again at publish.
+            // Keep this bound independent of the append/fence serialization API.
+            return Ok(std::borrow::Cow::Borrowed(entry));
+        }
+        let owner = self.attachment_owner().await;
+        tool_result_budget::ToolResultsBudget::new(&self.jetstream, owner, self.replicas)
+            .bound(entry)
+            .await
+            .map(std::borrow::Cow::Owned)
+    }
+
     fn patch_metadata_blocking<F>(&self, fence_token: Option<u64>, patch: F) -> Result<()>
     where
         F: FnMut(&mut crate::nats_session_metadata::SessionMetadata) -> Result<()>,
@@ -662,15 +709,16 @@ impl NatsSessionLogBackend {
         expected_last_sequence: u64,
         lease: &NatsSessionLease,
     ) -> Result<Option<u64>> {
+        let entry = self.bounded_entry(entry).await?;
         let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             self.session_id.clone(),
             self.replicas,
         );
-        self.ensure_lease_held(lease, entry)?;
+        self.ensure_lease_held(lease, &entry)?;
         let seq = match log
             .append_fenced(
-                entry,
+                &entry,
                 expected_last_sequence,
                 &uuid::Uuid::new_v4().to_string(),
             )
@@ -734,7 +782,8 @@ impl NatsSessionLogBackend {
         lease: &NatsSessionLease,
         mut write: FencedWrite,
     ) -> Result<u64> {
-        let entry = stamp_fence_token(entry, lease.fence_token());
+        let entry = self.bounded_entry(entry).await?;
+        let entry = stamp_fence_token(&entry, lease.fence_token());
         let log = crate::nats_session_log::NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             self.session_id.clone(),
@@ -833,13 +882,14 @@ impl NatsSessionLogBackend {
         log: &crate::nats_session_log::NatsSessionLog,
         entry: &harnx_core::session::SessionLogEntry,
     ) -> Result<u64> {
+        let entry = self.bounded_entry(entry).await?;
         let message_id =
-            timing_append_message_id(entry).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            timing_append_message_id(&entry).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut last_error = None;
         let mut appended_seq = None;
         for attempt in 1..=APPEND_ATTEMPTS {
             match log
-                .append_event_with_message_id_async(entry, message_id.clone())
+                .append_event_with_message_id_async(&entry, message_id.clone())
                 .await
             {
                 Ok(seq) => {
@@ -851,7 +901,7 @@ impl NatsSessionLogBackend {
                         warn!(
                             "retrying session append: session_id={} entry_type={} attempt={}/{} error={error:#}",
                             self.session_id(),
-                            crate::session_history::entry_type(entry),
+                            crate::session_history::entry_type(&entry),
                             attempt,
                             APPEND_ATTEMPTS,
                         );

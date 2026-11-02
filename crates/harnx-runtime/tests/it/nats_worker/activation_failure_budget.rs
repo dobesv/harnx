@@ -101,17 +101,10 @@ async fn pre_turn_infrastructure_failure_terminates_after_ten_failures() -> Resu
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     wait_for_terminal_activation(&consumer, &stream, 10).await?;
+    assert_eq!(consumer.get_info().await?.delivered.consumer_sequence, 10);
 
     assert_eq!(calls.load(Ordering::SeqCst), 0, "turn must never start");
-    let errors = log
-        .load_events_async()
-        .await?
-        .into_iter()
-        .filter_map(|(_, entry)| match entry {
-            SessionLogEntry::Error { message, .. } => Some(message),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let errors = error_messages(&log).await?;
     assert_eq!(
         errors.len(),
         1,
@@ -126,6 +119,18 @@ async fn pre_turn_infrastructure_failure_terminates_after_ten_failures() -> Resu
     daemon.abort();
     let _ = daemon.await;
     Ok(())
+}
+
+async fn error_messages(log: &NatsSessionLog) -> Result<Vec<String>> {
+    Ok(log
+        .load_events_async()
+        .await?
+        .into_iter()
+        .filter_map(|(_, entry)| match entry {
+            SessionLogEntry::Error { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect())
 }
 
 async fn redeliver_activation(
@@ -259,17 +264,10 @@ async fn run_limit_failure_terminates_after_ten_failures() -> Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     wait_for_terminal_activation(&consumer, &stream, 10).await?;
+    assert_eq!(consumer.get_info().await?.delivered.consumer_sequence, 10);
 
     assert_eq!(calls.load(Ordering::SeqCst), 0, "turn must never start");
-    let errors = log
-        .load_events_async()
-        .await?
-        .into_iter()
-        .filter_map(|(_, entry)| match entry {
-            SessionLogEntry::Error { message, .. } => Some(message),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let errors = error_messages(&log).await?;
     assert_eq!(errors.len(), 1, "only the last failure writes an error");
     assert!(
         errors[0].contains("Invalid limits record"),
