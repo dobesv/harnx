@@ -14,7 +14,7 @@ fault-injection = ["harnx-runtime/fault-injection"]
 [dependencies]
 a2a_server_lf = { version = "=0.5.1", package = "a2a-server-lf" }
 a2a_lf = { version = "=0.4.2", package = "a2a-lf" }
-a2a_pb = { version = "=0.3.1", package = "a2a-pb" }
+a2a_pb = { version = "=0.3.2", package = "a2a-pb" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 async-nats = { workspace = true }
