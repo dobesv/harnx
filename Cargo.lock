@@ -18,9 +18,9 @@ dependencies = [
 
 [[package]]
 name = "a2a-pb"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88dce304b61df41018fbdf3f6e46d6b0832c09c2c422cd40d812eb2e07e68185"
+checksum = "24091234b0c532f1ae1f5bba21e8840d542b6636b469fedcbad3a1167aae051e"
 dependencies = [
  "a2a-lf",
  "chrono",
