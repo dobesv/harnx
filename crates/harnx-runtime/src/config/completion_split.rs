@@ -136,7 +136,20 @@ impl Config {
             "stream" => complete_bool(self.stream),
             "save" => complete_bool(self.save),
             "tool_use" => complete_bool(self.tool_use),
-            "use_tools" | "bash_tools" => self.complete_use_tools_arg(setting.value_prefix),
+            "use_tools" => self.complete_use_tools_arg(setting.value_prefix),
+            // Script mode rejects these names (`is_bash_inner_tool_allowed`),
+            // so completing one would suggest a selector that can never
+            // enable script mode. `use_tools` keeps the full candidate set.
+            "bash_tools" => self
+                .complete_use_tools_arg(setting.value_prefix)
+                .into_iter()
+                .filter(|candidate| {
+                    let name = candidate
+                        .rsplit_once(',')
+                        .map_or(candidate.as_str(), |(_, last)| last);
+                    tool_selection::is_bash_inner_tool_allowed(name)
+                })
+                .collect(),
             "rag_reranker_model" => list_models(&self.clients, ModelType::Reranker)
                 .iter()
                 .map(|v| v.id())
@@ -236,6 +249,21 @@ fn complete_bool(value: bool) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn tool(name: &str) -> ToolDeclaration {
+        ToolDeclaration {
+            name: name.to_string(),
+            description: format!("tool {name}"),
+            parameters: Default::default(),
+            mcp_tool_name: None,
+            mcp_server_name: None,
+            call_template: None,
+            result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
+            kind: None,
+        }
+    }
+
     #[test]
     fn session_completion_uses_default_cluster_for_bare_agent() {
         let default_config = Config::default();
@@ -281,14 +309,52 @@ mod tests {
     }
 
     #[test]
-    fn bash_tools_set_completion_matches_use_tools() {
-        let config = Config::default();
+    fn bash_tools_set_completion_lists_setting_and_filters_inner_forbidden_names() {
+        // Injected MCP declarations keep the candidate set deterministic;
+        // handoff candidates from agent files vary by host.
+        let config = Config {
+            tools: Tools::init_from_mcp(Some(vec![
+                tool("fs_read"),
+                tool("atlas_session_handoff"),
+                tool("switch_agent"),
+                tool("ask_user"),
+                tool("bash"),
+            ])),
+            ..Config::default()
+        };
+
         let first_arg = config.command_complete(".set", &["bash"], vec![]);
         assert!(first_arg.contains(&("bash_tools ".to_string(), None)));
 
+        let use_tools = config.command_complete(".set", &["use_tools", ""], vec![]);
+        let bash_tools = config.command_complete(".set", &["bash_tools", ""], vec![]);
+
+        // use_tools completion is unchanged: control tools stay offerable
+        // (builtins are host-added, so both lists carry them).
         assert_eq!(
-            config.command_complete(".set", &["bash_tools", ""], vec![]),
-            config.command_complete(".set", &["use_tools", ""], vec![]),
+            use_tools,
+            vec![
+                ("*".to_string(), None),
+                ("fs_read".to_string(), None),
+                ("atlas_session_handoff".to_string(), None),
+                ("switch_agent".to_string(), None),
+                ("ask_user".to_string(), None),
+                ("bash".to_string(), None),
+                ("harnx_agent_session_history_read".to_string(), None),
+                ("harnx_read_session_meta".to_string(), None),
+                ("harnx_write_session_meta".to_string(), None),
+            ]
+        );
+        // bash_tools offers only names script mode can actually admit.
+        assert_eq!(
+            bash_tools,
+            vec![
+                ("*".to_string(), None),
+                ("fs_read".to_string(), None),
+                ("harnx_agent_session_history_read".to_string(), None),
+                ("harnx_read_session_meta".to_string(), None),
+                ("harnx_write_session_meta".to_string(), None),
+            ]
         );
     }
 

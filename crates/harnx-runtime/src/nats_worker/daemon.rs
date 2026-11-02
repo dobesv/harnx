@@ -909,6 +909,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bash_tools_session_override_clear_beats_agent_value() {
+        let config_with_agent = |bash_tools: Option<Vec<String>>| {
+            let mut config = Config::default();
+            let mut agent = crate::config::Agent::default();
+            agent.set_bash_tools(bash_tools);
+            config.use_agent_obj(agent).unwrap();
+            config
+        };
+
+        // A `null` clear persists as an empty list (not an absent field), so
+        // reconstruction must not fall back to the agent file's selectors.
+        let mut config = config_with_agent(Some(vec!["fs_*".to_string()]));
+        super::apply_tool_overrides(
+            &mut config,
+            &crate::nats_session_metadata::SessionOverrides {
+                bash_tools: Some(Vec::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config.extract_agent().bash_tools(),
+            Some(Vec::new()),
+            "explicit clear must survive reconstruction"
+        );
+
+        // An absent override means "no override": the agent value stands.
+        let mut config = config_with_agent(Some(vec!["fs_*".to_string()]));
+        super::apply_tool_overrides(
+            &mut config,
+            &crate::nats_session_metadata::SessionOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.extract_agent().bash_tools(),
+            Some(vec!["fs_*".to_string()]),
+            "absent override must leave the agent value untouched"
+        );
+    }
+
     #[tokio::test]
     async fn remote_session_cleanup_spawns_only_for_positive_retention() {
         harnx_core::require_nextest();

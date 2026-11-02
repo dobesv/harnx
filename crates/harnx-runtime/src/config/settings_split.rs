@@ -144,37 +144,36 @@ impl Config {
         setter(config, value)
     }
 
+    /// Split a `.set` value into tool selectors, trimming blanks. Shared by
+    /// `use_tools` and `bash_tools`, which differ only in how they treat
+    /// `null`.
+    fn split_selectors(value: &str) -> Vec<String> {
+        harnx_core::agent_config::split_tool_selectors(value)
+            .into_iter()
+            .map(str::trim)
+            .filter(|selector| !selector.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
     fn update_use_tools(config: &GlobalConfig, value: &str) -> Result<()> {
-        let value = if value == "null" {
-            None
-        } else {
-            Some(
-                harnx_core::agent_config::split_tool_selectors(value)
-                    .into_iter()
-                    .map(str::trim)
-                    .filter(|selector| !selector.is_empty())
-                    .map(String::from)
-                    .collect(),
-            )
-        };
+        let value = (value != "null").then(|| Self::split_selectors(value));
         Self::persist_override(config, SessionOverrideUpdate::UseTools(value.clone()))?;
         config.write().set_use_tools(value);
         Ok(())
     }
 
+    /// Unlike `use_tools`, `.set bash_tools null` is an explicit clear, not an
+    /// unset override: the clear persists as an empty selector list so worker
+    /// reconstruction re-applies it instead of falling back to the agent
+    /// file's `bash_tools`. `SessionOverrides` uses `Option`, where `None`
+    /// means "no override" (and serializes as absent).
     fn update_bash_tools(config: &GlobalConfig, value: &str) -> Result<()> {
-        let value = if value == "null" {
-            None
+        let value = Some(if value == "null" {
+            Vec::new()
         } else {
-            Some(
-                harnx_core::agent_config::split_tool_selectors(value)
-                    .into_iter()
-                    .map(str::trim)
-                    .filter(|selector| !selector.is_empty())
-                    .map(String::from)
-                    .collect(),
-            )
-        };
+            Self::split_selectors(value)
+        });
         Self::persist_override(config, SessionOverrideUpdate::BashTools(value.clone()))?;
         config.write().set_bash_tools(value)?;
         Ok(())
@@ -258,12 +257,24 @@ impl Config {
     /// `bash_tools` has no global default (unlike `use_tools`), so without an
     /// active session or agent there is nowhere to store the value; surface
     /// that instead of silently dropping it.
+    ///
+    /// The value must reach the same agent [`Config::extract_agent`] resolves:
+    /// when an explicit agent is active it wins tool selection, so writing
+    /// only the session (like `set_use_tools`) would make `.set bash_tools`
+    /// report success while the model keeps the old inner tool set. The
+    /// session copy keeps the per-session record in sync for session-derived
+    /// views (export, resume without the agent).
     pub fn set_bash_tools(&mut self, value: Option<Vec<String>>) -> Result<()> {
+        let mut applied = false;
         if let Some(session) = self.session.as_mut() {
-            session.set_bash_tools(value);
-        } else if let Some(agent) = self.agent.as_mut() {
+            session.set_bash_tools(value.clone());
+            applied = true;
+        }
+        if let Some(agent) = self.agent.as_mut() {
             agent.set_bash_tools(value);
-        } else {
+            applied = true;
+        }
+        if !applied {
             bail!("no active session or agent to apply bash_tools to");
         }
         Ok(())
@@ -462,7 +473,36 @@ mod bash_tools_command_tests {
 
         let guard = config.read();
         let session = guard.session.as_ref().unwrap();
-        assert_eq!(session.bash_tools(), None);
+        // `null` clears script mode and must be distinguishable from an unset
+        // override: the persisted record is an empty list, not absent, so a
+        // reconstructed worker re-applies the clear.
+        assert_eq!(session.bash_tools(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn set_bash_tools_reaches_explicit_agent_and_session() {
+        let mut config = Config::default();
+        let mut agent = crate::config::Agent::default();
+        agent.set_bash_tools(Some(vec!["old_*".to_string()]));
+        config.use_agent_obj(agent).unwrap();
+        let mut session = crate::config::session::new(&config, "bash-tools-agent", None).unwrap();
+        crate::config::session::attach_memory_log(&mut session);
+        config.session = Some(session);
+        let config = Arc::new(ConfigLock::new(config));
+
+        Config::update(&config, "bash_tools fs_*").unwrap();
+
+        let guard = config.read();
+        // `extract_agent` prefers the explicit agent, so the new selectors must
+        // land there or tool selection keeps the old inner set.
+        assert_eq!(
+            guard.extract_agent().bash_tools(),
+            Some(vec!["fs_*".to_string()])
+        );
+        assert_eq!(
+            guard.session.as_ref().unwrap().bash_tools(),
+            Some(vec!["fs_*".to_string()])
+        );
     }
 
     #[test]

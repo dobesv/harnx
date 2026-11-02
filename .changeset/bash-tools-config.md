@@ -8,4 +8,4 @@ When `bash_tools` is set and resolves to available tools, Harnx synthesizes a si
 
 While `bash_tools` resolves to tools, the name `bash` is reserved for script mode: an external tool of the same name is not exposed, and a `bash` call fails closed with a clear error rather than routing to it. Script execution itself is under development; in this release, calling the synthesized `bash` tool returns that error.
 
-Mixed-version deployments: session metadata carrying a `bash_tools` override uses strict field checking (`deny_unknown_fields`), so worker binaries older than this release cannot load it. Upgrade all workers before setting `bash_tools` overrides.
+Mixed-version deployments: session metadata carrying a `bash_tools` override uses strict field checking (`deny_unknown_fields`), so worker binaries older than this release cannot load it. The failure counts against the activation failure budget: after 10 failed deliveries an older worker records a durable session `Error` and terminates the activation. Upgrade all workers before setting `bash_tools` overrides.

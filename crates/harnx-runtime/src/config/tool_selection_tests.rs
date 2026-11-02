@@ -79,28 +79,33 @@ fn declaration_names(config: &Config, agent: &AgentConfig) -> Vec<String> {
 }
 
 #[test]
-fn bash_tool_names_resolves_string_selectors() {
+fn bash_tool_names_resolves_glob_and_explicit_selectors() {
     let config = config_with_tools();
-    let agent = agent_with(None, Some(vec!["fs_*".to_string()]));
-
-    assert_eq!(
-        config.bash_tool_names(&agent),
-        vec!["fs_read".to_string(), "fs_write".to_string()]
-    );
-}
-
-#[test]
-fn bash_tool_names_resolves_list_selectors() {
-    let config = config_with_tools();
-    let agent = agent_with(
-        None,
-        Some(vec!["fs_read".to_string(), "bash_exec".to_string()]),
-    );
-
-    assert_eq!(
-        config.bash_tool_names(&agent),
-        vec!["bash_exec".to_string(), "fs_read".to_string()]
-    );
+    for (selectors, expected) in [
+        (
+            &["fs_*"][..],
+            vec!["fs_read".to_string(), "fs_write".to_string()],
+        ),
+        (
+            &["fs_read", "bash_exec"][..],
+            vec!["bash_exec".to_string(), "fs_read".to_string()],
+        ),
+    ] {
+        let agent = agent_with(
+            None,
+            Some(
+                selectors
+                    .iter()
+                    .map(|selector| selector.to_string())
+                    .collect(),
+            ),
+        );
+        assert_eq!(
+            config.bash_tool_names(&agent),
+            expected,
+            "selectors: {selectors:?}"
+        );
+    }
 }
 
 #[test]
