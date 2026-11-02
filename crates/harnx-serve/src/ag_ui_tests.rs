@@ -1581,6 +1581,76 @@ fn build_local_input_sets_agent_and_session_meta() {
 }
 
 #[tokio::test]
+async fn ag_ui_run_returns_conflict_when_prompt_is_rejected() {
+    use crate::session_actor::{
+        PromptResult, SessionCommand, SessionHandle, SessionKey, SessionPromptOptions,
+        SessionRegistry, SessionState, SubscribeResult,
+    };
+
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "You are plain.");
+    let config = crate::session_actor::load_base_config_for_tests();
+    let registry = SessionRegistry::new(config.clone());
+    let key = SessionKey::local("plain", "ag-ui-rejected-prompt");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    registry.insert_handle_for_tests(key, SessionHandle { tx, actor_id: 1 });
+    let actor = tokio::spawn(async move {
+        let SessionCommand::Subscribe { reply } = rx.recv().await.expect("subscribe command")
+        else {
+            panic!("run must subscribe before prompting");
+        };
+        let (_event_tx, event_rx) = tokio::sync::broadcast::channel(1);
+        assert!(reply
+            .send(SubscribeResult {
+                snapshot: vec![],
+                compaction: None,
+                history_warnings: vec![],
+                state: SessionState::Idle,
+                events: event_rx,
+                log_entries: None,
+                tokens_usage: None,
+                session_base: None,
+            })
+            .is_ok());
+        let SessionCommand::Prompt {
+            text,
+            options,
+            reply,
+        } = rx.recv().await.expect("prompt command")
+        else {
+            panic!("run must submit prompt after subscribing");
+        };
+        assert_eq!(text, "trigger rejection");
+        assert_eq!(options, SessionPromptOptions::default());
+        reply
+            .send(PromptResult::Rejected {
+                reason: "test rejection".into(),
+            })
+            .expect("prompt response");
+        assert!(matches!(rx.recv().await, Some(SessionCommand::Unsubscribe)));
+    });
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ag_ui_run_with_call_fn(
+            &config,
+            &registry,
+            "plain",
+            "ag-ui-rejected-prompt",
+            &ag_ui_request_body("rejected-run", "trigger rejection"),
+            None,
+        ),
+    )
+    .await
+    .expect("AG-UI run should return without opening a stream");
+    assert!(matches!(outcome, Err(AgUiError::Conflict(reason)) if reason == "test rejection"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), actor)
+        .await
+        .expect("mock actor should finish after unsubscribe")
+        .expect("mock actor task");
+}
+
+#[tokio::test]
 async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
     let sandbox = TestConfigSandbox::new();
     sandbox.write_agent("hephaestus", "You are Hephaestus.");
