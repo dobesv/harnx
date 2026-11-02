@@ -287,14 +287,20 @@ pub(super) fn configured_worker_services(
         .agent
         .as_ref()
         .and_then(|agent| harnx_core::package_namespace::pkg_from_qualified(agent.name()));
-    let use_tools = config
+    let mut selectors = config
         .agent
         .as_ref()
         .and_then(|agent| agent.use_tools())
         // Fall back when no agent is active or the active agent has no use_tools.
         .or_else(|| config.use_tools.clone())
         .unwrap_or_default();
-    let servers = tool_servers_for_view(&config, agent_package, &use_tools);
+    // Script mode (T3.4): a bash-only agent has no use_tools but still
+    // needs the tool servers behind its bash_tools selectors, or the
+    // inner set resolves to nothing on the worker.
+    if let Some(bash_tools) = config.agent.as_ref().and_then(|agent| agent.bash_tools()) {
+        selectors.extend(bash_tools);
+    }
+    let servers = tool_servers_for_view(&config, agent_package, &selectors);
     (servers, config.hooks.clone().unwrap_or_default())
 }
 
@@ -535,6 +541,27 @@ mod tests {
             let mut config = config.write();
             config.agent = None;
             config.use_tools = Some(vec!["time_get_current_time".to_string()]);
+            config.tool_servers = vec![tool_server("time"), tool_server("weather")];
+        }
+
+        let (servers, _hooks) = configured_worker_services(&config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "time");
+    }
+
+    #[test]
+    fn configured_worker_services_starts_servers_for_bash_only_agent() {
+        // Script mode (T3.4, C1 from the PR1 review): an agent with
+        // `bash_tools` and no `use_tools` still starts the tool servers
+        // behind its bash_tools selectors, or the inner set resolves to
+        // nothing on the worker.
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            let mut agent = AgentConfig::from_prompt("worker");
+            agent.set_bash_tools(Some(vec!["time_*".to_string()]));
+            config.agent = Some(Agent::new(agent));
             config.tool_servers = vec![tool_server("time"), tool_server("weather")];
         }
 

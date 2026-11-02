@@ -431,9 +431,9 @@ async fn assert_context_declarations_and_precedence(instance_id: &ServerScope) {
         assert!(context.allowed_tool_names.contains(&visible_tool));
     }
     let collision = harnx_runtime::session_history::TOOL_NAME;
-    // The reserved script-mode `bash` stub leads the provider list but is
+    // The script-mode `bash` provider leads the provider list but is
     // inert without bash_tools, so it claims no other name.
-    assert_eq!(context.providers[0].name(), "reserved-bash");
+    assert_eq!(context.providers[0].name(), "bash-script");
     assert!(!context.providers[0].has_tool(collision));
     let nats_index = context
         .providers

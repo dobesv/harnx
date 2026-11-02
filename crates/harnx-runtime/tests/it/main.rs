@@ -12,6 +12,7 @@ mod generation;
 mod worker;
 
 mod agent_prompt_rendering;
+mod bash_script_mode;
 mod frontend_affine_workers;
 mod hook_supervisor;
 mod interruption;

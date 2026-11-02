@@ -53,6 +53,7 @@ hashes for semantically-identical payloads with different key ordering.
 │   ├── harnx-plans-tools/        # Toolset server: NATS-backed plan and todo management (standalone crate)
 │   ├── harnx-attachment-tools/   # Toolset server: NATS-backed attachment and media management (standalone crate)
 │   ├── harnx-blob-store/        # NATS-backed blob storage for attachments and plans (standalone crate)
+│   ├── harnx-script/             # In-process BashKit script backend for the `bash` tool; no runtime/NATS dependency (standalone crate)
 │   ├── harnx-mcp-server/        # MCP server: exports harnx tools and agents-as-tools over stdio or Streamable HTTP (standalone crate)
 │   ├── harnx-a2a-server/        # A2A server: exports harnx agents over JSON-RPC and SSE (standalone crate)
 │   └── harnx-test-bins/        # Internal dev/test binaries (publish = false)

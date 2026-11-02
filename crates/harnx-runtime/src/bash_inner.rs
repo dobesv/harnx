@@ -6,8 +6,8 @@
 //!
 //! - names outside `bash_tools` are rejected with a did-you-mean suggestion;
 //! - `bash`, `switch_agent`, `ask_user`, and `*_session_handoff` are rejected
-//!   even if a malformed allowlist contains them — the forked context still
-//!   shares `prepare_handoff_fn`, so the executor is the guard (T2.2 review);
+//!   even if a malformed allowlist contains them; the fork also clears the
+//!   handoff callback as defense in depth;
 //! - the serialized NATS request is checked against the broker's
 //!   `max_payload` before dispatch (`nats_tool_provider/request.rs` builds the
 //!   payload; the probe abstraction keeps tests off NATS);
@@ -37,11 +37,14 @@ use harnx_core::event::AgentEventSink;
 use harnx_core::sink::{current_agent_event_sink, with_agent_event_sink};
 use harnx_core::tool::{ToolCall, ToolProgress, ToolProvider, ToolResult, ToolUpdatePatch};
 use harnx_engine::tool::{
-    eval_inner_tool_call, InnerToolEvalOptions, ToolApprovalRequiredError, ToolCallEmitFn,
-    ToolEvalContext, ToolUpdateEmitFn, WorkBoundary,
+    eval_inner_tool_call, EvaluatedInnerCall, InnerToolCallStatus, InnerToolEvalOptions,
+    ToolApprovalRequiredError, ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn, WorkBoundary,
 };
 use serde_json::Value;
 use tokio::sync::Semaphore;
+
+mod script_adapter;
+pub use script_adapter::ScriptInnerExecutor;
 
 /// Cap on simultaneous inner calls per script run. `BashKit` background jobs
 /// and pipelines can fan out; without a cap one script could occupy every
@@ -51,6 +54,17 @@ pub const DEFAULT_MAX_CONCURRENT_INNER_CALLS: usize = 8;
 /// Cap on total inner calls per script run, on top of BashKit's own
 /// `ExecutionLimits`. Bounds the worst case for a runaway loop.
 pub const DEFAULT_MAX_INNER_CALLS_PER_SCRIPT: usize = 1000;
+
+/// Cap on `call()` attempts per script run, admitted or rejected. Rejected
+/// calls don't consume the call budget, so this is what bounds a
+/// rejection-only loop (review C1). Exceeding it is fatal: the script is
+/// spinning, not doing useful work.
+pub const MAX_INNER_CALL_ATTEMPTS_PER_SCRIPT: usize = 10_000;
+
+/// Retained trace entries per script run. Older entries are dropped and
+/// counted in [`InnerCallRun::dropped_trace_entries`]; the trace feeds
+/// human-facing output only, so a generous fixed cap is enough (review C1).
+pub const MAX_RETAINED_TRACE_ENTRIES: usize = 256;
 
 /// Maximum length of the `args_summary` trace field, in characters.
 const ARGS_SUMMARY_MAX_CHARS: usize = 120;
@@ -274,7 +288,10 @@ impl InnerCallExecutor {
             observer: observer.clone(),
             next_start_seq: AtomicU64::new(0),
             issued: AtomicUsize::new(0),
+            attempts: AtomicUsize::new(0),
             trace: Mutex::new(Vec::new()),
+            dropped_trace_entries: AtomicUsize::new(0),
+            first_failed: Mutex::new(None),
         }
     }
 }
@@ -304,8 +321,9 @@ pub enum InnerOutcome {
     /// Rejected before admission: not in `bash_tools`, a control tool, an
     /// oversized NATS request, or the script's call budget ran out.
     Rejected { reason: String },
-    /// The abort signal fired, the work boundary rejected the call, or the
-    /// provider returned a fatal error. The whole script must stop.
+    /// The abort signal fired, the work boundary rejected the call, the
+    /// provider returned a fatal error, or the script exceeded its attempt
+    /// cap. The whole script must stop.
     Fatal { message: String },
 }
 
@@ -359,6 +377,10 @@ pub enum InnerTraceStatus {
     ApprovalRequired,
     Rejected,
     Fatal,
+    /// The `call` future was dropped mid-flight (the interpreter cancelled a
+    /// background job); recorded by the drop guard so the trace and the
+    /// aggregator's running set stay consistent (review C8).
+    Cancelled,
 }
 
 impl InnerTraceStatus {
@@ -370,6 +392,7 @@ impl InnerTraceStatus {
             Self::ApprovalRequired => "approval_required",
             Self::Rejected => "rejected",
             Self::Fatal => "fatal",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -389,7 +412,15 @@ pub struct InnerCallRun {
     observer: Option<Arc<dyn InnerCallObserver>>,
     next_start_seq: AtomicU64,
     issued: AtomicUsize,
+    /// Total `call()` attempts, admitted or rejected (review C1).
+    attempts: AtomicUsize,
     trace: Mutex<Vec<InnerTraceEntry>>,
+    /// Trace entries dropped by the retention cap (review C1).
+    dropped_trace_entries: AtomicUsize,
+    /// First failed call of the run, kept even when the retention cap drops
+    /// its row, so `failed_call` reports the true first failure (PR3 review
+    /// F13).
+    first_failed: Mutex<Option<InnerTraceEntry>>,
 }
 
 impl InnerCallRun {
@@ -405,12 +436,51 @@ impl InnerCallRun {
         entries
     }
 
+    /// Total `call()` attempts, admitted or rejected.
+    pub fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::SeqCst)
+    }
+
+    /// Trace entries dropped by the retention cap
+    /// ([`MAX_RETAINED_TRACE_ENTRIES`]).
+    pub fn dropped_trace_entries(&self) -> usize {
+        self.dropped_trace_entries.load(Ordering::SeqCst)
+    }
+
+    /// First failed call of the run, kept even when trace retention drops
+    /// its row (PR3 review F13).
+    pub fn first_failed(&self) -> Option<InnerTraceEntry> {
+        self.first_failed
+            .lock()
+            .expect("first failure lock")
+            .clone()
+    }
+
     /// Execute one inner call through the full admission pipeline
     /// (PreToolUse hooks, dispatch, PostToolUse), enforcing the allowlist,
     /// call budget, and concurrency cap first. Payload limits apply before
     /// admission and again after hook mutations. The parent abort signal
     /// propagates: an aborted signal yields [`InnerOutcome::Fatal`].
     pub async fn call(&self, tool: &str, args: Value, abort_signal: &AbortSignal) -> InnerOutcome {
+        // Poll the abort before any admission gate, so a rejection-only
+        // loop still observes cancellation (review R1). Nothing has been
+        // attempted, so no trace row.
+        if abort_signal.aborted() {
+            return InnerOutcome::Fatal {
+                message: "aborted before tool call".to_string(),
+            };
+        }
+        // Rejections don't consume the call budget; this attempt counter is
+        // what bounds a rejection-only loop (review C1). Fatal for the same
+        // reason an abort is: the script is spinning, not doing work.
+        if self.attempts.fetch_add(1, Ordering::SeqCst) >= MAX_INNER_CALL_ATTEMPTS_PER_SCRIPT {
+            return InnerOutcome::Fatal {
+                message: format!(
+                    "bash script exceeded its limit of {} tool-call attempts",
+                    MAX_INNER_CALL_ATTEMPTS_PER_SCRIPT
+                ),
+            };
+        }
         let start = CallStart {
             started: Instant::now(),
             start_seq: self.next_start_seq.fetch_add(1, Ordering::SeqCst),
@@ -423,6 +493,16 @@ impl InnerCallRun {
             return self.reject(start, rejection.bytes, rejection.reason);
         }
 
+        let call = ToolCall::new(start.name.clone(), args, Some(start.call_id.clone()), None);
+        // Drop guard (review C8): if this future is dropped mid-flight — the
+        // interpreter cancelling a background job — record a cancelled row and
+        // fire `observer.finished`, so the trace and the aggregator's running
+        // set never leak the call. Disarmed on normal completion.
+        let mut cancel_guard = CancelGuard {
+            run: self,
+            start: Some(start),
+        };
+
         let _permit = self
             .semaphore
             .clone()
@@ -430,7 +510,6 @@ impl InnerCallRun {
             .await
             .expect("inner call semaphore is never closed");
 
-        let call = ToolCall::new(start.name.clone(), args, Some(start.call_id.clone()), None);
         let evaluated = match self.sink.clone() {
             // BashKit runs commands on its own tasks, which don't inherit
             // the turn's task-local sink. Re-scope the eval so hook notices
@@ -444,6 +523,11 @@ impl InnerCallRun {
 
         let (outcome, status, bytes) = classify_evaluation(tool, evaluated);
 
+        // Normal completion: disarm the guard, then record the final row.
+        let start = cancel_guard
+            .start
+            .take()
+            .expect("cancel guard is armed while dispatching");
         self.record_trace(start, status, bytes);
         outcome
     }
@@ -467,7 +551,7 @@ impl InnerCallRun {
 
     fn tool_rejection_reason(&self, tool: &str) -> Option<String> {
         // Control tools stay at the model boundary even if a malformed
-        // allowlist contains them. The fork still shares the handoff callback.
+        // allowlist contains them. The fork also clears the handoff callback.
         if !crate::config::is_bash_inner_tool_allowed(tool) {
             return Some(format!(
                 "tool '{tool}' cannot be called from a bash script (control tool)"
@@ -525,10 +609,28 @@ impl InnerCallRun {
             bytes,
             duration_ms: elapsed_ms(start.started),
         };
-        self.trace
-            .lock()
-            .expect("inner trace lock")
-            .push(entry.clone());
+        let mut trace = self.trace.lock().expect("inner trace lock");
+        trace.push(entry.clone());
+        // Retention only (review C1): the trace is human-facing output, so
+        // keep the newest entries and count the dropped ones rather than
+        // growing without bound on rejection-heavy scripts.
+        let overflow = trace.len().saturating_sub(MAX_RETAINED_TRACE_ENTRIES);
+        if overflow > 0 {
+            self.dropped_trace_entries
+                .fetch_add(overflow, Ordering::SeqCst);
+            trace.drain(0..overflow);
+        }
+        drop(trace);
+        // The retained window keeps only the newest entries, so the first
+        // failure of the run can age out of the trace entirely (PR3 review
+        // F13). Remember it separately; `failed_call` reports it even when
+        // its row is gone.
+        if !matches!(status, InnerTraceStatus::Ok | InnerTraceStatus::Cancelled) {
+            let mut first_failed = self.first_failed.lock().expect("first failure lock");
+            if first_failed.is_none() {
+                *first_failed = Some(entry.clone());
+            }
+        }
         if let Some(observer) = &self.observer {
             observer.finished(&entry);
         }
@@ -543,6 +645,23 @@ struct CallStart {
     call_id: String,
     name: String,
     args_summary: String,
+}
+
+/// Disarmed on normal completion; otherwise records a cancelled trace entry
+/// (and fires `observer.finished`) when the `call` future is dropped
+/// mid-flight, so the trace and the aggregator's running set stay consistent
+/// (review C8).
+struct CancelGuard<'a> {
+    run: &'a InnerCallRun,
+    start: Option<CallStart>,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(start) = self.start.take() {
+            self.run.record_trace(start, InnerTraceStatus::Cancelled, 0);
+        }
+    }
 }
 
 /// Aggregates inner-call lifecycle into the outer `bash` tool's progress.
@@ -688,14 +807,81 @@ fn serialized_size(value: &Value) -> u64 {
         .unwrap_or(0)
 }
 
+/// Value-free argument summary for the trace, progress, and `failed_call`
+/// surfaces: keys with value shapes only (`{"query": str(42), "count":
+/// number}`), never the values themselves. Argument values can arrive from
+/// pipes or stdin — content the model has never seen — and these surfaces
+/// persist in the outer transcript, so lengths are safe to show but values
+/// are not (PR3 review F17). Empty arguments render as `null` / `{}` and
+/// are omitted from trace lines.
 fn summarize_args(args: &Value) -> String {
-    let text = args.to_string();
-    if text.chars().count() <= ARGS_SUMMARY_MAX_CHARS {
-        return text;
+    let summary = match args {
+        Value::Null => "null".to_string(),
+        Value::Object(map) if map.is_empty() => "{}".to_string(),
+        Value::Object(map) => {
+            let fields: Vec<String> = map
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", value_shape(value)))
+                .collect();
+            format!("{{{}}}", fields.join(", "))
+        }
+        Value::Array(items) => format!("array({})", items.len()),
+        other => value_shape(other),
+    };
+    if summary.chars().count() <= ARGS_SUMMARY_MAX_CHARS {
+        return summary;
     }
-    let mut truncated: String = text.chars().take(ARGS_SUMMARY_MAX_CHARS - 1).collect();
+    let mut truncated: String = summary.chars().take(ARGS_SUMMARY_MAX_CHARS - 1).collect();
     truncated.push('…');
     truncated
+}
+
+/// Shape marker for one argument value: type plus length for strings and
+/// collections, never the value itself.
+fn value_shape(value: &Value) -> String {
+    match value {
+        Value::Null => "null".into(),
+        Value::Bool(_) => "bool".into(),
+        Value::Number(_) => "number".into(),
+        Value::String(text) => format!("str({})", text.chars().count()),
+        Value::Array(items) => format!("array({})", items.len()),
+        Value::Object(map) => format!("object({})", map.len()),
+    }
+}
+
+/// MCP domain error: a successful transport whose tool reported failure
+/// through `content` blocks plus `isError: true` (the equivalent of HTTP 200
+/// with an error body). Mirrors `harnx_script::commands::render::is_mcp_error`,
+/// which is `pub(super)` and unreachable from this crate (PR3 review F27).
+/// A raw `isError: true` key without MCP content blocks is a tool's own
+/// JSON, not a domain error.
+fn is_mcp_domain_error(output: &Value) -> bool {
+    output.get("content").is_some_and(Value::is_array)
+        && output.get("isError").and_then(Value::as_bool) == Some(true)
+}
+
+/// Human-readable message for an MCP domain error: the first text content
+/// block, then the `error` field, then a generic default. Mirrors
+/// `harnx_script::commands::render::error_text`.
+fn mcp_domain_error_text(output: &Value) -> String {
+    let text = output
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .map(str::trim)
+                .find(|text| !text.is_empty())
+        });
+    if let Some(text) = text {
+        return text.to_string();
+    }
+    output
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "tool reported an error".to_string())
 }
 
 fn suggest_tool_name<'a>(name: &str, allowed: &'a BTreeSet<String>) -> Option<&'a str> {
@@ -744,12 +930,12 @@ impl std::error::Error for CallRejection {}
 
 fn classify_evaluation(
     tool: &str,
-    evaluated: anyhow::Result<ToolResult>,
+    evaluated: anyhow::Result<EvaluatedInnerCall>,
 ) -> (InnerOutcome, InnerTraceStatus, u64) {
     match evaluated {
-        Ok(result) => {
-            let bytes = serialized_size(&result.output);
-            let (outcome, status) = classify_output(result);
+        Ok(evaluated) => {
+            let bytes = serialized_size(&evaluated.result.output);
+            let (outcome, status) = classify_output(evaluated.result, evaluated.status);
             (outcome, status, bytes)
         }
         Err(error) => {
@@ -768,43 +954,54 @@ fn classify_evaluation(
     }
 }
 
-fn classify_output(result: ToolResult) -> (InnerOutcome, InnerTraceStatus) {
-    if result
-        .output
-        .get("blocked_by_hook")
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        let reason = result
-            .output
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("blocked by hook")
-            .to_string();
-        return (InnerOutcome::Blocked { reason }, InnerTraceStatus::Blocked);
-    }
-    if result.output.get("is_error").and_then(Value::as_bool) == Some(true) {
-        let message = result
-            .output
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("tool error")
-            .to_string();
-        let partial_result = result.output.get("partial_result").cloned();
-        return (
-            InnerOutcome::ToolError {
-                message,
-                partial_result,
+fn classify_output(
+    result: ToolResult,
+    status: InnerToolCallStatus,
+) -> (InnerOutcome, InnerTraceStatus) {
+    match status {
+        InnerToolCallStatus::Blocked => {
+            let reason = result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("blocked by hook")
+                .to_string();
+            (InnerOutcome::Blocked { reason }, InnerTraceStatus::Blocked)
+        }
+        InnerToolCallStatus::ToolError => {
+            let message = result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("tool error")
+                .to_string();
+            let partial_result = result.output.get("partial_result").cloned();
+            (
+                InnerOutcome::ToolError {
+                    message,
+                    partial_result,
+                },
+                InnerTraceStatus::ToolError,
+            )
+        }
+        InnerToolCallStatus::Ok if is_mcp_domain_error(&result.output) => {
+            // Successful transport, but MCP reported failure. Keep the trace
+            // and failed_call consistent with the command layer.
+            (
+                InnerOutcome::ToolError {
+                    message: mcp_domain_error_text(&result.output),
+                    partial_result: None,
+                },
+                InnerTraceStatus::ToolError,
+            )
+        }
+        InnerToolCallStatus::Ok => (
+            InnerOutcome::Ok {
+                result: Box::new(result),
             },
-            InnerTraceStatus::ToolError,
-        );
+            InnerTraceStatus::Ok,
+        ),
     }
-    (
-        InnerOutcome::Ok {
-            result: Box::new(result),
-        },
-        InnerTraceStatus::Ok,
-    )
 }
 
 fn classify_error(tool: &str, error: anyhow::Error) -> (InnerOutcome, InnerTraceStatus) {
@@ -984,6 +1181,8 @@ mod tests {
             partial: Option<Value>,
         },
         NoticeThenOk(String, Value),
+        /// Terminal provider failure: maps to `InnerOutcome::Fatal` (C14).
+        Fatal(&'static str),
         Panic,
     }
 
@@ -1022,6 +1221,7 @@ mod tests {
                     )));
                     Ok(ToolProviderOutput::new(value.clone()))
                 }
+                Behavior::Fatal(message) => Err(ToolError::Fatal(anyhow::anyhow!(*message))),
                 Behavior::Panic => panic!("provider must not be dispatched"),
             }
         }
@@ -1465,14 +1665,16 @@ mod tests {
         match run.call("tool_a", json!({}), &abort).await {
             InnerOutcome::Fatal { message } => {
                 assert!(
-                    message.contains("interrupted"),
+                    message.contains("aborted before tool call"),
                     "unexpected fatal message: {message}"
                 );
             }
             other => panic!("expected fatal, got {other:?}"),
         }
         assert_eq!(log.count(), 0);
-        assert_eq!(run.trace()[0].status, InnerTraceStatus::Fatal);
+        // The pre-admission gate returns before anything is attempted, so
+        // no trace row (the attempt counter still advanced).
+        assert!(run.trace().is_empty());
     }
 
     #[tokio::test]
@@ -1647,15 +1849,53 @@ mod tests {
         let run = executor.begin_run(&ctx, PARENT_ROUND, None);
         let abort = create_abort_signal();
 
-        let long = json!({"text": "y".repeat(400)});
+        // Value-free summaries stay short for long values, so truncation
+        // needs many keys.
+        let long =
+            serde_json::Map::from_iter((0..40).map(|i| (format!("key_{i:03}"), json!("value"))));
         assert!(matches!(
-            run.call("tool_a", long, &abort).await,
+            run.call("tool_a", Value::Object(long), &abort).await,
             InnerOutcome::Ok { .. }
         ));
 
         let summary = &run.trace()[0].args_summary;
         assert_eq!(summary.chars().count(), ARGS_SUMMARY_MAX_CHARS);
         assert!(summary.ends_with('…'));
+    }
+
+    /// PR3 review F17: values piped into an inner call can be content the
+    /// model has never seen, and the trace summary persists in the outer
+    /// transcript — so the summary must show shapes, not values. The
+    /// dispatch itself still receives the full arguments.
+    #[tokio::test]
+    async fn args_summary_hides_values_from_piped_content() {
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Ok(json!("done")),
+        });
+        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+
+        let secret = "sk-synthetic-piped-secret-0123456789";
+        let args = json!({"text": secret, "count": 7, "flag": true, "list": [1, 2, 3]});
+        assert!(matches!(
+            run.call("tool_a", args.clone(), &abort).await,
+            InnerOutcome::Ok { .. }
+        ));
+
+        let summary = &run.trace()[0].args_summary;
+        assert_eq!(
+            summary,
+            r#"{text: str(36), count: number, flag: bool, list: array(3)}"#
+        );
+        assert!(!summary.contains(secret));
+
+        let calls = provider.log.calls.lock().expect("dispatch log lock");
+        assert_eq!(calls[0].args, args);
     }
 
     #[derive(Default)]
@@ -1773,7 +2013,67 @@ mod tests {
     #[test]
     fn args_summary_handles_null_and_short_values() {
         assert_eq!(summarize_args(&Value::Null), "null");
-        assert_eq!(summarize_args(&json!({"a": 1})), r#"{"a":1}"#);
+        assert_eq!(summarize_args(&json!({})), "{}");
+        assert_eq!(summarize_args(&json!({"a": 1})), "{a: number}");
+        assert_eq!(summarize_args(&json!("raw")), "str(3)");
+        assert_eq!(summarize_args(&json!([1, 2, 3])), "array(3)");
+    }
+
+    /// PR3 review F27: an MCP domain error arrives as a successful transport
+    /// with `isError: true` content. The trace row and the caller-visible
+    /// outcome must classify it as `ToolError`, matching the command layer's
+    /// exit 1, instead of a silent `Ok` row.
+    #[tokio::test]
+    async fn mcp_is_error_result_maps_to_tool_error_trace() {
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Ok(json!({
+                "content": [{"type": "text", "text": "synthetic failure text"}],
+                "isError": true,
+            })),
+        });
+        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+
+        let outcome = run.call("tool_a", json!({}), &abort).await;
+        match outcome {
+            InnerOutcome::ToolError {
+                message,
+                partial_result,
+            } => {
+                assert_eq!(message, "synthetic failure text");
+                assert!(partial_result.is_none());
+            }
+            other => panic!("expected ToolError, got {other:?}"),
+        }
+        assert_eq!(run.trace()[0].status, InnerTraceStatus::ToolError);
+    }
+
+    #[test]
+    fn mcp_domain_error_helpers() {
+        let error = json!({
+            "content": [{"type": "text", "text": "boom"}],
+            "isError": true,
+        });
+        assert!(is_mcp_domain_error(&error));
+        assert_eq!(mcp_domain_error_text(&error), "boom");
+
+        // Same shape, missing isError: a successful call.
+        assert!(!is_mcp_domain_error(&json!({
+            "content": [{"type": "text", "text": "boom"}],
+        })));
+        // A tool whose raw JSON happens to carry `isError: true` without
+        // MCP content blocks must not be mistaken for a domain error.
+        assert!(!is_mcp_domain_error(&json!({"isError": true})));
+        // No text content: fall back to the error field, then a default.
+        let textless = json!({"content": [], "isError": true, "error": "from error field"});
+        assert_eq!(mcp_domain_error_text(&textless), "from error field");
+        let bare = json!({"content": [], "isError": true});
+        assert_eq!(mcp_domain_error_text(&bare), "tool reported an error");
     }
 
     // ================================================================
@@ -2008,6 +2308,286 @@ mod tests {
             .split('\n')
             .count();
         assert_eq!(lines, 8, "fewer than the line cap, so all calls show");
+    }
+
+    #[derive(Default)]
+    struct StatusRecordingObserver {
+        started: AtomicUsize,
+        finished: Mutex<Vec<InnerTraceStatus>>,
+    }
+
+    impl InnerCallObserver for StatusRecordingObserver {
+        fn started(&self, _call: &ToolCall, _args: &Value) {
+            self.started.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn finished(&self, entry: &InnerTraceEntry) {
+            self.finished
+                .lock()
+                .expect("finished statuses lock")
+                .push(entry.status);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_call_future_records_cancelled_trace_and_finishes_observer() {
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::DelayedOk(Duration::from_millis(200), json!("late")),
+        });
+        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
+        let observer = Arc::new(StatusRecordingObserver::default());
+        let run = Arc::new(executor.begin_run(&ctx, PARENT_ROUND, Some(observer.clone())));
+        let abort = create_abort_signal();
+
+        // Call through a spawned task so cancelling the task drops the
+        // `call` future mid-provider, the way an interpreter cancelling a
+        // background job would (review C8).
+        let task_run = Arc::clone(&run);
+        let task_abort = Arc::clone(&abort);
+        let handle =
+            tokio::spawn(async move { task_run.call("tool_a", json!({}), &task_abort).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("call task must be cancelled, not completed");
+        assert!(join_error.is_cancelled());
+
+        assert_eq!(observer.started.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *observer.finished.lock().expect("finished statuses lock"),
+            vec![InnerTraceStatus::Cancelled],
+            "the drop guard must fire observer.finished exactly once"
+        );
+        let trace = run.trace();
+        assert!(
+            matches!(trace.as_slice(), [entry] if entry.status == InnerTraceStatus::Cancelled),
+            "dropped call must leave exactly one cancelled trace row"
+        );
+        // The attempt still counts; cancel doesn't refund the budget, which
+        // the review deemed fine.
+        assert_eq!(run.attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_fatal_maps_to_fatal_outcome() {
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Fatal("provider exploded"),
+        });
+        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+
+        let outcome = run.call("tool_a", json!({}), &create_abort_signal()).await;
+
+        match &outcome {
+            InnerOutcome::Fatal { message } => assert_eq!(message, "provider exploded"),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+        assert!(matches!(
+            run.trace().as_slice(),
+            [entry] if entry.status == InnerTraceStatus::Fatal
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_budget_admits_exactly_the_cap() {
+        // DelayedOk keeps every attempt in flight while all eight reserve,
+        // and the budget counter never decreases, so exactly three calls
+        // can be admitted (review C15).
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::DelayedOk(Duration::from_millis(30), json!("done")),
+        });
+        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let executor = executor_with(&["tool_a"], shared(&provider), (8, 3));
+        let run = Arc::new(executor.begin_run(&ctx, PARENT_ROUND, None));
+        let abort = create_abort_signal();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let run = Arc::clone(&run);
+            let abort = Arc::clone(&abort);
+            handles.push(tokio::spawn(async move {
+                run.call("tool_a", json!({}), &abort).await
+            }));
+        }
+        let mut admitted = 0;
+        let mut over_budget = 0;
+        for handle in handles {
+            match handle.await.expect("call task") {
+                InnerOutcome::Ok { .. } => admitted += 1,
+                InnerOutcome::Rejected { reason } => {
+                    assert!(reason.contains("exceeded its limit"), "{reason}");
+                    over_budget += 1;
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+        assert_eq!(admitted, 3);
+        assert_eq!(over_budget, 5);
+        assert_eq!(run.attempts(), 8);
+    }
+
+    #[tokio::test]
+    async fn aborted_signal_short_circuits_before_admission_gates() {
+        // A rejection-only loop must still observe cancellation, so the
+        // abort is polled before any gate (review R1). The Panic behavior
+        // proves the provider is never reached.
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Panic,
+        });
+        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+        abort.set_ctrlc();
+
+        let outcome = run.call("tool_a", json!({}), &abort).await;
+
+        match &outcome {
+            InnerOutcome::Fatal { message } => assert_eq!(message, "aborted before tool call"),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+        assert!(run.trace().is_empty(), "nothing was attempted");
+        assert_eq!(run.attempts(), 0, "aborted calls never begin an attempt");
+    }
+
+    /// PR3 review F13: the trace keeps only the newest 256 rows, so the
+    /// run's first failure must be kept separately — `failed_call` needs it
+    /// even after retention drops its row.
+    #[tokio::test]
+    async fn first_failure_survives_trace_retention() {
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Ok(json!("done")),
+        });
+        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let executor = executor_with(&["tool_a"], shared(&provider), (8, 1000));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+
+        // First failure: an out-of-allowlist rejection.
+        assert!(matches!(
+            run.call("tool_b", json!({}), &abort).await,
+            InnerOutcome::Rejected { .. }
+        ));
+        let first = run.first_failed().expect("rejection is the first failure");
+        assert_eq!(first.name, "tool_b");
+        assert_eq!(first.status, InnerTraceStatus::Rejected);
+
+        // Overflow the retained window with admitted calls.
+        for _ in 0..(MAX_RETAINED_TRACE_ENTRIES + 4) {
+            assert!(matches!(
+                run.call("tool_a", json!({}), &abort).await,
+                InnerOutcome::Ok { .. }
+            ));
+        }
+        assert!(run.dropped_trace_entries() >= 4);
+        // The rejected row has aged out of the retained trace, but the
+        // separately kept first failure is still there.
+        assert!(
+            run.trace().iter().all(|entry| entry.name != "tool_b"),
+            "retention keeps only the newest rows"
+        );
+        let first = run
+            .first_failed()
+            .expect("first failure survives retention");
+        assert_eq!(first.name, "tool_b");
+        assert_eq!(first.status, InnerTraceStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn rejection_loop_is_bounded_by_attempts_and_trace_retention() {
+        // Unknown tool: every call is rejected before admission, consuming
+        // no budget. The attempt cap must stop the loop with a Fatal, and
+        // the retained trace must stay bounded (review C1).
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Panic,
+        });
+        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+
+        let mut fatal = None;
+        for _ in 0..MAX_INNER_CALL_ATTEMPTS_PER_SCRIPT + 1 {
+            match run.call("tool_b", json!({}), &abort).await {
+                InnerOutcome::Rejected { .. } => {}
+                InnerOutcome::Fatal { message } => {
+                    fatal = Some(message);
+                    break;
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+        let message = fatal.expect("attempt cap was never reached");
+        assert!(message.contains("tool-call attempts"), "{message}");
+        assert_eq!(run.attempts(), MAX_INNER_CALL_ATTEMPTS_PER_SCRIPT + 1);
+        assert!(
+            run.trace().len() <= MAX_RETAINED_TRACE_ENTRIES,
+            "retained trace must be bounded"
+        );
+        assert_eq!(
+            run.dropped_trace_entries(),
+            MAX_INNER_CALL_ATTEMPTS_PER_SCRIPT - MAX_RETAINED_TRACE_ENTRIES
+        );
+    }
+
+    #[test]
+    fn aggregator_truncates_oversized_titles_and_markdown() {
+        // A pathological tool name must not push the outer progress row
+        // over the toolset byte caps, and truncation must not split a
+        // multibyte character (review C13).
+        let progress = Arc::new(RecordingProgress::default());
+        let aggregator =
+            InnerProgressAggregator::new(Arc::clone(&progress) as Arc<dyn ToolProgress>);
+
+        let running_name = "日".repeat(2_000);
+        assert!(running_name.len() > AGGREGATOR_MAX_TITLE_BYTES);
+        aggregator.started(&started_call(&running_name, "call-0"), &json!({}));
+
+        let line_name = "字".repeat(40_000);
+        assert!(line_name.len() > AGGREGATOR_MAX_MARKDOWN_BYTES);
+        aggregator.finished(&fake_entry(0, &line_name, InnerTraceStatus::Ok, "{}"));
+
+        let patches = progress.patches.lock().expect("patch log lock");
+        // First patch: emitted by `started`, so it still carries the running
+        // name in its title. The last patch comes from `finished`, when the
+        // running set is empty and the markdown carries the oversized line.
+        let first = patches.first().expect("at least one patch");
+        let title = first.title.as_deref().expect("title");
+        assert!(
+            title.len() <= AGGREGATOR_MAX_TITLE_BYTES,
+            "title is {} bytes",
+            title.len()
+        );
+        assert!(running_name.starts_with(title.strip_prefix("bash: ").expect("title prefix")));
+        let last = patches.last().expect("at least one patch");
+        let markdown = last.markdown.as_deref().expect("markdown");
+        assert!(
+            markdown.len() <= AGGREGATOR_MAX_MARKDOWN_BYTES,
+            "markdown is {} bytes",
+            markdown.len()
+        );
+        assert!(line_name.starts_with(markdown));
     }
 
     #[test]

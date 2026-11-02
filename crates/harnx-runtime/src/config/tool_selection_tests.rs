@@ -202,6 +202,12 @@ fn bash_declaration_has_exec_mirroring_params_and_hints() {
 
     assert_eq!(bash.idempotent_hint, Some(false));
     assert_eq!(bash.read_only_hint, Some(false));
+    // PR3 review F3: script `bash` is an execution tool, not a read.
+    assert_eq!(
+        bash.kind,
+        Some(harnx_core::event::ToolKind::Execute),
+        "synthesized bash declaration must declare ToolKind::Execute"
+    );
 
     let schema = bash.parameters.as_value();
     let properties = schema
@@ -325,35 +331,40 @@ fn bash_name_is_reserved_when_bash_tools_active() {
 }
 
 #[test]
-fn reserved_bash_provider_claims_only_active_bash_name() {
-    use crate::bash_provider::ReservedBashProvider;
+fn bash_provider_claims_only_active_bash_name() {
+    use crate::bash_provider::BashProvider;
     use harnx_core::tool::{ToolError, ToolProvider};
 
-    let active = ReservedBashProvider::new(true);
+    let active = BashProvider::new(true, Vec::new(), Vec::new(), None, None);
     assert!(active.has_tool("bash"));
     assert!(!active.has_tool("bash_exec"));
     assert!(!active.has_tool("fs_read"));
 
-    let inactive = ReservedBashProvider::new(false);
+    let inactive = BashProvider::new(false, Vec::new(), Vec::new(), None, None);
     assert!(!inactive.has_tool("bash"));
 
-    // An active stub must fail closed: recoverable error, never a silent
-    // dispatch to a raw-alias external `bash` route.
-    let error = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(async {
-            active
-                .call_tool(
-                    "bash",
-                    serde_json::json!({}),
-                    &harnx_core::abort::create_abort_signal(),
-                )
-                .await
-        })
-        .expect_err("reserved bash must return an error");
+    // An active provider without a round context slot must fail closed:
+    // recoverable error, never a silent dispatch to a raw-alias external
+    // `bash` route.
+    let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        active
+            .call_tool(
+                "bash",
+                serde_json::json!({"script": "true"}),
+                &harnx_core::abort::create_abort_signal(),
+            )
+            .await
+    });
+    let error = match result {
+        Err(error) => error,
+        // `ToolError` is not `Debug`, so a manual match replaces `expect_err`.
+        Ok(_) => panic!("provider without a slot must return an error"),
+    };
     match error {
         ToolError::Recoverable(error) => assert!(
-            error.to_string().contains("script mode is not available"),
+            error
+                .to_string()
+                .contains("cannot run scripts in this execution context"),
             "advisory error: {error}"
         ),
         ToolError::Fatal(_) => panic!("expected a recoverable error, got a fatal one"),

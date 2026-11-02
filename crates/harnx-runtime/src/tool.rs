@@ -126,18 +126,29 @@ pub async fn execute_tool_round_with_persistence(
     // so bare `_session_handoff` targets resolve to the same package (#709).
     let current_agent_package =
         harnx_core::package_namespace::pkg_from_qualified(input.agent().name()).map(str::to_string);
-    let mut eval_ctx = build_tool_eval_context(BuildToolEvalContextParams {
-        config,
-        instance_id,
-        agent_use_tools: agent_use_tools.as_deref(),
-        current_agent_package,
-        working_dir,
-        nats_hook_provider,
-        prepare_handoff_fn,
-        pending_async_context,
-    })
-    .await;
-    eval_ctx.tool_round = tool_round;
+    // Build the round context and hand it to the `bash` provider (C6). The
+    // context is wrapped in an `Arc` first: the slot stores a `Weak`, so the
+    // provider and context never form a strong cycle. `tool_round` is set
+    // before the wrap because the Arc makes the context immutable from here.
+    let eval_ctx = {
+        let bash_context_slot = Arc::new(crate::bash_provider::BashEvalContextSlot::default());
+        let mut ctx = build_tool_eval_context(BuildToolEvalContextParams {
+            config,
+            instance_id,
+            agent_use_tools: agent_use_tools.as_deref(),
+            current_agent_package,
+            working_dir,
+            nats_hook_provider,
+            prepare_handoff_fn,
+            pending_async_context,
+            bash_context_slot: Some(bash_context_slot.clone()),
+        })
+        .await;
+        ctx.tool_round = tool_round;
+        let eval_ctx = Arc::new(ctx);
+        bash_context_slot.set(&eval_ctx);
+        eval_ctx
+    };
     let guard = crate::tool_loop_guard::begin_round(tool_loop_guard.as_deref(), config, input);
     let (to_eval, refused) = screen_tool_round(guard, config, &tool_calls, &eval_ctx).await?;
     let results = match eval_tool_calls(&eval_ctx, to_eval, abort_signal).await {
@@ -455,6 +466,7 @@ async fn build_tool_eval_context_inner(
         nats_hook_provider,
         prepare_handoff_fn,
         pending_async_context,
+        bash_context_slot,
     } = params;
     let ToolRoundSnapshot {
         declarations: mut tool_declarations,
@@ -477,7 +489,7 @@ async fn build_tool_eval_context_inner(
 
     let decl_map = Arc::new(build_decl_map(tool_declarations));
     let allowed_tool_names: HashSet<String> = decl_map.keys().cloned().collect();
-    let providers = build_tool_providers(config, nats_provider);
+    let providers = build_tool_providers(config, nats_provider, bash_context_slot);
     let dispatch_hook_fn = build_dispatch_hook_fn(
         (config, session_name.as_deref()),
         working_dir,
@@ -552,26 +564,41 @@ fn build_confirm_tool_use_fn(config: &Config) -> Arc<ConfirmToolUseFn> {
 fn build_tool_providers(
     config: &GlobalConfig,
     nats_provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
+    bash_context_slot: Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
 ) -> Vec<Arc<dyn ToolProvider>> {
-    let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
-    // The reserved `bash` stub must come before the NATS provider so it wins
-    // `has_tool("bash")` against raw-name aliases registered from tool
-    // servers (script mode, #2537).
-    providers.push(Arc::new(crate::bash_provider::ReservedBashProvider::new(
-        config.read().bash_tools_active(),
-    )) as Arc<dyn ToolProvider>);
+    let mut base_providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
     // NATS is the runtime provider for configured sub-agent and tool-server tools.
+    // Its broker `max_payload` also feeds the script-mode pre-flight check.
+    let payload_limit = nats_provider
+        .as_ref()
+        .map(|nats| nats.script_payload_limit());
     if let Some(nats) = nats_provider {
-        providers.push(nats as Arc<dyn ToolProvider>);
+        base_providers.push(nats as Arc<dyn ToolProvider>);
     }
-    providers.push(
+    base_providers.push(
         Arc::new(crate::session_history::SessionHistoryProvider::new(
             config.clone(),
         )) as Arc<dyn ToolProvider>,
     );
-    providers.push(Arc::new(crate::session_meta_tool::SessionMetaProvider::new(
+    base_providers.push(Arc::new(crate::session_meta_tool::SessionMetaProvider::new(
         config.clone(),
     )) as Arc<dyn ToolProvider>);
+
+    // The script-mode `bash` provider must come before the NATS provider so
+    // it wins `has_tool("bash")` against raw-name aliases registered from
+    // tool servers (script mode, #2537). Its inner-call executor dispatches
+    // through the base provider list, which structurally excludes itself,
+    // so recursive `bash` dispatch is impossible.
+    let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
+    let active = config.read().bash_tools_active();
+    providers.push(Arc::new(crate::bash_provider::BashProvider::new(
+        active,
+        config.read().bash_inner_tool_declarations(),
+        base_providers.clone(),
+        bash_context_slot,
+        payload_limit,
+    )) as Arc<dyn ToolProvider>);
+    providers.extend(base_providers);
     providers
 }
 
@@ -828,12 +855,12 @@ mod tests {
         ));
     }
 
-    /// The reserved `bash` provider must sit first so it wins
+    /// The script-mode `bash` provider must sit first so it wins
     /// `has_tool("bash")` against NATS raw-name aliases, and must only claim
     /// the name while the active agent's `bash_tools` resolves to tools
     /// (script mode, #2537).
     #[test]
-    fn reserved_bash_provider_leads_and_tracks_bash_tools() {
+    fn bash_provider_leads_and_tracks_bash_tools() {
         let tools = harnx_core::tool::Tools::init_from_mcp(Some(vec![make_decl_with_templates(
             "fs_read", None, None,
         )]));
@@ -846,13 +873,13 @@ mod tests {
         };
         let config = Arc::new(ConfigLock::new(config));
 
-        let providers = build_tool_providers(&config, None);
-        assert_eq!(providers[0].name(), "reserved-bash");
+        let providers = build_tool_providers(&config, None, None);
+        assert_eq!(providers[0].name(), "bash-script");
         assert!(providers[0].has_tool("bash"));
 
         let bare = Arc::new(ConfigLock::new(Config::default()));
-        let providers = build_tool_providers(&bare, None);
-        assert_eq!(providers[0].name(), "reserved-bash");
+        let providers = build_tool_providers(&bare, None, None);
+        assert_eq!(providers[0].name(), "bash-script");
         assert!(
             !providers[0].has_tool("bash"),
             "inert when bash_tools resolves to nothing"

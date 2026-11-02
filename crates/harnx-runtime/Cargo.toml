@@ -47,6 +47,7 @@ harnx-toolset-server = { path = "../harnx-toolset-server" }
 harnx-rag = { path = "../harnx-rag" }
 harnx-render = { path = "../harnx-render" }
 harnx-spinner = { path = "../harnx-spinner" }
+harnx-script = { path = "../harnx-script" }
 http = { workspace = true }
 indexmap = { workspace = true }
 inquire = { workspace = true }

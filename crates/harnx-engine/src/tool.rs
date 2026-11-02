@@ -231,10 +231,34 @@ pub struct InnerToolEvalOptions {
     pub emit_tool_update_fn: Arc<ToolUpdateEmitFn>,
 }
 
+/// Typed outcome of one evaluated call, derived from the engine's own
+/// control flow rather than from output JSON keys, which a successful
+/// provider output could contain incidentally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InnerToolCallStatus {
+    /// Dispatched and completed without a provider failure.
+    Ok,
+    /// Dispatched but failed recoverably (provider error or unparsable args).
+    ToolError,
+    /// A hook blocked the call or a user denied it; never dispatched.
+    Blocked,
+}
+
+/// One evaluated inner call: the lossless result plus its typed status.
+#[derive(Debug)]
+pub struct EvaluatedInnerCall {
+    pub result: ToolResult,
+    pub status: InnerToolCallStatus,
+}
+
 impl ToolEvalContext {
     /// Fork admission state without inheriting operator consent or UI emitters.
     /// Hooks and work-boundary checks are shared; metadata is cloned. The outer
     /// context is unchanged. The supplied round replaces even a stale outer round.
+    /// The handoff preparation callback is dropped: inner calls must not make
+    /// durable child-session reservations. The engine still routes handoff
+    /// tool names, so the fork's caller remains responsible for rejecting
+    /// `*_session_handoff` before admission.
     ///
     /// Cancellation isn't stored in `ToolEvalContext`: pass the parent's existing
     /// `AbortSignal` to [`eval_inner_tool_call`] when evaluating the fork.
@@ -254,7 +278,7 @@ impl ToolEvalContext {
             emit_tool_update_fn: options.emit_tool_update_fn,
             confirm_tool_use_fn: Arc::new(|_, _, _| ToolUseConfirmation::Defer),
             dispatch_hook_fn: Arc::clone(&self.dispatch_hook_fn),
-            prepare_handoff_fn: self.prepare_handoff_fn.clone(),
+            prepare_handoff_fn: None,
         }
     }
 
@@ -303,7 +327,7 @@ pub async fn eval_tool_calls_with_authorization(
     abort_signal: &AbortSignal,
     authorization: Option<&dyn harnx_core::tool::ReplayAuthorization>,
 ) -> Result<Vec<ToolResult>> {
-    eval_tool_calls_inner(
+    let evaluated = eval_tool_calls_inner(
         ToolEvaluation {
             ctx,
             abort_signal,
@@ -312,7 +336,10 @@ pub async fn eval_tool_calls_with_authorization(
         },
         calls,
     )
-    .await
+    .await?;
+    // Batch callers keep the plain result list; the typed status is only
+    // consumed by the inner-call entry.
+    Ok(evaluated.into_iter().map(|call| call.result).collect())
 }
 
 /// Evaluate one explicit operator call through the normal hooks and providers.
@@ -353,7 +380,7 @@ pub async fn eval_operator_tool_call(
         results.len() == 1,
         "operator tool evaluation returned no result"
     );
-    Ok(results.remove(0))
+    Ok(results.remove(0).result)
 }
 
 /// Evaluate one script-originated call through the normal admission pipeline.
@@ -367,11 +394,14 @@ pub async fn eval_operator_tool_call(
 /// collect a trace without emitting child UI rows. This does not persist a round;
 /// providers receive `ctx.tool_round` and the call's ID (assigned here if missing).
 /// The context is borrowed immutably and can be shared by concurrent callers.
+///
+/// The returned [`InnerToolCallStatus`] classifies the call from the engine's
+/// own control flow; don't infer it from the output's JSON keys.
 pub async fn eval_inner_tool_call(
     ctx: &ToolEvalContext,
     call: ToolCall,
     abort_signal: &AbortSignal,
-) -> Result<ToolResult> {
+) -> Result<EvaluatedInnerCall> {
     let mut results = Box::pin(eval_tool_calls_inner(
         ToolEvaluation {
             ctx,
@@ -399,14 +429,15 @@ struct ToolEvaluation<'a> {
 
 enum ToolAdmission {
     Approved(ApprovedToolCall),
-    Immediate(Box<ToolResult>),
+    /// An admission-time result (blocked or unparsable args) with its typed status.
+    Immediate(Box<ToolResult>, InnerToolCallStatus),
     Deferred(DeferredToolCall),
 }
 
 async fn eval_tool_calls_inner(
     evaluation: ToolEvaluation<'_>,
     mut calls: Vec<ToolCall>,
-) -> Result<Vec<ToolResult>> {
+) -> Result<Vec<EvaluatedInnerCall>> {
     let ToolEvaluation {
         ctx,
         abort_signal,
@@ -426,9 +457,12 @@ async fn eval_tool_calls_inner(
     for call in calls {
         match prepare_tool_call(ctx, call, abort_signal).await? {
             ToolAdmission::Approved(call) => approved.push(call),
-            ToolAdmission::Immediate(result) => {
+            ToolAdmission::Immediate(result, status) => {
                 is_all_null = false;
-                output.push(*result);
+                output.push(EvaluatedInnerCall {
+                    result: *result,
+                    status,
+                });
             }
             ToolAdmission::Deferred(call) => deferred.push(call),
         }
@@ -460,9 +494,11 @@ async fn prepare_tool_call(
         Ok(json_data) => json_data,
         Err(ToolError::Recoverable(err)) => {
             let result = json!({"is_error": true, "error": format!("{err:#}")});
-            return Ok(ToolAdmission::Immediate(Box::new(ToolResult::new(
-                call, result,
-            ))));
+            return Ok(ToolAdmission::Immediate(
+                Box::new(ToolResult::new(call, result)),
+                // Unparsable arguments are a recoverable tool failure.
+                InnerToolCallStatus::ToolError,
+            ));
         }
         Err(ToolError::Fatal(err)) => return Err(err),
     };
@@ -497,7 +533,10 @@ async fn pre_tool_outcome(
 fn blocked_admission(ctx: &ToolEvalContext, call: ToolCall, reason: String) -> ToolAdmission {
     let value = json!({"error": reason, "blocked_by_hook": true});
     (ctx.emit_tool_blocked_fn)(&call, &value);
-    ToolAdmission::Immediate(Box::new(ToolResult::new(call, value)))
+    ToolAdmission::Immediate(
+        Box::new(ToolResult::new(call, value)),
+        InnerToolCallStatus::Blocked,
+    )
 }
 
 async fn approve_tool_call(
@@ -560,7 +599,7 @@ async fn collect_dispatch_results(
     evaluation: &ToolEvaluation<'_>,
     approved: Vec<ApprovedToolCall>,
     dispatch_results: Vec<Result<ToolProviderOutput, ToolError>>,
-) -> Result<(Vec<ToolResult>, bool)> {
+) -> Result<(Vec<EvaluatedInnerCall>, bool)> {
     let ToolEvaluation {
         ctx, abort_signal, ..
     } = *evaluation;
@@ -576,19 +615,25 @@ async fn collect_dispatch_results(
     let mut all_null = true;
     for (approved_call, result) in approved.into_iter().zip(results) {
         work_boundary(ctx, &approved_call.call, abort_signal, WorkBoundary::Accept).await?;
-        let (completed, was_null) = match result {
+        let (completed, status, was_null) = match result {
             Ok(provider_output) => {
-                complete_successful_tool_call(evaluation, &approved_call, provider_output).await?
+                let (completed, was_null) =
+                    complete_successful_tool_call(evaluation, &approved_call, provider_output)
+                        .await?;
+                (completed, InnerToolCallStatus::Ok, was_null)
             }
             Err(ToolError::Recoverable(error)) => {
                 let completed =
                     complete_failed_tool_call(ctx, approved_call, error, abort_signal).await?;
-                (completed, false)
+                (completed, InnerToolCallStatus::ToolError, false)
             }
             Err(ToolError::Fatal(error)) => return Err(error),
         };
         all_null &= was_null;
-        output.push(completed);
+        output.push(EvaluatedInnerCall {
+            result: completed,
+            status,
+        });
     }
     Ok((output, all_null))
 }

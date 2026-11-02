@@ -1550,6 +1550,9 @@ async fn build_orphan_tool_eval_context(
         working_dir: None,
         nats_hook_provider: None,
         pending_async_context: None,
+        // Orphan repair reruns calls outside the originating round; script
+        // mode's `bash` must fail closed there rather than redispatch.
+        bash_context_slot: None,
     })
     .await
 }

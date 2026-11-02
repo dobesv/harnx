@@ -6,6 +6,7 @@ members = [
     "crates/harnx-attachment-tools",
     "crates/harnx-mcp-server",
     "crates/harnx-blob-store",
+    "crates/harnx-script",
     "crates/harnx-client",
     "crates/harnx-core",
     "crates/harnx-engine",
@@ -87,6 +88,7 @@ debug = "line-tables-only"
 opt-level = "z"
 
 [workspace.dependencies]
+bashkit = { version = "=0.20.2", default-features = false, features = ["jq"] }
 anyhow = "1.0.69"
 bytes = "1.4.0"
 axum = "0.8"

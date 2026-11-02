@@ -91,10 +91,12 @@ async fn preserves_outputs_and_runs_pre_and_post_hooks_once() {
             continue_hook_outcome(),
         );
         ctx.confirm_tool_use_fn = Arc::new(|_, _, _| panic!("Continue needs no confirmation"));
-        let result = eval_inner_tool_call(&ctx, test_call("tool_a"), &create_abort_signal())
+        let evaluated = eval_inner_tool_call(&ctx, test_call("tool_a"), &create_abort_signal())
             .await
             .unwrap();
+        let result = evaluated.result;
 
+        assert_eq!(evaluated.status, InnerToolCallStatus::Ok);
         assert_eq!(result.output, output);
         assert!(
             result.content.is_empty(),
@@ -163,9 +165,11 @@ async fn block_returns_structured_error_without_dispatch_or_post_hooks() {
     ctx.emit_tool_blocked_fn = Arc::new(move |_, _| {
         captured.fetch_add(1, Ordering::SeqCst);
     });
-    let result = eval_inner_tool_call(&ctx, test_call("tool_a"), &create_abort_signal())
+    let evaluated = eval_inner_tool_call(&ctx, test_call("tool_a"), &create_abort_signal())
         .await
         .unwrap();
+    let result = evaluated.result;
+    assert_eq!(evaluated.status, InnerToolCallStatus::Blocked);
 
     assert_eq!(
         result.output,
@@ -205,19 +209,22 @@ async fn ask_uses_context_approval_or_denial() {
                 }
             }
         });
-        let result = eval_inner_tool_call(&ctx, test_call("tool_a"), &create_abort_signal())
+        let evaluated = eval_inner_tool_call(&ctx, test_call("tool_a"), &create_abort_signal())
             .await
             .unwrap();
+        let result = evaluated.result;
 
         assert_eq!(confirmations.load(Ordering::SeqCst), 1);
         let hooks = hooks.lock().unwrap();
         if approve {
+            assert_eq!(evaluated.status, InnerToolCallStatus::Ok);
             assert_eq!(result.output, Value::Null);
             assert!(matches!(
                 hooks.as_slice(),
                 [HookEvent::PreToolUse { .. }, HookEvent::PostToolUse { .. }]
             ));
         } else {
+            assert_eq!(evaluated.status, InnerToolCallStatus::Blocked);
             assert_eq!(
                 result.output,
                 json!({"error": "not approved", "blocked_by_hook": true})
@@ -239,9 +246,11 @@ async fn provider_error_keeps_partial_result_and_runs_failure_hook_once() {
         ))],
         continue_hook_outcome(),
     );
-    let result = eval_inner_tool_call(&ctx, test_call("tool_a"), &create_abort_signal())
+    let evaluated = eval_inner_tool_call(&ctx, test_call("tool_a"), &create_abort_signal())
         .await
         .unwrap();
+    let result = evaluated.result;
+    assert_eq!(evaluated.status, InnerToolCallStatus::ToolError);
 
     assert_eq!(
         result.output,
@@ -415,6 +424,7 @@ async fn concurrent_calls_share_context_and_route_progress_by_id() {
             eval_inner_tool_call(&ctx, test_call("updating_tool"), &abort)
                 .await
                 .unwrap()
+                .result
         })
     });
     let results: Vec<_> = join_all(handles)
