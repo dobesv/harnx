@@ -13,9 +13,20 @@ pub(crate) struct ReplaceInContent {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListPlansParams {
-    /// Optional 64-character session owner key.
+    /// Optional 64-character session owner key. Defaults to the caller's session
+    /// when present; otherwise lists every session. Conflicts with all_sessions: true.
     #[serde(default, deserialize_with = "blank_as_none")]
     pub(crate) owner: Option<String>,
+    /// List every session instead of defaulting to the caller's session (default false).
+    #[serde(default)]
+    pub(crate) all_sessions: bool,
+    /// Maximum plans per page. Defaults to 20; clamped to 1..100.
+    #[serde(default)]
+    pub(crate) limit: Option<u64>,
+    /// Opaque next_cursor from the previous page with the same scope. Omit for
+    /// the first page. Returns {items, next_cursor}; null next_cursor means done.
+    #[serde(default, deserialize_with = "blank_as_none")]
+    pub(crate) cursor: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
@@ -118,11 +129,22 @@ pub(crate) struct DeletePlanParams {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListTasksParams {
+    /// Full plan URL. Only tasks in this plan are listed.
     pub(crate) plan: String,
+    /// Status filter (default open; all disables it). Applied within each key
+    /// page, so even an empty items array may have a next_cursor.
     #[serde(default = "default_open_status")]
     pub(crate) filter: String,
+    /// Optional tag filter, applied within each key page.
     #[serde(default, deserialize_with = "blank_as_none")]
     pub(crate) tag: Option<String>,
+    /// Maximum task keys examined per page. Defaults to 20; clamped to 1..100.
+    #[serde(default)]
+    pub(crate) limit: Option<u64>,
+    /// Opaque next_cursor from the previous page for this plan. Keep filters
+    /// unchanged. Returns {items, next_cursor}; null next_cursor means done.
+    #[serde(default, deserialize_with = "blank_as_none")]
+    pub(crate) cursor: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
@@ -228,7 +250,15 @@ pub(crate) struct TaskSpec {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListNotesParams {
+    /// Full plan URL. Only notes in this plan are listed.
     pub(crate) plan: String,
+    /// Maximum notes per page. Defaults to 20; clamped to 1..100.
+    #[serde(default)]
+    pub(crate) limit: Option<u64>,
+    /// Opaque next_cursor from the previous page for this plan. Omit for the
+    /// first page. Returns {items, next_cursor}; null next_cursor means done.
+    #[serde(default, deserialize_with = "blank_as_none")]
+    pub(crate) cursor: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]

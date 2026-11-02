@@ -122,7 +122,7 @@ impl Toolset for PlansToolset {
     fn tools(&self) -> Vec<ToolSpec> {
         plan_tool_specs![
             ListPlansParams: "list_plans", true, LIST_PLANS_CALL,
-                "List NATS-backed plans, optionally filtered by session owner key.";
+                "List NATS-backed plans sorted by key. Defaults to the caller's session, or every session without a caller. Set owner to a session key or all_sessions: true for every session; owner and all_sessions: true conflict. limit defaults to 20, clamped to 1..100. Returns {items, next_cursor}; pass next_cursor as cursor with the same scope until null.";
             AddPlanParams: "add_plan", false, ADD_PLAN_CALL,
                 "Create a plan owned by the caller session. Returns its cid:plan URL.";
             GetPlanParams: "get_plan", true, GET_PLAN_CALL,
@@ -132,7 +132,7 @@ impl Toolset for PlansToolset {
             DeletePlanParams: "delete_plan", false, DELETE_PLAN_CALL,
                 "Delete a plan and all task/note documents by full cid:plan URL.";
             ListTasksParams: "list_tasks", true, LIST_TASKS_CALL,
-                "List tasks for a full cid:plan URL.";
+                "List tasks for a full cid:plan URL sorted by key. limit defaults to 20, clamped to 1..100 task keys per page. Status (default open; all disables) and tag filters apply within each key page, so items may be empty even with more pages. Returns {items, next_cursor}; pass next_cursor as cursor with the same plan and filters until null.";
             AddTaskParams: "add_task", false, ADD_TASK_CALL,
                 "Create a task in a plan. Dependencies must be task URLs.";
             GetTaskParams: "get_task", true, GET_TASK_CALL,
@@ -142,7 +142,7 @@ impl Toolset for PlansToolset {
             DeleteTaskParams: "delete_task", false, DELETE_TASK_CALL,
                 "Delete a task by full item URL.";
             ListNotesParams: "list_notes", true, LIST_NOTES_CALL,
-                "List notes for a full cid:plan URL.";
+                "List notes for a full cid:plan URL sorted by key. limit defaults to 20, clamped to 1..100. Returns {items, next_cursor}; pass next_cursor as cursor with the same plan until null.";
             AddNoteParams: "add_note", false, ADD_NOTE_CALL,
                 "Create a note in a plan and return its full item URL.";
             GetNoteParams: "get_note", true, GET_NOTE_CALL,
@@ -215,6 +215,28 @@ mod tests {
         assert_eq!(tools[0].kind(), Some(ToolProgressKind::Read));
         assert_eq!(tools[1].kind(), Some(ToolProgressKind::Edit));
         assert_eq!(tools[4].kind(), Some(ToolProgressKind::Delete));
+    }
+
+    #[test]
+    fn list_schemas_advertise_scope_and_pagination() {
+        for name in ["list_plans", "list_tasks", "list_notes"] {
+            let tools = PlansToolset::new().tools();
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            let properties = &tool.input_schema["properties"];
+            for param in ["limit", "cursor"] {
+                assert!(properties.get(param).is_some(), "{name}: {properties}");
+            }
+            let limit = properties["limit"]["description"].as_str().unwrap();
+            assert!(limit.contains("20") && limit.contains("1..100"));
+            assert!(tool.description.contains("{items, next_cursor}"));
+            if name == "list_plans" {
+                assert_eq!(properties["all_sessions"]["default"], false);
+                assert!(properties["owner"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("caller's session"));
+            }
+        }
     }
 
     #[test]

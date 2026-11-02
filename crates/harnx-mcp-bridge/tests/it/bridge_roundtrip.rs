@@ -230,6 +230,10 @@ async fn bridge_registers_plans_and_round_trips_an_invoke() -> Result<()> {
     let bridge = BridgeToolset::new(
         "plans",
         vec![
+            // Configure only the MCP child, not the test process's ambient broker.
+            "env".to_owned(),
+            format!("HARNX_NATS_URL={}", server.url),
+            format!("HARNX_NATS_TOKEN={TOKEN}"),
             plans_binary()?.display().to_string(),
             "--mcp-stdio".to_owned(),
         ],
@@ -280,6 +284,13 @@ async fn bridge_registers_plans_and_round_trips_an_invoke() -> Result<()> {
     assert!(value
         .get("content")
         .is_some_and(|content| content.is_array()));
+    assert_ne!(value["isError"], true, "list_plans failed: {value}");
+    let page: serde_json::Value = serde_json::from_str(
+        value["content"][0]["text"]
+            .as_str()
+            .expect("JSON list page"),
+    )?;
+    assert_eq!(page, json!({"items": [], "next_cursor": null}));
 
     server_task.abort();
     let _ = server_task.await;

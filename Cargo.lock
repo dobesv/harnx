@@ -4760,6 +4760,7 @@ dependencies = [
  "anyhow",
  "async-nats",
  "async-trait",
+ "base64 0.23.1",
  "chrono",
  "harnx-blob-store",
  "harnx-core",

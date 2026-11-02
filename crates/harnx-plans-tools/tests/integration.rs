@@ -279,9 +279,9 @@ async fn list_plans_ignores_task_named_plan() {
         .invoke("list_plans", json!({"owner": owner}), None)
         .await;
     let plans = json_result(&listed);
-    assert_eq!(plans.as_array().unwrap().len(), 1);
-    assert_eq!(plans[0]["id"], plan);
-    assert_eq!(plans[0]["task_count"], 1);
+    assert_eq!(plans["items"].as_array().unwrap().len(), 1);
+    assert_eq!(plans["items"][0]["id"], plan);
+    assert_eq!(plans["items"][0]["task_count"], 1);
 }
 
 #[tokio::test]
@@ -319,7 +319,7 @@ async fn assert_issue_metadata(
     assert!(value.get("parent_issue").is_none());
 
     let listed = json_result(&context.invoke("list_plans", json!({}), None).await);
-    let listed_plan = listed
+    let listed_plan = listed["items"]
         .as_array()
         .expect("plans array")
         .iter()
@@ -475,6 +475,20 @@ async fn blank_optional_arguments_are_treated_as_omitted() {
     assert_ne!(added["isError"], true, "add_plan failed: {added}");
     let plan = cid_from(&added);
 
+    for (tool, params) in [
+        ("list_plans", json!({"cursor": ""})),
+        ("list_tasks", json!({"plan": plan, "cursor": ""})),
+        ("list_notes", json!({"plan": plan, "cursor": ""})),
+    ] {
+        let listed = context
+            .invoke(tool, params, Some(context.caller.clone()))
+            .await;
+        assert_ne!(
+            listed["isError"], true,
+            "{tool} rejected blank cursor: {listed}"
+        );
+    }
+
     let updated = context
         .invoke(
             "update_plan",
@@ -626,7 +640,7 @@ async fn assert_plan_lists_items(context: &TestContext, items: PlanItems<'_>) {
             None,
         )
         .await;
-    assert!(json_result(&tasks)
+    assert!(json_result(&tasks)["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -634,7 +648,7 @@ async fn assert_plan_lists_items(context: &TestContext, items: PlanItems<'_>) {
     let notes = context
         .invoke("list_notes", json!({"plan": items.plan}), None)
         .await;
-    assert!(json_result(&notes)
+    assert!(json_result(&notes)["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -647,8 +661,8 @@ async fn assert_plan_lists_items(context: &TestContext, items: PlanItems<'_>) {
         .invoke("list_plans", json!({"owner": owner}), None)
         .await;
     let listed = json_result(&plans);
-    assert_eq!(listed[0]["task_count"], 2);
-    assert_eq!(listed[0]["note_count"], 1);
+    assert_eq!(listed["items"][0]["task_count"], 2);
+    assert_eq!(listed["items"][0]["note_count"], 1);
 }
 
 async fn delete_items_and_plan(context: &TestContext, items: PlanItems<'_>) {
@@ -684,7 +698,7 @@ async fn list_plans_filters_owner_and_touches_activity() {
     let listed = context
         .invoke("list_plans", json!({"owner": owner}), None)
         .await;
-    assert_eq!(json_result(&listed).as_array().unwrap().len(), 1);
+    assert_eq!(json_result(&listed)["items"].as_array().unwrap().len(), 1);
 
     let activity = context
         .jetstream
@@ -804,8 +818,8 @@ async fn legacy_stored_parent_issue_is_read_and_migrated_on_update() {
     assert_eq!(fetched["github_issue"], 2266);
     assert!(fetched.get("parent_issue").is_none());
     let listed = json_result(&context.invoke("list_plans", json!({}), None).await);
-    assert_eq!(listed[0]["github_issue"], 2266);
-    assert!(listed[0].get("parent_issue").is_none());
+    assert_eq!(listed["items"][0]["github_issue"], 2266);
+    assert!(listed["items"][0].get("parent_issue").is_none());
 
     let updated = context
         .invoke(
@@ -875,8 +889,11 @@ async fn invalid_external_task_urls_do_not_write_plan_metadata() {
     assert_issue_metadata(&context, &plan, None, None).await;
     let listed = json_result(&context.invoke("list_plans", json!({}), None).await);
     assert_eq!(
-        listed.as_array().unwrap().len(),
+        listed["items"].as_array().unwrap().len(),
         1,
         "invalid creates must not store documents"
     );
 }
+
+#[path = "pagination/mod.rs"]
+mod pagination;

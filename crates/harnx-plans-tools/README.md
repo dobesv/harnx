@@ -49,6 +49,40 @@ Arguments appear in tool-call summaries and may be visible in commit bodies. Avo
 
 Legacy stored `parent_issue` values load as `github_issue` and are written under the new name on the next update. Older callers can still send `parent_issue` as an alias, but it isn't advertised in tool schemas or returned in responses. Send only one of `github_issue` and `parent_issue`; providing both is rejected as a duplicate field. Documents without issue metadata still load unchanged.
 
+## List pagination and scope
+
+`list_plans`, `list_tasks`, and `list_notes` return a JSON object instead of an array:
+
+```json
+{"items": [], "next_cursor": null}
+```
+
+All three accept `limit` (default 20, clamped to 1..100) and an optional opaque
+`cursor`. Pass the previous `next_cursor` as `cursor` with the same scope and
+filters until `next_cursor` is null. Results are sorted by storage key, not by
+creation time. Cursors are key-based, so deleting an earlier item doesn't shift
+later pages. Listings aren't snapshots: concurrent inserts before the cursor
+won't appear on subsequent pages.
+
+`list_plans` defaults to the caller's session when session identity is available.
+Use `owner` (a 64-character session key) to select another session, or
+`all_sessions: true` to list every session. Without caller identity or an explicit
+owner, it lists every session. Combining `owner` and `all_sessions: true` is an
+error. Only plans returned on the page renew session activity.
+
+`list_tasks` and `list_notes` require a full plan URL and list only that plan's
+children. Task status (`filter`, default `open`, or `all` to disable) and `tag`
+filters apply **within each key page**. This bounds document reads to `limit`,
+but can return short or empty `items` with a non-null `next_cursor`. Keep paging
+even after an empty page.
+
+Only page document bodies are fetched, with at most 16 concurrent reads. Plan
+counts come from live task/note keys, without reading their bodies. Key listing
+still scans bucket-wide **headers only**: current slash-delimited KV keys occupy
+one NATS subject token, so NATS's dot-token wildcards can't filter their prefixes.
+Server-side prefix filtering requires a key migration or a separate index.
+Deleted and purged keys are excluded; concurrent deletions can shorten a page.
+
 ## Tools
 
 - Plans: `list_plans`, `add_plan`, `get_plan`, `update_plan`, `delete_plan`

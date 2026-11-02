@@ -6,7 +6,8 @@
 /// Every plans tool answers with one text block, so they share a result template.
 pub(crate) const RESULT: &str = "{{ result.content[0].text | default('') }}";
 
-pub(crate) const LIST_PLANS_CALL: &str = "list plans";
+// List results are {items, next_cursor}. Reuse next_cursor as cursor until null.
+pub(crate) const LIST_PLANS_CALL: &str = "list plans{% if args.owner %} owner={{ args.owner }}{% elif args.all_sessions %} all sessions{% else %} caller session (all if sessionless){% endif %} [limit={{ args.limit | default(20) }}, clamped 1..100]{% if args.cursor %} [next page]{% endif %}";
 
 pub(crate) const ADD_PLAN_CALL: &str = "create plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}{% if args.github_issue %}#{{ args.github_issue }}{% endif %}){% elif args.github_issue %} (#{{ args.github_issue }}){% endif %}{% if args.external_task_url %} <{{ args.external_task_url }}>{% endif %}{% if args.content %}
 {{ args.content | truncate(80) }}{% elif args.body %}
@@ -21,7 +22,7 @@ pub(crate) const UPDATE_PLAN_CALL: &str = "update plan {{ args.plan }}{% if args
 
 pub(crate) const DELETE_PLAN_CALL: &str = "delete plan {{ args.plan }}";
 
-pub(crate) const LIST_TASKS_CALL: &str = "list tasks {{ args.plan }}{% if args.filter and args.filter != 'open' %} [{{ args.filter }}]{% endif %}{% if args.tag %} #{{ args.tag }}{% endif %}";
+pub(crate) const LIST_TASKS_CALL: &str = "list tasks {{ args.plan }}{% if args.filter and args.filter != 'open' %} [{{ args.filter }}]{% endif %}{% if args.tag %} #{{ args.tag }}{% endif %} [limit={{ args.limit | default(20) }}, clamped 1..100 keys]{% if args.cursor %} [next page]{% endif %}";
 
 pub(crate) const ADD_TASK_CALL: &str = "create task {{ args.plan }}/{{ args.title }}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.body %}
 {{ args.body | truncate(80) }}{% endif %}";
@@ -34,7 +35,7 @@ pub(crate) const UPDATE_TASK_CALL: &str = "update task {{ args.id }}{% if args.t
 
 pub(crate) const DELETE_TASK_CALL: &str = "delete task {{ args.id }}";
 
-pub(crate) const LIST_NOTES_CALL: &str = "list notes {{ args.plan }}";
+pub(crate) const LIST_NOTES_CALL: &str = "list notes {{ args.plan }} [limit={{ args.limit | default(20) }}, clamped 1..100]{% if args.cursor %} [next page]{% endif %}";
 
 pub(crate) const ADD_NOTE_CALL: &str = "add note {{ args.plan }}{% if args.summary %} — {{ args.summary | truncate(60) }}{% endif %}{% if args.author %} by {{ args.author }}{% endif %}{% if args.body %}
 {{ args.body | truncate(80) }}{% endif %}";
@@ -52,6 +53,26 @@ mod tests {
     use super::*;
     use harnx_core::tool::render_tool_call_template;
     use serde_json::json;
+
+    #[test]
+    fn list_call_templates_display_scope_and_page_options() {
+        let defaults = render_tool_call_template(LIST_PLANS_CALL, &json!({}), "").unwrap();
+        assert!(defaults.contains("caller session (all if sessionless)"));
+        assert!(defaults.contains("limit=20"));
+        let all =
+            render_tool_call_template(LIST_PLANS_CALL, &json!({"all_sessions": true}), "").unwrap();
+        assert!(all.contains("all sessions"));
+        let owner =
+            render_tool_call_template(LIST_PLANS_CALL, &json!({"owner": "owner-key"}), "").unwrap();
+        assert!(owner.contains("owner=owner-key"));
+        for template in [LIST_PLANS_CALL, LIST_TASKS_CALL, LIST_NOTES_CALL] {
+            let args = json!({"plan": "cid:plan:pantheon%2Fatlas/abcDEF/example", "limit": 5, "cursor": "opaque"});
+            let rendered = render_tool_call_template(template, &args, "").unwrap();
+            assert!(rendered.contains("limit=5"));
+            assert!(rendered.contains("clamped 1..100"));
+            assert!(rendered.contains("next page"));
+        }
+    }
 
     #[test]
     fn plan_call_templates_display_issue_metadata() {
