@@ -1,10 +1,10 @@
 use super::super::params::*;
 use super::super::store::*;
-use super::OperationContext;
+use super::{pagination::KeyPage, OperationContext};
 use anyhow::anyhow;
 use harnx_blob_store::plans::{
-    create_document, delete_plan, get_document, list_documents, parse_plan, serialize_plan,
-    upsert_document, PlanDocument, PlanFrontMatter, StoredDocument,
+    create_document, delete_plan, get_document, get_documents, list_document_keys, list_documents,
+    parse_plan, serialize_plan, upsert_document, PlanDocument, PlanFrontMatter,
 };
 use harnx_core::cid_url::{CidUrl, PlanItem};
 use rmcp::model::{CallToolResult, ErrorData};
@@ -14,21 +14,41 @@ pub(crate) async fn list(
     context: &OperationContext<'_>,
     params: ListPlansParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let prefix = validate_owner(params.owner.as_ref())?;
-    let documents = list_documents(context.store, &prefix)
+    if params.owner.is_some() && params.all_sessions {
+        return Err(ErrorData::invalid_params(
+            "owner and all_sessions: true cannot be used together",
+            None,
+        ));
+    }
+    let owner = match (params.owner, params.all_sessions, context.caller) {
+        (Some(owner), _, _) => Some(owner),
+        (None, false, Some(caller)) => Some(session_from_tool(caller)?.owner()),
+        _ => None,
+    };
+    let prefix = validate_owner(owner.as_ref())?;
+    let keys = list_document_keys(context.store, &prefix)
+        .await
+        .map_err(map_internal)?;
+    let page = KeyPage::select(
+        keys.iter().filter(|key| is_plan_root(key)).cloned(),
+        &prefix,
+        params.limit,
+        params.cursor.as_deref(),
+    )?;
+    let documents = get_documents(context.store, &page.keys)
         .await
         .map_err(map_internal)?;
     let mut plans = Vec::new();
-    for (_, stored) in documents.iter().filter(|(key, _)| is_plan_root(key)) {
+    for (key, stored) in documents {
         let document = parse_plan(&stored.content).map_err(map_internal)?;
         let url = parse_plan_url(&document.front.id)?;
-        let plan_prefix = harnx_blob_store::plans::plan_prefix(&url).map_err(map_internal)?;
-        let task_count = count_children(&documents, &plan_prefix, "tasks");
-        let note_count = count_children(&documents, &plan_prefix, "notes");
+        let plan_prefix = key.strip_suffix("plan").expect("selected plan root");
+        let task_count = count_children(&keys, plan_prefix, "tasks");
+        let note_count = count_children(&keys, plan_prefix, "notes");
         plans.push(plan_json(&document, task_count, note_count));
         context.touch(&url).await;
     }
-    result_json(Value::Array(plans))
+    result_json(json!({"items": plans, "next_cursor": page.next_cursor}))
 }
 
 fn validate_owner(owner: Option<&String>) -> Result<String, ErrorData> {
@@ -53,11 +73,12 @@ fn is_plan_root(key: &str) -> bool {
     segments.len() == 4 && segments[0] == "plan" && segments[3] == "plan"
 }
 
-fn count_children(documents: &[(String, StoredDocument)], prefix: &str, sub: &str) -> usize {
+fn count_children(keys: &[String], prefix: &str, sub: &str) -> usize {
     let child_prefix = format!("{prefix}{sub}/");
-    documents
+    let start = keys.partition_point(|key| key < &child_prefix);
+    keys[start..]
         .iter()
-        .filter(|(key, _)| key.starts_with(&child_prefix))
+        .take_while(|key| key.starts_with(&child_prefix))
         .count()
 }
 

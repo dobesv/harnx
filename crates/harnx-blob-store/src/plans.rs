@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{self, kv};
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use harnx_core::cid_url::{CidUrl, PlanItem};
 use serde::{Deserialize, Serialize};
 
@@ -353,40 +353,64 @@ where
     bail!("plan document update conflict after {MAX_CAS_RETRIES} retries: {url}")
 }
 
-/// List live documents below a key prefix.
+/// List live keys below a prefix in lexicographic order, without fetching bodies.
+pub async fn list_document_keys(store: &kv::Store, prefix: &str) -> Result<Vec<String>> {
+    // KV keys use slashes, not NATS subject-token separators (dots). NATS cannot
+    // filter part of a token: `$KV.harnx_plans.plan/<owner>/>` isn't a prefix
+    // wildcard. Until keys are migrated or indexed, scan headers only via keys(),
+    // which uses LastPerSubject and excludes deleted/purged entries.
+    let mut keys = store.keys().await.context("list plan document keys")?;
+    let mut matching = Vec::new();
+    while let Some(key) = keys.next().await {
+        let key = key.context("read plan document key")?;
+        if key.starts_with(prefix) {
+            matching.push(key);
+        }
+    }
+    matching.sort_unstable();
+    Ok(matching)
+}
+
+/// Fetch only the requested keys, preserving order and skipping concurrent deletions.
+pub async fn get_documents(
+    store: &kv::Store,
+    keys: &[String],
+) -> Result<Vec<(String, StoredDocument)>> {
+    let documents: Vec<_> = stream::iter(keys.to_vec())
+        .map(|key| async move {
+            let Some(entry) = store
+                .entry(&key)
+                .await
+                .with_context(|| format!("read listed plan document {key}"))?
+            else {
+                return Ok(None);
+            };
+            if !matches!(entry.operation, kv::Operation::Put) {
+                return Ok(None);
+            }
+            let content = String::from_utf8(entry.value.to_vec())
+                .with_context(|| format!("listed plan document {key} is not UTF-8"))?;
+            Ok::<_, anyhow::Error>(Some((
+                key,
+                StoredDocument {
+                    content,
+                    revision: entry.revision,
+                },
+            )))
+        })
+        .buffered(16)
+        .try_collect()
+        .await?;
+    Ok(documents.into_iter().flatten().collect())
+}
+
+/// List all live documents below a key prefix, without pagination.
 pub async fn list_documents(
     store: &kv::Store,
     prefix: &str,
 ) -> Result<Vec<(String, StoredDocument)>> {
-    let mut keys = store.keys().await.context("list plan document keys")?;
-    let mut documents = Vec::new();
-    while let Some(key) = keys.next().await {
-        let key = key.context("read plan document key")?;
-        if !key.starts_with(prefix) {
-            continue;
-        }
-        let Some(entry) = store
-            .entry(&key)
-            .await
-            .context("read listed plan document")?
-        else {
-            continue;
-        };
-        if !matches!(entry.operation, kv::Operation::Put) {
-            continue;
-        }
-        let content =
-            String::from_utf8(entry.value.to_vec()).context("listed plan document is not UTF-8")?;
-        documents.push((
-            key,
-            StoredDocument {
-                content,
-                revision: entry.revision,
-            },
-        ));
-    }
-    documents.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(documents)
+    let keys = list_document_keys(store, prefix).await?;
+    get_documents(store, &keys).await
 }
 
 pub fn plan_prefix(url: &CidUrl) -> Result<String> {

@@ -1,10 +1,10 @@
 use super::super::params::*;
 use super::super::store::*;
-use super::{require_plan, OperationContext};
+use super::{pagination::KeyPage, require_plan, OperationContext};
 use anyhow::anyhow;
 use harnx_blob_store::plans::{
-    create_document, delete_document, get_document, list_documents, parse_note, serialize_note,
-    update_document, NoteDocument, NoteFrontMatter,
+    create_document, delete_document, get_document, get_documents, list_document_keys, parse_note,
+    serialize_note, update_document, NoteDocument, NoteFrontMatter,
 };
 use harnx_core::cid_url::{CidUrl, PlanItem};
 use rmcp::model::{CallToolResult, ErrorData};
@@ -20,7 +20,11 @@ pub(crate) async fn list(
         "{}notes/",
         harnx_blob_store::plans::plan_prefix(&plan).map_err(map_internal)?
     );
-    let documents = list_documents(context.store, &prefix)
+    let keys = list_document_keys(context.store, &prefix)
+        .await
+        .map_err(map_internal)?;
+    let page = KeyPage::select(keys, &prefix, params.limit, params.cursor.as_deref())?;
+    let documents = get_documents(context.store, &page.keys)
         .await
         .map_err(map_internal)?;
     let notes = documents
@@ -29,7 +33,7 @@ pub(crate) async fn list(
         .collect::<anyhow::Result<Vec<_>>>()
         .map_err(map_internal)?;
     context.touch(&plan).await;
-    result_json(Value::Array(notes))
+    result_json(json!({"items": notes, "next_cursor": page.next_cursor}))
 }
 
 pub(crate) async fn add(

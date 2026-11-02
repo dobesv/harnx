@@ -12,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod note;
+mod pagination;
 mod plan;
 mod task;
 
