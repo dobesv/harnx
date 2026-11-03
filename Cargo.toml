@@ -183,7 +183,7 @@ scraper = { version = "0.27.0", default-features = false, features = ["determini
 tempfile = "3"
 sys-locale = "0.3.1"
 html_to_markdown = "0.1.0"
-dom_smoothie = "0.18"
+dom_smoothie = "0.19"
 ipnet = "2.11"
 os_info = { version = "3.8.2", default-features = false }
 bm25 = { version = "2.0.1", features = ["parallelism"] }
