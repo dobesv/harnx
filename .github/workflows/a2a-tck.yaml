@@ -60,7 +60,7 @@ jobs:
         run: scripts/run-a2a-tck.sh
       - name: Upload JUnit and diagnostics
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: a2a-tck-reports
           path: target/a2a-tck-reports/
