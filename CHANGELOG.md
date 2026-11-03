@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.19 (2026-11-03)
+
+### Features
+
+#### Add `bash_tools` agent configuration field and session override (`.set bash_tools`) to support script mode.
+
+When `bash_tools` is set and resolves to available tools, Harnx synthesizes a single `bash` tool declaration whose parameters mirror `bash_exec` and whose description lists the inner tools available to scripts. The field accepts YAML lists or comma-separated strings with the same wildcard, brace expansion, and toolset selector syntax as `use_tools`. Excluded control tools (`switch_agent`, `*_session_handoff`, `ask_user`) and `bash` itself cannot be placed in `bash_tools`.
+
+While `bash_tools` resolves to tools, the name `bash` is reserved for script mode: an external tool of the same name is not exposed, and a `bash` call fails closed with a clear error rather than routing to it. Script execution itself is under development; in this release, calling the synthesized `bash` tool returns that error.
+
+Mixed-version deployments: session metadata carrying a `bash_tools` override uses strict field checking (`deny_unknown_fields`), so worker binaries older than this release cannot load it. The failure counts against the activation failure budget: after 10 failed deliveries an older worker records a durable session `Error` and terminates the activation. Upgrade all workers before setting `bash_tools` overrides.
+
+### Fixes
+
+- update assistant-ui (#2560)
+- update dependency @ag-ui/client to v1.0.3 (#2563)
+- update dependency @assistant-ui/react-markdown to v0.14.24 (#2564)
+- update dependency @assistant-ui/react-syntax-highlighter to v0.14.7 (#2567)
+- update rust crate a2a_lf to v0.4.2 (#2568)
+- update rust crate a2a_pb to v0.3.2 (#2578)
+- Return HTTP 409 with the rejection reason when an AG-UI run prompt is rejected, instead of opening a stream that can hang.
+- Bound plan, task, and note listings to 20 items by default (maximum 100), return `{items, next_cursor}` for key-based pagination, and fetch only page document bodies. Plan listings default to the caller's session; use `all_sessions: true` to list every session. Count tasks and notes from live keys and renew activity only for returned plans. Document cursor handling and filtered task pages in agent instructions.
+- Add the internal plumbing that script mode will use to run tool calls from inside a `bash` script: a lossless single-call evaluator in the engine, a forked tool context that defers approvals and keeps inner calls out of the transcript, and a runtime executor that enforces `bash_tools`, caps concurrency and call counts, and rolls inner-call progress into the outer `bash` row. Payload limits are checked again after PreToolUse argument mutations, before provider dispatch. Post-hook notices from detached hook tasks now reach the session that triggered them.
+
+#### Bound the `ToolResults` session-log entry by the broker's `max_payload`: a tool reply that passed the tool server's JSON size check can still overflow its YAML entry and wedge the session forever (#2555). The biggest outputs of an oversized round are degraded first into the same recoverable size error the tool server produces, with the original retained as a `cid:media:` attachment. Orphan repair applies the same bound, so a session already stuck with a journaled oversized reply recovers on its next message. Typed size rejections terminate the current activation on its first failure instead of retrying it ten times, recording an Error entry when it fits. Later user messages can start a fresh activation.
+
+Size-error fallbacks only replace outputs when they shrink and only claim attachment retention when storage succeeded. Shorter messages are tried even when the full error would grow an output, so rounds with many small results can still fit. Metadata lookup failures now warn before degrading without retention.
+
 ## 0.34.18 (2026-10-31)
 
 ### Features

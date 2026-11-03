@@ -1,6 +1,18 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.4.18 (2026-11-03)
+
+### Fixes
+
+- update assistant-ui (#2560)
+- update dependency @ag-ui/client to v1.0.3 (#2563)
+- update dependency @assistant-ui/react-markdown to v0.14.24 (#2564)
+- update dependency @assistant-ui/react-syntax-highlighter to v0.14.7 (#2567)
+- update rust crate a2a_lf to v0.4.2 (#2568)
+- update rust crate a2a_pb to v0.3.2 (#2578)
+- Encourage structural code edits with ast-grep, with examples for API migrations and changes scoped to a named function, plus guidance to apply and inspect narrow edits in one tool call, preview broad or uncertain rewrites, and validate the results.
+
 ## 0.4.17 (2026-10-31)
 
 ### Features
