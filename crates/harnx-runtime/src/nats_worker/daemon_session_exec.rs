@@ -10,6 +10,7 @@ use crate::nats_lease::NatsSessionLease;
 use crate::OnToolRoundFn;
 use anyhow::{Context, Result};
 use harnx_core::api_types::CompletionTokenUsage;
+use harnx_toolset_server::reply_limits::is_size_error;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -45,10 +46,13 @@ impl std::error::Error for DurableActivationError {
     }
 }
 
+/// Size rejections are permanent even when their diagnostic Error cannot be
+/// appended. Retrying the same entry cannot make it fit.
 pub(super) fn is_durable_activation_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<DurableActivationError>().is_some())
+    is_size_error(error)
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<DurableActivationError>().is_some())
 }
 
 /// A refusal no redelivery can change, such as a prompt without a durable run
@@ -236,6 +240,11 @@ impl WorkerRuntime {
         lease: &NatsSessionLease,
         error: anyhow::Error,
     ) -> anyhow::Error {
+        if is_size_error(&error) {
+            return self
+                .durabilize_pre_turn_failure(activation, lease, error)
+                .await;
+        }
         let budget = if is_activation_refusal(&error) {
             REFUSAL_CONFIRMATIONS
         } else {
@@ -1429,5 +1438,33 @@ mod timing_admission_tests {
         ));
         assert_eq!(latest_prompt_id(&entries, 3), Some("real".into()));
         assert_eq!(latest_prompt_id(&entries, 2), Some("prompt".into()));
+    }
+}
+
+#[cfg(test)]
+mod activation_error_tests {
+    use super::*;
+    use async_nats::jetstream::context::{PublishError, PublishErrorKind};
+
+    #[test]
+    fn typed_size_error_is_permanent_without_durable_marker() {
+        let error = anyhow::Error::from(PublishError::new(PublishErrorKind::MaxPayloadExceeded))
+            .context("append session entry");
+        assert!(is_durable_activation_error(&error));
+        assert!(error.downcast_ref::<DurableActivationError>().is_none());
+    }
+
+    #[test]
+    fn non_size_error_needs_a_durable_marker() {
+        for error in [
+            anyhow::anyhow!("max payload size exceeded"),
+            anyhow::Error::from(PublishError::new(PublishErrorKind::TimedOut))
+                .context("size exceeded while appending"),
+        ] {
+            assert!(!is_durable_activation_error(&error));
+            let durable =
+                anyhow::Error::new(DurableActivationError::new(error)).context("activation failed");
+            assert!(is_durable_activation_error(&durable));
+        }
     }
 }

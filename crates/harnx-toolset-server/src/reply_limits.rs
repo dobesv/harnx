@@ -42,14 +42,7 @@ impl PendingReply {
 
     fn size_error_within(&self, budget: usize) -> Result<ToolReply> {
         let retained = self.retained.as_ref().and_then(Option::as_deref);
-        let location = match retained {
-            Some(url) => format!("Full original ToolReply (application/json): {url}. Read with attachment_read using byte_offset/byte_limit."),
-            None => "Original was not retained: trusted session attachment storage is unavailable.".into(),
-        };
-        let message = format!(
-            "Tool reply exceeded storage/transport size limit ({} serialized bytes). {location} Tool side effects may already have occurred; narrow the request before retrying.",
-            self.original_bytes.len(),
-        );
+        let message = full_size_error_message(self.original_bytes.len(), retained);
         let mut reply = self.size_error(message);
         if encoded_len(&reply)? <= budget {
             return Ok(reply);
@@ -61,22 +54,13 @@ impl PendingReply {
             return Ok(reply);
         }
         if let Some(url) = retained {
-            reply = self.size_error(format!(
-                "Tool reply too large. Original: {url}. Side effects may have occurred."
-            ));
+            reply = self.size_error(short_size_error_message(url));
             reply.final_progress = None;
             if encoded_len(&reply)? <= budget {
                 return Ok(reply);
             }
         }
-        let location = if retained.is_some() {
-            "Original retained in session attachments; reference does not fit."
-        } else {
-            "Original not retained; no trusted attachment owner."
-        };
-        reply = self.size_error(format!(
-            "Tool reply too large. {location} Side effects may have occurred."
-        ));
+        reply = self.size_error(minimal_size_error_message(retained.is_some()));
         reply.final_progress = None;
         if encoded_len(&reply)? <= budget {
             return Ok(reply);
@@ -104,26 +88,31 @@ impl PendingReply {
     }
 }
 
-/// Attachment retention is available only for a trusted transport owner.
-/// The journal's replica count also applies to the original reply's storage.
-pub(crate) struct ReplyAttachments<'a> {
+/// Attachment retention for a trusted session owner. Tool servers derive the
+/// owner from the transport-validated request identity; the worker derives
+/// it from the session's canonical metadata.
+pub struct SessionAttachments<'a> {
     owner: Option<SessionRef>,
     js: &'a jetstream::Context,
     replicas: usize,
 }
 
-impl<'a> ReplyAttachments<'a> {
-    pub(crate) fn new(request: &ToolRequest, js: &'a jetstream::Context, replicas: usize) -> Self {
-        // Never infer ownership from model-authored arguments or the opaque
-        // parent_session_id. Only the transport's validated local identity works.
+impl<'a> SessionAttachments<'a> {
+    pub fn for_owner(
+        owner: Option<SessionRef>,
+        js: &'a jetstream::Context,
+        replicas: usize,
+    ) -> Self {
         Self {
-            owner: attachment_owner(request),
+            owner,
             js,
             replicas,
         }
     }
 
-    async fn retain(&self, original_bytes: &[u8]) -> Result<Option<String>> {
+    /// Retain `original_bytes` as a `cid:media:` attachment and return its URL.
+    /// `None` means no trusted owner was attached, so nothing was stored.
+    pub async fn retain(&self, original_bytes: &[u8]) -> Result<Option<String>> {
         let Some(session) = &self.owner else {
             return Ok(None);
         };
@@ -152,6 +141,56 @@ impl<'a> ReplyAttachments<'a> {
     }
 }
 
+/// The full recoverable size-error message. Shared by the tool-server reply
+/// bound and the worker's `ToolResults` session-log bound (#2555), so the
+/// model sees the same text and the same `attachment_read` recovery path in
+/// both failure modes.
+pub fn full_size_error_message(serialized_bytes: usize, retained_url: Option<&str>) -> String {
+    let location = match retained_url {
+        Some(url) => format!("Full original ToolReply (application/json): {url}. Read with attachment_read using byte_offset/byte_limit."),
+        None => "Original was not retained: trusted session attachment storage is unavailable.".into(),
+    };
+    format!(
+        "Tool reply exceeded storage/transport size limit ({serialized_bytes} serialized bytes). {location} Tool side effects may already have occurred; narrow the request before retrying."
+    )
+}
+
+/// Shortened size-error message used when even the full message does not fit.
+pub fn short_size_error_message(retained_url: &str) -> String {
+    format!("Tool reply too large. Original: {retained_url}. Side effects may have occurred.")
+}
+
+/// Smallest size-error message, used when the `cid:media:` reference itself
+/// does not fit. `retained` says whether the original was stored anyway.
+pub fn minimal_size_error_message(retained: bool) -> String {
+    let location = if retained {
+        "Original retained in session attachments; reference does not fit."
+    } else {
+        "Original not retained; no trusted attachment owner."
+    };
+    format!("Tool reply too large. {location} Side effects may have occurred.")
+}
+
+/// Attachment retention is available only for a trusted transport owner.
+/// The journal's replica count also applies to the original reply's storage.
+pub(crate) struct ReplyAttachments<'a> {
+    attachments: SessionAttachments<'a>,
+}
+
+impl<'a> ReplyAttachments<'a> {
+    pub(crate) fn new(request: &ToolRequest, js: &'a jetstream::Context, replicas: usize) -> Self {
+        // Never infer ownership from model-authored arguments or the opaque
+        // parent_session_id. Only the transport's validated local identity works.
+        Self {
+            attachments: SessionAttachments::for_owner(attachment_owner(request), js, replicas),
+        }
+    }
+
+    async fn retain(&self, original_bytes: &[u8]) -> Result<Option<String>> {
+        self.attachments.retain(original_bytes).await
+    }
+}
+
 fn attachment_owner(request: &ToolRequest) -> Option<SessionRef> {
     SessionRef::new(
         request
@@ -169,7 +208,7 @@ fn encoded_len(reply: &ToolReply) -> Result<usize> {
 
 /// async-nats 0.50 preserves these typed causes through KV UpdateError. Do not
 /// classify text: a tool, auth failure or outage may use the same words.
-pub(crate) fn is_size_error(error: &anyhow::Error) -> bool {
+pub fn is_size_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<jetstream::Error>()

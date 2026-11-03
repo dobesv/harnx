@@ -27,7 +27,18 @@ pub(super) struct ResultEnvironment {
 
 impl ResultEnvironment {
     pub async fn start() -> Result<Self> {
-        let broker = spawn_nats_server().await?.context("nats-server required")?;
+        Self::start_with_broker_config(None).await
+    }
+
+    /// Start with a raw `nats-server` config snippet — e.g. a `max_payload:`
+    /// ceiling — so a result can pass the tool server's JSON bound and still
+    /// overflow the worker's YAML session-log entry (#2555).
+    pub async fn start_with_broker_config(config: Option<&str>) -> Result<Self> {
+        let broker = match config {
+            Some(config) => common::spawn_configured_nats_server(config).await?,
+            None => spawn_nats_server().await?,
+        }
+        .context("nats-server required")?;
         let root = tempfile::tempdir()?;
         let env = vec![
             EnvGuard::set("HARNX_DATA_DIR", root.path().to_str().unwrap()),

@@ -613,6 +613,10 @@ async fn prepare_agent_session(
     }
     .callback(params.abort_signal.clone());
     let mut backend = NatsSessionLogBackend::new(jetstream.clone(), params.session_id, replicas);
+    // The canonical metadata store backs both metadata persistence and the
+    // `ToolResults` size bound: an oversized round derives its attachment
+    // owner (agent + local session id) from the canonical record.
+    backend = backend.with_metadata_store(params.session_metadata.cloned());
     if let Some(observer) = params.after_seq_observer {
         backend = backend.with_after_seq_observer(observer);
     }

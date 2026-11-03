@@ -6,6 +6,8 @@
 mod activation_error_disposition;
 #[path = "nats_worker/activation_failure_budget.rs"]
 mod activation_failure_budget;
+#[path = "nats_worker/activation_size_failure.rs"]
+mod activation_size_failure;
 #[path = "nats_worker/bounded_results.rs"]
 mod bounded_results;
 #[path = "nats_worker/cancellation.rs"]
@@ -59,6 +61,10 @@ mod tool_cli;
 mod tool_reservation;
 #[path = "nats_worker/tool_reservation_client.rs"]
 mod tool_reservation_client;
+#[path = "nats_worker/tool_result_budget_fallbacks.rs"]
+mod tool_result_budget_fallbacks;
+#[path = "nats_worker/tool_result_entry_budget.rs"]
+mod tool_result_entry_budget;
 #[path = "nats_worker/turn_continuation.rs"]
 mod turn_continuation;
 #[path = "nats_worker/turn_persistence.rs"]

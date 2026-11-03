@@ -1,5 +1,8 @@
 //! Runtime persistence adapter for in-memory session state.
 
+mod append_status;
+pub(crate) use append_status::AppendStatus;
+
 use super::GlobalConfig;
 use crate::nats_session_metadata::{
     SessionMetadata, SessionOverrideUpdate, SessionOverrides, SessionPropertiesUpdate,
@@ -17,7 +20,7 @@ pub trait SessionAppendSink: Send + Sync + Any {
     /// Append an entry and return its one-based durable sequence number.
     fn append(&self, entry: &SessionLogEntry) -> Result<u64>;
 
-    /// Recheck exact sink authority when a legacy bool-returning append lost its error.
+    /// Recheck exact sink authority before reporting a failed output append.
     fn validate_output(&self) -> Result<()> {
         Ok(())
     }
@@ -156,15 +159,24 @@ impl PendingExecutionContextPersistence {
 
 /// Append a log entry through the session's runtime persistence sink.
 pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
-    append_event_seq(session, entry).is_some()
+    append_event_status(session, entry).is_complete()
 }
 
-/// [`append_event`], returning the entry's durable sequence, or `None` when
-/// it was not appended.
-pub(crate) fn append_event_seq(session: &mut Session, entry: &SessionLogEntry) -> Option<u64> {
+/// Preserve the cause until the caller decides whether its sink is authoritative.
+pub(crate) fn append_event_status(session: &mut Session, entry: &SessionLogEntry) -> AppendStatus {
+    AppendStatus::from_result(append_event_seq(session, entry))
+}
+
+/// [`append_event`], retaining failures and the entry's durable sequence.
+pub(crate) fn append_event_seq(
+    session: &mut Session,
+    entry: &SessionLogEntry,
+) -> Result<Option<u64>> {
     let seq = append_through(sink(session), session.id(), entry)?;
-    session.log_entry_count = seq as usize;
-    Some(seq)
+    if let Some(seq) = seq {
+        session.log_entry_count = seq as usize;
+    }
+    Ok(seq)
 }
 
 /// The session's persistence sink, cloned so a caller can append through it
@@ -179,37 +191,39 @@ pub(super) fn append_through(
     sink: Option<&Arc<dyn SessionAppendSink>>,
     session_id: &str,
     entry: &SessionLogEntry,
-) -> Option<u64> {
+) -> Result<Option<u64>> {
     let Some(append_sink) = sink else {
         log::warn!(
             "session append dropped: no persistence sink attached (session_id={session_id} entry_type={})",
             crate::session_history::entry_type(entry)
         );
-        return None;
+        return Ok(None);
     };
     match append_sink.append(entry) {
-        Ok(seq) => Some(seq),
+        Ok(seq) => Ok(Some(seq)),
         Err(error) => {
             log::warn!(
                 "session append failed: session_id={session_id} entry_type={} error={error}",
                 crate::session_history::entry_type(entry)
             );
-            None
+            Err(error)
         }
     }
 }
 
 pub(super) fn require_authoritative_appends(
     session: &Session,
-    all_appended: bool,
+    appends: AppendStatus,
     operation: &str,
 ) -> Result<()> {
-    if all_appended {
+    if appends.is_complete() {
         return Ok(());
     }
     if let Some(sink) = sink(session).filter(|sink| sink.failure_is_fatal()) {
         sink.validate_output()?;
-        anyhow::bail!("failed to durably persist {operation}");
+        return appends
+            .into_result()
+            .with_context(|| format!("failed to durably persist {operation}"));
     }
     Ok(())
 }
@@ -311,3 +325,6 @@ pub fn persist_active_session_override(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

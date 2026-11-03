@@ -350,6 +350,15 @@ Test coverage at `reply_limits.rs:tests::size_words_are_not_a_size_error` explic
 negative cases. Same pattern applies to any error-classification logic that needs to
 distinguish genuine protocol conditions from incidental message content.
 
+The downcast only works while the typed cause survives the layers that wrap it. An
+append failure surfaced through a fresh `anyhow::bail!` or `map_err` without chaining the
+original error leaves `is_size_error` nothing to downcast, so a permanent size rejection
+silently re-enters the ten-delivery retry budget. Session-log appends must chain their
+source error: `config/session_persistence/append_status.rs` keeps the first append cause
+across a batch, and `require_authoritative_appends` adds operation context with
+`.with_context`, never `bail!`. Regression coverage:
+`tests/it/nats_worker/activation_size_failure.rs`.
+
 ### Telling a flake from a regression
 
 A failure that repeats on every attempt is not a flake. The `ci` profile retries

@@ -81,7 +81,7 @@ pub use harnx_toolset::TOOL_PROTOCOL_VERSION;
 pub mod invocation_journal;
 mod recovery;
 mod reply_cache;
-mod reply_limits;
+pub mod reply_limits;
 use reply_cache::*;
 pub const TOOL_SCHEMA_VERSION: u32 = 1;
 

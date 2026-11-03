@@ -4,7 +4,7 @@ use super::session_externalize::{
     attachments_dir, externalize_tool_result_content, record_externalized, session_ref,
 };
 use super::session_persistence::{
-    append_event, require_authoritative_appends, PendingExecutionContextPersistence,
+    append_event_status, require_authoritative_appends, PendingExecutionContextPersistence,
 };
 use crate::client::{MessageContent, MessageRole};
 use crate::tool::ToolResult;
@@ -58,7 +58,7 @@ pub(crate) fn prepare_tool_results_in_place(
     let accepted_observations = accept_tool_result_replacements(&mut pending.tool_results, results);
     let log_results = tool_outputs(&pending.tool_results);
 
-    let appended = append_event(
+    let appended = append_event_status(
         session,
         &SessionLogEntry::ToolResults {
             results: log_results,
@@ -66,12 +66,13 @@ pub(crate) fn prepare_tool_results_in_place(
         },
     );
     let all_appended = appended & record_externalized(session, cid_urls);
-    session.dirty |= !all_appended;
+    let tool_results_are_durable = all_appended.is_complete();
+    session.dirty |= !tool_results_are_durable;
     require_authoritative_appends(session, all_appended, "tool results")?;
     let persistence = PendingExecutionContextPersistence::for_session(
         session,
         accepted_observations,
-        all_appended,
+        tool_results_are_durable,
     );
     session.update_tokens();
     Ok(persistence)

@@ -17,18 +17,22 @@ pub(crate) fn prepare_input(session: &mut Session, input: &mut Input) -> Result<
     let mut unpatched = input.clone();
     unpatched.clear_patch();
     let all_appended = begin_turn(session, &unpatched, "")?;
-    session.dirty |= !all_appended;
+    session.dirty |= !all_appended.is_complete();
     require_authoritative_appends(session, all_appended, "user input")?;
     input.session_input_start = Some(history_len);
     session.update_tokens();
     Ok(())
 }
 
-pub(super) fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<bool> {
+pub(super) fn begin_turn(
+    session: &mut Session,
+    input: &Input,
+    _output: &str,
+) -> Result<AppendStatus> {
     if input.session_input_start.is_some() {
-        return Ok(true);
+        return Ok(AppendStatus::complete());
     }
-    let mut all_appended = true;
+    let mut all_appended = AppendStatus::complete();
     let is_continuation = is_tool_continuation(input);
 
     if session.messages.is_empty() && !is_continuation {
@@ -46,9 +50,9 @@ pub(super) fn begin_turn(session: &mut Session, input: &Input, _output: &str) ->
     Ok(all_appended)
 }
 
-fn append_initial_agent_messages(session: &mut Session, input: &Input) -> Result<bool> {
+fn append_initial_agent_messages(session: &mut Session, input: &Input) -> Result<AppendStatus> {
     let agent_messages = input.agent().build_messages(input)?;
-    let mut all_appended = true;
+    let mut all_appended = AppendStatus::complete();
     let mut cid_urls = std::collections::HashMap::new();
 
     for mut msg in agent_messages {
@@ -71,7 +75,7 @@ fn append_initial_agent_messages(session: &mut Session, input: &Input) -> Result
     Ok(all_appended)
 }
 
-fn append_user_turn_message(session: &mut Session, input: &Input) -> bool {
+fn append_user_turn_message(session: &mut Session, input: &Input) -> AppendStatus {
     // `seq` is the message's log-document index. `externalize_content` only
     // writes attachment files + rewrites `content` in memory (it takes
     // `&Session`, so it cannot append), so nothing must be appended between
@@ -100,11 +104,11 @@ fn append_user_turn_message(session: &mut Session, input: &Input) -> bool {
     all_appended
 }
 
-fn append_input_data_urls(session: &mut Session, input: &Input) -> bool {
+fn append_input_data_urls(session: &mut Session, input: &Input) -> AppendStatus {
     let new_data_urls = input.data_urls();
-    let mut all_appended = true;
+    let mut all_appended = AppendStatus::complete();
     if !new_data_urls.is_empty() {
-        all_appended &= append_event(
+        all_appended &= append_event_status(
             session,
             &SessionLogEntry::DataUrls {
                 urls: new_data_urls.clone(),
@@ -115,9 +119,9 @@ fn append_input_data_urls(session: &mut Session, input: &Input) -> bool {
     all_appended
 }
 
-fn append_injected_user_text(session: &mut Session, input: &Input) -> bool {
+fn append_injected_user_text(session: &mut Session, input: &Input) -> AppendStatus {
     let Some(injected) = input.injected_user_text() else {
-        return true;
+        return AppendStatus::complete();
     };
 
     // `skip_user_log_append` marks an input whose user text was folded out of
@@ -135,7 +139,7 @@ fn append_injected_user_text(session: &mut Session, input: &Input) -> bool {
         // prompts rather than becoming unadmitted ID-less user rows (issue
         // #2493's "injected user row has no admission identity").
         restore_injected_user_messages(session, input, injected);
-        return true;
+        return AppendStatus::complete();
     }
 
     let seq = session.next_seq();
@@ -176,7 +180,7 @@ pub(super) fn append_session_message(
     role: MessageRole,
     content: MessageContent,
 ) -> bool {
-    append_session_message_with_id(session, persisted_message_id(), role, content)
+    append_session_message_with_id(session, persisted_message_id(), role, content).is_complete()
 }
 
 /// Like [`append_session_message`] but with a caller-chosen id, so the durable
@@ -188,8 +192,8 @@ fn append_session_message_with_id(
     id: String,
     role: MessageRole,
     content: MessageContent,
-) -> bool {
-    append_event(
+) -> AppendStatus {
+    append_event_status(
         session,
         &SessionLogEntry::Message {
             id: Some(id),
