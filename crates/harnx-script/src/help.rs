@@ -104,13 +104,24 @@ fn json_syntax_flag(required: bool) -> String {
 fn syntax(name: &str, schema: &Value) -> String {
     let mut properties = properties(schema);
     let conflict = flag_table(&properties).is_err();
-    let json_required = has_required_json_property(&properties, conflict);
+    let json_required = has_required_json_property(&properties, conflict)
+        || has_unlisted_required_key(schema, &properties);
     let mut parts = vec![name.split_whitespace().collect::<Vec<_>>().join(" ")];
     if !conflict {
         collect_syntax_flags(&mut properties, &mut parts);
     }
     parts.push(json_syntax_flag(json_required));
     parts.join(" ")
+}
+
+fn has_unlisted_required_key(schema: &Value, properties: &[Property<'_>]) -> bool {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|key| !properties.iter().any(|property| property.key == key))
 }
 
 fn syntax_flag(property: &Property<'_>) -> String {

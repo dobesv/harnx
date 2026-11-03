@@ -506,3 +506,5 @@ async fn registered_command_nonzero_exit_is_recoverable_with_set_plus_e() {
     assert_eq!(result.stdout, "7\n");
     assert_eq!(result.stderr, "ordinary failure\n");
 }
+
+mod capture_errors;

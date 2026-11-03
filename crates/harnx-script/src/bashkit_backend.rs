@@ -167,8 +167,8 @@ impl ScriptBackend for BashKitBackend {
         let fatal = control.fatal.lock().unwrap().take();
         let mut capture = captured.lock().unwrap();
         let (status, exit_code, limit_hit) = if let Some(message) = fatal {
-            capture.append("", &format!("{message}\n"));
-            (ScriptStatus::Error, 1, None)
+            capture.record_error(message);
+            (ScriptStatus::Error, 1, capture.output_limit())
         } else {
             classify(result, &mut capture)
         };
@@ -180,6 +180,7 @@ impl ScriptBackend for BashKitBackend {
             exit_code,
             status,
             limit_hit,
+            error: capture.error.take(),
         }
     }
 }

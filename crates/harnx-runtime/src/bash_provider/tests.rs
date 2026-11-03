@@ -386,8 +386,7 @@ async fn huge_stdout_spills_into_limit_marker() {
     let abort = create_abort_signal();
     let output = ok(run(&bash, "big --path x", &abort).await);
     let payload = output.value;
-    // BashKit capped the stream: the run-level flags say so, and the
-    // rendered report tells the model how to ask for more.
+    // Render-time controls cannot recover bytes discarded by backend capture.
     assert_eq!(
         payload["stdout_truncated"], true,
         "2 MiB must exceed the 1 MiB stdout limit"
@@ -398,7 +397,7 @@ async fn huge_stdout_spills_into_limit_marker() {
         payload
     );
     let text = payload["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("truncated"), "{text}");
+    output::assert_backend_capture_notice(text);
     assert!(text.len() < 2 * 1024 * 1024, "report must stay bounded");
 }
 
@@ -680,3 +679,5 @@ async fn inner_calls_cannot_recurse_into_bash() {
         partial
     );
 }
+
+mod output;

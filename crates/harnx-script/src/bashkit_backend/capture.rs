@@ -42,6 +42,7 @@ pub(super) struct Capture {
     pub stdout: CapturedStream,
     pub stderr: CapturedStream,
     pub exit_code: i32,
+    pub error: Option<String>,
 }
 
 impl Capture {
@@ -50,7 +51,18 @@ impl Capture {
             stdout: CapturedStream::new(limits.max_stdout_bytes),
             stderr: CapturedStream::new(limits.max_stderr_bytes),
             exit_code: 0,
+            error: None,
         }
+    }
+
+    pub fn record_error(&mut self, message: String) {
+        self.append("", &format!("{message}\n"));
+        self.error = Some(message);
+    }
+
+    pub fn output_limit(&self) -> Option<String> {
+        (self.stdout.truncated || self.stderr.truncated)
+            .then(|| "output capture limit exceeded".to_owned())
     }
 
     pub fn append(&mut self, stdout: &str, stderr: &str) {

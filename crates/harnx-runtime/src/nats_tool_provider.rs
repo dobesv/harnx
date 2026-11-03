@@ -411,6 +411,7 @@ impl NatsToolProvider {
                 control_subject: self.instance_id.control_subject(),
             })
             .await;
+        let _completion = self.in_flight.completion_guard(&call_id);
         let request = harnx_nats_common::rpc::request(&self.client, subject, request);
         tokio::pin!(request);
         let response = tokio::select! {

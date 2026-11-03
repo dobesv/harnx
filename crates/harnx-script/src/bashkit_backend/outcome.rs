@@ -7,10 +7,11 @@ use super::capture::Capture;
 type Outcome = (ScriptStatus, i32, Option<String>);
 
 pub(super) fn classify(result: bashkit::Result<ExecResult>, capture: &mut Capture) -> Outcome {
-    match result {
+    let (status, code, limit) = match result {
         Ok(result) => classify_success(result, capture),
         Err(error) => classify_error(error, capture),
-    }
+    };
+    (status, code, limit.or_else(|| capture.output_limit()))
 }
 
 fn classify_success(result: ExecResult, capture: &mut Capture) -> Outcome {
@@ -22,16 +23,11 @@ fn classify_success(result: ExecResult, capture: &mut Capture) -> Outcome {
     } else {
         ScriptStatus::Error
     };
-    let limit = if capture.stdout.truncated || capture.stderr.truncated {
-        Some("output capture limit exceeded".to_owned())
-    } else {
-        None
-    };
-    (status, capture.exit_code, limit)
+    (status, capture.exit_code, None)
 }
 
 fn classify_error(error: Error, capture: &mut Capture) -> Outcome {
-    capture.append("", &format!("{error}\n"));
+    capture.record_error(error.to_string());
     match error {
         Error::Cancelled => (ScriptStatus::Cancelled, 130, None),
         Error::ResourceLimit(limit) => {

@@ -69,7 +69,7 @@ impl Config {
     /// harnx-script backend exposes as shell commands. Empty when script
     /// mode is inactive; same resolution and ordering as `bash_tool_names`.
     pub fn bash_inner_tool_declarations(&self) -> Vec<ToolDeclaration> {
-        let agent = self.extract_agent();
+        let agent = self.tool_selection_agent();
         let package = harnx_core::package_namespace::pkg_from_qualified(agent.name());
         self.select_bash_inner_tools(agent.bash_tools().as_deref().unwrap_or(&[]), package)
     }

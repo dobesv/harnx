@@ -395,3 +395,36 @@ fn bash_tools_respect_tool_use_disabled() {
     assert!(config.bash_tool_names(&agent).is_empty());
     assert!(config.select_tools(&agent).is_none());
 }
+
+#[test]
+fn bash_catalog_matches_declaration_with_session_override() {
+    let mut config = config_with_tools();
+    config.agent = Some(crate::config::Agent::new(agent_with(
+        None,
+        Some(vec!["fs_read".into()]),
+    )));
+    let mut session = Session::default();
+    session.set_bash_tools(Some(vec!["fs_write".into()]));
+    config.session = Some(session);
+
+    let effective = config.tool_selection_agent();
+    assert_eq!(config.bash_tool_names(&effective), vec!["fs_write"]);
+    let declaration = config.select_tools(&effective).unwrap().pop().unwrap();
+    assert_eq!(declaration.name, "bash");
+    assert!(declaration.description.contains("fs_write"));
+    assert!(!declaration.description.contains("fs_read"));
+    let catalog: Vec<_> = config
+        .bash_inner_tool_declarations()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert_eq!(catalog, config.bash_tool_names(&effective));
+
+    config
+        .session
+        .as_mut()
+        .unwrap()
+        .set_bash_tools(Some(vec![]));
+    assert!(!config.bash_tools_active());
+    assert!(config.bash_inner_tool_declarations().is_empty());
+}

@@ -101,3 +101,26 @@ fn collisions_and_reserved_json_document_the_escape_hatch() {
     assert_eq!(synopsis("tool", &reserved, ""), "tool --json <object>");
     assert!(help("tool", &reserved, "").contains("(property \"json\")"));
 }
+
+#[test]
+fn unlisted_required_keys_require_json_in_synopsis_and_help() {
+    use crate::cli_map::parse_args;
+
+    for properties in [
+        json!({}),
+        json!({"listed": {"type": "string"}}),
+        json!({"aB": {"type": "string"}, "a_b": {"type": "string"}}),
+    ] {
+        let schema = json!({"properties": properties, "required": ["unlisted"]});
+        let syntax = synopsis("tool", &schema, "");
+        assert!(syntax.ends_with(" --json <object>"), "{syntax}");
+        assert!(!syntax.contains("[--json"), "{syntax}");
+        assert!(help("tool", &schema, "").contains(&format!("    {syntax}\n")));
+        assert!(parse_args(&schema, &[], None).is_err());
+        let args = vec!["--json".into(), r#"{"unlisted":1}"#.into()];
+        assert_eq!(
+            parse_args(&schema, &args, None).unwrap(),
+            json!({"unlisted": 1})
+        );
+    }
+}

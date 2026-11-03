@@ -203,6 +203,7 @@ struct BashOutcome {
     stdout_truncated: bool,
     stderr_truncated: bool,
     limit_hit: Option<String>,
+    error: Option<String>,
     trace: Vec<crate::bash_inner::InnerTraceEntry>,
     /// Inner calls admitted over the trace-retention cap (256); their rows
     /// were dropped from `trace`, so the count is the only record left.
@@ -248,6 +249,7 @@ impl BashOutcome {
             stdout_truncated: result.stdout_truncated,
             stderr_truncated: result.stderr_truncated,
             limit_hit: result.limit_hit,
+            error: result.error.map(|error| sanitize_output_text(&error)),
             trace,
             trace_dropped,
             first_failed,
@@ -324,15 +326,23 @@ impl BashOutcome {
         }
     }
 
+    fn truncate_stream(&self, text: &str, capture_truncated: bool) -> String {
+        let mut opts = self.truncate_opts();
+        if capture_truncated {
+            // Override truncation's own hints too, not only the fenced notice.
+            opts.marker = Some("... [truncated at backend capture limit] ...".into());
+        }
+        truncate_output(text, &opts)
+    }
+
     fn payload(&self) -> Value {
-        let opts = self.truncate_opts();
         // Ported from `harnx-bash-tools/src/server/render.rs`
         // (`render_streams_block`): sanitize + truncate once, reuse for both
         // the JSON fields and the rendered report.
         let stdout_sanitized = sanitize_output_text(&self.stdout);
-        let stdout = truncate_output(&stdout_sanitized, &opts);
+        let stdout = self.truncate_stream(&stdout_sanitized, self.stdout_truncated);
         let stderr_sanitized = sanitize_output_text(&self.stderr);
-        let stderr = truncate_output(&stderr_sanitized, &opts);
+        let stderr = self.truncate_stream(&stderr_sanitized, self.stderr_truncated);
         let stdout_truncated = self.stdout_truncated || stdout != stdout_sanitized;
         let stderr_truncated = self.stderr_truncated || stderr != stderr_sanitized;
         let rendered = self.render(
@@ -358,6 +368,9 @@ impl BashOutcome {
             // display markdown falls back to the rendered report.
             "content": [{"type": "text", "text": rendered}],
         });
+        if let Some(error) = &self.error {
+            payload["error"] = json!(error);
+        }
         if self.trace_dropped > 0 {
             // Inner calls over the 256-row trace cap; their rows are gone,
             // so the count is the only record left (PR3 review F13).
@@ -378,6 +391,8 @@ impl BashOutcome {
             exit_code: i32,
             #[serde(skip_serializing_if = "Option::is_none")]
             limit_hit: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<&'a str>,
             total_lines: usize,
             total_bytes: usize,
         }
@@ -390,6 +405,7 @@ impl BashOutcome {
             status: self.status,
             exit_code: self.exit_code,
             limit_hit: self.limit_hit.as_deref(),
+            error: self.error.as_deref(),
             total_lines,
             total_bytes,
         })
@@ -399,12 +415,14 @@ impl BashOutcome {
             "stdout",
             stdout.text,
             stdout.truncated,
+            self.stdout_truncated,
         ));
         out.push('\n');
         out.push_str(&render_stream_block(
             "stderr",
             stderr.text,
             stderr.truncated,
+            self.stderr_truncated,
         ));
         if !self.trace.is_empty() {
             out.push_str("\n## inner call trace\n");
@@ -446,9 +464,18 @@ impl BashOutcome {
 /// One stream's fenced block with HTML markers, mirroring
 /// `harnx-bash-tools/src/server/render.rs::render_stream_block`. Content is
 /// already sanitized and truncated by the caller; this only formats.
-fn render_stream_block(name: &str, content: &str, truncated: bool) -> String {
+fn render_stream_block(
+    name: &str,
+    content: &str,
+    truncated: bool,
+    capture_truncated: bool,
+) -> String {
     let mut block = format!("<!-- start {name} -->\n```\n{content}");
-    if truncated {
+    if capture_truncated {
+        block.push_str(&format!(
+            "\n\n[{name} truncated at the backend capture limit. Discarded output is unavailable.]"
+        ));
+    } else if truncated {
         block.push_str(&format!(
             "\n\n[{name} truncated. Use max_output_bytes, head_lines, or tail_lines to see more]"
         ));

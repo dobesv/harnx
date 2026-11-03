@@ -35,6 +35,10 @@ async fn example() {
 - Output truncation preserves the command's exit status and sets truncation flags
   plus `limit_hit`. Timeout reports `timed_out`/124; cancellation reports
   `cancelled`/130. Streaming capture retains emitted partial output on errors.
+  Fatal command messages and errors returned by BashKit also appear in
+  `ScriptRun.error`, independent of stream caps. BashKit 0.20.2 reports late
+  syntax errors as ordinary stderr with exit 2; if its own stderr cap has
+  discarded that diagnostic, the backend can't recover it.
 - BashKit is pinned to `=0.20.2`, with only its `jq` feature enabled. HTTP, SSH,
   git, host filesystems, and Python/Monty aren't enabled. Curl/wget are also
   filtered out at construction. Builtins operate on virtual files, including

@@ -1,13 +1,16 @@
 //! Per-server call liveness, independent of turn and cleanup lifetimes.
 use harnx_core::instance::ServerScope;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 #[derive(Clone, Debug)]
 pub(crate) enum InFlightFailure {
     Unavailable(String),
 }
 
+// Every critical section is synchronous. A sync mutex lets dropped waits remove
+// their entries immediately, without spawning cleanup that can outlive a runtime.
 type InFlightMap = Mutex<HashMap<String, InFlightCall>>;
 static INSTANCE_IN_FLIGHT: OnceLock<std::sync::Mutex<HashMap<ServerScope, Weak<InFlightMap>>>> =
     OnceLock::new();
@@ -44,7 +47,25 @@ pub struct InFlightCancelTarget {
     pub control_subject: String,
 }
 
+pub(super) struct InFlightCompletionGuard {
+    calls: NatsInFlightCalls,
+    call_id: String,
+}
+
+impl Drop for InFlightCompletionGuard {
+    fn drop(&mut self) {
+        self.calls.calls.lock().remove(&self.call_id);
+    }
+}
+
 impl NatsInFlightCalls {
+    pub(super) fn completion_guard(&self, call_id: &str) -> InFlightCompletionGuard {
+        InFlightCompletionGuard {
+            calls: self.clone(),
+            call_id: call_id.to_owned(),
+        }
+    }
+
     /// Return the process-wide handle shared by provider and supervisor for an instance.
     pub fn for_instance(instance_id: &ServerScope) -> Self {
         let registry = INSTANCE_IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -71,7 +92,7 @@ impl NatsInFlightCalls {
             control_subject,
         } = registration;
         let (failure, receiver) = oneshot::channel();
-        self.calls.lock().await.insert(
+        self.calls.lock().insert(
             call_id,
             InFlightCall {
                 server,
@@ -84,14 +105,14 @@ impl NatsInFlightCalls {
     }
 
     pub(crate) async fn complete(&self, call_id: &str) {
-        self.calls.lock().await.remove(call_id);
+        self.calls.lock().remove(call_id);
     }
 
     /// Fail current calls routed to a supervised server that became unavailable.
     pub async fn fail_server_unavailable(&self, server: &str, message: impl Into<String>) {
         let message = message.into();
         let failures = {
-            let mut calls = self.calls.lock().await;
+            let mut calls = self.calls.lock();
             let call_ids = calls
                 .iter()
                 .filter(|(_, call)| call.server == server)
@@ -112,7 +133,6 @@ impl NatsInFlightCalls {
     pub async fn snapshot_for_session(&self, session_id: &str) -> Vec<InFlightCancelTarget> {
         self.calls
             .lock()
-            .await
             .iter()
             .filter(|(_, call)| call.session_id == session_id)
             .map(|(call_id, call)| InFlightCancelTarget {
@@ -146,5 +166,34 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].call_id, "a");
         assert_eq!(snapshot[0].control_subject, "ctl.srv");
+    }
+
+    #[tokio::test]
+    async fn completion_guard_removes_only_its_call() {
+        let calls = NatsInFlightCalls::default();
+        let failure = calls.register(registration("dropped", "s1")).await;
+        let _other = calls.register(registration("other", "s1")).await;
+        let guard = calls.completion_guard("dropped");
+        drop(guard);
+        assert!(failure.await.is_err());
+        let remaining = calls.snapshot_for_session("s1").await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].call_id, "other");
+    }
+
+    #[tokio::test]
+    async fn completion_guard_tolerates_prior_removal() {
+        let calls = NatsInFlightCalls::default();
+        for unavailable in [false, true] {
+            let _failure = calls.register(registration("call", "s1")).await;
+            let guard = calls.completion_guard("call");
+            if unavailable {
+                calls.fail_server_unavailable("srv", "stopped").await;
+            } else {
+                calls.complete("call").await;
+            }
+            drop(guard);
+            assert!(calls.snapshot_for_session("s1").await.is_empty());
+        }
     }
 }

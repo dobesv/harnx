@@ -59,6 +59,9 @@ pub struct ScriptRun {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub limit_hit: Option<String>,
+    /// Fatal command or interpreter diagnostic, independent of stream caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub status: ScriptStatus,
 }
 

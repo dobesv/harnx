@@ -548,6 +548,8 @@ async fn assert_server_unavailable(
     Ok(())
 }
 
+#[path = "nats_tool_provider/drop_cleanup.rs"]
+mod drop_cleanup;
 #[path = "nats_tool_provider/outage.rs"]
 mod outage;
 #[path = "nats_tool_provider/partial_result.rs"]
