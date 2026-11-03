@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+mod attachment_write;
 mod lifecycle_toolset;
 mod proxy;
 mod repo_clone;
@@ -113,13 +114,13 @@ pub fn sandbox_toolsets_with_names(
             bash,
             harnx_bash_tools::builtin_tool_specs(),
             gateway.clone(),
-            ports.bash,
+            proxy::Backend::Bash(ports.bash),
         )),
         Arc::new(ProxyToolset::new(
             fs,
             harnx_fs_tools::builtin_tool_specs(),
             gateway.clone(),
-            ports.fs,
+            proxy::Backend::Fs(ports.fs),
         )),
         Arc::new(LifecycleToolset {
             name: sandbox,

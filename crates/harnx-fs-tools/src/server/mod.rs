@@ -36,12 +36,17 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 #[cfg(test)]
 mod allowlist_tests;
+mod attachment;
 mod handler;
 mod handlers;
 mod params;
+mod sandbox_transport;
+pub use sandbox_transport::SANDBOX_HTTP_MAX_REQUEST_BODY_BYTES;
+pub(crate) use sandbox_transport::{location_args, WRITE_BYTES_DESCRIPTION};
 #[cfg(test)]
 pub(crate) mod tests;
 mod walk;
+mod write;
 
 pub use params::*;
 pub(crate) use walk::*;
@@ -51,6 +56,8 @@ use crate::tool_templates;
 #[derive(Clone)]
 pub struct FsServer {
     allowlist: Arc<ResolvedAllowlist>,
+    attachment_resolver: Option<Arc<dyn crate::AttachmentResolver>>,
+    sandbox_transport: bool,
     history: Arc<HistoryManager>,
     repo_locks: Arc<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>>,
     file_locks: Arc<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,

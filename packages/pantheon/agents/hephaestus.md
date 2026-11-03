@@ -17,6 +17,7 @@ use_tools:
 - sandbox_status
 - sandbox_release
 - fs_write
+- fs_write_attachment
 - fs_edit
 - fs_insert
 - fs_re_replace

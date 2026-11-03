@@ -1,4 +1,4 @@
-use super::{lifecycle_error, mcp_endpoint, Gateway};
+use super::{attachment_write, lifecycle_error, mcp_endpoint, Gateway};
 use async_trait::async_trait;
 use harnx_toolset::{ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolSpec, Toolset};
 use serde_json::{json, Map, Value};
@@ -9,7 +9,24 @@ pub(super) struct ProxyToolset {
     name: String,
     specs: Vec<ToolSpec>,
     gateway: Gateway,
-    port: u16,
+    backend: Backend,
+}
+
+pub(super) enum Backend {
+    Bash(u16),
+    Fs(u16),
+}
+
+impl Backend {
+    fn port(&self) -> u16 {
+        match self {
+            Self::Bash(port) | Self::Fs(port) => *port,
+        }
+    }
+
+    fn translates_attachment(&self, tool: &str) -> bool {
+        matches!(self, Self::Fs(_)) && tool == "write_attachment"
+    }
 }
 
 struct ResolvedInvocation {
@@ -22,12 +39,17 @@ struct ResolvedInvocation {
 }
 
 impl ProxyToolset {
-    pub(super) fn new(name: String, specs: Vec<ToolSpec>, gateway: Gateway, port: u16) -> Self {
+    pub(super) fn new(
+        name: String,
+        specs: Vec<ToolSpec>,
+        gateway: Gateway,
+        backend: Backend,
+    ) -> Self {
         Self {
             name,
             specs: specs.into_iter().map(proxy_spec).collect(),
             gateway,
-            port,
+            backend,
         }
     }
 
@@ -47,11 +69,19 @@ impl ProxyToolset {
                 self.name
             )));
         }
-        let mut args = args.as_object().cloned().ok_or_else(|| {
-            ToolInvokeError::Recoverable("tool arguments must be an object".to_string())
-        })?;
+        let Value::Object(mut args) = args else {
+            return Err(ToolInvokeError::Recoverable(
+                "tool arguments must be an object".to_string(),
+            ));
+        };
         let explicit = sandbox_override(args.remove("sandbox_id"))?;
         let sandbox_id = self.gateway.sandbox_id(explicit, &context).await?;
+        let (tool, args) = if self.backend.translates_attachment(&tool) {
+            let args = attachment_write::resolve(args, self.gateway.metadata.jetstream()).await?;
+            ("write_bytes".to_string(), args)
+        } else {
+            (tool, args)
+        };
         let pod_ip = self
             .gateway
             .manager
@@ -60,7 +90,7 @@ impl ProxyToolset {
             .map_err(lifecycle_error)?;
         Ok(ResolvedInvocation {
             sandbox_id,
-            endpoint: mcp_endpoint(&pod_ip, self.port),
+            endpoint: mcp_endpoint(&pod_ip, self.backend.port()),
             tool,
             args,
             capabilities: context.capabilities,
@@ -69,8 +99,9 @@ impl ProxyToolset {
     }
 
     async fn forward(&self, invocation: ResolvedInvocation) -> Result<Value, ToolInvokeError> {
-        self.gateway
-            .call_remote(
+        let result = self
+            .gateway
+            .call_with_activity_heartbeat(
                 &invocation.sandbox_id,
                 &invocation.endpoint,
                 &invocation.tool,
@@ -78,7 +109,11 @@ impl ProxyToolset {
                 invocation.capabilities,
                 invocation.cancel,
             )
-            .await
+            .await;
+        match (&self.backend, invocation.tool.as_str()) {
+            (Backend::Fs(_), "write_bytes") => result.map_err(attachment_write::remote_error),
+            _ => result.map_err(super::remote_error),
+        }
     }
 
     async fn execute(&self, invocation: ToolInvocation) -> Result<Value, ToolInvokeError> {

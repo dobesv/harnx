@@ -52,8 +52,8 @@ The gateway preserves the standard Harnx tool names and schemas:
 
 - `bash_exec`, `bash_spawn`, `bash_wait`, `bash_terminate`,
   `bash_read_exec_log`, and `bash_rollback_file`
-- `fs_read`, `fs_write`, `fs_edit`, `fs_insert`, `fs_re_replace`, `fs_ls`,
-  `fs_grep`, `fs_find`, and `fs_rollback_file`
+- `fs_read`, `fs_write`, `fs_write_attachment`, `fs_edit`, `fs_insert`,
+  `fs_re_replace`, `fs_ls`, `fs_grep`, `fs_find`, and `fs_rollback_file`
 - `sandbox_connect`, `sandbox_status`, and `sandbox_release`
 
 Every proxied bash/fs schema has an optional `sandbox_id`. Resolution order is:
@@ -78,10 +78,59 @@ bind to the same sandbox.
 
 Each sandbox must expose streamable HTTP MCP at path `/mcp` on two ports:
 - `harnx-bash-tools --mcp-http` on port 3002, exposing raw tools (`exec`, `spawn`, `wait`, `terminate`, `read_exec_log`, `rollback_file`).
-- `harnx-fs-tools --mcp-http` on port 3003, exposing raw tools (`read`, `write`, `edit`, `insert`, `re_replace`, `ls`, `grep`, `find`, `rollback_file`).
+- `harnx-fs-tools --mcp-http --sandbox-transport` on port 3003, exposing raw filesystem tools plus the gateway-only `write_bytes(path, data_base64)` transport. Without `--sandbox-transport`, `write_bytes` is neither listed nor callable.
 
 The gateway compiles tool schemas from its Harnx bash and filesystem crates.
 Upgrade the gateway and sandbox image together when those schemas change.
+
+### Rollout and sandbox configuration
+
+Attachment writing routes through the central gateway to the pod's private `write_bytes` tool. Because the sandbox launch configuration lives in an external infrastructure repository, follow these rollout steps:
+
+1. **Rollout order**: Roll sandbox pods with `--sandbox-transport` first, then deploy the gateway with this release. The reverse order is also safe: if an updated gateway routes `fs_write_attachment` to a pod that has not yet rolled, the call fails cleanly with a recoverable error:
+   ```text
+   sandbox fs server does not support write_bytes; enable --sandbox-transport (HARNX_FS_SANDBOX_TRANSPORT=1) for harnx-fs-tools in the sandbox image
+   ```
+   No data is corrupted or partially written, and requests succeed once the pods roll.
+
+2. **Update launch arguments or environment**: Update the sandbox pod definition or launcher script in your infrastructure repository to start `harnx-fs-tools` with `--sandbox-transport`, or set `HARNX_FS_SANDBOX_TRANSPORT=1`. For example:
+   ```sh
+   harnx-fs-tools --mcp-http --sandbox-transport --allow-rwx /workspace
+   ```
+   `--sandbox-transport` (or `HARNX_FS_SANDBOX_TRANSPORT=1`) works only with `--mcp-http`; startup rejects it in NATS-hosted and MCP stdio modes. This flag exposes the pod-private `write_bytes` tool and raises that server's MCP HTTP request body limit to 140,858,712 bytes ≈ 134.3 MiB (base64 of the 100 MiB file cap plus 1 MiB envelope). Proxies between the gateway and pod must permit request bodies of this size. Other tool servers retain their default 4 MiB limits. Do not add NATS credentials or network access to the pod; the gateway resolves attachments centrally.
+
+3. **Roll existing pods**: Running sandbox pods keep their existing startup commands until replaced. Terminate or drain existing warm-pool pods so new pods start with the updated flags.
+
+4. **Memory expectations**: Transfers of the maximum 100 MiB attachment size produce a base64 payload of 139,810,136 bytes ≈ 133.3 MiB (≈140 MB). On the gateway, encoding peaks at ~233 MiB (100 MiB raw + ~133 MiB base64). Raw bytes are dropped before serializing into the JSON-RPC request body (another ~133 MiB), giving a lower-bound estimate of ~267 MiB per in-flight call (HTTP and JSON buffering may add more). The pod similarly holds the request body plus decoded bytes while decoding before dropping the base64 string to write. No concurrency gating is applied. Standard sandbox pods provisioned with 30 GB of RAM easily accommodate this workload.
+
+5. **Verification**:
+   - Inspect the pod's `/mcp` endpoint (`tools/list` over HTTP) to verify that `write_bytes` is present in the list before routing agent traffic.
+   - Test by running `fs_write_attachment` from an agent session.
+
+### Adding gateway-private pod tools
+
+`write_bytes` is the template for a tool the gateway can call inside a pod that
+agents must never see:
+
+- Keep the tool out of `builtin_tool_specs()`
+  (`crates/harnx-fs-tools/src/toolset.rs`). The gateway builds every public
+  `fs_*` schema from those specs, so anything listed there becomes
+  agent-visible. The pod toolset lists and dispatches the private tool only
+  when its opt-in flag is set (`--sandbox-transport`).
+- `McpToolsetAdapter::dispatch_call_tool`
+  (`crates/harnx-toolset-server/src/mcp.rs`) rejects any tool name missing from
+  `toolset.tools()` with INVALID_PARAMS `unknown tool: <name>`. The gateway
+  recognizes a pod without the private tool from that preserved typed error
+  (protocol code plus exact message, see `remote_error` in
+  `crates/harnx-k8s-sandbox-tools/src/toolsets/attachment_write.rs`) and maps
+  it to recoverable rollout guidance — no `tools/list` round-trip, no retry.
+- Select gateway-side translation by backend identity
+  (`proxy::Backend::Fs` in `toolsets/proxy.rs`), not by registered toolset
+  name: `--fs-name` can rename the public toolset, or assign the name `fs` to
+  the bash backend.
+- Reject private fields on the public schema (`deny_unknown_fields` on the
+  shared params struct), so agent-supplied `data_base64` never reaches the
+  gateway's translation.
 
 Run the sandbox container with `/workspace` as its working directory. Pass `--allow-rwx /workspace` and `--no-sandbox` to `harnx-bash-tools`. Disabling the bash process sandbox here is intentional only when the Kubernetes pod is itself the security boundary. The filesystem server remains limited to `/workspace` via `--allow-rwx /workspace`.
 

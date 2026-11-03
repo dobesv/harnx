@@ -1,6 +1,7 @@
 use crate::server::{
-    EditFileParams, FindFilesParams, FsServer, InsertParams, ListDirectoryParams, ReReplaceParams,
-    ReadFileParams, RollbackParams, SearchFilesParams, WriteFileParams,
+    location_args, EditFileParams, FindFilesParams, FsServer, InsertParams, ListDirectoryParams,
+    ReReplaceParams, ReadFileParams, RollbackParams, SearchFilesParams, WriteAttachmentParams,
+    WriteBytesParams, WriteFileParams, WRITE_BYTES_DESCRIPTION,
 };
 use crate::tool_templates;
 use async_trait::async_trait;
@@ -13,10 +14,11 @@ use rmcp::model::{CallToolResult, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
 use serde_json::{Map, Value};
 use std::path::Path;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-/// Toolset exposing the filesystem tools (read, write, edit, insert,
-/// re_replace, ls, grep, find, rollback_file) backed by [`FsServer`].
+/// Toolset exposing the filesystem tools (read, write, write_attachment,
+/// edit, insert, re_replace, ls, grep, find, rollback_file) backed by [`FsServer`].
 /// Wraps the shared handler logic so the same `*_impl` methods serve both the
 /// toolset path and the `--mcp-stdio` back-compat path.
 #[derive(Clone)]
@@ -30,6 +32,25 @@ impl FsToolset {
         Self {
             server: FsServer::new(allowlist),
         }
+    }
+
+    /// Use the same resolver for every dispatch through the shared filesystem server.
+    pub fn with_attachment_resolver(
+        mut self,
+        resolver: Arc<dyn crate::AttachmentResolver>,
+    ) -> Self {
+        self.server = self.server.with_attachment_resolver(resolver);
+        self
+    }
+
+    /// Expose the private byte transport only on sandbox pod servers.
+    pub fn with_sandbox_transport(mut self) -> Self {
+        self.server = self.server.with_sandbox_transport();
+        self
+    }
+
+    pub fn attachment_resolver(&self) -> Option<&Arc<dyn crate::AttachmentResolver>> {
+        self.server.attachment_resolver()
     }
 }
 
@@ -51,9 +72,8 @@ fn spec<T: JsonSchema + 'static>(
     // Determine kind based on tool name
     let kind = match name {
         "read" | "ls" => Some(ToolProgressKind::Read),
-        "write" | "edit" | "insert" | "re_replace" | "rollback_file" => {
-            Some(ToolProgressKind::Edit)
-        }
+        "write" | "write_attachment" | "write_bytes" | "edit" | "insert" | "re_replace"
+        | "rollback_file" => Some(ToolProgressKind::Edit),
         "grep" | "find" => Some(ToolProgressKind::Search),
         _ => None,
     };
@@ -91,6 +111,11 @@ fn progress_patch(server: &FsServer, tool: &str, args: &Value) -> Option<ToolPro
     let (title, kind) = match tool {
         "read" => (format!("Reading {path}"), ToolProgressKind::Read),
         "edit" => (format!("Editing {path}"), ToolProgressKind::Edit),
+        "write_attachment" => (
+            format!("Writing attachment to {path}"),
+            ToolProgressKind::Edit,
+        ),
+        "write_bytes" => (format!("Writing bytes to {path}"), ToolProgressKind::Edit),
         "grep" => (
             format!(
                 "Searching for {:?} in {path}",
@@ -193,7 +218,8 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
             true,
             tool_templates::READ_CALL,
         ),
-        spec::<WriteFileParams>("write", "Write or create a file, replacing its contents.", false, tool_templates::WRITE_CALL),
+        spec::<WriteFileParams>("write", "Write or create a file, replacing its contents. To copy attachment bytes (including binary), use write_attachment.", false, tool_templates::WRITE_CALL),
+        spec::<WriteAttachmentParams>("write_attachment", "Copy exact bytes from a cid:media: attachment, or rendered Markdown from a cid:plan: URL, to a file. Creates or overwrites destination. No text decoding.", false, tool_templates::WRITE_ATTACHMENT_CALL),
         spec::<EditFileParams>("edit", "Replace exact text within an existing file.", false, tool_templates::EDIT_CALL),
         spec::<InsertParams>("insert", "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N; omit insert_line (or set N = total lines) to append to the end of the file. Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.", false, tool_templates::INSERT_CALL),
         spec::<ReReplaceParams>("re_replace", "Replace text in a file using a regular expression.      Uses fancy_regex syntax (supports lookahead/lookbehind).      Use $0 for the full match, $1/$2 etc. for capture groups in replacement.      Errors if pattern matches nothing. If pattern matches more than once,      set replace_all=true; otherwise only the first match is replaced.      For exact-text replacement use edit instead.", false, tool_templates::RE_REPLACE_CALL),
@@ -215,7 +241,16 @@ impl Toolset for FsToolset {
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
-        builtin_tool_specs()
+        let mut tools = builtin_tool_specs();
+        if self.server.sandbox_transport_enabled() {
+            tools.push(spec::<WriteBytesParams>(
+                "write_bytes",
+                WRITE_BYTES_DESCRIPTION,
+                false,
+                tool_templates::WRITE_BYTES_CALL,
+            ));
+        }
+        tools
     }
 
     async fn invoke(
@@ -235,13 +270,14 @@ impl Toolset for FsToolset {
         if let Some(patch) = progress_patch(&self.server, &invocation.tool, &invocation.args) {
             invocation.context.progress.update(patch);
         }
+        let location_args = location_args(&invocation.args);
         let result = self
             .server
-            .invoke_tool_value(&invocation.tool, invocation.args.clone())
+            .invoke_tool_value(&invocation.tool, invocation.args)
             .await;
         if let Ok(result) = &result {
             if let Some(patch) =
-                discovered_locations(&self.server, &invocation.tool, &invocation.args, result)
+                discovered_locations(&self.server, &invocation.tool, &location_args, result)
             {
                 invocation.context.progress.update(patch);
             }
@@ -364,7 +400,7 @@ mod tests {
 
     fn assert_tool_specs(toolset: &FsToolset) {
         let tools = toolset.tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         for tool in tools {
             assert_eq!(
                 tool.read_only_hint,

@@ -33,6 +33,7 @@ tracing = { workspace = true }
 globset = { workspace = true }
 
 [dev-dependencies]
+harnx-test-bins = { path = "../harnx-test-bins" }
 harnx-telemetry = { workspace = true, features = ["testing"] }
 metrics = { workspace = true }
 metrics-util = { workspace = true }

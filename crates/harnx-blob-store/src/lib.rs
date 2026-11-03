@@ -19,18 +19,20 @@
 
 mod activity;
 mod delete;
+mod limits;
 pub mod media;
 pub mod plans;
 mod resolve;
 
 pub use activity::{touch_activity, ActivityGuard};
 pub use delete::delete_owner;
+pub use limits::BlobTooLarge;
 pub use media::{
     ensure_attachments_bucket as create_or_open_attachments_bucket, get_media, put_media,
     ATTACHMENTS_BUCKET,
 };
 pub use plans::{ensure_plans_bucket, PLAN_BUCKET};
-pub use resolve::{resolve, ResolvedBlob};
+pub use resolve::{resolve, resolve_bounded, ResolvedBlob};
 
 use harnx_core::cid_url::{CidUrl, SessionRef};
 

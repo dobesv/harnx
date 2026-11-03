@@ -12,6 +12,10 @@ pub(crate) const READ_CALL: &str = "{{ args.path }}{% if args.offset %} +{{ args
 
 pub(crate) const WRITE_CALL: &str = "{{ args.path }} ({{ args.content | length }}ch)";
 
+pub(crate) const WRITE_ATTACHMENT_CALL: &str = "{{ args.path }} ← {{ args.url }}";
+
+pub(crate) const WRITE_BYTES_CALL: &str = "{{ args.path }}";
+
 pub(crate) const EDIT_CALL: &str = "{{ args.path }}{% if args.replace_all %} [all]{% endif %}\n▸ {{ args.old_text | truncate(60) }}\n↳ {{ args.new_text | truncate(60) }}";
 
 pub(crate) const INSERT_CALL: &str = "{{ args.path }}:{{ args.insert_line | default(value=\"end\") }}{% if args.column %}:{{ args.column }}{% endif %}\n↳ {{ args.insert_text | truncate(60) }}";

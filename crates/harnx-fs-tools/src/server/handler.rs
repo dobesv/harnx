@@ -4,6 +4,7 @@ use super::*;
 const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read",
     "write",
+    "write_attachment",
     "edit",
     "insert",
     "re_replace",
@@ -30,7 +31,7 @@ impl ServerHandler for FsServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Filesystem MCP server with read (text and local images), write, edit, insert, re_replace, listing, grep, and glob tools.",
+                "Filesystem MCP server with read (text and local images), write, write_attachment, edit, insert, re_replace, listing, grep, and glob tools.",
             )
     }
 
@@ -40,14 +41,17 @@ impl ServerHandler for FsServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = ToolAnnotations::new().read_only(true);
-        let tools = vec![
+        let mut tools = vec![
                 Tool::new("read", "Read a text file with line numbers, pagination, grep filtering, and smart truncation. Prefer this tool over shell commands like sed, cat, head, tail. Use offset+limit to read specific line ranges instead of sed -n. Also reads local image files (PNG, JPEG, GIF, WebP, up to 5MB) and returns them as viewable images for vision-capable models — use this to view/inspect an image file by its path.", Map::new())
                     .with_input_schema::<ReadFileParams>()
                     .annotate(read_only.clone())
                     .with_meta(make_tool_meta(tool_templates::READ_CALL)),
-                Tool::new("write", "Write or create a file, replacing its contents.", Map::new())
+                Tool::new("write", "Write or create a file, replacing its contents. To copy attachment bytes (including binary), use write_attachment.", Map::new())
                     .with_input_schema::<WriteFileParams>()
                     .with_meta(make_tool_meta(tool_templates::WRITE_CALL)),
+                Tool::new("write_attachment", "Copy exact bytes from a cid:media: attachment, or rendered Markdown from a cid:plan: URL, to a file. Creates or overwrites destination. No text decoding.", Map::new())
+                    .with_input_schema::<WriteAttachmentParams>()
+                    .with_meta(make_tool_meta(tool_templates::WRITE_ATTACHMENT_CALL)),
                 Tool::new("edit", "Replace exact text within an existing file.", Map::new())
                     .with_input_schema::<EditFileParams>()
                     .with_meta(make_tool_meta(tool_templates::EDIT_CALL)),
@@ -78,6 +82,13 @@ impl ServerHandler for FsServer {
                     .with_meta(make_tool_meta(tool_templates::ROLLBACK_FILE_CALL)),
             ];
 
+        if self.sandbox_transport_enabled() {
+            tools.push(
+                Tool::new("write_bytes", WRITE_BYTES_DESCRIPTION, Map::new())
+                    .with_input_schema::<WriteBytesParams>()
+                    .with_meta(make_tool_meta(tool_templates::WRITE_BYTES_CALL)),
+            );
+        }
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -93,6 +104,13 @@ impl ServerHandler for FsServer {
 }
 
 impl FsServer {
+    fn tool_enabled(&self, tool: &str) -> bool {
+        if tool == "write_bytes" {
+            return self.sandbox_transport_enabled();
+        }
+        BUILTIN_TOOL_NAMES.contains(&tool)
+    }
+
     /// The tool dispatch, which always finishes in a single step.
     ///
     /// `call_tool` must return `CallToolResponse`, whose other variants cover
@@ -107,7 +125,7 @@ impl FsServer {
         let enabled = request_wants_execution_context(&request);
         let tool_name = request.name.to_string();
         let result = match tool_name.as_str() {
-            tool if BUILTIN_TOOL_NAMES.contains(&tool) => domain_result(
+            tool if self.tool_enabled(tool) => domain_result(
                 self.invoke_tool_value(tool, Value::Object(request.arguments.unwrap_or_default()))
                     .await,
             ),
@@ -131,8 +149,11 @@ impl FsServer {
         tool: &str,
         args: Value,
     ) -> Result<CallToolResult, ErrorData> {
-        let observation_args = args.clone();
-        let arguments = args.as_object().cloned();
+        let observation_args = location_args(&args);
+        let arguments = match args {
+            Value::Object(arguments) => Some(arguments),
+            _ => None,
+        };
         let mut result = match tool {
             "read" => {
                 let params = parse_arguments::<ReadFileParams>(arguments)?;
@@ -141,6 +162,14 @@ impl FsServer {
             "write" => {
                 let params = parse_arguments::<WriteFileParams>(arguments)?;
                 self.write_file_impl(params).await
+            }
+            "write_bytes" if self.sandbox_transport_enabled() => {
+                let params = parse_arguments::<WriteBytesParams>(arguments)?;
+                self.write_base64_impl(params).await
+            }
+            "write_attachment" => {
+                let params = parse_arguments::<WriteAttachmentParams>(arguments)?;
+                self.write_attachment_impl(params).await
             }
             "edit" => {
                 let params = parse_arguments::<EditFileParams>(arguments)?;

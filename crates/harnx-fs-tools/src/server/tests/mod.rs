@@ -135,3 +135,6 @@ mod insert_ops;
 mod protocol;
 mod read_ops;
 mod regex_replace;
+mod write_attachment;
+mod write_bytes;
+mod write_ops;

@@ -192,7 +192,7 @@ fn assert_content_envelope(value: &Value) {
 async fn assert_registration(client: &async_nats::Client, instance_id: &ServerScope) -> Result<()> {
     let registration = wait_for_registration(client, instance_id).await?;
     assert_eq!(registration.server, "fs");
-    assert_eq!(registration.tools.len(), 9);
+    assert_eq!(registration.tools.len(), 10);
     let tool_hints: HashMap<_, _> = registration
         .tools
         .iter()
@@ -203,6 +203,7 @@ async fn assert_registration(client: &async_nats::Client, instance_id: &ServerSc
         HashMap::from([
             ("read", true),
             ("write", false),
+            ("write_attachment", false),
             ("edit", false),
             ("insert", false),
             ("re_replace", false),
@@ -398,4 +399,88 @@ fn first_nats_client_url(dir: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+mod attachment_host;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_attachment_over_nats_preserves_binary_and_empty_media() -> Result<()> {
+    use harnx_blob_store::media::{ensure_attachments_bucket, put_media};
+    use harnx_core::cid_url::CidUrl;
+
+    let Some(host) = attachment_host::AttachmentHost::start().await? else {
+        return Ok(());
+    };
+    let store = ensure_attachments_bucket(&host.jetstream, 1).await?;
+    let path = host.root.path().join("nested/image.png");
+    for (hash, bytes) in [
+        ("a", b"\x89PNG\r\n\x1a\n\xff\0\xfe".as_slice()),
+        ("b", b"".as_slice()),
+    ] {
+        let url = CidUrl::parse(&format!("cid:media:_temp/abcdef/{}", hash.repeat(64)))?;
+        put_media(&store, &url, bytes, "application/octet-stream").await?;
+        host.write_attachment(&path, &url.to_string()).await?;
+        assert_eq!(std::fs::read(&path)?, bytes);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_attachment_over_nats_writes_rendered_plan_markdown() -> Result<()> {
+    use harnx_blob_store::plans::{create_document, serialize_plan, PlanDocument, PlanFrontMatter};
+    use harnx_core::cid_url::CidUrl;
+
+    let Some(host) = attachment_host::AttachmentHost::start().await? else {
+        return Ok(());
+    };
+    let store = harnx_blob_store::ensure_plans_bucket(&host.jetstream, 1).await?;
+    let url = CidUrl::parse("cid:plan:_temp/abcdef/attachment-test")?;
+    let document = PlanDocument {
+        front: PlanFrontMatter {
+            id: url.to_string(),
+            title: Some("Attachment write test".to_string()),
+            created_at: "2026-11-02T00:00:00Z".to_string(),
+            ..Default::default()
+        },
+        body: "Exact Markdown: café\n\n- [ ] Copy plan\n".to_string(),
+    };
+    create_document(&store, &url, &serialize_plan(&document)?).await?;
+    let expected = harnx_blob_store::resolve(&host.jetstream, &url)
+        .await?
+        .bytes;
+    assert!(std::str::from_utf8(&expected)?.contains("Exact Markdown: café"));
+    let path = host.root.path().join("plan.md");
+    std::fs::write(&path, "old contents")?;
+    host.write_attachment(&path, &url.to_string()).await?;
+    assert_eq!(std::fs::read(&path)?, expected);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_attachment_over_nats_missing_media_is_recoverable_and_preserves_destination(
+) -> Result<()> {
+    let Some(host) = attachment_host::AttachmentHost::start().await? else {
+        return Ok(());
+    };
+    harnx_blob_store::media::ensure_attachments_bucket(&host.jetstream, 1).await?;
+    let path = host.root.path().join("existing.bin");
+    std::fs::write(&path, b"\xfforiginal\0")?;
+    let url = format!("cid:media:_temp/abcdef/{}", "c".repeat(64));
+    let reply = invoke(
+        &host.client,
+        &host.scope,
+        "write_attachment",
+        json!({
+            "path": path.to_string_lossy(), "url": url,
+        }),
+    )
+    .await?;
+    match reply.result {
+        Err(ToolErrorPayload::Recoverable(message)) => {
+            assert!(message.contains("not found"), "{message}")
+        }
+        other => anyhow::bail!("expected recoverable not-found error, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(path)?, b"\xfforiginal\0");
+    Ok(())
 }

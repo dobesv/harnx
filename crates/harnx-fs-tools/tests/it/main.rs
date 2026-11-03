@@ -4,3 +4,4 @@
 
 mod mcp_http_client;
 mod nats_fs;
+mod sandbox_transport;
