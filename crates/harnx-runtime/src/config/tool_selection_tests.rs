@@ -202,6 +202,12 @@ fn bash_declaration_has_exec_mirroring_params_and_hints() {
 
     assert_eq!(bash.idempotent_hint, Some(false));
     assert_eq!(bash.read_only_hint, Some(false));
+    // PR3 review F3: script `bash` is an execution tool, not a read.
+    assert_eq!(
+        bash.kind,
+        Some(harnx_core::event::ToolKind::Execute),
+        "synthesized bash declaration must declare ToolKind::Execute"
+    );
 
     let schema = bash.parameters.as_value();
     let properties = schema
@@ -325,35 +331,52 @@ fn bash_name_is_reserved_when_bash_tools_active() {
 }
 
 #[test]
-fn reserved_bash_provider_claims_only_active_bash_name() {
-    use crate::bash_provider::ReservedBashProvider;
+fn bash_provider_claims_only_active_bash_name() {
+    use crate::bash_provider::{BashProvider, BashProviderConfig};
     use harnx_core::tool::{ToolError, ToolProvider};
 
-    let active = ReservedBashProvider::new(true);
+    let active = BashProvider::new(BashProviderConfig {
+        active: true,
+        inner_declarations: Vec::new(),
+        base_providers: Vec::new(),
+        slot: None,
+        payload_limit: None,
+    });
     assert!(active.has_tool("bash"));
     assert!(!active.has_tool("bash_exec"));
     assert!(!active.has_tool("fs_read"));
 
-    let inactive = ReservedBashProvider::new(false);
+    let inactive = BashProvider::new(BashProviderConfig {
+        active: false,
+        inner_declarations: Vec::new(),
+        base_providers: Vec::new(),
+        slot: None,
+        payload_limit: None,
+    });
     assert!(!inactive.has_tool("bash"));
 
-    // An active stub must fail closed: recoverable error, never a silent
-    // dispatch to a raw-alias external `bash` route.
-    let error = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(async {
-            active
-                .call_tool(
-                    "bash",
-                    serde_json::json!({}),
-                    &harnx_core::abort::create_abort_signal(),
-                )
-                .await
-        })
-        .expect_err("reserved bash must return an error");
+    // An active provider without a round context slot must fail closed:
+    // recoverable error, never a silent dispatch to a raw-alias external
+    // `bash` route.
+    let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        active
+            .call_tool(
+                "bash",
+                serde_json::json!({"script": "true"}),
+                &harnx_core::abort::create_abort_signal(),
+            )
+            .await
+    });
+    let error = match result {
+        Err(error) => error,
+        // `ToolError` is not `Debug`, so a manual match replaces `expect_err`.
+        Ok(_) => panic!("provider without a slot must return an error"),
+    };
     match error {
         ToolError::Recoverable(error) => assert!(
-            error.to_string().contains("script mode is not available"),
+            error
+                .to_string()
+                .contains("cannot run scripts in this execution context"),
             "advisory error: {error}"
         ),
         ToolError::Fatal(_) => panic!("expected a recoverable error, got a fatal one"),
@@ -371,4 +394,37 @@ fn bash_tools_respect_tool_use_disabled() {
 
     assert!(config.bash_tool_names(&agent).is_empty());
     assert!(config.select_tools(&agent).is_none());
+}
+
+#[test]
+fn bash_catalog_matches_declaration_with_session_override() {
+    let mut config = config_with_tools();
+    config.agent = Some(crate::config::Agent::new(agent_with(
+        None,
+        Some(vec!["fs_read".into()]),
+    )));
+    let mut session = Session::default();
+    session.set_bash_tools(Some(vec!["fs_write".into()]));
+    config.session = Some(session);
+
+    let effective = config.tool_selection_agent();
+    assert_eq!(config.bash_tool_names(&effective), vec!["fs_write"]);
+    let declaration = config.select_tools(&effective).unwrap().pop().unwrap();
+    assert_eq!(declaration.name, "bash");
+    assert!(declaration.description.contains("fs_write"));
+    assert!(!declaration.description.contains("fs_read"));
+    let catalog: Vec<_> = config
+        .bash_inner_tool_declarations()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert_eq!(catalog, config.bash_tool_names(&effective));
+
+    config
+        .session
+        .as_mut()
+        .unwrap()
+        .set_bash_tools(Some(vec![]));
+    assert!(!config.bash_tools_active());
+    assert!(config.bash_inner_tool_declarations().is_empty());
 }

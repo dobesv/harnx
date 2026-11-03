@@ -64,6 +64,16 @@ impl Config {
         !self.bash_tool_names(&agent).is_empty()
     }
 
+    /// Full declarations of the active agent's `bash_tools` inner set, used
+    /// by the `BashProvider` to build the script-mode `ToolSpec`s the
+    /// harnx-script backend exposes as shell commands. Empty when script
+    /// mode is inactive; same resolution and ordering as `bash_tool_names`.
+    pub fn bash_inner_tool_declarations(&self) -> Vec<ToolDeclaration> {
+        let agent = self.tool_selection_agent();
+        let package = harnx_core::package_namespace::pkg_from_qualified(agent.name());
+        self.select_bash_inner_tools(agent.bash_tools().as_deref().unwrap_or(&[]), package)
+    }
+
     /// The inner tool set script mode exposes as shell commands, resolved from
     /// the given agent's `bash_tools` selectors. Independent of `use_tools`: a
     /// tool can be bash-only. Empty when `bash_tools` is unset, empty, matches

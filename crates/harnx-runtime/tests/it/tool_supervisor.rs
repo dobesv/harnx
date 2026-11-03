@@ -173,10 +173,10 @@ async fn assert_nats_eval_batch(instance_id: &ServerScope) -> Result<()> {
             .with_agent_use_tools(Some("*")),
     )
     .await;
-    // The reserved script-mode `bash` stub leads the provider list but claims
+    // The script-mode `bash` provider leads the provider list but claims
     // nothing without bash_tools; NATS is still the first dispatch provider
     // for actual tools.
-    assert_eq!(context.providers[0].name(), "reserved-bash");
+    assert_eq!(context.providers[0].name(), "bash-script");
     assert!(context
         .providers
         .iter()

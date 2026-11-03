@@ -60,7 +60,9 @@ pub(crate) fn synthesize_bash_declaration(inner_tools: &[ToolDeclaration]) -> To
         // "decisions", worker-loss section), so both hints must stay false.
         idempotent_hint: Some(false),
         read_only_hint: Some(false),
-        kind: None,
+        // Execution-kind like the shell tool it replaces (`bash_exec`); used
+        // by progress rendering and UI grouping.
+        kind: Some(harnx_core::event::ToolKind::Execute),
     }
 }
 

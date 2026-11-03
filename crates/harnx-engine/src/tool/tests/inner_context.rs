@@ -57,13 +57,6 @@ fn assert_inner_dependencies(inner: &ToolEvalContext, outer: &ToolEvalContext) {
             ),
         ),
         (
-            "handoff",
-            Arc::ptr_eq(
-                inner.prepare_handoff_fn.as_ref().unwrap(),
-                outer.prepare_handoff_fn.as_ref().unwrap(),
-            ),
-        ),
-        (
             "render declarations",
             Arc::ptr_eq(
                 &inner.render.as_ref().unwrap().decl_map,
@@ -73,6 +66,11 @@ fn assert_inner_dependencies(inner: &ToolEvalContext, outer: &ToolEvalContext) {
     ] {
         assert!(shared, "fork must share {name}");
     }
+    // Defense in depth: inner calls must never prepare a handoff.
+    assert!(
+        inner.prepare_handoff_fn.is_none(),
+        "fork must clear prepare_handoff_fn"
+    );
 }
 
 fn assert_copied_metadata(inner: &ToolEvalContext, outer: &ToolEvalContext) {
@@ -201,7 +199,8 @@ async fn fork_defers_approval_without_dispatch_or_changing_outer_consent() {
 
     let result = eval_inner_tool_call(&outer, test_call("tool_a"), &abort)
         .await
-        .unwrap();
+        .unwrap()
+        .result;
     assert_eq!(result.output, json!({"ok": true}));
     assert_eq!(*calls.lock().await, 1);
     assert_eq!(confirmations.load(Ordering::SeqCst), 1);
@@ -267,10 +266,12 @@ async fn fork_routes_lifecycle_and_progress_to_collectors_with_parent_round() {
     let abort = create_abort_signal();
     let success = eval_inner_tool_call(&inner, test_call("updating_tool"), &abort)
         .await
-        .unwrap();
+        .unwrap()
+        .result;
     let blocked = eval_inner_tool_call(&inner, test_call("blocked_tool"), &abort)
         .await
-        .unwrap();
+        .unwrap()
+        .result;
     let success_id = success.call.id.unwrap();
     let blocked_id = blocked.call.id.unwrap();
 
@@ -318,7 +319,8 @@ async fn excluded_provider_is_unreachable_in_fork_but_still_available_to_outer()
     let abort = create_abort_signal();
     let excluded = eval_inner_tool_call(&inner, test_call("bash"), &abort)
         .await
-        .unwrap();
+        .unwrap()
+        .result;
     assert_eq!(
         excluded.output,
         json!({"is_error": true, "error": "No tool provider configured for 'bash'"})
@@ -326,11 +328,13 @@ async fn excluded_provider_is_unreachable_in_fork_but_still_available_to_outer()
     assert_eq!(*calls.lock().await, 0);
     let base = eval_inner_tool_call(&inner, test_call("base_tool"), &abort)
         .await
-        .unwrap();
+        .unwrap()
+        .result;
     assert_eq!(base.output, json!({"base": true}));
     let parent = eval_inner_tool_call(&outer, test_call("bash"), &abort)
         .await
-        .unwrap();
+        .unwrap()
+        .result;
     assert_eq!(parent.output, json!({"outer": true}));
     assert_eq!(*calls.lock().await, 1);
 }

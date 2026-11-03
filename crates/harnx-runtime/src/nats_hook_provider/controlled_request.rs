@@ -33,7 +33,7 @@ pub(super) async fn request(
     ensure_local(&abort)?;
     let in_flight = NatsInFlightCalls::for_instance(&instance_id);
     let control_subject = instance_id.hook_control_subject(&server);
-    let _failure = in_flight
+    let (_failure, identity) = in_flight
         .register(InFlightRegistration {
             call_id: call_id.clone(),
             server,
@@ -51,7 +51,7 @@ pub(super) async fn request(
         harnx_nats_common::rpc::request(client, subject, request),
     )
     .await;
-    in_flight.complete(&call_id).await;
+    in_flight.complete(&call_id, &identity);
     match response {
         Ok(Ok(message)) => decode_hook_reply(&message.payload),
         error => anyhow::bail!("hook request did not acknowledge completion: {error:?}"),

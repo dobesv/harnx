@@ -38,6 +38,10 @@ pub struct BuildToolEvalContextParams<'a> {
     pub prepare_handoff_fn: Option<Arc<PrepareHandoffFn>>,
     pub nats_hook_provider: Option<Arc<NatsHookProvider>>,
     pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
+    /// Round context handoff for the script-mode `bash` provider (C6). The
+    /// caller fills the slot with the built context wrapped in an `Arc` right
+    /// after construction; `None` means `bash` fails closed on this path.
+    pub bash_context_slot: Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
 }
 
 impl<'a> BuildToolEvalContextParams<'a> {
@@ -51,6 +55,7 @@ impl<'a> BuildToolEvalContextParams<'a> {
             prepare_handoff_fn: None,
             nats_hook_provider: None,
             pending_async_context: None,
+            bash_context_slot: None,
         }
     }
 

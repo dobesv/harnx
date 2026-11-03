@@ -1,6 +1,13 @@
 //! Encoding, journaling and decoding one NATS tool invocation.
 use super::*;
 
+/// Payload slack reserved on top of each serialized `ToolRequest` for the
+/// NATS message envelope (headers counted toward `max_payload` on 2.11+,
+/// telemetry propagation entries, protocol framing). Script-mode pre-flight
+/// subtracts this so an admitted inner call can't exceed the broker limit
+/// (PR3 review F12).
+const JOURNAL_ENVELOPE_MARGIN_BYTES: usize = 1024;
+
 pub(super) struct ToolCallInput<'a> {
     pub name: &'a str,
     pub arguments: Value,
@@ -9,6 +16,72 @@ pub(super) struct ToolCallInput<'a> {
 }
 
 impl NatsToolProvider {
+    /// Script-mode `bash` pre-flight (T3.4): real broker `max_payload` plus a
+    /// probe that serializes the exact `ToolRequest` shape this module
+    /// publishes, so inner calls fail with a clear recoverable error before
+    /// dispatch instead of an opaque NATS publish failure. The probe mirrors
+    /// `prepare_request_with_progress` field for field: inner calls carry
+    /// their call id as `tool_call_id` and run in a parent round, and both
+    /// capabilities are always included so the estimate never undercounts a
+    /// progress-enabled call (PR3 review F12).
+    pub(crate) fn script_payload_limit(&self) -> crate::bash_inner::PayloadLimit {
+        use std::sync::Arc;
+        // Broker payload limit minus slack for the message envelope: NATS
+        // 2.11+ counts headers toward `max_payload`, and dispatch attaches
+        // idempotency/instance/call-id/content-type headers plus telemetry
+        // propagation entries and protocol framing. The probe also serializes
+        // the script-facing tool name, while real dispatch resolves the
+        // route's raw_name — the 1 KiB margin covers that delta and the full
+        // header set with generous slack (PR3 review F12).
+        let max_bytes = self
+            .client
+            .server_info()
+            .max_payload
+            .saturating_sub(JOURNAL_ENVELOPE_MARGIN_BYTES);
+        let parent_session_id = self.parent_session_id.clone();
+        let parent_agent = self.parent_agent.clone();
+        let parent_local_session_id = self.parent_local_session_id.clone();
+        let run_context = self.run_context.clone();
+        let request_size: crate::bash_inner::RequestSizeProbe = Arc::new(move |tool, args| {
+            let call_id = Uuid::new_v4().to_string();
+            let request = ToolRequest {
+                run_context: run_context.as_ref().map(|record| {
+                    harnx_toolset::AutonomousRunContext {
+                        snapshot: serde_json::to_value(record).expect("run limits serialize"),
+                        started_at_ms: chrono::Utc::now()
+                            .timestamp_millis()
+                            .try_into()
+                            .expect("current UTC time is positive"),
+                    }
+                }),
+                replay: None,
+                operation_id: call_id.clone(),
+                tool: tool.to_string(),
+                args: args.clone(),
+                parent_session_id: parent_session_id.clone(),
+                parent_agent: parent_agent.clone(),
+                parent_local_session_id: parent_local_session_id.clone(),
+                // Real inner calls pass their call id through the fork, so
+                // the probe must count it too; `tool_round` only affects
+                // size by its digit count.
+                call_id: call_id.clone(),
+                tool_call_id: Some(call_id),
+                tool_round: Some(1),
+                capabilities: BTreeSet::from([
+                    EXECUTION_CONTEXT_NAMESPACE.to_string(),
+                    CAPABILITY_TOOL_PROGRESS.to_string(),
+                ]),
+            };
+            serde_json::to_vec(&request)
+                .expect("tool request serializes")
+                .len()
+        });
+        crate::bash_inner::PayloadLimit {
+            max_bytes,
+            request_size,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn prepare_request(
         &self,

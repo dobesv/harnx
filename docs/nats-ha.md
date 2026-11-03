@@ -1112,7 +1112,23 @@ invocation from the stored checkpoint and calls the toolset's own `cancel`
 (`harnx-toolset-server/src/control.rs`). That **orphan cancel** path is what
 stops a call after the process that started it is gone. Cancellation is
 idempotent throughout: a call may be cancelled any number of times, with the
-same or different cancellation ids, and each answer is the same.
+same or different cancellation ids. The acknowledgement can change as the call
+progresses, for example from `Accepted` to `AlreadyFinished`.
+
+Dropping a NATS tool response wait before completion (for example, at a script
+deadline) removes its in-flight registration and schedules a fire-and-forget
+cancel through this control path. Dropped waits and explicit aborts publish the
+same cancellation three times, 100 ms apart, with a one-second timeout per
+publish. These bounded retries cover short admission races: an unknown-call
+rejection leaves no pending-cancel tombstone, and an orphan `Accepted` can run
+before the live invocation is registered. Retries do not wait for an
+acknowledgement or stop on a successful publish. Admission delayed beyond this
+retry window can still miss the cancellation.
+
+Completion removes a reservation only when the wait still owns it. Completed
+waits and replaced reservations do not schedule another cancel batch. Failover
+also suppresses cancellation so a replacement worker can resume the remote
+invocation.
 
 Hooks use the same mechanism. The hook server keeps no journal, so a call id it
 is not currently running is simply `AlreadyFinished` — nothing durable is left to

@@ -69,7 +69,7 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 | `temperature` | `float` | global default | Controls randomness (0 = deterministic, 1 = creative). Inherited from global config when `model` is omitted. |
 | `top_p` | `float` | global default | Nucleus sampling parameter. Alternative to temperature. Inherited from global config when `model` is omitted. |
 | `use_tools` | `list` | none | YAML list of tool specifiers. Also accepts a comma-separated string for backward compatibility. See [Tools](#tools). |
-| `bash_tools` | `list` | none | Tool specifiers exposed to script mode via a synthesized `bash` tool (preview; script execution arrives in a later release). See [Script Mode Tools](#script-mode-tools-bash_tools). |
+| `bash_tools` | `list` | none | Tool specifiers exposed to script mode via a synthesized `bash` tool. See [Script Mode Tools](#script-mode-tools-bash_tools). |
 | `description` | `string` | `""` | Short description shown in agent listings. |
 | `version` | `string` | `""` | Version identifier for the agent. |
 | `variables` | `list` | `[]` | Variables prompted on first use. See [Variables](#variables). |
@@ -260,23 +260,44 @@ When tools are enabled, their declarations are injected into the system prompt a
 
 ### Script Mode Tools (`bash_tools`)
 
-The `bash_tools` field enables script mode (in preview). Instead of invoking individual MCP tools across separate round trips, an agent can run multi-step scripts that chain tools and filter output locally.
+The `bash_tools` field enables script mode. Instead of invoking individual MCP tools across separate round trips, an agent can run multi-step scripts that chain tools and filter output locally.
 
 When `bash_tools` is configured and resolves to a non-empty set of tools, Harnx synthesizes a single `bash` tool declaration for the model. Its parameters mirror `bash_exec` (`script` instead of `command`, plus `timeout_secs`, `head_lines`, `tail_lines`, `max_output_bytes`; no `working_dir` or `env`), and its description lists the inner tools available inside the script.
+
+#### Configuration and Semantics
 
 - **Selector syntax**: Uses the same list, comma-separated string, glob, brace expansion, and toolset syntax as `use_tools`.
 - **Independent tool sets**: `bash_tools` is independent of `use_tools`. A tool can be exposed directly in `use_tools`, inside `bash_tools`, or in both.
 - **Excluded tools**: Control-flow tools (`switch_agent`, `*_session_handoff`, `ask_user`) and `bash` itself cannot be placed inside `bash_tools`; they remain at the direct conversation boundary.
-- **Reserved name**: While `bash_tools` resolves to tools, the name `bash` belongs to script mode. An external tool named `bash` is not exposed to the model, and a `bash` call fails closed instead of routing to it.
+- **Reserved name and migration**: While `bash_tools` resolves to tools, the bare name `bash` belongs to script mode. If a tool server registers a native bare `bash` tool, it is replaced while script mode is active. Qualified names like `<server>_bash` continue to work normally.
 - **No glob shadowing**: `use_tools` wildcard globs like `*` or `bash*` never match or synthesize the script-mode `bash` tool.
 - **Session override**: `.set bash_tools <selectors>` updates the active session's record; tool selection overlays that record on the active agent, so the change takes effect immediately but stays scoped to the session — switching sessions (the TUI picker keeps the agent) does not carry the override into other sessions. `.set bash_tools null` disables script mode for the session; unlike `use_tools`, the clear persists as an empty selector list rather than an unset override, so a restarted worker keeps script mode off instead of falling back to the agent file's `bash_tools`.
-- **Preview status**: Script execution is under development. In this release, calling the synthesized `bash` tool returns a recoverable error saying script mode is not available yet.
+- **Mixed-version deployments**: Agent frontmatter is parsed leniently, so older worker binaries silently ignore a frontmatter `bash_tools` field and the agent runs without script mode. Persisted session overrides are different: session metadata uses strict field checking (`deny_unknown_fields`), so an older worker cannot load a session carrying a `bash_tools` override. Upgrade all cluster workers before relying on `bash_tools` overrides (or before setting them), not just to enable script mode.
 
 ```yaml
 # Expose fs tools to script mode
 bash_tools:
   - fs_*
 ```
+
+#### Execution Environment
+
+- **In-process shell**: Scripts run in an in-process BashKit subshell with an isolated virtual filesystem. Working directory is `/tmp`. Scripts have no host filesystem access and no network access.
+- **Error handling**: `set -e` is enabled by default: the script stops when a command fails, following POSIX `set -e` rules — failures of non-final pipeline members, commands guarded with `&&`/`||` or `if`, and background jobs don't stop the run. Scripts can use `set +e` to handle non-zero exit codes.
+- **Command mappings**: Each inner tool becomes a command with the same name. Tool parameters map to kebab-case long options (e.g. `--file-path`, `--max-output-bytes`). Scalar values accept `--flag value` or `--flag=value`; booleans accept `--flag` / `--no-flag`; repeated arrays accept multiple flags. Complex or nested objects take JSON literals or `--json '<json>'` (or `--json -` for stdin).
+- **Discovery**: Scripts can run `tools [pattern]` to list available commands and their synopses, `help <tool>` for full parameter documentation, or `<tool> --help`.
+- **Output formatting**: Commands default to JSON when the tool produces structured content, or plain text otherwise. Passing `-o json` or `-o text` overrides this per command.
+- **Exit codes**:
+  - `0`: Success (rendered output on stdout).
+  - `1`: Tool error (message on stderr; partial results on stdout if available).
+  - `2`: Usage error (flag or schema mismatch on stderr; command is not dispatched).
+  - `3`: Approval required (`needs approval: <tool>; call it directly instead of from bash`). Tools requiring human approval fail fast rather than hanging the script.
+  - `4`: Blocked by policy or hook.
+  - `5`: Rejected.
+  - `127`: Unknown command (with did-you-mean suggestions).
+- **Hooks and concurrency**: Inner tool calls invoke standard tool hooks (`PreToolUse`, `PostToolUse`). Parallel jobs (`&` and pipelines) are supported up to a concurrency cap of 8 simultaneous inner calls per script.
+- **Trace and persistence**: The `bash` result includes a compact inner-call trace whose argument summaries show only keys and value shapes (type and length), so the generated trace, live progress, and `failed_call` summaries don't repeat values a script piped in from content the model hasn't seen. Usage errors and tool error messages on stderr can still quote the values they reject. Inner calls get no session-log rows of their own; the transcript records only the outer `bash` call. The NATS invocation journal still records each inner call's full request for retry and recovery.
+- **Worker interruption**: If a worker restarts while a script runs, the invocation is reported as interrupted and never automatically re-run, avoiding duplicate side effects.
 
 ### Attachment Tools
 
