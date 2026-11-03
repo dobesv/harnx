@@ -25,9 +25,15 @@ fn schema() -> Value {
     }})
 }
 
-#[test]
-fn argument_rules_table() {
-    let cases = [
+type ArgRuleCase = (
+    &'static str,
+    Vec<&'static str>,
+    Option<&'static str>,
+    serde_json::Value,
+);
+
+fn string_scalar_cases() -> Vec<ArgRuleCase> {
+    vec![
         ("empty and defaults not injected", vec![], None, json!({})),
         (
             "camelCase key",
@@ -59,6 +65,11 @@ fn argument_rules_table() {
             None,
             json!({"filePath":"a=b"}),
         ),
+    ]
+}
+
+fn numeric_scalar_cases() -> Vec<ArgRuleCase> {
+    vec![
         (
             "negative integer",
             vec!["--max-output-bytes", "-4"],
@@ -95,6 +106,10 @@ fn argument_rules_table() {
             None,
             json!({"ratio":2}),
         ),
+    ]
+}
+fn boolean_and_repeated_cases() -> Vec<ArgRuleCase> {
+    vec![
         (
             "boolean on",
             vec!["--enabled"],
@@ -143,6 +158,11 @@ fn argument_rules_table() {
             None,
             json!({"toggles":[true,false]}),
         ),
+    ]
+}
+
+fn complex_and_json_property_cases() -> Vec<ArgRuleCase> {
+    vec![
         (
             "object JSON",
             vec!["--settings", "{\"a\":{\"b\":1}}"],
@@ -203,6 +223,11 @@ fn argument_rules_table() {
             Some("{\"filePath\":\"stdin\"}"),
             json!({"filePath":"override"}),
         ),
+    ]
+}
+
+fn base_override_cases() -> Vec<ArgRuleCase> {
+    vec![
         ("stdin ignored", vec![], Some("not JSON"), json!({})),
         (
             "stdin ignored with literal JSON",
@@ -246,6 +271,11 @@ fn argument_rules_table() {
             None,
             json!({"tags":[]}),
         ),
+    ]
+}
+
+fn boundary_and_escape_cases() -> Vec<ArgRuleCase> {
+    vec![
         (
             "enum accepted",
             vec!["--mode=text"],
@@ -270,7 +300,20 @@ fn argument_rules_table() {
             None,
             json!({"filePath":"-o"}),
         ),
-    ];
+    ]
+}
+
+#[test]
+fn argument_rules_table() {
+    let cases = [
+        string_scalar_cases(),
+        numeric_scalar_cases(),
+        boolean_and_repeated_cases(),
+        complex_and_json_property_cases(),
+        base_override_cases(),
+        boundary_and_escape_cases(),
+    ]
+    .concat();
     for (name, args, stdin, expected) in cases {
         let actual =
             parse_args(&schema(), &argv(&args), stdin).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -278,9 +321,10 @@ fn argument_rules_table() {
     }
 }
 
-#[test]
-fn usage_errors_table() {
-    let cases = [
+type UsageErrorCase = (Vec<&'static str>, Option<&'static str>, &'static str);
+
+fn syntax_usage_error_cases() -> Vec<UsageErrorCase> {
+    vec![
         (vec!["--file-path"], None, "--file-path requires a value"),
         (
             vec!["--file-path", "--enabled"],
@@ -319,6 +363,11 @@ fn usage_errors_table() {
         ),
         (vec!["--counts=x"], None, "expected integer"),
         (vec!["--no-ratio"], None, "unknown flag"),
+    ]
+}
+
+fn type_and_json_usage_error_cases() -> Vec<UsageErrorCase> {
+    vec![
         (vec!["--settings=bad"], None, "expected JSON"),
         (vec!["--settings=[]"], None, "expected a JSON object"),
         (vec!["--records={}"], None, "expected a JSON array"),
@@ -363,7 +412,16 @@ fn usage_errors_table() {
         (vec!["positional"], None, "unexpected argument"),
         (vec!["-x"], None, "unexpected argument"),
         (vec!["-o", "json"], None, "call split_output_args"),
-    ];
+    ]
+}
+
+#[test]
+fn usage_errors_table() {
+    let cases = [
+        syntax_usage_error_cases(),
+        type_and_json_usage_error_cases(),
+    ]
+    .concat();
     for (args, stdin, expected) in cases {
         let error = parse_args(&schema(), &argv(&args), stdin).expect_err(&format!("{args:?}"));
         assert!(

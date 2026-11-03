@@ -62,26 +62,36 @@ fn terminated(mut text: String) -> String {
     text
 }
 
+fn block_text(block: &Value) -> String {
+    if block.get("type").and_then(Value::as_str) == Some("text") {
+        block
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    } else {
+        attachment_marker(block).unwrap_or_default()
+    }
+}
+
+fn append_block_text(text: &mut String, part: &str) {
+    if part.is_empty() {
+        return;
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(part);
+}
+
 fn content_text(value: &Value) -> String {
+    let Some(blocks) = value.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
     let mut text = String::new();
-    if let Some(blocks) = value.get("content").and_then(Value::as_array) {
-        for block in blocks {
-            let part = if block.get("type").and_then(Value::as_str) == Some("text") {
-                block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned()
-            } else {
-                attachment_marker(block).unwrap_or_default()
-            };
-            if !part.is_empty() {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str(&part);
-            }
-        }
+    for block in blocks {
+        let part = block_text(block);
+        append_block_text(&mut text, &part);
     }
     text
 }

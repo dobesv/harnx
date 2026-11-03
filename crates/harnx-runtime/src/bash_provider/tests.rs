@@ -189,13 +189,13 @@ type Harness = (
 
 fn harness(inner: Arc<dyn ToolProvider>, extra: Vec<Arc<dyn ToolProvider>>) -> Harness {
     let slot = Arc::new(BashEvalContextSlot::default());
-    let bash = Arc::new(BashProvider::new(
-        true,
-        inner_declarations(),
-        vec![inner.clone()],
-        Some(slot.clone()),
-        None,
-    ));
+    let bash = Arc::new(BashProvider::new(BashProviderConfig {
+        active: true,
+        inner_declarations: inner_declarations(),
+        base_providers: vec![inner.clone()],
+        slot: Some(slot.clone()),
+        payload_limit: None,
+    }));
     let hooks: Arc<Mutex<Vec<HookEvent>>> = Arc::default();
     let hook_collector = hooks.clone();
     let mut providers: Vec<Arc<dyn ToolProvider>> = vec![bash.clone()];
@@ -443,7 +443,13 @@ async fn dropped_trace_count_surfaces_in_result() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn missing_slot_fails_closed() {
-    let bash = BashProvider::new(true, inner_declarations(), vec![], None, None);
+    let bash = BashProvider::new(BashProviderConfig {
+        active: true,
+        inner_declarations: inner_declarations(),
+        base_providers: vec![],
+        slot: None,
+        payload_limit: None,
+    });
     let abort = create_abort_signal();
     let error = recoverable(run(&bash, "fs_read --path a", &abort).await, "no slot");
     assert!(
@@ -454,7 +460,13 @@ async fn missing_slot_fails_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inactive_provider_does_not_claim_bash() {
-    let bash = BashProvider::new(false, inner_declarations(), vec![], None, None);
+    let bash = BashProvider::new(BashProviderConfig {
+        active: false,
+        inner_declarations: inner_declarations(),
+        base_providers: vec![],
+        slot: None,
+        payload_limit: None,
+    });
     assert!(!bash.has_tool(BASH_TOOL_NAME));
 }
 
@@ -492,7 +504,13 @@ async fn dispatch_prefers_bash_script_provider_over_raw_alias() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replay_reports_interrupted_for_bash_only() {
-    let bash = BashProvider::new(true, inner_declarations(), vec![], None, None);
+    let bash = BashProvider::new(BashProviderConfig {
+        active: true,
+        inner_declarations: inner_declarations(),
+        base_providers: vec![],
+        slot: None,
+        payload_limit: None,
+    });
     let abort = create_abort_signal();
     let replay_bash = match bash
         .replay_tool_call(
@@ -557,7 +575,13 @@ async fn replay_reports_interrupted_for_bash_only() {
 /// `interrupted`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inactive_provider_replay_falls_through_for_bash() {
-    let bash = BashProvider::new(false, inner_declarations(), vec![], None, None);
+    let bash = BashProvider::new(BashProviderConfig {
+        active: false,
+        inner_declarations: inner_declarations(),
+        base_providers: vec![],
+        slot: None,
+        payload_limit: None,
+    });
     let abort = create_abort_signal();
     let replay = bash
         .replay_tool_call(

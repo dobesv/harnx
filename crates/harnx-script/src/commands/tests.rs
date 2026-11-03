@@ -81,16 +81,16 @@ fn specs() -> Vec<ToolSpec> {
 async fn run(script: &str, executor: Arc<FakeExecutor>) -> ScriptRun {
     let commands = tool_commands(specs(), executor).unwrap();
     BashKitBackend
-        .run(
+        .run(crate::ScriptRequest {
             script,
-            ScriptLimits {
+            limits: ScriptLimits {
                 timeout_secs: 5,
                 ..Default::default()
             },
             commands,
-            vec![],
-            CancellationToken::new(),
-        )
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        })
         .await
 }
 

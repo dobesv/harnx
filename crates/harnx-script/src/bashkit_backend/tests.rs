@@ -15,13 +15,13 @@ use crate::{
 
 async fn run(script: &str) -> ScriptRun {
     BashKitBackend
-        .run(
+        .run(crate::ScriptRequest {
             script,
-            ScriptLimits::default(),
-            vec![],
-            vec![],
-            CancellationToken::new(),
-        )
+            limits: ScriptLimits::default(),
+            commands: vec![],
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        })
         .await
 }
 
@@ -44,16 +44,16 @@ async fn mounts_are_binary_safe_and_can_be_read_only() {
         .await
         .unwrap();
     let result = BashKitBackend
-        .run(
-            "base64 -w0 /attachments/blob; echo; echo fail > /attachments/blob",
-            ScriptLimits::default(),
-            vec![],
-            vec![FsMount {
+        .run(crate::ScriptRequest {
+            script: "base64 -w0 /attachments/blob; echo; echo fail > /attachments/blob",
+            limits: ScriptLimits::default(),
+            commands: vec![],
+            fs_mounts: vec![FsMount {
                 path: "/attachments".into(),
                 fs: Arc::new(ReadOnlyFs::new(fs.clone())),
             }],
-            CancellationToken::new(),
-        )
+            cancel: CancellationToken::new(),
+        })
         .await;
     assert_eq!(result.stdout, "AAEC/w==\n");
     assert_eq!(result.status, ScriptStatus::Error, "{result:?}");
@@ -79,13 +79,13 @@ async fn each_run_has_fresh_shell_files_and_cancel_flag() {
     let token = CancellationToken::new();
     token.cancel();
     let cancelled = BashKitBackend
-        .run(
-            "echo should-not-run",
-            ScriptLimits::default(),
-            vec![],
-            vec![],
-            token,
-        )
+        .run(crate::ScriptRequest {
+            script: "echo should-not-run",
+            limits: ScriptLimits::default(),
+            commands: vec![],
+            fs_mounts: vec![],
+            cancel: token,
+        })
         .await;
     assert_eq!(cancelled.status, ScriptStatus::Cancelled);
     assert!(cancelled.stdout.is_empty());
@@ -137,16 +137,16 @@ fn wall_time_overrides_bashkit_default_and_zero_disables_it() {
 #[tokio::test]
 async fn command_limit_is_reported_with_partial_output() {
     let result = BashKitBackend
-        .run(
-            "echo before\necho middle\necho after",
-            ScriptLimits {
+        .run(crate::ScriptRequest {
+            script: "echo before\necho middle\necho after",
+            limits: ScriptLimits {
                 max_commands: 3,
                 ..Default::default()
             },
-            vec![],
-            vec![],
-            CancellationToken::new(),
-        )
+            commands: vec![],
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        })
         .await;
     assert_eq!(result.status, ScriptStatus::Error, "{result:?}");
     assert!(result.limit_hit.is_some(), "{result:?}");
@@ -157,22 +157,20 @@ async fn command_limit_is_reported_with_partial_output() {
 #[tokio::test]
 async fn output_caps_report_truncation_and_keep_utf8_valid() {
     let result = BashKitBackend
-        .run(
-            "printf 'éééé'; printf 'abcdef' >&2",
-            ScriptLimits {
+        .run(crate::ScriptRequest {
+            script: "printf 'éééé'; printf 'abcdef' >&2",
+            limits: ScriptLimits {
                 max_stdout_bytes: 5,
                 max_stderr_bytes: 3,
                 ..Default::default()
             },
-            vec![],
-            vec![],
-            CancellationToken::new(),
-        )
+            commands: vec![],
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        })
         .await;
-    assert!(result.stdout.len() <= 5, "{result:?}");
-    assert!(result.stderr.len() <= 3, "{result:?}");
-    assert!(result.stdout_truncated, "{result:?}");
-    assert!(result.stderr_truncated, "{result:?}");
+    assert_capped_stream(&result.stdout, result.stdout_truncated, 5);
+    assert_capped_stream(&result.stderr, result.stderr_truncated, 3);
     assert!(result.limit_hit.is_some());
 }
 
@@ -182,6 +180,17 @@ async fn syntax_error_reports_error() {
     assert_eq!(result.status, ScriptStatus::Error);
     assert_eq!(result.exit_code, 2, "{result:?}");
     assert!(result.stderr.contains("syntax error"), "{result:?}");
+}
+
+fn assert_capped_stream(text: &str, truncated: bool, max_bytes: usize) {
+    assert!(text.len() <= max_bytes, "{text:?}");
+    assert!(truncated, "{text:?}");
+}
+
+fn assert_timeout(result: &ScriptRun) {
+    assert_eq!(result.status, ScriptStatus::TimedOut, "{result:?}");
+    assert_eq!(result.exit_code, 124);
+    assert!(result.limit_hit.is_some());
 }
 
 enum Behavior {
@@ -198,6 +207,31 @@ struct ProbeCommand {
 }
 
 impl ProbeCommand {
+    fn assert_single_stopped(&self) {
+        assert_eq!(self.active.load(Ordering::SeqCst), 0);
+        assert_eq!(self.tokens.lock().unwrap().len(), 1);
+        assert!(self.tokens.lock().unwrap()[0].is_cancelled());
+    }
+
+    fn assert_first_stopped(&self) {
+        assert_eq!(self.active.load(Ordering::SeqCst), 0);
+        assert!(self.tokens.lock().unwrap()[0].is_cancelled());
+    }
+
+    fn assert_stopped(&self) {
+        assert_eq!(
+            self.active.load(Ordering::SeqCst),
+            0,
+            "orphan command future"
+        );
+        assert!(self
+            .tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .all(CancellationToken::is_cancelled));
+    }
+
     fn new(behavior: Behavior) -> Arc<Self> {
         Arc::new(Self {
             behavior,
@@ -254,13 +288,13 @@ async fn background_wait_registered_async_commands_overlap() {
     let command = ProbeCommand::new(Behavior::Barrier(Barrier::new(2)));
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        BashKitBackend.run(
-            "probe --flag & probe --flag & wait",
-            ScriptLimits::default(),
-            vec![command.clone()],
-            vec![],
-            CancellationToken::new(),
-        ),
+        BashKitBackend.run(crate::ScriptRequest {
+            script: "probe --flag & probe --flag & wait",
+            limits: ScriptLimits::default(),
+            commands: vec![command.clone()],
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        }),
     )
     .await
     .expect("commands ran sequentially");
@@ -277,13 +311,13 @@ async fn cancel_mid_loop_stops_within_one_second_without_orphan_jobs() {
     let t = token.clone();
     let task = tokio::spawn(async move {
         BashKitBackend
-            .run(
-                "probe & probe & while true; do sleep 0.01; done",
-                ScriptLimits::default(),
-                vec![c],
-                vec![],
-                t,
-            )
+            .run(crate::ScriptRequest {
+                script: "probe & probe & while true; do sleep 0.01; done",
+                limits: ScriptLimits::default(),
+                commands: vec![c],
+                fs_mounts: vec![],
+                cancel: t,
+            })
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), command.started.acquire_many(2))
@@ -300,17 +334,7 @@ async fn cancel_mid_loop_stops_within_one_second_without_orphan_jobs() {
     assert!(start.elapsed() < Duration::from_secs(1));
     assert_eq!(result.status, ScriptStatus::Cancelled, "{result:?}");
     assert_eq!(result.exit_code, 130);
-    assert_eq!(
-        command.active.load(Ordering::SeqCst),
-        0,
-        "orphan command future"
-    );
-    assert!(command
-        .tokens
-        .lock()
-        .unwrap()
-        .iter()
-        .all(CancellationToken::is_cancelled));
+    command.assert_stopped();
 }
 
 #[tokio::test]
@@ -321,13 +345,13 @@ async fn cancel_interrupts_pending_foreground_command() {
     let t = token.clone();
     let task = tokio::spawn(async move {
         BashKitBackend
-            .run(
-                "echo before; probe",
-                ScriptLimits::default(),
-                vec![c],
-                vec![],
-                t,
-            )
+            .run(crate::ScriptRequest {
+                script: "echo before; probe",
+                limits: ScriptLimits::default(),
+                commands: vec![c],
+                fs_mounts: vec![],
+                cancel: t,
+            })
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), command.started.acquire())
@@ -350,26 +374,22 @@ async fn timeout_reports_limit_and_drops_background_jobs() {
     let command = ProbeCommand::new(Behavior::Pending);
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        BashKitBackend.run(
-            "echo before; probe & sleep 100; wait",
-            ScriptLimits {
+        BashKitBackend.run(crate::ScriptRequest {
+            script: "echo before; probe & sleep 100; wait",
+            limits: ScriptLimits {
                 timeout_secs: 1,
                 ..Default::default()
             },
-            vec![command.clone()],
-            vec![],
-            CancellationToken::new(),
-        ),
+            commands: vec![command.clone()],
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        }),
     )
     .await
     .unwrap();
-    assert_eq!(result.status, ScriptStatus::TimedOut, "{result:?}");
-    assert_eq!(result.exit_code, 124);
-    assert!(result.limit_hit.is_some());
+    assert_timeout(&result);
     assert_eq!(result.stdout, "before\n");
-    assert_eq!(command.active.load(Ordering::SeqCst), 0);
-    assert_eq!(command.tokens.lock().unwrap().len(), 1);
-    assert!(command.tokens.lock().unwrap()[0].is_cancelled());
+    command.assert_single_stopped();
 }
 
 #[tokio::test]
@@ -380,13 +400,13 @@ async fn dropping_run_cleans_up_pending_jobs_and_signals_command_work() {
     let token = external.clone();
     let task = tokio::spawn(async move {
         BashKitBackend
-            .run(
-                "probe & sleep 100",
-                ScriptLimits::default(),
-                vec![c],
-                vec![],
-                token,
-            )
+            .run(crate::ScriptRequest {
+                script: "probe & sleep 100",
+                limits: ScriptLimits::default(),
+                commands: vec![c],
+                fs_mounts: vec![],
+                cancel: token,
+            })
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), command.started.acquire())
@@ -396,8 +416,7 @@ async fn dropping_run_cleans_up_pending_jobs_and_signals_command_work() {
         .forget();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    assert_eq!(command.active.load(Ordering::SeqCst), 0);
-    assert!(command.tokens.lock().unwrap()[0].is_cancelled());
+    command.assert_first_stopped();
     assert!(
         !external.is_cancelled(),
         "run must not cancel caller's token"
@@ -411,13 +430,13 @@ async fn fatal_registered_command_stops_even_with_errexit_disabled() {
         "set +e; probe & wait; echo after",
     ] {
         let result = BashKitBackend
-            .run(
+            .run(crate::ScriptRequest {
                 script,
-                ScriptLimits::default(),
-                vec![ProbeCommand::new(Behavior::Fatal)],
-                vec![],
-                CancellationToken::new(),
-            )
+                limits: ScriptLimits::default(),
+                commands: vec![ProbeCommand::new(Behavior::Fatal)],
+                fs_mounts: vec![],
+                cancel: CancellationToken::new(),
+            })
             .await;
         assert_eq!(result.status, ScriptStatus::Error, "{result:?}");
         assert!(result.stderr.contains("fatal inner call"), "{result:?}");
@@ -466,10 +485,7 @@ impl ScriptCommand for InspectCommand {
 async fn registered_command_receives_args_stdin_env_and_vfs_in_a_pipeline() {
     // Exercise the object-safe backend interface used by runtime callers too.
     let backend: &dyn ScriptBackend = &BashKitBackend;
-    let result = backend.run(
-        "export MODE=inspect\necho fixture > input.txt\nprintf 'one\\ntwo\\n' | inspect 'two words' | jq -r '.value'",
-        ScriptLimits::default(), vec![Arc::new(InspectCommand)], vec![], CancellationToken::new(),
-    ).await;
+    let result = backend.run(crate::ScriptRequest { script: "export MODE=inspect\necho fixture > input.txt\nprintf 'one\\ntwo\\n' | inspect 'two words' | jq -r '.value'", limits: ScriptLimits::default(), commands: vec![Arc::new(InspectCommand)], fs_mounts: vec![], cancel: CancellationToken::new() }).await;
     assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
     assert_eq!(result.stdout, "two words\n");
     assert!(result.stderr.is_empty());
@@ -478,13 +494,13 @@ async fn registered_command_receives_args_stdin_env_and_vfs_in_a_pipeline() {
 #[tokio::test]
 async fn registered_command_nonzero_exit_is_recoverable_with_set_plus_e() {
     let result = BashKitBackend
-        .run(
-            "set +e; inspect --fail; echo $?",
-            ScriptLimits::default(),
-            vec![Arc::new(InspectCommand)],
-            vec![],
-            CancellationToken::new(),
-        )
+        .run(crate::ScriptRequest {
+            script: "set +e; inspect --fail; echo $?",
+            limits: ScriptLimits::default(),
+            commands: vec![Arc::new(InspectCommand)],
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        })
         .await;
     assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
     assert_eq!(result.stdout, "7\n");

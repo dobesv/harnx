@@ -4,16 +4,20 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bashkit::{Builtin, BuiltinContext, Error, ExecResult, ExecutionLimits, LimitExceeded};
+use bashkit::{Builtin, BuiltinContext, Error, ExecResult, ExecutionLimits};
 
 use crate::{
-    CancellationToken, FsMount, InMemoryFs, ScriptBackend, ScriptCommand, ScriptCommandContext,
+    CancellationToken, InMemoryFs, ScriptBackend, ScriptCommand, ScriptCommandContext,
     ScriptLimits, ScriptRun, ScriptStatus,
 };
 
 mod capture;
+mod outcome;
 mod resolver;
+mod shell;
 use capture::Capture;
+use outcome::classify;
+use shell::build_shell;
 
 /// Stateless factory: BashKit cancellation flags and shell state never cross runs.
 #[derive(Clone, Copy, Debug, Default)]
@@ -109,14 +113,14 @@ impl Builtin for CommandAdapter {
 
 #[async_trait]
 impl ScriptBackend for BashKitBackend {
-    async fn run(
-        &self,
-        script: &str,
-        limits: ScriptLimits,
-        commands: Vec<Arc<dyn ScriptCommand>>,
-        fs_mounts: Vec<FsMount>,
-        cancel: CancellationToken,
-    ) -> ScriptRun {
+    async fn run(&self, request: crate::ScriptRequest<'_>) -> ScriptRun {
+        let crate::ScriptRequest {
+            script,
+            limits,
+            commands,
+            fs_mounts,
+            cancel,
+        } = request;
         let control = Arc::new(RunControl {
             stop: cancel.child_token(),
             fatal: Mutex::new(None),
@@ -124,27 +128,7 @@ impl ScriptBackend for BashKitBackend {
         });
         // This guard also cancels command-owned work if the caller drops `run`.
         let _cleanup = control.stop.clone().drop_guard();
-        let mut builder = Self::builder(&limits);
-        // A tool catalog registers discovery commands. Keep standalone backend
-        // diagnostics unchanged when no catalog is installed.
-        if commands.iter().any(|command| command.name() == "tools") {
-            builder = builder.command_resolver(Arc::new(resolver::MissingCommandResolver {
-                names: commands
-                    .iter()
-                    .map(|command| command.name().to_owned())
-                    .collect(),
-            }));
-        }
-        for command in commands {
-            builder = builder.builtin(
-                command.name().to_owned(),
-                Box::new(CommandAdapter {
-                    command,
-                    control: control.clone(),
-                }),
-            );
-        }
-        let mut bash = builder.build();
+        let mut bash = build_shell(&limits, commands, &control);
         let flag = bash.cancellation_token();
         control.flag.set(flag.clone()).unwrap();
         // BashKit resets shell options between exec calls. Keep errexit in the
@@ -196,51 +180,6 @@ impl ScriptBackend for BashKitBackend {
             exit_code,
             status,
             limit_hit,
-        }
-    }
-}
-
-fn classify(
-    result: bashkit::Result<ExecResult>,
-    capture: &mut Capture,
-) -> (ScriptStatus, i32, Option<String>) {
-    match result {
-        Ok(result) => {
-            // Streaming preserves partial output on errors; the final result is
-            // authoritative on success (not every compound command streams).
-            capture.replace(result);
-            let status = if capture.exit_code == 0 {
-                ScriptStatus::Ok
-            } else {
-                ScriptStatus::Error
-            };
-            let limit = if capture.stdout.truncated || capture.stderr.truncated {
-                Some("output capture limit exceeded".to_owned())
-            } else {
-                None
-            };
-            (status, capture.exit_code, limit)
-        }
-        Err(error) => {
-            capture.append("", &format!("{error}\n"));
-            match error {
-                Error::Cancelled => (ScriptStatus::Cancelled, 130, None),
-                Error::ResourceLimit(limit) => {
-                    let status = if matches!(limit, LimitExceeded::Timeout(_)) {
-                        ScriptStatus::TimedOut
-                    } else {
-                        ScriptStatus::Error
-                    };
-                    let code = if status == ScriptStatus::TimedOut {
-                        124
-                    } else {
-                        1
-                    };
-                    (status, code, Some(limit.to_string()))
-                }
-                Error::Parse { .. } => (ScriptStatus::Error, 2, None),
-                _ => (ScriptStatus::Error, 1, None),
-            }
         }
     }
 }

@@ -25,6 +25,11 @@ use tokio::sync::{mpsc, Semaphore};
 use super::*;
 use crate::bash_inner::{InnerCallExecutor, InnerCallExecutorConfig, InnerTraceStatus};
 
+mod assertions;
+use assertions::{
+    assert_adapter_cancelled, assert_finished_concurrency, assert_round_calls, assert_trace,
+};
+
 #[derive(Default)]
 struct Provider {
     calls: Mutex<Vec<(String, Value, Option<u64>)>>,
@@ -176,16 +181,16 @@ async fn script(script: &str, executor: Arc<ScriptInnerExecutor>) -> ScriptRun {
         })
         .collect();
     BashKitBackend
-        .run(
+        .run(harnx_script::ScriptRequest {
             script,
-            ScriptLimits {
+            limits: ScriptLimits {
                 timeout_secs: 5,
                 ..Default::default()
             },
-            tool_commands(tools, executor).unwrap(),
-            vec![],
-            CancellationToken::new(),
-        )
+            commands: tool_commands(tools, executor).unwrap(),
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        })
         .await
 }
 
@@ -222,20 +227,9 @@ async fn background_commands_through_adapter_respect_concurrency_cap() {
         .unwrap()
         .unwrap();
     assert_eq!(result.exit_code, 0, "{result:?}");
-    assert_eq!(provider.maximum.load(Ordering::SeqCst), 2);
-    assert_eq!(provider.active.load(Ordering::SeqCst), 0);
-    assert_eq!(provider.calls.lock().unwrap().len(), 6);
-    assert!(provider
-        .calls
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|call| call.2 == Some(42)));
-    assert_eq!(run.trace().len(), 6);
-    assert!(run
-        .trace()
-        .iter()
-        .all(|entry| entry.status == InnerTraceStatus::Ok));
+    assert_finished_concurrency(&provider, 2);
+    assert_round_calls(&provider, 6);
+    assert_trace(&run, 6, InnerTraceStatus::Ok);
     assert_eq!(hooks.lock().unwrap().len(), 12, "one pre/post per call");
 }
 
@@ -347,17 +341,7 @@ async fn cancellation_drops_queued_and_active_calls_without_aborting_parent() {
     cancel.cancel();
     assert!(matches!(first.await.unwrap(), CallOutcome::Fatal { .. }));
     assert!(matches!(second.await.unwrap(), CallOutcome::Fatal { .. }));
-    assert_eq!(provider.active.load(Ordering::SeqCst), 0);
-    assert!(!adapter.abort.aborted());
-    assert_eq!(
-        run.trace().len(),
-        2,
-        "active and queued calls both leave a trace"
-    );
-    assert!(run
-        .trace()
-        .iter()
-        .all(|entry| entry.status == InnerTraceStatus::Cancelled));
+    assert_adapter_cancelled(&run, &adapter, &provider);
     adapter.abort.set_ctrlc();
     let outcome = adapter.call("a", json!({}), CancellationToken::new()).await;
     assert!(matches!(outcome, CallOutcome::Fatal { .. }));

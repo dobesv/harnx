@@ -1,5 +1,8 @@
 //! Shared flag names and type classification for parsing and documentation.
 
+mod kebab;
+pub(crate) use kebab::kebab_case;
+
 use std::collections::BTreeMap;
 
 use serde_json::Value;
@@ -156,30 +159,4 @@ fn insert_flag(
         )));
     }
     Ok(())
-}
-
-pub(crate) fn kebab_case(key: &str) -> String {
-    let chars: Vec<_> = key.chars().collect();
-    let mut result = String::new();
-    for (index, &current) in chars.iter().enumerate() {
-        if !current.is_alphanumeric() {
-            if !result.is_empty() && !result.ends_with('-') {
-                result.push('-');
-            }
-            continue;
-        }
-        let previous = index.checked_sub(1).map(|i| chars[i]);
-        let next = chars.get(index + 1);
-        let boundary = current.is_uppercase()
-            && previous.is_some_and(|c| {
-                c.is_lowercase()
-                    || c.is_numeric()
-                    || (c.is_uppercase() && next.is_some_and(|next| next.is_lowercase()))
-            });
-        if boundary && !result.is_empty() && !result.ends_with('-') {
-            result.push('-');
-        }
-        result.extend(current.to_lowercase());
-    }
-    result.trim_end_matches('-').to_owned()
 }

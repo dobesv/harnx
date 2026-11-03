@@ -105,14 +105,16 @@ pub trait ScriptCommand: Send + Sync {
     ) -> Result<ScriptCommandOutput, String>;
 }
 
+/// Inputs for one invocation, including caller-supplied commands and mounts.
+pub struct ScriptRequest<'a> {
+    pub script: &'a str,
+    pub limits: ScriptLimits,
+    pub commands: Vec<Arc<dyn ScriptCommand>>,
+    pub fs_mounts: Vec<FsMount>,
+    pub cancel: CancellationToken,
+}
+
 #[async_trait]
 pub trait ScriptBackend: Send + Sync {
-    async fn run(
-        &self,
-        script: &str,
-        limits: ScriptLimits,
-        commands: Vec<Arc<dyn ScriptCommand>>,
-        fs_mounts: Vec<FsMount>,
-        cancel: CancellationToken,
-    ) -> ScriptRun;
+    async fn run(&self, request: ScriptRequest<'_>) -> ScriptRun;
 }

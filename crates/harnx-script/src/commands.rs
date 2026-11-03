@@ -69,18 +69,7 @@ pub fn tool_commands(
 ) -> Result<Vec<Arc<dyn ScriptCommand>>, UsageError> {
     let mut catalog = Catalog::new();
     for tool in tools {
-        if tool.name.is_empty()
-            || tool
-                .name
-                .chars()
-                .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '/')
-            || matches!(tool.name.as_str(), "tools" | "help")
-        {
-            return Err(UsageError::new(format!(
-                "invalid or reserved tool command name {:?}",
-                tool.name
-            )));
-        }
+        validate_tool_command_name(&tool.name)?;
         let name = tool.name.clone();
         if catalog.insert(name.clone(), tool).is_some() {
             return Err(UsageError::new(format!("duplicate tool command {name:?}")));
@@ -190,6 +179,33 @@ fn failure(exit_code: i32, message: impl AsRef<str>) -> ScriptCommandOutput {
         stderr: format!("{}\n", message.as_ref().trim_end()),
         ..Default::default()
     }
+}
+
+fn is_disallowed_command_char(ch: char) -> bool {
+    if ch == '/' {
+        return true;
+    }
+    if ch.is_whitespace() {
+        return true;
+    }
+    ch.is_control()
+}
+
+fn validate_tool_command_name(name: &str) -> Result<(), UsageError> {
+    if name.is_empty() {
+        return Err(invalid_tool_command_error(name));
+    }
+    if matches!(name, "tools" | "help") {
+        return Err(invalid_tool_command_error(name));
+    }
+    if name.chars().any(is_disallowed_command_char) {
+        return Err(invalid_tool_command_error(name));
+    }
+    Ok(())
+}
+
+fn invalid_tool_command_error(name: &str) -> UsageError {
+    UsageError::new(format!("invalid or reserved tool command name {name:?}"))
 }
 
 #[cfg(test)]

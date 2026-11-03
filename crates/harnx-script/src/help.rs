@@ -34,7 +34,7 @@ pub fn help(name: &str, schema: &Value, description: &str) -> String {
         );
     }
     for property in &properties {
-        let option = if conflict || property.flag == "json" || property.flag.is_empty() {
+        let option = if property_uses_json(property, conflict) {
             format!("--json <object> (property {:?})", property.key)
         } else {
             property.option()
@@ -71,29 +71,45 @@ pub fn help(name: &str, schema: &Value, description: &str) -> String {
     text
 }
 
+fn property_uses_json(property: &Property<'_>, conflict: bool) -> bool {
+    if conflict || property.flag.is_empty() {
+        return true;
+    }
+    property.flag == "json"
+}
+
+fn has_required_json_property(properties: &[Property<'_>], conflict: bool) -> bool {
+    properties
+        .iter()
+        .any(|p| p.required && property_uses_json(p, conflict))
+}
+
+fn collect_syntax_flags(properties: &mut [Property<'_>], parts: &mut Vec<String>) {
+    properties.sort_by_key(|property| !property.required);
+    for property in properties {
+        if !property_uses_json(property, false) {
+            parts.push(syntax_flag(property));
+        }
+    }
+}
+
+fn json_syntax_flag(required: bool) -> String {
+    if required {
+        "--json <object>".into()
+    } else {
+        "[--json <object>]".into()
+    }
+}
+
 fn syntax(name: &str, schema: &Value) -> String {
     let mut properties = properties(schema);
     let conflict = flag_table(&properties).is_err();
-    let json_required = properties.iter().any(|property| {
-        property.required && (conflict || property.flag == "json" || property.flag.is_empty())
-    });
+    let json_required = has_required_json_property(&properties, conflict);
     let mut parts = vec![name.split_whitespace().collect::<Vec<_>>().join(" ")];
     if !conflict {
-        properties.sort_by_key(|property| !property.required);
-        for property in &properties {
-            if property.flag != "json" && !property.flag.is_empty() {
-                parts.push(syntax_flag(property));
-            }
-        }
+        collect_syntax_flags(&mut properties, &mut parts);
     }
-    parts.push(
-        if json_required {
-            "--json <object>"
-        } else {
-            "[--json <object>]"
-        }
-        .into(),
-    );
+    parts.push(json_syntax_flag(json_required));
     parts.join(" ")
 }
 
@@ -141,10 +157,12 @@ fn indent(text: &mut String, description: &str, spaces: usize) {
 fn first_sentence(description: &str) -> String {
     let line = description.split_whitespace().collect::<Vec<_>>().join(" ");
     for (index, ch) in line.char_indices() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
         let rest = &line[index + ch.len_utf8()..];
-        if matches!(ch, '.' | '!' | '?')
-            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
-        {
+        let terminal = rest.is_empty() || rest.starts_with(char::is_whitespace);
+        if terminal {
             return line[..index + ch.len_utf8()].into();
         }
     }

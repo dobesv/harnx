@@ -592,11 +592,13 @@ fn build_tool_providers(
     let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
     let active = config.read().bash_tools_active();
     providers.push(Arc::new(crate::bash_provider::BashProvider::new(
-        active,
-        config.read().bash_inner_tool_declarations(),
-        base_providers.clone(),
-        bash_context_slot,
-        payload_limit,
+        crate::bash_provider::BashProviderConfig {
+            active,
+            inner_declarations: config.read().bash_inner_tool_declarations(),
+            base_providers: base_providers.clone(),
+            slot: bash_context_slot,
+            payload_limit,
+        },
     )) as Arc<dyn ToolProvider>);
     providers.extend(base_providers);
     providers

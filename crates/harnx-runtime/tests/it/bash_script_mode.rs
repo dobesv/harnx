@@ -2,6 +2,9 @@
 //! resolution → synthesized declaration → `BashProvider` at provider index 0
 //! → slot handoff → BashKit run → inner NATS tool dispatch → engine result.
 
+// Keep imports and fixtures under the same Unix gate as the e2e tests.
+#![cfg(unix)]
+
 use std::{
     ffi::OsString,
     path::PathBuf,
@@ -139,11 +142,24 @@ async fn wait_for_time_registration(
     Ok(())
 }
 
+fn assert_time_tools_active(config: &ConfigLock) {
+    assert!(
+        config.read().bash_tools_active(),
+        "bash_tools: time_* must activate script mode once declarations are cached"
+    );
+    let bash_tools = config.read().bash_inner_tool_declarations();
+    assert!(
+        bash_tools
+            .iter()
+            .any(|declaration| declaration.name == "time_get_current_time"),
+        "bash_tools must resolve the NATS time tools, got {bash_tools:?}"
+    );
+}
+
 /// Full-stack e2e: a real NATS broker, a real tool server process, a real
 /// agent config, the real runtime context construction, and a `bash` call
 /// that runs `time_get_current_time … | wc -l` through BashKit and the
 /// inner-call admission pipeline.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn bash_runs_nats_tool_pipeline_e2e() -> Result<()> {
     let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
@@ -175,17 +191,7 @@ async fn bash_runs_nats_tool_pipeline_e2e() -> Result<()> {
     // The declaration cache is what bash_tools resolution reads; the agent
     // loop refreshes it before tool rounds, and so must this test.
     harnx_runtime::tool_context::refresh_nats_tool_declarations(&config, &instance_id).await;
-    assert!(
-        config.read().bash_tools_active(),
-        "bash_tools: time_* must activate script mode once declarations are cached"
-    );
-    let bash_tools = config.read().bash_inner_tool_declarations();
-    assert!(
-        bash_tools
-            .iter()
-            .any(|declaration| declaration.name == "time_get_current_time"),
-        "bash_tools must resolve the NATS time tools, got {bash_tools:?}"
-    );
+    assert_time_tools_active(&config);
 
     let slot = Arc::new(BashEvalContextSlot::default());
     let mut params = BuildToolEvalContextParams::new(&config, &instance_id);
@@ -232,7 +238,6 @@ async fn bash_runs_nats_tool_pipeline_e2e() -> Result<()> {
 /// (PR3 review F9), so this test stands up the real NATS broker and time
 /// tool server like the pipeline e2e above. It needs no dispatch: the
 /// provider answers from its own policy before any remote replay.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn interrupted_bash_replays_as_reported_not_rerun() -> Result<()> {
     let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
@@ -308,7 +313,6 @@ async fn interrupted_bash_replays_as_reported_not_rerun() -> Result<()> {
 /// tool-server-native `bash` keeps normal NATS journal recovery. The
 /// provider-internal halves of both cases are covered in
 /// `bash_provider::tests`; this pins the engine-level fall-through.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn inactive_script_mode_leaves_bash_replay_to_other_providers() -> Result<()> {
     let config = script_mode_config();

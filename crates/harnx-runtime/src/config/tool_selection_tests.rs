@@ -332,15 +332,27 @@ fn bash_name_is_reserved_when_bash_tools_active() {
 
 #[test]
 fn bash_provider_claims_only_active_bash_name() {
-    use crate::bash_provider::BashProvider;
+    use crate::bash_provider::{BashProvider, BashProviderConfig};
     use harnx_core::tool::{ToolError, ToolProvider};
 
-    let active = BashProvider::new(true, Vec::new(), Vec::new(), None, None);
+    let active = BashProvider::new(BashProviderConfig {
+        active: true,
+        inner_declarations: Vec::new(),
+        base_providers: Vec::new(),
+        slot: None,
+        payload_limit: None,
+    });
     assert!(active.has_tool("bash"));
     assert!(!active.has_tool("bash_exec"));
     assert!(!active.has_tool("fs_read"));
 
-    let inactive = BashProvider::new(false, Vec::new(), Vec::new(), None, None);
+    let inactive = BashProvider::new(BashProviderConfig {
+        active: false,
+        inner_declarations: Vec::new(),
+        base_providers: Vec::new(),
+        slot: None,
+        payload_limit: None,
+    });
     assert!(!inactive.has_tool("bash"));
 
     // An active provider without a round context slot must fail closed:

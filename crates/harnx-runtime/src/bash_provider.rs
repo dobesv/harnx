@@ -77,14 +77,30 @@ pub struct BashProvider {
     backend: BashKitBackend,
 }
 
+/// Inputs resolved before a round's evaluation context exists.
+pub struct BashProviderConfig {
+    pub active: bool,
+    pub inner_declarations: Vec<harnx_core::tool::ToolDeclaration>,
+    pub base_providers: Vec<Arc<dyn ToolProvider>>,
+    pub slot: Option<Arc<BashEvalContextSlot>>,
+    pub payload_limit: Option<PayloadLimit>,
+}
+
+struct ScriptInvocation<'a> {
+    tool_round: Option<u64>,
+    abort: &'a AbortSignal,
+    progress: Arc<dyn ToolProgress>,
+}
+
 impl BashProvider {
-    pub fn new(
-        active: bool,
-        inner_declarations: Vec<harnx_core::tool::ToolDeclaration>,
-        base_providers: Vec<Arc<dyn ToolProvider>>,
-        slot: Option<Arc<BashEvalContextSlot>>,
-        payload_limit: Option<PayloadLimit>,
-    ) -> Self {
+    pub fn new(config: BashProviderConfig) -> Self {
+        let BashProviderConfig {
+            active,
+            inner_declarations,
+            base_providers,
+            slot,
+            payload_limit,
+        } = config;
         let allowed = inner_declarations
             .iter()
             .map(|declaration| declaration.name.clone())
@@ -124,10 +140,13 @@ impl BashProvider {
     async fn run_script(
         &self,
         arguments: Value,
-        origin: harnx_core::tool::ToolCallOrigin<'_>,
-        abort: &AbortSignal,
-        progress: Arc<dyn ToolProgress>,
+        invocation: ScriptInvocation<'_>,
     ) -> Result<ToolProviderOutput, ToolError> {
+        let ScriptInvocation {
+            tool_round,
+            abort,
+            progress,
+        } = invocation;
         let params: BashToolParams = serde_json::from_value(arguments)
             .map_err(|error| ToolError::Recoverable(anyhow!("invalid bash arguments: {error}")))?;
         let script = params
@@ -139,7 +158,7 @@ impl BashProvider {
         let aggregator = Arc::new(InnerProgressAggregator::new(progress));
         let run = Arc::new(
             self.executor
-                .begin_run(&context, origin.tool_round, Some(aggregator)),
+                .begin_run(&context, tool_round, Some(aggregator)),
         );
         let adapter = Arc::new(ScriptInnerExecutor::new(Arc::clone(&run), abort.clone()));
         let commands = tool_commands(self.specs.clone(), adapter).map_err(|error| {
@@ -155,9 +174,13 @@ impl BashProvider {
         // cancel the token and still await the backend so pending local work
         // is dropped and the trace keeps its cancelled rows.
         let token = CancellationToken::new();
-        let run_fut = self
-            .backend
-            .run(&script, limits, commands, Vec::new(), token.clone());
+        let run_fut = self.backend.run(harnx_script::ScriptRequest {
+            script: &script,
+            limits,
+            commands,
+            fs_mounts: Vec::new(),
+            cancel: token.clone(),
+        });
         tokio::pin!(run_fut);
         let result = tokio::select! {
             result = &mut run_fut => result,
@@ -167,14 +190,7 @@ impl BashProvider {
             }
         };
 
-        let outcome = BashOutcome::new(
-            result,
-            abort,
-            run.trace(),
-            run.dropped_trace_entries(),
-            run.first_failed(),
-            params,
-        );
+        let outcome = BashOutcome::new(result, abort, &run, params);
         outcome.into_provider_result()
     }
 }
@@ -198,15 +214,21 @@ struct BashOutcome {
     aborted: bool,
 }
 
+struct RenderedStream<'a> {
+    text: &'a str,
+    truncated: bool,
+}
+
 impl BashOutcome {
     fn new(
         result: harnx_script::ScriptRun,
         abort: &AbortSignal,
-        trace: Vec<crate::bash_inner::InnerTraceEntry>,
-        trace_dropped: usize,
-        first_failed: Option<crate::bash_inner::InnerTraceEntry>,
+        run: &crate::bash_inner::InnerCallRun,
         params: BashToolParams,
     ) -> Self {
+        let trace = run.trace();
+        let trace_dropped = run.dropped_trace_entries();
+        let first_failed = run.first_failed();
         let aborted = abort.aborted();
         let status = if aborted {
             "cancelled"
@@ -313,7 +335,16 @@ impl BashOutcome {
         let stderr = truncate_output(&stderr_sanitized, &opts);
         let stdout_truncated = self.stdout_truncated || stdout != stdout_sanitized;
         let stderr_truncated = self.stderr_truncated || stderr != stderr_sanitized;
-        let rendered = self.render(&stdout, &stderr, stdout_truncated, stderr_truncated);
+        let rendered = self.render(
+            RenderedStream {
+                text: &stdout,
+                truncated: stdout_truncated,
+            },
+            RenderedStream {
+                text: &stderr,
+                truncated: stderr_truncated,
+            },
+        );
         let mut payload = json!({
             "status": self.status,
             "exit_code": self.exit_code,
@@ -340,13 +371,7 @@ impl BashOutcome {
 
     /// YAML front matter + fenced stdout/stderr + trace lines, in the
     /// `bash_exec` report shape.
-    fn render(
-        &self,
-        stdout: &str,
-        stderr: &str,
-        stdout_truncated: bool,
-        stderr_truncated: bool,
-    ) -> String {
+    fn render(&self, stdout: RenderedStream<'_>, stderr: RenderedStream<'_>) -> String {
         #[derive(Serialize)]
         struct YamlHeader<'a> {
             status: &'a str,
@@ -370,9 +395,17 @@ impl BashOutcome {
         })
         .unwrap_or_default();
         let mut out = format!("```yaml\n{yaml}```\n");
-        out.push_str(&render_stream_block("stdout", stdout, stdout_truncated));
+        out.push_str(&render_stream_block(
+            "stdout",
+            stdout.text,
+            stdout.truncated,
+        ));
         out.push('\n');
-        out.push_str(&render_stream_block("stderr", stderr, stderr_truncated));
+        out.push_str(&render_stream_block(
+            "stderr",
+            stderr.text,
+            stderr.truncated,
+        ));
         if !self.trace.is_empty() {
             out.push_str("\n## inner call trace\n");
             for entry in &self.trace {
@@ -460,8 +493,15 @@ impl ToolProvider for BashProvider {
             )));
         }
         let origin = harnx_core::tool::ToolCallOrigin::default();
-        self.run_script(arguments, origin, abort, Arc::new(NoopProgress))
-            .await
+        self.run_script(
+            arguments,
+            ScriptInvocation {
+                tool_round: origin.tool_round,
+                abort,
+                progress: Arc::new(NoopProgress),
+            },
+        )
+        .await
     }
 
     async fn call_tool_with_progress(
@@ -477,7 +517,15 @@ impl ToolProvider for BashProvider {
                 "provider does not handle tool '{tool_name}'"
             )));
         }
-        self.run_script(arguments, origin, abort, progress).await
+        self.run_script(
+            arguments,
+            ScriptInvocation {
+                tool_round: origin.tool_round,
+                abort,
+                progress,
+            },
+        )
+        .await
     }
 
     /// A `bash` invocation is never re-run on worker loss: side effects may

@@ -4,17 +4,17 @@ Run BashKit scripts in-process with a fresh virtual filesystem and caller-regist
 async commands. This crate has no dependency on harnx-runtime, NATS, or agent state.
 
 ```rust
-use harnx_script::{BashKitBackend, CancellationToken, ScriptBackend, ScriptLimits};
+use harnx_script::{BashKitBackend, CancellationToken, ScriptBackend, ScriptLimits, ScriptRequest};
 
 async fn example() {
     let result = BashKitBackend
-        .run(
-            "echo '{\"value\":42}' | jq '.value'",
-            ScriptLimits::default(),
-            vec![], // Arc<dyn ScriptCommand>
-            vec![], // FsMount
-            CancellationToken::new(),
-        )
+        .run(ScriptRequest {
+            script: "echo '{\"value\":42}' | jq '.value'",
+            limits: ScriptLimits::default(),
+            commands: vec![], // Arc<dyn ScriptCommand>
+            fs_mounts: vec![], // FsMount
+            cancel: CancellationToken::new(),
+        })
         .await;
     assert_eq!(result.stdout, "42\n");
 }

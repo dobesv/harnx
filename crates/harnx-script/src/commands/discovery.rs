@@ -53,7 +53,10 @@ impl ScriptCommand for Discovery {
 impl Discovery {
     fn tools(&self, args: &[String]) -> ScriptCommandOutput {
         if args == ["--help"] {
-            return text(TOOLS_HELP.into());
+            return ScriptCommandOutput {
+                stdout: TOOLS_HELP.into(),
+                ..Default::default()
+            };
         }
         if args.len() > 1 {
             return failure(2, TOOLS_HELP);
@@ -71,45 +74,47 @@ impl Discovery {
             stdout.push_str(&help::synopsis(&tool.name, &tool.schema, &tool.description));
             stdout.push('\n');
         }
-        text(stdout)
+        ScriptCommandOutput {
+            stdout,
+            ..Default::default()
+        }
     }
 
     fn help(&self, args: &[String]) -> ScriptCommandOutput {
         if args.is_empty() || args == ["--help"] {
-            return text(HELP_HELP.into());
+            return ScriptCommandOutput {
+                stdout: HELP_HELP.into(),
+                ..Default::default()
+            };
         }
         let mut output = ScriptCommandOutput::default();
+        let mut documents = Vec::new();
         for name in args {
-            let document = match name.as_str() {
-                "tools" => Some(TOOLS_HELP.into()),
-                "help" => Some(HELP_HELP.into()),
-                _ => self
-                    .catalog
-                    .get(name)
-                    .map(|tool| help::help(&tool.name, &tool.schema, &tool.description)),
-            };
-            if let Some(document) = document {
-                if !output.stdout.is_empty() {
-                    output.stdout.push('\n');
+            match self.tool_document(name) {
+                Some(document) => documents.push(document),
+                None => {
+                    output.exit_code = 127;
+                    output.stderr.push_str(&unknown_command_message(
+                        name,
+                        self.catalog.keys().map(String::as_str),
+                    ));
+                    output.stderr.push('\n');
                 }
-                output.stdout.push_str(&document);
-            } else {
-                output.exit_code = 127;
-                output.stderr.push_str(&unknown_command_message(
-                    name,
-                    self.catalog.keys().map(String::as_str),
-                ));
-                output.stderr.push('\n');
             }
         }
+        output.stdout = documents.join("\n");
         output
     }
-}
 
-fn text(stdout: String) -> ScriptCommandOutput {
-    ScriptCommandOutput {
-        stdout,
-        ..Default::default()
+    fn tool_document(&self, name: &str) -> Option<String> {
+        match name {
+            "tools" => Some(TOOLS_HELP.into()),
+            "help" => Some(HELP_HELP.into()),
+            _ => self
+                .catalog
+                .get(name)
+                .map(|tool| help::help(&tool.name, &tool.schema, &tool.description)),
+        }
     }
 }
 
