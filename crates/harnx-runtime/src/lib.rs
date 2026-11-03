@@ -14,6 +14,7 @@ pub mod a2a_events;
 pub mod access;
 pub mod agent_loop;
 pub mod async_session_log;
+pub mod bash_inner;
 pub mod bash_provider;
 pub mod bootstrap;
 pub mod client;

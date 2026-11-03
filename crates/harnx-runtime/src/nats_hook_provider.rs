@@ -1,4 +1,6 @@
 mod controlled_request;
+#[cfg(test)]
+mod sink_tests;
 use crate::config::{Config, LOCAL_CLUSTER_KEY};
 use anyhow::{Context, Result};
 use async_nats::jetstream::{context::GetStreamErrorKind, ErrorCode};
@@ -7,6 +9,7 @@ use futures_util::TryStreamExt;
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl};
 use harnx_core::instance::ServerScope;
+use harnx_core::sink::{current_agent_event_sink, with_agent_event_sink};
 use harnx_hookset::{
     FailPolicy, HookRegistration, HookSpec, HOOK_EXPECTATIONS_BUCKET, HOOK_REGISTRY_BUCKET,
 };
@@ -404,7 +407,15 @@ impl NatsHookProvider {
                 hook: hook.clone(),
                 pending: pending.clone(),
             };
-            tokio::spawn(dispatch_one_best_effort_hook(dispatcher, params));
+            // Tokio tasks do not inherit the originating turn or inner eval sink.
+            let sink = current_agent_event_sink();
+            tokio::spawn(async move {
+                let dispatch = dispatch_one_best_effort_hook(dispatcher, params);
+                match sink {
+                    Some(sink) => with_agent_event_sink(sink, dispatch).await,
+                    None => dispatch.await,
+                }
+            });
         }
     }
 }
