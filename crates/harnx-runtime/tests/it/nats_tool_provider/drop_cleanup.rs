@@ -101,9 +101,18 @@ impl DropFixture {
         Ok(serde_json::from_slice(&message.payload)?)
     }
 
+    async fn assert_cancel_retries(&mut self, first: &ControlMessage) -> Result<()> {
+        // One logical cancellation has a fixed three-publish budget.
+        for _ in 1..3 {
+            assert_eq!(&self.next_cancel().await?, first);
+        }
+        self.assert_no_cancel().await;
+        Ok(())
+    }
+
     async fn assert_no_cancel(&mut self) {
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), self.controls.next())
+            tokio::time::timeout(Duration::from_millis(300), self.controls.next())
                 .await
                 .is_err(),
             "unexpected or duplicate remote cancel"
@@ -143,7 +152,7 @@ async fn timed_out_wait_removes_registration_and_cancels_remote_call() -> Result
     tokio::time::timeout(Duration::from_secs(5), remote_cancel.cancelled())
         .await
         .context("remote tool did not receive cancellation")?;
-    fixture.assert_no_cancel().await;
+    fixture.assert_cancel_retries(&control).await?;
     Ok(())
 }
 
@@ -190,7 +199,7 @@ async fn completed_wait_does_not_cancel_remote_call() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn explicit_abort_cancels_remote_call_only_once() -> Result<()> {
+async fn explicit_abort_schedules_one_cancel_batch() -> Result<()> {
     let Some(mut fixture) = DropFixture::start().await? else {
         return Ok(());
     };
@@ -209,10 +218,10 @@ async fn explicit_abort_cancels_remote_call_only_once() -> Result<()> {
     abort.set_ctrlc();
     assert!(call.await.is_err());
     assert!(fixture.calls.snapshot_for_session("").await.is_empty());
-    fixture.next_cancel().await?;
+    let control = fixture.next_cancel().await?;
     tokio::time::timeout(Duration::from_secs(5), remote_cancel.cancelled())
         .await
         .context("explicit abort did not cancel remote tool")?;
-    fixture.assert_no_cancel().await;
+    fixture.assert_cancel_retries(&control).await?;
     Ok(())
 }

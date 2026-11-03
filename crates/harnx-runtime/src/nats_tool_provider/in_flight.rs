@@ -56,23 +56,20 @@ pub(super) struct InFlightCompletionGuard<F: FnOnce()> {
     on_drop: Option<F>,
 }
 
+impl<F: FnOnce()> InFlightCompletionGuard<F> {
+    pub(super) fn complete(&self) -> bool {
+        self.calls.complete(&self.call_id, &self.identity)
+    }
+}
+
 impl<F: FnOnce()> Drop for InFlightCompletionGuard<F> {
     fn drop(&mut self) {
-        let removed = {
-            let mut calls = self.calls.calls.lock();
-            if calls
-                .get(&self.call_id)
-                .is_some_and(|call| Arc::ptr_eq(&call.identity, &self.identity))
-            {
-                calls.remove(&self.call_id)
-            } else {
-                None
-            }
-        };
         // Completion and supervision remove the entry first. A replacement
         // reservation has a different identity, even when it reuses the call ID.
-        if let Some(on_drop) = removed.and(self.on_drop.take()) {
-            on_drop();
+        if self.complete() {
+            if let Some(on_drop) = self.on_drop.take() {
+                on_drop();
+            }
         }
     }
 }
@@ -115,8 +112,10 @@ impl NatsInFlightCalls {
     pub(crate) async fn register(
         &self,
         registration: InFlightRegistration,
-    ) -> oneshot::Receiver<InFlightFailure> {
-        self.insert(registration, Arc::new(()))
+    ) -> (oneshot::Receiver<InFlightFailure>, Arc<()>) {
+        let identity = Arc::new(());
+        let receiver = self.insert(registration, Arc::clone(&identity));
+        (receiver, identity)
     }
 
     fn insert(
@@ -144,8 +143,18 @@ impl NatsInFlightCalls {
         receiver
     }
 
-    pub(crate) async fn complete(&self, call_id: &str) {
-        self.calls.lock().remove(call_id);
+    /// Retire only this reservation, never another wait for the same call ID.
+    pub(crate) fn complete(&self, call_id: &str, identity: &Arc<()>) -> bool {
+        let mut calls = self.calls.lock();
+        if calls
+            .get(call_id)
+            .is_some_and(|call| Arc::ptr_eq(&call.identity, identity))
+        {
+            calls.remove(call_id);
+            true
+        } else {
+            false
+        }
     }
 
     /// Fail current calls routed to a supervised server that became unavailable.
@@ -233,8 +242,10 @@ mod tests {
                 panic!("an old reservation must not cancel its replacement")
             })
             .await;
-        let mut replacement_failure = calls.register(registration("call", "s2")).await;
+        let (mut replacement_failure, replacement_identity) =
+            calls.register(registration("call", "s2")).await;
         assert!(old_failure.await.is_err());
+        assert!(!old_guard.complete());
         drop(old_guard);
         assert!(calls.snapshot_for_session("s1").await.is_empty());
         assert_eq!(calls.snapshot_for_session("s2").await.len(), 1);
@@ -242,7 +253,8 @@ mod tests {
             replacement_failure.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
-        calls.complete("call").await;
+        assert!(calls.complete("call", &replacement_identity));
+        assert!(!calls.complete("call", &replacement_identity));
     }
 
     #[tokio::test]
@@ -257,7 +269,7 @@ mod tests {
             if unavailable {
                 calls.fail_server_unavailable("srv", "stopped").await;
             } else {
-                calls.complete("call").await;
+                assert!(guard.complete());
             }
             drop(guard);
             assert!(calls.snapshot_for_session("s1").await.is_empty());

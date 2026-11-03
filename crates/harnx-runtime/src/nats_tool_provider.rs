@@ -22,6 +22,9 @@ use std::time::Duration;
 use uuid::Uuid;
 
 mod cancellation;
+#[cfg(test)]
+#[path = "nats_tool_provider/cancellation_races.rs"]
+mod cancellation_races;
 mod in_flight;
 pub use cancellation::publish_tool_cancel;
 use in_flight::InFlightFailure;
@@ -381,7 +384,7 @@ impl NatsToolProvider {
                     log::warn!("tool registration liveness check failed for '{key}' ({failures}/3): {error:?}");
                     if failures == 3 {
                         // This establishes loss of observability, not that the
-                        // tool stopped. transport_failure preserves that distinction.
+                        // tool stopped. The caller preserves that distinction.
                         return format!("tool completion unconfirmed: NATS registration '{key}' could not be read after 3 attempts");
                     }
                 }
@@ -402,7 +405,7 @@ impl NatsToolProvider {
             request,
             durable,
         } = pending;
-        let (mut supervised_failure, _completion) = self
+        let (mut supervised_failure, completion) = self
             .in_flight
             .register_guarded(
                 InFlightRegistration {
@@ -422,42 +425,31 @@ impl NatsToolProvider {
         tokio::pin!(request);
         let response = tokio::select! {
             _ = wait_abort_signal(abort) => {
-                self.in_flight.complete(&call_id).await;
-                // Failover abandons only this worker's wait. Cancelling the
-                // remote invocation would journal an interruption that the
-                // replacement worker then mistakes for the tool's outcome.
-                if !abort.aborted_failover() {
-                    self.schedule_cancel(&durable, &server);
-                }
-                return Err(ToolError::Fatal(anyhow!("tool call aborted")));
+                Err(ToolError::Fatal(anyhow!("tool call aborted")))
             }
             failure = &mut supervised_failure => {
-                self.in_flight.complete(&call_id).await;
                 let message = match failure {
                     Ok(InFlightFailure::Unavailable(message)) => message,
                     Err(_) => "tool server unavailable".to_string(),
                 };
-                return Err(self.transport_failure(&durable, &server, message));
+                Err(ToolError::Recoverable(anyhow!(message)))
             }
             message = self.wait_for_registration_loss(&registration_key) => {
-                self.in_flight.complete(&call_id).await;
-                return Err(self.transport_failure(&durable, &server, message));
+                Err(ToolError::Recoverable(anyhow!(message)))
             }
-            response = &mut request => response,
+            response = &mut request => response.map_err(|error| {
+                ToolError::Recoverable(anyhow!("tool server unavailable: {error}"))
+            }),
         };
-        self.in_flight.complete(&call_id).await;
-        match response {
-            Ok(message) => Ok(message),
-            Err(error) => Err(self.transport_failure(
-                &durable,
-                &server,
-                format!("tool server unavailable: {error}"),
-            )),
+        // A displaced wait must not cancel the shared call ID. Failover also
+        // leaves remote work intact so a replacement worker can recover it.
+        if !completion.complete() {
+            return response;
         }
-    }
-    fn transport_failure(&self, request: &ToolRequest, server: &str, message: String) -> ToolError {
-        self.schedule_cancel(request, server);
-        ToolError::Recoverable(anyhow!(message))
+        if response.is_err() && !abort.aborted_failover() {
+            self.schedule_cancel(&durable, &server);
+        }
+        response
     }
 }
 
@@ -775,7 +767,7 @@ mod tests {
         }
     }
 
-    async fn make_test_provider(client: &async_nats::Client) -> NatsToolProvider {
+    pub(super) async fn make_test_provider(client: &async_nats::Client) -> NatsToolProvider {
         let instance_id = ServerScope::new();
         let control_subscription = client
             .subscribe(instance_id.control_subject())

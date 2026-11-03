@@ -1,8 +1,11 @@
 //! Cancellation is addressed by session and call id, not by execution-control
-//! generation. Publishing it is fire-and-forget cleanup work: the tool
-//! server's journal, not a client-side retry loop, is what makes a cancel
-//! eventually reach an orphaned call.
+//! generation. Cleanup is fire-and-forget, with a short bounded resend window
+//! to cover cancellation racing ahead of remote invocation registration.
 use super::*;
+
+pub(super) const CANCEL_ATTEMPTS: usize = 3;
+const CANCEL_RETRY_DELAY: Duration = Duration::from_millis(100);
+const CANCEL_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Publish one cancel control message to the call's owning instance.
 pub async fn publish_tool_cancel(
@@ -29,8 +32,8 @@ pub async fn publish_tool_cancel(
 
 impl NatsToolProvider {
     /// Ask the tool server to cancel `request`, without waiting for it.
-    /// Never blocks the caller and never fails the in-progress call: a lost
-    /// cancel is retried by whoever asks again with a fresh cancellation id.
+    /// Resend the same cancellation three times to cover pre-registration
+    /// races. Each publish is bounded; no attempt waits for an acknowledgement.
     pub(super) fn schedule_cancel(&self, request: &ToolRequest, server: &str) {
         let target = InFlightCancelTarget {
             call_id: request.call_id.clone(),
@@ -49,10 +52,21 @@ impl NatsToolProvider {
             return;
         };
         runtime.spawn(async move {
-            if let Err(error) =
-                publish_tool_cancel(&client, &target, &session, &cancellation_id).await
-            {
-                log::debug!("tool cancel not published: {error:#}");
+            for attempt in 0..CANCEL_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(CANCEL_RETRY_DELAY).await;
+                }
+                let result = tokio::time::timeout(
+                    CANCEL_PUBLISH_TIMEOUT,
+                    publish_tool_cancel(&client, &target, &session, &cancellation_id),
+                )
+                .await;
+                if !matches!(&result, Ok(Ok(()))) {
+                    log::debug!(
+                        "tool cancel publish attempt {} failed: {result:?}",
+                        attempt + 1
+                    );
+                }
             }
         });
     }
