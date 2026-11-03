@@ -2,8 +2,7 @@
 //!
 //! [`InnerCallExecutor`] is the runtime-owned gate between the BashKit
 //! interpreter (PR3) and the engine admission pipeline. It owns the resolved
-//! `bash_tools` allowlist and the base provider list, and enforces them before
-//! anything reaches the engine:
+//! `bash_tools` allowlist and the base provider list, and applies admission limits:
 //!
 //! - names outside `bash_tools` are rejected with a did-you-mean suggestion;
 //! - `bash`, `switch_agent`, `ask_user`, and `*_session_handoff` are rejected
@@ -39,7 +38,7 @@ use harnx_core::sink::{current_agent_event_sink, with_agent_event_sink};
 use harnx_core::tool::{ToolCall, ToolProgress, ToolProvider, ToolResult, ToolUpdatePatch};
 use harnx_engine::tool::{
     eval_inner_tool_call, InnerToolEvalOptions, ToolApprovalRequiredError, ToolCallEmitFn,
-    ToolEvalContext, ToolUpdateEmitFn,
+    ToolEvalContext, ToolUpdateEmitFn, WorkBoundary,
 };
 use serde_json::Value;
 use tokio::sync::Semaphore;
@@ -80,13 +79,50 @@ const AGGREGATOR_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 /// it; keeping this a closure means tests don't need a NATS broker.
 pub type RequestSizeProbe = Arc<dyn Fn(&str, &Value) -> usize + Send + Sync>;
 
-/// Pre-flight payload check against the broker's `server_info().max_payload`
+/// Payload checks against the broker's `server_info().max_payload`, before
+/// admission and again on final hook-mutated arguments just before dispatch
 /// (usage precedent: `a2a_events.rs`). NATS requests aren't chunked, so an
 /// oversized request would fail at publish time with a much worse error.
 #[derive(Clone)]
 pub struct PayloadLimit {
     pub max_bytes: usize,
     pub request_size: RequestSizeProbe,
+}
+
+impl PayloadLimit {
+    fn check(&self, tool: &str, args: &Value) -> Result<(), CallRejection> {
+        let request_bytes = (self.request_size)(tool, args);
+        if request_bytes > self.max_bytes {
+            return Err(CallRejection {
+                bytes: request_bytes as u64,
+                reason: format!(
+                    "tool '{tool}' request is {request_bytes} bytes, above the broker's {} byte maximum payload",
+                    self.max_bytes
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn guard_dispatch(self: &Arc<Self>, ctx: &mut ToolEvalContext) {
+        let limit = Arc::clone(self);
+        let existing = ctx.work_boundary.take();
+        ctx.work_boundary = Some(Arc::new(move |boundary, call| {
+            let limit = Arc::clone(&limit);
+            let existing = existing.clone();
+            Box::pin(async move {
+                // Only Start carries the final hook-mutated arguments that the
+                // engine is about to dispatch. Accept still carries the input.
+                if matches!(boundary, WorkBoundary::Start) {
+                    limit.check(&call.name, &call.arguments)?;
+                }
+                if let Some(existing) = existing {
+                    existing(boundary, call).await?;
+                }
+                Ok(())
+            })
+        }));
+    }
 }
 
 /// Hook point for live inner-call activity. T2.5's progress aggregator
@@ -216,7 +252,7 @@ impl InnerCallExecutor {
             }
         });
 
-        let ctx = outer.fork_for_inner_calls(InnerToolEvalOptions {
+        let mut ctx = outer.fork_for_inner_calls(InnerToolEvalOptions {
             providers: self.providers.clone(),
             tool_round,
             emit_tool_call_fn,
@@ -224,6 +260,9 @@ impl InnerCallExecutor {
             emit_tool_blocked_fn,
             emit_tool_update_fn,
         });
+        if let Some(limit) = &self.payload_limit {
+            limit.guard_dispatch(&mut ctx);
+        }
 
         InnerCallRun {
             ctx,
@@ -368,8 +407,9 @@ impl InnerCallRun {
 
     /// Execute one inner call through the full admission pipeline
     /// (PreToolUse hooks, dispatch, PostToolUse), enforcing the allowlist,
-    /// payload limit, call budget, and concurrency cap first. The parent
-    /// abort signal propagates: an aborted signal yields [`InnerOutcome::Fatal`].
+    /// call budget, and concurrency cap first. Payload limits apply before
+    /// admission and again after hook mutations. The parent abort signal
+    /// propagates: an aborted signal yields [`InnerOutcome::Fatal`].
     pub async fn call(&self, tool: &str, args: Value, abort_signal: &AbortSignal) -> InnerOutcome {
         let start = CallStart {
             started: Instant::now(),
@@ -445,18 +485,8 @@ impl InnerCallRun {
     }
 
     fn check_payload_size(&self, tool: &str, args: &Value) -> Result<(), CallRejection> {
-        let Some(limit) = &self.payload_limit else {
-            return Ok(());
-        };
-        let request_bytes = (limit.request_size)(tool, args);
-        if request_bytes > limit.max_bytes {
-            return Err(CallRejection {
-                bytes: request_bytes as u64,
-                reason: format!(
-                    "tool '{tool}' request is {request_bytes} bytes, above the broker's {} byte maximum payload",
-                    limit.max_bytes
-                ),
-            });
+        if let Some(limit) = &self.payload_limit {
+            limit.check(tool, args)?;
         }
         Ok(())
     }
@@ -698,10 +728,19 @@ fn edit_distance(a: &[char], b: &str) -> usize {
     previous[b_chars.len()]
 }
 
+#[derive(Debug)]
 struct CallRejection {
     bytes: u64,
     reason: String,
 }
+
+impl std::fmt::Display for CallRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for CallRejection {}
 
 fn classify_evaluation(
     tool: &str,
@@ -714,6 +753,15 @@ fn classify_evaluation(
             (outcome, status, bytes)
         }
         Err(error) => {
+            if let Some(rejection) = error.downcast_ref::<CallRejection>() {
+                return (
+                    InnerOutcome::Rejected {
+                        reason: rejection.reason.clone(),
+                    },
+                    InnerTraceStatus::Rejected,
+                    rejection.bytes,
+                );
+            }
             let (outcome, status) = classify_error(tool, error);
             (outcome, status, 0)
         }
@@ -783,6 +831,8 @@ fn classify_error(tool: &str, error: anyhow::Error) -> (InnerOutcome, InnerTrace
 
 #[cfg(test)]
 mod tests {
+    mod payload;
+
     use super::*;
     use harnx_core::abort::create_abort_signal;
     use harnx_core::event::{AgentEvent, NoticeEvent};
@@ -807,6 +857,7 @@ mod tests {
         Continue,
         Block(&'static str),
         Ask(Option<&'static str>),
+        Mutate(Value),
     }
 
     /// Outer context with panicking emitters and confirmation: the fork must
@@ -846,6 +897,13 @@ mod tests {
             dispatch_hook_fn: Arc::new(move |event| {
                 let outcome = match &*control {
                     HookControl::Continue => continue_outcome(),
+                    HookControl::Mutate(arguments) => HookOutcome {
+                        control: HookResultControl::Continue,
+                        result: HookResult {
+                            mutated_tool_input: Some(arguments.clone()),
+                            ..HookResult::default()
+                        },
+                    },
                     HookControl::Block(reason) => HookOutcome {
                         control: HookResultControl::Block {
                             reason: reason.to_string(),
