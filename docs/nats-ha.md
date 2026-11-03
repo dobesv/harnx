@@ -1114,6 +1114,12 @@ stops a call after the process that started it is gone. Cancellation is
 idempotent throughout: a call may be cancelled any number of times, with the
 same or different cancellation ids, and each answer is the same.
 
+Dropping a NATS tool response wait before completion (for example, at a script
+deadline) removes its in-flight registration and schedules a fire-and-forget
+cancel through this control path. Completed waits and replaced reservations do
+not send another cancel. Failover also suppresses the drop cancel so a
+replacement worker can resume the remote invocation.
+
 Hooks use the same mechanism. The hook server keeps no journal, so a call id it
 is not currently running is simply `AlreadyFinished` — nothing durable is left to
 consult once the future is gone. The worker-side hook provider registers

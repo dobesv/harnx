@@ -27,6 +27,7 @@ struct InFlightCall {
     session_id: String,
     control_subject: String,
     failure: oneshot::Sender<InFlightFailure>,
+    identity: Arc<()>,
 }
 
 /// Everything a call is registered under: its own identity, the server
@@ -47,23 +48,53 @@ pub struct InFlightCancelTarget {
     pub control_subject: String,
 }
 
-pub(super) struct InFlightCompletionGuard {
+/// Remove an abandoned registration and cancel only the invocation it owned.
+pub(super) struct InFlightCompletionGuard<F: FnOnce()> {
     calls: NatsInFlightCalls,
     call_id: String,
+    identity: Arc<()>,
+    on_drop: Option<F>,
 }
 
-impl Drop for InFlightCompletionGuard {
+impl<F: FnOnce()> Drop for InFlightCompletionGuard<F> {
     fn drop(&mut self) {
-        self.calls.calls.lock().remove(&self.call_id);
+        let removed = {
+            let mut calls = self.calls.calls.lock();
+            if calls
+                .get(&self.call_id)
+                .is_some_and(|call| Arc::ptr_eq(&call.identity, &self.identity))
+            {
+                calls.remove(&self.call_id)
+            } else {
+                None
+            }
+        };
+        // Completion and supervision remove the entry first. A replacement
+        // reservation has a different identity, even when it reuses the call ID.
+        if let Some(on_drop) = removed.and(self.on_drop.take()) {
+            on_drop();
+        }
     }
 }
 
 impl NatsInFlightCalls {
-    pub(super) fn completion_guard(&self, call_id: &str) -> InFlightCompletionGuard {
-        InFlightCompletionGuard {
+    pub(super) async fn register_guarded<F: FnOnce()>(
+        &self,
+        registration: InFlightRegistration,
+        on_drop: F,
+    ) -> (
+        oneshot::Receiver<InFlightFailure>,
+        InFlightCompletionGuard<F>,
+    ) {
+        let identity = Arc::new(());
+        let guard = InFlightCompletionGuard {
             calls: self.clone(),
-            call_id: call_id.to_owned(),
-        }
+            call_id: registration.call_id.clone(),
+            identity: Arc::clone(&identity),
+            on_drop: Some(on_drop),
+        };
+        let receiver = self.insert(registration, identity);
+        (receiver, guard)
     }
 
     /// Return the process-wide handle shared by provider and supervisor for an instance.
@@ -85,6 +116,14 @@ impl NatsInFlightCalls {
         &self,
         registration: InFlightRegistration,
     ) -> oneshot::Receiver<InFlightFailure> {
+        self.insert(registration, Arc::new(()))
+    }
+
+    fn insert(
+        &self,
+        registration: InFlightRegistration,
+        identity: Arc<()>,
+    ) -> oneshot::Receiver<InFlightFailure> {
         let InFlightRegistration {
             call_id,
             server,
@@ -99,6 +138,7 @@ impl NatsInFlightCalls {
                 session_id,
                 control_subject,
                 failure,
+                identity,
             },
         );
         receiver
@@ -171,22 +211,49 @@ mod tests {
     #[tokio::test]
     async fn completion_guard_removes_only_its_call() {
         let calls = NatsInFlightCalls::default();
-        let failure = calls.register(registration("dropped", "s1")).await;
+        let cancellations = std::sync::atomic::AtomicUsize::new(0);
+        let (failure, guard) = calls
+            .register_guarded(registration("dropped", "s1"), || {
+                cancellations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await;
         let _other = calls.register(registration("other", "s1")).await;
-        let guard = calls.completion_guard("dropped");
         drop(guard);
         assert!(failure.await.is_err());
+        assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 1);
         let remaining = calls.snapshot_for_session("s1").await;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].call_id, "other");
+    }
+    #[tokio::test]
+    async fn stale_completion_guard_preserves_replacement_reservation() {
+        let calls = NatsInFlightCalls::default();
+        let (old_failure, old_guard) = calls
+            .register_guarded(registration("call", "s1"), || {
+                panic!("an old reservation must not cancel its replacement")
+            })
+            .await;
+        let mut replacement_failure = calls.register(registration("call", "s2")).await;
+        assert!(old_failure.await.is_err());
+        drop(old_guard);
+        assert!(calls.snapshot_for_session("s1").await.is_empty());
+        assert_eq!(calls.snapshot_for_session("s2").await.len(), 1);
+        assert!(matches!(
+            replacement_failure.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        calls.complete("call").await;
     }
 
     #[tokio::test]
     async fn completion_guard_tolerates_prior_removal() {
         let calls = NatsInFlightCalls::default();
         for unavailable in [false, true] {
-            let _failure = calls.register(registration("call", "s1")).await;
-            let guard = calls.completion_guard("call");
+            let (_failure, guard) = calls
+                .register_guarded(registration("call", "s1"), || {
+                    panic!("a removed call must not be cancelled again")
+                })
+                .await;
             if unavailable {
                 calls.fail_server_unavailable("srv", "stopped").await;
             } else {

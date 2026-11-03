@@ -37,10 +37,18 @@ impl NatsToolProvider {
             server: server.to_owned(),
             control_subject: self.instance_id.control_subject(),
         };
-        let session = request.parent_session_id.clone().unwrap_or_default();
+        // Match InvocationExecution::claim for calls without a parent session.
+        let session = request
+            .parent_session_id
+            .clone()
+            .unwrap_or_else(|| request.call_id.clone());
         let client = self.client.clone();
         let cancellation_id = Uuid::now_v7().to_string();
-        tokio::spawn(async move {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            log::debug!("tool cancel not published: no current Tokio runtime");
+            return;
+        };
+        runtime.spawn(async move {
             if let Err(error) =
                 publish_tool_cancel(&client, &target, &session, &cancellation_id).await
             {

@@ -402,16 +402,22 @@ impl NatsToolProvider {
             request,
             durable,
         } = pending;
-        let mut supervised_failure = self
+        let (mut supervised_failure, _completion) = self
             .in_flight
-            .register(InFlightRegistration {
-                call_id: call_id.clone(),
-                server: server.clone(),
-                session_id: durable.parent_session_id.clone().unwrap_or_default(),
-                control_subject: self.instance_id.control_subject(),
-            })
+            .register_guarded(
+                InFlightRegistration {
+                    call_id: call_id.clone(),
+                    server: server.clone(),
+                    session_id: durable.parent_session_id.clone().unwrap_or_default(),
+                    control_subject: self.instance_id.control_subject(),
+                },
+                || {
+                    if !abort.aborted_failover() {
+                        self.schedule_cancel(&durable, &server);
+                    }
+                },
+            )
             .await;
-        let _completion = self.in_flight.completion_guard(&call_id);
         let request = harnx_nats_common::rpc::request(&self.client, subject, request);
         tokio::pin!(request);
         let response = tokio::select! {
