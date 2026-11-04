@@ -96,103 +96,169 @@ pub(super) struct InnerMedia {
     store: Option<Arc<dyn MediaStore>>,
 }
 
+#[derive(Clone, Copy)]
+enum Pass {
+    Validate,
+    Upload,
+}
+
 impl InnerMedia {
     pub(super) fn new(store: Option<Arc<dyn MediaStore>>) -> Self {
         Self { store }
     }
 
     pub(super) async fn prepare(&self, value: &mut Value) -> Result<()> {
-        // Use the same image-reference validation as prepare_tool_result_images,
-        // without its diagnostic original_output copy (which can contain base64).
+        // Keep image-reference validation, but never retain a diagnostic copy
+        // of the original output, which can contain inline bytes.
         harnx_engine::media::extract_image_parts(value)
             .map_err(|_| invalid("invalid tool image attachment reference"))?;
-        self.rewrite(value, 0).await?;
+        // Both passes use the same walk, including JSON text mirrors. Reject
+        // invalid later items before any upload or mutation of the result.
+        self.rewrite(value, 0, Pass::Validate).await?;
+        self.rewrite(value, 0, Pass::Upload).await?;
         Ok(())
     }
 
-    fn rewrite<'a>(&'a self, value: &'a mut Value, depth: usize) -> BoxFuture<'a, Result<bool>> {
+    fn rewrite<'a>(
+        &'a self,
+        value: &'a mut Value,
+        depth: usize,
+        pass: Pass,
+    ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
             anyhow::ensure!(
                 depth < 128,
                 InvalidMedia("tool media nesting limit exceeded")
             );
             if let Some(data_url) = inline_data_url(value)? {
-                let attachment = self.externalize(&data_url).await?;
-                let path = attachment_path(&attachment.cid)?;
-                let text = format!("{} path={}", attachment.marker(), path.display());
-                *value = json!({
-                    "type": "text", "text": text, "uri": attachment.cid,
-                    "mimeType": attachment.mime_type, "size": attachment.size, "path": path,
-                });
-                return Ok(true);
+                return self.rewrite_block(value, &data_url, pass).await;
             }
             match value {
-                Value::String(text) if text.starts_with("data:") => {
-                    let attachment = self.externalize(text).await?;
-                    *text = format!(
-                        "{} path={}",
-                        attachment.marker(),
-                        attachment_path(&attachment.cid)?.display()
-                    );
-                    Ok(true)
-                }
-                Value::String(text) => {
-                    // MCP commonly duplicates structuredContent as a JSON text
-                    // block. Leaving that mirror untouched would leak the bytes.
-                    let trimmed = text.trim_start();
-                    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                        if let Ok(mut mirrored) = serde_json::from_str::<Value>(text) {
-                            if self.rewrite(&mut mirrored, depth + 1).await? {
-                                *text = mirrored.to_string();
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    Ok(false)
-                }
+                Value::String(text) => self.rewrite_text(text, depth, pass).await,
                 Value::Object(object) => {
-                    let mut changed = false;
-                    for child in object.values_mut() {
-                        changed |= self.rewrite(child, depth + 1).await?;
-                    }
-                    Ok(changed)
+                    self.rewrite_children(media_children(object), depth, pass)
+                        .await
                 }
-                Value::Array(items) => {
-                    let mut changed = false;
-                    for child in items {
-                        changed |= self.rewrite(child, depth + 1).await?;
-                    }
-                    Ok(changed)
-                }
+                Value::Array(items) => self.rewrite_children(items.iter_mut(), depth, pass).await,
                 _ => Ok(false),
             }
         })
     }
 
-    async fn externalize(&self, data_url: &str) -> Result<ExternalizedAttachment> {
-        let max_bytes = harnx_script::FsLimits::default().max_file_size;
-        let encoded = data_url
-            .split_once(";base64,")
-            .map(|(_, encoded)| encoded)
-            .ok_or_else(|| invalid("inline media requires a base64 data URI"))?;
-        anyhow::ensure!(
-            encoded.len() as u64 <= max_bytes.div_ceil(3) * 4,
-            InvalidMedia("inline media exceeds the attachment file-size limit")
-        );
-        let (_, bytes) = crate::nats_attachments::parse_data_url(data_url)
-            .map_err(|_| invalid("invalid inline media data URI or base64"))?;
-        anyhow::ensure!(
-            bytes.len() as u64 <= max_bytes,
-            InvalidMedia("inline media exceeds the attachment file-size limit")
-        );
-        drop(bytes);
-        self.store
+    async fn rewrite_children<'a>(
+        &self,
+        children: impl Iterator<Item = &'a mut Value> + Send,
+        depth: usize,
+        pass: Pass,
+    ) -> Result<bool> {
+        let mut changed = false;
+        for child in children {
+            changed |= self.rewrite(child, depth + 1, pass).await?;
+        }
+        Ok(changed)
+    }
+
+    async fn rewrite_block(&self, value: &mut Value, data_url: &str, pass: Pass) -> Result<bool> {
+        let Some(attachment) = self.externalize(data_url, pass).await? else {
+            return Ok(false);
+        };
+        let path = attachment_path(&attachment.cid)?;
+        let text = format!("{} path={}", attachment.marker(), path.display());
+        *value = json!({
+            "type": "text", "text": text, "uri": attachment.cid,
+            "mimeType": attachment.mime_type, "size": attachment.size, "path": path,
+        });
+        Ok(true)
+    }
+
+    async fn rewrite_text(&self, text: &mut String, depth: usize, pass: Pass) -> Result<bool> {
+        if is_base64_data_uri(text) {
+            let Some(attachment) = self.externalize(text, pass).await? else {
+                return Ok(false);
+            };
+            *text = format!(
+                "{} path={}",
+                attachment.marker(),
+                attachment_path(&attachment.cid)?.display()
+            );
+            return Ok(true);
+        }
+        // MCP can mirror structuredContent as JSON text. Parse typed media
+        // even when the JSON contains no data: URI, such as an image block.
+        let Some(mut mirrored) = json_mirror(text) else {
+            return Ok(false);
+        };
+        let changed = self.rewrite(&mut mirrored, depth + 1, pass).await?;
+        if changed {
+            *text = mirrored.to_string();
+        }
+        Ok(changed)
+    }
+
+    async fn externalize(
+        &self,
+        data_url: &str,
+        pass: Pass,
+    ) -> Result<Option<ExternalizedAttachment>> {
+        if matches!(pass, Pass::Validate) {
+            validate_data_url(data_url)?;
+            return Ok(None);
+        }
+        let attachment = self
+            .store
             .as_ref()
             .context("attachment storage unavailable for inline script media")?
             .store(data_url)
             .await
-            .context("externalize inner tool media")
+            .context("externalize inner tool media")?;
+        Ok(Some(attachment))
     }
+}
+
+fn validate_data_url(data_url: &str) -> Result<()> {
+    let max_bytes = harnx_script::FsLimits::default().max_file_size;
+    let encoded = data_url
+        .split_once(";base64,")
+        .map(|(_, encoded)| encoded)
+        .ok_or_else(|| invalid("inline media requires a base64 data URI"))?;
+    anyhow::ensure!(
+        encoded.len() as u64 <= max_bytes.div_ceil(3) * 4,
+        InvalidMedia("inline media exceeds the attachment file-size limit")
+    );
+    let (_, bytes) = crate::nats_attachments::parse_data_url(data_url)
+        .map_err(|_| invalid("invalid inline media data URI or base64"))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= max_bytes,
+        InvalidMedia("inline media exceeds the attachment file-size limit")
+    );
+    Ok(())
+}
+
+fn is_base64_data_uri(text: &str) -> bool {
+    text.strip_prefix("data:")
+        .is_some_and(|body| body.contains(";base64,"))
+}
+
+fn json_mirror(text: &str) -> Option<Value> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return serde_json::from_str(text).ok();
+    }
+    None
+}
+
+fn media_children(object: &mut serde_json::Map<String, Value>) -> impl Iterator<Item = &mut Value> {
+    let text_block = object.get("type").and_then(Value::as_str) == Some("text");
+    object.iter_mut().filter_map(move |(key, child)| {
+        if text_block && key == "text" {
+            // Literal text is not an inline attachment. JSON text mirrors still
+            // pass through the walker to find typed image/audio/resource blocks.
+            if child.as_str().is_some_and(|text| text.starts_with("data:")) {
+                return None;
+            }
+        }
+        Some(child)
+    })
 }
 
 fn inline_data_url(value: &Value) -> Result<Option<String>> {
@@ -252,13 +318,13 @@ fn inline_data_url(value: &Value) -> Result<Option<String>> {
                 Ok(resource
                     .get("uri")
                     .and_then(Value::as_str)
-                    .filter(|uri| uri.starts_with("data:"))
+                    .filter(|uri| is_base64_data_uri(uri))
                     .map(str::to_owned))
             }
         }
         "resource_link" => {
             if let Some(uri) = value.get("uri").and_then(Value::as_str) {
-                if uri.starts_with("data:") {
+                if is_base64_data_uri(uri) {
                     return Ok(Some(uri.to_owned()));
                 }
                 if uri.starts_with("cid:media:") {

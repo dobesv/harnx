@@ -85,12 +85,19 @@ fn mcp_domain_errors_are_distinct_from_raw_status_like_data() {
         json!({"is_error":true,"error":"business data"}),
         json!({"blocked_by_hook":true}),
         json!({"content":[],"isError":false}),
+        json!({"content":[{"type":"text","text":"boom"}]}),
     ] {
         assert!(!is_mcp_error(&value), "{value}");
     }
-    let domain = json!({"content":[{"type":"text","text":"file missing"}],"isError":true});
+    let domain = json!({
+        "content": [
+            {"type":"text","text":"file missing"},
+            {"type":"text","text":"and this too"},
+        ],
+        "isError": true,
+    });
     assert!(is_mcp_error(&domain));
-    assert_eq!(error_text(&domain), "file missing");
+    assert_eq!(error_text(&domain), "file missing\nand this too");
     assert_eq!(
         error_text(&json!({"content":[],"isError":true})),
         "tool reported an error"

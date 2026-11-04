@@ -1,3 +1,5 @@
+mod review;
+
 use std::{
     collections::{HashMap, HashSet},
     io,
