@@ -797,6 +797,10 @@ fn light_mode_uses_tmpdir_when_tmp_is_read_only() {
         &[]
     } else if skips_without_bubblewrap() {
         return;
+    } else if Path::new(env!("CARGO_TARGET_TMPDIR")).starts_with("/tmp") {
+        // The test's TMPDIR is made there, and would be read-only too.
+        eprintln!("skipping: the target directory is under /tmp");
+        return;
     } else {
         &[
             "bwrap",
@@ -807,6 +811,8 @@ fn light_mode_uses_tmpdir_when_tmp_is_read_only() {
             "--ro-bind",
             "/tmp",
             "/tmp",
+            "--dev",
+            "/dev",
             "--",
         ]
     };
