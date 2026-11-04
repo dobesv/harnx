@@ -40,6 +40,7 @@ fn info(snapshot: HistorySnapshot) -> SessionInfo {
             can_cancel: false,
             supports_snapshot: true,
         },
+        last_turn: None,
     }
 }
 

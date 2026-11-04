@@ -840,6 +840,10 @@ impl SessionActor {
                 can_cancel: true,
                 supports_snapshot: true,
             },
+            last_turn: self
+                .log_entries
+                .as_deref()
+                .and_then(crate::last_turn::last_turn),
         }
     }
 

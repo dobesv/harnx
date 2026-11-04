@@ -224,7 +224,8 @@ prompt. The body's **last supported message** selects the mode:
 - **Promptless join** (no non-empty trailing user message): hydrates with a
   synthetic `RUN_STARTED` → `session_attach_boundary` → `session_compaction` → `MESSAGES_SNAPSHOT`.
   For an idle session it appends
-  a synthetic `RUN_FINISHED` and closes; for a running or interrupted session it
+  a synthetic `RUN_FINISHED` and closes, whatever the last turn's outcome
+  (`session/get`'s `last_turn` reports it); for a running or interrupted session it
   follows that run's live events through the real terminal event.
 
 Passive clients keep a separate `GET .../events` connection open. Each
@@ -249,7 +250,7 @@ Same canonical session URL, negotiated into programmatic control.
   ```json
   { "jsonrpc": "2.0", "id": 1, "method": "session/get" }
   ```
-  **Result:** `{ "state": { … }, "history_snapshot": [...], "compaction": { … }, "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }`
+  **Result:** `{ "state": { … }, "history_snapshot": [...], "compaction": { … }, "last_turn": { … }, "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }`
   `compaction` is optional and omitted until the session has been compacted. See
   [Compacted history snapshots](#compacted-history-snapshots) for its shape.
 
@@ -268,6 +269,25 @@ Same canonical session URL, negotiated into programmatic control.
   - `{ "status": "awaiting_approval", "pending_interrupts": { … } }` — the turn
     is parked at an approval gate. It is not interrupted; the client's next move
     is a decision, not another cancel.
+
+  `last_turn` says how the session's most recent turn ended, from the last
+  `turn_end`, `error` or `cancel` entry in its log. It is omitted until a turn
+  has ended, and it stays while a later turn runs. A client that stopped
+  following a run needs it: `state` reads `idle` after any outcome, and
+  `history_snapshot` holds messages only, so a turn that failed partway looks
+  like one that finished with a short reply.
+  - `{ "outcome": "completed", "seq": 41, "ended_at": "…" }`
+  - `{ "outcome": "error", "seq": 41, "ended_at": "…", "message": "…" }` — the
+    worker gave up on the turn, for the reason in `message`.
+  - `{ "outcome": "timed_out", "seq": 41, "ended_at": "…", "deadline": "…" }` —
+    the run reached its time limit.
+  - `{ "outcome": "interrupted", "seq": 41, "ended_at": "…", "requested_by": "…" }`
+    — a user, parent session or frontend interrupted the turn, the same
+    `cancel` that makes `state` read `interrupted`. `requested_by` is omitted
+    when the cancel didn't name one.
+
+  `seq` is the log sequence of that entry. `ended_at` is omitted for entries
+  written without a timestamp.
 - **`session/history`**: Reads archived transcript pages without changing the session or model context. Takes `before_compaction` or inclusive `from_seq`/`to_seq`, plus optional `limit`; subsequent pages take an opaque `cursor`. See [History paging](#history-paging).
   ```json
   { "jsonrpc": "2.0", "id": 8, "method": "session/history", "params": { "before_compaction": 15, "limit": 2 } }

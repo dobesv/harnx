@@ -258,6 +258,9 @@ pub(crate) fn session_get_result(info: &SessionInfo, persistence: &str) -> Value
     if let Some(compaction) = &info.compaction {
         result["compaction"] = json!(compaction);
     }
+    if let Some(last_turn) = &info.last_turn {
+        result["last_turn"] = json!(last_turn);
+    }
     result
 }
 
