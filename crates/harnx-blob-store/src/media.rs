@@ -90,6 +90,21 @@ async fn put_media_chunked(
     Ok(())
 }
 
+/// Object size without downloading its body. Returns `None` when the object is
+/// missing. Lets `stat`/`exists` probes stay cheap instead of consuming a
+/// reader's cache or download budget.
+pub async fn media_size(store: &object_store::ObjectStore, url: &CidUrl) -> Result<Option<u64>> {
+    let key = url.kv_key();
+    match store.info(&key).await {
+        Ok(info) if info.deleted => Ok(None),
+        Ok(info) => Ok(Some(info.size as u64)),
+        Err(error) if error.kind() == object_store::InfoErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(anyhow::Error::from(error)).with_context(|| format!("stat media blob '{}'", key))
+        }
+    }
+}
+
 /// Get a media blob from the object store.
 ///
 /// Returns the bytes and the MIME type, or None if not found.

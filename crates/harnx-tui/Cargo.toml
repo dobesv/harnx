@@ -51,7 +51,7 @@ uuid = { workspace = true }
 crossterm = { workspace = true, features = ["use-dev-tty"] }
 
 [dev-dependencies]
-insta = { version = "1", features = ["yaml"] }
+insta = { workspace = true, features = ["yaml"] }
 pretty_assertions = "1.4.0"
 rand = "0.10.0"
 tokio-test = "0.4"

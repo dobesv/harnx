@@ -24,6 +24,8 @@ use serde_json::{json, Value};
 use super::*;
 use crate::bash_inner::MAX_RETAINED_TRACE_ENTRIES;
 
+mod python;
+
 /// `ToolError` is not `Debug`, so tests unwrap results through these helpers
 /// instead of `expect`/`expect_err`.
 fn ok(result: Result<ToolProviderOutput, ToolError>) -> ToolProviderOutput {

@@ -109,7 +109,7 @@ arboard = { workspace = true }
 [dev-dependencies]
 async-nats = { workspace = true }
 harnx-test-bins = { path = "../harnx-test-bins" }
-insta = { version = "1", features = ["yaml"] }
+insta = { workspace = true, features = ["yaml"] }
 pretty_assertions = "1.4.0"
 rand = "0.10.0"
 tokio-test = "0.4"

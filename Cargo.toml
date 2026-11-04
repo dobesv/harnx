@@ -98,6 +98,7 @@ eventsource-stream = "0.2.3"
 futures-util = "0.3.29"
 inquire = "0.9.0"
 is-terminal = "0.4.9"
+insta = "1"
 ratatui = { version = "0.30.1", features = ["crossterm_0_29", "unstable-rendered-line-info"] }
 regex = "1"
 serde = { version = "1.0.152", features = ["derive"] }

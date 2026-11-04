@@ -9,7 +9,7 @@ description = "In-process script backend with registered async commands and a vi
 
 [dependencies]
 async-trait = { workspace = true }
-bashkit = { workspace = true }
+bashkit = { workspace = true, features = ["python"] }
 globset = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -17,4 +17,5 @@ tokio = { workspace = true, features = ["macros", "sync", "time"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+insta = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

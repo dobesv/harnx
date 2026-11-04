@@ -4,7 +4,7 @@ use super::*;
 use crate::bash_provider::{BashEvalContextSlot, BashProvider};
 use base64::Engine;
 use harnx_blob_store::{
-    media::{ensure_attachments_bucket, get_media, put_media},
+    media::{ensure_attachments_bucket, get_media, optional_attachments_bucket, put_media},
     media_cid_url,
 };
 use harnx_core::{
@@ -152,12 +152,16 @@ async fn nats_fetcher_validates_cids_preserves_missing_errors_and_bounds_blob_do
         fetcher.fetch(&url.to_string(), 3).await.unwrap_err().kind(),
         io::ErrorKind::NotFound
     );
+    // Metadata-only stat: missing bucket or object is Ok(None) per the trait
+    // contract, and never provisions storage. Fetch still reports NotFound.
+    assert_eq!(fetcher.size(&url.to_string()).await?, None);
     assert!(
         optional_attachments_bucket(&js).await?.is_none(),
         "reads must not provision storage"
     );
     let store = ensure_attachments_bucket(&js, 1).await?;
     put_media(&store, &url, &[0, 255, 1], "application/octet-stream").await?;
+    assert_eq!(fetcher.size(&url.to_string()).await?, Some(3));
     assert!(fetcher
         .fetch(&url.to_string(), 2)
         .await
@@ -165,6 +169,16 @@ async fn nats_fetcher_validates_cids_preserves_missing_errors_and_bounds_blob_do
         .to_string()
         .contains("blob too large: 3 bytes exceeds limit of 2 bytes"));
     assert_eq!(fetcher.fetch(&url.to_string(), 3).await?, [0, 255, 1]);
+    // Sizes are memoized per CID: even after the object disappears, a repeat
+    // probe answers from the memo instead of a broker round trip.
+    store.delete(url.kv_key()).await?;
+    assert_eq!(fetcher.size(&url.to_string()).await?, Some(3));
+    // A missing object under an existing bucket is Ok(None) for size.
+    let missing = media_cid_url(
+        &SessionRef::new(Some("agent".into()), "attach2".into())?,
+        HASH,
+    );
+    assert_eq!(fetcher.size(&missing.to_string()).await?, None);
     Ok(())
 }
 
@@ -186,4 +200,58 @@ async fn mount_is_empty_and_fails_clearly_without_a_broker() {
             .contains("attachment storage unavailable"),
         "{result}"
     );
+}
+
+#[tokio::test]
+async fn python_heredoc_reads_tmp_and_real_nats_attachment() -> anyhow::Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let store = ensure_attachments_bucket(&js, 1).await?;
+    let url = media_cid_url(
+        &SessionRef::new(Some("pantheon/atlas".into()), "python1".into())?,
+        HASH,
+    );
+    let png = base64::engine::general_purpose::STANDARD.decode(PNG_BASE64)?;
+    put_media(&store, &url, &png, "image/png").await?;
+    let (provider, _ctx) = provider(Some(fetcher(js)));
+    let path = harnx_script::fs_attachments::attachment_path(&url.to_string())?;
+    let result = run(&provider, format!(
+        "echo temporary > /tmp/input.txt\npython3 - <<'EOF'\nfrom pathlib import Path\nprint(open('/tmp/input.txt').read(), end='')\ndata = Path('{}').read_bytes()\nprint(len(data))\nprint(list(data[:8]))\nEOF", path.display()
+    )).await;
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(
+        result["stdout"],
+        format!(
+            "temporary\n{}\n[137, 80, 78, 71, 13, 10, 26, 10]\n",
+            png.len()
+        )
+    );
+    assert!(result["trace"].as_array().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn nats_metadata_miss_sees_later_upload_and_deleted_blobs_are_missing() -> anyhow::Result<()>
+{
+    harnx_core::require_nextest();
+    let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let store = ensure_attachments_bucket(&js, 1).await?;
+    let url = media_cid_url(
+        &SessionRef::new(Some("agent".into()), "late01".into())?,
+        HASH,
+    );
+    let cid = url.to_string();
+    let reader = fetcher(js.clone());
+    assert_eq!(reader.size(&cid).await?, None);
+    put_media(&store, &url, &[0, 255, 1], "application/octet-stream").await?;
+    assert_eq!(reader.size(&cid).await?, Some(3));
+    store.delete(url.kv_key()).await?;
+    assert_eq!(fetcher(js).size(&cid).await?, None);
+    Ok(())
 }

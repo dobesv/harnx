@@ -2,11 +2,13 @@
 //!
 //! Each run starts in a fresh, in-memory `/tmp`, with `set -e` enabled. Scripts
 //! can opt out with `set +e`. Only registered commands can reach host services;
-//! the interpreter has no host filesystem, network, or Python capabilities.
+//! Bash and embedded Monty Python have no host filesystem or network access.
+//! Python can process virtual files but cannot call registered tool commands.
 
 mod bashkit_backend;
 pub mod cli_map;
 pub mod commands;
+pub mod description;
 pub mod fs_attachments;
 pub mod help;
 mod schema;
@@ -30,6 +32,9 @@ pub struct ScriptLimits {
     pub max_commands: usize,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
+    /// Monty heap and collected print-output ceiling per Python invocation.
+    /// Defaults to 64 MiB. Separate from BashKit's VFS and intermediate budgets.
+    pub max_python_memory_bytes: usize,
 }
 
 impl Default for ScriptLimits {
@@ -39,6 +44,7 @@ impl Default for ScriptLimits {
             max_commands: 10_000,
             max_stdout_bytes: 1_048_576,
             max_stderr_bytes: 1_048_576,
+            max_python_memory_bytes: 64 * 1024 * 1024,
         }
     }
 }
