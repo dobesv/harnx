@@ -36,7 +36,7 @@ fn assert_payload_rejection(outcome: InnerOutcome, bytes: usize) {
     assert_eq!(
         reason,
         format!(
-            "tool 'tool_a' request is {bytes} bytes, above the broker's {MAX_BYTES} byte maximum payload"
+            "tool 'tool_a' request is {bytes} bytes, above the {MAX_BYTES} byte per-request limit (broker max_payload minus the journal envelope margin)"
         )
     );
 }

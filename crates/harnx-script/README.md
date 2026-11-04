@@ -70,6 +70,75 @@ in `ReadOnlyFs`. Caller-supplied mounts and commands are capabilities: only pass
 implementations whose host access is intended. `BashKitBackend::builtin_names()`
 lists the compiled-in commands, excluding caller registrations.
 
+## Read-only attachments
+
+`fs_attachments::AttachmentFs::new(Arc<dyn AttachmentFetcher>).mount()` supplies
+an `FsMount` at `/attachments`. Create a fresh filesystem for each script run;
+`BashProvider` does this automatically. The fetcher stays runtime-owned, so this
+crate has no NATS dependency. Its async `fetch(cid, max_bytes)` validates media CID
+syntax, enforces the caller's access rules and bounds the download before allocating
+the full body. The filesystem also checks the returned length.
+
+Paths contain the **full media CID**, without an extra encoding layer:
+`/attachments/cid:media:<encoded-agent>/<session-id>/<sha256>`. BashKit accepts the
+colons and slashes. Keep the CID's existing agent encoding (`pantheon%2Fatlas`,
+for example) unchanged; don't decode `%2F` into another directory. Given a media
+CID in `cid`, `base64 -w0 "/attachments/$cid" | wc -c` counts its base64 bytes.
+`fs_attachments::attachment_path(cid)` builds this path and checks its path shape;
+the fetcher remains responsible for CID validation and authorization. Plan CIDs
+aren't mounted.
+
+- Files load on the first read or file metadata lookup. Successful bytes are
+  cached for that invocation; errors aren't cached, so a later read can retry.
+  Concurrent misses serialize to avoid duplicate downloads and unbounded pending
+  buffers. Dropping a run drops pending fetch futures, with no detached tasks.
+- Directory listings are always empty, even after successful reads. The root and
+  CID parent paths are virtual directories, not a view of object-store keys.
+  Scripts must already know the complete CID; globs cannot discover attachments.
+- Mutations fail with `EROFS: attachment filesystem is read-only`. Copying bytes
+  into `/tmp` is allowed. Missing CIDs report `attachment not found: <cid>`.
+- Default limits match BashKit: 10,000,000 bytes per attachment, 100,000,000 cached
+  bytes and 10,000 cached files, plus its path limits. Oversized files fail; they
+  aren't truncated. `AttachmentFs::with_limits` changes these limits for an
+  embedder. This is a separate mount budget from the writable root VFS budget.
+- Runtime reads use the same broker connection/credentials as the round's tools,
+  without creating buckets. Access matches current `attachment_read`: canonical,
+  explicit media CIDs may refer to another session. The CID owner determines its
+  storage key, **not** a same-session ACL. The mount doesn't enumerate storage or
+  add a bypass around broker permissions. If the round has no NATS connection,
+  listings still work and reads report that attachment storage is unavailable.
+
+### Inner tool media
+
+Runtime externalizes inline images, audio and embedded resource bodies before
+returning an inner result to a script. It uses the round's NATS connection and
+parent agent/session identity. Uploads finish before the command returns, so the
+next command can read the exact bytes through `/attachments` without waiting for
+round-end session synchronization. Inner media doesn't create nested transcript
+rows or automatically return an image from the outer `bash` call.
+
+Text output contains `[attachment: cid:media:… (mime, size)] path=/attachments/<full-cid>`.
+In `-o json` output, each inline media block becomes a text block with `text`,
+`uri`, `mimeType`, decoded `size` and `path` fields. For an MCP image result:
+
+```bash
+path=$(screenshot -o json | jq -r '.content[0].path')
+wc -c < "$path"
+```
+
+The runtime also replaces inline media in `structuredContent`, recoverable partial
+results and JSON text mirrors of structured results. Output format selection
+can't bypass externalization. Existing non-inline links aren't downloaded, and
+ordinary non-media values keep their shape. Scripts can still print base64
+explicitly with `base64 -w0 "$path"`; externalization removes automatic inline
+payloads, not deliberately generated script output.
+
+Malformed media and files over the 10,000,000-byte attachment limit are inner
+errors. Storage failures (including missing NATS or a missing session identity) stop
+the script, even under `set +e`; they never fall back to returning inline bytes.
+Media upload remains inside the inner-call concurrency cap. Cancellation drops
+pending upload futures, but it can't undo an upload already accepted by NATS.
+
 ## Schema-derived arguments and help
 
 `cli_map::parse_args(schema, argv, stdin) -> Result<Value, UsageError>` takes

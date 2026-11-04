@@ -15,7 +15,78 @@ pub(super) struct ToolCallInput<'a> {
     pub run_context: Option<&'a crate::nats_session_metadata::RunLimitsRecord>,
 }
 
+/// Broker `max_payload` minus the envelope margin, saturating at zero.
+/// Kept as a function so the margin arithmetic itself is unit-testable
+/// (PR3 round-2 review R1).
+fn script_effective_max_bytes(server_max_payload: usize) -> usize {
+    server_max_payload.saturating_sub(JOURNAL_ENVELOPE_MARGIN_BYTES)
+}
+
+/// The `ToolRequest` the pre-flight probe serializes. A free function so
+/// tests can assert it matches the shape `prepare_request_with_progress`
+/// builds for a real inner call (PR3 round-2 review R1).
+fn probe_request(
+    tool: &str,
+    args: &Value,
+    parent_session_id: &Option<String>,
+    parent_agent: &Option<String>,
+    parent_local_session_id: &Option<String>,
+    run_context: &Option<crate::nats_session_metadata::RunLimitsRecord>,
+) -> ToolRequest {
+    let call_id = Uuid::new_v4().to_string();
+    ToolRequest {
+        run_context: run_context
+            .as_ref()
+            .map(|record| harnx_toolset::AutonomousRunContext {
+                snapshot: serde_json::to_value(record).expect("run limits serialize"),
+                started_at_ms: chrono::Utc::now()
+                    .timestamp_millis()
+                    .try_into()
+                    .expect("current UTC time is positive"),
+            }),
+        replay: None,
+        operation_id: call_id.clone(),
+        tool: tool.to_string(),
+        args: args.clone(),
+        parent_session_id: parent_session_id.clone(),
+        parent_agent: parent_agent.clone(),
+        parent_local_session_id: parent_local_session_id.clone(),
+        // Real inner calls pass their call id through the fork, so the probe
+        // must count it too; `tool_round` only affects size by its digit
+        // count.
+        call_id: call_id.clone(),
+        tool_call_id: Some(call_id),
+        tool_round: Some(1),
+        capabilities: BTreeSet::from([
+            EXECUTION_CONTEXT_NAMESPACE.to_string(),
+            CAPABILITY_TOOL_PROGRESS.to_string(),
+        ]),
+    }
+}
+
 impl NatsToolProvider {
+    /// Attachment reads use this round's broker and credentials, not a new
+    /// connection or a process-global store. Constructing the fetcher does no I/O.
+    pub(crate) fn script_attachment_fetcher(
+        &self,
+    ) -> std::sync::Arc<dyn harnx_script::fs_attachments::AttachmentFetcher> {
+        crate::bash_provider::attachments::fetcher(async_nats::jetstream::new(self.client.clone()))
+    }
+
+    /// Capture the same parent identity and replica policy used for tool requests.
+    pub(crate) fn script_media_store(
+        &self,
+    ) -> std::sync::Arc<dyn crate::bash_inner::media::MediaStore> {
+        let owner = self.parent_local_session_id.as_ref().and_then(|session| {
+            harnx_core::cid_url::SessionRef::new(self.parent_agent.clone(), session.clone()).ok()
+        });
+        crate::bash_inner::media::nats_store(
+            async_nats::jetstream::new(self.client.clone()),
+            owner,
+            self.journal_replicas,
+        )
+    }
+
     /// Script-mode `bash` pre-flight (T3.4): real broker `max_payload` plus a
     /// probe that serializes the exact `ToolRequest` shape this module
     /// publishes, so inner calls fail with a clear recoverable error before
@@ -33,45 +104,20 @@ impl NatsToolProvider {
         // the script-facing tool name, while real dispatch resolves the
         // route's raw_name — the 1 KiB margin covers that delta and the full
         // header set with generous slack (PR3 review F12).
-        let max_bytes = self
-            .client
-            .server_info()
-            .max_payload
-            .saturating_sub(JOURNAL_ENVELOPE_MARGIN_BYTES);
+        let max_bytes = script_effective_max_bytes(self.client.server_info().max_payload);
         let parent_session_id = self.parent_session_id.clone();
         let parent_agent = self.parent_agent.clone();
         let parent_local_session_id = self.parent_local_session_id.clone();
         let run_context = self.run_context.clone();
         let request_size: crate::bash_inner::RequestSizeProbe = Arc::new(move |tool, args| {
-            let call_id = Uuid::new_v4().to_string();
-            let request = ToolRequest {
-                run_context: run_context.as_ref().map(|record| {
-                    harnx_toolset::AutonomousRunContext {
-                        snapshot: serde_json::to_value(record).expect("run limits serialize"),
-                        started_at_ms: chrono::Utc::now()
-                            .timestamp_millis()
-                            .try_into()
-                            .expect("current UTC time is positive"),
-                    }
-                }),
-                replay: None,
-                operation_id: call_id.clone(),
-                tool: tool.to_string(),
-                args: args.clone(),
-                parent_session_id: parent_session_id.clone(),
-                parent_agent: parent_agent.clone(),
-                parent_local_session_id: parent_local_session_id.clone(),
-                // Real inner calls pass their call id through the fork, so
-                // the probe must count it too; `tool_round` only affects
-                // size by its digit count.
-                call_id: call_id.clone(),
-                tool_call_id: Some(call_id),
-                tool_round: Some(1),
-                capabilities: BTreeSet::from([
-                    EXECUTION_CONTEXT_NAMESPACE.to_string(),
-                    CAPABILITY_TOOL_PROGRESS.to_string(),
-                ]),
-            };
+            let request = probe_request(
+                tool,
+                args,
+                &parent_session_id,
+                &parent_agent,
+                &parent_local_session_id,
+                &run_context,
+            );
             serde_json::to_vec(&request)
                 .expect("tool request serializes")
                 .len()
@@ -275,5 +321,74 @@ impl NatsToolProvider {
                 Err(ToolError::Fatal(anyhow!(interrupted)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    /// PR3 round-2 review R1: the pre-flight budget must leave the 1 KiB
+    /// envelope margin below the broker's advertised `max_payload`, and
+    /// must never go negative on tiny brokers.
+    #[test]
+    fn envelope_margin_leaves_slack_below_broker_max() {
+        assert_eq!(JOURNAL_ENVELOPE_MARGIN_BYTES, 1024);
+        assert_eq!(
+            script_effective_max_bytes(8 * 1024 * 1024),
+            8 * 1024 * 1024 - 1024
+        );
+        assert_eq!(script_effective_max_bytes(512), 0, "saturates at zero");
+    }
+
+    /// PR3 round-2 review R1/R4: the probe serializes the exact `ToolRequest`
+    /// shape a real inner-call dispatch builds (`prepare_request_with_progress`)
+    /// — same ids, round, parents, and the full capability set so a
+    /// progress-enabled call is never undercounted.
+    #[test]
+    fn probe_request_matches_real_dispatch_shape() {
+        let parents = (
+            Some("session-1".to_string()),
+            Some("agent-a".to_string()),
+            Some("local-7".to_string()),
+        );
+        let request = probe_request(
+            "fs_read",
+            &serde_json::json!({"path": "a"}),
+            &parents.0,
+            &parents.1,
+            &parents.2,
+            &None,
+        );
+
+        assert_eq!(request.tool, "fs_read");
+        assert_eq!(request.args, serde_json::json!({"path": "a"}));
+        // Inner calls pass their call id through the fork: all three id
+        // fields carry it.
+        assert!(!request.call_id.is_empty());
+        assert_eq!(request.operation_id, request.call_id);
+        assert_eq!(
+            request.tool_call_id.as_deref(),
+            Some(request.call_id.as_str())
+        );
+        assert_eq!(request.tool_round, Some(1));
+        assert!(request.replay.is_none());
+        assert!(request.run_context.is_none());
+        assert_eq!(request.parent_session_id.as_deref(), Some("session-1"));
+        assert_eq!(request.parent_agent.as_deref(), Some("agent-a"));
+        assert_eq!(request.parent_local_session_id.as_deref(), Some("local-7"));
+        assert!(request.capabilities.contains(EXECUTION_CONTEXT_NAMESPACE));
+        assert!(request.capabilities.contains(CAPABILITY_TOOL_PROGRESS));
+
+        // The probe's serialized size tracks the real serialized request:
+        // bigger arguments mean a strictly bigger probe.
+        let size = |args: &Value| {
+            let request = probe_request("fs_read", args, &parents.0, &parents.1, &parents.2, &None);
+            serde_json::to_vec(&request).expect("serializes").len()
+        };
+        let small = serde_json::json!({"path": "a"});
+        let large = serde_json::json!({"path": "a", "extra": "x".repeat(4096)});
+        assert!(size(&large) > size(&small));
+        assert!(size(&large) >= serde_json::to_vec(&large).expect("serializes").len());
     }
 }

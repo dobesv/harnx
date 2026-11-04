@@ -17,9 +17,12 @@
 //! [`ToolEvalContext`] once with the parent `tool_round` (taken from the outer
 //! `ToolCallOrigin` at call time), captures the agent event sink once, and
 //! wraps every inner eval in [`with_agent_event_sink`] so events emitted from
-//! BashKit-spawned tasks reach the right session. Inner calls are not
-//! durably recorded; their trace lives only in the `bash` ToolOutput
-//! (plan decision, PR2 architecture).
+//! BashKit-spawned tasks reach the right session. Inner calls get no
+//! session-log rows of their own; the transcript records only the outer
+//! `bash` call and the inner trace lives in its ToolOutput (plan decision,
+//! PR2 architecture). The NATS invocation journal still records each inner
+//! request in full for retry and recovery — "no durable inner calls" refers
+//! to the session log, not to the journal.
 //!
 //! Progress aggregation lives in [`InnerProgressAggregator`]: it implements
 //! [`InnerCallObserver`] and turns child lifecycle into the outer `bash`
@@ -27,7 +30,7 @@
 //! BashProvider passes its own `Arc<dyn ToolProgress>` to it; the engine's
 //! `RuntimeToolProgress` coalesces the rest.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -35,14 +38,24 @@ use std::time::Instant;
 use harnx_core::abort::AbortSignal;
 use harnx_core::event::AgentEventSink;
 use harnx_core::sink::{current_agent_event_sink, with_agent_event_sink};
-use harnx_core::tool::{ToolCall, ToolProgress, ToolProvider, ToolResult, ToolUpdatePatch};
+use harnx_core::tool::{ToolCall, ToolProvider, ToolResult, ToolUpdatePatch};
 use harnx_engine::tool::{
     eval_inner_tool_call, EvaluatedInnerCall, InnerToolCallStatus, InnerToolEvalOptions,
     ToolApprovalRequiredError, ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn, WorkBoundary,
 };
+// Share MCP domain-error classification with the command layer so both
+// layers report the same failure and keep text from every error block.
+use harnx_script::commands::{error_text, is_mcp_error};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 
+pub(crate) mod media;
+mod progress;
+pub use progress::{
+    InnerProgressAggregator, AGGREGATOR_MAX_RUNNING_NAMES, AGGREGATOR_MAX_TRACE_LINES,
+};
+#[cfg(test)]
+use progress::{AGGREGATOR_MAX_MARKDOWN_BYTES, AGGREGATOR_MAX_TITLE_BYTES};
 mod script_adapter;
 pub use script_adapter::ScriptInnerExecutor;
 
@@ -73,20 +86,6 @@ const ARGS_SUMMARY_MAX_CHARS: usize = 120;
 /// edit distance, so short typos suggest and garbage does not.
 const MAX_SUGGESTION_EDIT_DISTANCE: usize = 2;
 
-/// Running tool names shown in the aggregated progress title before the
-/// remainder is collapsed to `+N`.
-pub const AGGREGATOR_MAX_RUNNING_NAMES: usize = 3;
-
-/// Trace lines kept in the aggregated progress markdown (the newest ones).
-pub const AGGREGATOR_MAX_TRACE_LINES: usize = 10;
-
-/// Title cap, mirroring `harnx_toolset::progress::TOOL_PROGRESS_MAX_STRING_BYTES`
-/// (that module is private, so the value is repeated here).
-const AGGREGATOR_MAX_TITLE_BYTES: usize = 4 * 1024;
-
-/// Markdown cap, mirroring `TOOL_PROGRESS_MAX_MARKDOWN_BYTES`.
-const AGGREGATOR_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
-
 /// Computes the serialized size of the NATS `ToolRequest` that dispatching
 /// `(tool, args)` would produce. The runtime wiring (T3.4) builds the real
 /// request — same fields as `nats_tool_provider/request.rs` — and serializes
@@ -110,7 +109,7 @@ impl PayloadLimit {
             return Err(CallRejection {
                 bytes: request_bytes as u64,
                 reason: format!(
-                    "tool '{tool}' request is {request_bytes} bytes, above the broker's {} byte maximum payload",
+                    "tool '{tool}' request is {request_bytes} bytes, above the {} byte per-request limit (broker max_payload minus the journal envelope margin)",
                     self.max_bytes
                 ),
             });
@@ -280,6 +279,7 @@ impl InnerCallExecutor {
 
         InnerCallRun {
             ctx,
+            media: None,
             sink: current_agent_event_sink(),
             allowed: Arc::clone(&self.allowed),
             max_calls: self.max_calls,
@@ -401,6 +401,7 @@ impl InnerTraceStatus {
 /// can be shared across the tasks BashKit spawns for `&`/`wait` pipelines.
 pub struct InnerCallRun {
     ctx: ToolEvalContext,
+    media: Option<media::InnerMedia>,
     sink: Option<Arc<dyn AgentEventSink>>,
     allowed: Arc<BTreeSet<String>>,
     max_calls: usize,
@@ -521,6 +522,9 @@ impl InnerCallRun {
             None => eval_inner_tool_call(&self.ctx, call, abort_signal).await,
         };
 
+        // Keep the concurrency permit and cancellation guard until durable
+        // media writes finish, so a completed command can read its path at once.
+        let evaluated = self.prepare_media(evaluated).await;
         let (outcome, status, bytes) = classify_evaluation(tool, evaluated);
 
         // Normal completion: disarm the guard, then record the final row.
@@ -624,10 +628,15 @@ impl InnerCallRun {
         // The retained window keeps only the newest entries, so the first
         // failure of the run can age out of the trace entirely (PR3 review
         // F13). Remember it separately; `failed_call` reports it even when
-        // its row is gone.
+        // its row is gone. Concurrent failures can complete out of order,
+        // so keep the one with the lowest `start_seq`, not the first to
+        // finish recording (PR3 round-2 review R10).
         if !matches!(status, InnerTraceStatus::Ok | InnerTraceStatus::Cancelled) {
             let mut first_failed = self.first_failed.lock().expect("first failure lock");
-            if first_failed.is_none() {
+            let replace = first_failed
+                .as_ref()
+                .is_none_or(|existing| entry.start_seq < existing.start_seq);
+            if replace {
                 *first_failed = Some(entry.clone());
             }
         }
@@ -662,139 +671,6 @@ impl Drop for CancelGuard<'_> {
             self.run.record_trace(start, InnerTraceStatus::Cancelled, 0);
         }
     }
-}
-
-/// Aggregates inner-call lifecycle into the outer `bash` tool's progress.
-///
-/// Title: `bash: <running tool names, max 3> (<done> done, <running> running)`.
-/// Markdown: the newest [`AGGREGATOR_MAX_TRACE_LINES`] trace lines. Each event
-/// emits one `ToolUpdatePatch` through the outer progress handle the
-/// BashProvider received in `call_tool_with_progress`; the engine's
-/// `RuntimeToolProgress` already coalesces those, so this adds no timer.
-///
-/// Child progress patch bodies (a child's own title/markdown) are NOT
-/// surfaced: the title already names running tools and nested child markdown
-/// would bloat the outer row. Only lifecycle counts and trace lines show.
-pub struct InnerProgressAggregator {
-    progress: Arc<dyn ToolProgress>,
-    state: Mutex<AggregatorState>,
-}
-
-#[derive(Default)]
-struct AggregatorState {
-    /// Running calls in start order: admission sequence → tool name.
-    running: BTreeMap<u64, String>,
-    /// call_id → admission sequence, to remove finished calls in O(1).
-    call_seqs: HashMap<String, u64>,
-    next_seq: u64,
-    done: usize,
-    /// Newest trace lines last; capped at [`AGGREGATOR_MAX_TRACE_LINES`].
-    lines: Vec<String>,
-}
-
-impl InnerProgressAggregator {
-    /// Wrap the outer `bash` tool's progress handle.
-    pub fn new(progress: Arc<dyn ToolProgress>) -> Self {
-        Self {
-            progress,
-            state: Mutex::new(AggregatorState::default()),
-        }
-    }
-
-    fn update_running(&self, mutate: impl FnOnce(&mut AggregatorState)) {
-        let patch = {
-            let mut state = self.state.lock().expect("aggregator state lock");
-            mutate(&mut state);
-            aggregated_patch(&state)
-        };
-        self.progress.update(patch);
-    }
-}
-
-impl InnerCallObserver for InnerProgressAggregator {
-    fn started(&self, call: &ToolCall, _args: &Value) {
-        // The engine assigns IDs before admission, so the Started emitter
-        // always sees one.
-        let call_id = call.id.clone().expect("admitted inner call has an ID");
-        let name = call.name.clone();
-        self.update_running(|state| {
-            let seq = state.next_seq;
-            state.next_seq += 1;
-            state.running.insert(seq, name);
-            state.call_seqs.insert(call_id, seq);
-        });
-    }
-
-    fn finished(&self, entry: &InnerTraceEntry) {
-        let line = entry.to_progress_line();
-        self.update_running(|state| {
-            // Pre-admission rejections never started; they count as done
-            // without ever having been running.
-            if let Some(seq) = state.call_seqs.remove(&entry.call_id) {
-                state.running.remove(&seq);
-            }
-            state.done += 1;
-            state.lines.push(line);
-            let overflow = state.lines.len().saturating_sub(AGGREGATOR_MAX_TRACE_LINES);
-            state.lines.drain(0..overflow);
-        });
-    }
-}
-
-/// Snapshot the aggregate state as one patch. Bounded defensively: the
-/// trace summary stays far below the toolset limits, but a pathological tool
-/// name or args summary must not push the outer row over them.
-fn aggregated_patch(state: &AggregatorState) -> ToolUpdatePatch {
-    ToolUpdatePatch {
-        title: Some(truncate_bytes(
-            aggregated_title(state),
-            AGGREGATOR_MAX_TITLE_BYTES,
-        )),
-        // Omit markdown while no call has finished yet, so the patch doesn't
-        // clear the outer row's initial content.
-        markdown: (!state.lines.is_empty())
-            .then(|| truncate_bytes(state.lines.join("\n"), AGGREGATOR_MAX_MARKDOWN_BYTES)),
-        ..ToolUpdatePatch::default()
-    }
-}
-
-fn aggregated_title(state: &AggregatorState) -> String {
-    let mut title = String::from("bash:");
-    let names: Vec<&str> = state.running.values().map(String::as_str).collect();
-    if !names.is_empty() {
-        title.push(' ');
-        title.push_str(
-            &names
-                .iter()
-                .take(AGGREGATOR_MAX_RUNNING_NAMES)
-                .copied()
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        if names.len() > AGGREGATOR_MAX_RUNNING_NAMES {
-            title.push_str(&format!(" +{}", names.len() - AGGREGATOR_MAX_RUNNING_NAMES));
-        }
-    }
-    title.push_str(&format!(
-        " ({} done, {} running)",
-        state.done,
-        state.running.len()
-    ));
-    title
-}
-
-/// Truncate at a UTF-8 character boundary so the byte cap can't split a
-/// multi-byte character.
-fn truncate_bytes(mut text: String, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -847,41 +723,6 @@ fn value_shape(value: &Value) -> String {
         Value::Array(items) => format!("array({})", items.len()),
         Value::Object(map) => format!("object({})", map.len()),
     }
-}
-
-/// MCP domain error: a successful transport whose tool reported failure
-/// through `content` blocks plus `isError: true` (the equivalent of HTTP 200
-/// with an error body). Mirrors `harnx_script::commands::render::is_mcp_error`,
-/// which is `pub(super)` and unreachable from this crate (PR3 review F27).
-/// A raw `isError: true` key without MCP content blocks is a tool's own
-/// JSON, not a domain error.
-fn is_mcp_domain_error(output: &Value) -> bool {
-    output.get("content").is_some_and(Value::is_array)
-        && output.get("isError").and_then(Value::as_bool) == Some(true)
-}
-
-/// Human-readable message for an MCP domain error: the first text content
-/// block, then the `error` field, then a generic default. Mirrors
-/// `harnx_script::commands::render::error_text`.
-fn mcp_domain_error_text(output: &Value) -> String {
-    let text = output
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|blocks| {
-            blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .map(str::trim)
-                .find(|text| !text.is_empty())
-        });
-    if let Some(text) = text {
-        return text.to_string();
-    }
-    output
-        .get("error")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| "tool reported an error".to_string())
 }
 
 fn suggest_tool_name<'a>(name: &str, allowed: &'a BTreeSet<String>) -> Option<&'a str> {
@@ -984,12 +825,12 @@ fn classify_output(
                 InnerTraceStatus::ToolError,
             )
         }
-        InnerToolCallStatus::Ok if is_mcp_domain_error(&result.output) => {
+        InnerToolCallStatus::Ok if is_mcp_error(&result.output) => {
             // Successful transport, but MCP reported failure. Keep the trace
             // and failed_call consistent with the command layer.
             (
                 InnerOutcome::ToolError {
-                    message: mcp_domain_error_text(&result.output),
+                    message: error_text(&result.output),
                     partial_result: None,
                 },
                 InnerTraceStatus::ToolError,
@@ -1039,7 +880,7 @@ mod tests {
     use harnx_core::tool::{ToolCallOrigin, ToolError, ToolProgress, ToolProviderOutput};
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     type HookEvents = Arc<Mutex<Vec<HookEvent>>>;
 
@@ -1180,6 +1021,8 @@ mod tests {
             message: &'static str,
             partial: Option<Value>,
         },
+        /// Keep the first-started failure pending until a later call completes.
+        GatedRecoverable(Arc<Semaphore>, &'static str),
         NoticeThenOk(String, Value),
         /// Terminal provider failure: maps to `InnerOutcome::Fatal` (C14).
         Fatal(&'static str),
@@ -1214,6 +1057,10 @@ mod tests {
                         anyhow::anyhow!(*message),
                         partial.clone().unwrap_or(Value::Null),
                     )))
+                }
+                Behavior::GatedRecoverable(release, message) => {
+                    let _permit = release.acquire().await.expect("failure gate open");
+                    Err(ToolError::Recoverable(anyhow::anyhow!(*message)))
                 }
                 Behavior::NoticeThenOk(notice, value) => {
                     harnx_core::sink::emit_agent_event(AgentEvent::Notice(NoticeEvent::Info(
@@ -2053,29 +1900,6 @@ mod tests {
         assert_eq!(run.trace()[0].status, InnerTraceStatus::ToolError);
     }
 
-    #[test]
-    fn mcp_domain_error_helpers() {
-        let error = json!({
-            "content": [{"type": "text", "text": "boom"}],
-            "isError": true,
-        });
-        assert!(is_mcp_domain_error(&error));
-        assert_eq!(mcp_domain_error_text(&error), "boom");
-
-        // Same shape, missing isError: a successful call.
-        assert!(!is_mcp_domain_error(&json!({
-            "content": [{"type": "text", "text": "boom"}],
-        })));
-        // A tool whose raw JSON happens to carry `isError: true` without
-        // MCP content blocks must not be mistaken for a domain error.
-        assert!(!is_mcp_domain_error(&json!({"isError": true})));
-        // No text content: fall back to the error field, then a default.
-        let textless = json!({"content": [], "isError": true, "error": "from error field"});
-        assert_eq!(mcp_domain_error_text(&textless), "from error field");
-        let bare = json!({"content": [], "isError": true});
-        assert_eq!(mcp_domain_error_text(&bare), "tool reported an error");
-    }
-
     // ================================================================
     // T2.5 progress aggregation
     // ================================================================
@@ -2511,6 +2335,76 @@ mod tests {
         assert_eq!(first.status, InnerTraceStatus::Rejected);
     }
 
+    /// PR3 round-2 review R10: concurrent failures complete out of order, but
+    /// `first_failed` must report the call that started first, not the one
+    /// that happened to finish recording first.
+    #[tokio::test]
+    async fn first_failure_is_the_lowest_start_seq_under_concurrent_failures() {
+        let release_slow = Arc::new(Semaphore::new(0));
+        let slow_provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: Some(HashSet::from(["slow_fail"])),
+            progress_title: None,
+            behavior: Behavior::GatedRecoverable(release_slow.clone(), "slow failure"),
+        });
+        let fast_provider = Arc::new(FakeToolProvider {
+            log: Arc::new(DispatchLog::default()),
+            handles: Some(HashSet::from(["fast_fail"])),
+            progress_title: None,
+            behavior: Behavior::Recoverable {
+                message: "fast failure",
+                partial: None,
+            },
+        });
+        let providers: Vec<Arc<dyn ToolProvider>> =
+            vec![slow_provider.clone(), fast_provider.clone()];
+        let (ctx, _hooks) = outer_context(providers.clone(), HookControl::Continue);
+        let executor = executor_with(&["slow_fail", "fast_fail"], providers, (8, 100));
+        let run = Arc::new(executor.begin_run(&ctx, PARENT_ROUND, None));
+        let abort = create_abort_signal();
+
+        // Start the slow failure first so it owns the lower `start_seq`.
+        // Wait until it is actually dispatched (its provider logged the call)
+        // before starting the fast one. The gate keeps it pending until the
+        // fast failure has finished and recorded its trace.
+        let slow_provider_log = slow_provider.log.clone();
+        let slow = {
+            let run = run.clone();
+            let abort = abort.clone();
+            tokio::spawn(async move { run.call("slow_fail", json!({}), &abort).await })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slow_provider_log.count() == 0 {
+            assert!(Instant::now() < deadline, "slow failure never dispatched");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let fast = {
+            let run = run.clone();
+            let abort = abort.clone();
+            tokio::spawn(async move { run.call("fast_fail", json!({}), &abort).await })
+        };
+        assert!(matches!(
+            fast.await.expect("fast call task"),
+            InnerOutcome::ToolError { .. }
+        ));
+        assert!(!slow.is_finished(), "slow call must still be gated");
+        release_slow.add_permits(1);
+        assert!(matches!(
+            slow.await.expect("slow call task"),
+            InnerOutcome::ToolError { .. }
+        ));
+
+        let first = run.first_failed().expect("a failure was recorded");
+        assert_eq!(first.name, "slow_fail");
+        assert_eq!(first.start_seq, 0);
+        // The fast failure finished first, so completion order alone would
+        // have reported it; the recorded winner is the lower start order.
+        assert!(run
+            .trace()
+            .iter()
+            .any(|entry| entry.name == "fast_fail" && entry.start_seq == 1));
+    }
+
     #[tokio::test]
     async fn rejection_loop_is_bounded_by_attempts_and_trace_retention() {
         // Unknown tool: every call is rejected before admission, consuming
@@ -2604,15 +2498,5 @@ mod tests {
             fake_entry(0, "fs_read", InnerTraceStatus::Ok, r#"{"path":"a"}"#).to_progress_line(),
             "fs_read ok 42B 7ms {\"path\":\"a\"}"
         );
-    }
-
-    #[test]
-    fn truncate_bytes_respects_char_boundaries() {
-        let text = "é".repeat(10);
-        assert_eq!(text.len(), 20);
-        let truncated = truncate_bytes(text.clone(), 5);
-        assert_eq!(truncated, "éé".to_string());
-        assert!(truncated.len() <= 5);
-        assert_eq!(truncate_bytes(text.clone(), 20), text);
     }
 }

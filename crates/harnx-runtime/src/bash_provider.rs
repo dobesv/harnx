@@ -30,6 +30,8 @@ use crate::bash_inner::{
 };
 use crate::config::BASH_TOOL_NAME;
 
+pub(crate) mod attachments;
+
 /// Default `timeout_secs` for the `bash` tool, matching `bash_exec`.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 86_400;
 
@@ -75,6 +77,8 @@ pub struct BashProvider {
     executor: InnerCallExecutor,
     slot: Option<Arc<BashEvalContextSlot>>,
     backend: BashKitBackend,
+    attachment_fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
+    media_store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
 }
 
 /// Inputs resolved before a round's evaluation context exists.
@@ -123,7 +127,25 @@ impl BashProvider {
             executor: InnerCallExecutor::new(config),
             slot,
             backend: BashKitBackend,
+            attachment_fetcher: None,
+            media_store: None,
         }
+    }
+
+    pub(crate) fn with_attachment_fetcher(
+        mut self,
+        fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
+    ) -> Self {
+        self.attachment_fetcher = fetcher;
+        self
+    }
+
+    pub(crate) fn with_media_store(
+        mut self,
+        store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
+    ) -> Self {
+        self.media_store = store;
+        self
     }
 
     fn context_slot(&self) -> Result<Arc<ToolEvalContext>, ToolError> {
@@ -158,7 +180,8 @@ impl BashProvider {
         let aggregator = Arc::new(InnerProgressAggregator::new(progress));
         let run = Arc::new(
             self.executor
-                .begin_run(&context, tool_round, Some(aggregator)),
+                .begin_run(&context, tool_round, Some(aggregator))
+                .with_media(self.media_store.clone()),
         );
         let adapter = Arc::new(ScriptInnerExecutor::new(Arc::clone(&run), abort.clone()));
         let commands = tool_commands(self.specs.clone(), adapter).map_err(|error| {
@@ -178,7 +201,7 @@ impl BashProvider {
             script: &script,
             limits,
             commands,
-            fs_mounts: Vec::new(),
+            fs_mounts: vec![attachments::mount(self.attachment_fetcher.clone())],
             cancel: token.clone(),
         });
         tokio::pin!(run_fut);
@@ -564,6 +587,17 @@ impl ToolProvider for BashProvider {
     /// provider is active: an inactive agent has no resolved `bash_tools`,
     /// so its bare `bash` name belongs to a tool-server-native tool and must
     /// keep normal NATS journal recovery (PR3 review F9).
+    ///
+    /// Known limitation, accepted for v1 (PR3 round-2 review R2/R3):
+    /// `active` is evaluated at recovery time from the *current* config, not
+    /// from provenance recorded when the call was made. If `bash_tools`
+    /// changes (or the declaration cache is unpopulated) between crash and
+    /// recovery, ownership can drift: a script-owned `bash` orphan then
+    /// falls through to NATS replay (reply loss is impossible in-repo
+    /// because no in-repo tool registers a rerunnable bare `bash`), and an
+    /// external journaled `bash` can be answered `interrupted` if script
+    /// mode activates in between — reply loss only, never a rerun. A proper
+    /// fix needs a provenance marker on the journaled call.
     async fn replay_tool_call(
         &self,
         replay: ToolReplay<'_>,

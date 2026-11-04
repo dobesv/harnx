@@ -4,12 +4,15 @@ use crate::cli_map::OutputFormat;
 
 /// A successful transport can still carry an MCP tool-domain error. Only the
 /// canonical MCP envelope is interpreted here; raw business JSON stays data.
-pub(super) fn is_mcp_error(value: &Value) -> bool {
+/// Shared with the runtime executor, which classifies these as ToolError
+/// before the command layer sees them (PR3 round-2 review R6): one
+/// detector, one text extractor, no drift between layers.
+pub fn is_mcp_error(value: &Value) -> bool {
     value.get("content").is_some_and(Value::is_array)
         && value.get("isError").and_then(Value::as_bool) == Some(true)
 }
 
-pub(super) fn error_text(value: &Value) -> String {
+pub fn error_text(value: &Value) -> String {
     let text = content_text(value);
     if !text.trim().is_empty() {
         text
