@@ -20,8 +20,13 @@ pub struct TmuxHarness {
 }
 
 impl TmuxHarness {
-    /// Returns true when tmux appears to be installed and runnable.
+    /// Returns true when tmux appears to be installed and runnable, and the
+    /// process may create the Unix socket its server listens on.
     pub fn is_available() -> bool {
+        if harnx_core::unix_sockets_blocked() {
+            eprintln!("Unix sockets are blocked here, and tmux needs one");
+            return false;
+        }
         Command::new("tmux")
             .arg("-V")
             .output()

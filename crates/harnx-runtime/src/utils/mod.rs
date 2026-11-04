@@ -73,8 +73,8 @@ pub fn pretty_yaml_block(value: &serde_json::Value) -> String {
 /// Prefers `markdown` (set by harnx-runtime when an MCP `result_template`
 /// matched the call) over the raw `output`. When `markdown` is `None` or
 /// renders to whitespace, falls back to `extract_user_display_text` →
-/// string passthrough → YAML, then truncates to fit the current
-/// terminal. Both the TUI sink and the CLI sink call this so they
+/// string passthrough → YAML, then truncates to fit the terminal when
+/// stdout is one. Both the TUI sink and the CLI sink call this so they
 /// render identically.
 pub fn render_tool_result_text(output: &serde_json::Value, markdown: Option<&str>) -> String {
     use harnx_core::safety::{truncate_output, TruncateOpts};
@@ -82,17 +82,9 @@ pub fn render_tool_result_text(output: &serde_json::Value, markdown: Option<&str
 
     let mut opts = TruncateOpts::default();
     let marker = " [...] ";
-    // Drop (0, 0) sizes from non-TTY environments — `(cols as usize)
-    // .saturating_sub(...)` would yield 0 and truncate every line to
-    // nothing. Falling through leaves the safer `TruncateOpts::default()`
-    // (head_lines=25, line_head_bytes=500) in place.
-    if let Ok((cols, rows)) = crossterm::terminal::size().and_then(|(c, r)| {
-        if c > 0 && r > 0 {
-            Ok((c, r))
-        } else {
-            Err(std::io::Error::other("non-TTY: terminal size unavailable"))
-        }
-    }) {
+    // Without a terminal to fit, the safer `TruncateOpts::default()`
+    // (head_lines=25, line_head_bytes=500) stays in place.
+    if let Some((cols, rows)) = stdout_terminal_size() {
         opts.head_lines = 5.max((rows / 2) as usize);
         opts.tail_lines = 0;
         opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
@@ -107,6 +99,21 @@ pub fn render_tool_result_text(output: &serde_json::Value, markdown: Option<&str
         }),
     };
     truncate_output(&text, &opts)
+}
+
+/// The size of the terminal stdout writes to, or `None` when stdout is not a
+/// terminal. crossterm reports a size even then: the controlling terminal's,
+/// or `tput`'s default for `TERM` (80x24) when there is none, so piped output
+/// and test results would depend on who ran them. A (0, 0) size also counts
+/// as none: `(cols as usize).saturating_sub(...)` would yield 0 and truncate
+/// every line to nothing.
+fn stdout_terminal_size() -> Option<(u16, u16)> {
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    crossterm::terminal::size()
+        .ok()
+        .filter(|&(cols, rows)| cols > 0 && rows > 0)
 }
 
 pub use harnx_core::config_paths::get_env_name;
@@ -193,6 +200,23 @@ pub fn decode_bin<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests, like piped output, have no terminal on stdout. When `TERM`
+    /// names a terminal type there, crossterm still reports `tput`'s 80
+    /// columns, which used to cut tool results short.
+    #[test]
+    fn tool_results_fit_no_terminal_when_stdout_is_not_one() {
+        // Sets TERM for the whole process.
+        harnx_core::require_nextest();
+        if std::io::stdout().is_terminal() {
+            eprintln!("skipping: stdout is a terminal, as with --no-capture");
+            return;
+        }
+        std::env::set_var("TERM", "xterm-256color");
+        let line = "x".repeat(200);
+        let rendered = render_tool_result_text(&serde_json::Value::String(line.clone()), None);
+        assert_eq!(rendered, line);
+    }
 
     #[test]
     #[cfg(not(target_os = "windows"))]
