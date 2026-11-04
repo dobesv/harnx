@@ -98,15 +98,16 @@ batch per-item processing into a single Python invocation.
 
 ### Known crash risks and isolation limits
 
-The 64 MiB limit and 1-second timeout are cooperative VM checks, not hard OS-level
-process or memory isolation guarantees. Certain Python operations allocate directly
-on the host heap outside Monty's resource tracker. These allocations can exhaust host
-memory or trigger an unrecoverable process abort (`SIGABRT`), taking down the entire
-host worker process that runs script mode.
+The 64 MiB Python limit and the run timeout (86,400 seconds by default) are
+cooperative VM checks, not hard OS-level process or memory isolation guarantees.
+Certain Python operations allocate directly on the host heap outside Monty's
+resource tracker. These allocations can exhaust host memory or trigger an
+unrecoverable process abort (`SIGABRT`), taking down the entire host worker process
+that runs script mode.
 
-Tested through `harnx-script`'s `BashKitBackend` under production limits (64 MiB Python
-memory ceiling, 1-second timeout, BashKit 0.20.2 / Monty 0.0.19), confirmed failure examples
-include (non-exhaustive):
+Tested through `harnx-script`'s `BashKitBackend` with a 64 MiB Python memory ceiling,
+a 1-second test harness timeout, and BashKit 0.20.2 / Monty 0.0.19. Confirmed failure
+examples include (non-exhaustive):
 
 1. **Large JSON indent:** `json.dumps(0, indent=10**9)` attempts an untracked string
    allocation in native code and aborts the entire worker process (`SIGABRT`). An indent
@@ -118,7 +119,7 @@ include (non-exhaustive):
 3. **Import gate bypass:** BashKit filters `import re` with a line-prefix check. Prefixing
    the statement (for example `pass; import re`) bypasses the gate. Running
    `re.split('', 'a' * 4194304)` allocated ~302 MiB RSS and failed to stop cleanly at the
-   1-second timeout.
+   1-second test timeout.
 4. **Parser recursion:** Very long left-associative expression chains (such as `1+1+...`,
    `x.x.x...`, `f()()...`, or `a[0][0]...`) cause a parser stack overflow during AST
    construction before execution limits can apply.
@@ -154,6 +155,9 @@ implementation.
 
 The interpreter runs on a Tokio blocking worker so synchronous Monty execution
 can't prevent the caller from polling cancellation or its wall-clock deadline.
+A process-wide cap admits at most eight running or queued interpreter closures.
+Waiting for admission counts against the run deadline and observes cancellation;
+queued closures retain their permits until Tokio drops them.
 Cancellation sets BashKit's atomic flag (checked inside the VM) and cancels a
 child token used by registered commands. Once an interpreter has started, an
 explicit cancel or timeout awaits worker shutdown and drops interpreter-owned
@@ -163,7 +167,9 @@ finishes at the next VM/async checkpoint. The command context's token is
 cancelled on completion too. Prefer inline futures. A command that spawns
 detached work is responsible for stopping it using this token; cancellation
 cannot undo remote side effects. Completing a run never cancels its caller's
-token.
+token. Joining a running worker has no hard grace-period bound: a native Monty
+operation that misses VM checkpoints can delay cancellation indefinitely.
+Returning after a grace period would detach interpreter-owned work, not stop it.
 
 `FsMount` accepts a trusted virtual `FileSystem` mounted at an absolute path.
 Mounted filesystem paths start at `/`. For read-only mounts, wrap the filesystem

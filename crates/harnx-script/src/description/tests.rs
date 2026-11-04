@@ -123,6 +123,12 @@ fn attachment_idiom_requires_compatible_encoding_schema() {
     tool = creator(true);
     tool.name = "not_a_creator".into();
     assert!(examples::attachment_idiom(&[&tool]).is_none());
+    tool = creator(true);
+    tool.schema["required"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("unlistedRequired"));
+    assert!(examples::attachment_idiom(&[&tool]).is_none());
 }
 
 #[test]
@@ -137,6 +143,24 @@ fn pipeline_falls_back_without_a_compatible_reader() {
         .as_array_mut()
         .unwrap()
         .push(json!("token"));
+    assert!(examples::pipeline(&[&tool]).contains("Generic illustration"));
+    // Reader whose path enum excludes src/lib.rs falls back to generic illustration
+    tool = reader();
+    tool.schema["properties"]["path"]["enum"] = json!(["Cargo.toml", "README.md"]);
+    assert!(examples::pipeline(&[&tool]).contains("Generic illustration"));
+    // Reader whose path enum includes src/lib.rs is selected
+    tool = reader();
+    tool.schema["properties"]["path"]["enum"] = json!(["src/lib.rs", "README.md"]);
+    assert!(examples::pipeline(&[&tool]).contains("files_fs_read --path src/lib.rs -o text |"));
+    // Reader with an unlisted required property (not present in properties map) falls back
+    tool = reader();
+    tool.schema["required"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("unlisted_field"));
+    assert!(examples::pipeline(&[&tool]).contains("Generic illustration"));
+    // Normalizing an unlisted key must not alias an existing property's flag.
+    tool.schema["required"] = json!(["path", "Path"]);
     assert!(examples::pipeline(&[&tool]).contains("Generic illustration"));
 }
 

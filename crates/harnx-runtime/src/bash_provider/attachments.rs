@@ -1,6 +1,6 @@
 //! Explicit-CID reads on the same broker connection as the round's tools.
 
-use std::{collections::HashMap, io, sync::Arc};
+use std::{io, sync::Arc};
 
 use async_trait::async_trait;
 use harnx_blob_store::{media::media_size, touch_activity};
@@ -14,7 +14,6 @@ pub(crate) fn fetcher(jetstream: async_nats::jetstream::Context) -> Arc<dyn Atta
     Arc::new(NatsAttachmentFetcher {
         jetstream,
         bucket: std::sync::Mutex::new(None),
-        sizes: std::sync::Mutex::new(HashMap::new()),
     })
 }
 
@@ -28,10 +27,6 @@ struct NatsAttachmentFetcher {
     /// results are memoized: an absent bucket is looked up again so a store
     /// created later in the round is still seen.
     bucket: std::sync::Mutex<Option<async_nats::jetstream::object_store::ObjectStore>>,
-    /// Successful metadata sizes, per CID. Attachments are content-addressed,
-    /// so repeated `test -f`/`stat` probes reuse known sizes. Misses aren't
-    /// cached because an inner tool can upload that CID later in the round.
-    sizes: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl NatsAttachmentFetcher {
@@ -48,25 +43,16 @@ impl NatsAttachmentFetcher {
         Ok(store)
     }
 
-    /// Metadata-only size with a per-CID memo. Missing bucket or object is
-    /// `Ok(None)` per the trait contract; only broker consults touch activity.
+    /// Metadata-only size probe. Missing bucket or object is `Ok(None)` per
+    /// the trait contract; only broker consults touch activity.
     async fn lookup(&self, cid: &str) -> io::Result<Option<u64>> {
-        if let Some(size) = self.sizes.lock().expect("size cache poisoned").get(cid) {
-            return Ok(Some(*size));
-        }
         let url = parse_media(cid)?;
         let store = self.bucket().await.map_err(storage_error)?;
         let Some(store) = store else {
             return Ok(None);
         };
         let size = media_size(&store, &url).await.map_err(storage_error)?;
-        if let Some(size) = size {
-            // A miss can become readable after an inner tool uploads this CID.
-            // Cache only known sizes, not absence.
-            self.sizes
-                .lock()
-                .expect("size cache poisoned")
-                .insert(cid.to_owned(), size);
+        if size.is_some() {
             if let Err(error) = touch_activity(&self.jetstream, &url.owner()).await {
                 log::debug!("activity touch failed during script attachment read: {error:#}");
             }

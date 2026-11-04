@@ -33,6 +33,12 @@ broker-e2e-local = { max-threads = 16 }
 [profile.default]
 retries = 0
 
+# Async timeout futures cannot stop a blocking VM or a runtime's Drop. Kill the
+# isolated test process if a cancellation regression strands either one.
+[[profile.default.overrides]]
+filter = 'package(harnx-script) | test(/^bash_provider::tests::python::/)'
+slow-timeout = { period = "10s", terminate-after = 2 }
+
 [[profile.default.overrides]]
 filter = 'test(/^tmux_e2e::/) | test(/^interrupt_e2e::/)'
 test-group = 'heavy-e2e-local'
@@ -51,6 +57,10 @@ fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 4 }
 # Keep CI output readable: show final status for retried/failed tests.
 final-status-level = "flaky"
+
+[[profile.ci.overrides]]
+filter = 'package(harnx-script) | test(/^bash_provider::tests::python::/)'
+slow-timeout = { period = "10s", terminate-after = 2 }
 
 [[profile.ci.overrides]]
 filter = 'test(/^tmux_e2e::/) | test(/^interrupt_e2e::/)'

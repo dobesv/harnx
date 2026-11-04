@@ -190,14 +190,25 @@ type Harness = (
 );
 
 fn harness(inner: Arc<dyn ToolProvider>, extra: Vec<Arc<dyn ToolProvider>>) -> Harness {
+    harness_with_attachments(inner, extra, None)
+}
+
+fn harness_with_attachments(
+    inner: Arc<dyn ToolProvider>,
+    extra: Vec<Arc<dyn ToolProvider>>,
+    fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
+) -> Harness {
     let slot = Arc::new(BashEvalContextSlot::default());
-    let bash = Arc::new(BashProvider::new(BashProviderConfig {
-        active: true,
-        inner_declarations: inner_declarations(),
-        base_providers: vec![inner.clone()],
-        slot: Some(slot.clone()),
-        payload_limit: None,
-    }));
+    let bash = Arc::new(
+        BashProvider::new(BashProviderConfig {
+            active: true,
+            inner_declarations: inner_declarations(),
+            base_providers: vec![inner.clone()],
+            slot: Some(slot.clone()),
+            payload_limit: None,
+        })
+        .with_attachment_fetcher(fetcher),
+    );
     let hooks: Arc<Mutex<Vec<HookEvent>>> = Arc::default();
     let hook_collector = hooks.clone();
     let mut providers: Vec<Arc<dyn ToolProvider>> = vec![bash.clone()];

@@ -279,7 +279,7 @@ async fn busy_python() -> (
     let task_token = token.clone();
     let task = tokio::spawn(async move {
         let script = format!(
-            "probe & python3 - <<'EOF'\nopen('/attachments/{CID}').read()\nwhile True: pass\nEOF\nwait"
+            "probe & python3 - <<'EOF'\nfirst = True\nwhile True:\n if first:\n  first = False\n  open('/attachments/{CID}').read()\nEOF\nwait"
         );
         BashKitBackend
             .run(crate::ScriptRequest {
@@ -304,7 +304,6 @@ async fn busy_python() -> (
         .unwrap()
         .unwrap()
         .forget();
-    tokio::time::sleep(Duration::from_millis(50)).await;
     (task, token, command)
 }
 

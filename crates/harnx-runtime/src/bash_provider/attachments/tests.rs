@@ -15,6 +15,7 @@ use harnx_core::{
     tool::{ToolError, ToolProvider},
 };
 use harnx_engine::tool::ToolEvalContext;
+use harnx_script::FileSystem;
 use serde_json::{json, Value};
 
 const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -112,7 +113,21 @@ async fn nats_attachment_mount_reads_binary_is_readonly_and_resets_cache_per_run
         "{result}"
     );
     assert_eq!(get_media(&store, &url).await?.unwrap().0, png);
+    let check_exists = run(
+        &provider,
+        format!("[ -f '{}' ] && echo exists || echo missing", path.display()),
+    )
+    .await;
+    assert_eq!(check_exists["exit_code"], 0);
+    assert_eq!(check_exists["stdout"], "exists\n");
     store.delete(url.kv_key()).await?;
+    let check_deleted = run(
+        &provider,
+        format!("[ -f '{}' ] && echo exists || echo missing", path.display()),
+    )
+    .await;
+    assert_eq!(check_deleted["exit_code"], 0);
+    assert_eq!(check_deleted["stdout"], "missing\n");
     let result = run(&provider, format!("cat '{}'", path.display())).await;
     assert_ne!(result["exit_code"], 0);
     assert!(
@@ -169,10 +184,9 @@ async fn nats_fetcher_validates_cids_preserves_missing_errors_and_bounds_blob_do
         .to_string()
         .contains("blob too large: 3 bytes exceeds limit of 2 bytes"));
     assert_eq!(fetcher.fetch(&url.to_string(), 3).await?, [0, 255, 1]);
-    // Sizes are memoized per CID: even after the object disappears, a repeat
-    // probe answers from the memo instead of a broker round trip.
+    // Object deletion causes size() to return None without serving stale cached sizes.
     store.delete(url.kv_key()).await?;
-    assert_eq!(fetcher.size(&url.to_string()).await?, Some(3));
+    assert_eq!(fetcher.size(&url.to_string()).await?, None);
     // A missing object under an existing bucket is Ok(None) for size.
     let missing = media_cid_url(
         &SessionRef::new(Some("agent".into()), "attach2".into())?,
@@ -248,10 +262,42 @@ async fn nats_metadata_miss_sees_later_upload_and_deleted_blobs_are_missing() ->
     );
     let cid = url.to_string();
     let reader = fetcher(js.clone());
+    let fs = AttachmentFs::new(reader.clone());
+    let path = std::path::PathBuf::from(format!("/{cid}"));
+
+    // Missing initially: stat/exists report missing, size is None.
     assert_eq!(reader.size(&cid).await?, None);
+    assert!(!fs.exists(&path).await?);
+    assert!(fs.stat(&path).await.is_err());
+
+    // Newly uploaded: stat/exists see blob, size is Some(3).
     put_media(&store, &url, &[0, 255, 1], "application/octet-stream").await?;
     assert_eq!(reader.size(&cid).await?, Some(3));
+    assert!(fs.exists(&path).await?);
+    assert_eq!(fs.stat(&path).await?.size, 3);
+
+    // Deleted: stat/exists and size immediately report missing (no stale memo).
     store.delete(url.kv_key()).await?;
-    assert_eq!(fetcher(js).size(&cid).await?, None);
+    assert_eq!(reader.size(&cid).await?, None);
+    assert!(!fs.exists(&path).await?);
+    assert!(fs.stat(&path).await.is_err());
+
+    // Second blob: missing initially then newly uploaded.
+    let url2 = media_cid_url(
+        &SessionRef::new(Some("agent".into()), "late02".into())?,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    let cid2 = url2.to_string();
+    let path2 = std::path::PathBuf::from(format!("/{cid2}"));
+
+    assert_eq!(reader.size(&cid2).await?, None);
+    assert!(!fs.exists(&path2).await?);
+    assert!(fs.stat(&path2).await.is_err());
+
+    put_media(&store, &url2, &[42], "application/octet-stream").await?;
+    assert_eq!(reader.size(&cid2).await?, Some(1));
+    assert!(fs.exists(&path2).await?);
+    assert_eq!(fs.stat(&path2).await?.size, 1);
+
     Ok(())
 }

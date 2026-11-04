@@ -10,7 +10,7 @@ pub(super) fn pipeline(tools: &[&ToolSpec]) -> String {
         ["fs_read", "read_file", "file_read"]
             .iter()
             .any(|suffix| tool.name.ends_with(suffix))
-            && string_option(tool, "path", None).is_some()
+            && string_option(tool, "path", Some("src/lib.rs")).is_some()
             && required_only(tool, &["path"])
     });
     let (name, instruction) = match reader {
@@ -62,9 +62,17 @@ fn string_option<'a>(tool: &'a ToolSpec, flag: &str, value: Option<&str>) -> Opt
 }
 
 fn required_only(tool: &ToolSpec, flags: &[&str]) -> bool {
-    properties(&tool.schema)
-        .iter()
-        .all(|prop| !prop.required || flags.contains(&prop.flag.as_str()))
+    let props = properties(&tool.schema);
+    tool.schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .all(|key| {
+            props
+                .iter()
+                .any(|prop| key.as_str() == Some(prop.key) && flags.contains(&prop.flag.as_str()))
+        })
 }
 
 fn shell_word(word: &str) -> String {

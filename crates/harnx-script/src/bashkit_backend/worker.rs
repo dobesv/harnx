@@ -1,9 +1,18 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 use super::{BashKitBackend, RunControl};
-use crate::{ScriptBackend, ScriptRun, ScriptStatus};
+use crate::{CancellationToken, ScriptBackend, ScriptLimits, ScriptRun, ScriptStatus};
+
+// Cap running interpreters and retained closures in Tokio's blocking queue.
+// The permit lives in the closure, including after a queued caller returns.
+pub(super) const MAX_SCRIPT_WORKERS: usize = 8;
+pub(super) static ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_SCRIPT_WORKERS)));
 
 struct CancelOnDrop {
     control: Arc<RunControl>,
@@ -13,108 +22,179 @@ struct CancelOnDrop {
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.control.cancel();
-        // Aborting cannot stop a running blocking task, but removes queued work.
         self.worker.abort();
     }
 }
 
+struct Completed {
+    result: ScriptRun,
+    at: Instant,
+}
+
+impl Completed {
+    fn deadline_hit(&self, deadline: Instant, stopped: bool) -> bool {
+        if self.result.status == ScriptStatus::TimedOut {
+            return true;
+        }
+        // Completion time belongs to the worker, not its starved parent.
+        if self.at < deadline {
+            return false;
+        }
+        if stopped {
+            return true;
+        }
+        if self.result.exit_code == 0 || self.result.error.is_some() {
+            return false;
+        }
+        // BashKit 0.20.2 exposes Monty's VM timeout only as stderr/exit 1.
+        self.result
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("TimeoutError: time limit exceeded:"))
+    }
+}
+
+type Worker = tokio::task::JoinHandle<Completed>;
+
 #[async_trait]
 impl ScriptBackend for BashKitBackend {
     async fn run(&self, request: crate::ScriptRequest<'_>) -> ScriptRun {
-        let crate::ScriptRequest {
-            script,
-            limits,
-            commands,
-            fs_mounts,
-            cancel,
-        } = request;
+        let timeout = super::execution_limits(&request.limits).timeout;
+        let deadline = Instant::now() + timeout;
+        let limits = request.limits.clone();
+        let cancel = request.cancel.clone();
+        let permit = match admit(&cancel, deadline, timeout).await {
+            Ok(permit) => permit,
+            Err(result) => return finish(result, &limits),
+        };
         let control = Arc::new(RunControl {
             stop: cancel.child_token(),
             fatal: Mutex::new(None),
             flag: OnceLock::new(),
         });
-        let worker_control = control.clone();
-        let worker_limits = limits.clone();
-        let timeout = super::execution_limits(&limits).timeout;
-        let deadline = tokio::time::Instant::now() + timeout;
-        let script = script.to_owned();
-        let runtime = tokio::runtime::Handle::current();
-        // Monty executes synchronous VM slices. Keep the parent executor free
-        // to set the flag checked by those slices, even on a single-thread runtime.
-        let mut worker = tokio::task::spawn_blocking(move || {
-            runtime.block_on(BashKitBackend.execute(
-                crate::ScriptRequest {
-                    script: &script,
-                    limits: worker_limits,
-                    commands,
-                    fs_mounts,
-                    cancel: worker_control.stop.clone(),
-                },
-                worker_control,
-            ))
-        });
+        let mut worker = spawn(request, control.clone(), permit);
         let _cleanup = CancelOnDrop {
             control: control.clone(),
             worker: worker.abort_handle(),
         };
-        let result = tokio::select! {
+        let (result, stopped_by_deadline) = tokio::select! {
             biased;
-            () = cancel.cancelled() => {
-                stop_worker(&control, worker).await
-            }
-            () = tokio::time::sleep_until(deadline) => {
-                stop_worker(&control, worker).await
-            }
-            result = &mut worker => result,
+            () = cancel.cancelled() => (stop_worker(&control, worker).await, false),
+            result = &mut worker => (result, false),
+            () = tokio::time::sleep_until(deadline) => (stop_worker(&control, worker).await, true),
         };
-        let mut result = result.unwrap_or_else(worker_error);
-        // Monty can return a plain TimeoutError just before BashKit notices its
-        // own deadline. Use the host deadline, not exception-text matching, to
-        // report the run limit consistently (including a saturated worker pool).
-        if !cancel.is_cancelled() && tokio::time::Instant::now() >= deadline {
-            // Running interpreters and queued workers use different cancellation
-            // messages. Normalize by status, preserving unrelated tool/panic errors.
-            let message = format!("execution timeout exceeded ({timeout:?})");
-            if result.stderr == "cancelled\n" || result.stderr == "execution cancelled\n" {
-                result.stderr = format!("{message}\n");
-            }
-            if result.error.is_none()
-                || matches!(
-                    result.status,
-                    ScriptStatus::Cancelled | ScriptStatus::TimedOut
-                )
-            {
-                result.error = Some(message.clone());
-            }
-            result.status = ScriptStatus::TimedOut;
-            result.exit_code = 124;
-            result.limit_hit = Some(message);
+        let completed = result.unwrap_or_else(|error| Completed {
+            result: worker_error(error),
+            at: Instant::now(),
+        });
+        let deadline_hit = completed.deadline_hit(deadline, stopped_by_deadline);
+        let mut result = completed.result;
+        if !cancel.is_cancelled() && deadline_hit {
+            normalize_timeout(&mut result, timeout);
         }
-        // Worker failures and queued cancellation don't pass through the
-        // interpreter's capture. Apply the same cap to their diagnostics.
-        let mut capture = super::Capture::new(&limits);
-        capture.append("", &result.stderr);
-        result.stderr = capture.stderr.text;
-        result.stderr_truncated |= capture.stderr.truncated;
-        result
+        finish(result, &limits)
     }
+}
+
+async fn admit(
+    cancel: &CancellationToken,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<OwnedSemaphorePermit, ScriptRun> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(worker_failure(true, "cancelled\n".to_owned())),
+        () = tokio::time::sleep_until(deadline) => {
+            let mut result = worker_failure(true, "cancelled\n".to_owned());
+            normalize_timeout(&mut result, timeout);
+            Err(result)
+        }
+        permit = ADMISSION.clone().acquire_owned() => Ok(permit.expect("script admission never closes")),
+    }
+}
+
+fn spawn(
+    request: crate::ScriptRequest<'_>,
+    control: Arc<RunControl>,
+    permit: OwnedSemaphorePermit,
+) -> Worker {
+    let crate::ScriptRequest {
+        script,
+        limits,
+        commands,
+        fs_mounts,
+        cancel: _,
+    } = request;
+    let script = script.to_owned();
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let result = runtime.block_on(BashKitBackend.execute(
+            crate::ScriptRequest {
+                script: &script,
+                limits,
+                commands,
+                fs_mounts,
+                cancel: control.stop.clone(),
+            },
+            control,
+        ));
+        Completed {
+            result,
+            at: Instant::now(),
+        }
+    })
 }
 
 async fn stop_worker(
     control: &RunControl,
-    worker: tokio::task::JoinHandle<ScriptRun>,
-) -> Result<ScriptRun, tokio::task::JoinError> {
+    worker: Worker,
+) -> Result<Completed, tokio::task::JoinError> {
+    // Drain completed work before publishing a stop. Its timestamp also closes
+    // the race between this check and the worker finishing before cancellation.
+    if worker.is_finished() {
+        return worker.await;
+    }
     control.cancel();
     worker.abort();
     if control.flag.get().is_none() {
-        // Tokio only drains aborted blocking tasks when a pool thread is free.
-        // No interpreter has started. The published stop forbids later entry,
-        // so returning now cannot leave Python or tool commands running.
-        Ok(worker_failure(true, "cancelled\n".to_owned()))
+        // Tokio retains aborted queued captures until a pool thread drains them.
+        // Their admission permits stay held, so repeated cancellations stay bounded.
+        Ok(Completed {
+            result: worker_failure(true, "cancelled\n".to_owned()),
+            at: Instant::now(),
+        })
     } else {
-        // Running blocking tasks cannot be aborted; join cooperative VM/job cleanup.
+        // A native VM operation may ignore cancellation. Detaching would allow
+        // interpreter-owned tools to resume after the caller reports completion.
         worker.await
     }
+}
+
+fn normalize_timeout(result: &mut ScriptRun, timeout: Duration) {
+    let message = format!("execution timeout exceeded ({timeout:?})");
+    if result.stderr == "cancelled\n" || result.stderr == "execution cancelled\n" {
+        result.stderr = format!("{message}\n");
+    }
+    if result.error.is_none()
+        || matches!(
+            result.status,
+            ScriptStatus::Cancelled | ScriptStatus::TimedOut
+        )
+    {
+        result.error = Some(message.clone());
+    }
+    result.status = ScriptStatus::TimedOut;
+    result.exit_code = 124;
+    result.limit_hit = Some(message);
+}
+
+fn finish(mut result: ScriptRun, limits: &ScriptLimits) -> ScriptRun {
+    let mut capture = super::Capture::new(limits);
+    capture.append("", &result.stderr);
+    result.stderr = capture.stderr.text;
+    result.stderr_truncated |= capture.stderr.truncated;
+    result
 }
 
 fn worker_error(error: tokio::task::JoinError) -> ScriptRun {

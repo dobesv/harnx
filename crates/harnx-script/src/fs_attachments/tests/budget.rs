@@ -242,3 +242,57 @@ async fn metadata_error_leaves_no_claim_or_lock_and_can_retry() {
     assert_settled_budget(&fs);
     assert_no_download_locks(&fs, "retried metadata probe must remove its lock");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_flight_file_slot_rejects_downloads_and_cancellation_releases_it() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let fetcher = Arc::new(MetadataFetcher {
+        started: tx,
+        release: tokio::sync::Semaphore::new(0),
+        reported_size: Some(3),
+        actual_size: 3,
+    });
+    let fs = Arc::new(AttachmentFs::with_limits(
+        fetcher.clone(),
+        FsLimits::default().max_file_count(1),
+    ));
+    let reader_fs = fs.clone();
+    let first = tokio::spawn(async move {
+        reader_fs
+            .read_file(&PathBuf::from(format!("/{}", cid('a'))))
+            .await
+    });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap(),
+        Some(3)
+    );
+    assert_usage(&fs, 0, 0);
+    let others: Vec<_> = ('b'..='t')
+        .map(|letter| {
+            let fs = fs.clone();
+            tokio::spawn(async move {
+                fs.read_file(&PathBuf::from(format!("/{}", cid(letter))))
+                    .await
+            })
+        })
+        .collect();
+    for reader in others {
+        let error = tokio::time::timeout(Duration::from_secs(2), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("file-count limit exceeded"));
+    }
+    assert!(rx.try_recv().is_err(), "only the slot owner may download");
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert_settled_budget(&fs);
+    fetcher.release.add_permits(1);
+    let path = PathBuf::from(format!("/{}", cid('b')));
+    assert_eq!(fs.read_file(&path).await.unwrap(), [7; 3]);
+    assert_usage(&fs, 3, 1);
+    assert_settled_budget(&fs);
+}

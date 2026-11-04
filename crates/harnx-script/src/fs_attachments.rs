@@ -50,6 +50,8 @@ pub struct AttachmentFs {
     /// Bytes actually cached, for `usage()`.
     bytes: AtomicU64,
     files: AtomicU64,
+    /// Committed files plus slots owned by in-flight downloads.
+    slots: AtomicU64,
 }
 
 impl AttachmentFs {
@@ -66,6 +68,7 @@ impl AttachmentFs {
             budget: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             files: AtomicU64::new(0),
+            slots: AtomicU64::new(0),
         }
     }
 
@@ -117,14 +120,7 @@ impl AttachmentFs {
             return Ok(bytes); // Another reader already downloaded this CID.
         }
         let size = self.fetcher.size(cid).await?.ok_or_else(|| missing(cid))?;
-        {
-            let cache = self.cache.lock().await;
-            if cache.len() as u64 >= self.limits.max_file_count {
-                return Err(io::Error::other(
-                    "attachment cache file-count limit exceeded",
-                ));
-            }
-        }
+        let mut slot = FileSlot::reserve(self)?;
         // Reserve metadata-sized budget so small concurrent downloads don't
         // each claim a full file allowance. Fetch is bounded by the claim: stale
         // metadata cannot overcommit the cache, even if the fetcher ignores that
@@ -146,18 +142,43 @@ impl AttachmentFs {
             )));
         }
         let mut cache = self.cache.lock().await;
-        if cache.len() as u64 >= self.limits.max_file_count {
-            return Err(io::Error::other(
-                "attachment cache file-count limit exceeded",
-            ));
-        }
         self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         let bytes: Arc<[u8]> = bytes.into();
         cache.insert(cid.to_owned(), Arc::clone(&bytes));
         drop(cache);
         self.files.fetch_add(1, Ordering::Relaxed);
         reservation.settle(bytes.len() as u64);
+        slot.committed = true;
         Ok(bytes)
+    }
+}
+
+/// Claim before byte reservation and I/O. A failed byte claim or cancelled
+/// download returns its file slot without affecting committed usage.
+struct FileSlot<'a> {
+    fs: &'a AttachmentFs,
+    committed: bool,
+}
+
+impl FileSlot<'_> {
+    fn reserve(fs: &AttachmentFs) -> io::Result<FileSlot<'_>> {
+        fs.slots
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < fs.limits.max_file_count).then(|| current + 1)
+            })
+            .map_err(|_| io::Error::other("attachment cache file-count limit exceeded"))?;
+        Ok(FileSlot {
+            fs,
+            committed: false,
+        })
+    }
+}
+
+impl Drop for FileSlot<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.fs.slots.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 

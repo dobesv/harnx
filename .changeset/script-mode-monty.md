@@ -7,8 +7,9 @@ virtual `/tmp` files and read `/attachments`, without host filesystem, network,
 or tool-call access. Apply per-run Python memory and time limits, and stop busy
 loops on cancellation without blocking the agent executor.
 
-Known risks: Python memory limits (64 MiB) and timeouts are cooperative VM limits,
-not hard process isolation. Under BashKit 0.20.2 / Monty 0.0.19, certain inputs can
+Known risks: Python memory limits (64 MiB) and run timeouts (86,400 seconds by
+default, 1 second in the test harness) are cooperative VM limits, not hard process
+isolation. Under BashKit 0.20.2 / Monty 0.0.19, certain inputs can
 crash or OOM the entire host worker process. Known failure examples include:
 `json.dumps(0, indent=10**9)` aborts with SIGABRT (~159 MiB at indent 134217728),
 returning deeply shared list graphs (`x=[x,x]` ×30) expands to ~500 MiB during export

@@ -93,6 +93,7 @@ fn assert_usage(fs: &AttachmentFs, bytes: u64, files: u64) {
 #[track_caller]
 fn assert_settled_budget(fs: &AttachmentFs) {
     assert_eq!(fs.budget.load(Ordering::Relaxed), fs.usage().total_bytes);
+    assert_eq!(fs.slots.load(Ordering::Relaxed), fs.usage().file_count);
 }
 
 #[track_caller]
