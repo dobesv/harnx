@@ -17,7 +17,8 @@ fi
 # the filtered environment and a process group without it; it is the only
 # sandbox on macOS. harnx's own sandbox (harnx-sandbox-exec) marks the commands
 # it runs with HARNX_IN_SANDBOX, and since nothing can create namespaces in
-# there, light mode is the default inside it.
+# there, light mode is the default inside it. Claude Code's sandbox gets light
+# mode only when bubblewrap can't start there (see run_linux).
 mode=${HARNX_TEST_SANDBOX:-}
 if [ -z "$mode" ] && [ -n "${HARNX_IN_SANDBOX:-}" ]; then
     mode=light
@@ -191,7 +192,7 @@ run_linux() {
         exit 127
     fi
 
-    local home=/tmp/harnx-test pair error
+    local home=/tmp/harnx-test pair error ambient=("${pairs[@]}")
     local args=(
         --die-with-parent
         --unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts
@@ -222,8 +223,16 @@ run_linux() {
 
     # Where the host may block the namespaces bwrap needs, try the sandbox
     # once, so that a failure says what to do instead of every test failing
-    # with bwrap's own error.
-    if userns_may_be_blocked && ! error=$(bwrap "${args[@]}" true 2>&1 >/dev/null); then
+    # with bwrap's own error. Claude Code's sandbox, which sets
+    # SANDBOX_RUNTIME, blocks them unless its sandbox.allowNestedUserNamespaces
+    # setting is on, and there the test gets light mode instead.
+    if { [ -n "${SANDBOX_RUNTIME:-}" ] || userns_may_be_blocked; } &&
+        ! error=$(bwrap "${args[@]}" true 2>&1 >/dev/null); then
+        if [ -n "${SANDBOX_RUNTIME:-}" ]; then
+            mode=light
+            pairs=("${ambient[@]}")
+            run_in_process_group "$@"
+        fi
         echo "harnx test sandbox: bubblewrap can't start the sandbox here ($error). On Ubuntu 24.04, an AppArmor profile that allows \`userns\` for /usr/bin/bwrap fixes this without lifting the restriction for other programs; see AGENTS.md, \"Test sandbox\". Inside a container or harnx's own sandbox, set HARNX_TEST_SANDBOX=light for a private home and filtered environment without namespaces, or HARNX_TEST_SANDBOX=off to run unsandboxed." >&2
         # A shell's status for a command it found but can't run: bwrap is
         # there but can't run the test. A missing bwrap gets 127 above.
@@ -238,9 +247,12 @@ run_in_process_group() {
     local home child status
     # Under /tmp rather than macOS's long per-user TMPDIR: tests create Unix
     # sockets under the TMPDIR set below, and macOS caps a socket path at 104
-    # bytes. On macOS /tmp is a symlink; the resolved path is the one the
-    # children are given, so `pkill -f "$home"` below matches it.
-    home=$(mktemp -d /tmp/harnx-test.XXXXXX) || exit 1
+    # bytes. Claude Code's sandbox makes /tmp read-only and leaves only its own
+    # TMPDIR writable, so that is the fallback. On macOS /tmp is a symlink; the
+    # resolved path is the one the children are given, so `pkill -f "$home"`
+    # below matches it.
+    home=$(mktemp -d /tmp/harnx-test.XXXXXX 2>/dev/null) ||
+        home=$(mktemp -d "${TMPDIR:-/tmp}/harnx-test.XXXXXX") || exit 1
     home=$(CDPATH='' cd -P -- "$home" && pwd -P) || exit 1
     mkdir -p "$home/config/harnx" "$home/data/harnx" "$home/state/harnx" \
         "$home/cache" "$home/runtime" "$home/tmp" || exit 1

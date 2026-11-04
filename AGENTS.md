@@ -180,6 +180,20 @@ can create namespaces in there, so the runner uses light mode there by itself.
 That is how an agent runs the suite from its bash tool; the tests of what only
 bubblewrap gives skip there.
 
+Claude Code's Bash sandbox gets light mode as well. It sets
+`SANDBOX_RUNTIME=1` and blocks user namespaces unless
+`sandbox.allowNestedUserNamespaces` is on in `~/.claude/settings.json`; when
+that variable is set and bubblewrap can't start, the runner falls back to
+light mode instead of failing. Claude Code doesn't document the variable, so
+if it disappears, set `HARNX_TEST_SANDBOX=light` yourself. The sandbox also
+makes `/tmp` read-only apart from its own `$TMPDIR`, so light mode puts the
+private home under `$TMPDIR` when it can't write to `/tmp`. Its seccomp filter
+refuses to create Unix sockets unless `sandbox.network.allowAllUnixSockets` is
+on, so tests that need one (tmux and interrupt e2e, the llama-server mock)
+skip there; gate a new one on `harnx_core::unix_sockets_blocked()`. Both
+settings weaken Claude Code's sandbox, so turning them on is the user's call,
+not an agent's.
+
 Linux needs bubblewrap 0.5.0 or later (`sudo apt install bubblewrap`), and
 bubblewrap needs unprivileged user namespaces. Ubuntu 24.04 restricts them
 through AppArmor by default. An AppArmor profile that allows `userns` for
@@ -195,7 +209,8 @@ the sysctl says. CI lifts both on its throwaway runners:
 Containers block the namespaces too; set `HARNX_TEST_SANDBOX=light`
 there, or `off` to run unsandboxed. Without bubblewrap, every test fails with an
 install hint. Where an AppArmor restriction, a sysctl or a seccomp filter
-blocks the namespaces, every test fails with a message pointing here.
+blocks the namespaces, every test fails with a message pointing here, except
+inside Claude Code's sandbox, described above.
 This sandbox is unrelated to the bash tool's `--no-sandbox` (see "Bridged tool
 servers in tests").
 
@@ -222,7 +237,11 @@ again, and linking 128 of those was most of a Windows CI build.
 Test names carry the module, e.g. `tmux_e2e::retry_all_fail_shows_warnings_in_tui`,
 so select tests with `test(/^tmux_e2e::/)` rather than `binary(tmux_e2e)`;
 every integration binary is now named `it`. insta snapshots for these tests
-live in `tests/it/snapshots/` with an `it__` prefix.
+live in `tests/it/snapshots/` with an `it__` prefix. A test that reruns its own
+binary with `--exact <name>` needs that full name, and should check the run
+reports `1 passed`: a name that matches nothing runs no test and still exits
+0, which left `llama_server_mock`'s parent-death test passing without its
+helper for as long as the helper's name lacked the module.
 
 ### Bridged tool servers in tests
 

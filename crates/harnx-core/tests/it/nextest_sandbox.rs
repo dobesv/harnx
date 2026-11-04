@@ -16,18 +16,22 @@ struct Shell {
 
 impl Shell {
     /// nextest running a test, with this test's own `PATH` (so `bwrap`, `env`
-    /// and `sh` resolve) and `home` as `HOME`. Where the full sandbox can't
-    /// run, the runner can only give the light one, so tests that hold in
-    /// both modes check that one.
+    /// and `sh` resolve) and `TMPDIR`, and `home` as `HOME`. Where the full
+    /// sandbox can't run, the runner can only give the light one, so tests
+    /// that hold in both modes check that one.
     fn test_run(home: &Path) -> Self {
         let path = std::env::var("PATH").expect("PATH is set");
-        let shell = Self {
+        let mut shell = Self {
             vars: BTreeMap::new(),
         }
         .set("PATH", &path)
         .set("HOME", home.to_str().expect("UTF-8 home"))
         .set("NEXTEST", "1")
         .set("NEXTEST_ATTEMPT_ID", "nextest-sandbox-test");
+        // Where `/tmp` is read-only, light mode needs it for the private home.
+        if let Ok(tmpdir) = std::env::var("TMPDIR") {
+            shell = shell.set("TMPDIR", &tmpdir);
+        }
         if full_sandbox_available() {
             shell
         } else {
@@ -131,8 +135,19 @@ fn fake_home() -> tempfile::TempDir {
 
 /// Under `/tmp`, which the sandbox replaces on Linux. When these tests run
 /// sandboxed themselves, the outer sandbox's `/tmp` stands in for the host's.
+/// Claude Code's sandbox makes `/tmp` read-only except for its own TMPDIR
+/// under it. The runner can only give light mode there, which leaves `/tmp`
+/// alone, so that TMPDIR serves.
 fn tmp_dir() -> tempfile::TempDir {
-    tempfile::tempdir_in("/tmp").expect("create a directory under /tmp")
+    tempfile::tempdir_in("/tmp")
+        .or_else(|_| tempfile::tempdir())
+        .expect("create a directory under /tmp")
+}
+
+/// Whether this test may write directly in `/tmp`, which Claude Code's
+/// sandbox doesn't allow.
+fn tmp_is_writable() -> bool {
+    tempfile::tempdir_in("/tmp").is_ok()
 }
 
 fn stdout(output: &Output) -> String {
@@ -374,8 +389,13 @@ fn names_the_private_home_by_its_resolved_path() {
 /// Tests create Unix sockets under TMPDIR, and macOS caps a socket path at
 /// 104 bytes, so the runner keeps TMPDIR short even when the ambient one, like
 /// macOS's per-user directory, is long. 40 bytes leaves 64 for the rest.
+/// Where `/tmp` is read-only, the ambient TMPDIR is the only place it can use.
 #[test]
 fn keeps_tmpdir_short_enough_for_unix_sockets() {
+    if !tmp_is_writable() {
+        eprintln!("skipping: /tmp is read-only here, so the runner must use the ambient TMPDIR");
+        return;
+    }
     let home = fake_home();
     let long = home.path().join("a-long-ambient-temporary-directory-name");
     std::fs::create_dir(&long).expect("create the ambient TMPDIR");
@@ -690,7 +710,15 @@ fn light_mode_runs_without_namespaces() {
     assert_eq!(lines.len(), 2, "{printed}");
     let fields: Vec<&str> = lines[0].split(' ').collect();
     assert_eq!(fields[..2], ["light", "dropped"], "{printed}");
-    assert!(fields[2].starts_with("/tmp/harnx-test."), "{printed}");
+    let parent = if tmp_is_writable() {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    assert!(
+        fields[2].starts_with(&format!("{}/harnx-test.", parent.display())),
+        "{printed}"
+    );
     assert_eq!(
         Path::new(lines[1]),
         own,
@@ -713,6 +741,110 @@ fn picks_light_mode_inside_harnx_sandbox() {
     assert_eq!(
         env.get("HARNX_TEST_SANDBOX").map(String::as_str),
         Some("light")
+    );
+}
+
+/// Claude Code's sandbox sets `SANDBOX_RUNTIME` and blocks the namespaces
+/// bubblewrap needs unless a setting allows them. The runner falls back to
+/// light mode there, rather than failing every test, and keeps the full
+/// sandbox where bubblewrap does start. A `bwrap` that always fails stands in
+/// for a blocked one.
+#[cfg(target_os = "linux")]
+#[test]
+fn falls_back_to_light_mode_inside_claude_codes_sandbox() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = fake_home();
+    let bin = fake_home();
+    let bwrap = bin.path().join("bwrap");
+    std::fs::write(
+        &bwrap,
+        "#!/bin/sh\necho 'bwrap: No permissions to create new namespace' >&2\nexit 1\n",
+    )
+    .expect("write a failing bwrap");
+    std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o755))
+        .expect("make the failing bwrap executable");
+    let path = std::env::var("PATH").expect("PATH is set");
+    let mode_of = |shell: Shell| {
+        env_of(
+            &shell
+                .remove("HARNX_TEST_SANDBOX")
+                .set("SANDBOX_RUNTIME", "1")
+                .run(&["env"]),
+        )
+        .remove("HARNX_TEST_SANDBOX")
+    };
+    let blocked = Shell::test_run(home.path()).set(
+        "PATH",
+        &format!("{}:{path}", bin.path().to_str().expect("UTF-8 path")),
+    );
+    assert_eq!(mode_of(blocked).as_deref(), Some("light"));
+    if full_sandbox_available() {
+        assert_eq!(
+            mode_of(Shell::test_run(home.path())),
+            None,
+            "bwrap works here"
+        );
+    }
+}
+
+/// Claude Code's sandbox makes `/tmp` read-only and leaves only its own
+/// TMPDIR writable, so light mode puts the private home there. Where `/tmp`
+/// is writable, bubblewrap makes it read-only for the runner.
+#[cfg(target_os = "linux")]
+#[test]
+fn light_mode_uses_tmpdir_when_tmp_is_read_only() {
+    let read_only_tmp: &[&str] = if !tmp_is_writable() {
+        &[]
+    } else if skips_without_bubblewrap() {
+        return;
+    } else {
+        &[
+            "bwrap",
+            "--unshare-user",
+            "--bind",
+            "/",
+            "/",
+            "--ro-bind",
+            "/tmp",
+            "/tmp",
+            "--",
+        ]
+    };
+    let home = fake_home();
+    let tmpdir = fake_home();
+    let runner = Shell::test_run(home.path())
+        .set("HARNX_TEST_SANDBOX", "light")
+        .set("TMPDIR", tmpdir.path().to_str().expect("UTF-8 path"))
+        .command(&["sh", "-c", "echo \"$XDG_CONFIG_HOME\""]);
+    let mut command = match read_only_tmp.split_first() {
+        Some((program, args)) => {
+            let mut wrapped = Command::new(program);
+            wrapped
+                .args(args)
+                .arg(runner.get_program())
+                .args(runner.get_args())
+                .env_clear()
+                .envs(
+                    runner
+                        .get_envs()
+                        .filter_map(|(name, value)| Some((name, value?))),
+                );
+            wrapped
+        }
+        None => runner,
+    };
+    let printed = stdout(&command.output().expect("run scripts/nextest-sandbox"));
+    let private = Path::new(printed.trim()).parent().expect("private home");
+    assert_eq!(
+        private.parent(),
+        Some(
+            tmpdir
+                .path()
+                .canonicalize()
+                .expect("resolve TMPDIR")
+                .as_path()
+        ),
+        "{printed}"
     );
 }
 

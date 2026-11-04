@@ -19,6 +19,9 @@ use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn llama_server_mock_e2e_lifecycle() -> Result<()> {
+    if skips_without_unix_sockets() {
+        return Ok(());
+    }
     let temp_dir = TempDir::new()?;
     let socket_path = temp_dir.path().join("llama-server-mock.sock");
     let script_path = write_mock_script(temp_dir.path())?;
@@ -54,34 +57,13 @@ async fn llama_server_mock_e2e_lifecycle() -> Result<()> {
     let reqwest_client = reqwest::Client::new();
 
     let non_stream = client
-        .chat_completions_inner(
-            &reqwest_client,
-            ChatCompletionsData {
-                messages: vec![user_message("non-stream")],
-                temperature: None,
-                top_p: None,
-                functions: None,
-                stream: false,
-                attachments_dir: None,
-            },
-        )
+        .chat_completions_inner(&reqwest_client, chat_request("non-stream", false))
         .await?;
     assert_eq!(non_stream.text, "mock non streaming reply");
     assert!(non_stream.tool_calls.is_empty());
 
-    let (stream_text, text_event_count) = stream_chat(
-        &*client,
-        &reqwest_client,
-        ChatCompletionsData {
-            messages: vec![user_message("stream")],
-            temperature: None,
-            top_p: None,
-            functions: None,
-            stream: true,
-            attachments_dir: None,
-        },
-    )
-    .await?;
+    let (stream_text, text_event_count) =
+        stream_chat(&*client, &reqwest_client, chat_request("stream", true)).await?;
     assert_eq!(stream_text, "streaming chunk parade");
     assert!(
         text_event_count > 1,
@@ -92,12 +74,8 @@ async fn llama_server_mock_e2e_lifecycle() -> Result<()> {
         .chat_completions_inner(
             &reqwest_client,
             ChatCompletionsData {
-                messages: vec![user_message("tool")],
-                temperature: None,
-                top_p: None,
                 functions: Some(vec![tool_declaration()]),
-                stream: false,
-                attachments_dir: None,
+                ..chat_request("tool", false)
             },
         )
         .await?;
@@ -135,6 +113,9 @@ async fn llama_server_mock_e2e_lifecycle() -> Result<()> {
 /// subprocess, and both sockets are cleaned up on drop.
 #[tokio::test]
 async fn llama_server_mock_multi_model_distinct_processes() -> Result<()> {
+    if skips_without_unix_sockets() {
+        return Ok(());
+    }
     let temp_dir = TempDir::new()?;
     let binary_path = resolve_mock_binary_path()?;
     let script_path = write_mock_script(temp_dir.path())?;
@@ -205,33 +186,13 @@ async fn llama_server_mock_multi_model_distinct_processes() -> Result<()> {
 
     // Drive chat through model-a
     let resp_a = client_a
-        .chat_completions_inner(
-            &reqwest_client,
-            ChatCompletionsData {
-                messages: vec![user_message("hello from a")],
-                temperature: None,
-                top_p: None,
-                functions: None,
-                stream: false,
-                attachments_dir: None,
-            },
-        )
+        .chat_completions_inner(&reqwest_client, chat_request("hello from a", false))
         .await?;
     assert_eq!(resp_a.text, "mock non streaming reply");
 
     // Drive chat through model-b
     let resp_b = client_b
-        .chat_completions_inner(
-            &reqwest_client,
-            ChatCompletionsData {
-                messages: vec![user_message("hello from b")],
-                temperature: None,
-                top_p: None,
-                functions: None,
-                stream: false,
-                attachments_dir: None,
-            },
-        )
+        .chat_completions_inner(&reqwest_client, chat_request("hello from b", false))
         .await?;
     assert_eq!(resp_b.text, "mock non streaming reply");
 
@@ -272,6 +233,9 @@ async fn llama_server_mock_multi_model_distinct_processes() -> Result<()> {
 /// The mock ignores -hf flag, so we can verify end-to-end flow.
 #[tokio::test]
 async fn llama_server_mock_hf_repo_only() -> Result<()> {
+    if skips_without_unix_sockets() {
+        return Ok(());
+    }
     let temp_dir = TempDir::new()?;
     let socket_path = temp_dir.path().join("hf-model.sock");
     let script_path = write_mock_script(temp_dir.path())?;
@@ -307,17 +271,7 @@ async fn llama_server_mock_hf_repo_only() -> Result<()> {
 
     let reqwest_client = reqwest::Client::new();
     let resp = client
-        .chat_completions_inner(
-            &reqwest_client,
-            ChatCompletionsData {
-                messages: vec![user_message("test hf")],
-                temperature: None,
-                top_p: None,
-                functions: None,
-                stream: false,
-                attachments_dir: None,
-            },
-        )
+        .chat_completions_inner(&reqwest_client, chat_request("test hf", false))
         .await?;
 
     assert_eq!(resp.text, "mock non streaming reply");
@@ -330,6 +284,9 @@ async fn llama_server_mock_hf_repo_only() -> Result<()> {
 /// The mock ignores -hf flag, so we can verify end-to-end flow.
 #[tokio::test]
 async fn llama_server_mock_name_as_hf_repo() -> Result<()> {
+    if skips_without_unix_sockets() {
+        return Ok(());
+    }
     let temp_dir = TempDir::new()?;
     // Use distinct socket to get a distinct process (prevents collision with other tests)
     let socket_path = temp_dir.path().join("name-as-hf.sock");
@@ -365,17 +322,7 @@ async fn llama_server_mock_name_as_hf_repo() -> Result<()> {
 
     let reqwest_client = reqwest::Client::new();
     let resp = client
-        .chat_completions_inner(
-            &reqwest_client,
-            ChatCompletionsData {
-                messages: vec![user_message("test name as hf")],
-                temperature: None,
-                top_p: None,
-                functions: None,
-                stream: false,
-                attachments_dir: None,
-            },
-        )
+        .chat_completions_inner(&reqwest_client, chat_request("test name as hf", false))
         .await?;
 
     assert_eq!(resp.text, "mock non streaming reply");
@@ -413,24 +360,40 @@ mod parent_death {
     /// checks the socket stops accepting connections once that parent is gone.
     #[tokio::test]
     async fn llama_server_child_does_not_outlive_parent_process() -> Result<()> {
+        if skips_without_unix_sockets() {
+            return Ok(());
+        }
         let temp_dir = TempDir::new()?;
         let socket_path = temp_dir.path().join("orphan-check.sock");
         let script_path = write_mock_script(temp_dir.path())?;
         let binary_path = resolve_mock_binary_path()?;
 
-        let status = Command::new(std::env::current_exe()?)
+        let helper = Command::new(std::env::current_exe()?)
             .args([
                 "--exact",
-                "parent_death::spawn_registry_server_then_exit",
+                "llama_server_mock::parent_death::spawn_registry_server_then_exit",
                 "--ignored",
                 "--nocapture",
             ])
             .env(HELPER_SOCKET_ENV, &socket_path)
             .env(HELPER_SCRIPT_ENV, &script_path)
             .env(HELPER_BIN_ENV, &binary_path)
-            .status()
+            .output()
             .context("failed to run helper process")?;
-        assert!(status.success(), "helper process failed with {status}");
+        let helper_stdout = String::from_utf8_lossy(&helper.stdout);
+        assert!(
+            helper.status.success(),
+            "helper process failed with {}: {helper_stdout}{}",
+            helper.status,
+            String::from_utf8_lossy(&helper.stderr)
+        );
+        // A filter that names no test runs nothing and still succeeds, and the
+        // refused connection below would then pass without a server ever
+        // having run.
+        assert!(
+            helper_stdout.contains("1 passed"),
+            "the helper test did not run: {helper_stdout}"
+        );
 
         // The helper proved the server was serving before it exited, so a refused
         // connection now means the child died with its parent rather than never
@@ -494,23 +457,34 @@ mod parent_death {
             .expect("init orphan-check client");
 
         let response = client
-            .chat_completions_inner(
-                &reqwest::Client::new(),
-                ChatCompletionsData {
-                    messages: vec![user_message("spawn please")],
-                    temperature: None,
-                    top_p: None,
-                    functions: None,
-                    stream: false,
-                    attachments_dir: None,
-                },
-            )
+            .chat_completions_inner(&reqwest::Client::new(), chat_request("spawn please", false))
             .await
             .expect("chat through registry-spawned server");
         assert_eq!(response.text, "mock non streaming reply");
 
         UnixStream::connect(&socket_path)
             .expect("server should be serving before the helper exits");
+    }
+}
+
+/// The mock serves on a Unix socket, which some sandboxes refuse.
+fn skips_without_unix_sockets() -> bool {
+    let skip = harnx_core::unix_sockets_blocked();
+    if skip {
+        eprintln!("skipping: Unix sockets are blocked here");
+    }
+    skip
+}
+
+/// A request with one user message and none of the optional settings.
+fn chat_request(text: &str, stream: bool) -> ChatCompletionsData {
+    ChatCompletionsData {
+        messages: vec![user_message(text)],
+        temperature: None,
+        top_p: None,
+        functions: None,
+        stream,
+        attachments_dir: None,
     }
 }
 

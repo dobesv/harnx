@@ -81,3 +81,21 @@ pub fn require_nextest() {
         );
     }
 }
+
+/// Whether this process is refused permission to create Unix domain sockets.
+/// Claude Code's sandbox refuses them on Linux, through a seccomp filter its
+/// `sandbox.network.allowAllUnixSockets` setting turns off. A test that needs
+/// one, such as a tmux or llama-server test, skips when this is true. Any
+/// other failure to create a socket is left for the test itself to report.
+/// Always false off Unix.
+pub fn unix_sockets_blocked() -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixDatagram::unbound()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
