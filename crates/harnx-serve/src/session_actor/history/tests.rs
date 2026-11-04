@@ -89,3 +89,46 @@ async fn projection_failure_preserves_durable_cancel() {
     assert_preserved_fields(&actor, &entries);
     assert_presentation_warning(&actor);
 }
+
+#[tokio::test]
+async fn session_get_reports_how_the_last_turn_ended() {
+    let sandbox = TestConfigSandbox::new();
+    // The fixture's first turn completed at seq 3; the next prompt's turn fails.
+    let mut entries = crate::transcript_snapshot::tests::fixture(3);
+    entries.push((
+        4,
+        SessionLogEntry::Message {
+            id: Some("second-prompt".into()),
+            role: harnx_core::message::MessageRole::User,
+            content: harnx_core::message::MessageContent::Text("Try again.".into()),
+            timestamp: None,
+            fence_token: None,
+        },
+    ));
+    entries.push((
+        5,
+        SessionLogEntry::Error {
+            message: "provider returned 500".into(),
+            fence_token: 1,
+            timestamp: None,
+        },
+    ));
+    let loaded = crate::LoadedNatsSession {
+        session: Session::default(),
+        entries,
+        base_session: Session {
+            agent_name: Some("plain".into()),
+            ..Default::default()
+        },
+        worker_active: false,
+    };
+    let mut actor = actor(sandbox.config());
+    actor.apply_history_snapshot(LoadedHistorySnapshot::from_loaded(loaded));
+    // An idle state alone can't tell this turn from one that finished.
+    assert_eq!(actor.state, SessionState::Idle);
+    let result = crate::ag_ui_rpc::session_get_result(&actor.session_info(), "nats");
+    assert_eq!(
+        result["last_turn"],
+        serde_json::json!({ "seq": 5, "outcome": "error", "message": "provider returned 500" })
+    );
+}
