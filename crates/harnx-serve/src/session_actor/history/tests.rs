@@ -10,12 +10,24 @@ fn loaded_with_projection_error(
     // Invalid raw sequence fails D1 validation before projection, not control replay.
     entries[0].0 = 0;
     entries.push((4, control));
-    crate::LoadedNatsSession {
-        session: Session {
+    plain_session(
+        Session {
             tokens: 123,
             replay_warnings: vec!["existing replay warning".into()],
             ..Default::default()
         },
+        entries,
+        worker_active,
+    )
+}
+
+fn plain_session(
+    session: Session,
+    entries: Vec<(u64, SessionLogEntry)>,
+    worker_active: bool,
+) -> crate::LoadedNatsSession {
+    crate::LoadedNatsSession {
+        session,
         entries,
         base_session: Session {
             agent_name: Some("plain".into()),
@@ -39,6 +51,13 @@ fn actor(config: Config) -> SessionActor {
     .0
 }
 
+fn actor_after_load(loaded: crate::LoadedNatsSession) -> SessionActor {
+    let sandbox = TestConfigSandbox::new();
+    let mut actor = actor(sandbox.config());
+    actor.apply_history_snapshot(LoadedHistorySnapshot::from_loaded(loaded));
+    actor
+}
+
 fn assert_presentation_warning(actor: &SessionActor) {
     assert!(actor.history_snapshot.is_empty() && actor.compaction.is_none());
     assert_eq!(actor.history_warnings[0], "existing replay warning");
@@ -56,7 +75,6 @@ fn assert_preserved_fields(actor: &SessionActor, entries: &[(u64, SessionLogEntr
 
 #[tokio::test]
 async fn projection_failure_preserves_pending_approval_and_worker_lease() {
-    let sandbox = TestConfigSandbox::new();
     let loaded = loaded_with_projection_error(
         SessionLogEntry::HitlApprovalRequested {
             tool_call_id: "approval".into(),
@@ -66,8 +84,7 @@ async fn projection_failure_preserves_pending_approval_and_worker_lease() {
         true,
     );
     let entries = loaded.entries.clone();
-    let mut actor = actor(sandbox.config());
-    actor.apply_history_snapshot(LoadedHistorySnapshot::from_loaded(loaded));
+    let actor = actor_after_load(loaded);
     assert!(matches!(actor.state, SessionState::AwaitingApproval { .. }));
     assert!(actor.worker_active);
     assert_preserved_fields(&actor, &entries);
@@ -76,14 +93,12 @@ async fn projection_failure_preserves_pending_approval_and_worker_lease() {
 
 #[tokio::test]
 async fn projection_failure_preserves_durable_cancel() {
-    let sandbox = TestConfigSandbox::new();
     let loaded = loaded_with_projection_error(
         SessionLogEntry::cancel_request("stop".into(), "test".into()),
         false,
     );
     let entries = loaded.entries.clone();
-    let mut actor = actor(sandbox.config());
-    actor.apply_history_snapshot(LoadedHistorySnapshot::from_loaded(loaded));
+    let actor = actor_after_load(loaded);
     assert_eq!(actor.state, SessionState::Interrupted { cancel_seq: 4 });
     assert!(!actor.worker_active);
     assert_preserved_fields(&actor, &entries);
@@ -92,7 +107,6 @@ async fn projection_failure_preserves_durable_cancel() {
 
 #[tokio::test]
 async fn session_get_reports_how_the_last_turn_ended() {
-    let sandbox = TestConfigSandbox::new();
     // The fixture's first turn completed at seq 3; the next prompt's turn fails.
     let mut entries = crate::transcript_snapshot::tests::fixture(3);
     entries.push((
@@ -113,17 +127,7 @@ async fn session_get_reports_how_the_last_turn_ended() {
             timestamp: None,
         },
     ));
-    let loaded = crate::LoadedNatsSession {
-        session: Session::default(),
-        entries,
-        base_session: Session {
-            agent_name: Some("plain".into()),
-            ..Default::default()
-        },
-        worker_active: false,
-    };
-    let mut actor = actor(sandbox.config());
-    actor.apply_history_snapshot(LoadedHistorySnapshot::from_loaded(loaded));
+    let actor = actor_after_load(plain_session(Session::default(), entries, false));
     // An idle state alone can't tell this turn from one that finished.
     assert_eq!(actor.state, SessionState::Idle);
     let result = crate::ag_ui_rpc::session_get_result(&actor.session_info(), "nats");
