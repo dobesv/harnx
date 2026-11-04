@@ -381,38 +381,7 @@ async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<(
         .await?;
 
     // Seed the invocation journal exactly like a finished external call.
-    let request = harnx_toolset::ToolRequest {
-        run_context: None,
-        replay: None,
-        call_id: "wire-1".to_string(),
-        operation_id: "wire-1".to_string(),
-        tool: "bash".to_string(),
-        args: json!({"command": "true"}),
-        parent_session_id: Some("session-1".to_string()),
-        parent_agent: None,
-        parent_local_session_id: None,
-        tool_call_id: Some("bash-1".to_string()),
-        capabilities: Default::default(),
-        tool_round: Some(1),
-    };
-    let journal = harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
-        &async_nats::jetstream::new(client.clone()),
-        1,
-    )
-    .await?;
-    journal
-        .record(&request, ("bash", "external-scope", "external-server"))
-        .await?;
-    journal
-        .complete(
-            &request,
-            harnx_toolset::ToolReply {
-                call_id: "wire-1".to_string(),
-                result: Ok(json!({"native": true})),
-                final_progress: None,
-            },
-        )
-        .await?;
+    seed_journaled_bash_reply(&client).await?;
 
     // No tool servers: script mode stays inactive, so the bare `bash` name
     // belongs to the journaled external tool.
@@ -456,5 +425,41 @@ async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<(
         "the external tool's saved reply must be recovered, not a synthetic interruption: {}",
         result.output
     );
+    Ok(())
+}
+
+async fn seed_journaled_bash_reply(client: &async_nats::Client) -> Result<()> {
+    let request = harnx_toolset::ToolRequest {
+        run_context: None,
+        replay: None,
+        call_id: "wire-1".to_string(),
+        operation_id: "wire-1".to_string(),
+        tool: "bash".to_string(),
+        args: json!({"command": "true"}),
+        parent_session_id: Some("session-1".to_string()),
+        parent_agent: None,
+        parent_local_session_id: None,
+        tool_call_id: Some("bash-1".to_string()),
+        capabilities: Default::default(),
+        tool_round: Some(1),
+    };
+    let journal = harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
+        &async_nats::jetstream::new(client.clone()),
+        1,
+    )
+    .await?;
+    journal
+        .record(&request, ("bash", "external-scope", "external-server"))
+        .await?;
+    journal
+        .complete(
+            &request,
+            harnx_toolset::ToolReply {
+                call_id: "wire-1".to_string(),
+                result: Ok(json!({"native": true})),
+                final_progress: None,
+            },
+        )
+        .await?;
     Ok(())
 }

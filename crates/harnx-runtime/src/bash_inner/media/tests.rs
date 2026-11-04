@@ -100,16 +100,34 @@ fn harness(
     fetcher: Option<Arc<dyn AttachmentFetcher>>,
     fail: bool,
 ) -> (BashProvider, Arc<ToolEvalContext>) {
-    harness_with_post_hook(value, store, fetcher, fail, None)
+    harness_with_post_hook(
+        value,
+        HarnessOptions {
+            store,
+            fetcher,
+            fail,
+            mutation: None,
+        },
+    )
 }
 
-fn harness_with_post_hook(
-    value: Value,
+struct HarnessOptions {
     store: Option<Arc<dyn MediaStore>>,
     fetcher: Option<Arc<dyn AttachmentFetcher>>,
     fail: bool,
     mutation: Option<Value>,
+}
+
+fn harness_with_post_hook(
+    value: Value,
+    options: HarnessOptions,
 ) -> (BashProvider, Arc<ToolEvalContext>) {
+    let HarnessOptions {
+        store,
+        fetcher,
+        fail,
+        mutation,
+    } = options;
     let slot = BashEvalContextSlot::new();
     let declaration = serde_json::from_value(json!({
         "name":"screenshot", "description":"Capture a screenshot.",
@@ -171,11 +189,34 @@ async fn run(provider: &BashProvider, script: &str) -> Value {
         Err(ToolError::Recoverable(error)) => partial_result_of(&error).unwrap().clone(),
         Err(ToolError::Fatal(error)) => panic!("unexpected fatal provider error: {error:#}"),
     };
+    assert_no_inline_png(&value);
+    value
+}
+
+#[track_caller]
+fn assert_exit_code(result: &Value, expected: i32) {
+    assert_eq!(result["exit_code"], expected, "{result}");
+}
+
+#[track_caller]
+fn assert_no_inline_png(value: &Value) {
     assert!(
         !value.to_string().contains(PNG),
         "inline PNG leaked: {value}"
     );
-    value
+}
+
+#[track_caller]
+fn assert_single_upload(store: &MemoryStore) {
+    assert_eq!(store.0.lock().unwrap().len(), 1);
+}
+
+#[track_caller]
+fn assert_command_not_run(result: &Value) {
+    assert!(!result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("should-not-run"));
 }
 
 #[tokio::test]
@@ -197,7 +238,7 @@ async fn inline_png_is_readable_before_command_returns_in_all_output_modes() {
             "path=$({path}); test -n \"$path\"; base64 -w0 \"$path\" > /tmp/actual; test \"$(cat /tmp/actual)\" = '{PNG}'; wc -c < \"$path\"; screenshot {option}"
         );
         let result = run(&provider, &script).await;
-        assert_eq!(result["exit_code"], 0, "{result}");
+        assert_exit_code(&result, 0);
         assert!(
             result["stdout"].as_str().unwrap().starts_with("68\n"),
             "{result}"
@@ -206,7 +247,7 @@ async fn inline_png_is_readable_before_command_returns_in_all_output_modes() {
             .as_str()
             .unwrap()
             .contains("[attachment: cid:media:pantheon%2Fatlas/inner1/"));
-        assert_eq!(store.0.lock().unwrap().len(), 1);
+        assert_single_upload(&store);
     }
 }
 
@@ -219,7 +260,7 @@ async fn structured_media_and_serialized_json_mirrors_are_externalized() {
         .prepare(&mut value)
         .await
         .unwrap();
-    assert!(!value.to_string().contains(PNG));
+    assert_no_inline_png(&value);
     assert!(value["structuredContent"]["nested"][0]["path"]
         .as_str()
         .unwrap()
@@ -227,7 +268,7 @@ async fn structured_media_and_serialized_json_mirrors_are_externalized() {
     let mirror: Value =
         serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(mirror, value["structuredContent"]);
-    assert_eq!(store.0.lock().unwrap().len(), 1);
+    assert_single_upload(&store);
     let (provider, _ctx) = harness(
         json!({"content":[], "structuredContent": {"image":image()}}),
         Some(store.clone()),
@@ -235,7 +276,7 @@ async fn structured_media_and_serialized_json_mirrors_are_externalized() {
         false,
     );
     let result = run(&provider, "screenshot -o json | jq -r '.image.path'").await;
-    assert_eq!(result["exit_code"], 0, "{result}");
+    assert_exit_code(&result, 0);
     assert!(result["stdout"]
         .as_str()
         .unwrap()
@@ -269,7 +310,7 @@ async fn embedded_binary_text_resources_and_audio_use_the_same_store() {
             .unwrap()
             .contains("path=/attachments/"));
     }
-    assert!(!value.to_string().contains(PNG));
+    assert_no_inline_png(&value);
 }
 
 #[tokio::test]
@@ -287,12 +328,9 @@ async fn malformed_media_fails_without_echoing_inline_payloads() {
             false,
         );
         let result = run(&provider, "screenshot -o json; echo should-not-run").await;
-        assert_eq!(result["exit_code"], 1, "{result}");
+        assert_exit_code(&result, 1);
         assert!(!result.to_string().contains("SECRET"));
-        assert!(!result["stdout"]
-            .as_str()
-            .unwrap()
-            .contains("should-not-run"));
+        assert_command_not_run(&result);
         assert_eq!(result["trace"][0]["status"], "tool_error");
     }
 }
@@ -307,12 +345,12 @@ async fn recoverable_partial_results_have_no_inline_media() {
         true,
     );
     let result = run(&provider, "screenshot -o json").await;
-    assert_eq!(result["exit_code"], 1, "{result}");
+    assert_exit_code(&result, 1);
     assert!(result["stdout"]
         .as_str()
         .unwrap()
         .contains("path=/attachments/"));
-    assert_eq!(store.0.lock().unwrap().len(), 1);
+    assert_single_upload(&store);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -334,7 +372,7 @@ async fn nats_inline_png_round_trip_has_correct_owner_and_immediate_read_consist
     let result = run(&provider, &format!(
         "path=$(screenshot -o json | jq -r '.content[0].path'); base64 -w0 \"$path\" > /tmp/image; test \"$(cat /tmp/image)\" = '{PNG}'; echo \"$path\"; wc -c < \"$path\""
     )).await;
-    assert_eq!(result["exit_code"], 0, "{result}");
+    assert_exit_code(&result, 0);
     let expected_cid =
         cid_for_data_url_with_session(&owner(), &format!("data:image/png;base64,{PNG}"));
     assert_eq!(
@@ -365,10 +403,7 @@ async fn absent_storage_stops_even_with_errexit_disabled_and_plain_results_still
             .contains("attachment storage unavailable"),
         "{result}"
     );
-    assert!(!result["stdout"]
-        .as_str()
-        .unwrap()
-        .contains("should-not-run"));
+    assert_command_not_run(&result);
     assert_eq!(result["trace"][0]["status"], "fatal");
     for plain in [
         Value::Null,
@@ -459,7 +494,7 @@ async fn pending_media_writes_cancel_without_publishing_a_path_or_detached_uploa
     assert_eq!(report["status"], "cancelled");
     assert_eq!(report["stdout"], "");
     assert_eq!(report["trace"][0]["status"], "cancelled");
-    assert!(!report.to_string().contains(PNG));
+    assert_no_inline_png(report);
     assert_eq!(store.active.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(store.memory.0.lock().unwrap().is_empty());
 }
@@ -498,7 +533,7 @@ async fn concurrency_permits_cover_media_writes_until_the_command_finishes() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(result["exit_code"], 0, "{result}");
+    assert_exit_code(&result, 0);
     assert_eq!(result["stdout"], "done\n");
     assert_eq!(result["trace"].as_array().unwrap().len(), 12);
     assert!(store.peak.load(std::sync::atomic::Ordering::SeqCst) <= 8);
@@ -553,7 +588,7 @@ async fn nats_duplicate_inline_uploads_are_readable_while_other_commands_are_wri
         let result = run(&provider, &format!(
             "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do {{ path=$(screenshot -o json | jq -r '.content[0].path'); test -n \"$path\"; test \"$(base64 -w0 \"$path\")\" = '{PNG}'; echo verified; }} > /tmp/$i & done; wait; cat /tmp/*; echo done"
         )).await;
-        assert_eq!(result["exit_code"], 0, "{result}");
+        assert_exit_code(&result, 0);
         assert_eq!(
             result["stdout"],
             format!("{}done\n", "verified\n".repeat(12)),
@@ -590,15 +625,17 @@ async fn post_hook_injected_images_are_externalized_before_script_rendering() {
     let store = Arc::new(MemoryStore::default());
     let (provider, _ctx) = harness_with_post_hook(
         json!({"content":[{"type":"text", "text":"original"}]}),
-        Some(store.clone()),
-        Some(store),
-        false,
-        Some(json!({"content":[image()]})),
+        HarnessOptions {
+            store: Some(store.clone()),
+            fetcher: Some(store),
+            fail: false,
+            mutation: Some(json!({"content":[image()]})),
+        },
     );
     let result = run(&provider, &format!(
         "path=$(screenshot -o json | jq -r '.content[0].path'); test \"$(base64 -w0 \"$path\")\" = '{PNG}'; echo verified"
     )).await;
-    assert_eq!(result["exit_code"], 0, "{result}");
+    assert_exit_code(&result, 0);
     assert_eq!(result["stdout"], "verified\n");
 }
 
@@ -612,11 +649,11 @@ async fn data_uri_links_are_externalized_and_remote_links_never_trigger_storage(
         {"type":"resource_link", "uri":"https://example.com/image.png", "mimeType":"image/png"}
     ]});
     processor.prepare(&mut value).await.unwrap();
-    assert!(!value.to_string().contains(PNG));
+    assert_no_inline_png(&value);
     assert!(value["content"][0]["path"].is_string());
     assert_eq!(value["content"][0], value["content"][1]);
     assert_eq!(value["content"][2]["uri"], "https://example.com/image.png");
-    assert_eq!(store.0.lock().unwrap().len(), 1);
+    assert_single_upload(&store);
     let prepared = value.clone();
     processor.prepare(&mut value).await.unwrap();
     assert_eq!(value, prepared, "already externalized results are stable");
@@ -636,7 +673,7 @@ async fn structured_unwrapped_media_bodies_are_replaced_without_guessing_busines
         false,
     );
     let result = run(&provider, "screenshot -o json").await;
-    assert_eq!(result["exit_code"], 0, "{result}");
+    assert_exit_code(&result, 0);
     let document: Value = serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
     assert!(document["image"]["path"].is_string());
     assert!(document["resource"]["path"].is_string());

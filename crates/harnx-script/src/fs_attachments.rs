@@ -100,12 +100,10 @@ fn entry<'a>(path: &'a Path, limits: &FsLimits) -> io::Result<Entry<'a>> {
         return Ok(Entry::Directory);
     }
     let components: Vec<_> = path.split('/').collect();
-    if components
-        .iter()
-        .any(|part| part.is_empty() || matches!(*part, "." | "..") || part.contains('\\'))
-        || !components[0].starts_with("cid:media:")
-        || components[0] == "cid:media:"
-    {
+    if components.iter().any(|part| invalid_component(part)) {
+        return Err(invalid_path());
+    }
+    if !valid_media_prefix(components[0]) {
         return Err(invalid_path());
     }
     match components.len() {
@@ -113,6 +111,14 @@ fn entry<'a>(path: &'a Path, limits: &FsLimits) -> io::Result<Entry<'a>> {
         3 => Ok(Entry::Blob(path)),
         _ => Err(invalid_path()),
     }
+}
+
+fn invalid_component(part: &str) -> bool {
+    part.is_empty() || matches!(part, "." | "..") || part.contains('\\')
+}
+
+fn valid_media_prefix(part: &str) -> bool {
+    part.starts_with("cid:media:") && part != "cid:media:"
 }
 
 enum Entry<'a> {

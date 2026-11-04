@@ -262,80 +262,87 @@ fn media_children(object: &mut serde_json::Map<String, Value>) -> impl Iterator<
 }
 
 fn inline_data_url(value: &Value) -> Result<Option<String>> {
-    let Some(kind) = value.get("type").and_then(Value::as_str) else {
-        // Structured results may carry a resource body without the MCP wrapper.
-        // Require a MIME type before treating an otherwise ordinary data field
-        // as media; don't guess that every business string is base64.
-        if let Some(mime) = mime_type(value) {
-            let kind = mime.split('/').next().unwrap_or("").trim();
-            let data = value.get("blob").or_else(|| {
-                (kind.eq_ignore_ascii_case("image") || kind.eq_ignore_ascii_case("audio"))
-                    .then(|| value.get("data"))
-                    .flatten()
-            });
-            if let Some(data) = data {
-                let data = data
-                    .as_str()
-                    .ok_or_else(|| invalid("inline media body must be a string"))?;
-                return Ok(Some(format!("data:{mime};base64,{data}")));
-            }
-        }
-        return Ok(None);
-    };
-    match kind {
-        "image" => {
-            let mut images =
-                harnx_engine::media::extract_image_parts(&json!({"content": [value]}))?;
-            match images.pop() {
-                Some(MessageContentPart::ImageUrl { image_url }) => Ok(Some(image_url.url)),
-                _ => Err(invalid("inline image requires string data and MIME type")),
-            }
-        }
-        "audio" => {
-            let mime =
-                mime_type(value).ok_or_else(|| invalid("inline audio requires a MIME type"))?;
-            let data = value
-                .get("data")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid("inline audio requires base64 data"))?;
-            Ok(Some(format!("data:{mime};base64,{data}")))
-        }
-        "resource" => {
-            let resource = value
-                .get("resource")
-                .context(InvalidMedia("embedded resource is missing its body"))?;
-            let mime = mime_type(resource).unwrap_or("application/octet-stream");
-            if let Some(blob) = resource.get("blob").and_then(Value::as_str) {
-                Ok(Some(format!("data:{mime};base64,{blob}")))
-            } else if let Some(text) = resource.get("text").and_then(Value::as_str) {
-                Ok(Some(format!(
-                    "data:{mime};base64,{}",
-                    harnx_core::crypto::base64_encode(text.as_bytes())
-                )))
-            } else if resource.get("blob").is_some() || resource.get("text").is_some() {
-                Err(invalid("embedded resource body must be a string"))
-            } else {
-                Ok(resource
-                    .get("uri")
-                    .and_then(Value::as_str)
-                    .filter(|uri| is_base64_data_uri(uri))
-                    .map(str::to_owned))
-            }
-        }
-        "resource_link" => {
-            if let Some(uri) = value.get("uri").and_then(Value::as_str) {
-                if is_base64_data_uri(uri) {
-                    return Ok(Some(uri.to_owned()));
-                }
-                if uri.starts_with("cid:media:") {
-                    CidUrl::parse(uri)
-                        .map_err(|_| invalid("invalid media attachment reference"))?;
-                }
-            }
-            Ok(None)
-        }
+    match value.get("type").and_then(Value::as_str) {
+        Some("image") => image_data_url(value),
+        Some("audio") => audio_data_url(value),
+        Some("resource") => resource_data_url(value),
+        Some("resource_link") => resource_link_data_url(value),
+        None => unwrapped_data_url(value),
         _ => Ok(None),
     }
+}
+
+fn unwrapped_data_url(value: &Value) -> Result<Option<String>> {
+    // Structured results may carry a resource body without the MCP wrapper.
+    // Require a MIME type before treating an otherwise ordinary data field
+    // as media; don't guess that every business string is base64.
+    if let Some(mime) = mime_type(value) {
+        let kind = mime.split('/').next().unwrap_or("").trim();
+        let data = value.get("blob").or_else(|| {
+            (kind.eq_ignore_ascii_case("image") || kind.eq_ignore_ascii_case("audio"))
+                .then(|| value.get("data"))
+                .flatten()
+        });
+        if let Some(data) = data {
+            let data = data
+                .as_str()
+                .ok_or_else(|| invalid("inline media body must be a string"))?;
+            return Ok(Some(format!("data:{mime};base64,{data}")));
+        }
+    }
+    Ok(None)
+}
+
+fn image_data_url(value: &Value) -> Result<Option<String>> {
+    let mut images = harnx_engine::media::extract_image_parts(&json!({"content": [value]}))?;
+    match images.pop() {
+        Some(MessageContentPart::ImageUrl { image_url }) => Ok(Some(image_url.url)),
+        _ => Err(invalid("inline image requires string data and MIME type")),
+    }
+}
+
+fn audio_data_url(value: &Value) -> Result<Option<String>> {
+    let mime = mime_type(value).ok_or_else(|| invalid("inline audio requires a MIME type"))?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("inline audio requires base64 data"))?;
+    Ok(Some(format!("data:{mime};base64,{data}")))
+}
+
+fn resource_data_url(value: &Value) -> Result<Option<String>> {
+    let resource = value
+        .get("resource")
+        .context(InvalidMedia("embedded resource is missing its body"))?;
+    let mime = mime_type(resource).unwrap_or("application/octet-stream");
+    if let Some(blob) = resource.get("blob").and_then(Value::as_str) {
+        Ok(Some(format!("data:{mime};base64,{blob}")))
+    } else if let Some(text) = resource.get("text").and_then(Value::as_str) {
+        Ok(Some(format!(
+            "data:{mime};base64,{}",
+            harnx_core::crypto::base64_encode(text.as_bytes())
+        )))
+    } else if resource.get("blob").is_some() || resource.get("text").is_some() {
+        Err(invalid("embedded resource body must be a string"))
+    } else {
+        Ok(resource
+            .get("uri")
+            .and_then(Value::as_str)
+            .filter(|uri| is_base64_data_uri(uri))
+            .map(str::to_owned))
+    }
+}
+
+fn resource_link_data_url(value: &Value) -> Result<Option<String>> {
+    if let Some(uri) = value.get("uri").and_then(Value::as_str) {
+        if is_base64_data_uri(uri) {
+            return Ok(Some(uri.to_owned()));
+        }
+        if uri.starts_with("cid:media:") {
+            CidUrl::parse(uri).map_err(|_| invalid("invalid media attachment reference"))?;
+        }
+    }
+    Ok(None)
 }
 
 fn mime_type(value: &Value) -> Option<&str> {
