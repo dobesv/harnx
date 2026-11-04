@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.20 (2026-11-04)
+
+### Features
+
+- add write_attachment tool to fs and sandbox toolsets (#2566)
+
+#### Enable in-process script execution for the synthesized `bash` tool in script mode.
+
+When `bash_tools` resolves to inner tools, the synthesized `bash` tool runs scripts in an isolated BashKit subshell with an in-process virtual filesystem (`/tmp`), no host filesystem access, and no network access. Inner tools are exposed as commands with kebab-case options mapped from their JSON schemas, plus `--json` input overrides and `-o json|text` output formatting. Includes built-in `tools [pattern]` catalog discovery and `<tool> --help`. Inner tool calls invoke hooks and enforce a concurrency cap (default 8). Tools requiring interactive approval fail fast with exit code 3 (`needs approval: <tool>; call it directly instead of from bash`).
+
+If a worker restarts while a script runs, the call is reported as interrupted and is never automatically re-run.
+
+Note: while `bash_tools` is active, the bare tool name `bash` is replaced by script mode; qualified names like `<server>_bash` continue to work. Mixed-version clusters: older workers silently ignore a frontmatter `bash_tools` field (frontmatter parsing is lenient), but they cannot load persisted session overrides carrying `bash_tools` (session metadata uses strict field checking). Upgrade all workers before setting `bash_tools` overrides.
+
+### Fixes
+
+- `session/get` now reports how the session's last turn ended in `last_turn`: `completed`, `error` with the worker's message, `timed_out` with its deadline, or `interrupted`. A client that reconnects after a run ended can tell a failed turn from a finished one, which `state` and `history_snapshot` don't show.
+
+#### Add fs_write_attachment to copy session attachments into files, including in sandboxes.
+
+Sandbox operators must update the sandbox pod image or manifest to run `harnx-fs-tools` with `--sandbox-transport` (or `HARNX_FS_SANDBOX_TRANSPORT=1`) and replace existing pods so the gateway can deliver attachment bytes via `write_bytes`.
+
+`--sandbox-transport` and `HARNX_FS_SANDBOX_TRANSPORT=1` work only with `--mcp-http`; other modes exit at startup, so don't set the environment variable on shared manifests used by non-HTTP fs servers.
+
 ## 0.34.19 (2026-11-03)
 
 ### Features
