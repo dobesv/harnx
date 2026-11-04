@@ -286,6 +286,8 @@ pub struct SessionInfo {
     pub compaction: Option<SessionCompaction>,
     pub history_warnings: Vec<String>,
     pub capabilities: SessionCapabilities,
+    /// How the most recent turn ended; `None` until one has.
+    pub(crate) last_turn: Option<crate::last_turn::LastTurn>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

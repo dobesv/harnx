@@ -1918,19 +1918,6 @@ dependencies = [
 
 [[package]]
 name = "cssparser"
-version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c9cdaae01d5ed7882b04d795e7f752f46ff52d2fa3b50a20d28c464510bba98"
-dependencies = [
- "cssparser-macros",
- "dtoa-short",
- "itoa",
- "phf 0.13.1",
- "smallvec",
-]
-
-[[package]]
-name = "cssparser"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11119743ad110e8c1bdccd930d7f5c30c99e5fc76a7b63ec9807e84eef0c5f59"
@@ -2365,13 +2352,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498c698ac51127148a3984450e51fca7f01805a91d7a1f7a24af0a5f761e3385"
 dependencies = [
  "bit-set 0.11.1",
- "cssparser 0.38.0",
+ "cssparser",
  "foldhash 0.2.0",
  "html5ever 0.40.1",
  "memchr",
  "nom 8.0.0",
  "precomputed-hash",
- "selectors 0.41.0",
+ "selectors",
  "tendril 0.5.0",
 ]
 
@@ -4129,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "harnx"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "ansi_colours",
  "anyhow",
@@ -4226,7 +4213,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-a2a-server"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "a2a-lf",
  "a2a-pb",
@@ -4265,7 +4252,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-acp-server"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -4289,7 +4276,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-attachment-tools"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4315,7 +4302,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-aws-creds"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -4334,7 +4321,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-bash-tools"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4365,7 +4352,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-blob-store"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4384,7 +4371,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-claude-compatible-hook-server"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4406,7 +4393,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-client"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4449,7 +4436,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-core"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -4488,7 +4475,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-engine"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4509,7 +4496,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-exa-tools"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4530,7 +4517,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-fetch"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "fancy-regex 0.20.0",
@@ -4552,7 +4539,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-fetch-tools"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4578,7 +4565,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-fs-tools"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4608,7 +4595,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-git-history"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "gix",
@@ -4620,7 +4607,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-grep-tools"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4641,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-healthz"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -4653,7 +4640,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-hooks"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "fancy-regex 0.20.0",
@@ -4668,7 +4655,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-hookset"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4679,7 +4666,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-hookset-server"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4701,7 +4688,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-k8s-creds"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -4725,7 +4712,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-k8s-sandbox-tools"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4773,7 +4760,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-bridge"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4807,7 +4794,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-remote"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -4831,7 +4818,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-server"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4860,7 +4847,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-metrics"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -4895,7 +4882,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-pkg"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4926,7 +4913,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-plans-tools"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4952,7 +4939,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-proxy-auth"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4995,7 +4982,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-rag"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5021,7 +5008,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-render"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "ansi_colours",
  "anyhow",
@@ -5036,7 +5023,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-runtime"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5123,7 +5110,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-sandbox-common"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "birdcage",
@@ -5136,7 +5123,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-sandbox-run"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -5152,7 +5139,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-script"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "async-trait",
  "bashkit",
@@ -5165,7 +5152,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-serve"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "ag-ui-core",
  "anyhow",
@@ -5214,7 +5201,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-session"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "harnx-core",
@@ -5224,7 +5211,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-spinner"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -5234,7 +5221,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-telemetry"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -5265,7 +5252,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-test-bins"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -5284,7 +5271,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-time-tools"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -5310,7 +5297,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-tool-allow"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "gix",
  "tempfile",
@@ -5318,7 +5305,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-toolset"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5330,7 +5317,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-toolset-server"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -5364,7 +5351,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-tui"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -5410,7 +5397,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-worker"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -5569,16 +5556,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "html5ever"
-version = "0.39.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46a1761807faccc9a19e86944bbf40610014066306f96edcdedc2fb714bcb7b8"
-dependencies = [
- "log",
- "markup5ever 0.39.0",
 ]
 
 [[package]]
@@ -6582,24 +6559,13 @@ dependencies = [
 
 [[package]]
 name = "markup5ever"
-version = "0.39.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7122d987ec5f704ee56f6e5b41a7d93722e9aae27ae07cafa4036c4d3f9757de"
-dependencies = [
- "log",
- "tendril 0.5.0",
- "web_atoms 0.2.5",
-]
-
-[[package]]
-name = "markup5ever"
 version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ab3dc68ac4a0f5719e560136778c1ee716e296030d75dbd4484e37e39e3a842"
 dependencies = [
  "log",
  "tendril 0.5.0",
- "web_atoms 0.3.0",
+ "web_atoms",
 ]
 
 [[package]]
@@ -7695,17 +7661,6 @@ dependencies = [
 
 [[package]]
 name = "phf"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
-dependencies = [
- "phf_macros 0.13.1",
- "phf_shared 0.13.1",
- "serde",
-]
-
-[[package]]
-name = "phf"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "010378780309880b08997fae13be7834dba947d36393bd372f2b1556deb2a2f6"
@@ -7723,16 +7678,6 @@ checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
 dependencies = [
  "phf_generator 0.11.3",
  "phf_shared 0.11.3",
-]
-
-[[package]]
-name = "phf_codegen"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49aa7f9d80421bca176ca8dbfebe668cc7a2684708594ec9f3c0db0805d5d6e1"
-dependencies = [
- "phf_generator 0.13.1",
- "phf_shared 0.13.1",
 ]
 
 [[package]]
@@ -7757,16 +7702,6 @@ dependencies = [
 
 [[package]]
 name = "phf_generator"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "135ace3a761e564ec88c03a77317a7c6b80bb7f7135ef2544dbe054243b89737"
-dependencies = [
- "fastrand",
- "phf_shared 0.13.1",
-]
-
-[[package]]
-name = "phf_generator"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aeb62e0959d5a1bebc965f4d15d9e2b7cea002b6b0f5ba8cde6cc26738467100"
@@ -7783,19 +7718,6 @@ checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
 dependencies = [
  "phf_generator 0.11.3",
  "phf_shared 0.11.3",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
-name = "phf_macros"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "812f032b54b1e759ccd5f8b6677695d5268c588701effba24601f6932f8269ef"
-dependencies = [
- "phf_generator 0.13.1",
- "phf_shared 0.13.1",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -7828,15 +7750,6 @@ name = "phf_shared"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
-dependencies = [
- "siphasher",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher",
 ]
@@ -8485,9 +8398,9 @@ dependencies = [
 
 [[package]]
 name = "ratatui-textarea"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78cdce79220909bec1bb8307c29fad7d0df7434280da6ecaf44cb208393bed00"
+checksum = "6cf7263fbb7f37caa4bcfd00fc604ff1409f70456a833fbdff99282e88fdfe92"
 dependencies = [
  "ratatui-core",
  "ratatui-crossterm",
@@ -9038,17 +8951,16 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scraper"
-version = "0.27.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdd0be4d296f048bfb06dd01bbc80ef789ddd2e55583e8d2e6b804942abfabc2"
+checksum = "6844b5f49a5579f12ba4f89d9f7eec6d71889e4aa0bc7181821040ce66f08fff"
 dependencies = [
- "cssparser 0.37.0",
+ "cssparser",
  "ego-tree",
- "html5ever 0.39.0",
+ "html5ever 0.40.1",
  "indexmap 2.14.2",
  "precomputed-hash",
- "selectors 0.38.0",
- "tendril 0.5.0",
+ "selectors",
 ]
 
 [[package]]
@@ -9094,37 +9006,18 @@ dependencies = [
 
 [[package]]
 name = "selectors"
-version = "0.38.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8adfa1c298912827b8a28b223b3b874357397ae706e6190acd9bf28cee99114d"
-dependencies = [
- "bitflags 2.13.2",
- "cssparser 0.37.0",
- "derive_more",
- "log",
- "new_debug_unreachable",
- "phf 0.13.1",
- "phf_codegen 0.13.1",
- "precomputed-hash",
- "rustc-hash",
- "servo_arc 0.4.3",
- "smallvec",
-]
-
-[[package]]
-name = "selectors"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8322aebea94a6cc288ff884e8a49bdbceef60206c400c6c46d22e62fc4fd91a6"
 dependencies = [
  "bitflags 2.13.2",
- "cssparser 0.38.0",
+ "cssparser",
  "derive_more",
  "log",
  "new_debug_unreachable",
  "precomputed-hash",
  "rustc-hash",
- "servo_arc 0.5.0",
+ "servo_arc",
  "smallvec",
 ]
 
@@ -9338,15 +9231,6 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
-]
-
-[[package]]
-name = "servo_arc"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "170fb83ab34de17dc69aa7c67482b22218ddb85da56546f9bd6b929e32a05930"
-dependencies = [
- "stable_deref_trait",
 ]
 
 [[package]]
@@ -9645,18 +9529,6 @@ dependencies = [
 
 [[package]]
 name = "string_cache"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a18596f8c785a729f2819c0f6a7eae6ebeebdfffbfe4214ae6b087f690e31901"
-dependencies = [
- "new_debug_unreachable",
- "parking_lot",
- "phf_shared 0.13.1",
- "precomputed-hash",
-]
-
-[[package]]
-name = "string_cache"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ffa8a5dbe8b3f0bbe29d4c3225daafaeead63afdc1b65fc4c01a1384166038e6"
@@ -9675,18 +9547,6 @@ checksum = "c711928715f1fe0fe509c53b43e993a9a557babc2d0a3567d0a3006f1ac931a0"
 dependencies = [
  "phf_generator 0.11.3",
  "phf_shared 0.11.3",
- "proc-macro2",
- "quote",
-]
-
-[[package]]
-name = "string_cache_codegen"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "585635e46db231059f76c5849798146164652513eb9e8ab2685939dd90f29b69"
-dependencies = [
- "phf_generator 0.13.1",
- "phf_shared 0.13.1",
  "proc-macro2",
  "quote",
 ]
@@ -11027,18 +10887,6 @@ dependencies = [
 
 [[package]]
 name = "web_atoms"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "075474b12bcb3d2e3d4546580e9de478eeeead668a1761e2a8860c836b7ef297"
-dependencies = [
- "phf 0.13.1",
- "phf_codegen 0.13.1",
- "string_cache 0.9.0",
- "string_cache_codegen 0.6.1",
-]
-
-[[package]]
-name = "web_atoms"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7572660c8890448ba236b7376f27e389c6a7e1c70195622faced601f855c0ada"
@@ -11660,7 +11508,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "0.34.19"
+version = "0.34.20"
 dependencies = [
  "anyhow",
  "determinator",

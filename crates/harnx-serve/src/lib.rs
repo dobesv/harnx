@@ -15,6 +15,7 @@ mod agent_resolve;
 mod attachments;
 mod cid;
 mod interrupt_resume;
+mod last_turn;
 mod models_catalog;
 mod nats_access;
 mod request_identity;
