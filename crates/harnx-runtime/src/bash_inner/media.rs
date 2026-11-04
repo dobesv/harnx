@@ -16,6 +16,8 @@ use crate::nats_attachments::ExternalizedAttachment;
 #[async_trait::async_trait]
 pub(crate) trait MediaStore: Send + Sync {
     /// Return only after bytes are readable through this run's attachment fetcher.
+    /// Successful writes may be shared by other calls, so later failures don't
+    /// roll them back.
     async fn store(&self, data_url: &str) -> Result<ExternalizedAttachment>;
 }
 
@@ -266,7 +268,7 @@ fn inline_data_url(value: &Value) -> Result<Option<String>> {
         Some("image") => image_data_url(value),
         Some("audio") => audio_data_url(value),
         Some("resource") => resource_data_url(value),
-        Some("resource_link") => resource_link_data_url(value),
+        Some("resource_link") => resource_uri_data_url(value),
         None => unwrapped_data_url(value),
         _ => Ok(None),
     }
@@ -325,15 +327,11 @@ fn resource_data_url(value: &Value) -> Result<Option<String>> {
     } else if resource.get("blob").is_some() || resource.get("text").is_some() {
         Err(invalid("embedded resource body must be a string"))
     } else {
-        Ok(resource
-            .get("uri")
-            .and_then(Value::as_str)
-            .filter(|uri| is_base64_data_uri(uri))
-            .map(str::to_owned))
+        resource_uri_data_url(resource)
     }
 }
 
-fn resource_link_data_url(value: &Value) -> Result<Option<String>> {
+fn resource_uri_data_url(value: &Value) -> Result<Option<String>> {
     if let Some(uri) = value.get("uri").and_then(Value::as_str) {
         if is_base64_data_uri(uri) {
             return Ok(Some(uri.to_owned()));

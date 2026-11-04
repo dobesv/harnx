@@ -86,6 +86,7 @@ fn mcp_domain_errors_are_distinct_from_raw_status_like_data() {
         json!({"blocked_by_hook":true}),
         json!({"content":[],"isError":false}),
         json!({"content":[{"type":"text","text":"boom"}]}),
+        json!({"content":[{"type":"text","text":"ok"}],"isError":false}),
     ] {
         assert!(!is_mcp_error(&value), "{value}");
     }

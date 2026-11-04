@@ -24,13 +24,17 @@ pub(super) const AGGREGATOR_MAX_TITLE_BYTES: usize = 4 * 1024;
 /// Markdown cap, mirroring `TOOL_PROGRESS_MAX_MARKDOWN_BYTES`.
 pub(super) const AGGREGATOR_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 
+/// Keep one pathological name or argument summary from hiding newer trace lines.
+const AGGREGATOR_MAX_TRACE_LINE_BYTES: usize = 4 * 1024;
+
 /// Aggregates inner-call lifecycle into the outer `bash` tool's progress.
 ///
 /// Title: `bash: <running tool names, max 3> (<done> done, <running> running)`.
-/// Markdown: the newest [`AGGREGATOR_MAX_TRACE_LINES`] trace lines. Each event
-/// emits one `ToolUpdatePatch` through the outer progress handle the
-/// BashProvider received in `call_tool_with_progress`; the engine's
-/// `RuntimeToolProgress` already coalesces those, so this adds no timer.
+/// Markdown: the newest [`AGGREGATOR_MAX_TRACE_LINES`] trace lines. Lifecycle
+/// changes publish through the outer progress handle BashProvider received in
+/// `call_tool_with_progress`. Concurrent changes coalesce behind an in-flight
+/// publisher; the engine's `RuntimeToolProgress` rate-limits these without an
+/// extra timer here.
 ///
 /// Child progress patch bodies (a child's own title/markdown) are NOT
 /// surfaced: the title already names running tools and nested child markdown
@@ -50,6 +54,8 @@ struct AggregatorState {
     done: usize,
     /// Newest trace lines last; capped at [`AGGREGATOR_MAX_TRACE_LINES`].
     lines: Vec<String>,
+    publishing: bool,
+    pending: bool,
 }
 
 impl InnerProgressAggregator {
@@ -62,12 +68,26 @@ impl InnerProgressAggregator {
     }
 
     fn update_running(&self, mutate: impl FnOnce(&mut AggregatorState)) {
-        let patch = {
-            let mut state = self.state.lock().expect("aggregator state lock");
-            mutate(&mut state);
-            aggregated_patch(&state)
-        };
-        self.progress.update(patch);
+        let mut state = self.state.lock().expect("aggregator state lock");
+        mutate(&mut state);
+        state.pending = true;
+        if state.publishing {
+            return;
+        }
+        // One publisher drains the latest state in order. ToolProgress may
+        // invoke a synchronous emitter, so never call it under the state lock.
+        state.publishing = true;
+        loop {
+            let patch = aggregated_patch(&state);
+            state.pending = false;
+            drop(state);
+            self.progress.update(patch);
+            state = self.state.lock().expect("aggregator state lock");
+            if !state.pending {
+                state.publishing = false;
+                return;
+            }
+        }
     }
 }
 
@@ -86,7 +106,7 @@ impl InnerCallObserver for InnerProgressAggregator {
     }
 
     fn finished(&self, entry: &InnerTraceEntry) {
-        let line = entry.to_progress_line();
+        let line = truncate_bytes(entry.to_progress_line(), AGGREGATOR_MAX_TRACE_LINE_BYTES);
         self.update_running(|state| {
             // Pre-admission rejections never started; they count as done
             // without ever having been running.
@@ -158,16 +178,4 @@ fn truncate_bytes(mut text: String, max_bytes: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::truncate_bytes;
-
-    #[test]
-    fn truncate_bytes_respects_char_boundaries() {
-        let text = "é".repeat(10);
-        assert_eq!(text.len(), 20);
-        let truncated = truncate_bytes(text.clone(), 5);
-        assert_eq!(truncated, "éé".to_string());
-        assert!(truncated.len() <= 5);
-        assert_eq!(truncate_bytes(text.clone(), 20), text);
-    }
-}
+mod tests;
