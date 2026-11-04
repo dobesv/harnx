@@ -30,6 +30,12 @@
       "allowedVersions": "<0.18"
     },
     {
+      "description": "The pinned A2A TCK locks rpds-py 0.30.0, which has no Python 3.15 wheel and builds with PyO3 0.27 (max 3.14). Raise this when the TCK pin moves to a lockfile that installs on 3.15",
+      "matchFileNames": [".github/workflows/a2a-tck.yaml"],
+      "matchDepNames": ["python"],
+      "allowedVersions": "<3.15"
+    },
+    {
       "description": "Do not automerge major updates",
       "matchUpdateTypes": ["major"],
       "automerge": false
