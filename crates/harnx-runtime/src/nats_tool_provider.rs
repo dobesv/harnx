@@ -1532,3 +1532,6 @@ mod tests {
         responder.abort();
     }
 }
+
+#[cfg(test)]
+mod attachment_encoding_tests;

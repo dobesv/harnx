@@ -39,10 +39,16 @@ read in bounded pages. Binary content that is not a supported image type
 will return an error.
 ";
 
-const ATTACHMENT_CREATE_DESCRIPTION: &str = "Create a text attachment in the NATS object store.
+const ATTACHMENT_CREATE_DESCRIPTION: &str = "Create an attachment in the NATS object store.
 
-Returns the cid: URL for the created attachment. Only text MIME types
-are accepted (text/*, application/json, application/xml, application/yaml).
+Returns the cid: URL for the created attachment. Optional encoding is 'utf-8'
+(default, text MIME types only) or 'base64' (strict base64 input, any MIME type).
+Text MIME types require UTF-8 decoded content, including in base64 mode.
+The handler allows up to 5 MiB decoded, but the complete JSON request must fit
+NATS max_payload (default 1 MiB). Base64 uses 4*ceil(decoded_bytes/3) bytes;
+with the default broker, binary content must be smaller than 768 KiB, minus
+request/header overhead (script mode also reserves 1 KiB). Requests are not
+chunked; larger attachments need a higher broker limit.
 
 Requires caller session identity; returns an error when invoked via
 MCP stdio/HTTP bridges that do not provide session context.
@@ -246,11 +252,17 @@ fn attachment_create_schema() -> serde_json::Value {
         "properties": {
             "content": {
                 "type": "string",
-                "description": "The text content to store"
+                "description": "Content to store: text for utf-8, strict standard base64 for base64 encoding"
             },
             "mime_type": {
                 "type": "string",
-                "description": "MIME type (text/*, application/json, etc.)"
+                "description": "MIME type of decoded content; non-text types require encoding=base64"
+            },
+            "encoding": {
+                "type": "string",
+                "enum": ["utf-8", "base64"],
+                "default": "utf-8",
+                "description": "Content encoding; base64 allows binary MIME types"
             }
         },
         "required": ["content", "mime_type"]
@@ -272,6 +284,12 @@ mod tests {
         let tools = toolset.tools();
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
         assert_eq!(names, ["attachment_read", "attachment_create"]);
+        let create_schema = &tools[1].input_schema;
+        assert_eq!(
+            create_schema["properties"]["encoding"]["enum"],
+            json!(["utf-8", "base64"])
+        );
+        assert_eq!(create_schema["properties"]["encoding"]["default"], "utf-8");
         for (tool, read_only) in tools.iter().zip([true, false]) {
             assert_eq!(
                 (tool.idempotent_hint, tool.read_only_hint),

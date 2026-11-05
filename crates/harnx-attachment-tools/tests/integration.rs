@@ -13,6 +13,10 @@ use harnx_toolset::{SessionRef as ToolSessionRef, ToolInvocation, ToolInvocation
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+#[path = "integration/base64_bounds.rs"]
+mod base64_bounds;
+#[path = "integration/base64_text.rs"]
+mod base64_text;
 #[path = "integration/paging_fixture.rs"]
 mod paging_fixture;
 use paging_fixture::{assert_page, metadata, StoredAttachment};

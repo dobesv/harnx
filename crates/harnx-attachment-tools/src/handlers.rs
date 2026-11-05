@@ -13,7 +13,7 @@ use rmcp::model::{CallToolResult, ContentBlock, Role};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024; // 5 MB
+const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024; // 5 MiB
 
 /// Default byte limit when byte_offset is provided without byte_limit.
 /// This prevents unbounded reads while still allowing reasonably large pages.
@@ -90,8 +90,11 @@ fn has_byte_selectors(params: &AttachmentReadParams) -> bool {
 pub struct AttachmentCreateParams {
     /// The content to store.
     pub content: String,
-    /// MIME type of the content (text types only).
+    /// MIME type of the content.
     pub mime_type: String,
+    /// Content encoding: utf-8 (default) or base64.
+    #[serde(default)]
+    pub encoding: Option<String>,
 }
 
 /// Read an attachment or rendered plan from NATS-backed storage.
@@ -275,16 +278,42 @@ fn text_attachment_result(bytes: Vec<u8>, params: AttachmentReadParams) -> Resul
     ]))
 }
 
-/// Create a new text attachment in NATS object store.
+fn decode_attachment_content(content: String, encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    // This is a handler allocation limit, not a transport guarantee: the complete
+    // base64 JSON request must first fit the broker's max_payload (default 1 MiB).
+    // Bound decoder allocation before decoding. The final base64 quantum can
+    // still exceed the decoded limit, which attachment_create checks separately.
+    if encoding == Some("base64") && content.len() > MAX_ATTACHMENT_BYTES.div_ceil(3) * 4 {
+        return Err(format!(
+            "attachment payload too large: base64 content exceeds {} encoded bytes (5 MB decoded limit)",
+            MAX_ATTACHMENT_BYTES.div_ceil(3) * 4
+        ));
+    }
+    match encoding.unwrap_or("utf-8") {
+        "utf-8" => Ok(content.into_bytes()),
+        "base64" => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &content)
+            .map_err(|error| format!("invalid base64 attachment content: {error}")),
+        encoding => Err(format!(
+            "unsupported attachment encoding '{encoding}'; expected 'utf-8' or 'base64'"
+        )),
+    }
+}
+
+/// Create a text or base64-encoded binary attachment in NATS object store.
 pub async fn attachment_create(
     store: &ObjectStore,
     caller_session: Option<&harnx_toolset::SessionRef>,
     params: AttachmentCreateParams,
 ) -> Result<CallToolResult> {
-    if params.content.len() > MAX_ATTACHMENT_BYTES {
+    let bytes = match decode_attachment_content(params.content, params.encoding.as_deref()) {
+        Ok(bytes) => bytes,
+        Err(message) => return Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+    };
+
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
         return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
             "attachment payload too large: {} bytes exceeds the 5 MB limit",
-            params.content.len()
+            bytes.len()
         ))]));
     }
 
@@ -298,17 +327,27 @@ pub async fn attachment_create(
         }
     };
 
-    // Validate MIME type is text
-    if !is_text_mime(&params.mime_type) {
+    // UTF-8 mode preserves the original text-only MIME restriction.
+    if params.encoding.as_deref().unwrap_or("utf-8") == "utf-8" && !is_text_mime(&params.mime_type)
+    {
         return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
             "attachment_create only accepts text MIME types; got {}",
             params.mime_type
         ))]));
     }
 
+    // attachment_read decodes text MIME types as UTF-8, regardless of charset parameters.
+    if is_text_mime(&normalize_mime_base(&params.mime_type)) && std::str::from_utf8(&bytes).is_err()
+    {
+        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+            "attachment_create text MIME types require UTF-8 content; got {}",
+            params.mime_type
+        ))]));
+    }
+
     // Compute SHA256 hash
     let mut hasher = Sha256::new();
-    hasher.update(params.content.as_bytes());
+    hasher.update(&bytes);
     let hash_bytes = hasher.finalize();
     let hash = hex_encode(&hash_bytes);
 
@@ -321,7 +360,7 @@ pub async fn attachment_create(
     let url = media_cid_url(&core_session, &hash);
 
     // Store in object store
-    put_media(store, &url, params.content.as_bytes(), &params.mime_type)
+    put_media(store, &url, &bytes, &params.mime_type)
         .await
         .context("store attachment")?;
 

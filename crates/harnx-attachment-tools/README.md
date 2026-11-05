@@ -72,15 +72,27 @@ usage. Stored text above 5 MiB can be read; the 5 MiB limit applies to
 
 ### `attachment_create`
 
-Creates a new text attachment in NATS Object Storage owned by the caller's session.
+Creates a text or binary attachment in NATS Object Storage owned by the caller's session.
 
 - Returns the canonical `cid:media:<agent>/<session-id>/<hash>` URL for the stored attachment.
-- Accepts only text MIME types (`text/*`, `application/json`, `application/xml`, `application/yaml`, `application/x-yaml`).
-- Requires caller session identity; returns an error when invoked without session context.
+- Default `utf-8` encoding accepts only text MIME types (`text/*`, `application/json`, `application/xml`, `application/yaml`, `application/x-yaml`).
+- `base64` encoding accepts strict standard base64 and any MIME type. Stored bytes are decoded before hashing. Text MIME types still require UTF-8 decoded content because `attachment_read` decodes text as UTF-8, regardless of charset parameters. To retain non-UTF-8 bytes unchanged, use a binary MIME type such as `application/octet-stream` (not displayable by `attachment_read`).
+- The handler limits decoded payloads to 5 MiB. Oversized encoded input is rejected before decoding; the decoded-size check still handles the final base64 quantum.
+- The complete JSON tool request must also fit NATS `max_payload` (default 1 MiB). Base64 occupies `4 * ceil(decoded_bytes / 3)` bytes, so the default broker permits less than 768 KiB of binary content after request/header overhead; script mode also reserves 1 KiB for the envelope. Exact capacity depends on the serialized request. Requests are not chunked. A 5 MiB binary attachment needs 6,990,508 base64 bytes plus overhead, so requires a higher broker limit (for example, 8 MiB).
+- Requires caller session identity; returns an error when invoked without session context. Session identity is supplied by the runtime, not a tool argument.
 
 Parameters:
-- `content` (string, required): The text content to store.
-- `mime_type` (string, required): MIME type of the content.
+- `content` (string, required): Text or base64-encoded bytes to store.
+- `mime_type` (string, required): MIME type of the decoded content.
+- `encoding` (string, optional): `utf-8` (default) or `base64`.
+
+When this tool is in an agent's `bash_tools`, its generated `bash` description includes:
+
+```bash
+attachments_attachment_create --mime-type image/png --encoding base64 --content "$(base64 -w0 /tmp/x.png)"
+```
+
+`/tmp/x.png` must already exist in the script VFS. The command uses the agent-visible tool name; custom server names or cross-package tools can have different prefixes.
 
 ## NATS Object Store usage
 
@@ -92,7 +104,7 @@ media/<owner>/<hash>
 
 - `<owner>` is `session_key(agent, sid)` (64-character lowercase hex digest of the owning session identity).
 - `<hash>` is a 64-character lowercase SHA-256 digest. `attachment_create` hashes
-  the text bytes; bridge offloads and worker media caches hash the complete
+  the decoded content bytes; bridge offloads and worker media caches hash the complete
   MIME-bearing data URI. Treat returned CIDs as opaque references rather than
   deriving them from downloaded bytes.
 

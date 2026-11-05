@@ -92,6 +92,7 @@ arboard = { workspace = true, features = ["wayland-data-control"] }
 arboard = { workspace = true }
 
 [dev-dependencies]
+harnx-attachment-tools = { path = "../harnx-attachment-tools" }
 harnx-test-bins = { path = "../harnx-test-bins" }
 harnx-telemetry = { workspace = true, features = ["testing"] }
 harnx-time-tools = { path = "../harnx-time-tools" }
