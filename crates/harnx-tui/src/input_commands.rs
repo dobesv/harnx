@@ -243,6 +243,13 @@ impl Tui {
     }
 
     pub(super) async fn run_command(&mut self, line: &str) -> Result<()> {
+        #[cfg(test)]
+        if let Some(record) = self.command_override.clone() {
+            // Deterministic test seam: observe the dispatched command without
+            // touching any session state.
+            record(line);
+            return Ok(());
+        }
         if harnx_runtime::operator_tools::is_operator_tool_command(line) {
             match harnx_runtime::operator_tools::parse_operator_line(line) {
                 Ok(command) => self.start_operator_tool_command(command),

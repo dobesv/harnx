@@ -1504,9 +1504,18 @@ impl Tui {
             .position
             .min(self.app.detail_view_scroll.last_max_position);
 
-        // Render footer
+        // Render footer. The notice (shown only for the root-transcript
+        // footer) uses a brighter color than the dim hint legend.
         let footer_text = crate::detail_view::detail_view_footer_text(&self.app);
-        let footer = Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray));
+        let showing_notice = self.app.doc_view.is_none()
+            && self.app.detail_view_entry.is_none()
+            && self.app.footer_notice_text().is_some();
+        let footer_color = if showing_notice {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        let footer = Paragraph::new(footer_text).style(Style::default().fg(footer_color));
         frame.render_widget(footer, chunks[1]);
     }
 
@@ -1641,6 +1650,10 @@ impl Tui {
             .position
             .min(self.app.browsing_view_scroll.last_max_position);
 
+        self.render_browsing_footer(frame, chunks[1]);
+    }
+
+    fn render_browsing_footer(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         // Count navigable items and find display index
         let mut navigable_count = 0;
         let mut display_idx = 0;
@@ -1657,16 +1670,23 @@ impl Tui {
         let footer_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(chunks[1]);
+            .split(area);
 
         let counter_text = format!(" Item {} of {} (navigable)", display_idx, navigable_count);
         let counter_para = Paragraph::new(counter_text).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(counter_para, footer_chunks[0]);
 
-        let shortcuts_text =
-            " ↑↓/browse  ENTER/view raw  e/edit  d/delete  r/rewind  c/copy  ESC/close";
-        let shortcuts_para =
-            Paragraph::new(shortcuts_text).style(Style::default().fg(Color::DarkGray));
+        // A notice replaces the hint legend and uses a brighter color so
+        // refusals stand out from the dim hints.
+        let (shortcuts_text, color) = match self.app.footer_notice_text() {
+            Some(notice) => (format!(" {notice}"), Color::Yellow),
+            None => (
+                " ↑↓/browse  ENTER/view raw  e/edit  d/delete  r/rewind  c/copy  ESC/close"
+                    .to_string(),
+                Color::DarkGray,
+            ),
+        };
+        let shortcuts_para = Paragraph::new(shortcuts_text).style(Style::default().fg(color));
         frame.render_widget(shortcuts_para, footer_chunks[1]);
     }
 }

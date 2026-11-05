@@ -48,6 +48,24 @@ row to open it in the fullscreen transcript surface. On a compaction marker,
 `cid:` URLs open in a fullscreen document viewer; image and binary attachments
 open in their system application.
 
+While a row is focused, these action keys apply to it (`Shift+↑` / `Shift+↓`
+extends the selection to a range of rows):
+
+- `e` — edit the selected user message in your editor. Only user messages can
+  be edited, one at a time.
+- `d` or `Delete` — delete the selection (asks for confirmation first). A tool
+  call and its tool results are deleted together.
+- `r` — rewind the session to the selected item (asks for confirmation
+  first): everything after that entry is dropped. For a multi-row selection,
+  the rewind target is the earliest selected row, so later selected rows are
+  dropped too. Rewinding to a tool round keeps the whole round — calls and
+  results.
+- `c` — copy the focused row to the clipboard.
+- `i` — insert the focused row's text into the input composer.
+
+When an action cannot apply to the selection (for example, `e` on an assistant
+message), a notice appears in the footer instead of nothing happening.
+
 In the `cid:` document viewer, `Tab`/`↓` selects the next link and
 `Shift+Tab`/`↑` selects the previous link. Press `Enter` to follow the selected
 link. `Backspace` or `Esc` returns to the previous document, then closes the

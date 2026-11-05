@@ -71,6 +71,10 @@ pub(super) type TestCidResolveFn = Arc<
 #[cfg(test)]
 pub(super) type TestDetachedOpenFn =
     Arc<dyn Fn(&std::path::Path) -> anyhow::Result<()> + Send + Sync>;
+#[cfg(test)]
+pub(super) type TestClipboardFn = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
+#[cfg(test)]
+pub(super) type TestCommandFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct Tui {
     pub(super) config: GlobalConfig,
@@ -130,6 +134,10 @@ pub struct Tui {
     pub(super) cid_resolve_override: Option<TestCidResolveFn>,
     #[cfg(test)]
     pub(super) detached_open_override: Option<TestDetachedOpenFn>,
+    #[cfg(test)]
+    pub(super) copy_to_clipboard_override: Option<TestClipboardFn>,
+    #[cfg(test)]
+    pub(super) command_override: Option<TestCommandFn>,
     /// Sessions whose durable text append succeeded but whose worker activation
     /// must be retried without submitting the text as a second user message.
     pub(super) pending_remote_activations: HashSet<(String, String)>,
@@ -314,8 +322,10 @@ pub(super) struct App {
     /// Scroll state for the browsing view (used when transcript_browsing is true).
     /// Reset to follow=false, position=0 when focused item changes.
     pub(super) browsing_view_scroll: ratatui_widget_scrolling::ScrollState,
-    /// When set, detail view footer shows "Copied to clipboard ✓" until this instant.
-    pub(super) copy_notice_until: Option<std::time::Instant>,
+    /// Transient message shown in the browse and detail footers until this
+    /// instant. Browse actions that cannot apply to the focused item set it,
+    /// so `e`/`d`/`r` and friends never silently do nothing.
+    pub(super) footer_notice: Option<FooterNotice>,
     /// Set to true whenever transcript_focus changes so draw() scrolls once
     /// to keep the newly focused item visible, then clears it.
     pub(super) scroll_to_focused_item: bool,
@@ -1082,7 +1092,7 @@ impl Default for App {
             detail_view_title: None,
             transcript_browsing: false,
             browsing_view_scroll: ratatui_widget_scrolling::ScrollState::new(),
-            copy_notice_until: None,
+            footer_notice: None,
             scroll_to_focused_item: false,
             use_utc_timestamps: false,
             monitored_sessions: HashMap::new(),
@@ -1091,6 +1101,16 @@ impl Default for App {
     }
 }
 
+/// Transient footer message with an expiry, shown by the browse and detail
+/// footers in place of the shortcut hints.
+pub(super) struct FooterNotice {
+    pub(super) text: String,
+    pub(super) until: std::time::Instant,
+}
+
+/// How long a footer notice stays visible.
+const FOOTER_NOTICE_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl App {
     /// Returns the (min, max) indices of the current transcript selection.
     /// Used by render_detail_view to determine which entries to display.
@@ -1098,6 +1118,23 @@ impl App {
         let f = self.transcript_focus.unwrap_or(0);
         let a = self.transcript_selection_anchor.unwrap_or(f);
         (f.min(a), f.max(a))
+    }
+
+    /// Show a transient notice in the browse/detail footer, e.g. when a
+    /// browse action cannot apply to the focused item.
+    pub(super) fn show_footer_notice(&mut self, text: &str) {
+        self.footer_notice = Some(FooterNotice {
+            text: text.to_string(),
+            until: std::time::Instant::now() + FOOTER_NOTICE_DURATION,
+        });
+    }
+
+    /// The active footer notice, or `None` once it has expired.
+    pub(super) fn footer_notice_text(&self) -> Option<&str> {
+        self.footer_notice
+            .as_ref()
+            .filter(|notice| std::time::Instant::now() < notice.until)
+            .map(|notice| notice.text.as_str())
     }
 }
 

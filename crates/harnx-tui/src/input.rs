@@ -113,6 +113,7 @@ impl Tui {
     async fn handle_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.clear_footer_notice();
                 self.app.transcript_browsing = false;
                 self.app.transcript_focus = None;
                 self.app.transcript_selection_anchor = None;
@@ -124,7 +125,14 @@ impl Tui {
             (KeyCode::Down, KeyModifiers::NONE) => {
                 self.handle_down_key(key);
             }
+            (KeyCode::Up, KeyModifiers::SHIFT) => {
+                self.handle_up_key_shift();
+            }
+            (KeyCode::Down, KeyModifiers::SHIFT) => {
+                self.handle_down_key_shift();
+            }
             (KeyCode::Enter, KeyModifiers::NONE) => {
+                self.clear_footer_notice();
                 self.open_focused_root_item().await;
             }
             (KeyCode::Char('e'), KeyModifiers::NONE) => {
@@ -146,9 +154,11 @@ impl Tui {
                 KeyCode::Char('g' | '<') | KeyCode::Home,
                 KeyModifiers::NONE | KeyModifiers::SHIFT,
             ) => {
+                self.clear_footer_notice();
                 self.app.browsing_view_scroll.scroll_to_top();
             }
             (KeyCode::Char('G' | '>') | KeyCode::End, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.clear_footer_notice();
                 self.app.browsing_view_scroll.scroll_to_bottom();
             }
             _ => {} // consume all other keys to prevent bleed to input
@@ -210,6 +220,7 @@ impl Tui {
                 self.handle_tab(true).await;
             }
             (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.clear_footer_notice();
                 if self.app.detail_view_open {
                     self.app.detail_view_open = false;
                     // Return to browsing view (transcript_browsing stays true if it was true)
@@ -247,6 +258,7 @@ impl Tui {
                 self.handle_transcript_rewind();
             }
             (KeyCode::Enter, KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+                self.clear_footer_notice();
                 self.open_focused_root_item().await;
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
@@ -277,38 +289,37 @@ impl Tui {
             {
                 self.app.scroll_state.scroll_to_bottom();
             }
-            _ => {
-                // While a transcript item is focused all unhandled keys are
-                // silently consumed — they must not leak into the input widget.
-                // (The specific action keys e/d/i/c/r are handled above; anything
-                // else is irrelevant when focus is on a history item.)
-                if self.app.transcript_focus.is_some() {
-                    return Ok(());
-                }
-                // First character typed marks the current session read when needed.
-                self.mark_current_session_read(false).await;
-                // Exit history preview on any editing key — keep current content as new draft
-                if self.app.history_preview {
-                    self.app.history_index = None;
-                    self.app.history_preview = false;
-                    self.refresh_input_chrome();
-                }
-                // Any other key input clears pending message (converts back to draft)
-                if let Some(pending) = self.app.pending_message.take() {
-                    self.app.attachments = pending.attachments;
-                    self.app.attachment_dir = pending.attachment_dir;
-                    self.app.paste_count = pending.paste_count;
-                    self.clear_shared_pending_message().await;
-                    self.refresh_input_chrome();
-                }
-                // Clear completions on any non-tab key
-                if !self.app.completions.is_empty() {
-                    self.app.completions.clear();
-                }
-                self.app.input.input(TextInput::from(key));
-            }
+            _ => self.handle_draft_key(key).await,
         }
         Ok(())
+    }
+
+    async fn handle_draft_key(&mut self, key: KeyEvent) {
+        // Unhandled keys on a focused transcript item must not leak into the draft.
+        if self.app.transcript_focus.is_some() {
+            return;
+        }
+        // First character typed marks the current session read when needed.
+        self.mark_current_session_read(false).await;
+        // Exit history preview on any editing key — keep current content as new draft.
+        if self.app.history_preview {
+            self.app.history_index = None;
+            self.app.history_preview = false;
+            self.refresh_input_chrome();
+        }
+        // Any other key input clears pending message (converts back to draft).
+        if let Some(pending) = self.app.pending_message.take() {
+            self.app.attachments = pending.attachments;
+            self.app.attachment_dir = pending.attachment_dir;
+            self.app.paste_count = pending.paste_count;
+            self.clear_shared_pending_message().await;
+            self.refresh_input_chrome();
+        }
+        // Clear completions on any non-tab key.
+        if !self.app.completions.is_empty() {
+            self.app.completions.clear();
+        }
+        self.app.input.input(TextInput::from(key));
     }
 
     async fn handle_enter_key(&mut self) -> Result<()> {
@@ -450,6 +461,7 @@ impl Tui {
     }
 
     fn handle_up_key(&mut self, key: KeyEvent) {
+        self.clear_footer_notice();
         if self.app.detail_view_open {
             self.app.detail_view_scroll.scroll_up();
             return;
@@ -513,6 +525,7 @@ impl Tui {
     }
 
     fn handle_down_key(&mut self, key: KeyEvent) {
+        self.clear_footer_notice();
         if self.app.detail_view_open {
             self.app.detail_view_scroll.scroll_down();
             return;
@@ -545,6 +558,7 @@ impl Tui {
     }
 
     fn handle_up_key_shift(&mut self) {
+        self.clear_footer_notice();
         // If no focus yet, initialize it at the last navigable item (same as plain Up)
         let focus = if let Some(f) = self.app.transcript_focus {
             f
@@ -571,6 +585,7 @@ impl Tui {
     }
 
     fn handle_down_key_shift(&mut self) {
+        self.clear_footer_notice();
         let Some(focus) = self.app.transcript_focus else {
             return; // Shift+Down has no effect without an active focus
         };
@@ -796,29 +811,63 @@ impl Tui {
     }
 }
 
+/// What pressing `e` on a browse selection does: dispatch an `.edit message`
+/// command or refuse with a footer notice.
+enum EditOutcome {
+    Notice(String),
+    Edit { from: usize, to: usize },
+}
+
 impl Tui {
     /// Compute selected transcript index range [min, max] from focus+anchor.
-    fn get_selected_index_range(&self) -> (usize, usize) {
-        let focus = self
-            .app
-            .transcript_focus
-            .expect("transcript_focus required");
+    ///
+    /// Returns `None` when nothing is focused (browse mode with no focus),
+    /// so callers must degrade gracefully instead of unwrapping.
+    fn get_selected_index_range(&self) -> Option<(usize, usize)> {
+        let focus = self.app.transcript_focus?;
         let anchor = self.app.transcript_selection_anchor.unwrap_or(focus);
-        (focus.min(anchor), focus.max(anchor))
+        Some((focus.min(anchor), focus.max(anchor)))
+    }
+
+    /// Suffix a browse-action refusal with "item" or "selection" depending on
+    /// whether more than one item is highlighted. With no focus, "item".
+    fn browse_refusal_noun(&self, prefix: &str) -> String {
+        match self.get_selected_index_range() {
+            Some((start_idx, end_idx)) if start_idx != end_idx => {
+                format!("{prefix} selection")
+            }
+            _ => format!("{prefix} item"),
+        }
+    }
+
+    /// Notice for browse mutations refused because a turn is running. A
+    /// pending HITL approval also holds a turn open, so the wording covers
+    /// both.
+    pub(super) fn show_busy_notice(&mut self) {
+        self.app.show_footer_notice(
+            "Busy: wait for the current turn to finish (or answer pending approval)",
+        );
+    }
+
+    /// Clear any transient footer notice. Called on focus navigation and view
+    /// changes so the hint legend (e.g. `ESC/close`) stays discoverable.
+    fn clear_footer_notice(&mut self) {
+        self.app.footer_notice = None;
     }
 
     /// Get seq range (from_seq, to_seq) for selected items.
-    /// Returns None when selected items do not have sequence numbers.
+    ///
+    /// Scans the whole selection instead of sampling only the boundary items:
+    /// a range can start or end on an item without a seq (e.g. a markdown
+    /// link) while still covering sequenced rows in between. Returns `None`
+    /// when nothing is selected or no selected item has a sequence number.
     fn selected_seq_range(&self) -> Option<(usize, usize)> {
-        let (start_idx, end_idx) = self.get_selected_index_range();
-        let from = self
-            .app
-            .transcript
-            .get(start_idx)
-            .and_then(|item| item.seq());
-        let to = self.app.transcript.get(end_idx).and_then(|item| item.seq());
-        match (from, to) {
-            (Some(from), Some(to)) => Some((from.min(to), from.max(to))),
+        let (start_idx, end_idx) = self.get_selected_index_range()?;
+        let selected = self.app.transcript.get(start_idx..=end_idx)?;
+        let min = selected.iter().filter_map(|item| item.seq()).min();
+        let max = selected.iter().filter_map(|item| item.seq()).max();
+        match (min, max) {
+            (Some(from), Some(to)) => Some((from, to)),
             _ => None,
         }
     }
@@ -856,26 +905,76 @@ impl Tui {
     }
 
     /// Handle 'e' key: open edit command for selected item(s).
+    ///
+    /// Editing only applies to user messages (the data layer rewrites user
+    /// prompts), so a selection without one shows a footer notice instead of
+    /// running a command that is guaranteed to fail. A range with exactly one
+    /// user message proceeds normally: `.edit message <from>-<to>` rewrites
+    /// only the user entry, leaving tool-round rows in the range untouched.
     pub(super) async fn handle_transcript_edit(&mut self) -> Result<()> {
-        let Some((from, to)) = self.selected_seq_range() else {
+        if self.app.llm_busy {
+            self.show_busy_notice();
+            return Ok(());
+        }
+        let Some((start_idx, end_idx)) = self.get_selected_index_range() else {
+            self.app.show_footer_notice("Nothing selected");
             return Ok(());
         };
-        let cmd = if from == to {
-            format!(".edit message {}", from)
-        } else {
-            format!(".edit message {}-{}", from, to)
+        let Some(selected) = self.app.transcript.get(start_idx..=end_idx) else {
+            self.app
+                .show_footer_notice(&self.browse_refusal_noun("Can't edit this"));
+            return Ok(());
         };
-        self.run_command(&cmd).await?;
-        self.app.transcript_focus = None;
-        self.app.transcript_selection_anchor = None;
-        self.app.transcript_browsing = false;
-        self.app.scroll_state.follow = true;
+        match self.edit_outcome(selected) {
+            EditOutcome::Notice(notice) => self.app.show_footer_notice(&notice),
+            EditOutcome::Edit { from, to } => {
+                let cmd = if from == to {
+                    format!(".edit message {}", from)
+                } else {
+                    format!(".edit message {}-{}", from, to)
+                };
+                self.run_command(&cmd).await?;
+                self.app.transcript_focus = None;
+                self.app.transcript_selection_anchor = None;
+                self.app.transcript_browsing = false;
+                self.app.scroll_state.follow = true;
+            }
+        }
         Ok(())
+    }
+
+    /// Decide what pressing `e` does with the selected rows: dispatch an
+    /// `.edit message` command or refuse with a notice.
+    fn edit_outcome(&self, selected: &[TranscriptItem]) -> EditOutcome {
+        let user_messages = selected
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::UserText { seq: Some(_), .. }))
+            .count();
+        match (user_messages, self.selected_seq_range()) {
+            // Nothing sequenced in the selection: nothing to address the edit
+            // to. A sequenced selection without user messages can only hold
+            // non-editable rows.
+            (0, None) => EditOutcome::Notice(self.browse_refusal_noun("Can't edit this")),
+            (0, Some(_)) => EditOutcome::Notice("Only user messages can be edited".to_string()),
+            // Exactly one user message with its seq range: the edit runs.
+            (1, Some((from, to))) => EditOutcome::Edit { from, to },
+            (1, None) => EditOutcome::Notice(self.browse_refusal_noun("Can't edit this")),
+            _ => EditOutcome::Notice("Edit supports a single user message at a time".to_string()),
+        }
     }
 
     /// Handle 'd' or Delete key: open delete confirmation modal.
     pub(super) fn handle_transcript_delete(&mut self) {
+        if self.app.llm_busy {
+            // Mutating history while a turn runs races the worker: deleting an
+            // in-flight ToolCalls round leaves results appending onto a stale
+            // tail (#2557 review).
+            self.show_busy_notice();
+            return;
+        }
         let Some((from, to)) = self.selected_seq_range() else {
+            self.app
+                .show_footer_notice(&self.browse_refusal_noun("Can't delete this"));
             return;
         };
         self.app.modal = Some(crate::types::ModalState::ConfirmDelete { from, to });
@@ -883,17 +982,19 @@ impl Tui {
 
     /// Handle 'i' key: copy item text into input field, clear focus.
     fn handle_transcript_insert(&mut self) {
-        let focus = match self.app.transcript_focus {
-            Some(f) => f,
-            None => return,
+        let Some(focus) = self.app.transcript_focus else {
+            self.app.show_footer_notice("Nothing selected");
+            return;
         };
         let item = match self.app.transcript.get(focus) {
             Some(item) => item.clone(),
             None => return,
         };
-        if let Some(text) = Self::get_transcript_item_text(&item) {
-            self.set_input_text(&text);
-        }
+        let Some(text) = Self::get_transcript_item_text(&item) else {
+            self.app.show_footer_notice("Nothing to insert");
+            return;
+        };
+        self.set_input_text(&text);
         self.app.transcript_focus = None;
         self.app.transcript_selection_anchor = None;
         self.app.transcript_browsing = false;
@@ -902,14 +1003,35 @@ impl Tui {
 
     /// Handle 'c' key: copy item text to clipboard.
     pub(super) fn handle_transcript_copy(&mut self) {
-        if let Some(text) = self
+        let Some(focus) = self.app.transcript_focus else {
+            self.app.show_footer_notice("Nothing selected");
+            return;
+        };
+        match self
             .app
-            .transcript_focus
-            .and_then(|focus| self.app.transcript.get(focus))
+            .transcript
+            .get(focus)
             .and_then(Self::get_transcript_item_text)
         {
-            let _ = harnx_runtime::utils::set_text(&text);
+            Some(text) => {
+                match self.copy_text_to_clipboard(&text) {
+                    Ok(()) => self.app.show_footer_notice("✓ Copied to clipboard"),
+                    // The user must learn the copy failed — silently keeping
+                    // the old notice or showing nothing is worse than either.
+                    Err(_) => self.app.show_footer_notice("Copy failed"),
+                }
+            }
+            None => self.app.show_footer_notice("Nothing to copy"),
         }
+    }
+
+    /// Copy to the clipboard, dispatching through the test seam when set.
+    fn copy_text_to_clipboard(&self, text: &str) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(copy) = &self.copy_to_clipboard_override {
+            return copy(text);
+        }
+        harnx_runtime::utils::set_text(text)
     }
 
     /// Handle 'r' key: open rewind confirmation modal.
@@ -917,10 +1039,18 @@ impl Tui {
     /// Always rewinds to the *earliest* selected item regardless of selection
     /// direction, so Shift+selecting up vs down yields the same target.
     pub(super) fn handle_transcript_rewind(&mut self) {
-        let focus = self
-            .app
-            .transcript_focus
-            .expect("transcript_focus required");
+        if self.app.llm_busy {
+            // Rewinding while a turn runs drops the round the worker is about
+            // to append results for (#2557 review).
+            self.show_busy_notice();
+            return;
+        }
+        // Browse mode can be active with no focus; degrade to a notice
+        // instead of unwrapping.
+        let Some(focus) = self.app.transcript_focus else {
+            self.app.show_footer_notice("Nothing selected");
+            return;
+        };
         let focus = match self.app.transcript_selection_anchor {
             Some(anchor) => focus.min(anchor),
             None => focus,
@@ -930,6 +1060,7 @@ impl Tui {
             None => return,
         };
         let Some(seq) = item.seq() else {
+            self.app.show_footer_notice("Can't rewind to this item");
             return;
         };
         let user_text = match item {

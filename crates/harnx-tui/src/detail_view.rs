@@ -118,6 +118,7 @@ impl Tui {
 
     fn handle_passive_detail_view_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+            self.app.footer_notice = None;
             self.app.detail_view_open = false;
             self.app.detail_view_entry = None;
         } else {
@@ -130,7 +131,10 @@ impl Tui {
             return Ok(());
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, KeyModifiers::NONE) => self.app.detail_view_open = false,
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.app.footer_notice = None;
+                self.app.detail_view_open = false;
+            }
             (KeyCode::Char('e'), KeyModifiers::NONE) => self.edit_root_detail().await?,
             (KeyCode::Delete, KeyModifiers::NONE) | (KeyCode::Char('d'), KeyModifiers::NONE) => {
                 self.handle_transcript_delete();
@@ -138,8 +142,6 @@ impl Tui {
             (KeyCode::Char('r'), KeyModifiers::NONE) => self.handle_transcript_rewind(),
             (KeyCode::Char('c'), KeyModifiers::NONE) => {
                 self.handle_transcript_copy();
-                self.app.copy_notice_until =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
             }
             _ => {}
         }
@@ -167,6 +169,9 @@ impl Tui {
             }
             _ => return false,
         }
+        // A successful scroll is navigation: stale notices must not linger
+        // over the hint legend.
+        self.app.footer_notice = None;
         true
     }
 
@@ -248,11 +253,8 @@ pub(super) fn detail_view_footer_text(app: &App) -> String {
         " ↑↓/Tab: select link  Enter: open  Backspace/Esc: back  PgUp/PgDn: scroll".to_string()
     } else if app.detail_view_entry.is_some() {
         " ↑↓/scroll  PgUp/PgDn/scroll  g/G top/bot  ESC/back".to_string()
-    } else if app
-        .copy_notice_until
-        .is_some_and(|deadline| std::time::Instant::now() < deadline)
-    {
-        " ✓ Copied to clipboard".to_string()
+    } else if let Some(notice) = app.footer_notice_text() {
+        format!(" {notice}")
     } else {
         " ↑↓/scroll  e/edit  d/delete  r/rewind  c/copy  ESC/back".to_string()
     }
