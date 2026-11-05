@@ -1,0 +1,9 @@
+---
+source: crates/harnx-runtime/src/nats_tool_provider/attachment_encoding_tests.rs
+expression: "commands.join(\"\\n\")"
+---
+attachment_create --mime-type image/png --encoding base64 --content "$(base64 -w0 /tmp/x.png)"
+attachments_attachment_create --mime-type image/png --encoding base64 --content "$(base64 -w0 /tmp/x.png)"
+attachments_attachment_create --mime-type image/png --encoding base64 --content "$(base64 -w0 /tmp/x.png)"
+coding__attachments_attachment_create --mime-type image/png --encoding base64 --content "$(base64 -w0 /tmp/x.png)"
+media-tools_attachment_create --mime-type image/png --encoding base64 --content "$(base64 -w0 /tmp/x.png)"

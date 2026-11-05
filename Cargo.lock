@@ -5177,6 +5177,7 @@ dependencies = [
  "futures-util",
  "fuzzy-matcher",
  "globset",
+ "harnx-attachment-tools",
  "harnx-blob-store",
  "harnx-client",
  "harnx-core",

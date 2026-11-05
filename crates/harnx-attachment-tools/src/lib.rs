@@ -2,7 +2,7 @@
 //!
 //! This crate provides two tools for agent access to attachments:
 //! - `attachment_read`: Read media blobs and rendered plans with truncation support
-//! - `attachment_create`: Create new text attachments
+//! - `attachment_create`: Create text or base64-encoded binary attachments
 //!
 //! Both tools operate only over NATS JetStream. No filesystem or HTTP access.
 
