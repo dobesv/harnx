@@ -244,11 +244,11 @@ fn bash_declaration_has_exec_mirroring_params_and_hints() {
 
     let description = &bash.description;
     assert!(
-        description.contains("- fs_read: tool fs_read"),
+        description.contains("- fs_read [--json <object>]  # tool fs_read"),
         "description lists inner tool name + summary: {description}"
     );
     assert!(
-        description.contains("- fs_write: tool fs_write"),
+        description.contains("- fs_write [--json <object>]  # tool fs_write"),
         "bash-only tools appear in the description: {description}"
     );
 }
@@ -411,8 +411,10 @@ fn bash_catalog_matches_declaration_with_session_override() {
     assert_eq!(config.bash_tool_names(&effective), vec!["fs_write"]);
     let declaration = config.select_tools(&effective).unwrap().pop().unwrap();
     assert_eq!(declaration.name, "bash");
-    assert!(declaration.description.contains("fs_write"));
-    assert!(!declaration.description.contains("fs_read"));
+    // Generic worked examples may mention unselected tools. Only catalog
+    // synopsis lines describe commands available in this session.
+    assert!(declaration.description.contains("\n- fs_write "));
+    assert!(!declaration.description.contains("\n- fs_read "));
     let catalog: Vec<_> = config
         .bash_inner_tool_declarations()
         .into_iter()
@@ -427,4 +429,26 @@ fn bash_catalog_matches_declaration_with_session_override() {
         .set_bash_tools(Some(vec![]));
     assert!(!config.bash_tools_active());
     assert!(config.bash_inner_tool_declarations().is_empty());
+}
+#[test]
+fn bash_description_uses_executable_schemas_and_runtime_caps() {
+    let mut reader = tool("files_fs_read");
+    reader.description = "Read source files. Extra details belong in --help.".into();
+    reader.parameters = serde_json::from_value(serde_json::json!({
+        "type":"object", "properties":{
+            "path":{"type":"string"}, "head_lines":{"type":"integer"}
+        }, "required":["path"]
+    }))
+    .unwrap();
+    let bash = super::bash_declaration::synthesize_bash_declaration(&[reader]);
+    let description = &bash.description;
+    assert!(description.contains("- files_fs_read --path <string> [--head-lines <integer>] [--json <object>]  # Read source files."));
+    assert!(description.contains("files_fs_read --path src/lib.rs -o text |"));
+    assert!(description.contains(&format!(
+        "Inner tools: {} concurrent, {} admitted calls per script",
+        crate::bash_inner::DEFAULT_MAX_CONCURRENT_INNER_CALLS,
+        crate::bash_inner::DEFAULT_MAX_INNER_CALLS_PER_SCRIPT,
+    )));
+    assert!(!description.contains("Placeholder"));
+    assert!(!description.contains("Extra details"));
 }

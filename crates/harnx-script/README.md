@@ -39,10 +39,106 @@ async fn example() {
   `ScriptRun.error`, independent of stream caps. BashKit 0.20.2 reports late
   syntax errors as ordinary stderr with exit 2; if its own stderr cap has
   discarded that diagnostic, the backend can't recover it.
-- BashKit is pinned to `=0.20.2`, with only its `jq` feature enabled. HTTP, SSH,
-  git, host filesystems, and Python/Monty aren't enabled. Curl/wget are also
-  filtered out at construction. Builtins operate on virtual files, including
-  BashKit's synthetic `/etc` and `/proc`, not host files.
+- BashKit is pinned to `=0.20.2`, with `jq` and `python` enabled. HTTP, SSH,
+  git and host filesystems aren't enabled. Curl/wget are also filtered out at
+  construction. Builtins operate on virtual files, including BashKit's synthetic
+  `/etc` and `/proc`, not host files.
+
+## Embedded Python
+
+`python3` and `python` run the same Monty interpreter, not host CPython. Both
+accept `-c`, a VFS script filename, or code on stdin (`-` is optional). Interactive
+mode and third-party imports aren't supported. Use quoted heredocs for multiline
+code:
+
+```bash
+echo '1 2 3' > /tmp/numbers.txt
+python3 - <<'EOF'
+from pathlib import Path
+numbers = Path('/tmp/numbers.txt').read_text().split()
+print(sum(int(n) for n in numbers))
+EOF
+```
+
+`open()` and `pathlib.Path` use the same VFS as Bash, including lazy reads from
+full-CID `/attachments` paths. The attachment mount stays read-only. Monty's
+stdlib is a subset; network, subprocesses and `re` aren't available. Monty 0.0.19
+supports simple classes, but not inheritance or metaclasses. BashKit's older
+"no classes" hint doesn't describe this version.
+
+**Python cannot call tools.** No external-function handler is installed. Call
+tool commands in Bash, save their output in `/tmp`, then process those files in
+Python. Tool names, `tools` and `call_tool` aren't Python globals.
+
+The backend enables in-process Python with
+`.env("BASHKIT_ALLOW_INPROCESS_PYTHON", "1")` on each Bash builder. It never sets
+process-global environment variables. Python gets no extra host capabilities.
+
+`python_with_limits` uses the run's `timeout_secs` and
+`ScriptLimits::max_python_memory_bytes` (64 MiB by default). BashKit also clamps
+Python to the remaining run time. The parent deadline includes worker queue time
+and reports `timed_out`/124 plus `limit_hit`, even when Monty returns an ordinary
+`TimeoutError`. Cancellation reports `cancelled`/130; busy-loop cancellation is
+tested on a single-thread Tokio runtime with a one-second bound.
+
+Monty's heap and collected print output each use the per-invocation memory
+ceiling. Exceeding it returns exit 1 and a `MemoryError: memory limit exceeded`
+diagnostic on stderr; BashKit doesn't expose that VM exception as a typed
+`limit_hit`. `set +e` can recover from this command error. These are cooperative
+VM limits, not an OS-level process/RSS limit. VFS, parser and Bash intermediate
+budgets are separate. Python print output is buffered until the invocation
+returns, so cancellation/timeout can lose prints from an unfinished VM slice.
+
+BashKit charges each Python invocation against a shared per-script work budget
+(`max_memory / 64` units per invocation, consuming 1,048,576 units under the default
+64 MiB limit against a 100M unit budget). This caps a single script run at approximately
+95 Python invocations; invoking Python a 96th time aborts the script with a work units
+resource limit. Rather than invoking `python` or `python3` repeatedly inside shell loops,
+batch per-item processing into a single Python invocation.
+
+### Known crash risks and isolation limits
+
+The 64 MiB Python limit and the run timeout (86,400 seconds by default) are
+cooperative VM checks, not hard OS-level process or memory isolation guarantees.
+Certain Python operations allocate directly on the host heap outside Monty's
+resource tracker. These allocations can exhaust host memory or trigger an
+unrecoverable process abort (`SIGABRT`), taking down the entire host worker process
+that runs script mode.
+
+Tested through `harnx-script`'s `BashKitBackend` with a 64 MiB Python memory ceiling,
+a 1-second test harness timeout, and BashKit 0.20.2 / Monty 0.0.19. Confirmed failure
+examples include (non-exhaustive):
+
+1. **Large JSON indent:** `json.dumps(0, indent=10**9)` attempts an untracked string
+   allocation in native code and aborts the entire worker process (`SIGABRT`). An indent
+   of `134217728` allocated ~159 MiB RSS, well past the 64 MiB limit.
+2. **Exponential result export:** Returning a deeply shared list graph (`x = [x, x]`
+   repeated 30 times as the final expression) expands to ~500 MiB RSS during result bridge
+   conversion. Timeout and cancellation signals do not stop this native export in time,
+   resulting in an allocation failure and `SIGABRT`.
+3. **Import gate bypass:** BashKit filters `import re` with a line-prefix check. Prefixing
+   the statement (for example `pass; import re`) bypasses the gate. Running
+   `re.split('', 'a' * 4194304)` allocated ~302 MiB RSS and failed to stop cleanly at the
+   1-second test timeout.
+4. **Parser recursion:** Very long left-associative expression chains (such as `1+1+...`,
+   `x.x.x...`, `f()()...`, or `a[0][0]...`) cause a parser stack overflow during AST
+   construction before execution limits can apply.
+5. **Untracked string/bytes join and split:** Native preallocations in `str.join`, `bytes.join`,
+   `str.split`, and `bytes.split` allocate directly on the host heap outside Monty's memory
+   tracker and abort on host allocation failure.
+
+No newer compatible BashKit release is known to resolve these issues.
+
+**What is affected:** An allocation failure or abort crashes the entire host worker or
+host process running script mode, not just the Python invocation or subshell.
+
+**Configuration and guidance:** Python cannot be disabled separately in this version;
+no builder- or configuration-level setting exists to toggle Monty off while script mode is active.
+Use script mode with Python only in environments where a worker process crash is acceptable.
+For untrusted prompts, leave `bash_tools` unset so script mode is not enabled.
+
+See [Monty dependency audit](docs/monty-dependencies.md) for build scripts,
+registry `noexec`, minimum Rust versions and licenses.
 
 ## Registered commands and mounts
 
@@ -57,12 +153,23 @@ are shared `Arc`s with `Send + Sync`; calls aren't serialized by this backend.
 Keep admission limits and service-specific concurrency caps in the command's
 implementation.
 
-Cancellation selects the external token against script execution, sets BashKit's
-atomic flag, and drops interpreter-owned job futures. The command context's token
-is a child of the external token and is cancelled on completion, timeout, or
-caller drop too. Prefer inline futures. A command that spawns detached work is
-responsible for stopping it using this token; dropping a Rust future cannot undo
-remote side effects. Completing a run never cancels its caller's token.
+The interpreter runs on a Tokio blocking worker so synchronous Monty execution
+can't prevent the caller from polling cancellation or its wall-clock deadline.
+A process-wide cap admits at most eight running or queued interpreter closures.
+Waiting for admission counts against the run deadline and observes cancellation;
+queued closures retain their permits until Tokio drops them.
+Cancellation sets BashKit's atomic flag (checked inside the VM) and cancels a
+child token used by registered commands. Once an interpreter has started, an
+explicit cancel or timeout awaits worker shutdown and drops interpreter-owned
+jobs before returning. Unstarted queued work is aborted without waiting for
+pool capacity. Dropping the caller future signals the same shutdown; cleanup
+finishes at the next VM/async checkpoint. The command context's token is
+cancelled on completion too. Prefer inline futures. A command that spawns
+detached work is responsible for stopping it using this token; cancellation
+cannot undo remote side effects. Completing a run never cancels its caller's
+token. Joining a running worker has no hard grace-period bound: a native Monty
+operation that misses VM checkpoints can delay cancellation indefinitely.
+Returning after a grace period would detach interpreter-owned work, not stop it.
 
 `FsMount` accepts a trusted virtual `FileSystem` mounted at an absolute path.
 Mounted filesystem paths start at `/`. For read-only mounts, wrap the filesystem
@@ -90,8 +197,11 @@ aren't mounted.
 
 - Files load on the first read or file metadata lookup. Successful bytes are
   cached for that invocation; errors aren't cached, so a later read can retry.
+  Stat and `test -f` probes are metadata-only and do not download content or consume
+  cache budget.
   Concurrent misses serialize to avoid duplicate downloads and unbounded pending
-  buffers. Dropping a run drops pending fetch futures, with no detached tasks.
+  buffers. When the cache is full, subsequent reads fail fast before downloading
+  any content. Dropping a run drops pending fetch futures, with no detached tasks.
 - Directory listings are always empty, even after successful reads. The root and
   CID parent paths are virtual directories, not a view of object-store keys.
   Scripts must already know the complete CID; globs cannot discover attachments.
@@ -99,8 +209,10 @@ aren't mounted.
   into `/tmp` is allowed. Missing CIDs report `attachment not found: <cid>`.
 - Default limits match BashKit: 10,000,000 bytes per attachment, 100,000,000 cached
   bytes and 10,000 cached files, plus its path limits. Oversized files fail; they
-  aren't truncated. `AttachmentFs::with_limits` changes these limits for an
-  embedder. This is a separate mount budget from the writable root VFS budget.
+  aren't truncated. When total cached bytes reach the limit, downloads fail with
+  `attachment cache is full (<limit> byte limit)`. `AttachmentFs::with_limits`
+  changes these limits for an embedder. This is a separate mount budget from the
+  writable root VFS budget.
 - Runtime reads use the same broker connection/credentials as the round's tools,
   without creating buckets. Access matches current `attachment_read`: canonical,
   explicit media CIDs may refer to another session. The CID owner determines its
@@ -188,6 +300,22 @@ first and the description's first sentence. `help::help(name, schema, descriptio
 returns NAME, SYNOPSIS, DESCRIPTION and OPTIONS sections with type, default and
 enum metadata. Both use the parser's flag/type classification, including JSON
 fallbacks for real MCP schemas with `$ref`, `anyOf` or nullable types.
+
+## Generated `bash` description
+
+`description::bash_tool_description(tools, concurrent_cap, call_cap)` builds the
+model-facing guide from the resolved `ToolSpec` catalog. Builtins come from
+`BashKitBackend::builtin_names` (already filtered to exclude `curl`/`wget`);
+sorted tool synopses use the same generator as `tools` and `--help`. Runtime
+supplies admission caps; execution and filesystem defaults come from their limit
+types. The guide includes quoting patterns, Monty restrictions and one pipeline
+using a compatible file-reader tool, or an explicitly labeled generic example.
+
+The PNG attachment idiom appears only for an `attachment_create`-suffixed tool
+whose string flags accept `mime-type`, `encoding=base64` and `content`, with no
+other required arguments. Tools without an `encoding` property don't advertise
+binary creation. Snapshot tests log a rough characters/4 token estimate; execution
+tests run the quoting patterns and generated commands against BashKit.
 
 ## Tool command catalog
 

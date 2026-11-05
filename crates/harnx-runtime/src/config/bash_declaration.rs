@@ -2,19 +2,13 @@
 //!
 //! When an agent's `bash_tools` resolves to a non-empty inner tool set, the
 //! model gets one extra `bash` tool whose arguments mirror `bash_exec`. The
-//! description here is a placeholder: it lists each inner tool's name and a
-//! one-line summary. The full dialect guide (planned:
-//! crates/harnx-script/src/description.rs) replaces this generator, so keep
-//! all wording inside this module so the swap is a single-file change.
+//! script crate generates its dialect guide from the backend and inner schemas.
 
 use harnx_core::tool::{JsonSchema, ToolDeclaration};
 
 /// The tool name agents see when `bash_tools` resolves to a non-empty set.
 /// Distinct from `bash_exec`, which shells out to a real host shell.
 pub const BASH_TOOL_NAME: &str = "bash";
-
-/// Default wall-time budget for a script, mirroring `bash_exec` (24 hours).
-const DEFAULT_TIMEOUT_SECS: u64 = 86_400;
 
 /// Build the `bash` declaration for a resolved inner tool set. The set must
 /// already exclude control tools (see `tool_selection::select_bash_inner_tools`).
@@ -28,7 +22,7 @@ pub(crate) fn synthesize_bash_declaration(inner_tools: &[ToolDeclaration]) -> To
             },
             "timeout_secs": {
                 "type": "integer",
-                "default": DEFAULT_TIMEOUT_SECS,
+                "default": harnx_script::ScriptLimits::default().timeout_secs,
                 "description": "Kill the script after this many seconds. 0 means no deadline."
             },
             "head_lines": {
@@ -66,34 +60,19 @@ pub(crate) fn synthesize_bash_declaration(inner_tools: &[ToolDeclaration]) -> To
     }
 }
 
-/// Placeholder description: purpose line plus one bullet per inner tool.
-/// The full dialect guide (crates/harnx-script/src/description.rs) replaces
-/// this once the script backend lands.
+/// Use the same schema conversion as BashToolProvider's executable catalog.
 fn bash_tool_description(inner_tools: &[ToolDeclaration]) -> String {
-    let mut description = String::from(
-        "Run a bash script whose commands are this agent's tools, chaining several tool calls \
-and post-processing their results in one round trip. Placeholder description; a later \
-release documents the shell dialect and limits. Tool commands available in the script:\n",
-    );
-    for tool in inner_tools {
-        description.push_str(&format!(
-            "- {}: {}\n",
-            tool.name,
-            one_line_summary(&tool.description)
-        ));
-    }
-    description
-}
-
-/// First line of a tool description, whitespace-collapsed, as the one-line
-/// summary shown next to the tool's command name.
-fn one_line_summary(description: &str) -> String {
-    description
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let specs: Vec<_> = inner_tools
+        .iter()
+        .map(|tool| harnx_script::commands::ToolSpec {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            schema: tool.parameters.as_value().clone(),
+        })
+        .collect();
+    harnx_script::description::bash_tool_description(
+        &specs,
+        crate::bash_inner::DEFAULT_MAX_CONCURRENT_INNER_CALLS,
+        crate::bash_inner::DEFAULT_MAX_INNER_CALLS_PER_SCRIPT,
+    )
 }

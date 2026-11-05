@@ -95,7 +95,7 @@ arboard = { workspace = true }
 harnx-test-bins = { path = "../harnx-test-bins" }
 harnx-telemetry = { workspace = true, features = ["testing"] }
 harnx-time-tools = { path = "../harnx-time-tools" }
-insta = { version = "1", features = ["yaml"] }
+insta = { workspace = true, features = ["yaml"] }
 metrics-util = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }

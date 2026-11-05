@@ -13,6 +13,9 @@ use crate::{
     ScriptCommandContext, ScriptCommandOutput, ScriptLimits, ScriptRun, ScriptStatus,
 };
 
+mod python;
+mod worker;
+
 async fn run(script: &str) -> ScriptRun {
     BashKitBackend
         .run(crate::ScriptRequest {
@@ -101,9 +104,9 @@ async fn each_run_has_fresh_shell_files_and_cancel_flag() {
 }
 
 #[tokio::test]
-async fn host_files_network_and_python_are_unavailable() {
+async fn host_files_and_network_are_unavailable() {
     let names = BashKitBackend.builtin_names();
-    for name in ["curl", "wget", "python", "python3"] {
+    for name in ["curl", "wget"] {
         assert!(!names.iter().any(|n| n == name), "unexpected {name}");
         let result = run(&format!("{name} https://127.0.0.1:1/")).await;
         assert_eq!(result.exit_code, 127, "{result:?}");
@@ -416,6 +419,14 @@ async fn dropping_run_cleans_up_pending_jobs_and_signals_command_work() {
         .forget();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
+    // The blocking interpreter drops its command futures at the next checkpoint.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while command.active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("orphan command after caller drop");
     command.assert_first_stopped();
     assert!(
         !external.is_cancelled(),

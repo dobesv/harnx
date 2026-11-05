@@ -7,14 +7,15 @@ use async_trait::async_trait;
 use bashkit::{Builtin, BuiltinContext, Error, ExecResult, ExecutionLimits};
 
 use crate::{
-    CancellationToken, InMemoryFs, ScriptBackend, ScriptCommand, ScriptCommandContext,
-    ScriptLimits, ScriptRun, ScriptStatus,
+    CancellationToken, InMemoryFs, ScriptCommand, ScriptCommandContext, ScriptLimits, ScriptRun,
+    ScriptStatus,
 };
 
 mod capture;
 mod outcome;
 mod resolver;
 mod shell;
+mod worker;
 use capture::Capture;
 use outcome::classify;
 use shell::build_shell;
@@ -33,8 +34,10 @@ impl BashKitBackend {
             .fs(Arc::new(InMemoryFs::new()))
             .cwd("/tmp")
             .limits(execution_limits(limits))
+            .python_with_limits(python_limits(limits))
+            .env("BASHKIT_ALLOW_INPROCESS_PYTHON", "1")
             // Defense against accidental Cargo feature unification enabling HTTP.
-            // No host mounts, transports, or embedded runtimes are configured.
+            // No host mounts or network transports are configured.
             .builtin_filter(|name| !matches!(name, "curl" | "wget"))
     }
 
@@ -58,6 +61,12 @@ fn execution_limits(limits: &ScriptLimits) -> ExecutionLimits {
         .max_stderr_bytes(limits.max_stderr_bytes)
 }
 
+fn python_limits(limits: &ScriptLimits) -> bashkit::PythonLimits {
+    bashkit::PythonLimits::default()
+        .max_duration(execution_limits(limits).timeout)
+        .max_memory(limits.max_python_memory_bytes)
+}
+
 struct RunControl {
     stop: CancellationToken,
     fatal: Mutex<Option<String>>,
@@ -66,10 +75,12 @@ struct RunControl {
 
 impl RunControl {
     fn cancel(&self) {
+        // Publish the stop first: a worker installing its flag concurrently
+        // must see either this token or the flag write below.
+        self.stop.cancel();
         if let Some(flag) = self.flag.get() {
             flag.store(true, Ordering::Release);
         }
-        self.stop.cancel();
     }
 }
 
@@ -111,26 +122,25 @@ impl Builtin for CommandAdapter {
     }
 }
 
-#[async_trait]
-impl ScriptBackend for BashKitBackend {
-    async fn run(&self, request: crate::ScriptRequest<'_>) -> ScriptRun {
+impl BashKitBackend {
+    async fn execute(
+        &self,
+        request: crate::ScriptRequest<'_>,
+        control: Arc<RunControl>,
+    ) -> ScriptRun {
         let crate::ScriptRequest {
             script,
             limits,
             commands,
             fs_mounts,
-            cancel,
+            cancel: _,
         } = request;
-        let control = Arc::new(RunControl {
-            stop: cancel.child_token(),
-            fatal: Mutex::new(None),
-            flag: OnceLock::new(),
-        });
-        // This guard also cancels command-owned work if the caller drops `run`.
-        let _cleanup = control.stop.clone().drop_guard();
         let mut bash = build_shell(&limits, commands, &control);
         let flag = bash.cancellation_token();
         control.flag.set(flag.clone()).unwrap();
+        if control.stop.is_cancelled() {
+            flag.store(true, Ordering::Release);
+        }
         // BashKit resets shell options between exec calls. Keep errexit in the
         // same execution as the user's script; diagnostics have one extra line.
         let script = format!("set -e\n{script}");

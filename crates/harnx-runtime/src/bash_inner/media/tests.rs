@@ -62,6 +62,15 @@ impl AttachmentFetcher for MemoryStore {
         assert!(bytes.len() as u64 <= max_bytes);
         Ok(bytes)
     }
+
+    async fn size(&self, cid: &str) -> io::Result<Option<u64>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .get(cid)
+            .map(|bytes| bytes.len() as u64))
+    }
 }
 
 struct FakeTool {
