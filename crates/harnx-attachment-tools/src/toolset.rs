@@ -43,7 +43,12 @@ const ATTACHMENT_CREATE_DESCRIPTION: &str = "Create an attachment in the NATS ob
 
 Returns the cid: URL for the created attachment. Optional encoding is 'utf-8'
 (default, text MIME types only) or 'base64' (strict base64 input, any MIME type).
-The 5 MiB limit applies to decoded bytes.
+Text MIME types require UTF-8 decoded content, including in base64 mode.
+The handler allows up to 5 MiB decoded, but the complete JSON request must fit
+NATS max_payload (default 1 MiB). Base64 uses 4*ceil(decoded_bytes/3) bytes;
+with the default broker, binary content must be smaller than 768 KiB, minus
+request/header overhead (script mode also reserves 1 KiB). Requests are not
+chunked; larger attachments need a higher broker limit.
 
 Requires caller session identity; returns an error when invoked via
 MCP stdio/HTTP bridges that do not provide session context.

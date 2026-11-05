@@ -328,7 +328,8 @@ The `harnx-attachment-tools` server provides tools for reading and storing NATS-
     - `max_output_bytes` (integer, optional): Maximum output size in bytes.
     - `grep` (string, optional): Regex pattern to filter lines before truncation.
 - **`attachment_create(content, mime_type, encoding?)`**: Create a text or binary attachment in NATS Object Storage (`harnx_attachments`) owned by the invoking session.
-  - Returns the canonical `cid:media:` URL for the stored attachment. Decoded payloads are limited to 5 MiB.
+  - Returns the canonical `cid:media:` URL for the stored attachment. The handler accepts up to 5 MiB decoded, but the complete JSON request must fit NATS `max_payload` (default 1 MiB). Base64 expands bytes by about 4/3, so the default broker permits less than 768 KiB of binary content after request/header overhead; script mode also reserves 1 KiB for the envelope. Requests are not chunked. Larger attachments require a higher broker limit.
+  - Text MIME types require UTF-8 decoded bytes, even with base64 encoding or a different charset parameter. Use `application/octet-stream` to retain arbitrary bytes unchanged; `attachment_read` cannot display that binary type.
   - Parameters:
     - `content` (string, required): Text or strict standard base64, depending on `encoding`.
     - `mime_type` (string, required): MIME type of the decoded content. Non-text types require `encoding: "base64"`.
@@ -907,4 +908,6 @@ Sometimes you need agent behavior to adapt based on which tools are available. F
 
 ## Creating attachments
 
-`attachment_create` stores content in the NATS object store and returns a `cid:` URL. By default, `encoding` is `"utf-8"`, preserving the text-only MIME type restriction. Set `encoding` to `"base64"` to create binary attachments with any MIME type; `content` must then be strict standard base64. The 5 MiB size limit applies to decoded bytes. Invalid base64 and unsupported encoding values return clear tool errors.
+`attachment_create` stores content in the NATS object store and returns a `cid:` URL. By default, `encoding` is `"utf-8"`, preserving the text-only MIME type restriction. Set `encoding` to `"base64"` to create binary attachments with any MIME type; `content` must then be strict standard base64. Text MIME types require UTF-8 decoded bytes; charset parameters do not change how `attachment_read` decodes text. Non-UTF-8 files can be stored as `application/octet-stream`, but that binary type cannot be displayed by `attachment_read`.
+
+The 5 MiB decoded limit is a handler ceiling, not the effective transport limit. The complete JSON tool request must fit the broker's NATS `max_payload` (default 1 MiB). Base64 occupies `4 * ceil(decoded_bytes / 3)` bytes, leaving less than 768 KiB of binary capacity after request/header overhead with the default broker; script mode also reserves 1 KiB for the envelope. Exact capacity depends on the serialized request. Requests are not chunked or offloaded before dispatch. A 5 MiB binary attachment needs 6,990,508 base64 bytes plus overhead, so requires a higher broker limit (for example, 8 MiB). Script mode preflights request size and returns a recoverable error before dispatch; other NATS calls can fail at publish time. Invalid base64 and unsupported encoding values return clear tool errors.

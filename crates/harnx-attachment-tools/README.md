@@ -76,8 +76,9 @@ Creates a text or binary attachment in NATS Object Storage owned by the caller's
 
 - Returns the canonical `cid:media:<agent>/<session-id>/<hash>` URL for the stored attachment.
 - Default `utf-8` encoding accepts only text MIME types (`text/*`, `application/json`, `application/xml`, `application/yaml`, `application/x-yaml`).
-- `base64` encoding accepts strict standard base64 and any MIME type. Stored bytes are decoded before hashing.
-- Limits decoded payloads to 5 MiB. Oversized encoded input is rejected before decoding; the decoded-size check still handles the final base64 quantum.
+- `base64` encoding accepts strict standard base64 and any MIME type. Stored bytes are decoded before hashing. Text MIME types still require UTF-8 decoded content because `attachment_read` decodes text as UTF-8, regardless of charset parameters. To retain non-UTF-8 bytes unchanged, use a binary MIME type such as `application/octet-stream` (not displayable by `attachment_read`).
+- The handler limits decoded payloads to 5 MiB. Oversized encoded input is rejected before decoding; the decoded-size check still handles the final base64 quantum.
+- The complete JSON tool request must also fit NATS `max_payload` (default 1 MiB). Base64 occupies `4 * ceil(decoded_bytes / 3)` bytes, so the default broker permits less than 768 KiB of binary content after request/header overhead; script mode also reserves 1 KiB for the envelope. Exact capacity depends on the serialized request. Requests are not chunked. A 5 MiB binary attachment needs 6,990,508 base64 bytes plus overhead, so requires a higher broker limit (for example, 8 MiB).
 - Requires caller session identity; returns an error when invoked without session context. Session identity is supplied by the runtime, not a tool argument.
 
 Parameters:

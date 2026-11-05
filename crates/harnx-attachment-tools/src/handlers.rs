@@ -279,6 +279,8 @@ fn text_attachment_result(bytes: Vec<u8>, params: AttachmentReadParams) -> Resul
 }
 
 fn decode_attachment_content(content: String, encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    // This is a handler allocation limit, not a transport guarantee: the complete
+    // base64 JSON request must first fit the broker's max_payload (default 1 MiB).
     // Bound decoder allocation before decoding. The final base64 quantum can
     // still exceed the decoded limit, which attachment_create checks separately.
     if encoding == Some("base64") && content.len() > MAX_ATTACHMENT_BYTES.div_ceil(3) * 4 {
@@ -330,6 +332,15 @@ pub async fn attachment_create(
     {
         return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
             "attachment_create only accepts text MIME types; got {}",
+            params.mime_type
+        ))]));
+    }
+
+    // attachment_read decodes text MIME types as UTF-8, regardless of charset parameters.
+    if is_text_mime(&normalize_mime_base(&params.mime_type)) && std::str::from_utf8(&bytes).is_err()
+    {
+        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+            "attachment_create text MIME types require UTF-8 content; got {}",
             params.mime_type
         ))]));
     }

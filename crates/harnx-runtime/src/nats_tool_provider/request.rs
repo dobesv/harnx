@@ -341,6 +341,39 @@ mod probe_tests {
         assert_eq!(script_effective_max_bytes(512), 0, "saturates at zero");
     }
 
+    #[test]
+    fn base64_creation_request_respects_broker_budget() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let size = |bytes: usize| {
+            let content = STANDARD.encode(vec![0; bytes]);
+            assert_eq!(content.len(), bytes.div_ceil(3) * 4);
+            let args = serde_json::json!({
+                "content": content,
+                "mime_type": "application/octet-stream",
+                "encoding": "base64"
+            });
+            let request = probe_request(
+                "attachment_create",
+                &args,
+                &Some("session-1".into()),
+                &Some("agent-a".into()),
+                &Some("local-7".into()),
+                &None,
+            );
+            serde_json::to_vec(&request).unwrap().len()
+        };
+        let default_budget = script_effective_max_bytes(1024 * 1024);
+        assert!(size(760 * 1024) < default_budget);
+        // 768 KiB fills 1 MiB with base64 alone, before the request envelope.
+        assert!(size(768 * 1024) > default_budget);
+        let handler_limit: usize = 5 * 1024 * 1024;
+        assert_eq!(handler_limit.div_ceil(3) * 4, 6_990_508);
+        let max_request_bytes = size(handler_limit);
+        assert!(max_request_bytes > default_budget);
+        assert!(max_request_bytes < script_effective_max_bytes(8 * 1024 * 1024));
+    }
+
     /// PR3 round-2 review R1/R4: the probe serializes the exact `ToolRequest`
     /// shape a real inner-call dispatch builds (`prepare_request_with_progress`)
     /// — same ids, round, parents, and the full capability set so a
