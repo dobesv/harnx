@@ -111,6 +111,10 @@ impl Tui {
         self.app.main_streamed_text_idx = None;
         self.app.streamed_text_idx = None;
         self.app.last_ui_output_source = None;
+        // The rebuilt transcript invalidates the browse selection: leaving
+        // transcript_browsing set with no focus strands the user in a browse
+        // mode whose action keys only show "Nothing selected" notices.
+        self.app.transcript_browsing = false;
         self.app.transcript_focus = None;
         self.app.transcript_selection_anchor = None;
         self.subagent_rows_dirty = true;
@@ -281,5 +285,29 @@ impl Drop for Tui {
         self.clear_tool_confirmation_route();
         self.stop_session_activity_monitor();
         self.stop_subagent_monitors();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shared_session_refresh_exits_browse_mode() {
+        // The rebuilt transcript invalidates the browse selection; leaving
+        // transcript_browsing set with no focus would strand the user in a
+        // browse mode whose action keys can only refuse.
+        let config = crate::tests::test_config();
+        let mut tui = Tui::init(&config).await.unwrap();
+        tui.app.transcript_browsing = true;
+        tui.app.transcript_focus = Some(0);
+        tui.app.transcript_selection_anchor = Some(0);
+        let stamp = crate::event_isolation::EventStamp::live(&tui.live_events);
+
+        tui.refresh_shared_session_transcript(&stamp).await;
+
+        assert!(!tui.app.transcript_browsing);
+        assert_eq!(tui.app.transcript_focus, None);
+        assert_eq!(tui.app.transcript_selection_anchor, None);
     }
 }

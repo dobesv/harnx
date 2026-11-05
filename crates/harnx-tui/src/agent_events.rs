@@ -8,7 +8,7 @@ use crate::tool_transcript::{
 };
 use crate::types::{TranscriptItem, Tui};
 use crossterm::ExecutableCommand;
-use harnx_core::event::{AgentEvent, AgentSource, SessionEvent};
+use harnx_core::event::{AgentEvent, AgentSource, SessionEvent, TurnEvent};
 
 /// Concatenate `ContentBlock::Text(..)` fragments into a single String.
 /// Non-Text blocks (Image, ResourceLink, Opaque) are skipped — the TUI
@@ -152,6 +152,19 @@ impl Tui {
         }
     }
 
+    fn clear_pending_tool_seq_on_turn_end(&mut self, event: &AgentEvent, is_sub_agent: bool) {
+        // A finished turn has no more tool calls to bind. Don't let a pending
+        // seq leak into a later round.
+        if !is_sub_agent
+            && matches!(
+                event,
+                AgentEvent::Turn(TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. })
+            )
+        {
+            self.app.pending_tool_seq = None;
+        }
+    }
+
     pub(super) async fn render_agent_event(&mut self, event: AgentEvent) {
         use harnx_core::event::ModelEvent;
         let (source, event, is_sub_agent) = match event {
@@ -159,6 +172,7 @@ impl Tui {
             event => (None, event, false),
         };
         self.prepare_assistant_boundary(&event, source.as_ref(), is_sub_agent);
+        self.clear_pending_tool_seq_on_turn_end(&event, is_sub_agent);
         if self.handle_session_event(&event, is_sub_agent).await {
             return;
         }
@@ -187,24 +201,42 @@ impl Tui {
     }
 
     fn assign_live_log_seq(&mut self, seq: usize) {
-        // Try to backfill the seq into the most recent unsequenced transcript
-        // item (UserText, AssistantText, or ToolCall). If an item is found and
-        // patched, the seq has been consumed — clear pending_tool_seq.  If no
-        // item is found yet (e.g. ToolEvent::Started arrives after this event),
-        // store seq in pending_tool_seq so the upcoming ToolCall can pick it up.
+        // Backfill the seq into the most recent unsequenced transcript item
+        // (UserText, AssistantText, or ToolCall). A UserText or ToolCall
+        // backfill consumes the seq — clear pending_tool_seq. An AssistantText
+        // backfill keeps it pending: a ToolCalls log entry holds the assistant
+        // prose and the calls in one row, so the same round's ToolCall items
+        // share the seq. When no item can be patched yet (e.g.
+        // ToolEvent::Started arrives after this event), the seq is stored in
+        // pending_tool_seq for the upcoming ToolCall.
+        let mut backfilled_assistant_text = false;
         let mut backfilled = false;
         for item in self.app.transcript.iter_mut().rev() {
             match item {
+                // A sequenced UserText is a turn boundary: unsequenced items
+                // before it belong to an earlier turn (e.g. a stale reply from
+                // a non-streaming worker) and must not consume this round's
+                // seq.
+                TranscriptItem::UserText { seq: Some(_), .. } => break,
                 // Only backfill "live" entries — items with a timestamp are
                 // created during an active session.  The agent banner is
                 // AssistantText { seq: None, timestamp: None } and must not
                 // consume a seq that belongs to the first real message.
-                TranscriptItem::UserText {
+                TranscriptItem::AssistantText {
                     seq: item_seq @ None,
                     timestamp: Some(_),
                     ..
+                } => {
+                    *item_seq = Some(seq);
+                    backfilled = true;
+                    // A ToolCalls log entry holds the assistant prose and the
+                    // calls in one row, so the ToolCall items of the same round
+                    // share this seq. Keep it pending for them even though the
+                    // prose consumed the backfill.
+                    backfilled_assistant_text = true;
+                    break;
                 }
-                | TranscriptItem::AssistantText {
+                TranscriptItem::UserText {
                     seq: item_seq @ None,
                     timestamp: Some(_),
                     ..
@@ -221,11 +253,13 @@ impl Tui {
                 _ => {}
             }
         }
-        if backfilled {
-            // Seq consumed by an existing item; clear any pending slot.
+        if backfilled && !backfilled_assistant_text {
+            // Seq consumed by an item that has no same-round followers; clear
+            // any pending slot.
             self.app.pending_tool_seq = None;
         } else {
-            // No existing item to patch; save for the next ToolCall creation.
+            // No existing item to patch, or the backfilled prose belongs to a
+            // tool round: save the seq for ToolCall creation.
             self.app.pending_tool_seq = Some(seq);
         }
     }

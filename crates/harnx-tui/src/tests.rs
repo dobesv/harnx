@@ -87,6 +87,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 mod broker_isolation_tests;
+mod browse_actions;
 mod cancellation_escape_tests;
 mod command_completion;
 mod delegation_tests;
@@ -2069,42 +2070,12 @@ async fn live_log_seq_assignment_applies_to_tool_calls_started_after_seq_event()
     // Verify pending_tool_seq is still set: multiple tool calls in the same round
     // share the same log_seq, so we intentionally do NOT clear it after first use.
     // It will be cleared when the next LogSeqAssigned arrives (for a different round)
-    // and successfully backfills a UserText or AssistantText item, or overwritten by
+    // and successfully backfills a UserText or ToolCall item, or overwritten by
     // the next tool round's LogSeqAssigned.
     assert_eq!(
         tui.app.pending_tool_seq,
         Some(5),
         "pending_tool_seq should remain set so subsequent ToolCalls in same round share seq"
-    );
-}
-
-#[tokio::test]
-async fn log_seq_backfill_clears_pending_tool_seq() {
-    // When LogSeqAssigned arrives and backfills an EXISTING transcript item,
-    // pending_tool_seq must be cleared (not left set for the next ToolCall).
-    let config = test_config();
-    let mut tui = Tui::init(&config).await.unwrap();
-
-    // First add an AssistantText with seq=None so backfill can find it.
-    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
-        ModelEvent::MessageChunk {
-            blocks: vec![ContentBlock::Text("assistant reply".to_string())],
-        },
-    )))
-    .await
-    .unwrap();
-
-    // Now LogSeqAssigned should backfill the AssistantText and NOT set pending_tool_seq.
-    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
-        SessionEvent::LogSeqAssigned { seq: 3 },
-    )))
-    .await
-    .unwrap();
-
-    // Backfill succeeded — pending should be None.
-    assert_eq!(
-        tui.app.pending_tool_seq, None,
-        "pending_tool_seq must be None after backfill consumed the seq"
     );
 }
 
@@ -7582,37 +7553,6 @@ async fn test_d4_enter_opens_detail_view() {
         .unwrap();
 
     assert!(harness.tui().app.detail_view_open);
-}
-
-#[tokio::test]
-async fn test_d4_skips_delete_when_selected_items_have_no_seq() {
-    let mut harness = TuiTestHarness::new().await;
-    harness.tui().app.transcript.clear();
-    harness.tui().app.transcript.push(TranscriptItem::UserText {
-        text: "First".to_string(),
-        seq: None,
-        timestamp: None,
-    });
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::AssistantText {
-            text: "Second".to_string(),
-            seq: None,
-            timestamp: None,
-            rendered_cache: None,
-        });
-    harness.tui().app.transcript_focus = Some(1);
-    harness.tui().app.transcript_selection_anchor = Some(0);
-
-    harness
-        .tui()
-        .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
-        .await
-        .unwrap();
-
-    assert_eq!(harness.tui().app.modal, None);
 }
 
 #[tokio::test]

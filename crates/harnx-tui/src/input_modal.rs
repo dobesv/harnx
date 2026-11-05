@@ -525,6 +525,19 @@ impl Tui {
 
     /// Execute the action associated with the current modal and clear it.
     async fn confirm_modal_action(&mut self) -> Result<()> {
+        // A turn can start between opening the confirmation and pressing
+        // Enter (e.g. another client submits to the shared session). Re-check
+        // and drop the mutation instead of racing the worker.
+        if self.app.llm_busy
+            && matches!(
+                self.app.modal,
+                Some(ModalState::ConfirmDelete { .. } | ModalState::ConfirmRewind { .. })
+            )
+        {
+            self.app.modal = None;
+            self.show_busy_notice();
+            return Ok(());
+        }
         let Some(modal) = self.app.modal.take() else {
             return Ok(());
         };

@@ -1,6 +1,5 @@
 ---
 source: crates/harnx-tui/src/tests.rs
-assertion_line: 1858
 expression: rendered
 ---
 .exit rag                Leave RAG
@@ -18,8 +17,8 @@ expression: rendered
 .delete                  Delete agents, sessions, RAGs, or macros
 .delete message <n>      Delete a log entry by sequence number
 .delete message <n>-<m>  Delete a range of log entries
-.rewind <n>              Rewind session context to entry N (all later
-entries excluded)
+.rewind <n>              Rewind session context to entry N (later
+entries excluded; a tool-calls N keeps its paired tool-results)
 .exit                    Exit the interactive session
 
 Type ::: to start multi-line editing, type ::: to finish it.

@@ -163,7 +163,7 @@ fn build_initial_app(
             s.follow = false;
             s
         },
-        copy_notice_until: None,
+        footer_notice: None,
         scroll_to_focused_item: false,
         use_utc_timestamps: false,
         monitored_sessions: HashMap::new(),
@@ -274,6 +274,10 @@ impl Tui {
             cid_resolve_override: None,
             #[cfg(test)]
             detached_open_override: None,
+            #[cfg(test)]
+            copy_to_clipboard_override: None,
+            #[cfg(test)]
+            command_override: None,
             pending_remote_activations: HashSet::new(),
             session_activity_target: None,
             session_activity_handle: None,

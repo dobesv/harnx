@@ -411,6 +411,10 @@ fn message_role_for_assignment(
 ) -> Option<harnx_core::message::MessageRole> {
     match entry {
         SessionLogEntry::Message { role, .. } => Some(*role),
+        // A ToolCalls entry replays into one `MessageRole::Tool` message whose
+        // log_seq is the ToolCalls seq; ToolResults produces no message. Skip
+        // this and every reloaded tool round loses its seq (issue #2557).
+        SessionLogEntry::ToolCalls { .. } => Some(harnx_core::message::MessageRole::Tool),
         _ => None,
     }
 }
@@ -712,6 +716,63 @@ mod transcript_tests {
             vec![
                 (MessageRole::User, "prior question".to_string(), Some(0)),
                 (MessageRole::Assistant, "prior answer".to_string(), Some(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn transcript_render_preserves_tool_round_seq() {
+        // Issue #2557: ToolCalls entries must be queued for renumbering, or
+        // every reloaded tool round renders with `log_seq: None` and the TUI's
+        // delete/edit/rewind actions on tool-call rows silently no-op.
+        let entries = vec![
+            message(1, MessageRole::User, "run it"),
+            (
+                2,
+                SessionLogEntry::ToolCalls {
+                    text: "working on it".to_string(),
+                    thought: None,
+                    calls: vec![harnx_core::tool::ToolCall {
+                        name: "bash_exec".to_string(),
+                        arguments: serde_json::json!({"command": "echo hi"}),
+                        id: Some("call-1".to_string()),
+                        ..Default::default()
+                    }],
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                3,
+                SessionLogEntry::ToolResults {
+                    results: vec![harnx_core::session::ToolOutput {
+                        id: Some("call-1".to_string()),
+                        name: "bash_exec".to_string(),
+                        output: serde_json::json!({"ok": true}),
+                        markdown: None,
+                        content: vec![],
+                        switch_agent: None,
+                    }],
+                    timestamp: None,
+                },
+            ),
+            message(4, MessageRole::Assistant, "done"),
+        ];
+
+        let state = transcript_state_from_entries(&entries, "tool-round", false)
+            .expect("reconstruct transcript with a tool round");
+        let rows = state
+            .messages
+            .iter()
+            .map(|message| (message.role, message.log_seq))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rows,
+            vec![
+                (MessageRole::User, Some(0)),
+                (MessageRole::Tool, Some(1)),
+                (MessageRole::Assistant, Some(3)),
             ]
         );
     }

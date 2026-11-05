@@ -1084,11 +1084,22 @@ Required match-site updates (3 compile-time exhaustive matches):
 - `session_history.rs` — `entry_type` and `entry_searchable_text`
 
 Wildcard matches elsewhere (`session_reconstruct.rs`, fence helpers, etc.) compile without
-changes but should be audited for correctness.
+changes but should be audited for correctness. `message_role_for_assignment`
+(`config/remote_session_ops.rs`) is one such site: omitting `ToolCalls` made
+`renumber_remote_messages_for_window` wipe every reloaded tool message's `log_seq`,
+silently disabling TUI transcript actions on tool rows (#2557).
 
 Mid-tool entries (arriving between `ToolCalls` and `ToolResults`) must be queued in
 `messages_queued_during_tool` during reconstruction so tool_use→tool_result adjacency is
 preserved. See `SubAgentStarted` handling in `config/session.rs` for the pattern.
+
+A `ToolCalls`+`ToolResults` pair replays into ONE `MessageRole::Tool` message whose `log_seq`
+is the `ToolCalls` seq (`config/session/replay.rs::tool_results`); the `ToolResults` seq itself
+produces no message. The live TUI path mirrors this: a `ToolCalls` entry holds a round's
+assistant prose and calls, so an `AssistantText` backfill in `assign_live_log_seq`
+(`harnx-tui/src/agent_events.rs`) keeps `pending_tool_seq` — prose and `ToolCall` items of
+one round share a single `LogSeqAssigned` seq. Break either mapping and tool rounds get
+`seq: None`, which silently disables TUI delete/edit/rewind on those rows.
 
 Session identity is `(agent, local_id)` within a cluster. Use `Session::storage_key()`,
 `NatsSession::storage_key()`, or `SessionInitializer::session_key(local_id)` for all
@@ -1380,6 +1391,13 @@ with `SessionLogEntry` variants (previous section), which are protocol-versioned
 
 New `TranscriptItem::ToolCall` fields (`start_anchor`, `final_elapsed_ms`, `id`) support tool-call
 timer display and completion correlation. These are TUI-local; no protocol change.
+
+### TUI browse actions never silently no-op
+
+Transcript browse actions (`e`/`d`/`r`/`c`/`i` on a focused row, `crates/harnx-tui/src/input.rs`)
+must show feedback when they cannot apply: call `App::show_footer_notice` (3 s TTL, `types.rs`),
+rendered in place of the shortcut hints by the browse and detail footers. A silent `return` on
+an inapplicable item is a regression (#2557). Navigation keys and `Esc`/`Enter` clear the notice.
 
 ### The config lock and blocking NATS calls
 

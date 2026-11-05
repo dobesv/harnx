@@ -139,7 +139,7 @@ pub static COMMANDS: LazyLock<[Command; 52]> = LazyLock::new(|| {
         Command::with_usage(
             ".rewind",
             "<n>",
-            "Rewind session context to entry N (all later entries excluded)",
+            "Rewind session context to entry N (later entries excluded; a tool-calls N keeps its paired tool-results)",
         ),
         Command::new(".exit", "Exit the interactive session"),
     ]
