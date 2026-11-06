@@ -28,7 +28,7 @@ impl Toolset for FixtureTools {
         "fixture"
     }
     fn tools(&self) -> Vec<ToolSpec> {
-        ["echo", "hidden", "wait", "delegate"].into_iter().map(|name| ToolSpec {
+        ["echo", "hidden", "quiet", "wait", "delegate"].into_iter().map(|name| ToolSpec {
             name: name.into(), description: name.into(),
             input_schema: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
             cancellation_guarantee: Default::default(), idempotent_hint: false, read_only_hint: false,
@@ -232,11 +232,17 @@ struct LiveOperatorFixture {
     request: OperatorToolRequest,
 }
 
+struct SessionIdentity<'a> {
+    id: &'a str,
+    agent: &'a str,
+}
+
 impl LiveOperatorFixture {
     async fn start(
         config: crate::config::Config,
         client: async_nats::Client,
         scope: ServerScope,
+        identity: SessionIdentity<'_>,
     ) -> Result<Self> {
         let tools = Arc::new(FixtureTools {
             seen: Arc::new(Mutex::new(Vec::new())),
@@ -252,7 +258,7 @@ impl LiveOperatorFixture {
         let readiness = harnx_healthz::Readiness::default();
         let model_calls = Arc::new(AtomicUsize::new(0));
         let worker = spawn_operator_worker(&global, &readiness, &model_calls);
-        let session = operator_session(&client, "active-operator").await?;
+        let session = operator_session(&client, identity.id, identity.agent).await?;
         let request = OperatorToolRequest {
             version: 1,
             session_key: session.storage_key().into(),
@@ -260,6 +266,7 @@ impl LiveOperatorFixture {
             tool_use: true,
             command: OperatorToolCommand::List { pattern: None },
             json: true,
+            bash_timeout_secs: None,
         };
         let fixture = Self {
             client,
@@ -315,7 +322,7 @@ impl LiveOperatorFixture {
                     .iter()
                     .filter(|tool| tool.name.starts_with("fixture_"))
                     .count()
-                    == 4;
+                    == 5;
                 let hooks_ready = !hook.hooks().is_empty();
                 if !readiness.is_ready() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -671,11 +678,15 @@ fn spawn_operator_worker(
     )))
 }
 
-async fn operator_session(client: &async_nats::Client, id: &str) -> Result<NatsSession> {
+async fn operator_session(
+    client: &async_nats::Client,
+    id: &str,
+    agent: &str,
+) -> Result<NatsSession> {
     NatsSession::new(
         NatsSessionConfig {
             cluster: "local".into(),
-            initializer: SessionInitializer::named("metis", Default::default()),
+            initializer: SessionInitializer::named(agent, Default::default()),
             session_id: Some(id.into()),
             activation_route: SessionActivationRoute::ClusterShared,
         },
@@ -699,7 +710,16 @@ async fn live_worker_operator_commands_preserve_active_identity_hooks_allowed_to
     let scope = ServerScope::new();
     let _scope = TestEnvGuard::new("HARNX_SERVER_SCOPE", scope.as_str());
     let client = async_nats::connect(&url).await?;
-    let fixture = LiveOperatorFixture::start(seeded.parent_config.clone(), client, scope).await?;
+    let fixture = LiveOperatorFixture::start(
+        seeded.parent_config.clone(),
+        client,
+        scope,
+        SessionIdentity {
+            id: "active-operator",
+            agent: "metis",
+        },
+    )
+    .await?;
     let before = fixture.log().load_events_async().await?;
     fixture.wait_ready().await?;
     fixture.assert_inventory().await?;
@@ -708,6 +728,8 @@ async fn live_worker_operator_commands_preserve_active_identity_hooks_allowed_to
         .await?;
     fixture.assert_root_hook_policy().await?;
     fixture.assert_session_meta_tools().await?;
+    fixture.assert_bash_matrix().await?;
+    fixture.assert_bash_cancellation().await?;
     fixture.assert_cancellation().await?;
     assert_eq!(
         fixture.log().load_events_async().await?,
@@ -772,6 +794,7 @@ async fn managed_operator_invocation_starts_active_agent_hooks_and_cleans_regist
             args_json: "{}".into(),
         },
         json: true,
+        bash_timeout_secs: None,
     };
     let reply = call(&client, &request, request.command.clone()).await;
     assert_eq!(
@@ -869,3 +892,5 @@ fn managed_policy_command_preserves_windows_paths_spaces_and_json() {
         ]
     );
 }
+
+mod bash;

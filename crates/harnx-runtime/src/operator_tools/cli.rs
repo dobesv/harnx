@@ -28,6 +28,10 @@ pub struct ToolCommandExecution<'a> {
     pub command: &'a OperatorToolCommand,
     pub json: bool,
     pub abort: &'a AbortSignal,
+    /// Positive requested script timeout for a Bash command (#2630); `None`
+    /// keeps the script backend default. The operator envelope in
+    /// `tool_cmd` is unchanged.
+    pub bash_timeout_secs: Option<u64>,
 }
 
 pub async fn run_named_tool_command(
@@ -44,6 +48,7 @@ pub async fn run_named_tool_command(
         command,
         json,
         abort,
+        bash_timeout_secs,
     } = execution;
     let config = Arc::new(crate::config::ConfigLock::new(config.clone()));
     let session = crate::NatsSession::from_global_config(
@@ -79,6 +84,7 @@ pub async fn run_named_tool_command(
         tool_use: config.read().tool_use,
         command: command.clone(),
         json,
+        bash_timeout_secs,
     };
     // CLI keeps this future alive through its cancellation drain, so it awaits
     // the existing acknowledgement/cancel handshake instead of detaching it.
@@ -107,21 +113,27 @@ pub async fn run_reserved_tool_command(
     view: &ToolReservationView,
     execution: ToolCommandExecution<'_>,
 ) -> Result<OperatorToolReply> {
-    let ToolCommandExecution {
-        command,
-        json,
-        abort,
-    } = execution;
+    let ToolCommandExecution { command, abort, .. } = execution;
     let admitted = reservation.state();
     let scope = admitted
         .server_scope
         .clone()
         .context("Tool reservation is unavailable")?;
     let mut config = reservation.config().clone();
-    if matches!(command, OperatorToolCommand::Call { .. }) && config.run_context.is_none() {
+    let executes_tools = matches!(
+        command,
+        OperatorToolCommand::Call { .. } | OperatorToolCommand::Bash { .. }
+    );
+    if executes_tools && config.run_context.is_none() {
         config.run_context = Some(reservation.admit_external_call().await?);
     }
-    let ctx = reserved_eval_context(config, view, &scope).await?;
+    // #2630: agentless Bash evaluates on a command-scoped context with the
+    // slot-installed owner; other commands keep the plain by-value context.
+    let context = if let OperatorToolCommand::Bash { selection, .. } = command {
+        ReservedContext::Bash(reserved_bash_context(config, view, &scope, selection).await?)
+    } else {
+        ReservedContext::Plain(Box::new(reserved_eval_context(config, view, &scope).await?))
+    };
     let mut state = reservation.subscribe();
     let observed = state.borrow_and_update().clone();
     ensure!(
@@ -130,11 +142,7 @@ pub async fn run_reserved_tool_command(
     );
     ensure_current(reservation, &admitted)?;
     // Selection above already applies package sanitization and configured toolsets.
-    let command = match command {
-        OperatorToolCommand::List { .. } => OperatorToolCommand::List { pattern: None },
-        _ => command.clone(),
-    };
-    let call = evaluate(ctx, &command, ToolOutputFormat::from_json_flag(json), abort);
+    let call = context.evaluate(execution);
     tokio::pin!(call);
     tokio::select! {
         biased;
@@ -171,6 +179,155 @@ fn selected_provider_names(
         .filter(|tool| requested.contains(&tool.name))
         .map(|tool| tool.name.clone())
         .collect()
+}
+
+/// Which kind of evaluation context one reserved command runs on (#2630).
+enum ReservedContext {
+    Plain(Box<harnx_engine::tool::ToolEvalContext>),
+    Bash(ReservedBashContext),
+}
+
+impl ReservedContext {
+    fn evaluate(
+        self,
+        execution: ToolCommandExecution<'_>,
+    ) -> futures_util::future::LocalBoxFuture<'_, Result<OperatorToolReply>> {
+        let ToolCommandExecution {
+            command,
+            json,
+            abort,
+            bash_timeout_secs,
+        } = execution;
+        let format = ToolOutputFormat::from_json_flag(json);
+        match (self, command) {
+            (ReservedContext::Bash(owner), OperatorToolCommand::Bash { script, .. }) => {
+                Box::pin(evaluate_bash_owned(
+                    owner,
+                    super::BashInvocation {
+                        script,
+                        timeout_secs: bash_timeout_secs,
+                        format,
+                        abort,
+                    },
+                ))
+            }
+            (ReservedContext::Plain(ctx), command) => {
+                let command = match command {
+                    OperatorToolCommand::List { .. } => OperatorToolCommand::List { pattern: None },
+                    _ => command.clone(),
+                };
+                Box::pin(async move { evaluate(*ctx, &command, format, abort).await })
+            }
+            // The context kind always matches the command kind.
+            (ReservedContext::Bash(_), _) => unreachable!(),
+        }
+    }
+}
+
+/// Command-scoped context for one agentless Bash command (#2630): the
+/// strong slot owner is held by the caller for the whole run.
+struct ReservedBashContext {
+    owner: Arc<harnx_engine::tool::ToolEvalContext>,
+    root_call_id: String,
+}
+
+/// Agentless Bash admission (#2630): inferred commands admit the exact
+/// literal-name intersection with the discovered inventory — never
+/// selector/glob/toolset expansion — while explicit commands resolve their
+/// selectors through the normal package/toolset/glob path. Control tools
+/// stay out of the script catalog in both modes.
+fn reserved_bash_admitted_declarations(
+    config: &Config,
+    provider: &NatsToolProvider,
+    view: &ToolReservationView,
+    selection: &super::BashToolSelection,
+) -> Vec<harnx_core::tool::ToolDeclaration> {
+    let discovered = provider.declarations();
+    let resolved: HashSet<String> = match selection {
+        super::BashToolSelection::Inferred { names } => names.iter().cloned().collect(),
+        super::BashToolSelection::Explicit { .. } => {
+            selected_provider_names(config, provider, view)
+        }
+        // Session mode is TUI-only and never reaches the CLI reservation.
+        super::BashToolSelection::Session => HashSet::new(),
+    };
+    super::inner_declarations_for(&resolved, discovered)
+}
+
+async fn reserved_bash_context(
+    mut config: Config,
+    view: &ToolReservationView,
+    scope: &harnx_core::instance::ServerScope,
+    selection: &super::BashToolSelection,
+) -> Result<ReservedBashContext> {
+    let provider = tokio::time::timeout(
+        Duration::from_secs(60),
+        NatsToolProvider::discover_strict(
+            &config,
+            scope.clone(),
+            NatsInFlightCalls::default(),
+            view.package.as_deref(),
+        ),
+    )
+    .await
+    .context("Tool discovery timed out")??;
+    // Config clones share the cache. A reservation's catalog must remain private.
+    config.nats_tool_declarations =
+        Arc::new(parking_lot::RwLock::new(provider.declarations().to_vec()));
+    let admitted = reserved_bash_admitted_declarations(&config, &provider, view, selection);
+    let admitted_names: HashSet<String> = admitted.iter().map(|tool| tool.name.clone()).collect();
+    provider.ensure_unambiguous(&admitted_names)?;
+    let client = config.nats_client(config.default_cluster_key()).await?;
+    let hooks = tokio::time::timeout(
+        Duration::from_secs(60),
+        crate::nats_hook_provider::NatsHookProvider::discover_with_client(client, scope.clone()),
+    )
+    .await
+    .context("Operator hook discovery timed out")??;
+    let config = Arc::new(crate::config::ConfigLock::new(config));
+    let slot = crate::bash_provider::BashEvalContextSlot::new();
+    let selectors = view.use_tools.join(",");
+    let mut params = BuildToolEvalContextParams::new(&config, scope)
+        .with_agent_use_tools(Some(&selectors))
+        .with_current_agent_package(view.package.clone())
+        .with_command_bash(crate::bash_provider::CommandBashInputs {
+            inner_declarations: admitted,
+            // The operator already consented to this script's inner calls.
+            operator_inner_consent: true,
+        });
+    params.bash_context_slot = Some(slot.clone());
+    params.nats_hook_provider = Some(Arc::new(hooks));
+    let mut ctx =
+        crate::tool::build_tool_eval_context_with_provider(params, Arc::new(provider)).await;
+    // Late overwrite, after the existing seams: the allowed names are the
+    // synthetic `bash` plus the same admitted set the catalog and executor
+    // allowlist derive from.
+    ctx.allowed_tool_names = admitted_names;
+    ctx.allowed_tool_names
+        .insert(crate::config::BASH_TOOL_NAME.to_string());
+    let root_call_id = uuid::Uuid::new_v4().to_string();
+    super::approve_root_bash_call(&mut ctx, &root_call_id);
+    let owner = slot.install(ctx);
+    Ok(ReservedBashContext {
+        owner,
+        root_call_id,
+    })
+}
+
+/// Evaluate one agentless Bash command on its slot-installed context (#2630).
+/// The strong owner stays alive for the whole future, so the script provider
+/// can upgrade the weak slot reference to fork inner-call contexts.
+async fn evaluate_bash_owned(
+    context: ReservedBashContext,
+    invocation: super::BashInvocation<'_>,
+) -> Result<OperatorToolReply> {
+    let ReservedBashContext {
+        owner,
+        root_call_id,
+    } = context;
+    let reply = super::evaluate_bash(&owner, &root_call_id, invocation).await;
+    drop(owner);
+    reply
 }
 
 async fn reserved_eval_context(

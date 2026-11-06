@@ -108,14 +108,15 @@ async fn operator_tool_help_completion_and_missing_session_do_not_use_global_inv
         .unwrap(),
     );
     let mut tui = Tui::init(&config).await.unwrap();
-    for (line, expected) in [(".call ", "tool"), (".list ", "tools")] {
+    // `.call` now offers both operator subcommands (#2630 task 5).
+    for (line, expected) in [(".call ", vec!["tool", "bash"]), (".list ", vec!["tools"])] {
         assert_eq!(
             tui.compute_completions(line, line.len())
                 .await
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect::<Vec<_>>(),
-            [expected]
+            expected
         );
     }
     for line in [".info tool ", ".list tools ", ".call tool "] {

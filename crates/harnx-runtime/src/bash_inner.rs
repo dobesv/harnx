@@ -41,7 +41,8 @@ use harnx_core::sink::{current_agent_event_sink, with_agent_event_sink};
 use harnx_core::tool::{ToolCall, ToolProvider, ToolResult, ToolUpdatePatch};
 use harnx_engine::tool::{
     eval_inner_tool_call, EvaluatedInnerCall, InnerToolCallStatus, InnerToolEvalOptions,
-    ToolApprovalRequiredError, ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn, WorkBoundary,
+    ToolApprovalRequiredError, ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn,
+    ToolUseConfirmation, WorkBoundary,
 };
 // Share MCP domain-error classification with the command layer so both
 // layers report the same failure and keep text from every error block.
@@ -172,6 +173,10 @@ pub struct InnerCallExecutorConfig {
     pub max_calls: usize,
     /// NATS payload pre-flight; `None` skips the check (tests, non-NATS setups).
     pub payload_limit: Option<PayloadLimit>,
+    /// Operator script runs (#2630): auto-approve this run's inner calls
+    /// after the normal fork. Ordinary agent rounds leave this false and
+    /// keep the fork's Defer.
+    pub operator_inner_consent: bool,
 }
 
 impl InnerCallExecutorConfig {
@@ -183,6 +188,7 @@ impl InnerCallExecutorConfig {
             max_concurrent: DEFAULT_MAX_CONCURRENT_INNER_CALLS,
             max_calls: DEFAULT_MAX_INNER_CALLS_PER_SCRIPT,
             payload_limit: None,
+            operator_inner_consent: false,
         }
     }
 
@@ -196,6 +202,13 @@ impl InnerCallExecutorConfig {
         self.payload_limit = Some(payload_limit);
         self
     }
+
+    /// Operator script runs (#2630): auto-approve this run's inner calls
+    /// after the normal fork.
+    pub fn with_operator_inner_consent(mut self, operator_inner_consent: bool) -> Self {
+        self.operator_inner_consent = operator_inner_consent;
+        self
+    }
 }
 
 /// Runtime-owned gate for script-originated tool calls. Cheap to share via
@@ -206,6 +219,8 @@ pub struct InnerCallExecutor {
     max_concurrent: usize,
     max_calls: usize,
     payload_limit: Option<Arc<PayloadLimit>>,
+    /// #2630 operator script runs only; ordinary rounds never set this.
+    operator_inner_consent: bool,
 }
 
 impl InnerCallExecutor {
@@ -216,6 +231,7 @@ impl InnerCallExecutor {
             max_concurrent: config.max_concurrent.max(1),
             max_calls: config.max_calls,
             payload_limit: config.payload_limit.map(Arc::new),
+            operator_inner_consent: config.operator_inner_consent,
         }
     }
 
@@ -275,6 +291,15 @@ impl InnerCallExecutor {
         });
         if let Some(limit) = &self.payload_limit {
             limit.guard_dispatch(&mut ctx);
+        }
+        if self.operator_inner_consent {
+            // Operator script runs (#2630): the operator already consented to
+            // this script's inner calls. The normal fork resets confirmation
+            // to Defer — restore approval only on this runtime-owned fork.
+            // Hook Block/Deny still stops the call before any confirmation,
+            // and any further fork (child agents, nested scripts) resets to
+            // Defer again, so the consent never escapes this run.
+            ctx.confirm_tool_use_fn = Arc::new(|_, _, _| ToolUseConfirmation::Approve);
         }
 
         InnerCallRun {
@@ -891,6 +916,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     enum HookControl {
         Continue,
         Block(&'static str),
@@ -2498,5 +2524,197 @@ mod tests {
             fake_entry(0, "fs_read", InnerTraceStatus::Ok, r#"{"path":"a"}"#).to_progress_line(),
             "fs_read ok 42B 7ms {\"path\":\"a\"}"
         );
+    }
+
+    // --- #2630: operator-script inner consent -------------------------------
+
+    fn consenting_executor(providers: Vec<Arc<dyn ToolProvider>>) -> InnerCallExecutor {
+        InnerCallExecutor::new(
+            InnerCallExecutorConfig::new(vec!["tool_a".to_string()], providers)
+                .with_operator_inner_consent(true),
+        )
+    }
+
+    #[tokio::test]
+    async fn operator_consent_approves_inner_ask_and_dispatches() {
+        let log = Arc::new(DispatchLog::default());
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::clone(&log),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Ok(json!({"done": true})),
+        });
+        let (ctx, hooks) = outer_context(shared(&provider), HookControl::Ask(Some("needs review")));
+        let executor = consenting_executor(shared(&provider));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+
+        match run.call("tool_a", json!({"x": 1}), &abort).await {
+            InnerOutcome::Ok { result } => assert_eq!(result.output, json!({"done": true})),
+            other => panic!("expected dispatch, got {other:?}"),
+        }
+        assert_eq!(log.count(), 1, "consent approves the ask and dispatches");
+        assert_eq!(run.trace()[0].status, InnerTraceStatus::Ok);
+        let hooks = hooks.lock().expect("hook events lock");
+        assert!(matches!(hooks[0], HookEvent::PreToolUse { .. }));
+        assert!(matches!(hooks[1], HookEvent::PostToolUse { .. }));
+    }
+
+    #[tokio::test]
+    async fn operator_consent_does_not_bypass_the_allowlist() {
+        let log = Arc::new(DispatchLog::default());
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::clone(&log),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Panic,
+        });
+        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let executor = consenting_executor(shared(&provider));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+
+        match run.call("tool_b", json!({}), &abort).await {
+            InnerOutcome::Rejected { reason } => {
+                assert!(reason.contains("tool_b"), "actual: {reason}");
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+        assert_eq!(log.count(), 0, "denied names must never dispatch");
+    }
+
+    #[tokio::test]
+    async fn operator_consent_still_blocks_on_hook_block() {
+        let log = Arc::new(DispatchLog::default());
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::clone(&log),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Panic,
+        });
+        let (ctx, _hooks) =
+            outer_context(shared(&provider), HookControl::Block("denied by policy"));
+        let executor = consenting_executor(shared(&provider));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+
+        match run.call("tool_a", json!({}), &abort).await {
+            InnerOutcome::Blocked { reason } => assert_eq!(reason, "denied by policy"),
+            other => panic!("expected blocked, got {other:?}"),
+        }
+        assert_eq!(log.count(), 0);
+        assert_eq!(run.trace()[0].status, InnerTraceStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn ordinary_run_defers_approval_even_when_parent_context_approves() {
+        let log = Arc::new(DispatchLog::default());
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::clone(&log),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Panic,
+        });
+        let (mut ctx, _hooks) = outer_context(shared(&provider), HookControl::Ask(None));
+        // The parent (root operator) callback approves everything; the inner
+        // fork must still defer without command-scoped consent (#2630).
+        ctx.confirm_tool_use_fn = Arc::new(|_, _, _| ToolUseConfirmation::Approve);
+        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+
+        match run.call("tool_a", json!({}), &abort).await {
+            InnerOutcome::ApprovalRequired { tool, .. } => assert_eq!(tool, "tool_a"),
+            other => panic!("expected approval_required, got {other:?}"),
+        }
+        assert_eq!(log.count(), 0, "deferred calls must not dispatch");
+    }
+
+    #[tokio::test]
+    async fn operator_consent_does_not_leak_into_child_forks() {
+        let log = Arc::new(DispatchLog::default());
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::clone(&log),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Panic,
+        });
+        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let executor = consenting_executor(shared(&provider));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+
+        let call = started_call("tool_a", "call-1");
+        // The consented fork approves …
+        assert_eq!(
+            (run.ctx.confirm_tool_use_fn)(&call, &json!({}), None),
+            ToolUseConfirmation::Approve
+        );
+        assert!(
+            !Arc::ptr_eq(&run.ctx.confirm_tool_use_fn, &ctx.confirm_tool_use_fn),
+            "the outer context keeps its own confirmation"
+        );
+        // … but any child fork of it resets to Defer, so child agents and
+        // nested scripts keep their normal policies (#2630).
+        let child = run.ctx.fork_for_inner_calls(InnerToolEvalOptions {
+            providers: Vec::new(),
+            tool_round: None,
+            emit_tool_call_fn: Arc::new(|_, _| {}),
+            emit_tool_result_fn: Arc::new(|_, _| {}),
+            emit_tool_blocked_fn: Arc::new(|_, _| {}),
+            emit_tool_update_fn: Arc::new(|_, _| {}),
+        });
+        assert_eq!(
+            (child.confirm_tool_use_fn)(&call, &json!({}), None),
+            ToolUseConfirmation::Defer
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_and_subsequent_ordinary_runs_stay_unaffected() {
+        let log = Arc::new(DispatchLog::default());
+        let provider = Arc::new(FakeToolProvider {
+            log: Arc::clone(&log),
+            handles: None,
+            progress_title: None,
+            behavior: Behavior::Ok(json!({"done": true})),
+        });
+        let ask = HookControl::Ask(Some("needs review"));
+        let (consent_ctx, _hooks_a) = outer_context(shared(&provider), ask.clone());
+        let (ordinary_ctx, _hooks_b) = outer_context(shared(&provider), ask);
+        let consenting = consenting_executor(shared(&provider));
+        let ordinary = executor_with(&["tool_a"], shared(&provider), (8, 100));
+        let consent_run = Arc::new(consenting.begin_run(&consent_ctx, PARENT_ROUND, None));
+        let ordinary_run = Arc::new(ordinary.begin_run(&ordinary_ctx, PARENT_ROUND, None));
+        let abort = create_abort_signal();
+
+        let a = {
+            let run = Arc::clone(&consent_run);
+            let abort = abort.clone();
+            tokio::spawn(async move { run.call("tool_a", json!({}), &abort).await })
+        };
+        let b = {
+            let run = Arc::clone(&ordinary_run);
+            let abort = abort.clone();
+            tokio::spawn(async move { run.call("tool_a", json!({}), &abort).await })
+        };
+        assert!(matches!(
+            a.await.expect("consent call"),
+            InnerOutcome::Ok { .. }
+        ));
+        assert!(matches!(
+            b.await.expect("ordinary call"),
+            InnerOutcome::ApprovalRequired { .. }
+        ));
+        assert_eq!(log.count(), 1, "only the consented run dispatched");
+
+        // A later ordinary run from a fresh executor still defers.
+        let subsequent = executor_with(&["tool_a"], shared(&provider), (8, 100));
+        let run = subsequent.begin_run(&ordinary_ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+        assert!(matches!(
+            run.call("tool_a", json!({}), &abort).await,
+            InnerOutcome::ApprovalRequired { .. }
+        ));
+        assert_eq!(log.count(), 1);
     }
 }

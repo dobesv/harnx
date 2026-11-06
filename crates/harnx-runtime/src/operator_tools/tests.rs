@@ -504,3 +504,7 @@ async fn handlers_reject_missing_session_and_invalid_json_before_discovery() {
     .unwrap_err();
     assert_eq!(error.to_string(), "Tool arguments must be a JSON object");
 }
+
+mod bash;
+mod protocol;
+mod selection;

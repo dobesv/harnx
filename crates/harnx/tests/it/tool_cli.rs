@@ -77,3 +77,5 @@ fn tool_config_failures_have_json_stdout_and_human_stderr() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("error:"));
     }
 }
+
+mod bash;

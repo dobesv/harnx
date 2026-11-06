@@ -30,6 +30,7 @@ fn provider(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> (BashProvider, Arc<T
         base_providers: vec![],
         slot: Some(slot.clone()),
         payload_limit: None,
+        operator_inner_consent: false,
     })
     .with_attachment_fetcher(fetcher);
     let ctx = Arc::new(ToolEvalContext {

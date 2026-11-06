@@ -56,6 +56,17 @@ impl BashEvalContextSlot {
         *self.0.lock().expect("bash context slot lock") = Some(Arc::downgrade(context));
     }
 
+    /// Wrap one command's evaluation context, store the weak reference, and
+    /// hand back the strong owner (#2630). The caller must keep the returned
+    /// `Arc` alive for the whole run: the slot can only upgrade the `Weak`
+    /// while it lives. Because the slot stores a `Weak`, dropping the owner
+    /// releases the context with no retained cycle.
+    pub fn install(&self, context: ToolEvalContext) -> Arc<ToolEvalContext> {
+        let context = Arc::new(context);
+        self.set(&context);
+        context
+    }
+
     fn get(&self) -> Option<Arc<ToolEvalContext>> {
         self.0
             .lock()
@@ -88,6 +99,34 @@ pub struct BashProviderConfig {
     pub base_providers: Vec<Arc<dyn ToolProvider>>,
     pub slot: Option<Arc<BashEvalContextSlot>>,
     pub payload_limit: Option<PayloadLimit>,
+    /// #2630 operator script runs: auto-approve this run's inner calls
+    /// after the normal fork. Ordinary agent rounds keep the fork's Defer.
+    pub operator_inner_consent: bool,
+}
+
+/// Command-scoped inputs for one operator Bash script call (#2630).
+///
+/// Unlike ordinary rounds, the `bash` provider's activation and catalog come
+/// from the command itself, not the active agent's `bash_tools`: the provider
+/// stays active even when the admitted inner catalog is empty (pure shell),
+/// and operator-script runs carry runtime-local inner consent. Ordinary
+/// construction never supplies these inputs.
+#[derive(Debug, Clone)]
+pub struct CommandBashInputs {
+    /// The command's resolved inner declarations; may be empty. The executor
+    /// allowlist and the script command catalog derive from this same set.
+    pub inner_declarations: Vec<harnx_core::tool::ToolDeclaration>,
+    /// Auto-approve this run's inner calls after the normal inner fork.
+    /// Scoped to the run's fork only — never global/session/parent config,
+    /// never serialized to child agents, never accepted from user JSON.
+    pub operator_inner_consent: bool,
+}
+
+impl CommandBashInputs {
+    /// The synthetic outer `bash` declaration for this command's catalog.
+    pub fn bash_declaration(&self) -> harnx_core::tool::ToolDeclaration {
+        crate::config::synthesize_bash_declaration(&self.inner_declarations)
+    }
 }
 
 struct ScriptInvocation<'a> {
@@ -104,6 +143,7 @@ impl BashProvider {
             base_providers,
             slot,
             payload_limit,
+            operator_inner_consent,
         } = config;
         let allowed = inner_declarations
             .iter()
@@ -112,6 +152,9 @@ impl BashProvider {
         let mut config = InnerCallExecutorConfig::new(allowed, base_providers);
         if let Some(payload_limit) = payload_limit {
             config = config.with_payload_limit(payload_limit);
+        }
+        if operator_inner_consent {
+            config = config.with_operator_inner_consent(true);
         }
         let specs = inner_declarations
             .iter()

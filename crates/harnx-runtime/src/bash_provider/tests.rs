@@ -198,6 +198,38 @@ fn harness_with_attachments(
     extra: Vec<Arc<dyn ToolProvider>>,
     fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
 ) -> Harness {
+    harness_with_hooks(
+        inner,
+        extra,
+        fetcher,
+        HarnessPolicy {
+            hook_outcome: HookOutcome {
+                control: HookResultControl::Continue,
+                result: HookResult::default(),
+            },
+            operator_inner_consent: false,
+        },
+    )
+}
+
+struct HarnessPolicy {
+    hook_outcome: HookOutcome,
+    operator_inner_consent: bool,
+}
+
+/// Harness variant with a controllable PreToolUse outcome and consent flag,
+/// for #2630 coverage: `Ask` reaches the fork's confirmation, which the
+/// provider's `operator_inner_consent` either approves or leaves deferred.
+fn harness_with_hooks(
+    inner: Arc<dyn ToolProvider>,
+    extra: Vec<Arc<dyn ToolProvider>>,
+    fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
+    policy: HarnessPolicy,
+) -> Harness {
+    let HarnessPolicy {
+        hook_outcome,
+        operator_inner_consent,
+    } = policy;
     let slot = Arc::new(BashEvalContextSlot::default());
     let bash = Arc::new(
         BashProvider::new(BashProviderConfig {
@@ -206,6 +238,7 @@ fn harness_with_attachments(
             base_providers: vec![inner.clone()],
             slot: Some(slot.clone()),
             payload_limit: None,
+            operator_inner_consent,
         })
         .with_attachment_fetcher(fetcher),
     );
@@ -230,12 +263,8 @@ fn harness_with_attachments(
         confirm_tool_use_fn: Arc::new(|_, _, _| panic!("inner calls must not confirm")),
         dispatch_hook_fn: Arc::new(move |event| {
             hook_collector.lock().unwrap().push(event);
-            Box::pin(async move {
-                HookOutcome {
-                    control: HookResultControl::Continue,
-                    result: HookResult::default(),
-                }
-            })
+            let hook_outcome = hook_outcome.clone();
+            Box::pin(async move { hook_outcome })
         }),
         prepare_handoff_fn: None,
     });
@@ -461,6 +490,7 @@ async fn missing_slot_fails_closed() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        operator_inner_consent: false,
     });
     let abort = create_abort_signal();
     let error = recoverable(run(&bash, "fs_read --path a", &abort).await, "no slot");
@@ -478,6 +508,7 @@ async fn inactive_provider_does_not_claim_bash() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        operator_inner_consent: false,
     });
     assert!(!bash.has_tool(BASH_TOOL_NAME));
 }
@@ -522,6 +553,7 @@ async fn replay_reports_interrupted_for_bash_only() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        operator_inner_consent: false,
     });
     let abort = create_abort_signal();
     let replay_bash = match bash
@@ -593,6 +625,7 @@ async fn inactive_provider_replay_falls_through_for_bash() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        operator_inner_consent: false,
     });
     let abort = create_abort_signal();
     let replay = bash
@@ -690,6 +723,154 @@ async fn inner_calls_cannot_recurse_into_bash() {
             .is_none_or(|trace| trace.is_empty()),
         "no inner call may be dispatched for a bare `bash` command: {}",
         partial
+    );
+}
+
+/// #2630: an asking PreToolUse hook is auto-approved for operator script
+/// runs only when the provider carries the operator inner consent. The same
+/// script without consent stays approval-required.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_inner_consent_approves_asking_hooks_end_to_end() {
+    let ask = HookOutcome {
+        control: HookResultControl::Ask {
+            reason: Some("needs review".into()),
+        },
+        result: HookResult::default(),
+    };
+    let (bash, _slot, hooks, _ctx) = harness_with_hooks(
+        FakeProvider::new(),
+        Vec::new(),
+        None,
+        HarnessPolicy {
+            hook_outcome: ask.clone(),
+            operator_inner_consent: true,
+        },
+    );
+    let abort = create_abort_signal();
+    let output = ok(run(&bash, "fs_read --path a", &abort).await);
+    assert_eq!(output.value["status"], "ok", "{}", output.value);
+    assert_eq!(output.value["trace"][0]["status"], "ok", "{}", output.value);
+    assert_eq!(hooks.lock().unwrap().len(), 2, "Pre and Post hooks fired");
+
+    let (bash, _slot, _hooks, _ctx) = harness_with_hooks(
+        FakeProvider::new(),
+        Vec::new(),
+        None,
+        HarnessPolicy {
+            hook_outcome: ask,
+            operator_inner_consent: false,
+        },
+    );
+    let abort = create_abort_signal();
+    let error = recoverable(run(&bash, "fs_read --path a", &abort).await, "ask denied");
+    let partial = partial_result_of(&error).expect("failure carries partial result");
+    assert_eq!(
+        partial["trace"][0]["status"], "approval_required",
+        "{}",
+        partial
+    );
+    assert_ne!(partial["status"], "ok", "{}", partial);
+}
+
+/// #2630: consent only covers the confirmation branch — a blocking hook
+/// still stops the inner call before any dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_inner_consent_does_not_stop_hook_blocks() {
+    let block = HookOutcome {
+        control: HookResultControl::Block {
+            reason: "denied by policy".into(),
+        },
+        result: HookResult::default(),
+    };
+    let (bash, _slot, _hooks, _ctx) = harness_with_hooks(
+        FakeProvider::new(),
+        Vec::new(),
+        None,
+        HarnessPolicy {
+            hook_outcome: block,
+            operator_inner_consent: true,
+        },
+    );
+    let abort = create_abort_signal();
+    let error = recoverable(run(&bash, "fs_read --path a", &abort).await, "block");
+    let partial = partial_result_of(&error).expect("failure carries partial result");
+    assert_eq!(partial["trace"][0]["status"], "blocked", "{}", partial);
+}
+
+/// #2630 command-scoped catalog: the provider stays active with an empty
+/// inner set (pure shell), unknown tool names are never dispatched, and the
+/// slot's installed owner keeps the weak reference alive for exactly the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn command_scoped_catalog_stays_active_and_fails_closed_without_tools() {
+    let slot = Arc::new(BashEvalContextSlot::default());
+    let bash = Arc::new(BashProvider::new(BashProviderConfig {
+        // Command-scoped (#2630): active even though the catalog is empty.
+        active: true,
+        inner_declarations: Vec::new(),
+        base_providers: Vec::new(),
+        slot: Some(slot.clone()),
+        payload_limit: None,
+        operator_inner_consent: true,
+    }));
+    assert!(bash.has_tool(BASH_TOOL_NAME));
+
+    let hooks: Arc<Mutex<Vec<HookEvent>>> = Arc::default();
+    let hook_collector = hooks.clone();
+    let ctx = slot.install(ToolEvalContext {
+        work_boundary: None,
+        instance_id: ServerScope::new(),
+        tool_round: None,
+        render: None,
+        providers: vec![bash.clone()],
+        allowed_tool_names: HashSet::new(),
+        current_agent_package: None,
+        handoff_targets: HashMap::new(),
+        emit_tool_call_fn: Arc::new(|_, _| {}),
+        emit_tool_result_fn: Arc::new(|_, _| {}),
+        emit_tool_blocked_fn: Arc::new(|_, _| {}),
+        emit_tool_update_fn: Arc::new(|_, _| {}),
+        confirm_tool_use_fn: Arc::new(|_, _, _| panic!("no approval expected")),
+        dispatch_hook_fn: Arc::new(move |event| {
+            hook_collector.lock().unwrap().push(event);
+            Box::pin(async {
+                HookOutcome {
+                    control: HookResultControl::Continue,
+                    result: HookResult::default(),
+                }
+            })
+        }),
+        prepare_handoff_fn: None,
+    });
+
+    let abort = create_abort_signal();
+    let output = ok(run(&bash, "echo hi", &abort).await);
+    assert_eq!(output.value["status"], "ok", "{}", output.value);
+    assert_eq!(output.value["exit_code"], 0, "{}", output.value);
+    assert!(
+        output.value["trace"]
+            .as_array()
+            .is_none_or(|t| t.is_empty()),
+        "pure shell dispatches no inner calls: {}",
+        output.value
+    );
+
+    let error = recoverable(run(&bash, "fs_read --path a", &abort).await, "unknown");
+    let partial = partial_result_of(&error).expect("failure carries partial result");
+    assert_eq!(partial["exit_code"], 127, "unknown command: {}", partial);
+    assert!(
+        partial["trace"].as_array().is_none_or(|t| t.is_empty()),
+        "denied names must never dispatch: {}",
+        partial
+    );
+
+    // Releasing the strong owner dangles the weak slot: the next run fails
+    // closed instead of dispatching through a dead context (#2630).
+    drop(ctx);
+    let error = recoverable(run(&bash, "echo hi", &abort).await, "dangling");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("cannot run scripts in this execution context"),
+        "released owner must fail closed: {message}"
     );
 }
 

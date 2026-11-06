@@ -34,7 +34,7 @@ mod tool_selection;
 pub(crate) use tool_selection::is_bash_inner_tool_allowed;
 mod tool_servers_split;
 
-pub(crate) use self::bash_declaration::BASH_TOOL_NAME;
+pub(crate) use self::bash_declaration::{synthesize_bash_declaration, BASH_TOOL_NAME};
 pub(crate) use self::compaction::is_turn_prompt;
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;
