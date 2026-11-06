@@ -29,7 +29,7 @@ pub(crate) async fn list(
         .map_err(map_internal)?;
     let notes = documents
         .into_iter()
-        .map(|(_, stored)| parse_note(&stored.content).map(|note| note_json(&note)))
+        .map(|(_, stored)| parse_note(&stored.content).map(|note| listed_note_json(&note)))
         .collect::<anyhow::Result<Vec<_>>>()
         .map_err(map_internal)?;
     context.touch(&plan).await;
@@ -205,9 +205,62 @@ fn note_json(note: &NoteDocument) -> Value {
     })
 }
 
+const NOTE_BODY_PREVIEW_CHARS: usize = 200;
+
+fn listed_note_json(note: &NoteDocument) -> Value {
+    let mut value = note_json(note);
+    value["body"] = Value::String(truncate_note_preview(&note.body));
+    value
+}
+
+fn truncate_note_preview(body: &str) -> String {
+    let mut chars = body.chars();
+    let preview: String = chars.by_ref().take(NOTE_BODY_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        let mut truncated: String = preview.chars().take(NOTE_BODY_PREVIEW_CHARS - 1).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        preview
+    }
+}
+
 fn note_label(note: &NoteDocument, url: &CidUrl) -> String {
     non_empty(note.front.summary.as_deref())
         .map(ToOwned::to_owned)
         .or_else(|| plan_item_id(&url.to_string()))
         .unwrap_or_else(|| url.to_string())
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn note_preview_preserves_empty_short_and_boundary_bodies() {
+        for body in ["", "short", &"x".repeat(NOTE_BODY_PREVIEW_CHARS)] {
+            assert_eq!(truncate_note_preview(body), body);
+        }
+    }
+
+    #[test]
+    fn note_preview_is_bounded_and_marks_truncation() {
+        let body = "x".repeat(NOTE_BODY_PREVIEW_CHARS + 1);
+        let preview = truncate_note_preview(&body);
+        assert_eq!(preview.chars().count(), NOTE_BODY_PREVIEW_CHARS);
+        assert!(preview.ends_with('…'));
+        assert_eq!(
+            preview,
+            format!("{}…", "x".repeat(NOTE_BODY_PREVIEW_CHARS - 1))
+        );
+    }
+
+    #[test]
+    fn note_preview_never_splits_unicode_characters() {
+        let body = "é🙂".repeat(NOTE_BODY_PREVIEW_CHARS);
+        let preview = truncate_note_preview(&body);
+        assert_eq!(preview.chars().count(), NOTE_BODY_PREVIEW_CHARS);
+        assert!(preview.ends_with('…'));
+        assert!(preview.is_char_boundary(preview.len()));
+    }
 }
