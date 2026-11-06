@@ -6,6 +6,7 @@ use crate::{
 };
 use harnx_core::event::{SubAgentProgress, SubAgentProgressStatus};
 use harnx_core::message::MessageContent;
+use harnx_core::text::strip_think_tag;
 use harnx_toolset::ToolInvokeError;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -17,6 +18,9 @@ mod expired_replay_tests;
 
 #[cfg(test)]
 mod historical_terminal_tests;
+
+#[cfg(test)]
+mod progress_selection_tests;
 
 pub(super) fn subagent_error_message(prefix: impl std::fmt::Display, session_id: &str) -> String {
     format!("{prefix} (session_id: {session_id})")
@@ -445,10 +449,10 @@ fn synthesize_termination(
     buffering_sink: &InvocationBufferingSink,
     durable_progress: Option<&crate::PublicProgress>,
 ) -> SynthesizedResult {
-    let thinking_tail = buffering_sink.thinking_tail();
+    // A successful read may be empty after stripping thinking. Don't replace it
+    // with raw live text; only a failed or timed-out durable read needs fallback.
     let public_progress = durable_progress
         .cloned()
-        .filter(|p| p.available)
         .unwrap_or_else(|| buffering_sink.public_progress());
     synthesize_terminated_result(TerminationInputs {
         timeout: spec.timeout,
@@ -456,7 +460,8 @@ fn synthesize_termination(
         kind: spec.kind,
         session_id,
         usage: &progress.usage,
-        thinking_excerpt: Some(&thinking_tail),
+        // Child reasoning stays in its own session, including on bounded stops.
+        thinking_excerpt: None,
         budget: spec.budget,
         repetition: spec.repetition,
     })
@@ -475,6 +480,8 @@ pub(super) fn result_value(
                 .expect("completed sub-agent turn without result or termination"),
         )?,
     };
+    // Strip only at the delegation boundary; raw turn results and logs keep thinking.
+    let response = strip_think_tag(response);
     let source = child_source(toolset, &completed.session_id);
     // The parent knows which of its calls this answers; the summary the model
     // reads keeps to the invocation's own facts.
@@ -502,6 +509,57 @@ enum PromptTurn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_delegation_omits_thinking_even_without_durable_progress() {
+        use harnx_core::event::{AgentEvent, AgentEventSink, ContentBlock, ModelEvent, NullSink};
+
+        let sink = InvocationBufferingSink::new(Arc::new(NullSink));
+        sink.emit(AgentEvent::Model(ModelEvent::ThoughtChunk {
+            blocks: vec![ContentBlock::Text("private child reasoning".into())],
+        }));
+        sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("public partial answer".into())],
+        }));
+        let progress = SubAgentProgress {
+            invocation_id: "invocation".into(),
+            agent: "helper".into(),
+            session_id: "child".into(),
+            status: SubAgentProgressStatus::Failed,
+            elapsed_ms: 10,
+            usage: Default::default(),
+            tool_call_count: 1,
+            title: None,
+            tool_call_id: Some("parent-call".into()),
+        };
+        for kind in [
+            TerminationKind::Timeout,
+            TerminationKind::BudgetExceeded,
+            TerminationKind::Repetition,
+        ] {
+            let result = synthesize_termination(
+                TerminationSpec {
+                    timeout: None,
+                    kind,
+                    budget: (kind == TerminationKind::BudgetExceeded).then_some(20),
+                    repetition: (kind == TerminationKind::Repetition).then(|| {
+                        harnx_core::loop_guard::RepetitionTerminal::tool_calls("fs_read", 4)
+                    }),
+                },
+                "child",
+                &progress,
+                &sink,
+                None,
+            );
+            assert_eq!(result.termination.kind, kind);
+            assert_eq!(result.termination.session_id, "child");
+            assert!(result.termination.thinking_excerpt.is_none());
+            assert!(!result.response.contains("private child reasoning"));
+            assert!(result.response.contains("public partial answer"));
+            assert!(result.response.contains(&result.termination.retry_hint));
+        }
+        assert_eq!(sink.thinking_tail(), "private child reasoning");
+    }
 
     #[test]
     fn recoverable_subagent_errors_include_session_id_without_tool_guidance() {

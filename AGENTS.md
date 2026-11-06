@@ -770,7 +770,14 @@ rather than persistence changing what it writes.
   Rust unit tests, including the single-newline trim at tag boundaries.
 - `strip_think_tag` (`harnx-core/src/text.rs`) is LLM-facing: it removes a
   leading think block before replaying history to providers, and must stay
-  leading-only. `split_think_blocks` is display-facing (any position, ordered
+  leading-only. It also strips sub-agent delegation results returned to the
+  parent (`subagent_toolset/termination.rs::result_value` and
+  `terminated_result/public_progress.rs::from_entries`, issue #2634); raw turn
+  results, CLI termination synthesis, and child session logs keep thinking. In
+  `synthesize_termination`, a durable progress read of `Some(empty)` is
+  authoritative — only `None` (failed/timed-out read) may fall back to the raw
+  live sink (`sanitized_empty_durable_progress_does_not_expose_later_live_reasoning`).
+  `split_think_blocks` is display-facing (any position, ordered
   segments). Keep the two contracts separate.
 - CLI raw/non-TTY output keeps literal tags byte-for-byte — scripts may parse it
   (`raw_and_non_tty_output_remain_byte_identical` in `cli_thought_tests.rs`).
