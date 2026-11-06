@@ -1253,6 +1253,7 @@ pub(crate) fn build_ag_ui_event_stream(
         }
         crate::session_actor::SessionState::Idle
         | crate::session_actor::SessionState::Pending
+        | crate::session_actor::SessionState::Stalled { .. }
         | crate::session_actor::SessionState::Running { .. }
         | crate::session_actor::SessionState::Interrupting
         | crate::session_actor::SessionState::Interrupted { .. } => None,

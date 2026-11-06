@@ -26,6 +26,7 @@ mod session_actor_types;
 mod session_history;
 pub(crate) mod session_pagination;
 pub mod session_routes;
+mod stalled_turn;
 mod transcript_snapshot;
 mod web_url;
 
@@ -66,6 +67,7 @@ use harnx_core::access_rules::{AccessRules, CallerView};
 #[cfg(test)]
 use harnx_core::agent_ref::AgentRef;
 use harnx_core::message::MessageRole;
+use harnx_core::session::SessionLogEntry;
 use harnx_core::user_aliases::UserAliases;
 use harnx_rag::*;
 use harnx_runtime::{client::*, config::*, utils::*};
@@ -1798,6 +1800,13 @@ pub(crate) struct LoadedNatsSession {
     pub(crate) entries: Vec<(u64, harnx_core::session::SessionLogEntry)>,
     pub(crate) base_session: harnx_core::session::Session,
     pub(crate) worker_active: bool,
+    /// When the log's unanswered prompt was admitted, when that can be
+    /// established. Stall detection ages the prompt from it; `None` on paths
+    /// that had no admission to read or when the record is unavailable.
+    pub(crate) pending_prompt_admitted_at: Option<DateTime<Utc>>,
+    /// The read's `pending_prompt_seq` answer, resolved once so state
+    /// derivation and the admission lookup share it.
+    pub(crate) pending_prompt_seq: Option<u64>,
 }
 
 pub(crate) async fn load_nats_session_state(
@@ -1831,12 +1840,24 @@ pub(crate) async fn load_nats_session_state(
     reconcile_attention(&metadata_store, &storage_key, session, &entries).await;
     // If there was no holder before the read, sample once more to cover a
     // worker acquiring the lease and appending ToolCalls during the read.
-    let preserve_pending = match lease_was_active {
+    let worker_active = match lease_was_active {
         true => true,
         false => worker_lease_sample(&jetstream, &storage_key, session).await?,
     };
+    // A worker holding the lease makes a stall impossible, so only a
+    // workerless read pays for the prompt's admission age. The prompt sequence
+    // itself is resolved once here for every read — leased ones included —
+    // because the state derivation that consumes it distinguishes
+    // Pending/Idle/Interrupted on leased sessions too. This is that
+    // derivation's one replay of the log's mutations, not an extra one.
+    let prompt_seq = harnx_core::session_reconstruct::pending_prompt_seq(&entries);
+    let pending_prompt_admitted_at = if worker_active {
+        None
+    } else {
+        pending_prompt_admitted_at(&metadata_store, &storage_key, prompt_seq, &entries).await
+    };
     let base_session = metadata.base_session();
-    let loaded = if preserve_pending {
+    let loaded = if worker_active {
         harnx_runtime::nats_session_log::load_session_from_entries_with_metadata_preserving_pending(
             &entries,
             session,
@@ -1854,8 +1875,122 @@ pub(crate) async fn load_nats_session_state(
         session: loaded,
         entries,
         base_session,
-        worker_active: preserve_pending,
+        worker_active,
+        pending_prompt_admitted_at,
+        pending_prompt_seq: prompt_seq,
     })
+}
+
+/// When the log's newest unanswered prompt was admitted. Best effort: the
+/// prompt's own timestamp when the durable row carries one, else the
+/// `admitted_at` of its admission record. A prompt whose age cannot be
+/// established reads as running rather than stalled. `prompt_seq` is the
+/// read's resolved `pending_prompt_seq`; when an edit replaced the prompt,
+/// the age is traced back to the original prompt row it rewrote.
+async fn pending_prompt_admitted_at(
+    metadata_store: &harnx_runtime::nats_session_metadata::SessionMetadataStore,
+    storage_key: &str,
+    prompt_seq: Option<u64>,
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+) -> Option<DateTime<Utc>> {
+    let prompt_seq = prompt_seq?;
+    let entry = prompt_age_row(entries, prompt_seq)?;
+    if let Some(timestamp) = entry.timestamp() {
+        return Some(timestamp);
+    }
+    let SessionLogEntry::Message {
+        id: Some(prompt_id),
+        ..
+    } = entry
+    else {
+        return None;
+    };
+    match metadata_store
+        .prompt_admission(storage_key, prompt_id)
+        .await
+    {
+        Ok(Some(admission)) => Some(admission.admitted_at),
+        Ok(None) => None,
+        Err(error) => {
+            // The prompt's age is what makes a stalled turn visible; a store
+            // that answers nothing silently regresses the read to reporting
+            // running forever, so surface the failure.
+            log::warn!(
+                "session read: prompt admission lookup failed for '{storage_key}' prompt '{prompt_id}': {error:#}"
+            );
+            None
+        }
+    }
+}
+
+/// The row whose admission dates the pending prompt: the prompt itself, or —
+/// when an edit replaced it — the original prompt row the `EditEntries` chain
+/// rewrote. A replacement carries a fresh client id and no timestamp
+/// (`edit_user_message`), so neither its own admission lookup nor its row
+/// time can date the turn; the original's admission is the claim deadline
+/// that was already running for it.
+fn prompt_age_row(entries: &[(u64, SessionLogEntry)], prompt_seq: u64) -> Option<&SessionLogEntry> {
+    let (_, entry) = entries.iter().find(|(seq, _)| *seq == prompt_seq)?;
+    match entry {
+        SessionLogEntry::EditEntries { from, to, .. } => original_prompt_row(entries, *from, *to),
+        _ => Some(entry),
+    }
+}
+
+/// The original prompt row an `EditEntries` range rewrote: the newest user
+/// message inside the range, or — when the range replaced an earlier edit's
+/// mutation row instead of a prompt (chained edits) — the row that nested
+/// edit rewrote. The trace is depth-capped: a crafted log whose ranges point
+/// at each other would otherwise recurse forever, and a bounded miss reads as
+/// running — the same answer an untraceable age already gets.
+const MAX_EDIT_TRACE_DEPTH: usize = 32;
+
+fn original_prompt_row(
+    entries: &[(u64, SessionLogEntry)],
+    from: usize,
+    to: usize,
+) -> Option<&SessionLogEntry> {
+    trace_edit_chain(entries, from, to, MAX_EDIT_TRACE_DEPTH)
+}
+
+fn trace_edit_chain(
+    entries: &[(u64, SessionLogEntry)],
+    from: usize,
+    to: usize,
+    depth: usize,
+) -> Option<&SessionLogEntry> {
+    if depth == 0 {
+        return None;
+    }
+    let is_user_prompt = |entry: &SessionLogEntry| matches!(entry, SessionLogEntry::Message { id: Some(_), role, .. } if role.is_user());
+    if let Some((_, entry)) = newest_row_in_range(entries, from, to, is_user_prompt) {
+        return Some(entry);
+    }
+    // Chained edit: the row this edit replaced is an earlier edit's mutation.
+    let nested_edit = newest_row_in_range(entries, from, to, |entry| {
+        matches!(entry, SessionLogEntry::EditEntries { .. })
+    })?;
+    match nested_edit {
+        (_, SessionLogEntry::EditEntries { from, to, .. }) => {
+            trace_edit_chain(entries, *from, *to, depth - 1)
+        }
+        _ => None,
+    }
+}
+
+fn newest_row_in_range(
+    entries: &[(u64, SessionLogEntry)],
+    from: usize,
+    to: usize,
+    is_match: impl Fn(&SessionLogEntry) -> bool,
+) -> Option<&(u64, SessionLogEntry)> {
+    let in_range = |row: &(u64, SessionLogEntry)| {
+        usize::try_from(row.0).is_ok_and(|seq| seq >= from && seq <= to)
+    };
+    entries
+        .iter()
+        .rev()
+        .find(|row| in_range(row) && is_match(&row.1))
 }
 
 /// Whether a worker holds this session's lease right now.
@@ -4380,5 +4515,67 @@ mod tests {
             .expect("atlas@mycluster should resolve");
         assert_eq!(suffixed_target.agent(), "atlas");
         assert_eq!(suffixed_target.cluster(), "mycluster");
+    }
+
+    fn user_prompt_row(id: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: Some(id.to_string()),
+            role: harnx_core::message::MessageRole::User,
+            content: MessageContent::Text("original".into()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn edit_row(seq: u64, from: usize, to: usize) -> (u64, SessionLogEntry) {
+        (
+            seq,
+            SessionLogEntry::EditEntries {
+                from,
+                to,
+                replacements: vec![],
+            },
+        )
+    }
+
+    /// The prompt at seq 1 followed by `count` chained edits: the edit at
+    /// seq i+1 rewrites the row at seq i — the prompt for the first edit,
+    /// the previous edit's mutation row for every one after that. Tracing
+    /// the prompt's age from the last edit's range descends once per edit.
+    fn edit_chain(count: usize) -> Vec<(u64, SessionLogEntry)> {
+        let mut entries = vec![(1, user_prompt_row("original-prompt"))];
+        for i in 1..=count {
+            entries.push(edit_row(i as u64 + 1, i, i));
+        }
+        entries
+    }
+
+    #[test]
+    fn edit_chain_trace_resolves_a_chain_within_the_depth_cap() {
+        let entries = edit_chain(MAX_EDIT_TRACE_DEPTH);
+        let row = original_prompt_row(&entries, MAX_EDIT_TRACE_DEPTH, MAX_EDIT_TRACE_DEPTH)
+            .expect("a chain within the cap resolves to the original prompt");
+        assert!(matches!(row, SessionLogEntry::Message { id, role, .. }
+                if id.as_deref() == Some("original-prompt") && role.is_user()));
+    }
+
+    #[test]
+    fn edit_chain_trace_gives_up_one_hop_past_the_depth_cap() {
+        // One more chained edit than the cap allows: the trace cannot reach
+        // the original prompt, and a bounded miss reads as no traceable age.
+        let entries = edit_chain(MAX_EDIT_TRACE_DEPTH + 1);
+        assert_eq!(
+            original_prompt_row(&entries, MAX_EDIT_TRACE_DEPTH + 1, MAX_EDIT_TRACE_DEPTH + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn cyclic_edit_ranges_terminate_at_the_depth_cap() {
+        // Two edits whose ranges point at each other: without the cap the
+        // trace would recurse forever; with it, the bounded miss reads as no
+        // traceable age.
+        let entries = [edit_row(100, 101, 101), edit_row(101, 100, 100)];
+        assert_eq!(original_prompt_row(&entries, 101, 101), None);
     }
 }

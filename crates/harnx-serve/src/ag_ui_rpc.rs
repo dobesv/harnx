@@ -590,6 +590,11 @@ fn session_state_json(state: &SessionState, worker_active: bool) -> Value {
         SessionState::Idle if worker_active => json!({ "status": "running" }),
         SessionState::Idle => json!({ "status": "idle" }),
         SessionState::Pending => json!({ "status": "running" }),
+        SessionState::Stalled { prompt_seq, reason } => json!({
+            "status": "stalled",
+            "reason": reason.as_str(),
+            "prompt_seq": prompt_seq,
+        }),
         SessionState::Running { run_id, started_at } => json!({
             "status": "running",
             "run_id": run_id,
@@ -697,7 +702,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        session_actor::{SessionKey, SessionRegistry},
+        session_actor::{SessionKey, SessionRegistry, StallReason},
         test_support::{wait_for_state, TestConfigSandbox},
     };
     use bytes::Bytes;
@@ -1361,6 +1366,28 @@ mod tests {
         assert_eq!(
             session_state_json(&SessionState::Idle, false),
             json!({ "status": "idle" })
+        );
+        // A turn nobody is running: unclaimed, or its worker lost. The reason
+        // and prompt sequence tell a reconnected client which input stalled.
+        assert_eq!(
+            session_state_json(
+                &SessionState::Stalled {
+                    prompt_seq: 41,
+                    reason: StallReason::Unclaimed
+                },
+                false
+            ),
+            json!({ "status": "stalled", "reason": "unclaimed", "prompt_seq": 41 })
+        );
+        assert_eq!(
+            session_state_json(
+                &SessionState::Stalled {
+                    prompt_seq: 41,
+                    reason: StallReason::WorkerLost
+                },
+                false
+            ),
+            json!({ "status": "stalled", "reason": "worker_lost", "prompt_seq": 41 })
         );
     }
 

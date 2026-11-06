@@ -24,6 +24,8 @@ impl LoadedHistorySnapshot {
             entries: Some(loaded.entries),
             session_base: Some(loaded.base_session),
             worker_active: loaded.worker_active,
+            pending_prompt_admitted_at: loaded.pending_prompt_admitted_at,
+            pending_prompt_seq: loaded.pending_prompt_seq,
         }
     }
 }
@@ -53,7 +55,17 @@ impl SessionActor {
         // flight; the guard is here to keep the state machine right if the
         // append ever moves off the command path.
         if self.active_run.is_none() && !matches!(self.state, SessionState::Interrupting) {
-            self.state = derive_state_from_log(loaded.entries.as_deref());
+            // Judged at read time, not cached: whether a lease-less prompt has
+            // waited past its worker deadline changes with every second that
+            // passes without a claim.
+            self.state = derive_state_from_read(
+                loaded.entries.as_deref(),
+                loaded.worker_active,
+                loaded.pending_prompt_seq,
+                loaded.pending_prompt_admitted_at,
+                self.lease_acquisition_timeout(),
+                Utc::now(),
+            );
         }
         self.history_snapshot = loaded.messages;
         self.compaction = loaded.compaction;

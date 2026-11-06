@@ -60,8 +60,40 @@ export interface PromptResult {
   message_id: string | null;
 }
 
+// `session/get`'s `state`. A stalled turn has no worker running it: either the
+// prompt waited past the lease-acquisition timeout without a claim
+// (`unclaimed`), or the worker that claimed it lost its lease
+// (`worker_lost`). A worker that claims the prompt later turns the state back
+// to `running` on the next read.
+export interface StalledTurnState {
+  status: 'stalled';
+  reason: 'unclaimed' | 'worker_lost';
+  prompt_seq: number;
+}
+
+export type SessionState =
+  | { status: 'idle' }
+  | { status: 'running'; run_id?: string; started_at?: string }
+  | StalledTurnState
+  | { status: 'interrupting' }
+  | { status: 'interrupted'; cancel_seq: number }
+  | { status: 'awaiting_approval'; pending_interrupts: unknown };
+
+// How the most recent turn that reached a terminator ended. A turn that
+// stalled wrote no terminator, so it has no `last_turn` of its own —
+// `SessionState` with status `stalled` reports it instead.
+export interface LastTurn {
+  outcome: 'completed' | 'error' | 'timed_out' | 'interrupted';
+  seq: number;
+  ended_at?: string;
+  message?: string;
+  deadline?: string;
+  requested_by?: string;
+}
+
 export interface SessionInfo {
-  state?: unknown;
+  state?: SessionState;
+  last_turn?: LastTurn;
   canPrompt?: boolean;
   canCancel?: boolean;
   history_snapshot?: HistoryMessage[];

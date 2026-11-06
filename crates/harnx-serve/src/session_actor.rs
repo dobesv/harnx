@@ -26,7 +26,7 @@ use ag_ui_core::{
     },
 };
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::FutureExt;
 use harnx_core::{
@@ -150,6 +150,13 @@ struct LoadedHistorySnapshot {
     session_base: Option<harnx_core::session::Session>,
     /// A worker held this session's lease across the durable read.
     worker_active: bool,
+    /// When the read's unanswered prompt was admitted, for stall detection.
+    /// `None` when the read had no pending prompt, held a lease, or could not
+    /// establish the prompt's age.
+    pending_prompt_admitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The read's resolved `pending_prompt_seq`, so state derivation does not
+    /// replay the log's mutations again.
+    pending_prompt_seq: Option<u64>,
 }
 
 /// The session state the durable log implies for a session with no run of this
@@ -163,10 +170,21 @@ fn derive_state_from_log(
     let Some(entries) = entries else {
         return SessionState::Idle;
     };
+    // `pending_prompt_seq` replays the log's mutations, so resolve it once per
+    // read and hand every predicate the same answer.
+    let prompt_seq = harnx_core::session_reconstruct::pending_prompt_seq(entries);
+    derive_state_from_prompt(entries, prompt_seq)
+}
+
+/// [`derive_state_from_log`]'s body, with the pending prompt already resolved
+/// so a read that needs the prompt sequence anyway does not pay for it twice.
+fn derive_state_from_prompt(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    prompt_seq: Option<u64>,
+) -> SessionState {
     // A Cancel ends its approval gate, but input admitted after it is pending
     // work for a new turn. Don't report that input as already interrupted.
-    let pending = harnx_core::session_reconstruct::pending_prompt_seq(entries).is_some();
-    if !pending && harnx_core::session_reconstruct::current_turn_is_cancelled(entries) {
+    if prompt_seq.is_none() && harnx_core::session_reconstruct::current_turn_is_cancelled(entries) {
         return SessionState::Interrupted {
             cancel_seq: harnx_core::session_reconstruct::last_terminator_seq(entries),
         };
@@ -176,11 +194,49 @@ fn derive_state_from_log(
             pending: Box::new(PendingInterrupt { metadata }),
         };
     }
-    if pending {
+    if prompt_seq.is_some() {
         SessionState::Pending
     } else {
         SessionState::Idle
     }
+}
+
+/// The state one durable read implies for a session with no run of this
+/// server's own, judged at `now`: [`derive_state_from_log`]'s answer, plus the
+/// pending input that no worker can still be running, reported as stalled.
+/// Every reader derives this the same way — a session/get on any replica, and
+/// this actor after a follow failure — so the answer never depends on which
+/// replica is asked or what it cached. `prompt_seq` is the read's resolved
+/// `pending_prompt_seq`, shared with the load path that already replayed the
+/// log's mutations for it.
+fn derive_state_from_read(
+    entries: Option<&[(u64, harnx_core::session::SessionLogEntry)]>,
+    worker_active: bool,
+    prompt_seq: Option<u64>,
+    prompt_admitted_at: Option<DateTime<Utc>>,
+    lease_acquisition_timeout: Duration,
+    now: DateTime<Utc>,
+) -> SessionState {
+    let Some(entries) = entries else {
+        return SessionState::Idle;
+    };
+    let mut state = derive_state_from_prompt(entries, prompt_seq);
+    if state == SessionState::Pending {
+        if let Some(stalled) = crate::stalled_turn::stalled_turn(&crate::stalled_turn::StallRead {
+            entries,
+            worker_active,
+            prompt_seq,
+            prompt_admitted_at,
+            now,
+            lease_acquisition_timeout,
+        }) {
+            state = SessionState::Stalled {
+                prompt_seq: stalled.prompt_seq,
+                reason: stalled.reason,
+            };
+        }
+    }
+    state
 }
 
 fn spawn_session_actor(
@@ -658,27 +714,34 @@ impl SessionActor {
                 }
                 Err(error) => self.fail_handoff(&done, error),
             },
-            Err(err) => {
-                let message = done
-                    .handoff
-                    .take_failure()
-                    .unwrap_or_else(|| format!("{err:#}"));
-                log::error!(
-                    "session run failed: agent={} session_id={} run_id={}: {message}",
-                    self.key.display_ref(),
-                    self.key.session,
-                    done.run_id,
-                );
-                done.sink.sink.close_text_segment();
-                let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
-                    base: base_event(),
-                    message,
-                    code: None,
-                }));
-                self.state = SessionState::Idle;
-            }
+            Err(err) => self.fail_run(&done, err),
         }
         self.replay_pending_or_arm_reap(reap_sleep).await;
+    }
+
+    /// A turn's follow or task failed: tell the clients still on the stream,
+    /// and leave the state the latest durable read derived. This replica must
+    /// report what a fresh replica would derive from the same log and lease,
+    /// including a stalled turn nobody is running (issue #2625). The broadcast
+    /// `RUN_ERROR` stays the live notice; `session/get` reports the durable
+    /// answer.
+    fn fail_run(&mut self, done: &RunFinished, err: &anyhow::Error) {
+        let message = done
+            .handoff
+            .take_failure()
+            .unwrap_or_else(|| format!("{err:#}"));
+        log::error!(
+            "session run failed: agent={} session_id={} run_id={}: {message}",
+            self.key.display_ref(),
+            self.key.session,
+            done.run_id,
+        );
+        done.sink.sink.close_text_segment();
+        let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
+            base: base_event(),
+            message,
+            code: None,
+        }));
     }
 
     fn finish_completed_run(&mut self, done: &RunFinished) {
@@ -688,6 +751,7 @@ impl SessionActor {
             })),
             SessionState::Idle
             | SessionState::Pending
+            | SessionState::Stalled { .. }
             | SessionState::Running { .. }
             | SessionState::Interrupting
             | SessionState::Interrupted { .. } => None,
@@ -695,7 +759,7 @@ impl SessionActor {
         self.finish_run(done, result);
         if matches!(
             self.state,
-            SessionState::Idle | SessionState::Running { .. }
+            SessionState::Idle | SessionState::Stalled { .. } | SessionState::Running { .. }
         ) {
             self.state = SessionState::Idle;
         }
@@ -855,6 +919,17 @@ impl SessionActor {
         matches!(
             self.state,
             SessionState::Running { .. } | SessionState::AwaitingApproval { .. }
+        )
+    }
+
+    /// The first-claim deadline a follower gives a durable prompt, from the
+    /// same configured budget `session/get` uses to report it unclaimed.
+    fn lease_acquisition_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.actor_config
+                .base_config
+                .data
+                .nats_lease_acquisition_timeout_secs,
         )
     }
 

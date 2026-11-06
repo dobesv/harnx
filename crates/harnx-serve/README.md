@@ -254,7 +254,7 @@ Same canonical session URL, negotiated into programmatic control.
   `compaction` is optional and omitted until the session has been compacted. See
   [Compacted history snapshots](#compacted-history-snapshots) for its shape.
 
-  `state` is one of five shapes, derived from the durable session log (plus the
+  `state` is one of six shapes, derived from the durable session log (plus the
   session lease, so a turn this server never started is still reported as
   running):
   - `{ "status": "idle" }`
@@ -262,6 +262,17 @@ Same canonical session URL, negotiated into programmatic control.
     by a remote worker, or an admitted prompt waiting for its worker, reports
     plain `{ "status": "running" }`, with no run id. This means durable work is
     outstanding, not that a worker necessarily holds the lease.
+  - `{ "status": "stalled", "reason": "unclaimed", "prompt_seq": 41 }` — the
+    prompt at that log sequence has waited past the lease-acquisition timeout
+    (`nats_lease_acquisition_timeout_secs`, default 60) without a worker
+    claiming it, and no lease is held. A worker that later claims the prompt
+    turns the state back to `running` on the next read, so poll or re-check
+    before giving up.
+  - `{ "status": "stalled", "reason": "worker_lost", "prompt_seq": 41 }` — a
+    worker wrote output for that prompt's turn, then its lease disappeared and
+    the grace a follower's watchdog gives a reappearing lease has passed since
+    its last timestamped log write. `last_turn` still describes the last terminator, so a
+    stalled turn reads as one that never finished, which is what happened.
   - `{ "status": "interrupting" }` — this server's interrupt append is in
     flight.
   - `{ "status": "interrupted", "cancel_seq": 12 }` — a `Cancel` at that log
@@ -270,12 +281,18 @@ Same canonical session URL, negotiated into programmatic control.
     is parked at an approval gate. It is not interrupted; the client's next move
     is a decision, not another cancel.
 
+  A stalled turn keeps `canPrompt` and `canCancel` true: `session/prompt` can
+  add input for a worker to pick up, and `session/cancel` can settle the
+  stalled prompt.
+
   `last_turn` says how the session's most recent turn ended, from the last
   `turn_end`, `error` or `cancel` entry in its log. It is omitted until a turn
   has ended, and it stays while a later turn runs. A client that stopped
   following a run needs it: `state` reads `idle` after any outcome, and
   `history_snapshot` holds messages only, so a turn that failed partway looks
-  like one that finished with a short reply.
+  like one that finished with a short reply. A turn that stalled with no
+  terminator has no `last_turn` entry — `state.status: "stalled"` is what
+  reports it.
   - `{ "outcome": "completed", "seq": 41, "ended_at": "…" }`
   - `{ "outcome": "error", "seq": 41, "ended_at": "…", "message": "…" }` — the
     worker gave up on the turn, for the reason in `message`.

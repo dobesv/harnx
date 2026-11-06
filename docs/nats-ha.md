@@ -1228,6 +1228,30 @@ that budget expires. Increase the budget for slow worker startup or queue
 backlogs. The timeout ends observation, not the durable prompt, which may run
 later. Clients must distinguish `RUN_ERROR` from successful completion.
 
+Once the configured claim budget has passed with no lease, `session/get`
+itself stops reporting `running` and reports
+`state: { "status": "stalled", "reason": "unclaimed", "prompt_seq": … }`.
+Editing the pending prompt does not reset that budget: the replacement row
+carries no timestamp and no admission of its own, so its age is read from
+the original prompt's admission.
+A turn with worker output in the log reports `"reason": "worker_lost"` if no
+lease is present and the last timestamped worker write is at least the
+follower watchdog's grace old. An approval decision records no timestamp, so
+a turn whose newest worker row is the decision reports `running` until a
+later timestamped write. Both are read-time derivations from the log
+and the lease sample, identical on every replica and after an actor reap: no
+terminal entry is invented, so a worker that claims the prompt afterwards
+turns the state back to `running` on the next read. `canPrompt` and
+`canCancel` stay true, and `last_turn` keeps describing the last `turn_end`,
+`error` or `cancel`, so a stalled turn never masquerades as one that finished.
+
+Both deadlines are judged against wall-clock timestamps read from the log and
+the metadata store, so they assume the writer's clock and the reader's clock
+are within seconds of each other (NTP-synced hosts). The lease sample is the
+primary signal, so skew alone cannot fabricate a stall — it only shifts the
+moment a genuinely stalled turn crosses the 14s/60s boundaries, and
+future-dated timestamps read as young.
+
 After observing a lease, remote follow uses the existing consecutive-absence
 checks to report worker loss. Worker death and task failure produce `RUN_ERROR`
 on both paths; the local-actor path also supervises turn-task panics.
@@ -1235,9 +1259,10 @@ on both paths; the local-actor path also supervises turn-task panics.
 #### Recover an unanswered prompt after a delivery limit
 
 Worker and consumer [delivery limits](#delivery-limits) can stop redelivery
-without writing a terminal entry. An unanswered prompt then stays `running`
-in `session/get` even after an attachment times out. Observers don't invent a
-worker-fenced `Error` or `Cancel` to mark it finished.
+without writing a terminal entry. An unanswered prompt then reads as
+`stalled` in `session/get` after the claim budget expires, instead of
+`running` indefinitely. Observers still don't invent a worker-fenced `Error`
+or `Cancel` to mark it finished.
 
 1. Check worker availability, cluster subscriptions, and queue backlog. Restore
    the worker, then re-attach with a promptless run; attachment republishes
