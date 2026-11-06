@@ -142,7 +142,7 @@ impl Toolset for PlansToolset {
             DeleteTaskParams: "delete_task", false, DELETE_TASK_CALL,
                 "Delete a task by full item URL.";
             ListNotesParams: "list_notes", true, LIST_NOTES_CALL,
-                "List notes for a full cid:plan URL sorted by key. limit defaults to 20, clamped to 1..100. Returns {items, next_cursor}; pass next_cursor as cursor with the same plan until null.";
+                "List notes for a full cid:plan URL sorted by key. Bodies are previews capped at 200 characters; use get_note with the note URL to read the full body. limit defaults to 20, clamped to 1..100. Returns {items, next_cursor}; pass next_cursor as cursor with the same plan until null.";
             AddNoteParams: "add_note", false, ADD_NOTE_CALL,
                 "Create a note in a plan and return its full item URL.";
             GetNoteParams: "get_note", true, GET_NOTE_CALL,

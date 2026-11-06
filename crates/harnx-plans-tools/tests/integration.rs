@@ -140,6 +140,46 @@ async fn create_plan(context: &TestContext, name: &str) -> String {
 }
 
 #[tokio::test]
+async fn list_notes_previews_but_get_note_returns_full_unicode_body() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let plan = create_plan(&context, "Note previews").await;
+    let body = format!("{}tail🙂", "é".repeat(250));
+    let added = context
+        .invoke(
+            "add_note",
+            json!({"plan": plan, "id": "long", "summary": "long note", "body": body}),
+            None,
+        )
+        .await;
+    assert_ne!(added["isError"], true, "add_note failed: {added}");
+
+    let listed = json_result(
+        &context
+            .invoke("list_notes", json!({"plan": plan}), None)
+            .await,
+    );
+    let item = &listed["items"][0];
+    assert_eq!(item["id"], format!("{plan}/notes/long"));
+    assert_eq!(item["summary"], "long note");
+    assert_eq!(item["body"].as_str().unwrap().chars().count(), 200);
+    assert!(item["body"].as_str().unwrap().ends_with('…'));
+    assert_eq!(listed["next_cursor"], Value::Null);
+
+    let fetched = json_result(
+        &context
+            .invoke(
+                "get_note",
+                json!({"plan": plan, "note_id": format!("{plan}/notes/long")}),
+                None,
+            )
+            .await,
+    );
+    assert_eq!(fetched["body"], body);
+}
+
+#[tokio::test]
 async fn invoke_with_context_requires_identity_before_connecting() {
     let toolset = PlansToolset::with_nats_url("nats://127.0.0.1:1");
     let result = toolset

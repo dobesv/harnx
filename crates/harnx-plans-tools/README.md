@@ -71,8 +71,10 @@ owner, it lists every session. Combining `owner` and `all_sessions: true` is an
 error. Only plans returned on the page renew session activity.
 
 `list_tasks` and `list_notes` require a full plan URL and list only that plan's
-children. Task status (`filter`, default `open`, or `all` to disable) and `tag`
-filters apply **within each key page**. This bounds document reads to `limit`,
+children. Note bodies in `list_notes` are previews capped at 200 characters;
+use `get_note` with an item's full note URL to read its complete body. Task
+status (`filter`, default `open`, or `all` to disable) and `tag` filters apply
+**within each key page**. This bounds document reads to `limit`,
 but can return short or empty `items` with a non-null `next_cursor`. Keep paging
 even after an empty page.
 
