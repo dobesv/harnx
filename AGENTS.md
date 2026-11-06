@@ -78,7 +78,7 @@ cargo fmt --all                                               # Auto-format code
 cargo clippy --workspace --all-targets -- -D warnings         # Lint — treat warnings as errors
 cargo nextest run $(cargo xtask affected)                    # Run the tests of every package the change can affect, once
 cargo nextest run --workspace -E 'test(=<name>) | ...' --stress-count=20  # Stress only the tests you added or changed
-cs delta origin/HEAD                                          # Run CodeScene code quality analysis on current branch changes
+cs delta origin/HEAD --error-on-warnings                      # Run CodeScene analysis and fail on quality warnings
 python3 scripts/check_changesets.py                           # Check that every changeset will reach a changelog
 ```
 
@@ -90,6 +90,12 @@ If the workspace build fails with `Permission denied (os error 13)` from
 `protoc-bin-vendored-linux-x86_64`, the cargo registry is on a noexec mount, so
 `a2a-pb`'s vendored protoc binary can't run. Prefix cargo commands with
 `PROTOC=/usr/bin/protoc` to use the system protoc instead.
+
+If `cs delta` fails its license or API request with an SSL handshake error
+behind a TLS-intercepting proxy, set `CS_CERTS` to the proxy CA file path.
+Use `CS_CERTS="$SSL_CERT_FILE"` only when `SSL_CERT_FILE` is set and points to
+that CA. `cs` is a GraalVM native image and doesn't honor `SSL_CERT_FILE` on
+its own.
 
 **Scope the test run to the affected packages.** `cargo xtask affected` diffs
 the working tree, uncommitted and untracked files included, against its merge

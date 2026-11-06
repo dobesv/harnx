@@ -183,6 +183,12 @@ impl Gateway {
         Ok(())
     }
 
+    /// The session's usable ambient binding, if any.
+    ///
+    /// Unlike [`Gateway::sandbox_id`], well-formed but unusable bindings
+    /// (unknown version or blank ID) yield `None` instead of an error, so
+    /// callers like `sandbox_connect` can fall back to creating a fresh
+    /// sandbox and replacing the binding. Malformed metadata still errors.
     async fn ambient_binding(
         &self,
         session_id: Option<&str>,
@@ -204,7 +210,11 @@ impl Gateway {
             .cloned()
             .map(serde_json::from_value::<SandboxBinding>)
             .transpose()
-            .map(|binding| binding.map(|binding| binding.sandbox_id))
+            .map(|binding| {
+                binding
+                    .filter(|binding| binding.version == 1 && !binding.sandbox_id.trim().is_empty())
+                    .map(|binding| binding.sandbox_id)
+            })
             .map_err(|error| {
                 ToolInvokeError::Recoverable(format!("invalid ambient sandbox binding: {error}"))
             })
