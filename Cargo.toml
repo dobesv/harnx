@@ -166,7 +166,7 @@ time = { version = "0.3.36", features = ["macros"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
-jaq-all = { version = "0.3", features = ["formats"] }
+jaq-all = { version = "0.4", features = ["formats"] }
 indexmap = { version = "2.2.6", features = ["serde"] }
 hmac = "0.13.0"
 aws-config = { version = "1", features = ["sso"] }

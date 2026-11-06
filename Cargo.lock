@@ -6257,9 +6257,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jaq-all"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9729ff642d7995e5f6e4545ce25e699e9525cbe97ea63d5e75c7aeda9abec6c"
+checksum = "6603050d25bb91f796fdcf47fbc2f1e171aee9cacb2a9087114f165e60183b11"
 dependencies = [
  "codesnake",
  "jaq-core",
