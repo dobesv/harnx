@@ -36,13 +36,30 @@ pub(crate) async fn list(
     result_json(json!({"items": notes, "next_cursor": page.next_cursor}))
 }
 
+fn resolve_requested_note_id(plan: &CidUrl, id: Option<&str>) -> Result<Option<String>, ErrorData> {
+    id.map(|id| {
+        if id.starts_with("cid:") {
+            match parse_note_url(plan, id)? {
+                CidUrl::Plan {
+                    item: PlanItem::Note(id),
+                    ..
+                } => validate_item_id(&id),
+                _ => Err(ErrorData::invalid_params("expected note URL", None)),
+            }
+        } else {
+            validate_item_id(id)
+        }
+    })
+    .transpose()
+}
+
 pub(crate) async fn add(
     context: &OperationContext<'_>,
     params: AddNoteParams,
 ) -> Result<CallToolResult, ErrorData> {
     let plan = parse_plan_url(&params.plan)?;
     require_plan(context, &plan).await?;
-    let requested_id = params.id.as_deref().map(validate_item_id).transpose()?;
+    let requested_id = resolve_requested_note_id(&plan, params.id.as_deref())?;
     for _ in 0..100 {
         let id = requested_id.clone().unwrap_or_else(gen_id);
         let url = item_url(&plan, PlanItem::Note(id));
@@ -117,7 +134,11 @@ pub(crate) async fn get(
 
 fn note_location(plan: &str, id: &str) -> Result<(CidUrl, CidUrl), ErrorData> {
     let plan = parse_plan_url(plan)?;
-    let note = parse_note_url(&plan, id)?;
+    let note = if id.starts_with("cid:") {
+        parse_note_url(&plan, id)?
+    } else {
+        item_url(&plan, PlanItem::Note(validate_item_id(id)?))
+    };
     Ok((plan, note))
 }
 
@@ -125,8 +146,7 @@ pub(crate) async fn update(
     context: &OperationContext<'_>,
     params: UpdateNoteParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let plan = parse_plan_url(&params.plan)?;
-    let url = parse_note_url(&plan, &params.note_id)?;
+    let (plan, url) = note_location(&params.plan, &params.note_id)?;
     let edit_params = params.clone();
     let mut before_body = String::new();
     let stored = update_document(context.store, &url, |content| {

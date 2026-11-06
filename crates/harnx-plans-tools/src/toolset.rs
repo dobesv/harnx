@@ -144,13 +144,13 @@ impl Toolset for PlansToolset {
             ListNotesParams: "list_notes", true, LIST_NOTES_CALL,
                 "List notes for a full cid:plan URL sorted by key. Bodies are previews capped at 200 characters; use get_note with the note URL to read the full body. limit defaults to 20, clamped to 1..100. Returns {items, next_cursor}; pass next_cursor as cursor with the same plan until null.";
             AddNoteParams: "add_note", false, ADD_NOTE_CALL,
-                "Create a note in a plan and return its full item URL.";
+                "Create a note in a plan using an optional bare note ID or full note URL belonging to the plan, and return its full item URL.";
             GetNoteParams: "get_note", true, GET_NOTE_CALL,
-                "Read a note by full item URL.";
+                "Read a note using a bare note ID or full note URL belonging to the supplied plan.";
             UpdateNoteParams: "update_note", false, UPDATE_NOTE_CALL,
-                "Update a note by full item URL using revision CAS.";
+                "Update a note using a bare note ID or full note URL belonging to the supplied plan, using revision CAS.";
             DeleteNoteParams: "delete_note", false, DELETE_NOTE_CALL,
-                "Delete a note by full item URL.";
+                "Delete a note using a bare note ID or full note URL belonging to the supplied plan.";
         ]
     }
 
@@ -215,6 +215,21 @@ mod tests {
         assert_eq!(tools[0].kind(), Some(ToolProgressKind::Read));
         assert_eq!(tools[1].kind(), Some(ToolProgressKind::Edit));
         assert_eq!(tools[4].kind(), Some(ToolProgressKind::Delete));
+        for name in ["get_note", "update_note", "delete_note"] {
+            let description = &tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap()
+                .description;
+            assert!(
+                description.contains("bare note ID"),
+                "{name}: {description}"
+            );
+            assert!(
+                description.contains("full note URL"),
+                "{name}: {description}"
+            );
+        }
     }
 
     #[test]

@@ -290,6 +290,114 @@ async fn plan_task_and_note_crud_uses_full_urls() {
 }
 
 #[tokio::test]
+async fn note_crud_accepts_ids_and_full_urls() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let plan = create_plan(&context, "Note URL Compatibility").await;
+    let note_url = create_note(&context, &plan).await;
+
+    for note_id in ["design", note_url.as_str()] {
+        let fetched = context
+            .invoke("get_note", json!({"plan": plan, "note_id": note_id}), None)
+            .await;
+        assert_eq!(json_result(&fetched)["body"], "note body");
+    }
+    let updated = context
+        .invoke(
+            "update_note",
+            json!({"plan": plan, "note_id": "design", "append_body": "via id"}),
+            None,
+        )
+        .await;
+    assert_ne!(updated["isError"], true, "update_note failed: {updated}");
+    let fetched = context
+        .invoke("get_note", json!({"plan": plan, "note_id": note_url}), None)
+        .await;
+    assert_eq!(json_result(&fetched)["body"], "note body\nvia id");
+
+    let add_with_url = format!("{plan}/notes/from-url");
+    let added = context
+        .invoke(
+            "add_note",
+            json!({"plan": plan, "id": add_with_url, "body": "from URL"}),
+            None,
+        )
+        .await;
+    assert_ne!(added["isError"], true, "add_note failed: {added}");
+    assert!(cid_from(&added).ends_with("/notes/from-url"));
+
+    let deleted = context
+        .invoke(
+            "delete_note",
+            json!({"plan": plan, "note_id": "design"}),
+            None,
+        )
+        .await;
+    assert_ne!(deleted["isError"], true, "delete_note failed: {deleted}");
+    let missing = context
+        .invoke("get_note", json!({"plan": plan, "note_id": note_url}), None)
+        .await;
+    assert_error(&missing, "note not found");
+}
+
+#[tokio::test]
+async fn note_tools_reject_wrong_plan_kind_and_malformed_references() {
+    let Some(context) = TestContext::start().await else {
+        return;
+    };
+    let plan = create_plan(&context, "Invalid Note References").await;
+    let other_plan = create_plan(&context, "Other Note Plan").await;
+    create_note(&context, &plan).await;
+
+    let foreign_note = format!("{other_plan}/notes/foreign");
+    for tool in ["get_note", "update_note", "delete_note"] {
+        let result = context
+            .invoke(tool, json!({"plan": plan, "note_id": foreign_note}), None)
+            .await;
+        assert_error(&result, "belonging to");
+    }
+    let foreign_add = context
+        .invoke(
+            "add_note",
+            json!({"plan": plan, "id": foreign_note, "body": "bad"}),
+            None,
+        )
+        .await;
+    assert_error(&foreign_add, "belonging to");
+
+    let task_url = create_task(&context, &plan, "not-a-note", Vec::new()).await;
+    for bad_id in [task_url.as_str(), "cid:plan:broken", "not/valid"] {
+        for tool in ["get_note", "update_note", "delete_note"] {
+            let result = context
+                .invoke(tool, json!({"plan": plan, "note_id": bad_id}), None)
+                .await;
+            assert_eq!(
+                result["isError"], true,
+                "{tool} accepted invalid note reference {bad_id}"
+            );
+        }
+        let result = context
+            .invoke(
+                "add_note",
+                json!({"plan": plan, "id": bad_id, "body": "bad"}),
+                None,
+            )
+            .await;
+        assert_eq!(result["isError"], true, "add_note accepted {bad_id}");
+    }
+    let too_long_url = format!("{plan}/notes/{}", "a".repeat(65));
+    let rejected = context
+        .invoke(
+            "add_note",
+            json!({"plan": plan, "id": too_long_url, "body": "bad"}),
+            None,
+        )
+        .await;
+    assert_error(&rejected, "item ID must match");
+}
+
+#[tokio::test]
 async fn get_plan_segregates_task_and_note_ids() {
     let Some(context) = TestContext::start().await else {
         return;

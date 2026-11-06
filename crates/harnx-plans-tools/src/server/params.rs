@@ -264,7 +264,9 @@ pub(crate) struct ListNotesParams {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AddNoteParams {
+    /// Plan URL containing this note.
     pub(crate) plan: String,
+    /// Optional note ID (`[a-z0-9-]`, 1–64 characters) or full note URL belonging to `plan`.
     #[serde(default, deserialize_with = "blank_as_none")]
     pub(crate) id: Option<String>,
     pub(crate) body: String,
@@ -278,7 +280,7 @@ pub(crate) struct AddNoteParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetNoteParams {
     pub(crate) plan: String,
-    /// Full note URL belonging to `plan`.
+    /// Bare note ID or full note URL belonging to `plan`.
     pub(crate) note_id: String,
 }
 
@@ -286,6 +288,7 @@ pub(crate) struct GetNoteParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeleteNoteParams {
     pub(crate) plan: String,
+    /// Bare note ID or full note URL belonging to `plan`.
     pub(crate) note_id: String,
 }
 
@@ -293,6 +296,7 @@ pub(crate) struct DeleteNoteParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateNoteParams {
     pub(crate) plan: String,
+    /// Bare note ID or full note URL belonging to `plan`.
     pub(crate) note_id: String,
     #[serde(default, deserialize_with = "blank_as_none")]
     pub(crate) summary: Option<String>,

@@ -25,14 +25,14 @@ The native server reads standard `HARNX_NATS_*` connection variables. `--name <N
 cid:plan:pantheon%2Fatlas/armDRA/nats-attachments
 ```
 
-All other plan parameters require that full URL. Task and note get/update/delete operations also require full item URLs:
+All other plan parameters require that full URL. Task get/update/delete operations require full task URLs. Note tools accept either a bare note ID or full note URL belonging to the supplied plan; `add_note.id` accepts both forms too:
 
 ```text
 cid:plan:pantheon%2Fatlas/armDRA/nats-attachments/tasks/storage
 cid:plan:pantheon%2Fatlas/armDRA/nats-attachments/notes/design
 ```
 
-Task dependencies are task URLs. Bare plan names and bare item IDs are rejected.
+Task dependencies are task URLs. Bare plan names and bare task IDs are rejected. Note IDs use `[a-z0-9-]` and must contain 1–64 characters.
 
 ## Plan metadata
 
