@@ -251,10 +251,8 @@ For remote session inspection, use an explicit selector such as
 ### `harnx info agent <name>`
 
 Prints the fully-rendered agent configuration to stdout. This includes:
-- YAML front-matter with package patches applied and `use_tools` wildcards expanded to concrete tool names via live MCP servers.
+- YAML front-matter with package patches applied and `use_tools` shown faithfully: toolsets expand, and explicit tool names stay verbatim even when no local declaration exists (tool-server tools such as `bash_exec` or `fs_*` are declared by workers at runtime). Glob selectors (including `*`) stay in the list, followed by the tool names they match locally.
 - The system prompt with all variables and templates (MiniJinja) interpolated.
-
-If an MCP server fails during tool expansion, a warning is logged to stderr, and the command continues with the remaining tools.
 
 ## Inspect and Dump Sessions
 

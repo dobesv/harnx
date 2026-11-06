@@ -581,6 +581,29 @@ Toolsets that need the hosting NATS connection at construction time (like `harnx
 
 Binaries with `-mcp-` in the name are genuine MCP infrastructure (`harnx-mcp-bridge`, `harnx-mcp-remote`, `harnx-mcp-server`) or test fixtures (`harnx-mock-mcp`), not native toolsets.
 
+### Frontend processes cannot enumerate tool-server tools
+
+Tool servers register with the NATS broker, and only workers discover their
+declarations: `refresh_nats_tool_declarations`
+(`crates/harnx-runtime/src/tool_context.rs`) runs per worker turn
+(`agent_loop.rs`) and is a no-op without `HARNX_NATS_URL`. A frontend CLI/TUI
+process never populates `Config::nats_tool_declarations`, so
+`tool_declarations_for_use_tools` there yields only builtins and synthetic
+handoff tools — `bash_exec`, `fs_*`, and friends are invisible (#2628).
+
+Consequences:
+
+- Anything that lists, inspects, or calls a session's real tools must route
+  through the worker via an operator tool command
+  (`parse_operator_tool_command` in `crates/harnx-runtime/src/operator_tools.rs`;
+  `.list tools`, `.info tools`, `.info tool`, `.call tool`). The worker handler
+  does fresh broker discovery per command
+  (`nats_worker/operator_tools.rs`).
+- Offline rendering that can't reach the worker (`Config::expand_use_tools`,
+  used by `harnx info agent` / `.info agent`) must keep `use_tools` selectors
+  verbatim — filtering them against local declarations silently drops every
+  tool-server tool.
+
 ### Adding a new native toolset server
 
 The checklist below covers every integration point. Miss any and the release fails or the binary ships incomplete.

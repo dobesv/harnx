@@ -6,6 +6,11 @@ use globset::{GlobBuilder, GlobMatcher};
 /// because globset reads it as an escape on Unix.
 const GLOB_SYNTAX: [char; 7] = ['*', '?', '[', ']', '{', '}', '\\'];
 
+/// Whether a selector uses glob syntax rather than naming a single tool.
+pub(crate) fn is_glob(selector: &str) -> bool {
+    selector.contains(GLOB_SYNTAX)
+}
+
 /// A `use_tools` selector compiled once and matched against many tool names.
 ///
 /// Compiling a glob builds a regex, which costs far more than matching one.
@@ -24,7 +29,7 @@ impl ToolSelector {
     /// `literal_separator` is passed to [`GlobBuilder::literal_separator`]:
     /// whether `*` and `?` stop at `/`.
     pub(crate) fn new(selector: &str, literal_separator: bool) -> Self {
-        if !selector.contains(GLOB_SYNTAX) {
+        if !is_glob(selector) {
             return Self::Name(selector.to_string());
         }
         GlobBuilder::new(selector)
@@ -44,7 +49,17 @@ impl ToolSelector {
 
 #[cfg(test)]
 mod tests {
-    use super::ToolSelector;
+    use super::{is_glob, ToolSelector};
+
+    #[test]
+    fn is_glob_marks_glob_syntax_not_names() {
+        for selector in ["*", "fs_*", "fs_{read,write}", "fs_[rw]?", "fs\\*"] {
+            assert!(is_glob(selector), "{selector} should be a glob");
+        }
+        for selector in ["fs_read", "bash_exec", ""] {
+            assert!(!is_glob(selector), "{selector} should not be a glob");
+        }
+    }
 
     fn matching(selector: &str, literal_separator: bool, names: &[&str]) -> Vec<String> {
         let selector = ToolSelector::new(selector, literal_separator);

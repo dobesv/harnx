@@ -1,10 +1,12 @@
 ---
-source: crates/harnx-runtime/src/config/agent_tests.rs
+source: crates/harnx-runtime/src/config/agent_dump_tests.rs
+assertion_line: 223
 expression: rendered
 ---
 ---
 model: openai:gpt-4o
 use_tools:
+- '*'
 - alpha_tool
 - beta_tool
 - snapshot-agent_session_handoff
