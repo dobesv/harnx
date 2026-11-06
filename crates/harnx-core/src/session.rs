@@ -282,6 +282,23 @@ impl SessionLogEntry {
         }
     }
 
+    /// When this entry was written, when the writer recorded it. `None` on
+    /// variants that carry no time, and on rows written before timestamps
+    /// were stamped at append.
+    pub fn timestamp(&self) -> Option<DateTime<Utc>> {
+        match self {
+            SessionLogEntry::Message { timestamp, .. }
+            | SessionLogEntry::ToolCalls { timestamp, .. }
+            | SessionLogEntry::Cancel { timestamp, .. }
+            | SessionLogEntry::ToolResults { timestamp, .. }
+            | SessionLogEntry::Error { timestamp, .. }
+            | SessionLogEntry::TurnEnd { timestamp, .. }
+            | SessionLogEntry::CompactRequest { timestamp, .. }
+            | SessionLogEntry::CompactResult { timestamp, .. } => *timestamp,
+            _ => None,
+        }
+    }
+
     /// Fence token carried by this entry, if any. `Message`/`ToolCalls` carry an
     /// optional fence; `Cancel`, `Error`, and `TurnEnd` always carry one. All
     /// other variants are unfenced and return `None`.
@@ -841,6 +858,41 @@ mod tests {
             }
             other => panic!("expected message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_log_entry_timestamp_reports_the_row_s_recorded_time() {
+        let at = Utc::now();
+        let message = SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("hello".to_string()),
+            timestamp: Some(at),
+            fence_token: None,
+        };
+        assert_eq!(message.timestamp(), Some(at));
+    }
+
+    #[test]
+    fn session_log_entry_timestamp_is_none_when_the_writer_stamped_none() {
+        let turn_end = SessionLogEntry::TurnEnd {
+            through_seq: 3,
+            fence_token: 1,
+            timestamp: None,
+            usage: None,
+        };
+        assert_eq!(turn_end.timestamp(), None);
+    }
+
+    #[test]
+    fn session_log_entry_timestamp_is_none_for_variants_without_a_time() {
+        let gate = SessionLogEntry::HitlApprovalRequested {
+            tool_call_id: "call".into(),
+            summary: "confirm".into(),
+            fence_token: 1,
+        };
+        assert_eq!(gate.timestamp(), None);
+        assert_eq!(SessionLogEntry::Clear.timestamp(), None);
     }
 
     #[test]

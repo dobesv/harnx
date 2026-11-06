@@ -1606,6 +1606,25 @@ on the child stream (`SubAgentSessionNotes.tsx:81`); foreground interruption use
 local optimistic state cleared by the run terminal. When status appears stale,
 reload re-hydrates from the authoritative log.
 
+### `session/get` state is derived per read, never cached
+
+`state` in `session/get` (`session_state_json` in `ag_ui_rpc.rs`) is a pure
+derivation from one durable read — log entries plus the lease sample
+(`load_nats_session_state` in `harnx-serve/src/lib.rs` → `derive_state_from_read`
+in `session_actor.rs`). Every replica, and this actor after a failed follow,
+derives the same answer, so the actor never assigns a terminal state itself:
+`fail_run` (`session_actor.rs`) only closes the stream segment and broadcasts
+`RUN_ERROR`, leaving `self.state` to the next read (regression test
+`failed_follow_keeps_derived_state_and_broadcasts_run_error`). A read samples
+the lease once and cannot poll, so stall detection (`stalled_turn.rs`) proves a
+stall from what that single read has and reports `running` whenever it can't.
+Prompt rows aren't reliably timestamped: an unclaimed prompt ages from its
+admission record's `admitted_at` (`prompt_admission()`), and `worker_lost`
+ages from the worker's last timestamped write, within
+`harnx_runtime::nats_session::WORKER_LOST_GRACE` (the follower watchdog's
+window — don't duplicate it). Wire shapes: `crates/harnx-serve/README.md`
+`session/get`; background: `docs/nats-ha.md` "stalled" paragraph.
+
 ### Follow mode MUST emit durable entries only
 
 `SessionEventStream::attach()` (`nats_event_sink.rs:386`) subscribes to advisories first, then

@@ -89,6 +89,17 @@ const ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// jitter before a replacement worker can receive the activation.
 const ORPHAN_MISSING_CHECKS: u32 = 7;
 
+/// Grace a single point-in-time read gives a turn whose worker wrote to the
+/// log but no longer holds its lease, before the read declares the worker
+/// lost. The server-side check (`session/get`) samples the lease once, so it
+/// cannot poll for absence the way the follower watchdog does; instead it
+/// borrows the watchdog's whole missing-lease window
+/// (`ORPHAN_CHECK_INTERVAL` × `ORPHAN_MISSING_CHECKS`) and ages it from the
+/// worker's last durable log write, which is the last point-in-time evidence
+/// the read has.
+pub const WORKER_LOST_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(ORPHAN_CHECK_INTERVAL.as_secs() * ORPHAN_MISSING_CHECKS as u64);
+
 /// Maximum time an admitted turn may wait for its first worker lease.
 ///
 /// This is deliberately longer than the 30s lease TTL so slow worker startup

@@ -267,7 +267,20 @@ async fn unclaimed_prompt_has_bounded_attach_without_false_run_finished() {
     let get = fixture
         .rpc(json!({"jsonrpc":"2.0","id":2,"method":"session/get"}))
         .await;
-    assert_eq!(get["result"]["state"]["status"], "running");
+    // The acquisition budget expired with no worker claim: every replica now
+    // reports the turn as stalled instead of running forever (issue #2625).
+    let prompt_seq = harnx_core::session_reconstruct::pending_prompt_seq(
+        &fixture.log.load_events_latest_async().await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        get["result"]["state"],
+        json!({"status":"stalled","reason":"unclaimed","prompt_seq":prompt_seq}),
+        "{get}"
+    );
+    // Recovery stays open: a stalled turn can still be settled by hand.
+    assert_eq!(get["result"]["canPrompt"], true);
+    assert_eq!(get["result"]["canCancel"], true);
     let cancel = fixture
         .rpc(json!({"jsonrpc":"2.0","id":3,"method":"session/cancel"}))
         .await;
@@ -276,6 +289,45 @@ async fn unclaimed_prompt_has_bounded_attach_without_false_run_finished() {
         .rpc(json!({"jsonrpc":"2.0","id":4,"method":"session/get"}))
         .await;
     assert_eq!(settled["result"]["state"]["status"], "interrupted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_worker_reports_stalled_after_the_watchdog_grace() {
+    let Some(fixture) = Unclaimed::new(15).await else {
+        return;
+    };
+    // A worker claims the prompt, writes half a turn, then stops renewing its
+    // lease long enough that the follower watchdog would also have given up.
+    let lease = fixture.claim().await;
+    let written_at = chrono::Utc::now()
+        - harnx_runtime::nats_session::WORKER_LOST_GRACE
+        - chrono::Duration::seconds(5);
+    fixture
+        .log
+        .append_event_async(&SessionLogEntry::Message {
+            id: Some("partial-reply".into()),
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("half a turn".into()),
+            timestamp: Some(written_at),
+            fence_token: Some(9),
+        })
+        .await
+        .unwrap();
+    lease.release().await.unwrap();
+    let prompt_seq = harnx_core::session_reconstruct::pending_prompt_seq(
+        &fixture.log.load_events_latest_async().await.unwrap(),
+    )
+    .unwrap();
+    let get = fixture
+        .rpc(json!({"jsonrpc":"2.0","id":2,"method":"session/get"}))
+        .await;
+    assert_eq!(
+        get["result"]["state"],
+        json!({"status":"stalled","reason":"worker_lost","prompt_seq":prompt_seq}),
+        "{get}"
+    );
+    // last_turn still describes the last terminator, not the stalled turn.
+    assert!(get["result"].get("last_turn").is_none(), "{get}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -362,4 +414,110 @@ async fn unclaimed_prompt_retraction_settles_attach_without_claim() {
         .rpc(json!({"jsonrpc":"2.0","id":3,"method":"session/get"}))
         .await;
     assert_eq!(get["result"]["state"]["status"], "idle");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edited_pending_prompt_reports_stalled_from_the_original_admission() {
+    let Some(fixture) = Unclaimed::new(1).await else {
+        return;
+    };
+    // Production shape of a user edit (`edit_user_message`): the pending
+    // prompt is replaced with a row carrying a fresh client id and no
+    // timestamp, and that fresh id has no admission record of its own.
+    let prompt_seq = harnx_core::session_reconstruct::pending_prompt_seq(
+        &fixture.log.load_events_latest_async().await.unwrap(),
+    )
+    .unwrap() as usize;
+    let replacement = format!(
+        "type: message\nid: {}\nrole: user\ncontent: edited input\n",
+        Uuid::new_v4()
+    );
+    fixture
+        .log
+        .append_event_async(&SessionLogEntry::EditEntries {
+            from: prompt_seq,
+            to: prompt_seq,
+            replacements: vec![replacement],
+        })
+        .await
+        .unwrap();
+    // Past the acquisition budget: the replacement's own id has no admission,
+    // so the read must fall back to the original prompt's admission — the
+    // claim deadline that was already running — and report the turn stalled
+    // instead of running forever.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let get = fixture
+        .rpc(json!({"jsonrpc":"2.0","id":2,"method":"session/get"}))
+        .await;
+    let expected_prompt_seq = harnx_core::session_reconstruct::pending_prompt_seq(
+        &fixture.log.load_events_latest_async().await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        get["result"]["state"],
+        json!({"status":"stalled","reason":"unclaimed","prompt_seq":expected_prompt_seq}),
+        "{get}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn twice_edited_pending_prompt_reports_stalled_from_the_original_admission() {
+    let Some(fixture) = Unclaimed::new(1).await else {
+        return;
+    };
+    // A chained edit: the first edit replaces the prompt with a fresh row,
+    // and the second edit replaces that row again — by its inherited
+    // sequence, exactly like `edit_user_message` does when the client edits
+    // the replacement it already sees.
+    let prompt_seq = harnx_core::session_reconstruct::pending_prompt_seq(
+        &fixture.log.load_events_latest_async().await.unwrap(),
+    )
+    .unwrap() as usize;
+    let replacement = format!(
+        "type: message\nid: {}\nrole: user\ncontent: edited input\n",
+        Uuid::new_v4()
+    );
+    fixture
+        .log
+        .append_event_async(&SessionLogEntry::EditEntries {
+            from: prompt_seq,
+            to: prompt_seq,
+            replacements: vec![replacement],
+        })
+        .await
+        .unwrap();
+    let first_edit_seq = harnx_core::session_reconstruct::pending_prompt_seq(
+        &fixture.log.load_events_latest_async().await.unwrap(),
+    )
+    .unwrap() as usize;
+    let replacement = format!(
+        "type: message\nid: {}\nrole: user\ncontent: edited again\n",
+        Uuid::new_v4()
+    );
+    fixture
+        .log
+        .append_event_async(&SessionLogEntry::EditEntries {
+            from: first_edit_seq,
+            to: first_edit_seq,
+            replacements: vec![replacement],
+        })
+        .await
+        .unwrap();
+    // Past the acquisition budget: both replacements carry fresh ids with no
+    // admission of their own, and the second edit's range points at the
+    // first edit's mutation row, so the read has to walk the whole chain
+    // back to the original prompt's admission to date the turn.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let get = fixture
+        .rpc(json!({"jsonrpc":"2.0","id":2,"method":"session/get"}))
+        .await;
+    let expected_prompt_seq = harnx_core::session_reconstruct::pending_prompt_seq(
+        &fixture.log.load_events_latest_async().await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        get["result"]["state"],
+        json!({"status":"stalled","reason":"unclaimed","prompt_seq":expected_prompt_seq}),
+        "{get}"
+    );
 }

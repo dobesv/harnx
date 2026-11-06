@@ -295,6 +295,14 @@ pub enum SessionState {
     Idle,
     /// Durable input still needs a worker; this actor doesn't own its run.
     Pending,
+    /// Durable input has waited past its worker deadline with no lease to cover
+    /// it, so no live worker is running the turn. Derived on each read, never
+    /// cached as settled truth: a worker that later claims the prompt turns the
+    /// state back to running.
+    Stalled {
+        prompt_seq: u64,
+        reason: StallReason,
+    },
     Running {
         run_id: String,
         started_at: DateTime<Utc>,
@@ -311,6 +319,26 @@ pub enum SessionState {
     AwaitingApproval {
         pending: Box<PendingInterrupt>,
     },
+}
+
+/// Why a stalled turn has no worker running it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallReason {
+    /// No worker ever wrote for the turn, and the prompt has been waiting
+    /// longer than the lease-acquisition timeout.
+    Unclaimed,
+    /// A worker wrote for the turn, then its lease disappeared and the
+    /// follower watchdog's grace has passed since its last durable write.
+    WorkerLost,
+}
+
+impl StallReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StallReason::Unclaimed => "unclaimed",
+            StallReason::WorkerLost => "worker_lost",
+        }
+    }
 }
 
 /// Minimal AG-UI interrupt view. Worker continuation state remains in the durable log.
