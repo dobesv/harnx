@@ -1790,30 +1790,69 @@ async fn help_renders_in_tui_snapshot() {
 #[tokio::test]
 async fn representative_commands_render_into_tui_transcript() {
     let config = test_config();
-    let commands = [".help", ".info session", ".info tools"];
+    // `.info session` without arguments is a usage error, so use bare `.info`
+    // (sysinfo) as the representative plain-output command.
+    let commands = [".help", ".info", ".info tools"];
 
     for command in commands {
         let mut tui = Tui::init(&config).await.unwrap();
+        // init() seeds the transcript with a welcome banner and status line;
+        // measure what the command itself adds.
+        let baseline = tui.app.transcript.len();
         tui.run_command(command).await.unwrap();
+        // `.info tools` is an operator tool command: it finishes on a
+        // background task, so wait for its event instead of racing try_recv.
+        if harnx_runtime::operator_tools::is_operator_tool_command(command) {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), tui.event_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            tui.handle_tui_event(event).await.unwrap();
+        }
         while let Ok(event) = tui.event_rx.try_recv() {
             tui.handle_tui_event(event).await.unwrap();
         }
 
-        let transcript_text = tui
-            .app
-            .transcript
-            .iter()
-            .filter_map(|entry| match entry {
-                TranscriptItem::SystemText(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let added_texts = |wanted: fn(&TranscriptItem) -> bool| {
+            tui.app
+                .transcript
+                .iter()
+                .skip(baseline)
+                .filter(|entry| wanted(entry))
+                .filter_map(|entry| match entry {
+                    TranscriptItem::SystemText(text) | TranscriptItem::ErrorText(text) => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let added_system = added_texts(|entry| matches!(entry, TranscriptItem::SystemText(_)));
+        let added_error = added_texts(|entry| matches!(entry, TranscriptItem::ErrorText(_)));
 
-        assert!(
-            !transcript_text.is_empty(),
-            "expected command {command} to render output into TUI transcript"
-        );
+        if command == ".info tools" {
+            // No active session: the operator tool command reports a clear
+            // error instead of listing builtins and handoffs (#2628).
+            assert!(
+                added_system.is_empty(),
+                ".info tools without a session must not render a tool listing"
+            );
+            assert!(
+                added_error.contains("active session"),
+                ".info tools without a session must report the missing session, got: {added_error}"
+            );
+        } else {
+            assert!(
+                !added_system.is_empty(),
+                "expected command {command} to render output into TUI transcript"
+            );
+            assert!(
+                added_error.is_empty(),
+                "command {command} should not produce errors, got: {added_error}"
+            );
+        }
     }
 }
 

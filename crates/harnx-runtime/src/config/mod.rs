@@ -120,7 +120,7 @@ use crate::client::{
 };
 use crate::commands::{run_command, split_args_text};
 use crate::tool::{ToolDeclaration, ToolResult, Tools};
-use crate::tool_selector::ToolSelector;
+use crate::tool_selector::{is_glob, ToolSelector};
 use crate::utils::*;
 use harnx_hooks::HooksConfig;
 use harnx_rag::Rag;
@@ -1150,6 +1150,16 @@ impl Config {
             .collect()
     }
 
+    /// Expand an agent's `use_tools` selectors for offline display
+    /// (`harnx info agent`, the TUI agent-info overlay).
+    ///
+    /// Tool-server tools (bash_*, fs_*, …) are declared by workers at runtime,
+    /// so this process may not know their declarations — only builtins and
+    /// synthetic handoff tools are available offline (#2628). Never drop a
+    /// selector just because no local declaration matches: keep every selector
+    /// verbatim in its configured order, expand toolsets, deduplicate, and for
+    /// glob selectors (including `*`) also append the declarations this process
+    /// knows, so a wildcard cannot silently shrink to "just builtins".
     pub fn expand_use_tools(
         &self,
         use_tools: Option<&[String]>,
@@ -1162,41 +1172,36 @@ impl Config {
         };
 
         let selectors_str = use_tools.join(",");
+        // Toolset names expand to their contents; every other selector stays
+        // verbatim, known or not.
         let expanded_selectors = self.expanded_tool_selectors(&selectors_str);
-
-        // Wildcard "*" → all tools (use tool_declarations_for_use_tools unchanged)
-        if expanded_selectors.iter().any(|s| s.trim() == "*") {
-            let (declarations, _) =
-                self.tool_declarations_for_use_tools(Some(&selectors_str), active_pkg);
-            return declarations
-                .into_iter()
-                .map(|declaration| declaration.name)
-                .collect();
-        }
-
-        // Explicit selectors → filter declarations to matched names only
-        let selected_names: HashSet<&str> = expanded_selectors
-            .iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s as &str)
-            .collect();
 
         let (declarations, _) =
             self.tool_declarations_for_use_tools(Some(&selectors_str), active_pkg);
 
-        // Return only tools whose names are in the selected set (plus runtime-injected tools)
-        declarations
-            .into_iter()
-            .filter(|declaration| {
-                // Accept if explicitly selected by name
-                selected_names.contains(declaration.name.as_str()) ||
-                // Accept runtime-injected tools (external tools not in original builtin list)
-                declaration.mcp_server_name.is_some() ||
-                declaration.mcp_tool_name.is_some()
-            })
-            .map(|declaration| declaration.name)
-            .collect()
+        let mut seen = HashSet::new();
+        let mut expanded = Vec::new();
+        for selector in &expanded_selectors {
+            let selector = selector.trim();
+            if selector.is_empty() || !seen.insert(selector) {
+                continue;
+            }
+            expanded.push(selector.to_string());
+            // Glob selectors also list the declarations known in this process;
+            // the worker may resolve them against tool-server tools that are
+            // not discoverable here.
+            if is_glob(selector) {
+                let compiled = tool_name_selector(selector);
+                for declaration in &declarations {
+                    if compiled.is_match(&declaration.name)
+                        && seen.insert(declaration.name.as_str())
+                    {
+                        expanded.push(declaration.name.clone());
+                    }
+                }
+            }
+        }
+        expanded
     }
 
     pub fn tool_declarations_for_use_tools(

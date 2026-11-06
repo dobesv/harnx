@@ -33,6 +33,14 @@ pub fn parse_operator_tool_command(cmd: &str, args: Option<&str>) -> Result<Oper
                 name: rest.trim_end().into(),
             })
         }
+        // `.info tools` is an alias of `.list tools` kept for muscle memory:
+        // both spellings route to the worker, which owns the session's real
+        // tool list — the frontend only sees builtins and handoff
+        // declarations (#2628). It takes no arguments; a pattern belongs in
+        // `.list tools [pattern]`.
+        (".info", "tools") if rest.trim().is_empty() => {
+            Ok(OperatorToolCommand::List { pattern: None })
+        }
         (".list", "tools") if rest.split_whitespace().count() <= 1 => {
             Ok(OperatorToolCommand::List {
                 pattern: (!rest.is_empty()).then(|| rest.trim_end().into()),
@@ -51,7 +59,7 @@ pub fn parse_operator_tool_command(cmd: &str, args: Option<&str>) -> Result<Oper
             })
         }
         _ => {
-            bail!("Usage: .info tool <name>; .list tools [pattern]; .call tool <name> <args-json>")
+            bail!("Usage: .info tool <name>; .info tools; .list tools [pattern]; .call tool <name> <args-json>")
         }
     }
 }
@@ -72,7 +80,7 @@ pub fn is_operator_tool_command(line: &str) -> bool {
     let subject = args.split_whitespace().next();
     matches!(
         (cmd, subject),
-        (".info", Some("tool")) | (".list", _) | (".call", _)
+        (".info", Some("tool")) | (".info", Some("tools")) | (".list", _) | (".call", _)
     )
 }
 

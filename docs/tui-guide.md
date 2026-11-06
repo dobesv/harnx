@@ -222,10 +222,9 @@ for automatic title generation (`title_agent`, `title_update_threshold`).
 
 The `.info agent`, `.info session`, and `.dump session` commands display detailed information in a fullscreen scrollable overlay. Press `Esc` to close, and use arrow keys or `PgUp`/`PgDn` to scroll.
 
-- **`.info agent [<name>]`**: Shows the fully-rendered agent configuration (patches applied, prompt interpolated, and tools expanded).
+- **`.info agent [<name>]`**: Shows the fully-rendered agent configuration (patches applied, prompt interpolated, and tools expanded). Tool selectors are shown verbatim — toolsets expand, and glob selectors (including `*`) stay in the list alongside the tool names they match locally, because tool-server tools are only enumerated by workers at runtime.
   - If `<name>` is omitted, it defaults to the active agent.
   - **Note:** This replaces the old raw source view. To view the raw agent file, use `cat ~/.config/harnx/agents/<name>.md`.
-  - During expansion, if an MCP server fails, a warning is logged to stderr and the process continues with remaining tools.
 - **`.info session <agent> <id> [--format text|yaml|json]`**: Shows session metadata in an overlay (model, token usage, variables, etc.).
   - Both arguments are required, even when a session is active. Use `agent@cluster` for a remote agent.
   - Does **not** include the transcript or system prompt, and does **not** launch MCP servers.
@@ -235,21 +234,23 @@ The `.info agent`, `.info session`, and `.dump session` commands display detaile
   - Defaults to `text` (human-readable formatting). Supports `--format yaml` and `--format json` (JSONL).
   - For compacted sessions, text output shows marker → kept messages → later activity. Archived
     history is not shown inline.
-- **`.info`**, **`.info rag`**, **`.info tools`**: These commands continue to append information directly to the chat transcript.
+- **`.info`**, **`.info rag`**: These commands continue to append information directly to the chat transcript.
 - **`.info tool <name>`**: Formats the metadata and parameter schema for an allowed tool and appends it to the chat transcript.
 
-### `.call` / `.info tool` / `.list tools` - inspect and call tools
+### `.call` / `.info tool` / `.info tools` / `.list tools` - inspect and call tools
 
 Inspect available tools and execute tools directly without triggering an LLM inference turn:
 
 ```text
 .info tool <name>              Inspect metadata and schema for an allowed tool
+.info tools                    List allowed tools in the active session (alias of `.list tools`)
 .list tools [pattern]          List allowed tools in the active session
 .call tool <name> <args-json>  Invoke an allowed tool directly with JSON arguments
 ```
 
 - **Active session scoping**: These commands operate against the active session's allowed tools (reflecting the active agent's allowlist, package, and toolsets), rather than a global wildcard inventory. If no session is active, or if a tool is not permitted in the current session, the command reports an error.
 - **`.info tool <name>`**: Formats the tool description, runtime metadata, and input parameter schema as readable text and appends it to the chat transcript.
+- **`.info tools`**: Alias of `.list tools`. Lists the allowed tools of the active session — including tool-server tools such as bash/fs tools, which only the worker can see. Without an active session the command reports an error.
 - **`.list tools [pattern]`**: Lists allowed tools matching the optional glob pattern (e.g. `.list tools fs_*` or `.list tools`). Appends the formatted list to the chat transcript.
 - **`.call tool <name> <args-json>`**: Invokes the tool with `<args-json>`. Unlike CLI execution, `<args-json>` inside the TUI is parsed as the raw remainder following the tool name, preserving interior spaces, quotes, and newlines without shell escaping.
 - **Background execution and cancellation**: Tool commands execute as asynchronous background tasks. The input composer remains responsive during execution, and pressing `Ctrl+C` cancels the in-flight tool call cleanly without modifying the durable session transcript.

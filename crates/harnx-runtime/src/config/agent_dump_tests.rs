@@ -153,10 +153,51 @@ Hello {{project_name}} from {{agent.name}}.
         !rendered.contains("{{project_name}}"),
         "raw template var should be gone"
     );
+    // The wildcard must stay: tool-server declarations are not available
+    // offline, so dropping `*` would claim the concrete list is complete
+    // (#2628). Locally known matches follow it.
     assert!(
-        !rendered.contains("\"*\""),
-        "wildcard tool marker should be expanded away"
+        rendered.contains("- '*'"),
+        "wildcard selector should stay: {rendered}"
     );
+}
+
+/// Regression test for #2628: `harnx info agent` must list tool-server tools
+/// (bash_exec, fs_*, …) in `use_tools` even though this process has no
+/// declarations for them — they only exist on workers behind NATS.
+#[test]
+fn render_agent_dump_lists_tool_server_tools_without_local_declarations() {
+    // No locally known tool declarations, like the offline frontend config.
+    let rendered = render_test_agent_dump_fixture(
+        "server-tools-agent",
+        r#"---
+model: openai:gpt-4o
+use_tools:
+  - bash_exec
+  - fs_read
+  - plans_get_note
+  - harnx_agent_session_history_read
+---
+Server-tools agent body.
+"#,
+        &[],
+    );
+
+    assert!(
+        rendered.contains("use_tools:"),
+        "front-matter missing: {rendered}"
+    );
+    for tool in [
+        "bash_exec",
+        "fs_read",
+        "plans_get_note",
+        "harnx_agent_session_history_read",
+    ] {
+        assert!(
+            rendered.contains(&format!("- {tool}")),
+            "tool {tool} should be listed in use_tools: {rendered}"
+        );
+    }
 }
 
 #[test]

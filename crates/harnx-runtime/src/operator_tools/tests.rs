@@ -174,6 +174,15 @@ fn parser_preserves_raw_json_remainder_and_action_subject_grammar() {
             name: "visible".into()
         }
     );
+    // `.info tools` routes to the same worker listing as `.list tools`
+    // (#2628): the session's real tools only exist on the worker.
+    assert_eq!(
+        parse_operator_line(".info tools").unwrap(),
+        OperatorToolCommand::List { pattern: None }
+    );
+    assert!(is_operator_tool_command(".info tools"));
+    assert!(is_operator_tool_command(".list tools"));
+    assert!(!is_operator_tool_command(".info toolsy"));
     for line in [
         ".info tools visible",
         ".list tool",
@@ -468,6 +477,7 @@ async fn handlers_reject_missing_session_and_invalid_json_before_discovery() {
     ));
     for line in [
         ".info tool visible",
+        ".info tools",
         ".list tools",
         r#".call tool visible {"text":"a b"}"#,
     ] {

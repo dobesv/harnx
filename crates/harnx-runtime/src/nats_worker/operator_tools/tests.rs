@@ -393,6 +393,21 @@ impl LiveOperatorFixture {
             session.storage_key()
         );
         assert_eq!(result["structuredContent"]["agent"], "metis");
+        // `.info tools` is the alias of `.list tools`: with an active session
+        // it must return the worker's real tool list (#2628).
+        let mut list_output = Vec::new();
+        crate::commands::run_command_with_output(
+            &local,
+            crate::utils::create_abort_signal(),
+            ".info tools",
+            &mut list_output,
+        )
+        .await?;
+        let listing = String::from_utf8(list_output)?;
+        assert!(
+            listing.contains("fixture_echo"),
+            "`.info tools` must list the session's actual tools, got: {listing}"
+        );
         Ok(())
     }
 

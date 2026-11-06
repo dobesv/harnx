@@ -35,7 +35,10 @@ pub static COMMANDS: LazyLock<[Command; 52]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
-        Command::new(".info tools", "List all available tools and their status"),
+        Command::new(
+            ".info tools",
+            "List allowed tools in the active session (same as `.list tools`)",
+        ),
         Command::with_usage(".info tool", "<name>", "Inspect an allowed tool in the active session"),
         Command::with_usage(".list tools", "[pattern]", "List allowed tools in the active session"),
         Command::with_usage(".call tool", "<name> <args-json>", "Invoke an allowed tool without an inference turn"),
@@ -348,38 +351,11 @@ pub fn run_command_with_output_and_local_worker<'a>(
                     let info = config.read().agent_info()?;
                     write!(output, "{info}")?;
                 }
-                Some("tools") => {
-                    let conf = config.read();
-                    // Spell handoff tool names relative to the active agent's
-                    // package so they match the active-tool whitelist below and
-                    // what the agent actually sees (#709).
-                    let active_pkg = conf.active_package();
-                    let (declarations, _) =
-                        conf.tool_declarations_for_use_tools(Some("*"), active_pkg.as_deref());
-                    let active_tools = conf.active_tool_names();
-                    if declarations.is_empty() {
-                        writeln!(output, "No tools available")?;
-                    } else {
-                        for decl in &declarations {
-                            let marker = if active_tools.contains(&decl.name) {
-                                "●"
-                            } else {
-                                "○"
-                            };
-                            writeln!(output, "  {} {} - {}", marker, decl.name, decl.description)?;
-                        }
-                        let active_count = declarations
-                            .iter()
-                            .filter(|d| active_tools.contains(&d.name))
-                            .count();
-                        writeln!(
-                            output,
-                            "\n{} active / {} total",
-                            active_count,
-                            declarations.len()
-                        )?;
-                    }
-                }
+                // `.info tools` is intercepted as an operator tool command
+                // before this dispatch (see `is_operator_tool_command`) and
+                // routes to the worker, which holds the session's real tool
+                // list. Tool-server tools are not discoverable in this
+                // process (#2628).
                 Some("theme") => {
                     let config = config.read();
                     let mode = if config.light_theme() { "light" } else { "dark" };
