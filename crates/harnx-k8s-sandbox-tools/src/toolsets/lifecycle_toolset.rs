@@ -91,6 +91,16 @@ impl LifecycleToolset {
         if let Some(id) = args.sandbox_id.as_ref().filter(|id| !id.trim().is_empty()) {
             return Ok(id.clone());
         }
+        // Omitted or blank ID: reuse the sandbox already bound to the invoking
+        // session so repeated connects converge on one sandbox (#2633), and
+        // only claim a new one when no usable binding exists.
+        if let Some(id) = self
+            .gateway
+            .ambient_binding(context.invoking_session_id.as_deref())
+            .await?
+        {
+            return Ok(id);
+        }
         self.gateway
             .manager
             .create(&context.call_id, args.description.as_deref(), cancel)
@@ -252,11 +262,11 @@ pub(super) fn lifecycle_specs() -> Vec<ToolSpec> {
         ToolSpec {
             cancellation_guarantee: Default::default(),
             name: "connect".to_string(),
-            description: "Connect this Harnx session to an existing Kubernetes sandbox or create and start a new sandbox.".to_string(),
+            description: "Connect this Harnx session to an existing Kubernetes sandbox, the session's bound sandbox, or a newly created one.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "sandbox_id": {"type": "string", "description": "Existing sandbox ID; omit to create one."},
+                    "sandbox_id": {"type": "string", "description": "Existing sandbox ID; omit to reuse the session's bound sandbox, creating one if none is bound."},
                     "description": {"type": "string"},
                     "repos": {"type": "array", "items": {"type": "object", "properties": {
                         "repo_url": {"type": "string"}, "branch": {"type": "string"}, "path": {"type": "string"}

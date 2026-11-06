@@ -197,9 +197,14 @@ Serving routes through NATS:
 
 ## Lifecycle behavior
 
-`sandbox_connect` without an ID creates a `SandboxClaim` from the configured
-warm pool. The claim name is derived from the Harnx tool-call ID, making a
-redelivered creation request converge on the same claim. Optional `repos` are
+`sandbox_connect` resolves the sandbox in order: an explicit non-empty
+`sandbox_id` argument wins; otherwise it reuses the sandbox bound to the
+invoking session, creating a `SandboxClaim` from the configured warm pool only
+when no usable binding exists. A stored binding with an unknown version or blank
+ID is treated as unusable and replaced by the next connect. Malformed binding
+metadata still errors rather than silently creating a duplicate. The claim name is
+derived from the Harnx tool-call ID, so a redelivered creation request converges
+on the same claim. Optional `repos` are
 cloned through the bash server's `exec` tool after the sandbox is ready; each
 result reports its path, checked-out branch, or an error. Clone destinations must be below
 `/workspace`, and authentication/network-shaped failures are retried up to

@@ -1,5 +1,26 @@
 use super::*;
 
+fn connect_invocation(call_id: &str, session_id: &str, args: Value) -> ToolInvocation {
+    ToolInvocation {
+        tool: "connect".to_string(),
+        args,
+        context: ToolInvocationContext {
+            run_context: None,
+            call_id: call_id.to_string(),
+            invoking_session_id: Some(harnx_core::session_identity::session_key(
+                Some("coder"),
+                session_id,
+            )),
+            invoking_session: None,
+            capabilities: BTreeSet::new(),
+            checkpoint: None,
+            checkpoint_store: None,
+            partial_result_store: None,
+            progress: Default::default(),
+        },
+        cancel: CancellationToken::new(),
+    }
+}
 #[tokio::test(flavor = "multi_thread")]
 async fn release_uses_and_clears_the_ambient_binding() -> Result<()> {
     let Some(fixture) = ToolsetFixture::start("session-1", Some("claim-ambient")).await? else {
@@ -223,5 +244,157 @@ async fn ambiguous_post_dispatch_failure_is_not_replayed() -> Result<()> {
 
     assert!(matches!(error, ToolInvokeError::Recoverable(_)));
     assert_eq!(fixture.caller.calls.lock().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_without_id_reuses_the_ambient_binding() -> Result<()> {
+    let Some(fixture) = ToolsetFixture::start("session-reuse", Some("claim-ambient")).await? else {
+        return Ok(());
+    };
+
+    let result = fixture
+        .sandbox
+        .invoke_with_context(connect_invocation("call-reuse", "session-reuse", json!({})))
+        .await
+        .unwrap();
+
+    assert_eq!(result["sandbox_id"], "claim-ambient");
+    assert!(fixture
+        .api
+        .seen_ids
+        .lock()
+        .contains(&"claim-ambient".to_string()));
+    let binding = bound_sandbox(&fixture.metadata, "session-reuse").await?;
+    assert_eq!(binding.sandbox_id, "claim-ambient");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_with_id_resolves_and_updates_the_ambient_binding() -> Result<()> {
+    for (session_id, requested_id, expected_id) in [
+        ("session-blank", "   ", "claim-ambient"),
+        ("session-override", "claim-other", "claim-other"),
+    ] {
+        let Some(fixture) = ToolsetFixture::start(session_id, Some("claim-ambient")).await? else {
+            return Ok(());
+        };
+
+        let result = fixture
+            .sandbox
+            .invoke_with_context(connect_invocation(
+                "call-connect",
+                session_id,
+                json!({"sandbox_id": requested_id}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(result["sandbox_id"], expected_id);
+        let binding = bound_sandbox(&fixture.metadata, session_id).await?;
+        assert_eq!(binding.sandbox_id, expected_id);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_without_id_and_no_binding_creates_a_claim() -> Result<()> {
+    let Some(fixture) = ToolsetFixture::start("session-create", None).await? else {
+        return Ok(());
+    };
+
+    let result = fixture
+        .sandbox
+        .invoke_with_context(connect_invocation(
+            "call-create",
+            "session-create",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+
+    let sandbox_id = result["sandbox_id"].as_str().unwrap();
+    assert!(
+        sandbox_id.starts_with("sandbox-"),
+        "expected a fresh claim name, got {sandbox_id}"
+    );
+    let binding = bound_sandbox(&fixture.metadata, "session-create").await?;
+    assert_eq!(binding.version, 1);
+    assert_eq!(binding.sandbox_id, sandbox_id);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_without_id_replaces_an_unusable_binding() -> Result<()> {
+    let Some(fixture) = ToolsetFixture::start("session-stale", None).await? else {
+        return Ok(());
+    };
+    for unusable in [
+        json!({"version": 2, "sandbox_id": "claim-stale"}),
+        json!({"version": 1, "sandbox_id": "  "}),
+    ] {
+        fixture
+            .metadata
+            .replace_tool_context_value(
+                ToolContextEntry {
+                    session_id: &harnx_core::session_identity::session_key(
+                        Some("coder"),
+                        "session-stale",
+                    ),
+                    key: SANDBOX_CONTEXT_KEY,
+                },
+                unusable,
+            )
+            .await?;
+
+        let result = fixture
+            .sandbox
+            .invoke_with_context(connect_invocation("call-stale", "session-stale", json!({})))
+            .await
+            .unwrap();
+
+        let sandbox_id = result["sandbox_id"].as_str().unwrap();
+        assert_ne!(sandbox_id, "claim-stale");
+        assert!(
+            sandbox_id.starts_with("sandbox-"),
+            "expected a fresh claim name, got {sandbox_id}"
+        );
+        let binding = bound_sandbox(&fixture.metadata, "session-stale").await?;
+        assert_eq!(binding.version, 1);
+        assert_eq!(binding.sandbox_id, sandbox_id);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_without_id_fails_loudly_on_a_malformed_binding() -> Result<()> {
+    let Some(fixture) = ToolsetFixture::start("session-corrupt", None).await? else {
+        return Ok(());
+    };
+    fixture
+        .metadata
+        .replace_tool_context_value(
+            ToolContextEntry {
+                session_id: &harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-corrupt",
+                ),
+                key: SANDBOX_CONTEXT_KEY,
+            },
+            json!({"version": 1, "sandbox_id": 42}),
+        )
+        .await?;
+
+    let error = fixture
+        .sandbox
+        .invoke_with_context(connect_invocation(
+            "call-corrupt",
+            "session-corrupt",
+            json!({}),
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ToolInvokeError::Recoverable(_)));
     Ok(())
 }
