@@ -1,6 +1,24 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
 use super::*;
 
+struct WaitOutput {
+    streams_block: String,
+    total_lines: usize,
+    total_bytes: usize,
+}
+
+fn compile_wait_grep(options: &WaitOptions) -> Result<Option<Regex>, ErrorData> {
+    options
+        .grep
+        .as_deref()
+        .map(|pattern| {
+            Regex::new(pattern).map_err(|err| {
+                ErrorData::invalid_params(format!("invalid grep pattern: {err}"), None)
+            })
+        })
+        .transpose()
+}
+
 impl BashServer {
     // -----------------------------------------------------------------------
     // spawn
@@ -10,6 +28,15 @@ impl BashServer {
         &self,
         params: SpawnCommandParams,
     ) -> Result<CallToolResult, ErrorData> {
+        // Validate the nested wait's grep before prepare_exec so an invalid
+        // pattern fails the call with zero side effects: no logs, snapshots,
+        // or spawned process to clean up.
+        let grep_regex = params
+            .wait
+            .as_ref()
+            .map(compile_wait_grep)
+            .transpose()?
+            .flatten();
         let prepared = self
             .prepare_exec(
                 &params.command,
@@ -30,29 +57,18 @@ impl BashServer {
         let stderr_log_path = exec_dir.join("stderr.log");
         let execution_id = exec_dir.file_name().unwrap().to_string_lossy().into_owned();
 
-        let stdout_file = create_log_file(&stdout_log_path, "stdout")?;
-        let stderr_file = create_log_file(&stderr_log_path, "stderr")?;
-
-        let mut command = self
-            .build_command(
+        let child = self
+            .spawn_background_child(
                 CommandBuildCtx {
                     command: &params.command,
                     working_dir: &working_dir,
                     exec_dir: &exec_dir,
                     env: params.env.as_ref(),
                 },
-                Stdio::from(stdout_file),
-                Stdio::from(stderr_file),
+                &stdout_log_path,
+                &stderr_log_path,
             )
             .await?;
-        #[cfg(unix)]
-        command.wrap(ProcessGroup::leader());
-        #[cfg(windows)]
-        command.wrap(JobObject);
-
-        let child = command
-            .spawn()
-            .map_err(|err| internal_error(format!("failed to spawn command: {err}")))?;
 
         let entry = SpawnedProcess {
             child,
@@ -68,6 +84,14 @@ impl BashServer {
         self.store_spawned_process(execution_id.clone(), entry)
             .await;
 
+        if let Some(options) = params.wait {
+            let wait_params = WaitParams {
+                execution_id,
+                options,
+            };
+            return self.wait_for_process(wait_params, grep_regex).await;
+        }
+
         Ok(Self::build_spawn_result(SpawnResultCtx {
             execution_id: &execution_id,
             command: &params.command,
@@ -77,28 +101,50 @@ impl BashServer {
         }))
     }
 
+    async fn spawn_background_child(
+        &self,
+        ctx: CommandBuildCtx<'_>,
+        stdout_log_path: &Path,
+        stderr_log_path: &Path,
+    ) -> Result<Box<dyn ChildWrapper>, ErrorData> {
+        let stdout_file = create_log_file(stdout_log_path, "stdout")?;
+        let stderr_file = create_log_file(stderr_log_path, "stderr")?;
+
+        let mut command = self
+            .build_command(ctx, Stdio::from(stdout_file), Stdio::from(stderr_file))
+            .await?;
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        command.wrap(JobObject);
+
+        command
+            .spawn()
+            .map_err(|err| internal_error(format!("failed to spawn command: {err}")))
+    }
+
     // -----------------------------------------------------------------------
     // wait
     // -----------------------------------------------------------------------
 
     pub(crate) async fn wait_impl(&self, params: WaitParams) -> Result<CallToolResult, ErrorData> {
-        let timeout_secs = params.timeout_secs.unwrap_or(120);
-        let truncate_opts = Self::truncate_opts_from(
-            params.head_lines,
-            params.tail_lines,
-            params.max_output_bytes,
-        );
+        let grep_regex = compile_wait_grep(&params.options)?;
+        self.wait_for_process(params, grep_regex).await
+    }
 
-        let SpawnedProcess {
-            mut child,
-            command,
-            working_dir,
-            stdout_log_path,
-            stderr_log_path,
-            before_snap_ids,
-            snapshot_decision,
-            started_at,
-        } = {
+    async fn wait_for_process(
+        &self,
+        params: WaitParams,
+        grep_regex: Option<Regex>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let timeout_secs = params.options.effective_timeout_secs();
+        // The entry is removed up front so wait/terminate stay serialized per
+        // execution_id; every non-exit path below must re-store it or the
+        // process becomes untracked. A caller cancellation dropped mid-await
+        // loses the handle entirely — for spawn's initial wait the
+        // execution_id was never returned, so the running command is
+        // unreachable (known limitation, docs/bash-mcp-server.md).
+        let mut entry = {
             let mut map = self.inner.spawned.lock().await;
             map.remove(&params.execution_id).ok_or_else(|| {
                 ErrorData::invalid_params(
@@ -112,96 +158,86 @@ impl BashServer {
         };
 
         let timeout = Duration::from_secs(timeout_secs);
-        let wait_result = tokio::time::timeout(timeout, child.wait()).await;
-
-        // Read both log files
-        let stdout_content = tokio::fs::read_to_string(&stdout_log_path)
-            .await
-            .unwrap_or_default();
-        let stderr_content = tokio::fs::read_to_string(&stderr_log_path)
-            .await
-            .unwrap_or_default();
-
-        let grep_regex = match params.grep.as_deref() {
-            Some(pattern) => Some(Regex::new(pattern).map_err(|err| {
-                ErrorData::invalid_params(format!("invalid grep pattern: {err}"), None)
-            })?),
-            None => None,
+        let status = match tokio::time::timeout(timeout, entry.child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(err)) => {
+                // A failed wait does not prove the process exited. Keep its handle manageable.
+                self.store_spawned_process(params.execution_id.clone(), entry)
+                    .await;
+                return Err(internal_error(format!(
+                    "failed waiting for execution_id '{}': {err}",
+                    params.execution_id
+                )));
+            }
+            Err(_) => None,
         };
+
+        let output = Self::read_wait_output(
+            &params.execution_id,
+            &entry,
+            &params.options,
+            grep_regex.as_ref(),
+        )
+        .await;
+
+        if let Some(status) = status {
+            return self
+                .build_wait_exit_result(ExitResultCtx {
+                    execution_id: &params.execution_id,
+                    command: &entry.command,
+                    working_dir: &entry.working_dir,
+                    stdout_log_path: &entry.stdout_log_path,
+                    stderr_log_path: &entry.stderr_log_path,
+                    total_lines: output.total_lines,
+                    total_bytes: output.total_bytes,
+                    exit_code: status.code().unwrap_or(-1),
+                    streams_block: output.streams_block,
+                    before_snaps: &entry.before_snap_ids,
+                    snapshot_decision: &entry.snapshot_decision,
+                })
+                .await;
+        }
+
+        let result =
+            Self::build_wait_running_result(&params.execution_id, &entry, timeout_secs, output);
+        self.store_spawned_process(params.execution_id, entry).await;
+        Ok(result)
+    }
+
+    // Single output-reading path shared by the exit and running results:
+    // both outcomes must apply identical grep/filter/truncation semantics
+    // (enforced by the running_and_completed_wait_share_* tests).
+    async fn read_wait_output(
+        execution_id: &str,
+        entry: &SpawnedProcess,
+        options: &WaitOptions,
+        grep_regex: Option<&Regex>,
+    ) -> WaitOutput {
+        let truncate_opts = Self::truncate_opts_from(
+            options.head_lines,
+            options.tail_lines,
+            options.max_output_bytes,
+        );
+        let stdout_content = tokio::fs::read_to_string(&entry.stdout_log_path)
+            .await
+            .unwrap_or_default();
+        let stderr_content = tokio::fs::read_to_string(&entry.stderr_log_path)
+            .await
+            .unwrap_or_default();
         let (streams_block, stdout_lines, stderr_lines, stdout_bytes_len, stderr_bytes_len) =
             render_streams_block(
                 &stdout_content,
                 &stderr_content,
                 &truncate_opts,
-                grep_regex.as_ref(),
-                &params.execution_id,
-                &stdout_log_path,
-                &stderr_log_path,
+                grep_regex,
+                execution_id,
+                &entry.stdout_log_path,
+                &entry.stderr_log_path,
             );
-        let total_lines = stdout_lines + stderr_lines;
-        let total_bytes = stdout_bytes_len + stderr_bytes_len;
-
-        match wait_result {
-            Ok(Ok(status)) => {
-                self.build_wait_exit_result(ExitResultCtx {
-                    execution_id: &params.execution_id,
-                    command: &command,
-                    working_dir: &working_dir,
-                    stdout_log_path: &stdout_log_path,
-                    stderr_log_path: &stderr_log_path,
-                    total_lines,
-                    total_bytes,
-                    exit_code: status.code().unwrap_or(-1),
-                    streams_block,
-                    before_snaps: &before_snap_ids,
-                    snapshot_decision: &snapshot_decision,
-                })
-                .await
-            }
-            Ok(Err(err)) => Err(internal_error(format!(
-                "failed waiting for execution_id '{}': {err}",
-                params.execution_id
-            ))),
-            Err(_) => {
-                let mut map = self.inner.spawned.lock().await;
-                map.insert(
-                    params.execution_id.clone(),
-                    SpawnedProcess {
-                        child,
-                        command: command.clone(),
-                        working_dir: working_dir.clone(),
-                        stdout_log_path: stdout_log_path.clone(),
-                        stderr_log_path: stderr_log_path.clone(),
-                        before_snap_ids,
-                        snapshot_decision,
-                        started_at,
-                    },
-                );
-
-                let running_for = format_elapsed(started_at.elapsed());
-                let mut output = String::new();
-                render_metadata_header(
-                    &mut output,
-                    MetadataHeader {
-                        execution_id: Some(&params.execution_id),
-                        status: Some("running"),
-                        exit_code: None,
-                        command: Some(&command),
-                        working_dir: Some(&working_dir),
-                        stdout_log_path: Some(&stdout_log_path),
-                        stderr_log_path: Some(&stderr_log_path),
-                        total_lines: Some(total_lines),
-                        total_bytes: Some(total_bytes),
-                        running_for: Some(running_for.clone()),
-                    },
-                );
-                let _ = write!(output, "\n{streams_block}");
-                let summary = format!(
-                    "execution_id '{}' still running after {}s ({running_for} total)",
-                    params.execution_id, timeout_secs
-                );
-                Ok(Self::build_success_result(output, summary, vec![]))
-            }
+        WaitOutput {
+            streams_block,
+            total_lines: stdout_lines + stderr_lines,
+            total_bytes: stdout_bytes_len + stderr_bytes_len,
         }
     }
 
@@ -339,6 +375,36 @@ impl BashServer {
         );
         let _ = write!(output, "\n\nsignal: {}", signal);
         let summary = format!("sent {} to {}", signal, execution_id);
+        Self::build_success_result(output, summary, vec![])
+    }
+
+    fn build_wait_running_result(
+        execution_id: &str,
+        entry: &SpawnedProcess,
+        timeout_secs: u64,
+        wait_output: WaitOutput,
+    ) -> CallToolResult {
+        let running_for = format_elapsed(entry.started_at.elapsed());
+        let mut output = String::new();
+        render_metadata_header(
+            &mut output,
+            MetadataHeader {
+                execution_id: Some(execution_id),
+                status: Some("running"),
+                exit_code: None,
+                command: Some(&entry.command),
+                working_dir: Some(&entry.working_dir),
+                stdout_log_path: Some(&entry.stdout_log_path),
+                stderr_log_path: Some(&entry.stderr_log_path),
+                total_lines: Some(wait_output.total_lines),
+                total_bytes: Some(wait_output.total_bytes),
+                running_for: Some(running_for.clone()),
+            },
+        );
+        let _ = write!(output, "\n{}", wait_output.streams_block);
+        let summary = format!(
+            "execution_id '{execution_id}' still running after {timeout_secs}s ({running_for} total)"
+        );
         Self::build_success_result(output, summary, vec![])
     }
 

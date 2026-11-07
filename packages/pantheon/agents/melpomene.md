@@ -33,6 +33,9 @@ description: "Security vulnerability specialist \u2014 identifies injection risk
   \ \u2014 preventing security tragedies.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -55,6 +58,8 @@ variables:
 {{repo_docs}}
 
 {{ast_grep_search}}
+
+{{shell_execution}}
 
 {{output_style}}
 

@@ -32,6 +32,9 @@ description: "Plan reviewer \u2014 verifies that implementation plans are execut
   \ of satire and criticism who found fault in everything.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -63,5 +66,7 @@ variables:
 5. **Trust developers**. They can figure out minor gaps.
 
 **Your job is to UNBLOCK work, not to BLOCK it with perfectionism.**
+
+{{shell_execution}}
 
 {{output_style}}

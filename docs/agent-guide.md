@@ -258,6 +258,25 @@ use_tools:
 
 When tools are enabled, their declarations are injected into the system prompt as a numbered list appended after the prompt body.
 
+### Shell Execution Tools
+
+Agents configured with shell execution tools can run system commands and scripts. When an agent has the full shell execution trio (`bash_spawn`, `bash_wait`, `bash_terminate`), it should prefer `bash_spawn` with nested `wait` (e.g. `wait: { timeout_secs: 30 }`) over `bash_exec` for builds, tests, linters, and general CLI operations:
+
+```json
+{
+  "command": "cargo test --workspace",
+  "wait": {
+    "timeout_secs": 30,
+    "tail_lines": 50
+  }
+}
+```
+
+- **Wait expiry preserves the process**: If a command exceeds the wait duration, `bash_spawn` returns partial output and running status. Wait expiry does not stop or terminate the process. The agent can use `bash_wait` to continue waiting or `bash_terminate` to stop the process.
+- **LLM prompt cache reuse**: Bounded waits under 5 minutes are recommended because common LLM providers cache prompt context for 5 minutes. Returning control within this window allows the next turn to benefit from prompt cache reuse. Explicit longer waits remain supported.
+- **Quick commands with `bash_exec`**: `bash_exec` remains available for quick synchronous checks (such as `git status`, `date`, or ast-grep searches) where background process lifecycle tracking is unnecessary.
+- **Scoped tool availability**: Agents without the full trio use only their granted tools (such as standalone `bash_exec` or specialized tools). Do not treat background management tools as universal requirements for all agents. Process termination is handled exclusively through `bash_terminate`.
+
 ### Script Mode Tools (`bash_tools`)
 
 The `bash_tools` field enables script mode. Instead of invoking individual MCP tools across separate round trips, an agent can run multi-step scripts that chain tools and filter output locally.
@@ -824,6 +843,9 @@ model: claude:claude-3-5-sonnet
 use_tools:
   - fs_*
   - bash_exec
+  - bash_spawn
+  - bash_wait
+  - bash_terminate
 description: Coding assistant with file and shell access
 ---
 You are an expert software engineer. You can read and write files,

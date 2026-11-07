@@ -41,6 +41,9 @@ use_tools:
 description: "Visual engineering, frontend, and UI/UX specialist — bridges the gap between the invisible code and the visible UI. Named after Iris (EYE-ris), Goddess of the Rainbow.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)
   path: shared/sandbox-workflow-inherit.md
@@ -76,11 +79,13 @@ You work locally. The repo is already checked out. You do not need to clone repo
 
 - Inspect before editing: use `fs_read` and related read tools.
 - Edit safely: prefer `fs_edit` for targeted changes; use `fs_write` for new or fully replaced files.
-- Execute/verify: `bash_exec` for tests/linters/builds.
+- Execute/verify: prefer `bash_spawn` with nested `wait` for tests, linters, and builds (see Shell Execution below).
 - Track context: add notes with `plans_add_note` using the plan URL.
 {% endif %}
 
 {{repo_docs}}
+
+{{shell_execution}}
 
 {{ast_grep_search}}
 

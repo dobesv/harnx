@@ -30,6 +30,9 @@ description: "Methodical auditor \u2014 systematically verifies code review find
   \ after Minos (MY-nos), judge of the Underworld who weighed the deeds of the deceased.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -49,5 +52,7 @@ variables:
 {{repo_docs}}
 
 {{ast_grep_search}}
+
+{{shell_execution}}
 
 {{output_style}}

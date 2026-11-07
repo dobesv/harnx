@@ -7,7 +7,12 @@
 //! a temp config dir and drives `resolve_variables` — the production path — for
 //! each agent.
 
-use std::{ffi::OsStr, fs, path::Path, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use harnx_core::tool::ToolDeclaration;
 use harnx_runtime::client::{retrieve_model, ModelType};
@@ -308,6 +313,177 @@ fn agent_prompt_rendering_renders_all_shipped_agents() {
     assert!(
         file_backed_variables > 0,
         "no shipped agent exercised a file-backed variable"
+    );
+}
+
+const ELIGIBLE_SHELL_AGENTS: [&str; 33] = [
+    "coding/coder",
+    "pantheon/aeacus",
+    "pantheon/apollo",
+    "pantheon/argus",
+    "pantheon/aristarchus",
+    "pantheon/athena",
+    "pantheon/atlas",
+    "pantheon/calliope",
+    "pantheon/clio",
+    "pantheon/erato",
+    "pantheon/euterpe",
+    "pantheon/hephaestus",
+    "pantheon/hermes",
+    "pantheon/hestia",
+    "pantheon/iris",
+    "pantheon/melpomene",
+    "pantheon/metis",
+    "pantheon/minos",
+    "pantheon/mnemosyne",
+    "pantheon/momus",
+    "pantheon/nemesis",
+    "pantheon/opis",
+    "pantheon/peitho",
+    "pantheon/plato",
+    "pantheon/polyhymnia",
+    "pantheon/pytheas",
+    "pantheon/rhadamanthus",
+    "pantheon/sisyphus",
+    "pantheon/terpsichore",
+    "pantheon/thalia",
+    "pantheon/tyche",
+    "pantheon/urania",
+    "pantheon/zosimus",
+];
+
+const INELIGIBLE_SHELL_AGENTS: [&str; 12] = [
+    "coding/compact-coder",
+    "pantheon/compact-argus",
+    "pantheon/compact-deploy",
+    "pantheon/compact-dev",
+    "pantheon/compact-mnemosyne",
+    "pantheon/compact-planner",
+    "pantheon/compact-reliability",
+    "pantheon/compact-researcher",
+    "pantheon/compact-reviewer",
+    "pantheon/daedalus",
+    "pantheon/librarian",
+    "pantheon/oracle",
+];
+
+const SHELL_EXECUTION_TOOLS: [&str; 3] = ["bash_spawn", "bash_wait", "bash_terminate"];
+
+fn assert_eligible_shell_prompt(qualified_name: &str, prompt: &str) {
+    assert!(
+        prompt.contains("bash_spawn"),
+        "{qualified_name}: missing bash_spawn"
+    );
+    assert!(
+        prompt.contains("wait: { timeout_secs: 30 }"),
+        "{qualified_name}: missing wait example"
+    );
+    let lower = prompt.to_lowercase();
+    assert!(
+        lower.contains("prefer") && lower.contains("nested `wait`"),
+        "{qualified_name}: missing wait preference"
+    );
+    assert!(
+        prompt.contains("bash_wait") && prompt.contains("bash_terminate"),
+        "{qualified_name}: missing follow-up tools"
+    );
+    assert!(
+        lower.contains("wait expiry is not process termination")
+            || lower.contains("wait expiry does not terminate")
+            || lower.contains("wait expires, the process continues running"),
+        "{qualified_name}: missing expiry lifecycle guidance"
+    );
+    assert!(
+        lower.contains("under 5 minutes"),
+        "{qualified_name}: missing cache-TTL recommendation"
+    );
+    assert!(
+        lower.contains("120 seconds") || lower.contains("120s"),
+        "{qualified_name}: missing 120-second default"
+    );
+}
+
+fn assert_ineligible_shell_prompt(qualified_name: &str, prompt: &str, granted: &[String]) {
+    assert!(
+        !SHELL_EXECUTION_TOOLS
+            .iter()
+            .any(|tool| granted.iter().any(|name| name == tool)),
+        "{qualified_name}: ineligible agent has shell-tool grants: {granted:?}"
+    );
+    let lower = prompt.to_lowercase();
+    assert!(
+        !SHELL_EXECUTION_TOOLS
+            .iter()
+            .any(|tool| lower.contains(tool)),
+        "{qualified_name}: ineligible prompt mentions unavailable shell tools"
+    );
+    assert!(
+        !lower.contains("wait: { timeout_secs: 30 }")
+            && !lower.contains("nested `wait`")
+            && !lower.contains("wait expiry"),
+        "{qualified_name}: ineligible prompt contains nested-wait guidance"
+    );
+}
+
+fn rendered_shell_agent_inventory(workspace_root: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut eligible = BTreeSet::new();
+    let mut ineligible = BTreeSet::new();
+    for package in PACKAGES {
+        let agents_dir = workspace_root.join("packages").join(package).join("agents");
+        let mut failures = Vec::new();
+        let stems = agent_stems(&agents_dir, &mut failures);
+        assert!(
+            failures.is_empty(),
+            "{}: {failures:?}",
+            agents_dir.display()
+        );
+        for stem in stems {
+            let qualified_name = format!("{package}/{stem}");
+            let agent =
+                load_with_qualified_name(&Config::agent_file(&qualified_name), &qualified_name)
+                    .unwrap_or_else(|error| panic!("{qualified_name}: failed to load: {error}"));
+            let granted = agent.use_tools().unwrap_or_default();
+            let prompt = render_agent_prompt(&qualified_name, &[])
+                .unwrap_or_else(|error| panic!("{qualified_name}: {error}"));
+            if SHELL_EXECUTION_TOOLS
+                .iter()
+                .all(|tool| granted.iter().any(|name| name == tool))
+            {
+                eligible.insert(qualified_name.clone());
+                assert_eligible_shell_prompt(&qualified_name, &prompt);
+            } else {
+                ineligible.insert(qualified_name.clone());
+                assert_ineligible_shell_prompt(&qualified_name, &prompt, &granted);
+            }
+        }
+    }
+    (eligible, ineligible)
+}
+
+/// Check deployed guidance and tool grants on fully rendered activation prompts.
+#[test]
+fn rendered_shell_guidance_matches_agent_tool_eligibility() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+    let (eligible, ineligible) = rendered_shell_agent_inventory(&workspace_root);
+    let expected_eligible: BTreeSet<_> = ELIGIBLE_SHELL_AGENTS
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let expected_ineligible: BTreeSet<_> = INELIGIBLE_SHELL_AGENTS
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        eligible, expected_eligible,
+        "eligible agent inventory changed"
+    );
+    assert_eq!(
+        ineligible, expected_ineligible,
+        "ineligible agent inventory changed"
     );
 }
 

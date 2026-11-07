@@ -57,7 +57,8 @@ pub struct ToolSpec {
     /// Request/reply timeout advertised to transport clients, in seconds.
     /// Missing values use the client's default backstop for older registrations;
     /// zero disables the elapsed-time deadline so clients rely on cancellation
-    /// and server-liveness detection instead.
+    /// and server-liveness detection instead. MCP tool listings carry this
+    /// policy in `_meta` under [`TOOL_TIMEOUT_META_KEY`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Tool `_meta` as in-house JSON, including optional display templates.
@@ -88,6 +89,24 @@ impl TemplateKey {
             Self::Result => "result_template",
         }
     }
+}
+
+/// `_meta` key a tool server uses to advertise its request-timeout policy, in
+/// seconds, on transports whose tool listings carry no timeout field (MCP tools
+/// do not). `harnx_toolset_server` writes it from `ToolSpec.timeout_secs`, and
+/// `harnx-mcp-bridge` copies it back so NATS callers honor the wrapped server's
+/// policy instead of the caller's default backstop. Zero disables the
+/// elapsed-time deadline, matching `ToolSpec.timeout_secs`.
+pub const TOOL_TIMEOUT_META_KEY: &str = "timeout_secs";
+
+/// Read the timeout policy a tool advertised under [`TOOL_TIMEOUT_META_KEY`].
+///
+/// Absent or malformed values return `None`, so a tool that advertises no
+/// policy keeps the caller's default request backstop instead of silently
+/// losing its deadline.
+pub fn advertised_timeout_secs(meta: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    meta.get(TOOL_TIMEOUT_META_KEY)
+        .and_then(serde_json::Value::as_u64)
 }
 
 impl ToolSpec {
@@ -593,6 +612,35 @@ mod tests {
             serde_json::to_value(spec).expect("encode tool spec")["timeout_secs"],
             json!(0)
         );
+    }
+
+    fn timeout_meta(value: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().expect("object literal").clone()
+    }
+
+    fn assert_parsed_timeout(value: serde_json::Value, expected: Option<u64>) {
+        assert_eq!(
+            advertised_timeout_secs(&timeout_meta(&value)),
+            expected,
+            "timeout metadata: {value}"
+        );
+    }
+
+    #[test]
+    fn advertised_timeout_secs_parses_policy_and_rejects_malformed_values() {
+        let cases = [
+            (json!({ "timeout_secs": 0 }), Some(0)),
+            (json!({ "timeout_secs": 45 }), Some(45)),
+            // Unadvertised policy must preserve the caller's request backstop.
+            (json!({}), None),
+            (json!({ "call_template": "x" }), None),
+            (json!({ "timeout_secs": "none" }), None),
+            (json!({ "timeout_secs": 1.5 }), None),
+            (json!({ "timeout_secs": -1 }), None),
+        ];
+        for (value, expected) in cases {
+            assert_parsed_timeout(value, expected);
+        }
     }
 
     #[test]

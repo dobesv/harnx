@@ -283,6 +283,23 @@ presentation cap applies only to bridged results. See
 `docs/nats-ha.md#oversized-terminal-tool-replies` for per-result caps, attachment paging,
 and output-only terminal guard.
 
+### MCP bridge request timeout policy
+
+MCP tool listings have no timeout field, so harnx tool servers advertise their
+per-tool request-timeout policy in tool `_meta` under
+`harnx_toolset::TOOL_TIMEOUT_META_KEY` (`"timeout_secs"`): seconds, `0` = no elapsed
+deadline (matching `ToolSpec.timeout_secs`). `harnx-mcp-bridge` copies that value into
+`ToolSpec.timeout_secs` for its NATS registration, and
+`harnx_toolset_server::run_toolset_main`'s MCP adapter writes it from native specs, so
+bridged harnx toolsets inherit the same deadline policy as the native NATS route. Tools
+that advertise nothing — including third-party MCP servers — keep the caller's default
+request backstop (60 s in `harnx-runtime/src/nats_tool_provider.rs`), so bridging does not
+disable deadlines globally. This is why `harnx-bash-tools --mcp-stdio` advertises
+`timeout_secs: 0` for `spawn`/`wait`/`exec`: a nested spawn wait (`wait: {}`, 120 s
+default) must return its first execution_id-bearing response instead of expiring at the
+60 s backstop. Direct stdio clients that ignore unknown `_meta` keys are unaffected.
+See `crates/harnx-mcp-bridge/README.md#request-timeout-policy`.
+
 ### Session transcript and PreToolUse hook mutation
 
 ### Hook command strings must use `shell_words::join`

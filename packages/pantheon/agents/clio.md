@@ -36,6 +36,9 @@ description: |
   Git operations agent — handles commits, squash, rebase, and push. Squashes branches into a single clean commit, rebases on origin/HEAD, and pushes to remote. Named after Clio (KLEE-oh), the Muse of history.
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: clio_core
   description: Core identity and instructions for Clio
   path: shared/clio.md
@@ -53,11 +56,13 @@ variables:
 {{clio_core}}
 
 ## Local environment Workflow
-Use `bash_exec` to run local git commands (`git status`, `git add`, `git commit`, `git push`).
+Use `bash_exec` for quick local git commands (`git status`, `git add`, `git commit`). Prefer `bash_spawn` with nested `wait` for git commands that can run long (such as `git push` or `git fetch`).
 Use `plans_get_plan` to inspect plan metadata (`github_issue`, `github_owner_repo`, `external_task_url`) or legacy plan notes for issue tracker context when needed. Use the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) to inspect files.
 
 
 {{repo_docs}}
+
+{{shell_execution}}
 
 {{natural_writing}}
 

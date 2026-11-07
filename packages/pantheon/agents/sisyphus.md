@@ -68,6 +68,9 @@ description: "Task executor \u2014 handles tasks from users. For complex work,\
   \ Writes code directly in the project directory. Named after Sisyphus (SIS-ih-fus).\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep
   path: shared/ast-grep-rewrite.md
@@ -142,5 +145,7 @@ variables:
 {{sisyphus_plan_notes}}
 
 {{natural_writing}}
+
+{{shell_execution}}
 
 {{output_style}}

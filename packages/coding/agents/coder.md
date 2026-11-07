@@ -58,6 +58,10 @@ description: >
   Designed for solo coding sessions without the full Pantheon orchestration
   overhead.
 version: '0.4.19'
+variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 ---
 
 # Coder — Autonomous Coding Assistant
@@ -85,11 +89,13 @@ When implementing:
 
 **File system**: Use `fs_read`, `fs_ls`, `fs_grep`, and `fs_find` to read. Prefer ast-grep via `bash_exec` for structural code edits before `fs_re_replace`, replacement scripts, or large `fs_edit` calls. Use `fs_edit` for prose, literal text, unsupported languages, or changes clearer as a small patch; use `fs_write` for new files.
 
-**Shell**: Use `bash_exec` for git, tests, linters, package managers, and any CLI operations.
+**Shell**: Use `bash_spawn` or `bash_exec` according to Shell Execution guidance below.
 
 **Web search**: Use `exa_web_search_exa` for general research. Use `context7_resolve-library-id` + `context7_query-docs` for library/framework documentation.
 
 **Code search**: Use `bash_exec` with `rg` for text search, `sg` (ast-grep) for structural search. Use `grep_grep_query` to search public GitHub.
+
+{{shell_execution}}
 
 ## Structural Code Search with ast-grep
 

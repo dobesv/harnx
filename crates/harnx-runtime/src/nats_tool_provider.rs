@@ -973,6 +973,57 @@ mod tests {
         assert_eq!(request_timeout(None), Some(DEFAULT_REQUEST_TIMEOUT));
     }
 
+    /// The bridge→NATS policy boundary for a wrapped bash server.
+    ///
+    /// `harnx-mcp-bridge` copies the wrapped server's advertised
+    /// `_meta` timeout into `ToolSpec.timeout_secs`; the bash MCP server
+    /// advertises `Some(0)` for spawn, matching the native toolset. Its
+    /// nested `wait: {}` can hold the first response for the bash server's
+    /// 120-second wait default, longer than this provider's 60-second
+    /// backstop, which used to expire the caller's request mid-wait and drop
+    /// the execution_id-bearing first response. Registration must resolve that
+    /// spec to no elapsed deadline, while a tool that advertises no policy
+    /// (any third-party MCP server) keeps the backstop.
+    #[test]
+    fn bridged_spawn_wait_policy_survives_the_default_request_backstop() {
+        harnx_core::require_nextest();
+
+        const BASH_WAIT_DEFAULT_SECS: u64 = 120;
+        let timeout_for = |timeout_secs: Option<u64>| {
+            let registration = Registration {
+                package: None,
+                config: String::new(),
+                server: "wrapped".to_string(),
+                tools: vec![ToolSpec {
+                    cancellation_guarantee: Default::default(),
+                    name: "tool".to_string(),
+                    description: String::new(),
+                    input_schema: json!({ "type": "object" }),
+                    idempotent_hint: false,
+                    read_only_hint: false,
+                    timeout_secs,
+                    meta: None,
+                }],
+                schema_version: 1,
+                proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
+            };
+
+            let (tools, _) = build_registered_tools(None, vec![registration]);
+            tools
+                .get("wrapped_tool")
+                .or_else(|| tools.get("tool"))
+                .expect("registered route")
+                .request_timeout
+        };
+
+        // The 120-second nested-wait default fits inside a disabled deadline
+        // where it never fit inside the former 60-second backstop.
+        assert!(BASH_WAIT_DEFAULT_SECS > DEFAULT_REQUEST_TIMEOUT.as_secs());
+        assert_eq!(timeout_for(Some(0)), None);
+        // Tools that advertise nothing keep the caller's default backstop.
+        assert_eq!(timeout_for(None), Some(DEFAULT_REQUEST_TIMEOUT));
+    }
+
     /// Native toolsets ship their display templates in `ToolSpec.meta`; if that
     /// stops reaching `ToolDeclaration` the TUI falls back to a YAML dump.
     #[test]

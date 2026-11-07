@@ -138,3 +138,82 @@ async fn documented_errexit_exceptions_and_pipeline_statuses_match_backend() {
         assert!(result.stdout.is_empty(), "{script}: {result:?}");
     }
 }
+
+fn spawn_tool() -> ToolSpec {
+    ToolSpec {
+        name: "bash_spawn".into(),
+        description: "Spawn a background command, optionally waiting for completion.".into(),
+        // Optional Schemars objects can be nullable references, not inline objects.
+        schema: json!({
+            "type": "object", "required": ["command"],
+            "properties": {
+                "command": {"type": "string"},
+                "wait": {"anyOf": [{"$ref": "#/$defs/WaitOptions"}, {"type": "null"}]}
+            },
+            "$defs": {"WaitOptions": {"type": "object", "properties": {
+                "timeout_secs": {"type": ["integer", "null"]},
+                "head_lines": {"type": ["integer", "null"]},
+                "tail_lines": {"type": ["integer", "null"]},
+                "max_output_bytes": {"type": ["integer", "null"]},
+                "grep": {"type": ["string", "null"]}
+            }}}
+        }),
+    }
+}
+
+#[test]
+fn generated_guide_advertises_nested_wait_as_optional_json() {
+    let tool = spawn_tool();
+    let description = bash_tool_description(std::slice::from_ref(&tool), 8, 1000);
+    assert!(description.contains(
+        "- bash_spawn --command <string> [--wait <json>] [--json <object>]  # Spawn a background command, optionally waiting for completion."
+    ), "{description}");
+    assert!(description.contains("objects/complex values take quoted JSON"));
+    assert!(!description.contains("--wait-secs"));
+    assert!(!description.contains("--timeout-secs"));
+    let help = crate::help::help(&tool.name, &tool.schema, &tool.description);
+    assert!(help.contains("--wait <json>"), "{help}");
+    assert!(!help.contains("--head-lines"), "{help}");
+}
+
+#[tokio::test]
+async fn documented_json_flags_preserve_nested_wait_through_dispatch() {
+    let tool = spawn_tool();
+    let executor = Arc::new(Executor::default());
+    let waits = [
+        json!({}),
+        json!({"timeout_secs": 0, "head_lines": 0, "tail_lines": 0,
+            "max_output_bytes": 0, "grep": ""}),
+        json!({"timeout_secs": 600, "head_lines": 2, "tail_lines": 3,
+            "max_output_bytes": 1024, "grep": "error|warn"}),
+    ];
+    for wait in waits {
+        for script in [
+            format!("bash_spawn --command 'echo ready' --wait '{wait}'"),
+            format!("bash_spawn --json '{{\"command\":\"echo ready\",\"wait\":{wait}}}'"),
+        ] {
+            let result = run(&script, vec![tool.clone()], executor.clone()).await;
+            assert_eq!(result.status, ScriptStatus::Ok, "{script}: {result:?}");
+            assert_eq!(
+                executor.0.lock().unwrap().last().cloned(),
+                Some((
+                    tool.name.clone(),
+                    json!({"command": "echo ready", "wait": wait})
+                )),
+                "{script}"
+            );
+        }
+    }
+    let result = run(
+        "bash_spawn --command 'echo ready'",
+        vec![tool.clone()],
+        executor.clone(),
+    )
+    .await;
+    assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
+    assert_eq!(
+        executor.0.lock().unwrap().last().cloned(),
+        Some((tool.name, json!({"command": "echo ready"})))
+    );
+    assert_eq!(executor.0.lock().unwrap().len(), 7);
+}

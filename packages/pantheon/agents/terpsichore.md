@@ -28,6 +28,9 @@ use_tools:
 description: "Refactoring and completeness specialist — identifies missed simplification opportunities, partial fixes, incomplete implementations, and unaddressed edge cases. Named after Terpsichore (turp-SIK-uh-ree), the Muse of dance — ensuring code moves elegantly.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -50,6 +53,8 @@ variables:
 {{repo_docs}}
 
 {{ast_grep_search}}
+
+{{shell_execution}}
 
 {{output_style}}
 

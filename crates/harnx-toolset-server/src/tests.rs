@@ -286,7 +286,7 @@ mod adapter_wire_tests {
     type TestClientService = RunningService<RoleClient, TestClientHandler>;
 
     async fn setup_client_server(
-        toolset: Arc<AdapterTestToolset>,
+        toolset: Arc<dyn Toolset>,
     ) -> (TestClientService, TestServerService) {
         let (client_transport, server_transport) = duplex(65_536);
         let adapter = McpToolsetAdapter { toolset };
@@ -334,6 +334,103 @@ mod adapter_wire_tests {
             .unwrap()
             .contains("known tool execution failed"));
         assert_eq!(toolset.invocations.load(Ordering::SeqCst), 1);
+        client.cancel().await.unwrap();
+    }
+
+    fn timeout_policy_spec(name: &str, timeout_secs: Option<u64>) -> harnx_toolset::ToolSpec {
+        harnx_toolset::ToolSpec {
+            cancellation_guarantee: Default::default(),
+            name: name.to_owned(),
+            description: String::new(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            idempotent_hint: false,
+            read_only_hint: false,
+            timeout_secs,
+            meta: (name == "with_template").then(|| {
+                serde_json::json!({ "call_template": "Run {{name}}" })
+                    .as_object()
+                    .expect("meta object")
+                    .clone()
+            }),
+        }
+    }
+
+    struct TimeoutPolicyToolset;
+
+    #[async_trait::async_trait]
+    impl Toolset for TimeoutPolicyToolset {
+        fn name(&self) -> &str {
+            "timeout-policy-test"
+        }
+
+        fn tools(&self) -> Vec<harnx_toolset::ToolSpec> {
+            vec![
+                timeout_policy_spec("without_deadline", Some(0)),
+                timeout_policy_spec("bounded", Some(45)),
+                timeout_policy_spec("unadvertised", None),
+                timeout_policy_spec("with_template", None),
+            ]
+        }
+
+        async fn invoke(
+            &self,
+            _tool: &str,
+            _args: Value,
+            _cancel: CancellationToken,
+        ) -> Result<Value, ToolInvokeError> {
+            unreachable!("timeout policy test only lists tools")
+        }
+    }
+
+    fn advertised_timeout(tools: &[rmcp::model::Tool], name: &str) -> Option<serde_json::Value> {
+        tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("tool '{name}' advertised"))
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.0.get(harnx_toolset::TOOL_TIMEOUT_META_KEY))
+            .cloned()
+    }
+
+    fn assert_timeout_advertisement(
+        tools: &[rmcp::model::Tool],
+        name: &str,
+        expected: Option<serde_json::Value>,
+    ) {
+        assert_eq!(
+            advertised_timeout(tools, name),
+            expected,
+            "timeout for {name}"
+        );
+    }
+
+    /// MCP listings carry timeout metadata so bridge callers retain server policy.
+    #[tokio::test]
+    async fn list_tools_carries_timeout_policy_in_meta() {
+        let (client, _server) = setup_client_server(Arc::new(TimeoutPolicyToolset)).await;
+        let tools = client
+            .peer()
+            .list_tools(Default::default())
+            .await
+            .expect("list tools")
+            .tools;
+
+        for (name, expected) in [
+            ("without_deadline", Some(serde_json::json!(0))),
+            ("bounded", Some(serde_json::json!(45))),
+            ("unadvertised", None),
+            ("with_template", None),
+        ] {
+            assert_timeout_advertisement(&tools, name, expected);
+        }
+        let template_meta = tools
+            .iter()
+            .find(|tool| tool.name == "with_template")
+            .and_then(|tool| tool.meta.as_ref())
+            .and_then(|meta| meta.0.get("call_template"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(template_meta, Some("Run {{name}}"));
         client.cancel().await.unwrap();
     }
 }

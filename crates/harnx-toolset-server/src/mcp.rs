@@ -36,7 +36,19 @@ impl ServerHandler for McpToolsetAdapter {
                         .read_only(spec.read_only_hint)
                         .idempotent(spec.idempotent_hint),
                 );
-                tool.meta = spec.meta.map(MetaObject);
+                // MCP tool listings have no timeout field, so the request-timeout
+                // policy rides in `_meta`; `harnx-mcp-bridge` copies it back into
+                // `ToolSpec.timeout_secs` for NATS callers. Without it, a bridged
+                // long-running tool (bash spawn's nested wait) would inherit the
+                // caller's request backstop instead of the server's policy.
+                let mut meta = spec.meta.unwrap_or_default();
+                if let Some(timeout_secs) = spec.timeout_secs {
+                    meta.insert(
+                        harnx_toolset::TOOL_TIMEOUT_META_KEY.to_owned(),
+                        Value::from(timeout_secs),
+                    );
+                }
+                tool.meta = (!meta.is_empty()).then_some(MetaObject(meta));
                 tool
             })
             .collect();

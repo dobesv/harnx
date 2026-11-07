@@ -28,6 +28,9 @@ use_tools:
 description: "Coding conventions specialist — validates adherence to project patterns, naming conventions, file organization, import ordering, type safety, and documentation standards. Named after Euterpe (yoo-TUR-pee), the Muse of music and harmony.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -50,6 +53,8 @@ variables:
 {{repo_docs}}
 
 {{ast_grep_search}}
+
+{{shell_execution}}
 
 {{output_style}}
 
