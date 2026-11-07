@@ -150,6 +150,8 @@ async fn package_agent_sees_bare_same_package_delegation_tool() {
         [
             "session_new",
             "session_prompt",
+            "session_send",
+            "session_wait",
             "session_load",
             "session_cancel"
         ]

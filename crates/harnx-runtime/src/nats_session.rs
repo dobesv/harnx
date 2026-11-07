@@ -56,6 +56,9 @@ mod compaction_request;
 #[cfg(test)]
 mod compaction_request_tests;
 mod completion;
+// Async dispatch is wired into discovery in a later change.
+#[allow(dead_code)]
+pub(crate) mod dispatch;
 mod follow;
 pub use follow::{FollowBoundary, FollowBoundaryOptions};
 mod hitl;

@@ -1742,12 +1742,15 @@ mod tests {
     fn tool_timer_started_ignores_subagent_launcher_tools() {
         let mut state = make_state(false);
 
-        // session_new and session_prompt are launchers - should not be tracked
+        // session_new, session_prompt and session_send are launchers - not tracked
         state.tool_call_started("call-1", "session_new");
         assert!(!state.tool_timers.in_flight.contains_key("call-1"));
 
         state.tool_call_started("call-2", "session_prompt");
         assert!(!state.tool_timers.in_flight.contains_key("call-2"));
+
+        state.tool_call_started("call-7", "session_send");
+        assert!(!state.tool_timers.in_flight.contains_key("call-7"));
 
         // Prefixed forms should also be ignored
         state.tool_call_started("call-3", "oracle_session_new");
@@ -1756,14 +1759,20 @@ mod tests {
         state.tool_call_started("call-4", "pantheon__oracle_session_prompt");
         assert!(!state.tool_timers.in_flight.contains_key("call-4"));
 
-        // But session_load and session_cancel are NOT launchers
+        state.tool_call_started("call-8", "oracle_session_send");
+        assert!(!state.tool_timers.in_flight.contains_key("call-8"));
+
+        // But session_wait, session_load and session_cancel are NOT launchers
+        state.tool_call_started("call-9", "session_wait");
+        assert!(state.tool_timers.in_flight.contains_key("call-9"));
+
         state.tool_call_started("call-5", "session_load");
         assert!(state.tool_timers.in_flight.contains_key("call-5"));
 
         state.tool_call_started("call-6", "session_cancel");
         assert!(state.tool_timers.in_flight.contains_key("call-6"));
 
-        assert_eq!(state.tool_timers.in_flight.len(), 2);
+        assert_eq!(state.tool_timers.in_flight.len(), 3);
     }
 
     #[test]

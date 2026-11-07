@@ -60,6 +60,7 @@ use harnx_toolset::{
     server_identity_token, ControlMessage, Registration, ToolErrorPayload, ToolInvocation,
     ToolInvocationContext, ToolInvokeError, ToolReply, ToolRequest, Toolset, HDR_CALL_ID,
     HDR_IDEMPOTENCY_KEY, SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
+    SUBAGENT_SESSION_SEND_TOOL,
 };
 use opentelemetry::Context as OtelContext;
 use rmcp::model::{

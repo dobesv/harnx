@@ -35,12 +35,19 @@ use_tools:
 - plans_update_note
 - plans_update_task
 - pytheas_session_prompt
+- pytheas_session_send
+- pytheas_session_wait
+- pytheas_session_load
+
 - harnx_agent_session_history_read
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Deep work and complex refactoring specialist — grinds through autonomous, heavy-duty problem-solving at the forge. Named after Hephaestus (heh-FES-tus), the Divine Blacksmith.\n"
 version: '0.4.19'
 variables:
+- name: async_delegation
+  description: Preferred async delegation protocol (session_send/session_wait)
+  path: shared/async-delegation.md
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)
   path: shared/sandbox-workflow-inherit.md
@@ -65,6 +72,8 @@ variables:
 ---
 
 {{hephaestus_core}}
+
+{{async_delegation}}
 
 {% set has_sandbox = (tools | selectattr('name', 'equalto', 'sandbox_connect') | list | length) > 0 %}
 {% if has_sandbox %}

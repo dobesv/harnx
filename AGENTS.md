@@ -647,11 +647,11 @@ Native toolsets declare their tool categorization (`Read`, `Edit`, `Search`, `Ex
 
 - Call `spec.with_kind(ToolProgressKind::<variant>)` on every tool spec
 - Choose kind by tool semantics:
-  - `Read` — read-only data access (fs: `read`, `ls`; plans: `get_plan`, `get_task`, `get_note`, plus `list_*` tools; k8s-sandbox: `status`; subagent: `session_load`)
+  - `Read` — read-only data access (fs: `read`, `ls`; plans: `get_plan`, `get_task`, `get_note`, plus `list_*` tools; k8s-sandbox: `status`; subagent: `session_load`, `session_wait`)
   - `Edit` — file/content mutation (fs: `write`, `edit`, `insert`, `re_replace`, `rollback_file`; plans: `add_plan`, `update_plan`, `add_task`, `update_task`, `add_note`, `update_note`)
   - `Delete` — destructive removal (plans: `delete_plan`, `delete_task`, `delete_note`; k8s-sandbox: `release`; subagent: `session_cancel`)
   - `Search` — content or path search (grep, fs: `grep`, `find`; exa: `web_search_exa`)
-  - `Execute` — shell/command execution (all bash tools; k8s-sandbox: `connect`; subagent: `session_prompt`)
+  - `Execute` — shell/command execution (all bash tools; k8s-sandbox: `connect`; subagent: `session_prompt`, `session_send`)
   - `Fetch` — HTTP fetch (fetch tools; exa: `web_fetch_exa`)
   - `Think` — model reasoning
   - `SwitchMode` — mode changes
@@ -1351,6 +1351,56 @@ When running turns across multiple sessions, each `NatsSession` needs its own
 abort flag poisons every later turn in unrelated sessions. Process-wide abort belongs
 only on the supervisor. A session handle used for orphan reconciliation also cannot be
 reused; its abort flag is now set, and a replacement turn must create a fresh handle.
+
+### Sub-agent async delegation (session_send / session_wait)
+
+`session_send` and `session_wait` (issue #1550) add durable dispatch and
+prompt-specific observation on top of the unchanged synchronous
+`session_prompt`; `session_load` gained the same bounded `read` contract.
+Implementation: `nats_worker/subagent_toolset/async_session/`,
+`nats_session/dispatch.rs`, `nats_session_log/window.rs`,
+`nats_worker/subagent_toolset/session_read.rs`.
+
+1. **The handle is prompt identity, not execution identity** — `prompt_id` is
+   the original `AppendedPrompt.user_msg_id`; `invocation_id` stays diagnostic
+   only. Steering can bind several messages to one invocation, so waiting must
+   never key on the latest `invocation_prompt_seq` or session result. Repeated
+   waits recover the same terminal result without consuming it.
+
+2. **Soft wait is an observation budget, not execution time** — `wait.seconds`
+   (default 120, max 300) builds one absolute deadline at observer entry that
+   covers repair, polling and broker I/O (`observation/budget.rs`); a
+   zero-second wait is one bounded snapshot. Expiry never cancels the child and
+   never extends the inherited hard `timeout_secs` policy. The send receipt is
+   a tool result, not child progress: terminal truth stays runtime-owned, and
+   `is_subagent_launcher` (`harnx-toolset`) deliberately excludes
+   `session_send` from the generic tool-call timer while `session_wait` and
+   `session_load` are observation tools, not launchers.
+
+3. **Authorization is transport-attested, never caller-claimed** — wait
+   validates the caller against `admission.parent_storage_key` via the
+   `ToolInvocationContext` session identity (`observation/scope.rs`), not user
+   arguments. A missing trusted scope fails closed; there is no privileged
+   bypass.
+
+4. **Repair is bounded and separated from the snapshot scan** — a wait may run
+   at most one idempotent exact-sequence activation repair
+   (`observation/repair.rs`), only for a valid pending prompt with uncertain
+   activation; it never appends, changes the deadline, or resumes an
+   approval. That side effect is why `session_wait` is classified `Read` but
+   cannot claim the read-only hint. `session_load` is a pure read — it never
+   resumes, activates or repairs.
+
+5. **Bounded read contract** — the entire serialized result, metadata
+   included, fits `max_output_bytes` (default 16384, range 1024..65536);
+   physical scans cap at 1000 records / 8 MiB per page
+   (`nats_session_log/window.rs`); holes are explicit `omitted_ranges`
+   recoverable through the `entry_index` + `byte_offset` continuation, with
+   cuts landing on UTF-8 boundaries. Nested nullable schemas must be verified
+   through the production MCP export path
+   (`harnx-mcp-server/src/connection/tests.rs::production_subagent_async_specs_export_with_nullable_nested_options`),
+   not synthetic conversion tests — strict-mode clients send `null` for
+   omitted nested objects (see "Tool parameter schemas").
 
 ### Changing a JetStream consumer's configuration
 

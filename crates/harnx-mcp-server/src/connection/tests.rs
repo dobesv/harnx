@@ -105,6 +105,59 @@ fn provider_annotations_and_schema_survive_selection() {
     assert_eq!(annotations.idempotent_hint, Some(false));
 }
 
+/// Export the production async specs through MCP's real selection/conversion
+/// path, including nested null branches and strict schema constraints.
+#[test]
+fn production_subagent_async_specs_export_with_nullable_nested_options() {
+    let declarations: Vec<ToolDeclaration> =
+        harnx_runtime::nats_worker::subagent_async_tool_specs("oracle")
+            .into_iter()
+            .map(|spec| {
+                serde_json::from_value(json!({
+                    "name": format!("oracle_{}", spec.name),
+                    "description": spec.description,
+                    "parameters": spec.input_schema,
+                }))
+                .expect("production tool spec converts to provider declaration")
+            })
+            .collect();
+    let tools = selected_tools(
+        &Config::default(),
+        &ToolReservationView {
+            package: None,
+            use_tools: vec![
+                "oracle_session_send".to_owned(),
+                "oracle_session_wait".to_owned(),
+            ],
+        },
+        &declarations,
+    )
+    .unwrap();
+    assert_eq!(tools.len(), 2);
+    for tool in &tools {
+        let schema = &tool.input_schema;
+        assert_eq!(schema["additionalProperties"], json!(false));
+        let wait = &schema["properties"]["wait"];
+        let wait_object = &wait["anyOf"][0];
+        assert_eq!(wait["anyOf"][1], json!({"type":"null"}));
+        assert_eq!(wait_object["additionalProperties"], json!(false));
+        assert_eq!(wait_object["properties"]["seconds"]["maximum"], json!(300));
+        assert_eq!(wait_object["properties"]["seconds"]["default"], json!(120));
+        assert!(wait_object["properties"]["seconds"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Default 120"));
+        let read = &wait_object["properties"]["read"];
+        assert_eq!(read["anyOf"][1], json!({"type":"null"}));
+        assert_eq!(read["anyOf"][0]["additionalProperties"], json!(false));
+    }
+    assert_eq!(tools[0].input_schema["required"], json!(["message"]));
+    assert_eq!(
+        tools[1].input_schema["required"],
+        json!(["session_id", "prompt_id"])
+    );
+}
+
 #[test]
 fn disabled_tool_use_remains_empty() {
     let config = Config {

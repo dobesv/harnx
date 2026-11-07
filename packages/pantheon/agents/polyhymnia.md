@@ -18,6 +18,10 @@ use_tools:
 - fs_grep
 - fs_find
 - librarian_session_prompt
+- librarian_session_send
+- librarian_session_wait
+- librarian_session_load
+
 - plans_add_note
 - plans_get_note
 - plans_get_plan
@@ -32,6 +36,9 @@ description: "Privacy and compliance specialist \u2014 evaluates PII handling, d
   \ \u2014 guardian of sacred personal data.\n"
 version: '0.4.19'
 variables:
+- name: async_delegation
+  description: Preferred async delegation protocol (session_send/session_wait)
+  path: shared/async-delegation.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -50,6 +57,8 @@ variables:
 ---
 
 {{polyhymnia_core}}
+
+{{async_delegation}}
 
 {{repo_docs}}
 

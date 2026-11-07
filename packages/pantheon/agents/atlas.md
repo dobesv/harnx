@@ -28,19 +28,71 @@ use_tools:
 - fs_re_replace
 - fs_rollback_file
 - apollo_session_prompt
+- apollo_session_send
+- apollo_session_wait
+- apollo_session_load
+
 - argus_session_prompt
+- argus_session_send
+- argus_session_wait
+- argus_session_load
+
 - aristarchus_session_prompt
+- aristarchus_session_send
+- aristarchus_session_wait
+- aristarchus_session_load
+
 - athena_session_prompt
+- athena_session_send
+- athena_session_wait
+- athena_session_load
+
 - clio_session_prompt
+- clio_session_send
+- clio_session_wait
+- clio_session_load
+
 - fetch_fetch_markdown
 - hephaestus_session_prompt
+- hephaestus_session_send
+- hephaestus_session_wait
+- hephaestus_session_load
+
 - hermes_session_prompt
+- hermes_session_send
+- hermes_session_wait
+- hermes_session_load
+
 - hestia_session_prompt
+- hestia_session_send
+- hestia_session_wait
+- hestia_session_load
+
 - iris_session_prompt
+- iris_session_send
+- iris_session_wait
+- iris_session_load
+
 - librarian_session_prompt
+- librarian_session_send
+- librarian_session_wait
+- librarian_session_load
+
 - mnemosyne_session_prompt
+- mnemosyne_session_send
+- mnemosyne_session_wait
+- mnemosyne_session_load
+
 - oracle_session_prompt
+- oracle_session_send
+- oracle_session_wait
+- oracle_session_load
+
 - peitho_session_prompt
+- peitho_session_send
+- peitho_session_wait
+- peitho_session_load
+
 - plans_add_note
 - plans_add_task
 - plans_delete_note
@@ -56,12 +108,24 @@ use_tools:
 - plans_update_plan
 - plans_update_task
 - plato_session_prompt
+- plato_session_send
+- plato_session_wait
+- plato_session_load
+
 - pytheas_session_prompt
+- pytheas_session_send
+- pytheas_session_wait
+- pytheas_session_load
+
 - time_convert_time
 - time_get_current_time
 - time_wait
 - time_wait_until
 - zosimus_session_prompt
+- zosimus_session_send
+- zosimus_session_wait
+- zosimus_session_load
+
 - harnx_agent_session_history_read
 - attachments_attachment_read
 - attachments_attachment_create
@@ -71,6 +135,9 @@ description: "Plan execution orchestrator \u2014 manages plans and todos in loca
   \ who carries the world on his shoulders.\n"
 version: '0.4.19'
 variables:
+- name: async_delegation
+  description: Preferred async delegation protocol (session_send/session_wait)
+  path: shared/async-delegation.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -101,6 +168,8 @@ variables:
 ---
 
 {{atlas_core}}
+
+{{async_delegation}}
 
 {% set has_sandbox = (tools | selectattr('name', 'equalto', 'sandbox_connect') | list | length) > 0 %}
 {% if has_sandbox %}

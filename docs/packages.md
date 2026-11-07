@@ -103,7 +103,7 @@ Package agents and servers are automatically namespaced to avoid collisions with
 
 | What | On-disk name | Runtime name | Tool name visible to agent |
 |------|-------------|-------------|----------------------------|
-| Agent `coder.md` in `my-pkg` | `packages/my-pkg/agents/coder.md` | `my-pkg/coder` | `my-pkg__coder_session_prompt` |
+| Agent `coder.md` in `my-pkg` | `packages/my-pkg/agents/coder.md` | `my-pkg/coder` | `my-pkg__coder_session_prompt` (plus `..._session_new`, `..._session_send`, `..._session_wait`, `..._session_load`, `..._session_cancel`) |
 | Package tool server `fs.yaml`, used by an agent in `my-pkg` | `packages/my-pkg/tool_servers/fs.yaml` | `my-pkg__fs` | `fs_read` |
 | Package tool server `fs.yaml`, used by an agent outside `my-pkg` | `packages/my-pkg/tool_servers/fs.yaml` | `my-pkg__fs` | `my-pkg__fs_read` |
 | Top-level tool server `fs.yaml` | `tool_servers/fs.yaml` | `fs` | `fs_read` |

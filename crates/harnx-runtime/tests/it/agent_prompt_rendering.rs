@@ -789,3 +789,298 @@ fn compaction_prompts_contain_shared_request_reply_instruction() {
         .iter()
         .for_each(|path| assert_compaction_prompt_contains_phrases(path));
 }
+
+/// Agents that integrate the shared async-delegation protocol. Every one of
+/// them must resolve the `{{async_delegation}}` include and select the
+/// send/wait/load tools for each of its delegation targets.
+const ASYNC_DELEGATION_AGENTS: [&str; 16] = [
+    "apollo",
+    "aristarchus",
+    "athena",
+    "atlas",
+    "daedalus",
+    "hephaestus",
+    "hermes",
+    "hestia",
+    "iris",
+    "melpomene",
+    "metis",
+    "peitho",
+    "plato",
+    "polyhymnia",
+    "sisyphus",
+    "urania",
+];
+
+/// Heading the shared async-delegation include contributes. A rendered prompt
+/// that resolves the include contains it exactly once; a duplicate include
+/// renders it twice, and an unresolved one (or a missing protocol) renders it
+/// zero times.
+const ASYNC_DELEGATION_HEADING: &str = "Async Sub-Agent Delegation (session_send / session_wait)";
+
+/// Semantic phrases the shared async-delegation protocol must contribute to
+/// every integrating agent's rendered prompt: preferred 120-second soft wait,
+/// inherited hard policy, durable handle, re-wait safety, explicit
+/// next_index→read.index_min paging, and cancellation only when the tool is
+/// available.
+const ASYNC_DELEGATION_PHRASES: [&str; 8] = [
+    "wait: {seconds: 120}",
+    "hard execution deadline stays inherited from the target agent's policy",
+    "durable handle: `session_id` + `prompt_id`",
+    "Repeated waits recover the same result and never consume it",
+    "returned `next_index` as `read.index_min`",
+    "If a `{agent}_session_cancel` tool is available to you",
+    "Soft wait expiry alone never stops the child",
+    "`{agent}_session_prompt` remains fully supported for synchronous delegation",
+];
+
+/// Every session tool name the pantheon worker registers per configured agent,
+/// spelled the way the provider exposes them to same-package agents.
+const SESSION_TOOL_SUFFIXES: [&str; 6] = [
+    "session_new",
+    "session_prompt",
+    "session_send",
+    "session_wait",
+    "session_load",
+    "session_cancel",
+];
+
+/// Minimal worker-style declaration, mirroring how
+/// `refresh_nats_tool_declarations` seeds the config's cache: selection only
+/// matches on names, so the schemas stay minimal.
+fn session_tool_declaration(name: String) -> ToolDeclaration {
+    ToolDeclaration {
+        name,
+        description: "subagent session tool".to_string(),
+        parameters: Default::default(),
+        mcp_tool_name: None,
+        mcp_server_name: None,
+        call_template: None,
+        result_template: None,
+        idempotent_hint: None,
+        read_only_hint: None,
+        kind: None,
+    }
+}
+
+/// Load and resolve one integrating agent; returns it with its `use_tools`.
+fn loaded_async_agent(
+    qualified_name: &str,
+) -> Result<(harnx_runtime::config::Agent, Vec<String>), String> {
+    let agent_path = Config::agent_file(qualified_name);
+    let mut agent = load_with_qualified_name(&agent_path, qualified_name)
+        .map_err(|error| format!("{qualified_name}: failed to load: {error}"))?;
+    resolve_variables(&mut agent)
+        .map_err(|error| format!("{qualified_name}: failed to resolve variables: {error}"))?;
+    let use_tools = agent.use_tools().unwrap_or_default();
+    Ok((agent, use_tools))
+}
+
+/// Per-agent inputs shared by the async-guidance checks below: the agent's
+/// own selectors and what the production selector actually picked for it.
+struct AsyncAgentSelection<'a> {
+    qualified_name: &'a str,
+    use_tools: &'a [String],
+    selected_names: &'a std::collections::HashSet<&'a str>,
+}
+
+/// Selection failures for one agent: send/wait/load missing for a declared
+/// prompt target, or cancellation granted without a selector of its own.
+fn async_selection_failures(agent: &AsyncAgentSelection<'_>) -> Vec<String> {
+    let mut failures = Vec::new();
+    for selector in agent.use_tools {
+        let Some(target) = selector.strip_suffix("_session_prompt") else {
+            continue;
+        };
+        for suffix in ["session_send", "session_wait", "session_load"] {
+            let expected = format!("{target}_{suffix}");
+            if !agent.selected_names.contains(expected.as_str()) {
+                failures.push(format!(
+                    "{}: {selector} is selected but {expected} is not; \
+                     async guidance requires send/wait/load for every prompt target",
+                    agent.qualified_name
+                ));
+            }
+        }
+    }
+
+    failures.extend(
+        agent
+            .selected_names
+            .iter()
+            .filter(|name| name.ends_with("_session_cancel"))
+            .filter(|name| !agent.use_tools.iter().any(|selector| selector == *name))
+            .map(|name| {
+                format!(
+                    "{}: {name} selected without a matching use_tools selector",
+                    agent.qualified_name
+                )
+            }),
+    );
+    failures
+}
+
+/// Rendered-prompt semantics: every policy phrase present, the shared
+/// protocol heading exactly once (resolved, not duplicated), and no
+/// unresolved template markers leaking into the prompt.
+fn async_prompt_semantic_failures(agent: &AsyncAgentSelection<'_>, prompt: &str) -> Vec<String> {
+    let qualified_name = agent.qualified_name;
+    let mut failures: Vec<String> = ASYNC_DELEGATION_PHRASES
+        .iter()
+        .filter(|phrase| !prompt.contains(**phrase))
+        .map(|phrase| {
+            format!(
+                "{qualified_name}: rendered prompt is missing async delegation phrase '{phrase}'"
+            )
+        })
+        .collect();
+
+    let headings = prompt.matches(ASYNC_DELEGATION_HEADING).count();
+    if headings != 1 {
+        failures.push(format!(
+            "{qualified_name}: async delegation heading appears {headings} times, \
+             expected exactly one resolved include"
+        ));
+    }
+
+    failures.extend(
+        ["{{", "{%"]
+            .iter()
+            .filter(|marker| prompt.contains(*marker))
+            .map(|marker| {
+                format!(
+                    "{qualified_name}: rendered prompt still contains template marker '{marker}'"
+                )
+            }),
+    );
+    failures
+}
+
+/// Worker-style declarations for every pantheon agent, spelled the way the
+/// provider exposes the session tools to same-package agents.
+fn worker_session_declarations(agents_dir: &Path) -> Vec<ToolDeclaration> {
+    let mut scratch = Vec::new();
+    let mut declarations = Vec::new();
+    for stem in agent_stems(agents_dir, &mut scratch) {
+        for tool in SESSION_TOOL_SUFFIXES {
+            declarations.push(session_tool_declaration(format!("{stem}_{tool}")));
+        }
+    }
+    declarations
+}
+
+/// Production render + tool-selection coverage for the shipped async
+/// delegation guidance (review B1): for every integrating agent, the
+/// production selector must pick send/wait/load for each declared prompt
+/// target without granting unrequested cancellation, and the production
+/// renderer must expand the shared protocol with no unresolved or
+/// duplicated include.
+#[test]
+fn async_delegation_guidance_renders_and_selects_tools_for_all_integrating_agents() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        // Published crates do not include workspace package assets.
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+
+    // Production select path: `Config::select_tools` reading the worker-owned
+    // NATS declaration cache (`refresh_nats_tool_declarations` writes this
+    // exact field in production). Seed it with the six session tools for
+    // every pantheon agent so selectors resolve the way they do against a
+    // running worker.
+    let config = Config::default();
+    let agents_dir = workspace_root.join("packages/pantheon/agents");
+    *config.nats_tool_declarations.write() = worker_session_declarations(&agents_dir);
+
+    let mut failures = Vec::new();
+    for agent_name in ASYNC_DELEGATION_AGENTS {
+        let qualified_name = format!("pantheon/{agent_name}");
+
+        let (agent, use_tools) = match loaded_async_agent(&qualified_name) {
+            Ok(loaded) => loaded,
+            Err(failure) => {
+                failures.push(failure);
+                continue;
+            }
+        };
+
+        let selected = config.select_tools(&agent).unwrap_or_default();
+        let selected_names: std::collections::HashSet<&str> =
+            selected.iter().map(|tool| tool.name.as_str()).collect();
+        let selection = AsyncAgentSelection {
+            qualified_name: &qualified_name,
+            use_tools: &use_tools,
+            selected_names: &selected_names,
+        };
+        failures.extend(async_selection_failures(&selection));
+
+        // Production render path with the actually selected tools.
+        match agent.system_text_with_tools(&selected) {
+            Ok(prompt) => failures.extend(async_prompt_semantic_failures(&selection, &prompt)),
+            Err(error) => failures.push(format!(
+                "{qualified_name}: failed to render prompt: {error}"
+            )),
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "async delegation guidance or tool selection broken:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Fragment hygiene for the shared async-delegation include (review B1):
+/// like the sandbox fragments it must stay pure markdown — no Jinja tags —
+/// and keep the policy anchors the integrating agents inherit verbatim.
+/// The sandbox fragment's forbidden-term list does not apply here: this
+/// fragment must say the wait never *extends* the deadline and that a soft
+/// *expiry* never cancels the child, so async-specific checks replace it.
+#[test]
+fn shared_async_delegation_fragment_is_pure_markdown_and_policy_aligned() {
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+
+    let path = workspace_root.join("packages/pantheon/agents/shared/async-delegation.md");
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+
+    let mut failures = Vec::new();
+    let mut checker = FragmentChecker {
+        file_name: "async-delegation.md",
+        content: &content,
+        failures: &mut failures,
+    };
+    checker.check_jinja();
+
+    // Unconditional cancellation or unmapped paging wording would be copied
+    // verbatim into every integrating agent's prompt.
+    failures.extend(
+        [
+            "Stop the child with",
+            "page forward with the returned",
+            "86400",
+            "604800",
+        ]
+        .iter()
+        .filter(|forbidden| content.contains(*forbidden))
+        .map(|forbidden| format!("async-delegation.md: contains forbidden wording '{forbidden}'")),
+    );
+
+    failures.extend(
+        ASYNC_DELEGATION_PHRASES
+            .iter()
+            .filter(|phrase| !content.contains(**phrase))
+            .map(|phrase| {
+                format!("async-delegation.md: missing required policy phrase '{phrase}'")
+            }),
+    );
+
+    assert!(
+        failures.is_empty(),
+        "shared async delegation fragment failed hygiene or policy checks:\n{}",
+        failures.join("\n")
+    );
+}
