@@ -14,8 +14,8 @@ use harnx_runtime::{
     nats_lease::NatsLeaseConfig,
     nats_worker::{
         publish_targeted_session_activate, run_worker_daemon, targeted_consumer_name,
-        targeted_notify_subject, targeted_worker_ready_subject, LocalWorkerTarget, SessionActivate,
-        WorkerDaemonConfig,
+        targeted_notify_subject, targeted_worker_ready_subject, ActivationFaults, BusyWaiterProbe,
+        LocalWorkerTarget, SessionActivate, WorkerDaemonConfig,
     },
     utils::create_abort_signal,
     NatsSession, NatsSessionConfig,

@@ -10,6 +10,8 @@ mod activation_failure_budget;
 mod activation_size_failure;
 #[path = "nats_worker/bounded_results.rs"]
 mod bounded_results;
+#[path = "nats_worker/busy_activation_waiting.rs"]
+mod busy_activation_waiting;
 #[path = "nats_worker/cancellation.rs"]
 mod cancellation;
 use crate::common;
@@ -88,8 +90,9 @@ use harnx_runtime::{
         SessionInitializer, SessionMetadata, SessionMetadataStore, SessionOverrides,
     },
     nats_worker::{
-        publish_session_activate, run_agent_loop_with_nats, run_worker_daemon,
-        NatsSessionLogBackend, RunAgentLoopArgs, SessionActivate, WorkerDaemonConfig,
+        publish_session_activate, run_agent_loop_with_nats, run_worker_daemon, ActivationFaults,
+        BusyWaiterProbe, NatsSessionLogBackend, RunAgentLoopArgs, SessionActivate,
+        WorkerDaemonConfig,
     },
     utils::create_abort_signal,
     ControlCommand, NatsSession, NatsSessionConfig,

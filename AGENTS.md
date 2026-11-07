@@ -1180,7 +1180,7 @@ A lease record carries its holder's liveness identity: pid, a one-way hash of
 the host identity (machine id, boot id and pid namespace on Linux) and, on Linux,
 process start time. A worker that finds a session lease whose holder is provably
 dead on this host reclaims it right away (CAS delete at the observed revision, then
-a normal acquire) instead of busy-NAKing until the TTL expires — that is what
+a normal acquire) instead of deferring until the TTL expires — that is what
 keeps a one-shot `prompt` retry on the same session fast after `--timeout-secs`
 killed the previous worker. Proof means dead: the pid is gone, or exists but is
 a different process or a zombie. Anything else — missing identity fields
@@ -1360,12 +1360,14 @@ consumer. Use `create_consumer`, which updates it, and pass every field: an
 update replaces the whole configuration, and async-nats leaves zero values
 out, so an omitted field falls back to the server default. `backoff` has three
 effects the activation consumers depend on (`activation_transport.rs`): NATS
-replaces `ack_wait` with `backoff[0]`, a progress ack restarts the timer
-against the current delivery's entry, and a NAK asking for `delay` on delivery
-k waits `delay - backoff[0] + backoff[k-1]`. A message that reaches
-`max_deliver` is never delivered again, even after the limit is raised, and
-lowering the limit below a message's delivery count drops it without the
-max-deliveries advisory. See "Delivery limits" in `docs/nats-ha.md`.
+replaces `ack_wait` with the backoff entry for the delivery count, a progress
+ack restarts the timer against the current delivery's entry, and a NAK asking
+for `delay` on delivery k waits `delay - ack_wait + backoff[k-1]` — with this
+consumer's `backoff[0] == ack_wait`, that is exactly `delay` on the steady
+deliveries. A message that reaches `max_deliver` is never delivered again, even
+after the limit is raised, and lowering the limit below a message's delivery
+count drops it without the max-deliveries advisory. See "Delivery limits" in
+`docs/nats-ha.md`.
 
 ### Interrupt acceptance
 

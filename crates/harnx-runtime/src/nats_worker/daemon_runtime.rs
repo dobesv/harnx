@@ -3,6 +3,7 @@
 //! subscription, and handing the claimed session off to execution.
 
 mod activation_preflight;
+mod busy_wait;
 
 use super::activation_delivery::{ActivationDelivery, ActivationNakReason};
 use super::activation_failure::ActivationFailureTracker;
@@ -22,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::task::AbortOnDropHandle;
@@ -41,16 +43,17 @@ pub(super) const SESSION_TOOL_SERVER_START_TIMEOUT: Duration = Duration::from_se
 const BUSY_NAK_BASE_DELAY: Duration = Duration::from_secs(10);
 const BUSY_NAK_MAX_JITTER: Duration = Duration::from_secs(2);
 /// Deliveries after which a worker terminates an activation instead of handing
-/// it back for another one. Busy redeliveries count, which is the point: a
-/// session busy for this long is held by a worker whose own run covers the
-/// work, or by one that is stuck, and redelivering forever helps neither.
-/// With the consumer's backoff this is several hours of being busy. Failures
-/// after the lease is claimed are recorded on the session by the failure
-/// budget long before; failures before it is claimed, and any while the
-/// failure counter is unavailable, aren't counted and end here without an
-/// `Error`. Kept below the consumer's `max_deliver`, so a worker sees the
-/// activation and says why it gave up before JetStream stops delivering it
-/// silently.
+/// it back for another one. Busy deferrals don't trigger this worker limit:
+/// an activation whose session is busy parks on a busy waiter (`busy_wait.rs`)
+/// without advancing its current JetStream delivery count. Busy NAKs still
+/// increment that shared count, so a later non-busy failure can hit this limit
+/// after earlier busy redeliveries. Busy-only broker cycles remain subject to
+/// the consumer's `max_deliver` backstop. Failures after
+/// the lease is claimed are recorded on the session by the failure budget long
+/// before; failures before it is claimed, and any while the failure counter is
+/// unavailable, aren't counted and end here without an `Error`. Kept below the
+/// consumer's `max_deliver`, so a worker sees the activation and says why it
+/// gave up before JetStream stops delivering it silently.
 pub const MAX_ACTIVATION_DELIVERIES: i64 = 100;
 
 /// Borrowed parameters for [`WorkerRuntime::spawn_control_listener`].
@@ -119,6 +122,72 @@ enum ReservationOutcome {
     Reserved(u64),
     SameDelivery,
     DistinctDelivery,
+}
+
+/// Outcome of one whole claim attempt on a delivery, settled in one place
+/// (see issue #2206): the claim succeeded, the session is busy and the caller
+/// must park the delivery, or the delivery is already settled (acknowledged,
+/// NAKed, terminated, or handed back untouched) and needs nothing further.
+enum ClaimOutcome {
+    Claimed(ClaimedActivation),
+    /// Carries the activation so a busy waiter can retry with it.
+    Busy(SessionActivate),
+    Settled,
+}
+
+/// Outcome of claiming an already-reserved activation. `Busy` means the
+/// reservation has been released and the caller owns deciding what happens to
+/// the delivery: park it, or NAK it back.
+enum ClaimedOrBusy {
+    Claimed(ClaimedActivation),
+    Busy(SessionActivate),
+    Settled,
+}
+
+/// Who is running a claim. An admission claim that ends without a lease wakes
+/// parked waiters once it releases its reservation; a busy waiter's own claim
+/// releases quietly, or every waiter would wake itself into a claim loop
+/// against a live holder.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimOrigin {
+    Admission,
+    BusyWaiter,
+}
+
+/// The reservation a claim runs under, and who is claiming.
+#[derive(Clone, Copy)]
+struct ClaimContext {
+    reservation_generation: u64,
+    origin: ClaimOrigin,
+}
+
+/// Outcome of the preflight chain. `Busy` leaves the delivery untouched: the
+/// session is held elsewhere and the caller parks or NAKs. `Finished` means
+/// the delivery has already been settled (acknowledged, NAKed or
+/// terminated) by one of the preflights, or it settled as a duplicate.
+pub(super) enum PreflightOutcome {
+    Ready,
+    Busy,
+    Finished,
+}
+
+/// Whether the session lease key is held by someone else. `Settled` means a
+/// targeted lookup error already NAKed the delivery back, so the claim must
+/// end there instead of continuing with a broker-released delivery.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub(super) enum LeaseHolderCheck {
+    Free,
+    Held,
+    Settled,
+}
+
+/// Outcome of attempting the activation lease. `Held` leaves the delivery
+/// untouched for the caller to decide; `Settled` means a targeted
+/// acquisition error already NAKed the delivery back.
+enum LeaseAcquisition {
+    Acquired(Arc<NatsSessionLease>),
+    Held,
+    Settled,
 }
 
 fn record_publish_to_delivery(
@@ -190,6 +259,19 @@ pub(super) struct WorkerRuntime {
     pub(super) shutdown: tokio_util::sync::CancellationToken,
     pub(super) active: Mutex<HashMap<String, ActiveSession>>,
     pub(super) reservations: Mutex<HashMap<String, ActivationReservation>>,
+    /// Busy deliveries parked on this worker (see `busy_wait.rs`).
+    pub(super) busy_waiters: Mutex<HashMap<String, busy_wait::BusyWaiterSlot>>,
+    /// Task handles of every spawned busy waiter, parked or completing, for
+    /// shutdown settlement. Kept outside the per-session slots so a slot can
+    /// be removed the moment its last parked waiter finishes, instead of
+    /// staying until its own handle observes completion (which it never can).
+    pub(super) busy_waiter_handles: Mutex<Vec<JoinHandle<()>>>,
+    pub(super) busy_wait_max: Duration,
+    pub(super) busy_waiter_capacity: usize,
+    /// Test-only fault seams; `None` in production.
+    pub(super) activation_faults: Option<Arc<super::daemon_config::ActivationFaults>>,
+    /// Test-only live view of the busy-waiter registry; `None` in production.
+    pub(super) busy_waiter_probe: Option<Arc<super::daemon_config::BusyWaiterProbe>>,
 }
 
 impl WorkerRuntime {
@@ -256,6 +338,8 @@ impl WorkerRuntime {
         {
             active.remove(session_id);
         }
+        drop(active);
+        self.notify_session_released(session_id).await;
     }
 
     /// Close admission's active-session side and await every single-owner
@@ -276,6 +360,7 @@ impl WorkerRuntime {
             }
             self.release_activation_reservation(&session_id, generation)
                 .await;
+            self.notify_session_released(&session_id).await;
         }
         match tokio::time::timeout(Duration::from_secs(2), self.client.flush()).await {
             Ok(Ok(())) => {}
@@ -421,13 +506,23 @@ impl WorkerRuntime {
     /// Hand the activation back for another delivery after `delay`, unless it
     /// has used up [`MAX_ACTIVATION_DELIVERIES`]. Shutdown hands activations
     /// back through [`Self::shutdown_nak`] instead, so a rolling deploy never
-    /// spends an activation's last delivery.
+    /// spends an activation's last delivery. Busy activations normally park
+    /// on a waiter rather than reach this; a delayed NAK is the fallback for
+    /// busy deliveries past the waiter capacity or the busy-wait budget.
     async fn redeliver_later(
         delivery: &mut ActivationDelivery,
         delay: Duration,
         reason: ActivationNakReason,
     ) -> Result<()> {
         if delivery.delivered() < MAX_ACTIVATION_DELIVERIES {
+            return delivery.nak(Some(delay), reason).await;
+        }
+        if reason == ActivationNakReason::Busy {
+            // A busy deferral means the session is legitimately occupied, not
+            // that anything is failing, so spending the delivery limit on it
+            // would drop work a live session still owes (issue #2636). Keep
+            // handing it back: the consumer's `max_deliver` backstop (200) ends
+            // a delivery nothing ever settles.
             return delivery.nak(Some(delay), reason).await;
         }
         delivery.terminate("delivery limit").await?;
@@ -445,6 +540,15 @@ impl WorkerRuntime {
     }
 
     async fn flush_shutdown_disposition(&self) {
+        if self.activation_faults.as_ref().is_some_and(|faults| {
+            faults
+                .stall_shutdown_flush
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }) {
+            // Test seam: hold the shutdown flush open forever, so the
+            // shutdown settle timeout has to abort and join this waiter.
+            std::future::pending::<()>().await;
+        }
         match tokio::time::timeout(Duration::from_secs(2), self.client.flush()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -586,21 +690,34 @@ impl WorkerRuntime {
         delivery: &mut ActivationDelivery,
         activation: &SessionActivate,
         generation: u64,
-    ) -> Result<Option<Arc<NatsSessionLease>>> {
-        match self.acquire_activation_lease(activation, generation).await {
-            Ok(Some(lease)) => Ok(Some(lease)),
+    ) -> Result<LeaseAcquisition> {
+        let acquired = if self.activation_faults.as_ref().is_some_and(|faults| {
+            faults
+                .fail_targeted_lease_acquire
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }) {
+            Err(anyhow::anyhow!("injected activation lease failure"))
+        } else {
+            self.acquire_activation_lease(activation, generation).await
+        };
+        match acquired {
+            Ok(Some(lease)) => Ok(LeaseAcquisition::Acquired(lease)),
             Ok(None) => {
                 metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "lease_held").increment(1);
-                Self::busy_nak(delivery).await?;
-                Ok(None)
+                // The caller decides what a held lease means for the
+                // delivery: the claim path parks it, the failure-budget path
+                // NAKs it back.
+                Ok(LeaseAcquisition::Held)
             }
             Err(error) if self.uses_targeted_activation() => {
                 log::warn!(
                     "targeted activation lease attempt failed for session '{}': {error:#}",
                     activation.session_id
                 );
+                // Settle exactly once: the delivery is already handed back,
+                // so the caller must end the claim, never park it.
                 Self::delayed_nak(delivery, ActivationNakReason::ClaimError).await?;
-                Ok(None)
+                Ok(LeaseAcquisition::Settled)
             }
             Err(error) => Err(error),
         }
@@ -876,90 +993,163 @@ impl WorkerRuntime {
     async fn claim_activation(
         &self,
         delivery: &mut ActivationDelivery,
-    ) -> Result<Option<ClaimedActivation>> {
+        origin: ClaimOrigin,
+    ) -> Result<ClaimOutcome> {
         if self.shutdown.is_cancelled() {
             Self::shutdown_nak(delivery).await?;
-            return Ok(None);
+            return Ok(ClaimOutcome::Settled);
+        }
+        if self
+            .activation_faults
+            .as_ref()
+            .is_some_and(|faults| faults.fail_claims.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            // Test seam: exercise the claim-error disposition paths
+            // deterministically (handler and busy-waiter wake alike).
+            return Err(anyhow::anyhow!("injected activation claim failure"));
         }
         let Some(activation) = self.decode_activation(delivery).await? else {
-            return Ok(None);
+            return Ok(ClaimOutcome::Settled);
         };
-        let reservation_generation = match self
+        match self
             .reserve_activation(&activation.session_id, delivery.stream_sequence())
             .await
         {
-            ReservationOutcome::Reserved(generation) => generation,
+            ReservationOutcome::Reserved(generation) => {
+                let ctx = ClaimContext {
+                    reservation_generation: generation,
+                    origin,
+                };
+                match self
+                    .claim_reserved_activation(delivery, activation, ctx)
+                    .await?
+                {
+                    ClaimedOrBusy::Claimed(claimed) => Ok(ClaimOutcome::Claimed(claimed)),
+                    ClaimedOrBusy::Busy(activation) => Ok(ClaimOutcome::Busy(activation)),
+                    ClaimedOrBusy::Settled => Ok(ClaimOutcome::Settled),
+                }
+            }
             ReservationOutcome::SameDelivery => {
                 metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "same_delivery").increment(1);
-                return Ok(None);
+                Ok(ClaimOutcome::Settled)
             }
             ReservationOutcome::DistinctDelivery => {
+                // This worker is already running (or claiming) this session
+                // with a different delivery. The caller parks the delivery on
+                // a busy waiter instead of handing it back to JetStream.
                 metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "busy")
                     .increment(1);
-                Self::busy_nak(delivery).await?;
-                return Ok(None);
+                Ok(ClaimOutcome::Busy(activation))
             }
-        };
-        self.claim_reserved_activation(delivery, activation, reservation_generation)
-            .await
+        }
     }
 
     async fn claim_reserved_activation(
         &self,
         delivery: &mut ActivationDelivery,
         activation: SessionActivate,
-        reservation_generation: u64,
-    ) -> Result<Option<ClaimedActivation>> {
+        ctx: ClaimContext,
+    ) -> Result<ClaimedOrBusy> {
         let session_id = activation.session_id.clone();
-        let admission_started = std::time::Instant::now();
-        let result = async {
-            let span =
-                agent_activation_span(delivery.message().headers.as_ref(), &activation.session_id);
-            if !self
-                .activation_is_ready(delivery, &activation, reservation_generation)
-                .await?
-            {
-                metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "preflight_not_ready").increment(1);
-                return Ok(None);
-            }
-            if self.shutdown.is_cancelled() {
-                Self::shutdown_nak(delivery).await?;
-                return Ok(None);
-            }
-            let Some(lease) = self
-                .acquire_or_defer_activation(delivery, &activation, reservation_generation)
-                .await?
-            else {
-                return Ok(None);
-            };
-            let lease_acquired_at = std::time::Instant::now();
-            harnx_metrics::record_activation_phase("admission_to_lease", admission_started.elapsed());
-            metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "claimed").increment(1);
-            tracing::info!(event = "activation_lease_acquired", session_id = %activation.session_id,
-                activation_id = %activation.epoch, agent = activation.agent_name.as_deref().unwrap_or("unknown"), cluster = %self.cluster,
-                delivery_attempt = delivery.message().info().map_or(0, |i| i.delivered),
-                elapsed_ms = admission_started.elapsed().as_millis() as u64, reason = "claimed",
-                "activation lease acquired");
-            delivery.attach_lease(&lease);
-            if self.shutdown.is_cancelled() {
-                lease.release().await?;
-                Self::shutdown_nak(delivery).await?;
-                return Ok(None);
-            }
-            Ok(Some(ClaimedActivation {
-                activation,
-                lease,
-                reservation_generation,
-                span,
-                lease_acquired_at,
-            }))
-        }
-        .await;
-        if !matches!(result, Ok(Some(_))) {
-            self.release_activation_reservation(&session_id, reservation_generation)
+        let result = self.attempt_reserved_claim(delivery, activation, ctx).await;
+        if !matches!(result, Ok(ClaimedOrBusy::Claimed(_))) {
+            self.release_activation_reservation(&session_id, ctx.reservation_generation)
                 .await;
+            if ctx.origin == ClaimOrigin::Admission {
+                // The claim gave up its Starting reservation without ever
+                // holding a lease, so no lease-key Delete will ever signal
+                // that this worker is done with the session. Wake any parked
+                // waiters now instead of letting them wait out a recheck
+                // interval.
+                self.notify_session_released(&session_id).await;
+            }
+            if matches!(result, Ok(ClaimedOrBusy::Busy(_))) {
+                self.stop_busy_claim_heartbeat(delivery).await;
+            }
         }
         result
+    }
+
+    /// The claim attempt itself: preflight, the lease CAS, and building the
+    /// claimed activation. Every early exit settles the delivery or returns
+    /// it busy; the caller owns the reservation epilogue.
+    async fn attempt_reserved_claim(
+        &self,
+        delivery: &mut ActivationDelivery,
+        activation: SessionActivate,
+        ctx: ClaimContext,
+    ) -> Result<ClaimedOrBusy> {
+        let admission_started = std::time::Instant::now();
+        let span =
+            agent_activation_span(delivery.message().headers.as_ref(), &activation.session_id);
+        match self
+            .activation_is_ready(delivery, &activation, ctx.reservation_generation)
+            .await?
+        {
+            PreflightOutcome::Busy => {
+                return Ok(ClaimedOrBusy::Busy(activation));
+            }
+            PreflightOutcome::Finished => {
+                metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "preflight_not_ready").increment(1);
+                return Ok(ClaimedOrBusy::Settled);
+            }
+            PreflightOutcome::Ready => {}
+        }
+        if self.shutdown.is_cancelled() {
+            Self::shutdown_nak(delivery).await?;
+            return Ok(ClaimedOrBusy::Settled);
+        }
+        let lease = match self
+            .acquire_or_defer_activation(delivery, &activation, ctx.reservation_generation)
+            .await?
+        {
+            LeaseAcquisition::Acquired(lease) => lease,
+            LeaseAcquisition::Held => {
+                // The lease CAS lost: someone else holds the session. The
+                // caller parks the delivery instead of NAKing it back.
+                return Ok(ClaimedOrBusy::Busy(activation));
+            }
+            LeaseAcquisition::Settled => {
+                // A targeted acquisition error already NAKed the delivery
+                // back; the claim ends here and must not park it.
+                return Ok(ClaimedOrBusy::Settled);
+            }
+        };
+        let lease_acquired_at = std::time::Instant::now();
+        harnx_metrics::record_activation_phase("admission_to_lease", admission_started.elapsed());
+        metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "claimed")
+            .increment(1);
+        tracing::info!(event = "activation_lease_acquired", session_id = %activation.session_id,
+            activation_id = %activation.epoch, agent = activation.agent_name.as_deref().unwrap_or("unknown"), cluster = %self.cluster,
+            delivery_attempt = delivery.message().info().map_or(0, |i| i.delivered),
+            elapsed_ms = admission_started.elapsed().as_millis() as u64, reason = "claimed",
+            "activation lease acquired");
+        delivery.attach_lease(&lease);
+        if self.shutdown.is_cancelled() {
+            lease.release().await?;
+            Self::shutdown_nak(delivery).await?;
+            return Ok(ClaimedOrBusy::Settled);
+        }
+        Ok(ClaimedOrBusy::Claimed(ClaimedActivation {
+            activation,
+            lease,
+            reservation_generation: ctx.reservation_generation,
+            span,
+            lease_acquired_at,
+        }))
+    }
+
+    /// Test seam: hand a busy result back with the delivery's heartbeat
+    /// already stopped — what a wind-up lease lost mid-claim leaves behind —
+    /// so the dead-heartbeat park rejections are exercised end to end.
+    async fn stop_busy_claim_heartbeat(&self, delivery: &mut ActivationDelivery) {
+        if self.activation_faults.as_ref().is_some_and(|faults| {
+            faults
+                .busy_claims_dead_heartbeat
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }) {
+            delivery.stop_heartbeat().await;
+        }
     }
 
     pub(super) async fn handle_activation(
@@ -1000,9 +1190,21 @@ impl WorkerRuntime {
                     .map_or(0, |duration| duration.as_millis() as u64), reason = "admitted",
                 "activation admitted");
         }
-        let claimed = match self.claim_activation(&mut delivery).await {
-            Ok(Some(claimed)) => claimed,
-            Ok(None) => {
+        match self
+            .claim_activation(&mut delivery, ClaimOrigin::Admission)
+            .await
+        {
+            Ok(ClaimOutcome::Claimed(claimed)) => {
+                self.launch_claimed_session(claimed, delivery).await
+            }
+            Ok(ClaimOutcome::Busy(activation)) => {
+                // The delivery moves into the parked busy waiter, which keeps
+                // its progress heartbeats going. Returning here releases the
+                // admission permit: waiting on a busy session must never hold
+                // one.
+                self.park_busy_activation(activation, delivery).await
+            }
+            Ok(ClaimOutcome::Settled) => {
                 if let Ok(activation) =
                     serde_json::from_slice::<SessionActivate>(&delivery.message().payload)
                 {
@@ -1014,7 +1216,7 @@ impl WorkerRuntime {
                         reason = "not_claimed", "activation not claimed");
                 }
                 delivery.stop_heartbeat().await;
-                return Ok(());
+                Ok(())
             }
             Err(error) => {
                 if let Ok(activation) =
@@ -1034,9 +1236,19 @@ impl WorkerRuntime {
                     Self::delayed_nak(&mut delivery, ActivationNakReason::ClaimError).await
                 };
                 disposition?;
-                return Err(error);
+                Err(error)
             }
-        };
+        }
+    }
+
+    /// Hand a claimed activation to its session supervisor task. Shared by
+    /// admission (`handle_activation`) and by parked busy waiters that
+    /// claimed after their session freed up.
+    async fn launch_claimed_session(
+        self: &Arc<Self>,
+        claimed: ClaimedActivation,
+        delivery: ActivationDelivery,
+    ) -> Result<()> {
         let worker = Arc::clone(self);
         let session_id = claimed.activation.session_id.clone();
         let task_session_id = session_id.clone();

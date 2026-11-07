@@ -87,11 +87,20 @@ impl WorkerRuntime {
         if failures < super::super::daemon_session_exec::MAX_ACTIVATION_FAILURES {
             return self.retry_metadata_preflight_failure(delivery, error).await;
         }
-        let Some(lease) = self
+        let lease = match self
             .acquire_or_defer_activation(delivery, activation, generation)
             .await?
-        else {
-            return Ok(false);
+        {
+            LeaseAcquisition::Acquired(lease) => lease,
+            LeaseAcquisition::Held => {
+                // Reached only after the failure budget is spent: another
+                // holder owns the session, so hand this delivery back for a
+                // redelivery.
+                Self::busy_nak(delivery).await?;
+                return Ok(false);
+            }
+            // A targeted acquisition error already NAKed the delivery back.
+            LeaseAcquisition::Settled => return Ok(false),
         };
         delivery.attach_lease(&lease);
         let error = self
@@ -159,11 +168,19 @@ impl WorkerRuntime {
             }
             _ => return Ok(true),
         }
-        let Some(lease) = self
+        let lease = match self
             .acquire_or_defer_activation(delivery, activation, generation)
             .await?
-        else {
-            return Ok(false);
+        {
+            LeaseAcquisition::Acquired(lease) => lease,
+            LeaseAcquisition::Held => {
+                // Another holder won the lease while the interruption waited
+                // to be wound up; hand the delivery back for a redelivery.
+                Self::busy_nak(delivery).await?;
+                return Ok(false);
+            }
+            // A targeted acquisition error already NAKed the delivery back.
+            LeaseAcquisition::Settled => return Ok(false),
         };
         delivery.attach_lease(&lease);
         if self.shutdown.is_cancelled() {
@@ -224,18 +241,26 @@ impl WorkerRuntime {
         &self,
         delivery: &mut ActivationDelivery,
         activation: &SessionActivate,
-    ) -> Result<bool> {
-        match crate::nats_lease::lease_holder_in(
-            &self.lease_bucket,
-            &self.lease,
-            &activation.session_id,
-        )
-        .await
-        {
+    ) -> Result<LeaseHolderCheck> {
+        let holder = if self.activation_faults.as_ref().is_some_and(|faults| {
+            faults
+                .fail_targeted_lease_holder_read
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }) {
+            Err(anyhow::anyhow!("injected lease-holder lookup failure"))
+        } else {
+            crate::nats_lease::lease_holder_in(
+                &self.lease_bucket,
+                &self.lease,
+                &activation.session_id,
+            )
+            .await
+        };
+        match holder {
             Ok(Some(holder)) => {
                 if crate::nats_lease::holder_is_stale(&holder) {
                     // The holder provably died on this host (a SIGKILLed local
-                    // worker, a crashed daemon). Skip the busy NAK so the
+                    // worker, a crashed daemon). Skip the busy path so the
                     // acquisition CAS reclaims the stale key instead of the
                     // delivery waiting out the lease TTL; a live holder that
                     // took over meanwhile wins that CAS and we defer then.
@@ -250,7 +275,7 @@ impl WorkerRuntime {
                             .unwrap_or_default(),
                         holder.generation
                     );
-                    return Ok(true);
+                    return Ok(LeaseHolderCheck::Free);
                 }
                 log::debug!(
                     "deferring busy activation before session preflight: session_id={} holder_worker_id={} holder_generation={}",
@@ -258,10 +283,11 @@ impl WorkerRuntime {
                     holder.worker_id,
                     holder.generation
                 );
-                Self::busy_nak(delivery).await?;
-                Ok(false)
+                metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "busy_foreign")
+                    .increment(1);
+                Ok(LeaseHolderCheck::Held)
             }
-            Ok(None) => Ok(true),
+            Ok(None) => Ok(LeaseHolderCheck::Free),
             Err(error) => {
                 log::warn!(
                     "activation lease-holder preflight failed for '{}': {error:#}",
@@ -270,7 +296,9 @@ impl WorkerRuntime {
                 if self.uses_targeted_activation() {
                     Self::delayed_nak(delivery, super::ActivationNakReason::PreflightNotReady)
                         .await?;
-                    Ok(false)
+                    // The delivery is already handed back; end the claim here
+                    // instead of continuing with a broker-released delivery.
+                    Ok(LeaseHolderCheck::Settled)
                 } else {
                     Err(error)
                 }
@@ -283,48 +311,50 @@ impl WorkerRuntime {
         delivery: &mut ActivationDelivery,
         activation: &SessionActivate,
         generation: u64,
-    ) -> Result<bool> {
+    ) -> Result<PreflightOutcome> {
         if !self
             .targeted_route_preflight_passes(delivery, activation)
             .await?
         {
-            return Ok(false);
+            return Ok(PreflightOutcome::Finished);
         }
         // This cached KV read avoids metadata and full-log reads while another
         // owner is live. Lease acquisition below remains the ownership CAS.
-        if !self
+        match self
             .lease_holder_preflight_passes(delivery, activation)
             .await?
         {
-            return Ok(false);
+            LeaseHolderCheck::Held => return Ok(PreflightOutcome::Busy),
+            LeaseHolderCheck::Settled => return Ok(PreflightOutcome::Finished),
+            LeaseHolderCheck::Free => {}
         }
         if !self
             .metadata_preflight_passes(delivery, activation, generation)
             .await?
         {
-            return Ok(false);
+            return Ok(PreflightOutcome::Finished);
         }
 
         if self.shutdown.is_cancelled() {
             Self::shutdown_nak(delivery).await?;
-            return Ok(false);
+            return Ok(PreflightOutcome::Finished);
         }
 
         if !self
             .wind_up_preflight(delivery, activation, generation)
             .await?
         {
-            return Ok(false);
+            return Ok(PreflightOutcome::Finished);
         }
 
         if self
             .activation_status_preflight_finished(delivery, activation)
             .await?
         {
-            return Ok(false);
+            return Ok(PreflightOutcome::Finished);
         }
 
-        Ok(true)
+        Ok(PreflightOutcome::Ready)
     }
 }
 
