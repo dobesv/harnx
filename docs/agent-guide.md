@@ -630,6 +630,8 @@ Autonomous run deadlines belong to the runtime, not the delegating model:
 - **Inheritance across delegations**: All child delegations, handoffs, and resumed sessions within that autonomous run inherit the root run's deadline (`parent.deadline`). Autonomous activity cannot renew or extend this deadline.
 - **Worker-owned enforcement**: The worker daemon enforces deadlines independently while awaiting models, tool executions, retries, and nested sub-agents. If a calling process disconnects or dies while waiting, the detached worker continues running under its independent deadline and terminates cleanly when that deadline expires.
 
+Delegation results omit a leading `<think>...</think>` block from the child's response. A thinking-only response returns an empty `response`. Child session logs retain the original response, including thinking.
+
 #### Result Envelope on Limit Reached
 
 When a sub-agent invocation reaches a timeout or repetition limit:
@@ -700,7 +702,7 @@ Field reference for `termination`:
   - `output_excerpt`: Bounded public assistant text (up to 4 KiB).
   - `references`: Array of up to 16 canonical `cid:` URLs discovered during execution (up to 1,024 bytes per URL).
   - If no output or artifact references were captured, `available` is `false` and public progress is reported as unavailable.
-- `thinking_excerpt`: Bounded tail of thinking text (up to 4 KiB) when streaming is active, or `null` if none was captured (non-streaming requests yield no intermediate thinking text mid-call).
+- `thinking_excerpt`: Always `null` in sub-agent delegation results. Child reasoning is not returned to the parent; the child session's own log and events retain it. CLI termination diagnostics can still include a bounded thinking excerpt.
 - `retry_hint`: Guidance describing continuation rules based on termination scope.
 - For `"repetition"` stops: `source` (`"tool_calls"`, `"answer"`, or `"thinking"`), and for tool calls `tool` and `count`.
 

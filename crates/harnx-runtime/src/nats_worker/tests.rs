@@ -135,6 +135,7 @@ mod deadline_enforcement_tests;
 mod invocation_limit_tests;
 mod nats_server_tests;
 mod subagent_discovery_tests;
+mod subagent_thinking_tests;
 mod transcript_render_tests;
 
 /// A `nats-server` that dies with the test that started it.

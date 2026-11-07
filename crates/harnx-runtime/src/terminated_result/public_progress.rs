@@ -2,6 +2,7 @@ use super::{append_tail, lock_or_recover, INVOCATION_TEXT_TAIL_CAP_BYTES};
 use harnx_core::{
     message::{MessageContent, MessageContentPart, MessageRole},
     session::SessionLogEntry,
+    text::strip_think_tag,
 };
 use serde::Serialize;
 use std::sync::Mutex;
@@ -74,6 +75,8 @@ impl PublicProgress {
         visit(self, value, &mut 256, 0);
     }
 
+    /// Extract delegation progress, stripping leading thinking before bounding text
+    /// or collecting references so private reasoning can't become a public excerpt.
     pub fn from_entries(entries: &[(u64, SessionLogEntry)], prompt_seq: u64) -> Self {
         let end =
             crate::nats_session::invocation_terminal_seq(entries, prompt_seq).unwrap_or(u64::MAX);
@@ -88,17 +91,23 @@ impl PublicProgress {
                     content,
                     ..
                 } => match content {
-                    MessageContent::ToolCalls(calls) => progress.observe_text(&calls.text),
-                    MessageContent::Text(text) => progress.observe_text(text),
+                    MessageContent::ToolCalls(calls) => {
+                        progress.observe_text(strip_think_tag(&calls.text).as_ref())
+                    }
+                    MessageContent::Text(text) => {
+                        progress.observe_text(strip_think_tag(text).as_ref())
+                    }
                     MessageContent::Array(parts) => {
                         for part in parts {
                             if let MessageContentPart::Text { text } = part {
-                                progress.observe_text(text);
+                                progress.observe_text(strip_think_tag(text).as_ref());
                             }
                         }
                     }
                 },
-                SessionLogEntry::ToolCalls { text, .. } => progress.observe_text(text),
+                SessionLogEntry::ToolCalls { text, .. } => {
+                    progress.observe_text(strip_think_tag(text).as_ref())
+                }
                 SessionLogEntry::ToolResults { results, .. } => {
                     for result in results {
                         progress.observe_value(&result.output);
@@ -148,6 +157,53 @@ mod tests {
 mod durable_tests {
     use super::*;
     use crate::{synthesize_terminated_result, TerminationInputs, TerminationKind};
+
+    #[test]
+    fn durable_progress_strips_thinking_from_each_assistant_text_shape() {
+        use harnx_core::message::MessageContentToolCalls;
+
+        let message = |content| SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::Assistant,
+            content,
+            timestamp: None,
+            fence_token: None,
+        };
+        for (raw, expected) in [
+            (
+                "<think>private reasoning</think>\nPublic checkpoint",
+                Some("Public checkpoint"),
+            ),
+            ("<think>private reasoning only</think>", None),
+            ("  Plain checkpoint\n", Some("  Plain checkpoint\n")),
+        ] {
+            for entry in [
+                message(MessageContent::Text(raw.into())),
+                message(MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![],
+                    raw.into(),
+                    None,
+                ))),
+                message(MessageContent::Array(vec![MessageContentPart::Text {
+                    text: raw.into(),
+                }])),
+                SessionLogEntry::ToolCalls {
+                    text: raw.into(),
+                    thought: Some("private separate thought".into()),
+                    calls: vec![],
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ] {
+                let entries = vec![(2, entry)];
+                let original = entries.clone();
+                let progress = PublicProgress::from_entries(&entries, 1);
+                assert_eq!(progress.output_excerpt.as_deref(), expected);
+                assert_eq!(progress.available, expected.is_some());
+                assert_eq!(entries, original, "raw entries stay intact");
+            }
+        }
+    }
 
     #[test]
     fn nonstreaming_timeout_keeps_durable_artifact_references_but_not_later_turn_or_thinking() {

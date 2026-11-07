@@ -176,7 +176,7 @@ async fn historical_terminal_cancel_and_result_matrix() -> Result<()> {
 #[tokio::test]
 async fn scoped_failure_envelopes_preserve_available_durable_output_and_usage() -> Result<()> {
     use harnx_core::{
-        event::{AgentEvent, ModelEvent},
+        event::{AgentEvent, AgentEventSink, ContentBlock, ModelEvent},
         message::MessageRole,
         session::SessionLogEntry,
     };
@@ -196,6 +196,12 @@ async fn scoped_failure_envelopes_preserve_available_durable_output_and_usage() 
     );
     let reference = "cid:plan:pantheon%2Fatlas/armDRA/issue-2222";
     let output = format!("Saved partial results in {reference}");
+    let private_reference = "cid:plan:pantheon%2Fatlas/armDRA/private-thinking";
+    // Exceed the excerpt cap: stripping after bounding would lose the opening tag.
+    let tagged_output = format!(
+        "<think>{}\n{private_reference}</think>\n{output}",
+        "private reasoning ".repeat(crate::INVOCATION_TEXT_TAIL_CAP_BYTES)
+    );
     for (index, scope) in [
         Some(crate::TimeoutScope::LocalInvocation),
         Some(crate::TimeoutScope::InheritedDeadline),
@@ -211,19 +217,6 @@ async fn scoped_failure_envelopes_preserve_available_durable_output_and_usage() 
             harnx_core::session_identity::session_key(Some("helper"), &session_id),
             1,
         );
-        for (role, text) in [
-            (MessageRole::User, "work"),
-            (MessageRole::Assistant, output.as_str()),
-        ] {
-            log.append_event_async(&SessionLogEntry::Message {
-                id: None,
-                role,
-                content: MessageContent::Text(text.into()),
-                timestamp: None,
-                fence_token: Some(1),
-            })
-            .await?;
-        }
         let error = if let Some(scope) = scope {
             crate::TimeoutTerminal {
                 scope,
@@ -238,29 +231,7 @@ async fn scoped_failure_envelopes_preserve_available_durable_output_and_usage() 
             )
             .to_string()
         };
-        let terminal = if scope.is_some() {
-            SessionLogEntry::Cancel {
-                fence_token: 1,
-                cancellation_id: Some("deadline".into()),
-                requested_by: Some(error.clone()),
-                timestamp: None,
-            }
-        } else {
-            SessionLogEntry::Error {
-                message: error.clone(),
-                fence_token: 1,
-                timestamp: None,
-            }
-        };
-        log.append_event_async(&terminal).await?;
-        log.append_event_async(&SessionLogEntry::Message {
-            id: None,
-            role: MessageRole::Assistant,
-            content: MessageContent::Text("later turn must not leak".into()),
-            timestamp: None,
-            fence_token: Some(1),
-        })
-        .await?;
+        append_stopped_child_log(&log, &tagged_output, &error, scope.is_some()).await?;
         let reporter = toolset
             .start_progress_reporter(super::super::ProgressReporterStart {
                 child_session_id: session_id.clone(),
@@ -276,11 +247,15 @@ async fn scoped_failure_envelopes_preserve_available_durable_output_and_usage() 
             cache_write: 2,
             session_label: None,
         }));
+        let buffering_sink = Arc::new(InvocationBufferingSink::new(Arc::new(NullSink)));
+        buffering_sink.emit(AgentEvent::Model(ModelEvent::ThoughtChunk {
+            blocks: vec![ContentBlock::Text("buffered private reasoning".into())],
+        }));
         let finished = finish_completed_turn(CompletedTurnParams {
             toolset: &toolset,
             child_session_id: session_id.clone(),
             reporter,
-            buffering_sink: Arc::new(InvocationBufferingSink::new(Arc::new(NullSink))),
+            buffering_sink: buffering_sink.clone(),
             result: NatsTurnResult {
                 response: None,
                 error: Some(error),
@@ -320,6 +295,22 @@ async fn scoped_failure_envelopes_preserve_available_durable_output_and_usage() 
         assert!(response.contains(&output));
         assert!(response.contains(advice));
         assert!(!response.contains("later turn must not leak"));
+        let serialized = envelope.to_string();
+        assert!(!serialized.contains("private reasoning"));
+        assert!(!serialized.contains(private_reference));
+        assert!(!serialized.contains("<think>"));
+        assert_eq!(buffering_sink.thinking_tail(), "buffered private reasoning");
+        assert!(
+            log.load_events_async()
+                .await?
+                .iter()
+                .any(|(_, entry)| matches!(
+                    entry,
+                    SessionLogEntry::Message { role: MessageRole::Assistant, content, .. }
+                        if content.to_text() == tagged_output
+                )),
+            "durable child reasoning stays intact"
+        );
         match scope {
             Some(crate::TimeoutScope::InheritedDeadline | crate::TimeoutScope::OuterRun) => {
                 assert!(advice.contains("Do not retry:"));
@@ -337,5 +328,52 @@ async fn scoped_failure_envelopes_preserve_available_durable_output_and_usage() 
             }
         }
     }
+    Ok(())
+}
+
+async fn append_stopped_child_log(
+    log: &NatsSessionLog,
+    output: &str,
+    error: &str,
+    cancelled: bool,
+) -> Result<()> {
+    use harnx_core::{message::MessageRole, session::SessionLogEntry};
+
+    for (role, text) in [
+        (MessageRole::User, "work"),
+        (MessageRole::Assistant, output),
+    ] {
+        log.append_event_async(&SessionLogEntry::Message {
+            id: None,
+            role,
+            content: MessageContent::Text(text.into()),
+            timestamp: None,
+            fence_token: Some(1),
+        })
+        .await?;
+    }
+    let terminal = if cancelled {
+        SessionLogEntry::Cancel {
+            fence_token: 1,
+            cancellation_id: Some("deadline".into()),
+            requested_by: Some(error.into()),
+            timestamp: None,
+        }
+    } else {
+        SessionLogEntry::Error {
+            message: error.into(),
+            fence_token: 1,
+            timestamp: None,
+        }
+    };
+    log.append_event_async(&terminal).await?;
+    log.append_event_async(&SessionLogEntry::Message {
+        id: None,
+        role: MessageRole::Assistant,
+        content: MessageContent::Text("later turn must not leak".into()),
+        timestamp: None,
+        fence_token: Some(1),
+    })
+    .await?;
     Ok(())
 }
