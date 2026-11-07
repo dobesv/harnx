@@ -1,6 +1,9 @@
 // Auto-split from server.rs for cohesion. See server/mod.rs.
 use super::*;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct ExecCommandParams {
@@ -119,6 +122,8 @@ pub(crate) struct SpawnCommandParams {
     pub(crate) working_dir: Option<String>,
     #[serde(default)]
     pub(crate) env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub(crate) wait: Option<WaitOptions>,
 }
 
 impl JsonSchema for SpawnCommandParams {
@@ -130,6 +135,7 @@ impl JsonSchema for SpawnCommandParams {
         let command = generator.subschema_for::<String>();
         let working_dir = generator.subschema_for::<Option<String>>();
         let env = generator.subschema_for::<Option<HashMap<String, String>>>();
+        let wait = generator.subschema_for::<Option<WaitOptions>>();
         object_schema_with_desc(
             vec![
                 ("command", "Bash command to run in the background. Supports shebang lines: start the command with #!/usr/bin/env python3 (or node, ruby, etc.) to run a multi-line script with the correct interpreter instead of wrapping it in bash -c.", command),
@@ -143,15 +149,15 @@ impl JsonSchema for SpawnCommandParams {
                     "Additional environment variables for the command. Merged on top of the server's environment; per-call overrides only.",
                     env,
                 ),
+                ("wait", "Wait for completion or return partial output without stopping the process. Omit for immediate spawn-only behavior; {} waits up to 120 seconds by default.", wait),
             ],
             &["command"],
         )
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct WaitParams {
-    pub(crate) execution_id: String,
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+pub(crate) struct WaitOptions {
     #[serde(default)]
     pub(crate) timeout_secs: Option<u64>,
     #[serde(default)]
@@ -164,6 +170,46 @@ pub(crate) struct WaitParams {
     pub(crate) grep: Option<String>,
 }
 
+impl WaitOptions {
+    pub(crate) fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs.unwrap_or(120)
+    }
+
+    fn schema_properties(
+        generator: &mut SchemaGenerator,
+    ) -> Vec<(&'static str, &'static str, Schema)> {
+        let timeout_secs = generator.subschema_for::<Option<u64>>();
+        let head_lines = generator.subschema_for::<Option<usize>>();
+        let tail_lines = generator.subschema_for::<Option<usize>>();
+        let max_output_bytes = generator.subschema_for::<Option<usize>>();
+        let grep = generator.subschema_for::<Option<String>>();
+        vec![
+            ("timeout_secs", "Seconds to wait before returning partial output without killing the process. Defaults to 120; use 0 to poll immediately.", timeout_secs),
+            ("head_lines", "Return only the first N lines of output. Prefer this over post-processing with head.", head_lines),
+            ("tail_lines", "Return only the last N lines of output. Prefer this over post-processing with tail.", tail_lines),
+            ("max_output_bytes", "Truncate output to this many bytes.", max_output_bytes),
+            ("grep", "Filter output lines by regex.", grep),
+        ]
+    }
+}
+
+impl JsonSchema for WaitOptions {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("WaitOptions")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        object_schema_with_desc(Self::schema_properties(generator), &[])
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WaitParams {
+    pub(crate) execution_id: String,
+    #[serde(flatten)]
+    pub(crate) options: WaitOptions,
+}
+
 impl JsonSchema for WaitParams {
     fn schema_name() -> Cow<'static, str> {
         Cow::Borrowed("WaitParams")
@@ -171,22 +217,13 @@ impl JsonSchema for WaitParams {
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let execution_id = generator.subschema_for::<String>();
-        let timeout_secs = generator.subschema_for::<Option<u64>>();
-        let head_lines = generator.subschema_for::<Option<usize>>();
-        let tail_lines = generator.subschema_for::<Option<usize>>();
-        let max_output_bytes = generator.subschema_for::<Option<usize>>();
-        let grep = generator.subschema_for::<Option<String>>();
-        object_schema_with_desc(
-            vec![
-                ("execution_id", "The execution_id returned by spawn.", execution_id),
-                ("timeout_secs", "Seconds to wait before returning partial output without killing the process.", timeout_secs),
-                ("head_lines", "Return only the first N lines of output. Prefer this over post-processing with head.", head_lines),
-                ("tail_lines", "Return only the last N lines of output. Prefer this over post-processing with tail.", tail_lines),
-                ("max_output_bytes", "Truncate output to this many bytes.", max_output_bytes),
-                ("grep", "Filter output lines by regex.", grep),
-            ],
-            &["execution_id"],
-        )
+        let mut properties = vec![(
+            "execution_id",
+            "The execution_id returned by spawn.",
+            execution_id,
+        )];
+        properties.extend(WaitOptions::schema_properties(generator));
+        object_schema_with_desc(properties, &["execution_id"])
     }
 }
 

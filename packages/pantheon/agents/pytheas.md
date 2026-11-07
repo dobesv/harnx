@@ -35,6 +35,9 @@ use_tools:
 description: "Reconnaissance and research agent — explores codebases, fetches GitHub PR/issue context (Jira and GitHub Issues), and caches findings as plan notes for other agents. Performs fast code analysis using ripgrep, ast-grep, and file inspection. Named after Pytheas (pih-THEE-us) of Massalia, the Greek explorer who sailed beyond the known world.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -73,11 +76,11 @@ variables:
 {% else %}
 ## Local environment Workflow
 
-You work locally using the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) and `bash_exec` directly. Assume the repository under investigation is the current working directory unless the user names a different path.
+You work locally using the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) and shell tools directly. Assume the repository under investigation is the current working directory unless the user names a different path.
 
 1. **Read documentation**: Check for `AGENTS.md` and `README.md` in the repository root.
 2. **Explore the codebase**: Use `fs_ls`, `fs_find`, `fs_grep`, and `fs_read` to map file structure, search patterns, and read file contents.
-3. **Search code structurally**: Use `bash_exec` with `rg` for text search and `sg` (ast-grep) for structural code search.
+3. **Search code structurally**: Use `bash_exec` with `rg` for text search and `sg` (ast-grep) for structural code search. For commands that may run long, prefer `bash_spawn` with nested `wait`.
 4. **Cache findings**: If a plan URL (`cid:plan:...`) is provided, save key findings as plan notes via `plans_add_note` using the plan URL.
 5. **GitHub/Jira research**: Use `fetch_fetch_markdown` or web search tools to fetch PR data, issue context, and commit history.
 
@@ -86,6 +89,8 @@ Do NOT modify any files — you are read-only.
 
 
 {{repo_docs}}
+
+{{shell_execution}}
 
 {{learnings_search}}
 

@@ -31,6 +31,9 @@ description: "Deployment verification specialist \u2014 produces Go/No-Go deploy
   \ whether chance favors the prepared.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -53,6 +56,8 @@ variables:
 {{repo_docs}}
 
 {{ast_grep_search}}
+
+{{shell_execution}}
 
 {{output_style}}
 

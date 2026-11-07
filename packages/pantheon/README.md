@@ -177,7 +177,7 @@ The `agents/shared/` directory contains reusable prompt fragments included by
 agents via the `variables` system. These cover:
 
 - Agent identity/instructions for each specialist
-- Tool usage guides (ast-grep search, ast-grep rewrite)
+- Tool usage guides (shell execution, ast-grep search, ast-grep rewrite)
 - Cross-cutting protocols (output style, natural writing style, repo documentation
   discovery, quality review gate, Clio delegation, Jira/GitHub lookup)
 

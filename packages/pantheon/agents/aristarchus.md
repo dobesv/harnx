@@ -63,6 +63,9 @@ description: "Code review coordinator \u2014 orchestrates multi-agent code revie
   \ textual critic of antiquity.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: aristarchus_core
   description: Core identity and instructions for Aristarchus
   path: shared/aristarchus.md
@@ -82,5 +85,7 @@ variables:
 {{policy_test_coverage}}
 
 {{natural_writing}}
+
+{{shell_execution}}
 
 {{output_style}}

@@ -58,8 +58,8 @@ fn write_template(path: &Path, name: &str, extra: &str, script: &str) {
     .expect("write template");
 }
 
-/// Call templates advertised over MCP `list_tools`, keyed by tool name.
-async fn mcp_tools(server: BashServer) -> HashMap<String, (String, Value)> {
+/// Call templates, schemas and descriptions advertised over MCP `list_tools`.
+async fn mcp_tools(server: BashServer) -> HashMap<String, (String, Value, String)> {
     let (client_transport, server_transport) = duplex(65_536);
     let (server_service, client_service) = tokio::join!(
         serve_server(server, server_transport),
@@ -89,6 +89,7 @@ async fn mcp_tools(server: BashServer) -> HashMap<String, (String, Value)> {
                 (
                     template.to_string(),
                     Value::Object((*tool.input_schema).clone()),
+                    tool.description.as_deref().unwrap_or_default().to_string(),
                 ),
             )
         })
@@ -149,7 +150,7 @@ async fn bash_toolset_call_templates_match_mcp_handler() {
             .meta
             .as_ref()
             .unwrap_or_else(|| panic!("tool '{}' spec has no meta", spec.name));
-        let (call_template, input_schema) = advertised
+        let (call_template, input_schema, description) = advertised
             .get(&spec.name)
             .unwrap_or_else(|| panic!("tool '{}' missing from MCP handler", spec.name));
         assert_eq!(
@@ -161,6 +162,11 @@ async fn bash_toolset_call_templates_match_mcp_handler() {
         assert_eq!(
             &spec.input_schema, input_schema,
             "input schema mismatch for tool '{}'",
+            spec.name
+        );
+        assert_eq!(
+            &spec.description, description,
+            "description mismatch for tool '{}'",
             spec.name
         );
         assert!(
@@ -361,5 +367,81 @@ async fn reserved_builtin_name_is_hard_error_when_explicit_and_skipped_when_auto
         .await
         .expect("built-in exec remains callable");
     assert!(result.to_string().contains("builtin-exec"));
+    let _ = toolset.cleanup_log_dir().await;
+}
+
+/// The MCP listing must advertise each tool's request-timeout policy in
+/// `_meta` (`timeout_secs`), matching the native `BashToolset` specs. This is
+/// what `harnx-mcp-bridge` copies into `ToolSpec.timeout_secs`, so a bridged
+/// bash server runs under the same deadline policy as the native NATS
+/// toolset: spawn/wait/exec without an elapsed deadline (a nested
+/// `wait: {}` waits 120 seconds by default, longer than the caller's 60s
+/// backstop), short-lived tools on the caller's backstop.
+#[tokio::test]
+async fn mcp_meta_timeout_policy_matches_native_toolset_specs() {
+    let directory = tempfile::tempdir().expect("template directory");
+    let template_path = directory.path().join("slow.yaml");
+    write_template(
+        &template_path,
+        "slow",
+        "parameters:\n  delay: { type: integer, required: true }\n",
+        "sleep \"$DELAY\"",
+    );
+    let templates =
+        discover_tool_templates(None, &[template_path], &[]).expect("discover command template");
+    let server = BashServer::new_with_templates(sandbox_config(), templates.clone())
+        .expect("build MCP server");
+
+    let (client_transport, server_transport) = duplex(65_536);
+    let (server_service, client_service) = tokio::join!(
+        serve_server(server, server_transport),
+        serve_client(TemplateClientHandler, client_transport)
+    );
+    let _server_service = server_service.expect("serve bash MCP server");
+    let client_service = client_service.expect("serve MCP client");
+    let peer = client_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+    let advertised = peer
+        .list_tools(Default::default())
+        .await
+        .expect("list tools")
+        .tools;
+
+    let toolset = BashToolset::new(sandbox_config(), templates)
+        .await
+        .expect("build toolset");
+
+    for spec in toolset.tools() {
+        let advertised_meta = advertised
+            .iter()
+            .find(|tool| tool.name == spec.name)
+            .unwrap_or_else(|| panic!("tool '{}' not advertised over MCP", spec.name))
+            .meta
+            .as_ref()
+            .expect("advertised tool carries _meta");
+        let advertised_timeout = harnx_toolset::advertised_timeout_secs(&advertised_meta.0);
+        assert_eq!(
+            advertised_timeout, spec.timeout_secs,
+            "MCP-advertised timeout policy for '{}' must match the native toolset",
+            spec.name
+        );
+    }
+
+    // Command-template tools run without an elapsed deadline in the native
+    // toolset; the MCP listing must advertise the same policy.
+    let slow_meta = advertised
+        .iter()
+        .find(|tool| tool.name == "slow")
+        .expect("template tool advertised")
+        .meta
+        .as_ref()
+        .expect("template tool carries _meta");
+    assert_eq!(
+        harnx_toolset::advertised_timeout_secs(&slow_meta.0),
+        Some(0)
+    );
+
     let _ = toolset.cleanup_log_dir().await;
 }

@@ -645,6 +645,15 @@ async fn retire_child(manager: &ChildProcessManager, child: &mut Child) -> anyho
 
 fn map_tool(tool: Tool) -> ToolSpec {
     let annotations = tool.annotations.as_ref();
+    // MCP tool listings have no timeout field; harnx tool servers advertise
+    // their request-timeout policy in `_meta`
+    // (`harnx_toolset::TOOL_TIMEOUT_META_KEY`). Servers that advertise nothing
+    // keep `None`, which the runtime resolves to its default request backstop —
+    // third-party deadlines are not disabled globally by the bridge.
+    let timeout_secs = tool
+        .meta
+        .as_ref()
+        .and_then(|meta| harnx_toolset::advertised_timeout_secs(&meta.0));
     ToolSpec {
         cancellation_guarantee: Default::default(),
         name: tool.name.into(),
@@ -658,7 +667,7 @@ fn map_tool(tool: Tool) -> ToolSpec {
         read_only_hint: annotations
             .and_then(|value| value.read_only_hint)
             .unwrap_or(false),
-        timeout_secs: None,
+        timeout_secs,
         meta: tool.meta.map(|m| m.0),
     }
 }
@@ -923,6 +932,119 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("Running {{name}}")
         );
+    }
+
+    fn tool_with_meta(meta: serde_json::Value) -> rmcp::model::Tool {
+        let meta = rmcp::model::MetaObject(meta.as_object().expect("meta object").clone());
+        rmcp::model::Tool::new("echo", "Echo input", serde_json::Map::new()).with_meta(meta)
+    }
+
+    /// The bridged route's request deadline comes from the wrapped server's
+    /// advertised policy. A harnx bash server advertises `timeout_secs: 0` for
+    /// spawn so its nested `wait: {}` (120-second server-side default) is not
+    /// cut off by the runtime's 60-second backstop before the first
+    /// execution_id-bearing response can return.
+    #[test]
+    fn map_tool_propagates_advertised_timeout_policy() {
+        assert_eq!(
+            map_tool(tool_with_meta(serde_json::json!({
+                "call_template": "Spawn {{command}}",
+                "timeout_secs": 0
+            })))
+            .timeout_secs,
+            Some(0)
+        );
+        assert_eq!(
+            map_tool(tool_with_meta(serde_json::json!({ "timeout_secs": 45 }))).timeout_secs,
+            Some(45)
+        );
+        // Servers that advertise nothing keep the caller's default backstop.
+        assert_eq!(
+            map_tool(rmcp::model::Tool::new(
+                "echo",
+                "Echo input",
+                serde_json::Map::new()
+            ))
+            .timeout_secs,
+            None
+        );
+        assert_eq!(
+            map_tool(tool_with_meta(serde_json::json!({
+                "call_template": "x"
+            })))
+            .timeout_secs,
+            None
+        );
+        // Malformed policy values are ignored rather than disabling a deadline.
+        assert_eq!(
+            map_tool(tool_with_meta(serde_json::json!({
+                "timeout_secs": "forever"
+            })))
+            .timeout_secs,
+            None
+        );
+        assert_eq!(
+            map_tool(tool_with_meta(serde_json::json!({ "timeout_secs": 1.5 }))).timeout_secs,
+            None
+        );
+        assert_eq!(
+            map_tool(tool_with_meta(serde_json::json!({ "timeout_secs": -1 }))).timeout_secs,
+            None
+        );
+    }
+
+    /// Full stdio route against a real bash MCP server: the cached ToolSpecs
+    /// must carry the bash toolset's native request-timeout policy, so the
+    /// NATS registration built from them gives spawn/wait/exec no elapsed
+    /// deadline while short-lived tools keep the default backstop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bridged_bash_tools_carry_native_timeout_policy() {
+        let Some(binary) = bash_tools_binary() else {
+            eprintln!("skipping: harnx-bash-tools not built");
+            return;
+        };
+        let bridge = BridgeToolset::new(
+            "bash",
+            vec![
+                binary.display().to_string(),
+                "--mcp-stdio".to_owned(),
+                "--no-sandbox".to_owned(),
+            ],
+        )
+        .await
+        .expect("connect to bash MCP server");
+
+        let spec_timeout = |name: &str| {
+            bridge
+                .cached_tools()
+                .iter()
+                .find(|tool| tool.name == name)
+                .map(|tool| tool.timeout_secs)
+                .unwrap_or_else(|| panic!("bridged tool '{name}' missing"))
+        };
+
+        // Native policy (builtin_tool_specs): spawn/wait/exec disable the
+        // elapsed deadline. A spawn whose nested wait uses the 120-second
+        // default must therefore return its first response with an
+        // execution_id instead of hitting the former 60-second NATS deadline.
+        assert_eq!(spec_timeout("spawn"), Some(0));
+        assert_eq!(spec_timeout("wait"), Some(0));
+        assert_eq!(spec_timeout("exec"), Some(0));
+        // Tools the native toolset leaves on the caller's backstop keep it.
+        assert_eq!(spec_timeout("terminate"), None);
+        assert_eq!(spec_timeout("read_exec_log"), None);
+        assert_eq!(spec_timeout("rollback_file"), None);
+    }
+
+    #[cfg(unix)]
+    fn bash_tools_binary() -> Option<std::path::PathBuf> {
+        let mut dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        if dir.file_name().is_some_and(|name| name == "deps") {
+            dir.pop();
+        }
+        let binary = dir.join("harnx-bash-tools");
+        binary.is_file().then_some(binary)
     }
 
     #[cfg(unix)]
