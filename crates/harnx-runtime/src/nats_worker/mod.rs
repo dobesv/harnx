@@ -54,6 +54,16 @@ mod tool_supervisor;
 mod web_session_url;
 mod wind_up;
 
+/// Build the production send/wait tool specs for schema export integrations.
+/// This delegates to the same constructors used by the configured sub-agent toolset.
+#[doc(hidden)]
+pub fn subagent_async_tool_specs(agent: &str) -> Vec<harnx_toolset::ToolSpec> {
+    vec![
+        subagent_toolset::async_session::session_send_spec(agent, None),
+        subagent_toolset::async_session::session_wait_spec(agent),
+    ]
+}
+
 #[cfg(test)]
 mod compaction_tests;
 #[cfg(test)]

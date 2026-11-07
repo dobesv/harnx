@@ -1106,7 +1106,7 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
             .find(|(_, registration)| registration.server == agent)
             .expect("configured agent registration exists");
         assert_eq!(key, &format!("{instance_id}.____{agent}"));
-        assert_eq!(registration.tools.len(), 4);
+        assert_eq!(registration.tools.len(), 6);
         assert!(registration
             .tools
             .iter()

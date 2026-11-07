@@ -434,6 +434,10 @@ pub const SUBAGENT_SESSION_PROMPT_TOOL: &str = "session_prompt";
 pub const SUBAGENT_SESSION_LOAD_TOOL: &str = "session_load";
 /// Raw tool name for cancelling a sub-agent session.
 pub const SUBAGENT_SESSION_CANCEL_TOOL: &str = "session_cancel";
+/// Raw tool name for asynchronously dispatching a prompt to a sub-agent session.
+pub const SUBAGENT_SESSION_SEND_TOOL: &str = "session_send";
+/// Raw tool name for waiting on a previously dispatched sub-agent prompt.
+pub const SUBAGENT_SESSION_WAIT_TOOL: &str = "session_wait";
 
 /// Minimum elapsed time in milliseconds before showing a tool-call timer.
 /// Tools running less than this duration show no elapsed-time display.
@@ -445,17 +449,23 @@ pub const TOOL_TIMER_NOTICE_INTERVAL_MS: u64 = 10_000;
 
 /// Returns `true` if the given tool name is a sub-agent launcher.
 ///
-/// Launcher tools are `session_new` and `session_prompt` (and their agent/package-prefixed forms).
-/// They are excluded from the generic tool-call timer because they already emit periodic progress.
+/// Launcher tools are `session_new`, `session_prompt` and `session_send`
+/// (and their agent/package-prefixed forms). They are excluded from the
+/// generic tool-call timer because they already emit periodic progress, or —
+/// for `session_send` — because the receipt they return is a dispatch handle,
+/// not a child completion the timer could meaningfully age. `session_wait` and
+/// `session_load` are observation tools and are deliberately NOT launchers.
 ///
 /// # Examples
 /// ```
 /// # use harnx_toolset::is_subagent_launcher;
 /// assert!(is_subagent_launcher("session_new"));
 /// assert!(is_subagent_launcher("session_prompt"));
-/// assert!(is_subagent_launcher("oracle_session_prompt"));
+/// assert!(is_subagent_launcher("session_send"));
+/// assert!(is_subagent_launcher("oracle_session_send"));
 /// assert!(is_subagent_launcher("pantheon__oracle_session_prompt"));
 ///
+/// assert!(!is_subagent_launcher("session_wait"));
 /// assert!(!is_subagent_launcher("session_load"));
 /// assert!(!is_subagent_launcher("session_cancel"));
 /// assert!(!is_subagent_launcher("read_file"));
@@ -464,8 +474,10 @@ pub const TOOL_TIMER_NOTICE_INTERVAL_MS: u64 = 10_000;
 pub fn is_subagent_launcher(name: &str) -> bool {
     name == SUBAGENT_SESSION_NEW_TOOL
         || name == SUBAGENT_SESSION_PROMPT_TOOL
+        || name == SUBAGENT_SESSION_SEND_TOOL
         || name.ends_with(&format!("_{}", SUBAGENT_SESSION_NEW_TOOL))
         || name.ends_with(&format!("_{}", SUBAGENT_SESSION_PROMPT_TOOL))
+        || name.ends_with(&format!("_{}", SUBAGENT_SESSION_SEND_TOOL))
 }
 
 /// Serializable error returned in a [`ToolReply`].
@@ -710,23 +722,31 @@ mod tests {
         // Bare names
         assert!(is_subagent_launcher("session_new"));
         assert!(is_subagent_launcher("session_prompt"));
+        assert!(is_subagent_launcher("session_send"));
 
         // Agent-prefixed (single underscore)
         assert!(is_subagent_launcher("oracle_session_new"));
         assert!(is_subagent_launcher("oracle_session_prompt"));
+        assert!(is_subagent_launcher("oracle_session_send"));
         assert!(is_subagent_launcher("pantheon_session_new"));
         assert!(is_subagent_launcher("pantheon_session_prompt"));
+        assert!(is_subagent_launcher("pantheon_session_send"));
 
         // Package-prefixed (double underscore per package_namespace.rs)
         assert!(is_subagent_launcher("pantheon__oracle_session_new"));
         assert!(is_subagent_launcher("pantheon__oracle_session_prompt"));
+        assert!(is_subagent_launcher("pantheon__oracle_session_send"));
     }
 
     #[test]
     fn is_subagent_launcher_false_cases() {
-        // Other sub-agent control tools (NOT launchers)
+        // Observation tools are NOT launchers: wait may repair activation, and
+        // load is a pure read, but neither starts a child turn.
+        assert!(!is_subagent_launcher("session_wait"));
         assert!(!is_subagent_launcher("session_load"));
         assert!(!is_subagent_launcher("session_cancel"));
+        assert!(!is_subagent_launcher("oracle_session_wait"));
+        assert!(!is_subagent_launcher("pantheon__oracle_session_wait"));
 
         // Ordinary tools
         assert!(!is_subagent_launcher("read_file"));
@@ -948,5 +968,11 @@ mod tests {
         assert_eq!(SUBAGENT_SESSION_PROMPT_TOOL, "session_prompt");
         assert_eq!(SUBAGENT_SESSION_LOAD_TOOL, "session_load");
         assert_eq!(SUBAGENT_SESSION_CANCEL_TOOL, "session_cancel");
+    }
+
+    #[test]
+    fn async_subagent_session_tool_names_are_stable() {
+        assert_eq!(SUBAGENT_SESSION_SEND_TOOL, "session_send");
+        assert_eq!(SUBAGENT_SESSION_WAIT_TOOL, "session_wait");
     }
 }

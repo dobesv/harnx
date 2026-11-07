@@ -164,15 +164,26 @@ async fn idempotency_cache_rejects_growth_past_cap() {
 
 #[test]
 fn parent_session_id_supports_raw_session_start_tools() {
-    for tool in ["session_prompt", "session_new"] {
+    for tool in ["session_prompt", "session_new", "session_send"] {
         assert!(
             accepts_parent_session_id(tool),
             "expected support for {tool}"
         );
     }
-    assert!(!accepts_parent_session_id("session_load"));
-    assert!(!accepts_parent_session_id("prompt"));
-    assert!(!accepts_parent_session_id("agent_session_prompt"));
+    // Observation and control tools must not receive transport-owned
+    // parent args.
+    for tool in [
+        "session_wait",
+        "session_load",
+        "session_cancel",
+        "prompt",
+        "agent_session_prompt",
+    ] {
+        assert!(
+            !accepts_parent_session_id(tool),
+            "observation tools must not accept parent context: {tool}"
+        );
+    }
 }
 
 #[test]
