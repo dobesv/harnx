@@ -190,16 +190,19 @@ async fn busy_activation_at_high_delivery_count_is_not_terminated() -> Result<()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-    foreign_lease.release().await?;
+    // Break metadata reads before the holder releases, so the parked waiter's
+    // wake-up lands on a failing preflight deterministically rather than
+    // racing the bucket deletion with its (now immediate) claim attempt.
     jetstream
         .delete_key_value(harnx_runtime::nats_session_metadata::SESSION_METADATA_BUCKET)
         .await?;
+    foreign_lease.release().await?;
     wait_for_delivery_count(&consumer, 11).await?;
     let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(session_id), 1);
     assert_eq!(
         stream.get_info().await?.state.messages,
         1,
-        "first genuine failure after a high-count busy NAK must stay queued"
+        "first genuine failure after a high-count busy park must stay queued"
     );
     assert!(!log
         .load_events_async()
@@ -300,17 +303,30 @@ async fn legacy_activation_consumer(
 
 /// Deferring an activation while its session is busy used to have no limit,
 /// and activations for a session that stayed busy were redelivered for days.
-/// The deferral that would take an activation past its last allowed delivery
-/// terminates it instead. Whoever holds the session is left alone.
+/// Busy deferrals no longer spend deliveries: the worker parks the delivery
+/// on a busy waiter instead of NAKing it back, even one already past
+/// `MAX_ACTIVATION_DELIVERIES`, so a busy session can no longer spend its
+/// queued activations' delivery budget. Whoever holds the session is left
+/// alone; when the holder releases, the parked delivery claims and runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn busy_activation_at_the_delivery_limit_is_terminated() -> Result<()> {
+async fn busy_activation_at_the_delivery_limit_parks_and_survives() -> Result<()> {
     use harnx_runtime::nats_worker::MAX_ACTIVATION_DELIVERIES;
     let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
     let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "busy-past-delivery-limit";
-    seed_and_publish_activation(&jetstream, session_id, "never claimed").await?;
+    seed_session_metadata(&jetstream, session_id).await?;
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(session_id), 1);
+    crate::worker::append_admitted_fixture_user(&log, "delivery-limit-user", "never claimed")
+        .await?;
+    publish_session_activate(
+        &jetstream,
+        "local",
+        &SessionActivate::new(storage_key(session_id)),
+        1,
+    )
+    .await?;
     let stream = jetstream.get_stream("WORK_NOTIFY_local").await?;
     let consumer = legacy_activation_consumer(&stream).await?;
     for expected in 1..MAX_ACTIVATION_DELIVERIES {
@@ -327,7 +343,15 @@ async fn busy_activation_at_the_delivery_limit_is_terminated() -> Result<()> {
     )
     .await?;
 
-    wait_for_terminal_activation(&consumer, &stream, MAX_ACTIVATION_DELIVERIES as u64).await?;
+    // The worker takes the 100th delivery and parks it instead of
+    // terminating it. Give a would-be terminator a clear window first.
+    wait_for_delivery_count(&consumer, MAX_ACTIVATION_DELIVERIES as u64).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        stream.get_info().await?.state.messages,
+        1,
+        "a busy activation at the delivery limit must stay parked, not terminated"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(
         foreign_lease.is_held(),
@@ -343,6 +367,96 @@ async fn busy_activation_at_the_delivery_limit_is_terminated() -> Result<()> {
     );
 
     foreign_lease.release().await?;
+    wait_for_terminal_activation(&consumer, &stream, MAX_ACTIVATION_DELIVERIES as u64).await?;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the parked activation must claim and run once the holder releases"
+    );
+
+    worker.abort();
+    let stopped = worker.await;
+    assert!(matches!(stopped, Err(error) if error.is_cancelled()));
+    Ok(())
+}
+
+/// A busy deferral past the worker's delivery limit must not terminate the
+/// activation: the session is legitimately occupied, so the delivery keeps
+/// cycling back to the broker — bounded by the consumer's own `max_deliver`
+/// backstop — until the holder frees the session. Busy NAKs still increment
+/// JetStream's shared delivery count; a later non-busy failure can trigger the
+/// worker limit, but busy deferrals don't trigger it themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_nak_at_the_delivery_limit_does_not_terminate() -> Result<()> {
+    use harnx_runtime::nats_worker::MAX_ACTIVATION_DELIVERIES;
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+    let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let session_id = "busy-nak-past-delivery-limit";
+    seed_session_metadata(&jetstream, session_id).await?;
+    let log = NatsSessionLog::new_with_replicas(jetstream.clone(), storage_key(session_id), 1);
+    crate::worker::append_admitted_fixture_user(&log, "busy-nak-user", "survive the limit").await?;
+    publish_session_activate(
+        &jetstream,
+        "local",
+        &SessionActivate::new(storage_key(session_id)),
+        1,
+    )
+    .await?;
+    let stream = jetstream.get_stream("WORK_NOTIFY_local").await?;
+    let consumer = legacy_activation_consumer(&stream).await?;
+    for expected in 1..MAX_ACTIVATION_DELIVERIES {
+        assert_eq!(redeliver_activation(&consumer).await?, expected);
+    }
+
+    let foreign_lease =
+        acquire_worker_lease(&jetstream, &storage_key(session_id), "foreign-worker").await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    // Capacity zero: every busy delivery overflows the waiters immediately,
+    // so the delivery cycles through the broker exactly like the old
+    // busy-NAK path — but now at the delivery limit. The short ack wait
+    // keeps the consumer's backoff (measured against the ack wait) small, so
+    // the busy-NAK cadence stays seconds rather than the 300s backoff entry
+    // a default 30s consumer uses at this delivery count.
+    let daemon = WorkerDaemonConfig::managing("local", "busy-nak-limit-worker")
+        .with_busy_wait_limits_for_test(Duration::from_secs(6 * 60 * 60), 0)
+        .with_activation_ack_wait_for_test(Duration::from_secs(1));
+    let readiness = harnx_healthz::Readiness::default();
+    let worker = tokio::spawn(run_worker_daemon(
+        local_nats_runtime_config(server.url()),
+        daemon,
+        Some(counting_stub_call_fn(Arc::clone(&calls))),
+        Some(readiness.clone()),
+    ));
+    wait_until(CI_SAFE_TIMEOUT, move || readiness.is_ready()).await?;
+
+    // The worker takes the 100th delivery and busy-NAKs it: at the limit,
+    // the busy reason is exempt from termination, so the message keeps
+    // cycling instead of being terminated on the spot.
+    wait_for_delivery_count(&consumer, MAX_ACTIVATION_DELIVERIES as u64).await?;
+    tokio::time::sleep(Duration::from_secs(13)).await;
+    assert_eq!(
+        stream.get_info().await?.state.messages,
+        1,
+        "a busy deferral at the delivery limit must stay queued"
+    );
+    assert_eq!(
+        consumer.get_info().await?.num_ack_pending,
+        1,
+        "the delivery must keep cycling through the broker"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    foreign_lease.release().await?;
+    // The next redelivery claims cleanly and settles: the activation lost
+    // no work to the limit.
+    wait_for_terminal_activation(&consumer, &stream, MAX_ACTIVATION_DELIVERIES as u64).await?;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the busy-deferred activation must claim and run once the holder releases"
+    );
     worker.abort();
     let stopped = worker.await;
     assert!(matches!(stopped, Err(error) if error.is_cancelled()));

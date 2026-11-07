@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActivationNakReason {
     Busy,
     PreflightNotReady,
@@ -120,6 +120,16 @@ impl ActivationDelivery {
 
     pub(super) fn attach_lease(&self, lease: &Arc<NatsSessionLease>) {
         self.lease_tx.send_replace(Some(lease.lost_watch()));
+    }
+
+    /// Whether the progress heartbeat task is still running. It stops on its
+    /// own when an attached lease is lost, so anything that wants to keep
+    /// holding the delivery — parking it on a busy waiter — must check this
+    /// first: without heartbeats JetStream redelivers the delivery.
+    pub(super) fn heartbeat_alive(&self) -> bool {
+        self.heartbeat_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
     }
 
     pub(super) fn detach_lease(&self) {
