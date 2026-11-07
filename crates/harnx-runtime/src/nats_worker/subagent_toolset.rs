@@ -2,11 +2,26 @@
 
 mod termination;
 
+// Durable async dispatch (session_send) and prompt-specific bounded
+// observation (session_wait), plus the shared bounded read contract used by
+// both wait and session_load.
+pub(crate) mod async_session;
+
+mod session_read;
+
 #[cfg(test)]
 mod interrupt_tests;
 
 #[cfg(test)]
 mod policy_tests;
+
+#[cfg(test)]
+#[path = "subagent_toolset/session_load_tests.rs"]
+mod session_load_tests;
+
+#[cfg(test)]
+#[path = "subagent_toolset/session_async_wiring_tests.rs"]
+mod session_async_wiring_tests;
 
 use super::subagent_progress::{ReportedInvocation, SubagentProgressReporter};
 use crate::nats_event_sink::NatsEventSink;
@@ -25,7 +40,7 @@ use harnx_core::session::SessionLogEntry;
 use harnx_toolset::{
     ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolProgressKind, ToolSpec, Toolset,
     SUBAGENT_SESSION_CANCEL_TOOL, SUBAGENT_SESSION_LOAD_TOOL, SUBAGENT_SESSION_NEW_TOOL,
-    SUBAGENT_SESSION_PROMPT_TOOL,
+    SUBAGENT_SESSION_PROMPT_TOOL, SUBAGENT_SESSION_SEND_TOOL, SUBAGENT_SESSION_WAIT_TOOL,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -390,20 +405,66 @@ impl SubagentToolset {
     }
 
     async fn session_load(&self, args: Value) -> Result<Value, ToolInvokeError> {
-        let args: SessionArgs = parse_args(SUBAGENT_SESSION_LOAD_TOOL, args)?;
+        let args: LoadArgs = parse_args(SUBAGENT_SESSION_LOAD_TOOL, args)?;
         let session_id = required_session_id(args.session_id)?;
-        let events = NatsSessionLog::new(
-            self.jetstream.clone(),
-            harnx_core::session_identity::session_key(Some(&self.agent), &session_id),
-        )
-        .load_events_async()
-        .await
-        .map_err(|error| {
-            ToolInvokeError::Recoverable(format!(
-                "load sub-agent session '{session_id}': {error:#}"
-            ))
-        })?;
-        Ok(json!({ "session_id": session_id, "events": events }))
+        let mut read = args
+            .read
+            .unwrap_or_default()
+            .resolve()
+            .map_err(ToolInvokeError::Recoverable)?;
+        let storage = harnx_core::session_identity::session_key(Some(&self.agent), &session_id);
+        // Prompt scope is a pure read: it validates the target binding and
+        // bounds the page to that prompt's turn. Load never resumes,
+        // activates, repairs or waits on the session.
+        if let Some(prompt_id) = args.prompt_id.as_deref() {
+            if prompt_id.trim().is_empty() {
+                return Err(ToolInvokeError::Recoverable(
+                    "prompt_id must not be empty".into(),
+                ));
+            }
+            let scope = self.prompt_load_scope(&storage, prompt_id).await?;
+            session_read::scope_read_to_prompt(&mut read, scope.start, scope.end)
+                .map_err(ToolInvokeError::Recoverable)?;
+        }
+        let log = crate::nats_session_log::NatsSessionLog::new(self.jetstream.clone(), &storage);
+        // The page is merged into the wrapper below, so the wrapper's own
+        // serialized bytes are reserved first and the whole result respects
+        // max_output_bytes instead of only the inner page.
+        let wrapper = match args.prompt_id {
+            Some(prompt_id) => json!({ "session_id": session_id, "prompt_id": prompt_id }),
+            None => json!({ "session_id": session_id }),
+        };
+        let reserve = serde_json::to_vec(&wrapper)
+            .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?
+            .len()
+            .saturating_sub(1);
+        let page = session_read::read_session_log_window(&log, &read, reserve)
+            .await
+            .map_err(ToolInvokeError::Recoverable)?;
+        let result = merge_page_into_wrapper(wrapper, page)?;
+        Ok(result)
+    }
+
+    async fn prompt_load_scope(
+        &self,
+        storage: &str,
+        prompt_id: &str,
+    ) -> Result<async_session::observation::PromptScope, ToolInvokeError> {
+        async_session::observation::resolve_prompt_scope(self, storage, prompt_id)
+            .await
+            .map_err(|error| {
+                ToolInvokeError::Recoverable(match error {
+                    async_session::observation::PromptScopeError::UnknownPrompt => format!(
+                        "prompt_id '{prompt_id}' is not a dispatched prompt of this session"
+                    ),
+                    async_session::observation::PromptScopeError::Evidence(evidence) => {
+                        format!("prompt_id '{prompt_id}' binding cannot be proven: {evidence}")
+                    }
+                    async_session::observation::PromptScopeError::Unavailable => {
+                        "session log unavailable for prompt-scoped load".to_string()
+                    }
+                })
+            })
     }
 
     async fn session_cancel(
@@ -590,6 +651,23 @@ fn parse_args<T: for<'de> Deserialize<'de>>(tool: &str, args: Value) -> Result<T
         .map_err(|error| ToolInvokeError::Recoverable(format!("invalid {tool} arguments: {error}")))
 }
 
+/// Merge a bounded read page into the wrapper object the tool returns. The
+/// wrapper's serialized size (minus its closing brace) was reserved from the
+/// page budget, so the combined result provably fits max_output_bytes:
+/// merged = page + wrapper - 1 <= (max - wrapper + 1) + wrapper - 1 = max.
+fn merge_page_into_wrapper(mut wrapper: Value, page: Value) -> Result<Value, ToolInvokeError> {
+    let page_object = page
+        .as_object()
+        .ok_or_else(|| ToolInvokeError::Recoverable("read page must be an object".into()))?;
+    let target = wrapper
+        .as_object_mut()
+        .expect("load wrapper is always an object");
+    for (key, value) in page_object {
+        target.insert(key.clone(), value.clone());
+    }
+    Ok(wrapper)
+}
+
 fn parse_prompt_args(args: Value) -> Result<PromptArgs, ToolInvokeError> {
     let parsed: PromptArgs = parse_args(SUBAGENT_SESSION_PROMPT_TOOL, args)?;
     crate::nats_session_metadata::EffectiveDeadline::resolve(
@@ -639,6 +717,19 @@ struct SessionArgs {
     session_id: String,
 }
 
+/// Task 4b: session_load accepts the shared bounded `read` object and an
+/// optional prompt scope. Bounded is the default — an omitted `read` still
+/// applies the shared defaults instead of loading the whole log.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoadArgs {
+    session_id: String,
+    #[serde(default)]
+    prompt_id: Option<String>,
+    #[serde(default)]
+    read: Option<session_read::ReadOptions>,
+}
+
 #[async_trait]
 impl Toolset for SubagentToolset {
     fn can_replay(&self, tool: &str) -> bool {
@@ -646,6 +737,8 @@ impl Toolset for SubagentToolset {
             tool,
             SUBAGENT_SESSION_NEW_TOOL
                 | SUBAGENT_SESSION_PROMPT_TOOL
+                | SUBAGENT_SESSION_SEND_TOOL
+                | SUBAGENT_SESSION_WAIT_TOOL
                 | SUBAGENT_SESSION_LOAD_TOOL
                 | SUBAGENT_SESSION_CANCEL_TOOL
         )
@@ -655,7 +748,10 @@ impl Toolset for SubagentToolset {
         // Cancel replays retain the checkpointed invocation target, so they
         // cannot interrupt a later independent run in the same conversation. `run_prompt` binds a
         // durable child handle and deduplicates its prompt by invocation
-        // identity, so that reattaches instead of redelegating.
+        // identity, so that reattaches instead of redelegating. `session_send`
+        // replays reattach to the checkpointed session and return the original
+        // handle instead of appending a second prompt; `session_wait` replays
+        // re-observe the durable state, which repeated waits never consume.
         self.invoke_with_context(invocation).await
     }
 
@@ -678,6 +774,20 @@ impl Toolset for SubagentToolset {
         } else if tool == SUBAGENT_SESSION_PROMPT_TOOL {
             self.session_prompt(args, cancel, standalone_context())
                 .await
+        } else if tool == SUBAGENT_SESSION_SEND_TOOL || tool == SUBAGENT_SESSION_WAIT_TOOL {
+            // No transport-attested caller identity here, so dispatch and
+            // observation both fail closed on the trusted-scope check inside
+            // their entry points rather than accepting untrusted arguments.
+            async_session::observation::send_or_wait(
+                self,
+                ToolInvocation {
+                    tool: tool.to_string(),
+                    args,
+                    cancel,
+                    context: standalone_context(),
+                },
+            )
+            .await
         } else if tool == SUBAGENT_SESSION_LOAD_TOOL {
             self.session_load(args).await
         } else if tool == SUBAGENT_SESSION_CANCEL_TOOL {
@@ -695,7 +805,7 @@ impl Toolset for SubagentToolset {
     ) -> Result<Value, ToolInvokeError> {
         if matches!(
             invocation.tool.as_str(),
-            SUBAGENT_SESSION_NEW_TOOL | SUBAGENT_SESSION_PROMPT_TOOL
+            SUBAGENT_SESSION_NEW_TOOL | SUBAGENT_SESSION_PROMPT_TOOL | SUBAGENT_SESSION_SEND_TOOL
         ) {
             if let (Some(parent), Some(object)) = (
                 invocation.context.invoking_session_id.clone(),
@@ -715,6 +825,24 @@ impl Toolset for SubagentToolset {
             SUBAGENT_SESSION_PROMPT_TOOL => {
                 self.session_prompt(invocation.args, invocation.cancel, invocation.context)
                     .await
+            }
+            SUBAGENT_SESSION_SEND_TOOL => {
+                async_session::observation::send(
+                    self,
+                    invocation.args,
+                    invocation.cancel,
+                    invocation.context,
+                )
+                .await
+            }
+            SUBAGENT_SESSION_WAIT_TOOL => {
+                async_session::observation::wait(
+                    self,
+                    invocation.args,
+                    invocation.cancel,
+                    invocation.context,
+                )
+                .await
             }
             SUBAGENT_SESSION_CANCEL_TOOL => {
                 self.session_cancel(invocation.args, invocation.context)
@@ -791,6 +919,8 @@ fn tool_specs_with_policy(agent: &str, policy: Option<&TargetRunPolicy>) -> Vec<
     vec![
         session_new_spec(agent, policy),
         session_prompt_spec(agent, policy),
+        async_session::session_send_spec(agent, policy),
+        async_session::session_wait_spec(agent),
         session_id_tool_spec(agent, SessionIdTool::Load),
         session_id_tool_spec(agent, SessionIdTool::Cancel),
     ]
@@ -942,25 +1072,26 @@ impl SessionIdTool {
     fn describe(&self, agent: &str) -> String {
         match self {
             Self::Load => format!(
-                "Load an existing session on the '{agent}' agent and resume its prior context"
+                "Load one bounded, read-only page of events from an existing session on \
+                 the '{agent}' agent. Loading never resumes, activates or repairs the session"
             ),
             Self::Cancel => format!("Cancel a running prompt on the '{agent}' agent"),
         }
     }
 
-    /// Loading resumes context without touching the session; cancelling stops
-    /// whatever it was doing.
+    /// Loading is a pure read that never resumes, activates or repairs the
+    /// session; cancelling stops whatever it was doing.
     fn read_only(&self) -> bool {
         matches!(self, Self::Load)
     }
 }
 
 fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
+    if matches!(tool, SessionIdTool::Load) {
+        return session_load_spec(agent);
+    }
     let verb = tool.verb();
-    let kind = match tool {
-        SessionIdTool::Load => ToolProgressKind::Read,
-        SessionIdTool::Cancel => ToolProgressKind::Delete,
-    };
+    let kind = ToolProgressKind::Delete;
     ToolSpec {
         cancellation_guarantee: Default::default(),
         name: tool.tool_name().to_string(),
@@ -983,6 +1114,48 @@ fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
     }
     .with_call_template(&format!("@ {agent} {verb} {SHORT_SESSION_ID}"))
     .with_kind(kind)
+}
+
+/// Task 4b: session_load is a bounded, read-only inspection page. The shared
+/// `read` object matches session_wait/send waits; `prompt_id` restricts the
+/// page to one dispatched prompt's durable turn.
+fn session_load_spec(agent: &str) -> ToolSpec {
+    ToolSpec {
+        cancellation_guarantee: Default::default(),
+        name: SUBAGENT_SESSION_LOAD_TOOL.to_string(),
+        description: format!(
+            "Load one bounded, read-only page of events from an existing session on the \
+             '{agent}' agent. Never resumes, activates or repairs the session. Events carry \
+             their source index; page by passing the returned next_index as read.index_min on \
+             the next call, and recover omitted content with \
+             read.entry_index and read.byte_offset. An omitted read applies safe bounded \
+             defaults; prompt_id restricts the page to one dispatched prompt's turn."
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "The session ID to load"
+                },
+                "prompt_id": {
+                    "type": "string",
+                    "description": "Optional: restrict the page to one dispatched prompt's turn \
+                                    (its original prompt through its first terminal). Validated \
+                                    against the durable admission; later turns are excluded."
+                },
+                "read": session_read::read_object_schema(),
+            },
+            "required": ["session_id"],
+            "additionalProperties": false
+        }),
+        idempotent_hint: true,
+        read_only_hint: true,
+        timeout_secs: Some(60),
+        meta: None,
+    }
+    .with_call_template(&format!("@ {agent} load {SHORT_SESSION_ID}"))
+    .with_kind(ToolProgressKind::Read)
 }
 
 fn standalone_context() -> ToolInvocationContext {
@@ -1038,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn generates_four_agent_session_tools_with_stable_schemas() {
+    fn generates_six_agent_session_tools_with_stable_schemas() {
         let tools = tool_specs("pkg/helper");
         assert_eq!(
             tools
@@ -1048,6 +1221,8 @@ mod tests {
             vec![
                 "session_new",
                 "session_prompt",
+                "session_send",
+                "session_wait",
                 "session_load",
                 "session_cancel",
             ]
@@ -1076,10 +1251,23 @@ mod tests {
         assert!(tools[1].input_schema["properties"]["timeout_secs"]
             .get("minimum")
             .is_none());
-        assert_eq!(tools[2].input_schema["required"], json!(["session_id"]));
-        assert_eq!(tools[3].input_schema["required"], json!(["session_id"]));
+        // Async delegation: send keeps prompt's message contract plus the
+        // nested wait object; wait requires the exact durable handle.
+        assert_eq!(tools[2].input_schema["required"], json!(["message"]));
+        assert!(
+            tools[2].input_schema["properties"]["wait"].is_object(),
+            "send schema must expose the nested wait object"
+        );
+        assert_eq!(
+            tools[3].input_schema["required"],
+            json!(["session_id", "prompt_id"])
+        );
+        assert_eq!(tools[4].input_schema["required"], json!(["session_id"]));
+        assert_eq!(tools[5].input_schema["required"], json!(["session_id"]));
         assert_eq!(tools[0].timeout_secs, Some(0));
         assert_eq!(tools[1].timeout_secs, Some(0));
+        assert_eq!(tools[2].timeout_secs, Some(0));
+        assert_eq!(tools[3].timeout_secs, Some(0));
     }
 
     /// The `session_prompt` descriptions must steer models toward omitting
@@ -1131,13 +1319,19 @@ mod tests {
             .collect()
     }
 
-    /// The call templates every agent's four session tools should advertise,
+    /// The call templates every agent's six session tools should advertise,
     /// with `display` rendered into the leading `@ <agent>` mention.
     fn expected_call_templates(display: &str) -> Vec<String> {
         [
             format!("@ {display} new session"),
             format!(
                 "@ {display}{{% if args.session_id %}} [{{{{ args.session_id | truncate(8, end='') }}}}]{{% endif %}}\n{{{{ args.message }}}}"
+            ),
+            format!(
+                "@ {display}{{% if args.session_id %}} [{{{{ args.session_id | truncate(8, end='') }}}}]{{% endif %}}\n{{{{ args.message }}}}"
+            ),
+            format!(
+                "@ {display} [{{{{ args.session_id | truncate(8, end='') }}}}] wait\nsession_id: {{{{ args.session_id }}}}\nprompt_id: {{{{ args.prompt_id }}}}"
             ),
             format!("@ {display} load {{{{ args.session_id | truncate(8, end='') }}}}"),
             format!("@ {display} cancel {{{{ args.session_id | truncate(8, end='') }}}}"),
@@ -1207,6 +1401,16 @@ mod tests {
             "'session_prompt' should have Execute kind"
         );
         assert_eq!(
+            tool_map.get(SUBAGENT_SESSION_SEND_TOOL).unwrap().kind(),
+            Some(ToolProgressKind::Execute),
+            "'session_send' is a launcher and should have Execute kind"
+        );
+        assert_eq!(
+            tool_map.get(SUBAGENT_SESSION_WAIT_TOOL).unwrap().kind(),
+            Some(ToolProgressKind::Read),
+            "'session_wait' should have Read progress kind"
+        );
+        assert_eq!(
             tool_map.get(SUBAGENT_SESSION_LOAD_TOOL).unwrap().kind(),
             Some(ToolProgressKind::Read),
             "'session_load' should have Read kind"
@@ -1216,5 +1420,32 @@ mod tests {
             Some(ToolProgressKind::Delete),
             "'session_cancel' should have Delete kind"
         );
+    }
+
+    /// Progress hints stay conservative where behavior is not strictly pure:
+    /// `session_wait` may perform one idempotent activation repair per call,
+    /// so it cannot claim read-only even though it is classified Read for
+    /// progress purposes. `session_load` is a pure read. `session_send`
+    /// dispatches and is neither read-only nor idempotent.
+    #[test]
+    fn subagent_tool_hints_are_conservative() {
+        let tools = tool_specs("pkg/helper");
+        let tool_map: std::collections::HashMap<_, _> =
+            tools.iter().map(|s| (s.name.as_str(), s)).collect();
+
+        let send = tool_map.get(SUBAGENT_SESSION_SEND_TOOL).unwrap();
+        assert!(!send.read_only_hint);
+        assert!(!send.idempotent_hint);
+
+        let wait = tool_map.get(SUBAGENT_SESSION_WAIT_TOOL).unwrap();
+        assert!(
+            !wait.read_only_hint,
+            "wait can repair activation, so it must not claim read-only"
+        );
+        assert!(!wait.idempotent_hint);
+
+        let load = tool_map.get(SUBAGENT_SESSION_LOAD_TOOL).unwrap();
+        assert!(load.read_only_hint);
+        assert!(load.idempotent_hint);
     }
 }

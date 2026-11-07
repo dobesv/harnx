@@ -521,10 +521,12 @@ Harnx supports agent delegation, allowing a parent agent to run nested sub-agent
 Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP (Agent Client Protocol) and its stdio child process architecture have been removed.
 
 - **Markdown-only agent definitions**: Agents are defined solely by Markdown files with YAML front-matter in `<config-dir>/agents/*.md` (or package agents). ACP server configuration (`acp_servers/*.yaml`) and ACP stdio child processes no longer exist.
-- **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 4-tool toolset. Each registration advertises the raw names `session_new`, `session_prompt`, `session_load`, and `session_cancel`; the provider exposes them to agents with an agent-relative prefix:
+- **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 6-tool toolset. Each registration advertises the raw names `session_new`, `session_prompt`, `session_send`, `session_wait`, `session_load`, and `session_cancel`; the provider exposes them to agents with an agent-relative prefix:
   - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata.
   - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. `attachments` is a list of `cid:` attachment URLs passed to the sub-agent; repeated URLs are ignored. The parent session ID is propagated internally.
-  - `{agent}_session_load`: Reads prior event history for an existing sub-agent session log.
+  - `{agent}_session_send`: Asynchronously dispatches a prompt (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`, optional `wait`) and returns a durable `{session_id, prompt_id}` handle immediately instead of waiting for the child to finish. Omit `wait` (or pass `null`) for dispatch-only; pass `wait: {seconds: 120}` for a soft observation window.
+  - `{agent}_session_wait`: Soft-waits on a previously dispatched prompt (`session_id`, `prompt_id`, optional `wait`). Repeated waits recover the same result and never consume it. The wait never cancels the child or extends its execution deadline.
+  - `{agent}_session_load`: Reads a bounded, filterable page of prior event history for an existing sub-agent session log. Omitted or truncated material can be recovered with continuation metadata; loading never resumes, activates, or repairs a session.
   - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
 - **Route-aware execution**: On persistent clusters, sub-agent turns use the
   cluster-shared JetStream work queue (`WORK_NOTIFY_<cluster>`) and may run on
@@ -596,6 +598,54 @@ error output carries the child's identity as a `partial_result`:
 ```
 
 The parent can inspect that session or prompt it again.
+
+### Async Delegation: send, wait, and bounded load
+
+`{agent}_session_send` and `{agent}_session_wait` add an asynchronous delegation flow on top of the
+synchronous `{agent}_session_prompt`. `{agent}_session_prompt` remains a fully supported API with
+unchanged arguments, results, and cancellation behavior; nothing about it changed.
+
+**Preferred use.** When you do not need the child's reply to continue your own turn immediately,
+send with an explicit soft wait and leave the hard execution policy inherited:
+
+```json
+{"message": "research the topic and report findings", "wait": {"seconds": 120}}
+```
+
+- `wait.seconds` is an observation budget only, never execution time. Default 120, maximum 300;
+  it never cancels the child or extends its deadline. Prefer 120 — it stays under common LLM
+  prompt-cache TTL windows, so a follow-up turn is more likely to hit warm cache.
+- `timeout_secs` on send still means the hard child execution allowance. Omit it and let the
+  target agent's configured policy (or the inherited run deadline) govern; do not invent a
+  shortened run limit. Inherited deadlines can shorten the effective allowance, but the caller
+  never widens it.
+- The send result is a durable handle: `session_id` + `prompt_id`, plus `dispatch`
+  (`confirmed`/`unconfirmed`), `status`, `terminal`, and bounded partial output while waiting.
+  Keep the handle; every later wait and load keys off it.
+
+**Workflows with the handle:**
+
+- **Dispatch-only**: omit `wait` entirely to return immediately after the prompt is durably
+  queued. Do something else, then observe.
+- **Re-wait**: if the wait expires (`wait_expired: true`, still `pending`), call
+  `{agent}_session_wait` again with the same handle and another `wait`. Repeated waits recover
+  the same result and never consume it; the child was never cancelled by the expiry.
+- **Poll**: `wait: {seconds: 0}` takes one immediate bounded snapshot with no polling loop —
+  useful for a cheap status check between other work.
+- **Inspect**: `{agent}_session_load` returns a bounded page of the child's session log
+  (default limit 100 events, 16384 output bytes). Page forward by passing the returned
+  `next_index` as `read.index_min` on the next call,
+  or recover a single oversized event with the `read` object's `entry_index` + `byte_offset`
+  continuation. Earlier unbounded whole-log loads are intentionally gone: a default load can
+  no longer flood the parent's context.
+- **Cancel**: `{agent}_session_cancel` with the child's `session_id` stops the in-flight child,
+  where that tool is available to the caller. Soft wait expiry alone never does.
+
+Only durable terminal evidence reports `completed`, `failed`, `cancelled`, or `timed_out`; a
+pending approval reads as nonterminal `blocked`, and an elapsed deadline without terminal
+evidence is never reported as success. An async receipt or a soft expiry is a tool result, not
+child progress: dispatch and completion are distinct, and completion only ever surfaces from
+the child's own durable state.
 
 ### Run Limits & Sub-Agent Termination
 

@@ -18,7 +18,15 @@ use_tools:
 - fs_grep
 - fs_find
 - librarian_session_prompt
+- librarian_session_send
+- librarian_session_wait
+- librarian_session_load
+
 - oracle_session_prompt
+- oracle_session_send
+- oracle_session_wait
+- oracle_session_load
+
 - plans_add_note
 - plans_get_note
 - plans_get_plan
@@ -33,6 +41,9 @@ description: "Security vulnerability specialist \u2014 identifies injection risk
   \ \u2014 preventing security tragedies.\n"
 version: '0.4.19'
 variables:
+- name: async_delegation
+  description: Preferred async delegation protocol (session_send/session_wait)
+  path: shared/async-delegation.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -51,6 +62,8 @@ variables:
 ---
 
 {{melpomene_core}}
+
+{{async_delegation}}
 
 {{repo_docs}}
 

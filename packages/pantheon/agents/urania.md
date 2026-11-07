@@ -18,12 +18,20 @@ use_tools:
 - fs_grep
 - fs_find
 - oracle_session_prompt
+- oracle_session_send
+- oracle_session_wait
+- oracle_session_load
+
 - plans_add_note
 - plans_get_note
 - plans_get_plan
 - plans_list_notes
 - plans_update_note
 - pytheas_session_prompt
+- pytheas_session_send
+- pytheas_session_wait
+- pytheas_session_load
+
 - fs_rollback_file
 - harnx_agent_session_history_read
 - attachments_attachment_read
@@ -33,6 +41,9 @@ description: "Architecture and big picture specialist \u2014 evaluates cross-cut
   \ \u2014 seeing the codebase from above.\n"
 version: '0.4.19'
 variables:
+- name: async_delegation
+  description: Preferred async delegation protocol (session_send/session_wait)
+  path: shared/async-delegation.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -51,6 +62,8 @@ variables:
 ---
 
 {{urania_core}}
+
+{{async_delegation}}
 
 {{repo_docs}}
 
