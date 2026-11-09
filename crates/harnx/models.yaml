@@ -44,7 +44,7 @@
       - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: daybreak-red-latest
-      max_input_tokens: 400000
+      max_input_tokens: 272000
       max_output_tokens: 128000
       input_price: 12.5
       output_price: 75
@@ -669,7 +669,7 @@
       - .body.reasoning = {"summary":"auto"}
       endpoint: responses
     - name: gpt-5.6-cyber
-      max_input_tokens: 400000
+      max_input_tokens: 272000
       max_output_tokens: 128000
       input_price: 12.5
       output_price: 75
@@ -799,6 +799,18 @@
       input_price: 10
       output_price: 50
       cache_read_price: 1
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.reasoning = {"summary":"auto"}
+      endpoint: responses
+    - name: gpt-6-cyber
+      max_input_tokens: 922000
+      max_output_tokens: 128000
+      input_price: 20
+      output_price: 100
+      cache_read_price: 2
+      cache_write_price: 25
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -1959,6 +1971,7 @@
       input_price: 0.3
       output_price: 1.2
       cache_read_price: 0.007
+      supports_vision: true
       supports_tool_use: true
     - name: devstral-2512
       max_input_tokens: 256000
@@ -2216,17 +2229,17 @@
     - name: mistral-large-4
       max_input_tokens: 1048576
       max_output_tokens: 1048576
-      input_price: 1.36
-      output_price: 4.18
-      cache_read_price: 0.14
+      input_price: 0.7
+      output_price: 2.1
+      cache_read_price: 0.07
       supports_vision: true
       supports_tool_use: true
     - name: mistral-large-4-0
       max_input_tokens: 1048576
       max_output_tokens: 1048576
-      input_price: 1.36
-      output_price: 4.18
-      cache_read_price: 0.14
+      input_price: 0.7
+      output_price: 2.1
+      cache_read_price: 0.07
       supports_vision: true
       supports_tool_use: true
     - name: mistral-large-latest
@@ -4203,11 +4216,18 @@
       input_price: 1.5
       output_price: 9
     - name: gemini-omni-1.1-flash-preview
-      max_input_tokens: 57920
+      max_input_tokens: 131072
       max_output_tokens: 57920
       input_price: 1.5
       output_price: 9
       supports_vision: true
+    - name: gemini-omni-1.2-flash
+      max_input_tokens: 131072
+      max_output_tokens: 260640
+      input_price: 1.5
+      output_price: 9
+      supports_vision: true
+      supports_tool_use: false
     - name: gemini-robotics-er-2
       input_price: 1
       output_price: 5
@@ -4717,6 +4737,15 @@
       output_price: 16.5
       cache_read_price: 0.33
       cache_write_price: 4.125
+      supports_vision: true
+      supports_tool_use: true
+    - name: in.moonshotai.kimi-k3.1
+      max_input_tokens: 868928
+      max_output_tokens: 131072
+      input_price: 4.4
+      output_price: 22
+      cache_read_price: 0.22
+      cache_write_price: 5.5
       supports_vision: true
       supports_tool_use: true
     - name: meta.llama2-13b-chat-v1
@@ -5659,6 +5688,15 @@
       cache_write_price: 4.125
       supports_vision: true
       supports_tool_use: true
+    - name: us.moonshotai.kimi-k3.1
+      max_input_tokens: 868928
+      max_output_tokens: 131072
+      input_price: 4.4
+      output_price: 22
+      cache_read_price: 0.22
+      cache_write_price: 5.5
+      supports_vision: true
+      supports_tool_use: true
     - name: us.openai.gpt-5.4
       max_input_tokens: 922000
       max_output_tokens: 128000
@@ -6253,6 +6291,21 @@
       input_price: 0.42
       output_price: 1.26
       supports_vision: true
+    - name: hy4
+      max_input_tokens: 960000
+      max_output_tokens: 64000
+      input_price: 0.834
+      output_price: 2.501
+      cache_read_price: 0.042
+      supports_vision: true
+      supports_tool_use: true
+    - name: hy4-preview
+      max_input_tokens: 960000
+      max_output_tokens: 64000
+      input_price: 0.834
+      output_price: 2.501
+      cache_read_price: 0.042
+      supports_tool_use: true
     - name: kimi-k2.7-code
       max_input_tokens: 256000
       max_output_tokens: 256000
@@ -6373,6 +6426,15 @@
       output_price: 10
       cache_read_price: 0.2
       cache_write_price: 2
+      supports_vision: true
+      supports_tool_use: true
+    - name: kimi-k3.1-pro-highspeed
+      max_input_tokens: 1048576
+      max_output_tokens: 1048576
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 4
       supports_vision: true
       supports_tool_use: true
     - name: kimi-latest
@@ -11155,7 +11217,7 @@
       max_output_tokens: 163840
       input_price: 0.5
       output_price: 2.15
-      cache_read_price: 0.4
+      cache_read_price: 0.35
       supports_tool_use: true
     - name: deepseek-ai/DeepSeek-R1-0528-Turbo
       max_input_tokens: 32768
@@ -11198,7 +11260,7 @@
       max_output_tokens: 163840
       input_price: 0.25
       output_price: 0.95
-      cache_read_price: 0.216
+      cache_read_price: 0.13
       supports_tool_use: true
     - name: deepseek-ai/DeepSeek-V3.1-Terminus
       max_input_tokens: 163840
@@ -11226,9 +11288,9 @@
     - name: deepseek-ai/DeepSeek-V4-Flash-0731
       max_input_tokens: 1048576
       max_output_tokens: 1048576
-      input_price: 0.08
+      input_price: 0.06
       output_price: 0.18
-      cache_read_price: 0.016
+      cache_read_price: 0.015
       supports_vision: false
       supports_tool_use: true
     - name: deepseek-ai/DeepSeek-V4-Pro
@@ -11339,8 +11401,8 @@
     - name: google/gemma-4-31B-it
       max_input_tokens: 262144
       max_output_tokens: 262144
-      input_price: 0.13
-      output_price: 0.38
+      input_price: 0.2
+      output_price: 0.4
       supports_vision: true
       supports_tool_use: true
     - name: google/gemma-4-31B-it-Ultra
@@ -11852,7 +11914,7 @@
       input_price: 0.12
       type: embedding
     - name: voyage-lite-01
-      max_input_tokens: 4096
+      max_input_tokens: 4000
       input_price: 0.1
       type: embedding
     - name: voyage-lite-02-instruct
