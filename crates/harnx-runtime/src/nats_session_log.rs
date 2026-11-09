@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::runtime::{Builder, Handle};
 use tokio::time::timeout;
 
-const STREAM_NAME_PREFIX: &str = "SESSION_";
+pub(crate) const STREAM_NAME_PREFIX: &str = "SESSION_";
 const DUPLICATE_WINDOW: Duration = Duration::from_secs(120);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -59,6 +59,9 @@ impl NatsSessionLog {
     }
 
     /// Open or create a transcript using the cluster's configured replica count.
+    ///
+    /// Callers must reserve canonical session metadata before using this handle.
+    /// Use [`Self::new`] to inspect a transcript before metadata creation.
     pub fn new_with_replicas(
         jetstream: jetstream::Context,
         session_id: impl Into<String>,

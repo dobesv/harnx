@@ -512,3 +512,52 @@ async fn worker_limits_redelivery_on_an_existing_consumer() -> Result<()> {
     assert!(matches!(stopped, Err(error) if error.is_cancelled()));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_metadata_activation_does_not_create_an_error_only_stream() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker = spawn_worker_daemon_with_call_fn(
+        local_nats_runtime_config(server.url()),
+        "worker-missing-metadata",
+        counting_stub_call_fn(Arc::clone(&calls)),
+    )
+    .await?;
+    let jetstream = local_test_nats(server.url()).await?;
+    let key = storage_key("invalid-metadata");
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    store
+        .kv_store()
+        .put(
+            format!("sessions/{key}/meta"),
+            "not session metadata".into(),
+        )
+        .await?;
+    publish_session_activate(&jetstream, "local", &SessionActivate::new(&key), 1).await?;
+    let stream = jetstream.get_stream("WORK_NOTIFY_local").await?;
+    let consumer = legacy_activation_consumer(&stream).await?;
+    // Cross the infrastructure-failure budget so the worker tries to record
+    // its terminal error, rather than only testing an early retry.
+    wait_for_delivery_count(&consumer, 11).await?;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let name = harnx_runtime::nats_session_log::stream_name_for_session(&key);
+    let error = match jetstream.get_stream(&name).await {
+        Ok(_) => panic!("metadata-less activation created stream '{name}'"),
+        Err(error) => error,
+    };
+    match error.kind() {
+        async_nats::jetstream::context::GetStreamErrorKind::JetStream(error) => {
+            assert_eq!(
+                error.kind(),
+                async_nats::jetstream::ErrorCode::STREAM_NOT_FOUND
+            );
+        }
+        kind => panic!("expected STREAM_NOT_FOUND, got {kind:?}"),
+    }
+    worker.abort();
+    let _ = worker.await;
+    Ok(())
+}

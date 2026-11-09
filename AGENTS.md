@@ -1302,6 +1302,20 @@ opening a control handle; without metadata they return idle/not-found rather
 than creating one. Creating it there would stamp only the defaults, and the
 next prompt's request identity could never replace them.
 
+A `SESSION_` JetStream stream must never exist before canonical metadata does
+(`sessions/<storage_key>/meta` in `harnx_sessions`). The stream name is
+`SESSION_<sha256(storage_key)>` and cannot be reversed, and the remote GC
+enumerates KV metadata — a stream whose metadata write never landed is
+invisible to it forever (GH #2650). Inspect transcripts read-only
+(`NatsSessionLog::new` reads a missing stream as empty), reserve metadata with
+`SessionMetadataStore::create`, and only then touch the stream through a
+creation-capable handle (`new_with_replicas`/`with_replicas`). Failure-recording
+paths use `NatsSessionLogBackend::append_event_existing`, which appends only to
+an existing stream. Leftover orphans are reconciled by the periodic GC pass and
+`harnx list|delete orphan-streams` (`session_stream_orphans.rs`): grace equals
+the retention window, empty-only, leader metadata recheck immediately before
+delete, non-empty orphans quarantined, per-run deletion batch capped.
+
 See `docs/configuration-guide.md` under "Session User Identity" and
 `crates/harnx-serve/README.md` under "Request Identity" for user-facing config.
 

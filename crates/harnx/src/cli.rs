@@ -186,6 +186,9 @@ pub struct DeleteArgs {
 pub enum DeleteSubcommands {
     /// Delete a remote NATS session log stream + lease key
     Session(DeleteSessionArgs),
+    /// Delete empty remote NATS session streams that have no session metadata,
+    /// after re-checking every guard (age, emptiness, leases, metadata)
+    OrphanStreams(DeleteOrphanStreamsArgs),
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -197,6 +200,25 @@ pub struct DeleteSessionArgs {
     /// Cluster key from nats_servers/<name>.yaml
     #[arg(long)]
     pub cluster: String,
+}
+
+/// Guarded orphan-stream cleanup options for the CLI delete mode.
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct DeleteOrphanStreamsArgs {
+    /// Cluster key from nats_servers/<name>.yaml
+    #[arg(long)]
+    pub cluster: String,
+    /// A stream must be older than this many hours to be deleted. Defaults to
+    /// the configured session retention (cleanup_remote_sessions_days); pass it
+    /// explicitly when no retention is configured.
+    #[arg(long)]
+    pub grace_hours: Option<u64>,
+    /// Maximum number of orphan streams deleted in one run
+    #[arg(
+        long,
+        default_value_t = harnx_runtime::session_stream_orphans::DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN
+    )]
+    pub max: usize,
 }
 
 impl DeleteSessionArgs {
@@ -224,8 +246,18 @@ pub struct ListArgs {
 pub enum ListSubcommands {
     /// List sessions (local or remote based on --agent context)
     Sessions,
+    /// List remote NATS session streams that have no session metadata (dry run,
+    /// deletes nothing)
+    OrphanStreams(ListOrphanStreamsArgs),
     /// List available tools, optionally matching a tool selector
     Tools(ListToolsArgs),
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct ListOrphanStreamsArgs {
+    /// Cluster key from nats_servers/<name>.yaml
+    #[arg(long)]
+    pub cluster: String,
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -577,16 +609,59 @@ mod tests {
             "local",
         ])
         .unwrap();
-        match cli.command {
-            Some(Commands::Delete(args)) => match args.command {
-                DeleteSubcommands::Session(delete) => {
-                    assert_eq!(delete.agent, "oracle");
-                    assert_eq!(delete.session_id, "sess-1");
-                    assert_eq!(delete.cluster, "local");
-                }
-            },
-            other => panic!("unexpected command: {other:?}"),
-        }
+        assert_eq!(
+            cli.command,
+            Some(Commands::Delete(DeleteArgs {
+                command: DeleteSubcommands::Session(DeleteSessionArgs {
+                    agent: "oracle".into(),
+                    session_id: "sess-1".into(),
+                    cluster: "local".into(),
+                }),
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_delete_orphan_streams() {
+        let cli = Cli::try_parse_from([
+            "harnx",
+            "delete",
+            "orphan-streams",
+            "--cluster",
+            "local",
+            "--grace-hours",
+            "48",
+            "--max",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Delete(DeleteArgs {
+                command: DeleteSubcommands::OrphanStreams(DeleteOrphanStreamsArgs {
+                    cluster: "local".into(),
+                    grace_hours: Some(48),
+                    max: 2,
+                }),
+            }))
+        );
+    }
+
+    #[test]
+    fn delete_orphan_streams_defaults_to_bounded_batch() {
+        let cli = Cli::try_parse_from(["harnx", "delete", "orphan-streams", "--cluster", "local"])
+            .unwrap();
+        let Some(Commands::Delete(DeleteArgs {
+            command: DeleteSubcommands::OrphanStreams(delete),
+        })) = cli.command
+        else {
+            panic!("expected delete orphan-streams");
+        };
+        assert_eq!(delete.grace_hours, None);
+        assert_eq!(
+            delete.max,
+            harnx_runtime::session_stream_orphans::DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN
+        );
     }
 
     #[test]
@@ -598,6 +673,20 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_list_orphan_streams() {
+        let cli =
+            Cli::try_parse_from(["harnx", "list", "orphan-streams", "--cluster", "prod"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::List(ListArgs {
+                command: ListSubcommands::OrphanStreams(ListOrphanStreamsArgs {
+                    cluster: "prod".into()
+                }),
+            }))
+        );
     }
 
     #[test]
@@ -779,20 +868,27 @@ mod compact_command_tests {
     use super::*;
     use clap::Parser;
 
+    fn assert_compact_command(cli: Cli, expected: CompactSessionArgs) {
+        assert_eq!(
+            cli.command,
+            Some(Commands::Compact(CompactArgs {
+                command: CompactCommands::Session(expected),
+            }))
+        );
+    }
+
     #[test]
     fn parses_compact_session_command() {
         let cli = Cli::try_parse_from(["harnx", "compact", "session", "my-agent", "session-123"])
             .unwrap();
-        match cli.command {
-            Some(Commands::Compact(CompactArgs {
-                command: CompactCommands::Session(args),
-            })) => {
-                assert_eq!(args.agent, "my-agent");
-                assert_eq!(args.session, "session-123");
-                assert_eq!(args.timeout, 60); // default
-            }
-            _ => panic!("expected Compact Session command"),
-        }
+        assert_compact_command(
+            cli,
+            CompactSessionArgs {
+                agent: "my-agent".into(),
+                session: "session-123".into(),
+                timeout: 60,
+            },
+        );
     }
 
     #[test]
@@ -807,16 +903,14 @@ mod compact_command_tests {
             "session-456",
         ])
         .unwrap();
-        match cli.command {
-            Some(Commands::Compact(CompactArgs {
-                command: CompactCommands::Session(args),
-            })) => {
-                assert_eq!(args.agent, "my-agent@cluster");
-                assert_eq!(args.session, "session-456");
-                assert_eq!(args.timeout, 120);
-            }
-            _ => panic!("expected Compact Session command"),
-        }
+        assert_compact_command(
+            cli,
+            CompactSessionArgs {
+                agent: "my-agent@cluster".into(),
+                session: "session-456".into(),
+                timeout: 120,
+            },
+        );
     }
 
     #[test]

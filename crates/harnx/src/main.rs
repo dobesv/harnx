@@ -5,6 +5,7 @@ mod cli_replay_sink;
 mod compact;
 mod main_runtime;
 mod oneshot_nats;
+mod orphan_streams_cmd;
 mod session_dump;
 mod streaming_think_segmenter;
 mod tool_cmd;
@@ -581,12 +582,20 @@ async fn flush_new_entries(
 async fn run_delete_command(delete_args: &crate::cli::DeleteArgs) -> Result<()> {
     match &delete_args.command {
         DeleteSubcommands::Session(args) => run_session_delete_command(args).await,
+        DeleteSubcommands::OrphanStreams(args) => {
+            orphan_streams_cmd::run_orphan_stream_delete_command(args).await
+        }
     }
 }
 
 async fn run_list_command(list_args: &crate::cli::ListArgs, cli: &Cli) -> Result<u8> {
     match &list_args.command {
         ListSubcommands::Sessions => run_list_sessions(cli).await.map(|()| 0),
+        ListSubcommands::OrphanStreams(args) => {
+            orphan_streams_cmd::run_list_orphan_streams_command(args)
+                .await
+                .map(|()| 0)
+        }
         ListSubcommands::Tools(args) => {
             tool_cmd::run(
                 cli,

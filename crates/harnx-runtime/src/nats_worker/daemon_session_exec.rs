@@ -1074,7 +1074,9 @@ impl WorkerRuntime {
             fence_token: lease.fence_token(),
             timestamp: Some(chrono::Utc::now()),
         };
-        match backend.append_event(&entry).await {
+        // Metadata lookup may be the failure. Keep terminal errors for existing
+        // transcripts, but never create a stream for an uninitialized session.
+        match backend.append_event_existing(&entry).await {
             Ok(_) => Ok(true),
             Err(append_error) => {
                 log::warn!(
@@ -1332,8 +1334,13 @@ mod attention_tests {
             "an interruption is not a turn failure"
         );
 
-        // An ordinary failure still lands, so the guard is about the cause and
-        // not about silencing errors.
+        // An ordinary failure still lands in an existing transcript. Failure
+        // recording must not create a stream for an uninitialized session.
+        log.clone()
+            .with_replicas(1)
+            .last_entry_async()
+            .await
+            .unwrap();
         assert!(WorkerRuntime::record_session_error(
             &backend,
             &lease,

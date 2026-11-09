@@ -2,10 +2,10 @@
 
 use super::daemon_background::{launch_worker_services, WorkerServices};
 use super::daemon_runtime::WorkerRuntime;
+use super::remote_cleanup::spawn_remote_session_cleanup;
 use crate::config::{GlobalConfig, LOCAL_CLUSTER_KEY};
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_session_metadata::SessionMetadataStore;
-use crate::remote_session_cleanup::{run_periodic_remote_cleanup, CleanupOutcome};
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, consumer::pull};
 use futures_util::{FutureExt, Stream, StreamExt};
@@ -21,7 +21,6 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const ACTIVATION_STREAM_RETRY_DELAY: Duration = Duration::from_millis(250);
-const REMOTE_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Leaves five seconds of a typical 30-second Kubernetes grace period for the
 /// container runtime and process teardown.
 pub const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
@@ -247,74 +246,6 @@ pub(super) fn install_session_metadata_agent(
     let mut cfg = per_session.write();
     cfg.use_agent_obj(agent).context("activate session agent")?;
     apply_session_overrides(&mut cfg, &metadata.overrides)
-}
-
-fn spawn_remote_session_cleanup(
-    config: GlobalConfig,
-    cluster: String,
-    retention: Option<u64>,
-) -> Option<JoinHandle<()>> {
-    let days = match retention {
-        None => {
-            log::warn!(
-                "session GC DISABLED for cluster='{cluster}'; NATS session state grows unbounded; \
-                 set HARNX_CLEANUP_REMOTE_SESSIONS_DAYS or config key \
-                 cleanup_remote_sessions_days to enable it"
-            );
-            return None;
-        }
-        Some(0) => {
-            log::info!("session GC explicitly disabled for cluster='{cluster}'");
-            return None;
-        }
-        Some(days) => days,
-    };
-
-    log::info!("session GC enabled for cluster='{cluster}': retention_days={days} interval=1h");
-    Some(tokio::spawn(async move {
-        let mut interval = tokio::time::interval(REMOTE_SESSION_CLEANUP_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let snapshot = config.read().clone();
-            match run_periodic_remote_cleanup(&snapshot, days, &cluster).await {
-                CleanupOutcome::Ran(stats) if stats.deleted > 0 || stats.errors > 0 => {
-                    log::info!(
-                        "session GC completed for cluster='{cluster}': scanned={} deleted={} \
-                         skipped_active={} errors={}",
-                        stats.scanned,
-                        stats.deleted,
-                        stats.skipped_active,
-                        stats.errors
-                    );
-                }
-                CleanupOutcome::Ran(stats) => {
-                    log::debug!(
-                        "session GC completed for cluster='{cluster}': scanned={} deleted=0 \
-                         skipped_active={} errors=0",
-                        stats.scanned,
-                        stats.skipped_active
-                    );
-                }
-                CleanupOutcome::NotLeader => {
-                    log::debug!(
-                        "session GC did not run for cluster='{cluster}': another worker is leader"
-                    );
-                }
-                CleanupOutcome::Failed => {
-                    log::warn!(
-                        "session GC did not complete for cluster='{cluster}' this cycle; will retry \
-                         next tick"
-                    );
-                }
-                CleanupOutcome::Skipped => {
-                    log::debug!(
-                        "session GC skipped for cluster='{cluster}': current hour already collected"
-                    );
-                }
-            }
-        }
-    }))
 }
 
 /// Optional execution and lifecycle controls for a worker daemon.

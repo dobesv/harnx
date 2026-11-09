@@ -32,7 +32,15 @@ fn periodic_overrides(gc_session_id: &str, epoch_hour: u64) -> PeriodicCleanupOv
     PeriodicCleanupOverrides {
         gc_session_id,
         epoch_hour,
+        now_unix_secs: wall_clock_secs(),
     }
+}
+
+fn wall_clock_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock")
+        .as_secs()
 }
 
 struct SeededStaleSession {

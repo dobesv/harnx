@@ -31,7 +31,11 @@ stream. This cloud topology is unchanged.
 When session retention is configured (`cleanup_remote_sessions_days` /
 `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS`), cluster workers also run periodic session
 garbage collection. Passes are leader-elected across workers, ensuring one
-cleanup pass runs per wall-clock hour per cluster.
+cleanup pass runs per wall-clock hour per cluster. Each pass also
+reconciles orphaned `SESSION_` streams whose session metadata never landed:
+empty ones older than the retention window are deleted after re-checking
+metadata, leases, and A2A state; non-empty orphans are quarantined for manual
+review.
 
 When `serve_public_url` (`HARNX_SERVE_PUBLIC_URL`) is set, workers record
 `web_session_url` in session metadata before turn 1 for named-agent sessions

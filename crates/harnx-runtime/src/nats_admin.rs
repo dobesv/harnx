@@ -128,16 +128,19 @@ async fn load_optional_lease_bucket(
     }
 }
 
-async fn delete_session_stream(
+/// Delete one session's JetStream stream by its storage key. Orphan-stream
+/// reconciliation calls this directly once it has verified no other session
+/// state (metadata, leases, A2A tasks) exists.
+pub(crate) async fn delete_session_stream(
     jetstream: &async_nats::jetstream::Context,
-    session_id: &str,
+    storage_key: &str,
 ) -> Result<bool> {
-    let stream_name = stream_name_for_session(session_id);
+    let stream_name = stream_name_for_session(storage_key);
     match jetstream.delete_stream(&stream_name).await {
         Ok(_) => Ok(true),
         Err(error) if delete_stream_missing(&error.kind()) => Ok(false),
         Err(error) => Err(error).with_context(|| {
-            format!("Failed to delete session stream '{stream_name}' for '{session_id}'")
+            format!("Failed to delete session stream '{stream_name}' for '{storage_key}'")
         }),
     }
 }
@@ -165,7 +168,8 @@ async fn delete_session_lease(
     }
 }
 
-fn get_stream_missing(kind: &GetStreamErrorKind) -> bool {
+/// Whether a get-stream error means the stream does not exist.
+pub(crate) fn stream_missing(kind: &GetStreamErrorKind) -> bool {
     match kind {
         GetStreamErrorKind::JetStream(error) => error.kind() == ErrorCode::STREAM_NOT_FOUND,
         _ => false,
@@ -187,7 +191,7 @@ pub fn kv_bucket_missing(error: &async_nats::jetstream::context::KeyValueError) 
             .and_then(|source| {
                 source.downcast_ref::<async_nats::jetstream::context::GetStreamError>()
             })
-            .is_some_and(|stream_error| get_stream_missing(&stream_error.kind())),
+            .is_some_and(|stream_error| stream_missing(&stream_error.kind())),
         _ => false,
     }
 }
