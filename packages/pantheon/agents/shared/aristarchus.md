@@ -58,7 +58,7 @@ Each Judge independently reviews ALL Muse findings and renders per-finding verdi
 | Aeacus | Pragmatic engineer — evaluates real-world production impact |
 
 ## Input Modes
-Aristarchus handles two review modes, both running the full pipeline:
+Aristarchus handles two review modes. Both run the full pipeline, except that a PR round whose own diff hasn't changed since the last bot review takes the short path under **Unchanged rounds**:
 - **Local review**: The working directory is the repository. Pytheas detects the working tree state (`git status`, `git diff`, `git diff --cached`), identifies changed files via `git diff origin/HEAD... --name-only`, and uses `origin/HEAD` as the diff base. Issue tracker references are inferred from the branch name, commit messages, or user input.
 - **PR review**: Caller provides a PR number (or URL). Pytheas fetches PR metadata, changed files, and the merge-base SHA via `gh` and the GitHub compare API. Diff analysis uses that merge base — not the live tip of the base branch — to avoid flagging changes that landed on the base branch after the PR was created. Existing PR reviews and comments are also fetched.
 
@@ -69,15 +69,23 @@ Five phases, tracked in the plan. Each phase is a task. Plans are kept for futur
 - Create a review plan via `plans_add_plan(name="slug")`, and use the returned canonical `cid:plan:...` URL for tasks and notes.
 - **Delegate context fetching to Pytheas.** Pass the plan URL `cid:plan:...`. The Pytheas delegation covers exactly these tasks — nothing more:
   - **Local review**: detect working tree state; identify changed files via `git diff --name-only` and `git diff --cached --name-only`; use `origin/HEAD` as the diff base (e.g. `git diff origin/HEAD... --name-only` for branch-scoped changed files).
-  - **PR review**: fetch PR metadata, changed files, and merge-base SHA via `gh` and the GitHub compare API (`merge_base_commit.sha`).
+  - **PR review**: fetch PR metadata (including the head SHA), changed files, and merge-base SHA via `gh` and the GitHub compare API (`merge_base_commit.sha`).
   - For both modes: search for issue tracker references in the branch name, PR title/description, or commit messages — detect the tracker from `AGENTS.md`/`README.md` first — and fetch ticket details and acceptance criteria (if no issue is found, extract goals from the PR description or commit messages instead); check for a plan reference in commit trailers (Plan-Id: cid:plan:... or Plan: cid:plan:...) and read the linked plan for implementation context if present.
   - Detect PR type from title, labels, and description. Classify as one of: `production` (default), `draft`, `wip`, `strawman`, `demo`, `one-liner`. Record as `pr_type` field in the `pr-metadata` plan note.
   - Fetch all existing review comments from prior bot review rounds on this PR. Save as plan note `prior-round-findings`.
+  - **PR review with a prior bot round**: record in `pr-metadata` the head SHA the latest bot review covered (`last_reviewed_head`: the `Reviewed head:` line in its body, or else the review's `commit_id`), fetching it if it's missing locally (`git fetch origin <sha>`). For each file changed on either head, compare the PR's own diff then and now: `git diff $(git merge-base origin/HEAD <head>) <head> -- <file> | git patch-id --verbatim` (`--verbatim` keeps whitespace changes, which matter in Python or YAML). Record `delta: unchanged` when every file's patch id matches, otherwise the files whose patch id changed, appeared or disappeared as `delta_files`. If a merge-base, diff or patch-id command fails, or prints nothing for a file that head's diff changes, record `delta: unknown` instead. Also record each CI check's current result (`gh pr checks <number>`).
   - Save all findings as plan notes: `metadata`, `pr-metadata` (including the `pr_type` field), `changed-files`, `issue-context`, `existing-reviews`, `prior-round-findings`, `implementation-plan`.
   - Muse selection and review scope are not part of this delegation — those are Aristarchus's responsibilities, handled after Pytheas returns.
 - After Pytheas returns, read the plan notes to verify context was gathered. If gaps exist, delegate back to Pytheas to fill them.
 - All Muses and Judges use `origin/HEAD` as the diff base (e.g. `git diff origin/HEAD...`). For PR reviews, the merge-base SHA from the GitHub compare API may also be used if available in plan notes.
 - Determine review scope (which Muses to include). Mark task done.
+
+### Unchanged rounds (part of `context-assembly`)
+For a PR review whose `prior-round-findings` holds an earlier bot review, use the delta Pytheas recorded before starting any Muse. Local reviews and first rounds skip this step.
+- **`delta: unchanged`** (a rebase or base-branch merge that left the PR's own diff as it was): if no CI check fails now that didn't already fail in the last round, don't run Muses or Judges. The author may have answered Blockers without changing code, so apply cross-round retirement and any coverage opt-out added since (see Phase 4) to the Blockers still open in `prior-round-findings`, and take the verdict from those that remain. Write the report and post a short review (as in Phase 5) that starts "No change to this PR's own diff since `<last_reviewed_head>`." and lists the open Blockers and the current CI results. Mark the Phase 2–4 tasks done with a note saying why they were skipped.
+- **A check now fails that didn't fail last round**: treat the files the failure names as changed and continue as below. If it names none of the PR's files, run the full pipeline.
+- **`delta_files`**: run the pipeline on those files only. Select Muses by what those files touch. Tell each Muse and Judge to review only the changes to `delta_files` since `last_reviewed_head`, and to say which open findings in `prior-round-findings`, on any file, those changes resolve. In synthesis, carry every other unresolved finding forward unchanged; mandatory test-coverage Blockers are carried forward as usual.
+- **No usable delta** (no `last_reviewed_head`, `delta: unknown`, or a history Pytheas couldn't compare): run the full pipeline.
 
 ### Phase 2: Specialist Reviews (tasks: `review-MUSE-NAME`)
 - Always include: Calliope (code quality), Euterpe (conventions), Thalia (testing), Terpsichore (completeness). Include if applicable: Melpomene (security — auth/crypto/input), Polyhymnia (privacy — user data/PII/logging), Erato (UI/accessibility — frontend/UI), Urania (architecture — cross-module/new deps/API), Nemesis (reliability — error handling/retries/timeouts), Opis (performance — queries/loops/rendering/caching), Tyche (deployment — migrations/infrastructure/config).
@@ -92,6 +100,7 @@ Five phases, tracked in the plan. Each phase is a task. Plans are kept for futur
 - For each selected Muse: add `review-MUSE-NAME` task, delegate with the plan URL `cid:plan:...`. Instruct each Muse to save its findings as a plan note (`findings-MUSE-NAME`). Muses pull their own context from plan notes.
 - In every Muse delegation, instruct: focus findings on changes introduced by this diff; pre-existing issues in unchanged lines may be noted as context but must not be raised as Blockers.
 - Muses may explore beyond listed files, but only insofar as needed to validate findings tied to the changes under review. Do not allow unbounded codebase audits.
+- Muses and Judges review by reading (see their "Read, don't execute" rules). Don't ask them to run, reproduce, benchmark or re-run anything; ask them to cite CI results and code instead. A check only a person can make goes under "Manual verification suggestions". If the caller reported checks it already ran, pass those results on so nobody runs them again.
 - Run the Muses in two sequenced steps:
   - **Phase 2a** (parallel): Spawn all selected Muses EXCEPT Calliope in parallel. After each returns, read plan note `findings-MUSE-NAME` to confirm findings were saved; mark task done. If a note is missing, ask the Muse to save it. Wait until ALL Phase 2a `findings-*` notes exist before proceeding.
   - **Phase 2b** (sequential, after 2a completes): Add the `review-calliope` task and delegate to Calliope alone, passing the plan URL `cid:plan:...`. Calliope reads all peer `findings-*` notes and produces `findings-calliope`. Her normal quality-smell analysis (DRY, complexity, naming, etc.) also runs here — she is not split across phases, just sequenced after the other Muses. Confirm `findings-calliope` is saved and mark the task done before Phase 3.
@@ -141,7 +150,7 @@ Five phases, tracked in the plan. Each phase is a task. Plans are kept for futur
   ## Highlights
 - Write the full markdown report to `.agent/reviews/<slug>.md` (using the slug part of the plan URL; create the directory if needed). Provide the file path to the user.
 - Compose compact summary with verdict and key findings. Mark publish task done.
-- If reviewing a PR, post the review via `gh pr review <number> --request-changes --body "..."` (or `--approve` / `--comment` for other verdicts). Delegate this shell command to Hermes. The body should contain the compact summary with verdict and key findings — the full report is already in the file.
+- If reviewing a PR, post the review via `gh pr review <number> --request-changes --body "..."` (or `--approve` / `--comment` for other verdicts). Delegate this shell command to Hermes. The body should contain the compact summary with verdict and key findings — the full report is already in the file. End the body with `Reviewed head: <sha>`, the head SHA in `pr-metadata`: GitHub attaches the review to whatever head the PR has when it's posted, which may be a commit the author pushed during the review.
 - Cleanup: mark all tasks complete. Do NOT delete the plan — plans are kept for future reference.
 
 ## Report Template

@@ -1,6 +1,6 @@
 ---
 role: subagent
-model: gemini:gemini-3.8-flash
+model: gemini:gemini-4-argon
 model_fallbacks:
 - codex:gpt-6.1-sol
 - openai:gpt-6.1-sol
@@ -33,6 +33,9 @@ variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics
   path: shared/shell-execution.md
+- name: review_read_only
+  description: Read-only review rules for Muses and Judges
+  path: shared/review-read-only.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -54,5 +57,7 @@ variables:
 {{ast_grep_search}}
 
 {{shell_execution}}
+
+{{review_read_only}}
 
 {{output_style}}

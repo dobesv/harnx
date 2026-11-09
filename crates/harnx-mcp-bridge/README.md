@@ -15,7 +15,7 @@ harnx-mcp-bridge --name exa -- npx -y exa-mcp-server
 ```
 
 Options:
-- `--name <NAME>`: Server name used for NATS tool registration (required when serving).
+- `--name <NAME>`: Server name used for NATS tool registration (required when serving). Agents call the tools as `<NAME>_<tool>`. Don't reuse an agent's name: every agent is also registered as a toolset under its name without the package prefix (`pantheon/athena` becomes `athena_session_prompt`), and calls to a bridge that shares it can reach the wrong toolset and fail, for example with `unknown sub-agent tool`.
 - `--enable-tool <GLOB>`: Restrict advertised tools to matching glob patterns (repeatable).
 - `--metrics-addr <ADDR>`: Prometheus metrics endpoint (e.g. `:8456`).
 - `--healthz-addr <ADDR>`: Healthz readiness check endpoint (e.g. `:8457`).

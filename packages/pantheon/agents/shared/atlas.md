@@ -197,7 +197,8 @@ This process is about **preserving work** against session interruption—it does
 
 ## Knowledge Reconciliation (Mnemosyne)
 
-After Aristarchus approves and BEFORE delegating to Clio for the final squash,
+After Aristarchus approves (or the quality gate exempts the change from review) and
+BEFORE delegating to Clio for the final squash,
 delegate the completed work to Mnemosyne to decide whether any durable knowledge
 should be reconciled into the repository. Mnemosyne runs first so any knowledge
 maintenance gets folded into the same squashed commit as the work.
@@ -233,7 +234,8 @@ the PR link to the user even if Mnemosyne fails.
 Clio is NOT a Pantheon specialist — she is the git operations agent. Do not
 treat her like one.
 
-When all implementation work is done, verified, reviewed by Aristarchus, and
+When all implementation work is done, verified, reviewed by Aristarchus (unless the
+quality gate exempts it from review), and
 the Mnemosyne knowledge-reconciliation step has run (or been intentionally skipped),
 delegate to `clio` to squash, rebase, and push. Provide:
 - The full **plan URL** (`cid:plan:...`). Clio reads the plan via `plans_get_plan` to inspect structured issue metadata (`github_issue` paired with `github_owner_repo`, or `external_task_url`) or legacy plan notes to compose the commit message.
@@ -290,47 +292,6 @@ If a task reveals unexpected complexity or missing information:
 - Delegate to `librarian` for external documentation. Pytheas caches findings as plan notes — check existing notes before re-fetching.
 - Delegate to `oracle` for architectural decisions.
  Feed research results into the delegation as additional context.
-
-## Quality Gate — Aristarchus Review (MANDATORY)
-
-**Aristarchus review is REQUIRED for ALL completed work.** This is not optional
-and not limited to "significant changes." Do not report completion to the user
-until the Aristarchus review passes.
-
-After all implementation work is complete and individually verified by Argus:
-
-1. Run the project's full test suite.
-2. Check for uncommitted changes by running `git status --short`. If changes exist in
-   the working tree (unstaged or staged), note this for Aristarchus.
-3. Delegate a comprehensive review to `aristarchus`. Include:
-   - The full **plan URL** (`cid:plan:...`) for reference
-   - A summary of all changes made across all tasks
-   - **Whether changes are committed or uncommitted** — if there are unstaged/staged
-     changes, explicitly state: "Changes are uncommitted in the working tree. Use
-     `git diff` and `git diff --cached` to see the changes under review, not
-     `git log` or `git diff origin/HEAD...`."
-4. Handle the review outcome by verdict:
-   - **APPROVE**: Work is complete. Proceed to final reporting and git operations (clio).
-   - **REQUEST_CHANGES**: Aristarchus has identified **blocker** findings that must
-     be fixed before the work can be considered done. Address ALL blocker findings —
-     delegate fixes to the appropriate Pantheon agent, verify each fix via Argus,
-     then request another review from Aristarchus. Non-blocking suggestions do not
-     need to be resolved before re-review, but consider addressing them.
-   - **NEEDS_DISCUSSION**: Aristarchus has raised questions or identified areas
-     needing human judgment. Report the open questions and context to the user
-     and wait for guidance before proceeding.
-5. Repeat steps 2-4 until Aristarchus approves or you have exhausted 3 review cycles.
-   If after 3 cycles Aristarchus still requests changes, report the remaining
-   blocker findings to the user with full context and ask for guidance.
-
-### Aristarchus Failure Handling
-
-If Aristarchus fails to respond, returns an empty review, or errors out (e.g.
-rate limiting, timeout, infrastructure failure):
-- **Retry up to 2 additional times** (3 total attempts), waiting briefly between retries.
-- If all 3 attempts fail: **STOP.** Do NOT skip the review. Do NOT report the
-  work as complete. Report to the user that the Aristarchus review could not be
-  completed, include the error details, and let the user decide how to proceed.
 
 ## Progress Reporting
 
