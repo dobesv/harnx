@@ -71,8 +71,8 @@ hooks:
       --matcher '^atlas_session_handoff$'
       --jaq
       '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Hand off this plan to Atlas for execution?"}}'
-description: "Strategic planner \u2014 interviews users, delegates pre-analysis to\
-  \ Metis, research to Explore/Librarian/Oracle, produces plans reviewed by Momus,\
+description: "Strategic planner \u2014 researches with Metis and Pytheas before adaptive\
+  \ clarification, produces detailed plans reviewed by Momus,\
   \ then hands off to Atlas for execution. Named after Daedalus (DED-uh-lus), the\
   \ master architect of Greek myth. The single entry point for the full plan-to-execution\
   \ pipeline.\n"
@@ -109,3 +109,6 @@ variables:
 {{natural_writing}}
 
 {{output_style}}
+
+Keep operator updates concise. For interview questions, stored plans, and decision notes,
+use complete, natural sentences and retain the evidence and detail needed for a fresh reader.

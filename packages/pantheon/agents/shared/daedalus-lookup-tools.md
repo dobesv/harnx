@@ -43,4 +43,7 @@ Before using these tools, identify which tracker the project uses. Check:
 2. `README.md`
 3. User input (issue key format hints at tracker)
 
-Use GitHub tools for GitHub Issues, Jira tools for Jira. If unknown, ask the user.
+Use GitHub tools for GitHub Issues, Jira tools for Jira. Obtain repository guidance through
+Metis/Pytheas when needed; Daedalus has no shell or filesystem tools. If the tracker remains
+unknown, ask only when resolving a supplied reference requires it. Otherwise record the
+limitation and continue research or planning.
