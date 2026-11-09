@@ -100,16 +100,28 @@ pub(crate) struct TemplateSandbox<'a> {
     pub(crate) no_network: bool,
 }
 
-/// Build a `_meta` block carrying only the call template. Bash tools omit
+/// Build the `_meta` block a bash tool advertises. Bash tools omit
 /// `result_template` so the client keeps its audience-aware renderer, which is
 /// what surfaces the history diff blocks mutating tools append to their output.
-fn call_template_meta(call_template: &str) -> MetaObject {
-    MetaObject(
-        json!({ "call_template": call_template })
-            .as_object()
-            .expect("object literal")
-            .clone(),
-    )
+///
+/// `timeout_secs` mirrors the request-timeout policy from `builtin_tool_specs`
+/// onto MCP listings, which have no timeout field of their own:
+/// `harnx-mcp-bridge` copies it into `ToolSpec.timeout_secs`, so a bridged bash
+/// server runs under the same deadline policy as the native NATS toolset
+/// instead of the caller's default backstop (which cut spawn's nested wait off
+/// before it could return the first execution_id-bearing response).
+fn call_template_meta(call_template: &str, timeout_secs: Option<u64>) -> MetaObject {
+    let mut meta = json!({ "call_template": call_template })
+        .as_object()
+        .expect("object literal")
+        .clone();
+    if let Some(timeout_secs) = timeout_secs {
+        meta.insert(
+            harnx_toolset::TOOL_TIMEOUT_META_KEY.to_owned(),
+            json!(timeout_secs),
+        );
+    }
+    MetaObject(meta)
 }
 
 fn request_wants_execution_context(request: &CallToolRequestParams) -> bool {

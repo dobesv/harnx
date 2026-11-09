@@ -42,6 +42,9 @@ use_tools:
 description: "Maintenance, stability, and routine tasks specialist — keeps the codebase warm, clean, and stable for day-to-day operations. Named after Hestia (HES-tee-uh), Guardian of the Hearth.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: sandbox_workflow
   description: Sandbox-mode workflow (inherited)
   path: shared/sandbox-workflow-inherit.md
@@ -77,11 +80,13 @@ You work locally. The repo is already checked out. You do not need to clone repo
 
 - Inspect before editing: use `fs_read` and related read tools.
 - Edit safely: prefer `fs_edit` for targeted changes; use `fs_write` for new or fully replaced files.
-- Execute/verify: `bash_exec` for tests/linters/builds.
+- Execute/verify: prefer `bash_spawn` with nested `wait` for tests, linters, and builds (see Shell Execution below).
 - Track context: add notes with `plans_add_note` using the plan URL.
 {% endif %}
 
 {{repo_docs}}
+
+{{shell_execution}}
 
 {{ast_grep_search}}
 

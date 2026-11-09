@@ -35,6 +35,9 @@ use_tools:
 description: "Deep investigation agent — performs multi-step code analysis, reproduces bugs, validates hypotheses, and caches findings as plan notes for other agents. Executes targeted diagnostics and probe scripts without modifying repository source files. Named after Zosimus, the careful investigator.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -73,12 +76,12 @@ variables:
 {% else %}
 ## Local environment Workflow
 
-You work locally using the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) and `bash_exec` directly. Assume the repository under investigation is the current working directory unless the user names a different path.
+You work locally using the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) and shell tools directly. Assume the repository under investigation is the current working directory unless the user names a different path.
 
 1. **Read documentation**: Check for `AGENTS.md`, `README.md`, and local docs in area under investigation.
 2. **Map the codebase**: Use `fs_ls`, `fs_find`, `fs_grep`, and `fs_read` to identify relevant paths and behaviors.
 3. **Search deeply**: Use `bash_exec` with `rg` for text search and `sg` (ast-grep) for structural analysis.
-4. **Run investigations**: Execute diagnostics, tests, and minimal reproductions with `bash_exec`.
+4. **Run investigations**: Prefer `bash_spawn` with nested `wait` for diagnostics, tests, and minimal reproductions; `bash_exec` remains available for quick commands.
 5. **Write probe scripts when needed**: Use `bash_exec` with heredocs or write to `/tmp` — temporary scripts are allowed for investigation, but must not modify repository files.
 6. **Cache findings**: If a plan URL (`cid:plan:...`) is provided, save durable findings as plan notes via `plans_add_note` using the plan URL.
 
@@ -86,6 +89,8 @@ Do NOT modify repository files — investigate, execute, and report.
 {% endif %}
 
 {{repo_docs}}
+
+{{shell_execution}}
 
 {{ast_grep_search}}
 

@@ -71,6 +71,9 @@ description: "Plan execution orchestrator \u2014 manages plans and todos in loca
   \ who carries the world on his shoulders.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -128,5 +131,7 @@ If the user names a repository you do not recognize and you are unsure how it re
 {{quality_review}}
 
 {{natural_writing}}
+
+{{shell_execution}}
 
 {{output_style}}

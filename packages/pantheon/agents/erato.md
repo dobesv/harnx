@@ -28,6 +28,9 @@ use_tools:
 description: "UI/UX and accessibility specialist — evaluates design system compliance, responsive design, WCAG accessibility, ARIA usage, keyboard navigation, and user experience patterns. Named after Erato (EH-ruh-toh), the Muse of love poetry — ensuring the UI is lovable and accessible to all.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -50,6 +53,8 @@ variables:
 {{repo_docs}}
 
 {{ast_grep_search}}
+
+{{shell_execution}}
 
 {{output_style}}
 

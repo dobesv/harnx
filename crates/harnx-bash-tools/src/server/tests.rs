@@ -1,5 +1,7 @@
 use super::*;
 
+mod process_wait;
+
 #[cfg(unix)]
 use std::ffi::OsString;
 
@@ -574,17 +576,7 @@ fn spawn_params(command: impl Into<String>, working_dir: &Path) -> SpawnCommandP
         command: command.into(),
         working_dir: Some(working_dir.to_string_lossy().to_string()),
         env: None,
-    }
-}
-
-fn wait_params(execution_id: impl Into<String>) -> WaitParams {
-    WaitParams {
-        execution_id: execution_id.into(),
-        timeout_secs: Some(5),
-        head_lines: None,
-        tail_lines: None,
-        max_output_bytes: None,
-        grep: None,
+        wait: None,
     }
 }
 
@@ -1175,6 +1167,7 @@ async fn test_spawn_per_call_env_vars() {
             command: "echo $MY_SPAWN_VAR".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: Some(extra_env),
+            wait: None,
         })
         .await
         .unwrap();
@@ -1185,11 +1178,13 @@ async fn test_spawn_per_call_env_vars() {
     let wait_result = server
         .wait_impl(WaitParams {
             execution_id,
-            timeout_secs: Some(5),
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-            grep: None,
+            options: WaitOptions {
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                grep: None,
+            },
         })
         .await
         .unwrap();
@@ -1256,6 +1251,7 @@ async fn test_sandbox_spawn_per_call_env_vars() {
             command: "echo $MY_SANDBOX_SPAWN_VAR".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: Some(extra_env),
+            wait: None,
         })
         .await
         .unwrap();
@@ -1266,11 +1262,13 @@ async fn test_sandbox_spawn_per_call_env_vars() {
     let wait_result = server
         .wait_impl(WaitParams {
             execution_id,
-            timeout_secs: Some(15),
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-            grep: None,
+            options: WaitOptions {
+                timeout_secs: Some(15),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                grep: None,
+            },
         })
         .await
         .unwrap();
@@ -1541,6 +1539,7 @@ async fn test_spawn_and_wait() {
             command: "echo background && sleep 1".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: None,
+            wait: None,
         })
         .await
         .unwrap();
@@ -1557,11 +1556,13 @@ async fn test_spawn_and_wait() {
     let result = server
         .wait_impl(WaitParams {
             execution_id,
-            timeout_secs: Some(5),
-            head_lines: None,
-            tail_lines: Some(10),
-            max_output_bytes: None,
-            grep: None,
+            options: WaitOptions {
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: Some(10),
+                max_output_bytes: None,
+                grep: None,
+            },
         })
         .await
         .unwrap();
@@ -1583,6 +1584,7 @@ async fn test_spawn_wait_timeout() {
             command: "sleep 5".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: None,
+            wait: None,
         })
         .await
         .unwrap();
@@ -1592,9 +1594,12 @@ async fn test_spawn_wait_timeout() {
 
     let result = server
         .wait_impl(WaitParams {
-            timeout_secs: Some(1),
-            tail_lines: Some(10),
-            ..wait_params(execution_id)
+            execution_id,
+            options: WaitOptions {
+                timeout_secs: Some(1),
+                tail_lines: Some(10),
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
@@ -1615,15 +1620,21 @@ async fn test_wait_reports_total_runtime_so_polls_differ() {
 
     let first = server
         .wait_impl(WaitParams {
-            timeout_secs: Some(1),
-            ..wait_params(execution_id.clone())
+            execution_id: execution_id.clone(),
+            options: WaitOptions {
+                timeout_secs: Some(1),
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
     let second = server
         .wait_impl(WaitParams {
-            timeout_secs: Some(1),
-            ..wait_params(execution_id)
+            execution_id,
+            options: WaitOptions {
+                timeout_secs: Some(1),
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
@@ -1698,11 +1709,13 @@ async fn test_wait_unknown_execution_id() {
     let result = server
         .wait_impl(WaitParams {
             execution_id: "exec-does-not-exist".to_string(),
-            timeout_secs: Some(1),
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-            grep: None,
+            options: WaitOptions {
+                timeout_secs: Some(1),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                grep: None,
+            },
         })
         .await;
 
@@ -1734,6 +1747,7 @@ async fn test_spawn_with_output() {
             command: "for i in 1 2 3; do echo line$i; done".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: None,
+            wait: None,
         })
         .await
         .unwrap();
@@ -1744,11 +1758,13 @@ async fn test_spawn_with_output() {
     let result = server
         .wait_impl(WaitParams {
             execution_id,
-            timeout_secs: Some(5),
-            head_lines: None,
-            tail_lines: Some(10),
-            max_output_bytes: None,
-            grep: None,
+            options: WaitOptions {
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: Some(10),
+                max_output_bytes: None,
+                grep: None,
+            },
         })
         .await
         .unwrap();
@@ -1971,6 +1987,7 @@ async fn test_spawn_python_shebang() {
             command: "#!/usr/bin/env python3\nprint(\"hello from spawn python\")".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: None,
+            wait: None,
         })
         .await
         .unwrap();
@@ -1985,11 +2002,13 @@ async fn test_spawn_python_shebang() {
     let wait_result = server
         .wait_impl(WaitParams {
             execution_id,
-            timeout_secs: Some(10),
-            head_lines: None,
-            tail_lines: Some(20),
-            max_output_bytes: None,
-            grep: None,
+            options: WaitOptions {
+                timeout_secs: Some(10),
+                head_lines: None,
+                tail_lines: Some(20),
+                max_output_bytes: None,
+                grep: None,
+            },
         })
         .await
         .unwrap();
@@ -2165,6 +2184,7 @@ async fn test_wait_grep_filters_per_stream() {
                 .to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: None,
+            wait: None,
         })
         .await
         .unwrap();
@@ -2173,11 +2193,13 @@ async fn test_wait_grep_filters_per_stream() {
     let result = server
         .wait_impl(WaitParams {
             execution_id,
-            timeout_secs: Some(5),
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-            grep: Some("keep".to_string()),
+            options: WaitOptions {
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                grep: Some("keep".to_string()),
+            },
         })
         .await
         .unwrap();
@@ -2211,6 +2233,7 @@ async fn test_wait_truncation_triggers_and_mentions_log_path() {
             command: "for i in $(seq 1 200); do echo \"stdout-line-$i\"; done".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: None,
+            wait: None,
         })
         .await
         .unwrap();
@@ -2219,11 +2242,13 @@ async fn test_wait_truncation_triggers_and_mentions_log_path() {
     let result = server
         .wait_impl(WaitParams {
             execution_id: execution_id.clone(),
-            timeout_secs: Some(5),
-            head_lines: Some(2),
-            tail_lines: Some(2),
-            max_output_bytes: None,
-            grep: None,
+            options: WaitOptions {
+                timeout_secs: Some(5),
+                head_lines: Some(2),
+                tail_lines: Some(2),
+                max_output_bytes: None,
+                grep: None,
+            },
         })
         .await
         .unwrap();
@@ -2253,6 +2278,7 @@ async fn test_wait_max_output_bytes_truncates() {
             command: "for i in $(seq 1 200); do echo \"line-$i\"; done".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: None,
+            wait: None,
         })
         .await
         .unwrap();
@@ -2261,11 +2287,13 @@ async fn test_wait_max_output_bytes_truncates() {
     let result = server
         .wait_impl(WaitParams {
             execution_id,
-            timeout_secs: Some(5),
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: Some(32),
-            grep: None,
+            options: WaitOptions {
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: Some(32),
+                grep: None,
+            },
         })
         .await
         .unwrap();
@@ -2290,6 +2318,7 @@ async fn test_wait_stream_markers() {
             command: "echo only-stdout".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: None,
+            wait: None,
         })
         .await
         .unwrap();
@@ -2298,11 +2327,13 @@ async fn test_wait_stream_markers() {
     let result = server
         .wait_impl(WaitParams {
             execution_id,
-            timeout_secs: Some(5),
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-            grep: None,
+            options: WaitOptions {
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                grep: None,
+            },
         })
         .await
         .unwrap();
@@ -2341,11 +2372,13 @@ async fn test_concurrent_execution_log_isolation() {
             command: "echo alpha-out; echo alpha-err >&2; sleep 0.3".to_string(),
             working_dir: Some(wd.clone()),
             env: None,
+            wait: None,
         }),
         server.spawn_impl(SpawnCommandParams {
             command: "echo bravo-out; echo bravo-err >&2; sleep 0.3".to_string(),
             working_dir: Some(wd.clone()),
             env: None,
+            wait: None,
         }),
     );
 
@@ -2368,11 +2401,13 @@ async fn test_concurrent_execution_log_isolation() {
         server
             .wait_impl(WaitParams {
                 execution_id: id.clone(),
-                timeout_secs: Some(5),
-                head_lines: None,
-                tail_lines: None,
-                max_output_bytes: None,
-                grep: None,
+                options: WaitOptions {
+                    timeout_secs: Some(5),
+                    head_lines: None,
+                    tail_lines: None,
+                    max_output_bytes: None,
+                    grep: None,
+                },
             })
             .await
             .unwrap();
@@ -2415,6 +2450,7 @@ async fn test_spawn_wait_read_exec_log_returns_full_output() {
             command: "printf 'out1\\nout2\\nout3\\n'; printf 'err1\\nerr2\\n' >&2".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             env: None,
+            wait: None,
         })
         .await
         .unwrap();
@@ -2424,11 +2460,13 @@ async fn test_spawn_wait_read_exec_log_returns_full_output() {
     let result = server
         .wait_impl(WaitParams {
             execution_id: execution_id.clone(),
-            timeout_secs: Some(5),
-            head_lines: Some(1),
-            tail_lines: Some(1),
-            max_output_bytes: None,
-            grep: None,
+            options: WaitOptions {
+                timeout_secs: Some(5),
+                head_lines: Some(1),
+                tail_lines: Some(1),
+                max_output_bytes: None,
+                grep: None,
+            },
         })
         .await
         .unwrap();

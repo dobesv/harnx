@@ -71,6 +71,26 @@ The repeatable `--enable-tool <GLOB>` option applies across all modes:
 - **Session Identity**: Tools requiring caller session identity (such as attachment creation tools) fail clearly when called via stdio bridge, because standalone stdio invocations carry no session identity context.
 - **Process Lifecycle**: The bridge uses `ChildProcessManager` to manage child processes. On completion or error, the bridge explicitly stops and reaps the child process. `kill_on_drop` provides fallback protection against process leaks.
 
+## Request Timeout Policy
+
+MCP tool listings have no timeout field, so a wrapped server can advertise its
+per-tool request-timeout policy in the tool's `_meta` under `timeout_secs`
+(`harnx_toolset::TOOL_TIMEOUT_META_KEY`): seconds, with `0` meaning "no
+elapsed-time deadline", matching `ToolSpec.timeout_secs`. The bridge copies the
+value into `ToolSpec.timeout_secs` for its NATS registration.
+
+- Harnx tool servers (e.g. `harnx-bash-tools --mcp-stdio`, and native toolsets
+  served through `harnx_toolset_server`'s MCP adapter) advertise their native
+  policy, so a bridged server runs under the same deadline behavior as the
+  native NATS route. Bash `spawn`/`wait`/`exec` advertise `0`, so a nested spawn
+  wait (`wait: {}`, 120-second default) returns its first execution_id-bearing
+  response instead of expiring at the caller's 60-second backstop.
+- Tools that advertise nothing — including third-party MCP servers — keep
+  `timeout_secs: None`, which the runtime resolves to its default request
+  backstop (60 seconds). Bridging never disables deadlines globally.
+- Malformed values are ignored (backstop retained), not treated as `0`.
+- Direct stdio clients that ignore unknown `_meta` keys are unaffected.
+
 ## Result Limits and Original Attachments
 
 Every result is limited to **32,768 bytes** of compact serialized `CallToolResult`

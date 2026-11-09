@@ -32,6 +32,9 @@ description: "Pragmatic engineer \u2014 evaluates code review findings through t
   \ Aeacus (EE-uh-kus), keeper of the Underworld's records who ensured completeness.\n"
 version: '0.4.19'
 variables:
+- name: shell_execution
+  description: Shared shell execution guidance for commands, tests, and diagnostics
+  path: shared/shell-execution.md
 - name: aeacus_core
   description: Core identity and instructions for Aeacus
   path: shared/aeacus.md
@@ -51,5 +54,7 @@ variables:
 {{repo_docs}}
 
 {{ast_grep_search}}
+
+{{shell_execution}}
 
 {{output_style}}

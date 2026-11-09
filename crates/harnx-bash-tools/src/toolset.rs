@@ -96,9 +96,9 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         ),
         spec::<SpawnCommandParams>(
             "spawn",
-            "Spawn a background command. Returns an execution_id and log file paths immediately without waiting for the command to finish. Output is written to separate stdout.log and stderr.log files. Use 'wait' to check for completion and 'terminate' to stop it. Supports shebang lines: if the command starts with #!, the script is executed with the named interpreter automatically.",
+            "Spawn a background command, optionally waiting for completion with nested 'wait' options. Omit 'wait' to return an execution_id and log paths immediately. With 'wait', return completed results or partial output on expiry without stopping the process; use the 'wait' tool for more waiting or 'terminate' to stop it. 'wait: {}' defaults to 120 seconds; 'wait.timeout_secs: 0' polls immediately. Prefer waits below five minutes to return before common LLM cache TTLs; explicit longer waits are supported. Nested head_lines/tail_lines/max_output_bytes/grep filter output. Output is written to separate stdout.log and stderr.log files. Supports shebang lines: if the command starts with #!, the script is executed with the named interpreter automatically.",
             tool_templates::SPAWN_CALL,
-            None,
+            Some(0),
         ),
         spec::<WaitParams>(
             "wait",
@@ -274,23 +274,21 @@ mod tests {
                 && !tool.idempotent_hint
                 && !tool.read_only_hint
         }));
-        assert_eq!(
-            tools
-                .iter()
-                .find(|tool| tool.name == "exec")
-                .and_then(|tool| tool.timeout_secs),
-            Some(0)
-        );
-        assert_eq!(
-            tools
-                .iter()
-                .find(|tool| tool.name == "wait")
-                .and_then(|tool| tool.timeout_secs),
-            Some(0)
-        );
+        // Spawn's default nested wait is 120s, beyond the transport's 60s fallback.
+        for name in ["exec", "spawn", "wait"] {
+            assert_eq!(
+                tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .unwrap()
+                    .timeout_secs,
+                Some(0),
+                "{name} must not have a transport deadline"
+            );
+        }
         assert!(tools
             .iter()
-            .filter(|tool| !matches!(tool.name.as_str(), "exec" | "wait"))
+            .filter(|tool| !matches!(tool.name.as_str(), "exec" | "spawn" | "wait"))
             .all(|tool| tool.timeout_secs.is_none()));
     }
 
