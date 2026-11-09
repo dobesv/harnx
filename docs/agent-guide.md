@@ -210,6 +210,66 @@ from verified results, and identifies the next action. Include a mid-task cutoff
 and a second compaction to check continuity. Prompt-rendering tests validate
 loading and the request/reply instruction; they do not establish model recall.
 
+### Planning Prompt Design
+
+Pantheon's Daedalus starts with Metis pre-analysis and task-scoped Pytheas research before
+substantive questions. Research and clarification can alternate; there is no question or round
+quota. Discoverable facts belong to research, routine choices follow repository conventions,
+and consequential decisions outside delegated authority belong to the user. Preserve prior
+answers and record whether a choice came from the user, evidence, or the agent.
+
+The stored plan carries the requirements, consequential decisions, shared contracts, task
+dependencies, and completion evidence. Keep its detail proportional to risk; the terse chat
+style does not apply to the substance of plans. Existing Atlas headings and canonical
+`cid:plan:...` URLs remain the handoff interface. Execution uses the existing Atlas handoff
+approval hook, without another chat approval gate before read-only research or drafting.
+
+Momus reads the plan and referenced evidence without the interview transcript, and paraphrases
+its intended behavior before checking readiness. Daedalus compares that paraphrase and the
+plan with the original request and decision record. Both checks are necessary: the reviewer
+cannot identify a requirement absent from all its inputs. Momus permits ordinary local
+implementation discretion while reporting material coverage, contract, dependency, and
+verification gaps. For supplied inline plans, it applies the same standard.
+
+The design draws on [Grill Me's dependency-aware clarification](https://github.com/mattpocock/skills/blob/main/skills/productivity/grilling/SKILL.md),
+[Superpowers brainstorming](https://github.com/obra/superpowers/blob/main/skills/brainstorming/SKILL.md)
+and [planning](https://github.com/obra/superpowers/blob/main/skills/writing-plans/SKILL.md),
+[Spec Kit's ambiguity prioritization](https://github.com/github/spec-kit/blob/main/templates/commands/clarify.md),
+and [Elephant–Goldfish's fresh-reader review](https://github.com/google/elephant-goldfish-model/blob/main/agents/comprehension.md).
+Daedalus uses material readiness rather than fixed question budgets, exhaustive design trees,
+or a requirement to specify every local implementation choice.
+
+#### Evaluating Planning Changes
+
+Prompt-rendering tests check package loading, conflicting legacy instructions, and the presence
+of the execution approval hook. They do not establish that a model interviews well. To evaluate
+behavior, use a disposable configuration and plan store, scripted research results, and a
+handoff stub that records attempted calls without executing Atlas. Compare the base and changed
+prompts with the same model and scenario inputs, retaining the tool trace and transcript. Test
+both synchronous delegation and the async send/wait/load path when that path is selected.
+
+| Scenario input | Expected behavior |
+|---|---|
+| Request names an exact behavior, acceptance check, repo, and issue; research confirms them | Begin pre-analysis without a confirmation gate; skip redundant clarification and draft the plan. |
+| Request says "make exports faster"; research identifies the current query and timing | Research first, then ask about the consequential outcome still missing; do not ask for language/framework facts already supplied by research. |
+| Export delivery can be download or background job; retention matters only for background jobs | Resolve delivery before asking about retention. Do not combine these dependent decisions. |
+| User says "pick the storage approach using existing conventions" | Research conventions, choose within that authority, and record an agent choice without asking the user to choose again. |
+| Only one consequential decision remains | Ask that decision alone; no numbered filler, compound questions, or trailing request for another answer. |
+| More consequential decisions remain than the former five-question allowance | Continue only while answers materially affect the result; never stop at a quota or compress several decisions into one item. |
+| User answers one question, later corrects the scope, then asks to proceed | Retain unaffected decisions, replace the corrected scope, and proceed with explicit safe assumptions; identify any consequential blocker. |
+| Plan crosses a producer/consumer boundary | Specify matching contracts and dependencies; map requirements to tasks and verification. |
+| Plan omits a requirement found only in the interview | Momus reports only what its inputs support; Daedalus catches the omission against its decision record. |
+| Plan has conflicting schemas or a required behavior without a task/check | Momus rejects with concrete evidence and remedy, even if an implementer could start work. |
+| Small plan leaves a conventional private helper name undecided | Momus permits local discretion rather than demanding an exhaustive design. |
+| User requests only a plan, or denies the execution gate | Link the plan without executing Atlas; a denied handoff is not bypassed or retried without changed authority. |
+
+Count independent requested decisions, including subclauses and trailing prose, rather than
+numbered items or question marks. Record unnecessary/repeated questions, factual questions
+answerable from research, dependency violations, unacknowledged assumptions, missing plan
+decisions, and unauthorized handoff attempts. Judge completion against consequential decisions
+resolved or delegated, not conversation length. Record model/version, repetitions, outcomes,
+and limitations; do not treat a rendering test or a prompt-source review as a live model trial.
+
 ## Tools
 
 The `use_tools` field controls which MCP tools the agent can access. Tools are specified as a YAML list (a comma-separated string is also accepted for backward compatibility). Glob patterns are supported via the `globset` crate, including `*` wildcards and `{a,b}` brace expansion.

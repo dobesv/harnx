@@ -704,6 +704,96 @@ fn plan_creating_agents_expose_add_plan() {
     }
 }
 
+/// Check the assembled prompts: stale reminders in an outer agent must not
+/// contradict its shared policy. This does not establish model behavior.
+#[test]
+fn planning_prompts_do_not_restore_question_quotas_or_early_approval_gates() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+
+    for (name, policy) in [
+        ("pantheon/daedalus", "zero questions is valid"),
+        ("pantheon/metis", "zero candidate questions is valid"),
+        ("pantheon/momus", "without a numeric quota"),
+    ] {
+        let prompt = render_agent_prompt(name, &[]).expect("render planning agent");
+        let normalized = prompt
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        assert!(normalized.contains(policy), "{name}: missing {policy}");
+        for obsolete in [
+            "3-5 key questions maximum",
+            "maximum 5 questions",
+            "approve by default",
+            "80% clear is good enough",
+            "explicit confirmation before moving to phase 2",
+            "max 3 issues",
+            "maximum 3 issues per rejection",
+            "do not proceed without user confirmation",
+        ] {
+            assert!(
+                !normalized.contains(obsolete),
+                "{name}: assembled prompt restores obsolete policy: {obsolete}"
+            );
+        }
+    }
+}
+
+#[test]
+fn daedalus_research_and_review_tools_keep_the_execution_approval_hook() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+    let agent = load_with_qualified_name(
+        &Config::agent_file("pantheon/daedalus"),
+        "pantheon/daedalus",
+    )
+    .expect("load Daedalus");
+    let tools = agent.use_tools().expect("Daedalus tools");
+    // async_delegation_guidance_renders_and_selects_tools_for_all_integrating_agents
+    // checks send/wait/load through the production selector for every prompt target.
+    for required in [
+        "metis_session_prompt",
+        "pytheas_session_prompt",
+        "momus_session_prompt",
+        "atlas_session_handoff",
+    ] {
+        assert!(
+            tools.iter().any(|tool| tool == required),
+            "missing {required}"
+        );
+    }
+    let hooks = agent.hooks().expect("execution approval hook");
+    let hook = hooks
+        .entries
+        .iter()
+        .find(|hook| hook.command.contains("^atlas_session_handoff$"))
+        .expect("Atlas handoff hook");
+    assert_ne!(hook.async_hook, Some(true));
+    let args = shell_words::split(&hook.command).expect("valid hook command quoting");
+    assert_eq!(args.len(), 7);
+    assert_eq!(
+        args[..6],
+        [
+            "harnx-claude-compatible-hook-server",
+            "--event",
+            "PreToolUse",
+            "--matcher",
+            "^atlas_session_handoff$",
+            "--jaq",
+        ]
+    );
+    let output: serde_json::Value = serde_json::from_str(&args[6]).expect("literal hook output");
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "ask");
+}
+
 /// Target agents that should declare `sandbox_connect` in their front-matter `use_tools`.
 const TARGET_AGENTS: [&str; 11] = [
     "atlas",

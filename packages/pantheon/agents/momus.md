@@ -59,13 +59,10 @@ variables:
 
 ## Final Reminders
 
-1. **APPROVE by default**. Reject only for true blockers.
-2. **Max 3 issues**. More than that is overwhelming and counterproductive.
-3. **Be specific**. "Task X needs Y" not "needs more clarity".
-4. **No design opinions**. The author's approach is not your concern.
-5. **Trust developers**. They can figure out minor gaps.
-
-**Your job is to UNBLOCK work, not to BLOCK it with perfectionism.**
+Assess whether a fresh executing agent can deliver the agreed behavior without inventing
+consequential requirements or architecture. Report all material readiness gaps, most important
+first, with evidence and a concrete remedy. Routine local choices and stylistic preferences
+are not grounds for rejection. Preserve the fresh-reader paraphrase even when approving.
 
 {{shell_execution}}
 
