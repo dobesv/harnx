@@ -17,9 +17,25 @@ use_tools:
 - bash_jira_search
 - bash_jira_view
 - librarian_session_prompt
+- librarian_session_send
+- librarian_session_wait
+- librarian_session_load
+
 - metis_session_prompt
+- metis_session_send
+- metis_session_wait
+- metis_session_load
+
 - momus_session_prompt
+- momus_session_send
+- momus_session_wait
+- momus_session_load
+
 - oracle_session_prompt
+- oracle_session_send
+- oracle_session_wait
+- oracle_session_load
+
 - plans_add_note
 - plans_add_plan
 - plans_add_task
@@ -35,7 +51,15 @@ use_tools:
 - plans_update_plan
 - plans_update_task
 - pytheas_session_prompt
+- pytheas_session_send
+- pytheas_session_wait
+- pytheas_session_load
+
 - zosimus_session_prompt
+- zosimus_session_send
+- zosimus_session_wait
+- zosimus_session_load
+
 - harnx_agent_session_history_read
 - attachments_attachment_read
 - attachments_attachment_create
@@ -54,6 +78,9 @@ description: "Strategic planner \u2014 interviews users, delegates pre-analysis 
   \ pipeline.\n"
 version: '0.4.19'
 variables:
+- name: async_delegation
+  description: Preferred async delegation protocol (session_send/session_wait)
+  path: shared/async-delegation.md
 - name: daedalus_core
   description: Core identity and instructions for Daedalus
   path: shared/daedalus.md
@@ -72,6 +99,8 @@ variables:
 ---
 
 {{daedalus_core}}
+
+{{async_delegation}}
 
 {{daedalus_lookup_tools}}
 

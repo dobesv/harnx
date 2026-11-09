@@ -18,7 +18,15 @@ use_tools:
 - fs_grep
 - fs_find
 - librarian_session_prompt
+- librarian_session_send
+- librarian_session_wait
+- librarian_session_load
+
 - pytheas_session_prompt
+- pytheas_session_send
+- pytheas_session_wait
+- pytheas_session_load
+
 - fs_rollback_file
 - harnx_agent_session_history_read
 - attachments_attachment_read
@@ -31,6 +39,9 @@ variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics
   path: shared/shell-execution.md
+- name: async_delegation
+  description: Preferred async delegation protocol (session_send/session_wait)
+  path: shared/async-delegation.md
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
@@ -49,6 +60,8 @@ variables:
 ---
 
 {{metis_core}}
+
+{{async_delegation}}
 
 {{repo_docs}}
 

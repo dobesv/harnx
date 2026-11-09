@@ -17,5 +17,5 @@ packages/example-pkg/
 
 After installation:
 - Agent `example-pkg-agent` is exposed as `example-pkg/example-pkg-agent`
-- agent tool: `example-pkg__example-pkg-agent_session_prompt`
+- agent tools: `example-pkg__example-pkg-agent_session_new`, `example-pkg__example-pkg-agent_session_prompt`, `example-pkg__example-pkg-agent_session_send`, `example-pkg__example-pkg-agent_session_wait`, `example-pkg__example-pkg-agent_session_load`, `example-pkg__example-pkg-agent_session_cancel`
 - MCP tools (if any): `example-pkg__<server>_<tool>`

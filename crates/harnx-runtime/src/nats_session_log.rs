@@ -14,6 +14,12 @@ const STREAM_NAME_PREFIX: &str = "SESSION_";
 const DUPLICATE_WINDOW: Duration = Duration::from_secs(120);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounded physical inspection reads (plan #1550 Task 4): one-page scans with
+/// record/byte caps, purged-range-safe progress, and continuation lookup.
+mod window;
+
+pub use window::{LogWindow, SCAN_BYTE_LIMIT, SCAN_RECORD_LIMIT};
+
 #[derive(Clone)]
 pub struct NatsSessionLog {
     jetstream: jetstream::Context,
@@ -405,7 +411,7 @@ impl NatsSessionLog {
                 // Sequence may have been removed (retention/limits) leaving a gap;
                 // skip missing sequences rather than failing the whole read.
                 Ok(Err(error)) if error.kind() == LastRawMessageErrorKind::NoMessageFound => {
-                    continue
+                    continue;
                 }
                 Ok(Err(error)) => {
                     return Err(error).with_context(|| format!(
@@ -596,3 +602,7 @@ where
 #[cfg(test)]
 #[path = "nats_session_log/fenced_tests.rs"]
 mod fenced_tests;
+
+#[cfg(test)]
+#[path = "nats_session_log/window_tests.rs"]
+mod window_tests;

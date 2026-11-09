@@ -12,6 +12,16 @@
 //! The metadata store (`SessionMetadataStore::get(session_id).metadata.title.value`) is the
 //! canonical source. The reporter reads it at startup, refreshes on the 10s heartbeat, and
 //! preserves the last-observed title on read errors.
+//!
+//! # Scope: synchronous launchers only
+//!
+//! Only `session_new` and `session_prompt` wire this reporter. The async
+//! `session_send`/`session_wait` tools deliberately do not: an async receipt
+//! (dispatch handle) and a soft-wait expiry are tool results, not child
+//! progress, and emitting a `SubAgentProgress` terminal row for either would
+//! misreport dispatch as completion. A dispatched child's real progress is
+//! observed later through `session_wait`/`session_load` results, and its
+//! completion only ever surfaces from durable terminal evidence.
 
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_session_metadata::SessionMetadataStore;

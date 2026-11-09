@@ -55,7 +55,7 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
 
 /// Best-effort plain-text rendering of an entry, for `text_regex` matching and
 /// the row's `text` field. Bounded; image `cid:` refs are included as attachment markers.
-fn entry_searchable_text(entry: &SessionLogEntry) -> String {
+pub(crate) fn entry_searchable_text(entry: &SessionLogEntry) -> String {
     match entry {
         SessionLogEntry::Message { content, .. } => content.to_transcript_text(),
         SessionLogEntry::ToolCalls { text, calls, .. } => {
@@ -123,7 +123,7 @@ fn entry_searchable_text(entry: &SessionLogEntry) -> String {
 }
 
 /// Tool names referenced by an entry (for `tool_name` filtering).
-fn entry_tool_names(entry: &SessionLogEntry) -> Vec<String> {
+pub(crate) fn entry_tool_names(entry: &SessionLogEntry) -> Vec<String> {
     match entry {
         SessionLogEntry::ToolCalls { calls, .. } => calls.iter().map(|c| c.name.clone()).collect(),
         SessionLogEntry::ToolResults { results, .. } => {
