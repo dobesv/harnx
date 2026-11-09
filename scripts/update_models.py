@@ -81,22 +81,15 @@ CURATED_CAPABILITY_FLAGS = [
     "supports_tool_use",
 ]
 
+# Modes harnx ingests. Everything else the registry offers — image
+# generation, audio, speech, realtime, moderation, … — is out of scope for
+# the chat/embedding catalog, so one membership test rejects it.
 INCLUDED_MODES = {"chat", "embedding", "reranker"}
-EXCLUDED_MODES = {
-    "image_generation",
-    "audio_speech",
-    "audio_transcription",
-    "completion",
-    "moderation",
-    "speech",
-    "image_edit",
-    "image_variation",
-    "realtime",
-}
 
 CHAT_PROVIDER_DEFAULTS = {
     "openai",
     "anthropic",
+    "gemini",
     "google_ai",
     "vertex_ai",
     "bedrock",
@@ -122,6 +115,14 @@ CHAT_PROVIDER_DEFAULTS = {
 LITELLM_TO_HARNX_PROVIDER = {
     "openai": "openai",
     "anthropic": "claude",
+    # LiteLLM lists the Gemini catalog under the `gemini/` key prefix and
+    # `litellm_provider: "gemini"`; nothing upstream uses `google_ai` anymore.
+    # Without this entry every Gemini model is discarded before any other
+    # check runs, so a refresh silently keeps stale entries that lack
+    # `cache_read_price` and cached-token calls then record no cost (#2638).
+    "gemini": "gemini",
+    # Legacy alias kept for older registry snapshots that still tag entries
+    # `google_ai`.
     "google_ai": "gemini",
     "vertex_ai": "vertexai",
     "bedrock": "bedrock",
@@ -540,6 +541,21 @@ def infer_mode(prefix: str, payload: dict[str, Any]) -> str | None:
     return None
 
 
+def chat_output_is_supported(payload: dict[str, Any]) -> bool:
+    """Whether a chat model can return text, which is all the shipped
+    chat-completions transport parses.
+
+    LiteLLM tags audio-only Gemini entries (Lyria music generation, the TTS
+    previews) as mode `chat`, but their `supported_output_modalities` says
+    `["audio"]`. Shipping them as selectable chat models breaks every
+    selection (#2638 review), so an explicit output-modality list without
+    text disqualifies a chat entry. An absent list makes no claim, so the
+    model stays — zero-price text models are not affected.
+    """
+    output_modalities = payload.get("supported_output_modalities")
+    return not isinstance(output_modalities, list) or "text" in output_modalities
+
+
 def model_type_for_mode(mode: str) -> str | None:
     if mode == "chat":
         return None
@@ -854,39 +870,76 @@ def _regenerate_model_variants(
     return [with_variants[name] for name in sorted(with_variants, key=provider_sort_key)]
 
 
-def main() -> int:
-    _old_raw, old_by_provider = load_existing_data()
-    litellm = fetch_litellm_data()
-    today = dt.date.today()
+def _entry_provider_and_mode(
+    prefix: str, payload: dict[str, Any]
+) -> tuple[str, str] | None:
+    """Apply mode and output gating to an entry whose provider is mapped."""
+    mode = infer_mode(prefix, payload)
+    if mode is None or mode not in INCLUDED_MODES:
+        return None
+    if mode == "chat" and not chat_output_is_supported(payload):
+        return None
+    return LITELLM_TO_HARNX_PROVIDER[prefix], mode
 
+
+def resolve_catalog_entry(
+    key: str, payload: dict[str, Any], today: dt.date
+) -> tuple[str, str, str] | None:
+    """Map one registry entry to `(provider, model_name, mode)`, or `None`
+    when gating drops it: unmapped provider, unusable payload, unhandled
+    mode, audio-only chat output, or an invalid Bedrock id.
+    """
+    parsed = provider_prefix_and_model_name(key, payload)
+    if parsed is None:
+        return None
+    prefix, model_name = parsed
+    if prefix not in LITELLM_TO_HARNX_PROVIDER:
+        return None
+    if should_skip_model(today, payload):
+        return None
+    provider_and_mode = _entry_provider_and_mode(prefix, payload)
+    if provider_and_mode is None:
+        return None
+    provider, mode = provider_and_mode
+    if provider == "bedrock" and not is_valid_bedrock_model_name(model_name):
+        return None
+    return provider, model_name, mode
+
+
+def collect_provider_models(
+    litellm: dict[str, Any],
+    old_by_provider: dict[str, dict[str, dict[str, Any]]],
+) -> tuple[dict[str, dict[str, dict[str, Any]]], list[str]]:
+    """Run every registry entry through the ingestion gating.
+
+    Kept separate from `main` so tests can feed explicit payloads through the
+    same provider mapping, mode filtering, and model building the weekly
+    refresh uses, without network access.
+    """
+    today = dt.date.today()
     new_provider_models: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     warnings: list[str] = []
 
     for key, payload in litellm.items():
-        parsed = provider_prefix_and_model_name(key, payload)
-        if parsed is None:
+        resolved = resolve_catalog_entry(key, payload, today)
+        if resolved is None:
             continue
-        prefix, model_name = parsed
-        if prefix not in LITELLM_TO_HARNX_PROVIDER:
-            continue
-        if should_skip_model(today, payload):
-            continue
-
-        mode = infer_mode(prefix, payload)
-        if mode is None:
-            continue
-        if mode in EXCLUDED_MODES or mode not in INCLUDED_MODES:
-            continue
-
-        provider = LITELLM_TO_HARNX_PROVIDER[prefix]
-        if provider == "bedrock" and not is_valid_bedrock_model_name(model_name):
-            continue
+        provider, model_name, mode = resolved
         model = build_model_from_litellm(model_name, payload, mode)
         old_model = old_by_provider.get(provider, {}).get(model_name)
         model = merge_old_fields(model, old_model)
         apply_openai_endpoint_default(model, provider, payload)
         apply_openai_reasoning_summary(model, provider, payload)
         new_provider_models[provider][model_name] = model
+
+    return new_provider_models, warnings
+
+
+def main() -> int:
+    _old_raw, old_by_provider = load_existing_data()
+    litellm = fetch_litellm_data()
+
+    new_provider_models, warnings = collect_provider_models(litellm, old_by_provider)
 
     drop_bedrock_in_region_duplicates(new_provider_models["bedrock"])
     apply_bedrock_card_corrections(new_provider_models["bedrock"], warnings)

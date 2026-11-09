@@ -1661,6 +1661,60 @@ mod tests {
     }
 
     #[test]
+    fn unpriced_calls_with_tokens_are_counted_not_silently_dropped() {
+        harnx_core::require_nextest();
+        // #2638's visibility gap: a model with input/output prices but no
+        // cache-read price returns None for every cached-token call, and
+        // those calls used to leave no cost-metric trace at all.
+        let mut model_data = ModelData::new("metrics-model");
+        model_data.input_price = Some(3.0);
+        model_data.output_price = Some(15.0);
+        let model = Model::from_config("mypkg/openai", &[model_data])
+            .into_iter()
+            .next()
+            .expect("model should exist");
+        let mock = metrics_mock_client(&model);
+        let snapshot = run_metrics_tool_loop(&model, mock, vec![]);
+
+        assert_eq!(
+            token_metric_value(&snapshot, "cached"),
+            &DebugValue::Counter(14),
+            "tokens are still recorded for unpriced calls"
+        );
+
+        // Three calls, each with cached tokens the model cannot price: every
+        // one must be counted, and the cost gauge must stay absent.
+        assert_eq!(
+            metric_value(
+                &snapshot,
+                MetricKind::Counter,
+                harnx_metrics::LLM_UNPRICED_CALLS_TOTAL,
+                &[
+                    ("agent", "metrics-agent"),
+                    ("client", "mypkg/openai"),
+                    ("model", "metrics-model"),
+                    ("provider", ""),
+                ],
+            ),
+            &DebugValue::Counter(3)
+        );
+        let cost_key = metric_key(
+            MetricKind::Gauge,
+            harnx_metrics::LLM_COST_DOLLARS,
+            &[
+                ("agent", "metrics-agent"),
+                ("client", "mypkg/openai"),
+                ("model", "metrics-model"),
+                ("provider", ""),
+            ],
+        );
+        assert!(
+            !snapshot.iter().any(|(key, ..)| key == &cost_key),
+            "unpriced calls must not increment the cost gauge"
+        );
+    }
+
+    #[test]
     fn configured_client_records_canonical_provider_label() {
         harnx_core::require_nextest();
         let model = priced_metrics_model();

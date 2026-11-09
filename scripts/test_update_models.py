@@ -20,6 +20,11 @@ from update_models_bedrock_tests import (
     TestDropBedrockInRegionDuplicates,
     TestIsValidBedrockModelName,
 )
+from update_models_gemini_tests import (
+    TestChatOutputCompatibility,
+    TestGeminiProviderMapping,
+    TestGeminiRefreshPersistence,
+)
 from update_models_openai_tests import (
     TestOpenAIEndpointDefault,
     TestOpenAIReasoningSummaryDefault,
@@ -59,15 +64,12 @@ class TestProviderMapping(unittest.TestCase):
     def test_anthropic_maps_to_claude(self) -> None:
         self.assertEqual(um.LITELLM_TO_HARNX_PROVIDER["anthropic"], "claude")
 
-    def test_google_ai_maps_to_gemini(self) -> None:
-        self.assertEqual(um.LITELLM_TO_HARNX_PROVIDER["google_ai"], "gemini")
-
     def test_vertex_ai_maps_to_vertexai(self) -> None:
         self.assertEqual(um.LITELLM_TO_HARNX_PROVIDER["vertex_ai"], "vertexai")
 
-    def test_all_25_providers_present(self) -> None:
+    def test_all_26_providers_present(self) -> None:
         expected = {
-            "openai", "anthropic", "google_ai", "vertex_ai", "bedrock",
+            "openai", "anthropic", "gemini", "google_ai", "vertex_ai", "bedrock",
             "bedrock_converse", "mistral", "cohere", "groq", "perplexity",
             "deepseek", "voyage", "cloudflare", "openrouter", "ai21", "x_ai",
             "zhipu", "alibaba_cloud", "baidu", "tencent", "minimax",

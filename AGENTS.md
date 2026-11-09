@@ -542,6 +542,15 @@ as `patches` and `require_max_tokens`, describe harnx's own request handling,
 are never supplied upstream, and must stay in that list or a refresh resets
 them. Any new field of that kind belongs there too.
 
+A provider whose LiteLLM prefix is missing from `LITELLM_TO_HARNX_PROVIDER`
+never reaches the merge path at all: `regenerate_provider_models` copies the
+existing block verbatim and prints nothing, so the whole provider's prices
+freeze with no warning line. That is how Gemini went stale — LiteLLM renamed
+its `google_ai` prefix to `gemini`, every Gemini entry was dropped before any
+other check ran, and cached-token calls then recorded no cost (#2638). If an
+entire provider's prices look frozen, check the mapping table in
+`scripts/update_models.py` before blaming the registry.
+
 A model the registry adds starts with no `patches`, because only an existing
 entry has any to carry over. The refresh gives new models the patches harnx
 needs: `scripts/model_variants.py` adds `includeThoughts` to Gemini thinking
@@ -574,6 +583,13 @@ model card; add an entry with the card name in a comment, and delete it once
 upstream agrees. Verify a Bedrock model's limits against its card rather than
 trusting a refresh, and see issue #2025 for reconciling the catalog against
 `ListFoundationModels`.
+
+The script rewrites `crates/harnx/models.yaml` in place from the live
+registry — there is no dry-run or output-path option. Running it locally to
+refresh one provider also imports every other provider's current upstream
+drift, which does not belong in a scoped changeset. After a scoped refresh,
+take `HEAD:crates/harnx/models.yaml`, splice in only the `provider:` block
+you meant to change, and confirm `git diff` touches that block alone.
 
 ## Key Patterns
 

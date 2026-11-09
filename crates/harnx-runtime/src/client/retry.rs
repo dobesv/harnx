@@ -94,17 +94,47 @@ fn record_llm_metrics(
         .increment(tokens);
     }
 
-    if let Some(cost) = model.cost_usd(usage) {
-        // Counter increments accept only u64, so cumulative f64 cost is a monotonic gauge.
-        metrics::gauge!(
-            harnx_metrics::LLM_COST_DOLLARS,
-            "agent" => agent_name.to_owned(),
-            "client" => client_name,
-            "model" => model_name,
-            "provider" => provider,
-        )
-        .increment(cost);
+    match model.cost_usd(usage) {
+        Some(cost) => {
+            // Counter increments accept only u64, so cumulative f64 cost is a monotonic gauge.
+            metrics::gauge!(
+                harnx_metrics::LLM_COST_DOLLARS,
+                "agent" => agent_name.to_owned(),
+                "client" => client_name,
+                "model" => model_name,
+                "provider" => provider,
+            )
+            .increment(cost);
+        }
+        None if usage_has_tokens(usage) => {
+            // `cost_usd` refuses to estimate a partial price rather than
+            // under-reporting, so a call with tokens but no computable cost
+            // used to vanish from every spend metric with no signal (#2638:
+            // cached Gemini calls). Count it so the gap stays observable.
+            metrics::counter!(
+                harnx_metrics::LLM_UNPRICED_CALLS_TOTAL,
+                "agent" => agent_name.to_owned(),
+                "client" => client_name,
+                "model" => model_name,
+                "provider" => provider,
+            )
+            .increment(1);
+        }
+        None => {}
     }
+}
+
+/// Whether a usage report carries any tokens, separating a real but unpriced
+/// call from an empty report when deciding to count unpriced spend.
+fn usage_has_tokens(usage: &CompletionTokenUsage) -> bool {
+    [
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cached_tokens,
+        usage.cache_write_tokens,
+    ]
+    .into_iter()
+    .any(|tokens| tokens > 0)
 }
 
 /// Attempt an LLM call with retry (exponential backoff) and model fallback.
