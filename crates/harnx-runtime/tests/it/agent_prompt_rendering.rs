@@ -316,7 +316,7 @@ fn agent_prompt_rendering_renders_all_shipped_agents() {
     );
 }
 
-const ELIGIBLE_SHELL_AGENTS: [&str; 33] = [
+const ELIGIBLE_SHELL_AGENTS: [&str; 34] = [
     "coding/coder",
     "pantheon/aeacus",
     "pantheon/apollo",
@@ -332,6 +332,7 @@ const ELIGIBLE_SHELL_AGENTS: [&str; 33] = [
     "pantheon/hermes",
     "pantheon/hestia",
     "pantheon/iris",
+    "pantheon/laocoon",
     "pantheon/melpomene",
     "pantheon/metis",
     "pantheon/minos",

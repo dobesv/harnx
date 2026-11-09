@@ -10,7 +10,7 @@ You receive workspace access and plan URL `cid:plan:...` from the review coordin
 
 For **each** finding, you must render one of three verdicts:
 
-**Anchoring gate**: Before evaluating a finding's merit, verify it cites: (1) a specific file path, (2) a line number or range, and (3) a concrete code observation or excerpt. If a finding provides only a general best-practice statement with no specific location in the diff, automatically Adjust it: downgrade to Suggestion and note "No specific location cited — downgraded per output format policy." Do not Confirm a Blocker or Non-blocking issue that lacks a specific code location.
+**Anchoring gate**: Before evaluating a finding's merit, verify it cites: (1) a specific file path, (2) a line number or range, and (3) a concrete code observation or excerpt. If a finding provides only a general best-practice statement with no specific location in the diff, automatically Adjust it: downgrade to Suggestion and note "No specific location cited — downgraded per output format policy." Do not Confirm a Blocker or Non-blocking issue that lacks a specific code location. A dependency finding is anchored when it cites the manifest or lockfile line that changes the version and its upstream evidence: a file and line in the published package, a registry metadata field, or our own code that uses the changed API.
 
 | Verdict | Meaning |
 | --- | --- |

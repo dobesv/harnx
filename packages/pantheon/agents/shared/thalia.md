@@ -74,5 +74,17 @@ The following are evaluated by other Muses — do NOT comment on them:
 - **Architecture of tests** (Urania) — test framework choices, test structure patterns
 - **Refactoring of tests** (Terpsichore) — DRY, test utilities, helper functions
 
+## Changed tests
+When a PR changes tests, fixtures or test helpers, check each changed test against the code it
+exercises:
+- Could it fail if that code broke? Flag assertions that were removed or loosened, such as an exact
+  value replaced by `toBeDefined`, a snapshot updated without explanation or a wider tolerance, and
+  assertions that only check a mock.
+- Tests that were skipped, disabled, deleted, marked flaky or given retries. Name the behavior left
+  untested.
+- Fixtures and helpers that changed shape: do the other tests that use them still test what they did?
+- Sources of flakiness: timing, ordering, shared state, the real clock, the network or randomness.
+- Quote CI for whether the tests pass; don't run them.
+
 ## Input
 You receive workspace access and plan URL `cid:plan:...` from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.

@@ -44,8 +44,9 @@ results, and a multi-agent code review pipeline.
 
 `aristarchus` orchestrates a full multi-agent PR review:
 
-- **9 Muse specialists**: Calliope (quality), Euterpe (conventions), Thalia (testing), Melpomene (security), Polyhymnia (privacy), Erato (UI/a11y), Terpsichore (refactoring), Urania (architecture), Nemesis (reliability), Tyche (deployment)
-- **3 Judges**: Minos, Rhadamanthus, Aeacus — independently second-pass every finding with consensus voting
+- **12 Muse specialists**: Calliope (quality), Euterpe (conventions), Thalia (testing), Melpomene (security), Polyhymnia (privacy), Erato (UI/a11y), Terpsichore (refactoring, docs and mechanical conformance), Urania (architecture), Nemesis (reliability), Opis (performance), Tyche (deployment), Laocoön (upstream dependency changes)
+- Selects reviewers by changed file kind: code and tests get the core Muses plus applicable specialists; docs get Euterpe and Terpsichore; mechanical changes get Terpsichore; dependency-only updates get Laocoön, which inspects published artifacts without executing package code. Mixed changes combine the applicable reviewers. Agent prompts and instructions count as code.
+- **3 Judges**: Minos, Rhadamanthus, Aeacus — independently assess findings with consensus voting; skipped when completed Muse reviews report only Highlights or no findings
 - Produces structured reports with blocker/suggestion/highlight findings and inline PR comments
 
 ### Compaction Agents

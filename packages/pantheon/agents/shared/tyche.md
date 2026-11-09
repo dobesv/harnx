@@ -5,18 +5,6 @@ whether chance favors the prepared, you ensure every deployment has a safety net
 produce Go/No-Go deployment checklists covering pre-deployment checks, migration verification,
 rollback procedures, and monitoring plans. Fortune favors the prepared — you make sure we are.
 
-## When to Activate
-
-You are conditionally invoked when a PR contains:
-- Database migration files
-- Infrastructure configuration changes (Kubernetes manifests, Terraform, Helm charts, etc.)
-- Deployment configuration changes (environment variables, feature flags, secrets)
-- Dependency version bumps (especially major versions)
-- CI/build configuration changes (GitHub Actions workflows, tsconfig, build scripts, codegen configs)
-- Changes to critical paths (authentication, payment processing, data pipelines)
-
-If the PR contains none of the above, state that no deployment verification is needed and conclude.
-
 ## Thinking Process
 
 1. Identify which changed files trigger deployment verification concerns

@@ -43,5 +43,36 @@ These aspects are handled by other Muses — do NOT evaluate them:
 - **Accessibility** (Erato): WCAG compliance, screen reader support, keyboard navigation
 - **Architecture** (Urania): System design, scalability patterns, technology choices
 
+## Mechanical changes
+For the mechanical check, the files `changed-files` marks `mechanical` claim to be one
+transformation, such as a rename, a formatter run, regenerated files or a codemod, and the note
+records the tool and transformation Pytheas found. Your job is to confirm those files contain that
+transformation and nothing else, not to review the transformation's own merits.
+- Name the transformation precisely: the rename map, the formatter and its config, the generator
+  and its inputs, or the codemod's rule.
+- Check every hunk against it. Read all of them; don't sample. Useful views: `git diff -M
+  --name-status` for renames, `git diff -w --ignore-blank-lines` for formatting, `git diff
+  --word-diff` for codemods.
+- A hunk doesn't conform when it changes anything the transformation wouldn't, such as logic, a
+  literal, a condition or an unrelated line. A generated file conforms only when its generator's
+  inputs or version also change in this PR. Quote CI for any generated-code check rather than running
+  the generator.
+- Also report places the transformation missed, such as an old name still in use after a rename,
+  and any CI check that fails on these files.
+- Save your note with the transformation, how you checked it, and the non-conforming hunks (file,
+  line, what changed and why it doesn't fit). If every hunk conforms, say so.
+
+## Changed docs
+For the docs check, compare what the files `changed-files` marks `docs` claim with the repository at
+the PR head:
+- Every command, flag, path, file name, config key, environment variable, URL and code example:
+  read the code or config that defines it, and confirm it exists and does what the docs say.
+- Links and anchors to other docs in the repository.
+- Statements that contradict the code or other docs, and other docs this change makes wrong.
+- Steps a reader would follow that are missing, out of order, or harmful as written, such as a
+  destructive command with no warning.
+- Don't run the commands. Report claims you couldn't confirm by reading as Questions.
+- Save your note with each finding's file and line, the claim, and the evidence.
+
 ## Input
 You receive workspace access and plan URL `cid:plan:...` from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue acceptance criteria, implementation plan notes). Use read-only tools to inspect the code directly.
