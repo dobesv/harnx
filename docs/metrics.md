@@ -46,15 +46,16 @@ All exported metrics use the `harnx_` prefix.
 | `harnx_tool_call_duration_seconds` | Histogram | `tool` | Tool execution duration histogram. | Tool & MCP servers |
 | `harnx_sandbox_wakes_total` | Counter | none | Kubernetes sandboxes resumed from `Suspended` mode. | `harnx-k8s-sandbox-tools` |
 | `harnx_sandbox_hibernations_total` | Counter | `reason` | Kubernetes sandboxes suspended explicitly or after idle timeout. | `harnx-k8s-sandbox-tools` |
-| `harnx_activation_phase_seconds` | Histogram | `phase` | Duration of worker activation phases (`publish_to_delivery`, `delivery_to_admission`, `admission_to_lease`, `lease_to_turn_start`). Extended buckets: 0.005s to 300s. | `harnx-worker` |
+| `harnx_activation_phase_seconds` | Histogram | `phase` | Duration of worker activation phases (`publish_to_delivery`, `delivery_to_admission`, `admission_to_lease`, `lease_to_turn_start`, `busy_wait`). Extended buckets: 0.005s to 300s. | `harnx-worker` |
 | `harnx_activations_received_total` | Counter | `attempt` | Activation deliveries received by workers (`first` or `redelivery`). | `harnx-worker` |
-| `harnx_activation_claims_total` | Counter | `outcome` | Activation claim dispositions (`claimed`, `busy`, `lease_held`, `same_delivery`, `preflight_not_ready`, `failure_budget_term`, `refused_term`, `delivery_limit_term`, `error`). | `harnx-worker` |
+| `harnx_activation_claims_total` | Counter | `outcome` | Activation claim dispositions (`claimed`, `busy`, `busy_foreign`, `lease_held`, `busy_overflow`, `same_delivery`, `preflight_not_ready`, `failure_budget_term`, `refused_term`, `delivery_limit_term`, `error`). | `harnx-worker` |
 | `harnx_activation_naks_total` | Counter | `reason` | Successfully NAKed activation deliveries by bounded reason (`busy`, `preflight_not_ready`, `shutdown`, `settlement_rejection`, `claim_error`, `preparation_error`). | `harnx-worker` |
 | `harnx_activation_redeliveries_total` | Counter | none | Activation redeliveries received by workers (delivery count > 1). | `harnx-worker` |
 | `harnx_activation_claim_deadlines_total` | Counter | none | Client/parent watchdog timeouts waiting for a worker to claim an activated session. | Client / parent (`harnx`, `harnx-serve`) |
 | `harnx_worker_admission_permits` | Gauge | none | Available admission semaphore permits on this worker (0 to 8). | `harnx-worker` |
 | `harnx_worker_activation_handlers` | Gauge | none | In-flight activation handler tasks on this worker. | `harnx-worker` |
 | `harnx_worker_activations_waiting` | Gauge | none | Activations waiting locally for an admission permit on this worker (0 or 1). | `harnx-worker` |
+| `harnx_worker_busy_waiters` | Gauge | none | Activations parked on busy waiters in this worker process. | `harnx-worker` |
 | `harnx_nats_operation_seconds` | Histogram | `op` | JetStream and KV operation duration by bounded operation type. Extended buckets: 0.005s to 300s. | `harnx`, `harnx-serve`, `harnx-worker` |
 | `harnx_nats_operations_total` | Counter | `op`, `outcome` | JetStream and KV operation count by bounded operation and outcome (`ok`, `timeout`, `error`). | `harnx`, `harnx-serve`, `harnx-worker` |
 
@@ -95,45 +96,49 @@ The activation pipeline exports metrics on both the initiating client/parent pro
 | `harnx_worker_admission_permits` | Gauge | Worker | none | Available admission permits in this worker process (semaphore max 8). |
 | `harnx_worker_activation_handlers` | Gauge | Worker | none | Active activation handler tasks in flight in this worker process. |
 | `harnx_worker_activations_waiting` | Gauge | Worker | none | Activations waiting locally for an admission permit in this worker (strictly 0 or 1). |
+| `harnx_worker_busy_waiters` | Gauge | Worker | none | Activations parked on busy waiters in this worker process. |
 | `harnx_nats_operation_seconds` | Histogram | Worker, Client | `op` | Latency of individual JetStream and KV operations (buckets: 0.005s to 300s). |
 | `harnx_nats_operations_total` | Counter | Worker, Client | `op`, `outcome` | Count of JetStream and KV operations by bounded op and outcome (`ok`, `timeout`, `error`). |
 
 #### Label Cardinality and Recording Seams
 
 - **Bounded cardinality**: Metrics omit `session_id`, `agent_name`, and stream/subject names to prevent cardinality explosion. All labels are strictly bounded enums. To inspect specific sessions, correlate using structured log events.
-- **Process locality**: The worker gauges (`harnx_worker_admission_permits`, `harnx_worker_activation_handlers`, `harnx_worker_activations_waiting`) are process-local. Prometheus scrape targets identify individual worker instances via the `instance` or `pod` label.
+- **Process locality**: The worker gauges (`harnx_worker_admission_permits`, `harnx_worker_activation_handlers`, `harnx_worker_activations_waiting`, `harnx_worker_busy_waiters`) are process-local. Prometheus scrape targets identify individual worker instances via the `instance` or `pod` label.
 - **Worker waiting gauge vs true backlog**: `harnx_worker_activations_waiting` is strictly binary (`0` or `1`). The worker loop buffers at most one pending message while its 8 admission permits are busy. It does not reflect total backlog in NATS JetStream. For true consumer backlog across the cluster, check JetStream consumer `num_pending` via `nats consumer info <stream> <consumer>` (CLI) or the Prometheus NATS exporter metric `nats_consumer_num_pending`.
 - **Client vs Worker separation**: `harnx_activation_claim_deadlines_total` is recorded in the client process (`harnx`, `harnx-serve`, or parent worker running a sub-agent) when its lease watchdog expires. All other activation lifecycle metrics are recorded in `harnx-worker`.
 
 #### Activation Phases
 
-The `harnx_activation_phase_seconds` histogram segments time into four sequential phases:
+The `harnx_activation_phase_seconds` histogram segments activation time into lifecycle phases. Phase durations can overlap; don't sum them as sequential time.
 
 1. `publish_to_delivery`: Time elapsed between broker message publication (`info.published`) and worker stream delivery receipt (`delivered_wall`). Reflects JetStream queueing delay and network delivery.
    - **Clock skew caveat**: Compares the NATS server's publish timestamp against the worker host's local wall clock. If clock skew makes the worker clock appear behind the broker clock (negative elapsed time), the sample is clamped to 0s (`Duration::ZERO`) so it remains accounted for in the lowest histogram bucket (`le="0.005"`). Synchronize system clocks with NTP across NATS servers and worker hosts.
 2. `delivery_to_admission`: Time a delivered activation waited to acquire one of the worker's 8 concurrent admission permits. Reflects worker admission queueing and worker saturation.
 3. `admission_to_lease`: Time taken to run preflight checks and acquire the session lease in the KV bucket (`lease_create`). Reflects lease acquisition latency.
 4. `lease_to_turn_start`: Time from lease acquisition to active turn dispatch (task launch and active session registration). Reflects local turn preparation.
+5. `busy_wait`: Time a busy activation spent parked on a busy waiter before it claimed, settled or was handed back. Parking preserves the current JetStream delivery count, which may already exceed one after redelivery. For a parked delivery that claims on wake, `busy_wait` includes that claim, which is also measured by `admission_to_lease`; these phase durations overlap.
 
 #### Claim Outcomes
 
 The `harnx_activation_claims_total` counter categorizes the worker's decision for each delivered message:
 
 - `claimed`: Worker acquired the session lease and accepted the turn.
-- `busy`: Another delivery of the same session is already reserved on this worker; the message was delayed-NAKed (10s plus jitter, NAK reason `busy`).
-- `lease_held`: Lease creation in the KV bucket found another holder for this session; the message was delayed-NAKed (NAK reason `busy`).
+- `busy`: Another delivery of the same session is already reserved on this worker. This counts claim outcomes, not parking: exhausted waiter capacity can lead to a NAK, and a wake may claim or settle without another `busy` count.
+- `busy_foreign`: The lease preflight found another worker holding the session. This counts claim outcomes, not parking: exhausted waiter capacity can lead to a NAK, and a wake may claim or settle without another `busy_foreign` count.
+- `lease_held`: Lease creation in the KV bucket found another holder for this session (the preflight raced a takeover). The claim path parks the message on a busy waiter; the wind-up and failure-budget preflights hand it straight back with a delayed NAK (NAK reason `busy`) instead of parking.
+- `busy_overflow`: The session's parked-waiter capacity (or the worker's total) was exhausted, so the busy delivery fell back to a delayed NAK (NAK reason `busy`).
 - `same_delivery`: Duplicate delivery of an in-flight delivery attempt already being processed.
-- `preflight_not_ready`: `activation_is_ready` declined the activation before lease acquisition. This covers several cases: the lease-holder check found another worker holding the session (NAK reason `busy`), session metadata or routing was not ready (NAK reason `preflight_not_ready`), the worker was shutting down (NAK reason `shutdown`), or the activation was stale, cancelled, or missing metadata and was acked or terminated without a turn. Compare with `harnx_activation_naks_total` by reason to tell these apart; the `activation_claim_deferred` event only reports `reason="not_claimed"`.
+- `preflight_not_ready`: `activation_is_ready` declined the activation after settling it: session metadata was not ready (NAK reason `preflight_not_ready`), shutdown caused a NAK (`shutdown`), a wind-up lease race caused a busy NAK, or targeted-route validation terminated the delivery. Stale, cancelled, or missing-metadata activations may also be acked or terminated without a turn. `harnx_activation_naks_total` by reason distinguishes NAK outcomes; a Term has no NAK count. `activation_claim_deferred` only reports `reason="not_claimed"`.
 - `failure_budget_term`: The worker terminated the message with a JetStream `Term` ack because the activation failed ten times before its turn started, its turn failed, or it hit a typed size rejection. Size rejections terminate on the first failure. The worker attempts to record an `Error` on the session first; a size rejection remains terminal even if that diagnostic cannot be appended.
 - `refused_term`: The worker refused the activation on two deliveries, recorded why as an `Error` on the session, and terminated the message. A prompt with no durable run admission, such as one sent before run admissions existed, is refused this way.
-- `delivery_limit_term`: The activation had been delivered `MAX_ACTIVATION_DELIVERIES` (100) times, and the worker terminated it instead of NAKing it again. Usually a session that stayed busy for hours; the worker logs the session and the reason it would have NAKed.
-- `error`: Unexpected error occurred while attempting to claim the activation (e.g. NATS communication error).
+- `delivery_limit_term`: The activation had been delivered `MAX_ACTIVATION_DELIVERIES` (100) times, and the worker terminated it instead of NAKing it again. Busy deferrals are exempt from this worker limit, but busy NAKs still increment JetStream's shared delivery count. After enough busy redeliveries, one claim, preparation, preflight or settlement error can reach the 100-delivery limit and terminate the activation; repeated errors aren't required. A busy-only cycle remains exempt here, with JetStream's consumer `max_deliver` (200) as its backstop. The worker logs the session and the reason it would have NAKed.
+- `error`: Unexpected error occurred while attempting to claim the activation (e.g. NATS communication error). Counts both admission claims and parked-waiter wake claims, so a worker whose broker is flapping shows the same outcome from both paths.
 
 #### NAK Reasons
 
 The `harnx_activation_naks_total` counter tracks activation deliveries that the worker explicitly and successfully NAKed back to JetStream for redelivery or failover:
 
-- `busy`: The session lease is held by another worker (lease preflight or lease acquisition), or another delivery of the same session is already reserved on this worker. Delayed-NAKed for 10s plus jitter. A steady `busy` rate means activations for sessions that are already running, not worker saturation.
+- `busy`: The busy delivery fell back to broker redelivery: waiter capacity was exhausted, the six-hour busy-wait budget elapsed, or a lease race handed the delivery back (`lease_held`). The NAK requests 10–12s; consumer backoff adjusts the effective delay after delivery 30 (see [Delivery limits](nats-ha.md#delivery-limits)). The elapsed-time budget is not a session-health check; a healthy turn can exceed it. Busy NAKs increment JetStream's shared delivery count but don't trigger the worker's 100-delivery termination; a later non-busy error can. A busy-only cycle is bounded by the consumer's `max_deliver` (200).
 - `preflight_not_ready`: Session metadata or route preflight failed (or the lease-holder lookup errored); delayed-NAKed for retry.
 - `shutdown`: Worker is shutting down; immediately NAKs unhandled activations (including any buffered message waiting for an admission permit) so replacement workers can resume execution immediately.
 - `settlement_rejection`: Activation was rejected during active turn settlement.

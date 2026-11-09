@@ -51,6 +51,8 @@ pub const WORKER_ADMISSION_PERMITS: &str = "harnx_worker_admission_permits";
 pub const WORKER_ACTIVATION_HANDLERS: &str = "harnx_worker_activation_handlers";
 /// Activations waiting for admission in this worker process.
 pub const WORKER_ACTIVATIONS_WAITING: &str = "harnx_worker_activations_waiting";
+/// Activations parked as busy waiters in this worker process.
+pub const WORKER_BUSY_WAITERS: &str = "harnx_worker_busy_waiters";
 /// JetStream/KV operation duration by bounded operation.
 pub const NATS_OPERATION_SECONDS: &str = "harnx_nats_operation_seconds";
 /// JetStream/KV operation results by bounded operation and outcome.

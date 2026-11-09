@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActivationNakReason {
     Busy,
     PreflightNotReady,
@@ -122,15 +122,45 @@ impl ActivationDelivery {
         self.lease_tx.send_replace(Some(lease.lost_watch()));
     }
 
+    /// Whether the progress heartbeat task is still running. It stops on its
+    /// own when an attached lease is lost, so anything that wants to keep
+    /// holding the delivery — parking it on a busy waiter — must check this
+    /// first: without heartbeats JetStream redelivers the delivery.
+    pub(super) fn heartbeat_alive(&self) -> bool {
+        self.heartbeat_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
+    /// Resolves once the progress heartbeat task has stopped. It can stop on
+    /// its own when an attached lease is lost, and `heartbeat_alive` can miss
+    /// that by a scheduling step, so a waiter holding the delivery watches
+    /// this instead of sleeping past the acknowledgement deadline.
+    ///
+    /// Cancellation-safe by construction: the handle is only touched after
+    /// the await observed the stop. Taking it before awaiting would hand
+    /// ownership to a future `select!` can drop at any wake, silently
+    /// detaching the heartbeat; leaving it in after a completed await hands
+    /// `stop_heartbeat` a spent JoinHandle, which panics when polled again.
+    pub(super) async fn heartbeat_stopped(&mut self) {
+        wait_for_heartbeat_task(&mut self.heartbeat_task).await;
+    }
+
+    /// Cancel the heartbeat task's token and leave its handle in place, so
+    /// the task stops on its own — the way it does when an attached lease is
+    /// lost — with its spent handle left for `heartbeat_stopped` to observe
+    /// and reap. Mid-sleep test seam.
+    pub(super) fn cancel_heartbeat(&mut self) {
+        self.heartbeat_cancel.cancel();
+    }
+
     pub(super) fn detach_lease(&self) {
         self.lease_tx.send_replace(None);
     }
 
     pub(super) async fn stop_heartbeat(&mut self) {
         self.heartbeat_cancel.cancel();
-        if let Some(task) = self.heartbeat_task.take() {
-            let _ = task.await;
-        }
+        stop_heartbeat_task(self.heartbeat_task.take()).await;
     }
 
     pub(super) async fn ack(&mut self, reason: &str) -> Result<()> {
@@ -172,6 +202,25 @@ impl Drop for ActivationDelivery {
         self.heartbeat_cancel.cancel();
         if let Some(task) = self.heartbeat_task.take() {
             task.abort();
+        }
+    }
+}
+
+async fn wait_for_heartbeat_task(heartbeat_task: &mut Option<JoinHandle<()>>) {
+    if let Some(task) = heartbeat_task.as_mut() {
+        if task.is_finished() {
+            *heartbeat_task = None;
+            return;
+        }
+        let _ = task.await;
+        *heartbeat_task = None;
+    }
+}
+
+async fn stop_heartbeat_task(heartbeat_task: Option<JoinHandle<()>>) {
+    if let Some(task) = heartbeat_task {
+        if !task.is_finished() {
+            let _ = task.await;
         }
     }
 }
@@ -262,5 +311,59 @@ mod tests {
             count_at_disposition,
             "progress was sent after final disposition"
         );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stopped_without_task_returns_immediately() {
+        harnx_core::require_nextest();
+        let mut heartbeat_task = None;
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_heartbeat_task(&mut heartbeat_task),
+        )
+        .await
+        .expect("missing heartbeat task should return immediately");
+        assert!(heartbeat_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stopped_clears_finished_handle() {
+        harnx_core::require_nextest();
+        let mut heartbeat_task = Some(tokio::spawn(async {}));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !heartbeat_task.as_ref().is_some_and(JoinHandle::is_finished) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("heartbeat task did not finish");
+
+        wait_for_heartbeat_task(&mut heartbeat_task).await;
+
+        assert!(heartbeat_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_heartbeat_skips_finished_handle_already_polled() {
+        harnx_core::require_nextest();
+        let mut heartbeat_task = tokio::spawn(async {});
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !heartbeat_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("heartbeat task did not finish");
+        (&mut heartbeat_task)
+            .await
+            .expect("poll heartbeat task to completion");
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            stop_heartbeat_task(Some(heartbeat_task)),
+        )
+        .await
+        .expect("finished heartbeat handle should not be awaited again");
     }
 }

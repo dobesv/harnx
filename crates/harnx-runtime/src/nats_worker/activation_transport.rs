@@ -319,13 +319,18 @@ pub(super) fn activation_headers(message_id: HeaderValue) -> async_nats::HeaderM
 }
 
 /// The ack waits JetStream gives an activation's successive deliveries, the
-/// last one repeating. NATS replaces the consumer's ack wait with the first
-/// entry, and it measures a delayed NAK against the entry for the delivery
-/// count too, so a worker asking for `delay` on a later delivery waits
-/// `entry - ack_wait` longer. The steady entries leave those delays and the
-/// progress heartbeat as they were for the deliveries an activation normally
-/// uses; one redelivered past them, by workers that keep crashing on it say,
-/// comes back less and less often.
+/// last one repeating. With a backoff list, JetStream replaces the consumer's
+/// ack wait with the entry for the delivery count: an unacked delivery
+/// expires after `backoff[k-1]`, and a progress ack restarts that timer for
+/// the current delivery. A NAK asking for `delay` is measured against the
+/// entry too: the server schedules the next delivery after
+/// `delay - ack_wait + backoff[k-1]` (nats-server `processNak` sets the
+/// pending message's expiry offset from the ack wait, and `checkPending`
+/// applies the backoff entry as the deadline). Because this consumer keeps
+/// `backoff[0] == ack_wait`, the steady entries leave the busy-NAK delays and
+/// the progress heartbeat exactly as the delay asked for, on the deliveries
+/// an activation normally uses; one redelivered past them, by workers that
+/// keep crashing on it say, comes back less and less often.
 fn activation_backoff(ack_wait: Duration) -> Vec<Duration> {
     let mut backoff = vec![ack_wait; WORK_NOTIFY_STEADY_DELIVERIES];
     backoff.extend([2, 4, 10].map(|factor| ack_wait * factor));
