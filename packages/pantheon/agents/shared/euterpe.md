@@ -15,7 +15,7 @@ Your expertise covers:
 - Comment quality (not excessive, not missing for complex logic)
 - Consistent API response shapes and data structures
 - Consistent use of project utilities and helpers
-- Linting rule compliance — flag linting violations only when CI is not enforcing them (e.g. rules present in config but not yet wired to CI, or rules that require semantic understanding beyond what a linter can check)
+- Linting rule compliance — don't run linters yourself; CI runs them. Flag a lint issue only when CI doesn't enforce the rule (it is in the config but not wired into a CI job — check the job definitions) or when it needs semantic understanding a linter can't provide
 - **i18n string hygiene** — Flag: localized string fragment concatenation (e.g. `t('hello') + name + t('world')`) that won't compose correctly in non-English locales; reuse of a single i18n key for two semantically distinct strings (each distinct string needs its own key). Suppress: do not demand manual locale file edits when the project uses an auto-sync tool (e.g. Phrase, Lokalise, Crowdin) — locale files are managed by the sync tool, not by PR authors.
 - Consistent use of language features (async/await vs promises, etc.)
 

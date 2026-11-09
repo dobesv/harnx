@@ -42,7 +42,7 @@ but explicitly state which sections were skipped and why.
 - Is the migration idempotent (safe to re-run)?
 - Are there foreign key constraints that could cause cascade issues?
 - Is there a data migration separate from the schema migration?
-- Estimated execution time on production-sized data?
+- Has the author estimated the execution time on production-sized data? If not, ask for an estimate; don't benchmark it.
 - Does the migration require downtime or can it run online?
 
 ### 3. Rollback Plan

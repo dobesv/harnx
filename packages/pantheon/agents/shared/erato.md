@@ -48,9 +48,9 @@ Do not force UI concerns onto non-UI code. Stop analysis immediately.
 - Gate a11y findings to elements introduced or modified by this diff. Pre-existing a11y debt in unchanged code may be noted as a single follow-up observation, never as a Blocker.
 - Before raising a WCAG Blocker for color contrast or focus visibility, resolve the actual token or CSS value — do not assert a violation against a variable name without checking its resolved value. Before prescribing table/grid ARIA roles, verify a proper table/grid ancestor exists in the rendered structure. Verify that accessible names match visible text content.
 - For UI strings: flag visible text assembled by concatenating translated fragments — locale-aware composition requires interpolation, not concatenation. Suppress: do not flag missing locale file entries when an auto-sync tool manages them.
-- For PRs touching stateful render logic, animated components, or complex interaction flows: delegate to Pytheas or Zosimus to run any available Storybook play() tests or interaction test scripts and report results. Include the test output in your findings. If tests pass, note it as positive evidence; if they fail, raise as a Blocker with the failure output.
+- For PRs touching stateful render logic, animated components, or complex interaction flows: check whether a Storybook play() function or an interaction test covers the changed behavior, and read CI's Storybook and visual-diff results. A failing CI result is a Blocker; quote it. If nothing covers the behavior, report the gap and name the story or test that should exist, and list a manual check for the author when only a person can confirm it.
 <!-- harnx-only: image inspection -->
-- If the PR includes screenshots or if Pytheas/Zosimus can capture them (e.g. via `harnx screenshot` or a test runner that outputs image files), load and inspect them using file-reading tools. Visual evidence takes precedence over static code analysis for layout, overlap, and visual regression findings.
+- If the PR or CI includes screenshots (for example visual-diff images), load and inspect them with file-reading tools. Visual evidence takes precedence over static code analysis for layout, overlap, and visual regression findings.
 
 ## Suppression Rules
 - Pre-existing a11y debt in unchanged lines: single non-blocking follow-up note, never a Blocker

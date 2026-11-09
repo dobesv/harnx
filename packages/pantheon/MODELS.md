@@ -28,6 +28,9 @@ Harnx performance benchmark.
 - Reasoning-heavy agents and Atlas use Gemini 4 Argon as their Gemini
   fallback. Routine Gemini workers retain 3.8 Flash; compactors retain
   3.5 Flash-Lite as a fallback. Argon uses medium thinking by default.
+- Minos, the Judge that checks the evidence behind every Muse finding, starts
+  on Gemini 4 Argon at that default rather than 3.8 Flash (changed 2026-11-09).
+  The catalog defines no Argon effort variants, so Minos runs at that default.
 - Hermes and Hestia use Luna for small fixes and routine maintenance. Hestia
   tries direct MiniMax M3.1 Flash at low effort after both Luna routes. Their
   Claude fallback is Haiku 5.5; Bedrock MiniMax M2.5 remains available.
@@ -48,7 +51,8 @@ Codex immediately precedes the same OpenAI model and reasoning setting.
 | `coder`, `aristarchus` | `claude:claude-sonnet-5-5` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-3.8-flash` → `bedrock:us.zai.glm-5.3` |
 | All nine `compact-*` agents (including coding) | `codex:gpt-6-luna` → `openai:gpt-6-luna` → `gemini:gemini-3.5-flash-lite` → `claude:claude-haiku-5-5` → `bedrock:us.openai.gpt-6-luna` |
 | `aeacus` | `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-3.8-flash` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
-| `apollo`, `argus`, `calliope`, `clio`, `euterpe`, `minos`, `terpsichore`, `thalia` | `gemini:gemini-3.8-flash` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
+| `apollo`, `argus`, `calliope`, `clio`, `euterpe`, `terpsichore`, `thalia` | `gemini:gemini-3.8-flash` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
+| `minos` | `gemini:gemini-4-argon` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
 | `athena`, `metis`, `nemesis`, `opis`, `rhadamanthus`, `tyche`, `urania` | `bedrock:us.zai.glm-5.3` → `gemini:gemini-3.8-flash` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` |
 | `atlas` | `claude:claude-opus-5-5` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-4-argon` → `bedrock:us.zai.glm-5.3` |
 | `daedalus`, `sisyphus` | `claude:claude-opus-5-5` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-4-argon` → `bedrock:us.moonshotai.kimi-k3` |

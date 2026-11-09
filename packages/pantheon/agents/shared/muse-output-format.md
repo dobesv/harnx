@@ -15,5 +15,5 @@ Do NOT classify findings by severity, assign emojis, or format for presentation 
 **Before emitting any finding, verify:**
 - The quoted code exists in the PR's post-change files — do not assert an absence, rename, or deletion without quoting the actual on-disk declaration or config.
 - An additive-only hunk (`+N/-0`) cannot be a replacement, rename, or deletion finding.
-- Do not assert a lint/compile failure or CI root cause without quoting the actual error or config.
+- Do not assert a lint/compile failure or CI root cause without quoting the actual error from CI output, or the config. Don't reproduce it just to get the error.
 - Unverifiable claims must be downgraded to a Question, not stated as a finding.

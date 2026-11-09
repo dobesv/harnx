@@ -35,6 +35,9 @@ variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics
   path: shared/shell-execution.md
+- name: review_read_only
+  description: Read-only review rules for Muses and Judges
+  path: shared/review-read-only.md
 - name: aeacus_core
   description: Core identity and instructions for Aeacus
   path: shared/aeacus.md
@@ -56,5 +59,7 @@ variables:
 {{ast_grep_search}}
 
 {{shell_execution}}
+
+{{review_read_only}}
 
 {{output_style}}
