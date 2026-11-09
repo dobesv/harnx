@@ -26,6 +26,11 @@ const REMOTE_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// container runtime and process teardown.
 pub const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// How many activations the worker loop admits at once. The busy-waiter
+/// total capacity is derived from this (`busy_wait.rs`), so a worker can
+/// never park more deliveries than it could have been admitting.
+pub(super) const MAX_CONCURRENT_ADMISSIONS: usize = 8;
+
 /// Returned when graceful worker handoff did not finish before its process
 /// deadline. The binary turns this into a fail-stop exit instead of waiting for
 /// non-yielding work during Tokio runtime teardown.
@@ -51,7 +56,8 @@ pub use super::activation_transport::{
     validate_worker_id, worker_ready_subject, LocalWorkerTarget,
 };
 pub use super::daemon_config::{
-    resolve_worker_scope, NatsConnectionSource, WorkerActivationMode, WorkerDaemonConfig,
+    resolve_worker_scope, ActivationFaults, BusyWaiterProbe, NatsConnectionSource,
+    WorkerActivationMode, WorkerDaemonConfig,
 };
 
 pub(crate) fn should_append_control_log_entry(lease: &NatsSessionLease) -> bool {
@@ -346,6 +352,19 @@ fn spawn_shutdown_deadline(
     })
 }
 
+/// Cancels the worker shutdown token when dropped, so an aborted daemon future
+/// still triggers cooperative cleanup in the tasks it left behind. A normal
+/// completion has already cancelled the token, making the guard a no-op.
+struct CancelWorkerOnDrop(CancellationToken);
+
+impl Drop for CancelWorkerOnDrop {
+    fn drop(&mut self) {
+        if !self.0.is_cancelled() {
+            self.0.cancel();
+        }
+    }
+}
+
 async fn finish_worker_shutdown(
     runtime: &WorkerRuntime,
     readiness: &Option<harnx_healthz::Readiness>,
@@ -359,6 +378,14 @@ async fn finish_worker_shutdown(
         log::warn!("worker shutdown deadline task failed: {error}");
         Instant::now()
     });
+    // Parked busy waiters hold no reservations or leases, so they settle
+    // first: each NAKs its delivery back un-delayed for another worker.
+    if tokio::time::timeout_at(deadline, runtime.settle_busy_waiters())
+        .await
+        .is_err()
+    {
+        return Err(anyhow::Error::new(WorkerShutdownDeadlineExceeded));
+    }
     if tokio::time::timeout_at(deadline, runtime.shutdown_active_sessions())
         .await
         .is_err()
@@ -512,6 +539,10 @@ fn build_worker_runtime(build: WorkerRuntimeBuild) -> Arc<WorkerRuntime> {
         activation_failures,
     } = build;
     let cluster = setup.daemon.connection_key().to_string();
+    let busy_wait_max = setup.daemon.busy_wait_max();
+    let busy_waiter_capacity = setup.daemon.busy_waiter_capacity();
+    let activation_faults = setup.daemon.activation_faults();
+    let busy_waiter_probe = setup.daemon.busy_waiter_probe();
     let cleanup_retention = setup.config.read().cleanup_remote_sessions_days;
     // This is deliberately outside the activation reconnect loop: a broker
     // reconnect must not create another hourly collector in the same worker.
@@ -546,6 +577,12 @@ fn build_worker_runtime(build: WorkerRuntimeBuild) -> Arc<WorkerRuntime> {
         shutdown: setup.shutdown,
         active: Mutex::new(HashMap::new()),
         reservations: Mutex::new(HashMap::new()),
+        busy_waiters: Mutex::new(HashMap::new()),
+        busy_waiter_handles: Mutex::new(Vec::new()),
+        busy_wait_max,
+        busy_waiter_capacity,
+        activation_faults,
+        busy_waiter_probe,
     })
 }
 
@@ -616,6 +653,12 @@ pub async fn run_worker_daemon_with_shutdown(
     else {
         return Ok(());
     };
+    // An embedding caller can abort the daemon future without ever cancelling
+    // its token, so tie cancellation to the future's own lifetime as well:
+    // detached tasks spawned by the daemon (busy waiters, session
+    // supervisors) observe the cancelled token, settle their deliveries, and
+    // release this runtime instead of outliving the daemon for hours.
+    let _cancel_on_drop = CancelWorkerOnDrop(shutdown.clone());
     let _readiness_shutdown = mark_worker_ready_until_shutdown(&readiness, &shutdown);
     let deadline_on_shutdown = spawn_shutdown_deadline(shutdown.clone(), shutdown_timeout);
     let activation_runtime = Arc::clone(&runtime);
@@ -693,8 +736,6 @@ async fn reconnect_activation_stream<
     RejectFuture: Future<Output = std::result::Result<(), RejectError>>,
     RejectError: Display,
 {
-    const MAX_CONCURRENT_ADMISSIONS: usize = 8;
-
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ADMISSIONS));
     let mut handlers = tokio::task::JoinSet::new();
     let mut buffered_messages = None;

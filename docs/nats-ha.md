@@ -817,10 +817,14 @@ replacement worker may resume:
   be appended. An activation past the delivery limit is terminated without one.
 - **Non-terminal NAK** (`AckKind::Nak(None)`): failover path. The replacement
   worker resumes from the journal. Used for lease loss and shutdown.
-- **Busy NAK** (`AckKind::Nak(10–12s)`): in-memory fast-path for
-  already-running sessions or foreign lease holders. Avoids expensive
-  session-log reads when another worker is active and does not consume the
-  failure budget, though it counts toward the delivery limit.
+- **Busy NAK** (`AckKind::Nak(10–12s)`): the fallback for busy deliveries past
+  a worker's waiter capacity or busy-wait budget, and the handback when a lease
+  race on the wind-up or failure-budget preflight finds another holder (see
+  below). The delivery goes back to JetStream; it does not consume the failure
+  budget. A busy NAK doesn't itself trigger the worker's 100-delivery
+  termination, but it increments JetStream's shared delivery count, so one
+  later non-busy error can reach that limit. A busy-only cycle is bounded by
+  the consumer's `max_deliver` (200).
 - **Delayed NAK** (`AckKind::Nak(0.1–2s)`): exponential backoff for failures
   before a turn starts, claim errors and rejected settlements. Retries with
   increasing delay up to 2s maximum.
@@ -901,27 +905,84 @@ Repeated warnings for the same session mean that activation is cycling. Restore
 the bucket (check JetStream health and KV permissions) and the limit applies
 again from the next failure.
 
+#### Busy waiting
+
+An activation whose session is busy — running on the same worker, or leased by a
+foreign worker — is not NAKed back into the broker. The worker parks it on a
+busy waiter (`daemon_runtime/busy_wait.rs`): a task outside the admission
+permits that keeps the delivery's progress heartbeats going, so JetStream
+holds the delivery and `info.delivered` stays frozen at its current count. No
+broker round trip happens while parked, and the parked interval doesn't advance
+the delivery count or trigger the worker's delivery limit. A delivery whose
+heartbeat has stopped — a wind-up
+lease lost mid-claim — is never parked: it is handed straight back, because
+JetStream would redeliver it behind a sleeping waiter. A heartbeat that stops
+while the waiter is already asleep is handled the same way: the sleep watches
+the heartbeat task, and the delivery is handed back the moment it stops, not at
+the next recheck — the recheck can fall past the acknowledgement deadline. The
+waiter wakes on
+this worker's own session release (a turn finished, or an admission claim
+gave up its reservation without acquiring a lease), on the lease key
+disappearing from KV (foreign release, or TTL expiry after a crash), or on a
+recheck timer that runs at the lease TTL (clamped to at least one second) to
+cover a dropped watch; every wake re-runs the full claim path, so
+live-holder exclusion and stale-holder fencing are exactly those of a fresh
+delivery. Renewal Puts on the lease key are ignored while parked — only a
+delete wakes the waiter, the recheck deadline is absolute across them, and the
+busy-wait budget caps the sleep, so a still-busy delivery is handed back when
+the budget expires rather than after another recheck interval. The waiter also
+claims once immediately after parking, so a release that lands between the
+busy check and the registration cannot cost a recheck interval. Parked
+waiters are bounded per session (default 4) and in total (the per-session
+capacity times the worker's admission concurrency, 32 by default); the
+capacity and the six-hour busy-wait budget are currently test-tunable only,
+not operator settings. Shutdown sends parked waiters an un-delayed NAK. Below
+the consumer's `max_deliver` (200), another worker can receive the delivery on
+a shared route. On a worker-targeted route, another frontend's worker cannot
+receive it; recovery requires the owning frontend to restart a worker on the
+same route. A waiter that reaches the settlement timeout during normal shutdown
+is aborted and joined; its slot is reconciled, and an unsettled delivery is
+redelivered after its ack wait on the same consumer route while below that
+limit.
+
+Aborting the daemon future cancels the shutdown token, but skips
+`finish_worker_shutdown` and its waiter-settlement timeout. Waiter settlement
+is not bounded by that timeout when the daemon future is externally aborted.
+
 #### Delivery limits
 
 A worker terminates an activation instead of handing it back once JetStream
-has delivered it 100 times (`MAX_ACTIVATION_DELIVERIES`), whatever the reason:
-the session is busy, a preflight read failed, the claim failed or the
-settlement was rejected. It logs `terminating activation after <n> deliveries
-instead of redelivering it` with the session and counts
+has delivered it 100 times (`MAX_ACTIVATION_DELIVERIES`): a preflight read
+failed, the claim failed or the settlement was rejected. Busy deferrals are
+exempt from the worker's delivery-limit termination: parking preserves the
+current JetStream delivery count, which may already exceed one after an earlier
+redelivery. Busy NAKs that fall back to the broker (waiter overflow, or the
+busy-wait budget expiring while the session remains busy) also don't trigger that worker
+limit, but they still increment JetStream's shared delivery count. After enough
+busy redeliveries, one claim, preparation, preflight or settlement error can
+reach the worker's 100-delivery limit and terminate the activation. A busy-only
+cycle remains subject to the consumer's own `max_deliver` backstop (200). The worker logs
+`terminating activation after <n> deliveries instead of redelivering it` with
+the session and counts
 `harnx_activation_claims_total{outcome="delivery_limit_term"}`. Shutdown NAKs
-never terminate, so a rolling deploy can't use up an activation.
+don't trigger this worker limit. Below the consumer's `max_deliver` (200), a
+rolling deploy can hand an activation back for redelivery; at that limit, a NAK
+doesn't guarantee another delivery.
 
 The activation consumers carry their own limit as a backstop: `max_deliver`
 200, and a backoff that keeps the 30s ack wait for the first 30 deliveries and
-then grows to 60s, 120s and 300s. NATS uses the backoff in place of the ack
-wait, and it measures a delayed NAK against the backoff entry too, so a busy
-NAK on a later delivery comes back after about 40s, then 100s, then 280s. A
-session that stays busy therefore holds its other activations for about five
-hours before the worker's limit ends them. By then the worker holding the
-session has covered what they asked for, or it is stuck and keeps the session
-however often they come back. JetStream's limit only stops activations no
-worker settles, such as one that crashes every worker that takes it, and it
-does so without logging anything.
+then grows to 60s, 120s and 300s. NATS uses the backoff entry in place of the
+ack wait, and it measures a delayed NAK against it: a NAK asking for `delay`
+on delivery k comes back after `delay - ack_wait + backoff[k-1]` (for this
+consumer, exactly `delay` on the steady deliveries). Past the steady entries
+the cadence slows to the backoff itself — a busy NAK on delivery 100 comes
+back after roughly five minutes — and a session busy for longer than the
+busy-wait budget hands its queued activations back to this cadence. A
+redelivery that remains busy can park again with a fresh six-hour budget when
+waiter capacity is available.
+JetStream's limit only stops activations no worker settles, such as one
+that crashes every worker that takes it, and it does so without logging
+anything.
 
 Workers apply this configuration when they start, with `create_consumer`,
 which updates a consumer an earlier version created without a limit.

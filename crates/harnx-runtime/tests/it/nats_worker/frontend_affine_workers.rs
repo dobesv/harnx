@@ -199,10 +199,19 @@ impl TargetedFixture {
             ),
         )
         .await?;
-        wait_for_consumer_redelivery(&self.jetstream, WORKER_B).await?;
+        wait_for_targeted_delivery(&self.jetstream, WORKER_B, 1).await?;
         let before = self.counter_b.load(Ordering::SeqCst);
+        // While the foreign holder keeps the session, the activation parks on
+        // the worker instead of cycling through the broker, and its turn
+        // never starts.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(self.counter_b.load(Ordering::SeqCst), before);
         blocker.release().await?;
-        wait_until(CI_SAFE_TIMEOUT, || {
+        // The bound is shorter than any busy-NAK round trip (10-12s delay
+        // plus redelivery), so the turn starting within it proves the parked
+        // delivery woke on the lease-key watch rather than a broker
+        // redelivery.
+        wait_until(Duration::from_secs(8), || {
             self.counter_b.load(Ordering::SeqCst) > before
         })
         .await?;
@@ -399,15 +408,18 @@ async fn wait_for_consumer_idle(
     .await?
 }
 
-async fn wait_for_consumer_redelivery(
+/// Wait until the targeted worker's consumer has dispatched `minimum`
+/// deliveries.
+async fn wait_for_targeted_delivery(
     jetstream: &async_nats::jetstream::Context,
     worker_id: &str,
+    minimum: u64,
 ) -> Result<()> {
     let stream = jetstream.get_stream("LOCAL_WORK_NOTIFY_V2").await?;
     let consumer = targeted_consumer(&stream, worker_id).await?;
     tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {
-            if consumer.get_info().await?.num_redelivered > 0 {
+            if consumer.get_info().await?.delivered.consumer_sequence >= minimum {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -457,5 +469,215 @@ async fn targeted_local_transport_rejects_an_incompatible_existing_stream() -> R
         error.to_string().contains("incompatible subjects"),
         "unexpected topology error: {error:#}"
     );
+    Ok(())
+}
+
+/// A targeted worker with fault seams and a busy-waiter probe wired in, so
+/// the two targeted error-path regressions below can inject failures
+/// deterministically and assert nothing parks or launches behind the
+/// settlement.
+struct TargetedFaultFixture {
+    _root: tempfile::TempDir,
+    _guards: Vec<EnvVarGuard>,
+    _server: harnx_runtime::nats_local_server::SharedNatsServer,
+    jetstream: async_nats::jetstream::Context,
+    calls: Arc<AtomicUsize>,
+    probe: Arc<BusyWaiterProbe>,
+    faults: Arc<ActivationFaults>,
+    worker: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl TargetedFaultFixture {
+    /// Spawns the worker, or returns `None` when no nats-server is available.
+    async fn start(worker_id: &'static str) -> Result<Option<Self>> {
+        require_nextest();
+        if !nats_server_available() {
+            eprintln!("Skipping test: nats-server not available");
+            return Ok(None);
+        }
+        let root = tempfile::tempdir()?;
+        let mut guards = isolated_local_environment(root.path())?;
+        let server = harnx_runtime::nats_local_server::ensure_shared_server().await?;
+        guards.push(EnvVarGuard::set_value("HARNX_NATS_URL", &server.url));
+        guards.push(EnvVarGuard::set_value("HARNX_NATS_TOKEN", &server.token));
+        let client = async_nats::ConnectOptions::new()
+            .token(server.token.clone())
+            .connect(&server.url)
+            .await?;
+        let jetstream = async_nats::jetstream::new(client.clone());
+        let mut ready = subscribe_to_worker(&client, worker_id).await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::new(BusyWaiterProbe::default());
+        let faults = Arc::new(ActivationFaults::default());
+        let call_fn = counting_stub_call_fn(Arc::clone(&calls));
+        let daemon = WorkerDaemonConfig::local(worker_id)?
+            .with_activation_faults_for_test(Arc::clone(&faults))
+            .with_busy_waiter_probe_for_test(Arc::clone(&probe));
+        let config = Arc::new(ConfigLock::new(Config::default()));
+        let worker =
+            tokio::spawn(
+                async move { run_worker_daemon(config, daemon, Some(call_fn), None).await },
+            );
+        await_readiness(&mut ready, worker_id).await?;
+        Ok(Some(Self {
+            _root: root,
+            _guards: guards,
+            _server: server,
+            jetstream,
+            calls,
+            probe,
+            faults,
+            worker,
+        }))
+    }
+
+    async fn seed_prompt(&self, session_id: &str, text: &str) -> Result<u64> {
+        use harnx_runtime::nats_session_metadata::{
+            SessionInitializer, SessionMetadata, SessionMetadataStore, SessionOverrides,
+        };
+        let store = SessionMetadataStore::ensure(&self.jetstream, 1).await?;
+        store
+            .create(&SessionMetadata::new(
+                session_id,
+                SessionInitializer::inline("", Default::default(), SessionOverrides::default()),
+            ))
+            .await?;
+        let log = NatsSessionLog::new_with_replicas(
+            self.jetstream.clone(),
+            harnx_core::session_identity::session_key(None, session_id),
+            1,
+        );
+        crate::worker::append_admitted_fixture_user(&log, "fault-path-user", text).await
+    }
+
+    async fn publish(&self, session_id: &str, requested_seq: u64) -> Result<()> {
+        let worker_id = "targeted-fault-worker";
+        publish_targeted_session_activate(
+            &self.jetstream,
+            LocalWorkerTarget::new("__local__", worker_id)?,
+            &SessionActivate::targeted(
+                harnx_core::session_identity::session_key(None, session_id),
+                requested_seq,
+                worker_id,
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn redeliveries(&self) -> Result<usize> {
+        let stream = self.jetstream.get_stream("LOCAL_WORK_NOTIFY_V2").await?;
+        let consumer = targeted_consumer(&stream, "targeted-fault-worker").await?;
+        Ok(consumer.get_info().await?.num_redelivered as usize)
+    }
+}
+
+/// A targeted lease-holder preflight error must settle the delivery exactly
+/// once: NAK it back and end the claim. Continuing the claim after that NAK
+/// would launch a turn on a delivery the broker already owns, and parking it
+/// would consume waiter capacity on a delivery nothing will settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn targeted_lease_holder_read_error_settles_without_parking_or_launching() -> Result<()> {
+    let Some(fixture) = TargetedFaultFixture::start("targeted-fault-worker").await? else {
+        return Ok(());
+    };
+    fixture
+        .faults
+        .fail_targeted_lease_holder_read
+        .store(true, Ordering::SeqCst);
+    let session_id = "targeted-holder-read-error";
+    let prompt = fixture
+        .seed_prompt(session_id, "run after read error")
+        .await?;
+    fixture.publish(session_id, prompt).await?;
+    let before_redeliveries = fixture.redeliveries().await?;
+    // The NAK is delayed (100ms doubling to 2s); give it at least two cycles
+    // so a claim that wrongly continued would have launched by now.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        0,
+        "a settled delivery must not launch a turn"
+    );
+    assert_eq!(
+        fixture.probe.parked.load(Ordering::SeqCst),
+        0,
+        "a settled delivery must not park a busy waiter"
+    );
+    assert_eq!(
+        fixture.probe.slots.load(Ordering::SeqCst),
+        0,
+        "a settled delivery must not leave a waiter slot"
+    );
+    assert!(
+        fixture.redeliveries().await? > before_redeliveries,
+        "the settled delivery must come back through the broker"
+    );
+    // Recovering the fault lets the next redelivery claim cleanly: exactly
+    // one turn ever runs for this session.
+    fixture
+        .faults
+        .fail_targeted_lease_holder_read
+        .store(false, Ordering::SeqCst);
+    wait_until(CI_SAFE_TIMEOUT, || {
+        fixture.calls.load(Ordering::SeqCst) >= 1
+    })
+    .await?;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    fixture.worker.abort();
+    let _ = fixture.worker.await;
+    Ok(())
+}
+
+/// A targeted lease-acquisition error (after the preflights passed) must
+/// settle the delivery exactly once: NAK it back and end the claim. Treating
+/// that NAKed delivery as merely busy would park it while JetStream already
+/// owns it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn targeted_lease_acquire_error_settles_without_parking_or_launching() -> Result<()> {
+    let Some(fixture) = TargetedFaultFixture::start("targeted-fault-worker").await? else {
+        return Ok(());
+    };
+    fixture
+        .faults
+        .fail_targeted_lease_acquire
+        .store(true, Ordering::SeqCst);
+    let session_id = "targeted-acquire-error";
+    let prompt = fixture
+        .seed_prompt(session_id, "run after acquire error")
+        .await?;
+    fixture.publish(session_id, prompt).await?;
+    let before_redeliveries = fixture.redeliveries().await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        0,
+        "a settled delivery must not launch a turn"
+    );
+    assert_eq!(
+        fixture.probe.parked.load(Ordering::SeqCst),
+        0,
+        "a NAKed delivery must not park a busy waiter"
+    );
+    assert_eq!(
+        fixture.probe.slots.load(Ordering::SeqCst),
+        0,
+        "a NAKed delivery must not leave a waiter slot"
+    );
+    assert!(
+        fixture.redeliveries().await? > before_redeliveries,
+        "the settled delivery must come back through the broker"
+    );
+    fixture
+        .faults
+        .fail_targeted_lease_acquire
+        .store(false, Ordering::SeqCst);
+    wait_until(CI_SAFE_TIMEOUT, || {
+        fixture.calls.load(Ordering::SeqCst) >= 1
+    })
+    .await?;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    fixture.worker.abort();
+    let _ = fixture.worker.await;
     Ok(())
 }
