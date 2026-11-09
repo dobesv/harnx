@@ -11,7 +11,7 @@ There is no readline-based REPL.
 
 - **Tab Autocompletion** for dot-commands:
   - `.<tab>` to complete command names.
-  - `.info tool <tab>`, `.list tools <tab>`, and `.call tool <tab>` to complete allowed tool names in the active session.
+  - `.info tool <tab>`, `.list tools <tab>`, `.call <tab>` (completes `tool` and `bash`), and `.call tool <tab>` to complete allowed tool names in the active session.
   - `.model <tab>` to complete chat models.
   - `.set <tab>` to complete config keys.
   - `.set key <tab>` to complete config values.
@@ -246,6 +246,7 @@ Inspect available tools and execute tools directly without triggering an LLM inf
 .info tools                    List allowed tools in the active session (alias of `.list tools`)
 .list tools [pattern]          List allowed tools in the active session
 .call tool <name> <args-json>  Invoke an allowed tool directly with JSON arguments
+.call bash <script>            Run a BashKit script on the session's tool selection
 ```
 
 - **Active session scoping**: These commands operate against the active session's allowed tools (reflecting the active agent's allowlist, package, and toolsets), rather than a global wildcard inventory. If no session is active, or if a tool is not permitted in the current session, the command reports an error.
@@ -253,7 +254,14 @@ Inspect available tools and execute tools directly without triggering an LLM inf
 - **`.info tools`**: Alias of `.list tools`. Lists the allowed tools of the active session — including tool-server tools such as bash/fs tools, which only the worker can see. Without an active session the command reports an error.
 - **`.list tools [pattern]`**: Lists allowed tools matching the optional glob pattern (e.g. `.list tools fs_*` or `.list tools`). Appends the formatted list to the chat transcript.
 - **`.call tool <name> <args-json>`**: Invokes the tool with `<args-json>`. Unlike CLI execution, `<args-json>` inside the TUI is parsed as the raw remainder following the tool name, preserving interior spaces, quotes, and newlines without shell escaping.
-- **Background execution and cancellation**: Tool commands execute as asynchronous background tasks. The input composer remains responsive during execution, and pressing `Ctrl+C` cancels the in-flight tool call cleanly without modifying the durable session transcript.
+- **`.call bash <script>`**: Runs an ad-hoc BashKit script against the active session's tool selection without triggering an LLM inference turn.
+  - **Raw remainder parsing**: Consumes the entire line after `.call bash ` as the raw script, preserving quotes, spaces, and newlines without shell escaping. No stdin, file, or multiline input flags.
+  - **Session tool selection**: Operates against the union of the active session's configured `use_tools` ($U$) and `bash_tools` ($B$), admitting `Resolve(U ∪ B)`. The TUI does not accept `--tools` flags and does not perform static inference. Disabling tool use in the session request or worker configuration means the worker admits no inner tools regardless of `use_tools` or `bash_tools`; pure shell still runs.
+  - **Inner tool parameters**: Inner tools are schema-derived and require named `--<param>` options (such as `fs_read --path <file>`). Schema parameters have no single-dash short aliases (`-p`). Inner commands accept `-o json` or `-o text` to control output rendering. Positional tool arguments are not supported.
+  - **Scoped operator consent**: Inner tool calls auto-approve on `PreToolUse` hook `ask` decisions under operator consent. Hook `deny` decisions block the command with status 4 and the reason on stderr (stdout is empty); no JSON result is returned to the script. The `blocked_by_hook` result object applies only to direct tool calls. Excluded control tools (`bash`, `switch_agent`, `ask_user`, `*_session_handoff`) cannot be invoked. Delegated child sessions retain their normal confirmation policies.
+  - **Output**: Script results and diagnostics append to the chat transcript as system items. If the script fails or exits with a nonzero status, the transcript displays the failure and script exit code.
+  - **Worker version**: `.call bash` executes on the active session's worker. A worker built before Bash support rejects the command with a clean error instead of executing it, so upgrade and restart workers together with the frontend when deploying this feature.
+- **Background execution and cancellation**: Tool commands execute as asynchronous background tasks. The input composer remains responsive during execution, and pressing `Ctrl+C` cancels in-flight execution cleanly without modifying the durable session transcript.
 - **Output**: Tool results and diagnostics are appended to the chat transcript as system items. The call does not initiate an LLM model turn or record assistant messages.
 - **Scoped consent**: Direct invocation runs with root operator consent. When a `PreToolUse` hook asks for confirmation (`ask`), the root tool call auto-approves. Hook `deny` decisions, argument transformations, and input validations are strictly enforced. Nested tool calls initiated by delegated child agents do not inherit root consent and present the standard confirmation modal.
 

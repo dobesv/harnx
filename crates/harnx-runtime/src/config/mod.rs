@@ -34,7 +34,7 @@ mod tool_selection;
 pub(crate) use tool_selection::is_bash_inner_tool_allowed;
 mod tool_servers_split;
 
-pub(crate) use self::bash_declaration::BASH_TOOL_NAME;
+pub(crate) use self::bash_declaration::{synthesize_bash_declaration, BASH_TOOL_NAME};
 pub(crate) use self::compaction::is_turn_prompt;
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;
@@ -229,6 +229,17 @@ fn builtin_tool_declarations(selectors: &[String]) -> Vec<ToolDeclaration> {
         .filter(|(name, _)| selected(name))
         .map(|(_, declaration)| declaration())
         .collect()
+}
+
+/// Declaration of a built-in tool by exact name, when `name` is one of the
+/// in-process built-ins ([`BUILTIN_TOOLS`]). These are the tools the fixed
+/// providers in `tool::build_tool_providers` answer without a tool server,
+/// so a context built the ordinary way can dispatch them.
+pub(crate) fn builtin_tool_declaration(name: &str) -> Option<ToolDeclaration> {
+    BUILTIN_TOOLS
+        .iter()
+        .find(|(builtin, _)| *builtin == name)
+        .map(|(_, declaration)| declaration())
 }
 
 /// Compile a `use_tools` entry for matching against tool names, with `*`

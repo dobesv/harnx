@@ -199,18 +199,25 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
 async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
     match command {
         Commands::Prompt(_) => bail!("prompt commands use the one-shot execution path"),
-        Commands::Call(args) => {
-            let crate::cli::CallSubcommands::Tool(args) = &args.command;
-            tool_cmd::run(
-                cli,
-                harnx_runtime::operator_tools::OperatorToolCommand::Call {
-                    name: args.name.clone(),
-                    args_json: args.args_json.clone(),
-                },
-                args.json,
-            )
-            .await
-        }
+        Commands::Call(args) => match &args.command {
+            crate::cli::CallSubcommands::Tool(args) => {
+                tool_cmd::run(
+                    cli,
+                    harnx_runtime::operator_tools::OperatorToolCommand::Call {
+                        name: args.name.clone(),
+                        args_json: args.args_json.clone(),
+                    },
+                    args.json,
+                )
+                .await
+            }
+            // Selection and script analysis happen before configuration or
+            // worker startup, so bad scripts fail fast (#2630).
+            crate::cli::CallSubcommands::Bash(args) => {
+                let command = tool_cmd::call_bash_command(cli, args)?;
+                tool_cmd::run(cli, command, args.json).await
+            }
+        },
         Commands::Info(info_args) => run_info_command(info_args, cli).await,
         Commands::Dump(dump_args) => run_dump_command(dump_args).await.map(|()| 0),
         Commands::Open(open_args) => run_open_command(open_args).await.map(|()| 0),

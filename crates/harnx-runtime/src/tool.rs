@@ -130,9 +130,8 @@ pub async fn execute_tool_round_with_persistence(
     // context is wrapped in an `Arc` first: the slot stores a `Weak`, so the
     // provider and context never form a strong cycle. `tool_round` is set
     // before the wrap because the Arc makes the context immutable from here.
-    let eval_ctx = {
-        let bash_context_slot = Arc::new(crate::bash_provider::BashEvalContextSlot::default());
-        let mut ctx = build_tool_eval_context(BuildToolEvalContextParams {
+    let eval_ctx = build_round_eval_context(
+        BuildToolEvalContextParams {
             config,
             instance_id,
             agent_use_tools: agent_use_tools.as_deref(),
@@ -141,14 +140,12 @@ pub async fn execute_tool_round_with_persistence(
             nats_hook_provider,
             prepare_handoff_fn,
             pending_async_context,
-            bash_context_slot: Some(bash_context_slot.clone()),
-        })
-        .await;
-        ctx.tool_round = tool_round;
-        let eval_ctx = Arc::new(ctx);
-        bash_context_slot.set(&eval_ctx);
-        eval_ctx
-    };
+            bash_context_slot: None,
+            command_bash: None,
+        },
+        tool_round,
+    )
+    .await;
     let guard = crate::tool_loop_guard::begin_round(tool_loop_guard.as_deref(), config, input);
     let (to_eval, refused) = screen_tool_round(guard, config, &tool_calls, &eval_ctx).await?;
     let results = match eval_tool_calls(&eval_ctx, to_eval, abort_signal).await {
@@ -173,6 +170,17 @@ pub async fn execute_tool_round_with_persistence(
     let mut results = populate_result_markdown(results, &eval_ctx);
     persist_tool_results(config, &mut results, dry_run).await?;
     Ok(results)
+}
+
+async fn build_round_eval_context(
+    mut params: BuildToolEvalContextParams<'_>,
+    tool_round: Option<u64>,
+) -> Arc<ToolEvalContext> {
+    let slot = crate::bash_provider::BashEvalContextSlot::new();
+    params.bash_context_slot = Some(slot.clone());
+    let mut ctx = build_tool_eval_context(params).await;
+    ctx.tool_round = tool_round;
+    slot.install(ctx)
 }
 
 async fn persist_tool_results(
@@ -467,9 +475,10 @@ async fn build_tool_eval_context_inner(
         prepare_handoff_fn,
         pending_async_context,
         bash_context_slot,
+        command_bash,
     } = params;
     let ToolRoundSnapshot {
-        declarations: mut tool_declarations,
+        declarations: tool_declarations,
         handoff_targets,
         session_name,
         confirmation: confirm_tool_use_fn,
@@ -483,13 +492,14 @@ async fn build_tool_eval_context_inner(
         (provider, nats_hook_provider),
     )
     .await;
-    if let Some(provider) = &nats_provider {
-        tool_declarations.extend(provider.declarations_for_use_tools(agent_use_tools));
-    }
-
-    let decl_map = Arc::new(build_decl_map(tool_declarations));
+    let decl_map = Arc::new(build_context_decl_map(
+        tool_declarations,
+        nats_provider.as_deref(),
+        agent_use_tools,
+        command_bash.as_ref(),
+    ));
     let allowed_tool_names: HashSet<String> = decl_map.keys().cloned().collect();
-    let providers = build_tool_providers(config, nats_provider, bash_context_slot);
+    let providers = build_tool_providers(config, nats_provider, bash_context_slot, command_bash);
     let dispatch_hook_fn = build_dispatch_hook_fn(
         (config, session_name.as_deref()),
         working_dir,
@@ -546,6 +556,22 @@ fn snapshot_tool_round(
     }
 }
 
+fn build_context_decl_map(
+    mut declarations: Vec<ToolDeclaration>,
+    provider: Option<&NatsToolProvider>,
+    agent_use_tools: Option<&str>,
+    command_bash: Option<&crate::bash_provider::CommandBashInputs>,
+) -> HashMap<String, ToolDeclaration> {
+    if let Some(provider) = provider {
+        declarations.extend(provider.declarations_for_use_tools(agent_use_tools));
+    }
+    if let Some(inputs) = command_bash {
+        // The synthetic outer `bash` wins against raw aliases, matching dispatch order.
+        declarations.push(inputs.bash_declaration());
+    }
+    build_decl_map(declarations)
+}
+
 fn build_decl_map(tool_declarations: Vec<ToolDeclaration>) -> HashMap<String, ToolDeclaration> {
     tool_declarations
         .into_iter()
@@ -561,11 +587,27 @@ fn build_confirm_tool_use_fn(config: &Config) -> Arc<ConfirmToolUseFn> {
         .unwrap_or_else(|| Arc::new(default_confirm_tool_use))
 }
 
+/// Assemble normal providers, with an optional command-scoped Bash catalog.
+/// An override keeps Bash active even for pure shell and limits inner consent
+/// to that command. Base providers never contain Bash, preventing recursion.
 fn build_tool_providers(
     config: &GlobalConfig,
     nats_provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
     bash_context_slot: Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
+    command_bash: Option<crate::bash_provider::CommandBashInputs>,
 ) -> Vec<Arc<dyn ToolProvider>> {
+    let (bash_active, bash_inner_declarations, operator_inner_consent) = match command_bash {
+        Some(inputs) => (
+            true,
+            inputs.inner_declarations,
+            inputs.operator_inner_consent,
+        ),
+        None => (
+            config.read().bash_tools_active(),
+            config.read().bash_inner_tool_declarations(),
+            false,
+        ),
+    };
     let mut base_providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
     // NATS is the runtime provider for configured sub-agent and tool-server tools.
     // Its broker `max_payload` also feeds the script-mode pre-flight check.
@@ -594,14 +636,14 @@ fn build_tool_providers(
     // through the base provider list, which structurally excludes itself,
     // so recursive `bash` dispatch is impossible.
     let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
-    let active = config.read().bash_tools_active();
     providers.push(Arc::new(
         crate::bash_provider::BashProvider::new(crate::bash_provider::BashProviderConfig {
-            active,
-            inner_declarations: config.read().bash_inner_tool_declarations(),
+            active: bash_active,
+            inner_declarations: bash_inner_declarations,
             base_providers: base_providers.clone(),
             slot: bash_context_slot,
             payload_limit,
+            operator_inner_consent,
         })
         .with_attachment_fetcher(attachment_fetcher)
         .with_media_store(media_store),
@@ -881,17 +923,74 @@ mod tests {
         };
         let config = Arc::new(ConfigLock::new(config));
 
-        let providers = build_tool_providers(&config, None, None);
+        let providers = build_tool_providers(&config, None, None, None);
         assert_eq!(providers[0].name(), "bash-script");
         assert!(providers[0].has_tool("bash"));
 
         let bare = Arc::new(ConfigLock::new(Config::default()));
-        let providers = build_tool_providers(&bare, None, None);
+        let providers = build_tool_providers(&bare, None, None, None);
         assert_eq!(providers[0].name(), "bash-script");
         assert!(
             !providers[0].has_tool("bash"),
             "inert when bash_tools resolves to nothing"
         );
+    }
+
+    /// #2630: command-scoped provider inputs keep the leading `bash`
+    /// provider active even with an empty admitted catalog, while ordinary
+    /// construction stays inert on the same config.
+    #[test]
+    fn command_bash_provider_stays_active_with_empty_catalog() {
+        let config = Arc::new(ConfigLock::new(Config::default()));
+        let providers = build_tool_providers(
+            &config,
+            None,
+            None,
+            Some(crate::bash_provider::CommandBashInputs {
+                inner_declarations: Vec::new(),
+                operator_inner_consent: true,
+            }),
+        );
+        assert_eq!(providers[0].name(), "bash-script");
+        assert!(
+            providers[0].has_tool("bash"),
+            "command-scoped bash is active for pure shell"
+        );
+        for provider in &providers[1..] {
+            assert!(
+                !provider.has_tool("bash"),
+                "{} must not claim the reserved name",
+                provider.name()
+            );
+        }
+    }
+
+    /// #2630: a command-scoped context carries the synthetic `bash`
+    /// declaration in its map and allowed names, so the operator paths can
+    /// admit the command's `bash` call after their own overwrites.
+    #[tokio::test]
+    async fn command_bash_context_carries_synthetic_bash_declaration() {
+        let config = Arc::new(ConfigLock::new(Config::default()));
+        let instance_id = harnx_core::instance::ServerScope::new();
+        let context = build_tool_eval_context(
+            BuildToolEvalContextParams::new(&config, &instance_id).with_command_bash(
+                crate::bash_provider::CommandBashInputs {
+                    inner_declarations: vec![make_decl_with_templates("fs_read", None, None)],
+                    operator_inner_consent: true,
+                },
+            ),
+        )
+        .await;
+
+        assert!(context.allowed_tool_names.contains("bash"));
+        let decl_map = context
+            .render
+            .as_ref()
+            .expect("render context")
+            .decl_map
+            .as_ref();
+        assert!(decl_map.contains_key("bash"), "synthetic bash declaration");
+        assert!(context.providers[0].has_tool("bash"));
     }
 
     #[tokio::test]
