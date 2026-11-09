@@ -462,6 +462,42 @@ fn glm_5_3_uses_high_effort_for_chat_completions_and_converse() {
     assert!(converse["body"].get("reasoning_effort").is_none());
 }
 
+#[test]
+fn gemini_thinking_models_price_cached_token_calls() {
+    // #2638: the gemini provider stopped refreshing from LiteLLM, so shipped
+    // entries lacked `cache_read_price` and every cached-token call recorded
+    // no cost. Every thinking-capable Gemini model must be able to price a
+    // call that hits the prompt cache.
+    let mut checked = 0;
+    for model in provider_models("gemini") {
+        if !gemini_thinking_capable(&model) {
+            continue;
+        }
+        let usage = harnx_core::api_types::CompletionTokenUsage {
+            input_tokens: 200_000,
+            output_tokens: 1_000,
+            cached_tokens: 150_000,
+            cache_write_tokens: 0,
+        };
+        let cost = model.cost_usd(&usage).unwrap_or_else(|| {
+            panic!(
+                "thinking model {} cannot price a cached-token call",
+                model.id()
+            )
+        });
+        assert!(
+            cost > 0.0,
+            "{} priced a cached call at {cost}, which hides real spend",
+            model.id()
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no thinking-capable gemini models checked — catalog lost its Gemini family"
+    );
+}
+
 fn gemini_version(name: &str) -> Option<(u32, u32)> {
     let suffix = name.strip_prefix("gemini-")?;
     let mut version = suffix.split('-').next()?.split('.');

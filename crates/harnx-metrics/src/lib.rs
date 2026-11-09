@@ -19,6 +19,11 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub const LLM_TOKENS_TOTAL: &str = "harnx_llm_tokens_total";
 /// Cumulative chat-completion cost in dollars by agent, client, provider, and model.
 pub const LLM_COST_DOLLARS: &str = "harnx_llm_cost_dollars";
+/// Calls whose usage carried nonzero tokens but the model lacks a price needed
+/// to compute a cost, by agent, client, provider, and model. Their cost is
+/// deliberately not estimated (see `Model::cost_usd`), so this counter is the
+/// only metric signal that spend exists but is unpriced.
+pub const LLM_UNPRICED_CALLS_TOTAL: &str = "harnx_llm_unpriced_calls_total";
 /// Total HTTP requests by method, route, and status.
 pub const HTTP_REQUESTS_TOTAL: &str = "harnx_http_requests_total";
 /// HTTP request duration in seconds by method and route.

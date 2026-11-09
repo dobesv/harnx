@@ -1133,6 +1133,20 @@
 #  - https://ai.google.dev/api/rest/v1beta/models/streamGenerateContent
 - provider: gemini
   models:
+    - name: deep-research-max-preview-04-2026
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 2
+      output_price: 12
+      supports_vision: true
+      supports_tool_use: false
+    - name: deep-research-preview-04-2026
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 2
+      output_price: 12
+      supports_vision: true
+      supports_tool_use: false
     - name: gemini-2.0-flash
       max_input_tokens: 1048576
       max_output_tokens: 8192
@@ -1150,17 +1164,19 @@
     - name: gemini-2.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
-      input_price: 0
-      output_price: 0
+      input_price: 0.3
+      output_price: 2.5
+      cache_read_price: 0.03
       supports_vision: true
       supports_tool_use: true
       patches:
       - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-2.5-flash-lite
-      max_input_tokens: 1000000
-      max_output_tokens: 64000
-      input_price: 0
-      output_price: 0
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.1
+      output_price: 0.4
+      cache_read_price: 0.01
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -1168,14 +1184,19 @@
     - name: gemini-2.5-pro
       max_input_tokens: 1048576
       max_output_tokens: 65536
-      input_price: 0
-      output_price: 0
+      input_price: 1.25
+      output_price: 10
+      cache_read_price: 0.125
       supports_vision: true
       supports_tool_use: true
       patches:
       - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3-flash-preview
       max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.5
+      output_price: 3
+      cache_read_price: 0.05
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -1185,12 +1206,27 @@
       max_output_tokens: 65536
       input_price: 0.25
       output_price: 1.5
+      cache_read_price: 0.025
       supports_vision: true
       supports_tool_use: true
       patches:
       - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 2
+      output_price: 12
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
+    - name: gemini-3.1-pro-preview-customtools
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 2
+      output_price: 12
+      cache_read_price: 0.2
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -1200,6 +1236,7 @@
       max_output_tokens: 65536
       input_price: 1.5
       output_price: 9
+      cache_read_price: 0.15
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -1207,8 +1244,9 @@
     - name: gemini-3.5-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
-      input_price: 0.25
-      output_price: 1.5
+      input_price: 0.3
+      output_price: 2.5
+      cache_read_price: 0.03
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -1216,8 +1254,19 @@
     - name: gemini-3.6-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
-      input_price: 1.5
-      output_price: 9
+      input_price: 0.75
+      output_price: 3.75
+      cache_read_price: 0.075
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
+    - name: gemini-3.7-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.75
+      output_price: 3.75
+      cache_read_price: 0.075
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -1227,6 +1276,7 @@
       max_output_tokens: 65536
       input_price: 0.75
       output_price: 3.75
+      cache_read_price: 0.075
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -1242,11 +1292,122 @@
       supports_tool_use: true
       patches:
       - .body.generationConfig = ((.body.generationConfig // {}) | del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true}) | .body.generationConfig.maxOutputTokens = ([.body.generationConfig.maxOutputTokens // 65536, (if (.url | endswith(":generateContent")) then 32768 else 65536 end)] | min)
+    - name: gemini-embedding-001
+      max_input_tokens: 2048
+      input_price: 0.15
+      type: embedding
+    - name: gemini-embedding-2
+      max_input_tokens: 8192
+      input_price: 0.2
+      type: embedding
+    - name: gemini-exp-1114
+      max_input_tokens: 1048576
+      max_output_tokens: 8192
+      input_price: 0
+      output_price: 0
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-exp-1206
+      max_input_tokens: 1048576
+      max_output_tokens: 65535
+      input_price: 0.3
+      output_price: 2.5
+      cache_read_price: 0.03
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-flash-latest
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.75
+      output_price: 3.75
+      cache_read_price: 0.075
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-flash-lite-latest
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.3
+      output_price: 2.5
+      cache_read_price: 0.03
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-gemma-2-27b-it
+      max_input_tokens: 8192
+      max_output_tokens: 8192
+      input_price: 0.35
+      output_price: 1.05
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-gemma-2-9b-it
+      max_input_tokens: 8192
+      max_output_tokens: 8192
+      input_price: 0.35
+      output_price: 1.05
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-omni-1.1-flash
+      max_input_tokens: 131072
+      max_output_tokens: 65536
+      input_price: 1.5
+      output_price: 9
+      supports_vision: true
+    - name: gemini-omni-1.2-flash
+      max_input_tokens: 131072
+      max_output_tokens: 65536
+      input_price: 1.5
+      output_price: 9
+      supports_vision: true
+    - name: gemini-pro-latest
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 2
+      output_price: 12
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-robotics-er-2-preview
+      max_input_tokens: 131072
+      max_output_tokens: 65536
+      input_price: 1
+      output_price: 5
+      cache_read_price: 0.1
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-robotics-er-2-streaming-preview
+      max_input_tokens: 131072
+      max_output_tokens: 65536
+      input_price: 1
+      output_price: 5
+      supports_vision: true
+      supports_tool_use: true
     - name: gemma-3-27b-it
       max_input_tokens: 131072
       max_output_tokens: 8192
       input_price: 0
       output_price: 0
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemma-4-26b-a4b-it
+      max_input_tokens: 262144
+      max_output_tokens: 32768
+      input_price: 0
+      output_price: 0
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemma-4-31b-it
+      max_input_tokens: 262144
+      max_output_tokens: 32768
+      input_price: 0
+      output_price: 0
+      supports_vision: true
+      supports_tool_use: true
+    - name: learnlm-1.5-pro-experimental
+      max_input_tokens: 32767
+      max_output_tokens: 8192
+      input_price: 0
+      output_price: 0
+      supports_vision: true
+      supports_tool_use: true
     - name: text-embedding-004
       input_price: 0
       type: embedding
