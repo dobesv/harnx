@@ -565,7 +565,7 @@ async fn serve_requests(
     subscriptions: ToolSubscriptions<'_>,
     refresh: RegistrationRefresh<'_>,
 ) -> Result<()> {
-    let mut journal_reconciliation = Box::pin(invocation_journal::replica_reconciliations(
+    let mut journal_reconciliation = Box::pin(invocation_journal::config_reconciliations(
         jetstream::new(request_context.client.clone()),
         request_context.replicas,
         refresh.interval,
@@ -580,7 +580,7 @@ async fn serve_requests(
         tokio::select! {
             Some(result) = journal_reconciliation.next() => {
                 if let Err(error) = result {
-                    log::warn!("reconcile invocation journal replicas failed; retrying next interval: {error:#}");
+                    log::warn!("reconcile invocation journal config failed; retrying next interval: {error:#}");
                 }
             }
             request = subscriptions.tool_requests.next() => {
