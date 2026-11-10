@@ -8,8 +8,7 @@
 //! token, so a lookup lists a single round, or one call in it, rather than
 //! every session's rows. A call with no parent session is keyed
 //! `standalone/<call>`. Rows written before this layout, keyed
-//! `sessions/<session>/<call>`, are no longer read, but deleting their
-//! session still deletes them.
+//! `sessions/<session>/<call>`, are no longer read or deleted.
 use anyhow::{ensure, Context, Result};
 use async_nats::jetstream::{self, kv};
 use harnx_toolset::{ToolReply, ToolRequest};
@@ -128,9 +127,24 @@ impl InvocationJournal {
         // A caller may have loaded ToolCalls before deletion removed the
         // transcript. It must not dispatch a late request after journal cleanup.
         if let Err(error) = self.check_session_retained(request).await {
-            self.0.purge(key(request)).await?;
+            self.remove(&key(request)).await?;
             return Err(error);
         }
+        Ok(())
+    }
+
+    /// Remove every row whose key matches `pattern`, along with its earlier
+    /// revisions, in one request to the stream leader. A KV purge would leave
+    /// a marker message on each key's subject instead, and with one message
+    /// kept per key and no `max_age` on the bucket, nothing would ever remove
+    /// those markers.
+    async fn remove(&self, pattern: &str) -> Result<()> {
+        self.0
+            .stream
+            .purge()
+            .filter(format!("{}{pattern}", self.0.prefix))
+            .await
+            .with_context(|| format!("remove tool invocation journal rows {pattern}"))?;
         Ok(())
     }
 
@@ -288,20 +302,7 @@ impl InvocationJournal {
         self.0
             .put(format!("deleted/{session}"), "deleted".into())
             .await?;
-        for key in self.keys(&format!("{}.>", session_prefix(session))).await? {
-            self.0.purge(key).await?;
-        }
-        // Rows from before the session was a token of its own are keyed
-        // `sessions/<session>/<call>`. A worker's wire ids are UUIDs, so each
-        // of its rows' keys is one token, and listing single-token keys
-        // leaves out every row in the current layout.
-        let legacy = format!("sessions/{session}/");
-        for key in self.keys("*").await? {
-            if key.starts_with(&legacy) {
-                self.0.purge(key).await?;
-            }
-        }
-        Ok(())
+        self.remove(&format!("{}.>", session_prefix(session))).await
     }
 }
 

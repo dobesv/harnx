@@ -1579,6 +1579,8 @@ Replies must be persisted before execution ownership is marked stopped: graph
 nodes can be pruned before the parent writes `ToolResults`. Journal records retain
 the original server provenance and remain until session deletion. Cleanup follows
 transcript/lease removal and retains a deletion tombstone to reject late dispatch.
+It removes the session's rows with one stream purge filtered to their subjects,
+because a KV purge per row would leave a marker message that nothing removes.
 Tool servers cache the journal handle and reconcile its replica count against the
 execution store periodically, outside the request path.
 Journaled recovery does not repeat approval or post-use hooks.

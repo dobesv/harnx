@@ -114,29 +114,69 @@ async fn wind_up_lists_only_the_rounds_it_asks_for() -> Result<()> {
     Ok(())
 }
 
-/// Deleting a session lists that session's rows, plus the single-token keys
-/// where rows written before this layout still live. Rows the current layout
-/// wrote for other sessions are in neither listing.
+/// The subjects in the journal's stream that `filter`, a key pattern, matches,
+/// counting a key whose only message left is a purge marker.
+async fn stored_keys(server_url: &str, filter: &str) -> Result<Vec<String>> {
+    let client = async_nats::ConnectOptions::new()
+        .token(common::TOKEN.to_string())
+        .connect(server_url)
+        .await?;
+    let prefix = format!("$KV.{}.", invocation_journal::BUCKET);
+    let mut subjects = async_nats::jetstream::new(client)
+        .get_stream(format!("KV_{}", invocation_journal::BUCKET))
+        .await?
+        .info_with_subjects(format!("{prefix}{filter}"))
+        .await?;
+    let mut keys = Vec::new();
+    while let Some((subject, _)) = subjects.next().await.transpose()? {
+        keys.push(subject.strip_prefix(&prefix).unwrap_or(&subject).to_owned());
+    }
+    keys.sort();
+    Ok(keys)
+}
+
+/// Deleting a session removes its rows without listing any keys, and leaves
+/// nothing behind on their subjects: a KV purge would leave a marker per row,
+/// and nothing ever removes those. A call journaled after the deletion is
+/// refused, and the row it wrote before finding the tombstone goes the same
+/// way. Other sessions' rows and the tombstone stay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deleting_a_session_lists_its_own_rows_and_old_layout_keys() -> Result<()> {
+async fn deleting_a_session_leaves_nothing_on_its_rows_subjects() -> Result<()> {
     let (server, journal) = common::journal().await;
     journal_rows(
         &journal,
-        &[("parent", "mine", 4), ("other-parent", "theirs", 4)],
+        &[
+            ("parent", "mine", 4),
+            ("parent", "also-mine", 6),
+            ("other-parent", "theirs", 4),
+        ],
     )
     .await?;
 
     let ((), filters) = listings_during(&server.url, journal.purge_session("parent")).await?;
+    assert_eq!(filters, Vec::<String>::new());
+
+    let late = common::request_in_round("parent", "late", 7);
+    let error = journal
+        .record(&late, ("echo", "scope", "srv"))
+        .await
+        .expect_err("a deleted session takes no new calls");
+    assert!(error.to_string().contains("deleted"), "{error:#}");
 
     assert_eq!(
-        filters,
-        [
-            "$KV.harnx_tool_invocations.*",
-            "$KV.harnx_tool_invocations.sessions.parent.>",
-        ]
+        stored_keys(&server.url, "sessions.parent.>").await?,
+        Vec::<String>::new()
     );
-    assert!(journal.records_for_session("parent").await?.is_empty());
-    assert_eq!(journal.records_for_session("other-parent").await?.len(), 1);
+    assert_eq!(
+        stored_keys(&server.url, "sessions.other-parent.>")
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(
+        stored_keys(&server.url, "deleted/parent").await?,
+        ["deleted/parent"]
+    );
     Ok(())
 }
 
@@ -192,10 +232,9 @@ async fn ids_with_separators_or_escapes_keep_their_own_rows() -> Result<()> {
 
 /// Rows written before this layout sit under `sessions/<session>/<call>`, and
 /// nothing reads them any more. A session that has some resumes as if those
-/// calls were never journaled rather than failing, and deleting the session
-/// still deletes them.
+/// calls were never journaled rather than failing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rows_in_the_old_layout_are_ignored_and_deleted_with_their_session() -> Result<()> {
+async fn rows_in_the_old_layout_are_ignored() -> Result<()> {
     let (server, journal) = common::journal().await;
     let request = common::request_in_round("parent", "old-call", 4);
     let row = RecordedInvocation {
@@ -223,12 +262,6 @@ async fn rows_in_the_old_layout_are_ignored_and_deleted_with_their_session() -> 
     assert!(journal.find("parent", 4, "model-call").await?.is_none());
     assert!(journal.records_in_rounds("parent", &[4]).await?.is_empty());
     assert!(journal.recorded("parent", "old-call").await?.is_none());
-
-    journal.purge_session("parent").await?;
-    assert!(
-        store.get("sessions/parent/old-call").await?.is_none(),
-        "deleting the session deletes its old rows"
-    );
     Ok(())
 }
 
