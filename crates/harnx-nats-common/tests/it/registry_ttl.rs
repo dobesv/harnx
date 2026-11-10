@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use async_nats::jetstream;
+use async_nats::jetstream::{self, kv, stream};
+use futures_util::StreamExt;
 use harnx_nats_common::registry::{
-    ensure_bucket_with_ttl, reconcile_bucket_replicas, REGISTRATION_TTL,
+    ensure_bucket_with_ttl, reconcile_bucket, reconcile_bucket_replicas, REGISTRATION_TTL,
 };
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -309,6 +310,57 @@ async fn reconcile_bucket_replicas_never_lowers_an_existing_higher_count() -> Re
         3,
         "reconcile must never lower an existing bucket's replicas"
     );
+    Ok(())
+}
+
+/// A bucket's owner reconciles it periodically, so `reconcile_bucket` updates
+/// the stream once to apply a setting and sends no update after that, while
+/// the bucket already matches.
+#[tokio::test]
+async fn reconcile_bucket_updates_the_stream_only_when_a_setting_differs() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: no nats-server binary available");
+        return Ok(());
+    };
+    let jetstream = test_jetstream(&server).await?;
+    jetstream
+        .create_key_value(kv::Config {
+            bucket: "settings".to_string(),
+            num_replicas: 1,
+            ..Default::default()
+        })
+        .await
+        .context("create an uncompressed bucket")?;
+    let observer = test_jetstream(&server).await?;
+    let mut updates = observer
+        .client()
+        .subscribe("$JS.API.STREAM.UPDATE.KV_settings")
+        .await?;
+    // A round trip on the observer's connection, so the server has
+    // registered the subscription before the first update.
+    observer.query_account().await?;
+
+    let compress = |config: &mut stream::Config| config.compression = Some(stream::Compression::S2);
+    reconcile_bucket(&jetstream, "settings", 1, compress).await?;
+    reconcile_bucket(&jetstream, "settings", 1, compress).await?;
+    reconcile_bucket_replicas(&jetstream, "settings", 1).await?;
+    // And again, so every update request has reached the subscriber.
+    observer.query_account().await?;
+
+    let mut sent = 0;
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(100), updates.next()).await {
+        sent += 1;
+    }
+    assert_eq!(sent, 1, "only the first reconcile changed anything");
+    let config = jetstream
+        .get_stream("KV_settings")
+        .await?
+        .info()
+        .await?
+        .config
+        .clone();
+    assert_eq!(config.compression, Some(stream::Compression::S2));
     Ok(())
 }
 

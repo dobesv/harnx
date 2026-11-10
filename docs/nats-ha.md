@@ -1583,6 +1583,10 @@ It removes the session's rows with one stream purge filtered to their subjects,
 because a KV purge per row would leave a marker message that nothing removes.
 Tool servers cache the journal handle and reconcile its replica count against the
 execution store periodically, outside the request path.
+The journal bucket is S2-compressed. Opening the journal, and that periodic
+reconcile, turn compression on for a bucket an older build created without it.
+nats-server records the change at once, but each server only starts compressing
+its copy after it restarts, and then only blocks it fills or rewrites from then on.
 Journaled recovery does not repeat approval or post-use hooks.
 Legacy calls without a journal record retain the hint-based retry/interruption
 fallback, with lease revalidation after approval and before dispatch.

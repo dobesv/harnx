@@ -10,7 +10,7 @@
 //! `standalone/<call>`. Rows written before this layout, keyed
 //! `sessions/<session>/<call>`, are no longer read or deleted.
 use anyhow::{ensure, Context, Result};
-use async_nats::jetstream::{self, kv};
+use async_nats::jetstream::{self, kv, stream};
 use harnx_toolset::{ToolReply, ToolRequest};
 use serde::{Deserialize, Serialize};
 
@@ -58,20 +58,33 @@ impl RecordedInvocation {
 #[derive(Clone)]
 pub struct InvocationJournal(kv::Store, jetstream::Context);
 
-/// Reconcile durability away from the request path, so a replica count raised
-/// after this server started still reaches the journal bucket. Retain the
-/// future across incoming requests so busy traffic cannot starve reconciliation.
-pub(crate) fn replica_reconciliations(
+/// Reconcile the bucket's configuration away from the request path, so a
+/// replica count raised after this server started still reaches the journal
+/// bucket. Retain the future across incoming requests so busy traffic cannot
+/// starve reconciliation.
+pub(crate) fn config_reconciliations(
     js: jetstream::Context,
     replicas: usize,
     interval: std::time::Duration,
 ) -> impl futures_util::Stream<Item = Result<()>> {
     futures_util::stream::unfold(js, move |js| async move {
         tokio::time::sleep(interval).await;
-        let result =
-            harnx_nats_common::registry::reconcile_bucket_replicas(&js, BUCKET, replicas).await;
+        let result = reconcile(&js, replicas).await;
         Some((result, js))
     })
+}
+
+/// Raise an existing bucket's replica count to `replicas` and turn on the
+/// compression it is created with. Rows hold whole tool arguments and replies
+/// as JSON and stay until their session is deleted, and NATS compresses a
+/// whole block of them at a time, which S2 shrinks severalfold. nats-server
+/// stores a compression change right away, but each server's copy only
+/// starts compressing once that server restarts.
+async fn reconcile(js: &jetstream::Context, replicas: usize) -> Result<()> {
+    harnx_nats_common::registry::reconcile_bucket(js, BUCKET, replicas, |config| {
+        config.compression = Some(stream::Compression::S2);
+    })
+    .await
 }
 
 impl InvocationJournal {
@@ -84,14 +97,14 @@ impl InvocationJournal {
             .create_key_value(kv::Config {
                 bucket: BUCKET.into(),
                 num_replicas: replicas,
+                compression: true,
                 ..Default::default()
             })
             .await
         {
             Ok(store) => store,
             Err(_) => {
-                harnx_nats_common::registry::reconcile_bucket_replicas(js, BUCKET, replicas)
-                    .await?;
+                reconcile(js, replicas).await?;
                 js.get_key_value(BUCKET).await?
             }
         };

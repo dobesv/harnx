@@ -102,16 +102,33 @@ pub async fn reconcile_bucket_replicas(
     bucket: &str,
     num_replicas: usize,
 ) -> Result<()> {
+    reconcile_bucket(jetstream, bucket, num_replicas, |_| {}).await
+}
+
+/// [`reconcile_bucket_replicas`], also applying `configure` to the bucket's
+/// stream configuration, for settings that a bucket created by an older build
+/// lacks. Both changes go in one `update_stream` call, and none is sent when
+/// neither changes anything, so a periodic reconcile costs one `STREAM.INFO`
+/// a pass once the bucket matches.
+pub async fn reconcile_bucket(
+    jetstream: &jetstream::Context,
+    bucket: &str,
+    num_replicas: usize,
+    configure: impl FnOnce(&mut stream::Config),
+) -> Result<()> {
     let stream_name = format!("KV_{bucket}");
-    let mut config = fetch_stream_config(jetstream, &stream_name).await?;
-    let current_replicas = config.num_replicas;
-    if num_replicas <= current_replicas {
-        if should_log_declined_lowering(current_replicas, num_replicas) {
-            decline_lowering_replicas(bucket, current_replicas, num_replicas);
-        }
+    let current = fetch_stream_config(jetstream, &stream_name).await?;
+    let current_replicas = current.num_replicas;
+    let mut config = current.clone();
+    configure(&mut config);
+    if num_replicas > current_replicas {
+        config.num_replicas = num_replicas;
+    } else if should_log_declined_lowering(current_replicas, num_replicas) {
+        decline_lowering_replicas(bucket, current_replicas, num_replicas);
+    }
+    if config == current {
         return Ok(());
     }
-    config.num_replicas = num_replicas;
     update_stream_reporting_replicas(jetstream, &stream_name, config, current_replicas).await
 }
 
