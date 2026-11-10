@@ -559,6 +559,22 @@ nats_lease_acquisition_timeout_secs: 60
   When unset, workers emit a startup warning that automatic expiry is disabled
   and remote session state will grow unbounded.
 
+  The same sweep also reconciles orphaned session streams: a `SESSION_`
+  JetStream stream whose canonical metadata was never written (crash or network
+  failure between stream creation and the metadata write) is deleted only when
+  it is older than the retention window, still holds zero messages, has no
+  session or A2A lease, no unresolved A2A tasks, and still has no metadata on
+  re-check. Non-empty orphan streams are quarantined — logged for manual review,
+  never deleted automatically. `harnx list orphan-streams --cluster <cluster>`
+  reports them as a dry run; `harnx delete orphan-streams --cluster <cluster>`
+  runs the same guarded cleanup on demand. The periodic reconciliation runs
+  wherever `cleanup_remote_sessions_days` is positive — it reuses that retention
+  window as its grace period — so it is active automatically after an upgrade
+  wherever the session GC is enabled. When retention is unset or set to `0`
+  (disabled), the CLI path needs an explicit `harnx delete orphan-streams
+  --cluster <cluster> --grace-hours <n>`; a zero grace period is always
+  rejected.
+
   Read and write access to attachments (`cid:media:`) and plans (`cid:plan:`)
   refreshes the owning session's activity timestamp (`SessionActivity.last_activity_at`),
   debounced to ≤1 write/hour. This resets the retention clock so actively referenced

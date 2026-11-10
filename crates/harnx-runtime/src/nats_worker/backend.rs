@@ -703,6 +703,19 @@ impl NatsSessionLogBackend {
         self.append_event_with_lease(entry, None).await
     }
 
+    /// Persist failures without creating a stream when canonical metadata is
+    /// unavailable. An existing transcript may still need its terminal error.
+    pub(super) async fn append_event_existing(
+        &self,
+        entry: &harnx_core::session::SessionLogEntry,
+    ) -> Result<u64> {
+        let log = crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            self.session_id.clone(),
+        );
+        self.append_unfenced_entry(&log, entry).await
+    }
+
     pub(crate) async fn append_event_with_expected_last_sequence_and_lease(
         &self,
         entry: &harnx_core::session::SessionLogEntry,

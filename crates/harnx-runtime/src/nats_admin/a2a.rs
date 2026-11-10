@@ -96,7 +96,7 @@ impl DeletionFence {
                     .filter(format!("a2a.tasks.{storage}.*"))
                     .await?;
             }
-            Err(error) if super::get_stream_missing(&error.kind()) => (),
+            Err(error) if super::stream_missing(&error.kind()) => (),
             Err(error) => return Err(error.into()),
         }
         // Registry goes last, so a failed deletion can retry the first identity cleanup.

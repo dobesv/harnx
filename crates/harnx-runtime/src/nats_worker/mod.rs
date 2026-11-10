@@ -42,6 +42,7 @@ mod hook_process;
 mod hook_registration;
 mod hook_supervisor;
 mod operator_tools;
+mod remote_cleanup;
 pub mod server_reconciler;
 mod session_turn;
 mod session_watcher;

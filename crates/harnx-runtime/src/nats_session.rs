@@ -327,17 +327,24 @@ async fn ensure_session_metadata(
         return Ok(());
     }
 
-    // `transcript` must be a creation-capable handle (built with the resolved
-    // replica count): this empty-transcript check is the first touch of a
-    // brand-new session's stream, so it decides the stream's replica count.
+    // Inspect read-only: a failed metadata reservation must not leave a new
+    // SESSION_ stream behind. Only after metadata and activity are reserved may
+    // a handle with the resolved replica count create the stream.
     let existing_entries = transcript
         .load_events_async()
         .await
         .context("failed to inspect transcript before creating session metadata")?;
-    anyhow::ensure!(
-        existing_entries.is_empty(),
-        "session '{session_id}' has transcript entries but no canonical metadata; legacy or inconsistent sessions are not supported"
-    );
+    if !existing_entries.is_empty() {
+        // A racing creator may already have reserved metadata and appended its
+        // first row while we inspected the transcript.
+        if let Some(record) = store.get(&key).await? {
+            record.metadata.validate_initializer(initializer)?;
+            return store.ensure_reserved_activity(&key).await;
+        }
+        anyhow::bail!(
+            "session '{session_id}' has transcript entries but no canonical metadata; legacy or inconsistent sessions are not supported"
+        );
+    }
 
     let metadata = SessionMetadata::new(session_id, initializer.clone());
     if store.create(&metadata).await?.is_some() {
@@ -601,10 +608,9 @@ impl NatsSession {
                 .await?
             }
         };
-        let metadata_transcript = NatsSessionLog::new_with_replicas(
+        let metadata_transcript = NatsSessionLog::new(
             jetstream.clone(),
             config.initializer.session_key(&session_id),
-            replicas,
         );
         ensure_session_metadata(
             &metadata_store,
@@ -613,6 +619,20 @@ impl NatsSession {
             &config.initializer,
         )
         .await?;
+
+        if config
+            .session_id
+            .as_ref()
+            .is_some_and(|id| !id.trim().is_empty())
+        {
+            // Explicit-ID callers can use an idle session as a tool caller, so
+            // its transcript must exist before tools append progress to it.
+            metadata_transcript
+                .with_replicas(replicas)
+                .last_entry_async()
+                .await
+                .context("failed to open session transcript after reserving metadata")?;
+        }
 
         Ok(Self {
             storage_key: config.initializer.session_key(&session_id),

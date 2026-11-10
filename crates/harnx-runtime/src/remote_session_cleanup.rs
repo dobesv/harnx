@@ -2,6 +2,9 @@ use crate::config::Config;
 use crate::nats_admin::{self, kv_bucket_missing};
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_session_metadata::{ListedSession, SessionMetadataStore, SESSION_METADATA_BUCKET};
+use crate::session_stream_orphans::{
+    OrphanStreamCleanupOptions, DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN,
+};
 use async_nats::jetstream::kv::{Operation, Store};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +21,17 @@ pub struct RemoteCleanupStats {
     pub deleted: usize,
     pub skipped_active: usize,
     pub errors: usize,
+    /// `SESSION_` streams found with no session metadata (GH #2650).
+    pub orphan_streams: usize,
+    pub orphan_deleted: usize,
+    /// Non-empty orphan streams quarantined for manual review, never deleted.
+    pub orphan_quarantined: usize,
+    /// Orphans kept for other reasons: within the grace period, active, or
+    /// their metadata reappeared before the delete.
+    pub orphan_skipped: usize,
+    /// `SESSION_` streams that could not be mapped back to a storage key;
+    /// reported and never deleted.
+    pub orphan_unmapped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +46,9 @@ pub enum CleanupOutcome {
 pub struct PeriodicCleanupOverrides<'a> {
     pub gc_session_id: &'a str,
     pub epoch_hour: u64,
+    /// Wall clock used for retention thresholds, so tests can age state
+    /// deterministically. Production callers pass the current time.
+    pub now_unix_secs: u64,
 }
 
 pub async fn run_remote_cleanup(config: &Config, days: u64, cluster: &str) -> RemoteCleanupStats {
@@ -50,13 +67,15 @@ pub async fn run_periodic_remote_cleanup(
     if days == 0 {
         return CleanupOutcome::Skipped;
     }
+    let now = now_unix_secs();
     run_periodic_remote_cleanup_with(
         config,
         days,
         cluster,
         PeriodicCleanupOverrides {
             gc_session_id: GC_SESSION_ID,
-            epoch_hour: epoch_hour(now_unix_secs()),
+            epoch_hour: epoch_hour(now),
+            now_unix_secs: now,
         },
     )
     .await
@@ -83,7 +102,7 @@ async fn run_remote_cleanup_with_gc_id(
         }
     };
 
-    let stats = run_cleanup_pass(config, days, cluster).await;
+    let stats = run_cleanup_pass(config, days, cluster, now_unix_secs()).await;
     release_gc_lease(lease, cluster).await;
     stats
 }
@@ -102,6 +121,7 @@ pub async fn run_periodic_remote_cleanup_with(
     let PeriodicCleanupOverrides {
         gc_session_id,
         epoch_hour,
+        now_unix_secs,
     } = overrides;
 
     let lease = match acquire_gc_lease(config, cluster, gc_session_id).await {
@@ -133,7 +153,7 @@ pub async fn run_periodic_remote_cleanup_with(
         return CleanupOutcome::Skipped;
     }
 
-    let stats = match run_remote_cleanup_inner(config, days, cluster).await {
+    let stats = match run_remote_cleanup_inner(config, days, cluster, now_unix_secs).await {
         Ok(stats) => stats,
         Err(error) => {
             warn!(
@@ -166,8 +186,13 @@ fn outcome_after_marker_write(
     CleanupOutcome::Ran(stats)
 }
 
-async fn run_cleanup_pass(config: &Config, days: u64, cluster: &str) -> RemoteCleanupStats {
-    match run_remote_cleanup_inner(config, days, cluster).await {
+async fn run_cleanup_pass(
+    config: &Config,
+    days: u64,
+    cluster: &str,
+    now_unix_secs: u64,
+) -> RemoteCleanupStats {
+    match run_remote_cleanup_inner(config, days, cluster, now_unix_secs).await {
         Ok(stats) => stats,
         Err(error) => {
             warn!(
@@ -193,6 +218,20 @@ async fn release_gc_lease(lease: NatsSessionLease, cluster: &str) {
             cluster
         );
     }
+}
+
+/// Acquire the same `session_metadata_gc` leader lease the periodic GC uses,
+/// for the operator CLI (`harnx delete orphan-streams`). The CLI must not
+/// race a periodic pass's orphan reconciliation: both are bounded, but
+/// concurrent batches would double the effective deletion budget for the
+/// hour. Returns `None` when another pass holds the lease; callers should
+/// fail clearly rather than retry in a loop. Unlike the periodic path, no
+/// epoch-hour dedup marker is written — the operator asked explicitly.
+pub async fn acquire_session_gc_lease(
+    config: &Config,
+    cluster: &str,
+) -> anyhow::Result<Option<NatsSessionLease>> {
+    acquire_gc_lease(config, cluster, GC_SESSION_ID).await
 }
 
 async fn load_last_run_epoch_hour(config: &Config, cluster: &str) -> anyhow::Result<Option<u64>> {
@@ -232,6 +271,7 @@ async fn run_remote_cleanup_inner(
     config: &Config,
     days: u64,
     cluster: &str,
+    now_unix_secs: u64,
 ) -> anyhow::Result<RemoteCleanupStats> {
     let jetstream = config.nats_jetstream(cluster).await?;
     let metadata_kv = match jetstream.get_key_value(SESSION_METADATA_BUCKET).await {
@@ -241,7 +281,7 @@ async fn run_remote_cleanup_inner(
     };
     let metadata_store = SessionMetadataStore::from_store(metadata_kv, jetstream.client().clone());
     let lease_store = load_optional_lease_store(config, cluster).await?;
-    let threshold = cleanup_threshold(now_unix_secs(), days);
+    let threshold = cleanup_threshold(now_unix_secs, days);
     let records = metadata_store.list().await?;
     let candidates = candidate_session_ids(&records, threshold);
     let mut stats = RemoteCleanupStats {
@@ -260,7 +300,58 @@ async fn run_remote_cleanup_inner(
         handle_candidate(&context, &session_id, &mut stats).await;
     }
 
+    // Orphan-stream reconciliation (GH #2650). The scan above enumerates KV
+    // metadata, so a `SESSION_` stream whose metadata write never landed is
+    // invisible to it. Reuse the retention window as the orphan grace period:
+    // the knob already expresses how long session state may sit without
+    // activity, and a separate config would let orphan collection run on a
+    // clock operators never reviewed.
+    let orphan_options = OrphanStreamCleanupOptions {
+        grace_secs: days.saturating_mul(SECONDS_PER_DAY),
+        max_deletions: DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN,
+    };
+    // The metadata listing is already in hand; pass it as the inventory
+    // prefilter so the orphan scan skips a leader read per known session.
+    let known_metadata_keys: std::collections::HashSet<String> = records
+        .iter()
+        .map(|record| record.metadata.storage_key())
+        .collect();
+    let orphan_context = crate::session_stream_orphans::OrphanCleanupContext::from_parts(
+        jetstream.clone(),
+        metadata_store.clone(),
+        lease_store.clone(),
+    );
+    match crate::session_stream_orphans::orphan_cleanup_pass(
+        &orphan_context,
+        Some(&known_metadata_keys),
+        now_unix_secs,
+        &orphan_options,
+    )
+    .await
+    {
+        Ok(orphan) => record_orphan_cleanup(&mut stats, orphan),
+        Err(error) => {
+            warn!(
+                "orphan session stream cleanup failed: cluster={} days={} err={error:#}",
+                cluster, days
+            );
+            stats.errors += 1;
+        }
+    }
+
     Ok(stats)
+}
+
+fn record_orphan_cleanup(
+    stats: &mut RemoteCleanupStats,
+    orphan: crate::session_stream_orphans::OrphanStreamCleanupStats,
+) {
+    stats.orphan_streams = orphan.scanned + orphan.unmapped;
+    stats.orphan_deleted = orphan.deleted;
+    stats.orphan_quarantined = orphan.quarantined;
+    stats.orphan_skipped = orphan.retained() - orphan.quarantined;
+    stats.orphan_unmapped = orphan.unmapped;
+    stats.errors += orphan.errors;
 }
 
 async fn acquire_gc_lease(
@@ -366,27 +457,35 @@ async fn candidate_is_active(
     if crate::nats_admin::a2a::unresolved(context.metadata_store, session_id).await? {
         return Ok(true);
     }
-    if scoped_a2a_lease_present(context.lease_store, session_id).await? {
+    if a2a_lease_present(context.lease_store, session_id).await? {
         return Ok(true);
     }
-    if lease_present(context.lease_store, session_id).await? {
+    if session_lease_present(context.lease_store, session_id).await? {
         return Ok(true);
     }
 
     session_reactivated(context.metadata_store, session_id, context.threshold).await
 }
 
-async fn lease_present(lease_store: Option<&Store>, session_id: &str) -> anyhow::Result<bool> {
+/// Whether the session's worker lease (`sessions/<storage_key>/lock` in
+/// `harnx_leases`) is live. Shared with orphan-stream reconciliation, which
+/// must never delete a stream some worker still holds. Read from the stream
+/// leader like `a2a_lease_present` (docs/nats-ha.md): a follower that has not
+/// applied a fresh lease write would otherwise green-light a delete.
+pub(crate) async fn session_lease_present(
+    lease_store: Option<&Store>,
+    session_id: &str,
+) -> anyhow::Result<bool> {
     let Some(lease_store) = lease_store else {
         return Ok(false);
     };
     let lease_key = NatsLeaseConfig::default().key_for_session(session_id);
-    match lease_store.entry(lease_key.clone()).await {
+    match harnx_nats_common::leader_reads::entry(lease_store, &lease_key).await {
         Ok(Some(entry)) => Ok(matches!(entry.operation, Operation::Put)),
         Ok(None) => Ok(false),
-        Err(error) => Err(anyhow::Error::from(error)).map_err(|error| {
-            error.context(format!("Failed to inspect session lease key '{lease_key}'"))
-        }),
+        Err(error) => {
+            Err(error.context(format!("Failed to inspect session lease key '{lease_key}'")))
+        }
     }
 }
 
@@ -439,7 +538,9 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-async fn scoped_a2a_lease_present(
+/// Whether the session's scoped A2A lease (`sessions/<storage_key>/a2a/lock`)
+/// is live. Shared with orphan-stream reconciliation.
+pub(crate) async fn a2a_lease_present(
     lease_store: Option<&Store>,
     session_id: &str,
 ) -> anyhow::Result<bool> {
@@ -456,9 +557,9 @@ async fn scoped_a2a_lease_present(
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_session_ids, cleanup_threshold, epoch_hour, lease_present,
-        outcome_after_marker_write, run_periodic_remote_cleanup, run_periodic_remote_cleanup_with,
-        run_remote_cleanup, run_remote_cleanup_with_gc_id, CleanupOutcome,
+        candidate_session_ids, cleanup_threshold, epoch_hour, outcome_after_marker_write,
+        run_periodic_remote_cleanup, run_periodic_remote_cleanup_with, run_remote_cleanup,
+        run_remote_cleanup_with_gc_id, session_lease_present, CleanupOutcome,
         PeriodicCleanupOverrides, RemoteCleanupStats, SECONDS_PER_DAY, SECONDS_PER_HOUR,
     };
     use crate::config::{Config, NatsServerConfig};
@@ -574,7 +675,7 @@ mod tests {
             scanned: 3,
             deleted: 2,
             skipped_active: 1,
-            errors: 0,
+            ..RemoteCleanupStats::default()
         };
 
         assert_eq!(
@@ -589,7 +690,7 @@ mod tests {
             scanned: 3,
             deleted: 2,
             skipped_active: 1,
-            errors: 0,
+            ..RemoteCleanupStats::default()
         };
         let expected = RemoteCleanupStats {
             errors: 1,
@@ -603,8 +704,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_present_returns_false_when_lease_store_missing() {
-        assert!(!lease_present(None, "session-123")
+    async fn session_lease_present_returns_false_when_lease_store_missing() {
+        assert!(!session_lease_present(None, "session-123")
             .await
             .expect("missing lease store"));
     }
@@ -641,6 +742,7 @@ mod tests {
                 PeriodicCleanupOverrides {
                     gc_session_id: "gc-test",
                     epoch_hour: 42,
+                    now_unix_secs: 0,
                 },
             )
             .await,
