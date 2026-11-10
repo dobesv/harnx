@@ -43,6 +43,11 @@ use_tools:
   - fs_insert
   - fs_re_replace
   - fs_rollback_file
+  - laocoon_session_prompt
+  - laocoon_session_send
+  - laocoon_session_wait
+  - laocoon_session_load
+
   - librarian_session_prompt
   - librarian_session_send
   - librarian_session_wait

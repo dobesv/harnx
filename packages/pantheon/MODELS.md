@@ -53,6 +53,7 @@ Codex immediately precedes the same OpenAI model and reasoning setting.
 | `aeacus` | `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-3.8-flash` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
 | `apollo`, `argus`, `calliope`, `clio`, `euterpe`, `terpsichore`, `thalia` | `gemini:gemini-3.8-flash` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
 | `minos` | `gemini:gemini-4-argon` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
+| `laocoon` | `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-4-argon` → `claude:claude-opus-5-5:xhigh` → `bedrock:us.moonshotai.kimi-k3` |
 | `athena`, `metis`, `nemesis`, `opis`, `rhadamanthus`, `tyche`, `urania` | `bedrock:us.zai.glm-5.3` → `gemini:gemini-3.8-flash` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` |
 | `atlas` | `claude:claude-opus-5-5` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-4-argon` → `bedrock:us.zai.glm-5.3` |
 | `daedalus`, `sisyphus` | `claude:claude-opus-5-5` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-4-argon` → `bedrock:us.moonshotai.kimi-k3` |
