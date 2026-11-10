@@ -1587,6 +1587,23 @@ The journal bucket is S2-compressed. Opening the journal, and that periodic
 reconcile, turn compression on for a bucket an older build created without it.
 nats-server records the change at once, but each server only starts compressing
 its copy after it restarts, and then only blocks it fills or rewrites from then on.
+Two kinds of row expire instead of waiting for a session deletion. The deletion
+tombstone (`deleted/<session>`) lasts an hour: a worker that loaded the
+session's calls before the deletion loses its lease at its next renewal,
+seconds later. A session started again under the same agent and local id has
+the same storage key, so its tool calls are refused until the hour is up. The
+age is also checked when the tombstone is read, which retires tombstones older
+builds wrote without a TTL. A call with no parent session has a row keyed
+`standalone/<call>` that no deletion removes, and each write to it sets a TTL
+of a week. That has to stay well above any call's running time, because a row
+that expires under a running call turns its reply into an error.
+These TTLs need the bucket to allow per-message TTLs. A KV config turns them on
+through `limit_markers`, which also has NATS leave a marker for a minute where
+a row expired. Opening the journal and the periodic reconcile turn them on for
+an older bucket, with the same marker TTL, so that the next `ensure` finds the
+bucket unchanged. Until then, tombstones and rows are written without a TTL
+and stay, as before, because a bucket that doesn't allow TTLs rejects a message
+that carries one.
 Journaled recovery does not repeat approval or post-use hooks.
 Legacy calls without a journal record retain the hint-based retry/interruption
 fallback, with lease revalidation after approval and before dispatch.

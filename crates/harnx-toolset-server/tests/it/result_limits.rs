@@ -153,7 +153,7 @@ async fn exact_row_boundary_counts_cas_headers() -> Result<()> {
 async fn changed_kv_limit_recovers_real_10054_by_committing_terminal_without_reexecution(
 ) -> Result<()> {
     let mut fixture = Fixture::start(None, None).await?;
-    let mut config = fixture.store.stream.cached_info().config.clone();
+    let mut config = fixture.journal_config().await?;
     config.max_message_size = 8192;
     fixture.js.update_stream(config).await?;
     // Server journal handle predates the changed limit. Observe the actual

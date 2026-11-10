@@ -196,7 +196,7 @@ async fn sealed_journal_write_is_not_a_recoverable_size_failure() -> Result<()> 
             result = &mut pending => anyhow::bail!("tool did not park: {result:?}"),
             _ = tokio::time::sleep(Duration::from_secs(60)) => anyhow::bail!("tool did not enter"),
         }
-        let mut config = fixture.store.stream.cached_info().config.clone();
+        let mut config = fixture.journal_config().await?;
         config.sealed = true;
         fixture.js.update_stream(config).await?;
         fixture.toolset.release.notify_one();
