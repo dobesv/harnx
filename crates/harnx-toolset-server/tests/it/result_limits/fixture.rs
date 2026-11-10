@@ -161,6 +161,20 @@ impl Fixture {
         Ok(fixture)
     }
 
+    /// The journal stream's config as the server has it now. The tool server
+    /// brings the bucket up to date when it opens the journal, so `store`'s
+    /// cached copy no longer matches it, and updating the stream from that
+    /// copy would try to turn per-message TTLs off again.
+    pub async fn journal_config(&self) -> Result<jetstream::stream::Config> {
+        Ok(self
+            .js
+            .get_stream(format!("KV_{BUCKET}"))
+            .await?
+            .cached_info()
+            .config
+            .clone())
+    }
+
     pub async fn restart(&mut self) -> Result<()> {
         let client = connect(&self.broker.url).await?;
         self.serve_client(client).await
