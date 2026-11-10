@@ -31,7 +31,7 @@ pub enum CommandOutcome {
     OpenSessionPicker,
 }
 
-pub static COMMANDS: LazyLock<[Command; 52]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 53]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -42,6 +42,11 @@ pub static COMMANDS: LazyLock<[Command; 52]> = LazyLock::new(|| {
         Command::with_usage(".info tool", "<name>", "Inspect an allowed tool in the active session"),
         Command::with_usage(".list tools", "[pattern]", "List allowed tools in the active session"),
         Command::with_usage(".call tool", "<name> <args-json>", "Invoke an allowed tool without an inference turn"),
+        Command::with_usage(
+            ".call bash",
+            "<script>",
+            "Run a BashKit script on the session's tool selection, without an inference turn",
+        ),
         Command::with_usage(
             ".info env",
             "[name]",

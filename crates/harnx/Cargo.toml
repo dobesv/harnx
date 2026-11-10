@@ -81,6 +81,7 @@ harnx-fetch = { path = "../harnx-fetch" }
 harnx-rag = { path = "../harnx-rag" }
 harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
+harnx-script = { path = "../harnx-script" }
 harnx-spinner = { path = "../harnx-spinner" }
 harnx-telemetry = { workspace = true }
 harnx-toolset = { path = "../harnx-toolset" }

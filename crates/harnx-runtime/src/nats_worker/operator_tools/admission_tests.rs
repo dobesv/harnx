@@ -35,6 +35,7 @@ impl Calls {
                 tool_use: true,
                 command,
                 json: true,
+                bash_timeout_secs: None,
             },
             &create_abort_signal(),
         )
@@ -62,6 +63,7 @@ impl Calls {
                 command: &command,
                 json: true,
                 abort: &create_abort_signal(),
+                bash_timeout_secs: None,
             },
         )
         .await;

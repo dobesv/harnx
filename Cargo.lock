@@ -4284,6 +4284,7 @@ dependencies = [
  "harnx-rag",
  "harnx-render",
  "harnx-runtime",
+ "harnx-script",
  "harnx-spinner",
  "harnx-telemetry",
  "harnx-test-bins",

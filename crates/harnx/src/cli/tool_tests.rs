@@ -118,6 +118,66 @@ fn tool_commands_inherit_agent_at_top_level_action_and_subject_positions() {
 }
 
 #[test]
+fn call_bash_parses_positional_script_json_and_repeatable_tools() {
+    // Script is one raw positional argument; quoting/spacing inside survive.
+    let cli = Cli::try_parse_from([
+        "harnx",
+        "call",
+        "bash",
+        r#"echo "a  b" | grep -c x"#,
+        "--tools",
+        "fs_read,fs_{read,write}",
+        "--tools",
+        "toolset_a",
+        "--json",
+    ])
+    .unwrap();
+    let Some(Commands::Call(call)) = &cli.command else {
+        panic!("expected call");
+    };
+    let CallSubcommands::Bash(args) = &call.command else {
+        panic!("expected call bash");
+    };
+    assert_eq!(args.script, r#"echo "a  b" | grep -c x"#);
+    assert_eq!(
+        args.tools,
+        [
+            "fs_read,fs_{read,write}".to_string(),
+            "toolset_a".to_string()
+        ]
+    );
+    assert!(args.json);
+    assert!(cli.tool.is_empty());
+    // Human output is the default; --json stays optional.
+    let cli = Cli::try_parse_from(["harnx", "call", "bash", "echo hi"]).unwrap();
+    let Some(Commands::Call(call)) = &cli.command else {
+        panic!("expected call");
+    };
+    let CallSubcommands::Bash(args) = &call.command else {
+        panic!("expected call bash");
+    };
+    assert!(!args.json);
+    assert!(args.tools.is_empty());
+}
+
+#[test]
+fn call_bash_keeps_hyphenated_script_content_and_legacy_tool_flag() {
+    // A leading hyphen in the quoted script stays script content; the hidden
+    // global --tool/-t keeps parsing alongside the new --tools flag without
+    // a duplicate short-flag definition (debug_assert covers collisions).
+    let cli =
+        Cli::try_parse_from(["harnx", "call", "bash", "--flagged script", "-t", "legacy"]).unwrap();
+    let Some(Commands::Call(call)) = &cli.command else {
+        panic!("expected call");
+    };
+    let CallSubcommands::Bash(args) = &call.command else {
+        panic!("expected call bash");
+    };
+    assert_eq!(args.script, "--flagged script");
+    assert_eq!(cli.tool, ["legacy".to_string()]);
+}
+
+#[test]
 fn tool_commands_reject_invalid_subjects_missing_and_extra_arguments() {
     for argv in [
         vec!["harnx", "info", "tools", "fs.inspect"],

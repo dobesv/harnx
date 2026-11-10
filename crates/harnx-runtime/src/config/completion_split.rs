@@ -10,7 +10,7 @@ const FIXED_SUBCOMMANDS: &[(&str, &[&str])] = &[
         ".delete",
         &["agent", "session", "rag", "macro", "agent-data", "message"],
     ),
-    (".call", &["tool"]),
+    (".call", &["tool", "bash"]),
     (".list", &["tools"]),
     (".drop", &["tool"]),
     (".dump", &["session"]),
@@ -319,6 +319,28 @@ mod tests {
             config.command_complete(".session", &["alp"], vec!["alpha".into(), "beta".into()]),
             vec![("alpha".into(), None)],
         );
+    }
+
+    #[test]
+    fn call_completes_tool_and_bash_subjects_but_not_script_words() {
+        // `.call ` offers both subjects (#2630); the script after `bash`
+        // is free text and completes nothing.
+        let config = Config::default();
+        let completed = config.command_complete(".call", &[""], vec![]);
+        let names: Vec<String> = completed.into_iter().map(|(name, _)| name).collect();
+        assert!(names.contains(&"tool".to_string()), "{names:?}");
+        assert!(names.contains(&"bash".to_string()), "{names:?}");
+        assert_eq!(
+            config.command_complete(".call", &["ba"], vec![]),
+            vec![("bash".to_string(), None)]
+        );
+        assert!(config
+            .command_complete(".call", &["bash", "ec"], vec![])
+            .is_empty());
+        assert!(!config
+            .command_complete(".call", &["tool"], vec![])
+            .into_iter()
+            .any(|(name, _)| name == "bash"));
     }
 
     #[test]

@@ -256,6 +256,8 @@ pub struct CallArgs {
 pub enum CallSubcommands {
     /// Invoke a tool with a JSON object of arguments
     Tool(CallToolArgs),
+    /// Run a BashKit script whose inner tool calls use explicit or inferred tool selection
+    Bash(CallBashArgs),
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -265,6 +267,31 @@ pub struct CallToolArgs {
     /// JSON object of arguments, quoted as one shell argument
     #[arg(value_name = "ARGS_JSON")]
     pub args_json: String,
+    /// Print the complete tool result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `harnx call bash` (#2630): one operator script call.
+///
+/// Selection: `--tools`/`--tool`/`-t` are explicit selectors (additive for
+/// named agents); without any of them the literal command names are inferred
+/// from bounded static analysis. Agent, timeout and token options come from
+/// the existing global flags.
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct CallBashArgs {
+    /// BashKit script, quoted as one shell argument; hyphens stay script content
+    #[arg(value_name = "SCRIPT", allow_hyphen_values = true)]
+    pub script: String,
+    /// Tool selectors for the script's inner calls; repeatable, comma-separated
+    /// (commas inside braces are preserved). Empty disables inference; agentless
+    /// runs use pure shell, while named agents retain configured tools.
+    #[arg(
+        long = "tools",
+        value_name = "SELECTORS",
+        action = clap::ArgAction::Append
+    )]
+    pub tools: Vec<String>,
     /// Print the complete tool result as JSON
     #[arg(long)]
     pub json: bool,

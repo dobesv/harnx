@@ -12,6 +12,7 @@ pub mod description;
 pub mod fs_attachments;
 pub mod help;
 mod schema;
+pub mod tool_inference;
 
 use std::{collections::HashMap, path::Path, path::PathBuf, sync::Arc};
 

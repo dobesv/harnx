@@ -99,7 +99,7 @@ async fn removed_mcp_commands_are_not_completed() {
 }
 
 #[tokio::test]
-async fn operator_tool_help_completion_and_missing_session_do_not_use_global_inventory() {
+async fn operator_tool_completions_and_help_do_not_use_global_inventory() {
     let config = test_config();
     config.read().nats_tool_declarations.write().push(
         serde_json::from_value(serde_json::json!({
@@ -108,14 +108,14 @@ async fn operator_tool_help_completion_and_missing_session_do_not_use_global_inv
         .unwrap(),
     );
     let mut tui = Tui::init(&config).await.unwrap();
-    for (line, expected) in [(".call ", "tool"), (".list ", "tools")] {
+    for (line, expected) in [(".call ", vec!["tool", "bash"]), (".list ", vec!["tools"])] {
         assert_eq!(
             tui.compute_completions(line, line.len())
                 .await
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect::<Vec<_>>(),
-            [expected]
+            expected
         );
     }
     for line in [".info tool ", ".list tools ", ".call tool "] {
@@ -145,6 +145,15 @@ async fn operator_tool_help_completion_and_missing_session_do_not_use_global_inv
     assert!(
         help.contains(".info tool") && help.contains(".list tools") && help.contains(".call tool")
     );
+    assert!(help.contains(".call bash"));
+}
+
+#[tokio::test]
+async fn operator_tool_commands_run_outside_event_loop_and_fence_missing_session_error() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    // A `.call tool` rejected by the parser stays synchronous: no background
+    // task and no session requirement.
     tui.run_command(".call tool visible []").await.unwrap();
     assert!(!tui.app.llm_busy);
     assert!(tui.current_prompt_handle.is_none());

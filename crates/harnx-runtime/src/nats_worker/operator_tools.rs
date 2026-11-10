@@ -201,12 +201,13 @@ async fn admit_operator_call(
     if !matches!(
         request.command,
         crate::operator_tools::OperatorToolCommand::Call { .. }
+            | crate::operator_tools::OperatorToolCommand::Bash { .. }
     ) || snapshot.run_context.is_some()
     {
         return Ok(());
     }
-    // Only this explicit operator CALL is a frontend boundary. Keep any inherited
-    // run frozen, and don't turn inspection into execution admission.
+    // Only an explicit operator CALL/BASH is a frontend boundary. Keep any
+    // inherited run frozen, and don't turn inspection into execution admission.
     let record = RunLimitsRecord::admit_root(
         Default::default(),
         Default::default(),
@@ -248,20 +249,43 @@ async fn execute_claimed(
         _ = super::daemon_background::await_initial_background_services(&runtime.background_services_attempted) => {},
         _ = crate::utils::wait_abort_signal(abort) => anyhow::bail!("Operator tool command cancelled"),
     }
-    let selectors = if request.tool_use && config.read().tool_use {
+    let tools_enabled = request.tool_use && config.read().tool_use;
+    let agent_use_tools = if tools_enabled {
         request
             .use_tools
             .clone()
             .or_else(|| config.read().extract_agent().use_tools())
-            .unwrap_or_default()
     } else {
-        Vec::new()
+        None
+    };
+    // #2630: Bash commands keep startup claims distinct from admission.
+    // Claims only hint which servers to start; admission is authorization.
+    let (claim_selectors, admission_selectors) = match &request.command {
+        crate::operator_tools::OperatorToolCommand::Bash { selection, .. } if tools_enabled => {
+            let bash_tools = config.read().extract_agent().bash_tools();
+            crate::operator_tools::bash_selection_selectors(
+                selection,
+                agent_use_tools.clone(),
+                bash_tools,
+            )
+        }
+        // #2655: when tool use is disabled at the request or worker level,
+        // no Bash admission source (effective use_tools, bash_tools, or
+        // explicit selectors) reaches the inner admission/catalog, and no
+        // claims start tool servers. Direct `.call tool` gets the same
+        // semantics through the `agent_use_tools` gate above; only the
+        // synthetic `bash` keeps running, as pure shell.
+        crate::operator_tools::OperatorToolCommand::Bash { .. } => (Vec::new(), Vec::new()),
+        _ => {
+            let selectors = agent_use_tools.unwrap_or_default();
+            (selectors.clone(), selectors)
+        }
     };
     let package = config.read().active_package();
     let servers = super::daemon_background::tool_servers_for_view(
         &config.read(),
         package.as_deref(),
-        &selectors,
+        &claim_selectors,
     );
     if let Some(reconciler) = &claim.reconciler {
         let claimed = reconciler.claim_users(&claim.token, servers).await;
@@ -272,13 +296,18 @@ async fn execute_claimed(
     let mut hooks = if matches!(
         request.command,
         crate::operator_tools::OperatorToolCommand::Call { .. }
+            | crate::operator_tools::OperatorToolCommand::Bash { .. }
     ) {
         start_agent_hooks(runtime, config, &claim.token).await?
     } else {
         None
     };
     let result = execution
-        .execute_discovered(&selectors, package, hooks.as_ref().map(|(_, scope)| scope))
+        .execute_discovered(
+            &admission_selectors,
+            package,
+            hooks.as_ref().map(|(_, scope)| scope),
+        )
         .await;
     if let Some((hooks, _)) = &mut hooks {
         hooks.shutdown().await;
@@ -321,6 +350,22 @@ impl OperatorExecution<'_> {
             ..params
         };
         let provider = Arc::new(provider);
+        // #2630: Bash evaluates on a command-scoped context whose catalog,
+        // executor allowlist and allowed names all derive from one admitted
+        // set — Resolve(admission selectors) mapped onto the discovered
+        // inventory plus the in-process built-ins ordinary agent Bash uses,
+        // minus control tools. The synthetic `bash` stays allowed
+        // after the late overwrite, and the strong slot owner lives for the
+        // whole run.
+        if let crate::operator_tools::OperatorToolCommand::Bash { .. } = &request.command {
+            let resolved: std::collections::HashSet<String> = config
+                .read()
+                .select_tools_for_package(selectors, snapshot.active_package().as_deref())
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            return self.execute_bash(params, provider, &resolved).await;
+        }
         let mut ctx =
             crate::tool::build_tool_eval_context_with_provider(params, provider.clone()).await;
         // The declaration cache is an inventory, not an allowlist. In particular,
@@ -347,6 +392,61 @@ impl OperatorExecution<'_> {
             abort,
         )
         .await
+    }
+
+    async fn execute_bash(
+        &self,
+        params: crate::tool_context::BuildToolEvalContextParams<'_>,
+        provider: Arc<crate::nats_tool_provider::NatsToolProvider>,
+        resolved: &std::collections::HashSet<String>,
+    ) -> Result<OperatorToolReply> {
+        let crate::operator_tools::OperatorToolCommand::Bash { script, .. } = &self.request.command
+        else {
+            unreachable!("execute_bash requires a Bash command");
+        };
+        // #2655 finding B: admission maps the resolved names onto the
+        // discovered NATS inventory plus the in-process built-ins (session
+        // history, session metadata), the same universe ordinary agent Bash
+        // dispatches through. Selected built-ins no longer fall out of the
+        // catalog just because no tool server advertises them.
+        let admitted = crate::operator_tools::operator_bash_inner_declarations(
+            resolved,
+            provider.declarations(),
+        );
+        let admitted_names: std::collections::HashSet<String> =
+            admitted.iter().map(|tool| tool.name.clone()).collect();
+        provider.ensure_unambiguous(&admitted_names)?;
+        let slot = crate::bash_provider::BashEvalContextSlot::new();
+        let params = crate::tool_context::BuildToolEvalContextParams {
+            bash_context_slot: Some(slot.clone()),
+            command_bash: Some(crate::bash_provider::CommandBashInputs {
+                inner_declarations: admitted,
+                // The operator already consented to this script's inner
+                // calls; ordinary agent and child policies stay normal.
+                operator_inner_consent: true,
+            }),
+            ..params
+        };
+        let mut ctx = crate::tool::build_tool_eval_context_with_provider(params, provider).await;
+        ctx.allowed_tool_names = admitted_names;
+        ctx.allowed_tool_names
+            .insert(crate::config::BASH_TOOL_NAME.to_string());
+        let root_call_id = uuid::Uuid::new_v4().to_string();
+        crate::operator_tools::approve_root_bash_call(&mut ctx, &root_call_id);
+        let owner = slot.install(ctx);
+        let reply = crate::operator_tools::evaluate_bash(
+            &owner,
+            &root_call_id,
+            crate::operator_tools::BashInvocation {
+                script,
+                timeout_secs: self.request.bash_timeout_secs,
+                format: crate::tool_output::ToolOutputFormat::from_json_flag(self.request.json),
+                abort: self.abort,
+            },
+        )
+        .await;
+        drop(owner);
+        reply
     }
 
     async fn discover_hooks(

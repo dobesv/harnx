@@ -42,6 +42,11 @@ pub struct BuildToolEvalContextParams<'a> {
     /// caller fills the slot with the built context wrapped in an `Arc` right
     /// after construction; `None` means `bash` fails closed on this path.
     pub bash_context_slot: Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
+    /// Command-scoped `bash` provider inputs for one operator script call
+    /// (#2630): active even with an empty inner catalog, command-resolved
+    /// declarations, operator-only inner consent. `None` keeps the ordinary
+    /// config-driven provider.
+    pub command_bash: Option<crate::bash_provider::CommandBashInputs>,
 }
 
 impl<'a> BuildToolEvalContextParams<'a> {
@@ -56,6 +61,7 @@ impl<'a> BuildToolEvalContextParams<'a> {
             nats_hook_provider: None,
             pending_async_context: None,
             bash_context_slot: None,
+            command_bash: None,
         }
     }
 
@@ -66,6 +72,11 @@ impl<'a> BuildToolEvalContextParams<'a> {
 
     pub fn with_current_agent_package(mut self, package: Option<String>) -> Self {
         self.current_agent_package = package;
+        self
+    }
+
+    pub fn with_command_bash(mut self, inputs: crate::bash_provider::CommandBashInputs) -> Self {
+        self.command_bash = Some(inputs);
         self
     }
 }

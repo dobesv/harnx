@@ -62,6 +62,10 @@ harnx info tool fs_read --json                 # View tool declaration as JSON
 harnx call tool fs_read '{"path": "file.txt"}' # Call tool directly with JSON arguments
 harnx call tool fs_read '{"path": "file.txt"}' --json  # Return full tool result as JSON
 harnx -a agent1 call tool fs_read '{"path": "file.txt"}' # Call tool using agent allowlist
+harnx call bash 'fs_read --path file.txt | grep error' # Run BashKit script with inferred tools
+harnx call bash --tools 'fs_{read,write}' 'fs_read --path in.txt > out.txt' # Explicit tool selection
+harnx -a agent1 call bash --tools fs_find 'fs_find --pattern "*.rs"' # Additive tool selection on named agent
+harnx call bash --tools '' 'echo "pure shell"'  # Run script without starting tool servers
 harnx --info                                   # View system info
 harnx --rag rag1 --info                        # View RAG info
 
@@ -467,6 +471,81 @@ Tool execution through `harnx call tool` runs with scoped operator consent:
 - **Hook `deny` enforced**: A `PreToolUse` hook that returns `"deny"` (or exits with code 2) is strictly enforced. The tool is blocked immediately, returning a blocked tool result (`"blocked_by_hook": true`) and exiting with code 1.
 - **Hook mutations and schema validation**: Any argument mutations returned by hooks (`mutatedToolInput`) are applied before execution, and tool input schemas are validated normally.
 - **Nested approval isolation**: Root consent applies only to the root tool call ID. If the invoked tool spawns nested sub-agents or secondary tool calls, those nested calls do not inherit root approval. In the non-interactive CLI environment, nested approval requests safely defer or decline rather than executing unconfirmed.
+
+### `harnx call bash '<script>' [--tools <selectors>] [--json]`
+
+Executes a BashKit script directly against real tools in an isolated subshell with an in-process virtual filesystem (`/tmp`), without running an LLM model turn or creating an inference turn.
+
+```sh
+# Agentless invocation with static tool inference
+harnx call bash 'fs_read --path README.md | grep -i usage'
+
+# Explicit tool selection (disables inference; shell redirection writes to the in-memory virtual filesystem, not host)
+harnx call bash --tools 'fs_{read,write}' 'fs_read --path in.txt > out.txt'
+
+# Additive explicit selection with a named agent
+harnx -a coder call bash --tools fs_find 'fs_find --pattern "*.rs"'
+
+# Pure shell script (pass --tools '' to guarantee no tool servers are claimed or started)
+harnx call bash --tools '' 'echo "hello from bashkit"'
+```
+
+- **`<script>`**: Required positional BashKit script, passed as a single quoted shell argument. Hyphens inside the script stay script content (for example, tool flags like `fs_read --path file.txt` or shell switches like `grep -i usage`). There is no stdin, file, or multiline input mode. Files created via shell redirection (like `> out.txt`) reside in the temporary in-memory filesystem and disappear when the script finishes; modifying persistent host files requires host-aware tools (such as `fs_write`).
+  - **Inner tool parameters**: Inner tools are schema-derived and map property names to kebab-case named options (such as `fs_read --path <file>` or `fs_write --path <file> --content <text>`). Multiword property names convert to kebab case: for example, `old_text` becomes `--old-text`, and passing `--old_text` is rejected as an unknown flag. Schema parameters have no single-dash short aliases (`-p`). Inner commands accept `-o json` or `-o text` to control output rendering. Inner tools do not accept positional arguments; passing positional arguments causes a tool usage error.
+- **`--tools <selectors>`**: Repeatable option accepting comma-separated tool selectors (for example, `--tools fs_read,fs_write` or `--tools 'fs_{read,write}'`). Passing any explicit selector disables static inference. Commas inside braces are preserved during splitting. Note that `--tools` does not provide a `-t` short alias to prevent collisions; the existing global `--tool` and `-t` flags remain supported and merge additively with `--tools`.
+- **`--json`**: Outputs the complete tool result payload as a single JSON object.
+- **Default output**: Uses the same formatting as direct tool calls (`format_tool_result`): plain text strings print as text; structured or complex objects print as pretty-printed JSON.
+
+#### Tool Selection Contract
+
+Harnx resolves startup server claims and admitted inner tools according to caller mode and selection intent:
+
+| Caller / Mode | Startup Claims | Admitted Inner Tools |
+|---|---|---|
+| **Agentless CLI Inferred** (no `--agent`, no `--tools`) | Literal command names ($L$) | Exact literal intersection of $L$ with discovered inventory; no glob or toolset authorization |
+| **Agentless CLI Explicit** (`--tools <selectors>`) | Explicit selectors ($E$) | `Resolve(E)` |
+| **Named CLI Inferred** (`-a <agent>`, no `--tools`) | Literal command names ($L$) | `Resolve(U ∪ B)` |
+| **Named CLI Explicit** (`-a <agent>`, `--tools <selectors>`) | $U ∪ B ∪ E$ | `Resolve(U ∪ B ∪ E)` |
+
+- **Agentless Inferred**: Harnx runs bounded static analysis on the script AST before startup to extract literal command names ($L$). It claims only those names to start backing servers. Admission requires an exact literal-name match against discovered tool declarations. Literal command names are never expanded as globs or toolsets (for example, writing `fs_*` in the script will not authorize `fs_read`). If a configured toolset has the same name as an inferred command, the toolset takes precedence over the literal in selector resolution, including for `--tools`; rename or remove the colliding toolset to select the literal tool. Builtins like `echo` are inferred as literal names, so a builtin matching a configured toolset can claim and start that toolset's servers (admission remains bounded to exact literal matches). In agentless mode, `--tools ''` guarantees no tool servers are claimed or started. Unrelated warm servers do not widen admission.
+- **Agentless Explicit**: Providing `--tools` disables static inference. In agentless mode, an empty selector (`--tools ''`) runs as pure shell with an empty inner tool catalog, rather than falling back to inference.
+- **Named Inferred**: For a named agent (`-a <agent>`), static analysis claims literal names $L$ for server startup, but admission is strictly bounded by the agent's configured `use_tools` ($U$) and `bash_tools` ($B$). Inferred names never widen the agent's permissions beyond its configured tools.
+- **Named Explicit**: When `--tools` is provided with a named agent, explicit selectors $E$ are additive to the agent's configured $U$ and $B$, admitting `Resolve(U ∪ B ∪ E)`. If an empty selector (`--tools ''`) is passed with a named agent, it disables static inference while preserving the agent's configured $U$ and $B$ (admitting `Resolve(U ∪ B ∪ ∅) = Resolve(U ∪ B)`); it does not strip the agent's configured tools into pure shell.
+- **Worker version**: Named agent invocations execute on the tool worker, so the worker must run the same release as the CLI. A worker built before Bash support rejects the command with a clean error instead of executing it or hanging. Agentless invocations run in-process in the CLI and do not depend on the worker version.
+
+#### Static Inference Limitations and the `--tools` Remedy
+
+Tool inference uses bounded static AST analysis via BashKit. It parses script structure without executing the script.
+
+- **Dynamic commands**: Variables (such as `$cmd` or `${TOOL}`) cannot be resolved to tool names.
+- **Command wrappers**: Wrapper commands (such as `env FOO=1 fs_read`) record `env`, not `fs_read`.
+- **Interpreter reentry**: Commands like `eval 'fs_read'` or `source script.sh` are flagged as reentry; their inner arguments are not inspected.
+- **Truncation**: Scripts that exceed analysis limits (4096 recorded command and redirect nodes or 100,000 fuel operations) are truncated.
+- **Failure semantics**: Opaque, dynamic, or truncated scripts never fall back to wildcard or all-server discovery. For inferred tool selection, syntax errors in the script fail fast immediately during CLI argument processing, before launching workers or reserving tools. Explicit selection (`--tools`, `--tool`, or `-t`) skips static syntax analysis, so an invalid script reaches tool reservation and worker startup before failing when the script executes.
+- **Remedy**: Whenever a script uses variables, command wrappers, `eval`, or dynamic constructs, pass explicit selectors via `--tools` (for example, `harnx call bash --tools fs_read 'cmd="fs_read --path file.txt"; eval "$cmd"'`). When analysis is opaque or detects a wrapper, the CLI prints a warning to stderr suggesting `--tools`.
+
+#### Scoped Operator Consent and Inner Auto-Approval
+
+Scripts run under root operator consent:
+
+- **Operator inner call auto-approval**: When an operator runs `harnx call bash`, any `PreToolUse` hook that returns `"permissionDecision": "ask"` for an inner tool call is automatically approved. Unlike normal agent turns, the operator script does not prompt interactively for inner calls.
+- **Contrast with agent scripts**: Normal agent Bash scripts fail closed with exit code 3 (`needs approval: <tool>; call it directly instead of from bash`) when an inner tool requires confirmation.
+- **Hook `deny` enforced**: A `PreToolUse` hook that returns `"deny"` (or exits with code 2) blocks the inner tool call. The inner command exits with status 4 and writes the rejection reason to stderr (with empty stdout); it does not return a JSON object to the script. By default, BashKit enables `set -e`, so an unhandled denial makes the outer CLI exit 1. Scripts can use `set +e` to handle the inner status; if a later command succeeds and the script finishes with status 0, the CLI exits 0.
+- **Control tools excluded**: Control tools (`bash`, `switch_agent`, `ask_user`, and `*_session_handoff`) are excluded from the inner catalog and cannot be invoked from inside the script.
+- **Child agent isolation**: If an inner tool invokes a child agent or triggers delegated sub-agent turns, those child sessions retain their own normal confirmation policies and do not inherit operator auto-approval.
+
+#### Output Formatting and Process Exit Codes
+
+- **Process exit code**: The CLI process exits **0** when the script succeeds with script exit code 0. If the script fails, encounters an execution error, or exits with a nonzero status, the CLI process exits **1** (not the script's raw exit status).
+- **Script exit status in payload**: The script's actual exit status is preserved in the tool result payload: successful runs expose `exit_code` at the top level (for example, `{"exit_code": 0, ...}`), while failed runs expose it under `partial_result.exit_code` (for example, `{"partial_result": {"exit_code": 3, ...}}`).
+- **`--json` format**: In `--json` mode, successful runs and runtime errors handled by the execution runner emit a single JSON object on stdout (including tool-reported errors and provider results). If an error occurs inside the runner before a result is produced (such as a tool reservation failure or worker connection error), stdout outputs `{"isError": true, "error": "<message>"}` with exit code 1. However, early script syntax analysis errors during CLI argument processing fail fast before the runner starts: these print an error message to stderr and exit with code 1, leaving stdout empty.
+
+#### Timeouts, Cancellation, and Budget Caveats
+
+- **Default timeout (600s envelope)**: When `--timeout-secs` is omitted or passed as `0`, the operator execution envelope defaults to **600 seconds** (10 minutes). Unlike `harnx prompt`, direct tool and script calls do not run indefinitely with a 0 or unset timeout.
+- **Positive timeout**: Passing a positive `--timeout-secs` sets the script execution deadline. However, named worker execution is independently wrapped by the worker at its 600-second deadline; positive timeouts cannot extend execution beyond that 600-second operator envelope.
+- **Cancellation (`Ctrl+C`)**: Signals an abort, allows a 10-second drain window, releases tool reservations, and exits 1 without replay.
+- **Token budget caveat**: The CLI `--token-budget` option is parsed from global flags but is not forwarded to direct tool or script execution. Direct operator calls do not enforce token limits or create per-inner fresh token budgets.
 
 ## Standalone MCP Bridge Inspection and Invocation (`harnx-mcp-bridge`)
 

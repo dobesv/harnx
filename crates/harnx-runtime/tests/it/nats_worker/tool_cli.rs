@@ -652,6 +652,9 @@ impl Harness {
     }
 }
 
+#[path = "tool_cli/bash.rs"]
+mod bash;
+
 async fn assert_closed_reservation(h: &Harness) -> Result<()> {
     let mut config = h.config.read().clone();
     config.nats_routing = NatsRouting::Cluster("local".into());
@@ -677,6 +680,7 @@ async fn assert_closed_reservation(h: &Harness) -> Result<()> {
             },
             json: true,
             abort: &create_abort_signal(),
+            bash_timeout_secs: None,
         },
     )
     .await
