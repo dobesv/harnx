@@ -79,7 +79,7 @@ impl InvocationJournal {
             let config = limits.as_ref().expect("limits loaded");
             let budget = CompletionBudget::for_record(
                 &record,
-                entry.revision,
+                cas_header_bytes(entry.revision, self.row_ttl(&key)),
                 config,
                 self.1.client().server_info().max_payload,
             )?;
@@ -91,7 +91,7 @@ impl InvocationJournal {
                 .await?;
             record.reply = Some(reply.clone());
             let payload = budget.encode(&record)?;
-            let update = self.0.update(&key, payload.into(), entry.revision).await;
+            let update = self.update_row(&key, payload, entry.revision).await;
             match CompletionUpdate::classify(update, size_retry)? {
                 CompletionUpdate::Saved => return Ok(reply),
                 CompletionUpdate::Conflict => continue,
@@ -165,9 +165,11 @@ struct CompletionBudget {
 }
 
 impl CompletionBudget {
+    /// `headers` is the size of the header block the update sends, which
+    /// [`cas_header_bytes`] gives.
     fn for_record(
         record: &RecordedInvocation,
-        revision: u64,
+        headers: usize,
         config: &jetstream::stream::Config,
         wire_limit: usize,
     ) -> Result<Self> {
@@ -183,7 +185,6 @@ impl CompletionBudget {
         // `reply: null` occupies four bytes. Everything else, including
         // inputs, checkpoints and partial results, remains byte-for-byte data.
         let overhead = serde_json::to_vec(record)?.len() - 4;
-        let headers = cas_header_bytes(revision);
         Ok(Self {
             reply_bytes: wire_limit.min(row_bytes.saturating_sub(overhead + headers)),
             row_bytes,
@@ -201,21 +202,52 @@ impl CompletionBudget {
     }
 }
 
-fn cas_header_bytes(revision: u64) -> usize {
-    // async-nats kv::Store::update adds this one header. NATS counts the
-    // header block against max_payload AND the stream's max_message_size.
-    "NATS/1.0\r\nNats-Expected-Last-Subject-Sequence: \r\n\r\n".len() + revision.to_string().len()
+fn cas_header_bytes(revision: u64, ttl: Option<std::time::Duration>) -> usize {
+    // `update_row` sends the CAS header, and a TTL header for a row that
+    // expires. NATS counts the header block against max_payload AND the
+    // stream's max_message_size.
+    let ttl = ttl.map_or(0, |ttl| {
+        "Nats-TTL: \r\n".len() + ttl.as_secs().to_string().len()
+    });
+    "NATS/1.0\r\nNats-Expected-Last-Subject-Sequence: \r\n\r\n".len()
+        + revision.to_string().len()
+        + ttl
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn cas_header_budget_includes_revision_growth() {
-        assert_eq!(cas_header_bytes(1), 52);
-        assert_eq!(cas_header_bytes(10), 53);
-        assert_eq!(cas_header_bytes(u64::MAX), 71);
+        assert_eq!(cas_header_bytes(1, None), 52);
+        assert_eq!(cas_header_bytes(10, None), 53);
+        assert_eq!(cas_header_bytes(u64::MAX, None), 71);
+    }
+
+    #[test]
+    fn cas_header_budget_includes_a_ttl_header() {
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(
+            async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
+            "10",
+        );
+        headers.insert(async_nats::header::NATS_MESSAGE_TTL, "604800");
+        let wire = headers
+            .iter()
+            .map(|(name, values)| {
+                values
+                    .iter()
+                    .map(|value| format!("{name}: {value}\r\n").len())
+                    .sum::<usize>()
+            })
+            .sum::<usize>()
+            + "NATS/1.0\r\n\r\n".len();
+        assert_eq!(
+            cas_header_bytes(10, Some(Duration::from_secs(604_800))),
+            wire
+        );
     }
 
     #[test]

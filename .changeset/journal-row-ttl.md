@@ -1,0 +1,4 @@
+---
+harnx: patch
+---
+A session that was deleted and then started again under the same agent and name can run tools again. Deleting a session leaves a tombstone in the tool invocation journal, and it used to refuse every later tool call in a session with that agent and name, forever; it now refuses them for an hour and then expires. Tombstones left by earlier builds stop refusing calls once they are an hour old, but stay in the `harnx_tool_invocations` bucket. Journal rows for tool calls made outside any session, which nothing deleted, now expire a week after their last write; rows written before the upgrade stay. Opening the journal turns on per-message TTLs for an existing bucket, and until a tool server or worker from this build has done that, tombstones and rows are written without a TTL as before.

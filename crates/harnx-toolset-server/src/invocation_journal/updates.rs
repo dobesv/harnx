@@ -29,8 +29,7 @@ impl InvocationJournal {
             RecordUpdate::Changed(value) => value,
         };
         match self
-            .0
-            .update(key, serde_json::to_vec(&record)?.into(), entry.revision)
+            .update_row(key, serde_json::to_vec(&record)?, entry.revision)
             .await
         {
             Ok(_) => Ok(Some(value)),

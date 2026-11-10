@@ -7,17 +7,20 @@
 //! wire id each dispatch attempt mints. Each part is escaped into one subject
 //! token, so a lookup lists a single round, or one call in it, rather than
 //! every session's rows. A call with no parent session is keyed
-//! `standalone/<call>`. Rows written before this layout, keyed
-//! `sessions/<session>/<call>`, are no longer read or deleted.
+//! `standalone/<call>`, and having no session to be deleted with, its row
+//! expires a week after its last write. Rows written before this layout,
+//! keyed `sessions/<session>/<call>`, are no longer read or deleted.
 use anyhow::{ensure, Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use harnx_toolset::{ToolReply, ToolRequest};
 use serde::{Deserialize, Serialize};
 
 mod completion;
+mod expiry;
 mod leader_reads;
 mod replies;
 mod updates;
+use expiry::{EXPIRY_MARKER_TTL, STANDALONE_PREFIX};
 pub use replies::{JournalCheckpointStore, JournalPartialResultStore};
 use updates::RecordUpdate;
 
@@ -75,14 +78,18 @@ pub(crate) fn config_reconciliations(
 }
 
 /// Raise an existing bucket's replica count to `replicas` and turn on the
-/// compression it is created with. Rows hold whole tool arguments and replies
-/// as JSON and stay until their session is deleted, and NATS compresses a
-/// whole block of them at a time, which S2 shrinks severalfold. nats-server
-/// stores a compression change right away, but each server's copy only
-/// starts compressing once that server restarts.
+/// compression and per-message TTLs it is created with. Rows hold whole tool
+/// arguments and replies as JSON and stay until their session is deleted, and
+/// NATS compresses a whole block of them at a time, which S2 shrinks
+/// severalfold. nats-server stores a compression change right away, but each
+/// server's copy only starts compressing once that server restarts. These
+/// settings must be the ones `ensure`'s `kv::Config` produces, or every
+/// `ensure` finds the bucket different and comes here.
 async fn reconcile(js: &jetstream::Context, replicas: usize) -> Result<()> {
     harnx_nats_common::registry::reconcile_bucket(js, BUCKET, replicas, |config| {
         config.compression = Some(stream::Compression::S2);
+        config.allow_message_ttl = true;
+        config.subject_delete_marker_ttl = Some(EXPIRY_MARKER_TTL);
     })
     .await
 }
@@ -98,6 +105,7 @@ impl InvocationJournal {
                 bucket: BUCKET.into(),
                 num_replicas: replicas,
                 compression: true,
+                limit_markers: Some(EXPIRY_MARKER_TTL),
                 ..Default::default()
             })
             .await
@@ -134,8 +142,7 @@ impl InvocationJournal {
             checkpoint: None,
             partial_result: None,
         };
-        self.0
-            .create(key(request), serde_json::to_vec(&record)?.into())
+        self.create_row(&key(request), serde_json::to_vec(&record)?)
             .await?;
         // A caller may have loaded ToolCalls before deletion removed the
         // transcript. It must not dispatch a late request after journal cleanup.
@@ -164,9 +171,7 @@ impl InvocationJournal {
     pub(crate) async fn check_session_retained(&self, request: &ToolRequest) -> Result<()> {
         if let Some(session) = &request.parent_session_id {
             ensure!(
-                self.live_entry(&format!("deleted/{session}"))
-                    .await?
-                    .is_none(),
+                !self.recently_deleted(session).await?,
                 "tool invocation session was deleted"
             );
         }
@@ -312,9 +317,7 @@ impl InvocationJournal {
     pub async fn purge_session(&self, session: &str) -> Result<()> {
         // Retain a small tombstone after deleting the runnable session. Delayed
         // writers must not resurrect its journal or start another invocation.
-        self.0
-            .put(format!("deleted/{session}"), "deleted".into())
-            .await?;
+        self.write_tombstone(session).await?;
         self.remove(&format!("{}.>", session_prefix(session))).await
     }
 }
@@ -336,7 +339,7 @@ fn key(request: &ToolRequest) -> String {
             token(request.tool_call_id.as_deref().unwrap_or_default()),
             token(&request.call_id),
         ),
-        None => format!("standalone/{}", request.call_id),
+        None => format!("{STANDALONE_PREFIX}{}", request.call_id),
     }
 }
 
