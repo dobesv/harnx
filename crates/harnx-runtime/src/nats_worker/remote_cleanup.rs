@@ -69,15 +69,15 @@ fn log_cleanup_stats(stats: &RemoteCleanupStats, cluster: &str) {
     if cleanup_has_activity(stats) {
         log::info!(
             "session GC completed for cluster='{cluster}': scanned={} deleted={} \
-             skipped_active={} idle_streams={} idle_streams_deleted={} idle_streams_kept={} \
-             unmapped_streams={} errors={}",
+             skipped_active={} orphan_streams={} orphan_deleted={} orphan_kept={} \
+             orphan_unmapped={} errors={}",
             stats.scanned,
             stats.deleted,
             stats.skipped_active,
-            stats.idle_streams,
-            stats.idle_streams_deleted,
-            stats.idle_streams_kept,
-            stats.unmapped_streams,
+            stats.orphan_streams,
+            stats.orphan_deleted,
+            stats.orphan_kept,
+            stats.orphan_unmapped,
             stats.errors
         );
     } else {
@@ -90,13 +90,13 @@ fn log_cleanup_stats(stats: &RemoteCleanupStats, cluster: &str) {
     }
 }
 
-/// A pass that deleted something, kept an idle stream (a backlog the batch
+/// A pass that deleted something, kept an idle orphan (a backlog the batch
 /// limit deferred among them) or hit an error is worth an info line.
 fn cleanup_has_activity(stats: &RemoteCleanupStats) -> bool {
     [
         stats.deleted,
-        stats.idle_streams_deleted,
-        stats.idle_streams_kept,
+        stats.orphan_deleted,
+        stats.orphan_kept,
         stats.errors,
     ]
     .into_iter()
@@ -108,18 +108,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deletions_kept_idle_streams_and_errors_raise_gc_log_level() {
+    fn deletions_kept_orphans_and_errors_raise_gc_log_level() {
         for stats in [
             RemoteCleanupStats {
                 deleted: 1,
                 ..Default::default()
             },
             RemoteCleanupStats {
-                idle_streams_deleted: 1,
+                orphan_deleted: 1,
                 ..Default::default()
             },
             RemoteCleanupStats {
-                idle_streams_kept: 1,
+                orphan_kept: 1,
                 ..Default::default()
             },
             RemoteCleanupStats {
@@ -136,7 +136,7 @@ mod tests {
         let stats = RemoteCleanupStats {
             scanned: 3,
             skipped_active: 2,
-            unmapped_streams: 1,
+            orphan_unmapped: 1,
             ..Default::default()
         };
         assert!(!cleanup_has_activity(&stats));

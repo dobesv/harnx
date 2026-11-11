@@ -93,4 +93,4 @@ Deleted and purged keys are excluded; concurrent deletions can shorten a page.
 
 Tool responses include markdown cross-links (`[title](url)`) and MCP `ContentBlock::resource_link` entries with MIME `text/markdown; charset=utf-8` for the plan index and affected item, while preserving diff blocks for mutations.
 
-Writes use revision compare-and-set and retry conflicts up to five times. Reads and writes touch owner session activity so active plans follow session retention instead of a separate filesystem cleanup policy.
+Writes use revision compare-and-set and retry conflicts up to five times. Writes touch owner session activity so active plans follow session retention instead of a separate filesystem cleanup policy. Reads don't, so a session whose plans are only read still expires.

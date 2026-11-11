@@ -32,9 +32,9 @@ When session retention is configured (`cleanup_remote_sessions_days` /
 `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS`), cluster workers also run periodic session
 garbage collection. Passes are leader-elected across workers, ensuring one
 cleanup pass runs per wall-clock hour per cluster. Each pass also deletes
-`SESSION_` streams not written for the retention window, with or without
-session metadata, after re-checking leases, A2A state and the stream's age; at
-most 100 per pass.
+`SESSION_` streams whose session metadata is missing once nothing has written
+to them for the retention window, after re-checking metadata, leases, A2A state
+and the stream's age; at most 100 per pass.
 
 When `serve_public_url` (`HARNX_SERVE_PUBLIC_URL`) is set, workers record
 `web_session_url` in session metadata before turn 1 for named-agent sessions

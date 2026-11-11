@@ -1772,25 +1772,24 @@ applies its own retention setting:
 - **`n > 0`**: Enabled with an `n`-day retention period.
 
 The expiration threshold is measured from the session's last activity timestamp,
-falling back to its creation timestamp when no activity record exists. Read and
-write access to attachments (`cid:media:`) and plans (`cid:plan:`) refreshes
-the owning session's activity timestamp (`SessionActivity.last_activity_at`),
-debounced to ≤1 write/hour. This resets the retention clock, ensuring actively
-referenced media and plans remain available.
+falling back to its creation timestamp when no activity record exists. Turns
+refresh the activity timestamp (`SessionActivity.last_activity_at`), and so do
+writes to attachments (`cid:media:`) and plans (`cid:plan:`), debounced to ≤1
+write/hour. Reads don't, so a session whose plans and media are only read
+expires on schedule: a `cid:` link outlives its session's last write by at
+most the retention window.
 
-The same hourly sweep also judges every `SESSION_` stream by its own last
-write, or its creation if it holds no messages. A stream not written for the
-retention window is deleted with the rest of its session, whether or not the
-session has metadata, unless a session or A2A lease or an unresolved A2A task
-holds it. That collects a session that is only read: the activity refreshes
-above keep its activity record recent, but nothing writes to its stream. It
-also collects a stream whose canonical metadata was never written (for example
-after a crash between stream creation and the metadata write) or was lost with
-a recreated `harnx_sessions` bucket, which the metadata scan can't see. The
-guards and the stream's age are read again immediately before each delete, and
-one pass deletes at most 100 streams this way (`session_stream_gc.rs`).
-`harnx list orphan-streams --cluster <cluster>` reports streams without
-metadata as a dry run.
+The same hourly sweep collects `SESSION_` streams that have no session
+metadata, which the activity scan can't see: a stream whose canonical metadata
+was never written (for example after a crash between stream creation and the
+metadata write) or was lost with a recreated `harnx_sessions` bucket. Such an
+orphan is judged by its own last write, or its creation if it holds no
+messages, and deleted with whatever else its session left behind once that is
+older than the retention window, unless a session or A2A lease or an
+unresolved A2A task holds it. The guards, the metadata and the stream's age
+are read again immediately before each delete, and one pass deletes at most
+100 orphans (`session_stream_gc.rs`). `harnx list orphan-streams --cluster
+<cluster>` reports the orphans as a dry run.
 
 ### Stream Retention Decision (`max_age`)
 

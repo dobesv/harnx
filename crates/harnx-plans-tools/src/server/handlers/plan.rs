@@ -41,12 +41,11 @@ pub(crate) async fn list(
     let mut plans = Vec::new();
     for (key, stored) in documents {
         let document = parse_plan(&stored.content).map_err(map_internal)?;
-        let url = parse_plan_url(&document.front.id)?;
+        parse_plan_url(&document.front.id)?;
         let plan_prefix = key.strip_suffix("plan").expect("selected plan root");
         let task_count = count_children(&keys, plan_prefix, "tasks");
         let note_count = count_children(&keys, plan_prefix, "notes");
         plans.push(plan_json(&document, task_count, note_count));
-        context.touch(&url).await;
     }
     result_json(json!({"items": plans, "next_cursor": page.next_cursor}))
 }
@@ -215,7 +214,6 @@ pub(crate) async fn get(
             .ok()
             .map(|note| note.front.id)
     });
-    context.touch(&url).await;
     let label = plan_label(&document, &url);
     let value = json!({
         "id": document.front.id,

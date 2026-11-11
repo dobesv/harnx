@@ -559,24 +559,24 @@ nats_lease_acquisition_timeout_secs: 60
   When unset, workers emit a startup warning that automatic expiry is disabled
   and remote session state will grow unbounded.
 
-  A session is collected once either of two clocks passes the retention
-  window. One is its activity record (`SessionActivity.last_activity_at`),
-  which turns, attachment (`cid:media:`) reads and writes, and plan
-  (`cid:plan:`) reads and writes refresh, debounced to at most one write an
-  hour. The other is the last write to its transcript stream, or the stream's
-  creation if it holds no messages. A session that is only read, never written,
-  for the whole window is therefore collected even though reads keep its
-  activity record fresh. A session held by a session lease, a scoped A2A lease
-  or an unresolved A2A task is kept.
+  A session is collected once its activity record
+  (`SessionActivity.last_activity_at`) is older than the retention window, or
+  its creation if it has none. Turns refresh the record, and so do attachment
+  (`cid:media:`) and plan (`cid:plan:`) writes, those with an in-process
+  hourly debounce. Reads refresh nothing, so a session that is only read for
+  the whole window is collected. A session held by a session lease, a scoped
+  A2A lease or an unresolved A2A task is kept.
 
-  The stream clock also covers streams the activity clock can't see: a
-  `SESSION_` stream whose canonical metadata was never written (a crash or
-  network failure between stream creation and the metadata write) or was lost
-  with a recreated `harnx_sessions` bucket. Such a stream is deleted, messages
-  and all, once its last write is older than the retention window. Every guard
-  and the stream's age are read again immediately before each delete, and each
-  delete runs the whole cascade above. One pass deletes at most 100 streams
-  this way, so a backlog drains at about 100 an hour.
+  The same sweep collects `SESSION_` streams that have no session metadata,
+  which the activity scan can't see: a stream whose canonical metadata was
+  never written (a crash or network failure between stream creation and the
+  metadata write) or was lost with a recreated `harnx_sessions` bucket. Such a
+  stream is deleted, messages and all, once its last write, or its creation if
+  it holds no messages, is older than the retention window, unless a lease or
+  A2A work holds the session. The guards, the metadata and the stream's age are
+  read again immediately before each delete, and each delete runs the whole
+  cascade above. One pass deletes at most 100 such streams, so a backlog drains
+  at about 100 an hour.
 
   `harnx list orphan-streams --cluster <cluster>` reports streams without
   metadata as a dry run; `harnx delete orphan-streams --cluster <cluster>` runs

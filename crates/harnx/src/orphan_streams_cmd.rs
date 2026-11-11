@@ -8,7 +8,7 @@ use crate::cli::{DeleteOrphanStreamsArgs, ListOrphanStreamsArgs};
 use crate::config::WorkingMode;
 use crate::init_frontend_config;
 use anyhow::{bail, ensure, Result};
-use harnx_runtime::session_stream_gc::StreamCleanupStats;
+use harnx_runtime::session_stream_gc::OrphanStreamCleanupStats;
 use harnx_runtime::session_stream_orphans::OrphanStreamInventory;
 
 fn wall_clock_secs() -> u64 {
@@ -36,10 +36,9 @@ pub async fn run_orphan_stream_delete_command(args: &DeleteOrphanStreamsArgs) ->
     // lease is taken or any stream is read; the pass re-validates defensively.
     let grace_secs = resolve_grace_secs(args.grace_hours, config.cleanup_remote_sessions_days)?;
     let max_deletions = resolve_max_deletions(args.max)?;
-    let options = harnx_runtime::session_stream_gc::StreamCleanupOptions {
+    let options = harnx_runtime::session_stream_gc::OrphanStreamCleanupOptions {
         idle_secs: grace_secs,
         max_deletions,
-        scope: harnx_runtime::session_stream_gc::StreamScope::Orphans,
     };
 
     // Hold the same leader lease as the hourly session-metadata GC, so the
@@ -56,7 +55,7 @@ pub async fn run_orphan_stream_delete_command(args: &DeleteOrphanStreamsArgs) ->
         );
     };
 
-    let cleanup = harnx_runtime::session_stream_gc::cleanup_session_streams(
+    let cleanup = harnx_runtime::session_stream_gc::cleanup_orphan_session_streams(
         &config,
         &args.cluster,
         wall_clock_secs(),
@@ -214,7 +213,7 @@ pub fn render_orphan_inventory(
 
 /// Result report for `harnx delete orphan-streams`.
 pub fn render_cleanup_report(
-    stats: &StreamCleanupStats,
+    stats: &OrphanStreamCleanupStats,
     cluster: &str,
     grace_secs: u64,
     max_deletions: usize,
@@ -262,7 +261,7 @@ fn yes_no<'a>(flag: bool, yes: &'a str, no: &'a str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harnx_runtime::session_stream_gc::DEFAULT_MAX_STREAM_DELETIONS_PER_RUN;
+    use harnx_runtime::session_stream_gc::DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN;
     use harnx_runtime::session_stream_orphans::{OrphanStreamReport, UnmappedStreamReport};
 
     fn assert_contains_all(text: &str, fragments: &[&str]) {
@@ -312,8 +311,8 @@ mod tests {
         assert_eq!(resolve_max_deletions(2).unwrap(), 2);
         assert!(resolve_max_deletions(0).is_err());
         assert_eq!(
-            resolve_max_deletions(DEFAULT_MAX_STREAM_DELETIONS_PER_RUN).unwrap(),
-            DEFAULT_MAX_STREAM_DELETIONS_PER_RUN
+            resolve_max_deletions(DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN).unwrap(),
+            DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN
         );
     }
 
@@ -394,7 +393,7 @@ mod tests {
 
     #[test]
     fn cleanup_report_counts_every_field() {
-        let stats = StreamCleanupStats {
+        let stats = OrphanStreamCleanupStats {
             streams: 20,
             idle: 15,
             deleted: 5,
@@ -421,7 +420,7 @@ mod tests {
 
     #[test]
     fn cleanup_report_without_unmapped_or_deferred_stays_quiet() {
-        let stats = StreamCleanupStats {
+        let stats = OrphanStreamCleanupStats {
             streams: 2,
             idle: 2,
             deleted: 2,

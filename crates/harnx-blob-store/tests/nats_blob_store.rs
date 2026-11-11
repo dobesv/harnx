@@ -123,10 +123,26 @@ async fn resolve_media_returns_bytes_and_cache_metadata() -> Result<()> {
             immutable: true,
         }
     );
-    let activity = jetstream.get_key_value("harnx_sessions").await?;
-    let activity_key = format!("sessions/{}/activity", session.owner());
-    assert!(activity.get(&activity_key).await?.is_some());
+    assert!(
+        !activity_recorded(&jetstream, &session).await?,
+        "a read must leave session activity alone"
+    );
     Ok(())
+}
+
+/// Whether `session` has an activity record. Nothing creates the session
+/// bucket until something records activity.
+async fn activity_recorded(
+    jetstream: &async_nats::jetstream::Context,
+    session: &SessionRef,
+) -> Result<bool> {
+    let Ok(activity) = jetstream.get_key_value("harnx_sessions").await else {
+        return Ok(false);
+    };
+    Ok(activity
+        .get(format!("sessions/{}/activity", session.owner()))
+        .await?
+        .is_some())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -157,11 +173,7 @@ async fn resolve_bounded_media_preserves_bytes_and_cache_metadata() -> Result<()
     put_media(&store, &url, &bytes, "image/png").await?;
 
     let bounded = resolve_bounded(&jetstream, &url, bytes.len()).await?;
-    let activity = jetstream.get_key_value("harnx_sessions").await?;
-    assert!(activity
-        .get(format!("sessions/{}/activity", session.owner()))
-        .await?
-        .is_some());
+    assert!(!activity_recorded(&jetstream, &session).await?);
     assert_eq!(bounded, resolve(&jetstream, &url).await?);
     for max_bytes in [bytes.len() + 1, usize::MAX] {
         assert_eq!(resolve_bounded(&jetstream, &url, max_bytes).await?, bounded);

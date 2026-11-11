@@ -836,7 +836,7 @@ async fn delete_items_and_plan(context: &TestContext, items: PlanItems<'_>) {
 }
 
 #[tokio::test]
-async fn list_plans_filters_owner_and_touches_activity() {
+async fn list_plans_filters_owner() {
     let Some(context) = TestContext::start().await else {
         return;
     };
@@ -847,14 +847,6 @@ async fn list_plans_filters_owner_and_touches_activity() {
         .invoke("list_plans", json!({"owner": owner}), None)
         .await;
     assert_eq!(json_result(&listed)["items"].as_array().unwrap().len(), 1);
-
-    let activity = context
-        .jetstream
-        .get_key_value("harnx_sessions")
-        .await
-        .expect("activity bucket");
-    let key = format!("sessions/{}/activity", parsed.owner());
-    assert!(activity.get(&key).await.unwrap().is_some());
 }
 
 #[tokio::test]

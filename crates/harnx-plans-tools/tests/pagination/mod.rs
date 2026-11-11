@@ -241,8 +241,10 @@ async fn list_plans_counts_live_keys_without_fetching_children_or_other_pages() 
     assert_eq!(page["items"][0]["note_count"], 2);
 }
 
+/// Session GC ages a session by its activity record, so reading its plans
+/// must leave the record alone; only a write refreshes it.
 #[tokio::test]
-async fn list_plans_touches_only_returned_page_sessions() {
+async fn reading_plans_leaves_session_activity_alone() {
     let Some(context) = TestContext::start().await else {
         return;
     };
@@ -265,13 +267,6 @@ async fn list_plans_touches_only_returned_page_sessions() {
             .await,
     );
     assert_page(&first, &[plans[0].to_string()], true);
-    let activity = context
-        .jetstream
-        .get_key_value("harnx_sessions")
-        .await
-        .expect("activity bucket");
-    assert_session_activity(&activity, &plans, 1).await;
-
     let second = json_result(
         &context
             .invoke(
@@ -282,25 +277,39 @@ async fn list_plans_touches_only_returned_page_sessions() {
             .await,
     );
     assert_page(&second, &[plans[1].to_string()], true);
-    assert_session_activity(&activity, &plans, 2).await;
-}
-
-async fn assert_session_activity(
-    activity: &async_nats::jetstream::kv::Store,
-    plans: &[harnx_core::cid_url::CidUrl],
-    touched_count: usize,
-) {
-    for (index, plan) in plans.iter().enumerate() {
-        let entry = activity
-            .get(format!("sessions/{}/activity", plan.owner()))
-            .await
-            .unwrap();
-        assert_eq!(
-            entry.is_some(),
-            index < touched_count,
-            "only returned page sessions are touched"
+    let read = context
+        .invoke("get_plan", json!({"plan": plans[0].to_string()}), None)
+        .await;
+    assert_ne!(read["isError"], true, "get_plan failed: {read}");
+    for plan in &plans {
+        assert!(
+            !activity_recorded(&context, plan).await,
+            "a read touched {plan}"
         );
     }
+
+    let written = context
+        .invoke(
+            "update_plan",
+            json!({"plan": plans[0].to_string(), "summary": "written"}),
+            None,
+        )
+        .await;
+    assert_ne!(written["isError"], true, "update_plan failed: {written}");
+    assert!(activity_recorded(&context, &plans[0]).await);
+}
+
+/// Whether `plan`'s session has an activity record. Nothing creates the
+/// session bucket until something records activity.
+async fn activity_recorded(context: &TestContext, plan: &harnx_core::cid_url::CidUrl) -> bool {
+    let Ok(activity) = context.jetstream.get_key_value("harnx_sessions").await else {
+        return false;
+    };
+    activity
+        .get(format!("sessions/{}/activity", plan.owner()))
+        .await
+        .unwrap()
+        .is_some()
 }
 
 async fn create_child_items(context: &TestContext, plan: &str) {

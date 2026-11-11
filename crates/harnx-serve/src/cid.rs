@@ -55,7 +55,7 @@ impl Server {
         let Some(url) = parse_cid_path(req.uri().path()) else {
             return cid_error_response(StatusCode::BAD_REQUEST, "malformed cid URL", protected);
         };
-        // Authorization precedes blob reads, activity renewal, and conditional responses.
+        // Authorization precedes blob reads and conditional responses.
         if !self.can_access_cid(&req, &url).await {
             return cid_error_response(StatusCode::NOT_FOUND, "cid blob not found", protected);
         }

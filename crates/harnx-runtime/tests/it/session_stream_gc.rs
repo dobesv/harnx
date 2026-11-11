@@ -1,6 +1,6 @@
-//! Session streams that go unwritten for the retention window are deleted,
-//! with or without session metadata, and `harnx list orphan-streams` reports
-//! the ones without.
+//! Session streams with no metadata are deleted once nothing has written to
+//! them for the retention window, and `harnx list orphan-streams` reports
+//! them.
 use crate::worker;
 
 use anyhow::Result;
@@ -14,8 +14,8 @@ use harnx_runtime::remote_session_cleanup::{
     run_periodic_remote_cleanup_with, CleanupOutcome, PeriodicCleanupOverrides, RemoteCleanupStats,
 };
 use harnx_runtime::session_stream_gc::{
-    cleanup_session_streams, delete_idle_stream_guarded, GuardedStreamDelete, StreamCleanupOptions,
-    StreamCleanupStats, StreamCleanupWindow, StreamScope,
+    cleanup_orphan_session_streams, delete_orphan_stream_guarded, GuardedOrphanDelete,
+    OrphanStreamCleanupOptions, OrphanStreamCleanupStats, OrphanStreamCleanupWindow,
 };
 use harnx_runtime::session_stream_orphans::{
     list_orphan_session_streams, OrphanStreamInventory, OrphanStreamReport,
@@ -89,8 +89,8 @@ async fn seed_session_metadata(
     Ok(store)
 }
 
-/// Record activity for `storage_key` at `at_unix_secs`, as a reader touching
-/// the session would.
+/// Record activity for `storage_key` at `at_unix_secs`, as a turn or a plan or
+/// attachment write would.
 async fn seed_activity(
     store: &SessionMetadataStore,
     storage_key: &str,
@@ -139,40 +139,33 @@ impl StreamFixture {
         }))
     }
 
-    async fn cleanup(
-        &self,
-        now: u64,
-        max_deletions: usize,
-        scope: StreamScope,
-    ) -> Result<StreamCleanupStats> {
-        cleanup_session_streams(
+    async fn cleanup(&self, now: u64, max_deletions: usize) -> Result<OrphanStreamCleanupStats> {
+        cleanup_orphan_session_streams(
             &self.config,
             "local",
             now,
-            &StreamCleanupOptions {
+            &OrphanStreamCleanupOptions {
                 idle_secs: IDLE_SECS,
                 max_deletions,
-                scope,
             },
         )
         .await
     }
 
-    async fn guarded_delete(&self, key: &str, scope: StreamScope) -> Result<GuardedStreamDelete> {
-        delete_idle_stream_guarded(
+    async fn guarded_delete(&self, key: &str, now: u64) -> Result<GuardedOrphanDelete> {
+        delete_orphan_stream_guarded(
             &self.config,
             "local",
             key,
-            StreamCleanupWindow {
-                now_unix_secs: idle_clock(),
+            OrphanStreamCleanupWindow {
+                now_unix_secs: now,
                 idle_secs: IDLE_SECS,
-                scope,
             },
         )
         .await
     }
 
-    async fn assert_active_retained(&self, stats: &StreamCleanupStats, key: &str) {
+    async fn assert_active_retained(&self, stats: &OrphanStreamCleanupStats, key: &str) {
         assert_eq!((stats.deleted, stats.skipped_active), (0, 1));
         assert!(
             stream_exists(&self.jetstream, key).await,
@@ -263,7 +256,7 @@ fn assert_unmapped_inventory(inventory: &OrphanStreamInventory) {
     assert!(!inventory.unmapped[0].reason.is_empty());
 }
 
-fn assert_batch_counts(stats: &StreamCleanupStats) {
+fn assert_batch_counts(stats: &OrphanStreamCleanupStats) {
     assert_eq!(
         (stats.idle, stats.deleted, stats.deferred, stats.unmapped),
         (3, 2, 1, 1),
@@ -275,14 +268,14 @@ fn assert_batch_counts(stats: &StreamCleanupStats) {
 async fn assert_empty_orphan_cleanup(
     session_id: &str,
     now: u64,
-    expected: StreamCleanupStats,
+    expected: OrphanStreamCleanupStats,
 ) -> Result<()> {
     let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
     let key = storage_key(session_id);
     seed_stream(&fixture.jetstream, &key, 0).await?;
-    let stats = fixture.cleanup(now, 5, StreamScope::Orphans).await?;
+    let stats = fixture.cleanup(now, 5).await?;
     assert_eq!(stats, expected);
     assert_eq!(
         stream_exists(&fixture.jetstream, &key).await,
@@ -305,7 +298,7 @@ async fn assert_periodic_orphan_cleanup(
     let outcome = fixture
         .periodic_cleanup(&format!("{session_id}-streams"), now)
         .await;
-    let should_exist = expected.idle_streams_deleted == 0;
+    let should_exist = expected.orphan_deleted == 0;
     assert_eq!(outcome, CleanupOutcome::Ran(expected));
     assert_eq!(stream_exists(&fixture.jetstream, &key).await, should_exist);
     Ok(())
@@ -359,7 +352,7 @@ async fn an_idle_empty_orphan_is_deleted() -> Result<()> {
     assert_empty_orphan_cleanup(
         "cleanup-old",
         idle_clock(),
-        StreamCleanupStats {
+        OrphanStreamCleanupStats {
             streams: 1,
             idle: 1,
             deleted: 1,
@@ -383,9 +376,7 @@ async fn an_idle_orphan_with_messages_is_deleted_with_its_leftovers() -> Result<
         .put(activity_key(&key), "left behind".into())
         .await?;
 
-    let stats = fixture
-        .cleanup(idle_clock(), 5, StreamScope::Orphans)
-        .await?;
+    let stats = fixture.cleanup(idle_clock(), 5).await?;
 
     assert_eq!((stats.idle, stats.deleted, stats.errors), (1, 1, 0));
     assert!(!stream_exists(&fixture.jetstream, &key).await);
@@ -398,7 +389,7 @@ async fn an_orphan_written_within_the_window_is_kept() -> Result<()> {
     assert_empty_orphan_cleanup(
         "cleanup-recent",
         wall_clock_secs(),
-        StreamCleanupStats {
+        OrphanStreamCleanupStats {
             streams: 1,
             ..Default::default()
         },
@@ -416,65 +407,40 @@ async fn the_guarded_delete_keeps_a_stream_written_within_the_window() -> Result
     let key = storage_key("cleanup-rewritten");
     seed_stream(&fixture.jetstream, &key, 1).await?;
 
-    let guarded = delete_idle_stream_guarded(
-        &fixture.config,
-        "local",
-        &key,
-        StreamCleanupWindow {
-            now_unix_secs: wall_clock_secs(),
-            idle_secs: IDLE_SECS,
-            scope: StreamScope::All,
-        },
-    )
-    .await?;
+    let guarded = fixture.guarded_delete(&key, wall_clock_secs()).await?;
 
-    assert_eq!(guarded, GuardedStreamDelete::Recent);
+    assert_eq!(guarded, GuardedOrphanDelete::Recent);
     assert!(stream_exists(&fixture.jetstream, &key).await);
     Ok(())
 }
 
-/// A session whose readers keep its activity record fresh, but whose stream
-/// nothing has written for the window, is deleted by the hourly GC.
-/// `harnx delete orphan-streams` leaves it alone, since it has metadata.
+/// A session with metadata is judged by its activity record, which turns and
+/// plan and attachment writes refresh, never by its stream: one written only
+/// through plans, with a stream idle for the whole window, is kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_idle_session_with_recent_activity_is_deleted_by_the_hourly_gc() -> Result<()> {
+async fn a_session_with_metadata_is_left_to_the_activity_clock() -> Result<()> {
     let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
-    let session_id = "cleanup-read-only";
+    let session_id = "cleanup-written-elsewhere";
     let key = storage_key(session_id);
     let store = seed_session_metadata(&fixture.jetstream, session_id).await?;
     seed_stream(&fixture.jetstream, &key, 2).await?;
     let now = idle_clock();
     seed_activity(&store, &key, now).await?;
 
-    let orphans_only = fixture.cleanup(now, 5, StreamScope::Orphans).await?;
-    assert_eq!(
-        (orphans_only.deleted, orphans_only.skipped_metadata),
-        (0, 1)
-    );
-    assert!(stream_exists(&fixture.jetstream, &key).await);
-
     let outcome = fixture
         .periodic_cleanup(&format!("{session_id}-gc"), now)
         .await;
 
-    assert_eq!(
-        outcome,
-        CleanupOutcome::Ran(RemoteCleanupStats {
-            idle_streams: 1,
-            idle_streams_deleted: 1,
-            ..Default::default()
-        }),
-        "the activity scan keeps it, the stream scan deletes it"
-    );
-    assert!(!stream_exists(&fixture.jetstream, &key).await);
-    assert!(store.get(&key).await?.is_none(), "metadata goes too");
+    assert_eq!(outcome, CleanupOutcome::Ran(RemoteCleanupStats::default()));
+    assert!(stream_exists(&fixture.jetstream, &key).await);
+    assert!(store.get(&key).await?.is_some());
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn metadata_written_after_listing_keeps_an_orphan_in_the_orphans_scope() -> Result<()> {
+async fn metadata_written_after_listing_prevents_deletion() -> Result<()> {
     let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
@@ -492,13 +458,11 @@ async fn metadata_written_after_listing_keeps_an_orphan_in_the_orphans_scope() -
 
     // The guarded delete, the exact path the cleanup takes per candidate,
     // reads metadata from the leader right before deleting.
-    let guarded = fixture.guarded_delete(&key, StreamScope::Orphans).await?;
-    assert_eq!(guarded, GuardedStreamDelete::MetadataPresent);
+    let guarded = fixture.guarded_delete(&key, idle_clock()).await?;
+    assert_eq!(guarded, GuardedOrphanDelete::MetadataPresent);
 
     // And a full pass leaves the stream alone.
-    let stats = fixture
-        .cleanup(idle_clock(), 5, StreamScope::Orphans)
-        .await?;
+    let stats = fixture.cleanup(idle_clock(), 5).await?;
     assert_eq!((stats.deleted, stats.skipped_metadata), (0, 1));
     assert!(stream_exists(&fixture.jetstream, &key).await);
     Ok(())
@@ -514,7 +478,7 @@ async fn session_lease_prevents_idle_stream_deletion() -> Result<()> {
     let _lease =
         worker::acquire_worker_lease(&fixture.jetstream, &key, "orphan-lease-holder").await?;
 
-    let stats = fixture.cleanup(idle_clock(), 5, StreamScope::All).await?;
+    let stats = fixture.cleanup(idle_clock(), 5).await?;
 
     fixture.assert_active_retained(&stats, &key).await;
     Ok(())
@@ -539,7 +503,7 @@ async fn a2a_lease_prevents_idle_stream_deletion() -> Result<()> {
         .put(format!("sessions/{key}/a2a/lock"), "a2a-lease".into())
         .await?;
 
-    let stats = fixture.cleanup(idle_clock(), 5, StreamScope::All).await?;
+    let stats = fixture.cleanup(idle_clock(), 5).await?;
 
     fixture.assert_active_retained(&stats, &key).await;
     Ok(())
@@ -560,7 +524,7 @@ async fn unresolved_a2a_task_prevents_idle_stream_deletion() -> Result<()> {
         )
         .await?;
 
-    let stats = fixture.cleanup(idle_clock(), 5, StreamScope::All).await?;
+    let stats = fixture.cleanup(idle_clock(), 5).await?;
 
     fixture.assert_active_retained(&stats, &key).await;
     Ok(())
@@ -587,7 +551,7 @@ async fn idle_stream_cleanup_honors_batch_limit_and_keeps_unmapped() -> Result<(
         .await?;
     let now = idle_clock();
 
-    let stats = fixture.cleanup(now, 2, StreamScope::All).await?;
+    let stats = fixture.cleanup(now, 2).await?;
 
     assert_batch_counts(&stats);
     assert_eq!(
@@ -605,7 +569,7 @@ async fn idle_stream_cleanup_honors_batch_limit_and_keeps_unmapped() -> Result<(
     );
 
     // The next pass collects the remainder.
-    let stats = fixture.cleanup(now, 2, StreamScope::All).await?;
+    let stats = fixture.cleanup(now, 2).await?;
     assert_eq!(stats.deleted, 1);
     for key in &keys {
         assert!(!stream_exists(&fixture.jetstream, key).await);
@@ -622,8 +586,8 @@ async fn periodic_gc_collects_idle_orphan_streams() -> Result<()> {
         "periodic-gc-orphan",
         wall_clock_secs() + 2 * IDLE_SECS,
         RemoteCleanupStats {
-            idle_streams: 1,
-            idle_streams_deleted: 1,
+            orphan_streams: 1,
+            orphan_deleted: 1,
             ..Default::default()
         },
     )

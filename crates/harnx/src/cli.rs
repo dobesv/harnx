@@ -218,7 +218,7 @@ pub struct DeleteOrphanStreamsArgs {
     /// Maximum number of orphan streams deleted in one run
     #[arg(
         long,
-        default_value_t = harnx_runtime::session_stream_gc::DEFAULT_MAX_STREAM_DELETIONS_PER_RUN
+        default_value_t = harnx_runtime::session_stream_gc::DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN
     )]
     pub max: usize,
 }
@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(delete.grace_hours, None);
         assert_eq!(
             delete.max,
-            harnx_runtime::session_stream_gc::DEFAULT_MAX_STREAM_DELETIONS_PER_RUN
+            harnx_runtime::session_stream_gc::DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN
         );
     }
 
