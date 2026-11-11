@@ -1311,10 +1311,12 @@ invisible to it forever (GH #2650). Inspect transcripts read-only
 `SessionMetadataStore::create`, and only then touch the stream through a
 creation-capable handle (`new_with_replicas`/`with_replicas`). Failure-recording
 paths use `NatsSessionLogBackend::append_event_existing`, which appends only to
-an existing stream. Leftover orphans are reconciled by the periodic GC pass and
-`harnx list|delete orphan-streams` (`session_stream_orphans.rs`): grace equals
-the retention window, empty-only, leader metadata recheck immediately before
-delete, non-empty orphans quarantined, per-run deletion batch capped.
+an existing stream. Leftover orphans are collected by the periodic GC pass and
+`harnx list|delete orphan-streams` (`session_stream_gc.rs`; listing in
+`session_stream_orphans.rs`): an orphan goes once its last write is older than
+the retention window, empty or not, through the full session cascade, with
+metadata, leases, A2A and the stream's age re-read immediately before each
+delete, at most 100 deletions per pass.
 
 See `docs/configuration-guide.md` under "Session User Identity" and
 `crates/harnx-serve/README.md` under "Request Identity" for user-facing config.
@@ -1375,7 +1377,7 @@ URL components:
 
 Operational properties:
 - **Capability URL**: When access rules are off, the URL is the capability (bearer token) — possession grants access without per-resource ACLs. When access rules are enabled, `/v1/cid/*` requires a valid session-authorization check against the caller identity (see `cid.rs` — authorization runs before blob resolution and ETag handling).
-- **Activity renewal**: Any attachment or plan read or write touches the owning session's activity timestamp (`SessionActivity.last_activity_at`), debounced in-process to at most one write per hour. This resets the session retention clock while resources remain in active use.
+- **Activity renewal**: An attachment or plan write touches the owning session's activity timestamp (`SessionActivity.last_activity_at`), debounced in-process to at most one write per hour. Reads don't, so a session that is only read still expires; a write is what resets the retention clock.
 - **Session deletion cascade**: Session deletion (`delete_owner`) purges both `media/<owner>/` objects in `harnx_attachments` and `plan/<owner>/` keys in `harnx_plans`.
 - **Plans storage location**: Plans live exclusively in NATS JetStream KV (`harnx_plans`); previous filesystem storage under `.agent` is retired.
 

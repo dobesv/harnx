@@ -69,15 +69,14 @@ fn log_cleanup_stats(stats: &RemoteCleanupStats, cluster: &str) {
     if cleanup_has_activity(stats) {
         log::info!(
             "session GC completed for cluster='{cluster}': scanned={} deleted={} \
-             skipped_active={} orphan_streams={} orphan_deleted={} \
-             orphan_quarantined={} orphan_skipped={} orphan_unmapped={} errors={}",
+             skipped_active={} orphan_streams={} orphan_deleted={} orphan_kept={} \
+             orphan_unmapped={} errors={}",
             stats.scanned,
             stats.deleted,
             stats.skipped_active,
             stats.orphan_streams,
             stats.orphan_deleted,
-            stats.orphan_quarantined,
-            stats.orphan_skipped,
+            stats.orphan_kept,
             stats.orphan_unmapped,
             stats.errors
         );
@@ -91,11 +90,13 @@ fn log_cleanup_stats(stats: &RemoteCleanupStats, cluster: &str) {
     }
 }
 
+/// A pass that deleted something, kept an idle orphan (a backlog the batch
+/// limit deferred among them) or hit an error is worth an info line.
 fn cleanup_has_activity(stats: &RemoteCleanupStats) -> bool {
     [
         stats.deleted,
         stats.orphan_deleted,
-        stats.orphan_quarantined,
+        stats.orphan_kept,
         stats.errors,
     ]
     .into_iter()
@@ -107,7 +108,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deletions_quarantine_and_errors_raise_gc_log_level() {
+    fn deletions_kept_orphans_and_errors_raise_gc_log_level() {
         for stats in [
             RemoteCleanupStats {
                 deleted: 1,
@@ -118,7 +119,7 @@ mod tests {
                 ..Default::default()
             },
             RemoteCleanupStats {
-                orphan_quarantined: 1,
+                orphan_kept: 1,
                 ..Default::default()
             },
             RemoteCleanupStats {
@@ -131,12 +132,10 @@ mod tests {
     }
 
     #[test]
-    fn scanning_and_retaining_streams_keeps_gc_at_debug_level() {
+    fn scanning_without_changes_keeps_gc_at_debug_level() {
         let stats = RemoteCleanupStats {
             scanned: 3,
             skipped_active: 2,
-            orphan_streams: 4,
-            orphan_skipped: 3,
             orphan_unmapped: 1,
             ..Default::default()
         };

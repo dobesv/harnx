@@ -108,4 +108,4 @@ media/<owner>/<hash>
   MIME-bearing data URI. Treat returned CIDs as opaque references rather than
   deriving them from downloaded bytes.
 
-Reads and writes through this server touch the owning session's activity timestamp (`SessionActivity.last_activity_at`), debounced to at most once per hour. This resets the session retention clock while stored media remains in active use.
+Writes through this server touch the owning session's activity timestamp (`SessionActivity.last_activity_at`), debounced to at most once per hour, which resets the session retention clock. Reads don't, so media whose session is only read expires with it.

@@ -52,43 +52,103 @@ pub(crate) async fn delete_remote_session_by_key(
 ) -> Result<SessionDeleteResult> {
     let jetstream = config.nats_jetstream(cluster).await?;
     let lease_bucket = load_optional_lease_bucket(config, cluster).await?;
-    let metadata = a2a::metadata(&jetstream).await?;
-    let a2a_fence = match &metadata {
-        Some(metadata) => a2a::fence(metadata, session_id).await?,
-        None => None,
-    };
-    let stream_deleted = delete_session_stream(&jetstream, session_id).await?;
+    delete_session_state(&jetstream, lease_bucket, session_id, StreamDeletion::First).await
+}
+
+/// When a session deletion removes the session's stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamDeletion {
+    /// Before the rest, so nothing can append to the session meanwhile.
+    First,
+    /// After the rest, for an orphan that only its stream lets the GC find
+    /// again: a step that fails part way leaves the stream, and with it the
+    /// rest of the session, for the next pass.
+    Last,
+}
+
+/// Everything [`delete_remote_session_by_key`] removes, through handles the
+/// caller already holds.
+pub(crate) async fn delete_session_state(
+    jetstream: &async_nats::jetstream::Context,
+    lease_bucket: Option<async_nats::jetstream::kv::Store>,
+    session_id: &str,
+    stream: StreamDeletion,
+) -> Result<SessionDeleteResult> {
+    let a2a = A2aDeletion::begin(jetstream, session_id).await?;
+    let mut stream_deleted =
+        stream == StreamDeletion::First && delete_session_stream(jetstream, session_id).await?;
+    let result = delete_session_leftovers(jetstream, lease_bucket, session_id).await?;
+    a2a.finish(session_id).await?;
+    if stream == StreamDeletion::Last {
+        stream_deleted = delete_session_stream(jetstream, session_id).await?;
+    }
+    Ok(SessionDeleteResult {
+        stream_deleted,
+        ..result
+    })
+}
+
+/// The A2A admission fence a session deletion holds from start to finish.
+struct A2aDeletion {
+    metadata: Option<SessionMetadataStore>,
+    fence: Option<a2a::DeletionFence>,
+}
+
+impl A2aDeletion {
+    async fn begin(jetstream: &async_nats::jetstream::Context, session_id: &str) -> Result<Self> {
+        let metadata = a2a::metadata(jetstream).await?;
+        let fence = match &metadata {
+            Some(metadata) => a2a::fence(metadata, session_id).await?,
+            None => None,
+        };
+        Ok(Self { metadata, fence })
+    }
+
+    async fn finish(self, session_id: &str) -> Result<()> {
+        if let (Some(fence), Some(metadata)) = (self.fence, self.metadata) {
+            fence.finish(&metadata, session_id).await?;
+        }
+        Ok(())
+    }
+}
+
+/// A session's lease, journal rows, metadata keys, attachments and plans.
+async fn delete_session_leftovers(
+    jetstream: &async_nats::jetstream::Context,
+    lease_bucket: Option<async_nats::jetstream::kv::Store>,
+    session_id: &str,
+) -> Result<SessionDeleteResult> {
     let lease_deleted = delete_session_lease(lease_bucket, session_id).await?;
+    purge_session_journal(jetstream, session_id).await?;
+    let metadata_keys_deleted = purge_session_metadata(jetstream, session_id).await?;
+    // delete_owner removes media and plans, legacy attachments included.
+    let attachments_deleted = harnx_blob_store::delete_owner(jetstream, session_id).await?;
+    Ok(SessionDeleteResult {
+        stream_deleted: false,
+        lease_deleted,
+        metadata_keys_deleted,
+        attachments_deleted,
+    })
+}
+
+async fn purge_session_journal(
+    jetstream: &async_nats::jetstream::Context,
+    session_id: &str,
+) -> Result<()> {
     match jetstream
         .get_key_value(harnx_toolset_server::invocation_journal::BUCKET)
         .await
     {
         Ok(store) => {
             harnx_toolset_server::invocation_journal::InvocationJournal::from_store(
-                &jetstream, store,
+                jetstream, store,
             )
             .purge_session(session_id)
-            .await?
+            .await
         }
-        Err(error) if kv_bucket_missing(&error) => {}
-        Err(error) => return Err(error.into()),
+        Err(error) if kv_bucket_missing(&error) => Ok(()),
+        Err(error) => Err(error.into()),
     }
-    let metadata_keys_deleted = purge_session_metadata(&jetstream, session_id).await?;
-    // Use blob-store's delete_owner for unified media + plans deletion
-    let blob_deleted = harnx_blob_store::delete_owner(&jetstream, session_id).await?;
-    // Legacy attachments are included in delete_owner (media prefix), but keep
-    // the result aligned with SessionDeleteResult's attachments_deleted field
-    let attachments_deleted = blob_deleted;
-    if let (Some(fence), Some(metadata)) = (a2a_fence, metadata) {
-        fence.finish(&metadata, session_id).await?;
-    }
-
-    Ok(SessionDeleteResult {
-        stream_deleted,
-        lease_deleted,
-        metadata_keys_deleted,
-        attachments_deleted,
-    })
 }
 
 async fn purge_session_metadata(

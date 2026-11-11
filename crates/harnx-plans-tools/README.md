@@ -68,7 +68,7 @@ won't appear on subsequent pages.
 Use `owner` (a 64-character session key) to select another session, or
 `all_sessions: true` to list every session. Without caller identity or an explicit
 owner, it lists every session. Combining `owner` and `all_sessions: true` is an
-error. Only plans returned on the page renew session activity.
+error. Listing leaves session activity alone.
 
 `list_tasks` and `list_notes` require a full plan URL and list only that plan's
 children. Note bodies in `list_notes` are previews capped at 200 characters;
@@ -93,4 +93,4 @@ Deleted and purged keys are excluded; concurrent deletions can shorten a page.
 
 Tool responses include markdown cross-links (`[title](url)`) and MCP `ContentBlock::resource_link` entries with MIME `text/markdown; charset=utf-8` for the plan index and affected item, while preserving diff blocks for mutations.
 
-Writes use revision compare-and-set and retry conflicts up to five times. Reads and writes touch owner session activity so active plans follow session retention instead of a separate filesystem cleanup policy.
+Writes use revision compare-and-set and retry conflicts up to five times. Writes touch owner session activity so active plans follow session retention instead of a separate filesystem cleanup policy. Reads don't, so a session whose plans are only read still expires.

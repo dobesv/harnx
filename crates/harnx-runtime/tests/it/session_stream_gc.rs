@@ -1,23 +1,29 @@
+//! Session streams with no metadata are deleted once nothing has written to
+//! them for the retention window, and `harnx list orphan-streams` reports
+//! them.
 use crate::worker;
 
 use anyhow::Result;
 use async_nats::jetstream::stream;
+use chrono::{TimeZone, Utc};
 use harnx_runtime::nats_session_log::{stream_name_for_session, subject_for_session};
 use harnx_runtime::nats_session_metadata::{
-    SessionInitializer, SessionMetadata, SessionMetadataStore,
+    activity_key, SessionActivity, SessionInitializer, SessionMetadata, SessionMetadataStore,
 };
 use harnx_runtime::remote_session_cleanup::{
     run_periodic_remote_cleanup_with, CleanupOutcome, PeriodicCleanupOverrides, RemoteCleanupStats,
 };
+use harnx_runtime::session_stream_gc::{
+    cleanup_orphan_session_streams, delete_orphan_stream_guarded, GuardedOrphanDelete,
+    OrphanStreamCleanupOptions, OrphanStreamCleanupStats, OrphanStreamCleanupWindow,
+};
 use harnx_runtime::session_stream_orphans::{
-    cleanup_orphan_session_streams, delete_orphan_stream_guarded, list_orphan_session_streams,
-    GuardedOrphanDelete, OrphanStreamCleanupOptions, OrphanStreamCleanupStats,
-    OrphanStreamCleanupWindow, OrphanStreamInventory, OrphanStreamReport,
+    list_orphan_session_streams, OrphanStreamInventory, OrphanStreamReport,
 };
 use worker::{local_nats_runtime_config, require_nats_server};
 
 const AGENT: &str = "orphan-stream-agent";
-const GRACE_SECS: u64 = 24 * 60 * 60;
+const IDLE_SECS: u64 = 24 * 60 * 60;
 
 fn storage_key(session_id: &str) -> String {
     harnx_core::session_identity::session_key(Some(AGENT), session_id)
@@ -30,17 +36,20 @@ fn wall_clock_secs() -> u64 {
         .as_secs()
 }
 
-/// Ensure the session metadata bucket exists. Orphan reconciliation
-/// deliberately refuses to run without it: metadata presence is a hard
-/// deletion guard, and the metadata GC also skips clusters without the
-/// bucket.
+/// A clock just past the idle window, so a stream written now counts as idle.
+fn idle_clock() -> u64 {
+    wall_clock_secs() + IDLE_SECS + 60
+}
+
+/// Ensure the session metadata bucket exists. Stream cleanup deliberately
+/// refuses to run without it: metadata presence is read for every candidate,
+/// and the metadata GC also skips clusters without the bucket.
 async fn ensure_metadata_bucket(jetstream: &async_nats::jetstream::Context) -> Result<()> {
     SessionMetadataStore::ensure(jetstream, 1).await.map(|_| ())
 }
 
-/// A `SESSION_` stream for `storage_key` with `messages` messages and no
-/// session metadata — the state the periodic GC can never see today.
-async fn seed_orphan_stream(
+/// A `SESSION_` stream for `storage_key` holding `messages` messages.
+async fn seed_stream(
     jetstream: &async_nats::jetstream::Context,
     storage_key: &str,
     messages: u64,
@@ -57,7 +66,7 @@ async fn seed_orphan_stream(
         .await?;
     for _ in 0..messages {
         jetstream
-            .publish(subject.clone(), "orphan".into())
+            .publish(subject.clone(), "entry".into())
             .await?
             .await?;
     }
@@ -80,6 +89,27 @@ async fn seed_session_metadata(
     Ok(store)
 }
 
+/// Record activity for `storage_key` at `at_unix_secs`, as a turn or a plan or
+/// attachment write would.
+async fn seed_activity(
+    store: &SessionMetadataStore,
+    storage_key: &str,
+    at_unix_secs: u64,
+) -> Result<()> {
+    let activity = SessionActivity {
+        first_activation_at: None,
+        last_activity_at: Utc.timestamp_opt(at_unix_secs as i64, 0).unwrap(),
+    };
+    store
+        .kv_store()
+        .put(
+            activity_key(storage_key),
+            serde_json::to_vec(&activity)?.into(),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn stream_exists(jetstream: &async_nats::jetstream::Context, storage_key: &str) -> bool {
     jetstream
         .get_stream(&stream_name_for_session(storage_key))
@@ -87,13 +117,13 @@ async fn stream_exists(jetstream: &async_nats::jetstream::Context, storage_key: 
         .is_ok()
 }
 
-struct OrphanFixture {
+struct StreamFixture {
     config: harnx_runtime::config::Config,
     jetstream: async_nats::jetstream::Context,
     _server: crate::common::NatsServerHandle,
 }
 
-impl OrphanFixture {
+impl StreamFixture {
     async fn start() -> Result<Option<Self>> {
         let Some(server) = require_nats_server().await? else {
             return Ok(None);
@@ -115,21 +145,21 @@ impl OrphanFixture {
             "local",
             now,
             &OrphanStreamCleanupOptions {
-                grace_secs: GRACE_SECS,
+                idle_secs: IDLE_SECS,
                 max_deletions,
             },
         )
         .await
     }
 
-    async fn guarded_delete(&self, key: &str) -> Result<GuardedOrphanDelete> {
+    async fn guarded_delete(&self, key: &str, now: u64) -> Result<GuardedOrphanDelete> {
         delete_orphan_stream_guarded(
             &self.config,
             "local",
             key,
             OrphanStreamCleanupWindow {
-                now_unix_secs: wall_clock_secs() + GRACE_SECS + 60,
-                grace_secs: GRACE_SECS,
+                now_unix_secs: now,
+                idle_secs: IDLE_SECS,
             },
         )
         .await
@@ -151,6 +181,20 @@ impl OrphanFixture {
             }
         }
         remaining
+    }
+
+    async fn periodic_cleanup(&self, gc_session_id: &str, now: u64) -> CleanupOutcome {
+        run_periodic_remote_cleanup_with(
+            &self.config,
+            1,
+            "local",
+            PeriodicCleanupOverrides {
+                gc_session_id,
+                epoch_hour: now / 3_600,
+                now_unix_secs: now,
+            },
+        )
+        .await
     }
 }
 
@@ -197,7 +241,7 @@ fn assert_empty_orphan(orphan: &OrphanStreamReport, key: &str, name: &str) {
 fn assert_recent(created: u64) {
     let now = wall_clock_secs();
     assert!(created <= now);
-    assert!(created + GRACE_SECS > now);
+    assert!(created + IDLE_SECS > now);
 }
 
 fn assert_busy_orphan(busy: &OrphanStreamReport) {
@@ -214,23 +258,24 @@ fn assert_unmapped_inventory(inventory: &OrphanStreamInventory) {
 
 fn assert_batch_counts(stats: &OrphanStreamCleanupStats) {
     assert_eq!(
-        (stats.deleted, stats.scanned, stats.deferred, stats.unmapped),
-        (2, 3, 1, 1),
+        (stats.idle, stats.deleted, stats.deferred, stats.unmapped),
+        (3, 2, 1, 1),
         "batch cap must defer candidates without hiding them"
     );
 }
 
-async fn assert_empty_cleanup(
+/// An empty orphan stream, cleaned up at `now`.
+async fn assert_empty_orphan_cleanup(
     session_id: &str,
-    clock_offset: u64,
+    now: u64,
     expected: OrphanStreamCleanupStats,
 ) -> Result<()> {
-    let Some(fixture) = OrphanFixture::start().await? else {
+    let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
     let key = storage_key(session_id);
-    seed_orphan_stream(&fixture.jetstream, &key, 0).await?;
-    let stats = fixture.cleanup(wall_clock_secs() + clock_offset, 5).await?;
+    seed_stream(&fixture.jetstream, &key, 0).await?;
+    let stats = fixture.cleanup(now, 5).await?;
     assert_eq!(stats, expected);
     assert_eq!(
         stream_exists(&fixture.jetstream, &key).await,
@@ -239,29 +284,20 @@ async fn assert_empty_cleanup(
     Ok(())
 }
 
-async fn assert_periodic_cleanup(
+/// An empty orphan stream, through the worker's hourly GC at `now`.
+async fn assert_periodic_orphan_cleanup(
     session_id: &str,
-    clock_offset: u64,
+    now: u64,
     expected: RemoteCleanupStats,
 ) -> Result<()> {
-    let Some(fixture) = OrphanFixture::start().await? else {
+    let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
     let key = storage_key(session_id);
-    seed_orphan_stream(&fixture.jetstream, &key, 0).await?;
-    let now = wall_clock_secs() + clock_offset;
-    let gc_session_id = format!("{session_id}-streams");
-    let outcome = run_periodic_remote_cleanup_with(
-        &fixture.config,
-        1,
-        "local",
-        PeriodicCleanupOverrides {
-            gc_session_id: &gc_session_id,
-            epoch_hour: now / 3_600,
-            now_unix_secs: now,
-        },
-    )
-    .await;
+    seed_stream(&fixture.jetstream, &key, 0).await?;
+    let outcome = fixture
+        .periodic_cleanup(&format!("{session_id}-streams"), now)
+        .await;
     let should_exist = expected.orphan_deleted == 0;
     assert_eq!(outcome, CleanupOutcome::Ran(expected));
     assert_eq!(stream_exists(&fixture.jetstream, &key).await, should_exist);
@@ -270,24 +306,24 @@ async fn assert_periodic_cleanup(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn orphan_stream_inventory_reports_streams_without_metadata() -> Result<()> {
-    let Some(fixture) = OrphanFixture::start().await? else {
+    let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
 
     // A live session (stream + metadata) must never be reported.
     let live_id = "inventory-live";
     seed_session_metadata(&fixture.jetstream, live_id).await?;
-    seed_orphan_stream(&fixture.jetstream, &storage_key(live_id), 1).await?;
+    seed_stream(&fixture.jetstream, &storage_key(live_id), 1).await?;
 
-    // An empty orphan, the state GH #2650 leaves behind.
+    // An empty orphan, the state a failed metadata write leaves behind.
     let orphan_id = "inventory-orphan";
     let orphan_key = storage_key(orphan_id);
-    let orphan_name = seed_orphan_stream(&fixture.jetstream, &orphan_key, 0).await?;
+    let orphan_name = seed_stream(&fixture.jetstream, &orphan_key, 0).await?;
 
     // A non-empty orphan still counts as an orphan, with message data.
     let busy_id = "inventory-orphan-busy";
     let busy_key = storage_key(busy_id);
-    seed_orphan_stream(&fixture.jetstream, &busy_key, 2).await?;
+    seed_stream(&fixture.jetstream, &busy_key, 2).await?;
 
     // A SESSION_ stream whose subject cannot map back to a storage key.
     fixture
@@ -312,13 +348,13 @@ async fn orphan_stream_inventory_reports_streams_without_metadata() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn orphan_stream_cleanup_deletes_old_empty_orphan() -> Result<()> {
-    // Inject a clock beyond the grace window.
-    assert_empty_cleanup(
+async fn an_idle_empty_orphan_is_deleted() -> Result<()> {
+    assert_empty_orphan_cleanup(
         "cleanup-old",
-        GRACE_SECS + 60,
+        idle_clock(),
         OrphanStreamCleanupStats {
-            scanned: 1,
+            streams: 1,
+            idle: 1,
             deleted: 1,
             ..Default::default()
         },
@@ -326,51 +362,126 @@ async fn orphan_stream_cleanup_deletes_old_empty_orphan() -> Result<()> {
     .await
 }
 
+/// An orphan that holds messages goes too, once its last write is past the
+/// window, and the deletion takes the session's other leftovers with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn non_empty_orphan_stream_is_quarantined_not_deleted() -> Result<()> {
-    let Some(fixture) = OrphanFixture::start().await? else {
+async fn an_idle_orphan_with_messages_is_deleted_with_its_leftovers() -> Result<()> {
+    let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
-    let key = storage_key("cleanup-quarantine");
-    seed_orphan_stream(&fixture.jetstream, &key, 3).await?;
-    let now = wall_clock_secs() + GRACE_SECS + 60;
+    let key = storage_key("cleanup-messages");
+    seed_stream(&fixture.jetstream, &key, 3).await?;
+    let metadata = fixture.jetstream.get_key_value("harnx_sessions").await?;
+    metadata
+        .put(activity_key(&key), "left behind".into())
+        .await?;
 
-    let stats = fixture.cleanup(now, 5).await?;
+    let stats = fixture.cleanup(idle_clock(), 5).await?;
 
-    assert_eq!(stats.deleted, 0);
-    assert_eq!(stats.quarantined, 1);
+    assert_eq!((stats.idle, stats.deleted, stats.errors), (1, 1, 0));
+    assert!(!stream_exists(&fixture.jetstream, &key).await);
+    assert_eq!(metadata.get(activity_key(&key)).await?, None);
+    Ok(())
+}
+
+/// The orphan's stream is the only thing that lets a later pass find its
+/// session, so it goes last: a cascade that fails part way leaves the stream,
+/// and the next pass finishes the job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_orphan_whose_cascade_fails_is_retried_next_pass() -> Result<()> {
+    let Some(fixture) = StreamFixture::start().await? else {
+        return Ok(());
+    };
+    let key = storage_key("cleanup-retry");
+    seed_stream(&fixture.jetstream, &key, 1).await?;
+    // A journal bucket that refuses purges fails the cascade partway through.
+    let journal = "KV_harnx_tool_invocations";
+    fixture
+        .jetstream
+        .create_stream(stream::Config {
+            name: journal.into(),
+            subjects: vec!["$KV.harnx_tool_invocations.>".into()],
+            deny_purge: true,
+            ..Default::default()
+        })
+        .await?;
+
+    let failed = fixture.cleanup(idle_clock(), 5).await?;
+    assert_eq!((failed.deleted, failed.errors), (0, 1));
     assert!(stream_exists(&fixture.jetstream, &key).await);
-    // The single-stream guarded delete refuses it too.
-    let guarded = fixture.guarded_delete(&key).await?;
-    assert_eq!(guarded, GuardedOrphanDelete::NonEmpty { messages: 3 });
-    assert!(stream_exists(&fixture.jetstream, &key).await);
+
+    fixture.jetstream.delete_stream(journal).await?;
+    let retried = fixture.cleanup(idle_clock(), 5).await?;
+    assert_eq!((retried.deleted, retried.errors), (1, 0));
+    assert!(!stream_exists(&fixture.jetstream, &key).await);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn orphan_stream_within_grace_period_is_skipped() -> Result<()> {
-    assert_empty_cleanup(
+async fn an_orphan_written_within_the_window_is_kept() -> Result<()> {
+    assert_empty_orphan_cleanup(
         "cleanup-recent",
-        0,
+        wall_clock_secs(),
         OrphanStreamCleanupStats {
-            scanned: 1,
-            skipped_recent: 1,
+            streams: 1,
             ..Default::default()
         },
     )
     .await
 }
 
+/// The guarded delete reads the stream's age again just before deleting, so
+/// a stream written after the listing picked it is kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn metadata_written_after_inventory_prevents_deletion() -> Result<()> {
-    let Some(fixture) = OrphanFixture::start().await? else {
+async fn the_guarded_delete_keeps_a_stream_written_within_the_window() -> Result<()> {
+    let Some(fixture) = StreamFixture::start().await? else {
+        return Ok(());
+    };
+    let key = storage_key("cleanup-rewritten");
+    seed_stream(&fixture.jetstream, &key, 1).await?;
+
+    let guarded = fixture.guarded_delete(&key, wall_clock_secs()).await?;
+
+    assert_eq!(guarded, GuardedOrphanDelete::Recent);
+    assert!(stream_exists(&fixture.jetstream, &key).await);
+    Ok(())
+}
+
+/// A session with metadata is judged by its activity record, which turns and
+/// plan and attachment writes refresh, never by its stream: one written only
+/// through plans, with a stream idle for the whole window, is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_with_metadata_is_left_to_the_activity_clock() -> Result<()> {
+    let Some(fixture) = StreamFixture::start().await? else {
+        return Ok(());
+    };
+    let session_id = "cleanup-written-elsewhere";
+    let key = storage_key(session_id);
+    let store = seed_session_metadata(&fixture.jetstream, session_id).await?;
+    seed_stream(&fixture.jetstream, &key, 2).await?;
+    let now = idle_clock();
+    seed_activity(&store, &key, now).await?;
+
+    let outcome = fixture
+        .periodic_cleanup(&format!("{session_id}-gc"), now)
+        .await;
+
+    assert_eq!(outcome, CleanupOutcome::Ran(RemoteCleanupStats::default()));
+    assert!(stream_exists(&fixture.jetstream, &key).await);
+    assert!(store.get(&key).await?.is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_written_after_listing_prevents_deletion() -> Result<()> {
+    let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
     let session_id = "cleanup-metadata-late";
     let key = storage_key(session_id);
-    seed_orphan_stream(&fixture.jetstream, &key, 0).await?;
+    seed_stream(&fixture.jetstream, &key, 0).await?;
 
-    // Inventory sees the orphan...
+    // The listing sees the orphan...
     let inventory = list_orphan_session_streams(&fixture.config, "local").await?;
     assert_eq!(inventory.orphans.len(), 1);
     assert_eq!(inventory.orphans[0].storage_key, key);
@@ -378,43 +489,41 @@ async fn metadata_written_after_inventory_prevents_deletion() -> Result<()> {
     // ...then the session's metadata write lands, racing the cleanup.
     seed_session_metadata(&fixture.jetstream, session_id).await?;
 
-    // The guarded delete — the exact path the cleanup calls per candidate —
-    // re-reads metadata from the leader right before deleting.
-    let guarded = fixture.guarded_delete(&key).await?;
+    // The guarded delete, the exact path the cleanup takes per candidate,
+    // reads metadata from the leader right before deleting.
+    let guarded = fixture.guarded_delete(&key, idle_clock()).await?;
     assert_eq!(guarded, GuardedOrphanDelete::MetadataPresent);
 
     // And a full pass leaves the stream alone.
-    let now = wall_clock_secs() + GRACE_SECS + 60;
-    let stats = fixture.cleanup(now, 5).await?;
-    assert_eq!(stats.deleted, 0);
+    let stats = fixture.cleanup(idle_clock(), 5).await?;
+    assert_eq!((stats.deleted, stats.skipped_metadata), (0, 1));
     assert!(stream_exists(&fixture.jetstream, &key).await);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn session_lease_prevents_orphan_stream_deletion() -> Result<()> {
-    let Some(fixture) = OrphanFixture::start().await? else {
+async fn session_lease_prevents_idle_stream_deletion() -> Result<()> {
+    let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
     let key = storage_key("cleanup-leased");
-    seed_orphan_stream(&fixture.jetstream, &key, 0).await?;
+    seed_stream(&fixture.jetstream, &key, 0).await?;
     let _lease =
         worker::acquire_worker_lease(&fixture.jetstream, &key, "orphan-lease-holder").await?;
-    let now = wall_clock_secs() + GRACE_SECS + 60;
 
-    let stats = fixture.cleanup(now, 5).await?;
+    let stats = fixture.cleanup(idle_clock(), 5).await?;
 
     fixture.assert_active_retained(&stats, &key).await;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a2a_lease_prevents_orphan_stream_deletion() -> Result<()> {
-    let Some(fixture) = OrphanFixture::start().await? else {
+async fn a2a_lease_prevents_idle_stream_deletion() -> Result<()> {
+    let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
     let key = storage_key("cleanup-a2a-leased");
-    seed_orphan_stream(&fixture.jetstream, &key, 0).await?;
+    seed_stream(&fixture.jetstream, &key, 0).await?;
     let lease_bucket = fixture
         .jetstream
         .create_key_value(async_nats::jetstream::kv::Config {
@@ -426,21 +535,20 @@ async fn a2a_lease_prevents_orphan_stream_deletion() -> Result<()> {
     lease_bucket
         .put(format!("sessions/{key}/a2a/lock"), "a2a-lease".into())
         .await?;
-    let now = wall_clock_secs() + GRACE_SECS + 60;
 
-    let stats = fixture.cleanup(now, 5).await?;
+    let stats = fixture.cleanup(idle_clock(), 5).await?;
 
     fixture.assert_active_retained(&stats, &key).await;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unresolved_a2a_task_prevents_orphan_stream_deletion() -> Result<()> {
-    let Some(fixture) = OrphanFixture::start().await? else {
+async fn unresolved_a2a_task_prevents_idle_stream_deletion() -> Result<()> {
+    let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
     let key = storage_key("cleanup-a2a-unresolved");
-    seed_orphan_stream(&fixture.jetstream, &key, 0).await?;
+    seed_stream(&fixture.jetstream, &key, 0).await?;
     let metadata = fixture.jetstream.get_key_value("harnx_sessions").await?;
     metadata
         .put(
@@ -448,24 +556,23 @@ async fn unresolved_a2a_task_prevents_orphan_stream_deletion() -> Result<()> {
             r#"{"state":{"active":{"snapshot":{"task":{"status":{"state":"TASK_STATE_WORKING"}}}}}}"#.into(),
         )
         .await?;
-    let now = wall_clock_secs() + GRACE_SECS + 60;
 
-    let stats = fixture.cleanup(now, 5).await?;
+    let stats = fixture.cleanup(idle_clock(), 5).await?;
 
     fixture.assert_active_retained(&stats, &key).await;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn orphan_stream_cleanup_honors_batch_limit_and_keeps_unmapped() -> Result<()> {
-    let Some(fixture) = OrphanFixture::start().await? else {
+async fn idle_stream_cleanup_honors_batch_limit_and_keeps_unmapped() -> Result<()> {
+    let Some(fixture) = StreamFixture::start().await? else {
         return Ok(());
     };
     let keys: Vec<String> = (0..3)
         .map(|i| storage_key(&format!("cleanup-batch-{i}")))
         .collect();
     for key in &keys {
-        seed_orphan_stream(&fixture.jetstream, key, 0).await?;
+        seed_stream(&fixture.jetstream, key, 1).await?;
     }
     fixture
         .jetstream
@@ -475,7 +582,7 @@ async fn orphan_stream_cleanup_honors_batch_limit_and_keeps_unmapped() -> Result
             ..Default::default()
         })
         .await?;
-    let now = wall_clock_secs() + GRACE_SECS + 60;
+    let now = idle_clock();
 
     let stats = fixture.cleanup(now, 2).await?;
 
@@ -483,7 +590,7 @@ async fn orphan_stream_cleanup_honors_batch_limit_and_keeps_unmapped() -> Result
     assert_eq!(
         fixture.remaining_streams(&keys).await,
         1,
-        "exactly one orphan should remain for the next run"
+        "exactly one idle stream should remain for the next run"
     );
     assert!(
         fixture
@@ -503,14 +610,14 @@ async fn orphan_stream_cleanup_honors_batch_limit_and_keeps_unmapped() -> Result
     Ok(())
 }
 
-/// The periodic GC pass picks up orphan streams too: same leader lease, same
-/// hourly dedup, retention window as the grace period (GH #2650).
+/// The hourly GC picks up orphan streams: same leader lease, same hourly
+/// dedup, retention window as the idle window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn periodic_gc_collects_orphan_streams() -> Result<()> {
-    // days = 1, so two days puts the stream beyond retention.
-    assert_periodic_cleanup(
+async fn periodic_gc_collects_idle_orphan_streams() -> Result<()> {
+    // days = 1, so two days puts the stream past the window.
+    assert_periodic_orphan_cleanup(
         "periodic-gc-orphan",
-        2 * GRACE_SECS,
+        wall_clock_secs() + 2 * IDLE_SECS,
         RemoteCleanupStats {
             orphan_streams: 1,
             orphan_deleted: 1,
@@ -520,18 +627,14 @@ async fn periodic_gc_collects_orphan_streams() -> Result<()> {
     .await
 }
 
-/// A fresh orphan created by an in-flight session must survive a GC pass that
-/// runs with the real clock: the retention window is the grace period.
+/// A fresh orphan created by an in-flight session must survive a GC pass
+/// that runs with the real clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn periodic_gc_keeps_fresh_orphan_streams() -> Result<()> {
-    assert_periodic_cleanup(
+    assert_periodic_orphan_cleanup(
         "periodic-gc-fresh-orphan",
-        0,
-        RemoteCleanupStats {
-            orphan_streams: 1,
-            orphan_skipped: 1,
-            ..Default::default()
-        },
+        wall_clock_secs(),
+        RemoteCleanupStats::default(),
     )
     .await
 }

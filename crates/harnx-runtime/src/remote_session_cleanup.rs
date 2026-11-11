@@ -2,8 +2,9 @@ use crate::config::Config;
 use crate::nats_admin::{self, kv_bucket_missing};
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_session_metadata::{ListedSession, SessionMetadataStore, SESSION_METADATA_BUCKET};
-use crate::session_stream_orphans::{
-    OrphanStreamCleanupOptions, DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN,
+use crate::session_stream_gc::{
+    OrphanStreamCleanupOptions, OrphanStreamCleanupStats, StreamGcContext,
+    DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN,
 };
 use async_nats::jetstream::kv::{Operation, Store};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,14 +22,13 @@ pub struct RemoteCleanupStats {
     pub deleted: usize,
     pub skipped_active: usize,
     pub errors: usize,
-    /// `SESSION_` streams found with no session metadata (GH #2650).
+    /// `SESSION_` streams with no session metadata and no write for the
+    /// retention window.
     pub orphan_streams: usize,
     pub orphan_deleted: usize,
-    /// Non-empty orphan streams quarantined for manual review, never deleted.
-    pub orphan_quarantined: usize,
-    /// Orphans kept for other reasons: within the grace period, active, or
-    /// their metadata reappeared before the delete.
-    pub orphan_skipped: usize,
+    /// Idle orphans kept: held by a lease or an A2A task, written to or given
+    /// metadata during the pass, or left for the next pass by the batch limit.
+    pub orphan_kept: usize,
     /// `SESSION_` streams that could not be mapped back to a storage key;
     /// reported and never deleted.
     pub orphan_unmapped: usize,
@@ -300,28 +300,21 @@ async fn run_remote_cleanup_inner(
         handle_candidate(&context, &session_id, &mut stats).await;
     }
 
-    // Orphan-stream reconciliation (GH #2650). The scan above enumerates KV
-    // metadata, so a `SESSION_` stream whose metadata write never landed is
-    // invisible to it. Reuse the retention window as the orphan grace period:
-    // the knob already expresses how long session state may sit without
-    // activity, and a separate config would let orphan collection run on a
-    // clock operators never reviewed.
+    // A stream whose metadata was never written, or was lost with a recreated
+    // bucket, is invisible to the scan above. Judge each such orphan by its own
+    // last write, against the same retention window. The listing already in
+    // hand saves a metadata read per known session.
     let orphan_options = OrphanStreamCleanupOptions {
-        grace_secs: days.saturating_mul(SECONDS_PER_DAY),
+        idle_secs: days.saturating_mul(SECONDS_PER_DAY),
         max_deletions: DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN,
     };
-    // The metadata listing is already in hand; pass it as the inventory
-    // prefilter so the orphan scan skips a leader read per known session.
     let known_metadata_keys: std::collections::HashSet<String> = records
         .iter()
         .map(|record| record.metadata.storage_key())
         .collect();
-    let orphan_context = crate::session_stream_orphans::OrphanCleanupContext::from_parts(
-        jetstream.clone(),
-        metadata_store.clone(),
-        lease_store.clone(),
-    );
-    match crate::session_stream_orphans::orphan_cleanup_pass(
+    let orphan_context =
+        StreamGcContext::from_parts(jetstream.clone(), metadata_store.clone(), lease_store);
+    match crate::session_stream_gc::orphan_cleanup_pass(
         &orphan_context,
         Some(&known_metadata_keys),
         now_unix_secs,
@@ -329,7 +322,7 @@ async fn run_remote_cleanup_inner(
     )
     .await
     {
-        Ok(orphan) => record_orphan_cleanup(&mut stats, orphan),
+        Ok(orphans) => record_orphan_cleanup(&mut stats, &orphans),
         Err(error) => {
             warn!(
                 "orphan session stream cleanup failed: cluster={} days={} err={error:#}",
@@ -342,16 +335,12 @@ async fn run_remote_cleanup_inner(
     Ok(stats)
 }
 
-fn record_orphan_cleanup(
-    stats: &mut RemoteCleanupStats,
-    orphan: crate::session_stream_orphans::OrphanStreamCleanupStats,
-) {
-    stats.orphan_streams = orphan.scanned + orphan.unmapped;
-    stats.orphan_deleted = orphan.deleted;
-    stats.orphan_quarantined = orphan.quarantined;
-    stats.orphan_skipped = orphan.retained() - orphan.quarantined;
-    stats.orphan_unmapped = orphan.unmapped;
-    stats.errors += orphan.errors;
+fn record_orphan_cleanup(stats: &mut RemoteCleanupStats, orphans: &OrphanStreamCleanupStats) {
+    stats.orphan_streams = orphans.idle;
+    stats.orphan_deleted = orphans.deleted;
+    stats.orphan_kept = orphans.kept();
+    stats.orphan_unmapped = orphans.unmapped;
+    stats.errors += orphans.errors;
 }
 
 async fn acquire_gc_lease(

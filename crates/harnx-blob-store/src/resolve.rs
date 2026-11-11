@@ -6,7 +6,6 @@ use harnx_core::cid_url::CidUrl;
 use crate::{
     limits::check_size,
     media::{get_media_with_limit, optional_attachments_bucket},
-    touch_activity,
 };
 
 /// A resolved blob and its cache metadata.
@@ -19,6 +18,10 @@ pub struct ResolvedBlob {
 }
 
 /// Resolve a canonical `cid:` URL from NATS-backed storage.
+///
+/// A read leaves the owning session's activity record alone. Session GC ages a
+/// session by its activity, which turns and writes refresh, so a session that
+/// is only read still expires.
 pub async fn resolve(
     jetstream: &async_nats::jetstream::Context,
     url: &CidUrl,
@@ -70,9 +73,5 @@ async fn resolve_with_limit(
             }
         }
     };
-
-    if let Err(error) = touch_activity(jetstream, &url.owner()).await {
-        log::debug!("activity touch failed during resolve (non-fatal): {error:#}");
-    }
     Ok(resolved)
 }

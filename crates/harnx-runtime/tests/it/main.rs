@@ -58,7 +58,7 @@ mod nats_worker_web_session_url;
 mod package_loading;
 mod package_tool_naming_e2e;
 mod scope_discovery;
-mod session_stream_orphans;
+mod session_stream_gc;
 mod title_generation;
 mod tls_client_config;
 mod tool_reconciler;

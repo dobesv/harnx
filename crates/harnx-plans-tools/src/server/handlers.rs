@@ -23,6 +23,8 @@ pub(crate) struct OperationContext<'a> {
 }
 
 impl OperationContext<'_> {
+    /// Refresh the plan owner's session activity after a write. Reads leave it
+    /// alone, so a session whose plans are only read still ages out.
     pub(crate) async fn touch(&self, url: &CidUrl) {
         if let Err(error) = touch_activity(self.jetstream, &url.owner()).await {
             log::debug!("plan activity touch failed for {}: {error:#}", url.owner());

@@ -42,7 +42,6 @@ pub(crate) async fn list(
         }
         tasks.push(task_json(&task));
     }
-    context.touch(&plan).await;
     result_json(json!({"items": tasks, "next_cursor": page.next_cursor}))
 }
 
@@ -56,7 +55,6 @@ pub(crate) async fn get(
         .map_err(map_internal)?
         .ok_or_else(|| ErrorData::invalid_params(format!("task not found: {url}"), None))?;
     let task = parse_task(&stored.content).map_err(map_internal)?;
-    context.touch(&plan).await;
     result_json_with_resources(
         task_json(&task),
         item_resources(&plan, &url, "task", &task_label(&task, &url)),

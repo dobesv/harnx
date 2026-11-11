@@ -71,9 +71,10 @@ Worker session GC runs hourly only when `cleanup_remote_sessions_days` (or
 `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS`) is positive. Default is disabled. Session
 retention keeps live message identities, including the global first-message
 reservation. There is no independent short deduplication TTL. The same pass also
-collects orphaned empty `SESSION_` streams whose session metadata never landed
-(beyond the retention window, no leases, no A2A work, metadata re-checked before
-the delete); non-empty orphans are quarantined for manual review.
+deletes `SESSION_` streams that have no session metadata once nothing has
+written to them for the retention window, unless a lease or unresolved A2A work
+holds the session; the guards are read again before each delete, and an A2A
+session goes through the same coordinated deletion as below.
 
 Deletion acquires the distinct A2A scoped lease, validates the exact context
 revision and revision-purges authority before deleting the transcript. It refuses
