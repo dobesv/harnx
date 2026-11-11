@@ -11,6 +11,8 @@
 //! unresolved A2A task holds the session. Deletion runs the whole session
 //! cascade ([`nats_admin::delete_session_state`]), so any journal rows,
 //! metadata keys, attachments and plans left under the session go with it.
+//! The stream goes last, so a cascade that fails part way leaves the orphan
+//! for the next pass.
 //!
 //! Every guard is read again immediately before the delete, the stream's age
 //! last. JetStream has no conditional stream delete, so a write that lands
@@ -224,8 +226,13 @@ impl StreamGcContext {
         if last_write_unix_secs(&info) >= window.cutoff() {
             return Ok(GuardedOrphanDelete::Recent);
         }
-        nats_admin::delete_session_state(&self.jetstream, self.lease_store.clone(), storage_key)
-            .await?;
+        nats_admin::delete_session_state(
+            &self.jetstream,
+            self.lease_store.clone(),
+            storage_key,
+            nats_admin::StreamDeletion::Last,
+        )
+        .await?;
         Ok(GuardedOrphanDelete::Deleted)
     }
 }

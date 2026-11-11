@@ -384,6 +384,39 @@ async fn an_idle_orphan_with_messages_is_deleted_with_its_leftovers() -> Result<
     Ok(())
 }
 
+/// The orphan's stream is the only thing that lets a later pass find its
+/// session, so it goes last: a cascade that fails part way leaves the stream,
+/// and the next pass finishes the job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_orphan_whose_cascade_fails_is_retried_next_pass() -> Result<()> {
+    let Some(fixture) = StreamFixture::start().await? else {
+        return Ok(());
+    };
+    let key = storage_key("cleanup-retry");
+    seed_stream(&fixture.jetstream, &key, 1).await?;
+    // A journal bucket that refuses purges fails the cascade partway through.
+    let journal = "KV_harnx_tool_invocations";
+    fixture
+        .jetstream
+        .create_stream(stream::Config {
+            name: journal.into(),
+            subjects: vec!["$KV.harnx_tool_invocations.>".into()],
+            deny_purge: true,
+            ..Default::default()
+        })
+        .await?;
+
+    let failed = fixture.cleanup(idle_clock(), 5).await?;
+    assert_eq!((failed.deleted, failed.errors), (0, 1));
+    assert!(stream_exists(&fixture.jetstream, &key).await);
+
+    fixture.jetstream.delete_stream(journal).await?;
+    let retried = fixture.cleanup(idle_clock(), 5).await?;
+    assert_eq!((retried.deleted, retried.errors), (1, 0));
+    assert!(!stream_exists(&fixture.jetstream, &key).await);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_orphan_written_within_the_window_is_kept() -> Result<()> {
     assert_empty_orphan_cleanup(
