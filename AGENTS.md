@@ -1311,10 +1311,13 @@ invisible to it forever (GH #2650). Inspect transcripts read-only
 `SessionMetadataStore::create`, and only then touch the stream through a
 creation-capable handle (`new_with_replicas`/`with_replicas`). Failure-recording
 paths use `NatsSessionLogBackend::append_event_existing`, which appends only to
-an existing stream. Leftover orphans are reconciled by the periodic GC pass and
-`harnx list|delete orphan-streams` (`session_stream_orphans.rs`): grace equals
-the retention window, empty-only, leader metadata recheck immediately before
-delete, non-empty orphans quarantined, per-run deletion batch capped.
+an existing stream. The periodic GC also deletes any `SESSION_` stream not
+written for the retention window, orphan or not, through the full session
+cascade (`session_stream_gc.rs`): guards (leases, A2A, the stream's age) are
+re-read immediately before each delete, at most 100 deletions per pass, and a
+session that is only read still goes, since reads refresh activity but not the
+stream. `harnx list|delete orphan-streams` (`session_stream_orphans.rs` lists)
+covers streams without metadata only.
 
 See `docs/configuration-guide.md` under "Session User Identity" and
 `crates/harnx-serve/README.md` under "Request Identity" for user-facing config.

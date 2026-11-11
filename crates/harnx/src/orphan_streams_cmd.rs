@@ -1,14 +1,15 @@
 //! Commands and report rendering for `harnx list/delete orphan-streams` (GH #2650).
 //!
 //! Pure grace and batch helpers keep `cleanup_remote_sessions_days: 0` and
-//! `--grace-hours 0` from turning "GC disabled" into "delete every empty orphan
+//! `--grace-hours 0` from turning "GC disabled" into "delete every orphan
 //! immediately". Unit tests cover these bounds without connecting to NATS.
 
 use crate::cli::{DeleteOrphanStreamsArgs, ListOrphanStreamsArgs};
 use crate::config::WorkingMode;
 use crate::init_frontend_config;
 use anyhow::{bail, ensure, Result};
-use harnx_runtime::session_stream_orphans::{OrphanStreamCleanupStats, OrphanStreamInventory};
+use harnx_runtime::session_stream_gc::StreamCleanupStats;
+use harnx_runtime::session_stream_orphans::OrphanStreamInventory;
 
 fn wall_clock_secs() -> u64 {
     std::time::SystemTime::now()
@@ -35,9 +36,10 @@ pub async fn run_orphan_stream_delete_command(args: &DeleteOrphanStreamsArgs) ->
     // lease is taken or any stream is read; the pass re-validates defensively.
     let grace_secs = resolve_grace_secs(args.grace_hours, config.cleanup_remote_sessions_days)?;
     let max_deletions = resolve_max_deletions(args.max)?;
-    let options = harnx_runtime::session_stream_orphans::OrphanStreamCleanupOptions {
-        grace_secs,
+    let options = harnx_runtime::session_stream_gc::StreamCleanupOptions {
+        idle_secs: grace_secs,
         max_deletions,
+        scope: harnx_runtime::session_stream_gc::StreamScope::Orphans,
     };
 
     // Hold the same leader lease as the hourly session-metadata GC, so the
@@ -54,7 +56,7 @@ pub async fn run_orphan_stream_delete_command(args: &DeleteOrphanStreamsArgs) ->
         );
     };
 
-    let cleanup = harnx_runtime::session_stream_orphans::cleanup_orphan_session_streams(
+    let cleanup = harnx_runtime::session_stream_gc::cleanup_session_streams(
         &config,
         &args.cluster,
         wall_clock_secs(),
@@ -79,21 +81,22 @@ pub async fn run_orphan_stream_delete_command(args: &DeleteOrphanStreamsArgs) ->
 const SECONDS_PER_HOUR: u64 = 60 * 60;
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 
-/// Resolve the orphan grace period, in seconds.
+/// Resolve the orphan grace period, in seconds: how long a stream must have
+/// gone without a write before it is deleted.
 ///
 /// An explicit `--grace-hours` wins over the configured retention
 /// (`cleanup_remote_sessions_days`). `Some(0)` retention means "GC disabled"
 /// everywhere else in the product, so it never silently becomes a zero-hour
 /// grace window here: an operator on a disabled-GC cluster must pass
 /// `--grace-hours` with a deliberate positive value instead. Zero hours is
-/// rejected outright — "delete every empty orphan right now, regardless of
-/// age" is exactly the batch the grace period exists to prevent.
+/// rejected outright — "delete every orphan right now, however recently it
+/// was written" is exactly the batch the grace period exists to prevent.
 pub fn resolve_grace_secs(grace_hours: Option<u64>, retention_days: Option<u64>) -> Result<u64> {
     if let Some(hours) = grace_hours {
         ensure!(
             hours > 0,
-            "--grace-hours must be positive; 0 would delete every empty orphan \
-             stream immediately, regardless of age"
+            "--grace-hours must be positive; 0 would delete every orphan stream \
+             immediately, however recently it was written"
         );
         return Ok(hours.saturating_mul(SECONDS_PER_HOUR));
     }
@@ -211,20 +214,20 @@ pub fn render_orphan_inventory(
 
 /// Result report for `harnx delete orphan-streams`.
 pub fn render_cleanup_report(
-    stats: &OrphanStreamCleanupStats,
+    stats: &StreamCleanupStats,
     cluster: &str,
     grace_secs: u64,
     max_deletions: usize,
 ) -> String {
     let mut out = format!(
         "Orphan session stream cleanup on cluster '{cluster}' \
-         (grace={}h, max={max_deletions}): scanned={} deleted={} quarantined={} \
+         (grace={}h, max={max_deletions}): streams={} idle={} deleted={} \
          skipped_recent={} skipped_active={} skipped_metadata={} deferred={} \
          unmapped={} errors={}\n",
         grace_secs_to_hours(grace_secs),
-        stats.scanned,
+        stats.streams,
+        stats.idle,
         stats.deleted,
-        stats.quarantined,
         stats.skipped_recent,
         stats.skipped_active,
         stats.skipped_metadata,
@@ -232,12 +235,6 @@ pub fn render_cleanup_report(
         stats.unmapped,
         stats.errors
     );
-    if stats.quarantined > 0 {
-        out.push_str(&format!(
-            "Quarantined streams hold messages and are never deleted automatically; review them \
-             with 'harnx list orphan-streams --cluster {cluster}'.\n"
-        ));
-    }
     if stats.unmapped > 0 {
         out.push_str(&format!(
             "Unmappable streams are reported and never deleted automatically; see \
@@ -265,9 +262,8 @@ fn yes_no<'a>(flag: bool, yes: &'a str, no: &'a str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harnx_runtime::session_stream_orphans::{
-        OrphanStreamReport, UnmappedStreamReport, DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN,
-    };
+    use harnx_runtime::session_stream_gc::DEFAULT_MAX_STREAM_DELETIONS_PER_RUN;
+    use harnx_runtime::session_stream_orphans::{OrphanStreamReport, UnmappedStreamReport};
 
     fn assert_contains_all(text: &str, fragments: &[&str]) {
         for fragment in fragments {
@@ -316,8 +312,8 @@ mod tests {
         assert_eq!(resolve_max_deletions(2).unwrap(), 2);
         assert!(resolve_max_deletions(0).is_err());
         assert_eq!(
-            resolve_max_deletions(DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN).unwrap(),
-            DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN
+            resolve_max_deletions(DEFAULT_MAX_STREAM_DELETIONS_PER_RUN).unwrap(),
+            DEFAULT_MAX_STREAM_DELETIONS_PER_RUN
         );
     }
 
@@ -398,10 +394,10 @@ mod tests {
 
     #[test]
     fn cleanup_report_counts_every_field() {
-        let stats = OrphanStreamCleanupStats {
-            scanned: 15,
+        let stats = StreamCleanupStats {
+            streams: 20,
+            idle: 15,
             deleted: 5,
-            quarantined: 1,
             skipped_recent: 2,
             skipped_active: 3,
             skipped_metadata: 1,
@@ -413,7 +409,8 @@ mod tests {
         assert_contains_all(
             &text,
             &[
-                "scanned=15",
+                "streams=20",
+                "idle=15",
                 "deleted=5",
                 "deferred=3",
                 "grace=48h",
@@ -423,19 +420,16 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_report_without_quarantine_or_unmapped_stays_quiet() {
-        let stats = OrphanStreamCleanupStats {
-            scanned: 2,
+    fn cleanup_report_without_unmapped_or_deferred_stays_quiet() {
+        let stats = StreamCleanupStats {
+            streams: 2,
+            idle: 2,
             deleted: 2,
             ..Default::default()
         };
         let text = render_cleanup_report(&stats, "prod", SECONDS_PER_DAY, 5);
-        assert_contains_all(&text, &["scanned=2 deleted=2", "deferred=0"]);
-        for absent in [
-            "Quarantined streams",
-            "Unmappable streams",
-            "deferred to the next",
-        ] {
+        assert_contains_all(&text, &["idle=2 deleted=2", "deferred=0"]);
+        for absent in ["Unmappable streams", "deferred to the next"] {
             assert!(!text.contains(absent), "unexpected {absent:?} in {text:?}");
         }
     }

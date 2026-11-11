@@ -1778,14 +1778,19 @@ the owning session's activity timestamp (`SessionActivity.last_activity_at`),
 debounced to ≤1 write/hour. This resets the retention clock, ensuring actively
 referenced media and plans remain available.
 
-The same hourly sweep reconciles orphaned session streams: `SESSION_` streams
-whose canonical metadata was never written (for example after a crash between
-stream creation and the metadata write) are collected only when they are older
-than the retention window, still hold zero messages, carry no session or A2A
-lease and no unresolved A2A tasks, and still have no metadata when re-checked
-immediately before deletion. Non-empty orphan streams are quarantined and
-logged for manual review instead of deleted. `harnx list orphan-streams
---cluster <cluster>` reports the inventory as a dry run.
+The same hourly sweep also judges every `SESSION_` stream by its own last
+write, or its creation if it holds no messages. A stream not written for the
+retention window is deleted with the rest of its session, whether or not the
+session has metadata, unless a session or A2A lease or an unresolved A2A task
+holds it. That collects a session that is only read: the activity refreshes
+above keep its activity record recent, but nothing writes to its stream. It
+also collects a stream whose canonical metadata was never written (for example
+after a crash between stream creation and the metadata write) or was lost with
+a recreated `harnx_sessions` bucket, which the metadata scan can't see. The
+guards and the stream's age are read again immediately before each delete, and
+one pass deletes at most 100 streams this way (`session_stream_gc.rs`).
+`harnx list orphan-streams --cluster <cluster>` reports streams without
+metadata as a dry run.
 
 ### Stream Retention Decision (`max_age`)
 

@@ -52,12 +52,22 @@ pub(crate) async fn delete_remote_session_by_key(
 ) -> Result<SessionDeleteResult> {
     let jetstream = config.nats_jetstream(cluster).await?;
     let lease_bucket = load_optional_lease_bucket(config, cluster).await?;
-    let metadata = a2a::metadata(&jetstream).await?;
+    delete_session_state(&jetstream, lease_bucket, session_id).await
+}
+
+/// Everything [`delete_remote_session_by_key`] removes, through handles the
+/// caller already holds.
+pub(crate) async fn delete_session_state(
+    jetstream: &async_nats::jetstream::Context,
+    lease_bucket: Option<async_nats::jetstream::kv::Store>,
+    session_id: &str,
+) -> Result<SessionDeleteResult> {
+    let metadata = a2a::metadata(jetstream).await?;
     let a2a_fence = match &metadata {
         Some(metadata) => a2a::fence(metadata, session_id).await?,
         None => None,
     };
-    let stream_deleted = delete_session_stream(&jetstream, session_id).await?;
+    let stream_deleted = delete_session_stream(jetstream, session_id).await?;
     let lease_deleted = delete_session_lease(lease_bucket, session_id).await?;
     match jetstream
         .get_key_value(harnx_toolset_server::invocation_journal::BUCKET)
@@ -65,7 +75,7 @@ pub(crate) async fn delete_remote_session_by_key(
     {
         Ok(store) => {
             harnx_toolset_server::invocation_journal::InvocationJournal::from_store(
-                &jetstream, store,
+                jetstream, store,
             )
             .purge_session(session_id)
             .await?
@@ -73,9 +83,9 @@ pub(crate) async fn delete_remote_session_by_key(
         Err(error) if kv_bucket_missing(&error) => {}
         Err(error) => return Err(error.into()),
     }
-    let metadata_keys_deleted = purge_session_metadata(&jetstream, session_id).await?;
+    let metadata_keys_deleted = purge_session_metadata(jetstream, session_id).await?;
     // Use blob-store's delete_owner for unified media + plans deletion
-    let blob_deleted = harnx_blob_store::delete_owner(&jetstream, session_id).await?;
+    let blob_deleted = harnx_blob_store::delete_owner(jetstream, session_id).await?;
     // Legacy attachments are included in delete_owner (media prefix), but keep
     // the result aligned with SessionDeleteResult's attachments_deleted field
     let attachments_deleted = blob_deleted;

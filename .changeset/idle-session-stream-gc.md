@@ -1,0 +1,4 @@
+---
+harnx: minor
+---
+The hourly session GC now also deletes any session whose transcript stream has not been written for the retention window (`cleanup_remote_sessions_days`), whether or not the session still has metadata. Before, a session was judged only by its activity record, which attachment and plan reads refresh, so a session that was only read never aged out, and a stream without metadata that held messages was kept forever. A session held by a session lease, a scoped A2A lease or an unresolved A2A task is still kept, and each deletion removes the session's journal rows, metadata keys, attachments and plans along with the stream. At most 100 such streams are deleted per hourly pass, so a backlog left by a lost or recreated `harnx_sessions` bucket drains at about 100 an hour. `harnx delete orphan-streams` now deletes non-empty streams without metadata by the same rule, and its default `--max` is 100.
