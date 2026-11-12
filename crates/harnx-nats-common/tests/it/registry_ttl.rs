@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
+use harnx_nats_common::markers::{
+    self, allow_expiring_markers, DELETION_MARKER_TTL, EXPIRY_MARKER_TTL,
+};
 use harnx_nats_common::registry::{
     ensure_bucket_with_ttl, reconcile_bucket, reconcile_bucket_replicas, REGISTRATION_TTL,
 };
@@ -361,6 +364,98 @@ async fn reconcile_bucket_updates_the_stream_only_when_a_setting_differs() -> Re
         .config
         .clone();
     assert_eq!(config.compression, Some(stream::Compression::S2));
+    Ok(())
+}
+
+/// The `Nats-TTL` header on the latest message for `key` in `bucket`.
+async fn ttl_of(jetstream: &jetstream::Context, bucket: &str, key: &str) -> Result<Option<String>> {
+    let message = jetstream
+        .get_stream(format!("KV_{bucket}"))
+        .await?
+        .get_last_raw_message_by_subject(&format!("$KV.{bucket}.{key}"))
+        .await
+        .with_context(|| format!("read the latest message for {key}"))?;
+    Ok(message
+        .headers
+        .get(async_nats::header::NATS_MESSAGE_TTL)
+        .map(|ttl| ttl.as_str().to_owned()))
+}
+
+/// A bucket created with `limit_markers` takes purge markers that expire, and
+/// a revision-conditioned purge still loses to a newer write. A bucket that
+/// allows no TTLs still gets its marker, without one.
+#[tokio::test]
+async fn purges_leave_expiring_markers_where_the_bucket_allows_them() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: no nats-server binary available");
+        return Ok(());
+    };
+    let jetstream = test_jetstream(&server).await?;
+    let hour = Some(DELETION_MARKER_TTL.as_secs().to_string());
+    let expiring = jetstream
+        .create_key_value(kv::Config {
+            bucket: "expiring".to_string(),
+            limit_markers: Some(EXPIRY_MARKER_TTL),
+            ..Default::default()
+        })
+        .await?;
+    expiring.put("any", "value".into()).await?;
+    let revision = expiring.put("exact", "value".into()).await?;
+
+    markers::purge(&expiring, "any", None).await?;
+    markers::purge(&expiring, "exact", Some(revision)).await?;
+
+    assert_eq!(ttl_of(&jetstream, "expiring", "any").await?, hour);
+    assert_eq!(ttl_of(&jetstream, "expiring", "exact").await?, hour);
+    let stale = expiring.put("raced", "value".into()).await?;
+    expiring.put("raced", "newer".into()).await?;
+    assert!(
+        markers::purge(&expiring, "raced", Some(stale))
+            .await
+            .is_err(),
+        "a purge at a stale revision must fail"
+    );
+    assert_eq!(expiring.get("raced").await?, Some("newer".into()));
+
+    let plain = jetstream
+        .create_key_value(kv::Config {
+            bucket: "plain".to_string(),
+            ..Default::default()
+        })
+        .await?;
+    plain.put("any", "value".into()).await?;
+    markers::purge(&plain, "any", None).await?;
+    assert_eq!(ttl_of(&jetstream, "plain", "any").await?, None);
+    assert_eq!(plain.get("any").await?, None);
+    Ok(())
+}
+
+/// `allow_expiring_markers` brings a bucket created without TTLs to what
+/// `limit_markers` creates, so opening it with that config afterwards finds
+/// it unchanged.
+#[tokio::test]
+async fn reconciling_allows_expiring_markers_on_an_existing_bucket() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: no nats-server binary available");
+        return Ok(());
+    };
+    let jetstream = test_jetstream(&server).await?;
+    let config = |limit_markers| kv::Config {
+        bucket: "older".to_string(),
+        num_replicas: 1,
+        limit_markers,
+        ..Default::default()
+    };
+    jetstream.create_key_value(config(None)).await?;
+
+    reconcile_bucket(&jetstream, "older", 1, allow_expiring_markers).await?;
+
+    jetstream
+        .create_key_value(config(Some(EXPIRY_MARKER_TTL)))
+        .await
+        .context("the reconciled bucket matches a limit_markers create")?;
     Ok(())
 }
 

@@ -277,14 +277,48 @@ pub async fn delete_media_prefix(jetstream: &jetstream::Context, owner: &str) ->
         }
     }
 
+    let stream = jetstream
+        .get_stream(object_store_stream_name())
+        .await
+        .context("open the attachment object-store stream")?;
     for name in &names {
-        store
-            .delete(name)
+        delete_media_object(&store, &stream, name)
             .await
             .with_context(|| format!("delete media object '{}'", name))?;
     }
 
     Ok(names.len())
+}
+
+/// Remove one object, leaving nothing behind. The object store's own `delete`
+/// writes a metadata entry marked deleted, which then stays forever. The
+/// chunks go first, so a failure between the two purges leaves an entry the
+/// next deletion still finds, rather than chunks nothing points at.
+async fn delete_media_object(
+    store: &object_store::ObjectStore,
+    stream: &stream::Stream,
+    name: &str,
+) -> Result<()> {
+    use base64::Engine as _;
+    let info = match store.info(name).await {
+        Ok(info) => info,
+        Err(error) if error.kind() == object_store::InfoErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("read media object metadata"),
+    };
+    stream
+        .purge()
+        .filter(format!("$O.{ATTACHMENTS_BUCKET}.C.{}", info.nuid))
+        .await
+        .context("purge media object chunks")?;
+    // The object store names an object's metadata subject by the URL-safe
+    // base64 of its name.
+    let encoded = base64::engine::general_purpose::URL_SAFE.encode(name);
+    stream
+        .purge()
+        .filter(format!("$O.{ATTACHMENTS_BUCKET}.M.{encoded}"))
+        .await
+        .context("purge media object metadata")?;
+    Ok(())
 }
 
 #[cfg(test)]

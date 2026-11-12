@@ -28,10 +28,12 @@ impl A2aStore {
         if let Some(saved) =
             harnx_nats_common::leader_reads::entry(self.metadata().kv_store(), &key).await?
         {
-            self.metadata()
-                .kv_store()
-                .purge_expect_revision(key, Some(saved.revision))
-                .await?;
+            harnx_nats_common::markers::purge(
+                self.metadata().kv_store(),
+                &key,
+                Some(saved.revision),
+            )
+            .await?;
         }
         Ok(true)
     }

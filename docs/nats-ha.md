@@ -73,7 +73,10 @@ Harnx automatically manages the following JetStream resources:
 - **KV Bucket**: `harnx_sessions` — canonical session state. Each session uses
   `sessions/{storage_key}/meta` for immutable identity plus CAS-updated title,
   variables, overrides, and extensions, and `sessions/{storage_key}/activity`
-  for frequently renewed lifecycle timestamps. No expiry. Keys separate their
+  for frequently renewed lifecycle timestamps. No expiry for live keys, but
+  the bucket allows per-message TTLs so that a deletion's purge marker expires
+  after an hour (`harnx_nats_common::markers`); opening the metadata store
+  turns that on for an older bucket. Keys separate their
   parts with `/`, not `.`, so a whole key is one subject token: a consumer
   can't select one kind of key, such as every session's `meta`, and NATS never
   filters on values. Session listings therefore read the whole bucket in one
@@ -108,11 +111,15 @@ Harnx automatically manages the following JetStream resources:
   references; workers hydrate the matching blobs into their local
   content-addressed cache before calling a model. Object names follow
   `media/<owner>/<hash>` where `owner` is `session_key(agent, sid)` (see
-  `harnx_core::cid_url::CidUrl::kv_key`).
+  `harnx_core::cid_url::CidUrl::kv_key`). Session deletion purges each object's
+  chunk and metadata subjects, leaving nothing; the object store's own `delete`
+  would leave a metadata entry marked deleted that stays forever.
 - **KV Bucket**: `harnx_plans` — stores plan index, task, and note documents
   under `plan/<owner>/<slug>/...` keys. The bucket honours the cluster's configured
   `replicas` count (`ensure_plans_bucket`). Documents are retained indefinitely
-  until explicitly deleted or purged when the owning session is cleaned up.
+  until explicitly deleted or purged when the owning session is cleaned up. The
+  bucket allows per-message TTLs, which `ensure_plans_bucket` turns on for an
+  older bucket, so a deleted document's purge marker expires after an hour.
 - **Persistent activation streams**: `WORK_NOTIFY_<cluster>` captures
   `cluster.<cluster>.sessions.notify` with cluster-shared work-queue dispatch.
   All cluster workers bind to one shared durable pull consumer; per-worker
