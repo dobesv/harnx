@@ -19,6 +19,8 @@ cargo install --path crates/harnx-time-tools
 | `wait_until` | Wait until a specified timestamp. Returns `target`, `waited_seconds`, `started_at` and `ended_at`, in the requested timezone (the server's local timezone by default). |
 | `convert_time` | Convert a timestamp between timezones. |
 
+Both waits can end early with `stopped_by: "new_message"` when a message arrives for the caller. `stopped_by: "caller_deadline"` means your own run deadline is near: report now instead of waiting again. Without a caller run context (such as in MCP mode), there is no caller deadline bound.
+
 The start and end times make every wait's result different, so loop protection does not mistake a patient poll for a repeated call.
 
 ## CLI Options
