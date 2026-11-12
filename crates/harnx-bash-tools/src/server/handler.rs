@@ -123,6 +123,11 @@ impl BashServer {
         tool: &str,
         args: Value,
     ) -> Result<CallToolResult, ErrorData> {
+        self.inner
+            .spawned
+            .lock()
+            .await
+            .evict(std::time::Instant::now());
         let observation_args = args.clone();
         let tracked_working_dir = self.tracked_working_dir(tool, &args).await;
         let arguments = args.as_object().cloned();
@@ -182,6 +187,7 @@ impl BashServer {
             .spawned
             .lock()
             .await
+            .entries
             .get(execution_id)
             .map(|entry| entry.working_dir.clone())
     }

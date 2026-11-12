@@ -159,7 +159,7 @@ impl BashServer {
         Ok(Self {
             inner: Arc::new(BashServerInner {
                 allowlist,
-                spawned: Mutex::new(HashMap::new()),
+                spawned: Mutex::new(SpawnedProcesses::default()),
                 log_dir,
                 // Writable allowlist entries include broad shared paths such as /tmp.
                 // History discovers repositories lazily from actual snapshot paths, so
@@ -320,32 +320,28 @@ impl BashServer {
         entry: SpawnedProcess,
     ) -> Arc<SpawnedProcess> {
         let entry = Arc::new(entry);
-        self.inner
-            .spawned
-            .lock()
-            .await
-            .insert(execution_id, Arc::clone(&entry));
+        let mut spawned = self.inner.spawned.lock().await;
+        spawned.entries.insert(execution_id, Arc::clone(&entry));
+        spawned.evict(std::time::Instant::now());
         entry
     }
 
-    /// The tracked entry for `execution_id`. Entries are never removed, so a
-    /// wait or terminate running at the same time sees the same process.
+    /// Clones the tracked entry after evicting old exits. In-flight calls keep
+    /// their Arc, so eviction cannot interrupt a wait, status, or terminate.
     pub(crate) async fn get_spawned_entry(
         &self,
         execution_id: &str,
     ) -> Result<Arc<SpawnedProcess>, ErrorData> {
-        self.inner
-            .spawned
-            .lock()
-            .await
-            .get(execution_id)
-            .cloned()
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!("execution_id '{execution_id}' is not a tracked background process"),
-                    None,
-                )
-            })
+        let mut spawned = self.inner.spawned.lock().await;
+        spawned.evict(std::time::Instant::now());
+        spawned.entries.get(execution_id).cloned().ok_or_else(|| {
+            let message = if spawned.was_evicted(execution_id) {
+                format!("execution_id '{execution_id}' finished and is no longer tracked")
+            } else {
+                format!("execution_id '{execution_id}' is not a tracked background process")
+            };
+            ErrorData::invalid_params(message, None)
+        })
     }
 
     pub async fn cleanup_log_dir(&self) -> std::io::Result<()> {
