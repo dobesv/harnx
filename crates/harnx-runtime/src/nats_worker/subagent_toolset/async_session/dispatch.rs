@@ -198,6 +198,7 @@ fn ensure_receipt_fits(
         status: SessionPromptStatus::Cancelled,
         terminal: false,
         wait_expired: false,
+        stopped_by: None,
         elapsed_ms: u64::MAX,
         output: Value::Null,
     };

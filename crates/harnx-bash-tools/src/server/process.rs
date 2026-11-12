@@ -1,5 +1,88 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
+use super::exec::resolve_command_timeout;
 use super::*;
+use tokio_util::sync::CancellationToken;
+
+/// A wait on a tracked process: what to filter, how long to hold the call,
+/// and the signal that a new message arrived for the caller, which ends it
+/// early.
+struct WaitRequest {
+    execution_id: String,
+    options: WaitOptions,
+    /// When the wait gives up on its own and why: its own `seconds`, or the
+    /// minute it leaves before the caller's run deadline, whichever is first.
+    /// `None` for a forever wait with no caller deadline.
+    stop_at: Option<(tokio::time::Instant, WaitEnd)>,
+    new_message: CancellationToken,
+}
+
+impl WaitRequest {
+    /// A wait for the running call.
+    fn new(execution_id: String, options: WaitOptions, limit: WaitLimit) -> Self {
+        let now = tokio::time::Instant::now();
+        let own = match limit {
+            WaitLimit::Seconds(seconds) => Some((
+                now + Duration::from_secs(seconds),
+                WaitEnd::Elapsed(seconds),
+            )),
+            WaitLimit::Forever => None,
+        };
+        let caller = crate::toolset::invocation_wait_bound()
+            .map(|bound| (now + bound, WaitEnd::CallerDeadline));
+        let stop_at = match (own, caller) {
+            (Some(own), Some(caller)) => Some(if caller.0 <= own.0 { caller } else { own }),
+            (own, caller) => own.or(caller),
+        };
+        Self {
+            execution_id,
+            options,
+            stop_at,
+            new_message: crate::toolset::invocation_new_message(),
+        }
+    }
+
+    /// Why a wait that left the process running ended. A new message wins
+    /// over a limit it raced, since the caller has something to read either way.
+    fn end(&self) -> Option<WaitEnd> {
+        if self.new_message.is_cancelled() {
+            return Some(WaitEnd::NewMessage);
+        }
+        self.stop_at.map(|(_, end)| end)
+    }
+}
+
+/// How a wait that left the process running ended.
+#[derive(Clone, Copy)]
+enum WaitEnd {
+    /// Its fixed `seconds` passed.
+    Elapsed(u64),
+    /// A new message arrived for the caller.
+    NewMessage,
+    /// The wait reached the bound it keeps before the caller's run deadline.
+    CallerDeadline,
+}
+
+impl WaitEnd {
+    /// The running result's `stopped_by` line, for an end other than the limit.
+    fn stopped_by(self) -> Option<&'static str> {
+        match self {
+            Self::Elapsed(_) => None,
+            Self::NewMessage => Some("new_message"),
+            Self::CallerDeadline => Some("caller_deadline"),
+        }
+    }
+}
+
+/// What `wait` and `status` report about a tracked process.
+struct StateReport<'a> {
+    execution_id: &'a str,
+    entry: &'a SpawnedProcess,
+    exit: Option<ProcessExit>,
+    /// Why the wait that just ended stopped, when there was one.
+    waited: Option<WaitEnd>,
+    options: &'a WaitOptions,
+    grep_regex: Option<Regex>,
+}
 
 struct WaitOutput {
     streams_block: String,
@@ -28,15 +111,15 @@ impl BashServer {
         &self,
         params: SpawnCommandParams,
     ) -> Result<CallToolResult, ErrorData> {
-        // Validate the nested wait's grep before prepare_exec so an invalid
-        // pattern fails the call with zero side effects: no logs, snapshots,
-        // or spawned process to clean up.
-        let grep_regex = params
+        // Validate everything the nested wait and the deadline need before
+        // prepare_exec so a bad argument fails the call with zero side
+        // effects: no logs, snapshots, or spawned process to clean up.
+        let deadline_secs = resolve_command_timeout(params.timeout_secs)?;
+        let wait = params
             .wait
             .as_ref()
-            .map(compile_wait_grep)
-            .transpose()?
-            .flatten();
+            .map(|options| Ok::<_, ErrorData>((options.limit()?, compile_wait_grep(options)?)))
+            .transpose()?;
         let prepared = self
             .prepare_exec(
                 &params.command,
@@ -45,13 +128,33 @@ impl BashServer {
                 "before spawn",
             )
             .await?;
-        let ExecPreparation {
-            working_dir,
-            snapshot_decision,
-            before_snap_ids,
-        } = prepared;
-        self.ensure_log_dir().await?;
+        let (execution_id, entry) = self
+            .start_spawned_process(&params, prepared, deadline_secs)
+            .await?;
 
+        if let (Some(options), Some((limit, grep_regex))) = (params.wait, wait) {
+            let request = WaitRequest::new(execution_id, options, limit);
+            return self.wait_for_process(request, grep_regex).await;
+        }
+
+        Ok(Self::build_spawn_result(SpawnResultCtx {
+            execution_id: &execution_id,
+            command: &entry.command,
+            working_dir: &entry.working_dir,
+            stdout_log_path: &entry.stdout_log_path,
+            stderr_log_path: &entry.stderr_log_path,
+        }))
+    }
+
+    /// Spawns the command into its own log directory, hands it to a
+    /// supervisor and tracks it. Returns the new execution ID and entry.
+    async fn start_spawned_process(
+        &self,
+        params: &SpawnCommandParams,
+        prepared: ExecPreparation,
+        deadline_secs: u64,
+    ) -> Result<(String, Arc<SpawnedProcess>), ErrorData> {
+        self.ensure_log_dir().await?;
         let exec_dir = self.next_exec_dir()?.keep();
         let stdout_log_path = exec_dir.join("stdout.log");
         let stderr_log_path = exec_dir.join("stderr.log");
@@ -61,7 +164,7 @@ impl BashServer {
             .spawn_background_child(
                 CommandBuildCtx {
                     command: &params.command,
-                    working_dir: &working_dir,
+                    working_dir: &prepared.working_dir,
                     exec_dir: &exec_dir,
                     env: params.env.as_ref(),
                 },
@@ -70,35 +173,23 @@ impl BashServer {
             )
             .await?;
 
-        let entry = SpawnedProcess {
-            child,
+        let metadata = SpawnMetadata {
             command: params.command.clone(),
-            working_dir: working_dir.clone(),
-            stdout_log_path: stdout_log_path.clone(),
-            stderr_log_path: stderr_log_path.clone(),
-            before_snap_ids,
-            snapshot_decision: snapshot_decision.clone(),
-            started_at: std::time::Instant::now(),
+            working_dir: prepared.working_dir,
+            stdout_log_path,
+            stderr_log_path,
+            before_snap_ids: prepared.before_snap_ids,
+            snapshot_decision: prepared.snapshot_decision,
         };
-
-        self.store_spawned_process(execution_id.clone(), entry)
+        let deadline = Duration::from_secs(deadline_secs);
+        let entry = SpawnedProcess::start(child, deadline, metadata);
+        let entry = self
+            .store_spawned_process(execution_id.clone(), entry)
             .await;
-
-        if let Some(options) = params.wait {
-            let wait_params = WaitParams {
-                execution_id,
-                options,
-            };
-            return self.wait_for_process(wait_params, grep_regex).await;
-        }
-
-        Ok(Self::build_spawn_result(SpawnResultCtx {
-            execution_id: &execution_id,
-            command: &params.command,
-            working_dir: &working_dir,
-            stdout_log_path: &stdout_log_path,
-            stderr_log_path: &stderr_log_path,
-        }))
+        // Before any nested wait: a call interrupted while waiting still
+        // tells the caller which process it started.
+        crate::toolset::record_partial_result(entry.partial_result(&execution_id)).await;
+        Ok((execution_id, entry))
     }
 
     async fn spawn_background_child(
@@ -128,80 +219,79 @@ impl BashServer {
     // -----------------------------------------------------------------------
 
     pub(crate) async fn wait_impl(&self, params: WaitParams) -> Result<CallToolResult, ErrorData> {
-        let grep_regex = compile_wait_grep(&params.options)?;
-        self.wait_for_process(params, grep_regex).await
+        let options = params.options();
+        let limit = params.limit()?;
+        let grep_regex = compile_wait_grep(&options)?;
+        let request = WaitRequest::new(params.execution_id, options, limit);
+        self.wait_for_process(request, grep_regex).await
     }
 
     async fn wait_for_process(
         &self,
-        params: WaitParams,
+        request: WaitRequest,
         grep_regex: Option<Regex>,
     ) -> Result<CallToolResult, ErrorData> {
-        let timeout_secs = params.options.effective_timeout_secs();
-        // The entry is removed up front so wait/terminate stay serialized per
-        // execution_id; every non-exit path below must re-store it or the
-        // process becomes untracked. A caller cancellation dropped mid-await
-        // loses the handle entirely — for spawn's initial wait the
-        // execution_id was never returned, so the running command is
-        // unreachable (known limitation, docs/bash-mcp-server.md).
-        let mut entry = {
-            let mut map = self.inner.spawned.lock().await;
-            map.remove(&params.execution_id).ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!(
-                        "execution_id '{}' is not a tracked background process (or already waited on)",
-                        params.execution_id
-                    ),
-                    None,
-                )
-            })?
-        };
+        // The entry is shared, not taken: a dropped wait leaves the process
+        // tracked, and concurrent waits and terminates all see it.
+        let entry = self.get_spawned_entry(&request.execution_id).await?;
+        let exit = entry.wait_for_exit(&request).await?;
+        self.report_state(StateReport {
+            execution_id: &request.execution_id,
+            entry: &entry,
+            exit,
+            waited: request.end(),
+            options: &request.options,
+            grep_regex,
+        })
+        .await
+    }
 
-        let timeout = Duration::from_secs(timeout_secs);
-        let status = match tokio::time::timeout(timeout, entry.child.wait()).await {
-            Ok(Ok(status)) => Some(status),
-            Ok(Err(err)) => {
-                // A failed wait does not prove the process exited. Keep its handle manageable.
-                self.store_spawned_process(params.execution_id.clone(), entry)
-                    .await;
-                return Err(internal_error(format!(
-                    "failed waiting for execution_id '{}': {err}",
-                    params.execution_id
-                )));
+    // -----------------------------------------------------------------------
+    // status
+    // -----------------------------------------------------------------------
+
+    /// Reports the state as of now, without waiting for anything.
+    pub(crate) async fn status_impl(
+        &self,
+        params: StatusParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let options = params.options();
+        let grep_regex = compile_wait_grep(&options)?;
+        let entry = self.get_spawned_entry(&params.execution_id).await?;
+        let exit = entry.recorded_exit(&params.execution_id)?;
+        self.report_state(StateReport {
+            execution_id: &params.execution_id,
+            entry: &entry,
+            exit,
+            waited: None,
+            options: &options,
+            grep_regex,
+        })
+        .await
+    }
+
+    /// The running or finished result shared by `wait` and `status`. `waited`
+    /// is why the wait that just ended stopped, when there was one.
+    async fn report_state(&self, report: StateReport<'_>) -> Result<CallToolResult, ErrorData> {
+        let StateReport {
+            execution_id,
+            entry,
+            exit,
+            waited,
+            options,
+            grep_regex,
+        } = report;
+        let output =
+            Self::read_wait_output(execution_id, entry, options, grep_regex.as_ref()).await;
+        Ok(match exit {
+            Some(exit) => {
+                let kind = entry.exit_kind(&exit);
+                let ctx = entry.exit_result_ctx(execution_id, exit, output);
+                self.build_wait_exit_result(ctx, kind, &entry.exit_diff)
+                    .await
             }
-            Err(_) => None,
-        };
-
-        let output = Self::read_wait_output(
-            &params.execution_id,
-            &entry,
-            &params.options,
-            grep_regex.as_ref(),
-        )
-        .await;
-
-        if let Some(status) = status {
-            return self
-                .build_wait_exit_result(ExitResultCtx {
-                    execution_id: &params.execution_id,
-                    command: &entry.command,
-                    working_dir: &entry.working_dir,
-                    stdout_log_path: &entry.stdout_log_path,
-                    stderr_log_path: &entry.stderr_log_path,
-                    total_lines: output.total_lines,
-                    total_bytes: output.total_bytes,
-                    exit_code: status.code().unwrap_or(-1),
-                    streams_block: output.streams_block,
-                    before_snaps: &entry.before_snap_ids,
-                    snapshot_decision: &entry.snapshot_decision,
-                })
-                .await;
-        }
-
-        let result =
-            Self::build_wait_running_result(&params.execution_id, &entry, timeout_secs, output);
-        self.store_spawned_process(params.execution_id, entry).await;
-        Ok(result)
+            None => Self::build_wait_running_result(execution_id, entry, waited, output),
+        })
     }
 
     // Single output-reading path shared by the exit and running results:
@@ -245,58 +335,34 @@ impl BashServer {
     // terminate
     // -----------------------------------------------------------------------
 
-    // `return` is required here: the cfg(unix) and cfg(windows) blocks coexist
-    // textually, so the unix branch is not syntactically the function tail.
-    #[allow(clippy::needless_return)]
     pub(crate) async fn terminate_impl(
         &self,
         params: TerminateParams,
     ) -> Result<CallToolResult, ErrorData> {
         let normalized = params.signal.as_deref().unwrap_or("SIGTERM").to_uppercase();
-
-        #[cfg(unix)]
-        {
-            let signal = Self::parse_signal(&normalized)?;
-            let map = self.inner.spawned.lock().await;
-            let entry = Self::get_spawned_entry(&map, &params.execution_id)?;
-            self.send_signal(entry.child.as_ref(), signal, &params.execution_id)
-                .await?;
-            return Ok(Self::build_terminate_result(
-                &params.execution_id,
-                &normalized,
-                entry,
-            ));
-        }
-
-        #[cfg(windows)]
-        {
-            let mut map = self.inner.spawned.lock().await;
-            let entry = map.get_mut(&params.execution_id).ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!(
-                        "execution_id '{}' is not a tracked background process",
-                        params.execution_id
-                    ),
-                    None,
-                )
-            })?;
-            self.send_signal(entry.child.as_mut(), &normalized, &params.execution_id)
-                .await?;
-            return Ok(Self::build_terminate_result(
-                &params.execution_id,
-                &normalized,
-                entry,
-            ));
-        }
+        let control = Self::parse_signal(&normalized)?;
+        let entry = self.get_spawned_entry(&params.execution_id).await?;
+        // The supervisor drops its receiver once it has recorded the exit.
+        entry
+            .control
+            .send(control)
+            .map_err(|_| entry.ended_error(&params.execution_id))?;
+        Ok(Self::build_terminate_result(
+            &params.execution_id,
+            &normalized,
+            &entry,
+        ))
     }
 
+    /// `SIGKILL` goes through `start_kill`, which kills the whole process
+    /// group the same way the deadline does.
     #[cfg(unix)]
-    pub(crate) fn parse_signal(name: &str) -> Result<(i32, &'static str), ErrorData> {
+    pub(crate) fn parse_signal(name: &str) -> Result<ProcessControl, ErrorData> {
         match name {
-            "SIGTERM" | "TERM" => Ok((libc::SIGTERM, "SIGTERM")),
-            "SIGKILL" | "KILL" => Ok((libc::SIGKILL, "SIGKILL")),
-            "SIGINT" | "INT" => Ok((libc::SIGINT, "SIGINT")),
-            "SIGHUP" | "HUP" => Ok((libc::SIGHUP, "SIGHUP")),
+            "SIGTERM" | "TERM" => Ok(ProcessControl::Signal(libc::SIGTERM)),
+            "SIGKILL" | "KILL" => Ok(ProcessControl::Kill),
+            "SIGINT" | "INT" => Ok(ProcessControl::Signal(libc::SIGINT)),
+            "SIGHUP" | "HUP" => Ok(ProcessControl::Signal(libc::SIGHUP)),
             other => Err(ErrorData::invalid_params(
                 format!("unsupported signal: {other}"),
                 None,
@@ -304,52 +370,10 @@ impl BashServer {
         }
     }
 
-    #[cfg(unix)]
-    pub(crate) fn get_spawned_entry<'a>(
-        map: &'a HashMap<String, SpawnedProcess>,
-        execution_id: &str,
-    ) -> Result<&'a SpawnedProcess, ErrorData> {
-        map.get(execution_id).ok_or_else(|| {
-            ErrorData::invalid_params(
-                format!(
-                    "execution_id '{}' is not a tracked background process",
-                    execution_id
-                ),
-                None,
-            )
-        })
-    }
-
-    #[cfg(unix)]
-    pub(crate) async fn send_signal(
-        &self,
-        child: &dyn ChildWrapper,
-        signal: (i32, &'static str),
-        execution_id: &str,
-    ) -> Result<(), ErrorData> {
-        child.signal(signal.0).map_err(|err| {
-            internal_error(format!(
-                "failed to send {} to execution_id '{}': {err}",
-                signal.1, execution_id
-            ))
-        })
-    }
-
+    /// Windows has no signals: every one ends the process's job object.
     #[cfg(windows)]
-    pub(crate) async fn send_signal(
-        &self,
-        child: &mut dyn ChildWrapper,
-        signal: &str,
-        execution_id: &str,
-    ) -> Result<(), ErrorData> {
-        child.start_kill().map_err(|err| {
-            internal_error(format!(
-                "failed to terminate execution_id '{}': {err}",
-                execution_id
-            ))
-        })?;
-        let _ = signal;
-        Ok(())
+    pub(crate) fn parse_signal(_name: &str) -> Result<ProcessControl, ErrorData> {
+        Ok(ProcessControl::Kill)
     }
 
     pub(crate) fn build_terminate_result(
@@ -363,6 +387,7 @@ impl BashServer {
             MetadataHeader {
                 execution_id: Some(execution_id),
                 status: Some("terminated"),
+                stopped_by: None,
                 exit_code: None,
                 command: Some(&entry.command),
                 working_dir: Some(&entry.working_dir),
@@ -381,7 +406,7 @@ impl BashServer {
     fn build_wait_running_result(
         execution_id: &str,
         entry: &SpawnedProcess,
-        timeout_secs: u64,
+        waited: Option<WaitEnd>,
         wait_output: WaitOutput,
     ) -> CallToolResult {
         let running_for = format_elapsed(entry.started_at.elapsed());
@@ -391,6 +416,7 @@ impl BashServer {
             MetadataHeader {
                 execution_id: Some(execution_id),
                 status: Some("running"),
+                stopped_by: waited.and_then(WaitEnd::stopped_by),
                 exit_code: None,
                 command: Some(&entry.command),
                 working_dir: Some(&entry.working_dir),
@@ -402,21 +428,51 @@ impl BashServer {
             },
         );
         let _ = write!(output, "\n{}", wait_output.streams_block);
-        let summary = format!(
-            "execution_id '{execution_id}' still running after {timeout_secs}s ({running_for} total)"
-        );
+        let summary = match waited {
+            Some(WaitEnd::Elapsed(seconds)) => format!(
+                "execution_id '{execution_id}' still running after {seconds}s ({running_for} total)"
+            ),
+            Some(WaitEnd::NewMessage) => format!(
+                "execution_id '{execution_id}' still running; a new message arrived ({running_for} total)"
+            ),
+            Some(WaitEnd::CallerDeadline) => format!(
+                "execution_id '{execution_id}' still running; the run deadline is near ({running_for} total)"
+            ),
+            None => format!("execution_id '{execution_id}' still running ({running_for} total)"),
+        };
         Self::build_success_result(output, summary, vec![])
     }
 
-    pub(crate) async fn build_wait_exit_result(
+    /// Every wait that sees the exit reports the same diff: the first one
+    /// takes the after-exit snapshot, later ones reuse it.
+    async fn build_wait_exit_result(
         &self,
         ctx: ExitResultCtx<'_>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let summary = format!(
-            "execution_id '{}' exited with code {}",
-            ctx.execution_id, ctx.exit_code
-        );
-        self.build_exit_result(ctx, summary, "after wait").await
+        kind: ExitKind,
+        exit_diff: &OnceCell<Vec<String>>,
+    ) -> CallToolResult {
+        let summary = match kind {
+            ExitKind::TimedOut { deadline_secs } => format!(
+                "execution_id '{}' killed after its {deadline_secs}s deadline",
+                ctx.execution_id
+            ),
+            ExitKind::Exited => format!(
+                "execution_id '{}' exited with code {}",
+                ctx.execution_id, ctx.exit_code
+            ),
+        };
+        let diff_parts = exit_diff
+            .get_or_init(|| {
+                self.diff_snapshots(
+                    ctx.before_snaps,
+                    ctx.snapshot_decision,
+                    ctx.working_dir,
+                    "after wait",
+                )
+            })
+            .await
+            .clone();
+        Self::exit_result_with_diff(ctx, kind, summary, diff_parts)
     }
 
     pub(crate) fn build_spawn_result(ctx: SpawnResultCtx<'_>) -> CallToolResult {
@@ -426,6 +482,7 @@ impl BashServer {
             MetadataHeader {
                 execution_id: Some(ctx.execution_id),
                 status: Some("spawned"),
+                stopped_by: None,
                 exit_code: None,
                 command: Some(ctx.command),
                 working_dir: Some(ctx.working_dir),
@@ -438,6 +495,127 @@ impl BashServer {
         );
         let summary = format!("spawned {}", ctx.execution_id);
         Self::build_success_result(output, summary, vec![])
+    }
+}
+
+impl SpawnedProcess {
+    /// Hands `child` to a supervisor that kills its process group once
+    /// `deadline` passes, and starts the runtime clock.
+    pub(crate) fn start(
+        child: Box<dyn ChildWrapper>,
+        deadline: Duration,
+        metadata: SpawnMetadata,
+    ) -> Self {
+        let (exit, control) = spawn_supervisor(child, deadline);
+        let deadline_secs = deadline.as_secs();
+        let SpawnMetadata {
+            command,
+            working_dir,
+            stdout_log_path,
+            stderr_log_path,
+            before_snap_ids,
+            snapshot_decision,
+        } = metadata;
+        Self {
+            command,
+            working_dir,
+            stdout_log_path,
+            stderr_log_path,
+            before_snap_ids,
+            snapshot_decision,
+            started_at: std::time::Instant::now(),
+            deadline_secs,
+            exit,
+            control,
+            exit_diff: Arc::default(),
+        }
+    }
+
+    /// Waits up to the request's limit, or until a new message arrives for
+    /// the caller, for the supervisor to record an exit, then reports the
+    /// state as of now, so a wait that ends for any reason still answers.
+    async fn wait_for_exit(&self, request: &WaitRequest) -> Result<Option<ProcessExit>, ErrorData> {
+        let mut exit = self.exit.clone();
+        let limit = async {
+            match request.stop_at {
+                Some((at, _)) => tokio::time::sleep_until(at).await,
+                // The process's own deadline ends it, and so the wait.
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = exit.wait_for(Option::is_some) => {}
+            _ = limit => {}
+            _ = request.new_message.cancelled() => {}
+        }
+        self.recorded_exit(&request.execution_id)
+    }
+
+    /// What `spawn` records before it waits, so a call that does not
+    /// succeed still names the process it started.
+    fn partial_result(&self, execution_id: &str) -> Value {
+        json!({
+            "execution_id": execution_id,
+            "stdout_log_path": self.stdout_log_path.display().to_string(),
+            "stderr_log_path": self.stderr_log_path.display().to_string(),
+        })
+    }
+
+    /// The exit recorded so far, or the error that made the supervisor give
+    /// up. That error stays recorded, so every later call reports it too.
+    fn recorded_exit(&self, execution_id: &str) -> Result<Option<ProcessExit>, ErrorData> {
+        let exit = self.exit.borrow().clone();
+        match exit {
+            Some(ProcessExit {
+                wait_error: Some(error),
+                ..
+            }) => Err(internal_error(format!(
+                "failed waiting for execution_id '{execution_id}': {error}"
+            ))),
+            exit => Ok(exit),
+        }
+    }
+
+    /// Why a control message found the supervisor gone.
+    fn ended_error(&self, execution_id: &str) -> ErrorData {
+        self.recorded_exit(execution_id).err().unwrap_or_else(|| {
+            ErrorData::invalid_params(
+                format!("execution_id '{execution_id}' has already exited"),
+                None,
+            )
+        })
+    }
+
+    /// Whether `exit` was the supervisor enforcing this process's deadline.
+    fn exit_kind(&self, exit: &ProcessExit) -> ExitKind {
+        if exit.timed_out {
+            ExitKind::TimedOut {
+                deadline_secs: self.deadline_secs,
+            }
+        } else {
+            ExitKind::Exited
+        }
+    }
+
+    fn exit_result_ctx<'a>(
+        &'a self,
+        execution_id: &'a str,
+        exit: ProcessExit,
+        output: WaitOutput,
+    ) -> ExitResultCtx<'a> {
+        ExitResultCtx {
+            execution_id,
+            command: &self.command,
+            working_dir: &self.working_dir,
+            stdout_log_path: &self.stdout_log_path,
+            stderr_log_path: &self.stderr_log_path,
+            total_lines: output.total_lines,
+            total_bytes: output.total_bytes,
+            exit_code: exit.code.unwrap_or(-1),
+            streams_block: output.streams_block,
+            before_snaps: &self.before_snap_ids,
+            snapshot_decision: &self.snapshot_decision,
+        }
     }
 }
 

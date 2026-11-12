@@ -233,7 +233,7 @@ async fn template_tool_validates_then_runs_through_exec_pipeline() {
     );
     assert_eq!(
         echo.input_schema["properties"]["timeout_secs"]["minimum"],
-        json!(0)
+        json!(1)
     );
     assert_eq!(echo.timeout_secs, Some(0));
 
@@ -275,7 +275,7 @@ async fn template_tool_validates_then_runs_through_exec_pipeline() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn template_timeout_is_adjustable_and_zero_is_unlimited() {
+async fn template_timeout_is_adjustable_and_zero_is_rejected() {
     let directory = tempfile::tempdir().expect("template directory");
     let template_path = directory.path().join("slow.yaml");
     write_template(
@@ -311,16 +311,22 @@ async fn template_timeout_is_adjustable_and_zero_is_unlimited() {
     assert_eq!(timed_out["isError"], json!(true));
     assert!(timed_out.to_string().contains("timed out after 1s"));
 
-    let unlimited = toolset
+    let zero = toolset
         .invoke(
             "slow",
             json!({ "delay": 0, "timeout_secs": 0 }),
             CancellationToken::new(),
         )
         .await
-        .expect("zero timeout should disable the deadline");
-    assert_ne!(unlimited["isError"], json!(true));
-    assert!(unlimited.to_string().contains("finished"));
+        .expect_err("zero timeout is no longer an unlimited deadline");
+    assert!(zero.to_string().contains("between 1 and 86400"), "{zero}");
+
+    let default_deadline = toolset
+        .invoke("slow", json!({ "delay": 0 }), CancellationToken::new())
+        .await
+        .expect("an omitted timeout uses the default deadline");
+    assert_ne!(default_deadline["isError"], json!(true));
+    assert!(default_deadline.to_string().contains("finished"));
     let _ = toolset.cleanup_log_dir().await;
 }
 

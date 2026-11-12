@@ -1,4 +1,5 @@
-//! Per-server call liveness, independent of turn and cleanup lifetimes.
+//! Per-server call liveness, independent of turn and cleanup lifetimes, and
+//! which of a session's user messages its turn has yet to take in.
 use harnx_core::instance::ServerScope;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -11,7 +12,7 @@ pub(crate) enum InFlightFailure {
 
 // Every critical section is synchronous. A sync mutex lets dropped waits remove
 // their entries immediately, without spawning cleanup that can outlive a runtime.
-type InFlightMap = Mutex<HashMap<String, InFlightCall>>;
+type InFlightMap = Mutex<InFlightState>;
 static INSTANCE_IN_FLIGHT: OnceLock<std::sync::Mutex<HashMap<ServerScope, Weak<InFlightMap>>>> =
     OnceLock::new();
 
@@ -19,24 +20,61 @@ static INSTANCE_IN_FLIGHT: OnceLock<std::sync::Mutex<HashMap<ServerScope, Weak<I
 /// and by a session-scoped cancel to find every call it should reach.
 #[derive(Clone, Default)]
 pub struct NatsInFlightCalls {
-    calls: Arc<InFlightMap>,
+    state: Arc<InFlightMap>,
+}
+
+#[derive(Default)]
+struct InFlightState {
+    calls: HashMap<String, InFlightCall>,
+    /// Keyed like the calls' `session_id`. One lock covers both maps, so a
+    /// message noted while a call registers either finds the call or is
+    /// already pending when the call checks.
+    messages: HashMap<String, MessageMarks>,
+}
+
+/// The newest user message the session watcher saw, and the newest the turn
+/// has taken in. Sequences only move forward, so a watcher that sees a
+/// message after the turn already read it doesn't make it pending again.
+#[derive(Clone, Copy, Default)]
+struct MessageMarks {
+    seen: u64,
+    consumed: u64,
+}
+
+impl MessageMarks {
+    fn pending(&self) -> bool {
+        self.seen > self.consumed
+    }
 }
 
 struct InFlightCall {
     server: String,
     session_id: String,
     control_subject: String,
+    stop_on_new_message: bool,
     failure: oneshot::Sender<InFlightFailure>,
     identity: Arc<()>,
 }
 
+impl InFlightCall {
+    fn target(&self, call_id: &str) -> InFlightCancelTarget {
+        InFlightCancelTarget {
+            call_id: call_id.to_owned(),
+            server: self.server.clone(),
+            control_subject: self.control_subject.clone(),
+        }
+    }
+}
+
 /// Everything a call is registered under: its own identity, the server
-/// running it, the session it belongs to, and where a cancel for it goes.
+/// running it, the session it belongs to, where a cancel for it goes, and
+/// whether its tool ends a wait when a new message arrives.
 pub(crate) struct InFlightRegistration {
     pub call_id: String,
     pub server: String,
     pub session_id: String,
     pub control_subject: String,
+    pub stop_on_new_message: bool,
 }
 
 /// One in-flight call a session-scoped cancel can address: which server owns
@@ -74,6 +112,20 @@ impl<F: FnOnce()> Drop for InFlightCompletionGuard<F> {
     }
 }
 
+/// Forgets a session's message marks when dropped. The session watcher holds
+/// one while it follows the session, so a worker that runs many sessions
+/// keeps marks only for the ones it is running.
+pub(crate) struct SessionMessagesGuard {
+    calls: NatsInFlightCalls,
+    session_id: String,
+}
+
+impl Drop for SessionMessagesGuard {
+    fn drop(&mut self) {
+        self.calls.state.lock().messages.remove(&self.session_id);
+    }
+}
+
 impl NatsInFlightCalls {
     pub(super) async fn register_guarded<F: FnOnce()>(
         &self,
@@ -101,12 +153,12 @@ impl NatsInFlightCalls {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         registry.retain(|_, calls| calls.strong_count() > 0);
-        if let Some(calls) = registry.get(instance_id).and_then(Weak::upgrade) {
-            return Self { calls };
+        if let Some(state) = registry.get(instance_id).and_then(Weak::upgrade) {
+            return Self { state };
         }
-        let calls = Arc::new(Mutex::new(HashMap::new()));
-        registry.insert(instance_id.clone(), Arc::downgrade(&calls));
-        Self { calls }
+        let state = Arc::new(Mutex::new(InFlightState::default()));
+        registry.insert(instance_id.clone(), Arc::downgrade(&state));
+        Self { state }
     }
 
     pub(crate) async fn register(
@@ -128,14 +180,16 @@ impl NatsInFlightCalls {
             server,
             session_id,
             control_subject,
+            stop_on_new_message,
         } = registration;
         let (failure, receiver) = oneshot::channel();
-        self.calls.lock().insert(
+        self.state.lock().calls.insert(
             call_id,
             InFlightCall {
                 server,
                 session_id,
                 control_subject,
+                stop_on_new_message,
                 failure,
                 identity,
             },
@@ -145,7 +199,7 @@ impl NatsInFlightCalls {
 
     /// Retire only this reservation, never another wait for the same call ID.
     pub(crate) fn complete(&self, call_id: &str, identity: &Arc<()>) -> bool {
-        let mut calls = self.calls.lock();
+        let calls = &mut self.state.lock().calls;
         if calls
             .get(call_id)
             .is_some_and(|call| Arc::ptr_eq(&call.identity, identity))
@@ -161,7 +215,7 @@ impl NatsInFlightCalls {
     pub async fn fail_server_unavailable(&self, server: &str, message: impl Into<String>) {
         let message = message.into();
         let failures = {
-            let mut calls = self.calls.lock();
+            let calls = &mut self.state.lock().calls;
             let call_ids = calls
                 .iter()
                 .filter(|(_, call)| call.server == server)
@@ -180,16 +234,59 @@ impl NatsInFlightCalls {
     /// Snapshot the calls in flight for one session, so a session-scoped
     /// cancel can address each of them without holding the registry lock.
     pub async fn snapshot_for_session(&self, session_id: &str) -> Vec<InFlightCancelTarget> {
-        self.calls
+        self.state
             .lock()
+            .calls
             .iter()
             .filter(|(_, call)| call.session_id == session_id)
-            .map(|(call_id, call)| InFlightCancelTarget {
-                call_id: call_id.clone(),
-                server: call.server.clone(),
-                control_subject: call.control_subject.clone(),
-            })
+            .map(|(call_id, call)| call.target(call_id))
             .collect()
+    }
+
+    /// Record that a user message landed at `seq` for the session, and return
+    /// the session's calls in flight that end a wait when one does. Returns
+    /// none when the turn has already taken that message in.
+    pub(super) fn pending_message_targets(
+        &self,
+        session_id: &str,
+        seq: u64,
+    ) -> Vec<InFlightCancelTarget> {
+        let mut state = self.state.lock();
+        let InFlightState { calls, messages } = &mut *state;
+        let marks = messages.entry(session_id.to_owned()).or_default();
+        marks.seen = marks.seen.max(seq);
+        if seq <= marks.consumed {
+            return Vec::new();
+        }
+        calls
+            .iter()
+            .filter(|(_, call)| call.session_id == session_id && call.stop_on_new_message)
+            .map(|(call_id, call)| call.target(call_id))
+            .collect()
+    }
+
+    /// The session's turn has taken in every message through `through_seq`.
+    pub fn note_messages_consumed(&self, session_id: &str, through_seq: u64) {
+        let messages = &mut self.state.lock().messages;
+        let marks = messages.entry(session_id.to_owned()).or_default();
+        marks.consumed = marks.consumed.max(through_seq);
+    }
+
+    /// Whether a user message landed that the session's turn hasn't taken in.
+    pub fn message_pending(&self, session_id: &str) -> bool {
+        self.state
+            .lock()
+            .messages
+            .get(session_id)
+            .is_some_and(MessageMarks::pending)
+    }
+
+    /// Keep the session's message marks until the returned guard drops.
+    pub(crate) fn follow_session_messages(&self, session_id: &str) -> SessionMessagesGuard {
+        SessionMessagesGuard {
+            calls: self.clone(),
+            session_id: session_id.to_owned(),
+        }
     }
 }
 
@@ -203,7 +300,24 @@ mod tests {
             server: "srv".into(),
             session_id: session_id.into(),
             control_subject: "ctl.srv".into(),
+            stop_on_new_message: false,
         }
+    }
+
+    fn waiting(call_id: &str, session_id: &str) -> InFlightRegistration {
+        InFlightRegistration {
+            stop_on_new_message: true,
+            ..registration(call_id, session_id)
+        }
+    }
+
+    fn call_ids(targets: Vec<InFlightCancelTarget>) -> Vec<String> {
+        let mut ids = targets
+            .into_iter()
+            .map(|target| target.call_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
     }
 
     #[tokio::test]
@@ -274,5 +388,58 @@ mod tests {
             drop(guard);
             assert!(calls.snapshot_for_session("s1").await.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn in_flight_new_message_reaches_only_opted_in_calls_of_its_session() {
+        let calls = NatsInFlightCalls::default();
+        let _waiting = calls.register(waiting("wait", "s1")).await;
+        let _plain = calls.register(registration("plain", "s1")).await;
+        let _elsewhere = calls.register(waiting("elsewhere", "s2")).await;
+        assert_eq!(
+            call_ids(calls.pending_message_targets("s1", 10)),
+            vec!["wait".to_string()]
+        );
+    }
+
+    #[test]
+    fn in_flight_message_stays_pending_until_its_turn_consumes_it() {
+        let calls = NatsInFlightCalls::default();
+        assert!(!calls.message_pending("s1"), "nothing seen yet");
+        calls.pending_message_targets("s1", 10);
+        assert!(calls.message_pending("s1"));
+        assert!(!calls.message_pending("s2"), "marks are per session");
+        calls.note_messages_consumed("s1", 9);
+        assert!(calls.message_pending("s1"), "seq 10 is not consumed yet");
+        calls.note_messages_consumed("s1", 10);
+        assert!(!calls.message_pending("s1"));
+        calls.note_messages_consumed("s1", 4);
+        assert!(!calls.message_pending("s1"), "consumed never moves back");
+    }
+
+    #[tokio::test]
+    async fn in_flight_message_the_turn_already_read_signals_nothing() {
+        let calls = NatsInFlightCalls::default();
+        let _waiting = calls.register(waiting("wait", "s1")).await;
+        calls.note_messages_consumed("s1", 12);
+        // A watcher running behind the turn's own read sees the message late.
+        assert!(calls.pending_message_targets("s1", 12).is_empty());
+        assert!(!calls.message_pending("s1"));
+        assert_eq!(call_ids(calls.pending_message_targets("s1", 13)).len(), 1);
+    }
+
+    #[test]
+    fn in_flight_message_marks_last_as_long_as_their_session_is_followed() {
+        let calls = NatsInFlightCalls::default();
+        let followed = calls.follow_session_messages("s1");
+        let _other = calls.follow_session_messages("s2");
+        calls.pending_message_targets("s1", 3);
+        calls.pending_message_targets("s2", 3);
+        drop(followed);
+        assert!(
+            !calls.message_pending("s1"),
+            "dropping the guard forgets s1"
+        );
+        assert!(calls.message_pending("s2"), "other sessions keep theirs");
     }
 }

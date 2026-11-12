@@ -1,12 +1,14 @@
 use crate::server::{
     BashServer, ExecCommandParams, ReadExecLogParams, RollbackParams, SpawnCommandParams,
-    TerminateParams, WaitParams,
+    StatusParams, TerminateParams, WaitParams,
 };
 use crate::tool_template::ToolTemplate;
 use crate::tool_templates;
 use async_trait::async_trait;
 use harnx_sandbox_common::SandboxConfig;
-use harnx_toolset::{ToolInvokeError, ToolProgressKind, ToolSpec, Toolset};
+use harnx_toolset::{
+    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolProgressKind, ToolSpec, Toolset,
+};
 use rmcp::model::{CallToolResult, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
 use serde_json::{Map, Value};
@@ -15,6 +17,39 @@ use tokio_util::sync::CancellationToken;
 tokio::task_local! {
     /// Per-invocation token; foreground commands kill and reap before returning.
     pub(crate) static INVOCATION_CANCEL: CancellationToken;
+    /// Transport facts about a native invocation: the new-message signal that
+    /// ends `wait` and spawn's nested wait early, and where spawn records the
+    /// process it started.
+    static INVOCATION_CONTEXT: ToolInvocationContext;
+}
+
+/// The running call's new-message signal. Outside a native invocation (the
+/// MCP route) it never fires.
+pub(crate) fn invocation_new_message() -> CancellationToken {
+    INVOCATION_CONTEXT
+        .try_with(|context| context.new_message.clone())
+        .unwrap_or_default()
+}
+
+/// How long the running call may wait before it must stop for the caller's run
+/// deadline. `None` outside a native invocation (the MCP route has no run
+/// context) or when the caller has no deadline.
+pub(crate) fn invocation_wait_bound() -> Option<std::time::Duration> {
+    INVOCATION_CONTEXT
+        .try_with(|context| context.run_context.as_ref()?.wait_bound())
+        .ok()
+        .flatten()
+}
+
+/// Record `value` as the running call's partial result. Best effort: a failed
+/// record costs the call only what it would hand back if it then failed.
+pub(crate) async fn record_partial_result(value: Value) {
+    let Ok(context) = INVOCATION_CONTEXT.try_with(Clone::clone) else {
+        return;
+    };
+    if let Err(error) = context.record_partial_result(value).await {
+        log::warn!("could not record bash partial result: {error:#}");
+    }
 }
 
 /// Native toolset for sandboxed command execution and process management.
@@ -32,6 +67,13 @@ impl BashToolset {
         let server = BashServer::new_with_templates(sandbox_config, templates)?;
         server.initialize_allowlist().await;
         Ok(Self { server })
+    }
+
+    /// A toolset over an already configured server. Gated like the server
+    /// tests that call it, which don't build on Windows.
+    #[cfg(all(test, not(target_os = "windows")))]
+    pub(crate) fn from_server(server: BashServer) -> Self {
+        Self { server }
     }
 
     /// Remove temporary execution logs created by this toolset instance.
@@ -96,16 +138,24 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         ),
         spec::<SpawnCommandParams>(
             "spawn",
-            "Spawn a background command, optionally waiting for completion with nested 'wait' options. Omit 'wait' to return an execution_id and log paths immediately. With 'wait', return completed results or partial output on expiry without stopping the process; use the 'wait' tool for more waiting or 'terminate' to stop it. 'wait: {}' defaults to 120 seconds; 'wait.timeout_secs: 0' polls immediately. Prefer waits below five minutes to return before common LLM cache TTLs; explicit longer waits are supported. Nested head_lines/tail_lines/max_output_bytes/grep filter output. Output is written to separate stdout.log and stderr.log files. Supports shebang lines: if the command starts with #!, the script is executed with the named interpreter automatically.",
+            "Spawn a background command, optionally waiting for completion with nested 'wait' options. Omit 'wait' to return an execution_id and log paths immediately. With 'wait', return completed results or partial output on expiry without stopping the process; use the 'wait' tool for more waiting, 'status' to check without waiting, or 'terminate' to stop it. 'wait: {}' waits up to 240 seconds; 'wait.seconds' sets 1 to 240 seconds and 'wait.forever: true' waits until the process exits. A new message for you may end the wait early with 'stopped_by: new_message'; the process keeps running. 'stopped_by: caller_deadline' means your own run deadline is near: report now instead of waiting again. 'timeout_secs' (1 to 86400, default 86400) kills the process at its deadline, which is separate from any wait. Nested head_lines/tail_lines/max_output_bytes/grep filter output. Output is written to separate stdout.log and stderr.log files. Supports shebang lines: if the command starts with #!, the script is executed with the named interpreter automatically.",
             tool_templates::SPAWN_CALL,
             Some(0),
+        )
+        .with_stop_on_new_message(),
+        spec::<StatusParams>(
+            "status",
+            "Report a spawned background process's current state without waiting: running (with how long it has run), exited with its exit code, or killed at its timeout_secs deadline. Returns output metrics and truncated output. Use head_lines/tail_lines/grep to filter output.",
+            tool_templates::STATUS_CALL,
+            None,
         ),
         spec::<WaitParams>(
             "wait",
-            "Wait for a spawned background process to exit. Returns the exit code, output metrics, and truncated output. If the process does not exit within the timeout, returns its current status and partial output without killing it. Use head_lines/tail_lines/grep to filter output rather than post-processing with shell tools.",
+            "Wait for a spawned background process to exit. Returns the exit code, output metrics, and truncated output. 'seconds' (1 to 240, default 240) bounds the wait; if the process has not exited by then, returns its current status and partial output without killing it. 'forever: true' waits until the process exits. A new message for you may end the wait early with 'stopped_by: new_message'; the process keeps running. 'stopped_by: caller_deadline' means your own run deadline is near: report now instead of waiting again. Use the 'status' tool to check without waiting. Use head_lines/tail_lines/grep to filter output rather than post-processing with shell tools.",
             tool_templates::WAIT_CALL,
             Some(0),
-        ),
+        )
+        .with_stop_on_new_message(),
         spec::<TerminateParams>(
             "terminate",
             "Send a signal to a spawned background process. Default signal is SIGTERM. Supported signals: SIGTERM, SIGKILL, SIGINT, SIGHUP.",
@@ -160,7 +210,7 @@ impl Toolset for BashToolset {
         }
         let invocation =
             INVOCATION_CANCEL.scope(cancel.clone(), self.server.invoke_tool_value(tool, args));
-        let result = if matches!(tool, "wait" | "read_exec_log") {
+        let result = if matches!(tool, "wait" | "status" | "read_exec_log") {
             tokio::select! {
                 result = invocation => result,
                 _ = cancel.cancelled() => return Err(ToolInvokeError::Fatal("tool call cancelled".into())),
@@ -173,6 +223,21 @@ impl Toolset for BashToolset {
         } else {
             map_result(result)
         }
+    }
+
+    async fn invoke_with_context(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Value, ToolInvokeError> {
+        let ToolInvocation {
+            tool,
+            args,
+            context,
+            cancel,
+        } = invocation;
+        INVOCATION_CONTEXT
+            .scope(context, self.invoke(&tool, args, cancel))
+            .await
     }
 }
 
@@ -274,7 +339,7 @@ mod tests {
                 && !tool.idempotent_hint
                 && !tool.read_only_hint
         }));
-        // Spawn's default nested wait is 120s, beyond the transport's 60s fallback.
+        // Spawn's default nested wait is 240s, beyond the transport's 60s fallback.
         for name in ["exec", "spawn", "wait"] {
             assert_eq!(
                 tools
@@ -290,6 +355,31 @@ mod tests {
             .iter()
             .filter(|tool| !matches!(tool.name.as_str(), "exec" | "spawn" | "wait"))
             .all(|tool| tool.timeout_secs.is_none()));
+    }
+
+    #[test]
+    fn builtin_tool_names_are_pinned_and_status_is_execute() {
+        let specs = builtin_tool_specs();
+        assert_eq!(
+            specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            [
+                "exec",
+                "read_exec_log",
+                "spawn",
+                "status",
+                "wait",
+                "terminate",
+                "rollback_file"
+            ]
+        );
+        assert!(specs
+            .iter()
+            .all(|s| s.kind() == Some(ToolProgressKind::Execute)));
+        assert!(specs.iter().all(|s| !s.description.contains("cache")));
+        assert!(specs
+            .iter()
+            .filter(|s| ["exec", "spawn", "status", "wait"].contains(&s.name.as_str()))
+            .all(|s| s.input_schema["additionalProperties"] == json!(false)));
     }
 
     #[cfg(unix)]
@@ -320,8 +410,7 @@ mod tests {
                         "exec",
                         json!({
                             "command": command,
-                            "working_dir": working_dir,
-                            "timeout_secs": 0
+                            "working_dir": working_dir
                         }),
                         cancel,
                     )

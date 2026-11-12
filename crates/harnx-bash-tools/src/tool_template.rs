@@ -13,7 +13,7 @@ use minijinja::{Environment, UndefinedBehavior};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::server::{BUILTIN_TOOL_NAMES, COMMAND_TIMEOUT_ARG, DEFAULT_COMMAND_TIMEOUT_SECS};
+use crate::server::{BUILTIN_TOOL_NAMES, COMMAND_TIMEOUT_ARG, COMMAND_TIMEOUT_MAX_SECS};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ToolTemplate {
@@ -46,9 +46,10 @@ impl ToolTemplate {
             COMMAND_TIMEOUT_ARG.to_string(),
             json!({
                 "type": "integer",
-                "minimum": 0,
+                "minimum": 1,
+                "maximum": COMMAND_TIMEOUT_MAX_SECS,
                 "description": format!(
-                    "Kill the command after this many seconds. Defaults to {DEFAULT_COMMAND_TIMEOUT_SECS} (24 hours); use 0 for no deadline."
+                    "Kill the command after this many seconds, 1 to {COMMAND_TIMEOUT_MAX_SECS}. Defaults to {COMMAND_TIMEOUT_MAX_SECS} (24 hours)."
                 )
             }),
         );
@@ -707,7 +708,7 @@ script: echo ok
         let timeout = &schema["properties"]["timeout_secs"];
 
         assert_eq!(timeout["type"], json!("integer"));
-        assert_eq!(timeout["minimum"], json!(0));
+        assert_eq!(timeout["minimum"], json!(1));
         assert!(timeout["description"]
             .as_str()
             .is_some_and(|description| description.contains("86400")));
@@ -1311,8 +1312,9 @@ script: echo ok
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "minimum": 0,
-                        "description": "Kill the command after this many seconds. Defaults to 86400 (24 hours); use 0 for no deadline.",
+                        "minimum": 1,
+                        "maximum": 86400,
+                        "description": "Kill the command after this many seconds, 1 to 86400. Defaults to 86400 (24 hours).",
                     },
                 },
                 "required": ["number", "repo"],
@@ -1387,8 +1389,9 @@ script: echo ok
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "minimum": 0,
-                        "description": "Kill the command after this many seconds. Defaults to 86400 (24 hours); use 0 for no deadline.",
+                        "minimum": 1,
+                        "maximum": 86400,
+                        "description": "Kill the command after this many seconds, 1 to 86400. Defaults to 86400 (24 hours).",
                     },
                 },
                 "required": ["attempts", "branch"],

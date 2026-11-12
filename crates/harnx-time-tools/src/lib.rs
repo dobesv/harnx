@@ -4,7 +4,7 @@ mod tool_templates;
 use async_trait::async_trait;
 use chrono::{Datelike, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
-use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{ToolInvocation, ToolInvokeError, ToolSpec, Toolset};
 use jiff::{civil, Span, Timestamp};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -73,7 +73,7 @@ impl TimeToolset {
         }))
     }
 
-    async fn wait(&self, args: Value, cancel: CancellationToken) -> Result<Value, ToolInvokeError> {
+    async fn wait(&self, args: Value, signals: WaitSignals) -> Result<Value, ToolInvokeError> {
         let args: WaitParams = parse_args(args)?;
         if !(0.0..=3600.0).contains(&args.seconds) || args.seconds == 0.0 {
             return Err(ToolInvokeError::Recoverable(
@@ -83,20 +83,28 @@ impl TimeToolset {
         let duration = Duration::from_secs_f64(args.seconds);
         let tz: Tz = self.local_tz.parse().unwrap_or(chrono_tz::UTC);
         let started_at = Utc::now().with_timezone(&tz);
-        tokio::select! {
-            _ = tokio::time::sleep(duration) => Ok(json!({
-                "message": format!("Waited {:.1} seconds", args.seconds),
-                "started_at": started_at.format(RFC3339_SECONDS).to_string(),
-                "ended_at": Utc::now().with_timezone(&tz).format(RFC3339_SECONDS).to_string(),
-            })),
-            _ = cancel.cancelled() => Err(ToolInvokeError::Fatal("tool call cancelled".to_string())),
-        }
+        let stopped_after = signals.sleep(duration).await?;
+        let message = match stopped_after {
+            None => format!("Waited {:.1} seconds", args.seconds),
+            Some(waited) => format!(
+                "Waited {:.1} of {:.1} seconds; a new message arrived",
+                waited.as_secs_f64(),
+                args.seconds
+            ),
+        };
+        let mut result = json!({
+            "message": message,
+            "started_at": started_at.format(RFC3339_SECONDS).to_string(),
+            "ended_at": Utc::now().with_timezone(&tz).format(RFC3339_SECONDS).to_string(),
+        });
+        mark_stopped(&mut result, stopped_after);
+        Ok(result)
     }
 
     async fn wait_until(
         &self,
         args: Value,
-        cancel: CancellationToken,
+        signals: WaitSignals,
     ) -> Result<Value, ToolInvokeError> {
         let args: WaitUntilParams = parse_args(args)?;
         let timezone = args.timezone.as_deref().unwrap_or(&self.local_tz);
@@ -134,15 +142,62 @@ impl TimeToolset {
             ));
         }
         let duration = duration.to_std().map_err(recoverable)?;
-        tokio::select! {
-            _ = tokio::time::sleep(duration) => Ok(json!({
-                "target": target.format(RFC3339_SECONDS).to_string(),
-                "waited_seconds": duration.as_secs_f64(),
-                "started_at": now.format(RFC3339_SECONDS).to_string(),
-                "ended_at": Utc::now().with_timezone(&tz).format(RFC3339_SECONDS).to_string(),
-            })),
-            _ = cancel.cancelled() => Err(ToolInvokeError::Fatal("tool call cancelled".to_string())),
+        let stopped_after = signals.sleep(duration).await?;
+        let mut result = json!({
+            "target": target.format(RFC3339_SECONDS).to_string(),
+            "waited_seconds": stopped_after.unwrap_or(duration).as_secs_f64(),
+            "started_at": now.format(RFC3339_SECONDS).to_string(),
+            "ended_at": Utc::now().with_timezone(&tz).format(RFC3339_SECONDS).to_string(),
+        });
+        mark_stopped(&mut result, stopped_after);
+        Ok(result)
+    }
+
+    async fn dispatch(
+        &self,
+        tool: &str,
+        args: Value,
+        signals: WaitSignals,
+    ) -> Result<Value, ToolInvokeError> {
+        match tool {
+            "get_current_time" => self.current_time(args),
+            "convert_time" => self.convert_time(args),
+            "wait" => self.wait(args, signals).await,
+            "wait_until" => self.wait_until(args, signals).await,
+            _ => Err(ToolInvokeError::Recoverable(format!(
+                "unknown time tool: {tool}"
+            ))),
         }
+    }
+}
+
+/// What can end a wait before its time. Cancellation fails the call; a new
+/// message for the caller's session ends it early with its normal result.
+struct WaitSignals {
+    cancel: CancellationToken,
+    new_message: CancellationToken,
+}
+
+impl WaitSignals {
+    /// Sleep for `duration`. Returns how long the wait lasted when a new
+    /// message ended it early, and `None` when it ran its full course.
+    async fn sleep(&self, duration: Duration) -> Result<Option<Duration>, ToolInvokeError> {
+        let started = tokio::time::Instant::now();
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                Err(ToolInvokeError::Fatal("tool call cancelled".to_string()))
+            }
+            _ = self.new_message.cancelled() => Ok(Some(started.elapsed())),
+            _ = tokio::time::sleep(duration) => Ok(None),
+        }
+    }
+}
+
+/// Name the new message in a wait's result when one ended it early.
+fn mark_stopped(result: &mut Value, stopped_after: Option<Duration>) {
+    if stopped_after.is_some() {
+        result["stopped_by"] = json!("new_message");
     }
 }
 
@@ -172,15 +227,23 @@ impl Toolset for TimeToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        match tool {
-            "get_current_time" => self.current_time(args),
-            "convert_time" => self.convert_time(args),
-            "wait" => self.wait(args, cancel).await,
-            "wait_until" => self.wait_until(args, cancel).await,
-            _ => Err(ToolInvokeError::Recoverable(format!(
-                "unknown time tool: {tool}"
-            ))),
-        }
+        let signals = WaitSignals {
+            cancel,
+            new_message: CancellationToken::new(),
+        };
+        self.dispatch(tool, args, signals).await
+    }
+
+    async fn invoke_with_context(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Value, ToolInvokeError> {
+        let signals = WaitSignals {
+            cancel: invocation.cancel,
+            new_message: invocation.context.new_message,
+        };
+        self.dispatch(&invocation.tool, invocation.args, signals)
+            .await
     }
 }
 
@@ -406,11 +469,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["message"], "Waited 0.2 seconds");
+        assert!(result.get("stopped_by").is_none());
         let started =
             chrono::DateTime::parse_from_rfc3339(result["started_at"].as_str().unwrap()).unwrap();
         let ended =
             chrono::DateTime::parse_from_rfc3339(result["ended_at"].as_str().unwrap()).unwrap();
         assert!(ended >= started);
+    }
+
+    /// A new-message signal that fires after `delay`.
+    fn new_message_after(delay: Duration) -> CancellationToken {
+        let new_message = CancellationToken::new();
+        let signal = new_message.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            signal.cancel();
+        });
+        new_message
+    }
+
+    /// Invoke `tool` with a new-message signal that fires after 200 ms.
+    async fn invoke_until_new_message(tool: &str, args: Value) -> (Value, Duration) {
+        invoke_with_new_message(tool, args, new_message_after(Duration::from_millis(200))).await
+    }
+
+    async fn invoke_with_new_message(
+        tool: &str,
+        args: Value,
+        new_message: CancellationToken,
+    ) -> (Value, Duration) {
+        let started = std::time::Instant::now();
+        let result = TimeToolset::new()
+            .invoke_with_context(harnx_toolset::ToolInvocation {
+                tool: tool.into(),
+                args,
+                context: harnx_toolset::ToolInvocationContext {
+                    new_message,
+                    ..Default::default()
+                },
+                cancel: CancellationToken::new(),
+            })
+            .await
+            .expect("a new message ends the wait with a result");
+        (result, started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn wait_returns_early_on_new_message() {
+        let (result, elapsed) = invoke_until_new_message("wait", json!({ "seconds": 30.0 })).await;
+        assert!(elapsed < Duration::from_secs(5), "waited {elapsed:?}");
+        assert_eq!(result["stopped_by"], "new_message");
+        assert!(result["started_at"].is_string() && result["ended_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn wait_until_returns_early_on_new_message() {
+        let target = (Utc::now() + chrono::Duration::seconds(30))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let (result, elapsed) =
+            invoke_until_new_message("wait_until", json!({ "time": target, "timezone": "UTC" }))
+                .await;
+        assert!(elapsed < Duration::from_secs(5), "waited {elapsed:?}");
+        assert_eq!(result["stopped_by"], "new_message");
+        assert!(result["waited_seconds"].as_f64().unwrap() < 5.0);
+    }
+
+    /// The tool server fires the signal before the call starts when a message
+    /// was already pending at dispatch; the wait then returns at once.
+    #[tokio::test]
+    async fn wait_returns_at_once_when_a_new_message_is_already_pending() {
+        let new_message = CancellationToken::new();
+        new_message.cancel();
+        let (result, elapsed) =
+            invoke_with_new_message("wait", json!({ "seconds": 30.0 }), new_message).await;
+        assert!(elapsed < Duration::from_secs(5), "waited {elapsed:?}");
+        assert_eq!(result["stopped_by"], "new_message");
+    }
+
+    #[test]
+    fn only_the_waits_stop_on_new_message() {
+        let opted_in: Vec<String> = TimeToolset::new()
+            .tools()
+            .into_iter()
+            .filter(|spec| spec.stops_on_new_message())
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(opted_in, ["wait", "wait_until"]);
     }
 
     #[tokio::test]

@@ -1176,6 +1176,21 @@ idempotent throughout: a call may be cancelled any number of times, with the
 same or different cancellation ids. The acknowledgement can change as the call
 progresses, for example from `Accepted` to `AlreadyFinished`.
 
+A second control kind, `ControlKind::NewMessage`, is not a cancel. A tool whose
+spec carries `harnx:stop_on_new_message` (bash `spawn`/`wait`, time `wait`/
+`wait_until`, the sub-agent `session_send`/`session_wait`) opts in to being ended
+early when a new user message arrives for the waiting session. The worker sends
+the control message to the server, which trips the call's `new_message` token;
+the call then returns its normal result with `stopped_by: "new_message"`. It
+records no cancellation and does not end the turn, so the model reads the
+message on its next step. A call that opted in and sees a message already
+pending at admission gets the same effect from the `harnx:new_message_pending`
+request capability. Older servers drop the unknown control kind and the wait
+runs to its limit, as it does over the k8s-sandbox proxy and MCP stdio routes,
+where the opt-in is stripped. A server that receives `NewMessage` for a call it
+is not yet running answers the retryable `Unknown`, and the worker resends it a
+bounded number of times.
+
 Dropping a NATS tool response wait before completion (for example, at a script
 deadline) removes its in-flight registration and schedules a fire-and-forget
 cancel through this control path. Dropped waits and explicit aborts publish the

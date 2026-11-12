@@ -6,6 +6,7 @@
 //! none of its side effects: no repair, activation, resume or polling.
 
 use super::{
+    super::SessionPromptStatus,
     budget::{Budget, Stop},
     scope::Scope,
     snapshot::Snapshot,
@@ -20,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 pub(in crate::nats_worker::subagent_toolset) struct PromptScope {
     pub(in crate::nats_worker::subagent_toolset) start: u64,
     pub(in crate::nats_worker::subagent_toolset) end: u64,
+    pub(in crate::nats_worker::subagent_toolset) status: SessionPromptStatus,
 }
 
 pub(in crate::nats_worker::subagent_toolset) enum PromptScopeError {
@@ -47,9 +49,9 @@ pub(in crate::nats_worker::subagent_toolset) async fn resolve_prompt_scope(
         .map_err(|_| PromptScopeError::Unavailable)?
         .ok_or(PromptScopeError::UnknownPrompt)?;
     let log = NatsSessionLog::new(toolset.jetstream.clone(), storage);
-    // Zero budget: one bounded pass under the shared 10 s I/O cap. Load must
+    // Snapshot budget: one bounded pass under the shared 10 s I/O cap. Load must
     // never wait on the child, repair an activation or poll for progress.
-    let budget = Budget::new(0, CancellationToken::new());
+    let budget = Budget::snapshot(CancellationToken::new());
     let scope = Scope {
         storage: storage.to_owned(),
         admission,
@@ -70,13 +72,18 @@ pub(in crate::nats_worker::subagent_toolset) async fn resolve_prompt_scope(
     Ok(PromptScope {
         start,
         end: snapshot.output_end(),
+        status: snapshot.status(),
     })
 }
 
 fn scope_stop(stop: Stop) -> PromptScopeError {
-    // A zero budget allows one full pass; any stop means the shared I/O
+    // A snapshot budget allows one full pass; any stop means the shared I/O
     // bound was exhausted mid-scan, never that the prompt was disproven.
     match stop {
-        Stop::Expired | Stop::Cancelled | Stop::Unavailable => PromptScopeError::Unavailable,
+        Stop::Expired
+        | Stop::Cancelled
+        | Stop::Unavailable
+        | Stop::NewMessage
+        | Stop::CallerDeadline => PromptScopeError::Unavailable,
     }
 }

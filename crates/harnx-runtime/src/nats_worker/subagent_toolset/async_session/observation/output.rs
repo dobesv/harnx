@@ -2,8 +2,9 @@
 use super::{
     budget::{Budget, Stop},
     scope::Scope,
-    snapshot::Snapshot,
+    snapshot::{Snapshot, LIVE_UNPROVABLE},
     DispatchConfirmation, Observer, PromptHandle, SessionPromptResult, SessionPromptStatus,
+    WaitStop,
 };
 use crate::nats_session_log::NatsSessionLog;
 use crate::nats_worker::subagent_toolset::session_read::{
@@ -33,6 +34,7 @@ impl Frame {
                 status: SessionPromptStatus::Unknown,
                 terminal: false,
                 wait_expired: false,
+                stopped_by: None,
                 elapsed_ms: 0,
                 output: json!({}),
             },
@@ -82,6 +84,11 @@ impl Frame {
         self.complete = snapshot.complete && self.result.status != SessionPromptStatus::Unknown;
         if let Some(error) = snapshot.evidence_error() {
             self.error = Some(error);
+        } else if let Some(error) = snapshot.live_error() {
+            self.error = Some(error);
+        } else if self.error == Some(LIVE_UNPROVABLE) {
+            // The state became provable again, for example after a terminal.
+            self.error = None;
         }
     }
 
@@ -104,6 +111,7 @@ impl Frame {
             status: SessionPromptStatus::Cancelled,
             terminal: false,
             wait_expired: false,
+            stopped_by: Some(WaitStop::WIDEST),
             elapsed_ms: u64::MAX,
             output: Value::Null,
         };
@@ -140,7 +148,7 @@ impl Frame {
             Ok(page) => {
                 self.result.output = page;
                 self.rendered_through = Some(snapshot.through);
-                self.error = None;
+                self.error = snapshot.live_error();
             }
             Err(_) => {
                 self.error = Some("presentation_unavailable");
@@ -154,12 +162,31 @@ impl Frame {
         allowed && observer.snapshot.evidence_error().is_none()
     }
 
+    /// Repair republishes an activation for a prompt that is provably pending.
+    /// While the live state is unprovable (or any error is set) it stays off.
     pub(super) fn permits_repair(&self) -> bool {
         self.error.is_none()
     }
 
     pub(super) fn stopped(&mut self, reason: Stop) {
+        // An expired wait over an unprovable live state keeps saying why the
+        // state is unknown, which is more useful than that the wait ended.
+        let keep_live_error = reason == Stop::Expired && self.error == Some(LIVE_UNPROVABLE);
         self.error = Some(match reason {
+            // Not an error: the result is the last complete observation, and
+            // the caller waits again after reading its message.
+            Stop::NewMessage => {
+                self.result.stopped_by = Some(WaitStop::NewMessage);
+                return;
+            }
+            Stop::CallerDeadline => {
+                // A terminal result was not cut short; the work was done.
+                if !self.result.terminal {
+                    self.result.stopped_by = Some(WaitStop::CallerDeadline);
+                }
+                return;
+            }
+            Stop::Expired if keep_live_error => LIVE_UNPROVABLE,
             Stop::Expired => "soft_wait_expired",
             Stop::Cancelled => "observer_cancelled",
             Stop::Unavailable => "durable_observation_unavailable",

@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "prompt_injection/new_message.rs"]
+mod new_message;
+
 static SOLO_TURN_ROUNDS: AtomicUsize = AtomicUsize::new(0);
 static SOLO_TURN_INJECTIONS: AtomicUsize = AtomicUsize::new(0);
 static LATE_MSG_READY: LazyLock<Notify> = LazyLock::new(Notify::new);

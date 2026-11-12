@@ -10,7 +10,9 @@
 //! parent session, or a previous worker instance) interrupts: it records an
 //! `InterruptNotice`, fires the abort signal, and publishes a tool cancel for
 //! every call currently in flight for the session. A `Message` from a user
-//! only flags that input is waiting; it never touches the abort signal.
+//! only flags that input is waiting; it never touches the abort signal. An
+//! executable one also tells the session's calls that opted in to stop on a
+//! new message (waits), so the model sees it without waiting out the limit.
 //!
 //! The stream cursor survives reconnects: it advances as each message is
 //! seen, not only when the consumer runs dry (which an ordered push
@@ -73,7 +75,11 @@ pub(super) struct InterruptNotice {
 /// alongside the session's other per-execution tasks (lease-loss watch,
 /// control listener).
 pub(super) fn spawn_session_watcher(ctx: SessionWatcherCtx) -> tokio::task::JoinHandle<()> {
+    // Created before the task starts, so even a watcher aborted before its
+    // first poll forgets the session's message marks.
+    let messages = ctx.in_flight.follow_session_messages(&ctx.session_id);
     tokio::spawn(async move {
+        let _messages = messages;
         let mut cursor = ctx.start_after;
         loop {
             match watch_from(&ctx, &mut cursor).await {
@@ -175,6 +181,9 @@ async fn handle_cancel_entry(ctx: &SessionWatcherCtx, seq: u64, cancellation_id:
 }
 
 async fn handle_watcher_entry(ctx: &SessionWatcherCtx, seq: u64, entry: SessionLogEntry) {
+    if is_new_prompt(&entry) {
+        signal_new_message(ctx, seq);
+    }
     match entry {
         SessionLogEntry::Cancel {
             cancellation_id, ..
@@ -194,6 +203,31 @@ async fn handle_watcher_entry(ctx: &SessionWatcherCtx, seq: u64, entry: SessionL
             ctx.pending_input.store(true, Ordering::Relaxed);
         }
         _ => {}
+    }
+}
+
+/// An executable user message some other writer added. Everything a worker
+/// appends under its lease carries a fence token, and nothing a frontend or
+/// another session's dispatch writes does, so this worker's own compaction
+/// copy of a prompt doesn't count even when it is seen here before
+/// `own_appends` has caught up with it.
+fn is_new_prompt(entry: &SessionLogEntry) -> bool {
+    entry.fence_token().is_none() && super::agent_loop::executable_user_message_id(entry).is_some()
+}
+
+/// End the opted-in waits in flight for the session, so the model sees the
+/// message without waiting out a wait's limit. A spurious signal would be
+/// harmless anyway: the wait returns a still-running result and the model
+/// waits again.
+fn signal_new_message(ctx: &SessionWatcherCtx, seq: u64) {
+    let signalled = ctx
+        .in_flight
+        .note_pending_message(&ctx.client, &ctx.session_id, seq);
+    if signalled > 0 {
+        log::debug!(
+            "session watcher signalled waits of a new message: session_id={} seq={seq} calls={signalled}",
+            ctx.session_id
+        );
     }
 }
 

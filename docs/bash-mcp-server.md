@@ -82,7 +82,7 @@ ASCII letter or digit; remaining characters may also be hyphens or underscores.
 
 ## Restrict published tools
 
-By default, `harnx-bash-tools` publishes all built-in tools (`exec`, `spawn`, `wait`, `terminate`, `read_exec_log`) and any loaded command templates.
+By default, `harnx-bash-tools` publishes all built-in tools (`exec`, `spawn`, `status`, `wait`, `terminate`, `read_exec_log`, `rollback_file`) and any loaded command templates.
 
 Pass `--enable-tool <glob>` to limit published and callable tools to those matching the pattern. Tools that do not match are not registered and cannot be invoked. Repeat `--enable-tool` to specify multiple patterns. Without `--enable-tool`, all tools are published.
 
@@ -99,22 +99,37 @@ args:
   - --enable-tool
   - deploy_*
   - --enable-tool
-  - status
+  - service_status
 ```
 
-In this configuration, only template tools matching `deploy_*` and the `status` tool are exposed; the generic `exec` tool is omitted.
+In this configuration, only template tools matching `deploy_*` and the `service_status` tool are exposed; the generic `exec` tool is omitted.
+
+Built-in tool names are reserved: a command template named `exec`, `spawn`, `status`, `wait`, `terminate`, `read_exec_log` or `rollback_file` fails startup when you pass it with `--tool` or `--tools-dir`, and is skipped with a warning when it is auto-discovered. Give templates distinct names such as `service_status`.
 
 ## Built-in tools and execution model
 
-`harnx-bash-tools` exposes five built-in tools for running and managing commands:
+`harnx-bash-tools` exposes seven built-in tools for running and managing commands:
 
 | Tool | Purpose | Key parameters |
 | :--- | :--- | :--- |
-| `exec` | Synchronous foreground execution | `command`, `timeout_secs`, output filters (`head_lines`, `tail_lines`, `max_output_bytes`) |
-| `spawn` | Background execution with optional wait | `command`, optional nested `wait` configuration (`timeout_secs`, `head_lines`, `tail_lines`, `max_output_bytes`, `grep`) |
-| `wait` | Poll or wait on a background process | `execution_id`, flat wait and filter options (`timeout_secs`, `head_lines`, `tail_lines`, `max_output_bytes`, `grep`) |
+| `exec` | Synchronous foreground execution | `command`, `timeout_secs` (1 to 86400), output filters (`head_lines`, `tail_lines`, `max_output_bytes`) |
+| `spawn` | Background execution with optional wait | `command`, `timeout_secs` (kill deadline, 1 to 86400), optional nested `wait` configuration (`seconds`, `forever`, `head_lines`, `tail_lines`, `max_output_bytes`, `grep`) |
+| `status` | Report a background process's state without waiting | `execution_id`, output filters (`head_lines`, `tail_lines`, `max_output_bytes`, `grep`) |
+| `wait` | Wait on a background process | `execution_id`, `seconds` (1 to 240) or `forever`, output filters |
 | `terminate` | Stop a background process | `execution_id`, `signal` (`SIGTERM` default, `SIGKILL`, `SIGINT`, `SIGHUP`) |
 | `read_exec_log` | Read server-owned execution logs | `execution_id`, `stream` (`stdout`/`stderr`), paging and filter options |
+| `rollback_file` | Restore a repository to a prior harnx history snapshot | `commit_id` (the SHA from the `commit <sha>` line of a prior tool response's diff) |
+
+`spawn`, `status` and `wait` reject arguments they do not declare. In particular, `wait` no longer takes `timeout_secs` (use `seconds`), and a nested `wait` object does not either.
+
+### Deadlines versus waits
+
+Two independent limits apply to a background command:
+
+- **`timeout_secs` on `spawn`** is the process's own kill deadline, from 1 to 86400 seconds (24 hours, the default). When it passes, the whole process group is killed. A later `status` or `wait` reports `status: timed_out` with the summary `execution_id '<id>' killed after its <n>s deadline`. This is a normal result, not an error.
+- **A wait** only bounds how long a call holds the caller. It never stops the process.
+
+`exec` and command templates use the same `timeout_secs` range and default; `0` is rejected.
 
 ### Spawning processes with nested wait
 
@@ -123,28 +138,32 @@ The `spawn` tool starts a command in the background. It takes an optional nested
 ```json
 {
   "command": "cargo test",
+  "timeout_secs": 1800,
   "wait": {
-    "timeout_secs": 30,
+    "seconds": 30,
     "tail_lines": 50
   }
 }
 ```
 
 - **Omitted `wait`**: Returns immediately with `execution_id` and log file paths without waiting for the process to exit.
-- **Empty object (`wait: {}`)**: Uses the default timeout of 120 seconds (two minutes).
-- **Immediate poll (`wait: { timeout_secs: 0 }`)**: Checks current status immediately without blocking. Note that `timeout_secs: 0` in `wait` means an instant poll, unlike `exec` where `0` means an unlimited deadline.
+- **Empty object (`wait: {}`)**: Waits up to the default of 240 seconds.
+- **Fixed wait (`wait: { seconds: N }`)**: Waits up to `N` seconds, from 1 to 240. Other values are rejected; to check without waiting, omit `wait` and call `status`.
+- **Unbounded wait (`wait: { forever: true }`)**: Waits until the process exits, which the process's own `timeout_secs` deadline bounds. It cannot be combined with `seconds`.
 - **Output filtering**: The nested `wait` object accepts `head_lines`, `tail_lines`, `max_output_bytes`, and regex `grep` to filter or truncate command output before returning it. It does not accept `execution_id`, which is generated by `spawn`.
-- **Process lifecycle on wait expiry**: If the command finishes within the wait duration, `spawn` returns exit status, exit code, and captured output. If the command runs longer than the wait duration, `spawn` returns running status with partial output and the `execution_id`. **Wait expiry never terminates the process.** The process continues running in the background.
-- **Cache TTL recommendation**: Bounded wait durations under 5 minutes (such as 30 seconds or the 120-second default) are recommended. Many LLM providers cache prompt context for 5 minutes; returning before the cache expires allows the agent turn to reuse cached context. Explicit longer waits remain supported without artificial caps.
-- **Cancellation during the initial wait**: If the caller's turn is cancelled while the initial nested `wait` is still in progress, the call reports an interrupted result without an `execution_id` (the first response never reached the caller), and the command keeps running. Because the server hands the process over to the response path before the first reply, such a cancelled call can leave the running process unreachable through `wait` or `terminate`. Prefer bounded initial waits so the `execution_id` is delivered quickly, then continue with follow-up `wait` calls.
+- **Cancelled initial wait**: Over MCP stdio, MCP HTTP and the k8s-sandbox proxy there is no partial-result store, so if the caller cancels a `spawn` call during its nested wait, the `execution_id` is never returned. The process stays tracked and is killed at its `timeout_secs` deadline. The native NATS route records the `execution_id` as a partial result instead.
+- **Process lifecycle on wait expiry**: If the command finishes within the wait duration, `spawn` returns exit status, exit code, and captured output. If the command runs longer, `spawn` returns running status with partial output and the `execution_id`. **Wait expiry never terminates the process.**
 
-### Follow-up with `wait` and `terminate`
+### Follow-up with `status`, `wait` and `terminate`
 
 When a command outlasts its initial wait:
 
-1. **Continue waiting**: Call `wait` with `execution_id`. The standalone `wait` tool takes flat arguments (`execution_id`, `timeout_secs`, and output filters). Its default timeout is 120 seconds, and `timeout_secs: 0` performs an immediate status check. Expiry still leaves the process running.
-2. **Stop the process**: Call `terminate` with `execution_id`. It defaults to `SIGTERM`, and accepts `SIGKILL`, `SIGINT`, or `SIGHUP`. Process termination is handled exclusively through `terminate`.
-3. **Inspect full output**: Call `read_exec_log` with `execution_id` and stream (`stdout` or `stderr`) to page through log files when output was truncated.
+1. **Check without waiting**: Call `status` with `execution_id`. It returns immediately with `status: running` and `running_for`, `status: exited` and `exit_code`, or `status: timed_out`, plus output filtered by the same options as `wait`.
+2. **Continue waiting**: Call `wait` with `execution_id`. It takes flat arguments (`execution_id`, `seconds` or `forever`, and output filters) with a default of 240 seconds. Expiry still leaves the process running.
+3. **Stop the process**: Call `terminate` with `execution_id`. It defaults to `SIGTERM`, and accepts `SIGKILL`, `SIGINT`, or `SIGHUP`. Process termination is handled exclusively through `terminate`.
+4. **Inspect full output**: Call `read_exec_log` with `execution_id` and stream (`stdout` or `stderr`) to page through log files when output was truncated.
+
+Finished processes stay tracked, so `status` and repeated `wait` calls keep returning the same result.
 
 ### Foreground execution (`exec`)
 

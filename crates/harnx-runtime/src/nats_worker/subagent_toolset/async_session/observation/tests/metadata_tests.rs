@@ -17,7 +17,7 @@ fn minimum_budget_keeps_escaped_handles_status_and_maximal_error_metadata() {
         frame.result.dispatch = Some(DispatchConfirmation::Unconfirmed);
         frame.result.status = SessionPromptStatus::Pending;
         frame.stopped(Stop::Unavailable);
-        let result = frame.finish(&Budget::new(0, CancellationToken::new()));
+        let result = frame.finish(&Budget::snapshot(CancellationToken::new()));
         assert_eq!(result["session_id"], handle.session_id);
         assert_eq!(result["prompt_id"], handle.prompt_id);
         assert_eq!(result["status"], "unknown");
@@ -38,7 +38,7 @@ async fn impossible_identifier_budget_is_rejected_before_send_side_effects() -> 
         } else {
             args["session_id"] = json!("x".repeat(1000));
         }
-        args["wait"] = json!({"seconds": 0, "read": {"max_output_bytes": 1024}});
+        args["wait"] = json!({"seconds": 1, "read": {"max_output_bytes": 1024}});
         let error = send(&f.toolset, args, CancellationToken::new(), context)
             .await
             .unwrap_err();
@@ -58,7 +58,7 @@ async fn oversized_diagnostic_identity_cannot_discard_handle_or_observation_meta
         session_id: "child".into(),
         prompt_id: "original-prompt".into(),
     };
-    let budget = Budget::new(0, CancellationToken::new());
+    let budget = Budget::snapshot(CancellationToken::new());
     let mut scope = match Scope::resolve(&f.toolset, &handle, &f.wait_context(), &budget).await {
         Ok(scope) => scope,
         Err(_) => panic!("scope resolution"),

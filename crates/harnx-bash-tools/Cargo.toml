@@ -29,7 +29,7 @@ serde_json = { workspace = true }
 shell-words = { workspace = true }
 serde_yaml = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "sync"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
 
@@ -38,7 +38,8 @@ name = "harnx-bash-tools"
 path = "src/main.rs"
 
 [dev-dependencies]
+chrono = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }

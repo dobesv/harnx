@@ -71,19 +71,19 @@ async fn cancel_control_message_interrupts_running_hook() -> Result<()> {
         result = &mut invoke => anyhow::bail!("hook finished early: {result:?}"),
     }
 
+    // Hooks never wait on the caller's messages: a new-message signal is
+    // refused and leaves the hook running for the cancel that follows.
+    let new_message = ControlMessage::new_message("echo".into(), session_id.into(), call_id.into());
+    let ack = acknowledgement(&client, &scope, &new_message).await?;
+    assert!(matches!(ack.acceptance, CancelAcceptance::Rejected { .. }));
+
     let control = ControlMessage::cancel(
         "echo".into(),
         session_id.into(),
         call_id.into(),
         "c-1".into(),
     );
-    let ack_message = client
-        .request(
-            scope.hook_control_subject("echo"),
-            serde_json::to_vec(&control)?.into(),
-        )
-        .await?;
-    let ack: CancellationAcknowledgement = serde_json::from_slice(&ack_message.payload)?;
+    let ack = acknowledgement(&client, &scope, &control).await?;
     assert_eq!(ack.acceptance, CancelAcceptance::Accepted);
 
     let reply = tokio::time::timeout(Duration::from_secs(2), &mut invoke).await??;
@@ -92,6 +92,20 @@ async fn cancel_control_message_interrupts_running_hook() -> Result<()> {
     shutdown.cancel();
     task.await??;
     Ok(())
+}
+
+async fn acknowledgement(
+    client: &async_nats::Client,
+    scope: &ServerScope,
+    control: &ControlMessage,
+) -> Result<CancellationAcknowledgement> {
+    let ack_message = client
+        .request(
+            scope.hook_control_subject("echo"),
+            serde_json::to_vec(control)?.into(),
+        )
+        .await?;
+    Ok(serde_json::from_slice(&ack_message.payload)?)
 }
 
 fn assert_interrupted_reply(reply: async_nats::Message) -> Result<()> {

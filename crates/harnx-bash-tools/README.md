@@ -49,8 +49,8 @@ Batch toggles accept `1`, `true`, `yes`, or `on`:
 ## Command deadlines
 
 Foreground `exec` calls and command templates run for up to 86,400 seconds (24 hours) by
-default. Each call accepts `timeout_secs` to choose a shorter or longer deadline; use
-`timeout_secs: 0` to run without a deadline. Cancelling the tool call still terminates the
+default, which is also the maximum. Each call accepts `timeout_secs` from 1 to 86,400 to choose
+a shorter deadline; `0` is rejected. Cancelling the tool call still terminates the
 foreground command and its process group.
 
 `timeout_secs` is reserved execution metadata for command templates. It is injected into every
@@ -79,7 +79,7 @@ Each command template file contains the following fields:
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `name` | String (required) | Tool name. Must match `^[a-zA-Z][a-zA-Z0-9_]*$` and cannot collide with built-in tool names (`exec`, `read_exec_log`, `spawn`, `wait`, `terminate`, `rollback_file`). |
+| `name` | String (required) | Tool name. Must match `^[a-zA-Z][a-zA-Z0-9_]*$` and cannot collide with built-in tool names (`exec`, `read_exec_log`, `spawn`, `status`, `wait`, `terminate`, `rollback_file`). |
 | `description` | String (optional) | Human-readable description of the tool advertised to MCP clients. |
 | `parameters` | Map (optional) | Parameter definitions for the tool schema. Defaults to no parameters. |
 | `env` | Map (optional) | Key-value pairs injected directly into the script environment as fixed environment variables. |

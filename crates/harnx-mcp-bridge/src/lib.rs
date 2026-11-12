@@ -1025,13 +1025,14 @@ mod tests {
         };
 
         // Native policy (builtin_tool_specs): spawn/wait/exec disable the
-        // elapsed deadline. A spawn whose nested wait uses the 120-second
+        // elapsed deadline. A spawn whose nested wait uses the 240-second
         // default must therefore return its first response with an
         // execution_id instead of hitting the former 60-second NATS deadline.
         assert_eq!(spec_timeout("spawn"), Some(0));
         assert_eq!(spec_timeout("wait"), Some(0));
         assert_eq!(spec_timeout("exec"), Some(0));
         // Tools the native toolset leaves on the caller's backstop keep it.
+        assert_eq!(spec_timeout("status"), None);
         assert_eq!(spec_timeout("terminate"), None);
         assert_eq!(spec_timeout("read_exec_log"), None);
         assert_eq!(spec_timeout("rollback_file"), None);

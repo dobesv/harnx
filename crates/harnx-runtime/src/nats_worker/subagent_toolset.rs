@@ -416,6 +416,7 @@ impl SubagentToolset {
         // Prompt scope is a pure read: it validates the target binding and
         // bounds the page to that prompt's turn. Load never resumes,
         // activates, repairs or waits on the session.
+        let mut status = None;
         if let Some(prompt_id) = args.prompt_id.as_deref() {
             if prompt_id.trim().is_empty() {
                 return Err(ToolInvokeError::Recoverable(
@@ -425,14 +426,20 @@ impl SubagentToolset {
             let scope = self.prompt_load_scope(&storage, prompt_id).await?;
             session_read::scope_read_to_prompt(&mut read, scope.start, scope.end)
                 .map_err(ToolInvokeError::Recoverable)?;
+            status = Some(scope.status);
         }
         let log = crate::nats_session_log::NatsSessionLog::new(self.jetstream.clone(), &storage);
         // The page is merged into the wrapper below, so the wrapper's own
         // serialized bytes are reserved first and the whole result respects
         // max_output_bytes instead of only the inner page.
-        let wrapper = match args.prompt_id {
-            Some(prompt_id) => json!({ "session_id": session_id, "prompt_id": prompt_id }),
-            None => json!({ "session_id": session_id }),
+        let wrapper = match (args.prompt_id, status) {
+            (Some(prompt_id), Some(status)) => json!({
+                "session_id": session_id,
+                "prompt_id": prompt_id,
+                "status": status,
+                "terminal": status.is_terminal(),
+            }),
+            _ => json!({ "session_id": session_id }),
         };
         let reserve = serde_json::to_vec(&wrapper)
             .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?
@@ -1129,7 +1136,9 @@ fn session_load_spec(agent: &str) -> ToolSpec {
              their source index; page by passing the returned next_index as read.index_min on \
              the next call, and recover omitted content with \
              read.entry_index and read.byte_offset. An omitted read applies safe bounded \
-             defaults; prompt_id restricts the page to one dispatched prompt's turn."
+             defaults. With prompt_id the page is restricted to one dispatched prompt's turn \
+             and the result reports its status and terminal flag: this is how to check a \
+             prompt without waiting. To wait for it, use session_wait."
         ),
         input_schema: json!({
             "type": "object",

@@ -416,6 +416,7 @@ async fn a_call_this_process_still_holds_is_cancelled_where_it_was_dispatched() 
             server: "srv-live".into(),
             session_id: turn.storage_key.clone(),
             control_subject: live_scope.control_subject(),
+            stop_on_new_message: false,
         })
         .await;
     let mut journaled = turn.control(&journal_scope()).await;

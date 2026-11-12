@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch, Mutex, OnceCell};
 use uuid::Uuid;
 
 mod command;
@@ -53,12 +53,14 @@ mod lifecycle;
 mod params;
 mod process;
 mod render;
+mod supervisor;
 #[cfg(all(test, not(target_os = "windows")))]
 mod tests;
 
 pub(crate) use handlers::*;
 pub(crate) use params::*;
 pub(crate) use render::*;
+use supervisor::{spawn_supervisor, ProcessControl, ProcessExit};
 
 use crate::tool_template::ToolTemplate;
 use crate::tool_templates;
@@ -67,13 +69,23 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "exec",
     "read_exec_log",
     "spawn",
+    "status",
     "wait",
     "terminate",
     "rollback_file",
 ];
 
-/// Default execution deadline for foreground commands and command templates.
-pub(crate) const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+/// Longest execution deadline for commands and command templates, which is
+/// also the default.
+pub(crate) const COMMAND_TIMEOUT_MAX_SECS: u64 = 24 * 60 * 60;
+
+/// A wait that names no limit lasts this long.
+pub(crate) const WAIT_DEFAULT_SECS: u64 = 240;
+
+/// Longest fixed wait; `forever` is the only way to wait longer. It stays
+/// under the five-minute prompt-cache lifetime, so a model that waits the
+/// full limit still finds its cache warm when the result comes back.
+pub(crate) const WAIT_MAX_SECS: u64 = 240;
 
 /// Reserved per-call execution control automatically exposed by command templates.
 pub(crate) const COMMAND_TIMEOUT_ARG: &str = "timeout_secs";
@@ -168,9 +180,10 @@ fn finalize_direct_mcp_context(
     result
 }
 
-// Spawned process tracking
+/// A spawned background process. Its supervisor task owns the child; this
+/// entry only watches the exit and sends control messages, and it stays in the
+/// map after the process exits so later calls can still report the result.
 pub(crate) struct SpawnedProcess {
-    child: Box<dyn ChildWrapper>,
     command: String,
     working_dir: PathBuf,
     stdout_log_path: PathBuf,
@@ -179,11 +192,18 @@ pub(crate) struct SpawnedProcess {
     snapshot_decision: SnapshotDecision,
     /// Spawn time, kept across polls so each `wait` can report total runtime.
     started_at: std::time::Instant,
+    /// The kill deadline this process was spawned with.
+    deadline_secs: u64,
+    exit: watch::Receiver<Option<ProcessExit>>,
+    control: mpsc::UnboundedSender<ProcessControl>,
+    /// The diff between the before-spawn and after-exit snapshots, taken by
+    /// the first wait that sees the exit and reused by every later one.
+    exit_diff: Arc<OnceCell<Vec<String>>>,
 }
 
 struct BashServerInner {
     allowlist: Arc<ResolvedAllowlist>,
-    spawned: Mutex<HashMap<String, SpawnedProcess>>,
+    spawned: Mutex<HashMap<String, Arc<SpawnedProcess>>>,
     log_dir: PathBuf,
     history: Arc<HistoryManager>,
     /// Sandbox + env config. Sandbox-specific fields (`enabled`, `allowlist`,

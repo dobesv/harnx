@@ -8,6 +8,9 @@ use crate::nats_session_log::{LogWindow, NatsSessionLog, SCAN_BYTE_LIMIT, SCAN_R
 use crate::nats_session_metadata::InvocationAdmission;
 use harnx_core::session::SessionLogEntry;
 
+/// Error code for a live state the bounded scan cannot prove.
+pub(super) const LIVE_UNPROVABLE: &str = "live_state_unprovable";
+
 #[derive(Default)]
 pub(super) struct Snapshot {
     pub(super) prompt: Option<u64>,
@@ -121,14 +124,26 @@ impl Snapshot {
 
     fn track_round(&mut self, seq: u64, entry: SessionLogEntry) {
         match &entry {
+            SessionLogEntry::Compress { .. } => {
+                // A mid-turn compaction only runs between tool rounds and then
+                // re-logs the prompt and the kept rounds, so a settled round
+                // proves nothing is lost and the re-logged tail rebuilds it.
+                if self.round_is_settled() {
+                    self.round.clear();
+                    self.round_bytes = 0;
+                } else {
+                    self.unsafe_live = true;
+                    self.round.clear();
+                }
+            }
             SessionLogEntry::Clear
-            | SessionLogEntry::Compress { .. }
             | SessionLogEntry::EditEntries { .. }
             | SessionLogEntry::Rewind { .. } => {
                 // Raw terminals survive mutations; live approval derivation needs
                 // evidence that these bounded windows cannot reconstruct.
                 self.unsafe_live = true;
                 self.round.clear();
+                self.round_bytes = 0;
             }
             SessionLogEntry::ToolCalls { .. } => {
                 self.round.clear();
@@ -145,6 +160,19 @@ impl Snapshot {
             }
             _ => {}
         }
+    }
+
+    /// True when the kept round is empty or fully answered with no approval pending.
+    fn round_is_settled(&self) -> bool {
+        let answered = self
+            .round
+            .iter()
+            .any(|(_, entry)| matches!(entry, SessionLogEntry::ToolResults { .. }));
+        let no_approvals = matches!(
+            crate::nats_worker::derive_pending_hitl_approvals(&self.round),
+            Ok(approvals) if approvals.is_empty()
+        );
+        self.round.is_empty() || (answered && no_approvals)
     }
 
     fn keep_round_entry(&mut self, seq: u64, entry: SessionLogEntry) {
@@ -182,6 +210,24 @@ impl Snapshot {
             Ok(_) => SessionPromptStatus::Pending,
             Err(_) => SessionPromptStatus::Unknown,
         }
+    }
+
+    /// The observer has nothing further to learn by polling.
+    pub(super) fn settled(&self) -> bool {
+        self.terminal.is_some()
+            || self.evidence_error().is_some()
+            || self.status() == SessionPromptStatus::Blocked
+    }
+
+    /// Why the status is `Unknown` although no durable evidence is missing.
+    pub(super) fn live_error(&self) -> Option<&'static str> {
+        let unprovable = self.unsafe_live
+            || crate::nats_worker::derive_pending_hitl_approvals(&self.round).is_err();
+        (self.status() == SessionPromptStatus::Unknown
+            && self.complete
+            && self.evidence_error().is_none()
+            && unprovable)
+            .then_some(LIVE_UNPROVABLE)
     }
 
     pub(super) fn output_end(&self) -> u64 {

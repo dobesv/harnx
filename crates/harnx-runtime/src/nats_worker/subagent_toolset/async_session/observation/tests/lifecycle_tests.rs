@@ -22,7 +22,7 @@ async fn first_terminal_survives_steering_compaction_later_approval_deadline_and
     f.append(message("answer", MessageRole::Assistant, "original answer"))
         .await?;
     f.append(end(prompt.prompt.user_msg_seq())).await?;
-    let first = f.poll(json!({"seconds": 0})).await?;
+    let first = f.poll(json!({"seconds": 1})).await?;
     assert_eq!(first["status"], "completed");
     assert_eq!(first["terminal"], true);
     f.append(SessionLogEntry::Compress {
@@ -85,11 +85,11 @@ async fn success_requires_covering_durable_terminal_not_text_or_noncovering_turn
     ))
     .await?;
     f.append(end(0)).await?;
-    let pending = f.poll(json!({"seconds": 0})).await?;
+    let pending = f.status().await?;
     assert_eq!(pending["status"], "pending");
     assert_eq!(pending["terminal"], false);
     f.append(end(prompt.prompt.user_msg_seq())).await?;
-    let completed = f.poll(json!({"seconds": 0})).await?;
+    let completed = f.status().await?;
     assert_eq!(completed["status"], "completed");
     assert_eq!(completed["terminal"], true);
     assert_eq!(f.activation_count().await?, 1);
@@ -130,7 +130,7 @@ async fn durable_error_cancel_and_matching_timeout_are_distinct_and_first_wins()
         f.append(entry).await?;
         f.append(end(1)).await?;
         let result = f
-            .poll(json!({"seconds": 0, "include_partial": false}))
+            .poll(json!({"seconds": 1, "include_partial": false}))
             .await?;
         assert_eq!(result["status"], expected);
         assert_eq!(result["terminal"], true);
@@ -191,7 +191,7 @@ async fn prompt_identity_is_not_execution_identity_and_filters_never_classify_li
     f.append(end(seq)).await?;
     let result = f
         .poll(
-            json!({"seconds": 0, "read": {"types": ["message"], "text_regex": "nothing matches"}}),
+            json!({"seconds": 1, "read": {"types": ["message"], "text_regex": "nothing matches"}}),
         )
         .await?;
     assert_eq!(result["status"], "completed");
@@ -222,9 +222,43 @@ async fn retained_or_missing_original_and_gaps_never_substitute_a_compaction_cop
         ))
         .await?;
     stream.delete_message(1).await?;
-    let unknown = f.poll(json!({"seconds": 0})).await?;
+    let unknown = f.poll(json!({"seconds": 1})).await?;
     assert_eq!(unknown["status"], "unknown");
     assert_eq!(unknown["terminal"], false);
     assert_eq!(f.activation_count().await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn compaction_after_settled_round_keeps_prompt_pending() -> Result<()> {
+    let f = Fixture::new().await?;
+    let prompt = f.dispatch().await?;
+    settled_round(&f, "first-call").await?;
+    compaction_layout(&f).await?;
+    let pending = f.status().await?;
+    assert_eq!(pending["status"], "pending");
+    assert_eq!(pending["terminal"], false);
+    f.append(end(prompt.prompt.user_msg_seq())).await?;
+    let done = f.status().await?;
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["terminal"], true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn compaction_with_parked_approval_stays_unknown() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.dispatch().await?;
+    block(&f).await?;
+    f.append(SessionLogEntry::Compress {
+        prompt: "summary".into(),
+    })
+    .await?;
+    let result = f.poll(json!({"seconds": 1})).await?;
+    assert_eq!(result["status"], "unknown");
+    assert_eq!(
+        result["output"]["observation"]["error"],
+        "live_state_unprovable"
+    );
     Ok(())
 }

@@ -320,20 +320,20 @@ When tools are enabled, their declarations are injected into the system prompt a
 
 ### Shell Execution Tools
 
-Agents configured with shell execution tools can run system commands and scripts. When an agent has the full shell execution trio (`bash_spawn`, `bash_wait`, `bash_terminate`), it should prefer `bash_spawn` with nested `wait` (e.g. `wait: { timeout_secs: 30 }`) over `bash_exec` for builds, tests, linters, and general CLI operations:
+Agents configured with shell execution tools can run system commands and scripts. When an agent has the full shell execution trio (`bash_spawn`, `bash_wait`, `bash_terminate`), it should prefer `bash_spawn` with nested `wait` (e.g. `wait: { seconds: 30 }`, or `wait: {}` for the 240 second default) over `bash_exec` for builds, tests, linters, and general CLI operations:
 
 ```json
 {
   "command": "cargo test --workspace",
   "wait": {
-    "timeout_secs": 30,
+    "seconds": 30,
     "tail_lines": 50
   }
 }
 ```
 
 - **Wait expiry preserves the process**: If a command exceeds the wait duration, `bash_spawn` returns partial output and running status. Wait expiry does not stop or terminate the process. The agent can use `bash_wait` to continue waiting or `bash_terminate` to stop the process.
-- **LLM prompt cache reuse**: Bounded waits under 5 minutes are recommended because common LLM providers cache prompt context for 5 minutes. Returning control within this window allows the next turn to benefit from prompt cache reuse. Explicit longer waits remain supported.
+- **Wait length**: `wait.seconds` is 1 to 240 and defaults to 240; `wait: {forever: true}` waits until the process finishes, until a new message arrives for the agent (`stopped_by: "new_message"`), or until the agent's own run deadline is near (`stopped_by: "caller_deadline"`). `timeout_secs` on `bash_spawn` is the kill deadline for the process (1 to 86400, default 86400), not the wait length.
 - **Quick commands with `bash_exec`**: `bash_exec` remains available for quick synchronous checks (such as `git status`, `date`, or ast-grep searches) where background process lifecycle tracking is unnecessary.
 - **Scoped tool availability**: Agents without the full trio use only their granted tools (such as standalone `bash_exec` or specialized tools). Do not treat background management tools as universal requirements for all agents. Process termination is handled exclusively through `bash_terminate`.
 
@@ -603,8 +603,8 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
 - **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 6-tool toolset. Each registration advertises the raw names `session_new`, `session_prompt`, `session_send`, `session_wait`, `session_load`, and `session_cancel`; the provider exposes them to agents with an agent-relative prefix:
   - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata.
   - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. `attachments` is a list of `cid:` attachment URLs passed to the sub-agent; repeated URLs are ignored. The parent session ID is propagated internally.
-  - `{agent}_session_send`: Asynchronously dispatches a prompt (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`, optional `wait`) and returns a durable `{session_id, prompt_id}` handle immediately instead of waiting for the child to finish. Omit `wait` (or pass `null`) for dispatch-only; pass `wait: {seconds: 120}` for a soft observation window.
-  - `{agent}_session_wait`: Soft-waits on a previously dispatched prompt (`session_id`, `prompt_id`, optional `wait`). Repeated waits recover the same result and never consume it. The wait never cancels the child or extends its execution deadline.
+  - `{agent}_session_send`: Asynchronously dispatches a prompt (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`, optional `wait`) and returns a durable `{session_id, prompt_id}` handle immediately instead of waiting for the child to finish. Omit `wait` (or pass `null`) for dispatch-only; pass `wait: {}` (240 seconds) or `wait: {seconds: N}` or `wait: {forever: true}` for a soft observation window.
+  - `{agent}_session_wait`: Soft-waits on a previously dispatched prompt (`session_id`, `prompt_id`, and top-level `seconds` (1 to 240, default 240) or `forever: true`, plus optional `include_partial` and `read`). Repeated waits recover the same result and never consume it. The wait never cancels the child or extends its execution deadline.
   - `{agent}_session_load`: Reads a bounded, filterable page of prior event history for an existing sub-agent session log. Omitted or truncated material can be recovered with continuation metadata; loading never resumes, activates, or repairs a session.
   - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
 - **Route-aware execution**: On persistent clusters, sub-agent turns use the
@@ -688,12 +688,11 @@ unchanged arguments, results, and cancellation behavior; nothing about it change
 send with an explicit soft wait and leave the hard execution policy inherited:
 
 ```json
-{"message": "research the topic and report findings", "wait": {"seconds": 120}}
+{"message": "research the topic and report findings", "wait": {}}
 ```
 
-- `wait.seconds` is an observation budget only, never execution time. Default 120, maximum 300;
-  it never cancels the child or extends its deadline. Prefer 120 — it stays under common LLM
-  prompt-cache TTL windows, so a follow-up turn is more likely to hit warm cache.
+- The wait is an observation budget only, never execution time. `seconds` is 1 to 240 and defaults to 240, or pass `forever: true`; it never cancels the child or extends its deadline.
+- A wait that returns `stopped_by: "new_message"` ended because a new message arrived for the caller; read it before waiting again. `stopped_by: "caller_deadline"` means the caller's own run deadline is near; report what you have instead of waiting again.
 - `timeout_secs` on send still means the hard child execution allowance. Omit it and let the
   target agent's configured policy (or the inherited run deadline) govern; do not invent a
   shortened run limit. Inherited deadlines can shorten the effective allowance, but the caller
@@ -707,10 +706,9 @@ send with an explicit soft wait and leave the hard execution policy inherited:
 - **Dispatch-only**: omit `wait` entirely to return immediately after the prompt is durably
   queued. Do something else, then observe.
 - **Re-wait**: if the wait expires (`wait_expired: true`, still `pending`), call
-  `{agent}_session_wait` again with the same handle and another `wait`. Repeated waits recover
+  `{agent}_session_wait` again with the same handle, passing `seconds` or `forever: true` at the top level. Repeated waits recover
   the same result and never consume it; the child was never cancelled by the expiry.
-- **Poll**: `wait: {seconds: 0}` takes one immediate bounded snapshot with no polling loop —
-  useful for a cheap status check between other work.
+- **Poll**: check status without waiting with `{agent}_session_load` and `prompt_id`; it returns `status` and `terminal` immediately. For bash processes use `bash_status`.
 - **Inspect**: `{agent}_session_load` returns a bounded page of the child's session log
   (default limit 100 events, 16384 output bytes). Page forward by passing the returned
   `next_index` as `read.index_min` on the next call,

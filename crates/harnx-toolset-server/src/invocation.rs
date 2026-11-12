@@ -44,7 +44,7 @@ async fn invoke_claimed(
         .as_ref()
         .map(ProgressPublisher::handle)
         .unwrap_or_default();
-    let invocation = invocation(request, &recovery, &cancel, progress_handle);
+    let invocation = invocation(request, &recovery, &active, progress_handle);
     let toolset = context.toolset.clone();
     let in_flight = context.in_flight.clone();
     let call_id = request.call_id.clone();
@@ -138,6 +138,9 @@ fn invocation_context(
         checkpoint_store: Some(Arc::new(checkpoint_store)),
         partial_result_store: None,
         progress,
+        // Only a live invocation can be signalled; `invocation` wires its
+        // call's token in.
+        new_message: Default::default(),
     }
 }
 
@@ -161,10 +164,11 @@ fn build_invocation(
     }
 }
 
+/// The invocation the handler runs, signalled through `active`'s tokens.
 fn invocation(
     request: &ToolRequest,
     recovery: &recovery::InvocationRecovery,
-    cancel: &CancellationToken,
+    active: &execution::ActiveCall,
     progress: harnx_toolset::ToolProgressHandle,
 ) -> ToolInvocation {
     let mut context = invocation_context(
@@ -174,7 +178,8 @@ fn invocation(
         progress,
     );
     context.partial_result_store = Some(Arc::new(recovery.journal().partial_result_store(request)));
-    build_invocation(request, context, cancel.clone())
+    context.new_message = active.new_message.clone();
+    build_invocation(request, context, active.cancel.clone())
 }
 
 /// Build the invocation `Toolset::cancel` runs against for a call this

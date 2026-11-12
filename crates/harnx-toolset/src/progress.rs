@@ -9,6 +9,13 @@ use std::sync::Arc;
 /// Request capability enabling live tool progress messages and final snapshots.
 pub const CAPABILITY_TOOL_PROGRESS: &str = "harnx:tool_progress";
 
+/// Request capability saying a new message was already waiting for the
+/// caller's session when it dispatched the call. The tool server starts the
+/// call with its `ToolInvocationContext::new_message` signal already fired, so
+/// an opted-in wait returns at once instead of depending on a control message
+/// that could arrive before the server has admitted the call.
+pub const CAPABILITY_NEW_MESSAGE_PENDING: &str = "harnx:new_message_pending";
+
 /// Maximum bytes retained for a concise string field.
 pub const TOOL_PROGRESS_MAX_STRING_BYTES: usize = 4 * 1024;
 /// Maximum bytes retained for rendered markdown.

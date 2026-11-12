@@ -14,11 +14,14 @@ use tokio_util::sync::CancellationToken;
 const CLEANUP_BUDGET: Duration = Duration::from_secs(5);
 
 /// Handle on a call this process is still running, so a control message can
-/// stop it and tell the interrupted reply which cancellation caused the stop.
+/// stop it and tell the interrupted reply which cancellation caused the stop,
+/// or tell it that a new message arrived for its session.
 #[derive(Clone)]
 pub(super) struct ActiveCall {
     pub session_id: String,
     pub cancel: CancellationToken,
+    /// The call's `ToolInvocationContext::new_message` signal.
+    pub new_message: CancellationToken,
     cancellation_id: Arc<Mutex<Option<String>>>,
 }
 
@@ -42,6 +45,7 @@ impl ActiveCall {
 pub(super) struct InvocationExecution {
     pub session_id: String,
     pub call_id: String,
+    new_message: CancellationToken,
     cancellation_id: Arc<Mutex<Option<String>>>,
 }
 
@@ -57,6 +61,7 @@ impl InvocationExecution {
                 .clone()
                 .unwrap_or_else(|| request.call_id.clone()),
             call_id: request.call_id.clone(),
+            new_message: new_message_signal(request),
             cancellation_id: Arc::default(),
         })
     }
@@ -66,6 +71,7 @@ impl InvocationExecution {
         ActiveCall {
             session_id: self.session_id.clone(),
             cancel,
+            new_message: self.new_message.clone(),
             cancellation_id: self.cancellation_id.clone(),
         }
     }
@@ -128,6 +134,20 @@ impl InvocationExecution {
             );
         }
     }
+}
+
+/// The call's new-message signal. It starts fired when the caller says a
+/// message was already waiting at dispatch, since a control message sent then
+/// can reach this server before it has admitted the call.
+fn new_message_signal(request: &ToolRequest) -> CancellationToken {
+    let signal = CancellationToken::new();
+    if request
+        .capabilities
+        .contains(harnx_toolset::CAPABILITY_NEW_MESSAGE_PENDING)
+    {
+        signal.cancel();
+    }
+    signal
 }
 
 async fn run<F>(cancel: &CancellationToken, mut future: Pin<&mut F>) -> Option<F::Output>

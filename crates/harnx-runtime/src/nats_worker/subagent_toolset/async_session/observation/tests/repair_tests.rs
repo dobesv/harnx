@@ -88,7 +88,7 @@ async fn expired_admission_without_terminal_is_pending_not_timed_out_and_never_r
 async fn approval_committed_after_snapshot_suppresses_repair_on_refresh() -> Result<()> {
     let f = Fixture::new().await?;
     f.dispatch().await?;
-    let budget = Budget::new(120, CancellationToken::new());
+    let budget = Budget::new(WaitLimit::Seconds(120), BudgetStops::default());
     let handle = PromptHandle {
         session_id: "child".into(),
         prompt_id: "original-prompt".into(),
@@ -157,7 +157,7 @@ async fn lifecycle_scan_walks_bounded_pages_and_does_not_use_presentation_filter
     f.append(end(original.prompt.user_msg_seq())).await?;
     f.append(message("later", MessageRole::User, "must not leak"))
         .await?;
-    let result = f.poll(json!({"seconds": 0, "read": {"index_min": 1, "index_max": 1004, "types": ["message"]}})).await?;
+    let result = f.poll(json!({"seconds": 1, "read": {"index_min": 1, "index_max": 1004, "types": ["message"]}})).await?;
     assert_eq!(result["status"], "completed");
     // Lifecycle crossed the physical page cap; presentation still pages rather
     // than loading the entire history to satisfy a sparse filter.
@@ -165,7 +165,7 @@ async fn lifecycle_scan_walks_bounded_pages_and_does_not_use_presentation_filter
         .as_u64()
         .context("bounded presentation must expose progress")?;
     let page = f
-        .poll(json!({"seconds": 0, "read": {"index_min": next, "types": ["message"]}}))
+        .poll(json!({"seconds": 1, "read": {"index_min": next, "types": ["message"]}}))
         .await?;
     assert_eq!(page["status"], "completed");
     assert!(page["output"]

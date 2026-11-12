@@ -380,6 +380,7 @@ mod adapter_wire_tests {
                 timeout_policy_spec("bounded", Some(45)),
                 timeout_policy_spec("unadvertised", None),
                 timeout_policy_spec("with_template", None),
+                timeout_policy_spec("stops_on_new_message", None).with_stop_on_new_message(),
             ]
         }
 
@@ -442,6 +443,29 @@ mod adapter_wire_tests {
             .and_then(|meta| meta.0.get("call_template"))
             .and_then(serde_json::Value::as_str);
         assert_eq!(template_meta, Some("Run {{name}}"));
+        client.cancel().await.unwrap();
+    }
+
+    /// MCP cannot deliver the new-message signal, so its listing never claims
+    /// a tool stops on one.
+    #[tokio::test]
+    async fn list_tools_drops_the_stop_on_new_message_opt_in() {
+        let (client, _server) = setup_client_server(Arc::new(TimeoutPolicyToolset)).await;
+        let tools = client
+            .peer()
+            .list_tools(Default::default())
+            .await
+            .expect("list tools")
+            .tools;
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "stops_on_new_message")
+            .expect("opted-in tool listed");
+        let opt_in = tool
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.0.get(harnx_toolset::STOP_ON_NEW_MESSAGE_META_KEY));
+        assert_eq!(opt_in, None);
         client.cancel().await.unwrap();
     }
 }

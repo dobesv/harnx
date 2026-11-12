@@ -1,4 +1,5 @@
-//! Cancel one tool call, addressed by session and call ID.
+//! Cancel one tool call, or tell it a new message arrived, addressed by
+//! session and call ID.
 //!
 //! A call this process is still running is stopped locally. A call this
 //! process is not running (its owner is gone, or it never ran here) is
@@ -7,7 +8,7 @@
 //! else is hand off to the toolset's own `cancel` with whatever checkpoint the
 //! original invocation left behind.
 use super::*;
-use harnx_toolset::CancelAcceptance;
+use harnx_toolset::{CancelAcceptance, ControlKind};
 
 pub(super) async fn handle_control(message: async_nats::Message, context: &ToolRequestContext) {
     let Ok(control) = serde_json::from_slice::<ControlMessage>(&message.payload) else {
@@ -26,8 +27,8 @@ pub(super) async fn handle_control(message: async_nats::Message, context: &ToolR
     let _ = context.client.publish(reply, payload.into()).await;
 }
 
-/// Answer the cancel: a call this process is running is stopped locally, a
-/// call it is not running is decided from the journal instead.
+/// Answer the control: a call this process is running is signalled locally,
+/// a cancel for a call it is not running is decided from the journal instead.
 async fn decide(context: &ToolRequestContext, control: &ControlMessage) -> CancelAcceptance {
     if !valid_identity(control) {
         return CancelAcceptance::Rejected {
@@ -41,11 +42,34 @@ async fn decide(context: &ToolRequestContext, control: &ControlMessage) -> Cance
         .get(&control.call_id)
         .cloned();
     match active {
-        Some(call) if call.session_id == control.session_id => stop_call(&call, control),
+        Some(call) if call.session_id == control.session_id => signal_call(&call, control),
         Some(_) => CancelAcceptance::Rejected {
             reason: "call belongs to another session".into(),
         },
+        // Only a running wait can end early, and a toolset's orphan `cancel`
+        // would stop work the new message has nothing to do with. The call
+        // may not be admitted yet, so the sender is told to retry.
+        None if control.kind == ControlKind::NewMessage => CancelAcceptance::Unknown {
+            reason: "call is not running here yet; retry".into(),
+        },
         None => orphan_cancel(context, control).await,
+    }
+}
+
+/// Apply `control` to a call this process is running. A new message only
+/// fires the call's new-message signal: nothing records a cancellation, so the
+/// handler's own reply, typically a wait's still-running result, is what the
+/// caller gets.
+pub(super) fn signal_call(
+    call: &execution::ActiveCall,
+    control: &ControlMessage,
+) -> CancelAcceptance {
+    match control.kind {
+        ControlKind::Cancel => stop_call(call, control),
+        ControlKind::NewMessage => {
+            call.new_message.cancel();
+            CancelAcceptance::Accepted
+        }
     }
 }
 

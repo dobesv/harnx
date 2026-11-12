@@ -5,7 +5,8 @@
 //! there is nothing durable to consult once its future is gone.
 use super::*;
 use harnx_toolset::{
-    CancelAcceptance, CancellationAcknowledgement, ControlMessage, TOOL_PROTOCOL_VERSION,
+    CancelAcceptance, CancellationAcknowledgement, ControlKind, ControlMessage,
+    TOOL_PROTOCOL_VERSION,
 };
 
 pub(super) async fn handle_control(
@@ -32,6 +33,12 @@ async fn accept_cancel(control: &ControlMessage, active: &HookRegistry) -> Cance
     if !valid_identity(control) {
         return CancelAcceptance::Rejected {
             reason: "cancellation identity or protocol mismatch".into(),
+        };
+    }
+    // Hooks never wait on the caller's messages, so only a cancel applies.
+    if control.kind != ControlKind::Cancel {
+        return CancelAcceptance::Rejected {
+            reason: "hooks accept only cancel controls".into(),
         };
     }
     let hook = active.lock().await.get(&control.call_id).cloned();

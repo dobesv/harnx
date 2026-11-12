@@ -13,6 +13,7 @@ use crate::config::session::SessionAppendSink;
 use crate::config::{GlobalConfig, Input};
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_lease::NatsSessionLease;
+use crate::nats_tool_provider::NatsInFlightCalls;
 use anyhow::{Context, Result};
 use harnx_core::event::AgentEventSink;
 use parking_lot::Mutex;
@@ -403,8 +404,13 @@ impl SessionTurn {
             .invocation_id
             .as_str()
             .to_owned();
-        let injection =
-            build_mid_turn_injection_callback(self.backend.clone(), turn_cursor, invocation_id);
+        let in_flight = self.in_flight_for_turn(turn_cursor.load(Ordering::SeqCst));
+        let injection = build_mid_turn_injection_callback(
+            self.backend.clone(),
+            turn_cursor,
+            invocation_id,
+            in_flight,
+        );
         let attachment_sync = ToolRoundAttachmentSync {
             jetstream: self.worker.jetstream.clone(),
             config: self.per_session.clone(),
@@ -440,6 +446,15 @@ impl SessionTurn {
         // Wait before publishing TurnEnd or allowing ownership to be released.
         WorkerRuntime::wait_for_post_turn_maintenance(&self.per_session, &self.lease).await;
         Ok(outcome)
+    }
+
+    /// The worker's in-flight registry, told that the turn's input already
+    /// holds every message through `seed_cursor`: none of them should stop a
+    /// wait the turn dispatches.
+    fn in_flight_for_turn(&self, seed_cursor: u64) -> NatsInFlightCalls {
+        let in_flight = NatsInFlightCalls::for_instance(&self.worker.instance_id);
+        in_flight.note_messages_consumed(self.backend.session_id(), seed_cursor);
+        in_flight
     }
 
     async fn record_turn_end(&self, turn_cursor: u64) -> Result<()> {

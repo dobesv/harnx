@@ -251,6 +251,10 @@ pub(crate) struct MetadataHeader<'a> {
     pub(crate) execution_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) status: Option<&'a str>,
+    /// What ended a wait while the process kept running, when it was not the
+    /// wait's own limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stopped_by: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -333,6 +337,7 @@ pub(crate) fn render_timeout_message(ctx: TimeoutRenderContext<'_>) -> String {
         MetadataHeader {
             execution_id: Some(execution_id),
             status: Some("timeout"),
+            stopped_by: None,
             exit_code: None,
             command: Some(command),
             working_dir: Some(working_dir),
