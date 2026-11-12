@@ -62,8 +62,11 @@ upgrade clients and workers together.
 
 ### JetStream Resources
 Harnx automatically manages the following JetStream resources:
-- **KV Bucket**: `harnx_leases` — session leases with a tombstone marker
-  after release (not a bucket-wide TTL). This is the split-brain guard:
+- **KV Bucket**: `harnx_leases` — session leases, each with its own TTL,
+  which every renewal and every acquisition sets, including one taken over a
+  marker. Releasing, reclaiming or deleting a lease leaves a purge marker
+  that expires after an hour, the same TTL nats-server gives the markers it
+  leaves for expired leases (not a bucket-wide TTL). This is the split-brain guard:
   every durable write is fenced on the lease's KV revision, and a worker
   that loses its lease aborts. If this bucket can't survive a node loss,
   neither can a session mid-turn on that node.

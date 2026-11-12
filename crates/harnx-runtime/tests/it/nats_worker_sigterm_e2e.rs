@@ -605,7 +605,18 @@ async fn signal_and_wait_for_handoff(fixture: &Fixture, scenario: &RunningScenar
                 .next()
                 .await
                 .context("lease release watch closed")??;
-            if entry.operation == Operation::Delete {
+            if entry.operation == Operation::Put {
+                continue;
+            }
+            // A release leaves a KV purge marker. A lease left to expire
+            // leaves a marker too, but one nats-server writes, without
+            // the KV operation header.
+            let marker = lease_bucket.stream.get_raw_message(entry.revision).await?;
+            if marker
+                .headers
+                .get("KV-Operation")
+                .is_some_and(|operation| operation.as_str() == "PURGE")
+            {
                 return Ok::<_, anyhow::Error>(());
             }
         }
