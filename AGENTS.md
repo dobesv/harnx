@@ -1212,7 +1212,7 @@ including frontends that hold no lease. See `docs/nats-ha.md` under "Interruptio
 A lease record carries its holder's liveness identity: pid, a one-way hash of
 the host identity (machine id, boot id and pid namespace on Linux) and, on Linux,
 process start time. A worker that finds a session lease whose holder is provably
-dead on this host reclaims it right away (CAS delete at the observed revision, then
+dead on this host reclaims it right away (CAS purge at the observed revision, then
 a normal acquire) instead of deferring until the TTL expires — that is what
 keeps a one-shot `prompt` retry on the same session fast after `--timeout-secs`
 killed the previous worker. Proof means dead: the pid is gone, or exists but is
@@ -1223,6 +1223,16 @@ Windows never reclaim; Linux needs a readable boot id and pid namespace, and a
 machine id alone never suffices) — keeps the TTL as the only reclaim path.
 Never reclaim a live holder, and never let a frontend wait on a lease (see
 "Interrupt acceptance").
+
+Every write to a lease key must leave it expiring. A plain `delete` or
+`delete_expect_revision` leaves a marker with no TTL that stays until the key
+is written again, so releases, reclaims and forced deletions use
+`purge_expect_revision_with_ttl` / `purge_with_ttl`. And never take a lease with
+async-nats' `create_with_ttl`: over a delete or purge marker, which every
+released or expired lease leaves, it retries with a plain `update` and drops
+the TTL, so a holder that dies before its first renewal keeps the session
+forever. `nats_lease/slot.rs` publishes the create itself, expecting the
+marker's revision.
 
 ### Reading KV state that was just written
 

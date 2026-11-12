@@ -205,6 +205,12 @@ pub(crate) async fn delete_session_stream(
     }
 }
 
+/// Remove the session's lease, leaving a purge marker that expires. A marker
+/// already on the key is replaced too, so one an older build left without a
+/// TTL goes with its session. The purge is conditioned on the revision read
+/// here, so a lease taken or renewed meanwhile fails the deletion, which can
+/// be retried, instead of being removed from under its holder. `true` means a
+/// live lease was removed.
 async fn delete_session_lease(
     lease_bucket: Option<async_nats::jetstream::kv::Store>,
     session_id: &str,
@@ -212,20 +218,19 @@ async fn delete_session_lease(
     let Some(lease_bucket) = lease_bucket else {
         return Ok(false);
     };
-    let lease_key = NatsLeaseConfig::default().key_for_session(session_id);
-    match lease_bucket.entry(lease_key.clone()).await {
-        Ok(Some(entry)) if matches!(entry.operation, Operation::Put) => {
-            lease_bucket
-                .delete(&lease_key)
-                .await
-                .with_context(|| format!("Failed to delete session lease key '{lease_key}'"))?;
-            Ok(true)
-        }
-        Ok(Some(_)) | Ok(None) => Ok(false),
-        Err(error) => {
-            Err(error).with_context(|| format!("Failed to inspect session lease key '{lease_key}'"))
-        }
-    }
+    let config = NatsLeaseConfig::default();
+    let lease_key = config.key_for_session(session_id);
+    let entry = harnx_nats_common::leader_reads::entry(&lease_bucket, &lease_key)
+        .await
+        .with_context(|| format!("Failed to inspect session lease key '{lease_key}'"))?;
+    let Some(entry) = entry else {
+        return Ok(false);
+    };
+    lease_bucket
+        .purge_expect_revision_with_ttl(&lease_key, entry.revision, config.tombstone_ttl)
+        .await
+        .with_context(|| format!("Failed to delete session lease key '{lease_key}'"))?;
+    Ok(entry.operation == Operation::Put)
 }
 
 /// Whether a get-stream error means the stream does not exist.

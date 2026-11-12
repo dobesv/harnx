@@ -29,6 +29,7 @@ mod nats_event_fanout;
 mod nats_fixed_admission;
 mod nats_hooks_e2e;
 mod nats_lease;
+mod nats_lease_markers;
 mod nats_local_server;
 mod nats_macro_run_limits;
 mod nats_read_convergence;

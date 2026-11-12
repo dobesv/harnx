@@ -157,10 +157,10 @@ The `harnx_nats_operation_seconds` and `harnx_nats_operations_total` metrics tra
 - `kv_bucket_open`: Open KV bucket (`get_key_value`).
 - `kv_bucket_create`: Create KV bucket (`create_key_value`). Expected conflict errors during startup fallback to `kv_bucket_open`.
 - `lease_get`: Read session lease record (`bucket.get`).
-- `lease_create`: Acquire session lease with TTL (`bucket.create_with_ttl`).
+- `lease_create`: Acquire session lease with TTL: a publish expecting no prior message, then, over a release or expiry marker, one expecting the marker's revision (`publish_with_headers`).
 - `lease_renew`: CAS update to renew session lease fence token (`publish_with_headers`).
-- `lease_release`: Delete lease key with revision fencing (`bucket.delete_expect_revision`).
-- `lease_reclaim`: Delete a lease held by a worker that is provably dead on this host, at the observed revision (`bucket.delete_expect_revision`). `outcome="ok"` counts successful reclaims; a lost CAS race (another writer moved first) records `outcome="error"` and is benign.
+- `lease_release`: Replace the lease with an expiring purge marker, with revision fencing (`bucket.purge_expect_revision_with_ttl`).
+- `lease_reclaim`: Replace a lease held by a worker that is provably dead on this host with an expiring purge marker, at the observed revision (`bucket.purge_expect_revision_with_ttl`). `outcome="ok"` counts successful reclaims; a lost CAS race (another writer moved first) records `outcome="error"` and is benign.
 - `activation_publish`: Publish `SessionActivate` message to work queue.
 
 The `outcome` label is classified as:
