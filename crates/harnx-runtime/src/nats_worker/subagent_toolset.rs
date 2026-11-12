@@ -991,7 +991,9 @@ fn policy_description(policy: Option<&TargetRunPolicy>) -> String {
 }
 
 /// A truncated session ID, so the call header stays one short line.
-const SHORT_SESSION_ID: &str = "{{ args.session_id | truncate(8, end='') }}";
+/// The custom `truncate` filter takes a positional suffix; `end=''` raises
+/// a template error and makes the transcript fall back to raw arguments.
+const SHORT_SESSION_ID: &str = "{{ args.session_id | truncate(8, '') }}";
 
 fn session_new_spec(agent: &str, policy: Option<&TargetRunPolicy>) -> ToolSpec {
     ToolSpec {
@@ -1334,16 +1336,16 @@ mod tests {
         [
             format!("@ {display} new session"),
             format!(
-                "@ {display}{{% if args.session_id %}} [{{{{ args.session_id | truncate(8, end='') }}}}]{{% endif %}}\n{{{{ args.message }}}}"
+                "@ {display}{{% if args.session_id %}} [{{{{ args.session_id | truncate(8, '') }}}}]{{% endif %}}\n{{{{ args.message }}}}"
             ),
             format!(
-                "@ {display}{{% if args.session_id %}} [{{{{ args.session_id | truncate(8, end='') }}}}]{{% endif %}}\n{{{{ args.message }}}}"
+                "@ {display}{{% if args.session_id %}} [{{{{ args.session_id | truncate(8, '') }}}}]{{% endif %}}\n{{{{ args.message }}}}"
             ),
             format!(
-                "@ {display} [{{{{ args.session_id | truncate(8, end='') }}}}] wait\nsession_id: {{{{ args.session_id }}}}\nprompt_id: {{{{ args.prompt_id }}}}"
+                "@ {display} [{{{{ args.session_id | truncate(8, '') }}}}] wait {{{{ args.prompt_id | truncate(8, '') }}}}"
             ),
-            format!("@ {display} load {{{{ args.session_id | truncate(8, end='') }}}}"),
-            format!("@ {display} cancel {{{{ args.session_id | truncate(8, end='') }}}}"),
+            format!("@ {display} load {{{{ args.session_id | truncate(8, '') }}}}"),
+            format!("@ {display} cancel {{{{ args.session_id | truncate(8, '') }}}}"),
         ]
         .to_vec()
     }
