@@ -484,7 +484,7 @@ fn make_template_env<'a>() -> Environment<'a> {
     // filter is honored. Syntax errors and other hard failures still error.
     env.set_undefined_behavior(UndefinedBehavior::Chainable);
     // `truncate` is not a minijinja built-in; register it so templates can do
-    // `{{ args.message | truncate(60) }}` or `{{ args.id | truncate(8, end='') }}`.
+    // `{{ args.message | truncate(60) }}` or `{{ args.id | truncate(8, '') }}`.
     env.add_filter(
         "truncate",
         |value: &str, length: usize, end: Option<&str>| -> String {

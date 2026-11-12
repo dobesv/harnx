@@ -10,6 +10,8 @@ use ratatui::text::{Line, Span};
 use syntect::highlighting::Theme;
 use unicode_width::UnicodeWidthStr;
 
+mod compact;
+
 /// Icon for each tool kind.
 pub(crate) fn tool_kind_icon(kind: ToolKind) -> &'static str {
     match kind {
@@ -99,16 +101,8 @@ pub(crate) fn render_tool_call(args: RenderToolCallArgs<'_>) -> RenderedEntry {
         .fg(Color::DarkGray)
         .add_modifier(Modifier::DIM);
 
-    let has_live_updates = args.title.is_some()
-        || matches!(args.kind, Some(k) if !matches!(k, ToolKind::Other))
-        || !args.locations.is_empty();
-
-    // Preserve existing markdown-body-suppresses-header behavior when
-    // no live updates, not running, and no timer.
-    if let Some(ToolCallBody::Markdown(md)) = args.body {
-        if !has_live_updates && !args.is_running && args.timer.is_none() {
-            return crate::markdown_render::render_markdown(md, dim_gray, args.width, args.theme);
-        }
+    if let Some(entry) = compact::render(&args, dim_gray) {
+        return entry;
     }
 
     // Build the header line

@@ -7,6 +7,22 @@ use harnx_toolset::{
 };
 use serde_json::{json, Value};
 
+// Keep repeated observations compact without changing the model-facing result.
+// Errors have no status/output envelope, so retain their diagnostic instead.
+const WAIT_RESULT_TEMPLATE: &str = concat!(
+    "{% if result.is_error %}",
+    "{{ result.error | default(raw(), true) | replace('\r', ' ') | replace('\n', ' ') | truncate(100) }}",
+    "{% else %}{{ result.status | default('unknown', true) }}",
+    "{% if result.wait_expired %} (wait expired){% endif %}",
+    "{% if result.stopped_by %} ({{ result.stopped_by }}){% endif %}",
+    "{% if result.output.observation.error and result.output.observation.error != 'soft_wait_expired' %}",
+    " — {{ result.output.observation.error }}{% endif %}",
+    "{% if result.terminal and result.status != 'completed' %}",
+    "{% set diagnostic = result.output.events | default([]) | selectattr('type', 'equalto', 'error') | list | last %}",
+    "{% if diagnostic.text %} — {{ diagnostic.text | replace('\r', ' ') | replace('\n', ' ') | truncate(100) }}{% endif %}",
+    "{% endif %}{% endif %}",
+);
+
 /// Wait properties shared by `session_send.wait` and the top level of
 /// `session_wait`.
 pub(crate) fn wait_properties() -> serde_json::Map<String, Value> {
@@ -160,9 +176,14 @@ deadline. To check status without waiting, use session_load with prompt_id."
     }
     .without_request_timeout()
     .with_call_template(&format!(
-        "@ {agent} [{}] wait\nsession_id: {{{{ args.session_id }}}}\nprompt_id: {{{{ args.prompt_id }}}}",
+        "@ {agent} [{}] wait {{{{ args.prompt_id | truncate(8, '') }}}}",
         super::super::SHORT_SESSION_ID
     ))
+    .with_result_template(WAIT_RESULT_TEMPLATE)
     .with_kind(ToolProgressKind::Read)
     .with_stop_on_new_message()
 }
+
+#[cfg(test)]
+#[path = "specs_tests.rs"]
+mod tests;
