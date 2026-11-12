@@ -8,8 +8,12 @@ pub(crate) fn all() -> Vec<ToolSpec> {
     vec![
         get_current_time().with_kind(ToolProgressKind::Other),
         convert_time().with_kind(ToolProgressKind::Other),
-        wait().with_kind(ToolProgressKind::Other),
-        wait_until().with_kind(ToolProgressKind::Other),
+        wait()
+            .with_kind(ToolProgressKind::Other)
+            .with_stop_on_new_message(),
+        wait_until()
+            .with_kind(ToolProgressKind::Other)
+            .with_stop_on_new_message(),
     ]
 }
 
@@ -61,7 +65,7 @@ fn wait() -> ToolSpec {
     ToolSpec {
         cancellation_guarantee: harnx_toolset::CancellationGuarantee::HardOnDrop,
         name: "wait".to_string(),
-        description: "Wait for a specified number of seconds".to_string(),
+        description: "Wait for a specified number of seconds. A new message for you may end the wait early, with stopped_by: new_message in the result.".to_string(),
         input_schema: json!({
             "type": "object",
             "properties": { "seconds": { "type": "number" } },
@@ -79,7 +83,7 @@ fn wait_until() -> ToolSpec {
     ToolSpec {
         cancellation_guarantee: harnx_toolset::CancellationGuarantee::HardOnDrop,
         name: "wait_until".to_string(),
-        description: "Wait until a target time, up to 24 hours".to_string(),
+        description: "Wait until a target time, up to 24 hours. A new message for you may end the wait early, with stopped_by: new_message in the result.".to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {

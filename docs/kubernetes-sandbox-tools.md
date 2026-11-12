@@ -50,8 +50,8 @@ filesystem access on the coordinator worker.
 
 The gateway preserves the standard Harnx tool names and schemas:
 
-- `bash_exec`, `bash_spawn`, `bash_wait`, `bash_terminate`,
-  `bash_read_exec_log`, and `bash_rollback_file`
+- `bash_exec`, `bash_spawn`, `bash_status`, `bash_wait`,
+  `bash_terminate`, `bash_read_exec_log`, and `bash_rollback_file`
 - `fs_read`, `fs_write`, `fs_write_attachment`, `fs_edit`, `fs_insert`,
   `fs_re_replace`, `fs_ls`, `fs_grep`, `fs_find`, and `fs_rollback_file`
 - `sandbox_connect`, `sandbox_status`, and `sandbox_release`

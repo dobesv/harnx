@@ -36,103 +36,106 @@ fn empty_nested_wait_and_flat_wait_share_defaults() {
     let options = spawn.wait.expect("empty wait enables waiting");
     assert_eq!(options, WaitOptions::default());
     assert_eq!(wait.execution_id, "exec-123");
-    assert_eq!(wait.options, options);
-    assert_eq!(options.effective_timeout_secs(), 120);
-}
-
-fn assert_nested_and_flat_wait_options(
-    options: Value,
-    expected: WaitOptions,
-    effective_timeout_secs: u64,
-) {
-    let spawn: SpawnCommandParams =
-        serde_json::from_value(json!({"command": "echo hi", "wait": options})).unwrap();
-    let mut flat = options;
-    flat["execution_id"] = json!("exec-123");
-    let wait: WaitParams = serde_json::from_value(flat).unwrap();
-
-    assert_eq!(spawn.wait, Some(expected));
-    assert_eq!(spawn.wait.unwrap(), wait.options);
-    assert_eq!(
-        wait.options.effective_timeout_secs(),
-        effective_timeout_secs
-    );
+    assert_eq!(wait.options(), options);
+    assert_eq!(options.limit().unwrap(), WaitLimit::Seconds(240));
+    assert_eq!(wait.limit().unwrap(), WaitLimit::Seconds(240));
 }
 
 #[test]
-fn populated_and_zero_wait_options_match_flat_wait_options() {
+fn nested_and_flat_wait_options_match() {
     let cases = [
         (
-            json!({
-                "timeout_secs": 30,
-                "head_lines": 4,
-                "tail_lines": 7,
-                "max_output_bytes": 512,
-                "grep": "error|warning"
-            }),
-            WaitOptions {
-                timeout_secs: Some(30),
-                head_lines: Some(4),
-                tail_lines: Some(7),
-                max_output_bytes: Some(512),
-                grep: Some("error|warning".to_string()),
-            },
-            30,
+            json!({"seconds": 30, "head_lines": 4, "tail_lines": 7,
+                "max_output_bytes": 512, "grep": "error|warning"}),
+            WaitLimit::Seconds(30),
         ),
         (
-            json!({
-                "timeout_secs": 0,
-                "head_lines": 0,
-                "tail_lines": 0,
-                "max_output_bytes": 0,
-                "grep": ""
-            }),
-            WaitOptions {
-                timeout_secs: Some(0),
-                head_lines: Some(0),
-                tail_lines: Some(0),
-                max_output_bytes: Some(0),
-                grep: Some(String::new()),
-            },
-            0,
+            json!({"forever": true, "head_lines": 0}),
+            WaitLimit::Forever,
+        ),
+        (
+            json!({"seconds": null, "forever": null, "head_lines": null, "tail_lines": null,
+                "max_output_bytes": null, "grep": null}),
+            WaitLimit::Seconds(240),
         ),
     ];
-
-    for (input, expected, effective_timeout) in cases {
-        assert_nested_and_flat_wait_options(input, expected, effective_timeout);
+    for (input, limit) in cases {
+        let spawn: SpawnCommandParams =
+            serde_json::from_value(json!({"command": "echo hi", "wait": input})).unwrap();
+        let mut flat = input;
+        flat["execution_id"] = json!("exec-123");
+        let wait: WaitParams = serde_json::from_value(flat).unwrap();
+        let nested = spawn.wait.unwrap();
+        assert_eq!(nested, wait.options());
+        assert_eq!(nested.limit().unwrap(), limit);
+        assert_eq!(wait.limit().unwrap(), limit);
     }
 }
 
 #[test]
-fn null_wait_options_match_omitted_options() {
+fn null_wait_matches_omitted_wait() {
     let spawn: SpawnCommandParams =
         serde_json::from_value(json!({"command": "echo hi", "wait": null})).unwrap();
     assert_eq!(spawn.wait, None);
+}
 
-    let options = json!({
-        "timeout_secs": null,
-        "head_lines": null,
-        "tail_lines": null,
-        "max_output_bytes": null,
-        "grep": null
-    });
-    let spawn: SpawnCommandParams =
-        serde_json::from_value(json!({"command": "echo hi", "wait": options})).unwrap();
-    let mut flat = options;
-    flat["execution_id"] = json!("exec-123");
-    let wait: WaitParams = serde_json::from_value(flat).unwrap();
-    assert_eq!(spawn.wait, Some(WaitOptions::default()));
-    assert_eq!(wait.options, WaitOptions::default());
+#[test]
+fn wait_seconds_outside_range_or_with_forever_is_rejected() {
+    for seconds in [0, 241] {
+        let options = WaitOptions {
+            seconds: Some(seconds),
+            ..WaitOptions::default()
+        };
+        let message = options.limit().unwrap_err().message;
+        assert!(message.contains("between 1 and 240"), "{message}");
+        assert!(message.contains("omit wait"), "{message}");
+
+        let wait: WaitParams =
+            serde_json::from_value(json!({"execution_id": "x", "seconds": seconds})).unwrap();
+        let message = wait.limit().unwrap_err().message;
+        assert!(message.contains("between 1 and 240"), "{message}");
+        assert!(message.contains("bash_status"), "{message}");
+    }
+    let both = WaitOptions {
+        seconds: Some(5),
+        forever: Some(true),
+        ..WaitOptions::default()
+    };
+    assert!(both.limit().is_err());
+    let forever_false = WaitOptions {
+        seconds: Some(5),
+        forever: Some(false),
+        ..WaitOptions::default()
+    };
+    assert_eq!(forever_false.limit().unwrap(), WaitLimit::Seconds(5));
+}
+
+#[test]
+fn old_and_unknown_arguments_are_rejected() {
+    let nested = serde_json::from_value::<SpawnCommandParams>(json!({
+        "command": "echo hi", "wait": {"timeout_secs": 30}
+    }))
+    .unwrap_err();
+    assert!(nested.to_string().contains("unknown field"), "{nested}");
+    let flat = serde_json::from_value::<WaitParams>(json!({
+        "execution_id": "x", "timeout_secs": 30
+    }))
+    .unwrap_err();
+    assert!(flat.to_string().contains("unknown field"), "{flat}");
+    let status = serde_json::from_value::<StatusParams>(json!({
+        "execution_id": "x", "seconds": 3
+    }))
+    .unwrap_err();
+    assert!(status.to_string().contains("unknown field"), "{status}");
+    assert!(serde_json::from_value::<SpawnCommandParams>(json!({
+        "command": "echo hi", "bogus": 1
+    }))
+    .is_err());
 }
 
 #[test]
 fn nested_and_flat_wait_reject_invalid_option_types() {
-    for field in [
-        "timeout_secs",
-        "head_lines",
-        "tail_lines",
-        "max_output_bytes",
-    ] {
+    for field in ["seconds", "head_lines", "tail_lines", "max_output_bytes"] {
         for value in [json!(-1), json!("1"), json!(1.5)] {
             let mut options = json!({});
             options[field] = value;
@@ -170,7 +173,7 @@ fn nested_wait_schema_matches_flat_wait_properties() {
     let mut flat_properties = wait["properties"].as_object().unwrap().clone();
     flat_properties.remove("execution_id").unwrap();
     assert_eq!(nested_properties, &flat_properties);
-    assert_eq!(nested_properties.len(), 5);
+    assert_eq!(nested_properties.len(), 6);
     assert!(!nested_properties.contains_key("execution_id"));
     assert_eq!(nested["additionalProperties"], false);
     assert!(nested.get("required").is_none());
@@ -180,12 +183,7 @@ fn nested_wait_schema_matches_flat_wait_properties() {
     assert!(spawn["properties"].get("wait_secs").is_none());
     assert!(wait["properties"].get("wait_secs").is_none());
 
-    for field in [
-        "timeout_secs",
-        "head_lines",
-        "tail_lines",
-        "max_output_bytes",
-    ] {
+    for field in ["seconds", "head_lines", "tail_lines", "max_output_bytes"] {
         assert_eq!(nested_properties[field]["type"], json!(["integer", "null"]));
         assert_eq!(nested_properties[field]["minimum"], 0);
     }
@@ -198,4 +196,19 @@ fn nested_wait_schema_matches_flat_wait_properties() {
                 .as_array()
                 .is_some_and(|variants| variants.iter().any(|variant| variant["type"] == "null"))
     );
+}
+
+#[test]
+fn spawn_schema_has_timeout_and_every_params_schema_is_closed() {
+    let spawn = schema::<SpawnCommandParams>();
+    assert_eq!(
+        spawn["properties"]["timeout_secs"]["type"],
+        json!(["integer", "null"])
+    );
+    let status = schema::<StatusParams>();
+    assert_eq!(status["required"], json!(["execution_id"]));
+    assert!(status["properties"].get("seconds").is_none());
+    for schema in [&spawn, &status, &schema::<WaitParams>()] {
+        assert_eq!(schema["additionalProperties"], false);
+    }
 }

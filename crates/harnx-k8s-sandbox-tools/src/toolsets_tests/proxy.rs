@@ -26,20 +26,15 @@ async fn proxy_requires_or_resolves_an_ambient_session_binding() -> Result<()> {
             tool: "exec".to_string(),
             args: json!({"command": "pwd"}),
             context: ToolInvocationContext {
-                run_context: None,
                 call_id: "call-1".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),
                     "session-1",
                 )),
-                invoking_session: None,
                 capabilities: BTreeSet::from([
                     harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE.to_string(),
                 ]),
-                checkpoint: None,
-                checkpoint_store: None,
-                partial_result_store: None,
-                progress: Default::default(),
+                ..Default::default()
             },
             cancel: CancellationToken::new(),
         })
@@ -81,18 +76,12 @@ async fn proxy_explicit_override_is_one_call_and_not_forwarded() -> Result<()> {
             tool: "exec".to_string(),
             args: json!({"command": "pwd", "sandbox_id": "claim-explicit"}),
             context: ToolInvocationContext {
-                run_context: None,
                 call_id: "call-explicit".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),
                     "session-1",
                 )),
-                invoking_session: None,
-                capabilities: BTreeSet::new(),
-                checkpoint: None,
-                checkpoint_store: None,
-                partial_result_store: None,
-                progress: Default::default(),
+                ..Default::default()
             },
             cancel: CancellationToken::new(),
         })
@@ -124,18 +113,12 @@ async fn proxy_forwards_cancellation_after_the_mcp_call_starts() -> Result<()> {
             tool: "exec".to_string(),
             args: json!({"command": "sleep 30"}),
             context: ToolInvocationContext {
-                run_context: None,
                 call_id: "call-cancel".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),
                     "session-cancel",
                 )),
-                invoking_session: None,
-                capabilities: BTreeSet::new(),
-                checkpoint: None,
-                checkpoint_store: None,
-                partial_result_store: None,
-                progress: Default::default(),
+                ..Default::default()
             },
             cancel: invocation_cancel,
         })
@@ -226,18 +209,12 @@ async fn bash_routes_to_3002_and_fs_routes_to_3003() -> Result<()> {
             tool: "exec".to_string(),
             args: json!({"command": "pwd"}),
             context: ToolInvocationContext {
-                run_context: None,
                 call_id: "call-bash".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),
                     "session-routing",
                 )),
-                invoking_session: None,
-                capabilities: BTreeSet::new(),
-                checkpoint: None,
-                checkpoint_store: None,
-                partial_result_store: None,
-                progress: Default::default(),
+                ..Default::default()
             },
             cancel: CancellationToken::new(),
         })
@@ -251,18 +228,12 @@ async fn bash_routes_to_3002_and_fs_routes_to_3003() -> Result<()> {
             tool: "ls".to_string(),
             args: json!({"path": "/workspace"}),
             context: ToolInvocationContext {
-                run_context: None,
                 call_id: "call-fs".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),
                     "session-routing",
                 )),
-                invoking_session: None,
-                capabilities: BTreeSet::new(),
-                checkpoint: None,
-                checkpoint_store: None,
-                partial_result_store: None,
-                progress: Default::default(),
+                ..Default::default()
             },
             cancel: CancellationToken::new(),
         })
@@ -310,18 +281,12 @@ async fn proxy_name_override_does_not_change_upstream_endpoint() -> Result<()> {
             tool: "exec".to_string(),
             args: json!({"command": "pwd"}),
             context: ToolInvocationContext {
-                run_context: None,
                 call_id: "call-named".to_string(),
                 invoking_session_id: Some(harnx_core::session_identity::session_key(
                     Some("coder"),
                     "session-named",
                 )),
-                invoking_session: None,
-                capabilities: BTreeSet::new(),
-                checkpoint: None,
-                checkpoint_store: None,
-                partial_result_store: None,
-                progress: Default::default(),
+                ..Default::default()
             },
             cancel: CancellationToken::new(),
         })

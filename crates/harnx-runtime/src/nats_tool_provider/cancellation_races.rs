@@ -88,7 +88,7 @@ impl Fixture {
             server: "____time".into(),
             selector_server: "time".into(),
             raw_name: "wait".into(),
-            request_timeout: None,
+            ..Default::default()
         };
         let mut pending = self
             .provider
@@ -266,6 +266,7 @@ async fn stale_wait_failure_preserves_same_id_replacement_without_cancelling() -
             server: "____time".into(),
             session_id: "replacement-session".into(),
             control_subject: fixture.provider.instance_id.control_subject(),
+            stop_on_new_message: false,
         })
         .await;
     assert!(matches!(old_wait.await, Err(ToolError::Recoverable(_))));

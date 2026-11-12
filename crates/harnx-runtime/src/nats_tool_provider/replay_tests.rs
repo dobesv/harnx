@@ -19,7 +19,7 @@ fn replay_route_preserves_logical_identity_across_process_scopes() -> anyhow::Re
         server: "configured-server".into(),
         selector_server: "configured-server".into(),
         raw_name: "echo".into(),
-        request_timeout: None,
+        ..Default::default()
     };
     validate_replay_route(&route, &record)?;
     let mut wrong_server = route.clone();
@@ -322,7 +322,7 @@ async fn saved_reply_provider(client: async_nats::Client) -> anyhow::Result<Nats
                 server: "retryable".into(),
                 selector_server: "retryable".into(),
                 raw_name: "echo".into(),
-                request_timeout: None,
+                ..Default::default()
             },
         )]),
         registrations: Vec::new(),

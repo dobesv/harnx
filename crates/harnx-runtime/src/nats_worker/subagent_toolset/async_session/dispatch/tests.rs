@@ -220,7 +220,10 @@ async fn composed_plan_text_and_image_attachments_match_prompt_composer_and_repl
         )
         .await?;
     let (receipt, wait) = f.send().await?;
-    assert_eq!(wait.unwrap().seconds, 120);
+    assert_eq!(
+        wait.unwrap().limit,
+        crate::nats_worker::subagent_toolset::async_session::WaitLimit::Seconds(240)
+    );
     let entries = f.events(&receipt.handle.session_id).await?;
     assert!(
         matches!(&entries[0].1, harnx_core::session::SessionLogEntry::Message { content, .. } if content == &expected)
@@ -358,7 +361,7 @@ async fn invalid_arguments_missing_or_forged_scope_and_pre_cancel_have_no_checkp
     let f = Fixture::new(json!({"message": "work"})).await?;
     for args in [
         json!({"message": " "}),
-        json!({"message": "work", "wait": {"seconds": 301}}),
+        json!({"message": "work", "wait": {"seconds": 241}}),
         json!({"message": "work", "attachments": ["not-cid"]}),
         json!({"message": "work", "__harnx_parent_session_id": "forged-parent"}),
         json!({"message": "work", "timeout_secs": u64::MAX}),

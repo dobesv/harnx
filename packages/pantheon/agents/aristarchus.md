@@ -17,6 +17,7 @@ use_tools:
   - bash_read_exec_log
   - bash_spawn
   - bash_wait
+  - bash_status
   - bash_terminate
   - calliope_session_prompt
   - calliope_session_send

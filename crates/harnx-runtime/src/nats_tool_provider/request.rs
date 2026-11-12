@@ -60,6 +60,7 @@ fn probe_request(
         capabilities: BTreeSet::from([
             EXECUTION_CONTEXT_NAMESPACE.to_string(),
             CAPABILITY_TOOL_PROGRESS.to_string(),
+            CAPABILITY_NEW_MESSAGE_PENDING.to_string(),
         ]),
     }
 }
@@ -92,9 +93,10 @@ impl NatsToolProvider {
     /// publishes, so inner calls fail with a clear recoverable error before
     /// dispatch instead of an opaque NATS publish failure. The probe mirrors
     /// `prepare_request_with_progress` field for field: inner calls carry
-    /// their call id as `tool_call_id` and run in a parent round, and both
-    /// capabilities are always included so the estimate never undercounts a
-    /// progress-enabled call (PR3 review F12).
+    /// their call id as `tool_call_id` and run in a parent round, and every
+    /// optional capability is included so the estimate never undercounts a
+    /// progress-enabled call or one dispatched with a message pending
+    /// (PR3 review F12).
     pub(crate) fn script_payload_limit(&self) -> crate::bash_inner::PayloadLimit {
         use std::sync::Arc;
         // Broker payload limit minus slack for the message envelope: NATS
@@ -160,6 +162,9 @@ impl NatsToolProvider {
         if enable_progress {
             capabilities.insert(CAPABILITY_TOOL_PROGRESS.to_string());
         }
+        if self.dispatch_with_message_pending(route) {
+            capabilities.insert(CAPABILITY_NEW_MESSAGE_PENDING.to_string());
+        }
         let request = ToolRequest {
             run_context: run_context.map(|record| harnx_toolset::AutonomousRunContext {
                 snapshot: serde_json::to_value(record).expect("run limits serialize"),
@@ -202,6 +207,7 @@ impl NatsToolProvider {
             durable: request,
             call_id,
             server: route.server.clone(),
+            stop_on_new_message: route.stop_on_new_message,
             registration_key: registration_key(&self.instance_id, &route.server),
             subject: self
                 .instance_id
@@ -412,6 +418,9 @@ mod probe_tests {
         assert_eq!(request.parent_local_session_id.as_deref(), Some("local-7"));
         assert!(request.capabilities.contains(EXECUTION_CONTEXT_NAMESPACE));
         assert!(request.capabilities.contains(CAPABILITY_TOOL_PROGRESS));
+        assert!(request
+            .capabilities
+            .contains(CAPABILITY_NEW_MESSAGE_PENDING));
 
         // The probe's serialized size tracks the real serialized request:
         // bigger arguments mean a strictly bigger probe.

@@ -39,6 +39,7 @@ pub(super) async fn request(
             server,
             session_id,
             control_subject,
+            stop_on_new_message: false,
         })
         .await;
 

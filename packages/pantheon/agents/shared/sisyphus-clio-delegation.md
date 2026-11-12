@@ -42,7 +42,7 @@ Every final PR delivery must remain active while the pull request is opened and 
    pull request. For a compare link, pass Clio's `repository` value as `repo`, plus its
    `branch` and `head_owner`, so the tool can wait for the user to open the PR. Use the
    default 24-hour timeout unless
-   the task calls for another limit; `timeout_secs: 0` means no deadline.
+   the task calls for another limit.
 3. Let the tool do its own GitHub polling. Do not repeatedly wake the model to check whether
    a PR exists or whether checks have changed.
 4. When the tool returns, inspect the current checks, reviews, and comments. Failed checks or

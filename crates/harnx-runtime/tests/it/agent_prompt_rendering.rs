@@ -368,7 +368,8 @@ const INELIGIBLE_SHELL_AGENTS: [&str; 12] = [
     "pantheon/oracle",
 ];
 
-const SHELL_EXECUTION_TOOLS: [&str; 3] = ["bash_spawn", "bash_wait", "bash_terminate"];
+const SHELL_EXECUTION_TOOLS: [&str; 4] =
+    ["bash_spawn", "bash_status", "bash_wait", "bash_terminate"];
 
 fn assert_eligible_shell_prompt(qualified_name: &str, prompt: &str) {
     assert!(
@@ -376,16 +377,18 @@ fn assert_eligible_shell_prompt(qualified_name: &str, prompt: &str) {
         "{qualified_name}: missing bash_spawn"
     );
     assert!(
-        prompt.contains("wait: { timeout_secs: 30 }"),
+        prompt.contains("wait: {}") && prompt.contains("wait: {forever: true}"),
         "{qualified_name}: missing wait example"
     );
     let lower = prompt.to_lowercase();
     assert!(
-        lower.contains("prefer") && lower.contains("nested `wait`"),
+        lower.contains("prefer") && lower.contains("`bash_status`"),
         "{qualified_name}: missing wait preference"
     );
     assert!(
-        prompt.contains("bash_wait") && prompt.contains("bash_terminate"),
+        prompt.contains("bash_status")
+            && prompt.contains("bash_wait")
+            && prompt.contains("bash_terminate"),
         "{qualified_name}: missing follow-up tools"
     );
     assert!(
@@ -395,12 +398,8 @@ fn assert_eligible_shell_prompt(qualified_name: &str, prompt: &str) {
         "{qualified_name}: missing expiry lifecycle guidance"
     );
     assert!(
-        lower.contains("under 5 minutes"),
-        "{qualified_name}: missing cache-TTL recommendation"
-    );
-    assert!(
-        lower.contains("120 seconds") || lower.contains("120s"),
-        "{qualified_name}: missing 120-second default"
+        lower.contains("up to 240 seconds") && lower.contains("stopped_by: new_message"),
+        "{qualified_name}: missing 240-second wait and new-message guidance"
     );
 }
 
@@ -419,8 +418,7 @@ fn assert_ineligible_shell_prompt(qualified_name: &str, prompt: &str, granted: &
         "{qualified_name}: ineligible prompt mentions unavailable shell tools"
     );
     assert!(
-        !lower.contains("wait: { timeout_secs: 30 }")
-            && !lower.contains("nested `wait`")
+        !lower.contains("`bash_status`")
             && !lower.contains("wait expiry is not process termination"),
         "{qualified_name}: ineligible prompt contains nested-wait guidance"
     );
@@ -1086,12 +1084,12 @@ const ASYNC_DELEGATION_AGENTS: [&str; 16] = [
 const ASYNC_DELEGATION_HEADING: &str = "Async Sub-Agent Delegation (session_send / session_wait)";
 
 /// Semantic phrases the shared async-delegation protocol must contribute to
-/// every integrating agent's rendered prompt: preferred 120-second soft wait,
+/// every integrating agent's rendered prompt: preferred 240-second soft wait,
 /// inherited hard policy, durable handle, re-wait safety, explicit
 /// next_index→read.index_min paging, and cancellation only when the tool is
 /// available.
 const ASYNC_DELEGATION_PHRASES: [&str; 8] = [
-    "wait: {seconds: 120}",
+    "Send with `wait: {}` to wait up to 240 seconds",
     "hard execution deadline stays inherited from the target agent's policy",
     "durable handle: `session_id` + `prompt_id`",
     "Repeated waits recover the same result and never consume it",

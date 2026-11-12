@@ -83,7 +83,7 @@ value into `ToolSpec.timeout_secs` for its NATS registration.
   served through `harnx_toolset_server`'s MCP adapter) advertise their native
   policy, so a bridged server runs under the same deadline behavior as the
   native NATS route. Bash `spawn`/`wait`/`exec` advertise `0`, so a nested spawn
-  wait (`wait: {}`, 120-second default) returns its first execution_id-bearing
+  wait (`wait: {}`, 240-second default) returns its first execution_id-bearing
   response instead of expiring at the caller's 60-second backstop.
 - Tools that advertise nothing — including third-party MCP servers — keep
   `timeout_secs: None`, which the runtime resolves to its default request

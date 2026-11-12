@@ -314,8 +314,38 @@ impl BashServer {
         Ok(canonical)
     }
 
-    pub(crate) async fn store_spawned_process(&self, execution_id: String, entry: SpawnedProcess) {
-        self.inner.spawned.lock().await.insert(execution_id, entry);
+    pub(crate) async fn store_spawned_process(
+        &self,
+        execution_id: String,
+        entry: SpawnedProcess,
+    ) -> Arc<SpawnedProcess> {
+        let entry = Arc::new(entry);
+        self.inner
+            .spawned
+            .lock()
+            .await
+            .insert(execution_id, Arc::clone(&entry));
+        entry
+    }
+
+    /// The tracked entry for `execution_id`. Entries are never removed, so a
+    /// wait or terminate running at the same time sees the same process.
+    pub(crate) async fn get_spawned_entry(
+        &self,
+        execution_id: &str,
+    ) -> Result<Arc<SpawnedProcess>, ErrorData> {
+        self.inner
+            .spawned
+            .lock()
+            .await
+            .get(execution_id)
+            .cloned()
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("execution_id '{execution_id}' is not a tracked background process"),
+                    None,
+                )
+            })
     }
 
     pub async fn cleanup_log_dir(&self) -> std::io::Result<()> {

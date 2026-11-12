@@ -1,8 +1,8 @@
 ## Shell Execution
 
 When running commands, tests, or diagnostics:
-- Prefer `bash_spawn` with nested `wait` (e.g. `wait: { timeout_secs: 30 }`) over `bash_exec` for builds, tests, linters, and long-running operations.
-- If wait expires, the command continues running in the background — wait expiry is not process termination.
-- Call `bash_wait` to continue waiting, or `bash_terminate` to stop the process. A spawned command has no deadline of its own: terminate it when it runs well past its usual time with no new output.
-- Bounded waits under 5 minutes are recommended to stay within common LLM prompt cache TTLs (120 seconds is default).
-- `bash_exec` remains available for quick synchronous commands where background lifecycle management is unnecessary. Give it a `timeout_secs` well past the command's usual run time, so reaching it means the command is stuck rather than slow and nothing gets killed and rerun; without one, the limit is 24 hours.
+- Prefer `bash_spawn` over `bash_exec` for builds, tests, linters, and long-running operations. Set `timeout_secs` a little above the command's usual run time, so reaching it means the command is stuck rather than slow, and add `wait: {}` (up to 240 seconds) or `wait: {forever: true}` to wait for the result.
+- If the wait expires, the command keeps running in the background. Wait expiry is not process termination.
+- Check a spawned command without waiting using `bash_status`. Continue waiting with `bash_wait` (`seconds` 1 to 240, or `forever: true`), or stop the process with `bash_terminate`. A spawn killed at its `timeout_secs` deadline reports `status: timed_out`.
+- A wait that returns `stopped_by: new_message` ended because a new message arrived for you. Read it first; the command is still running. `stopped_by: caller_deadline` means your own run deadline is near: report now instead of waiting again.
+- `bash_exec` remains available for quick synchronous commands where background lifecycle management is unnecessary. `bash_exec` and spawn deadlines (`timeout_secs`) run from 1 second to 24 hours, which is also the default. Give `bash_exec` a `timeout_secs` well past the command's usual run time, so nothing gets killed and rerun.

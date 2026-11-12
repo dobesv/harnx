@@ -46,6 +46,16 @@ pub(crate) struct SpawnResultCtx<'a> {
     pub(crate) stderr_log_path: &'a Path,
 }
 
+/// What `spawn` records about a command besides its running child.
+pub(crate) struct SpawnMetadata {
+    pub(crate) command: String,
+    pub(crate) working_dir: PathBuf,
+    pub(crate) stdout_log_path: PathBuf,
+    pub(crate) stderr_log_path: PathBuf,
+    pub(crate) before_snap_ids: Vec<(PathBuf, gix::ObjectId)>,
+    pub(crate) snapshot_decision: SnapshotDecision,
+}
+
 /// Per-execution temp directory, log paths, id, and opened log file handles.
 pub(crate) struct ExecLog {
     pub(crate) exec_dir: PathBuf,
@@ -79,6 +89,24 @@ pub(crate) struct CommandBuildCtx<'a> {
     pub(crate) working_dir: &'a Path,
     pub(crate) exec_dir: &'a Path,
     pub(crate) env: Option<&'a HashMap<String, String>>,
+}
+
+/// How a finished process ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExitKind {
+    #[default]
+    Exited,
+    /// The supervisor killed it once its `timeout_secs` deadline passed.
+    TimedOut { deadline_secs: u64 },
+}
+
+impl ExitKind {
+    pub(crate) fn status(self) -> &'static str {
+        match self {
+            Self::Exited => "exited",
+            Self::TimedOut { .. } => "timed_out",
+        }
+    }
 }
 
 /// Inputs for assembling an "exited" tool result (shared by exec + wait).

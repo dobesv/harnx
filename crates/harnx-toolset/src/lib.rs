@@ -109,6 +109,12 @@ pub fn advertised_timeout_secs(meta: &serde_json::Map<String, serde_json::Value>
         .and_then(serde_json::Value::as_u64)
 }
 
+/// `_meta` key a tool sets to `true` when its waits end early, with their
+/// normal still-running result, once the caller's session gets a new message
+/// (a [`ControlKind::NewMessage`] control). The caller reads it to decide
+/// which in-flight calls to signal.
+pub const STOP_ON_NEW_MESSAGE_META_KEY: &str = "harnx:stop_on_new_message";
+
 impl ToolSpec {
     /// Disable the transport's elapsed-time request deadline for this tool.
     ///
@@ -156,6 +162,25 @@ impl ToolSpec {
             Value::String(kind.to_string()),
         );
         self
+    }
+
+    /// Declare that this tool's waits end early when a new message arrives
+    /// for the caller's session; see [`STOP_ON_NEW_MESSAGE_META_KEY`].
+    #[must_use]
+    pub fn with_stop_on_new_message(mut self) -> Self {
+        self.meta
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(STOP_ON_NEW_MESSAGE_META_KEY.to_string(), Value::Bool(true));
+        self
+    }
+
+    /// Whether this tool declared [`ToolSpec::with_stop_on_new_message`].
+    pub fn stops_on_new_message(&self) -> bool {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.get(STOP_ON_NEW_MESSAGE_META_KEY))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     /// Retrieve the static kind declaration from this tool spec.
@@ -252,6 +277,12 @@ pub struct ToolInvocationContext {
     /// Call-bound live progress sink. Defaults to a no-op for transports and
     /// callers that do not negotiate progress support.
     pub progress: ToolProgressHandle,
+    /// Fires when a new message arrives for the caller's session. A tool that
+    /// opted in with [`ToolSpec::with_stop_on_new_message`] ends its wait and
+    /// returns its normal still-running result; the call is not cancelled.
+    /// Defaults to a token that never fires, for transports that cannot
+    /// deliver the signal.
+    pub new_message: CancellationToken,
 }
 
 /// Re-export SessionRef to allow harnx-toolset-server to pass it through
@@ -292,6 +323,7 @@ impl fmt::Debug for ToolInvocationContext {
                 },
             )
             .field("progress", &self.progress)
+            .field("new_message", &self.new_message.is_cancelled())
             .finish()
     }
 }
@@ -369,6 +401,30 @@ pub trait Toolset: Send + Sync {
 pub struct AutonomousRunContext {
     pub snapshot: Value,
     pub started_at_ms: u64,
+}
+
+/// How long before the caller's run deadline a wait stops, so the caller still
+/// has time to read the result and answer before it is cancelled.
+pub const FOREVER_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl AutonomousRunContext {
+    /// The caller's run deadline, when the snapshot carries one.
+    pub fn deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let text = self.snapshot.get("deadline")?.as_str()?;
+        chrono::DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|deadline| deadline.with_timezone(&chrono::Utc))
+    }
+
+    /// How long a wait may run before it must stop for the caller's deadline:
+    /// the time left minus `FOREVER_DEADLINE_MARGIN`, zero once that has
+    /// passed. `None` when the caller has no deadline.
+    pub fn wait_bound(&self) -> Option<std::time::Duration> {
+        let left = (self.deadline()? - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default();
+        Some(left.saturating_sub(FOREVER_DEADLINE_MARGIN))
+    }
 }
 
 /// Request body for one tool invocation.
@@ -566,6 +622,41 @@ mod tests {
         let encoded = serde_json::to_vec(&value).expect("serialize wire type");
         let decoded: T = serde_json::from_slice(&encoded).expect("deserialize wire type");
         assert_eq!(decoded, value);
+    }
+
+    fn run_context(snapshot: Value) -> AutonomousRunContext {
+        AutonomousRunContext {
+            snapshot,
+            started_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn run_context_deadline_parses_rfc3339_and_tolerates_absence() {
+        let parsed = run_context(json!({"deadline": "2026-11-11T12:00:00Z"})).deadline();
+        assert_eq!(
+            parsed.map(|deadline| deadline.to_rfc3339()),
+            Some("2026-11-11T12:00:00+00:00".to_string())
+        );
+        for snapshot in [json!({}), json!({"deadline": null}), json!({"deadline": 5})] {
+            assert_eq!(run_context(snapshot).deadline(), None);
+        }
+    }
+
+    #[test]
+    fn run_context_wait_bound_deadline_leaves_the_margin() {
+        use std::time::Duration;
+        let bound = |secs: i64| {
+            let deadline = chrono::Utc::now() + chrono::Duration::seconds(secs);
+            run_context(json!({"deadline": deadline.to_rfc3339()})).wait_bound()
+        };
+        // (seconds until the deadline, expected bound range in seconds)
+        let cases = [(100, 36..=40), (30, 0..=0), (-30, 0..=0)];
+        for (secs, expected) in cases {
+            let got = bound(secs).expect("bound").as_secs();
+            assert!(expected.contains(&got), "{secs}s left gave {got}s");
+        }
+        assert_eq!(run_context(json!({})).wait_bound(), None::<Duration>);
     }
 
     fn tool_spec() -> ToolSpec {
@@ -802,6 +893,44 @@ mod tests {
         let ack = control.acknowledgement(CancelAcceptance::AlreadyFinished);
         assert_eq!(ack.session_id, "sess");
         assert!(matches!(ack.acceptance, CancelAcceptance::AlreadyFinished));
+    }
+
+    #[test]
+    fn new_message_control_is_tagged_new_message_and_round_trips() {
+        let control = ControlMessage::new_message("srv".into(), "sess".into(), "call-1".into());
+        assert_eq!(
+            serde_json::to_value(&control).unwrap(),
+            json!({
+                "protocol_version": TOOL_PROTOCOL_VERSION,
+                "server": "srv",
+                "session_id": "sess",
+                "operation_id": "call-1",
+                "cancellation_id": "new-message:call-1",
+                "call_id": "call-1",
+                "kind": "new_message",
+            })
+        );
+        assert_round_trip(control);
+    }
+
+    #[test]
+    fn stop_on_new_message_round_trips_through_meta() {
+        let spec = tool_spec().with_call_template("call");
+        assert!(!spec.stops_on_new_message());
+        let spec = spec.with_stop_on_new_message();
+        assert!(spec.stops_on_new_message());
+        let meta = spec.meta.as_ref().expect("meta map");
+        assert_eq!(meta[STOP_ON_NEW_MESSAGE_META_KEY], json!(true));
+        assert_eq!(meta["call_template"], json!("call"));
+        let back: ToolSpec =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).expect("decode spec");
+        assert!(back.stops_on_new_message());
+    }
+
+    #[test]
+    fn invocation_context_new_message_never_fires_by_default() {
+        assert_eq!(STOP_ON_NEW_MESSAGE_META_KEY, "harnx:stop_on_new_message");
+        assert!(!ToolInvocationContext::default().new_message.is_cancelled());
     }
 
     #[test]

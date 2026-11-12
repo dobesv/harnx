@@ -112,8 +112,24 @@ impl Fixture {
         .await?)
     }
 
+    /// Status of the prompt through `session_load`, the no-wait path: it
+    /// never repairs, activates or polls.
+    pub(super) async fn status(&self) -> Result<Value> {
+        Ok(self
+            .toolset
+            .session_load(json!({
+                "session_id": self.request.args["session_id"],
+                "prompt_id": self.request.call_id,
+            }))
+            .await?)
+    }
+
     pub(super) fn wait_args(&self, options: Value) -> Value {
-        json!({"session_id": self.request.args["session_id"], "prompt_id": self.request.call_id, "wait": options})
+        let mut args = json!({"session_id": self.request.args["session_id"], "prompt_id": self.request.call_id});
+        args.as_object_mut()
+            .expect("object")
+            .extend(options.as_object().expect("wait options object").clone());
+        args
     }
 
     pub(super) async fn append(&self, entry: SessionLogEntry) -> Result<u64> {
@@ -156,21 +172,25 @@ pub(super) fn end(through_seq: u64) -> SessionLogEntry {
     }
 }
 
-pub(super) async fn block(f: &Fixture) -> Result<()> {
-    f.append(SessionLogEntry::ToolCalls {
-        text: "waiting for approval".into(),
+/// A `ToolCalls` entry announcing one call.
+fn tool_calls(call_id: &str, name: &str) -> SessionLogEntry {
+    SessionLogEntry::ToolCalls {
+        text: String::new(),
         thought: None,
         calls: vec![harnx_core::tool::ToolCall {
-            id: Some("approval-tool".into()),
-            name: "danger".into(),
+            id: Some(call_id.into()),
+            name: name.into(),
             arguments: json!({}),
             thought_signature: None,
             reasoning_provenance: None,
         }],
         timestamp: None,
         fence_token: None,
-    })
-    .await?;
+    }
+}
+
+pub(super) async fn block(f: &Fixture) -> Result<()> {
+    f.append(tool_calls("approval-tool", "danger")).await?;
     f.append(SessionLogEntry::HitlApprovalRequested {
         tool_call_id: "approval-tool".into(),
         summary: "approve?".into(),
@@ -178,6 +198,29 @@ pub(super) async fn block(f: &Fixture) -> Result<()> {
     })
     .await?;
     Ok(())
+}
+
+/// A tool round the worker has fully answered.
+pub(super) async fn settled_round(f: &Fixture, call_id: &str) -> Result<()> {
+    f.append(tool_calls(call_id, "ping")).await?;
+    f.append(SessionLogEntry::ToolResults {
+        results: vec![],
+        timestamp: None,
+    })
+    .await?;
+    Ok(())
+}
+
+/// What a mid-turn compaction appends: the marker, a copy of the prompt, and
+/// a copy of each kept tool round. There is no `TurnEnd`.
+pub(super) async fn compaction_layout(f: &Fixture) -> Result<()> {
+    f.append(SessionLogEntry::Compress {
+        prompt: "summary".into(),
+    })
+    .await?;
+    f.append(message("original-prompt", MessageRole::User, "original"))
+        .await?;
+    settled_round(f, "kept-call").await
 }
 
 pub(super) fn serialized(value: &Value) -> usize {
@@ -188,6 +231,15 @@ pub(super) fn assert_pending(value: &Value, wait_expired: bool) {
     assert_eq!(value["status"], "pending");
     assert_eq!(value["terminal"], false);
     assert_eq!(value["wait_expired"], wait_expired);
+}
+
+pub(super) fn assert_unprovable(value: &Value, wait_expired: bool) {
+    assert_eq!(value["status"], "unknown");
+    assert_eq!(value["wait_expired"], wait_expired);
+    assert_eq!(
+        value["output"]["observation"]["error"],
+        "live_state_unprovable"
+    );
 }
 
 pub(super) async fn assert_initial_dispatch_unchanged(f: &Fixture) -> Result<()> {

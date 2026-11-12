@@ -137,17 +137,20 @@ fn production_subagent_async_specs_export_with_nullable_nested_options() {
     for tool in &tools {
         let schema = &tool.input_schema;
         assert_eq!(schema["additionalProperties"], json!(false));
-        let wait = &schema["properties"]["wait"];
-        let wait_object = &wait["anyOf"][0];
-        assert_eq!(wait["anyOf"][1], json!({"type":"null"}));
-        assert_eq!(wait_object["additionalProperties"], json!(false));
-        assert_eq!(wait_object["properties"]["seconds"]["maximum"], json!(300));
-        assert_eq!(wait_object["properties"]["seconds"]["default"], json!(120));
-        assert!(wait_object["properties"]["seconds"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("Default 120"));
-        let read = &wait_object["properties"]["read"];
+        let properties = if tool.name.ends_with("send") {
+            let wait = &schema["properties"]["wait"];
+            assert_eq!(wait["anyOf"][1], json!({"type":"null"}));
+            assert_eq!(wait["anyOf"][0]["additionalProperties"], json!(false));
+            &wait["anyOf"][0]["properties"]
+        } else {
+            assert!(schema["properties"].get("wait").is_none());
+            &schema["properties"]
+        };
+        assert_eq!(properties["seconds"]["minimum"], json!(1));
+        assert_eq!(properties["seconds"]["maximum"], json!(240));
+        assert_eq!(properties["seconds"]["default"], json!(240));
+        assert_eq!(properties["forever"]["type"], json!("boolean"));
+        let read = &properties["read"];
         assert_eq!(read["anyOf"][1], json!({"type":"null"}));
         assert_eq!(read["anyOf"][0]["additionalProperties"], json!(false));
     }

@@ -15,6 +15,7 @@ mod journal_layout;
 mod journal_listing;
 mod name_unit;
 mod nats_server;
+mod new_message;
 mod partial_result;
 mod progress;
 mod replay;

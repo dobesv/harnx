@@ -125,18 +125,17 @@ async fn send_dispatches_and_wait_observes_through_the_toolset() -> anyhow::Resu
     assert_eq!(sent["status"], json!("pending"));
     assert_eq!(sent["terminal"], json!(false));
 
-    // A zero-second wait takes one bounded snapshot without consuming the
-    // result; with no child worker running the prompt stays pending and the
-    // soft budget expires, never cancelling or failing the child. Dispatch
-    // confirmation is only repaired by a wait that can confirm it, and a
-    // zero-budget wait performs no repair, so it reports `null` (unknown).
+    // A one-second wait does not consume the result; with no child worker
+    // running the prompt stays pending and the soft budget expires, never
+    // cancelling or failing the child. The wait confirms the dispatch by
+    // repairing its activation.
     let waited = fixture
         .invoke(
             SUBAGENT_SESSION_WAIT_TOOL,
             json!({
                 "session_id": SESSION,
                 "prompt_id": prompt_id,
-                "wait": {"seconds": 0},
+                "seconds": 1,
             }),
             ToolInvocationContext {
                 call_id: "wiring-wait-1".into(),
@@ -148,7 +147,7 @@ async fn send_dispatches_and_wait_observes_through_the_toolset() -> anyhow::Resu
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     assert_eq!(waited["session_id"], json!(SESSION));
     assert_eq!(waited["prompt_id"], json!(prompt_id));
-    assert!(waited["dispatch"].is_null(), "got: {}", waited["dispatch"]);
+    assert_eq!(waited["dispatch"], json!("confirmed"));
     assert_eq!(waited["status"], json!("pending"));
     assert_eq!(waited["terminal"], json!(false));
     assert_eq!(waited["wait_expired"], json!(true));

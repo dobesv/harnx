@@ -10,6 +10,7 @@ description = "Shared toolset contract and wire types for harnx tool servers"
 [dependencies]
 anyhow.workspace = true
 async-trait = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio-util = { workspace = true }

@@ -343,6 +343,35 @@ async fn prompt_scoped_load_excludes_later_turns_and_never_activates() -> anyhow
 }
 
 #[tokio::test]
+async fn prompt_scoped_load_reports_status_and_terminal() -> anyhow::Result<()> {
+    let f = LoadFixture::new().await?;
+    let (prompt_id, prompt_seq) = f.dispatch_prompt().await?;
+    let args = json!({ "session_id": LoadFixture::SESSION, "prompt_id": prompt_id });
+    let activations = f.activation_count().await?;
+    let log_len = f.log.load_events_latest_async().await?.len();
+    let pending = f.load(args.clone()).await?;
+    // A pending prompt with an unconfirmed dispatch is only observed: load
+    // never repairs, activates or appends.
+    assert_eq!(f.activation_count().await?, activations);
+    assert_eq!(f.log.load_events_latest_async().await?.len(), log_len);
+    assert_eq!(
+        (&pending["status"], &pending["terminal"]),
+        (&json!("pending"), &json!(false))
+    );
+    f.log.append_event_async(&turn_end(prompt_seq)).await?;
+    let done = f.load(args).await?;
+    assert_eq!(
+        (&done["status"], &done["terminal"]),
+        (&json!("completed"), &json!(true))
+    );
+    let plain = f
+        .load(json!({ "session_id": LoadFixture::SESSION }))
+        .await?;
+    assert!(plain.get("status").is_none() && plain.get("terminal").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn prompt_scoped_load_fails_closed_for_unknown_prompts() -> anyhow::Result<()> {
     let f = LoadFixture::new().await?;
     let (prompt_id, _seq) = f.dispatch_prompt().await?;

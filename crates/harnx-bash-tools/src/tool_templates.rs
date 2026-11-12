@@ -27,9 +27,11 @@ pub(crate) const EXEC_CALL: &str = "```{{ args.command | shebang_lang }}\n$ {{ a
 
 pub(crate) const READ_EXEC_LOG_CALL: &str = "log {{ args.execution_id }}/{{ args.stream }}{% if args.grep %} /{{ args.grep }}/{% endif %}{% if args.offset %} +{{ args.offset }}{% endif %}{% if args.limit %} [:{{ args.limit }}]{% endif %}{% if args.tail %} [tail:{{ args.tail }}]{% endif %}{% if args.head_lines is not none %} [head:{{ args.head_lines }}]{% endif %}{% if args.tail_lines is not none %} [tail_lines:{{ args.tail_lines }}]{% endif %}{% if args.max_output_bytes is not none %} [:{{ args.max_output_bytes }}b]{% endif %}";
 
-pub(crate) const SPAWN_CALL: &str = "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }} &\n```{% if args.working_dir %}\n({{ args.working_dir }}) {% endif %}{% if args.wait is mapping %}\nwait [{% if args.wait.timeout_secs is defined and args.wait.timeout_secs is not none %}{{ args.wait.timeout_secs }}{% else %}120{% endif %}s]{% if args.wait.grep is defined and args.wait.grep is not none %} /{{ args.wait.grep }}/{% endif %}{% if args.wait.head_lines is defined and args.wait.head_lines is not none %} [head:{{ args.wait.head_lines }}]{% endif %}{% if args.wait.tail_lines is defined and args.wait.tail_lines is not none %} [tail:{{ args.wait.tail_lines }}]{% endif %}{% if args.wait.max_output_bytes is defined and args.wait.max_output_bytes is not none %} [:{{ args.wait.max_output_bytes }}b]{% endif %}{% endif %}";
+pub(crate) const SPAWN_CALL: &str = "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }} &\n```{% if args.working_dir %}\n({{ args.working_dir }}) {% endif %}{% if args.timeout_secs %}\n[{{ args.timeout_secs }}s kill] {% endif %}{% if args.wait is mapping %}\nwait [{% if args.wait.forever is defined and args.wait.forever %}forever{% elif args.wait.seconds is defined and args.wait.seconds is not none %}{{ args.wait.seconds }}s{% else %}240s{% endif %}]{% if args.wait.grep is defined and args.wait.grep is not none %} /{{ args.wait.grep }}/{% endif %}{% if args.wait.head_lines is defined and args.wait.head_lines is not none %} [head:{{ args.wait.head_lines }}]{% endif %}{% if args.wait.tail_lines is defined and args.wait.tail_lines is not none %} [tail:{{ args.wait.tail_lines }}]{% endif %}{% if args.wait.max_output_bytes is defined and args.wait.max_output_bytes is not none %} [:{{ args.wait.max_output_bytes }}b]{% endif %}{% endif %}";
 
-pub(crate) const WAIT_CALL: &str = "wait {{ args.execution_id }}{% if args.timeout_secs %} [{{ args.timeout_secs }}s]{% endif %}{% if args.grep %} /{{ args.grep }}/{% endif %}{% if args.head_lines %} [head:{{ args.head_lines }}]{% endif %}{% if args.tail_lines %} [tail:{{ args.tail_lines }}]{% endif %}{% if args.max_output_bytes %} [:{{ args.max_output_bytes }}b]{% endif %}";
+pub(crate) const STATUS_CALL: &str = "status {{ args.execution_id }}{% if args.grep %} /{{ args.grep }}/{% endif %}{% if args.head_lines %} [head:{{ args.head_lines }}]{% endif %}{% if args.tail_lines %} [tail:{{ args.tail_lines }}]{% endif %}{% if args.max_output_bytes %} [:{{ args.max_output_bytes }}b]{% endif %}";
+
+pub(crate) const WAIT_CALL: &str = "wait {{ args.execution_id }} [{% if args.forever %}forever{% elif args.seconds %}{{ args.seconds }}s{% else %}240s{% endif %}]{% if args.grep %} /{{ args.grep }}/{% endif %}{% if args.head_lines %} [head:{{ args.head_lines }}]{% endif %}{% if args.tail_lines %} [tail:{{ args.tail_lines }}]{% endif %}{% if args.max_output_bytes %} [:{{ args.max_output_bytes }}b]{% endif %}";
 
 pub(crate) const TERMINATE_CALL: &str =
     "kill {{ args.execution_id }}{% if args.signal %} ({{ args.signal }}){% endif %}";
@@ -51,7 +53,7 @@ pub(crate) fn command_template_call(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_template_call, SPAWN_CALL};
+    use super::{command_template_call, SPAWN_CALL, STATUS_CALL, WAIT_CALL};
     use harnx_core::tool::render_tool_call_template;
     use serde_json::{json, Value};
 
@@ -88,41 +90,59 @@ mod tests {
     fn spawn_call_renders_default_nested_wait() {
         for wait in [
             json!({}),
-            json!({"timeout_secs": null, "head_lines": null, "tail_lines": null,
+            json!({"seconds": null, "forever": null, "head_lines": null, "tail_lines": null,
                 "max_output_bytes": null, "grep": null}),
         ] {
-            let timeout = crate::server::WaitOptions::default().effective_timeout_secs();
-            assert_eq!(timeout, 120);
+            assert_eq!(
+                crate::server::WaitOptions::default().limit().unwrap(),
+                crate::server::WaitLimit::Seconds(240)
+            );
             assert_eq!(
                 render_spawn(json!({"command": "echo ready", "wait": wait})),
-                format!("```sh\n$ echo ready &\n```\nwait [{timeout}s]")
+                "```sh\n$ echo ready &\n```\nwait [240s]"
             );
         }
         assert_eq!(
             render_spawn(json!({"command": "echo ready", "wait": {"grep": "error"}})),
-            "```sh\n$ echo ready &\n```\nwait [120s] /error/"
+            "```sh\n$ echo ready &\n```\nwait [240s] /error/"
         );
     }
 
     #[test]
-    fn spawn_call_renders_zero_nested_wait_options() {
+    fn spawn_call_renders_forever_and_kill_deadline() {
         assert_eq!(
-            render_spawn(json!({"command": "echo ready", "wait": {
-                "timeout_secs": 0, "head_lines": 0, "tail_lines": 0,
-                "max_output_bytes": 0, "grep": ""
-            }})),
-            "```sh\n$ echo ready &\n```\nwait [0s] // [head:0] [tail:0] [:0b]"
+            render_spawn(json!({"command": "echo ready", "timeout_secs": 30,
+                "wait": {"forever": true}})),
+            "```sh\n$ echo ready &\n```\n[30s kill] \nwait [forever]"
         );
     }
 
     #[test]
-    fn spawn_call_renders_all_nested_wait_options_without_capping_timeout() {
+    fn spawn_call_renders_all_nested_wait_options() {
         assert_eq!(
             render_spawn(json!({"command": "echo ready", "working_dir": "/tmp", "wait": {
-                "timeout_secs": 600, "head_lines": 2, "tail_lines": 3,
+                "seconds": 200, "head_lines": 2, "tail_lines": 3,
                 "max_output_bytes": 1024, "grep": "error|warn"
             }})),
-            "```sh\n$ echo ready &\n```\n(/tmp) \nwait [600s] /error|warn/ [head:2] [tail:3] [:1024b]"
+            "```sh\n$ echo ready &\n```\n(/tmp) \nwait [200s] /error|warn/ [head:2] [tail:3] [:1024b]"
+        );
+    }
+
+    #[test]
+    fn wait_and_status_calls_render_limits() {
+        let wait = |args: Value| render_tool_call_template(WAIT_CALL, &args, "").unwrap();
+        assert_eq!(wait(json!({"execution_id": "e1"})), "wait e1 [240s]");
+        assert_eq!(
+            wait(json!({"execution_id": "e1", "forever": true})),
+            "wait e1 [forever]"
+        );
+        assert_eq!(
+            wait(json!({"execution_id": "e1", "seconds": 30, "grep": "x"})),
+            "wait e1 [30s] /x/"
+        );
+        assert_eq!(
+            render_tool_call_template(STATUS_CALL, &json!({"execution_id": "e1"}), "").unwrap(),
+            "status e1"
         );
     }
 

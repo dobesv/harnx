@@ -14,9 +14,9 @@ pub(in crate::nats_worker::subagent_toolset) use load::{
 use super::super::{normalize_session_id, SubagentToolset};
 use super::{
     dispatch, parse_send_args, parse_wait_args, DispatchConfirmation, PromptHandle, ResolvedWait,
-    SessionPromptResult, SessionPromptStatus,
+    SessionPromptResult, SessionPromptStatus, WaitStop,
 };
-use budget::{Budget, Stop};
+use budget::{Budget, BudgetStops, Stop};
 use harnx_toolset::{
     ToolInvocation, ToolInvocationContext, ToolInvokeError, SUBAGENT_SESSION_SEND_TOOL,
     SUBAGENT_SESSION_WAIT_TOOL,
@@ -74,7 +74,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn send(
         } else {
             SessionPromptStatus::Unknown
         };
-        Ok(frame.finish(&Budget::new(0, CancellationToken::new())))
+        Ok(frame.finish(&Budget::snapshot(CancellationToken::new())))
     }
 }
 
@@ -142,7 +142,16 @@ async fn observe(
         cancel,
         dispatch,
     } = request;
-    let budget = Budget::new(wait.seconds, cancel);
+    let budget = Budget::new(wait.limit, BudgetStops::for_call(cancel.clone(), context));
+    // A caller bound already reached must still report what the child is
+    // doing: the caller is about to run out of time and may be holding a
+    // finished result. Take one bounded pass, as session_load does.
+    let single_pass = budget.check() == Err(Stop::CallerDeadline);
+    let budget = if single_pass {
+        Budget::snapshot(cancel)
+    } else {
+        budget
+    };
     let mut frame = Frame::new(&handle, wait.read.max_output_bytes);
     frame.preflight(None)?;
     frame.result.dispatch = dispatch;
@@ -162,6 +171,7 @@ async fn observe(
         wait,
         budget,
         repaired: false,
+        single_pass,
     };
     if let Err(reason) = observer.run(&mut frame).await {
         frame.stopped(reason);
@@ -176,6 +186,8 @@ struct Observer<'a> {
     wait: ResolvedWait,
     budget: Budget,
     repaired: bool,
+    /// Observe once and stop for the caller's deadline instead of waiting.
+    single_pass: bool,
 }
 
 impl Observer<'_> {
@@ -191,16 +203,14 @@ impl Observer<'_> {
             // Cache a bounded partial page before sleeping. On expiry/cancellation
             // there is no extra I/O allowance outside the absolute soft deadline.
             frame.render(self).await?;
-            if self.snapshot.status() != SessionPromptStatus::Pending {
-                return Ok(());
+            if self.single_pass {
+                return Err(Stop::CallerDeadline);
             }
-            if self.budget.is_zero() {
-                // One logical snapshot, never repair or a second poll.
-                frame.result.wait_expired = true;
+            if self.snapshot.settled() {
                 return Ok(());
             }
             self.maybe_repair(frame).await?;
-            if self.snapshot.status() != SessionPromptStatus::Pending {
+            if self.snapshot.settled() {
                 frame.render(self).await?;
                 return Ok(());
             }

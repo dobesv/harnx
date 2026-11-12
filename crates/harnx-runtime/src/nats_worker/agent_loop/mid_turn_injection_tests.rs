@@ -10,6 +10,7 @@ use crate::nats_session_metadata::{
     AdmissionAuthority, InvocationAdmission, SessionInitializer, SessionMetadata,
     SessionMetadataStore,
 };
+use crate::nats_tool_provider::NatsInFlightCalls;
 use harnx_core::input::Input;
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::require_nextest;
@@ -67,6 +68,8 @@ struct InjectionHarness {
     storage_key: String,
     backend: crate::nats_worker::NatsSessionLogBackend,
     invocation_id: String,
+    client: async_nats::Client,
+    in_flight: NatsInFlightCalls,
 }
 
 /// Admit `prompt_id` under a fresh invocation and bind the prompt admission.
@@ -101,7 +104,7 @@ async fn spawn_harness(name: &str) -> anyhow::Result<Option<InjectionHarness>> {
         return Ok(None);
     };
     let client = async_nats::connect(&url).await?;
-    let jetstream = async_nats::jetstream::new(client);
+    let jetstream = async_nats::jetstream::new(client.clone());
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
     let session_id = crate::nats_worker::new_remote_session_id();
     let storage_key = harnx_core::session_identity::session_key(Some(name), &session_id);
@@ -126,6 +129,8 @@ async fn spawn_harness(name: &str) -> anyhow::Result<Option<InjectionHarness>> {
         storage_key,
         backend,
         invocation_id: String::new(),
+        client,
+        in_flight: NatsInFlightCalls::default(),
     }))
 }
 
@@ -147,7 +152,22 @@ impl InjectionHarness {
     }
 
     fn callback(&self, cursor: Arc<AtomicU64>) -> crate::agent_loop::OnToolRoundFn {
-        build_mid_turn_injection_callback(self.backend.clone(), cursor, self.invocation_id.clone())
+        build_mid_turn_injection_callback(
+            self.backend.clone(),
+            cursor,
+            self.invocation_id.clone(),
+            self.in_flight.clone(),
+        )
+    }
+
+    /// What the session watcher does when a user message lands at `seq`.
+    fn watcher_saw(&self, seq: u64) {
+        self.in_flight
+            .note_pending_message(&self.client, &self.storage_key, seq);
+    }
+
+    fn message_pending(&self) -> bool {
+        self.in_flight.message_pending(&self.storage_key)
     }
 
     fn input() -> Input {
@@ -391,6 +411,49 @@ async fn idless_rejection_reports_log_seq_and_note_like_flag() -> anyhow::Result
     assert!(
         message.contains("runtime-note-prefixed text=true"),
         "diagnostic must report the prefix lookalike flag: {message}"
+    );
+    harness.shutdown();
+    Ok(())
+}
+
+/// A wait dispatched after a tool round must not stop for a message that
+/// round dealt with: one it injected, or a compaction copy of one the turn
+/// already holds, which the fold never selects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injection_leaves_nothing_it_read_pending_for_new_message_waits() -> anyhow::Result<()> {
+    require_nextest();
+    let Some(mut harness) = spawn_harness("mid-turn-injection-consumed").await? else {
+        eprintln!("Skipping test: nats-server not available");
+        return Ok(());
+    };
+    let prompt = UserRow {
+        id: Some("prompt"),
+        text: "start",
+    };
+    let cursor = Arc::new(AtomicU64::new(harness.append_user(prompt).await?));
+    harness.invocation_id = admit(&harness, "prompt").await?;
+    let steering = || UserRow {
+        id: Some("steering"),
+        text: "steer",
+    };
+    harness.watcher_saw(harness.append_user(steering()).await?);
+    harness.bind_steering("steering").await?;
+    let callback = harness.callback(Arc::clone(&cursor));
+    callback(&mut InjectionHarness::input(), &[]).await?;
+    assert!(
+        !harness.message_pending(),
+        "the injected message is taken in"
+    );
+
+    harness.append(compress_row("summary")).await?;
+    harness.watcher_saw(harness.append_user(steering()).await?);
+    assert!(harness.message_pending());
+    let mut input = InjectionHarness::input();
+    callback(&mut input, &[]).await?;
+    assert!(input.injected_user_text().is_none());
+    assert!(
+        !harness.message_pending(),
+        "a copy is never injected, so it must not stay pending"
     );
     harness.shutdown();
     Ok(())

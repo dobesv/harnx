@@ -39,6 +39,7 @@ fn proxy_tool_surface_includes_bash_and_filesystem_tools() {
             "bash_exec",
             "bash_read_exec_log",
             "bash_spawn",
+            "bash_status",
             "bash_wait",
             "bash_terminate",
             "bash_rollback_file",
@@ -65,6 +66,22 @@ fn proxy_tool_surface_includes_bash_and_filesystem_tools() {
             "fs_rollback_file",
         ]
     );
+}
+
+/// The native bash spawn and wait stop on a new message; reached through the
+/// proxy over MCP they cannot, so the proxy must not advertise it.
+#[test]
+fn proxied_bash_waits_do_not_advertise_stop_on_new_message() {
+    let native: Vec<ToolSpec> = harnx_bash_tools::builtin_tool_specs()
+        .into_iter()
+        .filter(|spec| spec.stops_on_new_message())
+        .collect();
+    let native_names: Vec<&str> = native.iter().map(|spec| spec.name.as_str()).collect();
+    assert_eq!(native_names, ["spawn", "wait"]);
+    assert!(native
+        .into_iter()
+        .map(proxy_spec)
+        .all(|spec| !spec.stops_on_new_message()));
 }
 
 #[test]

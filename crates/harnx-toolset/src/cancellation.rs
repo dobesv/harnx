@@ -35,9 +35,9 @@ pub struct CancellationAcknowledgement {
     pub acceptance: CancelAcceptance,
 }
 
-/// Request to cancel one tool invocation, addressed by session and call id.
-/// The server name prevents another subscriber on a shared control subject
-/// from answering on its behalf.
+/// Request to cancel one tool invocation, or to tell it a new message arrived,
+/// addressed by session and call id. The server name prevents another
+/// subscriber on a shared control subject from answering on its behalf.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlMessage {
     pub protocol_version: u32,
@@ -53,6 +53,11 @@ pub struct ControlMessage {
 #[serde(rename_all = "snake_case")]
 pub enum ControlKind {
     Cancel,
+    /// A new message arrived for the call's session. A call that opted in
+    /// with [`crate::ToolSpec::with_stop_on_new_message`] ends its wait and
+    /// returns its normal result; nothing is cancelled. Servers that predate
+    /// this kind cannot decode the message and drop it.
+    NewMessage,
 }
 
 impl ControlMessage {
@@ -70,6 +75,21 @@ impl ControlMessage {
             cancellation_id,
             call_id,
             kind: ControlKind::Cancel,
+        }
+    }
+
+    /// Tell the call that a new message arrived for its session. The signal
+    /// carries no cancellation, so its id is derived from the call: every
+    /// resend names the same signal.
+    pub fn new_message(server: String, session_id: String, call_id: String) -> Self {
+        Self {
+            protocol_version: TOOL_PROTOCOL_VERSION,
+            server,
+            session_id,
+            operation_id: call_id.clone(),
+            cancellation_id: format!("new-message:{call_id}"),
+            call_id,
+            kind: ControlKind::NewMessage,
         }
     }
 

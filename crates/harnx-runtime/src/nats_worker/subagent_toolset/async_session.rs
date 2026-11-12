@@ -1,5 +1,6 @@
 //! Async sub-agent send/wait contracts, durable dispatch and bounded observation.
-//! Both observation entry points share the nested `wait` options and
+//! `session_send.wait` and the top-level `session_wait` options share one
+//! resolver, and both entry points use the
 //! [`super::session_read`] formatter. Discovery is wired separately; synchronous
 //! `session_prompt` behavior and schema stay unchanged.
 //!
@@ -9,21 +10,30 @@
 
 pub(super) mod dispatch;
 pub(super) mod observation;
+mod specs;
 
-use super::session_read::{read_object_schema, ReadOptions, ResolvedRead};
+pub(crate) use specs::{session_send_spec, session_wait_spec};
+
+use super::session_read::{ReadOptions, ResolvedRead};
 use crate::nats_session_metadata::{CallTimeoutOverride, EffectiveDeadline};
-use harnx_toolset::{
-    ToolProgressKind, ToolSpec, SUBAGENT_SESSION_SEND_TOOL, SUBAGENT_SESSION_WAIT_TOOL,
-};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
-/// Default soft wait: 120 seconds, kept below the common five-minute LLM
-/// cache TTL window. Applies to explicit `wait: {}` on send and to an omitted
-/// `wait` on `session_wait`. Omitted `send.wait` remains dispatch-only.
-pub(crate) const DEFAULT_WAIT_SECONDS: u64 = 120;
-/// Maximum accepted soft wait. Caller choice only; never recommended.
-pub(crate) const MAX_WAIT_SECONDS: u64 = 300;
+/// Default soft wait in seconds. Applies to an explicit `wait: {}` on send and
+/// to an omitted `seconds` on `session_wait`. Omitted `send.wait` remains
+/// dispatch-only.
+pub(crate) const WAIT_DEFAULT_SECS: u64 = 240;
+/// Maximum accepted soft wait in seconds; `forever` lifts it explicitly. It
+/// stays under the five-minute prompt-cache lifetime, so a parent that waits
+/// the full limit still finds its cache warm when the result comes back.
+pub(crate) const WAIT_MAX_SECS: u64 = 240;
+
+/// How long an observation may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitLimit {
+    Seconds(u64),
+    Forever,
+}
 
 /// Soft-observation options shared by `session_send.wait` and `session_wait`.
 /// All fields optional; `null` is equivalent to omission. The wait budget is
@@ -35,17 +45,18 @@ pub(crate) struct WaitOptions {
     #[serde(default)]
     pub(crate) seconds: Option<u64>,
     #[serde(default)]
+    pub(crate) forever: Option<bool>,
+    #[serde(default)]
     pub(crate) include_partial: Option<bool>,
     #[serde(default)]
     pub(crate) read: Option<ReadOptions>,
 }
 
-/// A validated `wait` object.
+/// A validated wait request.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedWait {
-    /// Soft observation budget. Zero permits one bounded snapshot operation,
-    /// no repair/retry/wait loop.
-    pub(crate) seconds: u64,
+    /// Soft observation limit.
+    pub(crate) limit: WaitLimit,
     /// Whether pending/blocked observations include partial child output.
     /// Terminal output is delivered under the same bound either way.
     pub(crate) include_partial: bool,
@@ -55,23 +66,58 @@ pub(crate) struct ResolvedWait {
 impl Default for ResolvedWait {
     fn default() -> Self {
         Self {
-            seconds: DEFAULT_WAIT_SECONDS,
+            limit: WaitLimit::Seconds(WAIT_DEFAULT_SECS),
             include_partial: true,
             read: ResolvedRead::default(),
         }
     }
 }
 
-impl WaitOptions {
-    pub(crate) fn resolve(&self) -> Result<ResolvedWait, String> {
-        let seconds = self.seconds.unwrap_or(DEFAULT_WAIT_SECONDS);
-        if seconds > MAX_WAIT_SECONDS {
-            return Err(format!("wait.seconds must be at most {MAX_WAIT_SECONDS}"));
+/// Which tool carries the wait options; it decides the out-of-range error text.
+#[derive(Debug, Clone, Copy)]
+enum WaitCaller {
+    Send,
+    Wait,
+}
+
+impl WaitCaller {
+    fn range_error(self) -> String {
+        match self {
+            Self::Send => format!(
+                "wait.seconds must be between 1 and {WAIT_MAX_SECS}; omit wait to return immediately"
+            ),
+            Self::Wait => format!(
+                "seconds must be between 1 and {WAIT_MAX_SECS}; to check status without waiting, \
+                 call session_load with prompt_id"
+            ),
         }
+    }
+}
+
+impl WaitOptions {
+    /// Resolve the nested `session_send.wait` object.
+    pub(crate) fn resolve(&self) -> Result<ResolvedWait, String> {
+        self.resolve_for(WaitCaller::Send)
+    }
+
+    fn resolve_for(&self, caller: WaitCaller) -> Result<ResolvedWait, String> {
+        let forever = self.forever.unwrap_or(false);
+        if forever && self.seconds.is_some() {
+            return Err("pass either seconds or forever, not both".to_string());
+        }
+        let limit = if forever {
+            WaitLimit::Forever
+        } else {
+            let seconds = self.seconds.unwrap_or(WAIT_DEFAULT_SECS);
+            if !(1..=WAIT_MAX_SECS).contains(&seconds) {
+                return Err(caller.range_error());
+            }
+            WaitLimit::Seconds(seconds)
+        };
         let include_partial = self.include_partial.unwrap_or(true);
         let read = self.read.clone().unwrap_or_default().resolve()?;
         Ok(ResolvedWait {
-            seconds,
+            limit,
             include_partial,
             read,
         })
@@ -102,6 +148,16 @@ pub(crate) enum SessionPromptStatus {
     Unknown,
 }
 
+impl SessionPromptStatus {
+    /// Whether durable evidence ended the prompt.
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::TimedOut
+        )
+    }
+}
+
 /// Whether the dispatched prompt's activation was durably confirmed.
 /// `None` means unknown at observation time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -109,6 +165,22 @@ pub(crate) enum SessionPromptStatus {
 pub(crate) enum DispatchConfirmation {
     Confirmed,
     Unconfirmed,
+}
+
+/// What ended a wait early with its normal result, other than its own limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WaitStop {
+    /// A new message arrived for the waiting caller.
+    NewMessage,
+    /// The wait reached the minute it leaves before the caller's run deadline.
+    CallerDeadline,
+}
+
+impl WaitStop {
+    /// The value with the longest serialized name, which result metadata
+    /// reserves room for.
+    pub(crate) const WIDEST: Self = Self::CallerDeadline;
 }
 
 /// Shared send/wait result envelope. `output` carries the bounded read (same
@@ -126,6 +198,9 @@ pub(crate) struct SessionPromptResult {
     pub(crate) status: SessionPromptStatus,
     pub(crate) terminal: bool,
     pub(crate) wait_expired: bool,
+    /// What ended the wait early, when it was not the wait's own limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stopped_by: Option<WaitStop>,
     pub(crate) elapsed_ms: u64,
     pub(crate) output: Value,
 }
@@ -141,6 +216,7 @@ pub(crate) fn result_metadata_bytes(session_id: &str, prompt_id: &str) -> usize 
         status: SessionPromptStatus::Unknown,
         terminal: false,
         wait_expired: false,
+        stopped_by: Some(WaitStop::WIDEST),
         elapsed_ms: u64::MAX,
         output: Value::Null,
     };
@@ -193,14 +269,33 @@ pub(crate) struct SendArgs {
     pub(crate) tool_call_id: Option<String>,
 }
 
-/// `session_wait` arguments. Requires the exact original prompt handle.
+/// `session_wait` arguments. Requires the exact original prompt handle. The
+/// wait options sit at the top level; serde cannot combine `flatten` with
+/// `deny_unknown_fields`, so they are declared directly.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WaitArgs {
     pub(crate) session_id: String,
     pub(crate) prompt_id: String,
     #[serde(default)]
-    pub(crate) wait: Option<WaitOptions>,
+    pub(crate) seconds: Option<u64>,
+    #[serde(default)]
+    pub(crate) forever: Option<bool>,
+    #[serde(default)]
+    pub(crate) include_partial: Option<bool>,
+    #[serde(default)]
+    pub(crate) read: Option<ReadOptions>,
+}
+
+impl WaitArgs {
+    fn wait_options(&self) -> WaitOptions {
+        WaitOptions {
+            seconds: self.seconds,
+            forever: self.forever,
+            include_partial: self.include_partial,
+            read: self.read.clone(),
+        }
+    }
 }
 
 /// Parse and fully validate `session_send` arguments before any side effect.
@@ -234,20 +329,24 @@ pub(crate) fn parse_send_args(args: Value) -> Result<(SendArgs, Option<ResolvedW
 }
 
 /// Parse and fully validate `session_wait` arguments before any side effect.
-/// An omitted `wait` defaults to a 120-second soft wait.
+/// Omitted `seconds` defaults to a 240-second soft wait.
 pub(crate) fn parse_wait_args(args: Value) -> Result<(WaitArgs, ResolvedWait), String> {
-    let parsed: WaitArgs = serde_json::from_value(args)
-        .map_err(|error| format!("invalid session_wait arguments: {error}"))?;
+    let nested_wait = args.get("wait").is_some();
+    let parsed: WaitArgs = serde_json::from_value(args).map_err(|error| {
+        let hint = if nested_wait {
+            "; session_wait takes seconds/forever at the top level, the nested wait object was removed"
+        } else {
+            ""
+        };
+        format!("invalid session_wait arguments: {error}{hint}")
+    })?;
     if parsed.session_id.trim().is_empty() {
         return Err("session_id must not be empty".to_string());
     }
     if parsed.prompt_id.trim().is_empty() {
         return Err("prompt_id must not be empty".to_string());
     }
-    let resolved = parsed
-        .wait
-        .as_ref()
-        .map_or_else(|| Ok(ResolvedWait::default()), WaitOptions::resolve)?;
+    let resolved = parsed.wait_options().resolve_for(WaitCaller::Wait)?;
     ensure_result_metadata_fits(
         &parsed.session_id,
         &parsed.prompt_id,
@@ -256,133 +355,8 @@ pub(crate) fn parse_wait_args(args: Value) -> Result<(WaitArgs, ResolvedWait), S
     Ok((parsed, resolved))
 }
 
-/// The shared `wait` object schema. Nested and strict: unknown fields are
-/// rejected at every level.
-pub(crate) fn wait_object_schema() -> Value {
-    json!({
-        "type": "object",
-        "description": "Optional soft wait for this prompt. The seconds are an \
-    observation budget only — they never extend the child's hard execution \
-    deadline, and expiry never cancels the child. Omitted or null means no wait \
-    for session_send (dispatch-only); session_wait defaults an omitted wait to \
-    120 seconds.",
-        "properties": {
-            "seconds": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 300,
-                "default": 120,
-                "description": "Soft observation budget in seconds. Default 120, \
-    maximum 300. Zero takes one immediate bounded snapshot. Expiry returns the \
-    partial snapshot; the child keeps running."
-            },
-            "include_partial": {
-                "type": "boolean",
-                "description": "Whether to include partial child output while the \
-    prompt is pending or blocked. Default true. Explicit false omits pending/\
-    blocked text; terminal output is still returned under the same byte bound."
-            },
-            "read": json!({"anyOf": [read_object_schema(), {"type": "null"}]})
-        },
-        "additionalProperties": false
-    })
-}
-
-/// Tool spec for `session_send` (agent-prefixed at registration by Task 5).
-pub(crate) fn session_send_spec(agent: &str, policy: Option<&super::TargetRunPolicy>) -> ToolSpec {
-    ToolSpec {
-        cancellation_guarantee: Default::default(),
-        name: SUBAGENT_SESSION_SEND_TOOL.to_string(),
-        description: format!(
-            "Asynchronously send a prompt to the '{agent}' agent and optionally \
-soft-wait for its result. Omit session_id (or pass an empty/whitespace value) to \
-start a new session with a generated ID. Returns a durable {{session_id, \
-prompt_id}} handle immediately; wait with the agent's session_wait tool to \
-observe the result, or omit wait entirely for dispatch-only. Sub-agents return \
-files by including cid: attachment URLs in their reply. {}",
-            super::policy_description(policy)
-        ),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "message": {
-                    "type": "string",
-                    "description": "The prompt message to send to the agent"
-                },
-                "attachments": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Optional list of cid: attachment URLs to pass to the sub-agent"
-                },
-                "session_id": {
-                    "type": "string",
-                    "description": "Optional. Omit (or pass an empty/whitespace value) to start a new session with a generated ID; this is the default. To continue an earlier session, pass the exact session_id returned by a prior call. IDs are case-sensitive and local to this agent. Do not invent a session ID."
-                },
-                "timeout_secs": {
-                    "type": "integer",
-                    "description": super::policy_description(policy)
-                },
-                "wait": json!({"anyOf": [wait_object_schema(), {"type": "null"}]})
-            },
-            "required": ["message"],
-            "additionalProperties": false
-        }),
-        idempotent_hint: false,
-        read_only_hint: false,
-        timeout_secs: None,
-        meta: None,
-    }
-    .without_request_timeout()
-    .with_call_template(&format!(
-        "@ {agent}{{% if args.session_id %}} [{}]{{% endif %}}\n{{{{ args.message }}}}",
-        super::SHORT_SESSION_ID
-    ))
-    .with_kind(ToolProgressKind::Execute)
-}
-
-/// Tool spec for `session_wait` (agent-prefixed at registration by Task 5).
-pub(crate) fn session_wait_spec(agent: &str) -> ToolSpec {
-    ToolSpec {
-        cancellation_guarantee: Default::default(),
-        name: SUBAGENT_SESSION_WAIT_TOOL.to_string(),
-        description: format!(
-            "Wait (soft) for the result of a prompt previously dispatched to the \
-'{agent}' agent with session_send. Returns the prompt's durable observation: \
-status, terminal flag and bounded output with continuation metadata. Repeated \
-waits recover the same result and never consume it. The wait never cancels \
-the child or extends its execution deadline."
-        ),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "session_id": {
-                    "type": "string",
-                    "description": "The session ID the prompt was dispatched to. \
-Case-sensitive; do not invent."
-                },
-                "prompt_id": {
-                    "type": "string",
-                    "description": "The prompt_id from the session_send result handle \
-(the original prompt identity, not an invocation ID)."
-                },
-                "wait": json!({"anyOf": [wait_object_schema(), {"type": "null"}]})
-            },
-            "required": ["session_id", "prompt_id"],
-            "additionalProperties": false
-        }),
-        idempotent_hint: false,
-        read_only_hint: false,
-        timeout_secs: None,
-        meta: None,
-    }
-    .without_request_timeout()
-    .with_call_template(&format!(
-        "@ {agent} [{}] wait\nsession_id: {{{{ args.session_id }}}}\nprompt_id: {{{{ args.prompt_id }}}}",
-        super::SHORT_SESSION_ID
-    ))
-    .with_kind(ToolProgressKind::Read)
-}
-
 #[cfg(test)]
 #[path = "async_session_tests.rs"]
 mod async_session_tests;
+#[cfg(test)]
+mod new_message_tests;

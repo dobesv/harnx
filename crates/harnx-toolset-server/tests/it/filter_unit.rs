@@ -140,15 +140,9 @@ mod tests {
             args: Value::Null,
             cancel: CancellationToken::new(),
             context: harnx_toolset::ToolInvocationContext {
-                run_context: None,
                 call_id: "test".to_string(),
                 invoking_session_id: Some("session".to_string()),
-                invoking_session: None,
-                capabilities: Default::default(),
-                checkpoint: None,
-                checkpoint_store: None,
-                partial_result_store: None,
-                progress: Default::default(),
+                ..Default::default()
             },
         }
     }

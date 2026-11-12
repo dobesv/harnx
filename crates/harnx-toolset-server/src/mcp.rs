@@ -42,6 +42,10 @@ impl ServerHandler for McpToolsetAdapter {
                 // long-running tool (bash spawn's nested wait) would inherit the
                 // caller's request backstop instead of the server's policy.
                 let mut meta = spec.meta.unwrap_or_default();
+                // MCP has no control subject to deliver a new-message signal
+                // on, so a tool reached this way cannot stop on one, and a
+                // bridge must not advertise that it does.
+                meta.remove(harnx_toolset::STOP_ON_NEW_MESSAGE_META_KEY);
                 if let Some(timeout_secs) = spec.timeout_secs {
                     meta.insert(
                         harnx_toolset::TOOL_TIMEOUT_META_KEY.to_owned(),
@@ -113,12 +117,13 @@ impl McpToolsetAdapter {
             invoking_session: None,
             capabilities,
             // MCP transports have no journal to record a checkpoint or a
-            // partial result in, and no control subject a later cancel could
-            // arrive on.
+            // partial result in, and no control subject a later cancel or
+            // new-message signal could arrive on.
             checkpoint: None,
             checkpoint_store: None,
             partial_result_store: None,
             progress: Default::default(),
+            new_message: Default::default(),
         };
         let attestation = RequestAttestation {
             call_id: invocation_context.call_id.clone(),

@@ -13,7 +13,8 @@ use harnx_core::tool::{
 };
 use harnx_toolset::{
     ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec,
-    CAPABILITY_TOOL_PROGRESS, HDR_CALL_ID, HDR_CONTENT_TYPE, HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
+    CAPABILITY_NEW_MESSAGE_PENDING, CAPABILITY_TOOL_PROGRESS, HDR_CALL_ID, HDR_CONTENT_TYPE,
+    HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
 };
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use serde_json::Value;
@@ -30,7 +31,13 @@ pub use cancellation::publish_tool_cancel;
 use in_flight::InFlightFailure;
 pub(crate) use in_flight::InFlightRegistration;
 pub use in_flight::{InFlightCancelTarget, NatsInFlightCalls};
+mod new_message;
+#[cfg(test)]
+pub(crate) use new_message::NEW_MESSAGE_ATTEMPTS;
 mod execution_context;
+#[cfg(test)]
+#[path = "nats_tool_provider/new_message_tests.rs"]
+mod new_message_tests;
 mod partial_result;
 mod progress;
 mod replay;
@@ -45,17 +52,21 @@ const REGISTRATION_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const JSON_CONTENT_TYPE: &str = "application/json";
 
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(Default))]
 struct RegisteredTool {
     server: String,
     selector_server: String,
     raw_name: String,
     request_timeout: Option<Duration>,
+    /// The tool ends its wait when a new message arrives for the session.
+    stop_on_new_message: bool,
 }
 
 struct PendingToolRequest {
     durable: ToolRequest,
     call_id: String,
     server: String,
+    stop_on_new_message: bool,
     registration_key: String,
     subject: String,
     request: async_nats::Request,
@@ -270,6 +281,7 @@ impl NatsToolProvider {
                 selector_server: registration.server.clone(),
                 raw_name,
                 request_timeout: request_timeout(spec.timeout_secs),
+                stop_on_new_message: spec.stops_on_new_message(),
             });
         }
 
@@ -400,6 +412,7 @@ impl NatsToolProvider {
         let PendingToolRequest {
             call_id,
             server,
+            stop_on_new_message,
             registration_key,
             subject,
             request,
@@ -413,6 +426,7 @@ impl NatsToolProvider {
                     server: server.clone(),
                     session_id: durable.parent_session_id.clone().unwrap_or_default(),
                     control_subject: self.instance_id.control_subject(),
+                    stop_on_new_message,
                 },
                 || {
                     if !abort.aborted_failover() {
@@ -421,6 +435,9 @@ impl NatsToolProvider {
                 },
             )
             .await;
+        if stop_on_new_message {
+            self.signal_message_since_dispatch(&durable, &server);
+        }
         let request = harnx_nats_common::rpc::request(&self.client, subject, request);
         tokio::pin!(request);
         let response = tokio::select! {
@@ -469,6 +486,7 @@ fn registered_tool(
     let result_template = template("result_template");
     // Extract kind before moving spec
     let kind = spec.kind().map(|k| k.into());
+    let stop_on_new_message = spec.stops_on_new_message();
     let parameters = match JsonSchema::from_tool_schema(spec.input_schema) {
         Ok(parameters) => parameters,
         Err(error) => {
@@ -487,6 +505,7 @@ fn registered_tool(
         selector_server: registration.server.clone(),
         raw_name,
         request_timeout: request_timeout(spec.timeout_secs),
+        stop_on_new_message,
     };
     let declaration = ToolDeclaration {
         name: name.clone(),
@@ -831,7 +850,7 @@ mod tests {
                 server: "fs".into(),
                 selector_server: "fs".into(),
                 raw_name: "read".into(),
-                request_timeout: None,
+                ..Default::default()
             },
         );
         let abort = harnx_core::abort::create_abort_signal();
@@ -886,9 +905,9 @@ mod tests {
         let provider = make_test_provider(&client).await;
         let route = RegisteredTool {
             server: "test-server".to_string(),
-            selector_server: "test-server".to_string(),
             raw_name: "test-tool".to_string(),
             request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            ..Default::default()
         };
 
         global::set_text_map_propagator(TraceContextPropagator::new());
@@ -1357,9 +1376,9 @@ mod tests {
                 "stream".to_string(),
                 RegisteredTool {
                     server: "progress-test".to_string(),
-                    selector_server: "progress-test".to_string(),
                     raw_name: "stream".to_string(),
                     request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+                    ..Default::default()
                 },
             )]),
             registrations: Vec::new(),

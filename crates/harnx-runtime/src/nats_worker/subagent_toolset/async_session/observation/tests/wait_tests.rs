@@ -4,19 +4,18 @@ use harnx_core::{message::MessageRole, session::SessionLogEntry};
 use std::time::Duration;
 
 #[tokio::test]
-async fn zero_poll_is_read_only_and_live_polls_have_changing_observation_metadata() -> Result<()> {
+async fn live_polls_have_changing_observation_metadata() -> Result<()> {
     let f = Fixture::new().await?;
     f.dispatch().await?;
-    let first = f.poll(json!({"seconds": 0})).await?;
+    let first = f.poll(json!({"seconds": 1})).await?;
     tokio::time::sleep(Duration::from_millis(2)).await;
-    let second = f.poll(json!({"seconds": 0})).await?;
+    let second = f.poll(json!({"seconds": 1})).await?;
     assert_pending(&first, true);
-    assert_eq!(first["output"]["observation"]["error"], Value::Null);
+    assert_eq!(first["output"]["observation"]["error"], "soft_wait_expired");
     assert_ne!(
         first["output"]["observation"]["observed_at_ms"],
         second["output"]["observation"]["observed_at_ms"]
     );
-    assert_initial_dispatch_unchanged(&f).await?;
     Ok(())
 }
 
@@ -36,7 +35,7 @@ async fn initial_send_wait_and_later_wait_share_formatter_and_soft_expiry_never_
         .await?
         .iter()
         .any(|(_, e)| matches!(e, SessionLogEntry::Cancel { .. })));
-    let later = f.poll(json!({"seconds": 0})).await?;
+    let later = f.poll(json!({"seconds": 1})).await?;
     assert_eq!(first["output"]["events"], later["output"]["events"]);
     f.append(message(
         "done",
@@ -45,9 +44,9 @@ async fn initial_send_wait_and_later_wait_share_formatter_and_soft_expiry_never_
     ))
     .await?;
     f.append(end(1)).await?;
-    let completed = f.poll(json!({"seconds": 0})).await?;
+    let completed = f.poll(json!({"seconds": 1})).await?;
     let mut replay = f.request.args.clone();
-    replay["wait"] = json!({"seconds": 0});
+    replay["wait"] = json!({"seconds": 1});
     let initial_replay = send(
         &f.toolset,
         replay,
@@ -93,7 +92,7 @@ async fn observer_cancel_returns_handle_without_child_cancel_or_false_cancelled_
     );
     assert_eq!(f.log.load_events_latest_async().await?.len(), 1);
     f.append(end(1)).await?;
-    assert_eq!(f.poll(json!({"seconds": 0})).await?["status"], "completed");
+    assert_eq!(f.status().await?["status"], "completed");
     Ok(())
 }
 
@@ -173,15 +172,15 @@ async fn bounded_terminal_partial_continuation_and_empty_range_keep_whole_result
         ))
         .await?;
     f.append(end(1)).await?;
-    let result = f.poll(json!({"seconds": 0, "read": {"max_output_bytes": 1024, "head_lines": 1, "tail_lines": 1}})).await?;
+    let result = f.poll(json!({"seconds": 1, "read": {"max_output_bytes": 1024, "head_lines": 1, "tail_lines": 1}})).await?;
     assert_eq!(result["status"], "completed");
     assert!(serialized(&result) <= 1024);
     assert_eq!(result["output"]["truncated"], true);
-    let continuation = f.poll(json!({"seconds": 0, "read": {"max_output_bytes": 1024, "entry_index": index, "byte_offset": 0}})).await?;
+    let continuation = f.poll(json!({"seconds": 1, "read": {"max_output_bytes": 1024, "entry_index": index, "byte_offset": 0}})).await?;
     assert!(serialized(&continuation) <= 1024);
     assert!(continuation["output"]["continuation"].is_object());
     let empty = f
-        .poll(json!({"seconds": 0, "read": {"index_min": 1000}}))
+        .poll(json!({"seconds": 1, "read": {"index_min": 1000}}))
         .await?;
     for key in [
         "events",
@@ -196,7 +195,7 @@ async fn bounded_terminal_partial_continuation_and_empty_range_keep_whole_result
         );
     }
     let outside = f
-        .poll(json!({"seconds": 0, "read": {"entry_index": 1000, "byte_offset": 0}}))
+        .poll(json!({"seconds": 1, "read": {"entry_index": 1000, "byte_offset": 0}}))
         .await?;
     assert_eq!(
         outside["output"]["observation"]["error"],
@@ -217,7 +216,7 @@ async fn broker_unavailability_keeps_handle_budget_and_unknown_without_terminal_
         session_id: "child".into(),
         prompt_id: "original-prompt".into(),
     };
-    let budget = Budget::new(1, CancellationToken::new());
+    let budget = Budget::new(WaitLimit::Seconds(1), BudgetStops::default());
     let scope = match Scope::resolve(&f.toolset, &handle, &f.wait_context(), &budget).await {
         Ok(s) => s,
         Err(_) => panic!("scope resolution"),
@@ -231,6 +230,7 @@ async fn broker_unavailability_keeps_handle_budget_and_unknown_without_terminal_
         wait: ResolvedWait::default(),
         budget,
         repaired: false,
+        single_pass: false,
     };
     let mut frame = Frame::new(&handle, 1024);
     frame.bind(&observer.scope);
@@ -261,5 +261,53 @@ async fn send_without_wait_returns_dispatch_receipt_without_starting_observation
     assert_pending(&result, false);
     assert!(result["output"].get("events").is_none());
     assert_initial_dispatch_unchanged(&f).await?;
+    Ok(())
+}
+
+/// The wait context with a new-message signal that fires after `delay`.
+fn context_with_new_message(f: &Fixture, delay: Duration) -> ToolInvocationContext {
+    let new_message = CancellationToken::new();
+    let signal = new_message.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        signal.cancel();
+    });
+    ToolInvocationContext {
+        new_message,
+        ..f.wait_context()
+    }
+}
+
+#[tokio::test]
+async fn new_message_ends_session_wait_with_its_pending_result() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.dispatch().await?;
+    let context = context_with_new_message(&f, Duration::from_millis(200));
+    let args = f.wait_args(json!({"seconds": 30}));
+    let result = wait(&f.toolset, args, CancellationToken::new(), context).await?;
+    assert_pending(&result, false);
+    assert_eq!(result["stopped_by"], "new_message");
+    assert!(result["elapsed_ms"].as_u64().unwrap() < 20_000, "{result}");
+    // An ordinary expiry names no stop, and the child kept running.
+    let expired = f.poll(json!({"seconds": 1})).await?;
+    assert!(expired.get("stopped_by").is_none(), "{expired}");
+    assert_pending(&expired, true);
+    Ok(())
+}
+
+/// A message already pending when send starts its wait still dispatches the
+/// prompt, then returns the dispatched handle at once instead of waiting.
+#[tokio::test]
+async fn new_message_pending_before_send_wait_returns_the_dispatched_handle() -> Result<()> {
+    let f = Fixture::new().await?;
+    let context = f.send_context();
+    context.new_message.cancel();
+    let mut args = f.request.args.clone();
+    args["wait"] = json!({"seconds": 30});
+    let result = send(&f.toolset, args, CancellationToken::new(), context).await?;
+    assert_eq!(result["prompt_id"], "original-prompt");
+    assert_pending(&result, false);
+    assert_eq!(result["stopped_by"], "new_message");
+    assert!(result["elapsed_ms"].as_u64().unwrap() < 20_000, "{result}");
     Ok(())
 }

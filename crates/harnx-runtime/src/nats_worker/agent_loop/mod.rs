@@ -18,6 +18,7 @@ use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
 use crate::nats_session::{NatsSession, NatsSessionConfig, PendingHitlApproval};
 use crate::nats_session_metadata::{SessionMetadata, SessionMetadataStore};
+use crate::nats_tool_provider::NatsInFlightCalls;
 use crate::tool_context::{discover_nats_hook_provider_fresh, discover_nats_tool_provider_fresh};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
@@ -344,15 +345,20 @@ async fn verify_injected_prompt_admissions(
     Ok(())
 }
 
+/// Inject user messages that arrived during a tool round into the next
+/// request, and tell `in_flight` how far the turn has read the session log,
+/// so a wait dispatched later doesn't stop for a message already injected.
 pub(crate) fn build_mid_turn_injection_callback(
     backend: NatsSessionLogBackend,
     cursor: Arc<AtomicU64>,
     invocation_id: String,
+    in_flight: NatsInFlightCalls,
 ) -> OnToolRoundFn {
     Arc::new(move |merged_input, _results| {
         let backend = backend.clone();
         let cursor = Arc::clone(&cursor);
         let invocation_id = invocation_id.clone();
+        let in_flight = in_flight.clone();
         Box::pin(async move {
             let tail = match backend.load_events_latest_async().await {
                 Ok(entries) => entries,
@@ -361,12 +367,18 @@ pub(crate) fn build_mid_turn_injection_callback(
                     return Err(err);
                 }
             };
+            // Every executable message through the end of this read is either
+            // folded in below or a copy of one the turn already has, so none
+            // of them is still waiting. Marking the read's end rather than the
+            // cursor also clears a compaction copy, which the fold never selects.
+            let read_through = tail.last().map_or(0, |(seq, _)| *seq);
             let current = match cursor.load(std::sync::atomic::Ordering::SeqCst) {
                 0 => None,
                 seq => Some(seq),
             };
             let (messages, latest_seq) = fold_new_user_messages_since(&tail, current);
             if messages.is_empty() {
+                in_flight.note_messages_consumed(backend.session_id(), read_through);
                 return Ok(());
             }
             let store = backend
@@ -387,6 +399,7 @@ pub(crate) fn build_mid_turn_injection_callback(
             if let Some(seq) = latest_seq {
                 cursor.store(seq, std::sync::atomic::Ordering::SeqCst);
             }
+            in_flight.note_messages_consumed(backend.session_id(), read_through);
             Ok(())
         })
     })

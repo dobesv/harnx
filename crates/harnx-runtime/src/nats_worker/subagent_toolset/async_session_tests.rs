@@ -1,6 +1,8 @@
-//! Task 1 contract tests for the shared async send/wait schemas, wait
+//! Contract tests for the shared async send/wait schemas, wait
 //! defaults, handle metadata budget, and the frozen result envelope.
 
+use super::super::session_read::read_object_schema;
+use super::specs::wait_object_schema;
 use super::*;
 use serde_json::json;
 
@@ -20,12 +22,12 @@ fn serialized(value: &Value) -> usize {
 fn wait_defaults_apply_to_omitted_and_null_fields() {
     for wait in [
         json!({}),
-        json!({ "seconds": null, "include_partial": null, "read": null }),
+        json!({ "seconds": null, "forever": null, "include_partial": null, "read": null }),
     ] {
         let resolved: WaitOptions = serde_json::from_value(wait).expect("wait options parse");
         let resolved = resolved.resolve().expect("defaults resolve");
-        assert_eq!(resolved.seconds, DEFAULT_WAIT_SECONDS);
-        assert_eq!(resolved.seconds, 120);
+        assert_eq!(resolved.limit, WaitLimit::Seconds(WAIT_DEFAULT_SECS));
+        assert_eq!(resolved.limit, WaitLimit::Seconds(240));
         assert!(resolved.include_partial);
         let super::super::session_read::ReadMode::Sequential(seq) = &resolved.read.mode else {
             panic!("default read should be sequential");
@@ -37,16 +39,39 @@ fn wait_defaults_apply_to_omitted_and_null_fields() {
 
 #[test]
 fn wait_seconds_bounds_and_errors() {
-    assert_eq!(
-        wait_options(json!({ "seconds": 301 })).unwrap_err(),
-        "wait.seconds must be at most 300"
-    );
-    let zero = wait_options(json!({ "seconds": 0 })).expect("zero is a valid snapshot wait");
-    assert_eq!(zero.seconds, Some(0));
-    let max = wait_options(json!({ "seconds": 300 })).expect("300 is valid");
-    assert_eq!(max.seconds, Some(300));
+    for seconds in [0, 241] {
+        assert_eq!(
+            wait_options(json!({ "seconds": seconds })).unwrap_err(),
+            "wait.seconds must be between 1 and 240; omit wait to return immediately"
+        );
+    }
+    for seconds in [1, 240] {
+        assert_eq!(
+            wait_options(json!({ "seconds": seconds })).unwrap().seconds,
+            Some(seconds)
+        );
+    }
     // Negative seconds are rejected at deserialization (u64).
     assert!(serde_json::from_value::<WaitOptions>(json!({ "seconds": -1 })).is_err());
+}
+
+#[test]
+fn forever_resolves_and_excludes_seconds() {
+    let resolved = |value| {
+        serde_json::from_value::<WaitOptions>(value)
+            .unwrap()
+            .resolve()
+    };
+    assert_eq!(
+        resolved(json!({"forever": true})).unwrap().limit,
+        WaitLimit::Forever
+    );
+    assert_eq!(
+        resolved(json!({"forever": false})).unwrap().limit,
+        WaitLimit::Seconds(240)
+    );
+    let error = resolved(json!({"seconds": 30, "forever": true})).unwrap_err();
+    assert!(error.contains("either seconds or forever"), "{error}");
 }
 
 #[test]
@@ -108,6 +133,7 @@ fn result_envelope_shape_is_frozen() {
         status: SessionPromptStatus::Pending,
         terminal: false,
         wait_expired: false,
+        stopped_by: None,
         elapsed_ms: 1234,
         output: json!({ "events": [] }),
     };
@@ -142,6 +168,7 @@ fn result_envelope_shape_is_frozen() {
         status: SessionPromptStatus::Unknown,
         terminal: false,
         wait_expired: true,
+        stopped_by: None,
         elapsed_ms: 120_000,
         output: Value::Null,
     };
@@ -179,7 +206,7 @@ fn parse_send_args_accepts_dispatch_only_and_explicit_wait() {
     let (_, wait) = parse_send_args(json!({ "message": "hello", "wait": {} }))
         .expect("explicit empty wait parses");
     let wait = wait.expect("explicit wait resolves");
-    assert_eq!(wait.seconds, DEFAULT_WAIT_SECONDS);
+    assert_eq!(wait.limit, WaitLimit::Seconds(WAIT_DEFAULT_SECS));
     assert!(wait.include_partial);
 }
 
@@ -197,7 +224,7 @@ fn parse_send_args_rejects_unknown_fields_and_invalid_wait() {
         "wait": { "seconds": 400 },
     }))
     .expect_err("oversized wait rejected");
-    assert_eq!(error, "wait.seconds must be at most 300");
+    assert!(error.contains("between 1 and 240"), "{error}");
 
     let error = parse_send_args(json!({
         "message": "hello",
@@ -235,6 +262,14 @@ fn parse_send_args_rejects_session_ids_that_break_the_handle_budget() {
     );
 }
 
+fn wait_args_with(extra: Value) -> Result<ResolvedWait, String> {
+    let mut args = json!({ "session_id": "child-1", "prompt_id": "prompt-9" });
+    args.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    parse_wait_args(args).map(|(_, wait)| wait)
+}
+
 #[test]
 fn parse_wait_args_defaults_and_validation() {
     let (args, wait) = parse_wait_args(json!({
@@ -245,27 +280,41 @@ fn parse_wait_args_defaults_and_validation() {
     assert_eq!(args.session_id, "child-1");
     assert_eq!(args.prompt_id, "prompt-9");
     assert_eq!(
-        wait.seconds, DEFAULT_WAIT_SECONDS,
-        "omitted wait defaults to 120"
+        wait.limit,
+        WaitLimit::Seconds(240),
+        "omitted seconds default"
     );
     assert!(wait.include_partial);
+    assert_eq!(
+        wait_args_with(json!({ "seconds": 240 })).unwrap().limit,
+        WaitLimit::Seconds(240)
+    );
+    assert_eq!(
+        wait_args_with(json!({ "forever": true })).unwrap().limit,
+        WaitLimit::Forever
+    );
+    assert_eq!(
+        wait_args_with(json!({ "forever": false })).unwrap().limit,
+        WaitLimit::Seconds(240)
+    );
+}
 
-    let (_, wait) = parse_wait_args(json!({
-        "session_id": "child-1",
-        "prompt_id": "prompt-9",
-        "wait": { "seconds": 0 },
-    }))
-    .expect("immediate snapshot wait parses");
-    assert_eq!(wait.seconds, 0);
+#[test]
+fn parse_wait_args_rejects_bad_seconds_and_nested_wait() {
+    for seconds in [0, 241] {
+        let error = wait_args_with(json!({ "seconds": seconds })).unwrap_err();
+        assert!(error.contains("between 1 and 240"), "{error}");
+        assert!(error.contains("session_load"), "{error}");
+    }
+    let error = wait_args_with(json!({ "seconds": 30, "forever": true })).unwrap_err();
+    assert!(error.contains("either seconds or forever"), "{error}");
+    let error = wait_args_with(json!({ "wait": {} })).unwrap_err();
+    assert!(error.contains("unknown field"), "{error}");
+    assert!(error.contains("top level"), "{error}");
+}
 
-    let (_, wait) = parse_wait_args(json!({
-        "session_id": "child-1",
-        "prompt_id": "prompt-9",
-        "wait": { "seconds": 300 },
-    }))
-    .expect("explicit maximum parses");
-    assert_eq!(wait.seconds, 300);
-
+#[test]
+fn parse_wait_args_rejects_empty_ids_and_unknown_fields() {
     assert_eq!(
         parse_wait_args(json!({ "session_id": "  ", "prompt_id": "p" })).unwrap_err(),
         "session_id must not be empty"
@@ -285,7 +334,7 @@ fn parse_wait_args_rejects_handles_that_cannot_be_returned() {
     let error = parse_wait_args(json!({
         "session_id": "s".repeat(1_000),
         "prompt_id": "p".repeat(1_000),
-        "wait": { "read": { "max_output_bytes": 1024 } },
+        "read": { "max_output_bytes": 1024 },
     }))
     .expect_err("oversized handle rejected");
     assert!(
@@ -306,8 +355,7 @@ fn tool_schemas_are_strict_and_nested() {
         json!({"type":"null"})
     );
     assert_eq!(wait["additionalProperties"], json!(false));
-    assert_eq!(wait["properties"]["seconds"]["maximum"], json!(300));
-    assert_eq!(wait["properties"]["seconds"]["minimum"], json!(0));
+    assert_seconds_and_forever(&wait["properties"]);
     assert_eq!(
         wait["properties"]["include_partial"]["type"],
         json!("boolean")
@@ -332,12 +380,34 @@ fn tool_schemas_are_strict_and_nested() {
         json!(["session_id", "prompt_id"])
     );
     assert_eq!(wait_tool.input_schema["additionalProperties"], json!(false));
-    let wait_property = &wait_tool.input_schema["properties"]["wait"];
-    assert_eq!(wait_property["anyOf"][1], json!({"type":"null"}));
+    let properties = &wait_tool.input_schema["properties"];
+    assert!(properties.get("wait").is_none(), "session_wait is flat");
+    assert_seconds_and_forever(properties);
+}
+
+fn assert_seconds_and_forever(properties: &Value) {
+    let seconds = &properties["seconds"];
     assert_eq!(
-        wait_property["anyOf"][0]["additionalProperties"],
-        json!(false)
+        (
+            &seconds["minimum"],
+            &seconds["maximum"],
+            &seconds["default"]
+        ),
+        (&json!(1), &json!(240), &json!(240))
     );
+    assert_eq!(properties["forever"]["type"], json!("boolean"));
+}
+
+#[test]
+fn descriptions_do_not_mention_cache() {
+    let send = session_send_spec("pkg/helper", None);
+    let wait = session_wait_spec("pkg/helper");
+    for text in [
+        serde_json::to_string(&send).unwrap(),
+        serde_json::to_string(&wait).unwrap(),
+    ] {
+        assert!(!text.to_lowercase().contains("cache"), "{text}");
+    }
 }
 
 #[test]
@@ -345,18 +415,20 @@ fn nullable_wait_and_nested_read_schema_match_parser() {
     // Specs come from production tool_specs, not an independent schema fixture.
     let tools = super::super::tool_specs("pkg/helper");
     let send = &tools[2].input_schema["properties"]["wait"];
-    let wait = &tools[3].input_schema["properties"]["wait"];
-    for schema in [send, wait] {
-        assert_eq!(schema["anyOf"][1], json!({"type":"null"}));
-        assert_eq!(schema["anyOf"][0]["additionalProperties"], json!(false));
+    assert_eq!(send["anyOf"][1], json!({"type":"null"}));
+    assert_eq!(send["anyOf"][0]["additionalProperties"], json!(false));
+    let flat = &tools[3].input_schema["properties"];
+    for read in [&send["anyOf"][0]["properties"]["read"], &flat["read"]] {
+        assert_eq!(read["anyOf"][1], json!({"type":"null"}));
+        assert_eq!(read["anyOf"][0]["additionalProperties"], json!(false));
     }
-    let read = &send["anyOf"][0]["properties"]["read"];
-    assert_eq!(read["anyOf"][1], json!({"type":"null"}));
-    assert_eq!(read["anyOf"][0]["additionalProperties"], json!(false));
     assert!(parse_send_args(json!({"message":"x"})).is_ok());
     assert!(parse_send_args(json!({"message":"x", "wait":null})).is_ok());
     assert!(parse_wait_args(json!({"session_id":"s", "prompt_id":"p"})).is_ok());
-    assert!(parse_wait_args(json!({"session_id":"s", "prompt_id":"p", "wait":null})).is_ok());
+    assert!(parse_wait_args(
+        json!({"session_id":"s", "prompt_id":"p", "seconds":null, "forever":null, "read":null})
+    )
+    .is_ok());
     assert!(wait_options(json!({"seconds":null, "include_partial":null, "read":null})).is_ok());
 }
 
@@ -385,9 +457,9 @@ fn send_and_wait_schemas_stay_within_their_bounds() {
         );
     }
     let wait_schema = wait_object_schema();
-    assert_eq!(wait_schema["properties"]["seconds"]["maximum"], json!(300));
-    assert!(wait_options(json!({ "seconds": 300 })).is_ok());
-    assert!(wait_options(json!({ "seconds": 301 })).is_err());
+    assert_eq!(wait_schema["properties"]["seconds"]["maximum"], json!(240));
+    assert!(wait_options(json!({ "seconds": 240 })).is_ok());
+    assert!(wait_options(json!({ "seconds": 241 })).is_err());
 }
 
 #[test]

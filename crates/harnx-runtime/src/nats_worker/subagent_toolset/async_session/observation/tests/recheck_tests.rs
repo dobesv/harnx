@@ -2,7 +2,7 @@ use super::{fixture::*, *};
 
 async fn pending(f: &Fixture) -> Result<(Scope, Snapshot, Budget)> {
     f.dispatch().await?;
-    let budget = Budget::new(120, CancellationToken::new());
+    let budget = Budget::new(WaitLimit::Seconds(120), BudgetStops::default());
     let handle = PromptHandle {
         session_id: "child".into(),
         prompt_id: "original-prompt".into(),

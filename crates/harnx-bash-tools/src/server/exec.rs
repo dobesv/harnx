@@ -10,7 +10,7 @@ impl BashServer {
         &self,
         params: ExecCommandParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let timeout_secs = resolve_command_timeout(params.timeout_secs);
+        let timeout_secs = Some(resolve_command_timeout(params.timeout_secs)?);
         self.exec_pipeline(ExecPipelineParams {
             command: &params.command,
             working_dir: params.working_dir.as_deref(),
@@ -35,8 +35,8 @@ impl BashServer {
             ErrorData::invalid_params(format!("unknown tool template: {name}"), None)
         })?;
         let mut script_args = args.clone();
-        let requested_timeout = parse_template_timeout(script_args.remove(COMMAND_TIMEOUT_ARG))
-            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        let requested_timeout = parse_template_timeout(script_args.remove(COMMAND_TIMEOUT_ARG))?;
+        let timeout_secs = resolve_command_timeout(requested_timeout)?;
         let bound = registered
             .template
             .validate_and_bind(&script_args)
@@ -60,7 +60,7 @@ impl BashServer {
             command: &command,
             working_dir: None,
             extra_env: Some(&extra_env),
-            timeout_secs: resolve_command_timeout(requested_timeout),
+            timeout_secs: Some(timeout_secs),
             truncate_opts: Self::truncate_opts_from(None, None, None),
             template_sandbox: Some(TemplateSandbox {
                 enabled: registered.sandbox_enabled,
@@ -318,24 +318,38 @@ impl BashServer {
             ctx.total_lines,
             format_size(ctx.total_bytes)
         );
-        self.build_exit_result(ctx, summary, "after exec").await
+        let diff_parts = self
+            .diff_snapshots(
+                ctx.before_snaps,
+                ctx.snapshot_decision,
+                ctx.working_dir,
+                "after exec",
+            )
+            .await;
+        Ok(Self::exit_result_with_diff(
+            ctx,
+            ExitKind::default(),
+            summary,
+            diff_parts,
+        ))
     }
 
-    /// Shared assembly for "exited" results: metadata header + streams block,
-    /// then after-snapshot diff. `summary` and `snapshot_label` differ per tool.
-    pub(crate) async fn build_exit_result(
-        &self,
+    /// Shared assembly for "exited" results (exec and wait): metadata header
+    /// and streams block, then the after-snapshot diff each tool took.
+    pub(crate) fn exit_result_with_diff(
         ctx: ExitResultCtx<'_>,
+        kind: ExitKind,
         summary: String,
-        snapshot_label: &str,
-    ) -> Result<CallToolResult, ErrorData> {
+        diff_parts: Vec<String>,
+    ) -> CallToolResult {
         let mut output = String::new();
         render_metadata_header(
             &mut output,
             MetadataHeader {
                 execution_id: Some(ctx.execution_id),
-                status: Some("exited"),
-                exit_code: Some(ctx.exit_code),
+                status: Some(kind.status()),
+                stopped_by: None,
+                exit_code: (kind == ExitKind::Exited).then_some(ctx.exit_code),
                 command: Some(ctx.command),
                 working_dir: Some(ctx.working_dir),
                 stdout_log_path: Some(ctx.stdout_log_path),
@@ -346,15 +360,7 @@ impl BashServer {
             },
         );
         let _ = write!(output, "\n{}", ctx.streams_block);
-        let diff_parts = self
-            .diff_snapshots(
-                ctx.before_snaps,
-                ctx.snapshot_decision,
-                ctx.working_dir,
-                snapshot_label,
-            )
-            .await;
-        Ok(Self::build_success_result(output, summary, diff_parts))
+        Self::build_success_result(output, summary, diff_parts)
     }
 
     pub(crate) fn build_timeout_result(
@@ -395,44 +401,55 @@ impl BashServer {
     }
 }
 
-fn resolve_command_timeout(requested: Option<u64>) -> Option<u64> {
+/// The command deadline in seconds: the default when unset, otherwise the
+/// requested value within `1..=COMMAND_TIMEOUT_MAX_SECS`.
+pub(super) fn resolve_command_timeout(requested: Option<u64>) -> Result<u64, ErrorData> {
     match requested {
-        None => Some(DEFAULT_COMMAND_TIMEOUT_SECS),
-        Some(0) => None,
-        Some(seconds) => Some(seconds),
+        None => Ok(COMMAND_TIMEOUT_MAX_SECS),
+        Some(seconds) if (1..=COMMAND_TIMEOUT_MAX_SECS).contains(&seconds) => Ok(seconds),
+        Some(_) => Err(ErrorData::invalid_params(
+            format!("timeout_secs must be between 1 and {COMMAND_TIMEOUT_MAX_SECS}"),
+            None,
+        )),
     }
 }
 
-fn parse_template_timeout(value: Option<Value>) -> anyhow::Result<Option<u64>> {
+fn parse_template_timeout(value: Option<Value>) -> Result<Option<u64>, ErrorData> {
     match value {
-        None => Ok(None),
-        Some(Value::Number(number)) => match number.as_u64() {
-            Some(number) => Ok(Some(number)),
-            None => anyhow::bail!("timeout_secs must be a non-negative integer"),
-        },
-        Some(_) => anyhow::bail!("timeout_secs must be a non-negative integer"),
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number.as_u64().map(Some).ok_or_else(|| {
+            ErrorData::invalid_params("timeout_secs must be a non-negative integer", None)
+        }),
+        Some(_) => Err(ErrorData::invalid_params(
+            "timeout_secs must be a non-negative integer",
+            None,
+        )),
     }
 }
 
 #[cfg(test)]
 mod timeout_tests {
     use super::{parse_template_timeout, resolve_command_timeout};
-    use crate::server::DEFAULT_COMMAND_TIMEOUT_SECS;
+    use crate::server::COMMAND_TIMEOUT_MAX_SECS;
     use serde_json::json;
 
     #[test]
-    fn resolves_default_override_and_unlimited_timeouts() {
+    fn resolves_default_override_and_rejects_out_of_range() {
         assert_eq!(
-            resolve_command_timeout(None),
-            Some(DEFAULT_COMMAND_TIMEOUT_SECS)
+            resolve_command_timeout(None).unwrap(),
+            COMMAND_TIMEOUT_MAX_SECS
         );
-        assert_eq!(resolve_command_timeout(Some(17)), Some(17));
-        assert_eq!(resolve_command_timeout(Some(0)), None);
+        assert_eq!(resolve_command_timeout(Some(17)).unwrap(), 17);
+        for bad in [0, COMMAND_TIMEOUT_MAX_SECS + 1] {
+            let error = resolve_command_timeout(Some(bad)).unwrap_err();
+            assert!(error.message.contains("between 1 and 86400"), "{error:?}");
+        }
     }
 
     #[test]
     fn template_timeout_accepts_non_negative_integers_only() {
         assert_eq!(parse_template_timeout(None).unwrap(), None);
+        assert_eq!(parse_template_timeout(Some(json!(null))).unwrap(), None);
         assert_eq!(parse_template_timeout(Some(json!(0))).unwrap(), Some(0));
         assert_eq!(parse_template_timeout(Some(json!(17))).unwrap(), Some(17));
         assert!(parse_template_timeout(Some(json!(-1))).is_err());

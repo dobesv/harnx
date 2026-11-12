@@ -295,7 +295,7 @@ bridged harnx toolsets inherit the same deadline policy as the native NATS route
 that advertise nothing — including third-party MCP servers — keep the caller's default
 request backstop (60 s in `harnx-runtime/src/nats_tool_provider.rs`), so bridging does not
 disable deadlines globally. This is why `harnx-bash-tools --mcp-stdio` advertises
-`timeout_secs: 0` for `spawn`/`wait`/`exec`: a nested spawn wait (`wait: {}`, 120 s
+`timeout_secs: 0` for `spawn`/`wait`/`exec`: a nested spawn wait (`wait: {}`, 240 s
 default) must return its first execution_id-bearing response instead of expiring at the
 60 s backstop. Direct stdio clients that ignore unknown `_meta` keys are unaffected.
 See `crates/harnx-mcp-bridge/README.md#request-timeout-policy`.
@@ -1416,10 +1416,12 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    never key on the latest `invocation_prompt_seq` or session result. Repeated
    waits recover the same terminal result without consuming it.
 
-2. **Soft wait is an observation budget, not execution time** — `wait.seconds`
-   (default 120, max 300) builds one absolute deadline at observer entry that
-   covers repair, polling and broker I/O (`observation/budget.rs`); a
-   zero-second wait is one bounded snapshot. Expiry never cancels the child and
+2. **Soft wait is an observation budget, not execution time** — `seconds`
+   (1 to 240, default 240) or `forever: true` builds one absolute deadline at
+   observer entry that covers repair, polling and broker I/O
+   (`observation/budget.rs`); there is no zero-second wait, and `session_load`
+   with `prompt_id` is the snapshot that never waits. A wait also ends early
+   with `stopped_by: "new_message"` or `"caller_deadline"`. Expiry never cancels the child and
    never extends the inherited hard `timeout_secs` policy. The send receipt is
    a tool result, not child progress: terminal truth stays runtime-owned, and
    `is_subagent_launcher` (`harnx-toolset`) deliberately excludes
@@ -1476,7 +1478,9 @@ a lease disappearing or a process exiting. TUI, one-shot and followers return on
 it; don't reintroduce a wait for tools to die before the editor comes back.
 
 Tool protocol v5 carries `CancelAcceptance::{Accepted, AlreadyFinished, Rejected,
-Unknown}` and nothing else. There is no cleanup status to report and no physical
+Unknown}` and nothing else for cancels. The same control channel also carries
+`ControlKind::NewMessage`, which is not a cancel: it ends an opted-in wait and
+records nothing. There is no cleanup status to report and no physical
 shutdown to confirm — a cancel is best effort and its acknowledgement is for
 logging. Cancels are idempotent, so resending one is always allowed and is how
 wind-up and resume reach a call whose original invocation is gone. Don't add a
