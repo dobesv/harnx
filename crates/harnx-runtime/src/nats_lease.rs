@@ -1,5 +1,6 @@
 mod holder_liveness;
 mod scope;
+mod slot;
 use crate::config::DEFAULT_BUCKET_REPLICAS;
 use crate::nats_metrics;
 use crate::nats_session_metadata::SessionMetadataStore;
@@ -8,6 +9,7 @@ use async_nats::header::{NATS_EXPECTED_LAST_SUBJECT_SEQUENCE, NATS_MESSAGE_ID, N
 use async_nats::jetstream::{self, context::PublishErrorKind, kv, stream};
 pub use holder_liveness::holder_reclaim_supported;
 use serde::{Deserialize, Serialize};
+use slot::LeaseSlot;
 use std::future::Future;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -120,6 +122,8 @@ struct LeaseState {
     worker_id: String,
     generation: u64,
     ttl: Duration,
+    /// How long the marker a release leaves on the key lasts.
+    marker_ttl: Duration,
     held: AtomicBool,
     fence_token: AtomicU64,
     renew_lock: Mutex<()>,
@@ -162,21 +166,14 @@ impl NatsSessionLease {
         let mut record = LeaseRecord::new(worker_id.clone(), generation);
         record.execution_id = execution_id.clone();
         let acquired_at = time::Instant::now();
-        let revision = match create_lease(&bucket, &key, &record, config.ttl).await? {
-            Some(revision) => revision,
-            None => {
-                // Another holder owns the key. When that holder provably died
-                // on this host — a SIGKILLed local worker, a crashed daemon —
-                // reclaim the stale lease now instead of waiting out its TTL.
-                // Anything less certain keeps the old back-off behaviour.
-                if !try_reclaim_stale_lease(&bucket, session_id, &key).await? {
-                    return Ok(None);
-                }
-                let Some(revision) = create_lease(&bucket, &key, &record, config.ttl).await? else {
-                    return Ok(None);
-                };
-                revision
-            }
+        let slot = LeaseSlot {
+            jetstream: &jetstream,
+            bucket: &bucket,
+            key: &key,
+            marker_ttl: config.tombstone_ttl,
+        };
+        let Some(revision) = claim_lease(&slot, session_id, &record, config.ttl).await? else {
+            return Ok(None);
         };
 
         let (status_tx, _status_rx) = watch::channel(true);
@@ -185,6 +182,7 @@ impl NatsSessionLease {
             worker_id,
             generation,
             ttl: config.ttl,
+            marker_ttl: config.tombstone_ttl,
             held: AtomicBool::new(true),
             fence_token: AtomicU64::new(revision),
             renew_lock: Mutex::new(()),
@@ -290,7 +288,7 @@ impl NatsSessionLease {
         match harnx_metrics::time_nats_operation(
             "lease_release",
             self.bucket
-                .delete_expect_revision(&self.key, Some(revision)),
+                .purge_expect_revision_with_ttl(&self.key, revision, self.state.marker_ttl),
         )
         .await
         {
@@ -343,7 +341,7 @@ impl Drop for NatsSessionLease {
                     let revision = state.fence_token.load(Ordering::SeqCst);
                     let _ = harnx_metrics::time_nats_operation(
                         "lease_release",
-                        bucket.delete_expect_revision(&key, Some(revision)),
+                        bucket.purge_expect_revision_with_ttl(&key, revision, state.marker_ttl),
                     )
                     .await;
                 }
@@ -468,26 +466,37 @@ pub async fn session_has_active_lease(
         .is_some())
 }
 
+/// Take the lease key for `record`, reclaiming it first from a holder that
+/// provably died on this host. `Ok(None)` means another holder keeps it.
+async fn claim_lease(
+    slot: &LeaseSlot<'_>,
+    session_id: &str,
+    record: &LeaseRecord,
+    ttl: Duration,
+) -> Result<Option<u64>> {
+    if let Some(revision) = create_lease(slot, record, ttl).await? {
+        return Ok(Some(revision));
+    }
+    // Another holder owns the key. When that holder provably died on this
+    // host — a SIGKILLed local worker, a crashed daemon — reclaim the stale
+    // lease now instead of waiting out its TTL. Anything less certain keeps
+    // the old back-off behaviour.
+    if !try_reclaim_stale_lease(slot, session_id).await? {
+        return Ok(None);
+    }
+    create_lease(slot, record, ttl).await
+}
+
 /// Claim the session's lease key. A create conflict means another owner still
 /// holds it, so the caller backs off rather than taking the session over; the
 /// holder's own TTL is what eventually frees the key.
 async fn create_lease(
-    bucket: &kv::Store,
-    key: &str,
+    slot: &LeaseSlot<'_>,
     record: &LeaseRecord,
     ttl: Duration,
 ) -> Result<Option<u64>> {
     let payload = serde_json::to_vec(record).context("Failed to serialize lease record")?;
-    match harnx_metrics::time_nats_operation(
-        "lease_create",
-        bucket.create_with_ttl(key, payload.into(), ttl),
-    )
-    .await
-    {
-        Ok(revision) => Ok(Some(revision)),
-        Err(error) if is_create_conflict(&error) => Ok(None),
-        Err(error) => Err(error).context("Failed to acquire NATS lease"),
-    }
+    harnx_metrics::time_nats_operation("lease_create", slot.create(payload, ttl)).await
 }
 
 /// Delete the lease at `key` when its holder is provably dead on this host.
@@ -503,8 +512,8 @@ async fn create_lease(
 /// `Ok(false)`, so a contended acquire surfaces a `ClaimError`-style delayed
 /// NAK rather than a quiet defer; that is bounded and self-healing, and
 /// indistinguishable from any other broker read failure.
-async fn try_reclaim_stale_lease(bucket: &kv::Store, session_id: &str, key: &str) -> Result<bool> {
-    let Some(entry) = harnx_metrics::time_nats_operation("lease_get", bucket.entry(key))
+async fn try_reclaim_stale_lease(slot: &LeaseSlot<'_>, session_id: &str) -> Result<bool> {
+    let Some(entry) = harnx_metrics::time_nats_operation("lease_get", slot.bucket.entry(slot.key))
         .await
         .map_err(anyhow::Error::from)
         .with_context(|| format!("Failed to read NATS lease for session '{session_id}'"))?
@@ -525,9 +534,8 @@ async fn try_reclaim_stale_lease(bucket: &kv::Store, session_id: &str, key: &str
         return Ok(false);
     }
     delete_stale_lease_at_revision(
-        bucket,
+        slot,
         session_id,
-        key,
         ObservedLease {
             revision: entry.revision,
             record: &record,
@@ -547,9 +555,8 @@ struct ObservedLease<'a> {
 /// attempt gives up. Split from [`try_reclaim_stale_lease`] so the CAS
 /// outcome can be tested directly against a replaced lease.
 async fn delete_stale_lease_at_revision(
-    bucket: &kv::Store,
+    slot: &LeaseSlot<'_>,
     session_id: &str,
-    key: &str,
     observed: ObservedLease<'_>,
 ) -> Result<bool> {
     let ObservedLease { revision, record } = observed;
@@ -557,12 +564,7 @@ async fn delete_stale_lease_at_revision(
         .holder
         .as_ref()
         .expect("reclaim precondition: holder identity present");
-    match harnx_metrics::time_nats_operation(
-        "lease_reclaim",
-        bucket.delete_expect_revision(key, Some(revision)),
-    )
-    .await
-    {
+    match harnx_metrics::time_nats_operation("lease_reclaim", slot.remove(revision)).await {
         Ok(()) => {
             info!(
                 "reclaimed stale session lease from dead holder: session_id={session_id} holder_worker_id={} holder_pid={} holder_generation={}",
@@ -580,7 +582,10 @@ async fn delete_stale_lease_at_revision(
             Ok(false)
         }
         Err(error) => Err(anyhow::Error::from(error)).with_context(|| {
-            format!("Failed to reclaim stale NATS lease key '{key}' for session '{session_id}'")
+            format!(
+                "Failed to reclaim stale NATS lease key '{}' for session '{session_id}'",
+                slot.key
+            )
         }),
     }
 }
@@ -797,10 +802,6 @@ async fn renew_once(
     }
 }
 
-fn is_create_conflict(error: &kv::CreateError) -> bool {
-    matches!(error.kind(), kv::CreateErrorKind::AlreadyExists)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +898,18 @@ mod tests {
             nats_metrics::snapshot().lease_reclaims > reclaims_before,
             "reclaim must be counted"
         );
+        // The reclaim leaves a marker, and the lease taken over it still expires.
+        let latest = bucket
+            .stream
+            .get_last_raw_message_by_subject(&format!("$KV.{}.{}", bucket.name, lease.key()))
+            .await?;
+        assert_eq!(
+            latest
+                .headers
+                .get(async_nats::header::NATS_MESSAGE_TTL)
+                .map(|ttl| ttl.as_str().to_owned()),
+            Some(config.ttl.as_secs().to_string())
+        );
         lease.stop_renewal_for_test().await;
         drop(lease);
         let _ = nats.kill();
@@ -940,10 +953,15 @@ mod tests {
             .await
             .context("replace the lease between read and reclaim")?;
 
+        let slot = LeaseSlot {
+            jetstream: &js,
+            bucket: &bucket,
+            key: &key,
+            marker_ttl: config.tombstone_ttl,
+        };
         let reclaimed = delete_stale_lease_at_revision(
-            &bucket,
+            &slot,
             "reclaim-cas-lost",
-            &key,
             ObservedLease {
                 revision: observed,
                 record: &stale,
