@@ -157,7 +157,12 @@ async fn lifecycle_scan_walks_bounded_pages_and_does_not_use_presentation_filter
     f.append(end(original.prompt.user_msg_seq())).await?;
     f.append(message("later", MessageRole::User, "must not leak"))
         .await?;
-    let result = f.poll(json!({"seconds": 1, "read": {"index_min": 1, "index_max": 1004, "types": ["message"]}})).await?;
+    // This test checks lifecycle paging, not read speed. The first poll makes
+    // ~2,000 sequential broker reads (lifecycle scan plus presentation window)
+    // and the second ~1,000, which can take over a second on slower CI runners
+    // (Windows). A timed-out poll keeps its terminal status but drops the page,
+    // so give it plenty of room; it returns as soon as the page is ready.
+    let result = f.poll(json!({"seconds": 30, "read": {"index_min": 1, "index_max": 1004, "types": ["message"]}})).await?;
     assert_eq!(result["status"], "completed");
     // Lifecycle crossed the physical page cap; presentation still pages rather
     // than loading the entire history to satisfy a sparse filter.
@@ -165,7 +170,7 @@ async fn lifecycle_scan_walks_bounded_pages_and_does_not_use_presentation_filter
         .as_u64()
         .context("bounded presentation must expose progress")?;
     let page = f
-        .poll(json!({"seconds": 1, "read": {"index_min": next, "types": ["message"]}}))
+        .poll(json!({"seconds": 30, "read": {"index_min": next, "types": ["message"]}}))
         .await?;
     assert_eq!(page["status"], "completed");
     assert!(page["output"]
