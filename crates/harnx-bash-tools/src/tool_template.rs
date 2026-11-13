@@ -15,6 +15,14 @@ use serde_json::{json, Map, Value};
 
 use crate::server::{BUILTIN_TOOL_NAMES, COMMAND_TIMEOUT_ARG, COMMAND_TIMEOUT_MAX_SECS};
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OnUserMessage {
+    #[default]
+    Ignore,
+    Terminate,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ToolTemplate {
     pub(crate) name: String,
@@ -25,6 +33,8 @@ pub struct ToolTemplate {
     pub(crate) sandbox: Option<SandboxConfig>,
     #[serde(default)]
     pub(crate) template: bool,
+    #[serde(default)]
+    pub(crate) on_user_message: OnUserMessage,
     pub(crate) script: String,
 }
 
@@ -1460,3 +1470,6 @@ script: echo ok
         );
     }
 }
+
+#[cfg(test)]
+mod new_message_tests;

@@ -97,7 +97,23 @@ Each command template file contains the following fields:
 | `env` | Map (optional) | Key-value pairs injected directly into the script environment as fixed environment variables. |
 | `sandbox` | Map (optional) | Sandbox capabilities for this template. Omitting this field uses the server's default sandbox allowlist. |
 | `template` | Boolean (optional) | Enable Minijinja rendering of `script` before execution. Default is `false`. |
+| `on_user_message` | String (optional) | Action when a new user message arrives: `ignore` (default) or `terminate` (terminate and reap the foreground process group). Unknown values fail template loading. |
 | `script` | String (required) | Script body to execute as bash under the sandbox. |
+
+With `on_user_message: terminate`, native NATS calls also stop for a user message
+already pending at dispatch. The foreground process group is terminated and reaped
+before a normal, non-error result returns `status: interrupted`,
+`stopped_by: new_message`, and partial stdout/stderr with log paths. The tool's
+description automatically explains this behavior. Read the new message, then re-run
+the template if still appropriate; no background execution remains to resume.
+Templates with `on_user_message: ignore` (or the field omitted) and generic `exec`
+calls ignore new messages. MCP stdio and k8s-sandbox proxy routes do not deliver
+these signals.
+
+`status: interrupted` doesn't prove the command failed or didn't finish its work.
+The exit code isn't reported, even when the command exits just as the message
+arrives, or when the shell has exited but a background child still holds its
+output open.
 
 #### Parameter definitions
 

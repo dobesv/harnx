@@ -47,6 +47,8 @@ mod env;
 mod exec;
 mod exec_log;
 mod foreground_cleanup;
+mod foreground_output;
+mod foreground_run;
 mod handler;
 mod handlers;
 mod lifecycle;
@@ -64,7 +66,7 @@ pub(crate) use render::*;
 use retention::SpawnedProcesses;
 use supervisor::{spawn_supervisor, ProcessControl, ProcessExit};
 
-use crate::tool_template::ToolTemplate;
+use crate::tool_template::{OnUserMessage, ToolTemplate};
 use crate::tool_templates;
 
 pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
@@ -103,8 +105,10 @@ pub(crate) struct RegisteredToolTemplate {
     pub(crate) sandbox_enabled: bool,
     pub(crate) no_network: bool,
     pub(crate) ignored_grants: bool,
+    pub(crate) on_user_message: OnUserMessage,
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct TemplateSandbox<'a> {
     pub(crate) enabled: bool,

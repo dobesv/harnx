@@ -22,6 +22,7 @@ impl BashServer {
                 params.max_output_bytes,
             ),
             template_sandbox: None,
+            on_user_message: OnUserMessage::Ignore,
         })
         .await
     }
@@ -58,6 +59,7 @@ impl BashServer {
 
         self.exec_pipeline(ExecPipelineParams {
             command: &command,
+            on_user_message: registered.on_user_message,
             working_dir: None,
             extra_env: Some(&extra_env),
             timeout_secs: Some(timeout_secs),
@@ -100,35 +102,28 @@ impl BashServer {
             stderr_file,
         } = self.setup_exec_log().await?;
 
-        let command = self
-            .build_command_with_sandbox(
+        let RunOutcome {
+            status,
+            kind,
+            stdout_str,
+            stderr_str,
+        } = self
+            .run_exec_command(
+                &params,
                 CommandBuildCtx {
                     command: params.command,
                     working_dir: &working_dir,
                     exec_dir: &exec_dir,
                     env: params.extra_env,
                 },
-                params.template_sandbox,
-                Stdio::piped(),
-                Stdio::piped(),
+                LogTargets {
+                    stdout_file,
+                    stderr_file,
+                    stdout_log_path: &stdout_log_path,
+                    stderr_log_path: &stderr_log_path,
+                },
             )
             .await?;
-        let RunOutcome {
-            status,
-            timed_out,
-            stdout_str,
-            stderr_str,
-        } = Self::run_to_completion(
-            command,
-            params.timeout_secs,
-            LogTargets {
-                stdout_file,
-                stderr_file,
-                stdout_log_path: &stdout_log_path,
-                stderr_log_path: &stderr_log_path,
-            },
-        )
-        .await?;
 
         // exec does not expose a grep param; pass None
         let (streams_block, stdout_lines, stderr_lines, stdout_bytes_len, stderr_bytes_len) =
@@ -144,14 +139,12 @@ impl BashServer {
         let total_lines = stdout_lines + stderr_lines;
         let total_bytes = stdout_bytes_len + stderr_bytes_len;
 
-        if timed_out {
+        if let ExitKind::TimedOut { deadline_secs } = kind {
             return self.build_timeout_result(TimeoutResultCtx {
                 command: params.command,
                 working_dir: &working_dir,
                 execution_id: &execution_id,
-                timeout_secs: params
-                    .timeout_secs
-                    .expect("timed-out commands always have a deadline"),
+                timeout_secs: deadline_secs,
                 total_lines,
                 total_bytes,
                 stdout: &stdout_str,
@@ -162,19 +155,22 @@ impl BashServer {
             });
         }
 
-        self.build_exec_success_result(ExitResultCtx {
-            execution_id: &execution_id,
-            command: params.command,
-            working_dir: &working_dir,
-            stdout_log_path: &stdout_log_path,
-            stderr_log_path: &stderr_log_path,
-            total_lines,
-            total_bytes,
-            exit_code: status.code().unwrap_or(-1),
-            streams_block,
-            before_snaps: &before_snaps,
-            snapshot_decision: &snapshot_decision,
-        })
+        self.build_exec_success_result(
+            ExitResultCtx {
+                execution_id: &execution_id,
+                command: params.command,
+                working_dir: &working_dir,
+                stdout_log_path: &stdout_log_path,
+                stderr_log_path: &stderr_log_path,
+                total_lines,
+                total_bytes,
+                exit_code: status.code().unwrap_or(-1),
+                streams_block,
+                before_snaps: &before_snaps,
+                snapshot_decision: &snapshot_decision,
+            },
+            kind,
+        )
         .await
     }
 
@@ -311,10 +307,16 @@ impl BashServer {
     pub(crate) async fn build_exec_success_result(
         &self,
         ctx: ExitResultCtx<'_>,
+        kind: ExitKind,
     ) -> Result<CallToolResult, ErrorData> {
+        let prefix = match kind {
+            ExitKind::Interrupted => "stopped_by: new_message".to_owned(),
+            ExitKind::TimedOut { .. } | ExitKind::Exited => {
+                format!("exit_code: {}", ctx.exit_code)
+            }
+        };
         let summary = format!(
-            "exit_code: {}, {} lines, {}",
-            ctx.exit_code,
+            "{prefix}, {} lines, {}",
             ctx.total_lines,
             format_size(ctx.total_bytes)
         );
@@ -326,12 +328,7 @@ impl BashServer {
                 "after exec",
             )
             .await;
-        Ok(Self::exit_result_with_diff(
-            ctx,
-            ExitKind::default(),
-            summary,
-            diff_parts,
-        ))
+        Ok(Self::exit_result_with_diff(ctx, kind, summary, diff_parts))
     }
 
     /// Shared assembly for "exited" results (exec and wait): metadata header
@@ -348,7 +345,7 @@ impl BashServer {
             MetadataHeader {
                 execution_id: Some(ctx.execution_id),
                 status: Some(kind.status()),
-                stopped_by: None,
+                stopped_by: (kind == ExitKind::Interrupted).then_some("new_message"),
                 exit_code: (kind == ExitKind::Exited).then_some(ctx.exit_code),
                 command: Some(ctx.command),
                 working_dir: Some(ctx.working_dir),

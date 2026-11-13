@@ -36,11 +36,21 @@ fn build_registered_tool_template(
     let has_grants = sandbox_has_grants(&sandbox);
     let (read_paths, write_paths) = expand_template_grant_paths(&template.name, &sandbox)?;
     let name = template.name.clone();
-    let description = template
+    let mut description = template
         .description
         .clone()
         .unwrap_or_else(|| format!("Run shell command template `{name}`."));
+    if template.on_user_message == OnUserMessage::Terminate {
+        let trimmed = description.trim_end();
+        let punctuation = trimmed.chars().last();
+        description = trimmed.to_owned();
+        if !matches!(punctuation, Some('.' | '!' | '?')) {
+            description.push('.');
+        }
+        description.push_str(" A new message for you may end this command early with 'stopped_by: new_message'; the process group is terminated and partial output is returned. Read the message, then re-run this tool if still appropriate.");
+    }
     let entry = RegisteredToolTemplate {
+        on_user_message: template.on_user_message,
         template,
         description,
         input_schema,
