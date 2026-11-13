@@ -68,6 +68,7 @@ pub use hitl::{
 };
 pub mod interrupt;
 mod prompt_append;
+mod steering;
 pub use compaction_request::{request_compaction_session, CompactSubmit, CompactionRequest};
 pub use completion::completed_subagent_progress;
 pub mod fixed_admission;
@@ -770,6 +771,13 @@ impl NatsSession {
         self
     }
 
+    /// Inherited run context. Admission here stays reserve-only: steering is
+    /// an explicit per-caller opt-in via `with_steering_admission()`, never
+    /// enabled inside this builder. Turning it on here would silently let
+    /// handoff (`nats_worker/agent_loop/mod.rs`), macro continuation
+    /// (`commands.rs`) and inherited web handoff
+    /// (`harnx-serve/src/session_actor/cancellation.rs`) join a session's
+    /// active turn, which they must not (issue #2672, plan decision D6a).
     pub fn with_inherited_admission(
         mut self,
         parent: crate::nats_session_metadata::RunLimitsRecord,
@@ -791,6 +799,9 @@ impl NatsSession {
     }
 
     /// Interactive text submitted by a trusted frontend joins active work.
+    /// The sub-agent toolset's `session_prompt` builder also opts in, so an
+    /// inherited caller can join a busy child's turn (issue #2672); other
+    /// inherited callers keep the reserve-only path.
     pub fn with_steering_admission(mut self) -> Self {
         self.steering_admission = true;
         self
@@ -827,7 +838,7 @@ impl NatsSession {
         steering: bool,
         content: Option<&MessageContent>,
     ) -> Result<String> {
-        use crate::nats_session_metadata::{AdmissionAuthority, InvocationAdmission};
+        use crate::nats_session_metadata::InvocationAdmission;
         // Reserved structured ids (runtime notes, timing notices) mark
         // non-executable rows in the session log. A prompt admitted under one
         // would be silently skipped by every executable-prompt check, so
@@ -839,7 +850,9 @@ impl NatsSession {
             .prompt_admission(&self.storage_key, user_msg_id)
             .await?
         {
-            return Ok(saved.invocation_id.as_str().to_owned());
+            return self
+                .replay_prompt_admission(user_msg_id, &saved, content)
+                .await;
         }
         let authority = self.admission_authority.as_ref().context(
             "execution admission requires explicit frontend authority or inherited run context",
@@ -849,20 +862,14 @@ impl NatsSession {
             !fixed_admission::admission_closed(&entries, user_msg_id, user_msg_id),
             "fixed admission closed without prompt; cannot replay through ordinary admission"
         );
-        if steering && matches!(authority, AdmissionAuthority::External { .. }) {
-            if let Some(active) = self
-                .metadata_store
-                .active_admission(&self.storage_key, &entries)
-                .await?
-            {
-                self.metadata_store
-                    .bind_prompt_admission(
-                        &self.storage_key,
-                        user_msg_id,
-                        active.invocation_id.as_str(),
-                    )
-                    .await?;
-                return Ok(active.invocation_id.as_str().to_owned());
+        // Steering joins the active turn instead of reserving a new
+        // invocation. Trusted frontends (External) always opted in; inherited
+        // callers join too, but only when their session builder opted in via
+        // `with_steering_admission` (issue #2672). Everyone else still falls
+        // through to `reserve_admission`, which refuses a busy session.
+        if steering {
+            if let Some(invocation) = self.steering_join_invocation(user_msg_id, &entries).await? {
+                return Ok(invocation);
             }
         }
         let mut intent = InvocationAdmission::new(
@@ -884,17 +891,88 @@ impl NatsSession {
     }
 
     async fn append_user_content(&self, content: MessageContent) -> Result<AppendedPrompt> {
+        self.append_user_content_inner(content, steering::SteeringAttempt::default())
+            .await
+    }
+
+    async fn append_user_content_inner(
+        &self,
+        content: MessageContent,
+        attempt: steering::SteeringAttempt,
+    ) -> Result<AppendedPrompt> {
         self.check_parent_work("child-prompt-admission").await?;
-        let user_msg_id = match &self.invocation_id {
-            Some(invocation) => {
-                if let Some(prompt) = self.existing_prompt_with_message_id(invocation).await? {
-                    return Ok(prompt);
-                }
-                invocation.clone()
+        if let Some(prompt) = self.replayed_invocation_prompt().await? {
+            return Ok(prompt);
+        }
+        let user_msg_id = self
+            .invocation_id
+            .clone()
+            .unwrap_or_else(new_client_message_id);
+        match self
+            .deliver_admitted_content(&content, user_msg_id.clone(), &attempt)
+            .await
+        {
+            Ok(prompt) => Ok(prompt),
+            Err(error) => {
+                self.recover_late_steering(error, &content, user_msg_id)
+                    .await
             }
-            None => new_client_message_id(),
-        };
-        self.admit_prompt(&user_msg_id, self.steering_admission, Some(&content))
+        }
+    }
+
+    /// The committed row under this session's invocation id: a sub-agent
+    /// retry replays it as-is instead of re-admitting.
+    async fn replayed_invocation_prompt(&self) -> Result<Option<AppendedPrompt>> {
+        match &self.invocation_id {
+            Some(invocation) => self.existing_prompt_with_message_id(invocation).await,
+            None => Ok(None),
+        }
+    }
+
+    /// A fresh steering join binds the live head, but that turn can end before
+    /// the message is appended; the append backstop then refuses with the
+    /// typed late-steering error (CodeRabbit O1). The SAME recovery a
+    /// same-id retry uses runs here: re-run admission once, which re-proves
+    /// the turn terminal and the message absent, then joins the new live
+    /// head or reserves this prompt and delivers once. Every other error,
+    /// and callers that did not opt into steering, keep today's propagation.
+    async fn recover_late_steering(
+        &self,
+        error: anyhow::Error,
+        content: &MessageContent,
+        user_msg_id: String,
+    ) -> Result<AppendedPrompt> {
+        if !self.steering_admission
+            || error
+                .downcast_ref::<prompt_append::LateSteeringRefusal>()
+                .is_none()
+        {
+            return Err(error);
+        }
+        // A competing retry may have delivered this prompt's row while the
+        // first attempt raced the turn's end (CodeRabbit B): replay the
+        // committed receipt instead of re-delivering into the same refusal —
+        // the caller would otherwise see an error for a prompt that already
+        // completed.
+        if let Some(prompt) = self.existing_prompt_with_message_id(&user_msg_id).await? {
+            return Ok(prompt);
+        }
+        self.deliver_admitted_content(content, user_msg_id, &steering::SteeringAttempt::default())
+            .await
+    }
+
+    /// One admission-then-append pass: admit (which may join the live head),
+    /// then append under the current binding.
+    async fn deliver_admitted_content(
+        &self,
+        content: &MessageContent,
+        user_msg_id: String,
+        _attempt: &steering::SteeringAttempt,
+    ) -> Result<AppendedPrompt> {
+        self.admit_prompt(&user_msg_id, self.steering_admission, Some(content))
+            .await?;
+        #[cfg(test)]
+        self.inject_steering_fault(user_msg_id.as_str(), _attempt.fault)
             .await?;
         let admitted = self
             .metadata_store
@@ -907,7 +985,7 @@ impl NatsSession {
                 .clone()
                 .context("prompt admission has no original content")?
         } else {
-            content
+            content.clone()
         };
         self.append_user_content_unchecked(content, user_msg_id)
             .await
@@ -974,22 +1052,35 @@ impl NatsSession {
 
     /// Find an already committed prompt by its stable append id. Sub-agent
     /// invocation retries and frontend confirmation retries share this path.
+    /// The receipt carries the row's admitted invocation from the prompt
+    /// binding (CodeRabbit O2): a boundary-follow replay needs that identity.
+    /// The binding read is async, so the row is found first and the binding is
+    /// read after it.
     async fn existing_prompt_with_message_id(
         &self,
         message_id: &str,
     ) -> Result<Option<AppendedPrompt>> {
         let entries = self.load_durable_entries().await?;
-        Ok(entries.iter().find_map(|(seq, entry)| match entry {
+        let user_msg_seq = entries.iter().find_map(|(seq, entry)| match entry {
             SessionLogEntry::Message {
                 id: Some(id), role, ..
-            } if role.is_user() && id == message_id => Some(AppendedPrompt {
-                execution_id: None,
-                user_msg_id: message_id.into(),
-                user_msg_seq: *seq,
-                events: None,
-                live: None,
-            }),
+            } if role.is_user() && id == message_id => Some(*seq),
             _ => None,
+        });
+        let Some(user_msg_seq) = user_msg_seq else {
+            return Ok(None);
+        };
+        let execution_id = self
+            .metadata_store
+            .prompt_admission(&self.storage_key, message_id)
+            .await?
+            .map(|admission| admission.invocation_id.as_str().to_owned());
+        Ok(Some(AppendedPrompt {
+            execution_id,
+            user_msg_id: message_id.into(),
+            user_msg_seq,
+            events: None,
+            live: None,
         }))
     }
 

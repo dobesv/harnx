@@ -13,7 +13,10 @@
 
 mod activity;
 mod admission;
-pub use admission::{AdmissionAuthority, AdmissionOrigin, InvocationAdmission};
+pub use admission::{
+    AdmissionAuthority, AdmissionOrigin, InvocationAdmission, JoinedDispatch, SessionBusy,
+    VoidJoinRelease,
+};
 mod execution_context;
 mod initializer;
 mod model;

@@ -48,6 +48,14 @@ pub(in crate::nats_worker::subagent_toolset) async fn resolve_prompt_scope(
         .await
         .map_err(|_| PromptScopeError::Unavailable)?
         .ok_or(PromptScopeError::UnknownPrompt)?;
+    // A joined-dispatch record's content is authoritative for the prompt
+    // identity check; without it the invocation's admission supplies the
+    // content as before (issue #2672).
+    let joined = toolset
+        .session_metadata
+        .joined_dispatch(storage, prompt_id)
+        .await
+        .map_err(|_| PromptScopeError::Unavailable)?;
     let log = NatsSessionLog::new(toolset.jetstream.clone(), storage);
     // Snapshot budget: one bounded pass under the shared 10 s I/O cap. Load must
     // never wait on the child, repair an activation or poll for progress.
@@ -55,6 +63,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn resolve_prompt_scope(
     let scope = Scope {
         storage: storage.to_owned(),
         admission,
+        joined,
         prompt_id: prompt_id.to_owned(),
         call_id: String::new(),
     };

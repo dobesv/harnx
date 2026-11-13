@@ -17,6 +17,9 @@ its deadline.
   wait: {}
 ```
 
+- Sending to a running child with `session_send` or `session_prompt` joins its current turn
+  and wakes waits that stop on new messages. The message runs under that turn's existing
+  deadline; `timeout_secs` doesn't extend it.
 - The result is a durable handle: `session_id` + `prompt_id`. Keep it.
 - If the wait expires (`wait_expired: true`, `status: "pending"`), re-wait on the same handle
   with `{agent}_session_wait`, passing `seconds` (1 to 240, default 240) or `forever: true` at

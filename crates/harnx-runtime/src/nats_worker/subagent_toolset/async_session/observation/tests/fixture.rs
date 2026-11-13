@@ -173,7 +173,7 @@ pub(super) fn end(through_seq: u64) -> SessionLogEntry {
 }
 
 /// A `ToolCalls` entry announcing one call.
-fn tool_calls(call_id: &str, name: &str) -> SessionLogEntry {
+pub(super) fn tool_calls(call_id: &str, name: &str) -> SessionLogEntry {
     SessionLogEntry::ToolCalls {
         text: String::new(),
         thought: None,

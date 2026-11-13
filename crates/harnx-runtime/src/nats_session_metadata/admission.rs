@@ -10,6 +10,10 @@ use chrono::{DateTime, Utc};
 use harnx_core::session::SessionLogEntry;
 use serde::{Deserialize, Serialize};
 
+mod joined;
+
+pub use joined::{JoinedDispatch, VoidJoinRelease};
+
 /// Authority supplied only by harness frontend adapters or inherited runtime work.
 #[derive(Clone, Debug)]
 pub enum AdmissionAuthority {
@@ -104,6 +108,35 @@ fn prompt_key(storage: &str, id: &str) -> String {
     let key = harnx_core::session_identity::session_key(Some(storage), id);
     format!("sessions/{storage}/prompt_admissions/{key}")
 }
+
+/// Why [`SessionMetadataStore::reserve_admission`] refused a new invocation.
+/// Typed so the dispatch busy-race retry matches the refusal structurally
+/// instead of on error text (issue #2672, review F3). The [`Display`] strings
+/// are the caller-visible contract and are unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionBusy {
+    /// The admission head names an invocation that is still running (or whose
+    /// run is unconfirmed), so a new reservation would collide with it.
+    ActiveInvocation { invocation_id: String },
+    /// The head CAS kept changing within its bounded attempts.
+    ReservationKeptChanging,
+}
+
+impl std::fmt::Display for SessionBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ActiveInvocation { invocation_id } => write!(
+                f,
+                "session busy: invocation {invocation_id} is active or admission is unconfirmed"
+            ),
+            Self::ReservationKeptChanging => {
+                write!(f, "session busy: admission reservation kept changing")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionBusy {}
 
 /// Compaction re-logs kept rows under their original ids; replay treats the
 /// first occurrence as the operative prompt (a later copy is history).
@@ -261,24 +294,7 @@ impl SessionMetadataStore {
                 "invalid fixed admission reservation"
             );
         }
-        let frozen = match self.admission(storage, id).await? {
-            Some(saved) => saved,
-            None => {
-                let payload = serde_json::to_vec(intent)?;
-                if self
-                    .kv_store()
-                    .update(intent_key(storage, id), payload.into(), 0)
-                    .await
-                    .is_err()
-                {
-                    self.admission(storage, id)
-                        .await?
-                        .context("admission create unconfirmed")?
-                } else {
-                    intent.clone()
-                }
-            }
-        };
+        let frozen = self.frozen_admission(storage, intent).await?;
         if intent.fixed_ticket.is_some() || frozen.fixed_ticket.is_some() {
             ensure!(
                 intent.fixed_ticket == frozen.fixed_ticket
@@ -286,6 +302,66 @@ impl SessionMetadataStore {
                 "fixed admission identity or content mismatch"
             );
         }
+        self.win_admission_head(storage, &frozen, entries).await
+    }
+
+    /// The stored admission for this prompt id, or a create-only write of the
+    /// intent itself when none exists yet. On an unconfirmed create, re-read
+    /// the leader: a concurrent writer may have minted it first.
+    async fn frozen_admission(
+        &self,
+        storage: &str,
+        intent: &InvocationAdmission,
+    ) -> Result<InvocationAdmission> {
+        let id = intent.invocation_id.as_str();
+        if let Some(saved) = self.admission(storage, id).await? {
+            return Ok(saved);
+        }
+        let payload = serde_json::to_vec(intent)?;
+        if self
+            .kv_store()
+            .update(intent_key(storage, id), payload.into(), 0)
+            .await
+            .is_err()
+        {
+            self.admission(storage, id)
+                .await?
+                .context("admission create unconfirmed")
+        } else {
+            Ok(intent.clone())
+        }
+    }
+
+    /// Take the admission head for the frozen admission's invocation,
+    /// replacing only terminal predecessors. A live predecessor refuses with
+    /// the typed busy error so the caller's retry can downcast it (issue
+    /// #2672, review F3); CAS exhaustion is the other typed refusal.
+    /// `pub(crate)` so the dispatch race regressions can drive the win with
+    /// a hand-held stale frozen snapshot (CodeRabbit A).
+    pub(crate) async fn win_admission_head(
+        &self,
+        storage: &str,
+        frozen: &InvocationAdmission,
+        entries: &[(u64, SessionLogEntry)],
+    ) -> Result<InvocationAdmission> {
+        // Fence (CodeRabbit A): a frozen snapshot can go stale when a joined
+        // record's void recovery recontents the stored candidate — the head
+        // CAS below only sees the head, so a reserver paused since before the
+        // recontent would otherwise win the head and deliver superseded
+        // content against the authoritative joined record. `frozen_admission`
+        // is create-only and `recontent_candidate_admission` is the only
+        // rewriter of a stored intent, so a mismatch proves the snapshot is
+        // stale; the typed busy refusal sends the caller back through its
+        // bounded busy race to re-decide.
+        let stored = self
+            .admission(storage, frozen.invocation_id.as_str())
+            .await?
+            .context("frozen admission missing")?;
+        if stored != *frozen {
+            // Typed so the caller's busy-race retry downcasts it (CodeRabbit A).
+            return Err(SessionBusy::ReservationKeptChanging.into());
+        }
+        let id = frozen.invocation_id.as_str();
         let head = head_key(storage);
         for _ in 0..16 {
             let current = self.leader_entry(&head).await?;
@@ -293,13 +369,17 @@ impl SessionMetadataStore {
             if let Some(entry) = &current {
                 let current_id = std::str::from_utf8(&entry.value)?;
                 if current_id == id {
-                    return Ok(frozen);
+                    return Ok(frozen.clone());
                 }
-                ensure!(
-                    self.admission_is_terminal(storage, current_id, entries)
-                        .await?,
-                    "session busy: invocation {current_id} is active or admission is unconfirmed"
-                );
+                if !self
+                    .admission_is_terminal(storage, current_id, entries)
+                    .await?
+                {
+                    return Err(SessionBusy::ActiveInvocation {
+                        invocation_id: current_id.to_owned(),
+                    }
+                    .into());
+                }
             }
             if harnx_nats_common::cas::update(
                 self.kv_store(),
@@ -310,10 +390,10 @@ impl SessionMetadataStore {
             .await
             .is_ok()
             {
-                return Ok(frozen);
+                return Ok(frozen.clone());
             }
         }
-        anyhow::bail!("session busy: admission reservation kept changing")
+        Err(SessionBusy::ReservationKeptChanging.into())
     }
 
     pub async fn active_admission(
@@ -337,7 +417,10 @@ impl SessionMetadataStore {
         ))
     }
 
-    async fn admission_is_terminal(
+    /// Whether the invocation's log terminal or fixed-admission outcome proves
+    /// its run closed. Shared with the dispatch join path, which must tell a
+    /// replayable historical invocation from a leftover candidate intent.
+    pub(crate) async fn admission_is_terminal(
         &self,
         storage: &str,
         id: &str,
@@ -389,6 +472,37 @@ impl SessionMetadataStore {
             );
         }
         Ok(())
+    }
+
+    /// The invocation id the prompt's admission binding currently names, or
+    /// `None` when the prompt was never bound. Raw binding value, unlike
+    /// [`Self::prompt_admission`], which resolves the bound invocation.
+    pub async fn prompt_admission_binding(
+        &self,
+        storage: &str,
+        prompt: &str,
+    ) -> Result<Option<String>> {
+        let bytes = self.leader_value(&prompt_key(storage, prompt)).await?;
+        bytes
+            .map(|bytes| {
+                std::str::from_utf8(&bytes)
+                    .context("invalid prompt admission binding")
+                    .map(str::to_owned)
+            })
+            .transpose()
+    }
+
+    /// The invocation id currently holding the admission head, if any. This is
+    /// the concurrency-fenced pointer `reserve_admission` CASes; reading it
+    /// tells a dispatcher whether its own prompt id owns the session.
+    pub async fn admission_head(&self, storage: &str) -> Result<Option<String>> {
+        let bytes = self.leader_value(&head_key(storage)).await?;
+        bytes
+            .map(|bytes| {
+                let id = std::str::from_utf8(&bytes).context("invalid admission head")?;
+                Ok(id.to_owned())
+            })
+            .transpose()
     }
 }
 

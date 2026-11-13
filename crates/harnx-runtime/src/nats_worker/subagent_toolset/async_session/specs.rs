@@ -80,7 +80,9 @@ pub(crate) fn session_send_spec(
         description: format!(
             "Asynchronously send a prompt to the '{agent}' agent and optionally \
 soft-wait for its result. Omit session_id (or pass an empty/whitespace value) to \
-start a new session with a generated ID. Returns a durable {{session_id, \
+start a new session with a generated ID. A message to a running child joins its \
+current turn under that turn's existing deadline; timeout_secs does not extend it. \
+Returns a durable {{session_id, \
 prompt_id}} handle immediately; omit wait for dispatch-only, pass wait to soft-wait \
 up to 240 seconds here (a new message for you may end the wait early; stopped_by: \"caller_deadline\" means your own run deadline is near, so report now instead of waiting again), use \
 session_wait to wait later and session_load to check status without waiting. Sub-agents return \

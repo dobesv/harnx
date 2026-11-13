@@ -11,7 +11,15 @@ async fn pending_wait_repairs_once_with_fresh_exact_sequence_and_replay_is_idemp
         .session_metadata
         .prompt_admission(f.log.storage_key(), "original-prompt")
         .await?;
-    let first = f.poll(json!({"seconds": 1})).await?;
+    // A non-originating observer may repair delivery, but cannot replace
+    // the admission used by the worker to freeze execution limits.
+    let first = wait(
+        &f.toolset,
+        f.wait_args(json!({"seconds": 1})),
+        CancellationToken::new(),
+        unrelated_context(),
+    )
+    .await?;
     assert_eq!(first["status"], "pending");
     assert_eq!(first["dispatch"], "confirmed");
     assert_eq!(f.activation_count().await?, 2);
@@ -25,7 +33,14 @@ async fn pending_wait_repairs_once_with_fresh_exact_sequence_and_replay_is_idemp
     assert_eq!(activation.execution_id.as_deref(), Some("original-prompt"));
     assert!(activation.epoch.starts_with("observe:wait-call:"));
     assert!(activation.tool_confirmation_subject.is_none());
-    f.poll(json!({"seconds": 1})).await?;
+    assert!(activation.token_budget.is_none());
+    wait(
+        &f.toolset,
+        f.wait_args(json!({"seconds": 1})),
+        CancellationToken::new(),
+        unrelated_context(),
+    )
+    .await?;
     assert_eq!(
         f.activation_count().await?,
         2,
@@ -76,7 +91,13 @@ async fn expired_admission_without_terminal_is_pending_not_timed_out_and_never_r
         .session_metadata
         .put_invocation_limits(f.log.storage_key(), &frozen)
         .await?;
-    let result = f.poll(json!({"seconds": 1})).await?;
+    let result = wait(
+        &f.toolset,
+        f.wait_args(json!({"seconds": 1})),
+        CancellationToken::new(),
+        unrelated_context(),
+    )
+    .await?;
     assert_eq!(result["status"], "pending");
     assert_eq!(result["terminal"], false);
     assert_eq!(f.activation_count().await?, 1);
@@ -184,4 +205,13 @@ async fn lifecycle_scan_walks_bounded_pages_and_does_not_use_presentation_filter
         .iter()
         .all(|e| e["index"].as_u64().unwrap() >= original.prompt.user_msg_seq()));
     Ok(())
+}
+
+fn unrelated_context() -> ToolInvocationContext {
+    ToolInvocationContext {
+        call_id: "wait-call".into(),
+        invoking_session_id: Some("foreign-parent".into()),
+        run_context: Some(crate::nats_session::test_support::inherited_tool_context()),
+        ..Default::default()
+    }
 }

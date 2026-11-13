@@ -17,6 +17,9 @@ use tokio_util::sync::CancellationToken;
 mod expired_replay_tests;
 
 #[cfg(test)]
+mod busy_join_tests;
+
+#[cfg(test)]
 mod historical_terminal_tests;
 
 #[cfg(test)]
@@ -44,26 +47,7 @@ pub(super) async fn run_prompt(
         return Err(ToolInvokeError::Fatal("sub-agent tool call aborted".into()));
     }
     let cancel = params.cancel.clone();
-    let lineage = params.context.run_context.as_ref().ok_or_else(|| {
-        ToolInvokeError::Fatal("sub-agent execution requires inherited run context".into())
-    })?;
-    let parent: crate::nats_session_metadata::RunLimitsRecord =
-        serde_json::from_value(lineage.snapshot.clone()).map_err(|error| {
-            ToolInvokeError::Fatal(format!("invalid inherited run context: {error}"))
-        })?;
-    let admitted_at = chrono::DateTime::from_timestamp_millis(
-        i64::try_from(lineage.started_at_ms)
-            .map_err(|error| ToolInvokeError::Fatal(error.to_string()))?,
-    )
-    .ok_or_else(|| ToolInvokeError::Fatal("invalid original invocation time".into()))?;
-    let session = checkpointed_session(toolset, &params).await?;
-    let session = session.with_inherited_admission(
-        parent,
-        params.context.call_id.clone(),
-        admitted_at,
-        crate::nats_session_metadata::InvocationEdgeKind::Delegation,
-        params.timeout_secs,
-    );
+    let session = inherited_prompt_session(toolset, &params).await?;
     record_child(toolset, &params.context, session.session_id()).await;
     // Replay of an already-answered invocation keys off
     // `NatsSession::invocation_id`, so every child needs one bound here. The
@@ -117,6 +101,37 @@ pub(super) async fn run_prompt(
             Err(error)
         }
     }
+}
+
+async fn inherited_prompt_session(
+    toolset: &SubagentToolset,
+    params: &PromptParams,
+) -> Result<NatsSession, ToolInvokeError> {
+    let lineage = params.context.run_context.as_ref().ok_or_else(|| {
+        ToolInvokeError::Fatal("sub-agent execution requires inherited run context".into())
+    })?;
+    let parent: crate::nats_session_metadata::RunLimitsRecord =
+        serde_json::from_value(lineage.snapshot.clone()).map_err(|error| {
+            ToolInvokeError::Fatal(format!("invalid inherited run context: {error}"))
+        })?;
+    let admitted_at = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(lineage.started_at_ms)
+            .map_err(|error| ToolInvokeError::Fatal(error.to_string()))?,
+    )
+    .ok_or_else(|| ToolInvokeError::Fatal("invalid original invocation time".into()))?;
+    let session = checkpointed_session(toolset, params).await?;
+    let session = session.with_inherited_admission(
+        parent,
+        params.context.call_id.clone(),
+        admitted_at,
+        crate::nats_session_metadata::InvocationEdgeKind::Delegation,
+        params.timeout_secs,
+    );
+    // session_prompt is interactive from the parent's viewpoint: a busy child
+    // is joined mid-turn like TUI/web steering, not refused with "session
+    // busy". Only this builder opts in (issue #2672); handoff, macro
+    // continuation and web handoff keep the reserve-only path.
+    Ok(session.with_steering_admission())
 }
 
 async fn checkpointed_session(

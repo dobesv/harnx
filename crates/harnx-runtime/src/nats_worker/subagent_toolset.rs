@@ -782,9 +782,9 @@ impl Toolset for SubagentToolset {
             self.session_prompt(args, cancel, standalone_context())
                 .await
         } else if tool == SUBAGENT_SESSION_SEND_TOOL || tool == SUBAGENT_SESSION_WAIT_TOOL {
-            // No transport-attested caller identity here, so dispatch and
-            // observation both fail closed on the trusted-scope check inside
-            // their entry points rather than accepting untrusted arguments.
+            // Both entry points require transport-attested context. Wait does
+            // not require dispatch ownership, but hidden arguments cannot
+            // replace that context on this standalone route.
             async_session::observation::send_or_wait(
                 self,
                 ToolInvocation {
