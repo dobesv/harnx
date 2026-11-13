@@ -277,14 +277,57 @@ pub async fn delete_media_prefix(jetstream: &jetstream::Context, owner: &str) ->
         }
     }
 
+    let stream = jetstream
+        .get_stream(object_store_stream_name())
+        .await
+        .context("open the attachment object-store stream")?;
     for name in &names {
-        store
-            .delete(name)
+        delete_media_object(&stream, name)
             .await
             .with_context(|| format!("delete media object '{}'", name))?;
     }
 
     Ok(names.len())
+}
+
+/// Remove one object, leaving nothing behind. The object store's own `delete`
+/// writes a metadata entry marked deleted, which then stays forever. The
+/// chunks go first, so a failure between the two purges leaves an entry the
+/// next deletion still finds, rather than chunks nothing points at.
+async fn delete_media_object(stream: &stream::Stream, name: &str) -> Result<()> {
+    use base64::Engine as _;
+    // The object store names an object's metadata subject by the URL-safe
+    // base64 of its name.
+    let metadata_subject = format!(
+        "$O.{ATTACHMENTS_BUCKET}.M.{}",
+        base64::engine::general_purpose::URL_SAFE.encode(name)
+    );
+    // Read the metadata from the stream leader. `ObjectStore::info` is a direct
+    // read that a replica behind the object's latest write can answer with
+    // "not found", which would leave the object behind.
+    let message = match stream
+        .get_last_raw_message_by_subject(&metadata_subject)
+        .await
+    {
+        Ok(message) => message,
+        Err(error) if error.kind() == stream::LastRawMessageErrorKind::NoMessageFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("read media object metadata"),
+    };
+    let info: object_store::ObjectInfo =
+        serde_json::from_slice(&message.payload).context("decode media object metadata")?;
+    stream
+        .purge()
+        .filter(format!("$O.{ATTACHMENTS_BUCKET}.C.{}", info.nuid))
+        .await
+        .context("purge media object chunks")?;
+    stream
+        .purge()
+        .filter(metadata_subject)
+        .await
+        .context("purge media object metadata")?;
+    Ok(())
 }
 
 #[cfg(test)]

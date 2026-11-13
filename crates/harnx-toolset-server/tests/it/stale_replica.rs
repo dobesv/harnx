@@ -249,3 +249,64 @@ async fn deleted_session_takes_no_new_calls_while_replicas_lag() -> Result<()> {
     assert!(error.to_string().contains("deleted"), "{error:#}");
     Ok(())
 }
+
+/// Diverts the attachment object store's direct gets to the stale replica, the
+/// way a replica that hasn't applied an object's metadata answers them.
+/// Consumers still reach the real stream, so listing objects works.
+fn stale_attachments_config() -> String {
+    let attachments = "OBJ_harnx_attachments";
+    format!(
+        r#"mappings = {{
+  "$JS.API.DIRECT.GET.{attachments}": "$JS.API.DIRECT.GET.{STALE_REPLICA}"
+  "$JS.API.DIRECT.GET.{attachments}.>": "$JS.API.DIRECT.GET.{STALE_REPLICA}.>"
+}}
+"#
+    )
+}
+
+/// Deleting a session's attachments reads each object's metadata from the
+/// stream leader. A direct read answered by a lagging replica says the object
+/// isn't there, and acting on that would leave the object behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_attachments_reads_object_metadata_from_the_leader() -> Result<()> {
+    let server = common::spawn_configured_nats_server(Some(&stale_attachments_config()))
+        .await?
+        .context("nats-server required")?;
+    let client = async_nats::ConnectOptions::new()
+        .token(common::TOKEN.to_string())
+        .connect(&server.url)
+        .await?;
+    let js = jetstream::new(client);
+    js.create_stream(stream::Config {
+        name: STALE_REPLICA.into(),
+        subjects: vec!["harnx.test.stale-replica".into()],
+        allow_direct: true,
+        storage: stream::StorageType::Memory,
+        ..Default::default()
+    })
+    .await?;
+    let store = harnx_blob_store::media::ensure_attachments_bucket(&js, 1).await?;
+    let session = harnx_core::cid_url::SessionRef::new(Some("agent".into()), "lagged".into())?;
+    let url = harnx_blob_store::media_cid_url(
+        &session,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
+    harnx_blob_store::media::put_media(&store, &url, b"attachment", "text/plain").await?;
+    anyhow::ensure!(
+        store.info(url.kv_key()).await.is_err(),
+        "a direct get saw an object the stale replica never applied"
+    );
+
+    let deleted = harnx_blob_store::delete_owner(&js, &session.owner()).await?;
+
+    assert_eq!(deleted, 1);
+    let left = js
+        .get_stream("OBJ_harnx_attachments")
+        .await?
+        .info()
+        .await?
+        .state
+        .messages;
+    assert_eq!(left, 0, "the object's chunks and metadata must be gone");
+    Ok(())
+}

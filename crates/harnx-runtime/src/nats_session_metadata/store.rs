@@ -43,21 +43,24 @@ impl SessionMetadataStore {
                 history: 1,
                 num_replicas: replicas,
                 storage: stream::StorageType::File,
+                // Lets deletions leave markers that expire.
+                limit_markers: Some(harnx_nats_common::markers::EXPIRY_MARKER_TTL),
                 ..Default::default()
             })
             .await;
         let store = match create {
             Ok(store) => store,
             Err(_) => {
-                if let Err(error) = harnx_nats_common::registry::reconcile_bucket_replicas(
+                if let Err(error) = harnx_nats_common::registry::reconcile_bucket(
                     jetstream,
                     SESSION_METADATA_BUCKET,
                     replicas,
+                    harnx_nats_common::markers::allow_expiring_markers,
                 )
                 .await
                 {
                     log::warn!(
-                        "could not reconcile replicas for bucket '{SESSION_METADATA_BUCKET}': {error:#}"
+                        "could not reconcile config for bucket '{SESSION_METADATA_BUCKET}': {error:#}"
                     );
                 }
                 jetstream
@@ -138,10 +141,8 @@ impl SessionMetadataStore {
                     // Metadata + activity span two KV keys. Roll back only the
                     // exact revision we created so a concurrent winner or patch
                     // can never be deleted by this failed reservation.
-                    if let Err(rollback_error) = self
-                        .store
-                        .delete_expect_revision(&key, Some(revision))
-                        .await
+                    if let Err(rollback_error) =
+                        harnx_nats_common::markers::purge(&self.store, &key, Some(revision)).await
                     {
                         log::warn!(
                             "failed to roll back incomplete session metadata: key={key} revision={revision} error={rollback_error:#}"
@@ -271,14 +272,22 @@ fn sort_sessions_by_activity(sessions: &mut [ListedSession]) {
 }
 
 impl SessionMetadataStore {
+    /// Purge every key under the session's prefix. Most keys get a marker
+    /// that expires. A2A records keep a permanent one: they are created with
+    /// a strict create (`update(key, value, 0)`) so a deleted document can't
+    /// be revived, which only a marker that stays prevents.
     pub async fn purge_session_prefix(&self, session_id: &str) -> Result<usize> {
         let prefix = session_prefix(session_id);
+        let a2a_prefix = format!("{prefix}/a2a/");
         let mut keys = self.store.keys().await.map_err(anyhow::Error::from)?;
         let mut deleted = 0;
         while let Some(key) = keys.next().await {
             let key = key.map_err(anyhow::Error::from)?;
-            if key == prefix || key.starts_with(&format!("{prefix}/")) {
+            if key.starts_with(&a2a_prefix) {
                 self.store.purge(&key).await?;
+                deleted += 1;
+            } else if key == prefix || key.starts_with(&format!("{prefix}/")) {
+                harnx_nats_common::markers::purge(&self.store, &key, None).await?;
                 deleted += 1;
             }
         }

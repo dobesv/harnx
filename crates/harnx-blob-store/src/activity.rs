@@ -76,6 +76,8 @@ async fn get_or_create_metadata_bucket(jetstream: &jetstream::Context) -> Result
             .create_key_value(kv::Config {
                 bucket: SESSION_METADATA_BUCKET.to_string(),
                 storage: jetstream::stream::StorageType::File,
+                // As the runtime creates it: lets deletions leave markers that expire.
+                limit_markers: Some(harnx_nats_common::markers::EXPIRY_MARKER_TTL),
                 ..Default::default()
             })
             .await

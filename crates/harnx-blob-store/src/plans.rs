@@ -154,23 +154,30 @@ pub fn parse_note(content: &str) -> Result<NoteDocument> {
     })
 }
 
-/// Ensure the plans bucket exists and has at least the requested replica count.
+/// Ensure the plans bucket exists, has at least the requested replica count,
+/// and allows the per-message TTLs its deletion markers expire with.
 pub async fn ensure_plans_bucket(
     jetstream: &jetstream::Context,
     replicas: usize,
 ) -> Result<kv::Store> {
     match jetstream.get_key_value(PLAN_BUCKET).await {
         Ok(store) => {
-            if let Err(error) = harnx_nats_common::registry::reconcile_bucket_replicas(
+            if let Err(error) = harnx_nats_common::registry::reconcile_bucket(
                 jetstream,
                 PLAN_BUCKET,
                 replicas,
+                harnx_nats_common::markers::allow_expiring_markers,
             )
             .await
             {
-                log::warn!("could not reconcile replicas for plans bucket: {error:#}");
+                log::warn!("could not reconcile config for plans bucket: {error:#}");
             }
-            Ok(store)
+            if store.stream.cached_info().config.allow_message_ttl {
+                return Ok(store);
+            }
+            // Reopen so the store's cached config shows the TTLs the
+            // reconcile may just have allowed.
+            Ok(jetstream.get_key_value(PLAN_BUCKET).await.unwrap_or(store))
         }
         Err(error) if error.kind() == jetstream::context::KeyValueErrorKind::GetBucket => {
             let created = jetstream
@@ -178,6 +185,7 @@ pub async fn ensure_plans_bucket(
                     bucket: PLAN_BUCKET.to_string(),
                     storage: jetstream::stream::StorageType::File,
                     num_replicas: replicas,
+                    limit_markers: Some(harnx_nats_common::markers::EXPIRY_MARKER_TTL),
                     ..Default::default()
                 })
                 .await;
@@ -280,7 +288,7 @@ async fn delete_key(store: &kv::Store, key: &str) -> Result<Option<String>> {
         }
         let content =
             String::from_utf8(entry.value.to_vec()).context("plan document is not UTF-8")?;
-        match store.purge_expect_revision(key, Some(entry.revision)).await {
+        match harnx_nats_common::markers::purge(store, key, Some(entry.revision)).await {
             Ok(()) => return Ok(Some(content)),
             Err(error) if error.kind() == kv::PurgeErrorKind::WrongLastRevision => continue,
             Err(error) => {

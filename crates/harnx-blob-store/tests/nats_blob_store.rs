@@ -4,12 +4,14 @@ use harnx_blob_store::{
     media::{ensure_attachments_bucket, get_media, put_media},
     media_cid_url,
     plans::{
-        create_document, serialize_note, serialize_plan, serialize_task, NoteDocument,
-        NoteFrontMatter, PlanDocument, PlanFrontMatter, TaskDocument, TaskFrontMatter,
+        create_document, delete_document, serialize_note, serialize_plan, serialize_task,
+        NoteDocument, NoteFrontMatter, PlanDocument, PlanFrontMatter, TaskDocument,
+        TaskFrontMatter,
     },
     resolve, resolve_bounded, touch_activity, BlobTooLarge, ResolvedBlob,
 };
 use harnx_core::cid_url::{CidUrl, PlanItem, SessionRef};
+use harnx_nats_common::markers::DELETION_MARKER_TTL;
 
 const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const HASH_B: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
@@ -543,6 +545,100 @@ async fn delete_owner_removes_media_and_plan_prefixes_only() -> Result<()> {
     assert!(plans_store.get(&deleted_task.kv_key()).await?.is_none());
     assert!(get_media(&media_store, &retained_media).await?.is_some());
     assert!(plans_store.get(&retained_plan.kv_key()).await?.is_some());
+
+    // The deleted object leaves no metadata entry behind, and the deleted
+    // plan keys keep only markers that expire.
+    assert_eq!(
+        object_metadata_messages(&jetstream, &deleted_media.kv_key()).await?,
+        0
+    );
+    for key in [deleted_plan.kv_key(), deleted_task.kv_key()] {
+        assert_eq!(
+            ttl_of(
+                &jetstream,
+                "KV_harnx_plans",
+                &format!("$KV.harnx_plans.{key}")
+            )
+            .await?,
+            Some(DELETION_MARKER_TTL.as_secs().to_string())
+        );
+    }
+    Ok(())
+}
+
+/// Messages left on an attachment object's metadata subject.
+async fn object_metadata_messages(
+    jetstream: &async_nats::jetstream::Context,
+    name: &str,
+) -> Result<u64> {
+    use base64::Engine as _;
+    let subject = format!(
+        "$O.harnx_attachments.M.{}",
+        base64::engine::general_purpose::URL_SAFE.encode(name)
+    );
+    use futures_util::StreamExt as _;
+    let stream = jetstream.get_stream("OBJ_harnx_attachments").await?;
+    let mut subjects = stream.info_with_subjects(&subject).await?;
+    let mut count = 0;
+    while let Some(entry) = subjects.next().await {
+        count += entry?.1 as u64;
+    }
+    Ok(count)
+}
+
+/// The `Nats-TTL` header on the latest message for `subject` in `stream`.
+async fn ttl_of(
+    jetstream: &async_nats::jetstream::Context,
+    stream: &str,
+    subject: &str,
+) -> Result<Option<String>> {
+    let message = jetstream
+        .get_stream(stream)
+        .await?
+        .get_last_raw_message_by_subject(subject)
+        .await
+        .with_context(|| format!("read the latest message for {subject}"))?;
+    Ok(message
+        .headers
+        .get(async_nats::header::NATS_MESSAGE_TTL)
+        .map(|ttl| ttl.as_str().to_owned()))
+}
+
+/// Builds before this created the plans bucket without per-message TTLs.
+/// Opening it turns them on, so a deleted document leaves a marker that
+/// expires.
+#[tokio::test(flavor = "multi_thread")]
+async fn opening_an_older_plans_bucket_allows_expiring_markers() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some((_server, jetstream)) = isolated_jetstream().await? else {
+        return Ok(());
+    };
+    jetstream
+        .create_key_value(async_nats::jetstream::kv::Config {
+            bucket: "harnx_plans".to_string(),
+            storage: async_nats::jetstream::stream::StorageType::File,
+            num_replicas: 1,
+            ..Default::default()
+        })
+        .await
+        .context("create the bucket the way older builds did")?;
+
+    let store = ensure_plans_bucket(&jetstream, 1).await?;
+
+    assert!(store.stream.cached_info().config.allow_message_ttl);
+    let session = SessionRef::new(Some("pantheon/atlas".to_string()), "older1".to_string())?;
+    let plan = plan_item_url(&session, PlanItem::Index);
+    create_document(&store, &plan, "plan").await?;
+    delete_document(&store, &plan).await?;
+    assert_eq!(
+        ttl_of(
+            &jetstream,
+            "KV_harnx_plans",
+            &format!("$KV.harnx_plans.{}", plan.kv_key())
+        )
+        .await?,
+        Some(DELETION_MARKER_TTL.as_secs().to_string())
+    );
     Ok(())
 }
 
