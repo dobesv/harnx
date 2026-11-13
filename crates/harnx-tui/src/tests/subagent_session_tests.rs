@@ -23,6 +23,9 @@ mod progress_recovery;
 #[path = "subagent_session_tests/links.rs"]
 mod links;
 
+#[path = "subagent_session_tests/placement.rs"]
+mod placement;
+
 #[path = "subagent_session_tests/replies.rs"]
 mod replies;
 

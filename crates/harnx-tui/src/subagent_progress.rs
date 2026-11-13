@@ -1,27 +1,13 @@
 //! Per-invocation sub-agent progress state and transcript correlation.
 
+use crate::subagent_rows::{
+    has_visible_origin, upsert_invocation, upsert_legacy, RowChange, RowUpdate, TranscriptEdit,
+};
 use crate::subagent_transcript::update_row;
 use crate::types::{
-    MonitoredSessionKey, MonitoredSessionState, SubAgentInvocationProgress, SubAgentStatus,
-    TranscriptItem, Tui,
+    MonitoredSessionKey, MonitoredSessionState, SubAgentInvocationProgress, SubAgentStatus, Tui,
 };
 use harnx_core::event::{SubAgentProgress, SubAgentProgressStatus};
-
-struct RowUpdate {
-    key: MonitoredSessionKey,
-    status: SubAgentStatus,
-    invocation_id: Option<String>,
-    progress: Option<SubAgentInvocationProgress>,
-}
-
-/// What an update did to a sub-agent's transcript row.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RowChange {
-    /// The row already holds a terminal snapshot, which nothing reopens.
-    Rejected,
-    Updated,
-    Created,
-}
 
 impl Tui {
     pub(super) fn record_subagent_completed(
@@ -95,12 +81,31 @@ impl Tui {
         // backwards, and the heartbeats of two invocations running on one
         // child at once must not swap it back and forth, reloading the child's
         // log every time.
-        if running && change == RowChange::Created {
+        if running && matches!(change, RowChange::Created(_)) {
             self.follow_invocation(&key, &invocation_id);
         }
         self.show_in_open_views(&invocation_id, &status, &progress);
         self.ensure_subagent_monitor(key);
         self.pin_transcript_to_bottom();
+    }
+
+    pub(super) fn record_recovered_subagent_progress(&mut self, snapshot: SubAgentProgress) {
+        if !valid_snapshot(&snapshot) {
+            return;
+        }
+        if has_visible_origin(&self.app.transcript, &snapshot) {
+            self.record_subagent_progress(None, snapshot);
+        } else {
+            // Compaction may have hidden the originating call. Keep an open
+            // child view current without resurrecting archived rows at the tail.
+            let status = SubAgentStatus::from_progress(snapshot.status);
+            let invocation_id = snapshot.invocation_id.clone();
+            self.show_in_open_views(
+                &invocation_id,
+                &status,
+                &SubAgentInvocationProgress::new(snapshot),
+            );
+        }
     }
 
     /// Show an invocation's latest status and metrics in every open view of it.
@@ -111,7 +116,12 @@ impl Tui {
         progress: &SubAgentInvocationProgress,
     ) {
         for view in &mut self.app.subagent_view_stack {
-            if view_matches_invocation(view.progress.as_ref(), invocation_id) {
+            if view_matches_invocation(view.progress.as_ref(), invocation_id)
+                && !view
+                    .progress
+                    .as_ref()
+                    .is_some_and(SubAgentInvocationProgress::is_terminal)
+            {
                 view.status = status.clone();
                 view.progress = Some(progress.clone());
             }
@@ -134,10 +144,22 @@ impl Tui {
             }
             None => &mut self.app.transcript,
         };
-        match update.invocation_id.clone() {
+        let change = match update.invocation_id.clone() {
             Some(invocation_id) => upsert_invocation(transcript, update, invocation_id),
             None => upsert_legacy(transcript, update),
+        };
+        let edit = match change {
+            RowChange::Created(position) => Some(TranscriptEdit::Splice {
+                replaced: position..position,
+                added: 1,
+            }),
+            RowChange::Relocated { from, to } => Some(TranscriptEdit::Move { from, to }),
+            _ => None,
+        };
+        if let Some(edit) = edit {
+            self.rebase_subagent_transcript_indices(parent, edit);
         }
+        change
     }
 
     /// Point the child's monitor at `invocation_id`. A child prompted again
@@ -190,82 +212,4 @@ fn view_matches_invocation(
     invocation_id: &str,
 ) -> bool {
     progress.is_some_and(|current| current.snapshot.invocation_id == invocation_id)
-}
-
-fn upsert_invocation(
-    transcript: &mut Vec<TranscriptItem>,
-    update: RowUpdate,
-    invocation_id: String,
-) -> RowChange {
-    let existing = transcript.iter_mut().find(|item| {
-        matches!(
-            item,
-            TranscriptItem::SubAgentSession {
-                invocation_id: Some(row_invocation_id),
-                ..
-            } if row_invocation_id == &invocation_id
-        )
-    });
-    if let Some(TranscriptItem::SubAgentSession {
-        status, progress, ..
-    }) = existing
-    {
-        if progress.as_ref().is_some_and(|current| {
-            matches!(
-                current.snapshot.status,
-                SubAgentProgressStatus::Done
-                    | SubAgentProgressStatus::Failed
-                    | SubAgentProgressStatus::Cancelled
-            )
-        }) {
-            return RowChange::Rejected;
-        }
-        *status = update.status;
-        if update.progress.is_some() {
-            *progress = update.progress;
-        }
-        return RowChange::Updated;
-    }
-    transcript.push(TranscriptItem::SubAgentSession {
-        key: update.key,
-        status: update.status,
-        invocation_id: Some(invocation_id),
-        progress: update.progress,
-    });
-    RowChange::Created
-}
-
-fn upsert_legacy(transcript: &mut Vec<TranscriptItem>, update: RowUpdate) -> RowChange {
-    let latest_tool = transcript
-        .iter()
-        .rposition(|item| matches!(item, TranscriptItem::ToolCall { .. }));
-    let latest_row = transcript.iter().rposition(
-        |item| matches!(item, TranscriptItem::SubAgentSession { key, .. } if key == &update.key),
-    );
-    let row_follows_tool = latest_row.is_some_and(|row| latest_tool.is_none_or(|tool| row > tool));
-    if row_follows_tool {
-        update_legacy_status(transcript, latest_row, update.status);
-        return RowChange::Updated;
-    }
-    transcript.push(TranscriptItem::SubAgentSession {
-        key: update.key,
-        status: update.status,
-        invocation_id: None,
-        progress: None,
-    });
-    RowChange::Created
-}
-
-fn update_legacy_status(
-    transcript: &mut [TranscriptItem],
-    row: Option<usize>,
-    status: SubAgentStatus,
-) {
-    let Some(TranscriptItem::SubAgentSession {
-        status: row_status, ..
-    }) = row.and_then(|row| transcript.get_mut(row))
-    else {
-        return;
-    };
-    *row_status = status;
 }

@@ -27,6 +27,7 @@ mod subagent_failure;
 mod subagent_monitor;
 mod subagent_progress;
 mod subagent_render;
+mod subagent_rows;
 mod subagent_sessions;
 mod subagent_transcript;
 pub mod terminal;

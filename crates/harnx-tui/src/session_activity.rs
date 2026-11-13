@@ -74,9 +74,10 @@ impl Tui {
         if !observation.accepts(self) {
             return;
         }
-        if observation.historical
-            && !matches!(event, AgentEvent::Turn(TurnEvent::SubAgentProgress(_)))
-        {
+        if observation.historical {
+            if let AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)) = event {
+                self.record_recovered_subagent_progress(progress);
+            }
             return;
         }
         let refresh_before = matches!(event, AgentEvent::Turn(TurnEvent::Started));

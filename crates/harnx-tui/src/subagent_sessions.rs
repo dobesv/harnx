@@ -397,8 +397,13 @@ impl Tui {
                 self.record_subagent_progress(parent, progress.clone());
                 true
             }
-            AgentEvent::Tool(ToolEvent::Completed { output, .. }) => {
-                let progress = subagent_progress_from_output(output);
+            AgentEvent::Tool(ToolEvent::Completed { id, output, .. }) => {
+                let progress = subagent_progress_from_output(output).map(|mut progress| {
+                    if progress.tool_call_id.is_none() {
+                        progress.tool_call_id = Some(id.clone());
+                    }
+                    progress
+                });
                 let Some(key) = subagent_key_from_output(output, &cluster) else {
                     if let Some(progress) = progress {
                         self.record_subagent_progress(parent, progress);
@@ -407,12 +412,11 @@ impl Tui {
                     return false;
                 };
 
-                self.insert_subagent_reply(parent, &key, output);
-
                 match progress {
                     Some(progress) => self.record_subagent_progress(parent, progress),
-                    None => self.record_subagent_completed(parent, key),
+                    None => self.record_subagent_completed(parent, key.clone()),
                 }
+                self.insert_subagent_reply(parent, &key, output);
                 true
             }
             _ => false,
@@ -463,7 +467,12 @@ impl Tui {
         let progress = crate::lifecycle::subagent_progress_from_output(output);
         let invocation_id = progress.as_ref().map(|p| p.invocation_id.as_str());
         let transcript = self.subagent_transcript_mut(parent);
-        insert_reply_before_status_row(transcript, key, invocation_id, result_item);
+        let (replaced, added) =
+            insert_reply_before_status_row(transcript, key, invocation_id, result_item);
+        self.rebase_subagent_transcript_indices(
+            parent,
+            crate::subagent_rows::TranscriptEdit::Splice { replaced, added },
+        );
     }
 
     /// The transcript that owns `parent`'s sub-agent rows: the monitored
@@ -756,7 +765,7 @@ fn insert_reply_before_status_row(
     key: &MonitoredSessionKey,
     invocation_id: Option<&str>,
     result_item: TranscriptItem,
-) {
+) -> (std::ops::Range<usize>, usize) {
     let pos = transcript
         .iter()
         .rposition(|item| {
@@ -802,5 +811,7 @@ fn insert_reply_before_status_row(
                 .take_while(|item| matches!(item, TranscriptItem::MarkdownLink { .. }))
                 .count()
     });
+    let added = 1 + links.len();
     transcript.splice(start..end, std::iter::once(result_item).chain(links));
+    (start..end, added)
 }
