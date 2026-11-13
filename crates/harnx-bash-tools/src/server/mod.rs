@@ -53,6 +53,7 @@ mod lifecycle;
 mod params;
 mod process;
 mod render;
+mod retention;
 mod supervisor;
 #[cfg(all(test, not(target_os = "windows")))]
 mod tests;
@@ -60,6 +61,7 @@ mod tests;
 pub(crate) use handlers::*;
 pub(crate) use params::*;
 pub(crate) use render::*;
+use retention::SpawnedProcesses;
 use supervisor::{spawn_supervisor, ProcessControl, ProcessExit};
 
 use crate::tool_template::ToolTemplate;
@@ -182,7 +184,7 @@ fn finalize_direct_mcp_context(
 
 /// A spawned background process. Its supervisor task owns the child; this
 /// entry only watches the exit and sends control messages, and it stays in the
-/// map after the process exits so later calls can still report the result.
+/// map for a bounded time after exit so later calls can still report the result.
 pub(crate) struct SpawnedProcess {
     command: String,
     working_dir: PathBuf,
@@ -203,7 +205,7 @@ pub(crate) struct SpawnedProcess {
 
 struct BashServerInner {
     allowlist: Arc<ResolvedAllowlist>,
-    spawned: Mutex<HashMap<String, Arc<SpawnedProcess>>>,
+    spawned: Mutex<SpawnedProcesses>,
     log_dir: PathBuf,
     history: Arc<HistoryManager>,
     /// Sandbox + env config. Sandbox-specific fields (`enabled`, `allowlist`,

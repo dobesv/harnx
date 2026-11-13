@@ -180,7 +180,7 @@ fn assert_completed_stream_output(text: &OutputText<'_>) {
 async fn assert_invalid_spawn_side_effects(directory: &TestDir, server: &BashServer) {
     assert!(!directory.path().join("must-not-exist").exists());
     assert!(!server.inner.log_dir.exists());
-    assert!(server.inner.spawned.lock().await.is_empty());
+    assert!(server.inner.spawned.lock().await.entries.is_empty());
 }
 
 fn assert_diff_commit_and_path(diff: &str) {
@@ -216,10 +216,10 @@ async fn assert_running_process_can_finish(
     initial_runtime: &str,
 ) {
     assert!(!initial_runtime.is_empty());
-    let started_at = server.inner.spawned.lock().await[execution_id].started_at;
+    let started_at = server.inner.spawned.lock().await.entries[execution_id].started_at;
     // Shift the timestamp instead of sleeping to test accumulated running time.
     let mut spawned = server.inner.spawned.lock().await;
-    let entry = Arc::get_mut(spawned.get_mut(execution_id).unwrap()).unwrap();
+    let entry = Arc::get_mut(spawned.entries.get_mut(execution_id).unwrap()).unwrap();
     entry.started_at = started_at - Duration::from_secs(10);
     drop(spawned);
 
@@ -231,7 +231,7 @@ async fn assert_running_process_can_finish(
     );
     assert!(extract_field(&poll, "running_for").ends_with('s'));
     assert_eq!(
-        server.inner.spawned.lock().await[execution_id].started_at,
+        server.inner.spawned.lock().await.entries[execution_id].started_at,
         started_at - Duration::from_secs(10)
     );
     assert_ne!(extract_field(&poll, "running_for"), initial_runtime);
@@ -307,6 +307,7 @@ async fn omitted_wait_keeps_spawn_only_result() {
         .spawned
         .lock()
         .await
+        .entries
         .contains_key(&execution_id));
     finish(&server, &execution_id).await;
 }
@@ -595,7 +596,7 @@ async fn spawn_wait_preserves_snapshot_diffs_on_completion_and_after_expiry() {
             );
             assert_eq!(extract_field(&text, "status"), "running");
             assert!(!text.contains("```diff"));
-            assert!(!server.inner.spawned.lock().await[&execution_id]
+            assert!(!server.inner.spawned.lock().await.entries[&execution_id]
                 .before_snap_ids
                 .is_empty());
             std::fs::write(directory.path().join("release"), "").unwrap();
@@ -612,7 +613,7 @@ async fn spawn_wait_preserves_snapshot_diffs_on_completion_and_after_expiry() {
     }
 }
 
-fn status_params(execution_id: &str) -> StatusParams {
+pub(super) fn status_params(execution_id: &str) -> StatusParams {
     StatusParams {
         execution_id: execution_id.to_owned(),
         head_lines: None,
