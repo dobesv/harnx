@@ -4,14 +4,20 @@
 //! key and no `max_age` on the bucket, nothing removes that marker, so every
 //! key ever deleted keeps one. A bucket that allows per-message TTLs can give
 //! the marker one instead.
+//!
+//! Only where nothing depends on the marker staying. A strict create,
+//! `update(key, value, 0)`, fails over a marker but succeeds once it has
+//! expired, so a key guarded that way against being revived after deletion,
+//! as A2A records are, has to keep a permanent marker.
 
 use async_nats::jetstream::{kv, stream};
 use std::time::Duration;
 
 /// How long the marker a deletion leaves lasts. A revision-conditioned purge
-/// fences a stale writer with it, and that writer's compare-and-set still
-/// fails once the marker expires, since the revision it expects no longer
-/// exists.
+/// fences a stale writer with it, and that writer's compare-and-set at a
+/// revision above zero still fails once the marker expires, since the
+/// revision it expects no longer exists. A strict create (revision zero)
+/// does not; see the module docs.
 pub const DELETION_MARKER_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// How long the marker nats-server leaves in place of an expired message

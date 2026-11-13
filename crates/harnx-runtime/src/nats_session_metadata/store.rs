@@ -272,13 +272,21 @@ fn sort_sessions_by_activity(sessions: &mut [ListedSession]) {
 }
 
 impl SessionMetadataStore {
+    /// Purge every key under the session's prefix. Most keys get a marker
+    /// that expires. A2A records keep a permanent one: they are created with
+    /// a strict create (`update(key, value, 0)`) so a deleted document can't
+    /// be revived, which only a marker that stays prevents.
     pub async fn purge_session_prefix(&self, session_id: &str) -> Result<usize> {
         let prefix = session_prefix(session_id);
+        let a2a_prefix = format!("{prefix}/a2a/");
         let mut keys = self.store.keys().await.map_err(anyhow::Error::from)?;
         let mut deleted = 0;
         while let Some(key) = keys.next().await {
             let key = key.map_err(anyhow::Error::from)?;
-            if key == prefix || key.starts_with(&format!("{prefix}/")) {
+            if key.starts_with(&a2a_prefix) {
+                self.store.purge(&key).await?;
+                deleted += 1;
+            } else if key == prefix || key.starts_with(&format!("{prefix}/")) {
                 harnx_nats_common::markers::purge(&self.store, &key, None).await?;
                 deleted += 1;
             }

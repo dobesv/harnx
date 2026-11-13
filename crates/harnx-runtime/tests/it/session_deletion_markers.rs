@@ -39,6 +39,10 @@ async fn deleting_a_session_leaves_expiring_metadata_markers() -> Result<()> {
     );
     store.create(&metadata).await?;
     let key = metadata.storage_key();
+    // A2A records are created with strict creates, so their tombstones must
+    // stay to keep a deleted record from being revived.
+    let a2a_key = format!("sessions/{key}/a2a/index");
+    store.kv_store().put(&a2a_key, "{}".into()).await?;
     let runtime = local_nats_runtime_config(server.url()).read().clone();
 
     harnx_runtime::nats_admin::delete_remote_session(&runtime, "local", AGENT, "deleted").await?;
@@ -51,6 +55,8 @@ async fn deleting_a_session_leaves_expiring_metadata_markers() -> Result<()> {
     assert!(store.get(&key).await?.is_none());
     assert_eq!(ttl_of(&js, &metadata_key(&key)).await?, hour);
     assert_eq!(ttl_of(&js, &activity_key(&key)).await?, hour);
+    assert_eq!(ttl_of(&js, &a2a_key).await?, None);
+    assert_eq!(store.kv_store().get(&a2a_key).await?, None);
     Ok(())
 }
 

@@ -76,7 +76,9 @@ Harnx automatically manages the following JetStream resources:
   for frequently renewed lifecycle timestamps. No expiry for live keys, but
   the bucket allows per-message TTLs so that a deletion's purge marker expires
   after an hour (`harnx_nats_common::markers`); opening the metadata store
-  turns that on for an older bucket. Keys separate their
+  turns that on for an older bucket. A2A records keep permanent tombstones,
+  since they are created with strict creates that only a standing marker
+  stops from reviving a deleted record. Keys separate their
   parts with `/`, not `.`, so a whole key is one subject token: a consumer
   can't select one kind of key, such as every session's `meta`, and NATS never
   filters on values. Session listings therefore read the whole bucket in one

@@ -77,8 +77,7 @@ pub(crate) async fn fence(
         .as_ref()
         .is_none_or(|entry| entry.operation == Operation::Put)
     {
-        harnx_nats_common::markers::purge(
-            kv,
+        kv.purge_expect_revision(
             &context_key,
             Some(current.map_or(0, |entry| entry.revision)),
         )
@@ -120,21 +119,17 @@ impl DeletionFence {
                             == Some(storage),
                         "A2A first identity belongs to another session"
                     );
-                    harnx_nats_common::markers::purge(
-                        metadata.kv_store(),
-                        &key,
-                        Some(entry.revision),
-                    )
-                    .await?;
+                    metadata
+                        .kv_store()
+                        .purge_expect_revision(key, Some(entry.revision))
+                        .await?;
                 }
             }
         }
-        harnx_nats_common::markers::purge(
-            metadata.kv_store(),
-            &format!("a2a.registry.{}", sha256(storage)),
-            None,
-        )
-        .await?;
+        metadata
+            .kv_store()
+            .purge(format!("a2a.registry.{}", sha256(storage)))
+            .await?;
         self.lease.release().await
     }
 }
