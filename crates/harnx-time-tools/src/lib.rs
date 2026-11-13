@@ -1,5 +1,7 @@
 mod tool_specs;
 mod tool_templates;
+#[cfg(test)]
+mod wait_tests;
 
 use async_trait::async_trait;
 use chrono::{Datelike, Offset, TimeZone, Utc};
@@ -9,6 +11,7 @@ use jiff::{civil, Span, Timestamp};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// RFC 3339 at second precision with the offset, matching `wait_until`'s target.
@@ -85,9 +88,14 @@ impl TimeToolset {
         let started_at = Utc::now().with_timezone(&tz);
         let stopped_after = signals.sleep(duration).await?;
         let message = match stopped_after {
-            None => format!("Waited {:.1} seconds", args.seconds),
-            Some(waited) => format!(
+            WaitOutcome::Completed => format!("Waited {:.1} seconds", args.seconds),
+            WaitOutcome::NewMessage(waited) => format!(
                 "Waited {:.1} of {:.1} seconds; a new message arrived",
+                waited.as_secs_f64(),
+                args.seconds
+            ),
+            WaitOutcome::CallerDeadline(waited) => format!(
+                "Waited {:.1} of {:.1} seconds; the run deadline is near",
                 waited.as_secs_f64(),
                 args.seconds
             ),
@@ -145,7 +153,7 @@ impl TimeToolset {
         let stopped_after = signals.sleep(duration).await?;
         let mut result = json!({
             "target": target.format(RFC3339_SECONDS).to_string(),
-            "waited_seconds": stopped_after.unwrap_or(duration).as_secs_f64(),
+            "waited_seconds": stopped_after.waited(duration).as_secs_f64(),
             "started_at": now.format(RFC3339_SECONDS).to_string(),
             "ended_at": Utc::now().with_timezone(&tz).format(RFC3339_SECONDS).to_string(),
         });
@@ -171,34 +179,65 @@ impl TimeToolset {
     }
 }
 
-/// What can end a wait before its time. Cancellation fails the call; a new
-/// message for the caller's session ends it early with its normal result.
+/// Cancellation fails the call; a new message or caller deadline ends it
+/// early with a normal result so the caller can respond.
 struct WaitSignals {
     cancel: CancellationToken,
     new_message: CancellationToken,
+    caller_deadline: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+enum WaitOutcome {
+    Completed,
+    NewMessage(Duration),
+    CallerDeadline(Duration),
+}
+
+impl WaitOutcome {
+    fn waited(self, duration: Duration) -> Duration {
+        match self {
+            Self::Completed => duration,
+            Self::NewMessage(waited) | Self::CallerDeadline(waited) => waited,
+        }
+    }
 }
 
 impl WaitSignals {
-    /// Sleep for `duration`. Returns how long the wait lasted when a new
-    /// message ended it early, and `None` when it ran its full course.
-    async fn sleep(&self, duration: Duration) -> Result<Option<Duration>, ToolInvokeError> {
-        let started = tokio::time::Instant::now();
+    async fn sleep(&self, duration: Duration) -> Result<WaitOutcome, ToolInvokeError> {
+        let started = Instant::now();
+        let own_deadline = started + duration;
+        let caller_first = self
+            .caller_deadline
+            .is_some_and(|caller| caller <= own_deadline);
+        let stop_at = self
+            .caller_deadline
+            .unwrap_or(own_deadline)
+            .min(own_deadline);
         tokio::select! {
             biased;
             _ = self.cancel.cancelled() => {
                 Err(ToolInvokeError::Fatal("tool call cancelled".to_string()))
             }
-            _ = self.new_message.cancelled() => Ok(Some(started.elapsed())),
-            _ = tokio::time::sleep(duration) => Ok(None),
+            _ = self.new_message.cancelled() => Ok(WaitOutcome::NewMessage(started.elapsed())),
+            _ = tokio::time::sleep_until(stop_at) => {
+                if caller_first {
+                    Ok(WaitOutcome::CallerDeadline(started.elapsed()))
+                } else {
+                    Ok(WaitOutcome::Completed)
+                }
+            }
         }
     }
 }
 
-/// Name the new message in a wait's result when one ended it early.
-fn mark_stopped(result: &mut Value, stopped_after: Option<Duration>) {
-    if stopped_after.is_some() {
-        result["stopped_by"] = json!("new_message");
-    }
+fn mark_stopped(result: &mut Value, stopped_after: WaitOutcome) {
+    let reason = match stopped_after {
+        WaitOutcome::Completed => return,
+        WaitOutcome::NewMessage(_) => "new_message",
+        WaitOutcome::CallerDeadline(_) => "caller_deadline",
+    };
+    result["stopped_by"] = json!(reason);
 }
 
 impl Default for TimeToolset {
@@ -230,6 +269,7 @@ impl Toolset for TimeToolset {
         let signals = WaitSignals {
             cancel,
             new_message: CancellationToken::new(),
+            caller_deadline: None,
         };
         self.dispatch(tool, args, signals).await
     }
@@ -238,9 +278,16 @@ impl Toolset for TimeToolset {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Value, ToolInvokeError> {
+        let caller_deadline = invocation
+            .context
+            .run_context
+            .as_ref()
+            .and_then(harnx_toolset::AutonomousRunContext::wait_bound)
+            .map(|bound| Instant::now() + bound);
         let signals = WaitSignals {
             cancel: invocation.cancel,
             new_message: invocation.context.new_message,
+            caller_deadline,
         };
         self.dispatch(&invocation.tool, invocation.args, signals)
             .await
@@ -444,12 +491,22 @@ mod tests {
             .iter()
             .find(|tool| tool.name == "wait")
             .expect("wait spec");
-        assert!(wait.timeout_secs.expect("wait timeout") > 3_600);
+        assert_eq!(wait.timeout_secs, Some(3_660));
+        assert!(wait.input_schema["properties"]["seconds"]
+            .get("maximum")
+            .is_none());
         let wait_until = tools
             .iter()
             .find(|tool| tool.name == "wait_until")
             .expect("wait-until spec");
-        assert!(wait_until.timeout_secs.expect("wait-until timeout") > 86_400);
+        assert_eq!(wait_until.timeout_secs, Some(86_460));
+        for spec in [wait, wait_until] {
+            assert!(spec.description.contains("stopped_by: new_message"));
+            assert!(spec.description.contains("stopped_by: caller_deadline"));
+            assert!(spec
+                .description
+                .contains("report now instead of waiting again"));
+        }
     }
 
     #[tokio::test]
