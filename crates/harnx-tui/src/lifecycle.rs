@@ -89,6 +89,7 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
             TranscriptItem::UserText { text, .. }
             | TranscriptItem::AssistantText { text, .. }
             | TranscriptItem::ToolResultMarkdown { text, .. } => text.len(),
+            TranscriptItem::RuntimeNote { text, compact, .. } => text.len() + compact.len(),
             TranscriptItem::CompactionMarker {
                 text,
                 summary_text,
@@ -169,6 +170,67 @@ fn build_initial_app(
         monitored_sessions: HashMap::new(),
         subagent_view_stack: Vec::new(),
     })
+}
+
+/// Project a user-role row into transcript items: runtime notes collapse to
+/// a compact dim one-liner, ordinary prompts become `UserText` (plus their
+/// markdown-link rows).
+///
+/// Classification prefers the durable message id when the caller has one:
+/// runtime notes carry reserved ids (`runtime-note-v1-…`, `timing-v1-…`), so
+/// an admitted prompt whose text merely starts with the `[Runtime note] `
+/// prefix keeps normal user rendering on history reload. Id-less callers
+/// (live `UserEvent::Message` carries only content) fall back to
+/// display-only content classification; see `runtime_note::compact_display`
+/// for that tradeoff.
+///
+/// `position` bundles the log seq and timestamp shown in meta suffixes and
+/// the detail view.
+pub(crate) fn push_user_role_item(
+    items: &mut Vec<TranscriptItem>,
+    text: String,
+    id: Option<&str>,
+    position: (Option<usize>, Option<chrono::DateTime<chrono::Utc>>),
+) {
+    let (seq, timestamp) = position;
+    let is_runtime_note = match id {
+        Some(id) => harnx_core::runtime_note::is_reserved_message_id(id),
+        None => harnx_core::runtime_note::compact_display(&text).is_some(),
+    };
+    if is_runtime_note {
+        // Reserved ids only ever come from harnx's own note append paths, so
+        // the text always carries a prefix `compact_display` recognizes; the
+        // fallback keeps a degenerate forged row renderable regardless.
+        let compact = harnx_core::runtime_note::compact_display(&text)
+            .unwrap_or_else(|| text.lines().next().unwrap_or_default().to_string());
+        items.push(TranscriptItem::RuntimeNote {
+            text,
+            compact,
+            seq,
+            timestamp,
+        });
+    } else {
+        items.push(TranscriptItem::UserText {
+            text: text.clone(),
+            seq,
+            timestamp,
+        });
+        append_markdown_links(items, &text);
+    }
+}
+
+/// Project a single durable user-role `Message` into transcript items,
+/// compacting runtime notes to a dim one-liner (see `push_user_role_item`).
+fn push_user_message(items: &mut Vec<TranscriptItem>, msg: &Message) {
+    let text = msg.content.to_transcript_text();
+    if !text.is_empty() {
+        push_user_role_item(
+            items,
+            text,
+            msg.id.as_deref(),
+            (msg.log_seq, msg.log_timestamp),
+        );
+    }
 }
 
 pub(crate) fn append_markdown_links(items: &mut Vec<TranscriptItem>, markdown: &str) {
@@ -879,17 +941,7 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
     for msg in messages {
         match msg.role {
             MessageRole::System => {}
-            MessageRole::User => {
-                let text = msg.content.to_transcript_text();
-                if !text.is_empty() {
-                    items.push(TranscriptItem::UserText {
-                        text: text.clone(),
-                        seq: msg.log_seq,
-                        timestamp: msg.log_timestamp,
-                    });
-                    append_markdown_links(&mut items, &text);
-                }
-            }
+            MessageRole::User => push_user_message(&mut items, msg),
             MessageRole::Assistant => {
                 let text = msg.content.to_transcript_text();
                 if !text.is_empty() {
@@ -1085,6 +1137,10 @@ fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mu
         | TranscriptItem::AttachmentItem(text)
         | TranscriptItem::AttachmentPreviewLine(text)
         | TranscriptItem::MutationNotice(text) => lines.extend(text.lines().map(str::to_string)),
+        // Full raw text, not the compact one-liner: this flattening feeds the
+        // archived-compaction detail view, which is where the full note must
+        // stay readable once the transcript row is archived.
+        TranscriptItem::RuntimeNote { text, .. } => lines.extend(text.lines().map(str::to_string)),
         TranscriptItem::ToolCall {
             tool_name, body, ..
         } => {
@@ -1127,6 +1183,7 @@ fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mu
 fn compaction_section_label(item: &TranscriptItem) -> Option<String> {
     match item {
         TranscriptItem::UserText { .. } => Some("── user ──".to_string()),
+        TranscriptItem::RuntimeNote { .. } => Some("── runtime note ──".to_string()),
         TranscriptItem::AssistantText { .. } => Some("── assistant ──".to_string()),
         TranscriptItem::ToolCall { tool_name, .. } => Some(format!("── tool call: {tool_name} ──")),
         TranscriptItem::ToolResultMarkdown { .. } => Some("── tool result ──".to_string()),
@@ -1716,6 +1773,23 @@ mod markdown_link_tests {
             &mut lines,
         );
         assert_eq!(lines, vec!["Docs: https://example.com"]);
+    }
+
+    #[test]
+    fn compaction_detail_serializes_full_runtime_note_text() {
+        // The archived-compaction detail view must keep the full raw note:
+        // the transcript row only shows the compact one-liner.
+        let mut lines = Vec::new();
+        flatten_transcript_item_to_compaction_lines(
+            &TranscriptItem::RuntimeNote {
+                text: "[Runtime note] multi line note\nsecond line".into(),
+                compact: "multi line note".into(),
+                seq: None,
+                timestamp: None,
+            },
+            &mut lines,
+        );
+        assert_eq!(lines, vec!["[Runtime note] multi line note", "second line"]);
     }
 
     #[tokio::test]

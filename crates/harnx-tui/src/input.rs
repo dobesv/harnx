@@ -876,6 +876,10 @@ impl Tui {
     pub(crate) fn get_transcript_item_text(item: &TranscriptItem) -> Option<String> {
         match item {
             TranscriptItem::UserText { text, .. } => Some(text.clone()),
+            // Runtime notes copy/insert their raw text: the transcript shows
+            // only the compact one-liner, so this is the only way to get the
+            // full model-facing note into the clipboard or input box.
+            TranscriptItem::RuntimeNote { text, .. } => Some(text.clone()),
             TranscriptItem::AssistantText { text, .. } => Some(text.clone()),
             TranscriptItem::CompactionMarker { detail_text, .. } => Some(detail_text.clone()),
             TranscriptItem::ToolCall {

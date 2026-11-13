@@ -146,14 +146,14 @@ fn apply_child_tool_event(state: &mut MonitoredSessionState, event: ToolEvent) {
 
 fn append_child_prompt(state: &mut MonitoredSessionState, content: String) {
     // Replayed/attached user prompt for a subagent session.
-    // Matches top-level AgentEvent::User handling which also appends links.
-    let mut items = vec![TranscriptItem::UserText {
-        text: content.clone(),
-        seq: None,
-        timestamp: Some(chrono::Utc::now()),
-    }];
-    crate::lifecycle::append_markdown_links(&mut items, &content);
-    state.transcript.extend(items);
+    // Matches top-level AgentEvent::User handling, including runtime-note
+    // compaction (live child events carry no message id).
+    crate::lifecycle::push_user_role_item(
+        &mut state.transcript,
+        content,
+        None,
+        (None, Some(chrono::Utc::now())),
+    );
 }
 
 fn start_child_turn(state: &mut MonitoredSessionState) -> Option<SubAgentStatus> {
@@ -306,6 +306,23 @@ mod tests {
                 TranscriptItem::UserText { text, .. },
                 TranscriptItem::MarkdownLink { text: link_text, url }
             ] if text.contains("Docs") && link_text == "Docs" && url == "https://docs.example.com"
+        ));
+    }
+
+    #[test]
+    fn child_runtime_note_renders_compact_not_as_user_prompt() {
+        let mut state = MonitoredSessionState::new(SubAgentStatus::Running);
+        apply_child_event(
+            &mut state,
+            AgentEvent::User(harnx_core::event::UserEvent::Message {
+                content: "[Runtime note] The user interrupted this turn. Incomplete tool calls above were cancelled.".into(),
+            }),
+        );
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [TranscriptItem::RuntimeNote { text, compact, .. }]
+                if compact == "Turn interrupted; incomplete tool calls cancelled"
+                    && text.starts_with("[Runtime note]")
         ));
     }
 

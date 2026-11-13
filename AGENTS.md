@@ -1543,6 +1543,27 @@ with `SessionLogEntry` variants (previous section), which are protocol-versioned
 New `TranscriptItem::ToolCall` fields (`start_anchor`, `final_elapsed_ms`, `id`) support tool-call
 timer display and completion correlation. These are TUI-local; no protocol change.
 
+### Runtime notes: id-based identity, content-based display
+
+Runtime notes are user-role rows the runtime injects (timing notices, replayed
+sub-agent starts/cancels, compaction summaries). Identity stays id-based: the
+reserved id prefixes (`runtime-note-v1-`, `timing-v1-`, `is_reserved_message_id`
+in `harnx_core::runtime_note`) protect admission and execution, and the
+`[Runtime note] ` text prefix is never trusted there. Content-prefix matching is
+display-only: `runtime_note::compact_display` /
+`timing_identity::compact_timing_display` collapse a note to a dim one-liner
+for TUI and CLI, and the TUI classifies id-first (`push_user_role_item`,
+`harnx-tui/src/lifecycle.rs`) so an admitted prompt that merely mimics the
+prefix still renders as `UserText`; id-less callers (live `UserEvent::Message`
+carries only content) fall back to content matching.
+
+Adding a runtime-note kind requires two changes: a `compact_display` arm in
+`harnx-core/src/runtime_note.rs` and a producer contract test in `harnx-runtime`
+that runs the producer's exact output through `compact_display` (see
+`config/session/replay/runtime_note.rs`, `timing_notice.rs`, and the compaction
+summary test in `config/session.rs`). Without the contract test, producer wording
+drift silently degrades the note to the truncated-first-line fallback.
+
 ### TUI browse actions never silently no-op
 
 Transcript browse actions (`e`/`d`/`r`/`c`/`i` on a focused row, `crates/harnx-tui/src/input.rs`)

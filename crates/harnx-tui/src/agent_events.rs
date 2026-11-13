@@ -64,14 +64,11 @@ fn notice_items(event: harnx_core::event::NoticeEvent) -> Vec<TranscriptItem> {
     }
 }
 
-fn replayed_user_items(content: String) -> Vec<TranscriptItem> {
+pub(crate) fn replayed_user_items(content: String) -> Vec<TranscriptItem> {
     // Replayed history must not consume a later live LogSeqAssigned event.
-    let mut items = vec![TranscriptItem::UserText {
-        text: content.clone(),
-        seq: None,
-        timestamp: None,
-    }];
-    crate::lifecycle::append_markdown_links(&mut items, &content);
+    // Live user events carry no message id, so classification is content-only.
+    let mut items = Vec::new();
+    crate::lifecycle::push_user_role_item(&mut items, content, None, (None, None));
     items
 }
 
@@ -213,11 +210,12 @@ impl Tui {
         let mut backfilled = false;
         for item in self.app.transcript.iter_mut().rev() {
             match item {
-                // A sequenced UserText is a turn boundary: unsequenced items
-                // before it belong to an earlier turn (e.g. a stale reply from
-                // a non-streaming worker) and must not consume this round's
-                // seq.
-                TranscriptItem::UserText { seq: Some(_), .. } => break,
+                // A sequenced UserText or RuntimeNote is a turn boundary:
+                // unsequenced items before it belong to an earlier turn (e.g.
+                // a stale reply from a non-streaming worker) and must not
+                // consume this round's seq.
+                TranscriptItem::UserText { seq: Some(_), .. }
+                | TranscriptItem::RuntimeNote { seq: Some(_), .. } => break,
                 // Only backfill "live" entries — items with a timestamp are
                 // created during an active session.  The agent banner is
                 // AssistantText { seq: None, timestamp: None } and must not

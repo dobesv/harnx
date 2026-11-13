@@ -67,6 +67,63 @@ pub fn is_reserved_message_id(id: &str) -> bool {
         || id.starts_with(crate::timing_identity::TIMING_MESSAGE_ID_PREFIX)
 }
 
+/// Compact one-line display form of a runtime note, for UI rendering.
+/// Returns `None` for text that is not a runtime note.
+///
+/// Every `[Runtime note]` kind gets a short line: timing notices become
+/// `⏱ 526m 40s elapsed · 913m 19s left of 1440m`, sub-agent starts, turn
+/// interruptions and compaction summaries get a short phrase, and an unknown
+/// note falls back to a truncated first line. The raw text still reaches the
+/// model unchanged; only UI rendering uses this.
+///
+/// Tradeoff for callers: unlike the id-based checks above, this classifies by
+/// content. The no-text-prefix rule in the module docs exists to protect
+/// admission and execution decisions, where a lookalike prompt must stay
+/// executable — rendering is not such a decision, so a user prompt that
+/// mimics this format still executes and still reaches the model verbatim.
+/// What it loses is display fidelity only: it renders as a dim one-liner
+/// (multi-line bodies truncate to the first line) with no markdown-link rows
+/// and no edit/rewind affordances. Callers that have the durable message id
+/// should classify id-first and treat non-reserved ids as prompts (the TUI
+/// history-replay path does this); id-less callers — live user events carry
+/// only content — must accept the tradeoff above.
+pub fn compact_display(text: &str) -> Option<String> {
+    if let Some(timing) = crate::timing_identity::compact_timing_display(text) {
+        return Some(timing);
+    }
+    let body = text.strip_prefix(RUNTIME_NOTE_PREFIX)?;
+    Some(compact_prose(body))
+}
+
+/// Compact form of a non-timing runtime note (the prefix is already stripped).
+fn compact_prose(body: &str) -> String {
+    if let Some(rest) = body.strip_prefix("Started sub-agent '") {
+        if let Some((agent, tail)) = rest.split_once("' in session ") {
+            let session_id = tail.strip_suffix('.').unwrap_or(tail);
+            return format!("Sub-agent '{agent}' started (session {session_id})");
+        }
+    }
+    if body.starts_with("The user interrupted this turn") {
+        return "Turn interrupted; incomplete tool calls cancelled".to_string();
+    }
+    if body.strip_prefix("Earlier conversation summary:").is_some() {
+        return "Earlier conversation summary".to_string();
+    }
+    truncated_first_line(body)
+}
+
+/// First line of an unrecognized note, cut to a display-friendly length.
+fn truncated_first_line(body: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let first = body.lines().next().unwrap_or("");
+    if first.chars().count() <= MAX_CHARS {
+        return first.to_string();
+    }
+    let mut truncated: String = first.chars().take(MAX_CHARS).collect();
+    truncated.push('…');
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +161,107 @@ mod tests {
         assert!(!is_reserved_message_id(&uuid::Uuid::new_v4().to_string()));
         // The human-readable note prefix in an id is not reserved by itself.
         assert!(!is_reserved_message_id(RUNTIME_NOTE_PREFIX.trim_end()));
+    }
+
+    #[test]
+    fn non_notes_have_no_compact_form() {
+        assert_eq!(compact_display("What is the capital of France?"), None);
+        assert_eq!(compact_display(""), None);
+        assert_eq!(compact_display("[Runtime note]"), None);
+        // Missing trailing space: not the note prefix, so not a note.
+        assert_eq!(compact_display("[Runtime note]no space"), None);
+    }
+
+    #[test]
+    fn timing_notice_compacts_to_elapsed_and_remaining() {
+        let text = "[Runtime note] ⏱ v1 {\"version\":\"v1\",\"origin\":\"2026-11-12T20:40:32Z\",\
+\"invocation_id\":\"ca615ba5\",\"coverage\":1,\"highest_elapsed_bucket\":35} | \
+start: 2026-11-12T20:40:32Z, current: 2026-11-13T05:27:12Z, elapsed: 526m 40s, \
+deadline: 2026-11-13T20:40:32Z, remaining: 913m 19s, budget: 1440m";
+        assert_eq!(
+            compact_display(text).as_deref(),
+            Some("⏱ 526m 40s elapsed · 913m 19s left of 1440m")
+        );
+    }
+
+    #[test]
+    fn timing_notice_without_deadline_compacts_to_elapsed_only() {
+        let text = "[Runtime note] ⏱ v1 {\"version\":\"v1\",\"origin\":\"2026-11-13T06:00:00Z\",\
+\"invocation_id\":\"inv\",\"coverage\":1,\"highest_elapsed_bucket\":0} | \
+start: 2026-11-13T06:00:00Z, current: 2026-11-13T06:10:00Z, elapsed: 10m";
+        assert_eq!(compact_display(text).as_deref(), Some("⏱ 10m elapsed"));
+    }
+
+    #[test]
+    fn timing_notice_thresholds_survive_compacting() {
+        let build = |coverage: u32| {
+            format!(
+                "[Runtime note] ⏱ v1 {{\"version\":\"v1\",\"origin\":\"2026-11-13T06:00:00Z\",\
+\"invocation_id\":\"inv\",\"coverage\":{coverage},\"highest_elapsed_bucket\":2}} | \
+start: 2026-11-13T06:00:00Z, current: 2026-11-13T18:00:00Z, elapsed: 720m, \
+deadline: 2026-11-14T06:00:00Z, remaining: 720m, budget: 1440m"
+            )
+        };
+        // Coverage bitmask: 1 = initial, 2 = 50%, 4 = 75%, 8 = 90%.
+        assert_eq!(
+            compact_display(&build(1 | 2)).as_deref(),
+            Some("⏱ 720m elapsed · 720m left of 1440m · 50% threshold passed")
+        );
+        assert_eq!(
+            compact_display(&build(1 | 2 | 4)).as_deref(),
+            Some("⏱ 720m elapsed · 720m left of 1440m · 75% threshold passed")
+        );
+        assert_eq!(
+            compact_display(&build(1 | 2 | 4 | 8)).as_deref(),
+            Some("⏱ 720m elapsed · 720m left of 1440m · 90% threshold passed")
+        );
+    }
+
+    #[test]
+    fn sub_agent_start_note_compacts() {
+        let text = "[Runtime note] Started sub-agent 'pantheon/plato' in session child-direct.";
+        assert_eq!(
+            compact_display(text).as_deref(),
+            Some("Sub-agent 'pantheon/plato' started (session child-direct)")
+        );
+    }
+
+    #[test]
+    fn cancel_note_compacts() {
+        let text = "[Runtime note] The user interrupted this turn. Incomplete tool calls above were cancelled.";
+        assert_eq!(
+            compact_display(text).as_deref(),
+            Some("Turn interrupted; incomplete tool calls cancelled")
+        );
+    }
+
+    #[test]
+    fn compaction_summary_note_compacts_without_summary_body() {
+        let text =
+            "[Runtime note] Earlier conversation summary:\n\nPRIOR WORK SUMMARY line one\nline two";
+        assert_eq!(
+            compact_display(text).as_deref(),
+            Some("Earlier conversation summary")
+        );
+    }
+
+    #[test]
+    fn unknown_note_falls_back_to_truncated_first_line() {
+        let short = "[Runtime note] Some future note kind.";
+        assert_eq!(
+            compact_display(short).as_deref(),
+            Some("Some future note kind.")
+        );
+
+        let long_first_line = format!("[Runtime note] {}", "x".repeat(100));
+        let compact = compact_display(&long_first_line).expect("compact form");
+        assert_eq!(compact.chars().count(), 81);
+        assert!(compact.ends_with('…'));
+        // Only the first line is kept, even when more lines follow.
+        let multi_line = "[Runtime note] first line of an unknown note\nsecond line";
+        assert_eq!(
+            compact_display(multi_line).as_deref(),
+            Some("first line of an unknown note")
+        );
     }
 }

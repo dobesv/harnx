@@ -222,6 +222,88 @@ pub fn is_timing_notice(text: &str) -> bool {
     TimingReceipt::from_notice_line(text).is_some()
 }
 
+/// Compact one-line display form of a timing notice, for UI rendering only.
+///
+/// Turns a raw notice line into something like
+/// `⏱ 526m 40s elapsed · 913m 19s left of 1440m · 90% threshold passed`.
+/// Duration values are reused verbatim from the notice's human-readable
+/// context, so the compact form never disagrees with the model-facing text.
+/// Returns `None` when the line is not a parseable timing notice, or when the
+/// line carries no readable context (old receipt-only lines fall back to the
+/// caller's generic runtime-note handling).
+///
+/// This reads the note text, which the admission-side checks in this module
+/// deliberately never do. That is fine here: rendering makes no admission or
+/// execution decision, so a user-authored lookalike only loses some display
+/// verbosity and nothing about the message's executability changes.
+pub fn compact_timing_display(line: &str) -> Option<String> {
+    let receipt = TimingReceipt::from_notice_line(line)?;
+    let context = TimingReceipt::context_start(line).map_or("", |start| &line[start..]);
+    let fields = TimingDisplayFields::parse(context);
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(elapsed) = fields.elapsed {
+        parts.push(format!("⏱ {elapsed} elapsed"));
+    }
+    if let (Some(remaining), Some(budget)) = (fields.remaining, fields.budget) {
+        parts.push(format!("{remaining} left of {budget}"));
+    }
+    // Milestone coverage is cumulative, so a covered threshold stays true for
+    // every later notice. Surface the highest covered one: the threshold
+    // emission is the notice's "time is running low" signal, and without it
+    // the compact form would hide it behind plain elapsed/remaining numbers.
+    if let Some(percent) = covered_threshold_percent(&receipt.coverage) {
+        parts.push(format!("{percent}% threshold passed"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(" · "))
+}
+
+/// Highest covered deadline threshold, as a percentage of the budget.
+fn covered_threshold_percent(coverage: &MilestoneCoverage) -> Option<u32> {
+    if coverage.contains(MilestoneCoverage::PERCENT_90) {
+        Some(90)
+    } else if coverage.contains(MilestoneCoverage::PERCENT_75) {
+        Some(75)
+    } else if coverage.contains(MilestoneCoverage::PERCENT_50) {
+        Some(50)
+    } else {
+        None
+    }
+}
+
+/// The display-relevant fields of a timing notice's human-readable context.
+struct TimingDisplayFields<'a> {
+    elapsed: Option<&'a str>,
+    remaining: Option<&'a str>,
+    budget: Option<&'a str>,
+}
+
+impl<'a> TimingDisplayFields<'a> {
+    /// Parse the `label: value` pairs of the notice context.
+    ///
+    /// Timestamp values contain colons but never `": "`, and duration values
+    /// contain neither, so splitting each comma-separated part at the first
+    /// `": "` cannot cut into a value.
+    fn parse(context: &'a str) -> Self {
+        let mut fields = Self {
+            elapsed: None,
+            remaining: None,
+            budget: None,
+        };
+        for (label, value) in context.split(", ").filter_map(|part| part.split_once(": ")) {
+            match label {
+                "elapsed" => fields.elapsed = Some(value),
+                "remaining" => fields.remaining = Some(value),
+                "budget" => fields.budget = Some(value),
+                _ => {}
+            }
+        }
+        fields
+    }
+}
+
 /// Cache key for timing state: (storage identifier, session id, invocation id).
 ///
 /// Invocation cache is keyed by storage/session plus invocation identity
@@ -336,6 +418,31 @@ mod tests {
     fn invalid_receipt_json_returns_none() {
         let line = format!("{}not valid json", TIMING_HEADER);
         assert!(TimingReceipt::from_notice_line(&line).is_none());
+    }
+
+    #[test]
+    fn compact_display_requires_receipt_and_context() {
+        // Malformed receipt: not a timing notice at all.
+        let line = format!("{}not valid json | elapsed: 5m", TIMING_HEADER);
+        assert!(compact_timing_display(&line).is_none());
+        // Old receipt-only format without the context separator has nothing
+        // to show; the caller falls back to generic runtime-note handling.
+        let origin: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+        let receipt = TimingReceipt::initial(origin, "inv-old".to_string());
+        let bare = format!("{}{}", TIMING_HEADER, receipt.to_json());
+        assert!(compact_timing_display(&bare).is_none());
+        // Full line compacts with verbatim duration values.
+        let notice = format!(
+            "{}{}{}start: 2024-01-15T12:00:00Z, current: 2024-01-15T12:05:00Z, elapsed: 5m, \
+deadline: 2024-01-15T13:00:00Z, remaining: 55m, budget: 1h",
+            TIMING_HEADER,
+            receipt.to_json(),
+            TIMING_CONTEXT_SEPARATOR
+        );
+        assert_eq!(
+            compact_timing_display(&notice).as_deref(),
+            Some("⏱ 5m elapsed · 55m left of 1h")
+        );
     }
 
     #[test]

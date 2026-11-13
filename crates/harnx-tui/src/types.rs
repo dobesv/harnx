@@ -860,6 +860,16 @@ pub enum TranscriptItem {
         seq: Option<usize>,
         timestamp: Option<DateTime<Utc>>,
     },
+    /// Runtime-authored context note (timing notice, sub-agent start, turn
+    /// interruption, compaction summary) injected with the user role.
+    /// `compact` is the dim one-liner shown in the transcript; `text` keeps
+    /// the full raw note for the detail view.
+    RuntimeNote {
+        text: String,
+        compact: String,
+        seq: Option<usize>,
+        timestamp: Option<DateTime<Utc>>,
+    },
     AssistantText {
         text: String,
         seq: Option<usize>,
@@ -1018,6 +1028,7 @@ impl TranscriptItem {
     pub(crate) fn seq(&self) -> Option<usize> {
         match self {
             TranscriptItem::UserText { seq, .. } => *seq,
+            TranscriptItem::RuntimeNote { seq, .. } => *seq,
             TranscriptItem::AssistantText { seq, .. } => *seq,
             TranscriptItem::ToolCall { seq, .. } => *seq,
             _ => None,
@@ -1034,6 +1045,7 @@ impl TranscriptItem {
         matches!(
             self,
             TranscriptItem::UserText { .. }
+                | TranscriptItem::RuntimeNote { .. }
                 | TranscriptItem::AssistantText { .. }
                 | TranscriptItem::ToolCall { .. }
                 | TranscriptItem::CompactionMarker { .. }
