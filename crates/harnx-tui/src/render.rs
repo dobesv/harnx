@@ -14,6 +14,10 @@ use ratatui::Frame;
 use syntect::highlighting::Theme;
 use unicode_width::UnicodeWidthStr;
 
+mod runtime_note;
+
+use runtime_note::TranscriptDisplay;
+
 fn dim_style(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::DIM)
 }
@@ -157,6 +161,12 @@ impl Tui {
         state: RenderEntryState,
         theme: Option<&Theme>,
     ) -> RenderedEntry {
+        let display = TranscriptDisplay {
+            show_seq,
+            show_ts,
+            use_utc,
+            width,
+        };
         match entry {
             TranscriptItem::SourceHeading(source) => {
                 let lines = Self::render_text_entry(
@@ -192,6 +202,12 @@ impl Tui {
                 let lines = Self::render_text_entry("", text, dim_style(Color::DarkGray), false);
                 RenderedEntry::from_lines(lines, width)
             }
+            TranscriptItem::RuntimeNote {
+                compact,
+                seq,
+                timestamp,
+                ..
+            } => Self::render_runtime_note_entry(compact, *seq, *timestamp, &display),
             TranscriptItem::MutationNotice(text) => {
                 let lines = Self::render_text_entry("", text, dim_style(Color::Yellow), false);
                 RenderedEntry::from_lines(lines, width)
@@ -209,13 +225,8 @@ impl Tui {
                         .add_modifier(Modifier::BOLD),
                     true,
                 );
-                if let Some(suffix) =
-                    Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
-                {
-                    if let Some(first_line) = lines.first_mut() {
-                        first_line.spans.push(suffix);
-                    }
-                }
+                let suffix = Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc);
+                Self::append_meta_suffix(&mut lines, suffix);
                 RenderedEntry::from_lines(lines, width)
             }
             TranscriptItem::AssistantText {
@@ -1203,22 +1214,11 @@ impl Tui {
         let label_style = Style::default().fg(Color::DarkGray);
         let mut lines = Vec::new();
 
+        // Same body the inline `push_field!` macro used to have, moved to
+        // `runtime_note::push_detail_field` to keep this function lean.
         macro_rules! push_field {
             ($key:expr, $value:expr) => {
-                if $value.contains('\n') {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("{}:", $key),
-                        label_style,
-                    )]));
-                    for line in $value.lines() {
-                        lines.push(Line::from(Span::raw(line.to_string())));
-                    }
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{}: ", $key), label_style),
-                        Span::raw($value.to_string()),
-                    ]));
-                }
+                runtime_note::push_detail_field(&mut lines, label_style, $key, $value)
             };
         }
 
@@ -1282,31 +1282,34 @@ impl Tui {
                 text,
                 seq,
                 timestamp,
-            } => {
-                lines.push(Line::from(Span::styled("── user ──", label_style)));
-                if let Some(s) = seq {
-                    push_field!("seq", &s.to_string());
-                }
-                if let Some(ts) = timestamp {
-                    push_field!("timestamp", &ts.to_rfc3339());
-                }
-                push_field!("text", text);
-            }
+            } => Self::push_message_detail(
+                &mut lines,
+                label_style,
+                "── user ──",
+                (text, *seq, *timestamp),
+            ),
+            TranscriptItem::RuntimeNote {
+                text,
+                seq,
+                timestamp,
+                ..
+            } => Self::push_message_detail(
+                &mut lines,
+                label_style,
+                "── runtime note ──",
+                (text, *seq, *timestamp),
+            ),
             TranscriptItem::AssistantText {
                 text,
                 seq,
                 timestamp,
                 rendered_cache: _,
-            } => {
-                lines.push(Line::from(Span::styled("── assistant ──", label_style)));
-                if let Some(s) = seq {
-                    push_field!("seq", &s.to_string());
-                }
-                if let Some(ts) = timestamp {
-                    push_field!("timestamp", &ts.to_rfc3339());
-                }
-                push_field!("text", text);
-            }
+            } => Self::push_message_detail(
+                &mut lines,
+                label_style,
+                "── assistant ──",
+                (text, *seq, *timestamp),
+            ),
             item @ TranscriptItem::ToolResultMarkdown { .. } => {
                 lines.push(Line::from(Span::styled("── tool result ──", label_style)));
                 push_field!("result", item.tool_result_detail_text().unwrap_or(""));
@@ -1334,7 +1337,7 @@ impl Tui {
                     (Some(from), Some(to)) => format!("{from}–{to}"),
                     _ => "n/a".to_string(),
                 };
-                push_field!("seq_range", seq_range);
+                push_field!("seq_range", &seq_range);
                 push_field!("detail", detail_text);
             }
             TranscriptItem::SystemText(text) => {

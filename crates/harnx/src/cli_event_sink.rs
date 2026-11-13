@@ -714,7 +714,10 @@ impl CliSinkState {
         let UserEvent::Message { content } = event;
         self.cleanup_or_warn();
         if !content.is_empty() {
-            eprintln!("{}", dimmed_text(&content));
+            // Runtime notes (timing, sub-agent starts, interruptions) print as
+            // their compact one-liner; ordinary prompts stay verbatim.
+            let compact = harnx_core::runtime_note::compact_display(&content);
+            eprintln!("{}", dimmed_text(compact.as_deref().unwrap_or(&content)));
         }
     }
 
@@ -899,6 +902,43 @@ mod tests {
 
     #[cfg(unix)]
     use crate::test_utils::capture_output;
+
+    #[cfg(unix)]
+    #[test]
+    fn user_event_runtime_note_prints_compact_line() {
+        let note = "[Runtime note] Started sub-agent 'pantheon/plato' in session child-direct.";
+        let output = capture_output(|| {
+            let mut state = make_state(false);
+            state.print_user_event(UserEvent::Message {
+                content: note.to_string(),
+            });
+        });
+
+        assert!(
+            output.contains("Sub-agent 'pantheon/plato' started (session child-direct)"),
+            "expected compact line in {output:?}"
+        );
+        assert!(
+            !output.contains("[Runtime note]"),
+            "raw note text must not print: {output:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_event_ordinary_prompt_prints_verbatim() {
+        let output = capture_output(|| {
+            let mut state = make_state(false);
+            state.print_user_event(UserEvent::Message {
+                content: "hello world".to_string(),
+            });
+        });
+
+        assert!(
+            output.contains("hello world"),
+            "ordinary prompt must print verbatim: {output:?}"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

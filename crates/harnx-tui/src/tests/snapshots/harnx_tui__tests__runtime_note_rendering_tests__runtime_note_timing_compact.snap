@@ -1,0 +1,5 @@
+---
+source: crates/harnx-tui/src/tests/runtime_note_rendering_tests.rs
+expression: expected
+---
+⏱ 526m 40s elapsed · 913m 19s left of 1440m

@@ -895,6 +895,20 @@ mod tests {
     }
 
     #[test]
+    fn notice_line_compacts_for_display() {
+        // Contract test: evaluate_timing builds the notice line, and the
+        // display helper in harnx-core must parse it into a compact one-liner.
+        // If the line format drifts, compact_display degrades to its
+        // truncated-first-line fallback.
+        let output = evaluate_at_initial_deadline(1440 * 60, 1440 * 60);
+        let line = output.notice_line.expect("initial notice");
+        let compact =
+            harnx_core::runtime_note::compact_display(&line).expect("notice line must compact");
+        assert_eq!(compact, "⏱ 0s elapsed · 1440m left of 1440m");
+        assert!(!compact.contains("[Runtime note]"), "compact: {compact}");
+    }
+
+    #[test]
     fn is_timing_notice_classifier_accepts_trailing_context() {
         let origin = fixed_time();
         let receipt = TimingReceipt::initial(origin, "inv-test".to_string());
