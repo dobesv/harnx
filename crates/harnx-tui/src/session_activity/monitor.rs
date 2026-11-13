@@ -78,8 +78,9 @@ impl SessionEventForwarder<'_> {
     ) -> bool {
         let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(history)
             .unwrap_or_else(|_| history.to_vec());
-        // Compaction trims model context, but archived rows and open child
-        // views remain visible and still need their terminal progress.
+        // Compaction can hide the originating call while its child view stays
+        // open. Replay terminal metrics; the TUI only inserts a recovered row
+        // when its invocation or originating tool call is still visible.
         harnx_runtime::nats_session::completed_subagent_progress(&effective, after_seq)
             .into_iter()
             .all(|progress| {

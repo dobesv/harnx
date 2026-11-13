@@ -416,6 +416,15 @@ pub struct SubAgentInvocationProgress {
 }
 
 impl SubAgentInvocationProgress {
+    pub(super) fn is_terminal(&self) -> bool {
+        matches!(
+            self.snapshot.status,
+            SubAgentProgressStatus::Done
+                | SubAgentProgressStatus::Failed
+                | SubAgentProgressStatus::Cancelled
+        )
+    }
+
     pub(super) fn new(snapshot: SubAgentProgress) -> Self {
         Self {
             snapshot,

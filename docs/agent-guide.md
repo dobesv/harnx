@@ -887,7 +887,10 @@ used to drill into grandchildren; press `Esc` to return one level. The Web UI
 renders the same metrics under the parent assistant message, restores completed
 rows from session history, and retains navigation into the child session.
 Child output remains in the child transcript rather than being rendered inline
-in the parent.
+in the parent. TUI status rows stay beside the originating tool call and its
+reply, including when recovered completion snapshots arrive after later
+activity. Reopening a compacted session keeps archived calls and their status
+rows hidden; a child view that was already open still receives terminal metrics.
 
 Interfaces learn about a delegation from `TurnEvent::SubAgentProgress` events on
 the parent session's stream (`sessions.{parent_session_id}.events`). The first
