@@ -133,7 +133,7 @@ where
 }
 
 pub(crate) async fn join_pipe(
-    task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    task: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
     name: &str,
 ) -> Result<Vec<u8>, ErrorData> {
     task.await
@@ -251,8 +251,7 @@ pub(crate) struct MetadataHeader<'a> {
     pub(crate) execution_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) status: Option<&'a str>,
-    /// What ended a wait while the process kept running, when it was not the
-    /// wait's own limit.
+    /// What ended a wait or foreground template early, apart from its own limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stopped_by: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]

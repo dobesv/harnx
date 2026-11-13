@@ -8,6 +8,7 @@ pub(crate) struct ExecPipelineParams<'a> {
     pub(crate) timeout_secs: Option<u64>,
     pub(crate) truncate_opts: TruncateOpts,
     pub(crate) template_sandbox: Option<TemplateSandbox<'a>>,
+    pub(crate) on_user_message: OnUserMessage,
 }
 
 /// Inputs for building a sandboxed child command. Groups the parameters
@@ -77,7 +78,7 @@ pub(crate) struct LogTargets<'a> {
 /// Result of running a command to completion (exec path).
 pub(crate) struct RunOutcome {
     pub(crate) status: std::process::ExitStatus,
-    pub(crate) timed_out: bool,
+    pub(crate) kind: ExitKind,
     pub(crate) stdout_str: String,
     pub(crate) stderr_str: String,
 }
@@ -96,8 +97,10 @@ pub(crate) struct CommandBuildCtx<'a> {
 pub(crate) enum ExitKind {
     #[default]
     Exited,
-    /// The supervisor killed it once its `timeout_secs` deadline passed.
+    /// Its `timeout_secs` deadline passed and the process group was killed.
     TimedOut { deadline_secs: u64 },
+    /// A foreground template terminated its process group for a new message.
+    Interrupted,
 }
 
 impl ExitKind {
@@ -105,6 +108,7 @@ impl ExitKind {
         match self {
             Self::Exited => "exited",
             Self::TimedOut { .. } => "timed_out",
+            Self::Interrupted => "interrupted",
         }
     }
 }

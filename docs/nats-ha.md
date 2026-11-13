@@ -1189,8 +1189,9 @@ same or different cancellation ids. The acknowledgement can change as the call
 progresses, for example from `Accepted` to `AlreadyFinished`.
 
 A second control kind, `ControlKind::NewMessage`, is not a cancel. A tool whose
-spec carries `harnx:stop_on_new_message` (bash `spawn`/`wait`, time `wait`/
-`wait_until`, the sub-agent `session_send`/`session_wait`) opts in to being ended
+spec carries `harnx:stop_on_new_message` (bash `spawn`/`wait`, command templates
+with `on_user_message: terminate`, time `wait`/`wait_until`, the sub-agent
+`session_send`/`session_wait`) opts in to being ended
 early when a new user message arrives for the waiting session. The worker sends
 the control message to the server, which trips the call's `new_message` token;
 the call then returns its normal result with `stopped_by: "new_message"`. It
@@ -1201,7 +1202,9 @@ request capability. Older servers drop the unknown control kind and the wait
 runs to its limit, as it does over the k8s-sandbox proxy and MCP stdio routes,
 where the opt-in is stripped. A server that receives `NewMessage` for a call it
 is not yet running answers the retryable `Unknown`, and the worker resends it a
-bounded number of times.
+bounded number of times. Unlike bash background waits, an opted-in foreground
+command template terminates and reaps its process group before returning
+`status: interrupted` with partial output; re-run the template to wait again.
 
 Dropping a NATS tool response wait before completion (for example, at a script
 deadline) removes its in-flight registration and schedules a fire-and-forget

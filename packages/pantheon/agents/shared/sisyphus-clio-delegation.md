@@ -50,7 +50,11 @@ Every final PR delivery must remain active while the pull request is opened and 
    wait cycle. If everything is clear, report the stable PR status. If the wait timed out,
    was cancelled, or returned `activity_stalled`, report the remaining blocker precisely.
 
-The waiter returns only after all checks are terminal and activity has been quiet for five
+If the waiter returns `stopped_by: new_message`, its foreground process has stopped.
+Read the new message first, then re-run `bash_wait_for_pr_stable` if waiting is still
+appropriate. An interrupted wait does not mean the PR is stable.
+
+Otherwise, the waiter returns after all checks are terminal and activity has been quiet for five
 minutes, or after the head and checks have been unchanged for 15 minutes followed by five
 quiet minutes. Terminal includes passing, failing, skipped, and cancelled checks; the agent,
 not the waiter, decides what action the result requires.

@@ -452,6 +452,8 @@ impl BashServer {
         exit_diff: &OnceCell<Vec<String>>,
     ) -> CallToolResult {
         let summary = match kind {
+            // Background wait paths cannot be interrupted by a new message.
+            ExitKind::Interrupted => "stopped_by: new_message".to_string(),
             ExitKind::TimedOut { deadline_secs } => format!(
                 "execution_id '{}' killed after its {deadline_secs}s deadline",
                 ctx.execution_id

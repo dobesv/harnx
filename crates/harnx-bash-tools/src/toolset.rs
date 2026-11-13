@@ -2,7 +2,7 @@ use crate::server::{
     BashServer, ExecCommandParams, ReadExecLogParams, RollbackParams, SpawnCommandParams,
     StatusParams, TerminateParams, WaitParams,
 };
-use crate::tool_template::ToolTemplate;
+use crate::tool_template::{OnUserMessage, ToolTemplate};
 use crate::tool_templates;
 use async_trait::async_trait;
 use harnx_sandbox_common::SandboxConfig;
@@ -18,8 +18,8 @@ tokio::task_local! {
     /// Per-invocation token; foreground commands kill and reap before returning.
     pub(crate) static INVOCATION_CANCEL: CancellationToken;
     /// Transport facts about a native invocation: the new-message signal that
-    /// ends `wait` and spawn's nested wait early, and where spawn records the
-    /// process it started.
+    /// ends `wait`, spawn's nested wait, and opted-in foreground templates early,
+    /// and where spawn records the process it started.
     static INVOCATION_CONTEXT: ToolInvocationContext;
 }
 
@@ -184,7 +184,7 @@ impl Toolset for BashToolset {
     fn tools(&self) -> Vec<ToolSpec> {
         let mut tools = builtin_tool_specs();
         tools.extend(self.server.tool_templates().map(|(name, registered)| {
-            ToolSpec {
+            let spec = ToolSpec {
                 cancellation_guarantee: Default::default(),
                 name: name.clone(),
                 description: registered.description.clone(),
@@ -194,7 +194,12 @@ impl Toolset for BashToolset {
                 timeout_secs: Some(0),
                 meta: None,
             }
-            .with_call_template(&tool_templates::command_template_call(name))
+            .with_call_template(&tool_templates::command_template_call(name));
+            if registered.on_user_message == OnUserMessage::Terminate {
+                spec.with_stop_on_new_message()
+            } else {
+                spec
+            }
         }));
         tools
     }

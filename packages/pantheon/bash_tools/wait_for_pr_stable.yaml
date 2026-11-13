@@ -1,4 +1,5 @@
 name: wait_for_pr_stable
+on_user_message: terminate
 description: Wait for a GitHub pull request to appear and become stable without agent polling
 parameters:
   pr_url:
