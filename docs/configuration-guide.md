@@ -482,6 +482,12 @@ Titles are shown in session listings, and the active title is also used to set
 the terminal window title in the TUI and the browser tab title in the web UI (as
 `harnx — <title>`).
 
+The title agent receives the first and latest user messages plus excerpts of
+intermediate user requests, assistant activity, tool arguments, and tool results. Long sessions retain initial
+discoveries and recent progress within an 8,000-character transcript budget, so
+fetched issue contents can inform the title even after a follow-up request. After
+compaction, the conversation summary supplies earlier context.
+
 - **title_agent**: Name of the agent used to generate titles. When unset, no
   titles are generated. Can be set globally in `config.yaml` or per-agent in an
   agent's front matter (the agent-level value takes precedence). Point it at a
