@@ -1,6 +1,7 @@
 use super::*;
 
 mod new_message;
+mod process_eviction;
 mod process_wait;
 use process_wait::{wait_params, wait_params_with};
 

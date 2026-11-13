@@ -8,7 +8,7 @@
 use super::foreground_cleanup::ProcessIdentity;
 use process_wrap::tokio::ChildWrapper;
 use std::process::ExitStatus;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
 /// How long to back off before waiting again after a failed wait. A failed
@@ -24,6 +24,9 @@ const MAX_WAIT_FAILURES: u32 = 5;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProcessExit {
     pub(crate) code: Option<i32>,
+    /// When the supervisor reaped the process, not when a caller first waited.
+    /// None if waiting failed and the process's fate is unknown.
+    pub(crate) exited_at: Option<Instant>,
     /// The supervisor killed the process group at its deadline.
     pub(crate) timed_out: bool,
     /// The supervisor gave up because waiting kept failing, so the process's
@@ -99,6 +102,7 @@ impl Supervisor {
         match status {
             Ok(status) => Some(ProcessExit {
                 code: status.code(),
+                exited_at: Some(Instant::now()),
                 timed_out: self.timed_out,
                 wait_error: None,
             }),
@@ -112,6 +116,7 @@ impl Supervisor {
             log::warn!("waiting on a spawned process keeps failing; giving up: {error}");
             return Some(ProcessExit {
                 code: None,
+                exited_at: None,
                 timed_out: false,
                 wait_error: Some(error.to_string()),
             });

@@ -56,6 +56,18 @@ foreground command and its process group.
 `timeout_secs` is reserved execution metadata for command templates. It is injected into every
 template's input schema automatically and must not be declared under the YAML `parameters` map.
 
+## Background process retention
+
+Finished `spawn` processes and their cached diffs remain available for up to 30 minutes
+from exit. At most 128 finished processes are retained; older exits are dropped first.
+Cleanup runs on tool calls, process registration, and process lookup, so an idle server
+cleans up on its next call. Running processes are never evicted, and calls already
+waiting on a process still return its full result after eviction.
+
+The most recent 1,024 evicted execution IDs report that the process finished and is no
+longer tracked. Older evicted IDs return the same error as unknown IDs. Eviction does
+not delete log files; `read_exec_log` can still read them.
+
 ## Shell command templates
 
 Command templates allow defining custom fixed shell command shapes in YAML files. Each template registers as a distinct MCP tool with a strongly typed input schema. Instead of giving an agent arbitrary shell execution privileges, templates restrict execution to a fixed script where agent-provided parameters are validated against a schema and passed to the script as environment variables.
