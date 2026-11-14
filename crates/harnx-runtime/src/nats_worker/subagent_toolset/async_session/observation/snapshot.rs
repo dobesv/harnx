@@ -89,6 +89,9 @@ impl Snapshot {
     fn accept(&mut self, seq: u64, entry: SessionLogEntry, scope: &Scope) {
         if self.prompt.is_none() {
             self.find_prompt(seq, &entry, scope);
+            // A joined prompt can land mid-round. Retain earlier live state
+            // without moving the output boundary found by find_prompt().
+            self.track_live_round(seq, entry);
             return;
         }
         let prompt = self.prompt.expect("prompt checked");
@@ -102,7 +105,7 @@ impl Snapshot {
                 .then(|| (seq, terminal_status(&row.1, &scope.admission)));
             return;
         }
-        self.track_round(seq, row.1);
+        self.track_live_round(seq, row.1);
     }
 
     fn find_prompt(&mut self, seq: u64, entry: &SessionLogEntry, scope: &Scope) {
@@ -114,11 +117,26 @@ impl Snapshot {
         } = entry
         {
             if role.is_user() && id == &scope.prompt_id {
-                self.identity_mismatch |= Some(content) != scope.admission.prompt_content.as_ref();
+                self.identity_mismatch |= Some(content) != scope.prompt_content();
                 if !self.identity_mismatch {
                     self.prompt = Some(seq);
                 }
             }
+        }
+    }
+
+    fn track_live_round(&mut self, seq: u64, entry: SessionLogEntry) {
+        match entry {
+            SessionLogEntry::TurnEnd { .. }
+            | SessionLogEntry::Cancel { .. }
+            | SessionLogEntry::Error { .. } => {
+                // Joined prompts share the current round, not completed turns'
+                // approvals or uncertainty. This never changes the output start.
+                self.round.clear();
+                self.round_bytes = 0;
+                self.unsafe_live = false;
+            }
+            entry => self.track_round(seq, entry),
         }
     }
 

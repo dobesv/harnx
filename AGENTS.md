@@ -1438,11 +1438,15 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    `session_send` from the generic tool-call timer while `session_wait` and
    `session_load` are observation tools, not launchers.
 
-3. **Authorization is transport-attested, never caller-claimed** — wait
-   validates the caller against `admission.parent_storage_key` via the
-   `ToolInvocationContext` session identity (`observation/scope.rs`), not user
-   arguments. A missing trusted scope fails closed; there is no privileged
-   bypass.
+3. **Authorization is transport-attested, never caller-claimed** — observation
+   (`session_wait`, prompt-scoped `session_load`) is namespace-wide: any caller
+   in the agent namespace may wait on a prompt handle, and observation must
+   never check that the caller is the dispatching parent (issue #2672).
+   Dispatch replay and activation still validate caller identity against the
+   joined record and `admission.parent_storage_key` via the trusted
+   `ToolInvocationContext` session identity (`observation/scope.rs`,
+   `nats_session/dispatch.rs`), not user arguments. A missing trusted scope
+   fails closed; there is no privileged bypass.
 
 4. **Repair is bounded and separated from the snapshot scan** — a wait may run
    at most one idempotent exact-sequence activation repair

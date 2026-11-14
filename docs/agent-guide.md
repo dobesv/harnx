@@ -692,6 +692,7 @@ send with an explicit soft wait and leave the hard execution policy inherited:
 ```
 
 - The wait is an observation budget only, never execution time. `seconds` is 1 to 240 and defaults to 240, or pass `forever: true`; it never cancels the child or extends its deadline.
+- Any caller with access to an agent's `session_wait` or `session_load` can observe a known session and prompt in that agent's namespace, even when another caller sent the prompt. Dispatch replay still requires the original caller's identity.
 - A wait that returns `stopped_by: "new_message"` ended because a new message arrived for the caller; read it before waiting again. `stopped_by: "caller_deadline"` means the caller's own run deadline is near; report what you have instead of waiting again.
 - `timeout_secs` on send still means the hard child execution allowance. Omit it and let the
   target agent's configured policy (or the inherited run deadline) govern; do not invent a

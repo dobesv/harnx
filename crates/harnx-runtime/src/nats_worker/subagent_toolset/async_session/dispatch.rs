@@ -72,29 +72,42 @@ pub(in crate::nats_worker::subagent_toolset) async fn dispatch_send(
     ensure_receipt_fits(session.session_id(), &context.call_id, budget)?;
     let session = session
         .with_inherited_admission(
-            inherited.parent,
+            inherited.parent.clone(),
             context.call_id.clone(),
             inherited.admitted_at,
             InvocationEdgeKind::Delegation,
             args.timeout_secs,
         )
-        .with_execution_parent(inherited.parent_key, context.call_id.clone());
+        .with_execution_parent(inherited.parent_key.clone(), context.call_id.clone());
     // Replayed delivery never re-fetches attachments or replaces original
     // content, even if the referenced resource disappeared after admission.
-    let content = match toolset
-        .session_metadata
-        .admission(session.storage_key(), &context.call_id)
+    // A joined-dispatch record is authoritative here, including over a
+    // leftover candidate intent from an earlier busy reserve (issue #2672).
+    let content = match session
+        .metadata_store()
+        .joined_dispatch(session.storage_key(), &context.call_id)
         .await
         .map_err(recoverable)?
     {
-        Some(saved) => saved.prompt_content.ok_or_else(|| {
-            ToolInvokeError::Fatal("dispatch admission has no original content".into())
-        })?,
-        None => {
-            toolset
-                .compose_prompt_content(args.message, args.attachments.unwrap_or_default())
-                .await?
+        Some(joined) => {
+            ensure_joined_caller(&joined, &inherited.parent_key, &inherited.parent)?;
+            joined.prompt_content
         }
+        None => match toolset
+            .session_metadata
+            .admission(session.storage_key(), &context.call_id)
+            .await
+            .map_err(recoverable)?
+        {
+            Some(saved) => saved.prompt_content.ok_or_else(|| {
+                ToolInvokeError::Fatal("dispatch admission has no original content".into())
+            })?,
+            None => {
+                toolset
+                    .compose_prompt_content(args.message, args.attachments.unwrap_or_default())
+                    .await?
+            }
+        },
     };
     check_cancel(&cancel)?;
     record_child(toolset, &context, session.session_id()).await?;
@@ -132,6 +145,24 @@ struct InheritedDispatch {
     parent_key: String,
     parent: RunLimitsRecord,
     admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A joined-dispatch record is the caller's immutable dispatch identity. The
+/// same parent fields the invocation-level check compares must match before
+/// the record's content can be replayed to this caller. One shared predicate
+/// with the other replay/activation sites (issue #2672, review F7).
+fn ensure_joined_caller(
+    joined: &crate::nats_session_metadata::JoinedDispatch,
+    parent_key: &str,
+    parent: &RunLimitsRecord,
+) -> Result<(), ToolInvokeError> {
+    if joined.matches_caller(Some(parent_key), Some(parent.invocation_id.as_str())) {
+        Ok(())
+    } else {
+        Err(ToolInvokeError::Fatal(
+            "dispatch admission parent scope mismatch".into(),
+        ))
+    }
 }
 
 fn validate_send_context(

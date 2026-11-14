@@ -4,6 +4,51 @@ use harnx_core::{message::MessageRole, session::SessionLogEntry};
 use std::time::Duration;
 
 #[tokio::test]
+async fn normal_prompt_observes_for_unrelated_caller_with_correct_content_and_status() -> Result<()>
+{
+    let f = Fixture::new().await?;
+    let dispatched = f.dispatch().await?;
+    let context = ToolInvocationContext {
+        call_id: "unrelated-wait".into(),
+        invoking_session_id: Some(harnx_core::session_identity::session_key(
+            Some("other"),
+            "foreign-parent",
+        )),
+        invoking_session: Some(harnx_toolset::SessionRef {
+            agent: Some("other".into()),
+            session_id: "foreign-parent".into(),
+        }),
+        ..Default::default()
+    };
+    let pending = wait(
+        &f.toolset,
+        f.wait_args(json!({"seconds": 1})),
+        CancellationToken::new(),
+        context.clone(),
+    )
+    .await?;
+    assert_eq!(pending["status"], "pending");
+    assert_eq!(pending["terminal"], false);
+    assert!(serde_json::to_string(&pending["output"])?.contains("original"));
+    f.append(message("reply", MessageRole::Assistant, "original answer"))
+        .await?;
+    f.append(end(dispatched.prompt.user_msg_seq())).await?;
+    let completed = wait(
+        &f.toolset,
+        f.wait_args(json!({"seconds": 1})),
+        CancellationToken::new(),
+        context,
+    )
+    .await?;
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["terminal"], true);
+    let output = serde_json::to_string(&completed["output"])?;
+    assert!(output.contains("original"), "{output}");
+    assert!(output.contains("original answer"), "{output}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn live_polls_have_changing_observation_metadata() -> Result<()> {
     let f = Fixture::new().await?;
     f.dispatch().await?;
@@ -97,16 +142,12 @@ async fn observer_cancel_returns_handle_without_child_cancel_or_false_cancelled_
 }
 
 #[tokio::test]
-async fn forged_parent_missing_scope_wrong_agent_session_token_and_missing_binding_fail_closed(
+async fn missing_or_inconsistent_context_wrong_agent_session_token_and_missing_binding_fail_closed(
 ) -> Result<()> {
     let f = Fixture::new().await?;
     f.dispatch().await?;
     for context in [
         ToolInvocationContext::default(),
-        ToolInvocationContext {
-            invoking_session_id: Some("foreign-parent".into()),
-            ..f.wait_context()
-        },
         ToolInvocationContext {
             invoking_session: Some(harnx_toolset::SessionRef {
                 agent: Some("other".into()),

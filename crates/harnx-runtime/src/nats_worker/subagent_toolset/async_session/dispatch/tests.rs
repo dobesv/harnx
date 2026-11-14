@@ -133,6 +133,12 @@ fn make_toolset(
     )
 }
 
+fn assert_saved_handle(checkpoint: &Value, partial_result: &Value, handle: &PromptHandle) {
+    assert_eq!(checkpoint["prompt_id"], handle.prompt_id);
+    assert_eq!(partial_result["prompt_id"], handle.prompt_id);
+    assert_eq!(partial_result["session_id"], handle.session_id);
+}
+
 #[tokio::test]
 async fn lost_reply_restarts_from_journal_with_same_handle_and_frozen_deadline() -> Result<()> {
     let f = Fixture::new(json!({"message": "original", "session_id": "   "})).await?;
@@ -148,17 +154,10 @@ async fn lost_reply_restarts_from_journal_with_same_handle_and_frozen_deadline()
         saved.reply.is_none(),
         "simulate lost tool reply, not completed journal replay"
     );
-    assert_eq!(
-        saved.checkpoint.as_ref().unwrap()["prompt_id"],
-        handle.prompt_id
-    );
-    assert_eq!(
-        saved.partial_result.as_ref().unwrap()["prompt_id"],
-        handle.prompt_id
-    );
-    assert_eq!(
-        saved.partial_result.as_ref().unwrap()["session_id"],
-        handle.session_id
+    assert_saved_handle(
+        saved.checkpoint.as_ref().unwrap(),
+        saved.partial_result.as_ref().unwrap(),
+        &handle,
     );
     let reopened = InvocationJournal::ensure(&f.js, 1).await?;
     let restarted = make_toolset(&f.js, SessionMetadataStore::ensure(&f.js, 1).await?);
@@ -489,35 +488,186 @@ async fn concurrent_replays_share_one_prompt_and_one_exact_activation() -> Resul
     Ok(())
 }
 
+/// A journaled second-parent send request against the fixture's busy child.
+async fn joining_request(f: &Fixture, call: &str, message: &str) -> Result<ToolRequest> {
+    let mut request = f.request.clone();
+    request.call_id = call.into();
+    request.operation_id = format!("{call}-operation");
+    request.parent_session_id = Some("parent-b".into());
+    request.run_context = Some(crate::nats_session::test_support::inherited_tool_context());
+    request.args = json!({
+        "message": message,
+        "session_id": f.request.args["session_id"],
+    });
+    f.journal
+        .record(&request, ("session_send", "helper", "server"))
+        .await?;
+    Ok(request)
+}
+
+/// A caller claiming an existing joined call id under a different parent.
+async fn joining_request_imposter(f: &Fixture, call: &str, message: &str) -> Result<ToolRequest> {
+    // Built from scratch: even a re-record of the same key would collide, so
+    // only the journaling of the imposter's own identity happens here.
+    let mut request = f.request.clone();
+    request.call_id = call.into();
+    request.operation_id = format!("{call}-imposter-operation");
+    request.parent_session_id = Some("parent-c".into());
+    request.run_context = Some(crate::nats_session::test_support::inherited_tool_context());
+    request.args = json!({
+        "message": message,
+        "session_id": f.request.args["session_id"],
+    });
+    f.journal
+        .record(&request, ("session_send", "helper", "server"))
+        .await?;
+    Ok(request)
+}
+
+async fn joining_context(f: &Fixture, request: &ToolRequest) -> Result<ToolInvocationContext> {
+    Ok(ToolInvocationContext {
+        call_id: request.call_id.clone(),
+        invoking_session_id: request.parent_session_id.clone(),
+        run_context: request.run_context.clone(),
+        checkpoint: None,
+        checkpoint_store: Some(Arc::new(f.journal.checkpoint_store(request))),
+        partial_result_store: Some(Arc::new(f.journal.partial_result_store(request))),
+        ..Default::default()
+    })
+}
+
+async fn assert_imposter_rejected(f: &Fixture, handle: &PromptHandle) -> Result<()> {
+    // Another caller cannot replay the joined call id.
+    let imposter = joining_request_imposter(f, &handle.prompt_id, "imposter message").await?;
+    let context = joining_context(f, &imposter).await?;
+    let error =
+        match dispatch_send(&f.toolset, imposter.args, CancellationToken::new(), context).await {
+            Ok(_) => panic!("foreign caller replayed a joined dispatch"),
+            Err(error) => error,
+        };
+    assert_eq!(
+        error.to_string(),
+        "dispatch admission parent scope mismatch"
+    );
+    assert_eq!(f.events(&handle.session_id).await?.len(), 2);
+    Ok(())
+}
+
 #[tokio::test]
-async fn independent_send_to_busy_session_returns_error_not_acceptance() -> Result<()> {
+async fn send_to_busy_session_joins_active_turn_and_replays_identically() -> Result<()> {
     let f = Fixture::new(json!({"message": "work", "session_id": "busy"})).await?;
     let (accepted, _) = f.send().await?;
-    let mut competing = f.request.clone();
-    competing.call_id = "independent".into();
-    competing.operation_id = "independent-operation".into();
-    f.journal
-        .record(&competing, ("session_send", "helper", "server"))
-        .await?;
-    let context = ToolInvocationContext {
-        call_id: competing.call_id.clone(),
-        checkpoint: None,
-        checkpoint_store: Some(Arc::new(f.journal.checkpoint_store(&competing))),
-        partial_result_store: Some(Arc::new(f.journal.partial_result_store(&competing))),
-        ..f.context().await?
-    };
-    let result = dispatch_send(
+    let storage =
+        harnx_core::session_identity::session_key(Some("helper"), &accepted.handle.session_id);
+    // A second parent joins the busy session's active turn (issue #2672).
+    let joining = joining_request(&f, "join-call", "joined steering").await?;
+    let context = joining_context(&f, &joining).await?;
+    let (joined, _) = dispatch_send(
         &f.toolset,
-        competing.args,
+        joining.args.clone(),
         CancellationToken::new(),
         context,
     )
-    .await;
-    let Err(error) = result else {
-        panic!("busy session claimed acceptance");
-    };
-    assert!(error.to_string().contains("session busy"));
-    assert_eq!(f.events(&accepted.handle.session_id).await?.len(), 1);
+    .await?;
+    assert_eq!(joined.handle.prompt_id, "join-call");
+    assert_eq!(joined.handle.session_id, accepted.handle.session_id);
+    assert_eq!(
+        joined.prompt.execution_id(),
+        Some(accepted.handle.prompt_id.as_str()),
+        "joined prompt is bound to the active invocation"
+    );
+    let record = f
+        .toolset
+        .session_metadata
+        .joined_dispatch(&storage, "join-call")
+        .await?
+        .context("joined dispatch record missing")?;
+    assert_eq!(record.parent_storage_key.as_deref(), Some("parent-b"));
+    assert_eq!(record.invocation_id, accepted.handle.prompt_id);
+    let expected = f
+        .toolset
+        .compose_prompt_content("joined steering".into(), vec![])
+        .await?;
+    let events = f.events(&accepted.handle.session_id).await?;
+    assert_eq!(events.len(), 2, "one original and one joined message");
+    assert!(
+        matches!(&events[1].1, harnx_core::session::SessionLogEntry::Message { id, role, content, .. }
+        if id.as_deref() == Some("join-call") && role.is_user() && content == &expected)
+    );
+    // The joined call mints no limits record and leaves the active
+    // invocation's own limits alone.
+    assert_eq!(
+        f.toolset
+            .session_metadata
+            .get_invocation_limits(&storage, &accepted.handle.prompt_id)
+            .await?,
+        None
+    );
+    assert_eq!(
+        f.toolset
+            .session_metadata
+            .get_invocation_limits(&storage, "join-call")
+            .await?,
+        None
+    );
+    // Same-call retry returns the same handle and appends nothing.
+    let context = joining_context(&f, &joining).await?;
+    let (retry, _) = dispatch_send(
+        &f.toolset,
+        json!({"message": "changed retry", "timeout_secs": 1234, "session_id": "busy"}),
+        CancellationToken::new(),
+        context,
+    )
+    .await?;
+    assert_eq!(retry.handle, joined.handle);
+    assert_eq!(retry.prompt, joined.prompt);
+    assert_eq!(f.events(&accepted.handle.session_id).await?.len(), 2);
+    assert_imposter_rejected(&f, &joined.handle).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn joined_replay_reuses_recorded_content_without_refetching_attachments() -> Result<()> {
+    use harnx_blob_store::media::{ensure_attachments_bucket, put_media};
+    use harnx_core::cid_url::CidUrl;
+    let image =
+        "cid:media:parent/source/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let f = Fixture::new(json!({"message": "work", "session_id": "attach"})).await?;
+    let (accepted, _) = f.send().await?;
+    let bucket = ensure_attachments_bucket(&f.js, 1).await?;
+    put_media(&bucket, &CidUrl::parse(image)?, b"image", "image/png").await?;
+    let mut joining = joining_request(&f, "join-call", "inspect").await?;
+    joining.args["attachments"] = json!([image]);
+    let expected = f
+        .toolset
+        .compose_prompt_content("inspect".into(), vec![image.into()])
+        .await?;
+    let context = joining_context(&f, &joining).await?;
+    let (joined, _) = dispatch_send(
+        &f.toolset,
+        joining.args.clone(),
+        CancellationToken::new(),
+        context,
+    )
+    .await?;
+    assert_eq!(joined.handle.prompt_id, "join-call");
+    let events = f.events(&accepted.handle.session_id).await?;
+    assert!(
+        matches!(&events[1].1, harnx_core::session::SessionLogEntry::Message { content, .. } if content == &expected)
+    );
+    // The referenced blob disappears; the joined replay must still succeed
+    // from the recorded content without re-fetching attachments.
+    bucket.delete(CidUrl::parse(image)?.kv_key()).await?;
+    let context = joining_context(&f, &joining).await?;
+    let (replay, _) = dispatch_send(
+        &f.toolset,
+        joining.args.clone(),
+        CancellationToken::new(),
+        context,
+    )
+    .await?;
+    assert_eq!(replay.handle, joined.handle);
+    assert_eq!(f.events(&accepted.handle.session_id).await?.len(), 2);
     Ok(())
 }
 
