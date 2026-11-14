@@ -13,15 +13,19 @@
 //! canonical source. The reporter reads it at startup, refreshes on the 10s heartbeat, and
 //! preserves the last-observed title on read errors.
 //!
-//! # Scope: synchronous launchers only
+//! # Scope: synchronous launchers and the async dispatch watcher
 //!
-//! Only `session_new` and `session_prompt` wire this reporter. The async
-//! `session_send`/`session_wait` tools deliberately do not: an async receipt
-//! (dispatch handle) and a soft-wait expiry are tool results, not child
-//! progress, and emitting a `SubAgentProgress` terminal row for either would
-//! misreport dispatch as completion. A dispatched child's real progress is
-//! observed later through `session_wait`/`session_load` results, and its
-//! completion only ever surfaces from durable terminal evidence.
+//! `session_new` and `session_prompt` wire this reporter directly around the
+//! in-process child turn. The async `session_send`/`session_wait` tools wire it
+//! through a background watcher (`subagent_toolset/async_session/progress.rs`)
+//! that feeds the child's advisory events into the reporter and follows the
+//! child prompt's durable log: a dispatch watcher announces `Running` as soon
+//! as the prompt is dispatched, keeps heartbeating while the child runs, and
+//! only reports a terminal state from the child prompt's durable terminal
+//! evidence. A dispatch receipt (dispatch-only `session_send`) and a
+//! soft-wait expiry are tool results, not child progress — neither can produce
+//! a terminal row, because the watcher keeps running past both and terminal
+//! status comes only from durable settlement of the child.
 
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_session_metadata::SessionMetadataStore;
@@ -95,6 +99,11 @@ impl ProgressMetric {
 #[derive(Debug)]
 enum ProgressCommand {
     Metric(ProgressMetric),
+    /// Replace the accumulated usage estimate with an authoritative durable
+    /// total (the child turn's `TurnEnd` row). The async watcher sends this
+    /// right before `Finish`; the synchronous path never needs it, because its
+    /// events already carry every request's usage.
+    SetUsage(CompletionTokenUsage),
     Finish {
         status: SubAgentProgressStatus,
         reply: oneshot::Sender<(SubAgentProgress, anyhow::Result<()>)>,
@@ -165,6 +174,12 @@ impl ProgressTracker {
         self.snapshot.title = title;
     }
 
+    /// Overwrite the accumulated usage estimate with a durable total. No
+    /// snapshot is published: the finish that follows carries the value.
+    fn set_usage(&mut self, usage: CompletionTokenUsage) {
+        self.snapshot.usage = usage;
+    }
+
     fn heartbeat(&mut self, elapsed_ms: u64) -> SubAgentProgress {
         self.snapshot.elapsed_ms = elapsed_ms;
         self.snapshot.clone()
@@ -182,6 +197,7 @@ struct ReporterTaskConfig {
     parent_sink: Option<NatsEventSink>,
     title: ReporterTitleConfig,
     heartbeat: Duration,
+    share: Option<SharedSnapshots>,
 }
 
 enum ReporterEvent {
@@ -201,7 +217,17 @@ struct ReporterTask {
     heartbeats: tokio::time::Interval,
     commands: mpsc::UnboundedReceiver<ProgressCommand>,
     title_read: Option<TitleRead>,
+    /// The reporter's latest published snapshot, shared with whoever started
+    /// the reporter (the async dispatch watcher). The wait path merges it into
+    /// its terminal summary so the durable summary cannot win a
+    /// first-terminal-wins race against a richer live view. The sync path has
+    /// no second publisher and shares nothing.
+    share: Option<SharedSnapshots>,
 }
+
+/// Latest published snapshot of a running reporter, shared between the
+/// reporter actor and the dispatcher that started it.
+pub(super) type SharedSnapshots = std::sync::Arc<std::sync::Mutex<Option<SubAgentProgress>>>;
 
 impl ReporterTask {
     fn new(config: ReporterTaskConfig, commands: mpsc::UnboundedReceiver<ProgressCommand>) -> Self {
@@ -231,6 +257,20 @@ impl ReporterTask {
             heartbeats,
             commands,
             title_read: None,
+            share: config.share,
+        }
+    }
+
+    /// Publish a best-effort snapshot, sharing it with the dispatching
+    /// watcher when one asked for the reporter's latest view.
+    fn share_and_publish(&self, snapshot: SubAgentProgress) {
+        self.share_snapshot(&snapshot);
+        publish_progress(self.parent_sink.as_ref(), &self.source, snapshot);
+    }
+
+    fn share_snapshot(&self, snapshot: &SubAgentProgress) {
+        if let Some(share) = &self.share {
+            *share.lock().expect("progress share mutex") = Some(snapshot.clone());
         }
     }
 
@@ -238,7 +278,7 @@ impl ReporterTask {
         // Announce the invocation before its first metric or heartbeat, so a
         // live view shows the child as soon as it is bound.
         let announcement = self.tracker.heartbeat(0);
-        publish_progress(self.parent_sink.as_ref(), &self.source, announcement);
+        self.share_and_publish(announcement);
         while self.process_next_event().await {}
     }
 
@@ -251,7 +291,13 @@ impl ReporterTask {
 
     async fn next_event(&mut self) -> Option<ReporterEvent> {
         tokio::select! {
-            Some(command) = self.commands.recv() => Some(ReporterEvent::Command(command)),
+            command = self.commands.recv() => {
+                // Every reporter handle is gone. Stop heartbeating instead of
+                // advertising a Running child nobody will ever finish; a wait
+                // that never settles would otherwise keep the row alive
+                // forever with no publisher left to terminate it.
+                command.map(ReporterEvent::Command)
+            }
             _ = self.heartbeats.tick(), if self.title_read.is_none() => {
                 Some(ReporterEvent::Heartbeat)
             }
@@ -282,6 +328,10 @@ impl ReporterTask {
                 self.handle_metric(metric);
                 true
             }
+            ProgressCommand::SetUsage(usage) => {
+                self.tracker.set_usage(usage);
+                true
+            }
             ProgressCommand::Finish { status, reply } => {
                 self.handle_finish(status, reply).await;
                 false
@@ -291,7 +341,7 @@ impl ReporterTask {
 
     fn handle_metric(&mut self, metric: ProgressMetric) {
         let snapshot = self.tracker.apply(metric, elapsed_ms(self.started));
-        publish_progress(self.parent_sink.as_ref(), &self.source, snapshot);
+        self.share_and_publish(snapshot);
     }
 
     async fn handle_finish(
@@ -300,6 +350,9 @@ impl ReporterTask {
         reply: oneshot::Sender<(SubAgentProgress, anyhow::Result<()>)>,
     ) {
         let snapshot = self.tracker.finish(status, elapsed_ms(self.started));
+        // Share even on delivery failure: the watcher's one-shot retry reads
+        // the terminal snapshot back from the share.
+        self.share_snapshot(&snapshot);
         let delivery =
             publish_terminal_progress(self.parent_sink.as_ref(), &self.source, snapshot.clone())
                 .await;
@@ -320,7 +373,7 @@ impl ReporterTask {
             self.tracker.update_title(title);
         }
         let snapshot = self.tracker.heartbeat(elapsed_ms(self.started));
-        publish_progress(self.parent_sink.as_ref(), &self.source, snapshot);
+        self.share_and_publish(snapshot);
     }
 }
 
@@ -336,6 +389,20 @@ impl SubagentProgressReporter {
         session_metadata: SessionMetadataStore,
         heartbeat: Duration,
     ) -> Self {
+        Self::start_shared(invocation, parent_sink, session_metadata, heartbeat, None).await
+    }
+
+    /// Like [`Self::start`], additionally sharing every published snapshot
+    /// (see [`SharedSnapshots`]). The async dispatch watcher uses this so the
+    /// wait path's durable summary can carry the live view's title, tool
+    /// count and usage.
+    pub(super) async fn start_shared(
+        invocation: ReportedInvocation,
+        parent_sink: Option<NatsEventSink>,
+        session_metadata: SessionMetadataStore,
+        heartbeat: Duration,
+        share: Option<SharedSnapshots>,
+    ) -> Self {
         let title_source: Arc<dyn SessionTitleSource> = Arc::new(session_metadata);
         Self::start_with_title_source(
             invocation,
@@ -343,6 +410,7 @@ impl SubagentProgressReporter {
             title_source,
             heartbeat,
             TITLE_READ_TIMEOUT,
+            share,
         )
         .await
     }
@@ -353,6 +421,7 @@ impl SubagentProgressReporter {
         title_source: Arc<dyn SessionTitleSource>,
         heartbeat: Duration,
         title_read_timeout: Duration,
+        share: Option<SharedSnapshots>,
     ) -> Self {
         let initial_title = read_title(
             title_source.as_ref(),
@@ -370,6 +439,7 @@ impl SubagentProgressReporter {
                 read_timeout: title_read_timeout,
             },
             heartbeat,
+            share,
         )
     }
 
@@ -378,6 +448,7 @@ impl SubagentProgressReporter {
         parent_sink: Option<NatsEventSink>,
         title: ReporterTitleConfig,
         heartbeat: Duration,
+        share: Option<SharedSnapshots>,
     ) -> Self {
         let (tx, commands) = mpsc::unbounded_channel();
         let sink = Arc::new(ProgressEventSink { tx: tx.clone() });
@@ -386,6 +457,7 @@ impl SubagentProgressReporter {
             parent_sink,
             title,
             heartbeat,
+            share,
         };
         tokio::spawn(async move { ReporterTask::new(config, commands).run().await });
         Self { sink, tx }
@@ -393,6 +465,13 @@ impl SubagentProgressReporter {
 
     pub(super) fn sink(&self) -> Arc<dyn AgentEventSink> {
         Arc::clone(&self.sink)
+    }
+
+    /// Replace the accumulated usage estimate with an authoritative durable
+    /// total before `finish`. Ordered ahead of a following `finish` on the
+    /// same command channel, so the terminal snapshot carries it.
+    pub(super) fn set_usage(&self, usage: CompletionTokenUsage) {
+        let _ = self.tx.send(ProgressCommand::SetUsage(usage));
     }
 
     pub(super) async fn finish(
@@ -545,6 +624,53 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn dropped_reporter_stops_heartbeating() {
+        // Once every handle is dropped the actor must stop publishing: a
+        // Running row nobody can finish must not keep heartbeating (the
+        // watcher drops its reporter exactly like this when the prompt's
+        // binding is gone). One tick can race the drop itself, so the
+        // assertion is that nothing more is published afterwards.
+        let share: SharedSnapshots = Arc::new(std::sync::Mutex::new(None));
+        let reporter = SubagentProgressReporter::start_with_title_source(
+            invocation(),
+            None,
+            Arc::new(StubTitleSource::new([])),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Some(Arc::clone(&share)),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let before = share
+            .lock()
+            .expect("share mutex")
+            .clone()
+            .expect("heartbeats published snapshots");
+        assert!(
+            before.elapsed_ms > 0,
+            "heartbeats were running before the drop"
+        );
+        drop(reporter);
+        // Several heartbeat periods for a straggler tick to land, if any.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let after_drop = share
+            .lock()
+            .expect("share mutex")
+            .clone()
+            .expect("last snapshot remains shared");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let settled = share
+            .lock()
+            .expect("share mutex")
+            .clone()
+            .expect("last snapshot remains shared");
+        assert_eq!(
+            settled, after_drop,
+            "the actor stopped heartbeating once its handles dropped"
+        );
+    }
+
     async fn reporter(source: StubTitleSource, heartbeat: Duration) -> SubagentProgressReporter {
         SubagentProgressReporter::start_with_title_source(
             invocation(),
@@ -552,6 +678,7 @@ mod tests {
             Arc::new(source),
             heartbeat,
             Duration::from_millis(100),
+            None,
         )
         .await
     }
@@ -655,6 +782,7 @@ mod tests {
             Arc::new(source.clone()),
             Duration::from_millis(5),
             Duration::from_millis(5),
+            None,
         )
         .await;
         wait_for_reads(&source, 3).await;
@@ -679,6 +807,7 @@ mod tests {
             Arc::new(source.clone()),
             Duration::from_millis(10),
             Duration::from_secs(60),
+            None,
         )
         .await;
         wait_for_reads(&source, 2).await;
@@ -782,6 +911,38 @@ mod tests {
         assert_eq!(heartbeat.status, SubAgentProgressStatus::Running);
         assert_eq!(heartbeat.elapsed_ms, 10_000);
         assert_eq!(heartbeat.tool_call_count, 1);
+    }
+
+    #[test]
+    fn set_usage_replaces_the_accumulated_estimate_for_the_terminal_snapshot() {
+        let mut tracker = tracker();
+        tracker.apply(
+            ProgressMetric::Usage(CompletionTokenUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            10,
+        );
+        tracker.set_usage(CompletionTokenUsage {
+            input_tokens: 40,
+            output_tokens: 6,
+            cached_tokens: 11,
+            cache_write_tokens: 2,
+        });
+        let done = tracker.finish(SubAgentProgressStatus::Done, 100);
+        // The durable turn total replaces the lossy per-request estimate
+        // instead of summing with it.
+        assert_eq!(
+            done.usage,
+            CompletionTokenUsage {
+                input_tokens: 40,
+                output_tokens: 6,
+                cached_tokens: 11,
+                cache_write_tokens: 2,
+            }
+        );
     }
 
     #[test]

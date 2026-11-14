@@ -10,6 +10,23 @@ use harnx_core::{
 use harnx_toolset::ToolRequest;
 use harnx_toolset_server::invocation_journal::InvocationJournal;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// A distinct parent scope per fixture instance; see `configured`.
+fn unique_parent() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("trusted-parent-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Progress cadence overrides for `Fixture::configured_cadence`: the
+/// heartbeat and poll the watcher's reporter uses, and the watcher's
+/// per-pass durable-scan bound. `None` keeps the fixture's fast default.
+pub(super) struct Cadence {
+    pub(super) heartbeat: Option<Duration>,
+    pub(super) poll: Option<Duration>,
+    pub(super) watcher_pass_limit: Option<Duration>,
+}
 
 pub(super) struct Fixture {
     pub(super) server: NatsServerHandle,
@@ -26,6 +43,35 @@ impl Fixture {
     }
 
     pub(super) async fn configured(agent: &str, cluster: &str, session_id: &str) -> Result<Self> {
+        Self::configured_cadence(
+            agent,
+            cluster,
+            session_id,
+            Cadence {
+                heartbeat: None,
+                poll: None,
+                watcher_pass_limit: None,
+            },
+        )
+        .await
+    }
+
+    /// Progress cadence (heartbeat, poll) and the watcher's per-pass
+    /// durable-scan bound, for the long-horizon watcher test: a pass bound
+    /// far below the poll cadence lets a bind-to-terminal span of many
+    /// budget lifetimes run in milliseconds instead of sleeping out the
+    /// 10 s default.
+    pub(super) async fn configured_cadence(
+        agent: &str,
+        cluster: &str,
+        session_id: &str,
+        cadence: Cadence,
+    ) -> Result<Self> {
+        let Cadence {
+            heartbeat,
+            poll,
+            watcher_pass_limit,
+        } = cadence;
         let server = spawn_nats_server()
             .await?
             .context("nats-server required for observer tests")?;
@@ -35,14 +81,25 @@ impl Fixture {
             agent,
             SubagentSessionRoute::new(cluster, crate::SessionActivationRoute::ClusterShared),
             SubagentNats::new(js.client().clone(), js.clone(), metadata, 1),
-        );
+        )
+        // Fast progress cadence for the watcher tests; harmless for the
+        // observer-only tests, which never read progress events.
+        .with_progress_heartbeat(heartbeat.unwrap_or(Duration::from_millis(20)))
+        .with_progress_poll(poll.unwrap_or(Duration::from_millis(50)));
+        let toolset = match watcher_pass_limit {
+            Some(limit) => toolset.with_watcher_pass_limit(limit),
+            None => toolset,
+        };
         let request = ToolRequest {
             operation_id: "operation".into(),
             call_id: "original-prompt".into(),
             tool: "session_send".into(),
             args: json!({"message": "original", "session_id": session_id}),
             run_context: Some(crate::nats_session::test_support::inherited_tool_context()),
-            parent_session_id: Some("trusted-parent".into()),
+            // Unique per fixture: the watcher registry is process-global, so
+            // two fixtures sharing a parent scope would share (and shadow)
+            // watchers when tests run in one process.
+            parent_session_id: Some(unique_parent()),
             parent_agent: None,
             parent_local_session_id: None,
             replay: None,

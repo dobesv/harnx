@@ -623,7 +623,7 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
 
 ### Sub-Agent Tool Result Marker
 
-When `{agent}_session_new` or `{agent}_session_prompt` completes, the tool returns a JSON object containing the sub-agent response text, the existing structured identification marker (`sub_agent`), and the invocation's terminal progress snapshot (`sub_agent_progress`):
+When `{agent}_session_new` or `{agent}_session_prompt` completes, the tool returns a JSON object containing the sub-agent response text, the existing structured identification marker (`sub_agent`), and the invocation's terminal progress snapshot (`sub_agent_progress`). A settled `{agent}_session_wait` — and a `{agent}_session_send` whose soft wait covered the child's settlement — returns the same marker pair next to the durable status fields, but no `response` text: the async result carries the terminal classification and progress snapshot only, and repeated waits recover the same result.
 
 ```json
 {
@@ -657,6 +657,14 @@ same child session. Token usage accumulates every model call made directly by
 that child; tool count includes tools started directly by it. Nested agents'
 model and tool events stay on their own progress rows and are not double
 counted in the parent invocation.
+
+Two boundary behaviors are worth knowing. Live progress rows for dispatched
+children exist only while the parent's process runs: reopening a parent
+session after a restart shows no row for a still-running child until a
+`session_wait` observes it again (the settled wait result carries the terminal
+summary for replay). And live progress reaches the TUI between parent turns,
+but the web and ACP frontends subscribe per turn, so they show dispatched
+children's progress only while a parent turn is active.
 
 If the call does not succeed, because the child's turn fails, the tool server
 is lost, the parent is interrupted, or a worker restart loses the response, its

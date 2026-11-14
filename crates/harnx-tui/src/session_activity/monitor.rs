@@ -339,6 +339,7 @@ async fn refresh_durable_activity(
 
 fn event_activity(event: &AgentEvent) -> Option<bool> {
     match event {
+        AgentEvent::Turn(TurnEvent::SubAgentProgress(_)) => None,
         AgentEvent::Turn(TurnEvent::Started) => Some(true),
         AgentEvent::Turn(TurnEvent::Ended { .. } | TurnEvent::Interrupted { .. }) => Some(false),
         AgentEvent::Turn(_)
@@ -351,7 +352,16 @@ fn event_activity(event: &AgentEvent) -> Option<bool> {
         ) => Some(false),
         // Nested activity keeps the parent turn busy. A nested Ended event is
         // not the parent session's terminal boundary.
-        AgentEvent::SubAgent { .. } => Some(true),
+        AgentEvent::SubAgent { event, .. } => match event.as_ref() {
+            // Live progress of a dispatched child is not parent activity: it
+            // arrives while the parent turn is idle too (dispatch-only
+            // heartbeats), and marking it active would flap the idle
+            // indicator until the next durable refresh resets it. While the
+            // parent really is busy (an in-turn wait), its own turn events
+            // and the durable history already keep activity true.
+            AgentEvent::Turn(TurnEvent::SubAgentProgress(_)) => None,
+            _ => Some(true),
+        },
         AgentEvent::Notice(_)
         | AgentEvent::User(_)
         | AgentEvent::Session(_)
@@ -562,6 +572,58 @@ mod tests {
                 AgentEvent::Turn(TurnEvent::Ended {
                     outcome: Default::default(),
                 }),
+            )),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn sub_agent_progress_advisories_never_flip_parent_activity() {
+        use harnx_core::event::{SubAgentProgress, SubAgentProgressStatus};
+        let progress = |status| {
+            event_activity(&AgentEvent::sub_agent(
+                Default::default(),
+                AgentEvent::Turn(TurnEvent::SubAgentProgress(SubAgentProgress {
+                    invocation_id: "prompt-1".into(),
+                    agent: "helper".into(),
+                    session_id: "child".into(),
+                    status,
+                    elapsed_ms: 12_000,
+                    usage: Default::default(),
+                    tool_call_count: 3,
+                    title: Some("child work".into()),
+                    tool_call_id: Some("parent-call".into()),
+                })),
+            ))
+        };
+        assert_eq!(
+            event_activity(&AgentEvent::Turn(TurnEvent::SubAgentProgress(
+                harnx_core::event::SubAgentProgress {
+                    invocation_id: "prompt-1".into(),
+                    agent: "helper".into(),
+                    session_id: "child".into(),
+                    status: SubAgentProgressStatus::Running,
+                    elapsed_ms: 12_000,
+                    usage: Default::default(),
+                    tool_call_count: 3,
+                    title: Some("child work".into()),
+                    tool_call_id: Some("parent-call".into()),
+                },
+            ))),
+            None
+        );
+        // A running child's heartbeat arrives while the parent is idle too
+        // (dispatch-only): it must not flip the idle indicator active.
+        assert_eq!(progress(SubAgentProgressStatus::Running), None);
+        // The terminal advisory repairs the row without touching activity.
+        assert_eq!(progress(SubAgentProgressStatus::Done), None);
+        assert_eq!(progress(SubAgentProgressStatus::Failed), None);
+        assert_eq!(progress(SubAgentProgressStatus::Cancelled), None);
+        // Other nested events still keep the parent busy.
+        assert_eq!(
+            event_activity(&AgentEvent::sub_agent(
+                Default::default(),
+                AgentEvent::Model(ModelEvent::Error("child failed".into())),
             )),
             Some(true)
         );

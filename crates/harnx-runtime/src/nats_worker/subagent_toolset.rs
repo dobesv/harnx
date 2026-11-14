@@ -51,6 +51,11 @@ use tokio_util::sync::CancellationToken;
 // durable session and preserves blocking call-and-return semantics.
 const SESSION_NEW_INITIAL_PROMPT: &str = "Start a new session.";
 const SUBAGENT_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(10);
+/// How often a dispatched prompt's progress watcher re-reads the child's
+/// durable log for terminal evidence. The heartbeat stays the cadence for
+/// liveness/title updates; this bounds how late a terminal row can arrive
+/// after the child settles.
+const SUBAGENT_PROGRESS_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub(crate) struct SubagentSessionRoute {
@@ -97,6 +102,11 @@ pub(crate) struct SubagentToolset {
     session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     replicas: usize,
     progress_heartbeat: Duration,
+    progress_poll: Duration,
+    /// Per-pass I/O bound of dispatched-prompt watchers' durable scan. `None`
+    /// keeps the observation default (`IO_LIMIT`); tests pin a smaller bound
+    /// to span several passes in milliseconds. See `WatchScan::refresh`.
+    watcher_pass_limit: Option<Duration>,
     lease_acquisition_timeout: Duration,
     run_policy: Option<TargetRunPolicy>,
     default_user_id: Option<String>,
@@ -158,6 +168,8 @@ impl SubagentToolset {
             session_metadata: nats.session_metadata,
             replicas: nats.replicas,
             progress_heartbeat: SUBAGENT_PROGRESS_HEARTBEAT,
+            progress_poll: SUBAGENT_PROGRESS_POLL,
+            watcher_pass_limit: None,
             lease_acquisition_timeout: nats.lease_acquisition_timeout,
             run_policy: None,
             default_user_id: None,
@@ -177,6 +189,21 @@ impl SubagentToolset {
     #[cfg(test)]
     pub(crate) fn with_progress_heartbeat(mut self, heartbeat: Duration) -> Self {
         self.progress_heartbeat = heartbeat;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_progress_poll(mut self, poll: Duration) -> Self {
+        self.progress_poll = poll;
+        self
+    }
+
+    /// Pin the dispatched-prompt watcher's per-pass durable-scan bound. A
+    /// bind-time budget bug would starve the watcher after this bound, so a
+    /// small value reproduces long-running children without a real sleep.
+    #[cfg(test)]
+    pub(crate) fn with_watcher_pass_limit(mut self, limit: Duration) -> Self {
+        self.watcher_pass_limit = Some(limit);
         self
     }
 
@@ -812,7 +839,10 @@ impl Toolset for SubagentToolset {
     ) -> Result<Value, ToolInvokeError> {
         if matches!(
             invocation.tool.as_str(),
-            SUBAGENT_SESSION_NEW_TOOL | SUBAGENT_SESSION_PROMPT_TOOL | SUBAGENT_SESSION_SEND_TOOL
+            SUBAGENT_SESSION_NEW_TOOL
+                | SUBAGENT_SESSION_PROMPT_TOOL
+                | SUBAGENT_SESSION_SEND_TOOL
+                | SUBAGENT_SESSION_WAIT_TOOL
         ) {
             if let (Some(parent), Some(object)) = (
                 invocation.context.invoking_session_id.clone(),

@@ -131,22 +131,70 @@ impl NatsEventSink {
         jetstream: jetstream::Context,
         session_id: impl Into<String>,
     ) -> Self {
+        Self::create(client, jetstream, session_id, false).await
+    }
+
+    /// Like [`NatsEventSink::new`], but re-reads the session log stream's
+    /// latest sequence immediately before each publish and re-stamps the
+    /// envelope's `after_seq`.
+    ///
+    /// Use this for publishers that are NOT the session's own writer and keep
+    /// publishing while that writer appends durable entries — the async
+    /// dispatch progress watcher. A normally-constructed sink's cell is
+    /// advanced by the log backend through [`NatsEventSink::after_seq_handle`],
+    /// which an out-of-band publisher has no access to; without re-stamping,
+    /// every client that applied newer durable entries would fence the
+    /// advisories away. The session's own sinks do not need this: one JetStream
+    /// stream-info request per published advisory is the price, and only the
+    /// out-of-band publisher pays it.
+    pub async fn with_live_seq_tracking(
+        client: async_nats::Client,
+        jetstream: jetstream::Context,
+        session_id: impl Into<String>,
+    ) -> Self {
+        Self::create(client, jetstream, session_id, true).await
+    }
+
+    async fn create(
+        client: async_nats::Client,
+        jetstream: jetstream::Context,
+        session_id: impl Into<String>,
+        track_live_seq: bool,
+    ) -> Self {
         let session_id = session_id.into();
         let stream_name = crate::nats_session_log::stream_name_for_session(&session_id);
-        let seed = match jetstream.get_stream(&stream_name).await {
-            Ok(mut stream) => stream
+        // One lookup for both the seed and the live-tracking handle; on
+        // failure tracking stays unbound and the next publish retries it.
+        let mut seed = 0;
+        let mut live_stream = None;
+        if let Ok(mut stream) = jetstream.get_stream(&stream_name).await {
+            seed = stream
                 .info()
                 .await
                 .map(|i| i.state.last_sequence)
-                .unwrap_or(0),
-            Err(_) => 0,
-        };
+                .unwrap_or(0);
+            if track_live_seq {
+                live_stream = Some(stream);
+            }
+        }
         let subject = events_subject(&session_id);
-        let publisher = spawn_publisher(client.clone(), subject.clone());
+        let after_seq = Arc::new(AtomicU64::new(seed));
+        let live_seq = if track_live_seq {
+            Some(LiveSeq {
+                jetstream,
+                stream_name,
+                stream: live_stream,
+                after_seq: Arc::clone(&after_seq),
+                rebind_not_before: None,
+            })
+        } else {
+            None
+        };
+        let publisher = spawn_publisher(client.clone(), subject.clone(), live_seq);
         Self {
             client,
             subject,
-            after_seq: Arc::new(AtomicU64::new(seed)),
+            after_seq,
             publisher,
         }
     }
@@ -166,7 +214,8 @@ impl NatsEventSink {
     /// from the cached atomic; generation authority is checked before publish.
     pub async fn publish_event(&self, event: AgentEvent) {
         let envelope = self.envelope(event);
-        if let Err(error) = publish_live_envelope(&self.client, &self.subject, envelope).await {
+        if let Err(error) = publish_live_envelope(&self.client, &self.subject, envelope, None).await
+        {
             log::debug!("advisory event publish failed (lossy-OK): {error:#}");
         }
     }
@@ -220,9 +269,84 @@ impl NatsEventSink {
     }
 }
 
+/// Live per-publish re-stamp source for `after_seq`; see
+/// [`NatsEventSink::with_live_seq_tracking`]. The stream handle binds
+/// lazily: a construction-time lookup failure keeps `stream: None`, and the
+/// next publish retries the lookup, so a transient outage cannot disable
+/// tracking for the sink's whole lifetime.
+#[derive(Clone)]
+struct LiveSeq {
+    jetstream: jetstream::Context,
+    stream_name: String,
+    stream: Option<jetstream::stream::Stream>,
+    after_seq: Arc<AtomicU64>,
+    /// Earliest retry of an unbound `get_stream`. Publishing is a single
+    /// FIFO task, so a broker outage must not add one failed lookup per
+    /// advisory; until this instant the publish keeps the stamped sequence.
+    rebind_not_before: Option<tokio::time::Instant>,
+}
+
+/// How long an unbound live-seq source waits before retrying `get_stream`.
+const LIVE_SEQ_REBIND_BACKOFF: Duration = Duration::from_secs(5);
+
+impl LiveSeq {
+    /// Refresh `after_seq` from the stream's current `last_sequence`, binding
+    /// the stream handle first when a construction-time lookup failed. A
+    /// binding or refresh failure keeps the stamped sequence — advisories are
+    /// lossy by contract — and retries on the next publish.
+    async fn restamp(&mut self, envelope: &mut AdvisoryEnvelope) {
+        if self.stream.is_none() {
+            if self
+                .rebind_not_before
+                .is_some_and(|not_before| tokio::time::Instant::now() < not_before)
+            {
+                return;
+            }
+            match self.rebind().await {
+                Ok(()) => self.rebind_not_before = None,
+                Err(error) => {
+                    self.rebind_not_before =
+                        Some(tokio::time::Instant::now() + LIVE_SEQ_REBIND_BACKOFF);
+                    log::debug!(
+                        "live after_seq tracking unavailable for '{}': {error}; \
+                         advisories keep their previous stamp",
+                        self.stream_name
+                    );
+                    return;
+                }
+            }
+        }
+        match self
+            .stream
+            .as_mut()
+            .expect("rebind leaves a stream on success")
+            .info()
+            .await
+        {
+            Ok(info) => {
+                let seq = info.state.last_sequence;
+                self.after_seq.fetch_max(seq, Ordering::Relaxed);
+                envelope.after_seq = self.after_seq.load(Ordering::Relaxed);
+            }
+            Err(error) => {
+                log::debug!(
+                    "live after_seq refresh failed for '{}': {error:#}",
+                    self.stream_name
+                );
+            }
+        }
+    }
+
+    async fn rebind(&mut self) -> anyhow::Result<()> {
+        self.stream = Some(self.jetstream.get_stream(&self.stream_name).await?);
+        Ok(())
+    }
+}
+
 fn spawn_publisher(
     client: async_nats::Client,
     subject: String,
+    mut live_seq: Option<LiveSeq>,
 ) -> tokio::sync::mpsc::UnboundedSender<PublisherCommand> {
     let (publisher, mut rx) = tokio::sync::mpsc::unbounded_channel::<PublisherCommand>();
     // Ends when every clone of this sink is dropped and the channel closes.
@@ -233,7 +357,7 @@ fn spawn_publisher(
                 PublisherCommand::Event { envelope, delivery } => {
                     let result = tokio::time::timeout(
                         CONTROL_DELIVERY_TIMEOUT,
-                        publish_live_envelope(&client, &subject, *envelope),
+                        publish_live_envelope(&client, &subject, *envelope, live_seq.as_mut()),
                     )
                     .await;
                     let error = match result {
@@ -269,11 +393,21 @@ fn spawn_publisher(
 /// Interruption is a durable `Cancel` in the session log, and clients drop
 /// what it superseded by sequence (`LiveEventState`), so the publisher has no
 /// authority left to consult before sending.
+///
+/// With a live seq source, the envelope's `after_seq` is re-stamped from the
+/// stream's current `last_sequence` right before the publish, so caught-up
+/// clients do not fence the advisory away (J-A2). A failed refresh keeps the
+/// stamped sequence: advisories are lossy by contract, and blocking the single
+/// publisher FIFO on a control read would stall every later event.
 async fn publish_live_envelope(
     client: &async_nats::Client,
     subject: &str,
-    envelope: AdvisoryEnvelope,
+    mut envelope: AdvisoryEnvelope,
+    live_seq: Option<&mut LiveSeq>,
 ) -> Result<()> {
+    if let Some(live) = live_seq {
+        live.restamp(&mut envelope).await;
+    }
     publish_envelope(client, subject, envelope).await
 }
 

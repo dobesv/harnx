@@ -257,6 +257,11 @@ pub trait CheckpointStore: Send + Sync {
 #[derive(Clone, Default)]
 pub struct ToolInvocationContext {
     pub run_context: Option<AutonomousRunContext>,
+    /// Wire/RPC op id of this invocation (same as `ToolRequest::call_id`),
+    /// NOT the parent transcript's tool-call id: a retried or replayed call
+    /// mints a new one. Correlating a child row with the parent's transcript
+    /// call needs the transport-injected `__harnx_tool_call_id` hidden
+    /// argument instead.
     pub call_id: String,
     pub invoking_session_id: Option<String>,
     /// The caller's session identity (agent + local session id) for cid: URL construction.
@@ -507,9 +512,11 @@ pub const TOOL_TIMER_NOTICE_INTERVAL_MS: u64 = 10_000;
 ///
 /// Launcher tools are `session_new`, `session_prompt` and `session_send`
 /// (and their agent/package-prefixed forms). They are excluded from the
-/// generic tool-call timer because they already emit periodic progress, or —
-/// for `session_send` — because the receipt they return is a dispatch handle,
-/// not a child completion the timer could meaningfully age. `session_wait` and
+/// generic tool-call timer because they report their own progress: a
+/// synchronous `session_prompt` streams live child progress, and a
+/// dispatched `session_send` gets a background progress watcher whose row
+/// already shows the child's own state. A dispatch receipt is a handle, not
+/// a child completion the timer could meaningfully age. `session_wait` and
 /// `session_load` are observation tools and are deliberately NOT launchers.
 ///
 /// # Examples

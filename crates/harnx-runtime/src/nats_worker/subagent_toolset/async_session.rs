@@ -10,6 +10,7 @@
 
 pub(super) mod dispatch;
 pub(super) mod observation;
+mod progress;
 mod specs;
 
 pub(crate) use specs::{session_send_spec, session_wait_spec};
@@ -285,6 +286,17 @@ pub(crate) struct WaitArgs {
     pub(crate) include_partial: Option<bool>,
     #[serde(default)]
     pub(crate) read: Option<ReadOptions>,
+    /// Transport-owned routing arguments, declared because of
+    /// `deny_unknown_fields`; the server scrubs model-supplied values before
+    /// injecting them (see `add_parent_context_args` in harnx-toolset-server).
+    /// `session_wait` receives the parent transcript's tool call id so the
+    /// watcher it starts labels the child's row like the dispatch call did;
+    /// the parent scope itself is ignored, the caller's attested context is
+    /// the only authority.
+    #[serde(default, rename = "__harnx_parent_session_id")]
+    pub(crate) parent_session_id: Option<String>,
+    #[serde(default, rename = "__harnx_tool_call_id")]
+    pub(crate) tool_call_id: Option<String>,
 }
 
 impl WaitArgs {

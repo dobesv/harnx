@@ -170,10 +170,16 @@ fn parent_session_id_supports_raw_session_start_tools() {
             "expected support for {tool}"
         );
     }
-    // Observation and control tools must not receive transport-owned
-    // parent args.
+    // session_wait starts a progress watcher when its process did not dispatch
+    // the prompt, and that watcher labels the child's row with the parent
+    // transcript's call id.
+    assert!(
+        accepts_parent_session_id("session_wait"),
+        "session_wait needs the parent tool call id for its watcher's row"
+    );
+    // Observation and control tools that never start a watcher must not
+    // receive transport-owned parent args.
     for tool in [
-        "session_wait",
         "session_load",
         "session_cancel",
         "prompt",

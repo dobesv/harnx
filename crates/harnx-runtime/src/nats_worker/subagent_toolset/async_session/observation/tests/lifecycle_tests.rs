@@ -169,7 +169,7 @@ async fn prompt_identity_is_not_execution_identity_and_filters_never_classify_li
     };
     let mut admission =
         InvocationAdmission::new(&authority, "different-execution".into(), None, None);
-    admission.parent_storage_key = Some("trusted-parent".into());
+    admission.parent_storage_key = f.request.parent_session_id.clone();
     admission.prompt_content = Some(MessageContent::Text("original".into()));
     f.toolset
         .session_metadata

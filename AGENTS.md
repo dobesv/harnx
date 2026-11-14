@@ -1467,6 +1467,20 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    not synthetic conversion tests — strict-mode clients send `null` for
    omitted nested objects (see "Tool parameter schemas").
 
+6. **Dispatched prompts report progress from a parent-side watcher, not from
+   the child's turn** (issue #2664) — successful dispatch and an authorized
+   `session_wait` start (`async_session/progress.rs`) a
+   `SubagentProgressReporter` watcher, deduplicated per prompt in-process.
+   Keyed on `prompt_id` (the shared `invocation_id`), so dispatch and later
+   waits upsert one row. Terminal rows come only from the child prompt's
+   durable terminal evidence — a dispatch receipt and a soft-wait expiry are
+   tool results and never produce one. The watcher publishes out-of-band on
+   the parent's advisory subject and must re-stamp `after_seq` per publish
+   (`NatsEventSink::with_live_seq_tracking`), or caught-up clients fence its
+   advisories away silently; its durable scan builds a fresh `Budget` per
+   pass (`WatchScan::refresh`) because a budget deadline is absolute from
+   construction.
+
 ### Changing a JetStream consumer's configuration
 
 `Stream::get_or_create_consumer` returns an existing consumer unchanged, so a
