@@ -8,11 +8,14 @@ use super::super::WaitLimit;
 
 // Same per-operation bound as the durable log reader. A snapshot budget gets
 // one logical pass under this bound, not a fresh bound per read.
-const IO_LIMIT: Duration = Duration::from_secs(10);
+pub(in crate::nats_worker::subagent_toolset) const IO_LIMIT: Duration = Duration::from_secs(10);
 pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// What ends an observation besides its own limit. Visible one level above
+/// `observation` because the watcher's `WatchScan::refresh` reports a
+/// transient `Err(Stop)` to the poll loop in `async_session::progress`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Stop {
+pub(in crate::nats_worker::subagent_toolset) enum Stop {
     Expired,
     Cancelled,
     Unavailable,
@@ -73,12 +76,23 @@ impl Budget {
     }
 
     /// One logical pass under the shared I/O cap, for reads that must never
-    /// wait on the child.
+    /// wait on the child. The pass deadline is absolute from this call, so a
+    /// long-lived poller must build a fresh budget per pass (keeping its own
+    /// read cursor) — reusing one built at startup fails every read past the
+    /// first pass. See `WatchScan::refresh` in `load.rs` for the pattern.
     pub(super) fn snapshot(cancel: CancellationToken) -> Self {
+        Self::snapshot_with_pass_limit(cancel, IO_LIMIT)
+    }
+
+    /// Like [`Budget::snapshot`], but the pass bound comes from the caller.
+    /// The watcher's durable scan uses this so tests can pin a bound far
+    /// below its poll cadence and span several limits in milliseconds
+    /// instead of sleeping out the default.
+    pub(super) fn snapshot_with_pass_limit(cancel: CancellationToken, limit: Duration) -> Self {
         let start = Instant::now();
         Self {
             start,
-            limit_deadline: Some(start + IO_LIMIT),
+            limit_deadline: Some(start + limit),
             stops: BudgetStops {
                 cancel,
                 ..Default::default()

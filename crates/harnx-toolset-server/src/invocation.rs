@@ -262,14 +262,21 @@ pub(super) fn add_parent_context_args(
 }
 
 pub(super) fn accepts_parent_session_id(tool: &str) -> bool {
-    // Sub-agent toolsets reserve these raw names for calls that can start a
-    // child turn. `session_send` is included because async dispatch needs the
-    // transport-owned `__harnx_tool_call_id` to label the child session against
-    // the transcript call (cancels and journal replay resolve by that id), even
-    // though its storage scope comes from the attested context, never the args.
-    // `session_wait`/`session_load` only observe; they get no hidden args.
+    // Sub-agent toolsets reserve these raw names for calls that can start or
+    // observe a child turn. `session_send` needs the transport-owned
+    // `__harnx_tool_call_id` to label the child session against the
+    // transcript call (cancels and journal replay resolve by that id), even
+    // though its storage scope comes from the attested context, never the
+    // args. `session_wait` gets the same id so the progress watcher a wait
+    // starts (a restarted parent waits on a child it never dispatched)
+    // labels its row exactly like the dispatch call did; without it, web and
+    // ACP frontends see updates for an unknown/inert tool call id.
+    // `session_load` never starts a watcher and gets no hidden args.
     matches!(
         tool,
-        SUBAGENT_SESSION_PROMPT_TOOL | SUBAGENT_SESSION_NEW_TOOL | SUBAGENT_SESSION_SEND_TOOL
+        SUBAGENT_SESSION_PROMPT_TOOL
+            | SUBAGENT_SESSION_NEW_TOOL
+            | SUBAGENT_SESSION_SEND_TOOL
+            | SUBAGENT_SESSION_WAIT_TOOL
     )
 }

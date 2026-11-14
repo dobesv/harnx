@@ -165,6 +165,72 @@ fn linked_history(key: &MonitoredSessionKey) -> Vec<TranscriptItem> {
     )
 }
 
+/// A settled async `session_wait` result has no `response` key, but the wait
+/// attaches the `sub_agent` marker and a terminal `sub_agent_progress`
+/// summary. The history rebuild must restore the child's row from that pair
+/// exactly like it does for a synchronous child completion.
+#[test]
+fn settled_async_wait_result_rebuilds_history_row() {
+    use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+    use harnx_core::tool::{ToolCall, ToolResult};
+    use std::collections::HashMap;
+
+    let key = monitored_key("metis", "asyncchild");
+    let progress = subagent_progress(&key, "prompt-1", SubAgentProgressStatus::Done, 1_250);
+    let output = serde_json::json!({
+        "session_id": "asyncchild",
+        "prompt_id": "prompt-1",
+        "status": "completed",
+        "terminal": true,
+        "wait_expired": false,
+        "elapsed_ms": 1_250,
+        "sub_agent": {
+            "agent": "metis",
+            "session_id": "asyncchild",
+        },
+        "sub_agent_progress": serde_json::to_value(&progress).unwrap(),
+    });
+    let call = ToolCall::new("session_wait".into(), serde_json::Value::Null, None, None);
+    let messages = vec![Message::new(
+        MessageRole::Tool,
+        MessageContent::ToolCalls(MessageContentToolCalls::new(
+            vec![ToolResult::new(call, output)],
+            String::new(),
+            None,
+        )),
+    )];
+    let items = crate::lifecycle::messages_to_transcript_items_for_cluster(
+        &messages,
+        &HashMap::new(),
+        Some(&key.cluster),
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::ToolCall { tool_name, .. } if tool_name == "session_wait")),
+        "the wait call itself rebuilds: {items:?}"
+    );
+    let row = items
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::SubAgentSession {
+                key: row_key,
+                status,
+                invocation_id,
+                progress,
+            } => Some((row_key, status, invocation_id, progress)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no sub-agent row rebuilt from the settled wait: {items:?}"));
+    assert_eq!(row.0, &key);
+    assert_eq!(row.1, &SubAgentStatus::Completed);
+    assert_eq!(row.2.as_deref(), Some("prompt-1"));
+    let progress = row.3.as_ref().expect("row carries the terminal progress");
+    assert_eq!(progress.snapshot.status, SubAgentProgressStatus::Done);
+    assert_eq!(progress.snapshot.elapsed_ms, 1_250);
+    assert_eq!(progress.snapshot.invocation_id, "prompt-1");
+}
+
 #[tokio::test]
 async fn subagent_reply_does_not_replace_adjacent_equal_tool_result() {
     let mut tui = crate::types::Tui::init(&test_config()).await.unwrap();

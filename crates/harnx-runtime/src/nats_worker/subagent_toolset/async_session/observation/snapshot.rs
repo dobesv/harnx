@@ -6,6 +6,7 @@ use super::{
 };
 use crate::nats_session_log::{LogWindow, NatsSessionLog, SCAN_BYTE_LIMIT, SCAN_RECORD_LIMIT};
 use crate::nats_session_metadata::InvocationAdmission;
+use harnx_core::api_types::CompletionTokenUsage;
 use harnx_core::session::SessionLogEntry;
 
 /// Error code for a live state the bounded scan cannot prove.
@@ -16,6 +17,10 @@ pub(super) struct Snapshot {
     pub(super) prompt: Option<u64>,
     pub(super) through: u64,
     pub(super) terminal: Option<(u64, SessionPromptStatus)>,
+    /// The durable turn total, when the terminal row is a `TurnEnd` that
+    /// carries one. Authoritative usage for a settled prompt, unlike the
+    /// lossy per-request advisory estimates.
+    pub(super) terminal_usage: Option<CompletionTokenUsage>,
     pub(super) complete: bool,
     gap: bool,
     unsafe_live: bool,
@@ -101,8 +106,15 @@ impl Snapshot {
         if crate::nats_session::invocation_terminal_seq(std::slice::from_ref(&row), prompt)
             .is_some()
         {
-            self.terminal = (!self.gap && !self.identity_mismatch)
-                .then(|| (seq, terminal_status(&row.1, &scope.admission)));
+            if !self.gap && !self.identity_mismatch {
+                if let SessionLogEntry::TurnEnd {
+                    usage: Some(usage), ..
+                } = &row.1
+                {
+                    self.terminal_usage = Some(usage.clone());
+                }
+                self.terminal = Some((seq, terminal_status(&row.1, &scope.admission)));
+            }
             return;
         }
         self.track_live_round(seq, row.1);
@@ -250,6 +262,18 @@ impl Snapshot {
 
     pub(super) fn output_end(&self) -> u64 {
         self.terminal.map_or(self.through, |(seq, _)| seq)
+    }
+
+    /// The prompt's durable terminal classification with the `TurnEnd` usage
+    /// total, when the scan proved one. `Failed`/`Cancelled`/`TimedOut`
+    /// terminals have no `TurnEnd`, so the usage is `None` there — callers
+    /// fall back to the live watcher's accumulated estimate instead of
+    /// reporting zero.
+    pub(super) fn terminal_evidence(
+        &self,
+    ) -> Option<(SessionPromptStatus, Option<CompletionTokenUsage>)> {
+        self.terminal
+            .map(|(_, status)| (status, self.terminal_usage.clone()))
     }
 }
 

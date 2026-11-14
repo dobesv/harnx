@@ -382,6 +382,65 @@ async fn nats_event_sink_publishes_to_correct_subject() -> Result<()> {
     Ok(())
 }
 
+/// Live after_seq tracking rebinds after a construction-time lookup failure:
+/// a sink built before the session's durable stream exists starts unbound,
+/// and once the stream appears the next publish restamps `after_seq` from
+/// its current `last_sequence` instead of keeping the stale stamp forever.
+#[tokio::test]
+async fn live_seq_tracking_rebinds_after_initial_lookup_failure() -> Result<()> {
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not found");
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+
+    let session_id = format!("test-{}", uuid::Uuid::new_v4());
+    let mut sub = client.subscribe(events_subject(&session_id)).await?;
+
+    // Constructed while the durable stream does not exist yet: the live-seq
+    // lookup fails and the sink keeps its construction-time stamp (0).
+    let sink = harnx_runtime::nats_event_sink::NatsEventSink::with_live_seq_tracking(
+        client.clone(),
+        jetstream.clone(),
+        session_id.clone(),
+    )
+    .await;
+
+    // The stream appears later, and its durable log advances.
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::new_with_replicas(
+        jetstream.clone(),
+        &session_id,
+        1,
+    );
+    log.load_events_async().await?;
+    log.append_event_async(&SessionLogEntry::Message {
+        id: Some("m1".into()),
+        role: MessageRole::User,
+        content: MessageContent::Text("durable entry".into()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await?;
+
+    // The advisory published now must have rebound and restamped from the
+    // stream's current last_sequence, so caught-up clients cannot fence it.
+    sink.emit_required(AgentEvent::Notice(NoticeEvent::Info("after rebind".into())));
+    sink.flush().await?;
+    let msg = timeout(Duration::from_secs(2), sub.next())
+        .await
+        .expect("advisory should arrive")
+        .expect("subscription stays open");
+    let envelope = AdvisoryEnvelope::from_bytes(&msg.payload)?;
+    assert!(
+        envelope.after_seq >= 1,
+        "rebound tracking restamps from the stream's last_sequence, got after_seq {}",
+        envelope.after_seq
+    );
+
+    Ok(())
+}
+
 /// Test: Multiple events maintain ordering.
 #[tokio::test]
 async fn multiple_events_maintain_ordering() -> Result<()> {
