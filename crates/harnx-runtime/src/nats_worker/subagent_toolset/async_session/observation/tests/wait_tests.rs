@@ -168,7 +168,11 @@ async fn missing_or_inconsistent_context_wrong_agent_session_token_and_missing_b
     for (key, value) in [
         ("session_id", "wrong-session"),
         ("prompt_id", "wrong-token"),
-        ("__harnx_parent_session_id", "trusted-parent"),
+        // The hidden transport argument is declared now (the server injects
+        // it so a wait-started watcher can label its row), so the parse no
+        // longer rejects it — but a value that disagrees with the trusted
+        // scope still fails closed.
+        ("__harnx_parent_session_id", "untrusted-parent"),
     ] {
         let mut args = f.wait_args(json!({"seconds": 1}));
         args[key] = json!(value);
@@ -350,5 +354,61 @@ async fn new_message_pending_before_send_wait_returns_the_dispatched_handle() ->
     assert_pending(&result, false);
     assert_eq!(result["stopped_by"], "new_message");
     assert!(result["elapsed_ms"].as_u64().unwrap() < 20_000, "{result}");
+    Ok(())
+}
+
+/// The byte-budget drop order of a settled result's terminal attachment:
+/// presentation (`sub_agent_progress`) goes first, the history-rebuild
+/// marker (`sub_agent`) only when both cannot fit (R2-T1).
+#[tokio::test]
+async fn settled_marker_survives_one_budget_drop_but_not_two() -> Result<()> {
+    let f = Fixture::new().await?;
+    let evidence = |max_bytes| TerminalSummary {
+        child: progress::ChildIdentity {
+            agent: f.toolset.agent.clone(),
+            session_id: "child".into(),
+            prompt_id: "original-prompt".into(),
+        },
+        status: SessionPromptStatus::Completed,
+        usage: None,
+        live: None,
+        max_bytes,
+    };
+    let base = json!({
+        "status": "completed",
+        "session_id": "child",
+        "prompt_id": "original-prompt",
+        "output": "child's final answer",
+    });
+    let mut full = base.clone();
+    attach_terminal_progress(&mut full, &f.toolset, evidence(usize::MAX));
+    assert!(full.get("sub_agent").is_some());
+    assert!(full.get("sub_agent_progress").is_some());
+    let full_bytes = serialized(&full);
+
+    // One byte short of the full result: the progress drops, the marker stays.
+    let marker_only_bytes = {
+        let mut marker_only = base.clone();
+        attach_terminal_progress(&mut marker_only, &f.toolset, evidence(full_bytes - 1));
+        assert!(
+            marker_only.get("sub_agent_progress").is_none(),
+            "progress is the first field to drop"
+        );
+        assert!(
+            marker_only.get("sub_agent").is_some(),
+            "the marker fits, so it survives the first drop"
+        );
+        serialized(&marker_only)
+    };
+
+    // One byte short of marker-only: both drop, the base result survives.
+    let mut bare = base.clone();
+    attach_terminal_progress(&mut bare, &f.toolset, evidence(marker_only_bytes - 1));
+    assert!(bare.get("sub_agent").is_none());
+    assert!(bare.get("sub_agent_progress").is_none());
+    assert_eq!(
+        bare, base,
+        "the result itself is never truncated by the attachment"
+    );
     Ok(())
 }

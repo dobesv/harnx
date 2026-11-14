@@ -10,6 +10,7 @@ mod joined_tests;
 mod lifecycle_tests;
 mod repair_tests;
 mod wait_tests;
+mod watcher_tests;
 
 mod live_tests;
 mod metadata_tests;
