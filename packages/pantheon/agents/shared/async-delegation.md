@@ -5,8 +5,14 @@ tools when you don't need the child's reply to continue your own turn.
 
 ## Preferred flow
 
-Send with `wait: {}` to wait up to 240 seconds, or `wait: {forever: true}` when there is
-nothing else to do until the child finishes. Leave `timeout_secs` omitted, so the child's
+Send with `wait: {}` to wait up to 240 seconds. For work expected to finish within roughly
+two hours, repeat 240-second waits until it finishes, even when there is nothing else to do.
+Returning to the model between waits can keep its prompt cache warm and avoid paying to
+reprocess the full context after a long idle wait; savings depend on the provider's cache
+lifetime and pricing. Reserve `wait: {forever: true}` for waits expected to last roughly two
+hours or longer with no other work to do; an unknown duration alone is not a reason to use it.
+
+Leave `timeout_secs` omitted, so the child's
 hard execution deadline stays inherited from the target agent's policy. Never invent a
 shortened run limit; the wait is observation time only and never cancels the child or extends
 its deadline.
@@ -22,7 +28,7 @@ its deadline.
   deadline; `timeout_secs` doesn't extend it.
 - The result is a durable handle: `session_id` + `prompt_id`. Keep it.
 - If the wait expires (`wait_expired: true`, `status: "pending"`), re-wait on the same handle
-  with `{agent}_session_wait`, passing `seconds` (1 to 240, default 240) or `forever: true` at
+  with `{agent}_session_wait`, passing `seconds` (1 to 240, default 240) at
   the top level. Repeated waits recover the same result and never consume it.
 - A wait that returns `stopped_by: "new_message"` ended because a new message arrived for you.
   Read it before waiting again.
