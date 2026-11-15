@@ -61,3 +61,26 @@ class TestClientSupport(unittest.TestCase):
         self.assertEqual(kinds["cohere"], {None, "reranker"})
         refreshed = um.regenerate_provider_models("cohere", old, fetched["cohere"], kinds["cohere"])
         self.assertEqual({model["name"] for model in refreshed}, {"command-a-03-2025"})
+
+    def test_a_provider_whose_entries_are_all_deprecated_is_still_covered(self) -> None:
+        registry = {
+            "jamba-large": registry_entry("ai21", {"deprecation_date": "2020-01-01"}),
+        }
+        old = {
+            "jamba-large": {"name": "jamba-large"},
+            "jamba-embed": {"name": "jamba-embed", "type": "embedding"},
+        }
+        fetched, _ = um.collect_provider_models(registry, {"ai21": old})
+        self.assertNotIn("ai21", fetched)
+        refreshed = um.regenerate_provider_models(
+            "ai21", old, fetched.get("ai21"), um.registry_kinds(registry)["ai21"]
+        )
+        # The chat model is dropped; the embedding kind the registry doesn't
+        # list stays hand-maintained.
+        self.assertEqual([model["name"] for model in refreshed], ["jamba-embed"])
+
+    def test_a_provider_the_registry_doesnt_list_is_kept_as_it_is(self) -> None:
+        old = {"jamba-large": {"name": "jamba-large"}}
+        kinds = um.registry_kinds({})
+        refreshed = um.regenerate_provider_models("ai21", old, None, kinds.get("ai21"))
+        self.assertEqual(refreshed, [old["jamba-large"]])

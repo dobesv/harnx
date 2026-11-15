@@ -831,18 +831,21 @@ def regenerate_provider_models(
     listed_kinds: set[str | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Rebuild one provider from the registry, or keep it as it is when the
-    registry has nothing for it.
+    registry lists nothing for it.
 
     For each kind of model (chat, embedding, reranker) the registry lists for
     a provider, the registry is the whole list: a model it stops listing is
     dropped with its aliases, and the diff summary reports it as removed.
-    Hand-maintained entries are for providers and kinds it doesn't list, such
-    as Jina's embedding models.
+    That holds when every entry of a kind is deprecated or uncallable, so
+    `fetched_models` can be empty while `listed_kinds` isn't. Hand-maintained
+    entries are for providers and kinds it doesn't list, such as Jina's
+    embedding models.
     """
-    if not fetched_models:
-        return [copy.deepcopy(old_models[name]) for name in sorted(old_models, key=provider_sort_key)]
+    fetched_models = fetched_models or {}
     if listed_kinds is None:
         listed_kinds = {model.get("type") for model in fetched_models.values()}
+    if not listed_kinds:
+        return [copy.deepcopy(old_models[name]) for name in sorted(old_models, key=provider_sort_key)]
     models = _models_of_unlisted_kinds(old_models, listed_kinds)
     models.update(_registry_base_models(provider, fetched_models))
     return _regenerate_model_variants(provider, models)
