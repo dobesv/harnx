@@ -1,5 +1,7 @@
 name: jira_view
 description: View a Jira work item
+output:
+  max_output_bytes: 65536
 parameters:
   key:    { type: string, required: true, pattern: "^[A-Z][A-Z0-9]+-[0-9]+$", description: "Issue key e.g. FDEV-1234" }
   fields: { type: string, required: false, description: "Comma-separated fields; default summary,description,status,assignee,comment" }

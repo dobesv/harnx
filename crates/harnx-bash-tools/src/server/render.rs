@@ -198,6 +198,12 @@ pub(crate) fn grep_filter(content: &str, grep_regex: &Regex) -> String {
         .join("\n")
 }
 
+pub(crate) struct StreamLogHints<'a> {
+    pub(crate) execution_id: &'a str,
+    pub(crate) stdout_log_path: &'a Path,
+    pub(crate) stderr_log_path: &'a Path,
+}
+
 /// Render separate stdout and stderr blocks, each grep-filtered and truncated independently.
 /// Returns (rendered_string, stdout_lines, stderr_lines, stdout_bytes, stderr_bytes).
 /// Metrics reflect post-grep content so callers see accurate totals.
@@ -206,9 +212,7 @@ pub(crate) fn render_streams_block(
     stderr: &str,
     truncate_opts: &TruncateOpts,
     grep_regex: Option<&Regex>,
-    execution_id: &str,
-    stdout_log_path: &Path,
-    stderr_log_path: &Path,
+    log_hints: Option<StreamLogHints<'_>>,
 ) -> (String, usize, usize, usize, usize) {
     let stdout_filtered = grep_regex
         .map(|r| grep_filter(stdout, r))
@@ -226,13 +230,17 @@ pub(crate) fn render_streams_block(
         "stdout",
         &stdout_filtered,
         truncate_opts,
-        Some((execution_id, stdout_log_path)),
+        log_hints
+            .as_ref()
+            .map(|hint| (hint.execution_id, hint.stdout_log_path)),
     );
     let stderr_block = render_stream_block(
         "stderr",
         &stderr_filtered,
         truncate_opts,
-        Some((execution_id, stderr_log_path)),
+        log_hints
+            .as_ref()
+            .map(|hint| (hint.execution_id, hint.stderr_log_path)),
     );
 
     let rendered = format!("{stdout_block}\n\n{stderr_block}");
@@ -305,9 +313,7 @@ pub(crate) struct TimeoutRenderContext<'a> {
     pub(crate) timeout_secs: u64,
     pub(crate) total_lines: usize,
     pub(crate) total_bytes: usize,
-    pub(crate) stdout: &'a str,
-    pub(crate) stderr: &'a str,
-    pub(crate) truncate_opts: &'a TruncateOpts,
+    pub(crate) streams_block: &'a str,
     pub(crate) stdout_log_path: &'a Path,
     pub(crate) stderr_log_path: &'a Path,
 }
@@ -320,9 +326,7 @@ pub(crate) fn render_timeout_message(ctx: TimeoutRenderContext<'_>) -> String {
         timeout_secs,
         total_lines,
         total_bytes,
-        stdout,
-        stderr,
-        truncate_opts,
+        streams_block,
         stdout_log_path,
         stderr_log_path,
     } = ctx;
@@ -346,15 +350,6 @@ pub(crate) fn render_timeout_message(ctx: TimeoutRenderContext<'_>) -> String {
             total_bytes: Some(total_bytes),
             running_for: None,
         },
-    );
-    let (streams_block, _, _, _, _) = render_streams_block(
-        stdout,
-        stderr,
-        truncate_opts,
-        None,
-        execution_id,
-        stdout_log_path,
-        stderr_log_path,
     );
     let _ = write!(output, "\n{streams_block}");
     output

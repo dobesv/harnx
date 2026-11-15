@@ -21,6 +21,7 @@ impl BashServer {
                 params.tail_lines,
                 params.max_output_bytes,
             ),
+            include_log_hints: true,
             template_sandbox: None,
             on_user_message: OnUserMessage::Ignore,
         })
@@ -44,12 +45,12 @@ impl BashServer {
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         let command = registered
             .template
-            .render_script(&bound)
+            .render_script(&bound.env)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
 
         // Parameter bindings take precedence over author-supplied top-level env.
         let mut extra_env = registered.template.env.clone().unwrap_or_default();
-        extra_env.extend(bound);
+        extra_env.extend(bound.env);
         if !registered.sandbox_enabled {
             log::warn!("tool '{name}' runs UNSANDBOXED (sandbox.enabled=false)");
             if registered.ignored_grants {
@@ -63,7 +64,12 @@ impl BashServer {
             working_dir: None,
             extra_env: Some(&extra_env),
             timeout_secs: Some(timeout_secs),
-            truncate_opts: Self::truncate_opts_from(None, None, None),
+            truncate_opts: Self::truncate_opts_from(
+                bound.output.head_lines,
+                bound.output.tail_lines,
+                bound.output.max_output_bytes,
+            ),
+            include_log_hints: false,
             template_sandbox: Some(TemplateSandbox {
                 enabled: registered.sandbox_enabled,
                 read_paths: &registered.read_paths,
@@ -132,9 +138,11 @@ impl BashServer {
                 &stderr_str,
                 &params.truncate_opts,
                 None,
-                &execution_id,
-                &stdout_log_path,
-                &stderr_log_path,
+                params.include_log_hints.then_some(StreamLogHints {
+                    execution_id: &execution_id,
+                    stdout_log_path: &stdout_log_path,
+                    stderr_log_path: &stderr_log_path,
+                }),
             );
         let total_lines = stdout_lines + stderr_lines;
         let total_bytes = stdout_bytes_len + stderr_bytes_len;
@@ -147,9 +155,7 @@ impl BashServer {
                 timeout_secs: deadline_secs,
                 total_lines,
                 total_bytes,
-                stdout: &stdout_str,
-                stderr: &stderr_str,
-                truncate_opts: &params.truncate_opts,
+                streams_block: &streams_block,
                 stdout_log_path: &stdout_log_path,
                 stderr_log_path: &stderr_log_path,
             });
@@ -371,9 +377,7 @@ impl BashServer {
             timeout_secs: ctx.timeout_secs,
             total_lines: ctx.total_lines,
             total_bytes: ctx.total_bytes,
-            stdout: ctx.stdout,
-            stderr: ctx.stderr,
-            truncate_opts: ctx.truncate_opts,
+            streams_block: ctx.streams_block,
             stdout_log_path: ctx.stdout_log_path,
             stderr_log_path: ctx.stderr_log_path,
         }))

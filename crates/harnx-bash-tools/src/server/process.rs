@@ -320,9 +320,11 @@ impl BashServer {
                 &stderr_content,
                 &truncate_opts,
                 grep_regex,
-                execution_id,
-                &entry.stdout_log_path,
-                &entry.stderr_log_path,
+                Some(StreamLogHints {
+                    execution_id,
+                    stdout_log_path: &entry.stdout_log_path,
+                    stderr_log_path: &entry.stderr_log_path,
+                }),
             );
         WaitOutput {
             streams_block,

@@ -1,0 +1,170 @@
+mod defaults;
+
+use super::*;
+
+const LONG_LINES: &str = "printf '%05000d\\n' 0; printf '%05000d\\n' 0 >&2";
+
+async fn template_tools(root: &Path, script: &str) -> (BashServer, BashToolset) {
+    let path = root.join("output.yaml");
+    write_template(&path, "output", "", script);
+    let templates = discover_tool_templates(None, &[path], &[]).unwrap();
+    let server =
+        BashServer::new_with_templates(sandbox_config_for(root), templates.clone()).unwrap();
+    let toolset = BashToolset::new(sandbox_config_for(root), templates)
+        .await
+        .unwrap();
+    (server, toolset)
+}
+
+fn assistant_text(result: &Value) -> &str {
+    result["content"][0]["text"].as_str().unwrap()
+}
+
+fn assert_template_long_lines(result: &Value, full: bool) {
+    assert_ne!(result["isError"], true, "{result}");
+    let text = assistant_text(result);
+    assert_eq!(
+        text.matches(&"0".repeat(5000)).count(),
+        if full { 2 } else { 0 }
+    );
+    assert_eq!(text.contains("removed from line"), !full, "{text}");
+    assert!(!text.contains("read_exec_log"), "{text}");
+    if !full {
+        assert!(
+            text.contains("Use max_output_bytes, head_lines, or tail_lines to see more]"),
+            "{text}"
+        );
+    }
+    assert!(text.contains("execution_id:"), "{text}");
+    assert!(text.contains("stdout_log_path:"), "{text}");
+}
+
+#[tokio::test]
+async fn template_output_controls_recover_long_lines_on_native_and_mcp_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, toolset) = template_tools(dir.path(), LONG_LINES).await;
+    for (args, full) in [
+        (json!({}), false),
+        (json!({"max_output_bytes": 65536}), true),
+    ] {
+        let result = toolset
+            .invoke("output", args.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_template_long_lines(&result, full);
+        let result = mcp_call_template(server.clone(), "output", args)
+            .await
+            .unwrap();
+        assert_template_long_lines(&result, full);
+    }
+    let result = toolset
+        .invoke(
+            "exec",
+            json!({"command": LONG_LINES}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let text = assistant_text(&result);
+    assert!(text.contains("Use max_output_bytes, head_lines, or tail_lines to see more; full log via read_exec_log: execution_id="), "{text}");
+    toolset.cleanup_log_dir().await.unwrap();
+}
+
+#[tokio::test]
+async fn template_output_controls_apply_head_tail_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let toolset = template_tools(dir.path(), "printf 'first\\nmiddle\\nlast\\n'")
+        .await
+        .1;
+    for (args, kept, dropped) in [
+        (json!({"head_lines": 1, "tail_lines": 0}), "first", "last"),
+        (json!({"head_lines": 0, "tail_lines": 1}), "last", "first"),
+    ] {
+        let result = toolset
+            .invoke("output", args, CancellationToken::new())
+            .await
+            .unwrap();
+        let text = assistant_text(&result);
+        let stdout = text.split("<!-- start stdout -->").nth(1).unwrap();
+        assert!(stdout.contains(kept), "{text}");
+        assert!(!stdout.contains(dropped), "{text}");
+        assert!(!stdout.contains("middle"), "{text}");
+        assert!(!stdout.contains("read_exec_log"), "{text}");
+    }
+    toolset.cleanup_log_dir().await.unwrap();
+}
+
+#[tokio::test]
+async fn template_output_controls_do_not_enter_script_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let toolset = template_tools(dir.path(), "printf 'controls=%s:%s:%s\\n' \"${HEAD_LINES-unset}\" \"${TAIL_LINES-unset}\" \"${MAX_OUTPUT_BYTES-unset}\"").await.1;
+    let result = toolset
+        .invoke(
+            "output",
+            json!({"head_lines": 1, "tail_lines": 1, "max_output_bytes": 65536}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        assistant_text(&result).contains("controls=unset:unset:unset"),
+        "{result}"
+    );
+    toolset.cleanup_log_dir().await.unwrap();
+}
+
+#[tokio::test]
+async fn template_output_controls_return_invalid_params_before_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let toolset = template_tools(dir.path(), "touch ran.marker").await.1;
+    for name in ["head_lines", "tail_lines", "max_output_bytes"] {
+        for bad in [
+            json!(-1),
+            json!(1.5),
+            json!("4"),
+            json!(true),
+            json!([]),
+            json!({}),
+        ] {
+            let error = toolset
+                .invoke("output", json!({name: bad}), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolInvokeError::Recoverable(_)), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("invalid type for parameter `{name}`:")),
+                "{error}"
+            );
+        }
+    }
+    assert!(!dir.path().join("ran.marker").exists());
+    toolset.cleanup_log_dir().await.unwrap();
+}
+
+#[tokio::test]
+async fn template_timeout_truncation_uses_output_controls_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let toolset = template_tools(dir.path(), &format!("{LONG_LINES}; sleep 30"))
+        .await
+        .1;
+    let result = toolset
+        .invoke(
+            "output",
+            json!({"timeout_secs": 1}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["isError"], true, "{result}");
+    let text = assistant_text(&result);
+    assert!(text.contains("timed out after 1s"), "{text}");
+    assert!(text.contains("removed from line"), "{text}");
+    assert!(
+        text.contains("Use max_output_bytes, head_lines, or tail_lines to see more]"),
+        "{text}"
+    );
+    assert!(!text.contains("read_exec_log"), "{text}");
+    toolset.cleanup_log_dir().await.unwrap();
+}

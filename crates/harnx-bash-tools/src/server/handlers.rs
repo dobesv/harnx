@@ -7,6 +7,7 @@ pub(crate) struct ExecPipelineParams<'a> {
     pub(crate) extra_env: Option<&'a HashMap<String, String>>,
     pub(crate) timeout_secs: Option<u64>,
     pub(crate) truncate_opts: TruncateOpts,
+    pub(crate) include_log_hints: bool,
     pub(crate) template_sandbox: Option<TemplateSandbox<'a>>,
     pub(crate) on_user_message: OnUserMessage,
 }
@@ -32,9 +33,7 @@ pub(crate) struct TimeoutResultCtx<'a> {
     pub(crate) timeout_secs: u64,
     pub(crate) total_lines: usize,
     pub(crate) total_bytes: usize,
-    pub(crate) stdout: &'a str,
-    pub(crate) stderr: &'a str,
-    pub(crate) truncate_opts: &'a TruncateOpts,
+    pub(crate) streams_block: &'a str,
     pub(crate) stdout_log_path: &'a Path,
     pub(crate) stderr_log_path: &'a Path,
 }

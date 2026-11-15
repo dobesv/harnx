@@ -35,7 +35,7 @@ pub(crate) fn synthesize_bash_declaration(inner_tools: &[ToolDeclaration]) -> To
             },
             "max_output_bytes": {
                 "type": "integer",
-                "description": "Truncate the script output to this many bytes."
+                "description": "Truncate the script output to this many bytes. Setting this also returns long lines in full, subject to the byte cap and line window."
             }
         },
         "required": ["script"]
