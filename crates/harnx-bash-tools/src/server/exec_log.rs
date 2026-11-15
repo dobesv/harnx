@@ -269,7 +269,12 @@ impl BashServer {
         tail_lines: Option<usize>,
         max_output_bytes: Option<usize>,
     ) -> TruncateOpts {
-        let default_opts = TruncateOpts::default();
+        let mut default_opts = TruncateOpts::default();
+        // An explicit byte budget is the recovery path for long lines.
+        if max_output_bytes.is_some() {
+            default_opts.line_head_bytes = 0;
+            default_opts.line_tail_bytes = 0;
+        }
         TruncateOpts {
             head_lines: head_lines.unwrap_or(default_opts.head_lines),
             tail_lines: tail_lines.unwrap_or(default_opts.tail_lines),

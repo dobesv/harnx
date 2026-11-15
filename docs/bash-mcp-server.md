@@ -108,7 +108,7 @@ Built-in tool names are reserved: a command template named `exec`, `spawn`, `sta
 
 ## Built-in tools and execution model
 
-`harnx-bash-tools` exposes seven built-in tools for running and managing commands:
+`harnx-bash-tools` exposes seven built-in tools for running and managing commands, as well as command templates loaded from YAML:
 
 | Tool | Purpose | Key parameters |
 | :--- | :--- | :--- |
@@ -119,8 +119,11 @@ Built-in tool names are reserved: a command template named `exec`, `spawn`, `sta
 | `terminate` | Stop a background process | `execution_id`, `signal` (`SIGTERM` default, `SIGKILL`, `SIGINT`, `SIGHUP`) |
 | `read_exec_log` | Read server-owned execution logs | `execution_id`, `stream` (`stdout`/`stderr`), paging and filter options |
 | `rollback_file` | Restore a repository to a prior harnx history snapshot | `commit_id` (the SHA from the `commit <sha>` line of a prior tool response's diff) |
+| Command templates | Predefined script execution | Declared template parameters, plus reserved controls (`timeout_secs`, `head_lines`, `tail_lines`, `max_output_bytes`) |
 
 `spawn`, `status` and `wait` reject arguments they do not declare. In particular, `wait` no longer takes `timeout_secs` (use `seconds`), and a nested `wait` object does not either.
+
+Output filters (`head_lines`, `tail_lines`, `max_output_bytes`) shape the returned text across `exec`, `spawn` wait, `status`, `wait`, `read_exec_log`, and command templates. When `max_output_bytes` is provided explicitly, per-line clipping is disabled across all bash tools and the in-process `bash` script tool, allowing long single lines to be returned in full subject to the byte cap and line window.
 
 ### Deadlines versus waits
 
@@ -168,6 +171,50 @@ Finished processes stay tracked, so `status` and repeated `wait` calls keep retu
 ### Foreground execution (`exec`)
 
 `exec` runs commands synchronously with a 24-hour default deadline. It is best suited for quick one-off commands (such as git checks, ast-grep queries, and single utility calls) where process lifecycle tracking is unnecessary. For tests, builds, and commands that may run long or stall, prefer `spawn` with nested `wait`.
+
+## Shell command templates
+
+Command templates define custom fixed shell command shapes in YAML files discovered in `$HARNX_PACKAGE_DIR/bash_tools/*.yaml` or specified via `--tool`/`--tools-dir`. Each template registers as a distinct tool with a typed input schema.
+
+### Reserved template parameters
+
+Every command template automatically injects four reserved parameters into its schema:
+
+- `timeout_secs`: Kill deadline in seconds (1 to 86400, default 86400).
+- `head_lines`: First N lines of each stream to return (default 25).
+- `tail_lines`: Last N lines of each stream to return (default 75).
+- `max_output_bytes`: Output byte limit (default 16384). Setting this also disables per-line clipping.
+
+Declaring any of these names under a template's YAML `parameters` map causes the template to fail loading with an error naming the parameter. Reserved parameters are handled by the server and stripped before arguments reach the script environment.
+
+### Template output defaults
+
+Use an optional top-level `output:` block to set per-template defaults:
+
+```yaml
+output:
+  head_lines: 25
+  tail_lines: 75
+  max_output_bytes: 65536
+```
+
+All three entries are optional non-negative integers. Unknown keys and invalid values (including `null`) fail loading with the field name. Defaults appear in the tool's input schema and are never passed to the script environment.
+
+Precedence is per field: non-null caller argument, then template default, then server default (25 head lines, 75 tail lines, 16384 bytes). Null caller arguments inherit defaults. Without `output:` or with `output: {}`, behavior is unchanged. A template-set `max_output_bytes` disables per-line clipping just like a caller-set limit. Byte caps and line windows still apply independently to stdout and stderr, excluding result metadata and formatting.
+
+The shipped `gh_issue_view` and `jira_view` templates use `max_output_bytes: 65536`. If invoked inside the in-process `bash` script tool, the outer `bash` call still needs its own `max_output_bytes`; inner defaults don't prevent outer clipping.
+
+### Truncation and long-line recovery
+
+Without a template byte default or caller byte limit, output is truncated when exceeding 16 KiB per stream or when lines exceed ~2,000 bytes. Passing `max_output_bytes` explicitly disables per-line clipping, returning whole lines within the specified byte cap and line window. This long-line recovery applies across `exec`, `spawn` wait/status, `read_exec_log`, command templates, and the in-process `bash` script tool.
+
+When a template tool's output is truncated, the hint lists only template-supported parameters:
+
+```
+[stdout truncated from X to Y. Use max_output_bytes, head_lines, or tail_lines to see more]
+```
+
+Template hints do not mention `read_exec_log` because template tools accept output controls directly, and their callers may not have `read_exec_log`. Re-calling a template with larger limits re-runs its command.
 
 ## Native and stdio modes
 

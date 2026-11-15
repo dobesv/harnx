@@ -327,7 +327,12 @@ impl BashOutcome {
     fn truncate_opts(&self) -> TruncateOpts {
         // Same defaults as `bash_exec` (`truncate_opts_from`): head/tail
         // window plus a byte cap, per output stream.
-        let defaults = TruncateOpts::default();
+        let mut defaults = TruncateOpts::default();
+        // An explicit byte budget is the recovery path for long lines.
+        if self.params.max_output_bytes.is_some() {
+            defaults.line_head_bytes = 0;
+            defaults.line_tail_bytes = 0;
+        }
         TruncateOpts {
             head_lines: self.params.head_lines.unwrap_or(defaults.head_lines),
             tail_lines: self.params.tail_lines.unwrap_or(defaults.tail_lines),

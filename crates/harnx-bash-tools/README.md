@@ -54,7 +54,9 @@ a shorter deadline; `0` is rejected. Cancelling the tool call still terminates t
 foreground command and its process group.
 
 `timeout_secs` is reserved execution metadata for command templates. It is injected into every
-template's input schema automatically and must not be declared under the YAML `parameters` map.
+template's input schema automatically alongside output controls (`head_lines`, `tail_lines`,
+`max_output_bytes`) and must not be declared under the YAML `parameters` map. See
+[Reserved template parameters](#reserved-template-parameters) for details.
 
 ## Background process retention
 
@@ -171,6 +173,59 @@ script: |
   set -euo pipefail
   gh issue view "$NUMBER" --repo "$REPO" --json title,body,comments
 ```
+
+### Reserved template parameters
+
+Command templates automatically inject four reserved parameters into their tool schema alongside author-declared parameters. Declaring any of these names under a template's `parameters` map causes loading to fail with an error naming the parameter.
+
+Reserved parameters control process execution and output formatting. They are processed by the server and are never passed to the script environment:
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `timeout_secs` | Integer (1–86400) | 86400 | Command execution deadline in seconds. `0` is rejected. |
+| `head_lines` | Integer (>= 0) | 25 | Return only the first N lines of each stream. |
+| `tail_lines` | Integer (>= 0) | 75 | Return only the last N lines of each stream. |
+| `max_output_bytes` | Integer (>= 0) | 16384 | Truncate output to this many bytes. Setting this also disables per-line clipping. |
+
+#### Template output defaults
+
+Template authors can set output defaults in an optional top-level `output:` block:
+
+```yaml
+output:
+  head_lines: 25
+  tail_lines: 75
+  max_output_bytes: 65536
+```
+
+Each entry is optional and must be a non-negative integer. Unknown keys, negative numbers, fractional values, strings, and `null` are rejected at load time with the field name. These defaults aren't script parameters or environment bindings. Declared defaults appear in the tool's input schema.
+
+Each field is resolved independently: a non-null caller argument overrides the template default, then the server default in the table above. An omitted or null caller argument inherits the template default. Omitting `output:` (or using `output: {}`) preserves existing server behavior.
+
+A template default `max_output_bytes` counts as explicit and disables per-line clipping, just like a caller-set limit. The byte cap and head/tail line window still apply to stdout and stderr independently; result metadata and formatting are outside those caps. The shipped `gh_issue_view` and `jira_view` templates default to `max_output_bytes: 65536`.
+
+When calling a template inside the in-process `bash` script tool, the outer `bash` call still needs its own `max_output_bytes` to prevent clipping its rendered output. Template defaults affect only the inner command.
+
+#### Output truncation and long lines
+
+When output exceeds default limits, bash tools truncate output using a head/tail line window and per-line middle clipping (~2,000 bytes per line replaced with `... [truncated: N bytes removed from line] ...`).
+
+Passing `max_output_bytes` explicitly disables per-line clipping. This applies to:
+- Command templates
+- Foreground execution (`exec`)
+- Background process output (`spawn` wait, `wait`, `status`)
+- Execution log inspection (`read_exec_log`)
+- The in-process `bash` script tool in `harnx-runtime`
+
+With per-line clipping disabled, output is bounded only by the requested byte cap and line window (`head_lines`/`tail_lines`), allowing single-line outputs (such as JSON payloads) to be returned in full.
+
+When template output is truncated, the hint lists only output controls:
+
+```
+[stdout truncated from X to Y. Use max_output_bytes, head_lines, or tail_lines to see more]
+```
+
+Template hints do not mention `read_exec_log` because template tools accept output controls directly, and callers may not have `read_exec_log`. Re-calling a template with larger limits re-runs its command.
 
 ### Threat model and security framing
 

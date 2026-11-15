@@ -26,6 +26,74 @@ async fn presentation_truncation_keeps_output_control_guidance() {
     assert!(!text.contains("backend capture limit"), "{text}");
 }
 
+#[tokio::test]
+async fn bash_explicit_byte_budget_recovers_long_lines() {
+    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let line = "0".repeat(5000);
+    for max_output_bytes in [None, Some(65536)] {
+        let mut params = json!({"script": "printf '%05000d\\n' 0; printf '%05000d\\n' 0 >&2"});
+        if let Some(cap) = max_output_bytes {
+            params["max_output_bytes"] = json!(cap);
+        }
+        let output = ok(bash.call_tool("bash", params, &create_abort_signal()).await);
+        let full = max_output_bytes.is_some();
+        for stream in ["stdout", "stderr"] {
+            let text = output.value[stream].as_str().unwrap();
+            assert_eq!(text.contains(&line), full, "{stream}: {text}");
+            assert_eq!(
+                text.contains("removed from line"),
+                !full,
+                "{stream}: {text}"
+            );
+            assert_eq!(output.value[format!("{stream}_truncated")], !full);
+            let expected = if full {
+                format!("{line}\n")
+            } else {
+                truncate_output(&format!("{line}\n"), &TruncateOpts::default())
+            };
+            assert_eq!(text, expected);
+        }
+        let report = output.value["content"][0]["text"].as_str().unwrap();
+        assert_eq!(report.matches(&line).count(), if full { 2 } else { 0 });
+        assert_eq!(report.contains("removed from line"), !full);
+    }
+}
+
+#[tokio::test]
+async fn bash_explicit_byte_budget_keeps_line_window_and_byte_cap() {
+    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let output = ok(bash
+        .call_tool(
+            "bash",
+            json!({
+                "script": "printf '%05000d\\n' 0; echo omitted-middle; printf '%05000d\\n' 0",
+                "head_lines": 1, "tail_lines": 1, "max_output_bytes": 65536
+            }),
+            &create_abort_signal(),
+        )
+        .await);
+    let text = output.value["stdout"].as_str().unwrap();
+    assert_eq!(text.matches(&"0".repeat(5000)).count(), 2);
+    assert!(!text.contains("omitted-middle"));
+    assert!(!text.contains("removed from line"));
+    for cap in [0, 1024] {
+        let output = ok(bash
+            .call_tool(
+                "bash",
+                json!({"script": "printf '%05000d\\n' 0", "max_output_bytes": cap}),
+                &create_abort_signal(),
+            )
+            .await);
+        let text = output.value["stdout"].as_str().unwrap();
+        // Core's marker can exceed tiny byte caps; keep that behavior unchanged.
+        if cap > 0 {
+            assert!(text.len() <= cap as usize);
+        }
+        assert!(!text.contains("removed from line"));
+        assert_eq!(output.value["stdout_truncated"], true);
+    }
+}
+
 struct FatalProvider;
 
 #[async_trait::async_trait]
