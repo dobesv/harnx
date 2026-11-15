@@ -420,12 +420,18 @@ mod tests {
             concurrent.push(verifier.verify(&token));
         }
         for result in futures::future::join_all(concurrent).await {
-            assert_eq!(result.unwrap_err(), VerifyFailure::UnknownKid);
+            let failure = result.unwrap_err();
+            assert_eq!(failure, VerifyFailure::JwksUnavailable);
+            assert_eq!(
+                failure.category(),
+                "jwks unavailable (expired set, refresh throttled)"
+            );
+            assert!(!failure.is_jwks_fault());
         }
         advance(REFETCH_THROTTLE.as_millis() as u64 - 1);
         assert_eq!(
             verifier.verify(&token).await.unwrap_err(),
-            VerifyFailure::UnknownKid
+            VerifyFailure::JwksUnavailable
         );
         assert_eq!(server.fetches(), 2);
 
@@ -440,7 +446,7 @@ mod tests {
         server.swap(JWKS_PRIMARY);
         assert_eq!(
             verifier.verify(&token).await.unwrap_err(),
-            VerifyFailure::UnknownKid
+            VerifyFailure::JwksUnavailable
         );
         advance(REFETCH_THROTTLE.as_millis() as u64);
         verifier.verify(&token).await.unwrap();
@@ -577,6 +583,7 @@ mod tests {
             VerifyFailure::UnsupportedAlgorithm,
             VerifyFailure::MissingKid,
             VerifyFailure::UnknownKid,
+            VerifyFailure::JwksUnavailable,
             VerifyFailure::JwksFetch,
             VerifyFailure::JwksBody,
             VerifyFailure::InvalidKey,

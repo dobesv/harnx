@@ -434,7 +434,7 @@ To require a valid token, configure `forge-fit` (or `bearer-claim:CLAIM`) as the
   - Verification failures fail closed: HTTP 401 Unauthorized with JSON-RPC error code `-32000` and a static reason category (e.g. `bad bearer token signature`, `bearer token is expired`, `jwks fetch failed`).
   - No fallthrough: if a bearer source is selected and an `Authorization: Bearer` token is present, any verification or decoding failure rejects the request immediately. Subsequent identity sources are never tried.
   - Missing `Authorization` header or non-`Bearer` scheme falls through to the next configured identity source.
-- **Logging**: JWKS infrastructure faults (fetch, body, key parse) are logged at `warn` with a reason category; per-token rejections are logged at `debug`, so forged-token noise doesn't hide an outage.
+- **Logging**: JWKS fetch failures and invalid responses are logged at `warn` with a reason category, bounded by the 30-second refetch throttle. Per-request rejections, including invalid keys and `jwks unavailable (expired set, refresh throttled)`, are logged at `debug`, so forged-token noise doesn't hide an outage.
 - **Redaction**: Raw tokens, claim values, and JWKS response payloads are never logged or echoed in error responses. Only the resolved identity (DN or claim string) is stored as the session or task owner.
 - **Startup Validation**:
   - Setting any of `--bearer-jwks-url`, `--bearer-issuer`, or `--bearer-audience` without the others fails startup: `"--bearer-jwks-url, --bearer-issuer and --bearer-audience are all required to enable bearer token verification"`.

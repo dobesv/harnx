@@ -18,8 +18,8 @@ use tokio::sync::Mutex;
 /// so the library default of 60 s would be too loose.
 const LEEWAY_SECONDS: u64 = 10;
 
-/// At most one JWKS refetch per throttle window. Within the window an unknown
-/// `kid` fails closed; a flood of garbage `kid`s can't cause a fetch storm.
+/// At most one JWKS refetch per throttle window, for unknown `kid`s or expired
+/// sets. Both fail closed within the window to prevent fetch storms.
 const REFETCH_THROTTLE: Duration = Duration::from_secs(30);
 
 /// Bound trust in removed keys even when their `kid` keeps matching. Expired
@@ -61,6 +61,7 @@ pub enum VerifyFailure {
     UnsupportedAlgorithm,
     MissingKid,
     UnknownKid,
+    JwksUnavailable,
     JwksFetch,
     JwksBody,
     InvalidKey,
@@ -81,6 +82,7 @@ impl VerifyFailure {
             Self::UnsupportedAlgorithm => "unsupported bearer token algorithm",
             Self::MissingKid => "bearer token has no key id",
             Self::UnknownKid => "bearer token key id is unknown",
+            Self::JwksUnavailable => "jwks unavailable (expired set, refresh throttled)",
             Self::JwksFetch => "jwks fetch failed",
             Self::JwksBody => "jwks response is invalid",
             Self::InvalidKey => "jwks key is invalid",
@@ -151,7 +153,7 @@ pub struct BearerVerifier {
     client: reqwest::Client,
     state: std::sync::Mutex<JwksCache>,
     /// Held only while a refetch is in flight, so concurrent unknown-`kid`
-    /// misses share one fetch.
+    /// misses or expired-cache requests share one fetch.
     fetch_lock: Mutex<()>,
     clock: Clock,
 }
@@ -258,7 +260,14 @@ impl BearerVerifier {
             let now = (self.clock)();
             if let Some(last) = state.last_fetch {
                 if now.saturating_sub(last) < REFETCH_THROTTLE.as_millis() as u64 {
-                    return Err(VerifyFailure::UnknownKid);
+                    let expired = state.fetched_at.is_some_and(|fetched_at| {
+                        now.saturating_sub(fetched_at) >= JWKS_CACHE_MAX_AGE.as_millis() as u64
+                    });
+                    return Err(if expired {
+                        VerifyFailure::JwksUnavailable
+                    } else {
+                        VerifyFailure::UnknownKid
+                    });
                 }
             }
             // Record before awaiting: cancellation must not bypass the throttle.
