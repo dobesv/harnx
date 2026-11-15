@@ -29,7 +29,7 @@ fn resolve_defaults_apply_to_omitted_and_null_fields() {
                 seq.tail_lines,
                 resolved.max_output_bytes
             ),
-            (100, 25, 75, 16_384)
+            (100, 250, 750, 131_072)
         );
     }
 }
@@ -52,14 +52,14 @@ fn resolve_rejects_limit_out_of_bounds() {
 fn resolve_rejects_max_output_bytes_out_of_bounds() {
     assert_eq!(
         resolve(json!({ "max_output_bytes": 1023 })).unwrap_err(),
-        "read.max_output_bytes must be between 1024 and 65536"
+        "read.max_output_bytes must be between 1024 and 307200"
     );
     assert_eq!(
-        resolve(json!({ "max_output_bytes": 65537 })).unwrap_err(),
-        "read.max_output_bytes must be between 1024 and 65536"
+        resolve(json!({ "max_output_bytes": 307201 })).unwrap_err(),
+        "read.max_output_bytes must be between 1024 and 307200"
     );
     resolve(json!({ "max_output_bytes": 1024 })).expect("minimum budget valid");
-    resolve(json!({ "max_output_bytes": 65536 })).expect("maximum budget valid");
+    resolve(json!({ "max_output_bytes": 307200 })).expect("maximum budget valid");
 }
 
 #[test]
@@ -132,8 +132,26 @@ fn schema_is_strict_at_every_level() {
     let schema = read_object_schema();
     assert_eq!(schema["additionalProperties"], json!(false));
     assert_numeric_bounds(&schema["properties"]["limit"], 1, 500);
-    assert_numeric_bounds(&schema["properties"]["max_output_bytes"], 1024, 65536);
+    assert_numeric_bounds(&schema["properties"]["max_output_bytes"], 1024, 307200);
     for option in ["index_min", "index_max", "entry_index", "byte_offset"] {
         assert_eq!(schema["properties"][option]["minimum"], json!(0));
+    }
+}
+
+#[test]
+fn schema_descriptions_match_read_defaults() {
+    let schema = read_object_schema();
+    for (field, default) in [
+        ("head_lines", DEFAULT_HEAD_LINES),
+        ("tail_lines", DEFAULT_TAIL_LINES),
+        ("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES),
+    ] {
+        assert!(
+            schema["properties"][field]["description"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("Default {default}.")),
+            "{field}"
+        );
     }
 }

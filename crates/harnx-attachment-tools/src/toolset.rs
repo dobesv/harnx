@@ -239,7 +239,7 @@ fn attachment_read_schema() -> serde_json::Value {
             "byte_limit": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Maximum bytes to return from byte_offset. Defaults to 64 KiB when byte_offset is provided without byte_limit."
+                "description": "Maximum bytes to return from byte_offset. Defaults to 128 KiB when byte_offset is provided without byte_limit."
             }
         },
         "required": ["url"]
@@ -322,6 +322,9 @@ mod tests {
         assert!(schema["properties"]["byte_limit"]["description"]
             .as_str()
             .unwrap()
-            .contains("64 KiB"));
+            .contains(&format!(
+                "{} KiB",
+                crate::handlers::DEFAULT_BYTE_LIMIT / 1024
+            )));
     }
 }

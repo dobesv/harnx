@@ -1,8 +1,11 @@
 mod defaults;
 
 use super::*;
+use harnx_core::safety::DEFAULT_MAX_BYTES;
 
-const LONG_LINES: &str = "printf '%05000d\\n' 0; printf '%05000d\\n' 0 >&2";
+fn long_lines(length: usize) -> String {
+    format!("printf 'HEAD%0{length}dTAIL\\n' 0; printf 'HEAD%0{length}dTAIL\\n' 0 >&2")
+}
 
 async fn template_tools(root: &Path, script: &str) -> (BashServer, BashToolset) {
     let path = root.join("output.yaml");
@@ -20,14 +23,15 @@ fn assistant_text(result: &Value) -> &str {
     result["content"][0]["text"].as_str().unwrap()
 }
 
-fn assert_template_long_lines(result: &Value, full: bool) {
-    assert_ne!(result["isError"], true, "{result}");
+fn assert_template_long_lines(result: &Value, length: usize, full: bool) {
+    assert_ne!(result["isError"], true);
     let text = assistant_text(result);
-    assert_eq!(
-        text.matches(&"0".repeat(5000)).count(),
-        if full { 2 } else { 0 }
-    );
-    assert_eq!(text.contains("removed from line"), !full, "{text}");
+    let line = format!("HEAD{}TAIL", "0".repeat(length));
+    assert_eq!(text.matches(&line).count(), if full { 2 } else { 0 });
+    assert_eq!(text.matches("HEAD00000000000000000000").count(), 2);
+    assert_eq!(text.matches("00000000000000000000TAIL").count(), 2);
+    assert!(!text.contains("removed from line"));
+    assert_eq!(text.contains("bytes removed, showing first"), !full);
     assert!(!text.contains("read_exec_log"), "{text}");
     if !full {
         assert!(
@@ -41,33 +45,36 @@ fn assert_template_long_lines(result: &Value, full: bool) {
 
 #[tokio::test]
 async fn template_output_controls_recover_long_lines_on_native_and_mcp_paths() {
-    let dir = tempfile::tempdir().unwrap();
-    let (server, toolset) = template_tools(dir.path(), LONG_LINES).await;
-    for (args, full) in [
-        (json!({}), false),
-        (json!({"max_output_bytes": 65536}), true),
-    ] {
+    for length in [5000, DEFAULT_MAX_BYTES + 4096] {
+        let dir = tempfile::tempdir().unwrap();
+        let command = long_lines(length);
+        let (server, toolset) = template_tools(dir.path(), &command).await;
+        for (args, full) in [
+            (json!({}), length < DEFAULT_MAX_BYTES),
+            (json!({"max_output_bytes": length + 1024}), true),
+        ] {
+            let result = toolset
+                .invoke("output", args.clone(), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_template_long_lines(&result, length, full);
+            let result = mcp_call_template(server.clone(), "output", args)
+                .await
+                .unwrap();
+            assert_template_long_lines(&result, length, full);
+        }
         let result = toolset
-            .invoke("output", args.clone(), CancellationToken::new())
+            .invoke(
+                "exec",
+                json!({"command": command, "max_output_bytes": 1024}),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
-        assert_template_long_lines(&result, full);
-        let result = mcp_call_template(server.clone(), "output", args)
-            .await
-            .unwrap();
-        assert_template_long_lines(&result, full);
+        let text = assistant_text(&result);
+        assert!(text.contains("Use max_output_bytes, head_lines, or tail_lines to see more; full log via read_exec_log: execution_id="), "{text}");
+        toolset.cleanup_log_dir().await.unwrap();
     }
-    let result = toolset
-        .invoke(
-            "exec",
-            json!({"command": LONG_LINES}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let text = assistant_text(&result);
-    assert!(text.contains("Use max_output_bytes, head_lines, or tail_lines to see more; full log via read_exec_log: execution_id="), "{text}");
-    toolset.cleanup_log_dir().await.unwrap();
 }
 
 #[tokio::test]
@@ -146,7 +153,8 @@ async fn template_output_controls_return_invalid_params_before_execution() {
 #[tokio::test]
 async fn template_timeout_truncation_uses_output_controls_only() {
     let dir = tempfile::tempdir().unwrap();
-    let toolset = template_tools(dir.path(), &format!("{LONG_LINES}; sleep 30"))
+    let command = long_lines(DEFAULT_MAX_BYTES + 4096);
+    let toolset = template_tools(dir.path(), &format!("{command}; sleep 30"))
         .await
         .1;
     let result = toolset
@@ -160,7 +168,10 @@ async fn template_timeout_truncation_uses_output_controls_only() {
     assert_eq!(result["isError"], true, "{result}");
     let text = assistant_text(&result);
     assert!(text.contains("timed out after 1s"), "{text}");
-    assert!(text.contains("removed from line"), "{text}");
+    assert!(!text.contains("removed from line"));
+    assert!(text.contains("bytes removed, showing first"));
+    assert!(text.contains("HEAD00000000000000000000"));
+    assert!(text.contains("00000000000000000000TAIL"));
     assert!(
         text.contains("Use max_output_bytes, head_lines, or tail_lines to see more]"),
         "{text}"

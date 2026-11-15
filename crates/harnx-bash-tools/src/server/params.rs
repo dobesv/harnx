@@ -108,7 +108,7 @@ impl JsonSchema for ReadExecLogParams {
                 ("tail_lines", "Return only the last N lines.", tail_lines),
                 (
                     "max_output_bytes",
-                    "Truncate output to this many bytes. Setting this also returns long lines in full, subject to the byte cap and line window.",
+                    "Truncate output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window.",
                     max_output_bytes,
                 ),
             ],
@@ -245,7 +245,7 @@ impl WaitOptions {
         vec![
             ("head_lines", "Return only the first N lines of output. Prefer this over post-processing with head.", head_lines),
             ("tail_lines", "Return only the last N lines of output. Prefer this over post-processing with tail.", tail_lines),
-            ("max_output_bytes", "Truncate output to this many bytes. Setting this also returns long lines in full, subject to the byte cap and line window.", max_output_bytes),
+            ("max_output_bytes", "Truncate output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window.", max_output_bytes),
             ("grep", "Filter output lines by regex.", grep),
         ]
     }

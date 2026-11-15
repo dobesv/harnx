@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use parts::replace_part;
 use storage::{data_url_cid, fatal, AttachmentUploads, Storage};
 
-pub const DEFAULT_MAX_RESULT_BYTES: usize = 32_768;
+pub const DEFAULT_MAX_RESULT_BYTES: usize = harnx_core::safety::DEFAULT_MAX_BYTES;
 /// Room for an explicit error, attachment reference and retrieval instructions.
 pub const MIN_MAX_RESULT_BYTES: usize = 1024;
 

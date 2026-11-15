@@ -1327,7 +1327,7 @@ script: echo ok
                     },
                     "max_output_bytes": {
                         "type": "integer", "minimum": 0,
-                        "description": "Truncate output to this many bytes. Setting this also returns long lines in full, subject to the byte cap and line window. Prefer this over `| head -c N` in the command.",
+                        "description": "Truncate output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window. Prefer this over `| head -c N` in the command.",
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -1444,7 +1444,7 @@ script: echo ok
                     },
                     "max_output_bytes": {
                         "type": "integer", "minimum": 0,
-                        "description": "Truncate output to this many bytes. Setting this also returns long lines in full, subject to the byte cap and line window. Prefer this over `| head -c N` in the command.",
+                        "description": "Truncate output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window. Prefer this over `| head -c N` in the command.",
                     },
                     "timeout_secs": {
                         "type": "integer",

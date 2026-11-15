@@ -183,9 +183,9 @@ Reserved parameters control process execution and output formatting. They are pr
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `timeout_secs` | Integer (1–86400) | 86400 | Command execution deadline in seconds. `0` is rejected. |
-| `head_lines` | Integer (>= 0) | 25 | Return only the first N lines of each stream. |
-| `tail_lines` | Integer (>= 0) | 75 | Return only the last N lines of each stream. |
-| `max_output_bytes` | Integer (>= 0) | 16384 | Truncate output to this many bytes. Setting this also disables per-line clipping. |
+| `head_lines` | Integer (>= 0) | 250 | Return only the first N lines of each stream. |
+| `tail_lines` | Integer (>= 0) | 750 | Return only the last N lines of each stream. |
+| `max_output_bytes` | Integer (>= 0) | 131072 | Truncate output to this many bytes. Long lines are preserved within the byte cap and line window. |
 
 #### Template output defaults
 
@@ -202,22 +202,22 @@ Each entry is optional and must be a non-negative integer. Unknown keys, negativ
 
 Each field is resolved independently: a non-null caller argument overrides the template default, then the server default in the table above. An omitted or null caller argument inherits the template default. Omitting `output:` (or using `output: {}`) preserves existing server behavior.
 
-A template default `max_output_bytes` counts as explicit and disables per-line clipping, just like a caller-set limit. The byte cap and head/tail line window still apply to stdout and stderr independently; result metadata and formatting are outside those caps. The shipped `gh_issue_view` and `jira_view` templates default to `max_output_bytes: 65536`.
+The byte cap and head/tail line window apply to stdout and stderr independently; result metadata and formatting are outside those caps. The shipped `gh_issue_view` and `jira_view` templates keep their `max_output_bytes: 65536` defaults.
 
-When calling a template inside the in-process `bash` script tool, the outer `bash` call still needs its own `max_output_bytes` to prevent clipping its rendered output. Template defaults affect only the inner command.
+When calling a template inside the in-process `bash` script tool, the outer `bash` call has its own byte cap and line window. Increase its `max_output_bytes` or line limits separately if needed. Template defaults affect only the inner command.
 
 #### Output truncation and long lines
 
-When output exceeds default limits, bash tools truncate output using a head/tail line window and per-line middle clipping (~2,000 bytes per line replaced with `... [truncated: N bytes removed from line] ...`).
+Bash tools default to 250 head lines, 750 tail lines, and a 131072-byte (128 KiB) cap per stream. Per-line clipping is off by default, so long single-line JSON is returned intact when it fits the byte cap. Output exceeding the byte cap or line window is still truncated.
 
-Passing `max_output_bytes` explicitly disables per-line clipping. This applies to:
+These defaults apply to:
 - Command templates
 - Foreground execution (`exec`)
 - Background process output (`spawn` wait, `wait`, `status`)
 - Execution log inspection (`read_exec_log`)
 - The in-process `bash` script tool in `harnx-runtime`
 
-With per-line clipping disabled, output is bounded only by the requested byte cap and line window (`head_lines`/`tail_lines`), allowing single-line outputs (such as JSON payloads) to be returned in full.
+Set `max_output_bytes`, `head_lines`, or `tail_lines` explicitly to adjust the byte cap or line window.
 
 When template output is truncated, the hint lists only output controls:
 

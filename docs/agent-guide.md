@@ -719,7 +719,8 @@ send with an explicit soft wait and leave the hard execution policy inherited:
   the same result and never consume it; the child was never cancelled by the expiry.
 - **Poll**: check status without waiting with `{agent}_session_load` and `prompt_id`; it returns `status` and `terminal` immediately. For bash processes use `bash_status`.
 - **Inspect**: `{agent}_session_load` returns a bounded page of the child's session log
-  (default limit 100 events, 16384 output bytes). Page forward by passing the returned
+  (default limit 100 events, 131072 output bytes; per-event preview 250 head lines
+  and 750 tail lines; `max_output_bytes` range 1024–307200). Page forward by passing the returned
   `next_index` as `read.index_min` on the next call,
   or recover a single oversized event with the `read` object's `entry_index` + `byte_offset`
   continuation. Earlier unbounded whole-log loads are intentionally gone: a default load can

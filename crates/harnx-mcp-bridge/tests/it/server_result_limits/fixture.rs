@@ -162,7 +162,10 @@ impl Fixture {
         let normalized = original
             .result
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        assert!(serde_json::to_vec(&normalized)?.len() <= 32_768);
+        assert!(
+            serde_json::to_vec(&normalized)?.len()
+                <= harnx_mcp_bridge::result_limits::DEFAULT_MAX_RESULT_BYTES
+        );
         Ok(normalized)
     }
 

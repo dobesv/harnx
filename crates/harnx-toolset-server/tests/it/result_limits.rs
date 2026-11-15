@@ -16,7 +16,9 @@ async fn native_above_default_payload_preserves_original_and_sibling_across_rest
     let mut fixture = Fixture::start(None, None).await?;
     assert_eq!(fixture.client.server_info().max_payload, 1_048_576);
     let big = request("large-native", 2 * 1024 * 1024, true);
-    let small = request("small-sibling", 64 * 1024, false);
+    // The bridge derives its presentation cap from this shared default.
+    let bridge_cap = harnx_core::safety::DEFAULT_MAX_BYTES;
+    let small = request("small-sibling", bridge_cap + 4096, false);
     let (large, sibling) = tokio::try_join!(fixture.call(&big), fixture.call(&small))?;
     assert!(matches!(
         reply(&large).result,
@@ -28,7 +30,7 @@ async fn native_above_default_payload_preserves_original_and_sibling_across_rest
     );
     assert_eq!(reply(&sibling).result, Ok(output(&small.args)));
     assert!(
-        sibling.payload.len() > 32_768,
+        sibling.payload.len() > bridge_cap,
         "native replies have no bridge presentation cap"
     );
     fixture.check_stored(&big, &large, 1_048_576).await?;

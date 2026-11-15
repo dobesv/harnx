@@ -28,4 +28,4 @@ Private, loopback, link-local, multicast, and other special-purpose IP addresses
 
 Every tool accepts `url`, `headers`, `proxy`, `max_length`, `start_index`, `head_lines`, `tail_lines`, and `max_output_bytes`. `fetch_youtube_transcript` also accepts `lang` (default `en`).
 
-`max_length` and `start_index` preserve upstream compatibility and run first. Smart line and byte truncation runs after content transformation. Set `max_length` to `0` to disable the compatibility character limit. Responses are always capped at 10 MiB before transformation and requests have a 30-second deadline.
+`max_length` (default 131072 characters) and `start_index` preserve upstream compatibility and run first. Smart truncation then keeps 250 head lines and 750 tail lines within a 131072-byte (128 KiB) budget, with per-line clipping off by default. Set `max_length` to `0` to disable the compatibility character limit; the smart truncation limits still apply. Responses are always capped at 10 MiB before transformation and requests have a 30-second deadline.

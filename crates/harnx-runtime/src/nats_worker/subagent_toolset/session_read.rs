@@ -35,15 +35,21 @@ pub(crate) const DEFAULT_READ_LIMIT: u64 = 100;
 /// Maximum number of matched events per page.
 pub(crate) const MAX_READ_LIMIT: u64 = 500;
 /// Default head-preview lines per event.
-pub(crate) const DEFAULT_HEAD_LINES: u64 = 25;
+pub(crate) const DEFAULT_HEAD_LINES: u64 = harnx_core::safety::DEFAULT_HEAD_LINES as u64;
 /// Default tail-preview lines per event.
-pub(crate) const DEFAULT_TAIL_LINES: u64 = 75;
+pub(crate) const DEFAULT_TAIL_LINES: u64 = harnx_core::safety::DEFAULT_TAIL_LINES as u64;
 /// Default serialized budget of one read result, including metadata.
-pub(crate) const DEFAULT_MAX_OUTPUT_BYTES: u64 = 16_384;
+pub(crate) const DEFAULT_MAX_OUTPUT_BYTES: u64 = harnx_core::safety::DEFAULT_MAX_BYTES as u64;
 /// Smallest accepted `max_output_bytes`. Keeps any metadata-only page valid.
 pub(crate) const MIN_MAX_OUTPUT_BYTES: u64 = 1_024;
 /// Largest accepted `max_output_bytes`.
-pub(crate) const MAX_MAX_OUTPUT_BYTES: u64 = 65_536;
+pub(crate) const MAX_MAX_OUTPUT_BYTES: u64 = 307_200;
+
+const _: () = assert!(
+    DEFAULT_MAX_OUTPUT_BYTES >= MIN_MAX_OUTPUT_BYTES
+        && DEFAULT_MAX_OUTPUT_BYTES <= MAX_MAX_OUTPUT_BYTES
+);
+
 // Physical scan caps live with the physical reader (nats_session_log) so the
 // bounded JetStream scan and every in-memory simulation share one source of
 // truth. SCAN_BYTE_LIMIT has no in-page use yet — only the physical reader
@@ -285,21 +291,21 @@ fn sequential_read_properties() -> Value {
             "head_lines": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Head-preview lines per event when its rendered text \
-    exceeds the line window. Default 25."
+                "description": format!("Head-preview lines per event when its rendered text \
+    exceeds the line window. Default {DEFAULT_HEAD_LINES}.")
             },
             "tail_lines": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Tail-preview lines per event when its rendered text \
-    exceeds the line window. Default 75."
+                "description": format!("Tail-preview lines per event when its rendered text \
+    exceeds the line window. Default {DEFAULT_TAIL_LINES}.")
             },
             "max_output_bytes": {
                 "type": "integer",
-                "minimum": 1024,
-                "maximum": 65536,
-                "description": "Serialized budget of the whole read result, \
-    metadata included. Default 16384."
+                "minimum": MIN_MAX_OUTPUT_BYTES,
+                "maximum": MAX_MAX_OUTPUT_BYTES,
+                "description": format!("Serialized budget of the whole read result, \
+    metadata included. Default {DEFAULT_MAX_OUTPUT_BYTES}.")
             }
     })
 }

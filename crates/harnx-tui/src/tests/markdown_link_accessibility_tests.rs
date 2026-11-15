@@ -202,7 +202,7 @@ fn history(
 }
 
 fn middle_link_template() -> String {
-    let defaults = harnx_core::safety::TruncateOpts::default();
+    let defaults = harnx_core::safety::TruncateOpts::display_default();
     let terminal_head = crossterm::terminal::size().map_or(0, |(_, rows)| usize::from(rows / 2));
     // Non-TTY previews keep a tail (75 lines by default), while TTY previews
     // keep only a head sized by terminal height. Put both links in the omitted
