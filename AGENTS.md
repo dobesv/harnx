@@ -151,6 +151,13 @@ when it fails on something `cs` can't reproduce, satisfy the PR check. A
 check stuck in `queued` restarts with
 `gh api -X POST repos/dobesv/harnx/check-runs/<id>/rerequest`.
 
+`cs delta` also fails on "String Heavy Function Arguments" once roughly 39%
+of a module's function arguments are strings. Test fixtures and multi-setting
+constructors trip it; group related settings into one config struct and
+bundle stringly-typed fixture data into typed structs and consts instead of
+adding `&str` parameters (see `BearerVerificationConfig` and `TestKey` in
+`harnx-a2a-server/src/bearer_verify.rs` and `bearer_verify_test_util.rs`).
+
 ### Test sandbox
 
 On Linux and macOS, every test nextest runs goes through
@@ -1299,8 +1306,13 @@ access checks requiring ownership match (admin scope can bypass ownership). See
 
 Shared request identity resolution lives in `harnx_runtime::identity`
 (`identity.rs`), used by `harnx-a2a-server` and `harnx-serve`. It extracts from
-configured HTTP headers or cookies and is fail-closed: an empty or malformed
-matching source returns an error rather than falling back. User aliases
+configured headers, cookies, or `Authorization: Bearer` tokens (`forge-fit`,
+`bearer-claim:CLAIM` — decoded without any signature check) and is fail-closed:
+an empty, malformed or unusable matching source returns an error rather than
+falling back. Bearer verification is async (JWKS fetch and cache), so it lives
+only in `harnx-a2a-server` (`bearer_verify.rs`, the `--bearer-*` flags, off by
+default); while a verifier is configured, that crate's sync decode-only
+resolution paths fail closed rather than decode tokens. User aliases
 (`users.yaml`) may also assign configured `groups` and `roles` to matched callers;
 these are merged with header memberships but never grant ownership. See
 `docs/configuration-guide.md` under "User Aliases" for the merge semantics.

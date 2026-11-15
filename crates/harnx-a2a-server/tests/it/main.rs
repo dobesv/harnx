@@ -1,4 +1,5 @@
 mod access;
+mod bearer;
 mod compat;
 mod context_authority;
 mod e2e;

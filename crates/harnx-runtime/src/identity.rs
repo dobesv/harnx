@@ -1,14 +1,18 @@
-//! Request identity from trusted proxy-supplied headers or cookies, not authentication.
+//! Request identity from trusted headers, cookies, or bearer claims, not authentication.
 //!
 //! A proxy must authenticate callers and strip or overwrite client-supplied identity
-//! sources. Persist only the resolved user ID, never raw request headers or cookies.
+//! sources. Bearer decoding doesn't verify signatures; callers needing verification must
+//! use `IdentitySources::select` and supply verified claims. Persist only the resolved
+//! user ID, never raw request headers, cookies, or bearer tokens.
 
 use std::{fmt, str::FromStr};
 
 use anyhow::{bail, Context};
 use http::{header::COOKIE, HeaderMap, HeaderName};
 
+mod bearer;
 mod membership;
+pub use bearer::BearerIdentity;
 pub use membership::{merge_memberships, MembershipHeaders};
 
 /// First comma-separated entry of the first header field, trimmed.
@@ -31,12 +35,46 @@ pub fn first_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 pub enum IdentitySource {
     Header(HeaderName),
     Cookie(String),
+    ForgeFit,
+    BearerClaim(String),
+}
+
+/// Ordered selection, before any bearer decoding or verification.
+///
+/// Deliberately doesn't implement `Debug`: the bearer branch contains a raw token.
+pub enum IdentitySelection<'a> {
+    Resolved(String),
+    Bearer(BearerIdentity<'a>),
+}
+
+impl IdentitySelection<'_> {
+    fn decode(self) -> Result<String, IdentityError> {
+        match self {
+            Self::Resolved(value) => Ok(value),
+            Self::Bearer(bearer) => bearer.decode(),
+        }
+    }
 }
 
 impl IdentitySource {
-    /// Resolve this source only. Missing yields `None`; present but unusable fails closed.
-    pub fn resolve<'a>(&self, headers: &'a HeaderMap) -> Result<Option<&'a str>, IdentityError> {
-        match self {
+    pub fn is_bearer(&self) -> bool {
+        matches!(self, Self::ForgeFit | Self::BearerClaim(_))
+    }
+
+    /// Decode-only resolution. Bearer signatures and time/issuer/audience aren't checked.
+    /// Use only behind a verifying proxy; use `select` to supply verified claims instead.
+    pub fn resolve(&self, headers: &HeaderMap) -> Result<Option<String>, IdentityError> {
+        self.select(headers)?
+            .map(IdentitySelection::decode)
+            .transpose()
+    }
+
+    /// Select this source without decoding bearer tokens. See `IdentitySources::select`.
+    pub fn select<'a>(
+        &'a self,
+        headers: &'a HeaderMap,
+    ) -> Result<Option<IdentitySelection<'a>>, IdentityError> {
+        let value = match self {
             Self::Header(name) => {
                 let Some(header) = headers.get(name) else {
                     return Ok(None);
@@ -50,21 +88,35 @@ impl IdentitySource {
                 }
             }
             Self::Cookie(name) => cookie_value(headers, name),
-        }
+            Self::ForgeFit | Self::BearerClaim(_) => {
+                return bearer::select(self, headers)
+                    .map(|value| value.map(IdentitySelection::Bearer));
+            }
+        }?;
+        Ok(value.map(|value| IdentitySelection::Resolved(value.to_owned())))
     }
 }
 
 impl FromStr for IdentitySource {
     type Err = anyhow::Error;
 
-    /// Parse `header:NAME`, `cookie:NAME`, or bare `NAME` (a header).
-    /// Prefixes are case-insensitive. Names must be nonempty HTTP tokens.
+    /// Parse `header:NAME`, `cookie:NAME`, `forge-fit`, or `bearer-claim:CLAIM`.
+    /// Bare names are headers, except `forge-fit` (use `header:forge-fit` for that header).
+    /// Prefixes are case-insensitive. Header/cookie names must be HTTP tokens;
+    /// claim names are nonempty, case-sensitive top-level JSON keys, not paths.
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if raw.eq_ignore_ascii_case("forge-fit") {
+            return Ok(Self::ForgeFit);
+        }
         let (cookie, name) = match raw.split_once(':') {
+            Some((prefix, name)) if prefix.eq_ignore_ascii_case("bearer-claim") => {
+                anyhow::ensure!(!name.is_empty(), "empty bearer identity claim name");
+                return Ok(Self::BearerClaim(name.to_owned()));
+            }
             Some((prefix, name)) if prefix.eq_ignore_ascii_case("header") => (false, name),
             Some((prefix, name)) if prefix.eq_ignore_ascii_case("cookie") => (true, name),
             Some(_) => {
-                bail!("invalid identity source '{raw}': expected header:NAME or cookie:NAME")
+                bail!("invalid identity source '{raw}': expected header:NAME, cookie:NAME, forge-fit or bearer-claim:CLAIM")
             }
             None => (false, raw),
         };
@@ -112,10 +164,34 @@ impl IdentitySources {
     /// Cookies use the first exact name match across all Cookie fields. Values
     /// may be quoted, must contain RFC 6265 cookie-octets, and aren't URL-decoded.
     /// Malformed unrelated cookies are ignored; a matching cookie without `=` is invalid.
+    /// Bearer sources decode without verification; see `select` for verification plumbing.
     pub fn resolve(&self, headers: &HeaderMap) -> Result<Option<String>, IdentityError> {
+        self.select(headers)?
+            .map(IdentitySelection::decode)
+            .transpose()
+    }
+
+    pub fn has_bearer_source(&self) -> bool {
+        self.sources.iter().any(IdentitySource::is_bearer)
+    }
+
+    /// First-present-wins selection without decoding or verifying any bearer token.
+    /// An earlier usable header/cookie returns `Resolved`, even with an invalid token.
+    /// An unusable earlier source errors; missing/non-Bearer Authorization falls through.
+    ///
+    /// Verification-enabled callers must match `Bearer`, asynchronously verify `token()`,
+    /// then pass only the verified JSON object to `BearerIdentity::resolve_claims`.
+    /// Propagate verification/claim errors without retrying later sources. Never call
+    /// decode-only `resolve` on a verification-enabled path. Both HTTP middleware and
+    /// direct handler paths must follow this contract; no client-provided marker is proof
+    /// of verification. Selection borrows the policy and headers across the verification.
+    pub fn select<'a>(
+        &'a self,
+        headers: &'a HeaderMap,
+    ) -> Result<Option<IdentitySelection<'a>>, IdentityError> {
         for source in &self.sources {
-            if let Some(value) = source.resolve(headers)? {
-                return Ok(Some(value.to_owned()));
+            if let Some(selection) = source.select(headers)? {
+                return Ok(Some(selection));
             }
         }
         Ok(None)
@@ -391,5 +467,382 @@ mod tests {
                 .as_deref(),
             Some("primary")
         );
+    }
+
+    fn payload_token(payload: &[u8]) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(payload))
+    }
+
+    fn bearer_headers(claims: serde_json::Value) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let token = payload_token(&serde_json::to_vec(&claims).unwrap());
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    fn assert_bearer_failure(source: &str, headers: &HeaderMap) {
+        let mut headers = headers.clone();
+        headers.append("authorization", "Bearer later.valid.token".parse().unwrap());
+        headers.insert("x-fallback", "fallback-identity".parse().unwrap());
+        let error = policy(&[source, "x-fallback"])
+            .resolve(&headers)
+            .unwrap_err();
+        // Exact messages also prove no decoder, token, claim, or identity text leaks.
+        match error {
+            IdentityError::EmptyValue => {
+                assert_eq!(error.to_string(), "empty user identity source");
+                assert_eq!(format!("{error:?}"), "EmptyValue");
+            }
+            IdentityError::InvalidValue => {
+                assert_eq!(error.to_string(), "invalid user identity source");
+                assert_eq!(format!("{error:?}"), "InvalidValue");
+            }
+        }
+    }
+
+    #[test]
+    fn bearer_sources_parse_and_report_presence() {
+        for raw in ["forge-fit", "FoRgE-FiT"] {
+            assert_eq!(
+                raw.parse::<IdentitySource>().unwrap(),
+                IdentitySource::ForgeFit
+            );
+        }
+        assert_eq!(
+            "BeArEr-ClAiM:Principal".parse::<IdentitySource>().unwrap(),
+            IdentitySource::BearerClaim("Principal".into())
+        );
+        assert_eq!(
+            "header:forge-fit".parse::<IdentitySource>().unwrap(),
+            IdentitySource::Header(HeaderName::from_static("forge-fit"))
+        );
+        assert!("bearer-claim:".parse::<IdentitySource>().is_err());
+        assert!("forge-fit:principal".parse::<IdentitySource>().is_err());
+        assert!(policy(&["forge-fit"]).has_bearer_source());
+        assert!(policy(&["cookie:user", "bearer-claim:principal"]).has_bearer_source());
+        assert!(!policy(&["header:forge-fit", "cookie:user"]).has_bearer_source());
+        assert!(!policy(&[]).has_bearer_source());
+        let error = "unknown:source"
+            .parse::<IdentitySource>()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("header:NAME, cookie:NAME, forge-fit or bearer-claim:CLAIM"));
+    }
+
+    #[test]
+    fn forge_fit_builds_cn_first_dn_and_org_only_identity() {
+        use serde_json::json;
+        let sources = policy(&["forge-fit"]);
+        let headers = bearer_headers(json!({
+            "principal": "655362:312d3308-8954-42b0-aa38-771a10c88656",
+            "context": {"cloudId": "d0d52620-3203-4cfa-8db5-f2587155f0dd"}
+        }));
+        assert_eq!(sources.resolve(&headers).unwrap().as_deref(), Some(
+            "CN=655362:312d3308-8954-42b0-aa38-771a10c88656,OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+        ));
+        for claims in [
+            json!({"context": {"cloudId": "site-id"}}),
+            json!({"principal": "unidentified", "context": {"cloudId": "site-id"}}),
+        ] {
+            assert_eq!(
+                sources.resolve(&bearer_headers(claims)).unwrap().as_deref(),
+                Some("OU=site-id,O=atlassian.com")
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_missing_or_basic_authorization_falls_through() {
+        for source in ["forge-fit", "bearer-claim:principal"] {
+            let sources = policy(&[source, "x-fallback"]);
+            let mut headers = HeaderMap::new();
+            headers.insert("x-fallback", "fallback".parse().unwrap());
+            for authorization in [
+                None,
+                Some("Basic credentials"),
+                Some("Bearerish token"),
+                Some(""),
+            ] {
+                headers.remove("authorization");
+                if let Some(value) = authorization {
+                    headers.insert("authorization", value.parse().unwrap());
+                }
+                assert_eq!(
+                    sources.resolve(&headers).unwrap().as_deref(),
+                    Some("fallback")
+                );
+                assert_eq!(policy(&[source]).resolve(&headers).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_token_whitespace_is_trimmed() {
+        let token = payload_token(br#"{"principal":"account-id","context":{"cloudId":"site-id"}}"#);
+        for scheme in ["bearer", "Bearer", "BEARER", "bEaReR"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                format!(" {scheme}\t  {token} \t").parse().unwrap(),
+            );
+            assert_eq!(
+                policy(&["forge-fit"]).resolve(&headers).unwrap().as_deref(),
+                Some("CN=account-id,OU=site-id,O=atlassian.com")
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_malformed_tokens_fail_closed_without_leaking_data() {
+        let mut tokens = vec![
+            "secret-token".to_owned(),
+            "secret.token".into(),
+            "a.b.c.d".into(),
+            ".e30.signature".into(),
+            "header..signature".into(),
+            "header.e30.".into(),
+            "header.%%%secret-payload.signature".into(),
+            "header.eyJ9=.signature".into(),
+        ];
+        for payload in [
+            b"not-json-secret".as_slice(),
+            b"[]",
+            b"null",
+            b"42",
+            b"\"secret-string\"",
+            b"\xff",
+        ] {
+            tokens.push(payload_token(payload));
+        }
+        for source in ["forge-fit", "bearer-claim:principal"] {
+            for token in &tokens {
+                let mut headers = HeaderMap::new();
+                headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+                assert_bearer_failure(source, &headers);
+            }
+            for raw in [b"Bearer".as_slice(), b"Bearer \t", b"Bearer \xff"] {
+                let mut headers = HeaderMap::new();
+                headers.insert("authorization", HeaderValue::from_bytes(raw).unwrap());
+                assert_bearer_failure(source, &headers);
+            }
+        }
+    }
+
+    #[test]
+    fn forge_fit_missing_or_invalid_context_fails_closed() {
+        use serde_json::json;
+        for claims in [
+            json!({"principal": "secret-account"}),
+            json!({"context": null}),
+            json!({"context": "secret-context"}),
+            json!({"context": []}),
+            json!({"context": {}}),
+            json!({"context": {"cloudId": null}}),
+            json!({"context": {"cloudId": 123}}),
+            json!({"context": {"cloudId": false}}),
+            json!({"context": {"cloudId": []}}),
+            json!({"context": {"cloudId": {}}}),
+            json!({"context": {"cloudId": ""}}),
+        ] {
+            assert_bearer_failure("forge-fit", &bearer_headers(claims));
+        }
+    }
+
+    #[test]
+    fn forge_fit_present_nonstring_or_empty_principal_fails_closed() {
+        use serde_json::json;
+        for principal in [
+            json!(null),
+            json!(123),
+            json!(false),
+            json!([]),
+            json!({}),
+            json!(""),
+        ] {
+            assert_bearer_failure(
+                "forge-fit",
+                &bearer_headers(json!({
+                    "principal": principal, "context": {"cloudId": "secret-site"}
+                })),
+            );
+        }
+    }
+
+    #[test]
+    fn forge_fit_rejects_ambiguous_dn_components_in_principal_and_cloud_id() {
+        use serde_json::json;
+        let mut invalid = vec![
+            " secret".to_owned(),
+            "secret ".into(),
+            "\u{2003}secret".into(),
+            "secret\u{2003}".into(),
+        ];
+        for ch in [
+            ',', '=', '+', '<', '>', '#', ';', '"', '\\', '\0', '\n', '\r', '\t', '\u{7f}',
+            '\u{85}',
+        ] {
+            invalid.push(format!("secret{ch}component"));
+        }
+        for value in invalid {
+            for claims in [
+                json!({"principal": value, "context": {"cloudId": "secret-site"}}),
+                json!({"principal": "secret-account", "context": {"cloudId": value}}),
+            ] {
+                assert_bearer_failure("forge-fit", &bearer_headers(claims));
+            }
+        }
+    }
+
+    #[test]
+    fn bearer_claim_returns_trimmed_bare_account_id_without_comma_splitting() {
+        use serde_json::json;
+        for (value, expected) in [
+            ("655362:account-id", "655362:account-id"),
+            ("  account-id  ", "account-id"),
+            ("\u{2003}account-id\u{2003}", "account-id"),
+            (
+                "CN=account,OU=site,O=atlassian.com",
+                "CN=account,OU=site,O=atlassian.com",
+            ),
+        ] {
+            let headers = bearer_headers(json!({"principal": value}));
+            assert_eq!(
+                policy(&["bearer-claim:principal"])
+                    .resolve(&headers)
+                    .unwrap()
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_claim_missing_nonstring_empty_or_control_values_fail_closed() {
+        use serde_json::json;
+        assert_bearer_failure(
+            "bearer-claim:principal",
+            &bearer_headers(json!({"Principal": "secret"})),
+        );
+        for value in [
+            json!(null),
+            json!(123),
+            json!(false),
+            json!([]),
+            json!({}),
+            json!(""),
+            json!("   "),
+            json!("secret\nclaim"),
+            json!("secret\0claim"),
+            json!("secret\u{85}claim"),
+            json!("\tsecret"),
+        ] {
+            assert_bearer_failure(
+                "bearer-claim:principal",
+                &bearer_headers(json!({"principal": value})),
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_claim_uses_literal_top_level_keys_not_nested_paths() {
+        use serde_json::json;
+        let headers =
+            bearer_headers(json!({"context.cloudId": "literal", "context": {"cloudId": "nested"}}));
+        assert_eq!(
+            policy(&["bearer-claim:context.cloudId"])
+                .resolve(&headers)
+                .unwrap()
+                .as_deref(),
+            Some("literal")
+        );
+        assert_bearer_failure(
+            "bearer-claim:context.cloudId",
+            &bearer_headers(json!({"context": {"cloudId": "nested"}})),
+        );
+    }
+
+    #[test]
+    fn bearer_resolution_preserves_order_and_never_decodes_lower_priority_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user", "header-user".parse().unwrap());
+        headers.insert("cookie", "user=cookie-user".parse().unwrap());
+        headers.insert(
+            "authorization",
+            "Bearer invalid-secret-token".parse().unwrap(),
+        );
+        assert_eq!(
+            policy(&["x-user", "forge-fit"])
+                .resolve(&headers)
+                .unwrap()
+                .as_deref(),
+            Some("header-user")
+        );
+        assert_eq!(
+            policy(&["cookie:user", "forge-fit"])
+                .resolve(&headers)
+                .unwrap()
+                .as_deref(),
+            Some("cookie-user")
+        );
+        assert_bearer_failure("forge-fit", &headers);
+        headers.insert("x-user", "".parse().unwrap());
+        assert_eq!(
+            policy(&["x-user", "forge-fit"]).resolve(&headers),
+            Err(IdentityError::EmptyValue)
+        );
+    }
+
+    #[test]
+    fn bearer_selection_maps_only_supplied_verified_claims() {
+        use serde_json::json;
+        let headers = bearer_headers(
+            json!({"principal": "unverified-account", "context": {"cloudId": "unverified-site"}}),
+        );
+        for (source, expected) in [
+            (
+                "forge-fit",
+                "CN=verified-account,OU=verified-site,O=atlassian.com",
+            ),
+            ("bearer-claim:principal", "verified-account"),
+        ] {
+            let sources = policy(&[source, "x-fallback"]);
+            let Some(IdentitySelection::Bearer(bearer)) = sources.select(&headers).unwrap() else {
+                panic!("expected bearer selection")
+            };
+            assert!(bearer.token().starts_with("e30."));
+            let claims =
+                json!({"principal": "verified-account", "context": {"cloudId": "verified-site"}});
+            assert_eq!(
+                bearer.resolve_claims(claims.as_object().unwrap()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                bearer.resolve_claims(json!({}).as_object().unwrap()),
+                Err(IdentityError::InvalidValue)
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_selection_stops_before_verification_and_respects_precedence() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user", "header-user".parse().unwrap());
+        headers.insert("authorization", "Bearer not-even-a-jwt".parse().unwrap());
+        let sources = policy(&["x-user", "forge-fit"]);
+        assert!(
+            matches!(sources.select(&headers).unwrap(), Some(IdentitySelection::Resolved(value)) if value == "header-user")
+        );
+        let sources = policy(&["forge-fit", "x-user"]);
+        let Some(IdentitySelection::Bearer(bearer)) = sources.select(&headers).unwrap() else {
+            panic!("expected bearer selection")
+        };
+        assert_eq!(bearer.token(), "not-even-a-jwt");
+        headers.insert("x-user", "".parse().unwrap());
+        let sources = policy(&["x-user", "forge-fit"]);
+        assert!(matches!(
+            sources.select(&headers),
+            Err(IdentityError::EmptyValue)
+        ));
     }
 }

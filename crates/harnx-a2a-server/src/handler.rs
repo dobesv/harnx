@@ -82,8 +82,11 @@ impl HarnxHandler {
             cancel_snapshot_gate: None,
         }
     }
-    fn owner(&self, params: &ServiceParams) -> Result<RequestIdentity, A2AError> {
-        let owner = self.identity.resolve_request_params(params)?;
+    async fn owner(&self, params: &ServiceParams) -> Result<RequestIdentity, A2AError> {
+        let owner = self
+            .identity
+            .resolve_request_params_verified(params)
+            .await?;
         if let Some(rules) = self.backend.store.access_rules() {
             if owner.principal.user_id().is_none() {
                 return Err(crate::identity::missing_identity());
@@ -333,7 +336,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        let owner = self.owner(params)?;
+        let owner = self.owner(params).await?;
         let immediate = return_immediately(req.configuration.as_ref());
         let (admission, length) = self.admit_request(owner.clone(), req).await?;
         let mut task = self.resolve_send_task(&owner, admission, immediate).await?;
@@ -345,7 +348,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
-        let owner = self.owner(params)?;
+        let owner = self.owner(params).await?;
         let mut task = self
             .reconcile(&owner, self.task(&owner, &req.id).await?)
             .await?
@@ -358,7 +361,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         req: CancelTaskRequest,
     ) -> Result<Task, A2AError> {
-        let owner = self.owner(params)?;
+        let owner = self.owner(params).await?;
         let initial = self.task(&owner, &req.id).await?;
         #[cfg(test)]
         if let Some(gate) = &self.cancel_snapshot_gate {
@@ -377,7 +380,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
-        let owner = self.owner(params)?;
+        let owner = self.owner(params).await?;
         let context = req
             .context_id
             .as_deref()
@@ -407,7 +410,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let owner = self.owner(params)?;
+        let owner = self.owner(params).await?;
         let (admission, length) = self.admit_request(owner.clone(), req).await?;
         let (mut snapshot, events) = if admission.direct || admission.events.is_some() {
             (admission.snapshot, admission.events)
@@ -423,7 +426,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let owner = self.owner(params)?;
+        let owner = self.owner(params).await?;
         let record = self
             .reconcile(&owner, self.task(&owner, &req.id).await?)
             .await?;
@@ -457,7 +460,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         _req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.owner(params)?;
+        self.owner(params).await?;
         Err(A2AError::push_notification_not_supported())
     }
     async fn get_push_config(
@@ -465,7 +468,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         _req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.owner(params)?;
+        self.owner(params).await?;
         Err(A2AError::push_notification_not_supported())
     }
     async fn list_push_configs(
@@ -473,7 +476,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         _req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        self.owner(params)?;
+        self.owner(params).await?;
         Err(A2AError::push_notification_not_supported())
     }
     async fn delete_push_config(
@@ -481,7 +484,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         _req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
-        self.owner(params)?;
+        self.owner(params).await?;
         Err(A2AError::push_notification_not_supported())
     }
     async fn get_extended_agent_card(
@@ -489,7 +492,7 @@ impl RequestHandler for HarnxHandler {
         params: &ServiceParams,
         _req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
-        self.owner(params)?;
+        self.owner(params).await?;
         Err(A2AError::unsupported_operation(
             "extended agent cards are not supported",
         ))
