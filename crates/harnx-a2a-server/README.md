@@ -19,7 +19,8 @@ Usage: harnx-a2a-server [OPTIONS] --agent <SPEC>
 | `--host <HOST>` | `127.0.0.1` | HTTP bind host. Set explicitly (for example, `0.0.0.0`) when listening behind a reverse proxy or container gateway. |
 | `--port <PORT>` | `3020` | HTTP bind port. Distinct from toolset ports (3000–3007) and MCP HTTP (3010). |
 | `--agent <SPEC>` | *(required)* | Agent export specification: bare `name` or `alias=name`. Repeatable, comma-separated. Environment variable `HARNX_A2A_AGENTS`. Specifying CLI flags replaces `HARNX_A2A_AGENTS`. There is no default "expose all" mode; at least one agent is required. |
-| `--metrics-addr <ADDR>` | disabled | Optional Prometheus listener (`IP:PORT` or `:PORT`); exports recovery, pending-age and sweep diagnostics. |
+| `--healthz-addr <ADDR>` | disabled | Optional readiness listener at `/healthz` (`IP:PORT` or `:PORT`); environment variable `HARNX_HEALTHZ_ADDR`. CLI takes precedence. |
+| `--metrics-addr <ADDR>` | disabled | Optional Prometheus listener at `/metrics` (`IP:PORT` or `:PORT`); exports HTTP request metrics and recovery, pending-age and sweep diagnostics. CLI only, no environment variable fallback. |
 | `--cluster <CLUSTER>` | none | Target NATS cluster name for shared workers. |
 | `--config-dir <PATH>` | `HARNX_CONFIG_DIR` | Path to the harnx configuration directory containing `config.yaml`. |
 | `--access-rules <PATH>` | `<config dir>/access.yaml` if present | Access rules file, also set by `HARNX_ACCESS_RULES`. Requires `--user-id-header` when rules are enabled. |
@@ -43,6 +44,34 @@ harnx-a2a-server \
 - **Explicit exports only**: Wildcards (`*`, `?`, glob characters) are rejected.
 - **Agent validation**: Every exported agent must exist in local agent markdown or builtin configuration at startup. Unknown agents cause startup failure.
 - **Lookup key uniqueness**: Any collision across export lookup keys fails startup immediately.
+
+## Readiness and metrics ports
+
+```sh
+harnx-a2a-server --agent reviewer --host 0.0.0.0 --port 3020 \
+  --healthz-addr :8081 --metrics-addr :8456
+curl -i http://127.0.0.1:8081/healthz
+curl http://127.0.0.1:8456/metrics
+```
+
+A2A traffic uses port `3020` by default. Readiness and metrics are opt-in,
+independent listeners; `8081` and `8456` are example ports, not defaults. Don't
+reuse the application port or put both optional listeners on the same port.
+Blank hosts bind `0.0.0.0`. Restrict readiness and metrics to your probe/scraper
+network; they don't use A2A authentication or access rules.
+
+`GET /healthz` returns an empty `503 Service Unavailable` until agent validation,
+NATS/JetStream connection, coordination provisioning, backend initialization and
+the A2A listener bind succeed, then an empty `200 OK`. SIGTERM or Ctrl-C flips it
+back to `503` before runners are aborted/drained and HTTP shutdown finishes. This
+is startup/shutdown readiness, not a continuous check of broker or worker health.
+Use it for a Kubernetes readiness probe, not a liveness probe.
+
+`GET /metrics` serves Prometheus text, including HTTP request counts and durations
+with bounded route-template labels, plus A2A recovery diagnostics. Metrics use
+`--metrics-addr` only, matching `harnx-serve` and `harnx-worker`; they don't read
+`HARNX_METRICS_ADDR`. See [operations](../../docs/a2a-operations.md#listeners-and-readiness)
+and [Kubernetes deployment](../../docs/kubernetes-deployment.md#a2a-backends-behind-ingress).
 
 ## Endpoints and Name Resolution
 
