@@ -451,14 +451,26 @@ async fn existing_list_mode_keeps_human_output_filters_and_child_cleanup() -> Re
 }
 
 #[tokio::test]
+async fn default_result_limit_preserves_results_above_old_cap() -> Result<()> {
+    let expected = json!({"content": [{"type": "text", "text": "x".repeat(100_000)}]});
+    let fixture = Fixture::new(json!({"call_result": expected}))?;
+    let output = fixture.run(&["--call-tool", "mixed_tool"]).await?;
+    assert_json_result(&output, &expected, true)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn oversized_contextless_result_is_bounded_error_and_nonzero() -> Result<()> {
     let fixture = Fixture::new(
-        json!({"call_result": {"content": [{"type": "text", "text": "large".repeat(10000)}]}}),
+        json!({"call_result": {"content": [{"type": "text", "text": "large".repeat(30000)}]}}),
     )?;
     let output = fixture.run(&["--call-tool", "mixed_tool"]).await?;
     assert!(!output.status.success());
     let result: Value = serde_json::from_slice(&output.stdout)?;
-    assert!(serde_json::to_vec(&result)?.len() <= 32768);
+    assert!(
+        serde_json::to_vec(&result)?.len()
+            <= harnx_mcp_bridge::result_limits::DEFAULT_MAX_RESULT_BYTES
+    );
     assert_eq!(result["isError"], true);
     let message = result["content"][0]["text"].as_str().unwrap();
     assert!(message.contains("original was not retained"));

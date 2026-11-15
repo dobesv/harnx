@@ -1662,7 +1662,7 @@ The shared NATS tool server checks native and bridged terminal replies against
 both the connected broker's `max_payload` and the journal stream's independent
 message-size limit. The budget includes the complete invocation row, CAS headers,
 and final reply metadata. This is a per-record/message limit, not a whole-session
-limit. Native results that fit aren't subject to the MCP bridge's 32 KiB
+limit. Native results that fit aren't subject to the MCP bridge's 128 KiB
 presentation cap.
 
 An oversized terminal reply is stored as an `application/json` attachment under
@@ -1696,6 +1696,14 @@ re-wedge the session exactly as before the fix. A round of many small results th
 overflows only by count keeps its outputs: a size error is bigger than the result it
 replaces, so nothing is degraded and the typed rejection terminates the activation
 instead.
+
+The 128 KiB agent-facing default (`harnx-core` `DEFAULT_MAX_BYTES`) applies per
+truncation application, not per tool result: bash tools truncate stdout and
+stderr independently (`harnx-bash-tools/src/server/render.rs`), so one result
+can carry about 256 KiB, and with the default 1 MiB broker payload ceiling a
+round of roughly seven parallel full-size results reaches the budget. Hitting
+that budget degrades results through the path above — it is the designed
+backstop for aggressive parallel fan-out, not a bug.
 
 ## Manual Compaction
 

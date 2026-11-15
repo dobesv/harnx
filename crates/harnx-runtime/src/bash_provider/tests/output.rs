@@ -27,35 +27,47 @@ async fn presentation_truncation_keeps_output_control_guidance() {
 }
 
 #[tokio::test]
-async fn bash_explicit_byte_budget_recovers_long_lines() {
+async fn bash_default_and_explicit_byte_budgets_bound_long_lines() {
+    use harnx_core::safety::DEFAULT_MAX_BYTES;
+
     let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
-    let line = "0".repeat(5000);
-    for max_output_bytes in [None, Some(65536)] {
-        let mut params = json!({"script": "printf '%05000d\\n' 0; printf '%05000d\\n' 0 >&2"});
-        if let Some(cap) = max_output_bytes {
-            params["max_output_bytes"] = json!(cap);
+    for length in [5000, 100_000, (DEFAULT_MAX_BYTES / 5000 + 1) * 5000] {
+        let line = format!("HEAD{}TAIL", "0".repeat(length));
+        for max_output_bytes in [None, Some(65536)] {
+            // BashKit bounds printf field widths, so build oversized lines in chunks.
+            let chunks = length / 5000;
+            let mut params = json!({
+                "script": format!("printf HEAD; printf HEAD >&2; for i in $(seq 1 {chunks}); do printf '%05000d' 0; printf '%05000d' 0 >&2; done; printf 'TAIL\\n'; printf 'TAIL\\n' >&2")
+            });
+            if let Some(cap) = max_output_bytes {
+                params["max_output_bytes"] = json!(cap);
+            }
+            let output = ok(bash.call_tool("bash", params, &create_abort_signal()).await);
+            let cap = max_output_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+            let full = line.len() < cap;
+            for stream in ["stdout", "stderr"] {
+                let text = output.value[stream].as_str().unwrap();
+                assert_eq!(text.contains(&line), full, "{stream}");
+                assert!(!text.contains("removed from line"), "{stream}");
+                assert_eq!(output.value[format!("{stream}_truncated")], !full);
+                assert!(text.starts_with("HEAD"), "{stream}");
+                assert!(text.ends_with("TAIL\n"), "{stream}");
+                assert!(text.len() <= cap, "{stream}");
+                assert_eq!(text.contains("bytes removed, showing first"), !full);
+                let expected = truncate_output(
+                    &format!("{line}\n"),
+                    &TruncateOpts {
+                        max_output_bytes: cap,
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(text, expected);
+            }
+            let report = output.value["content"][0]["text"].as_str().unwrap();
+            assert_eq!(report.matches(&line).count(), if full { 2 } else { 0 });
+            assert!(!report.contains("removed from line"));
+            assert_eq!(report.contains("bytes removed, showing first"), !full);
         }
-        let output = ok(bash.call_tool("bash", params, &create_abort_signal()).await);
-        let full = max_output_bytes.is_some();
-        for stream in ["stdout", "stderr"] {
-            let text = output.value[stream].as_str().unwrap();
-            assert_eq!(text.contains(&line), full, "{stream}: {text}");
-            assert_eq!(
-                text.contains("removed from line"),
-                !full,
-                "{stream}: {text}"
-            );
-            assert_eq!(output.value[format!("{stream}_truncated")], !full);
-            let expected = if full {
-                format!("{line}\n")
-            } else {
-                truncate_output(&format!("{line}\n"), &TruncateOpts::default())
-            };
-            assert_eq!(text, expected);
-        }
-        let report = output.value["content"][0]["text"].as_str().unwrap();
-        assert_eq!(report.matches(&line).count(), if full { 2 } else { 0 });
-        assert_eq!(report.contains("removed from line"), !full);
     }
 }
 

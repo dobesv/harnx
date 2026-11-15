@@ -270,14 +270,14 @@ Use `--no-sandbox` when the test scope is bash behavior, not sandbox isolation. 
 
 ### MCP bridge result limits
 
-Bridged MCP tool results are capped at 32 KiB serialized JSON by default
+Bridged MCP tool results are capped at 128 KiB serialized JSON by default
 (`--max-result-bytes` / `HARNX_MCP_MAX_RESULT_BYTES`, minimum 1024). Oversized parts
 offload to NATS attachments with original MIME and bytes; oversized aggregates fall back
 to `application/json`, preserving success status for collective fitting parts if representable,
 or returning an explicit error for unrepresentable schemas/metadata. Calls without trusted
 session identity or NATS storage (e.g. direct CLI) return bounded recoverable errors
-without retaining originals. Native tool results above 32 KiB pass unchanged when within
-server storage/wire limits (broker `max_payload` and journal KV row budget); the 32 KiB
+without retaining originals. Native tool results above 128 KiB pass unchanged when within
+server storage/wire limits (broker `max_payload` and journal KV row budget); the 128 KiB
 presentation cap applies only to bridged results. See
 `crates/harnx-mcp-bridge/README.md#result-limits-and-original-attachments` and
 `docs/nats-ha.md#oversized-terminal-tool-replies` for per-result caps, attachment paging,
@@ -1468,7 +1468,8 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    resumes, activates or repairs.
 
 5. **Bounded read contract** — the entire serialized result, metadata
-   included, fits `max_output_bytes` (default 16384, range 1024..65536);
+   included, fits `max_output_bytes` (default 131072, range 1024..307200).
+   Per-event previews default to 250 head lines and 750 tail lines;
    physical scans cap at 1000 records / 8 MiB per page
    (`nats_session_log/window.rs`); holes are explicit `omitted_ranges`
    recoverable through the `entry_index` + `byte_offset` continuation, with

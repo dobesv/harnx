@@ -9,8 +9,8 @@ pub(super) struct MixedParts {
 
 impl MixedParts {
     pub fn new() -> Self {
-        let large = "head\"\n日本語👋\\\u{0000}".repeat(4000) + "END";
-        let bytes = [0, 1, 254, 255].repeat(12000);
+        let large = "head\"\n日本語👋\\\u{0000}".repeat(DEFAULT_MAX_RESULT_BYTES / 8) + "END";
+        let bytes = [0, 1, 254, 255].repeat(DEFAULT_MAX_RESULT_BYTES / 2);
         let annotation = json!({"audience": ["assistant"], "priority": 0.75});
         let original = json!({"content": [
             {"type": "text", "text": "small\r\nunchanged\u{0000}", "annotations": annotation},

@@ -12,6 +12,7 @@ use serde_json::{json, Map, Value};
 use crate::format;
 
 use super::model::PlayerResponse;
+use super::params::DEFAULT_MAX_LENGTH;
 use super::{FetchParams, FetchServer, YoutubeTranscriptParams};
 
 pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 6] = [
@@ -68,9 +69,9 @@ fn metric_tool_name(tool: &str) -> &'static str {
         .unwrap_or("unknown")
 }
 
-fn output(value: &str, params: &FetchParams, disable_line_clipping: bool) -> String {
+fn output(value: &str, params: &FetchParams) -> String {
     let (window, _) = params.compatibility_window(value);
-    truncate_output(&window, &params.truncation_opts(disable_line_clipping))
+    truncate_output(&window, &params.truncation_opts())
 }
 
 fn json_output(value: &str, params: &FetchParams) -> String {
@@ -80,7 +81,7 @@ fn json_output(value: &str, params: &FetchParams) -> String {
     } else {
         window
     };
-    truncate_output(&preview, &params.truncation_opts(true))
+    truncate_output(&preview, &params.truncation_opts())
 }
 
 impl FetchServer {
@@ -97,7 +98,7 @@ impl FetchServer {
 
     pub async fn fetch_html_impl(&self, params: FetchParams) -> Result<CallToolResult, ErrorData> {
         let page = self.fetch_page(&params).await?;
-        Ok(text_result(output(&page.body, &params, true)))
+        Ok(text_result(output(&page.body, &params)))
     }
 
     pub async fn fetch_markdown_impl(
@@ -108,14 +109,13 @@ impl FetchServer {
         Ok(text_result(output(
             &format::html_to_md(&page.body),
             &params,
-            false,
         )))
     }
 
     pub async fn fetch_txt_impl(&self, params: FetchParams) -> Result<CallToolResult, ErrorData> {
         let page = self.fetch_page(&params).await?;
         let text = format::html_to_text(&page.body).map_err(domain_error)?;
-        Ok(text_result(output(&text, &params, false)))
+        Ok(text_result(output(&text, &params)))
     }
 
     pub async fn fetch_json_impl(&self, params: FetchParams) -> Result<CallToolResult, ErrorData> {
@@ -134,7 +134,7 @@ impl FetchServer {
         let page = self.fetch_page(&params).await?;
         let markdown =
             format::readable_markdown(&page.body, page.final_url.as_str()).map_err(domain_error)?;
-        Ok(text_result(output(&markdown, &params, false)))
+        Ok(text_result(output(&markdown, &params)))
     }
 
     pub async fn fetch_youtube_transcript_impl(
@@ -183,7 +183,7 @@ impl FetchServer {
             .await
             .map_err(domain_error)?;
         let transcript = format::transcript_lines(&captions.body).map_err(domain_error)?;
-        Ok(text_result(output(&transcript, &params.fetch, false)))
+        Ok(text_result(output(&transcript, &params.fetch)))
     }
 }
 
@@ -285,7 +285,7 @@ pub(crate) fn tool_schema(name: &str) -> Map<String, Value> {
     );
     properties.insert(
         "max_length".to_owned(),
-        json!({"type":"integer","minimum":0,"default":5000,"description":"Compatibility character limit applied before smart truncation. Zero means unlimited."}),
+        json!({"type":"integer","minimum":0,"default":DEFAULT_MAX_LENGTH,"description":"Compatibility character limit applied before smart truncation. Zero means unlimited."}),
     );
     properties.insert(
         "start_index".to_owned(),
@@ -325,7 +325,11 @@ mod tests {
         for (name, _) in TOOL_DESCRIPTIONS {
             let schema = Value::Object(tool_schema(name));
             assert_eq!(schema["required"], json!(["url"]));
-            assert_eq!(schema["properties"]["max_length"]["default"], 5000);
+            assert_eq!(DEFAULT_MAX_LENGTH, 131_072);
+            assert_eq!(
+                schema["properties"]["max_length"]["default"],
+                DEFAULT_MAX_LENGTH
+            );
             assert!(schema["properties"].get("max_output_bytes").is_some());
         }
     }

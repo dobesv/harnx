@@ -85,7 +85,7 @@ pub struct Args {
     pub tool_args: Option<String>,
 
     /// Maximum compact serialized JSON bytes per tool result (not per round).
-    #[arg(long, env = "HARNX_MCP_MAX_RESULT_BYTES", default_value = "32768", value_parser = result_limits::parse_max_result_bytes)]
+    #[arg(long, env = "HARNX_MCP_MAX_RESULT_BYTES", default_value_t = result_limits::DEFAULT_MAX_RESULT_BYTES, value_parser = result_limits::parse_max_result_bytes)]
     pub max_result_bytes: usize,
 }
 
@@ -755,6 +755,18 @@ mod tests {
         ]);
         assert_eq!(args.enable_tool, vec!["search", "exec*"]);
         assert_eq!(args.child, vec!["echo"]);
+    }
+
+    #[test]
+    fn args_default_result_limit_is_128_kib() {
+        let args = Args::parse_from(["mcp-bridge", "--", "echo"]);
+        assert_eq!(super::result_limits::DEFAULT_MAX_RESULT_BYTES, 131_072);
+        assert_eq!(
+            args.max_result_bytes,
+            super::result_limits::DEFAULT_MAX_RESULT_BYTES
+        );
+        let args = Args::parse_from(["mcp-bridge", "--max-result-bytes", "262144", "--", "echo"]);
+        assert_eq!(args.max_result_bytes, 262_144);
     }
 
     #[test]

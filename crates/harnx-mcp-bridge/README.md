@@ -93,7 +93,7 @@ value into `ToolSpec.timeout_secs` for its NATS registration.
 
 ## Result Limits and Original Attachments
 
-Every result is limited to **32,768 bytes** of compact serialized `CallToolResult`
+Every result is limited to **131,072 bytes (128 KiB)** of compact serialized `CallToolResult`
 JSON by default. This is a per-result limit, not a limit shared across calls in a
 round. JSON escaping, all content parts, annotations, `structuredContent`, `_meta`
 and envelope fields count. Direct CLI stdout adds a trailing newline outside the

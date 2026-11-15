@@ -17,7 +17,10 @@ async fn bridge_result_below_presentation_cap_is_bounded_durably_by_independent_
         "structuredContent": {"schema": "unchanged"}, "_meta": {"kept": true}, "isError": true
     }))?;
     let original = serde_json::to_value(original)?;
-    assert!(serde_json::to_vec(&original)?.len() < 32_768);
+    assert!(
+        serde_json::to_vec(&original)?.len()
+            < harnx_mcp_bridge::result_limits::DEFAULT_MAX_RESULT_BYTES
+    );
     let mut fixture = Fixture::new(None, "shared-size-call", &original).await?;
     let mut saved = None;
     for restart in [false, true] {
@@ -51,8 +54,7 @@ async fn bridge_result_below_presentation_cap_is_bounded_durably_by_independent_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bridged_part_offload_and_shared_terminal_guard_work_below_default_chunk_size() -> Result<()>
 {
-    // Short lines leave a preview above the independent 8 KiB KV cap; a single
-    // line would also be clipped by the bridge's existing line limit.
+    // Keep the bridge preview above the independent 8 KiB KV cap.
     let text = ("x".repeat(300) + "\n").repeat(1000);
     let original = json!({"content": [{"type": "text", "text": text}]});
     let fixture = Fixture::new(Some(16 * 1024), "small-wire-bridge", &original).await?;

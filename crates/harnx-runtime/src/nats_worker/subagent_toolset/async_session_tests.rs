@@ -33,7 +33,7 @@ fn wait_defaults_apply_to_omitted_and_null_fields() {
             panic!("default read should be sequential");
         };
         assert_eq!(seq.limit, 100);
-        assert_eq!(resolved.read.max_output_bytes, 16_384);
+        assert_eq!(resolved.read.max_output_bytes, 131_072);
     }
 }
 
@@ -78,10 +78,10 @@ fn forever_resolves_and_excludes_seconds() {
 fn wait_validates_nested_read_options() {
     let error = wait_options(json!({ "read": { "limit": 0 } })).unwrap_err();
     assert_eq!(error, "read.limit must be between 1 and 500");
-    let error = wait_options(json!({ "read": { "max_output_bytes": 65_537 } })).unwrap_err();
+    let error = wait_options(json!({ "read": { "max_output_bytes": 307_201 } })).unwrap_err();
     assert_eq!(
         error,
-        "read.max_output_bytes must be between 1024 and 65536"
+        "read.max_output_bytes must be between 1024 and 307200"
     );
 }
 
@@ -366,7 +366,7 @@ fn tool_schemas_are_strict_and_nested() {
     assert_eq!(read["additionalProperties"], json!(false));
     assert_eq!(
         read["properties"]["max_output_bytes"]["maximum"],
-        json!(65536)
+        json!(307200)
     );
     assert_eq!(
         read["properties"]["max_output_bytes"]["minimum"],

@@ -28,9 +28,9 @@ async fn invoke_both_paths(server: &BashServer, toolset: &BashToolset, args: Val
 async fn template_default_byte_limit_recovers_long_lines_on_native_and_mcp_paths() {
     let dir = tempfile::tempdir().unwrap();
     let (server, toolset) =
-        tools_with_defaults(dir.path(), LONG_LINES, "{max_output_bytes: 65536}").await;
+        tools_with_defaults(dir.path(), &long_lines(5000), "{max_output_bytes: 65536}").await;
     for result in invoke_both_paths(&server, &toolset, json!({})).await {
-        assert_template_long_lines(&result, true);
+        assert_template_long_lines(&result, 5000, true);
     }
     for result in invoke_both_paths(&server, &toolset, json!({"max_output_bytes": 1024})).await {
         assert_ne!(result["isError"], true, "{result}");

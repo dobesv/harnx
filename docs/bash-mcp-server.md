@@ -123,7 +123,7 @@ Built-in tool names are reserved: a command template named `exec`, `spawn`, `sta
 
 `spawn`, `status` and `wait` reject arguments they do not declare. In particular, `wait` no longer takes `timeout_secs` (use `seconds`), and a nested `wait` object does not either.
 
-Output filters (`head_lines`, `tail_lines`, `max_output_bytes`) shape the returned text across `exec`, `spawn` wait, `status`, `wait`, `read_exec_log`, and command templates. When `max_output_bytes` is provided explicitly, per-line clipping is disabled across all bash tools and the in-process `bash` script tool, allowing long single lines to be returned in full subject to the byte cap and line window.
+Output filters (`head_lines`, `tail_lines`, `max_output_bytes`) shape the returned text across `exec`, `spawn` wait, `status`, `wait`, `read_exec_log`, and command templates. Per-line clipping is off by default across all bash tools and the in-process `bash` script tool, allowing long single lines to be returned in full subject to the byte cap and line window.
 
 ### Deadlines versus waits
 
@@ -181,9 +181,9 @@ Command templates define custom fixed shell command shapes in YAML files discove
 Every command template automatically injects four reserved parameters into its schema:
 
 - `timeout_secs`: Kill deadline in seconds (1 to 86400, default 86400).
-- `head_lines`: First N lines of each stream to return (default 25).
-- `tail_lines`: Last N lines of each stream to return (default 75).
-- `max_output_bytes`: Output byte limit (default 16384). Setting this also disables per-line clipping.
+- `head_lines`: First N lines of each stream to return (default 250).
+- `tail_lines`: Last N lines of each stream to return (default 750).
+- `max_output_bytes`: Output byte limit (default 131072). Long lines are preserved within the byte cap and line window.
 
 Declaring any of these names under a template's YAML `parameters` map causes the template to fail loading with an error naming the parameter. Reserved parameters are handled by the server and stripped before arguments reach the script environment.
 
@@ -200,13 +200,13 @@ output:
 
 All three entries are optional non-negative integers. Unknown keys and invalid values (including `null`) fail loading with the field name. Defaults appear in the tool's input schema and are never passed to the script environment.
 
-Precedence is per field: non-null caller argument, then template default, then server default (25 head lines, 75 tail lines, 16384 bytes). Null caller arguments inherit defaults. Without `output:` or with `output: {}`, behavior is unchanged. A template-set `max_output_bytes` disables per-line clipping just like a caller-set limit. Byte caps and line windows still apply independently to stdout and stderr, excluding result metadata and formatting.
+Precedence is per field: non-null caller argument, then template default, then server default (250 head lines, 750 tail lines, 131072 bytes). Null caller arguments inherit defaults. Without `output:` or with `output: {}`, the server defaults apply. Per-line clipping is off by default. Byte caps and line windows apply independently to stdout and stderr, excluding result metadata and formatting.
 
-The shipped `gh_issue_view` and `jira_view` templates use `max_output_bytes: 65536`. If invoked inside the in-process `bash` script tool, the outer `bash` call still needs its own `max_output_bytes`; inner defaults don't prevent outer clipping.
+The shipped `gh_issue_view` and `jira_view` templates keep their `max_output_bytes: 65536` defaults. If invoked inside the in-process `bash` script tool, the outer `bash` call has its own byte cap and line window. Increase its limits separately if needed; template defaults affect only the inner command.
 
 ### Truncation and long-line recovery
 
-Without a template byte default or caller byte limit, output is truncated when exceeding 16 KiB per stream or when lines exceed ~2,000 bytes. Passing `max_output_bytes` explicitly disables per-line clipping, returning whole lines within the specified byte cap and line window. This long-line recovery applies across `exec`, `spawn` wait/status, `read_exec_log`, command templates, and the in-process `bash` script tool.
+Default output limits are 250 head lines, 750 tail lines, and 131072 bytes (128 KiB) per stream. Per-line clipping is off by default, so long lines are returned intact when they fit the byte cap. Set `max_output_bytes`, `head_lines`, or `tail_lines` explicitly to adjust those limits. This applies across `exec`, `spawn` wait/status, `read_exec_log`, command templates, and the in-process `bash` script tool.
 
 When a template tool's output is truncated, the hint lists only template-supported parameters:
 

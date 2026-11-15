@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use harnx_core::safety::{TruncateOpts, DEFAULT_MAX_BYTES};
 use serde::Deserialize;
 
-pub const DEFAULT_MAX_LENGTH: usize = 5000;
+/// Character window deliberately equal in number to the shared byte budget.
+pub const DEFAULT_MAX_LENGTH: usize = DEFAULT_MAX_BYTES;
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct FetchParams {
@@ -44,27 +45,13 @@ impl FetchParams {
         Ok(())
     }
 
-    pub fn truncation_opts(&self, disable_line_clipping: bool) -> TruncateOpts {
+    pub fn truncation_opts(&self) -> TruncateOpts {
         let defaults = TruncateOpts::default();
         TruncateOpts {
-            offset: None,
-            limit: None,
             head_lines: self.head_lines.unwrap_or(defaults.head_lines),
             tail_lines: self.tail_lines.unwrap_or(defaults.tail_lines),
-            line_head_bytes: if disable_line_clipping {
-                0
-            } else {
-                defaults.line_head_bytes
-            },
-            line_tail_bytes: if disable_line_clipping {
-                0
-            } else {
-                defaults.line_tail_bytes
-            },
-            max_output_bytes: self
-                .max_output_bytes
-                .unwrap_or(defaults.max_output_bytes.min(DEFAULT_MAX_BYTES)),
-            marker: defaults.marker,
+            max_output_bytes: self.max_output_bytes.unwrap_or(defaults.max_output_bytes),
+            ..defaults
         }
     }
 
@@ -100,6 +87,29 @@ impl YoutubeTranscriptParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncation_defaults_use_shared_byte_budget_without_clamping() {
+        let params = FetchParams::default();
+        let input = "x".repeat(DEFAULT_MAX_BYTES);
+        let opts = params.truncation_opts();
+        assert_eq!(opts, TruncateOpts::default());
+        assert_eq!(opts.max_output_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(harnx_core::safety::truncate_output(&input, &opts), input);
+    }
+
+    #[test]
+    fn compatibility_default_and_zero_unlimited_keep_character_semantics() {
+        assert_eq!(DEFAULT_MAX_LENGTH, 131_072);
+        let value = "日".repeat(DEFAULT_MAX_LENGTH + 1);
+        let mut params = FetchParams::default();
+        assert_eq!(
+            params.compatibility_window(&value),
+            ("日".repeat(DEFAULT_MAX_LENGTH), true)
+        );
+        params.max_length = Some(0);
+        assert_eq!(params.compatibility_window(&value), (value, false));
+    }
 
     #[test]
     fn compatibility_window_matches_upstream_semantics() {

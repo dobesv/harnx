@@ -76,15 +76,28 @@ pub fn pretty_yaml_block(value: &serde_json::Value) -> String {
 /// string passthrough → YAML, then truncates to fit the terminal when
 /// stdout is one. Both the TUI sink and the CLI sink call this so they
 /// render identically.
+///
+/// Truncation uses `TruncateOpts::display_default()` (compact legacy values),
+/// deliberately decoupled from the larger agent-facing defaults in
+/// `harnx-core` `safety.rs`, so raising agent output limits never changes
+/// what the terminal shows.
 pub fn render_tool_result_text(output: &serde_json::Value, markdown: Option<&str>) -> String {
+    render_tool_result_text_for_terminal(output, markdown, stdout_terminal_size())
+}
+
+fn render_tool_result_text_for_terminal(
+    output: &serde_json::Value,
+    markdown: Option<&str>,
+    terminal_size: Option<(u16, u16)>,
+) -> String {
     use harnx_core::safety::{truncate_output, TruncateOpts};
     use harnx_core::tool::extract_user_display_text;
 
-    let mut opts = TruncateOpts::default();
+    let mut opts = TruncateOpts::display_default();
     let marker = " [...] ";
-    // Without a terminal to fit, the safer `TruncateOpts::default()`
-    // (head_lines=25, line_head_bytes=500) stays in place.
-    if let Some((cols, rows)) = stdout_terminal_size() {
+    // Without a terminal to fit, keep compact display defaults rather than
+    // the larger agent-facing output limits.
+    if let Some((cols, rows)) = terminal_size {
         opts.head_lines = 5.max((rows / 2) as usize);
         opts.tail_lines = 0;
         opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
@@ -200,6 +213,48 @@ pub fn decode_bin<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_result_display_truncation_matches_legacy_tty_and_non_tty_output() {
+        use harnx_core::safety::{truncate_output, TruncateOpts};
+
+        let inputs = [
+            "x".repeat(6000),
+            (1..=600).map(|n| format!("line-{n}\n")).collect(),
+            format!("{}\n", "z".repeat(5000)).repeat(120),
+        ];
+        for terminal_size in [None, Some((80_u16, 24_u16)), Some((1000, 1000))] {
+            // Spell out the old display contract so agent defaults can't change it.
+            let mut legacy = TruncateOpts {
+                offset: None,
+                limit: None,
+                head_lines: 25,
+                tail_lines: 75,
+                line_head_bytes: 500,
+                line_tail_bytes: 1500,
+                max_output_bytes: 16_384,
+                marker: None,
+            };
+            if let Some((cols, rows)) = terminal_size {
+                legacy.head_lines = 5.max(usize::from(rows / 2));
+                legacy.tail_lines = 0;
+                legacy.line_head_bytes = usize::from(cols).saturating_sub(3 + " [...] ".len());
+                legacy.line_tail_bytes = 0;
+                legacy.marker = Some(" [...] ".to_owned());
+            }
+            for input in &inputs {
+                let output = serde_json::Value::String(input.clone());
+                assert_eq!(
+                    render_tool_result_text_for_terminal(&output, None, terminal_size),
+                    truncate_output(input, &legacy)
+                );
+                assert_eq!(
+                    render_tool_result_text_for_terminal(&output, Some(input), terminal_size),
+                    truncate_output(input.trim(), &legacy)
+                );
+            }
+        }
+    }
 
     /// Tests, like piped output, have no terminal on stdout. When `TERM`
     /// names a terminal type there, crossterm still reports `tput`'s 80

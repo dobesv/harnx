@@ -10,7 +10,7 @@ pub(crate) const HEAD_LINES_DESCRIPTION: &str =
     "Return only the first N lines of each stream. Prefer this over `| head -N` in the command.";
 pub(crate) const TAIL_LINES_DESCRIPTION: &str =
     "Return only the last N lines of each stream. Prefer this over `| tail -N` in the command.";
-pub(crate) const MAX_OUTPUT_BYTES_DESCRIPTION: &str = "Truncate output to this many bytes. Setting this also returns long lines in full, subject to the byte cap and line window. Prefer this over `| head -c N` in the command.";
+pub(crate) const MAX_OUTPUT_BYTES_DESCRIPTION: &str = "Truncate output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window. Prefer this over `| head -c N` in the command.";
 
 pub(crate) const OUTPUT_CONTROL_PARAMS: [(&str, &str); 3] = [
     ("head_lines", HEAD_LINES_DESCRIPTION),

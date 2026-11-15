@@ -48,7 +48,7 @@ Two paging modes are available:
 **Byte-based paging:**
 - `url` (string, required): The canonical `cid:` URL to read.
 - `byte_offset` (integer, optional): Zero-based byte position to start reading; defaults to 0 when only `byte_limit` is supplied. Must be a UTF-8 character boundary.
-- `byte_limit` (integer, optional): Positive page size; defaults to 65,536 bytes when only `byte_offset` is supplied.
+- `byte_limit` (integer, optional): Positive page size; defaults to 131,072 bytes (128 KiB) when only `byte_offset` is supplied.
 
 Use byte paging for minified JSON or long single lines retained from oversized tool
 results. For example, call `attachment_read` with the retained `url`,
